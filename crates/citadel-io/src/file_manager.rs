@@ -157,7 +157,7 @@ impl FileHeader {
             tree_root: PageId(0),
             tree_depth: 0,
             tree_entries: 0,
-            catalog_root: PageId(0),
+            catalog_root: PageId::INVALID,
             total_pages: 0,
             high_water_mark: 0,
             pending_free_root: PageId::INVALID,

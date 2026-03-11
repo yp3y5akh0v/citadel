@@ -1,4 +1,15 @@
-pub use citadel_core as types;
+mod builder;
+mod database;
+
+// Public API
+pub use builder::DatabaseBuilder;
+pub use database::{Database, DbStats};
+pub use citadel_core::error::{Error, Result};
+pub use citadel_core::types::{Argon2Profile, CipherId};
+pub use citadel_txn::integrity::{IntegrityReport, IntegrityError};
+
+// Internal crate re-exports (used by integration tests and advanced usage)
+pub use citadel_core as core;
 pub use citadel_crypto as crypto;
 pub use citadel_io as io;
 pub use citadel_page as page;

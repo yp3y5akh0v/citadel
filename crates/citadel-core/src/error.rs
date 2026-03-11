@@ -64,6 +64,15 @@ pub enum Error {
     #[error("unsupported cipher: {0}")]
     UnsupportedCipher(u8),
 
+    #[error("table not found: {0}")]
+    TableNotFound(String),
+
+    #[error("table already exists: {0}")]
+    TableAlreadyExists(String),
+
+    #[error("passphrase is required")]
+    PassphraseRequired,
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }

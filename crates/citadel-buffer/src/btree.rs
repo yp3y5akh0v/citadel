@@ -14,6 +14,7 @@ use citadel_page::{branch_node, leaf_node};
 use crate::allocator::PageAllocator;
 
 /// B+ tree metadata. Lightweight struct — pages are stored externally.
+#[derive(Clone)]
 pub struct BTree {
     pub root: PageId,
     pub depth: u16,

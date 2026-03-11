@@ -11,6 +11,7 @@ use citadel_io::file_manager::CommitSlot;
 use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
 
+use crate::catalog::TableDescriptor;
 use crate::manager::TxnManager;
 
 /// A read-only transaction with snapshot isolation.
@@ -21,8 +22,6 @@ pub struct ReadTxn<'a> {
     manager: &'a TxnManager,
     txn_id: TxnId,
     snapshot: CommitSlot,
-    /// Local page cache for this read transaction.
-    /// Pages are cloned from the buffer pool on first access.
     page_cache: HashMap<PageId, Page>,
 }
 
@@ -50,15 +49,82 @@ impl<'a> ReadTxn<'a> {
         self.snapshot.tree_root
     }
 
-    /// Get the snapshot's entry count.
+    /// Get the snapshot's entry count for the default table.
     pub fn entry_count(&self) -> u64 {
         self.snapshot.tree_entries
     }
 
-    /// Look up a key. Returns the value if found.
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let mut current = self.snapshot.tree_root;
+    // ── Default table operations ──────────────────────────────────────
 
+    /// Look up a key in the default table.
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.search_tree(self.snapshot.tree_root, key)
+    }
+
+    /// Check if a key exists in the default table.
+    pub fn contains_key(&mut self, key: &[u8]) -> Result<bool> {
+        Ok(self.get(key)?.is_some())
+    }
+
+    // ── Named table operations ────────────────────────────────────────
+
+    /// Look up a key in a named table.
+    pub fn table_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let desc = self.lookup_table(table)?;
+        self.search_tree(desc.root_page, key)
+    }
+
+    /// Check if a key exists in a named table.
+    pub fn table_contains_key(&mut self, table: &[u8], key: &[u8]) -> Result<bool> {
+        Ok(self.table_get(table, key)?.is_some())
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────
+
+    /// Look up a table descriptor in the catalog.
+    fn lookup_table(&mut self, name: &[u8]) -> Result<TableDescriptor> {
+        let catalog_root = self.snapshot.catalog_root;
+        if !catalog_root.is_valid() {
+            return Err(Error::TableNotFound(
+                String::from_utf8_lossy(name).into_owned(),
+            ));
+        }
+
+        // Search the catalog B+ tree for the table name
+        let mut current = catalog_root;
+        loop {
+            let page = self.load_page(current)?;
+            match page.page_type() {
+                Some(PageType::Leaf) => {
+                    return match leaf_node::search(page, name) {
+                        Ok(idx) => {
+                            let cell = leaf_node::read_cell(page, idx);
+                            if cell.val_type == ValueType::Tombstone {
+                                Err(Error::TableNotFound(
+                                    String::from_utf8_lossy(name).into_owned(),
+                                ))
+                            } else {
+                                Ok(TableDescriptor::deserialize(&cell.value))
+                            }
+                        }
+                        Err(_) => Err(Error::TableNotFound(
+                            String::from_utf8_lossy(name).into_owned(),
+                        )),
+                    };
+                }
+                Some(PageType::Branch) => {
+                    current = branch_node::search(page, name);
+                }
+                _ => {
+                    return Err(Error::InvalidPageType(page.page_type_raw(), current));
+                }
+            }
+        }
+    }
+
+    /// Search for a key in an arbitrary B+ tree starting at `root`.
+    fn search_tree(&mut self, root: PageId, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let mut current = root;
         loop {
             let page = self.load_page(current)?;
             match page.page_type() {
@@ -84,12 +150,6 @@ impl<'a> ReadTxn<'a> {
         }
     }
 
-    /// Check if a key exists.
-    pub fn contains_key(&mut self, key: &[u8]) -> Result<bool> {
-        Ok(self.get(key)?.is_some())
-    }
-
-    /// Load a page into the local cache and return a reference to it.
     fn load_page(&mut self, page_id: PageId) -> Result<&Page> {
         if !self.page_cache.contains_key(&page_id) {
             let page = self.manager.fetch_page(page_id)?;
@@ -121,14 +181,12 @@ mod tests {
     fn read_after_write_commit() {
         let mgr = create_test_manager();
 
-        // Write some data
         {
             let mut wtx = mgr.begin_write().unwrap();
             wtx.insert(b"hello", b"world").unwrap();
             wtx.commit().unwrap();
         }
 
-        // Read it back
         {
             let mut rtx = mgr.begin_read();
             assert_eq!(rtx.get(b"hello").unwrap(), Some(b"world".to_vec()));
@@ -141,31 +199,23 @@ mod tests {
     fn snapshot_isolation() {
         let mgr = create_test_manager();
 
-        // Write initial data
         {
             let mut wtx = mgr.begin_write().unwrap();
             wtx.insert(b"key1", b"v1").unwrap();
             wtx.commit().unwrap();
         }
 
-        // Start a read — should see key1
         let mut rtx = mgr.begin_read();
         assert_eq!(rtx.get(b"key1").unwrap(), Some(b"v1".to_vec()));
 
-        // Write more data after the read started
         {
             let mut wtx = mgr.begin_write().unwrap();
             wtx.insert(b"key2", b"v2").unwrap();
             wtx.commit().unwrap();
         }
 
-        // The read should NOT see key2 (snapshot isolation)
-        // Note: In our implementation, the snapshot is captured at begin_read time.
-        // The read sees the tree root at that point. The write created a new root
-        // via CoW, so the old root is unchanged.
         assert_eq!(rtx.get(b"key2").unwrap(), None);
 
-        // A new read should see both
         let mut rtx2 = mgr.begin_read();
         assert_eq!(rtx2.get(b"key1").unwrap(), Some(b"v1".to_vec()));
         assert_eq!(rtx2.get(b"key2").unwrap(), Some(b"v2".to_vec()));
@@ -184,5 +234,34 @@ mod tests {
         let mut rtx = mgr.begin_read();
         assert!(rtx.contains_key(b"exists").unwrap());
         assert!(!rtx.contains_key(b"nope").unwrap());
+    }
+
+    #[test]
+    fn read_named_table() {
+        let mgr = create_test_manager();
+
+        {
+            let mut wtx = mgr.begin_write().unwrap();
+            wtx.create_table(b"mydata").unwrap();
+            wtx.table_insert(b"mydata", b"hello", b"world").unwrap();
+            wtx.commit().unwrap();
+        }
+
+        let mut rtx = mgr.begin_read();
+        assert_eq!(
+            rtx.table_get(b"mydata", b"hello").unwrap(),
+            Some(b"world".to_vec())
+        );
+        assert_eq!(rtx.table_get(b"mydata", b"missing").unwrap(), None);
+    }
+
+    #[test]
+    fn read_nonexistent_table() {
+        let mgr = create_test_manager();
+        let mut rtx = mgr.begin_read();
+        assert!(matches!(
+            rtx.table_get(b"nope", b"key"),
+            Err(citadel_core::Error::TableNotFound(_))
+        ));
     }
 }

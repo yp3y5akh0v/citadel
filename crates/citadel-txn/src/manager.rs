@@ -25,6 +25,8 @@ use citadel_io::file_manager::{
 use citadel_io::traits::PageIO;
 use citadel_page::page::Page;
 
+use crate::catalog::TableDescriptor;
+use crate::integrity::{self, IntegrityReport};
 use crate::pending_free;
 use crate::read_txn::ReadTxn;
 use crate::write_txn::WriteTxn;
@@ -121,7 +123,7 @@ impl TxnManager {
             tree_root: root_id,
             tree_depth: 1,
             tree_entries: 0,
-            catalog_root: PageId(0),
+            catalog_root: PageId::INVALID,
             total_pages: 1,
             high_water_mark: 1,
             pending_free_root: PageId::INVALID,
@@ -195,15 +197,11 @@ impl TxnManager {
         Ok(page.clone())
     }
 
-    /// Commit a write transaction. Implements the full 6-step commit protocol.
+    /// Commit a write transaction using the shadow-paging commit protocol.
     ///
-    /// Step 0: Set recovery flag + fsync
-    /// Step 1: Process pending-free chain (GC + write new chain)
-    /// Step 2: Write all dirty pages to disk (encrypted)
-    /// Step 3: Write updated commit slot to inactive slot
-    /// Step 4: fsync (ensures data + slot are durable)
-    /// Step 5: Flip god byte (single-byte atomic write)
-    /// Step 6: fsync (ensures god byte is durable)
+    /// Sets recovery flag, processes pending-free chain, flushes dirty pages,
+    /// writes the inactive commit slot, fsyncs, flips the god byte, and fsyncs
+    /// again. Returns success only after the final fsync completes.
     pub(crate) fn commit_write(
         &self,
         txn_id: TxnId,
@@ -212,16 +210,17 @@ impl TxnManager {
         tree: &BTree,
         old_slot: &CommitSlot,
         deferred_free: &[PageId],
+        catalog_root: PageId,
     ) -> Result<()> {
         let mut state = self.state.lock();
 
-        // Step 0: Set recovery flag + fsync
+        // Set recovery flag
         let current_god_byte = read_god_byte(&*self.io)?;
         let recovery_god_byte = current_god_byte | GOD_BIT_RECOVERY;
         write_god_byte(&*self.io, recovery_god_byte)?;
         self.io.fsync()?;
 
-        // Step 1: Process pending-free chain
+        // Process pending-free chain (GC + write new chain)
         let freed_this_txn = alloc.commit();
         let oldest_active = self.oldest_active_reader_locked(&state);
 
@@ -236,10 +235,7 @@ impl TxnManager {
             oldest_active,
         )?;
 
-        // Store reclaimed pages in ManagerState for the next writer's allocator
-        // (Don't add to local alloc — it gets dropped after commit)
-
-        // Step 2: Write all dirty pages to disk (pages with txn_id == current txn)
+        // Flush dirty pages to disk (encrypted)
         for page in pages.values_mut() {
             if page.txn_id() == txn_id {
                 page.update_checksum();
@@ -256,14 +252,14 @@ impl TxnManager {
             }
         }
 
-        // Step 3: Build and write new commit slot to INACTIVE slot
+        // Write new commit slot to inactive slot
         let inactive_slot_idx = 1 - state.active_slot;
         let new_slot = CommitSlot {
             txn_id,
             tree_root: tree.root,
             tree_depth: tree.depth,
             tree_entries: tree.entry_count,
-            catalog_root: old_slot.catalog_root,
+            catalog_root,
             total_pages: alloc.high_water_mark(),
             high_water_mark: alloc.high_water_mark(),
             pending_free_root: new_pf_root,
@@ -273,14 +269,13 @@ impl TxnManager {
         };
         write_commit_slot(&*self.io, inactive_slot_idx, &new_slot)?;
 
-        // Step 4: fsync (ensures dirty pages + commit slot are durable)
         self.io.fsync()?;
 
-        // Step 5: Flip god byte (bit 0 = new active slot, bit 1 = 0 clear recovery)
+        // Flip god byte (atomic commit point)
         let new_god_byte = inactive_slot_idx as u8 & GOD_BIT_ACTIVE_SLOT;
         write_god_byte(&*self.io, new_god_byte)?;
 
-        // Step 6: fsync (ensures god byte is durable)
+        // Final fsync — commit is durable after this returns
         self.io.fsync()?;
 
         // Update manager state
@@ -336,6 +331,339 @@ impl TxnManager {
         self.state.lock().reader_table.len()
     }
 
+    /// Run integrity check on the database.
+    pub fn integrity_check(&self) -> Result<IntegrityReport> {
+        integrity::run_integrity_check(self)
+    }
+
+    /// Copy a consistent snapshot to the destination I/O.
+    pub fn backup_to(&self, dest_io: &dyn PageIO) -> Result<()> {
+        use std::collections::HashSet;
+        let slot = self.current_slot();
+
+        // Collect all reachable pages
+        let mut reachable = HashSet::new();
+        self.collect_tree_pages(slot.tree_root, &mut reachable)?;
+
+        if slot.catalog_root.is_valid() {
+            let table_roots = self.collect_catalog_pages(slot.catalog_root, &mut reachable)?;
+            for root in table_roots {
+                self.collect_tree_pages(root, &mut reachable)?;
+            }
+        }
+
+        if slot.pending_free_root.is_valid() {
+            self.collect_chain_pages(slot.pending_free_root, &mut reachable)?;
+        }
+
+        // Read source file header
+        let mut header_buf = [0u8; citadel_core::FILE_HEADER_SIZE];
+        self.io.read_at(0, &mut header_buf)?;
+        let mut header = file_manager::FileHeader::deserialize(&header_buf)?;
+
+        // Set both commit slots to the snapshot, slot 0 active
+        header.slots = [slot.clone(), slot];
+        header.god_byte = 0;
+
+        // Calculate needed file size
+        let max_page = reachable.iter().map(|p| p.as_u32()).max().unwrap_or(0);
+        let needed_size = citadel_core::FILE_HEADER_SIZE as u64
+            + (max_page as u64 + 1) * PAGE_SIZE as u64;
+        dest_io.truncate(needed_size)?;
+
+        // Write header
+        dest_io.write_at(0, &header.serialize())?;
+
+        // Copy all reachable pages (raw encrypted bytes — no decrypt/re-encrypt)
+        for &page_id in &reachable {
+            let offset = page_offset(page_id);
+            let mut buf = [0u8; PAGE_SIZE];
+            self.io.read_page(offset, &mut buf)?;
+            dest_io.write_page(offset, &buf)?;
+        }
+
+        dest_io.fsync()?;
+        Ok(())
+    }
+
+    /// Compact the database into a new file with sequential page IDs.
+    pub fn compact_to(&self, dest_io: &dyn PageIO) -> Result<()> {
+        use std::collections::HashMap as StdMap;
+        use std::collections::HashSet;
+        use citadel_page::{branch_node, leaf_node};
+        use citadel_core::types::ValueType;
+
+        let slot = self.current_slot();
+        let mut next_id: u32 = 0;
+        let mut old_to_new: StdMap<PageId, PageId> = StdMap::new();
+        let mut catalog_leaves: HashSet<PageId> = HashSet::new();
+
+        // Walk all trees, assign new sequential page IDs
+        self.assign_new_ids(slot.tree_root, &mut old_to_new, &mut next_id)?;
+
+        if slot.catalog_root.is_valid() {
+            let table_roots = {
+                let mut reachable = HashSet::new();
+                let roots = self.collect_catalog_pages(slot.catalog_root, &mut reachable)?;
+                roots
+            };
+
+            self.assign_new_ids(slot.catalog_root, &mut old_to_new, &mut next_id)?;
+
+            // Collect catalog leaf page IDs (they contain TableDescriptors that need fixup)
+            self.collect_catalog_leaf_pages(slot.catalog_root, &mut catalog_leaves)?;
+
+            for root in &table_roots {
+                self.assign_new_ids(*root, &mut old_to_new, &mut next_id)?;
+            }
+        }
+
+        // Copy each page with remapped IDs
+        let total_pages = next_id;
+        let needed_size = citadel_core::FILE_HEADER_SIZE as u64
+            + total_pages as u64 * PAGE_SIZE as u64;
+        dest_io.truncate(needed_size)?;
+
+        for (&old_id, &new_id) in &old_to_new {
+            let mut page = self.read_page_from_disk(old_id)?;
+
+            // Update page_id
+            page.set_page_id(new_id);
+
+            // Remap child pointers in branch pages
+            if page.page_type() == Some(citadel_core::types::PageType::Branch) {
+                for i in 0..page.num_cells() as usize {
+                    let old_child = branch_node::get_child(&page, i);
+                    if let Some(&new_child) = old_to_new.get(&old_child) {
+                        let offset = page.cell_offset(i as u16) as usize;
+                        page.data[offset..offset + 4]
+                            .copy_from_slice(&new_child.as_u32().to_le_bytes());
+                    }
+                }
+                let old_right = page.right_child();
+                if old_right.is_valid() {
+                    if let Some(&new_right) = old_to_new.get(&old_right) {
+                        page.set_right_child(new_right);
+                    }
+                }
+            }
+
+            // Remap table root pages in catalog leaf cells
+            if catalog_leaves.contains(&old_id) {
+                for i in 0..page.num_cells() {
+                    let cell = leaf_node::read_cell(&page, i);
+                    if cell.val_type != ValueType::Tombstone
+                        && cell.value.len() >= crate::catalog::TABLE_DESCRIPTOR_SIZE
+                    {
+                        let desc = TableDescriptor::deserialize(cell.value);
+                        if let Some(&new_root) = old_to_new.get(&desc.root_page) {
+                            let cell_off = page.cell_offset(i) as usize;
+                            let key_len = u16::from_le_bytes(
+                                page.data[cell_off..cell_off + 2].try_into().unwrap(),
+                            ) as usize;
+                            let value_start = cell_off + 6 + key_len + 1;
+                            page.data[value_start..value_start + 4]
+                                .copy_from_slice(&new_root.as_u32().to_le_bytes());
+                        }
+                    }
+                }
+            }
+
+            page.update_checksum();
+
+            // Encrypt with fresh IV and write to new location
+            let offset = page_offset(new_id);
+            let mut encrypted = [0u8; PAGE_SIZE];
+            page_cipher::encrypt_page(
+                &self.dek, &self.mac_key, new_id, self.epoch,
+                page.as_bytes(), &mut encrypted,
+            );
+            dest_io.write_page(offset, &encrypted)?;
+        }
+
+        // Write file header
+        let mut header_buf = [0u8; citadel_core::FILE_HEADER_SIZE];
+        self.io.read_at(0, &mut header_buf)?;
+        let mut header = file_manager::FileHeader::deserialize(&header_buf)?;
+
+        let new_tree_root = old_to_new.get(&slot.tree_root).copied().unwrap_or(PageId(0));
+        let new_catalog_root = if slot.catalog_root.is_valid() {
+            old_to_new.get(&slot.catalog_root).copied().unwrap_or(PageId::INVALID)
+        } else {
+            PageId::INVALID
+        };
+
+        let new_slot = CommitSlot {
+            txn_id: slot.txn_id,
+            tree_root: new_tree_root,
+            tree_depth: slot.tree_depth,
+            tree_entries: slot.tree_entries,
+            catalog_root: new_catalog_root,
+            total_pages,
+            high_water_mark: total_pages,
+            pending_free_root: PageId::INVALID,
+            encryption_epoch: slot.encryption_epoch,
+            dek_id: slot.dek_id,
+            checksum: 0,
+        };
+
+        header.slots = [new_slot.clone(), new_slot];
+        header.god_byte = 0;
+
+        dest_io.write_at(0, &header.serialize())?;
+        dest_io.fsync()?;
+
+        Ok(())
+    }
+
+    /// Collect all page IDs in a B+ tree.
+    fn collect_tree_pages(
+        &self,
+        root: PageId,
+        reachable: &mut std::collections::HashSet<PageId>,
+    ) -> Result<()> {
+        use citadel_page::branch_node;
+
+        let mut stack = vec![root];
+        while let Some(page_id) = stack.pop() {
+            if !reachable.insert(page_id) {
+                continue;
+            }
+            let page = self.read_page_from_disk(page_id)?;
+            if page.page_type() == Some(citadel_core::types::PageType::Branch) {
+                for i in 0..page.num_cells() as usize {
+                    stack.push(branch_node::get_child(&page, i));
+                }
+                let right = page.right_child();
+                if right.is_valid() {
+                    stack.push(right);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Collect catalog pages and return named table root pages.
+    fn collect_catalog_pages(
+        &self,
+        catalog_root: PageId,
+        reachable: &mut std::collections::HashSet<PageId>,
+    ) -> Result<Vec<PageId>> {
+        use citadel_page::{branch_node, leaf_node};
+        use citadel_core::types::ValueType;
+
+        let mut table_roots = Vec::new();
+        let mut stack = vec![catalog_root];
+        while let Some(page_id) = stack.pop() {
+            if !reachable.insert(page_id) {
+                continue;
+            }
+            let page = self.read_page_from_disk(page_id)?;
+            match page.page_type() {
+                Some(citadel_core::types::PageType::Leaf) => {
+                    for i in 0..page.num_cells() {
+                        let cell = leaf_node::read_cell(&page, i);
+                        if cell.val_type != ValueType::Tombstone && cell.value.len() >= 4 {
+                            let desc = TableDescriptor::deserialize(cell.value);
+                            if desc.root_page.is_valid() {
+                                table_roots.push(desc.root_page);
+                            }
+                        }
+                    }
+                }
+                Some(citadel_core::types::PageType::Branch) => {
+                    for i in 0..page.num_cells() as usize {
+                        stack.push(branch_node::get_child(&page, i));
+                    }
+                    let right = page.right_child();
+                    if right.is_valid() {
+                        stack.push(right);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(table_roots)
+    }
+
+    /// Collect pending-free chain page IDs.
+    fn collect_chain_pages(
+        &self,
+        root: PageId,
+        reachable: &mut std::collections::HashSet<PageId>,
+    ) -> Result<()> {
+        let mut current = root;
+        while current.is_valid() {
+            if !reachable.insert(current) {
+                break;
+            }
+            let page = self.read_page_from_disk(current)?;
+            current = page.right_child();
+        }
+        Ok(())
+    }
+
+    /// Collect catalog leaf page IDs (pages that contain TableDescriptor values).
+    fn collect_catalog_leaf_pages(
+        &self,
+        catalog_root: PageId,
+        leaves: &mut std::collections::HashSet<PageId>,
+    ) -> Result<()> {
+        use citadel_page::branch_node;
+
+        let mut stack = vec![catalog_root];
+        while let Some(page_id) = stack.pop() {
+            let page = self.read_page_from_disk(page_id)?;
+            match page.page_type() {
+                Some(citadel_core::types::PageType::Leaf) => {
+                    leaves.insert(page_id);
+                }
+                Some(citadel_core::types::PageType::Branch) => {
+                    for i in 0..page.num_cells() as usize {
+                        stack.push(branch_node::get_child(&page, i));
+                    }
+                    let right = page.right_child();
+                    if right.is_valid() {
+                        stack.push(right);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Walk a tree depth-first, assigning new sequential page IDs.
+    fn assign_new_ids(
+        &self,
+        root: PageId,
+        mapping: &mut std::collections::HashMap<PageId, PageId>,
+        next_id: &mut u32,
+    ) -> Result<()> {
+        use citadel_page::branch_node;
+
+        let mut stack = vec![root];
+        while let Some(page_id) = stack.pop() {
+            if mapping.contains_key(&page_id) {
+                continue;
+            }
+            mapping.insert(page_id, PageId(*next_id));
+            *next_id += 1;
+
+            let page = self.read_page_from_disk(page_id)?;
+            if page.page_type() == Some(citadel_core::types::PageType::Branch) {
+                for i in 0..page.num_cells() as usize {
+                    stack.push(branch_node::get_child(&page, i));
+                }
+                let right = page.right_child();
+                if right.is_valid() {
+                    stack.push(right);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Load pending-free chain pages from disk into the HashMap.
     fn load_pending_free_chain(
         &self,
@@ -369,7 +697,7 @@ impl TxnManager {
     }
 
     /// Read and decrypt a single page from disk.
-    pub(crate) fn read_page_from_disk(&self, page_id: PageId) -> Result<Page> {
+    pub fn read_page_from_disk(&self, page_id: PageId) -> Result<Page> {
         let offset = page_offset(page_id);
         let mut encrypted = [0u8; PAGE_SIZE];
         self.io.read_page(offset, &mut encrypted)?;

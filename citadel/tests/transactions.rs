@@ -766,16 +766,12 @@ fn for_each_multi_leaf_tree() {
     }
 }
 
-// --- BUG #3 Regression: Reclaimed pages must be reused ---
-
 #[test]
 fn reclaimed_pages_reused() {
-    // BUG #3 regression: reclaimed pages were stored in a local allocator
-    // that got dropped. The next writer should reuse reclaimed pages.
     let storage = std::sync::Arc::new(SharedStorage::new(8 * 1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
-    // Step 1: Insert 200 keys (creates many pages)
+    // Insert 200 keys
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 0..200u32 {
@@ -792,7 +788,7 @@ fn reclaimed_pages_reused() {
     assert!(hwm_after_insert > 1,
         "inserting 200 keys should allocate multiple pages, HWM={hwm_after_insert}");
 
-    // Step 2: Delete all 200 keys (CoW frees pages, pending-free chain created)
+    // Delete all 200 keys (CoW frees pages)
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 0..200u32 {
@@ -807,15 +803,14 @@ fn reclaimed_pages_reused() {
     assert!(hwm_after_delete >= hwm_after_insert,
         "CoW deletes should not shrink HWM: after_insert={hwm_after_insert} after_delete={hwm_after_delete}");
 
-    // Step 3: A third commit with no active readers should reclaim pages
-    // (oldest_active_reader = next_txn_id > all freed_at_txn)
+    // Trigger reclaim with no active readers
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"trigger-reclaim", b"x").unwrap();
         wtx.commit().unwrap();
     }
 
-    // Step 4: Insert new data — should reuse reclaimed pages, not grow HWM much
+    // Insert new data — should reuse reclaimed pages, not grow HWM much
     let hwm_before_reuse = mgr.current_slot().high_water_mark;
     {
         let mut wtx = mgr.begin_write().unwrap();
