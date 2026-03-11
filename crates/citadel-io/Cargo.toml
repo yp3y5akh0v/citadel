@@ -6,12 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 description = "I/O layer for Citadel: PageIO trait, sync I/O, file locking, file management"
 
+[features]
+default = []
+io-uring = ["dep:io-uring"]
+
 [dependencies]
 citadel-core = { workspace = true }
 xxhash-rust = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }

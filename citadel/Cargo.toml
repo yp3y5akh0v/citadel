@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Citadel: encrypted-first embedded database engine"
 
+[features]
+default = []
+io-uring = ["citadel-io/io-uring"]
+
 [dependencies]
 citadel-core = { workspace = true }
 citadel-crypto = { workspace = true }

@@ -50,6 +50,7 @@ parking_lot = "0.12"
 
 # I/O
 libc = "0.2"
+io-uring = "0.7"
 
 # Cipher traits
 cipher = "0.4"

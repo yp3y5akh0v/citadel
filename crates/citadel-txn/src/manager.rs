@@ -235,7 +235,7 @@ impl TxnManager {
             oldest_active,
         )?;
 
-        // Flush dirty pages to disk (encrypted)
+        let mut encrypted_pages: Vec<(u64, [u8; PAGE_SIZE])> = Vec::new();
         for page in pages.values_mut() {
             if page.txn_id() == txn_id {
                 page.update_checksum();
@@ -248,8 +248,12 @@ impl TxnManager {
                     &self.dek, &self.mac_key, page_id,
                     self.epoch, page.as_bytes(), &mut encrypted,
                 );
-                self.io.write_page(offset, &encrypted)?;
+                encrypted_pages.push((offset, encrypted));
             }
+        }
+
+        if !encrypted_pages.is_empty() {
+            self.io.flush_pages(&encrypted_pages)?;
         }
 
         // Write new commit slot to inactive slot
