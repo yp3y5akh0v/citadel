@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 
-/// SIEVE eviction cache (NSDI 2024).
+/// SIEVE eviction cache.
 ///
 /// Single FIFO queue with a moving eviction hand and a visited bit.
 /// Dirty entries are pinned and never evictable.
 ///
-/// O(1) amortized eviction, 21% better miss ratio than FIFO,
-/// 6x better than LRU under concurrency.
+/// O(1) amortized eviction.
 pub struct SieveCache<V> {
     entries: Vec<SieveEntry<V>>,
     /// Maps key -> index in entries vec.

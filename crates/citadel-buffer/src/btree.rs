@@ -5,7 +5,6 @@
 //! are freed via the allocator's pending-free list.
 //!
 //! The tree uses `HashMap<PageId, Page>` as the in-memory page store.
-//! In Phase 3, this will be backed by the encrypted BufferPool.
 
 use std::collections::HashMap;
 use citadel_core::{Error, Result};
@@ -84,7 +83,7 @@ impl BTree {
         val_type: ValueType,
         value: &[u8],
     ) -> Result<bool> {
-        // Phase 1: Walk root to leaf, recording path
+        // Walk root to leaf, recording path
         let (path, leaf_id) = self.walk_to_leaf(pages, key)?;
 
         // Check if key already exists
@@ -93,10 +92,10 @@ impl BTree {
             leaf_node::search(page, key).is_ok()
         };
 
-        // Phase 2: CoW the leaf
+        // CoW the leaf
         let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
 
-        // Phase 3: Try to insert into CoW'd leaf
+        // Try to insert into CoW'd leaf
         let leaf_ok = {
             let page = pages.get_mut(&new_leaf_id).unwrap();
             leaf_node::insert(page, key, val_type, value)
@@ -111,12 +110,12 @@ impl BTree {
             return Ok(!key_exists);
         }
 
-        // Phase 4: Leaf is full — split
+        // Leaf is full — split
         let (sep_key, right_id) = split_leaf_with_insert(
             pages, alloc, txn_id, new_leaf_id, key, val_type, value,
         );
 
-        // Phase 5: Propagate split up through ancestors
+        // Propagate split up through ancestors
         self.root = propagate_split_up(
             pages, alloc, txn_id, &path, new_leaf_id, &sep_key, right_id,
             &mut self.depth,
@@ -136,7 +135,7 @@ impl BTree {
         txn_id: TxnId,
         key: &[u8],
     ) -> Result<bool> {
-        // Phase 1: Walk root to leaf
+        // Walk root to leaf
         let (path, leaf_id) = self.walk_to_leaf(pages, key)?;
 
         // Check if key exists
@@ -148,14 +147,14 @@ impl BTree {
             return Ok(false);
         }
 
-        // Phase 2: CoW the leaf and delete
+        // CoW the leaf and delete
         let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
         {
             let page = pages.get_mut(&new_leaf_id).unwrap();
             leaf_node::delete(page, key);
         }
 
-        // Phase 3: Check if leaf became empty
+        // Check if leaf became empty
         let leaf_empty = pages.get(&new_leaf_id).unwrap().num_cells() == 0;
 
         if !leaf_empty || path.is_empty() {
@@ -165,7 +164,7 @@ impl BTree {
             return Ok(true);
         }
 
-        // Phase 4: Empty leaf — remove from tree
+        // Empty leaf — remove from tree
         alloc.free(new_leaf_id);
         pages.remove(&new_leaf_id);
 
@@ -202,8 +201,6 @@ impl BTree {
         }
     }
 }
-
-// ── Helper functions ──
 
 /// Copy-on-Write: clone a page to a new page ID, free the old one.
 fn cow_page(

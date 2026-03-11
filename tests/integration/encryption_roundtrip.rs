@@ -1,4 +1,4 @@
-//! Integration test: full encryption round-trip through all Phase 1 layers.
+//! Integration test: full encryption round-trip through all layers.
 //!
 //! Creates a database file, writes encrypted pages via buffer pool,
 //! flushes to disk, reads back, verifies data integrity.

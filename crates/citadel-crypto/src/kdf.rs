@@ -33,7 +33,6 @@ pub fn derive_mk_with_profile(
 }
 
 /// Derive a Master Key using PBKDF2-HMAC-SHA256 (FIPS mode fallback).
-/// Uses 600,000 iterations per OWASP 2026 minimum recommendation.
 #[cfg(feature = "fips")]
 pub fn derive_mk_pbkdf2(
     passphrase: &[u8],

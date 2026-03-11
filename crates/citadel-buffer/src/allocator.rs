@@ -1,9 +1,9 @@
 //! Page allocator for the CoW B+ tree.
 //!
-//! Uses a two-phase pending-free model (inspired by redb):
+//! Uses a two-phase pending-free model:
 //! - New pages are allocated from `ready_to_use` (reclaimed) or high water mark
 //! - Freed pages go into `freed_this_txn` (not reusable until committed + no older readers)
-//! - On-disk pending-free chain persistence happens in Phase 3 (commit protocol)
+//! - On-disk pending-free chain persistence happens during commit
 
 use citadel_core::types::PageId;
 

@@ -5,6 +5,7 @@ members = [
     "crates/citadel-io",
     "crates/citadel-page",
     "crates/citadel-buffer",
+    "crates/citadel-txn",
     "citadel",
 ]
 resolver = "2"
@@ -22,6 +23,7 @@ citadel-crypto = { path = "crates/citadel-crypto" }
 citadel-io = { path = "crates/citadel-io" }
 citadel-page = { path = "crates/citadel-page" }
 citadel-buffer = { path = "crates/citadel-buffer" }
+citadel-txn = { path = "crates/citadel-txn" }
 
 # Crypto
 aes = "0.8"

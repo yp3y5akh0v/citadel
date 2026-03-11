@@ -1,10 +1,10 @@
 [package]
-name = "citadel"
+name = "citadel-txn"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Citadel: encrypted-first embedded database engine"
+description = "Transaction manager with MVCC, commit protocol, and pending-free chain for Citadel"
 
 [dependencies]
 citadel-core = { workspace = true }
@@ -12,7 +12,4 @@ citadel-crypto = { workspace = true }
 citadel-io = { workspace = true }
 citadel-page = { workspace = true }
 citadel-buffer = { workspace = true }
-citadel-txn = { workspace = true }
-
-[dev-dependencies]
-tempfile = "3"
+parking_lot = { workspace = true }
