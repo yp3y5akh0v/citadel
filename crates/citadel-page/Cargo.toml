@@ -1,0 +1,11 @@
+[package]
+name = "citadel-page"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Page format, serialization, and checksum for Citadel B+ tree pages"
+
+[dependencies]
+citadel-core = { workspace = true }
+xxhash-rust = { workspace = true }

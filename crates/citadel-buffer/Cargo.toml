@@ -1,0 +1,14 @@
+[package]
+name = "citadel-buffer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Buffer pool with SIEVE eviction and encrypt/decrypt pipeline for Citadel"
+
+[dependencies]
+citadel-core = { workspace = true }
+citadel-crypto = { workspace = true }
+citadel-io = { workspace = true }
+citadel-page = { workspace = true }
+parking_lot = { workspace = true }

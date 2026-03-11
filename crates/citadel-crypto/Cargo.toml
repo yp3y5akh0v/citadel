@@ -1,0 +1,35 @@
+[package]
+name = "citadel-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cryptographic primitives for Citadel: AES-256-CTR + HMAC-SHA256, key management, Argon2id"
+
+[dependencies]
+citadel-core = { workspace = true }
+aes = { workspace = true }
+ctr = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hkdf = { workspace = true }
+argon2 = { workspace = true }
+aes-kw = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
+rand = { workspace = true }
+cipher = { workspace = true }
+
+[dependencies.chacha20]
+workspace = true
+optional = true
+
+[dependencies.pbkdf2]
+workspace = true
+optional = true
+
+[features]
+default = ["aes-cipher"]
+aes-cipher = []
+chacha = ["dep:chacha20"]
+fips = ["dep:pbkdf2"]

@@ -1,0 +1,58 @@
+[workspace]
+members = [
+    "crates/citadel-core",
+    "crates/citadel-crypto",
+    "crates/citadel-io",
+    "crates/citadel-page",
+    "crates/citadel-buffer",
+    "citadel",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Internal crates
+citadel-core = { path = "crates/citadel-core" }
+citadel-crypto = { path = "crates/citadel-crypto" }
+citadel-io = { path = "crates/citadel-io" }
+citadel-page = { path = "crates/citadel-page" }
+citadel-buffer = { path = "crates/citadel-buffer" }
+
+# Crypto
+aes = "0.8"
+ctr = "0.9"
+chacha20 = "0.9"
+hmac = "0.12"
+sha2 = "0.10"
+hkdf = "0.12"
+argon2 = "0.5"
+aes-kw = "0.2"
+pbkdf2 = "0.12"
+subtle = "2.5"
+zeroize = { version = "1.7", features = ["derive"] }
+rand = "0.8"
+
+# Hashing
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+# Error handling
+thiserror = "2.0"
+
+# Sync
+parking_lot = "0.12"
+
+# I/O
+libc = "0.2"
+
+# Cipher traits
+cipher = "0.4"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
