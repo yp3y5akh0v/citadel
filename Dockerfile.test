@@ -1,0 +1,13 @@
+FROM rust:latest
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY citadel/ citadel/
+
+# Build everything with io-uring feature (compile-only, no io_uring syscalls)
+RUN cargo test --workspace --features citadel/io-uring --no-run 2>&1
+
+# Tests run via: docker run --security-opt seccomp=unconfined <image>
+CMD ["cargo", "test", "--workspace", "--features", "citadel/io-uring"]

@@ -26,22 +26,17 @@ impl UringPageIO {
     pub fn try_new(file: File) -> Option<Self> {
         let fd = file.into_raw_fd();
 
+        // No setup_defer_taskrun/setup_single_issuer: our Mutex allows
+        // multiple threads to submit (serialized), but single_issuer
+        // restricts to the creating thread's task_struct (EEXIST otherwise).
         let ring = IoUring::builder()
-            .setup_defer_taskrun()
-            .setup_single_issuer()
             .setup_coop_taskrun()
             .setup_clamp()
-            .build(1024)
-            .or_else(|_| {
-                IoUring::builder()
-                    .setup_coop_taskrun()
-                    .setup_clamp()
-                    .build(1024)
-            })
+            .build(256)
             .or_else(|_| {
                 IoUring::builder()
                     .setup_clamp()
-                    .build(1024)
+                    .build(256)
             });
 
         match ring {
@@ -54,6 +49,21 @@ impl UringPageIO {
                 None
             }
         }
+    }
+
+    fn drain_cqes(ring: &mut IoUring, expected: usize) -> Result<()> {
+        let mut completed = 0;
+        while completed < expected {
+            let result = ring.completion().next().map(|cqe| cqe.result());
+            if let Some(r) = result {
+                if r < 0 {
+                    while ring.completion().next().is_some() {}
+                    return Err(Error::Io(io::Error::from_raw_os_error(-r)));
+                }
+                completed += 1;
+            }
+        }
+        Ok(())
     }
 
     fn submit_one(&self, sqe: io_uring::squeue::Entry) -> Result<i32> {
@@ -175,29 +185,38 @@ impl PageIO for UringPageIO {
         }
 
         let mut ring = self.ring.lock().unwrap();
-        let total = pages.len() + 1;
 
-        for (i, (offset, buf)) in pages.iter().enumerate() {
-            let sqe = opcode::Write::new(
-                types::Fd(self.fd),
-                buf.as_ptr(),
-                PAGE_SIZE as u32,
-            )
-            .offset(*offset)
-            .build()
-            .user_data(i as u64);
+        // Query actual SQ capacity — kernel may clamp below our requested size
+        let sq_cap = ring.submission().capacity();
+        // Reserve 1 slot for fsync in the last batch
+        let batch_size = sq_cap.saturating_sub(1).max(1);
 
-            unsafe {
-                ring.submission()
-                    .push(&sqe)
-                    .map_err(|_| sq_full_err())?;
+        // Submit writes in batches that fit the SQ
+        for chunk in pages.chunks(batch_size) {
+            for (i, (offset, buf)) in chunk.iter().enumerate() {
+                let sqe = opcode::Write::new(
+                    types::Fd(self.fd),
+                    buf.as_ptr(),
+                    PAGE_SIZE as u32,
+                )
+                .offset(*offset)
+                .build()
+                .user_data(i as u64);
+
+                unsafe {
+                    ring.submission()
+                        .push(&sqe)
+                        .map_err(|_| sq_full_err())?;
+                }
             }
+
+            ring.submit_and_wait(chunk.len())?;
+            Self::drain_cqes(&mut ring, chunk.len())?;
         }
 
-        // Fsync with IO_DRAIN barrier
+        // Final fsync
         let fsync_sqe = opcode::Fsync::new(types::Fd(self.fd))
             .build()
-            .flags(io_uring::squeue::Flags::IO_DRAIN)
             .user_data(u64::MAX);
 
         unsafe {
@@ -206,19 +225,8 @@ impl PageIO for UringPageIO {
                 .map_err(|_| sq_full_err())?;
         }
 
-        ring.submit_and_wait(total)?;
-
-        let mut completed = 0;
-        while completed < total {
-            if let Some(cqe) = ring.completion().next() {
-                let result = cqe.result();
-                if result < 0 {
-                    while ring.completion().next().is_some() {}
-                    return Err(Error::Io(io::Error::from_raw_os_error(-result)));
-                }
-                completed += 1;
-            }
-        }
+        ring.submit_and_wait(1)?;
+        Self::drain_cqes(&mut ring, 1)?;
 
         Ok(())
     }

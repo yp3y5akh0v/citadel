@@ -9,6 +9,7 @@ use citadel_crypto::page_cipher::compute_dek_id;
 use citadel_io::file_lock;
 use citadel_io::file_manager::FileHeader;
 use citadel_io::sync_io::SyncPageIO;
+use citadel_io::traits::PageIO;
 use citadel_txn::manager::TxnManager;
 
 use crate::database::Database;
@@ -81,6 +82,18 @@ impl DatabaseBuilder {
         })
     }
 
+    fn create_page_io(file: std::fs::File) -> Box<dyn PageIO> {
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        {
+            if let Some(uring) = citadel_io::uring_io::UringPageIO::try_new(
+                file.try_clone().expect("failed to clone file handle"),
+            ) {
+                return Box::new(uring);
+            }
+        }
+        Box::new(SyncPageIO::new(file))
+    }
+
     /// Create a new database. Fails if the data file already exists.
     pub fn create(self) -> Result<Database> {
         let passphrase = self
@@ -114,7 +127,7 @@ impl DatabaseBuilder {
         file_lock::try_lock_exclusive(&file)?;
 
         let dek_id = compute_dek_id(&keys.mac_key, &keys.dek);
-        let io = Box::new(SyncPageIO::new(file));
+        let io = Self::create_page_io(file);
 
         let manager = TxnManager::create(
             io,
@@ -165,7 +178,7 @@ impl DatabaseBuilder {
 
         let dek_id = compute_dek_id(&keys.mac_key, &keys.dek);
 
-        let io = Box::new(SyncPageIO::new(file));
+        let io = Self::create_page_io(file);
 
         let manager = TxnManager::open(
             io,
