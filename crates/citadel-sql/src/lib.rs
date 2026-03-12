@@ -4,6 +4,7 @@ pub mod encoding;
 pub mod parser;
 pub mod eval;
 pub mod schema;
+pub mod planner;
 pub mod executor;
 pub mod connection;
 

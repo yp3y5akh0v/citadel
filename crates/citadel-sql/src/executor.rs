@@ -4,10 +4,11 @@ use std::collections::BTreeMap;
 
 use citadel::Database;
 
-use crate::encoding::{decode_composite_key, decode_row, encode_composite_key, encode_row};
+use crate::encoding::{decode_composite_key, decode_key_value, decode_row, encode_composite_key, encode_row};
 use crate::error::{Result, SqlError};
 use crate::eval::{eval_expr, is_truthy};
 use crate::parser::*;
+use crate::planner::{self, ScanPlan};
 use crate::schema::SchemaManager;
 use crate::types::*;
 
@@ -543,6 +544,385 @@ fn find_index_in_schemas(schema: &SchemaManager, index_name: &str) -> Option<(St
     None
 }
 
+// ── Index scan helpers ───────────────────────────────────────────────
+
+fn extract_pk_key(
+    idx_key: &[u8],
+    idx_value: &[u8],
+    is_unique: bool,
+    num_index_cols: usize,
+    num_pk_cols: usize,
+) -> Result<Vec<u8>> {
+    if is_unique && !idx_value.is_empty() {
+        Ok(idx_value.to_vec())
+    } else {
+        let total_cols = num_index_cols + num_pk_cols;
+        let all_values = decode_composite_key(idx_key, total_cols)?;
+        let pk_values = &all_values[num_index_cols..];
+        Ok(encode_composite_key(pk_values))
+    }
+}
+
+fn check_range_conditions(
+    idx_key: &[u8],
+    num_prefix_cols: usize,
+    range_conds: &[(BinOp, Value)],
+    num_index_cols: usize,
+) -> Result<RangeCheck> {
+    if range_conds.is_empty() {
+        return Ok(RangeCheck::Match);
+    }
+
+    let num_to_decode = num_prefix_cols + 1;
+    if num_to_decode > num_index_cols {
+        return Ok(RangeCheck::Match);
+    }
+
+    // Decode just enough columns to check the range column
+    let mut pos = 0;
+    for _ in 0..num_prefix_cols {
+        let (_, n) = decode_key_value(&idx_key[pos..])?;
+        pos += n;
+    }
+    let (range_val, _) = decode_key_value(&idx_key[pos..])?;
+
+    let mut exceeds_upper = false;
+    let mut below_lower = false;
+
+    for (op, val) in range_conds {
+        match op {
+            BinOp::Lt => { if range_val >= *val { exceeds_upper = true; } }
+            BinOp::LtEq => { if range_val > *val { exceeds_upper = true; } }
+            BinOp::Gt => { if range_val <= *val { below_lower = true; } }
+            BinOp::GtEq => { if range_val < *val { below_lower = true; } }
+            _ => {}
+        }
+    }
+
+    if exceeds_upper {
+        Ok(RangeCheck::ExceedsUpper)
+    } else if below_lower {
+        Ok(RangeCheck::BelowLower)
+    } else {
+        Ok(RangeCheck::Match)
+    }
+}
+
+enum RangeCheck {
+    Match,
+    BelowLower,
+    ExceedsUpper,
+}
+
+/// Collect rows via ReadTxn using the scan plan.
+fn collect_rows_read(
+    db: &Database,
+    table_schema: &TableSchema,
+    where_clause: &Option<Expr>,
+) -> Result<Vec<Vec<Value>>> {
+    let plan = planner::plan_select(table_schema, where_clause);
+    let lower_name = &table_schema.name;
+
+    match plan {
+        ScanPlan::SeqScan => {
+            let mut rows = Vec::new();
+            let mut rtx = db.begin_read();
+            let mut scan_err: Option<SqlError> = None;
+            rtx.table_for_each(lower_name.as_bytes(), |key, value| {
+                match decode_full_row(table_schema, key, value) {
+                    Ok(row) => rows.push(row),
+                    Err(e) => scan_err = Some(e),
+                }
+                Ok(())
+            }).map_err(SqlError::Storage)?;
+            if let Some(e) = scan_err { return Err(e); }
+            Ok(rows)
+        }
+
+        ScanPlan::PkLookup { pk_values } => {
+            let key = encode_composite_key(&pk_values);
+            let mut rtx = db.begin_read();
+            match rtx.table_get(lower_name.as_bytes(), &key).map_err(SqlError::Storage)? {
+                Some(value) => {
+                    let row = decode_full_row(table_schema, &key, &value)?;
+                    Ok(vec![row])
+                }
+                None => Ok(vec![]),
+            }
+        }
+
+        ScanPlan::IndexScan {
+            idx_table, prefix, num_prefix_cols,
+            range_conds, is_unique, index_columns, ..
+        } => {
+            let num_pk_cols = table_schema.primary_key_columns.len();
+            let num_index_cols = index_columns.len();
+            let mut pk_keys: Vec<Vec<u8>> = Vec::new();
+
+            {
+                let mut rtx = db.begin_read();
+                let mut scan_err: Option<SqlError> = None;
+                rtx.table_scan_from(&idx_table, &prefix, |key, value| {
+                    if !key.starts_with(&prefix) {
+                        return Ok(false);
+                    }
+                    match check_range_conditions(key, num_prefix_cols, &range_conds, num_index_cols) {
+                        Ok(RangeCheck::ExceedsUpper) => return Ok(false),
+                        Ok(RangeCheck::BelowLower) => return Ok(true),
+                        Ok(RangeCheck::Match) => {}
+                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                    }
+                    match extract_pk_key(key, value, is_unique, num_index_cols, num_pk_cols) {
+                        Ok(pk) => pk_keys.push(pk),
+                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                    }
+                    Ok(true)
+                }).map_err(SqlError::Storage)?;
+                if let Some(e) = scan_err { return Err(e); }
+            }
+
+            let mut rows = Vec::new();
+            let mut rtx = db.begin_read();
+            for pk_key in &pk_keys {
+                if let Some(value) = rtx.table_get(lower_name.as_bytes(), pk_key).map_err(SqlError::Storage)? {
+                    rows.push(decode_full_row(table_schema, pk_key, &value)?);
+                }
+            }
+            Ok(rows)
+        }
+    }
+}
+
+/// Collect rows via WriteTxn using the scan plan.
+fn collect_rows_write(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    table_schema: &TableSchema,
+    where_clause: &Option<Expr>,
+) -> Result<Vec<Vec<Value>>> {
+    let plan = planner::plan_select(table_schema, where_clause);
+    let lower_name = &table_schema.name;
+
+    match plan {
+        ScanPlan::SeqScan => {
+            let mut rows = Vec::new();
+            let mut scan_err: Option<SqlError> = None;
+            wtx.table_for_each(lower_name.as_bytes(), |key, value| {
+                match decode_full_row(table_schema, key, value) {
+                    Ok(row) => rows.push(row),
+                    Err(e) => scan_err = Some(e),
+                }
+                Ok(())
+            }).map_err(SqlError::Storage)?;
+            if let Some(e) = scan_err { return Err(e); }
+            Ok(rows)
+        }
+
+        ScanPlan::PkLookup { pk_values } => {
+            let key = encode_composite_key(&pk_values);
+            match wtx.table_get(lower_name.as_bytes(), &key).map_err(SqlError::Storage)? {
+                Some(value) => {
+                    let row = decode_full_row(table_schema, &key, &value)?;
+                    Ok(vec![row])
+                }
+                None => Ok(vec![]),
+            }
+        }
+
+        ScanPlan::IndexScan {
+            idx_table, prefix, num_prefix_cols,
+            range_conds, is_unique, index_columns, ..
+        } => {
+            let num_pk_cols = table_schema.primary_key_columns.len();
+            let num_index_cols = index_columns.len();
+            let mut pk_keys: Vec<Vec<u8>> = Vec::new();
+
+            {
+                let mut scan_err: Option<SqlError> = None;
+                wtx.table_scan_from(&idx_table, &prefix, |key, value| {
+                    if !key.starts_with(&prefix) {
+                        return Ok(false);
+                    }
+                    match check_range_conditions(key, num_prefix_cols, &range_conds, num_index_cols) {
+                        Ok(RangeCheck::ExceedsUpper) => return Ok(false),
+                        Ok(RangeCheck::BelowLower) => return Ok(true),
+                        Ok(RangeCheck::Match) => {}
+                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                    }
+                    match extract_pk_key(key, value, is_unique, num_index_cols, num_pk_cols) {
+                        Ok(pk) => pk_keys.push(pk),
+                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                    }
+                    Ok(true)
+                }).map_err(SqlError::Storage)?;
+                if let Some(e) = scan_err { return Err(e); }
+            }
+
+            let mut rows = Vec::new();
+            for pk_key in &pk_keys {
+                if let Some(value) = wtx.table_get(lower_name.as_bytes(), pk_key).map_err(SqlError::Storage)? {
+                    rows.push(decode_full_row(table_schema, pk_key, &value)?);
+                }
+            }
+            Ok(rows)
+        }
+    }
+}
+
+/// Collect (encoded_key, full_row) pairs via ReadTxn using the scan plan.
+/// Used by DELETE and UPDATE which need the encoded PK key.
+fn collect_keyed_rows_read(
+    db: &Database,
+    table_schema: &TableSchema,
+    where_clause: &Option<Expr>,
+) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    let plan = planner::plan_select(table_schema, where_clause);
+    let lower_name = &table_schema.name;
+
+    match plan {
+        ScanPlan::SeqScan => {
+            let mut rows = Vec::new();
+            let mut rtx = db.begin_read();
+            let mut scan_err: Option<SqlError> = None;
+            rtx.table_for_each(lower_name.as_bytes(), |key, value| {
+                match decode_full_row(table_schema, key, value) {
+                    Ok(row) => rows.push((key.to_vec(), row)),
+                    Err(e) => scan_err = Some(e),
+                }
+                Ok(())
+            }).map_err(SqlError::Storage)?;
+            if let Some(e) = scan_err { return Err(e); }
+            Ok(rows)
+        }
+
+        ScanPlan::PkLookup { pk_values } => {
+            let key = encode_composite_key(&pk_values);
+            let mut rtx = db.begin_read();
+            match rtx.table_get(lower_name.as_bytes(), &key).map_err(SqlError::Storage)? {
+                Some(value) => {
+                    let row = decode_full_row(table_schema, &key, &value)?;
+                    Ok(vec![(key, row)])
+                }
+                None => Ok(vec![]),
+            }
+        }
+
+        ScanPlan::IndexScan {
+            idx_table, prefix, num_prefix_cols,
+            range_conds, is_unique, index_columns, ..
+        } => {
+            let num_pk_cols = table_schema.primary_key_columns.len();
+            let num_index_cols = index_columns.len();
+            let mut pk_keys: Vec<Vec<u8>> = Vec::new();
+
+            {
+                let mut rtx = db.begin_read();
+                let mut scan_err: Option<SqlError> = None;
+                rtx.table_scan_from(&idx_table, &prefix, |key, value| {
+                    if !key.starts_with(&prefix) {
+                        return Ok(false);
+                    }
+                    match check_range_conditions(key, num_prefix_cols, &range_conds, num_index_cols) {
+                        Ok(RangeCheck::ExceedsUpper) => return Ok(false),
+                        Ok(RangeCheck::BelowLower) => return Ok(true),
+                        Ok(RangeCheck::Match) => {}
+                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                    }
+                    match extract_pk_key(key, value, is_unique, num_index_cols, num_pk_cols) {
+                        Ok(pk) => pk_keys.push(pk),
+                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                    }
+                    Ok(true)
+                }).map_err(SqlError::Storage)?;
+                if let Some(e) = scan_err { return Err(e); }
+            }
+
+            let mut rows = Vec::new();
+            let mut rtx = db.begin_read();
+            for pk_key in &pk_keys {
+                if let Some(value) = rtx.table_get(lower_name.as_bytes(), pk_key).map_err(SqlError::Storage)? {
+                    rows.push((pk_key.clone(), decode_full_row(table_schema, pk_key, &value)?));
+                }
+            }
+            Ok(rows)
+        }
+    }
+}
+
+/// Collect (encoded_key, full_row) pairs via WriteTxn using the scan plan.
+fn collect_keyed_rows_write(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    table_schema: &TableSchema,
+    where_clause: &Option<Expr>,
+) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    let plan = planner::plan_select(table_schema, where_clause);
+    let lower_name = &table_schema.name;
+
+    match plan {
+        ScanPlan::SeqScan => {
+            let mut rows = Vec::new();
+            let mut scan_err: Option<SqlError> = None;
+            wtx.table_for_each(lower_name.as_bytes(), |key, value| {
+                match decode_full_row(table_schema, key, value) {
+                    Ok(row) => rows.push((key.to_vec(), row)),
+                    Err(e) => scan_err = Some(e),
+                }
+                Ok(())
+            }).map_err(SqlError::Storage)?;
+            if let Some(e) = scan_err { return Err(e); }
+            Ok(rows)
+        }
+
+        ScanPlan::PkLookup { pk_values } => {
+            let key = encode_composite_key(&pk_values);
+            match wtx.table_get(lower_name.as_bytes(), &key).map_err(SqlError::Storage)? {
+                Some(value) => {
+                    let row = decode_full_row(table_schema, &key, &value)?;
+                    Ok(vec![(key, row)])
+                }
+                None => Ok(vec![]),
+            }
+        }
+
+        ScanPlan::IndexScan {
+            idx_table, prefix, num_prefix_cols,
+            range_conds, is_unique, index_columns, ..
+        } => {
+            let num_pk_cols = table_schema.primary_key_columns.len();
+            let num_index_cols = index_columns.len();
+            let mut pk_keys: Vec<Vec<u8>> = Vec::new();
+
+            {
+                let mut scan_err: Option<SqlError> = None;
+                wtx.table_scan_from(&idx_table, &prefix, |key, value| {
+                    if !key.starts_with(&prefix) {
+                        return Ok(false);
+                    }
+                    match check_range_conditions(key, num_prefix_cols, &range_conds, num_index_cols) {
+                        Ok(RangeCheck::ExceedsUpper) => return Ok(false),
+                        Ok(RangeCheck::BelowLower) => return Ok(true),
+                        Ok(RangeCheck::Match) => {}
+                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                    }
+                    match extract_pk_key(key, value, is_unique, num_index_cols, num_pk_cols) {
+                        Ok(pk) => pk_keys.push(pk),
+                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                    }
+                    Ok(true)
+                }).map_err(SqlError::Storage)?;
+                if let Some(e) = scan_err { return Err(e); }
+            }
+
+            let mut rows = Vec::new();
+            for pk_key in &pk_keys {
+                if let Some(value) = wtx.table_get(lower_name.as_bytes(), pk_key).map_err(SqlError::Storage)? {
+                    rows.push((pk_key.clone(), decode_full_row(table_schema, pk_key, &value)?));
+                }
+            }
+            Ok(rows)
+        }
+    }
+}
+
 // ── DML ─────────────────────────────────────────────────────────────
 
 fn exec_insert(
@@ -641,20 +1021,7 @@ fn exec_select(
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
 
-    let mut rows = Vec::new();
-    {
-        let mut rtx = db.begin_read();
-        let mut scan_err: Option<SqlError> = None;
-        rtx.table_for_each(lower_name.as_bytes(), |key, value| {
-            match decode_full_row(table_schema, key, value) {
-                Ok(row) => rows.push(row),
-                Err(e) => scan_err = Some(e),
-            }
-            Ok(())
-        }).map_err(SqlError::Storage)?;
-        if let Some(e) = scan_err { return Err(e); }
-    }
-
+    let rows = collect_rows_read(db, table_schema, &stmt.where_clause)?;
     process_select(table_schema, rows, stmt)
 }
 
@@ -748,32 +1115,20 @@ fn exec_update(
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
-    let mut matching_rows: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
-    {
-        let mut rtx = db.begin_read();
-        let mut scan_err: Option<SqlError> = None;
-        rtx.table_for_each(lower_name.as_bytes(), |key, value| {
-            match decode_full_row(table_schema, key, value) {
-                Ok(row) => {
-                    let matches = match &stmt.where_clause {
-                        Some(where_expr) => {
-                            match eval_expr(where_expr, &table_schema.columns, &row) {
-                                Ok(val) => is_truthy(&val),
-                                Err(_) => false,
-                            }
-                        }
-                        None => true,
-                    };
-                    if matches {
-                        matching_rows.push((key.to_vec(), row));
+    let all_candidates = collect_keyed_rows_read(db, table_schema, &stmt.where_clause)?;
+    let matching_rows: Vec<(Vec<u8>, Vec<Value>)> = all_candidates.into_iter()
+        .filter(|(_, row)| {
+            match &stmt.where_clause {
+                Some(where_expr) => {
+                    match eval_expr(where_expr, &table_schema.columns, row) {
+                        Ok(val) => is_truthy(&val),
+                        Err(_) => false,
                     }
                 }
-                Err(e) => scan_err = Some(e),
+                None => true,
             }
-            Ok(())
-        }).map_err(SqlError::Storage)?;
-        if let Some(e) = scan_err { return Err(e); }
-    }
+        })
+        .collect();
 
     if matching_rows.is_empty() {
         return Ok(ExecutionResult::RowsAffected(0));
@@ -909,32 +1264,20 @@ fn exec_delete(
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
-    let mut rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
-    {
-        let mut rtx = db.begin_read();
-        let mut scan_err: Option<SqlError> = None;
-        rtx.table_for_each(lower_name.as_bytes(), |key, value| {
-            match decode_full_row(table_schema, key, value) {
-                Ok(row) => {
-                    let matches = match &stmt.where_clause {
-                        Some(where_expr) => {
-                            match eval_expr(where_expr, &table_schema.columns, &row) {
-                                Ok(val) => is_truthy(&val),
-                                Err(_) => false,
-                            }
-                        }
-                        None => true,
-                    };
-                    if matches {
-                        rows_to_delete.push((key.to_vec(), row));
+    let all_candidates = collect_keyed_rows_read(db, table_schema, &stmt.where_clause)?;
+    let rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = all_candidates.into_iter()
+        .filter(|(_, row)| {
+            match &stmt.where_clause {
+                Some(where_expr) => {
+                    match eval_expr(where_expr, &table_schema.columns, row) {
+                        Ok(val) => is_truthy(&val),
+                        Err(_) => false,
                     }
                 }
-                Err(e) => scan_err = Some(e),
+                None => true,
             }
-            Ok(())
-        }).map_err(SqlError::Storage)?;
-        if let Some(e) = scan_err { return Err(e); }
-    }
+        })
+        .collect();
 
     if rows_to_delete.is_empty() {
         return Ok(ExecutionResult::RowsAffected(0));
@@ -1048,19 +1391,7 @@ fn exec_select_in_txn(
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
 
-    let mut rows = Vec::new();
-    {
-        let mut scan_err: Option<SqlError> = None;
-        wtx.table_for_each(lower_name.as_bytes(), |key, value| {
-            match decode_full_row(table_schema, key, value) {
-                Ok(row) => rows.push(row),
-                Err(e) => scan_err = Some(e),
-            }
-            Ok(())
-        }).map_err(SqlError::Storage)?;
-        if let Some(e) = scan_err { return Err(e); }
-    }
-
+    let rows = collect_rows_write(wtx, table_schema, &stmt.where_clause)?;
     process_select(table_schema, rows, stmt)
 }
 
@@ -1073,31 +1404,20 @@ fn exec_update_in_txn(
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
-    let mut matching_rows: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
-    {
-        let mut scan_err: Option<SqlError> = None;
-        wtx.table_for_each(lower_name.as_bytes(), |key, value| {
-            match decode_full_row(table_schema, key, value) {
-                Ok(row) => {
-                    let matches = match &stmt.where_clause {
-                        Some(where_expr) => {
-                            match eval_expr(where_expr, &table_schema.columns, &row) {
-                                Ok(val) => is_truthy(&val),
-                                Err(_) => false,
-                            }
-                        }
-                        None => true,
-                    };
-                    if matches {
-                        matching_rows.push((key.to_vec(), row));
+    let all_candidates = collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?;
+    let matching_rows: Vec<(Vec<u8>, Vec<Value>)> = all_candidates.into_iter()
+        .filter(|(_, row)| {
+            match &stmt.where_clause {
+                Some(where_expr) => {
+                    match eval_expr(where_expr, &table_schema.columns, row) {
+                        Ok(val) => is_truthy(&val),
+                        Err(_) => false,
                     }
                 }
-                Err(e) => scan_err = Some(e),
+                None => true,
             }
-            Ok(())
-        }).map_err(SqlError::Storage)?;
-        if let Some(e) = scan_err { return Err(e); }
-    }
+        })
+        .collect();
 
     if matching_rows.is_empty() {
         return Ok(ExecutionResult::RowsAffected(0));
@@ -1230,31 +1550,20 @@ fn exec_delete_in_txn(
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
-    let mut rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
-    {
-        let mut scan_err: Option<SqlError> = None;
-        wtx.table_for_each(lower_name.as_bytes(), |key, value| {
-            match decode_full_row(table_schema, key, value) {
-                Ok(row) => {
-                    let matches = match &stmt.where_clause {
-                        Some(where_expr) => {
-                            match eval_expr(where_expr, &table_schema.columns, &row) {
-                                Ok(val) => is_truthy(&val),
-                                Err(_) => false,
-                            }
-                        }
-                        None => true,
-                    };
-                    if matches {
-                        rows_to_delete.push((key.to_vec(), row));
+    let all_candidates = collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?;
+    let rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = all_candidates.into_iter()
+        .filter(|(_, row)| {
+            match &stmt.where_clause {
+                Some(where_expr) => {
+                    match eval_expr(where_expr, &table_schema.columns, row) {
+                        Ok(val) => is_truthy(&val),
+                        Err(_) => false,
                     }
                 }
-                Err(e) => scan_err = Some(e),
+                None => true,
             }
-            Ok(())
-        }).map_err(SqlError::Storage)?;
-        if let Some(e) = scan_err { return Err(e); }
-    }
+        })
+        .collect();
 
     if rows_to_delete.is_empty() {
         return Ok(ExecutionResult::RowsAffected(0));

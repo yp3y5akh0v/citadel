@@ -135,6 +135,33 @@ impl<'a> WriteTxn<'a> {
         Ok(())
     }
 
+    /// Seek to `start_key` in a named table and iterate forward.
+    /// The callback returns `true` to continue or `false` to stop.
+    pub fn table_scan_from<F>(&mut self, table: &[u8], start_key: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<bool>,
+    {
+        self.ensure_table(table)?;
+        let root = self.named_trees[table].root;
+        self.preload_all_pages(root)?;
+        let mut cursor = if start_key.is_empty() {
+            Cursor::first(&self.pages, root)?
+        } else {
+            Cursor::seek(&self.pages, root, start_key)?
+        };
+        while cursor.is_valid() {
+            if let Some(entry) = cursor.current(&self.pages) {
+                if entry.val_type != ValueType::Tombstone {
+                    if !f(&entry.key, &entry.value)? {
+                        break;
+                    }
+                }
+            }
+            cursor.next(&self.pages)?;
+        }
+        Ok(())
+    }
+
     // ── Named table operations ────────────────────────────────────────
 
     /// Create a new named table. Fails if the table already exists.

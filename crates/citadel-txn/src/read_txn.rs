@@ -118,6 +118,32 @@ impl<'a> ReadTxn<'a> {
         Ok(())
     }
 
+    /// Seek to `start_key` in a named table and iterate forward.
+    /// The callback returns `true` to continue or `false` to stop.
+    pub fn table_scan_from<F>(&mut self, table: &[u8], start_key: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<bool>,
+    {
+        let desc = self.lookup_table(table)?;
+        self.preload_all_pages(desc.root_page)?;
+        let mut cursor = if start_key.is_empty() {
+            Cursor::first(&self.page_cache, desc.root_page)?
+        } else {
+            Cursor::seek(&self.page_cache, desc.root_page, start_key)?
+        };
+        while cursor.is_valid() {
+            if let Some(entry) = cursor.current(&self.page_cache) {
+                if entry.val_type != ValueType::Tombstone {
+                    if !f(&entry.key, &entry.value)? {
+                        break;
+                    }
+                }
+            }
+            cursor.next(&self.page_cache)?;
+        }
+        Ok(())
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────
 
     /// Look up a table descriptor in the catalog.
