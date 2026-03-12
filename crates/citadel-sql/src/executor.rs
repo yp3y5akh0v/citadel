@@ -11,7 +11,7 @@ use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
 
-/// Execute a parsed SQL statement.
+/// Execute a parsed SQL statement in auto-commit mode.
 pub fn execute(
     db: &Database,
     schema: &mut SchemaManager,
@@ -24,6 +24,28 @@ pub fn execute(
         Statement::Select(sel) => exec_select(db, schema, sel),
         Statement::Update(upd) => exec_update(db, schema, upd),
         Statement::Delete(del) => exec_delete(db, schema, del),
+        Statement::Begin | Statement::Commit | Statement::Rollback => {
+            Err(SqlError::Unsupported("transaction control in auto-commit mode".into()))
+        }
+    }
+}
+
+/// Execute a parsed SQL statement within an existing write transaction.
+pub fn execute_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    stmt: &Statement,
+) -> Result<ExecutionResult> {
+    match stmt {
+        Statement::CreateTable(ct) => exec_create_table_in_txn(wtx, schema, ct),
+        Statement::DropTable(dt) => exec_drop_table_in_txn(wtx, schema, dt),
+        Statement::Insert(ins) => exec_insert_in_txn(wtx, schema, ins),
+        Statement::Select(sel) => exec_select_in_txn(wtx, schema, sel),
+        Statement::Update(upd) => exec_update_in_txn(wtx, schema, upd),
+        Statement::Delete(del) => exec_delete_in_txn(wtx, schema, del),
+        Statement::Begin | Statement::Commit | Statement::Rollback => {
+            Err(SqlError::Unsupported("nested transaction control".into()))
+        }
     }
 }
 
@@ -47,7 +69,6 @@ fn exec_create_table(
         return Err(SqlError::PrimaryKeyRequired);
     }
 
-    // Check for duplicate columns
     let mut seen = std::collections::HashSet::new();
     for col in &stmt.columns {
         let lower = col.name.to_ascii_lowercase();
@@ -56,7 +77,6 @@ fn exec_create_table(
         }
     }
 
-    // Build TableSchema
     let columns: Vec<ColumnDef> = stmt.columns.iter().enumerate().map(|(i, c)| {
         ColumnDef {
             name: c.name.to_ascii_lowercase(),
@@ -79,7 +99,6 @@ fn exec_create_table(
         primary_key_columns,
     };
 
-    // Create the data table and persist schema
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     SchemaManager::ensure_schema_table(&mut wtx)?;
     wtx.create_table(lower_name.as_bytes()).map_err(SqlError::Storage)?;
@@ -113,6 +132,83 @@ fn exec_drop_table(
     Ok(ExecutionResult::Ok)
 }
 
+fn exec_create_table_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    stmt: &CreateTableStmt,
+) -> Result<ExecutionResult> {
+    let lower_name = stmt.name.to_ascii_lowercase();
+
+    if schema.contains(&lower_name) {
+        if stmt.if_not_exists {
+            return Ok(ExecutionResult::Ok);
+        }
+        return Err(SqlError::TableAlreadyExists(stmt.name.clone()));
+    }
+
+    if stmt.primary_key.is_empty() {
+        return Err(SqlError::PrimaryKeyRequired);
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for col in &stmt.columns {
+        let lower = col.name.to_ascii_lowercase();
+        if !seen.insert(lower.clone()) {
+            return Err(SqlError::DuplicateColumn(col.name.clone()));
+        }
+    }
+
+    let columns: Vec<ColumnDef> = stmt.columns.iter().enumerate().map(|(i, c)| {
+        ColumnDef {
+            name: c.name.to_ascii_lowercase(),
+            data_type: c.data_type,
+            nullable: c.nullable,
+            position: i as u16,
+        }
+    }).collect();
+
+    let primary_key_columns: Vec<u16> = stmt.primary_key.iter().map(|pk_name| {
+        let lower = pk_name.to_ascii_lowercase();
+        columns.iter().position(|c| c.name == lower)
+            .map(|i| i as u16)
+            .ok_or_else(|| SqlError::ColumnNotFound(pk_name.clone()))
+    }).collect::<Result<_>>()?;
+
+    let table_schema = TableSchema {
+        name: lower_name.clone(),
+        columns,
+        primary_key_columns,
+    };
+
+    SchemaManager::ensure_schema_table(wtx)?;
+    wtx.create_table(lower_name.as_bytes()).map_err(SqlError::Storage)?;
+    SchemaManager::save_schema(wtx, &table_schema)?;
+
+    schema.register(table_schema);
+    Ok(ExecutionResult::Ok)
+}
+
+fn exec_drop_table_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    stmt: &DropTableStmt,
+) -> Result<ExecutionResult> {
+    let lower_name = stmt.name.to_ascii_lowercase();
+
+    if !schema.contains(&lower_name) {
+        if stmt.if_exists {
+            return Ok(ExecutionResult::Ok);
+        }
+        return Err(SqlError::TableNotFound(stmt.name.clone()));
+    }
+
+    wtx.drop_table(lower_name.as_bytes()).map_err(SqlError::Storage)?;
+    SchemaManager::delete_schema(wtx, &lower_name)?;
+
+    schema.remove(&lower_name);
+    Ok(ExecutionResult::Ok)
+}
+
 // ── DML ─────────────────────────────────────────────────────────────
 
 fn exec_insert(
@@ -124,15 +220,12 @@ fn exec_insert(
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
-    // Determine column ordering
     let insert_columns = if stmt.columns.is_empty() {
-        // All columns in schema order
         table_schema.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
     } else {
         stmt.columns.iter().map(|c| c.to_ascii_lowercase()).collect()
     };
 
-    // Map insert columns to schema indices
     let col_indices: Vec<usize> = insert_columns.iter().map(|name| {
         table_schema.column_index(name)
             .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))
@@ -150,14 +243,12 @@ fn exec_insert(
             )));
         }
 
-        // Build full row (all columns)
         let mut row = vec![Value::Null; table_schema.columns.len()];
         for (i, expr) in value_row.iter().enumerate() {
             let val = eval_const_expr(expr)?;
             let col_idx = col_indices[i];
             let col = &table_schema.columns[col_idx];
 
-            // Type coercion
             let coerced = if val.is_null() {
                 Value::Null
             } else {
@@ -170,14 +261,12 @@ fn exec_insert(
             row[col_idx] = coerced;
         }
 
-        // Check NOT NULL constraints
         for col in &table_schema.columns {
             if !col.nullable && row[col.position as usize].is_null() {
                 return Err(SqlError::NotNullViolation(col.name.clone()));
             }
         }
 
-        // Encode PK and value
         let pk_values: Vec<Value> = table_schema.pk_indices()
             .iter()
             .map(|&i| row[i].clone())
@@ -188,7 +277,6 @@ fn exec_insert(
         let value_values: Vec<Value> = non_pk.iter().map(|&i| row[i].clone()).collect();
         let value = encode_row(&value_values);
 
-        // Check key/value size limits
         if key.len() > citadel_core::MAX_KEY_SIZE {
             return Err(SqlError::KeyTooLarge { size: key.len(), max: citadel_core::MAX_KEY_SIZE });
         }
@@ -196,7 +284,6 @@ fn exec_insert(
             return Err(SqlError::RowTooLarge { size: value.len(), max: citadel_core::MAX_INLINE_VALUE_SIZE });
         }
 
-        // Insert, checking for duplicate
         let is_new = wtx.table_insert(lower_name.as_bytes(), &key, &value)
             .map_err(SqlError::Storage)?;
         if !is_new {
@@ -218,7 +305,6 @@ fn exec_select(
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
 
-    // Scan all rows
     let mut rows = Vec::new();
     {
         let mut rtx = db.begin_read();
@@ -233,7 +319,15 @@ fn exec_select(
         if let Some(e) = scan_err { return Err(e); }
     }
 
-    // WHERE filter
+    process_select(table_schema, rows, stmt)
+}
+
+/// Shared SELECT processing: WHERE, aggregation, ORDER BY, LIMIT/OFFSET, projection.
+fn process_select(
+    table_schema: &TableSchema,
+    mut rows: Vec<Vec<Value>>,
+    stmt: &SelectStmt,
+) -> Result<ExecutionResult> {
     if let Some(ref where_expr) = stmt.where_clause {
         rows.retain(|row| {
             match eval_expr(where_expr, &table_schema.columns, row) {
@@ -243,7 +337,6 @@ fn exec_select(
         });
     }
 
-    // Check for aggregation
     let has_aggregates = stmt.columns.iter().any(|c| match c {
         SelectColumn::Expr { expr, .. } => is_aggregate_expr(expr),
         _ => false,
@@ -253,12 +346,10 @@ fn exec_select(
         return exec_aggregate(table_schema, &rows, stmt);
     }
 
-    // ORDER BY
     if !stmt.order_by.is_empty() {
         sort_rows(&mut rows, &stmt.order_by, &table_schema.columns)?;
     }
 
-    // OFFSET
     if let Some(ref offset_expr) = stmt.offset {
         let offset = eval_const_int(offset_expr)? as usize;
         if offset < rows.len() {
@@ -268,13 +359,11 @@ fn exec_select(
         }
     }
 
-    // LIMIT
     if let Some(ref limit_expr) = stmt.limit {
         let limit = eval_const_int(limit_expr)? as usize;
         rows.truncate(limit);
     }
 
-    // Projection
     let (col_names, projected) = project_rows(table_schema, &stmt.columns, &rows)?;
 
     Ok(ExecutionResult::Query(QueryResult {
@@ -292,7 +381,6 @@ fn exec_update(
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
-    // Scan and collect rows that match WHERE
     let mut matching_rows: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
     {
         let mut rtx = db.begin_read();
@@ -324,8 +412,7 @@ fn exec_update(
         return Ok(ExecutionResult::RowsAffected(0));
     }
 
-    // Build all changes first, then validate, then apply
-    let mut changes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, bool)> = Vec::new(); // (old_key, new_key, new_value, pk_changed)
+    let mut changes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, bool)> = Vec::new();
 
     for (old_key, row) in &matching_rows {
         let mut row = row.clone();
@@ -367,19 +454,11 @@ fn exec_update(
         changes.push((old_key.clone(), new_key, new_value, pk_changed));
     }
 
-    // Validate: detect PK conflicts before applying any changes
     {
         use std::collections::HashSet;
-        let old_keys: HashSet<&[u8]> = changes.iter().map(|(ok, _, _, _)| ok.as_slice()).collect();
         let mut new_keys: HashSet<Vec<u8>> = HashSet::new();
         for (old_key, new_key, _, pk_changed) in &changes {
             if *pk_changed && new_key != old_key {
-                // New key must not collide with an existing key that isn't being moved
-                if !old_keys.contains(new_key.as_slice()) {
-                    // New key doesn't belong to any row being updated — check if it exists in DB
-                    // We'll check during apply below
-                }
-                // New key must not collide with another new key in this batch
                 if !new_keys.insert(new_key.clone()) {
                     return Err(SqlError::DuplicateKey);
                 }
@@ -389,14 +468,12 @@ fn exec_update(
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
 
-    // Phase 1: Delete all old keys that are changing PK
     for (old_key, _, _, pk_changed) in &changes {
         if *pk_changed {
             wtx.table_delete(lower_name.as_bytes(), old_key).map_err(SqlError::Storage)?;
         }
     }
 
-    // Phase 2: Insert/update all new keys
     for (_, new_key, new_value, pk_changed) in &changes {
         if *pk_changed {
             let is_new = wtx.table_insert(lower_name.as_bytes(), &new_key, &new_value)
@@ -424,7 +501,6 @@ fn exec_delete(
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
-    // Scan and collect keys that match WHERE
     let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
     {
         let mut rtx = db.begin_read();
@@ -465,6 +541,278 @@ fn exec_delete(
     Ok(ExecutionResult::RowsAffected(count))
 }
 
+// ── DML (in-transaction) ────────────────────────────────────────────
+
+fn exec_insert_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &InsertStmt,
+) -> Result<ExecutionResult> {
+    let lower_name = stmt.table.to_ascii_lowercase();
+    let table_schema = schema.get(&lower_name)
+        .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+
+    let insert_columns = if stmt.columns.is_empty() {
+        table_schema.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+    } else {
+        stmt.columns.iter().map(|c| c.to_ascii_lowercase()).collect()
+    };
+
+    let col_indices: Vec<usize> = insert_columns.iter().map(|name| {
+        table_schema.column_index(name)
+            .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))
+    }).collect::<Result<_>>()?;
+
+    let mut count: u64 = 0;
+
+    for value_row in &stmt.values {
+        if value_row.len() != insert_columns.len() {
+            return Err(SqlError::InvalidValue(format!(
+                "expected {} values, got {}",
+                insert_columns.len(),
+                value_row.len()
+            )));
+        }
+
+        let mut row = vec![Value::Null; table_schema.columns.len()];
+        for (i, expr) in value_row.iter().enumerate() {
+            let val = eval_const_expr(expr)?;
+            let col_idx = col_indices[i];
+            let col = &table_schema.columns[col_idx];
+
+            let coerced = if val.is_null() {
+                Value::Null
+            } else {
+                val.coerce_to(col.data_type).ok_or_else(|| SqlError::TypeMismatch {
+                    expected: col.data_type.to_string(),
+                    got: val.data_type().to_string(),
+                })?
+            };
+
+            row[col_idx] = coerced;
+        }
+
+        for col in &table_schema.columns {
+            if !col.nullable && row[col.position as usize].is_null() {
+                return Err(SqlError::NotNullViolation(col.name.clone()));
+            }
+        }
+
+        let pk_values: Vec<Value> = table_schema.pk_indices()
+            .iter()
+            .map(|&i| row[i].clone())
+            .collect();
+        let key = encode_composite_key(&pk_values);
+
+        let non_pk = table_schema.non_pk_indices();
+        let value_values: Vec<Value> = non_pk.iter().map(|&i| row[i].clone()).collect();
+        let value = encode_row(&value_values);
+
+        if key.len() > citadel_core::MAX_KEY_SIZE {
+            return Err(SqlError::KeyTooLarge { size: key.len(), max: citadel_core::MAX_KEY_SIZE });
+        }
+        if value.len() > citadel_core::MAX_INLINE_VALUE_SIZE {
+            return Err(SqlError::RowTooLarge { size: value.len(), max: citadel_core::MAX_INLINE_VALUE_SIZE });
+        }
+
+        let is_new = wtx.table_insert(lower_name.as_bytes(), &key, &value)
+            .map_err(SqlError::Storage)?;
+        if !is_new {
+            return Err(SqlError::DuplicateKey);
+        }
+        count += 1;
+    }
+
+    Ok(ExecutionResult::RowsAffected(count))
+}
+
+fn exec_select_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+) -> Result<ExecutionResult> {
+    let lower_name = stmt.from.to_ascii_lowercase();
+    let table_schema = schema.get(&lower_name)
+        .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
+
+    let mut rows = Vec::new();
+    {
+        let mut scan_err: Option<SqlError> = None;
+        wtx.table_for_each(lower_name.as_bytes(), |key, value| {
+            match decode_full_row(table_schema, key, value) {
+                Ok(row) => rows.push(row),
+                Err(e) => scan_err = Some(e),
+            }
+            Ok(())
+        }).map_err(SqlError::Storage)?;
+        if let Some(e) = scan_err { return Err(e); }
+    }
+
+    process_select(table_schema, rows, stmt)
+}
+
+fn exec_update_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &UpdateStmt,
+) -> Result<ExecutionResult> {
+    let lower_name = stmt.table.to_ascii_lowercase();
+    let table_schema = schema.get(&lower_name)
+        .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+
+    let mut matching_rows: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
+    {
+        let mut scan_err: Option<SqlError> = None;
+        wtx.table_for_each(lower_name.as_bytes(), |key, value| {
+            match decode_full_row(table_schema, key, value) {
+                Ok(row) => {
+                    let matches = match &stmt.where_clause {
+                        Some(where_expr) => {
+                            match eval_expr(where_expr, &table_schema.columns, &row) {
+                                Ok(val) => is_truthy(&val),
+                                Err(_) => false,
+                            }
+                        }
+                        None => true,
+                    };
+                    if matches {
+                        matching_rows.push((key.to_vec(), row));
+                    }
+                }
+                Err(e) => scan_err = Some(e),
+            }
+            Ok(())
+        }).map_err(SqlError::Storage)?;
+        if let Some(e) = scan_err { return Err(e); }
+    }
+
+    if matching_rows.is_empty() {
+        return Ok(ExecutionResult::RowsAffected(0));
+    }
+
+    let mut changes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, bool)> = Vec::new();
+
+    for (old_key, row) in &matching_rows {
+        let mut row = row.clone();
+        let mut pk_changed = false;
+        for (col_name, expr) in &stmt.assignments {
+            let col_idx = table_schema.column_index(col_name)
+                .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
+            let new_val = eval_expr(expr, &table_schema.columns, &row)?;
+            let col = &table_schema.columns[col_idx];
+
+            let coerced = if new_val.is_null() {
+                if !col.nullable {
+                    return Err(SqlError::NotNullViolation(col.name.clone()));
+                }
+                Value::Null
+            } else {
+                new_val.coerce_to(col.data_type).ok_or_else(|| SqlError::TypeMismatch {
+                    expected: col.data_type.to_string(),
+                    got: new_val.data_type().to_string(),
+                })?
+            };
+
+            if table_schema.primary_key_columns.contains(&(col_idx as u16)) {
+                pk_changed = true;
+            }
+            row[col_idx] = coerced;
+        }
+
+        let pk_values: Vec<Value> = table_schema.pk_indices()
+            .iter()
+            .map(|&i| row[i].clone())
+            .collect();
+        let new_key = encode_composite_key(&pk_values);
+
+        let non_pk = table_schema.non_pk_indices();
+        let value_values: Vec<Value> = non_pk.iter().map(|&i| row[i].clone()).collect();
+        let new_value = encode_row(&value_values);
+
+        changes.push((old_key.clone(), new_key, new_value, pk_changed));
+    }
+
+    {
+        use std::collections::HashSet;
+        let mut new_keys: HashSet<Vec<u8>> = HashSet::new();
+        for (old_key, new_key, _, pk_changed) in &changes {
+            if *pk_changed && new_key != old_key {
+                if !new_keys.insert(new_key.clone()) {
+                    return Err(SqlError::DuplicateKey);
+                }
+            }
+        }
+    }
+
+    for (old_key, _, _, pk_changed) in &changes {
+        if *pk_changed {
+            wtx.table_delete(lower_name.as_bytes(), old_key).map_err(SqlError::Storage)?;
+        }
+    }
+
+    for (_, new_key, new_value, pk_changed) in &changes {
+        if *pk_changed {
+            let is_new = wtx.table_insert(lower_name.as_bytes(), new_key, new_value)
+                .map_err(SqlError::Storage)?;
+            if !is_new {
+                return Err(SqlError::DuplicateKey);
+            }
+        } else {
+            wtx.table_insert(lower_name.as_bytes(), new_key, new_value)
+                .map_err(SqlError::Storage)?;
+        }
+    }
+
+    let count = changes.len() as u64;
+    Ok(ExecutionResult::RowsAffected(count))
+}
+
+fn exec_delete_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &DeleteStmt,
+) -> Result<ExecutionResult> {
+    let lower_name = stmt.table.to_ascii_lowercase();
+    let table_schema = schema.get(&lower_name)
+        .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+
+    let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
+    {
+        let mut scan_err: Option<SqlError> = None;
+        wtx.table_for_each(lower_name.as_bytes(), |key, value| {
+            match decode_full_row(table_schema, key, value) {
+                Ok(row) => {
+                    let matches = match &stmt.where_clause {
+                        Some(where_expr) => {
+                            match eval_expr(where_expr, &table_schema.columns, &row) {
+                                Ok(val) => is_truthy(&val),
+                                Err(_) => false,
+                            }
+                        }
+                        None => true,
+                    };
+                    if matches {
+                        keys_to_delete.push(key.to_vec());
+                    }
+                }
+                Err(e) => scan_err = Some(e),
+            }
+            Ok(())
+        }).map_err(SqlError::Storage)?;
+        if let Some(e) = scan_err { return Err(e); }
+    }
+
+    if keys_to_delete.is_empty() {
+        return Ok(ExecutionResult::RowsAffected(0));
+    }
+
+    for key in &keys_to_delete {
+        wtx.table_delete(lower_name.as_bytes(), key).map_err(SqlError::Storage)?;
+    }
+    let count = keys_to_delete.len() as u64;
+    Ok(ExecutionResult::RowsAffected(count))
+}
+
 // ── Aggregation ─────────────────────────────────────────────────────
 
 fn exec_aggregate(
@@ -472,9 +820,7 @@ fn exec_aggregate(
     rows: &[Vec<Value>],
     stmt: &SelectStmt,
 ) -> Result<ExecutionResult> {
-    // Group rows by GROUP BY keys
     let groups: BTreeMap<Vec<Value>, Vec<&Vec<Value>>> = if stmt.group_by.is_empty() {
-        // No GROUP BY: all rows are one group
         let mut m = BTreeMap::new();
         m.insert(vec![], rows.iter().collect());
         m
@@ -490,6 +836,7 @@ fn exec_aggregate(
     };
 
     let mut result_rows = Vec::new();
+    let output_cols = build_output_columns(&stmt.columns, table_schema);
 
     for (_group_key, group_rows) in &groups {
         let mut result_row = Vec::new();
@@ -510,32 +857,30 @@ fn exec_aggregate(
             }
         }
 
+        if let Some(ref having) = stmt.having {
+            let passes = match eval_aggregate_expr(having, &table_schema.columns, group_rows) {
+                Ok(val) => is_truthy(&val),
+                Err(SqlError::ColumnNotFound(_)) => {
+                    match eval_expr(having, &output_cols, &result_row) {
+                        Ok(val) => is_truthy(&val),
+                        Err(_) => false,
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+            if !passes {
+                continue;
+            }
+        }
+
         result_rows.push(result_row);
     }
 
-    // HAVING filter
-    if let Some(ref having) = stmt.having {
-        // For HAVING, we need column defs matching the output columns
-        let output_cols = build_output_columns(&stmt.columns, table_schema);
-        result_rows.retain(|row| {
-            // Re-evaluate HAVING as aggregate expression
-            // For simplicity, we evaluate HAVING against the group
-            // This requires special handling — for now, we evaluate
-            // against the output row using output column defs
-            match eval_expr(having, &output_cols, row) {
-                Ok(val) => is_truthy(&val),
-                Err(_) => false,
-            }
-        });
-    }
-
-    // ORDER BY on aggregate results
     if !stmt.order_by.is_empty() {
         let output_cols = build_output_columns(&stmt.columns, table_schema);
         sort_rows(&mut result_rows, &stmt.order_by, &output_cols)?;
     }
 
-    // LIMIT/OFFSET
     if let Some(ref offset_expr) = stmt.offset {
         let offset = eval_const_int(offset_expr)? as usize;
         if offset < result_rows.len() {
@@ -549,7 +894,6 @@ fn exec_aggregate(
         result_rows.truncate(limit);
     }
 
-    // Column names
     let col_names = stmt.columns.iter().map(|c| match c {
         SelectColumn::AllColumns => "*".into(),
         SelectColumn::Expr { alias: Some(a), .. } => a.clone(),
@@ -652,7 +996,6 @@ fn eval_aggregate_expr(
             }
         }
 
-        // Non-aggregate expression: evaluate against first row in group
         Expr::Column(_) => {
             if let Some(first) = group_rows.first() {
                 eval_expr(expr, columns, first)
@@ -673,7 +1016,7 @@ fn eval_aggregate_expr(
                     right: Box::new(Expr::Literal(r)),
                 },
                 columns,
-                &[], // not used for literals
+                &[],
             )
         }
 
@@ -707,12 +1050,10 @@ fn decode_full_row(
 
     let mut row = vec![Value::Null; schema.columns.len()];
 
-    // Place PK values
     for (i, &col_idx) in schema.primary_key_columns.iter().enumerate() {
         row[col_idx as usize] = pk_values[i].clone();
     }
 
-    // Place non-PK values
     let non_pk = schema.non_pk_indices();
     for (i, &col_idx) in non_pk.iter().enumerate() {
         if i < non_pk_values.len() {
@@ -793,7 +1134,6 @@ fn project_rows(
     select_cols: &[SelectColumn],
     rows: &[Vec<Value>],
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
-    // Determine output columns
     let mut col_names = Vec::new();
     let mut projectors: Vec<Box<dyn Fn(&[Value]) -> Result<Value>>> = Vec::new();
 
@@ -858,18 +1198,44 @@ fn build_output_columns(
 ) -> Vec<ColumnDef> {
     let mut out = Vec::new();
     for (i, col) in select_cols.iter().enumerate() {
-        let name = match col {
-            SelectColumn::AllColumns => format!("col{i}"),
-            SelectColumn::Expr { alias: Some(a), .. } => a.clone(),
-            SelectColumn::Expr { expr, .. } => expr_display_name(expr),
+        let (name, data_type) = match col {
+            SelectColumn::AllColumns => (format!("col{i}"), DataType::Null),
+            SelectColumn::Expr { alias: Some(a), expr } => {
+                (a.clone(), infer_expr_type(expr, table_schema))
+            }
+            SelectColumn::Expr { expr, .. } => {
+                (expr_display_name(expr), infer_expr_type(expr, table_schema))
+            }
         };
         out.push(ColumnDef {
             name,
-            data_type: DataType::Null, // type not important for evaluation
+            data_type,
             nullable: true,
             position: i as u16,
         });
     }
-    let _ = table_schema;
     out
+}
+
+fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
+    match expr {
+        Expr::Column(name) => {
+            let lower = name.to_ascii_lowercase();
+            schema.columns.iter()
+                .find(|c| c.name == lower)
+                .map(|c| c.data_type)
+                .unwrap_or(DataType::Null)
+        }
+        Expr::Literal(v) => v.data_type(),
+        Expr::CountStar => DataType::Integer,
+        Expr::Function { name, .. } => {
+            match name.to_ascii_uppercase().as_str() {
+                "COUNT" => DataType::Integer,
+                "AVG" => DataType::Real,
+                "SUM" | "MIN" | "MAX" => DataType::Null,
+                _ => DataType::Null,
+            }
+        }
+        _ => DataType::Null,
+    }
 }

@@ -52,6 +52,12 @@ pub enum SqlError {
     #[error("column '{0}' is ambiguous in aggregate query")]
     AmbiguousColumn(String),
 
+    #[error("transaction already active")]
+    TransactionAlreadyActive,
+
+    #[error("no active transaction")]
+    NoActiveTransaction,
+
     #[error("storage error: {0}")]
     Storage(#[from] citadel_core::Error),
 }

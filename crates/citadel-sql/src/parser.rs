@@ -17,6 +17,9 @@ pub enum Statement {
     Select(SelectStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
+    Begin,
+    Commit,
+    Rollback,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +154,9 @@ fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
         sp::Statement::Query(query) => convert_query(*query),
         sp::Statement::Update(update) => convert_update(update),
         sp::Statement::Delete(delete) => convert_delete(delete),
+        sp::Statement::StartTransaction { .. } => Ok(Statement::Begin),
+        sp::Statement::Commit { .. } => Ok(Statement::Commit),
+        sp::Statement::Rollback { .. } => Ok(Statement::Rollback),
         _ => Err(SqlError::Unsupported(format!(
             "statement type: {}",
             stmt
@@ -875,6 +881,30 @@ mod tests {
             }
             _ => panic!("expected Select"),
         }
+    }
+
+    #[test]
+    fn parse_begin() {
+        let stmt = parse_sql("BEGIN").unwrap();
+        assert!(matches!(stmt, Statement::Begin));
+    }
+
+    #[test]
+    fn parse_begin_transaction() {
+        let stmt = parse_sql("BEGIN TRANSACTION").unwrap();
+        assert!(matches!(stmt, Statement::Begin));
+    }
+
+    #[test]
+    fn parse_commit() {
+        let stmt = parse_sql("COMMIT").unwrap();
+        assert!(matches!(stmt, Statement::Commit));
+    }
+
+    #[test]
+    fn parse_rollback() {
+        let stmt = parse_sql("ROLLBACK").unwrap();
+        assert!(matches!(stmt, Statement::Rollback));
     }
 
     #[test]

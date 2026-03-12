@@ -812,3 +812,108 @@ fn tables_listing() {
     tables.sort();
     assert_eq!(tables, vec!["alpha", "gamma"]);
 }
+
+// ── HAVING with alias and aggregate expressions ─────────────────────
+
+#[test]
+fn having_with_count_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, customer TEXT NOT NULL, amount INTEGER)"
+    ).unwrap();
+    conn.execute("INSERT INTO orders VALUES (1, 'alice', 50)").unwrap();
+    conn.execute("INSERT INTO orders VALUES (2, 'alice', 75)").unwrap();
+    conn.execute("INSERT INTO orders VALUES (3, 'bob', 100)").unwrap();
+    conn.execute("INSERT INTO orders VALUES (4, 'alice', 25)").unwrap();
+
+    let qr = conn.query(
+        "SELECT customer, COUNT(*) AS cnt FROM orders GROUP BY customer HAVING cnt > 1"
+    ).unwrap();
+    assert_eq!(qr.rows.len(), 1);
+    assert_eq!(qr.rows[0][0], Value::Text("alice".into()));
+    assert_eq!(qr.rows[0][1], Value::Integer(3));
+}
+
+#[test]
+fn having_with_avg_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE scores (id INTEGER NOT NULL PRIMARY KEY, team TEXT NOT NULL, score REAL NOT NULL)"
+    ).unwrap();
+    conn.execute("INSERT INTO scores VALUES (1, 'red', 8.5)").unwrap();
+    conn.execute("INSERT INTO scores VALUES (2, 'red', 9.0)").unwrap();
+    conn.execute("INSERT INTO scores VALUES (3, 'blue', 3.0)").unwrap();
+    conn.execute("INSERT INTO scores VALUES (4, 'blue', 4.0)").unwrap();
+
+    let qr = conn.query(
+        "SELECT team, AVG(score) AS avg_score FROM scores GROUP BY team HAVING avg_score > 5.0"
+    ).unwrap();
+    assert_eq!(qr.rows.len(), 1);
+    assert_eq!(qr.rows[0][0], Value::Text("red".into()));
+}
+
+#[test]
+fn having_with_min_max_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE temps (id INTEGER NOT NULL PRIMARY KEY, city TEXT NOT NULL, temp INTEGER NOT NULL)"
+    ).unwrap();
+    conn.execute("INSERT INTO temps VALUES (1, 'nyc', 30)").unwrap();
+    conn.execute("INSERT INTO temps VALUES (2, 'nyc', 90)").unwrap();
+    conn.execute("INSERT INTO temps VALUES (3, 'la', 60)").unwrap();
+    conn.execute("INSERT INTO temps VALUES (4, 'la', 70)").unwrap();
+
+    let qr = conn.query(
+        "SELECT city, MAX(temp) AS high FROM temps GROUP BY city HAVING high >= 90"
+    ).unwrap();
+    assert_eq!(qr.rows.len(), 1);
+    assert_eq!(qr.rows[0][0], Value::Text("nyc".into()));
+    assert_eq!(qr.rows[0][1], Value::Integer(90));
+
+    let qr = conn.query(
+        "SELECT city, MIN(temp) AS low FROM temps GROUP BY city HAVING low > 50"
+    ).unwrap();
+    assert_eq!(qr.rows.len(), 1);
+    assert_eq!(qr.rows[0][0], Value::Text("la".into()));
+    assert_eq!(qr.rows[0][1], Value::Integer(60));
+}
+
+#[test]
+fn having_aggregate_expr_and_alias_combined() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, cat TEXT NOT NULL, price INTEGER NOT NULL)"
+    ).unwrap();
+    for i in 1..=5 {
+        conn.execute(&format!("INSERT INTO items VALUES ({i}, 'a', {i}0)")).unwrap();
+    }
+    for i in 6..=7 {
+        conn.execute(&format!("INSERT INTO items VALUES ({i}, 'b', 5)")).unwrap();
+    }
+
+    let qr = conn.query(
+        "SELECT cat, SUM(price) AS total FROM items GROUP BY cat HAVING SUM(price) > 100"
+    ).unwrap();
+    assert_eq!(qr.rows.len(), 1);
+    assert_eq!(qr.rows[0][0], Value::Text("a".into()));
+    assert_eq!(qr.rows[0][1], Value::Integer(150));
+
+    let qr = conn.query(
+        "SELECT cat, SUM(price) AS total FROM items GROUP BY cat HAVING total > 100"
+    ).unwrap();
+    assert_eq!(qr.rows.len(), 1);
+    assert_eq!(qr.rows[0][0], Value::Text("a".into()));
+    assert_eq!(qr.rows[0][1], Value::Integer(150));
+}
