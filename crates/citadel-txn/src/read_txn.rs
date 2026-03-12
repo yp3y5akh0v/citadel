@@ -11,6 +11,8 @@ use citadel_io::file_manager::CommitSlot;
 use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
 
+use citadel_buffer::cursor::Cursor;
+
 use crate::catalog::TableDescriptor;
 use crate::manager::TxnManager;
 
@@ -66,6 +68,24 @@ impl<'a> ReadTxn<'a> {
         Ok(self.get(key)?.is_some())
     }
 
+    /// Iterate all key-value pairs in the default table in sorted order.
+    pub fn for_each<F>(&mut self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
+        self.preload_all_pages(self.snapshot.tree_root)?;
+        let mut cursor = Cursor::first(&self.page_cache, self.snapshot.tree_root)?;
+        while cursor.is_valid() {
+            if let Some(entry) = cursor.current(&self.page_cache) {
+                if entry.val_type != ValueType::Tombstone {
+                    f(&entry.key, &entry.value)?;
+                }
+            }
+            cursor.next(&self.page_cache)?;
+        }
+        Ok(())
+    }
+
     // ── Named table operations ────────────────────────────────────────
 
     /// Look up a key in a named table.
@@ -77,6 +97,25 @@ impl<'a> ReadTxn<'a> {
     /// Check if a key exists in a named table.
     pub fn table_contains_key(&mut self, table: &[u8], key: &[u8]) -> Result<bool> {
         Ok(self.table_get(table, key)?.is_some())
+    }
+
+    /// Iterate all key-value pairs in a named table in sorted order.
+    pub fn table_for_each<F>(&mut self, table: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
+        let desc = self.lookup_table(table)?;
+        self.preload_all_pages(desc.root_page)?;
+        let mut cursor = Cursor::first(&self.page_cache, desc.root_page)?;
+        while cursor.is_valid() {
+            if let Some(entry) = cursor.current(&self.page_cache) {
+                if entry.val_type != ValueType::Tombstone {
+                    f(&entry.key, &entry.value)?;
+                }
+            }
+            cursor.next(&self.page_cache)?;
+        }
+        Ok(())
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
@@ -156,6 +195,32 @@ impl<'a> ReadTxn<'a> {
             self.page_cache.insert(page_id, page);
         }
         Ok(self.page_cache.get(&page_id).unwrap())
+    }
+
+    fn preload_all_pages(&mut self, root: PageId) -> Result<()> {
+        let mut stack = vec![root];
+        while let Some(current) = stack.pop() {
+            if !self.page_cache.contains_key(&current) {
+                let page = self.manager.fetch_page(current)?;
+                self.page_cache.insert(current, page);
+            }
+            let page = self.page_cache.get(&current).unwrap();
+            match page.page_type() {
+                Some(PageType::Branch) => {
+                    let num_cells = page.num_cells() as usize;
+                    for i in 0..num_cells {
+                        stack.push(branch_node::get_child(page, i));
+                    }
+                    let right = page.right_child();
+                    if right.is_valid() {
+                        stack.push(right);
+                    }
+                }
+                Some(PageType::Leaf) => {}
+                _ => return Err(Error::InvalidPageType(page.page_type_raw(), current)),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -263,5 +328,65 @@ mod tests {
             rtx.table_get(b"nope", b"key"),
             Err(citadel_core::Error::TableNotFound(_))
         ));
+    }
+
+    #[test]
+    fn for_each_default_table() {
+        let mgr = create_test_manager();
+
+        {
+            let mut wtx = mgr.begin_write().unwrap();
+            wtx.insert(b"c", b"3").unwrap();
+            wtx.insert(b"a", b"1").unwrap();
+            wtx.insert(b"b", b"2").unwrap();
+            wtx.commit().unwrap();
+        }
+
+        let mut rtx = mgr.begin_read();
+        let mut pairs = Vec::new();
+        rtx.for_each(|k, v| {
+            pairs.push((k.to_vec(), v.to_vec()));
+            Ok(())
+        }).unwrap();
+
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0], (b"a".to_vec(), b"1".to_vec()));
+        assert_eq!(pairs[1], (b"b".to_vec(), b"2".to_vec()));
+        assert_eq!(pairs[2], (b"c".to_vec(), b"3".to_vec()));
+    }
+
+    #[test]
+    fn for_each_empty_table() {
+        let mgr = create_test_manager();
+        let mut rtx = mgr.begin_read();
+        let mut count = 0;
+        rtx.for_each(|_, _| { count += 1; Ok(()) }).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn table_for_each_named_table() {
+        let mgr = create_test_manager();
+
+        {
+            let mut wtx = mgr.begin_write().unwrap();
+            wtx.create_table(b"items").unwrap();
+            wtx.table_insert(b"items", b"x", b"10").unwrap();
+            wtx.table_insert(b"items", b"y", b"20").unwrap();
+            wtx.table_insert(b"items", b"z", b"30").unwrap();
+            wtx.commit().unwrap();
+        }
+
+        let mut rtx = mgr.begin_read();
+        let mut pairs = Vec::new();
+        rtx.table_for_each(b"items", |k, v| {
+            pairs.push((k.to_vec(), v.to_vec()));
+            Ok(())
+        }).unwrap();
+
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0], (b"x".to_vec(), b"10".to_vec()));
+        assert_eq!(pairs[1], (b"y".to_vec(), b"20".to_vec()));
+        assert_eq!(pairs[2], (b"z".to_vec(), b"30".to_vec()));
     }
 }

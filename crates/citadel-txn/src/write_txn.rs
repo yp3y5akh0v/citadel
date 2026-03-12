@@ -115,6 +115,26 @@ impl<'a> WriteTxn<'a> {
         Ok(())
     }
 
+    /// Iterate all key-value pairs in a named table in sorted order.
+    pub fn table_for_each<F>(&mut self, table: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<()>,
+    {
+        self.ensure_table(table)?;
+        let root = self.named_trees[table].root;
+        self.preload_all_pages(root)?;
+        let mut cursor = Cursor::first(&self.pages, root)?;
+        while cursor.is_valid() {
+            if let Some(entry) = cursor.current(&self.pages) {
+                if entry.val_type != ValueType::Tombstone {
+                    f(&entry.key, &entry.value)?;
+                }
+            }
+            cursor.next(&self.pages)?;
+        }
+        Ok(())
+    }
+
     // ── Named table operations ────────────────────────────────────────
 
     /// Create a new named table. Fails if the table already exists.
@@ -700,6 +720,29 @@ mod tests {
             wtx.create_table(b"test"),
             Err(citadel_core::Error::TableAlreadyExists(_))
         ));
+    }
+
+    #[test]
+    fn table_for_each_named() {
+        let mgr = create_test_manager();
+
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.create_table(b"data").unwrap();
+        wtx.table_insert(b"data", b"b", b"2").unwrap();
+        wtx.table_insert(b"data", b"a", b"1").unwrap();
+        wtx.table_insert(b"data", b"c", b"3").unwrap();
+
+        let mut pairs = Vec::new();
+        wtx.table_for_each(b"data", |k, v| {
+            pairs.push((k.to_vec(), v.to_vec()));
+            Ok(())
+        }).unwrap();
+
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0], (b"a".to_vec(), b"1".to_vec()));
+        assert_eq!(pairs[1], (b"b".to_vec(), b"2".to_vec()));
+        assert_eq!(pairs[2], (b"c".to_vec(), b"3".to_vec()));
+        wtx.commit().unwrap();
     }
 
     use citadel_core::MAX_KEY_SIZE;

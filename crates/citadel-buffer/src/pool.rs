@@ -193,6 +193,11 @@ impl BufferPool {
         let offset = page_offset(page_id);
         self.cache.contains(offset)
     }
+
+    /// Clear all entries from the cache.
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
 }
 
 #[cfg(test)]

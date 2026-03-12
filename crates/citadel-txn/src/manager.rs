@@ -288,8 +288,9 @@ impl TxnManager {
         state.deferred_free = old_chain_pages;
         state.reclaimed_pages = reclaimed;
 
-        // Invalidate buffer pool cache (stale entries from CoW)
-        self.pool.lock().discard_dirty();
+        // Clear buffer pool — CoW may have reused freed page IDs with new content,
+        // making cached entries stale.
+        self.pool.lock().clear();
 
         self.write_active.store(false, Ordering::SeqCst);
 

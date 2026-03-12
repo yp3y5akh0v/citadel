@@ -243,6 +243,18 @@ impl<V: Default> SieveCache<V> {
     pub fn dirty_count(&self) -> usize {
         self.entries.iter().filter(|e| e.occupied && e.dirty).count()
     }
+
+    /// Remove all entries from the cache.
+    pub fn clear(&mut self) {
+        for entry in &mut self.entries {
+            entry.occupied = false;
+            entry.visited = false;
+            entry.dirty = false;
+        }
+        self.index.clear();
+        self.len = 0;
+        self.hand = 0;
+    }
 }
 
 #[cfg(test)]

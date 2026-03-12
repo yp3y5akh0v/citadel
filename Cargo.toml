@@ -6,6 +6,7 @@ members = [
     "crates/citadel-page",
     "crates/citadel-buffer",
     "crates/citadel-txn",
+    "crates/citadel-sql",
     "citadel",
 ]
 resolver = "2"
@@ -54,6 +55,9 @@ io-uring = "0.7"
 
 # Cipher traits
 cipher = "0.4"
+
+# SQL
+sqlparser = "0.61"
 
 [profile.release]
 lto = "fat"

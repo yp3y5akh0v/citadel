@@ -1,0 +1,17 @@
+[package]
+name = "citadel-sql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SQL engine for Citadel encrypted database"
+
+[dependencies]
+citadel-core = { workspace = true }
+citadel-txn = { workspace = true }
+citadel = { path = "../../citadel" }
+sqlparser = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
