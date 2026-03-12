@@ -49,7 +49,7 @@ pub enum SqlError {
     #[error("integer overflow")]
     IntegerOverflow,
 
-    #[error("column '{0}' is ambiguous in aggregate query")]
+    #[error("column '{0}' is ambiguous")]
     AmbiguousColumn(String),
 
     #[error("index '{0}' not found")]

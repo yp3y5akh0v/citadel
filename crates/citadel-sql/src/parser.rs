@@ -69,9 +69,32 @@ pub struct InsertStmt {
 }
 
 #[derive(Debug, Clone)]
+pub struct TableRef {
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JoinType {
+    Inner,
+    Cross,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone)]
+pub struct JoinClause {
+    pub join_type: JoinType,
+    pub table: TableRef,
+    pub on_clause: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SelectStmt {
     pub columns: Vec<SelectColumn>,
     pub from: String,
+    pub from_alias: Option<String>,
+    pub joins: Vec<JoinClause>,
     pub distinct: bool,
     pub where_clause: Option<Expr>,
     pub order_by: Vec<OrderByItem>,
@@ -111,6 +134,7 @@ pub struct OrderByItem {
 pub enum Expr {
     Literal(Value),
     Column(String),
+    QualifiedColumn { table: String, column: String },
     BinaryOp { left: Box<Expr>, op: BinOp, right: Box<Expr> },
     UnaryOp { op: UnaryOp, expr: Box<Expr> },
     IsNull(Box<Expr>),
@@ -340,18 +364,22 @@ fn convert_query(query: sp::Query) -> Result<Statement> {
         if select.from.is_empty() {
             return Err(SqlError::Parse("SELECT requires FROM".into()));
         }
-        return Err(SqlError::Unsupported("multi-table FROM (JOINs)".into()));
+        return Err(SqlError::Unsupported("comma-separated FROM tables".into()));
     }
 
     let table_with_joins = &select.from[0];
-    if !table_with_joins.joins.is_empty() {
-        return Err(SqlError::Unsupported("JOINs".into()));
-    }
-
-    let from = match &table_with_joins.relation {
-        sp::TableFactor::Table { name, .. } => object_name_to_string(name),
+    let (from, from_alias) = match &table_with_joins.relation {
+        sp::TableFactor::Table { name, alias, .. } => {
+            let table_name = object_name_to_string(name);
+            let alias_str = alias.as_ref().map(|a| a.name.value.clone());
+            (table_name, alias_str)
+        }
         _ => return Err(SqlError::Unsupported("non-table FROM source".into())),
     };
+
+    let joins = table_with_joins.joins.iter()
+        .map(|j| convert_join(j))
+        .collect::<Result<Vec<_>>>()?;
 
     // Projection
     let columns: Vec<SelectColumn> = select.projection.iter()
@@ -408,6 +436,8 @@ fn convert_query(query: sp::Query) -> Result<Statement> {
     Ok(Statement::Select(SelectStmt {
         columns,
         from,
+        from_alias,
+        joins,
         distinct,
         where_clause,
         order_by,
@@ -416,6 +446,42 @@ fn convert_query(query: sp::Query) -> Result<Statement> {
         group_by,
         having,
     }))
+}
+
+fn convert_join(join: &sp::Join) -> Result<JoinClause> {
+    let (join_type, constraint) = match &join.join_operator {
+        sp::JoinOperator::Inner(c) => (JoinType::Inner, Some(c)),
+        sp::JoinOperator::Join(c) => (JoinType::Inner, Some(c)),
+        sp::JoinOperator::CrossJoin(c) => (JoinType::Cross, Some(c)),
+        sp::JoinOperator::Left(c) => (JoinType::Left, Some(c)),
+        sp::JoinOperator::LeftSemi(c) => (JoinType::Left, Some(c)),
+        sp::JoinOperator::LeftAnti(c) => (JoinType::Left, Some(c)),
+        sp::JoinOperator::Right(c) => (JoinType::Right, Some(c)),
+        sp::JoinOperator::RightSemi(c) => (JoinType::Right, Some(c)),
+        sp::JoinOperator::RightAnti(c) => (JoinType::Right, Some(c)),
+        other => return Err(SqlError::Unsupported(format!("join type: {other:?}"))),
+    };
+
+    let (name, alias) = match &join.relation {
+        sp::TableFactor::Table { name, alias, .. } => {
+            let table_name = object_name_to_string(name);
+            let alias_str = alias.as_ref().map(|a| a.name.value.clone());
+            (table_name, alias_str)
+        }
+        _ => return Err(SqlError::Unsupported("non-table JOIN source".into())),
+    };
+
+    let on_clause = match constraint {
+        Some(sp::JoinConstraint::On(expr)) => Some(convert_expr(expr)?),
+        Some(sp::JoinConstraint::None) | None => None,
+        Some(other) => return Err(SqlError::Unsupported(format!("join constraint: {other:?}"))),
+    };
+
+    Ok(JoinClause {
+        join_type,
+        table: TableRef { name, alias },
+        on_clause,
+    })
 }
 
 fn convert_update(update: sp::Update) -> Result<Statement> {
@@ -485,8 +551,14 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
         sp::Expr::Value(v) => convert_value(&v.value),
         sp::Expr::Identifier(ident) => Ok(Expr::Column(ident.value.clone())),
         sp::Expr::CompoundIdentifier(parts) => {
-            // For now, take the last part as column name
-            Ok(Expr::Column(parts.last().unwrap().value.clone()))
+            if parts.len() == 2 {
+                Ok(Expr::QualifiedColumn {
+                    table: parts[0].value.clone(),
+                    column: parts[1].value.clone(),
+                })
+            } else {
+                Ok(Expr::Column(parts.last().unwrap().value.clone()))
+            }
         }
         sp::Expr::BinaryOp { left, op, right } => {
             let bin_op = convert_bin_op(op)?;
@@ -886,8 +958,99 @@ mod tests {
     }
 
     #[test]
-    fn reject_joins() {
-        assert!(parse_sql("SELECT * FROM a JOIN b ON a.id = b.id").is_err());
+    fn parse_inner_join() {
+        let stmt = parse_sql("SELECT * FROM a JOIN b ON a.id = b.id").unwrap();
+        match stmt {
+            Statement::Select(sel) => {
+                assert_eq!(sel.from, "a");
+                assert_eq!(sel.joins.len(), 1);
+                assert_eq!(sel.joins[0].join_type, JoinType::Inner);
+                assert_eq!(sel.joins[0].table.name, "b");
+                assert!(sel.joins[0].on_clause.is_some());
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn parse_inner_join_explicit() {
+        let stmt = parse_sql("SELECT * FROM a INNER JOIN b ON a.id = b.a_id").unwrap();
+        match stmt {
+            Statement::Select(sel) => {
+                assert_eq!(sel.joins.len(), 1);
+                assert_eq!(sel.joins[0].join_type, JoinType::Inner);
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn parse_cross_join() {
+        let stmt = parse_sql("SELECT * FROM a CROSS JOIN b").unwrap();
+        match stmt {
+            Statement::Select(sel) => {
+                assert_eq!(sel.joins.len(), 1);
+                assert_eq!(sel.joins[0].join_type, JoinType::Cross);
+                assert!(sel.joins[0].on_clause.is_none());
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn parse_left_join() {
+        let stmt = parse_sql("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id").unwrap();
+        match stmt {
+            Statement::Select(sel) => {
+                assert_eq!(sel.joins.len(), 1);
+                assert_eq!(sel.joins[0].join_type, JoinType::Left);
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn parse_table_alias() {
+        let stmt = parse_sql("SELECT u.id FROM users u JOIN orders o ON u.id = o.user_id").unwrap();
+        match stmt {
+            Statement::Select(sel) => {
+                assert_eq!(sel.from, "users");
+                assert_eq!(sel.from_alias.as_deref(), Some("u"));
+                assert_eq!(sel.joins[0].table.name, "orders");
+                assert_eq!(sel.joins[0].table.alias.as_deref(), Some("o"));
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn parse_multi_join() {
+        let stmt = parse_sql(
+            "SELECT * FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id"
+        ).unwrap();
+        match stmt {
+            Statement::Select(sel) => {
+                assert_eq!(sel.joins.len(), 2);
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn parse_qualified_column() {
+        let stmt = parse_sql("SELECT u.id, u.name FROM users u").unwrap();
+        match stmt {
+            Statement::Select(sel) => {
+                match &sel.columns[0] {
+                    SelectColumn::Expr { expr: Expr::QualifiedColumn { table, column }, .. } => {
+                        assert_eq!(table, "u");
+                        assert_eq!(column, "id");
+                    }
+                    other => panic!("expected QualifiedColumn, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Select"),
+        }
     }
 
     #[test]

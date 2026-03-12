@@ -1021,19 +1021,23 @@ fn exec_select(
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
 
+    if !stmt.joins.is_empty() {
+        return exec_select_join(db, schema, stmt);
+    }
+
     let rows = collect_rows_read(db, table_schema, &stmt.where_clause)?;
-    process_select(table_schema, rows, stmt)
+    process_select(&table_schema.columns, rows, stmt)
 }
 
 /// Shared SELECT processing: WHERE, aggregation, ORDER BY, LIMIT/OFFSET, projection.
 fn process_select(
-    table_schema: &TableSchema,
+    columns: &[ColumnDef],
     mut rows: Vec<Vec<Value>>,
     stmt: &SelectStmt,
 ) -> Result<ExecutionResult> {
     if let Some(ref where_expr) = stmt.where_clause {
         rows.retain(|row| {
-            match eval_expr(where_expr, &table_schema.columns, row) {
+            match eval_expr(where_expr, columns, row) {
                 Ok(val) => is_truthy(&val),
                 Err(_) => false,
             }
@@ -1046,17 +1050,17 @@ fn process_select(
     });
 
     if has_aggregates || !stmt.group_by.is_empty() {
-        return exec_aggregate(table_schema, &rows, stmt);
+        return exec_aggregate(columns, &rows, stmt);
     }
 
     if stmt.distinct {
-        let (col_names, mut projected) = project_rows(table_schema, &stmt.columns, &rows)?;
+        let (col_names, mut projected) = project_rows(columns, &stmt.columns, &rows)?;
 
         let mut seen = std::collections::HashSet::new();
         projected.retain(|row| seen.insert(row.clone()));
 
         if !stmt.order_by.is_empty() {
-            let output_cols = build_output_columns(&stmt.columns, table_schema);
+            let output_cols = build_output_columns(&stmt.columns, columns);
             sort_rows(&mut projected, &stmt.order_by, &output_cols)?;
         }
 
@@ -1081,7 +1085,7 @@ fn process_select(
     }
 
     if !stmt.order_by.is_empty() {
-        sort_rows(&mut rows, &stmt.order_by, &table_schema.columns)?;
+        sort_rows(&mut rows, &stmt.order_by, columns)?;
     }
 
     if let Some(ref offset_expr) = stmt.offset {
@@ -1098,12 +1102,295 @@ fn process_select(
         rows.truncate(limit);
     }
 
-    let (col_names, projected) = project_rows(table_schema, &stmt.columns, &rows)?;
+    let (col_names, projected) = project_rows(columns, &stmt.columns, &rows)?;
 
     Ok(ExecutionResult::Query(QueryResult {
         columns: col_names,
         rows: projected,
     }))
+}
+
+
+fn resolve_table_name<'a>(
+    schema: &'a SchemaManager,
+    name: &str,
+) -> Result<&'a TableSchema> {
+    let lower = name.to_ascii_lowercase();
+    schema.get(&lower)
+        .ok_or_else(|| SqlError::TableNotFound(name.to_string()))
+}
+
+fn build_joined_columns(
+    tables: &[(String, &TableSchema)],
+) -> Vec<ColumnDef> {
+    let mut result = Vec::new();
+    let mut pos: u16 = 0;
+
+    for (alias, schema) in tables {
+        for col in &schema.columns {
+            result.push(ColumnDef {
+                name: format!("{}.{}", alias.to_ascii_lowercase(), col.name),
+                data_type: col.data_type,
+                nullable: col.nullable,
+                position: pos,
+            });
+            pos += 1;
+        }
+    }
+
+    result
+}
+
+fn table_alias_or_name(name: &str, alias: &Option<String>) -> String {
+    alias.as_ref().unwrap_or(&name.to_string()).to_ascii_lowercase()
+}
+
+fn collect_all_rows_read(
+    db: &Database,
+    table_schema: &TableSchema,
+) -> Result<Vec<Vec<Value>>> {
+    collect_rows_read(db, table_schema, &None)
+}
+
+fn collect_all_rows_write(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    table_schema: &TableSchema,
+) -> Result<Vec<Vec<Value>>> {
+    collect_rows_write(wtx, table_schema, &None)
+}
+
+fn exec_select_join(
+    db: &Database,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+) -> Result<ExecutionResult> {
+    let from_schema = resolve_table_name(schema, &stmt.from)?;
+    let from_alias = table_alias_or_name(&stmt.from, &stmt.from_alias);
+    let mut outer_rows = collect_all_rows_read(db, from_schema)?;
+
+    let mut tables: Vec<(String, &TableSchema)> = vec![(from_alias.clone(), from_schema)];
+
+    for join in &stmt.joins {
+        let inner_schema = resolve_table_name(schema, &join.table.name)?;
+        let inner_alias = table_alias_or_name(&join.table.name, &join.table.alias);
+        let inner_rows = collect_all_rows_read(db, inner_schema)?;
+
+        let mut preview_tables = tables.clone();
+        preview_tables.push((inner_alias.clone(), inner_schema));
+        let combined_cols = build_joined_columns(&preview_tables);
+
+        let mut new_rows = Vec::new();
+
+        match join.join_type {
+            JoinType::Inner | JoinType::Cross => {
+                for outer in &outer_rows {
+                    for inner in &inner_rows {
+                        let combined: Vec<Value> = outer.iter()
+                            .chain(inner.iter())
+                            .cloned()
+                            .collect();
+                        if let Some(ref on_expr) = join.on_clause {
+                            match eval_expr(on_expr, &combined_cols, &combined) {
+                                Ok(val) if is_truthy(&val) => new_rows.push(combined),
+                                _ => {}
+                            }
+                        } else {
+                            new_rows.push(combined);
+                        }
+                    }
+                }
+            }
+            JoinType::Left => {
+                let inner_col_count = inner_schema.columns.len();
+                for outer in &outer_rows {
+                    let mut matched = false;
+                    for inner in &inner_rows {
+                        let combined: Vec<Value> = outer.iter()
+                            .chain(inner.iter())
+                            .cloned()
+                            .collect();
+                        if let Some(ref on_expr) = join.on_clause {
+                            match eval_expr(on_expr, &combined_cols, &combined) {
+                                Ok(val) if is_truthy(&val) => {
+                                    new_rows.push(combined);
+                                    matched = true;
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            new_rows.push(combined);
+                            matched = true;
+                        }
+                    }
+                    if !matched {
+                        let mut padded = outer.clone();
+                        padded.extend(std::iter::repeat(Value::Null).take(inner_col_count));
+                        new_rows.push(padded);
+                    }
+                }
+            }
+            JoinType::Right => {
+                let outer_col_count = if outer_rows.is_empty() {
+                    tables.iter().map(|(_, s)| s.columns.len()).sum()
+                } else {
+                    outer_rows[0].len()
+                };
+                let mut inner_matched = vec![false; inner_rows.len()];
+                for outer in &outer_rows {
+                    for (j, inner) in inner_rows.iter().enumerate() {
+                        let combined: Vec<Value> = outer.iter()
+                            .chain(inner.iter())
+                            .cloned()
+                            .collect();
+                        if let Some(ref on_expr) = join.on_clause {
+                            match eval_expr(on_expr, &combined_cols, &combined) {
+                                Ok(val) if is_truthy(&val) => {
+                                    new_rows.push(combined);
+                                    inner_matched[j] = true;
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            new_rows.push(combined);
+                            inner_matched[j] = true;
+                        }
+                    }
+                }
+                for (j, inner) in inner_rows.iter().enumerate() {
+                    if !inner_matched[j] {
+                        let mut padded: Vec<Value> = std::iter::repeat(Value::Null)
+                            .take(outer_col_count)
+                            .collect();
+                        padded.extend(inner.iter().cloned());
+                        new_rows.push(padded);
+                    }
+                }
+            }
+        }
+
+        tables.push((inner_alias, inner_schema));
+        outer_rows = new_rows;
+    }
+
+    let joined_cols = build_joined_columns(&tables);
+    process_select(&joined_cols, outer_rows, stmt)
+}
+
+fn exec_select_join_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+) -> Result<ExecutionResult> {
+    let from_schema = resolve_table_name(schema, &stmt.from)?;
+    let from_alias = table_alias_or_name(&stmt.from, &stmt.from_alias);
+    let mut outer_rows = collect_all_rows_write(wtx, from_schema)?;
+
+    let mut tables: Vec<(String, &TableSchema)> = vec![(from_alias.clone(), from_schema)];
+
+    for join in &stmt.joins {
+        let inner_schema = resolve_table_name(schema, &join.table.name)?;
+        let inner_alias = table_alias_or_name(&join.table.name, &join.table.alias);
+        let inner_rows = collect_all_rows_write(wtx, inner_schema)?;
+
+        let mut preview_tables = tables.clone();
+        preview_tables.push((inner_alias.clone(), inner_schema));
+        let combined_cols = build_joined_columns(&preview_tables);
+
+        let mut new_rows = Vec::new();
+
+        match join.join_type {
+            JoinType::Inner | JoinType::Cross => {
+                for outer in &outer_rows {
+                    for inner in &inner_rows {
+                        let combined: Vec<Value> = outer.iter()
+                            .chain(inner.iter())
+                            .cloned()
+                            .collect();
+                        if let Some(ref on_expr) = join.on_clause {
+                            match eval_expr(on_expr, &combined_cols, &combined) {
+                                Ok(val) if is_truthy(&val) => new_rows.push(combined),
+                                _ => {}
+                            }
+                        } else {
+                            new_rows.push(combined);
+                        }
+                    }
+                }
+            }
+            JoinType::Left => {
+                let inner_col_count = inner_schema.columns.len();
+                for outer in &outer_rows {
+                    let mut matched = false;
+                    for inner in &inner_rows {
+                        let combined: Vec<Value> = outer.iter()
+                            .chain(inner.iter())
+                            .cloned()
+                            .collect();
+                        if let Some(ref on_expr) = join.on_clause {
+                            match eval_expr(on_expr, &combined_cols, &combined) {
+                                Ok(val) if is_truthy(&val) => {
+                                    new_rows.push(combined);
+                                    matched = true;
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            new_rows.push(combined);
+                            matched = true;
+                        }
+                    }
+                    if !matched {
+                        let mut padded = outer.clone();
+                        padded.extend(std::iter::repeat(Value::Null).take(inner_col_count));
+                        new_rows.push(padded);
+                    }
+                }
+            }
+            JoinType::Right => {
+                let outer_col_count = if outer_rows.is_empty() {
+                    tables.iter().map(|(_, s)| s.columns.len()).sum()
+                } else {
+                    outer_rows[0].len()
+                };
+                let mut inner_matched = vec![false; inner_rows.len()];
+                for outer in &outer_rows {
+                    for (j, inner) in inner_rows.iter().enumerate() {
+                        let combined: Vec<Value> = outer.iter()
+                            .chain(inner.iter())
+                            .cloned()
+                            .collect();
+                        if let Some(ref on_expr) = join.on_clause {
+                            match eval_expr(on_expr, &combined_cols, &combined) {
+                                Ok(val) if is_truthy(&val) => {
+                                    new_rows.push(combined);
+                                    inner_matched[j] = true;
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            new_rows.push(combined);
+                            inner_matched[j] = true;
+                        }
+                    }
+                }
+                for (j, inner) in inner_rows.iter().enumerate() {
+                    if !inner_matched[j] {
+                        let mut padded: Vec<Value> = std::iter::repeat(Value::Null)
+                            .take(outer_col_count)
+                            .collect();
+                        padded.extend(inner.iter().cloned());
+                        new_rows.push(padded);
+                    }
+                }
+            }
+        }
+
+        tables.push((inner_alias, inner_schema));
+        outer_rows = new_rows;
+    }
+
+    let joined_cols = build_joined_columns(&tables);
+    process_select(&joined_cols, outer_rows, stmt)
 }
 
 fn exec_update(
@@ -1387,12 +1674,16 @@ fn exec_select_in_txn(
     schema: &SchemaManager,
     stmt: &SelectStmt,
 ) -> Result<ExecutionResult> {
+    if !stmt.joins.is_empty() {
+        return exec_select_join_in_txn(wtx, schema, stmt);
+    }
+
     let lower_name = stmt.from.to_ascii_lowercase();
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
 
     let rows = collect_rows_write(wtx, table_schema, &stmt.where_clause)?;
-    process_select(table_schema, rows, stmt)
+    process_select(&table_schema.columns, rows, stmt)
 }
 
 fn exec_update_in_txn(
@@ -1582,7 +1873,7 @@ fn exec_delete_in_txn(
 // ── Aggregation ─────────────────────────────────────────────────────
 
 fn exec_aggregate(
-    table_schema: &TableSchema,
+    columns: &[ColumnDef],
     rows: &[Vec<Value>],
     stmt: &SelectStmt,
 ) -> Result<ExecutionResult> {
@@ -1594,7 +1885,7 @@ fn exec_aggregate(
         let mut m: BTreeMap<Vec<Value>, Vec<&Vec<Value>>> = BTreeMap::new();
         for row in rows {
             let group_key: Vec<Value> = stmt.group_by.iter()
-                .map(|expr| eval_expr(expr, &table_schema.columns, row))
+                .map(|expr| eval_expr(expr, columns, row))
                 .collect::<Result<_>>()?;
             m.entry(group_key).or_default().push(row);
         }
@@ -1602,7 +1893,7 @@ fn exec_aggregate(
     };
 
     let mut result_rows = Vec::new();
-    let output_cols = build_output_columns(&stmt.columns, table_schema);
+    let output_cols = build_output_columns(&stmt.columns, columns);
 
     for (_group_key, group_rows) in &groups {
         let mut result_row = Vec::new();
@@ -1616,7 +1907,7 @@ fn exec_aggregate(
                 }
                 SelectColumn::Expr { expr, .. } => {
                     let val = eval_aggregate_expr(
-                        expr, &table_schema.columns, group_rows,
+                        expr, columns, group_rows,
                     )?;
                     result_row.push(val);
                 }
@@ -1624,7 +1915,7 @@ fn exec_aggregate(
         }
 
         if let Some(ref having) = stmt.having {
-            let passes = match eval_aggregate_expr(having, &table_schema.columns, group_rows) {
+            let passes = match eval_aggregate_expr(having, columns, group_rows) {
                 Ok(val) => is_truthy(&val),
                 Err(SqlError::ColumnNotFound(_)) => {
                     match eval_expr(having, &output_cols, &result_row) {
@@ -1648,7 +1939,7 @@ fn exec_aggregate(
     }
 
     if !stmt.order_by.is_empty() {
-        let output_cols = build_output_columns(&stmt.columns, table_schema);
+        let output_cols = build_output_columns(&stmt.columns, columns);
         sort_rows(&mut result_rows, &stmt.order_by, &output_cols)?;
     }
 
@@ -1767,7 +2058,7 @@ fn eval_aggregate_expr(
             }
         }
 
-        Expr::Column(_) => {
+        Expr::Column(_) | Expr::QualifiedColumn { .. } => {
             if let Some(first) = group_rows.first() {
                 eval_expr(expr, columns, first)
             } else {
@@ -1901,7 +2192,7 @@ fn sort_rows(
 }
 
 fn project_rows(
-    schema: &TableSchema,
+    columns: &[ColumnDef],
     select_cols: &[SelectColumn],
     rows: &[Vec<Value>],
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
@@ -1911,7 +2202,7 @@ fn project_rows(
     for sel_col in select_cols {
         match sel_col {
             SelectColumn::AllColumns => {
-                for col in &schema.columns {
+                for col in columns {
                     let idx = col.position as usize;
                     col_names.push(col.name.clone());
                     projectors.push(Box::new(move |row: &[Value]| Ok(row[idx].clone())));
@@ -1921,9 +2212,9 @@ fn project_rows(
                 let name = alias.clone().unwrap_or_else(|| expr_display_name(expr));
                 col_names.push(name);
                 let expr = expr.clone();
-                let columns = schema.columns.clone();
+                let owned_cols = columns.to_vec();
                 projectors.push(Box::new(move |row: &[Value]| {
-                    eval_expr(&expr, &columns, row)
+                    eval_expr(&expr, &owned_cols, row)
                 }));
             }
         }
@@ -1939,6 +2230,7 @@ fn project_rows(
 fn expr_display_name(expr: &Expr) -> String {
     match expr {
         Expr::Column(name) => name.clone(),
+        Expr::QualifiedColumn { table, column } => format!("{table}.{column}"),
         Expr::Literal(v) => format!("{v}"),
         Expr::CountStar => "COUNT(*)".into(),
         Expr::Function { name, args } => {
@@ -1965,17 +2257,17 @@ fn op_symbol(op: &BinOp) -> &'static str {
 
 fn build_output_columns(
     select_cols: &[SelectColumn],
-    table_schema: &TableSchema,
+    columns: &[ColumnDef],
 ) -> Vec<ColumnDef> {
     let mut out = Vec::new();
     for (i, col) in select_cols.iter().enumerate() {
         let (name, data_type) = match col {
             SelectColumn::AllColumns => (format!("col{i}"), DataType::Null),
             SelectColumn::Expr { alias: Some(a), expr } => {
-                (a.clone(), infer_expr_type(expr, table_schema))
+                (a.clone(), infer_expr_type(expr, columns))
             }
             SelectColumn::Expr { expr, .. } => {
-                (expr_display_name(expr), infer_expr_type(expr, table_schema))
+                (expr_display_name(expr), infer_expr_type(expr, columns))
             }
         };
         out.push(ColumnDef {
@@ -1988,12 +2280,19 @@ fn build_output_columns(
     out
 }
 
-fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
+fn infer_expr_type(expr: &Expr, columns: &[ColumnDef]) -> DataType {
     match expr {
         Expr::Column(name) => {
             let lower = name.to_ascii_lowercase();
-            schema.columns.iter()
-                .find(|c| c.name == lower)
+            columns.iter()
+                .find(|c| c.name.to_ascii_lowercase() == lower)
+                .map(|c| c.data_type)
+                .unwrap_or(DataType::Null)
+        }
+        Expr::QualifiedColumn { table, column } => {
+            let qualified = format!("{}.{}", table.to_ascii_lowercase(), column.to_ascii_lowercase());
+            columns.iter()
+                .find(|c| c.name.to_ascii_lowercase() == qualified)
                 .map(|c| c.data_type)
                 .unwrap_or(DataType::Null)
         }

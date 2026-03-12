@@ -63,20 +63,26 @@ fn flip_op(op: BinOp) -> BinOp {
     }
 }
 
+fn resolve_column_name<'a>(expr: &'a Expr) -> Option<&'a str> {
+    match expr {
+        Expr::Column(name) => Some(name.as_str()),
+        Expr::QualifiedColumn { column, .. } => Some(column.as_str()),
+        _ => None,
+    }
+}
+
 fn extract_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<SimplePredicate> {
     match expr {
         Expr::BinaryOp { left, op, right } if is_comparison(*op) => {
-            match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(name), Expr::Literal(val)) => {
-                    let col_idx = schema.column_index(name)?;
-                    Some(SimplePredicate { col_idx, op: *op, value: val.clone() })
-                }
-                (Expr::Literal(val), Expr::Column(name)) => {
-                    let col_idx = schema.column_index(name)?;
-                    Some(SimplePredicate { col_idx, op: flip_op(*op), value: val.clone() })
-                }
-                _ => None,
+            if let (Some(name), Expr::Literal(val)) = (resolve_column_name(left), right.as_ref()) {
+                let col_idx = schema.column_index(name)?;
+                return Some(SimplePredicate { col_idx, op: *op, value: val.clone() });
             }
+            if let (Expr::Literal(val), Some(name)) = (left.as_ref(), resolve_column_name(right)) {
+                let col_idx = schema.column_index(name)?;
+                return Some(SimplePredicate { col_idx, op: flip_op(*op), value: val.clone() });
+            }
+            None
         }
         _ => None,
     }

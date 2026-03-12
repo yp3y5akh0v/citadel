@@ -14,9 +14,25 @@ pub fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Value]) -> Result<Va
 
         Expr::Column(name) => {
             let lower = name.to_ascii_lowercase();
+            let matches: Vec<usize> = columns.iter().enumerate()
+                .filter(|(_, c)| {
+                    let cn = c.name.to_ascii_lowercase();
+                    cn == lower || cn.ends_with(&format!(".{lower}"))
+                })
+                .map(|(i, _)| i)
+                .collect();
+            match matches.len() {
+                0 => Err(SqlError::ColumnNotFound(name.clone())),
+                1 => Ok(row[matches[0]].clone()),
+                _ => Err(SqlError::AmbiguousColumn(name.clone())),
+            }
+        }
+
+        Expr::QualifiedColumn { table, column } => {
+            let qualified = format!("{}.{}", table.to_ascii_lowercase(), column.to_ascii_lowercase());
             let idx = columns.iter()
-                .position(|c| c.name.to_ascii_lowercase() == lower)
-                .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))?;
+                .position(|c| c.name.to_ascii_lowercase() == qualified)
+                .ok_or_else(|| SqlError::ColumnNotFound(format!("{table}.{column}")))?;
             Ok(row[idx].clone())
         }
 
