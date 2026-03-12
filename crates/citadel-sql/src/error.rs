@@ -52,6 +52,15 @@ pub enum SqlError {
     #[error("column '{0}' is ambiguous in aggregate query")]
     AmbiguousColumn(String),
 
+    #[error("index '{0}' not found")]
+    IndexNotFound(String),
+
+    #[error("index '{0}' already exists")]
+    IndexAlreadyExists(String),
+
+    #[error("unique constraint violated on index '{0}'")]
+    UniqueViolation(String),
+
     #[error("transaction already active")]
     TransactionAlreadyActive,
 

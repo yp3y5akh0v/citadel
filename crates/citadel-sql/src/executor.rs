@@ -11,6 +11,93 @@ use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
 
+// ── Index helpers ────────────────────────────────────────────────────
+
+fn encode_index_key(
+    idx: &IndexDef,
+    row: &[Value],
+    pk_values: &[Value],
+) -> Vec<u8> {
+    let indexed_values: Vec<Value> = idx.columns.iter()
+        .map(|&col_idx| row[col_idx as usize].clone())
+        .collect();
+
+    if idx.unique {
+        let any_null = indexed_values.iter().any(|v| v.is_null());
+        if !any_null {
+            return encode_composite_key(&indexed_values);
+        }
+    }
+
+    let mut all_values = indexed_values;
+    all_values.extend_from_slice(pk_values);
+    encode_composite_key(&all_values)
+}
+
+fn encode_index_value(
+    idx: &IndexDef,
+    row: &[Value],
+    pk_values: &[Value],
+) -> Vec<u8> {
+    if idx.unique {
+        let indexed_values: Vec<Value> = idx.columns.iter()
+            .map(|&col_idx| row[col_idx as usize].clone())
+            .collect();
+        let any_null = indexed_values.iter().any(|v| v.is_null());
+        if !any_null {
+            return encode_composite_key(pk_values);
+        }
+    }
+    vec![]
+}
+
+fn insert_index_entries(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    table_schema: &TableSchema,
+    row: &[Value],
+    pk_values: &[Value],
+) -> Result<()> {
+    for idx in &table_schema.indices {
+        let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
+        let key = encode_index_key(idx, row, pk_values);
+        let value = encode_index_value(idx, row, pk_values);
+
+        let is_new = wtx.table_insert(&idx_table, &key, &value)
+            .map_err(SqlError::Storage)?;
+
+        if idx.unique && !is_new {
+            let indexed_values: Vec<Value> = idx.columns.iter()
+                .map(|&col_idx| row[col_idx as usize].clone())
+                .collect();
+            let any_null = indexed_values.iter().any(|v| v.is_null());
+            if !any_null {
+                return Err(SqlError::UniqueViolation(idx.name.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn delete_index_entries(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    table_schema: &TableSchema,
+    row: &[Value],
+    pk_values: &[Value],
+) -> Result<()> {
+    for idx in &table_schema.indices {
+        let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
+        let key = encode_index_key(idx, row, pk_values);
+        wtx.table_delete(&idx_table, &key).map_err(SqlError::Storage)?;
+    }
+    Ok(())
+}
+
+fn index_columns_changed(idx: &IndexDef, old_row: &[Value], new_row: &[Value]) -> bool {
+    idx.columns.iter().any(|&col_idx| {
+        old_row[col_idx as usize] != new_row[col_idx as usize]
+    })
+}
+
 /// Execute a parsed SQL statement in auto-commit mode.
 pub fn execute(
     db: &Database,
@@ -20,6 +107,8 @@ pub fn execute(
     match stmt {
         Statement::CreateTable(ct) => exec_create_table(db, schema, ct),
         Statement::DropTable(dt) => exec_drop_table(db, schema, dt),
+        Statement::CreateIndex(ci) => exec_create_index(db, schema, ci),
+        Statement::DropIndex(di) => exec_drop_index(db, schema, di),
         Statement::Insert(ins) => exec_insert(db, schema, ins),
         Statement::Select(sel) => exec_select(db, schema, sel),
         Statement::Update(upd) => exec_update(db, schema, upd),
@@ -39,6 +128,8 @@ pub fn execute_in_txn(
     match stmt {
         Statement::CreateTable(ct) => exec_create_table_in_txn(wtx, schema, ct),
         Statement::DropTable(dt) => exec_drop_table_in_txn(wtx, schema, dt),
+        Statement::CreateIndex(ci) => exec_create_index_in_txn(wtx, schema, ci),
+        Statement::DropIndex(di) => exec_drop_index_in_txn(wtx, schema, di),
         Statement::Insert(ins) => exec_insert_in_txn(wtx, schema, ins),
         Statement::Select(sel) => exec_select_in_txn(wtx, schema, sel),
         Statement::Update(upd) => exec_update_in_txn(wtx, schema, upd),
@@ -97,6 +188,7 @@ fn exec_create_table(
         name: lower_name.clone(),
         columns,
         primary_key_columns,
+        indices: vec![],
     };
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
@@ -123,7 +215,15 @@ fn exec_drop_table(
         return Err(SqlError::TableNotFound(stmt.name.clone()));
     }
 
+    let table_schema = schema.get(&lower_name).unwrap();
+    let idx_tables: Vec<Vec<u8>> = table_schema.indices.iter()
+        .map(|idx| TableSchema::index_table_name(&lower_name, &idx.name))
+        .collect();
+
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    for idx_table in &idx_tables {
+        wtx.drop_table(idx_table).map_err(SqlError::Storage)?;
+    }
     wtx.drop_table(lower_name.as_bytes()).map_err(SqlError::Storage)?;
     SchemaManager::delete_schema(&mut wtx, &lower_name)?;
     wtx.commit().map_err(SqlError::Storage)?;
@@ -178,6 +278,7 @@ fn exec_create_table_in_txn(
         name: lower_name.clone(),
         columns,
         primary_key_columns,
+        indices: vec![],
     };
 
     SchemaManager::ensure_schema_table(wtx)?;
@@ -202,11 +303,244 @@ fn exec_drop_table_in_txn(
         return Err(SqlError::TableNotFound(stmt.name.clone()));
     }
 
+    let table_schema = schema.get(&lower_name).unwrap();
+    let idx_tables: Vec<Vec<u8>> = table_schema.indices.iter()
+        .map(|idx| TableSchema::index_table_name(&lower_name, &idx.name))
+        .collect();
+
+    for idx_table in &idx_tables {
+        wtx.drop_table(idx_table).map_err(SqlError::Storage)?;
+    }
     wtx.drop_table(lower_name.as_bytes()).map_err(SqlError::Storage)?;
     SchemaManager::delete_schema(wtx, &lower_name)?;
 
     schema.remove(&lower_name);
     Ok(ExecutionResult::Ok)
+}
+
+fn exec_create_index(
+    db: &Database,
+    schema: &mut SchemaManager,
+    stmt: &CreateIndexStmt,
+) -> Result<ExecutionResult> {
+    let lower_table = stmt.table_name.to_ascii_lowercase();
+    let lower_idx = stmt.index_name.to_ascii_lowercase();
+
+    let table_schema = schema.get(&lower_table)
+        .ok_or_else(|| SqlError::TableNotFound(stmt.table_name.clone()))?;
+
+    if table_schema.index_by_name(&lower_idx).is_some() {
+        if stmt.if_not_exists {
+            return Ok(ExecutionResult::Ok);
+        }
+        return Err(SqlError::IndexAlreadyExists(stmt.index_name.clone()));
+    }
+
+    let col_indices: Vec<u16> = stmt.columns.iter().map(|col_name| {
+        let lower = col_name.to_ascii_lowercase();
+        table_schema.column_index(&lower)
+            .map(|i| i as u16)
+            .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))
+    }).collect::<Result<_>>()?;
+
+    let idx_def = IndexDef {
+        name: lower_idx.clone(),
+        columns: col_indices,
+        unique: stmt.unique,
+    };
+
+    let idx_table = TableSchema::index_table_name(&lower_table, &lower_idx);
+
+    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    SchemaManager::ensure_schema_table(&mut wtx)?;
+    wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
+
+    // Populate index from existing rows
+    let pk_indices = table_schema.pk_indices();
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    {
+        let mut scan_err: Option<SqlError> = None;
+        wtx.table_for_each(lower_table.as_bytes(), |key, value| {
+            match decode_full_row(table_schema, key, value) {
+                Ok(row) => rows.push(row),
+                Err(e) => scan_err = Some(e),
+            }
+            Ok(())
+        }).map_err(SqlError::Storage)?;
+        if let Some(e) = scan_err { return Err(e); }
+    }
+
+    for row in &rows {
+        let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
+        let key = encode_index_key(&idx_def, row, &pk_values);
+        let value = encode_index_value(&idx_def, row, &pk_values);
+        let is_new = wtx.table_insert(&idx_table, &key, &value)
+            .map_err(SqlError::Storage)?;
+        if idx_def.unique && !is_new {
+            let indexed_values: Vec<Value> = idx_def.columns.iter()
+                .map(|&col_idx| row[col_idx as usize].clone())
+                .collect();
+            let any_null = indexed_values.iter().any(|v| v.is_null());
+            if !any_null {
+                return Err(SqlError::UniqueViolation(stmt.index_name.clone()));
+            }
+        }
+    }
+
+    let mut updated_schema = table_schema.clone();
+    updated_schema.indices.push(idx_def);
+    SchemaManager::save_schema(&mut wtx, &updated_schema)?;
+    wtx.commit().map_err(SqlError::Storage)?;
+
+    schema.register(updated_schema);
+    Ok(ExecutionResult::Ok)
+}
+
+fn exec_drop_index(
+    db: &Database,
+    schema: &mut SchemaManager,
+    stmt: &DropIndexStmt,
+) -> Result<ExecutionResult> {
+    let lower_idx = stmt.index_name.to_ascii_lowercase();
+
+    let (table_name, _idx_pos) = match find_index_in_schemas(schema, &lower_idx) {
+        Some(found) => found,
+        None => {
+            if stmt.if_exists {
+                return Ok(ExecutionResult::Ok);
+            }
+            return Err(SqlError::IndexNotFound(stmt.index_name.clone()));
+        }
+    };
+
+    let idx_table = TableSchema::index_table_name(&table_name, &lower_idx);
+
+    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    wtx.drop_table(&idx_table).map_err(SqlError::Storage)?;
+
+    let table_schema = schema.get(&table_name).unwrap();
+    let mut updated_schema = table_schema.clone();
+    updated_schema.indices.retain(|i| i.name != lower_idx);
+    SchemaManager::save_schema(&mut wtx, &updated_schema)?;
+    wtx.commit().map_err(SqlError::Storage)?;
+
+    schema.register(updated_schema);
+    Ok(ExecutionResult::Ok)
+}
+
+fn exec_create_index_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    stmt: &CreateIndexStmt,
+) -> Result<ExecutionResult> {
+    let lower_table = stmt.table_name.to_ascii_lowercase();
+    let lower_idx = stmt.index_name.to_ascii_lowercase();
+
+    let table_schema = schema.get(&lower_table)
+        .ok_or_else(|| SqlError::TableNotFound(stmt.table_name.clone()))?;
+
+    if table_schema.index_by_name(&lower_idx).is_some() {
+        if stmt.if_not_exists {
+            return Ok(ExecutionResult::Ok);
+        }
+        return Err(SqlError::IndexAlreadyExists(stmt.index_name.clone()));
+    }
+
+    let col_indices: Vec<u16> = stmt.columns.iter().map(|col_name| {
+        let lower = col_name.to_ascii_lowercase();
+        table_schema.column_index(&lower)
+            .map(|i| i as u16)
+            .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))
+    }).collect::<Result<_>>()?;
+
+    let idx_def = IndexDef {
+        name: lower_idx.clone(),
+        columns: col_indices,
+        unique: stmt.unique,
+    };
+
+    let idx_table = TableSchema::index_table_name(&lower_table, &lower_idx);
+
+    SchemaManager::ensure_schema_table(wtx)?;
+    wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
+
+    let pk_indices = table_schema.pk_indices();
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    {
+        let mut scan_err: Option<SqlError> = None;
+        wtx.table_for_each(lower_table.as_bytes(), |key, value| {
+            match decode_full_row(table_schema, key, value) {
+                Ok(row) => rows.push(row),
+                Err(e) => scan_err = Some(e),
+            }
+            Ok(())
+        }).map_err(SqlError::Storage)?;
+        if let Some(e) = scan_err { return Err(e); }
+    }
+
+    for row in &rows {
+        let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
+        let key = encode_index_key(&idx_def, row, &pk_values);
+        let value = encode_index_value(&idx_def, row, &pk_values);
+        let is_new = wtx.table_insert(&idx_table, &key, &value)
+            .map_err(SqlError::Storage)?;
+        if idx_def.unique && !is_new {
+            let indexed_values: Vec<Value> = idx_def.columns.iter()
+                .map(|&col_idx| row[col_idx as usize].clone())
+                .collect();
+            let any_null = indexed_values.iter().any(|v| v.is_null());
+            if !any_null {
+                return Err(SqlError::UniqueViolation(stmt.index_name.clone()));
+            }
+        }
+    }
+
+    let mut updated_schema = table_schema.clone();
+    updated_schema.indices.push(idx_def);
+    SchemaManager::save_schema(wtx, &updated_schema)?;
+
+    schema.register(updated_schema);
+    Ok(ExecutionResult::Ok)
+}
+
+fn exec_drop_index_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    stmt: &DropIndexStmt,
+) -> Result<ExecutionResult> {
+    let lower_idx = stmt.index_name.to_ascii_lowercase();
+
+    let (table_name, _idx_pos) = match find_index_in_schemas(schema, &lower_idx) {
+        Some(found) => found,
+        None => {
+            if stmt.if_exists {
+                return Ok(ExecutionResult::Ok);
+            }
+            return Err(SqlError::IndexNotFound(stmt.index_name.clone()));
+        }
+    };
+
+    let idx_table = TableSchema::index_table_name(&table_name, &lower_idx);
+    wtx.drop_table(&idx_table).map_err(SqlError::Storage)?;
+
+    let table_schema = schema.get(&table_name).unwrap();
+    let mut updated_schema = table_schema.clone();
+    updated_schema.indices.retain(|i| i.name != lower_idx);
+    SchemaManager::save_schema(wtx, &updated_schema)?;
+
+    schema.register(updated_schema);
+    Ok(ExecutionResult::Ok)
+}
+
+fn find_index_in_schemas(schema: &SchemaManager, index_name: &str) -> Option<(String, usize)> {
+    for table_name in schema.table_names() {
+        if let Some(ts) = schema.get(table_name) {
+            if let Some(pos) = ts.indices.iter().position(|i| i.name == index_name) {
+                return Some((table_name.to_string(), pos));
+            }
+        }
+    }
+    None
 }
 
 // ── DML ─────────────────────────────────────────────────────────────
@@ -289,6 +623,8 @@ fn exec_insert(
         if !is_new {
             return Err(SqlError::DuplicateKey);
         }
+
+        insert_index_entries(&mut wtx, table_schema, &row, &pk_values)?;
         count += 1;
     }
 
@@ -443,15 +779,25 @@ fn exec_update(
         return Ok(ExecutionResult::RowsAffected(0));
     }
 
-    let mut changes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, bool)> = Vec::new();
+    struct UpdateChange {
+        old_key: Vec<u8>,
+        new_key: Vec<u8>,
+        new_value: Vec<u8>,
+        pk_changed: bool,
+        old_row: Vec<Value>,
+        new_row: Vec<Value>,
+    }
+
+    let pk_indices = table_schema.pk_indices();
+    let mut changes: Vec<UpdateChange> = Vec::new();
 
     for (old_key, row) in &matching_rows {
-        let mut row = row.clone();
+        let mut new_row = row.clone();
         let mut pk_changed = false;
         for (col_name, expr) in &stmt.assignments {
             let col_idx = table_schema.column_index(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-            let new_val = eval_expr(expr, &table_schema.columns, &row)?;
+            let new_val = eval_expr(expr, &table_schema.columns, &new_row)?;
             let col = &table_schema.columns[col_idx];
 
             let coerced = if new_val.is_null() {
@@ -469,28 +815,28 @@ fn exec_update(
             if table_schema.primary_key_columns.contains(&(col_idx as u16)) {
                 pk_changed = true;
             }
-            row[col_idx] = coerced;
+            new_row[col_idx] = coerced;
         }
 
-        let pk_values: Vec<Value> = table_schema.pk_indices()
-            .iter()
-            .map(|&i| row[i].clone())
-            .collect();
+        let pk_values: Vec<Value> = pk_indices.iter().map(|&i| new_row[i].clone()).collect();
         let new_key = encode_composite_key(&pk_values);
 
         let non_pk = table_schema.non_pk_indices();
-        let value_values: Vec<Value> = non_pk.iter().map(|&i| row[i].clone()).collect();
+        let value_values: Vec<Value> = non_pk.iter().map(|&i| new_row[i].clone()).collect();
         let new_value = encode_row(&value_values);
 
-        changes.push((old_key.clone(), new_key, new_value, pk_changed));
+        changes.push(UpdateChange {
+            old_key: old_key.clone(), new_key, new_value, pk_changed,
+            old_row: row.clone(), new_row,
+        });
     }
 
     {
         use std::collections::HashSet;
         let mut new_keys: HashSet<Vec<u8>> = HashSet::new();
-        for (old_key, new_key, _, pk_changed) in &changes {
-            if *pk_changed && new_key != old_key {
-                if !new_keys.insert(new_key.clone()) {
+        for c in &changes {
+            if c.pk_changed && c.new_key != c.old_key {
+                if !new_keys.insert(c.new_key.clone()) {
                     return Err(SqlError::DuplicateKey);
                 }
             }
@@ -499,22 +845,53 @@ fn exec_update(
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
 
-    for (old_key, _, _, pk_changed) in &changes {
-        if *pk_changed {
-            wtx.table_delete(lower_name.as_bytes(), old_key).map_err(SqlError::Storage)?;
+    for c in &changes {
+        let old_pk: Vec<Value> = pk_indices.iter().map(|&i| c.old_row[i].clone()).collect();
+
+        for idx in &table_schema.indices {
+            if index_columns_changed(idx, &c.old_row, &c.new_row) || c.pk_changed {
+                let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
+                let old_idx_key = encode_index_key(idx, &c.old_row, &old_pk);
+                wtx.table_delete(&idx_table, &old_idx_key).map_err(SqlError::Storage)?;
+            }
+        }
+
+        if c.pk_changed {
+            wtx.table_delete(lower_name.as_bytes(), &c.old_key).map_err(SqlError::Storage)?;
         }
     }
 
-    for (_, new_key, new_value, pk_changed) in &changes {
-        if *pk_changed {
-            let is_new = wtx.table_insert(lower_name.as_bytes(), &new_key, &new_value)
+    for c in &changes {
+        let new_pk: Vec<Value> = pk_indices.iter().map(|&i| c.new_row[i].clone()).collect();
+
+        if c.pk_changed {
+            let is_new = wtx.table_insert(lower_name.as_bytes(), &c.new_key, &c.new_value)
                 .map_err(SqlError::Storage)?;
             if !is_new {
                 return Err(SqlError::DuplicateKey);
             }
         } else {
-            wtx.table_insert(lower_name.as_bytes(), &new_key, &new_value)
+            wtx.table_insert(lower_name.as_bytes(), &c.new_key, &c.new_value)
                 .map_err(SqlError::Storage)?;
+        }
+
+        for idx in &table_schema.indices {
+            if index_columns_changed(idx, &c.old_row, &c.new_row) || c.pk_changed {
+                let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
+                let new_idx_key = encode_index_key(idx, &c.new_row, &new_pk);
+                let new_idx_val = encode_index_value(idx, &c.new_row, &new_pk);
+                let is_new = wtx.table_insert(&idx_table, &new_idx_key, &new_idx_val)
+                    .map_err(SqlError::Storage)?;
+                if idx.unique && !is_new {
+                    let indexed_values: Vec<Value> = idx.columns.iter()
+                        .map(|&col_idx| c.new_row[col_idx as usize].clone())
+                        .collect();
+                    let any_null = indexed_values.iter().any(|v| v.is_null());
+                    if !any_null {
+                        return Err(SqlError::UniqueViolation(idx.name.clone()));
+                    }
+                }
+            }
         }
     }
 
@@ -532,7 +909,7 @@ fn exec_delete(
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
-    let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
+    let mut rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
     {
         let mut rtx = db.begin_read();
         let mut scan_err: Option<SqlError> = None;
@@ -549,7 +926,7 @@ fn exec_delete(
                         None => true,
                     };
                     if matches {
-                        keys_to_delete.push(key.to_vec());
+                        rows_to_delete.push((key.to_vec(), row));
                     }
                 }
                 Err(e) => scan_err = Some(e),
@@ -559,15 +936,18 @@ fn exec_delete(
         if let Some(e) = scan_err { return Err(e); }
     }
 
-    if keys_to_delete.is_empty() {
+    if rows_to_delete.is_empty() {
         return Ok(ExecutionResult::RowsAffected(0));
     }
 
+    let pk_indices = table_schema.pk_indices();
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    for key in &keys_to_delete {
+    for (key, row) in &rows_to_delete {
+        let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
+        delete_index_entries(&mut wtx, table_schema, row, &pk_values)?;
         wtx.table_delete(lower_name.as_bytes(), key).map_err(SqlError::Storage)?;
     }
-    let count = keys_to_delete.len() as u64;
+    let count = rows_to_delete.len() as u64;
     wtx.commit().map_err(SqlError::Storage)?;
     Ok(ExecutionResult::RowsAffected(count))
 }
@@ -651,6 +1031,8 @@ fn exec_insert_in_txn(
         if !is_new {
             return Err(SqlError::DuplicateKey);
         }
+
+        insert_index_entries(wtx, table_schema, &row, &pk_values)?;
         count += 1;
     }
 
@@ -721,15 +1103,25 @@ fn exec_update_in_txn(
         return Ok(ExecutionResult::RowsAffected(0));
     }
 
-    let mut changes: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, bool)> = Vec::new();
+    struct UpdateChange {
+        old_key: Vec<u8>,
+        new_key: Vec<u8>,
+        new_value: Vec<u8>,
+        pk_changed: bool,
+        old_row: Vec<Value>,
+        new_row: Vec<Value>,
+    }
+
+    let pk_indices = table_schema.pk_indices();
+    let mut changes: Vec<UpdateChange> = Vec::new();
 
     for (old_key, row) in &matching_rows {
-        let mut row = row.clone();
+        let mut new_row = row.clone();
         let mut pk_changed = false;
         for (col_name, expr) in &stmt.assignments {
             let col_idx = table_schema.column_index(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-            let new_val = eval_expr(expr, &table_schema.columns, &row)?;
+            let new_val = eval_expr(expr, &table_schema.columns, &new_row)?;
             let col = &table_schema.columns[col_idx];
 
             let coerced = if new_val.is_null() {
@@ -747,50 +1139,81 @@ fn exec_update_in_txn(
             if table_schema.primary_key_columns.contains(&(col_idx as u16)) {
                 pk_changed = true;
             }
-            row[col_idx] = coerced;
+            new_row[col_idx] = coerced;
         }
 
-        let pk_values: Vec<Value> = table_schema.pk_indices()
-            .iter()
-            .map(|&i| row[i].clone())
-            .collect();
+        let pk_values: Vec<Value> = pk_indices.iter().map(|&i| new_row[i].clone()).collect();
         let new_key = encode_composite_key(&pk_values);
 
         let non_pk = table_schema.non_pk_indices();
-        let value_values: Vec<Value> = non_pk.iter().map(|&i| row[i].clone()).collect();
+        let value_values: Vec<Value> = non_pk.iter().map(|&i| new_row[i].clone()).collect();
         let new_value = encode_row(&value_values);
 
-        changes.push((old_key.clone(), new_key, new_value, pk_changed));
+        changes.push(UpdateChange {
+            old_key: old_key.clone(), new_key, new_value, pk_changed,
+            old_row: row.clone(), new_row,
+        });
     }
 
     {
         use std::collections::HashSet;
         let mut new_keys: HashSet<Vec<u8>> = HashSet::new();
-        for (old_key, new_key, _, pk_changed) in &changes {
-            if *pk_changed && new_key != old_key {
-                if !new_keys.insert(new_key.clone()) {
+        for c in &changes {
+            if c.pk_changed && c.new_key != c.old_key {
+                if !new_keys.insert(c.new_key.clone()) {
                     return Err(SqlError::DuplicateKey);
                 }
             }
         }
     }
 
-    for (old_key, _, _, pk_changed) in &changes {
-        if *pk_changed {
-            wtx.table_delete(lower_name.as_bytes(), old_key).map_err(SqlError::Storage)?;
+    for c in &changes {
+        let old_pk: Vec<Value> = pk_indices.iter().map(|&i| c.old_row[i].clone()).collect();
+
+        for idx in &table_schema.indices {
+            if index_columns_changed(idx, &c.old_row, &c.new_row) || c.pk_changed {
+                let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
+                let old_idx_key = encode_index_key(idx, &c.old_row, &old_pk);
+                wtx.table_delete(&idx_table, &old_idx_key).map_err(SqlError::Storage)?;
+            }
+        }
+
+        if c.pk_changed {
+            wtx.table_delete(lower_name.as_bytes(), &c.old_key).map_err(SqlError::Storage)?;
         }
     }
 
-    for (_, new_key, new_value, pk_changed) in &changes {
-        if *pk_changed {
-            let is_new = wtx.table_insert(lower_name.as_bytes(), new_key, new_value)
+    for c in &changes {
+        let new_pk: Vec<Value> = pk_indices.iter().map(|&i| c.new_row[i].clone()).collect();
+
+        if c.pk_changed {
+            let is_new = wtx.table_insert(lower_name.as_bytes(), &c.new_key, &c.new_value)
                 .map_err(SqlError::Storage)?;
             if !is_new {
                 return Err(SqlError::DuplicateKey);
             }
         } else {
-            wtx.table_insert(lower_name.as_bytes(), new_key, new_value)
+            wtx.table_insert(lower_name.as_bytes(), &c.new_key, &c.new_value)
                 .map_err(SqlError::Storage)?;
+        }
+
+        for idx in &table_schema.indices {
+            if index_columns_changed(idx, &c.old_row, &c.new_row) || c.pk_changed {
+                let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
+                let new_idx_key = encode_index_key(idx, &c.new_row, &new_pk);
+                let new_idx_val = encode_index_value(idx, &c.new_row, &new_pk);
+                let is_new = wtx.table_insert(&idx_table, &new_idx_key, &new_idx_val)
+                    .map_err(SqlError::Storage)?;
+                if idx.unique && !is_new {
+                    let indexed_values: Vec<Value> = idx.columns.iter()
+                        .map(|&col_idx| c.new_row[col_idx as usize].clone())
+                        .collect();
+                    let any_null = indexed_values.iter().any(|v| v.is_null());
+                    if !any_null {
+                        return Err(SqlError::UniqueViolation(idx.name.clone()));
+                    }
+                }
+            }
         }
     }
 
@@ -807,7 +1230,7 @@ fn exec_delete_in_txn(
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
-    let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
+    let mut rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
     {
         let mut scan_err: Option<SqlError> = None;
         wtx.table_for_each(lower_name.as_bytes(), |key, value| {
@@ -823,7 +1246,7 @@ fn exec_delete_in_txn(
                         None => true,
                     };
                     if matches {
-                        keys_to_delete.push(key.to_vec());
+                        rows_to_delete.push((key.to_vec(), row));
                     }
                 }
                 Err(e) => scan_err = Some(e),
@@ -833,14 +1256,17 @@ fn exec_delete_in_txn(
         if let Some(e) = scan_err { return Err(e); }
     }
 
-    if keys_to_delete.is_empty() {
+    if rows_to_delete.is_empty() {
         return Ok(ExecutionResult::RowsAffected(0));
     }
 
-    for key in &keys_to_delete {
+    let pk_indices = table_schema.pk_indices();
+    for (key, row) in &rows_to_delete {
+        let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
+        delete_index_entries(wtx, table_schema, row, &pk_values)?;
         wtx.table_delete(lower_name.as_bytes(), key).map_err(SqlError::Storage)?;
     }
-    let count = keys_to_delete.len() as u64;
+    let count = rows_to_delete.len() as u64;
     Ok(ExecutionResult::RowsAffected(count))
 }
 

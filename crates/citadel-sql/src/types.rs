@@ -217,15 +217,24 @@ pub struct ColumnDef {
     pub position: u16,
 }
 
+/// Index definition stored as part of the table schema.
+#[derive(Debug, Clone)]
+pub struct IndexDef {
+    pub name: String,
+    pub columns: Vec<u16>,
+    pub unique: bool,
+}
+
 /// Table schema stored in the _schema table.
 #[derive(Debug, Clone)]
 pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub primary_key_columns: Vec<u16>,
+    pub indices: Vec<IndexDef>,
 }
 
-const SCHEMA_VERSION: u8 = 1;
+const SCHEMA_VERSION: u8 = 2;
 
 impl TableSchema {
     pub fn serialize(&self) -> Vec<u8> {
@@ -256,17 +265,31 @@ impl TableSchema {
             buf.extend_from_slice(&pk_idx.to_le_bytes());
         }
 
+        // Indices (v2+)
+        buf.extend_from_slice(&(self.indices.len() as u16).to_le_bytes());
+        for idx in &self.indices {
+            let idx_name = idx.name.as_bytes();
+            buf.extend_from_slice(&(idx_name.len() as u16).to_le_bytes());
+            buf.extend_from_slice(idx_name);
+            buf.extend_from_slice(&(idx.columns.len() as u16).to_le_bytes());
+            for &col_idx in &idx.columns {
+                buf.extend_from_slice(&col_idx.to_le_bytes());
+            }
+            buf.push(if idx.unique { 1 } else { 0 });
+        }
+
         buf
     }
 
     pub fn deserialize(data: &[u8]) -> crate::error::Result<Self> {
         let mut pos = 0;
 
-        if data.is_empty() || data[0] != SCHEMA_VERSION {
+        if data.is_empty() || (data[0] != SCHEMA_VERSION && data[0] != 1) {
             return Err(crate::error::SqlError::InvalidValue(
                 "invalid schema version".into(),
             ));
         }
+        let version = data[0];
         pos += 1;
 
         // Table name
@@ -310,12 +333,38 @@ impl TableSchema {
             pos += 2;
             primary_key_columns.push(pk_idx);
         }
+        let indices = if version >= 2 && pos + 2 <= data.len() {
+            let idx_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            let mut idxs = Vec::with_capacity(idx_count);
+            for _ in 0..idx_count {
+                let idx_name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                pos += 2;
+                let idx_name = String::from_utf8_lossy(&data[pos..pos + idx_name_len]).into_owned();
+                pos += idx_name_len;
+                let col_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                pos += 2;
+                let mut cols = Vec::with_capacity(col_count);
+                for _ in 0..col_count {
+                    let col_idx = u16::from_le_bytes([data[pos], data[pos + 1]]);
+                    pos += 2;
+                    cols.push(col_idx);
+                }
+                let unique = data[pos] != 0;
+                pos += 1;
+                idxs.push(IndexDef { name: idx_name, columns: cols, unique });
+            }
+            idxs
+        } else {
+            vec![]
+        };
         let _ = pos;
 
         Ok(Self {
             name,
             columns,
             primary_key_columns,
+            indices,
         })
     }
 
@@ -335,6 +384,17 @@ impl TableSchema {
     /// Get the PK column indices as usize.
     pub fn pk_indices(&self) -> Vec<usize> {
         self.primary_key_columns.iter().map(|&i| i as usize).collect()
+    }
+
+    /// Get index definition by name (case-insensitive).
+    pub fn index_by_name(&self, name: &str) -> Option<&IndexDef> {
+        let lower = name.to_ascii_lowercase();
+        self.indices.iter().find(|i| i.name == lower)
+    }
+
+    /// Get the KV table name for an index.
+    pub fn index_table_name(table_name: &str, index_name: &str) -> Vec<u8> {
+        format!("__idx_{table_name}_{index_name}").into_bytes()
     }
 }
 
@@ -419,6 +479,7 @@ mod tests {
                 ColumnDef { name: "active".into(), data_type: DataType::Boolean, nullable: false, position: 2 },
             ],
             primary_key_columns: vec![0],
+            indices: vec![],
         };
 
         let data = schema.serialize();
@@ -435,6 +496,55 @@ mod tests {
         assert_eq!(restored.columns[2].name, "active");
         assert_eq!(restored.columns[2].data_type, DataType::Boolean);
         assert_eq!(restored.primary_key_columns, vec![0]);
+    }
+
+    #[test]
+    fn schema_roundtrip_with_indices() {
+        let schema = TableSchema {
+            name: "orders".into(),
+            columns: vec![
+                ColumnDef { name: "id".into(), data_type: DataType::Integer, nullable: false, position: 0 },
+                ColumnDef { name: "customer".into(), data_type: DataType::Text, nullable: false, position: 1 },
+                ColumnDef { name: "amount".into(), data_type: DataType::Real, nullable: true, position: 2 },
+            ],
+            primary_key_columns: vec![0],
+            indices: vec![
+                IndexDef { name: "idx_customer".into(), columns: vec![1], unique: false },
+                IndexDef { name: "idx_amount_uniq".into(), columns: vec![2], unique: true },
+            ],
+        };
+
+        let data = schema.serialize();
+        let restored = TableSchema::deserialize(&data).unwrap();
+
+        assert_eq!(restored.indices.len(), 2);
+        assert_eq!(restored.indices[0].name, "idx_customer");
+        assert_eq!(restored.indices[0].columns, vec![1]);
+        assert!(!restored.indices[0].unique);
+        assert_eq!(restored.indices[1].name, "idx_amount_uniq");
+        assert_eq!(restored.indices[1].columns, vec![2]);
+        assert!(restored.indices[1].unique);
+    }
+
+    #[test]
+    fn schema_v1_backward_compat() {
+        let old_schema = TableSchema {
+            name: "test".into(),
+            columns: vec![
+                ColumnDef { name: "id".into(), data_type: DataType::Integer, nullable: false, position: 0 },
+            ],
+            primary_key_columns: vec![0],
+            indices: vec![],
+        };
+        let mut data = old_schema.serialize();
+        // Patch to v1 format: replace version byte and truncate index data
+        data[0] = 1;
+        // Remove the last 2 bytes (index count = 0)
+        data.truncate(data.len() - 2);
+
+        let restored = TableSchema::deserialize(&data).unwrap();
+        assert_eq!(restored.name, "test");
+        assert!(restored.indices.is_empty());
     }
 
     #[test]

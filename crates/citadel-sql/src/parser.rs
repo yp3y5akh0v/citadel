@@ -13,6 +13,8 @@ use crate::types::{DataType, Value};
 pub enum Statement {
     CreateTable(CreateTableStmt),
     DropTable(DropTableStmt),
+    CreateIndex(CreateIndexStmt),
+    DropIndex(DropIndexStmt),
     Insert(InsertStmt),
     Select(SelectStmt),
     Update(UpdateStmt),
@@ -41,6 +43,21 @@ pub struct ColumnSpec {
 #[derive(Debug, Clone)]
 pub struct DropTableStmt {
     pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateIndexStmt {
+    pub index_name: String,
+    pub table_name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+    pub if_not_exists: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DropIndexStmt {
+    pub index_name: String,
     pub if_exists: bool,
 }
 
@@ -137,6 +154,7 @@ pub fn parse_sql(sql: &str) -> Result<Statement> {
 fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
     match stmt {
         sp::Statement::CreateTable(ct) => convert_create_table(ct),
+        sp::Statement::CreateIndex(ci) => convert_create_index(ci),
         sp::Statement::Drop {
             object_type: sp::ObjectType::Table,
             if_exists,
@@ -148,6 +166,20 @@ fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
             }
             Ok(Statement::DropTable(DropTableStmt {
                 name: object_name_to_string(&names[0]),
+                if_exists,
+            }))
+        }
+        sp::Statement::Drop {
+            object_type: sp::ObjectType::Index,
+            if_exists,
+            names,
+            ..
+        } => {
+            if names.len() != 1 {
+                return Err(SqlError::Unsupported("multi-index DROP".into()));
+            }
+            Ok(Statement::DropIndex(DropIndexStmt {
+                index_name: object_name_to_string(&names[0]),
                 if_exists,
             }))
         }
@@ -224,6 +256,34 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
         columns,
         primary_key: inline_pk,
         if_not_exists,
+    }))
+}
+
+fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
+    let index_name = ci.name
+        .as_ref()
+        .map(object_name_to_string)
+        .ok_or_else(|| SqlError::Parse("index name required".into()))?;
+
+    let table_name = object_name_to_string(&ci.table_name);
+
+    let columns: Vec<String> = ci.columns.iter().map(|idx_col| {
+        match &idx_col.column.expr {
+            sp::Expr::Identifier(ident) => Ok(ident.value.clone()),
+            other => Err(SqlError::Unsupported(format!("expression index: {other}"))),
+        }
+    }).collect::<Result<_>>()?;
+
+    if columns.is_empty() {
+        return Err(SqlError::Parse("index must have at least one column".into()));
+    }
+
+    Ok(Statement::CreateIndex(CreateIndexStmt {
+        index_name,
+        table_name,
+        columns,
+        unique: ci.unique,
+        if_not_exists: ci.if_not_exists,
     }))
 }
 
@@ -955,6 +1015,76 @@ mod tests {
     #[test]
     fn reject_distinct_on() {
         assert!(parse_sql("SELECT DISTINCT ON (id) * FROM users").is_err());
+    }
+
+    #[test]
+    fn parse_create_index() {
+        let stmt = parse_sql("CREATE INDEX idx_name ON users (name)").unwrap();
+        match stmt {
+            Statement::CreateIndex(ci) => {
+                assert_eq!(ci.index_name, "idx_name");
+                assert_eq!(ci.table_name, "users");
+                assert_eq!(ci.columns, vec!["name"]);
+                assert!(!ci.unique);
+                assert!(!ci.if_not_exists);
+            }
+            _ => panic!("expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn parse_create_unique_index() {
+        let stmt = parse_sql("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap();
+        match stmt {
+            Statement::CreateIndex(ci) => {
+                assert!(ci.unique);
+                assert_eq!(ci.columns, vec!["email"]);
+            }
+            _ => panic!("expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn parse_create_index_if_not_exists() {
+        let stmt = parse_sql("CREATE INDEX IF NOT EXISTS idx_x ON t (a)").unwrap();
+        match stmt {
+            Statement::CreateIndex(ci) => assert!(ci.if_not_exists),
+            _ => panic!("expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn parse_create_index_multi_column() {
+        let stmt = parse_sql("CREATE INDEX idx_multi ON t (a, b, c)").unwrap();
+        match stmt {
+            Statement::CreateIndex(ci) => {
+                assert_eq!(ci.columns, vec!["a", "b", "c"]);
+            }
+            _ => panic!("expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn parse_drop_index() {
+        let stmt = parse_sql("DROP INDEX idx_name").unwrap();
+        match stmt {
+            Statement::DropIndex(di) => {
+                assert_eq!(di.index_name, "idx_name");
+                assert!(!di.if_exists);
+            }
+            _ => panic!("expected DropIndex"),
+        }
+    }
+
+    #[test]
+    fn parse_drop_index_if_exists() {
+        let stmt = parse_sql("DROP INDEX IF EXISTS idx_name").unwrap();
+        match stmt {
+            Statement::DropIndex(di) => {
+                assert!(di.if_exists);
+            }
+            _ => panic!("expected DropIndex"),
+        }
     }
 
     #[test]
