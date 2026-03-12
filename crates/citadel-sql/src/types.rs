@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 /// SQL data types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +125,27 @@ impl PartialEq for Value {
 }
 
 impl Eq for Value {}
+
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Value::Null => 0u8.hash(state),
+            Value::Integer(i) => {
+                // Hash via f64 bits so Integer(n) and Real(n.0) produce the same hash,
+                // matching the cross-type PartialEq contract.
+                1u8.hash(state);
+                (*i as f64).to_bits().hash(state);
+            }
+            Value::Real(r) => {
+                1u8.hash(state);
+                r.to_bits().hash(state);
+            }
+            Value::Text(s) => { 2u8.hash(state); s.hash(state); }
+            Value::Blob(b) => { 3u8.hash(state); b.hash(state); }
+            Value::Boolean(b) => { 4u8.hash(state); b.hash(state); }
+        }
+    }
+}
 
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {

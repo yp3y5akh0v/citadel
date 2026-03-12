@@ -1898,3 +1898,183 @@ fn order_by_expression() {
     assert_eq!(qr.rows[1][0], Value::Integer(3)); // sum=10
     assert_eq!(qr.rows[2][0], Value::Integer(1)); // sum=13
 }
+
+// ════════════════════════════════════════════════════════════════════
+// DISTINCT EDGE CASES
+// ════════════════════════════════════════════════════════════════════
+
+#[test]
+fn distinct_integer_real_cross_type_dedup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, int_val INTEGER, real_val REAL)"
+    ).unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10, NULL)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, NULL, 10.0)").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 20, NULL)").unwrap();
+
+    let qr = conn.query("SELECT DISTINCT int_val FROM t WHERE int_val IS NOT NULL").unwrap();
+    assert_eq!(qr.rows.len(), 2);
+}
+
+#[test]
+fn distinct_null_equals_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
+    ).unwrap();
+    conn.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, NULL)").unwrap();
+
+    let qr = conn.query("SELECT DISTINCT val FROM t").unwrap();
+    assert_eq!(qr.rows.len(), 1, "multiple NULLs should collapse to one in DISTINCT");
+    assert!(qr.rows[0][0].is_null());
+}
+
+#[test]
+fn distinct_preserves_without_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)"
+    ).unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 5)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 5)").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 5)").unwrap();
+
+    let qr = conn.query("SELECT val FROM t").unwrap();
+    assert_eq!(qr.rows.len(), 3);
+
+    let qr = conn.query("SELECT DISTINCT val FROM t").unwrap();
+    assert_eq!(qr.rows.len(), 1);
+}
+
+#[test]
+fn distinct_multi_column_null_combinations() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, b INTEGER)"
+    ).unwrap();
+    conn.execute("INSERT INTO t VALUES (1, NULL, NULL)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, NULL, NULL)").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, NULL, 1)").unwrap();
+    conn.execute("INSERT INTO t VALUES (4, 1, NULL)").unwrap();
+    conn.execute("INSERT INTO t VALUES (5, 1, NULL)").unwrap();
+
+    let qr = conn.query("SELECT DISTINCT a, b FROM t").unwrap();
+    assert_eq!(qr.rows.len(), 3);
+}
+
+#[test]
+fn distinct_single_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
+    ).unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'only')").unwrap();
+
+    let qr = conn.query("SELECT DISTINCT val FROM t").unwrap();
+    assert_eq!(qr.rows.len(), 1);
+    assert_eq!(qr.rows[0][0], Value::Text("only".into()));
+}
+
+#[test]
+fn distinct_with_where_clause() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, cat TEXT NOT NULL, val INTEGER NOT NULL)"
+    ).unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a', 10)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'b', 10)").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 'a', 20)").unwrap();
+    conn.execute("INSERT INTO t VALUES (4, 'b', 20)").unwrap();
+    conn.execute("INSERT INTO t VALUES (5, 'a', 10)").unwrap();
+
+    let qr = conn.query(
+        "SELECT DISTINCT val FROM t WHERE cat = 'a' ORDER BY val"
+    ).unwrap();
+    assert_eq!(qr.rows.len(), 2);
+    assert_eq!(qr.rows[0][0], Value::Integer(10));
+    assert_eq!(qr.rows[1][0], Value::Integer(20));
+}
+
+#[test]
+fn distinct_count_star_not_affected() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)"
+    ).unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 5)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 5)").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 5)").unwrap();
+
+    let qr = conn.query("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(qr.rows[0][0], Value::Integer(3));
+}
+
+#[test]
+fn distinct_with_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)"
+    ).unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 10)").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 20)").unwrap();
+
+    let qr = conn.query("SELECT DISTINCT val AS unique_val FROM t ORDER BY unique_val").unwrap();
+    assert_eq!(qr.columns, vec!["unique_val"]);
+    assert_eq!(qr.rows.len(), 2);
+    assert_eq!(qr.rows[0][0], Value::Integer(10));
+    assert_eq!(qr.rows[1][0], Value::Integer(20));
+}
+
+#[test]
+fn distinct_all_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
+    ).unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'hello')").unwrap();
+
+    let qr = conn.query("SELECT DISTINCT val FROM t").unwrap();
+    assert_eq!(qr.rows.len(), 1);
+
+    conn.execute(
+        "CREATE TABLE t2 (id INTEGER NOT NULL PRIMARY KEY, val REAL NOT NULL)"
+    ).unwrap();
+    conn.execute("INSERT INTO t2 VALUES (1, 3.14)").unwrap();
+    conn.execute("INSERT INTO t2 VALUES (2, 3.14)").unwrap();
+    conn.execute("INSERT INTO t2 VALUES (3, 2.71)").unwrap();
+
+    let qr = conn.query("SELECT DISTINCT val FROM t2 ORDER BY val").unwrap();
+    assert_eq!(qr.rows.len(), 2);
+}

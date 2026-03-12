@@ -843,3 +843,67 @@ fn rapid_queries_500() {
         }
     }
 }
+
+// ── DISTINCT stress ─────────────────────────────────────────────────
+
+#[test]
+fn distinct_many_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)"
+    ).unwrap();
+
+    for i in 0..500 {
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i % 10)).unwrap();
+    }
+
+    let qr = conn.query("SELECT DISTINCT val FROM t ORDER BY val").unwrap();
+    assert_eq!(qr.rows.len(), 10);
+    for (i, row) in qr.rows.iter().enumerate() {
+        assert_eq!(row[0], Value::Integer(i as i64));
+    }
+}
+
+#[test]
+fn distinct_multi_column_many_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL)"
+    ).unwrap();
+
+    for i in 0..300 {
+        conn.execute(&format!(
+            "INSERT INTO t VALUES ({i}, {}, {})", i % 5, i % 7
+        )).unwrap();
+    }
+
+    let qr = conn.query("SELECT DISTINCT a, b FROM t ORDER BY a, b").unwrap();
+    assert_eq!(qr.rows.len(), 35);
+}
+
+#[test]
+fn distinct_with_limit_on_large_dataset() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)"
+    ).unwrap();
+
+    for i in 0..1000 {
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i % 50)).unwrap();
+    }
+
+    let qr = conn.query("SELECT DISTINCT val FROM t ORDER BY val LIMIT 5").unwrap();
+    assert_eq!(qr.rows.len(), 5);
+    for (i, row) in qr.rows.iter().enumerate() {
+        assert_eq!(row[0], Value::Integer(i as i64));
+    }
+}

@@ -346,6 +346,37 @@ fn process_select(
         return exec_aggregate(table_schema, &rows, stmt);
     }
 
+    if stmt.distinct {
+        let (col_names, mut projected) = project_rows(table_schema, &stmt.columns, &rows)?;
+
+        let mut seen = std::collections::HashSet::new();
+        projected.retain(|row| seen.insert(row.clone()));
+
+        if !stmt.order_by.is_empty() {
+            let output_cols = build_output_columns(&stmt.columns, table_schema);
+            sort_rows(&mut projected, &stmt.order_by, &output_cols)?;
+        }
+
+        if let Some(ref offset_expr) = stmt.offset {
+            let offset = eval_const_int(offset_expr)? as usize;
+            if offset < projected.len() {
+                projected = projected.split_off(offset);
+            } else {
+                projected.clear();
+            }
+        }
+
+        if let Some(ref limit_expr) = stmt.limit {
+            let limit = eval_const_int(limit_expr)? as usize;
+            projected.truncate(limit);
+        }
+
+        return Ok(ExecutionResult::Query(QueryResult {
+            columns: col_names,
+            rows: projected,
+        }));
+    }
+
     if !stmt.order_by.is_empty() {
         sort_rows(&mut rows, &stmt.order_by, &table_schema.columns)?;
     }
@@ -874,6 +905,11 @@ fn exec_aggregate(
         }
 
         result_rows.push(result_row);
+    }
+
+    if stmt.distinct {
+        let mut seen = std::collections::HashSet::new();
+        result_rows.retain(|row| seen.insert(row.clone()));
     }
 
     if !stmt.order_by.is_empty() {

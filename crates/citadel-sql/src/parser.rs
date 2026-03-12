@@ -55,6 +55,7 @@ pub struct InsertStmt {
 pub struct SelectStmt {
     pub columns: Vec<SelectColumn>,
     pub from: String,
+    pub distinct: bool,
     pub where_clause: Option<Expr>,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<Expr>,
@@ -266,6 +267,14 @@ fn convert_query(query: sp::Query) -> Result<Statement> {
         _ => return Err(SqlError::Unsupported("UNION/INTERSECT/EXCEPT".into())),
     };
 
+    let distinct = match &select.distinct {
+        Some(sp::Distinct::Distinct) => true,
+        Some(sp::Distinct::On(_)) => {
+            return Err(SqlError::Unsupported("DISTINCT ON".into()));
+        }
+        _ => false,
+    };
+
     // FROM clause
     if select.from.len() != 1 {
         if select.from.is_empty() {
@@ -339,6 +348,7 @@ fn convert_query(query: sp::Query) -> Result<Statement> {
     Ok(Statement::Select(SelectStmt {
         columns,
         from,
+        distinct,
         where_clause,
         order_by,
         limit,
@@ -905,6 +915,46 @@ mod tests {
     fn parse_rollback() {
         let stmt = parse_sql("ROLLBACK").unwrap();
         assert!(matches!(stmt, Statement::Rollback));
+    }
+
+    #[test]
+    fn parse_select_distinct() {
+        let stmt = parse_sql("SELECT DISTINCT name FROM users").unwrap();
+        match stmt {
+            Statement::Select(sel) => {
+                assert!(sel.distinct);
+                assert_eq!(sel.columns.len(), 1);
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn parse_select_without_distinct() {
+        let stmt = parse_sql("SELECT name FROM users").unwrap();
+        match stmt {
+            Statement::Select(sel) => {
+                assert!(!sel.distinct);
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn parse_select_distinct_all_columns() {
+        let stmt = parse_sql("SELECT DISTINCT * FROM users").unwrap();
+        match stmt {
+            Statement::Select(sel) => {
+                assert!(sel.distinct);
+                assert!(matches!(sel.columns[0], SelectColumn::AllColumns));
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn reject_distinct_on() {
+        assert!(parse_sql("SELECT DISTINCT ON (id) * FROM users").is_err());
     }
 
     #[test]

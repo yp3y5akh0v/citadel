@@ -598,3 +598,59 @@ fn group_by_in_transaction() {
 
     conn.execute("COMMIT").unwrap();
 }
+
+// ── DISTINCT within transactions ─────────────────────────────────────
+
+#[test]
+fn distinct_within_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER NOT NULL)").unwrap();
+
+    assert_ok(conn.execute("BEGIN").unwrap());
+
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 10)").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 20)").unwrap();
+    conn.execute("INSERT INTO t VALUES (4, 20)").unwrap();
+    conn.execute("INSERT INTO t VALUES (5, 30)").unwrap();
+
+    let qr = conn.query("SELECT DISTINCT val FROM t ORDER BY val").unwrap();
+    assert_eq!(qr.rows.len(), 3);
+    assert_eq!(qr.rows[0][0], Value::Integer(10));
+    assert_eq!(qr.rows[1][0], Value::Integer(20));
+    assert_eq!(qr.rows[2][0], Value::Integer(30));
+
+    assert_ok(conn.execute("COMMIT").unwrap());
+
+    let qr = conn.query("SELECT DISTINCT val FROM t ORDER BY val").unwrap();
+    assert_eq!(qr.rows.len(), 3);
+}
+
+#[test]
+fn distinct_sees_uncommitted_within_txn() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, color TEXT NOT NULL)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'red')").unwrap();
+
+    assert_ok(conn.execute("BEGIN").unwrap());
+
+    conn.execute("INSERT INTO t VALUES (2, 'red')").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 'blue')").unwrap();
+
+    let qr = conn.query("SELECT DISTINCT color FROM t ORDER BY color").unwrap();
+    assert_eq!(qr.rows.len(), 2);
+    assert_eq!(qr.rows[0][0], Value::Text("blue".into()));
+    assert_eq!(qr.rows[1][0], Value::Text("red".into()));
+
+    assert_ok(conn.execute("ROLLBACK").unwrap());
+
+    let qr = conn.query("SELECT DISTINCT color FROM t ORDER BY color").unwrap();
+    assert_eq!(qr.rows.len(), 1);
+    assert_eq!(qr.rows[0][0], Value::Text("red".into()));
+}
