@@ -67,6 +67,12 @@ pub enum SqlError {
     #[error("no active transaction")]
     NoActiveTransaction,
 
+    #[error("subquery must return exactly one column")]
+    SubqueryMultipleColumns,
+
+    #[error("scalar subquery returned more than one row")]
+    SubqueryMultipleRows,
+
     #[error("storage error: {0}")]
     Storage(#[from] citadel_core::Error),
 }

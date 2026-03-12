@@ -32,6 +32,14 @@ pub fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Value]) -> Result<Va
             let qualified = format!("{}.{}", table.to_ascii_lowercase(), column.to_ascii_lowercase());
             let idx = columns.iter()
                 .position(|c| c.name.to_ascii_lowercase() == qualified)
+                .or_else(|| {
+                    let lower_col = column.to_ascii_lowercase();
+                    let matches: Vec<usize> = columns.iter().enumerate()
+                        .filter(|(_, c)| c.name.to_ascii_lowercase() == lower_col)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if matches.len() == 1 { Some(matches[0]) } else { None }
+                })
                 .ok_or_else(|| SqlError::ColumnNotFound(format!("{table}.{column}")))?;
             Ok(row[idx].clone())
         }
@@ -64,8 +72,23 @@ pub fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Value]) -> Result<Va
         }
 
         Expr::CountStar => {
-            // Aggregates are evaluated at the executor level, not here.
             Err(SqlError::Unsupported("COUNT(*) in non-aggregate context".into()))
+        }
+
+        Expr::InList { expr: e, list, negated } => {
+            let lhs = eval_expr(e, columns, row)?;
+            eval_in_values(&lhs, list, columns, row, *negated)
+        }
+
+        Expr::InSet { expr: e, values, has_null, negated } => {
+            let lhs = eval_expr(e, columns, row)?;
+            eval_in_set(&lhs, values, *has_null, *negated)
+        }
+
+        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => {
+            Err(SqlError::Unsupported(
+                "subquery not materialized (internal error)".into(),
+            ))
         }
     }
 }
@@ -164,6 +187,57 @@ fn eval_arithmetic(
             expected: "numeric".into(),
             got: format!("{} and {}", left.data_type(), right.data_type()),
         }),
+    }
+}
+
+fn eval_in_values(
+    lhs: &Value,
+    list: &[Expr],
+    columns: &[ColumnDef],
+    row: &[Value],
+    negated: bool,
+) -> Result<Value> {
+    if list.is_empty() {
+        return Ok(Value::Boolean(negated));
+    }
+    if lhs.is_null() {
+        return Ok(Value::Null);
+    }
+    let mut has_null = false;
+    for item in list {
+        let rhs = eval_expr(item, columns, row)?;
+        if rhs.is_null() {
+            has_null = true;
+        } else if lhs == &rhs {
+            return Ok(Value::Boolean(!negated));
+        }
+    }
+    if has_null {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Boolean(negated))
+    }
+}
+
+fn eval_in_set(
+    lhs: &Value,
+    values: &std::collections::HashSet<Value>,
+    has_null: bool,
+    negated: bool,
+) -> Result<Value> {
+    if values.is_empty() && !has_null {
+        return Ok(Value::Boolean(negated));
+    }
+    if lhs.is_null() {
+        return Ok(Value::Null);
+    }
+    if values.contains(lhs) {
+        return Ok(Value::Boolean(!negated));
+    }
+    if has_null {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Boolean(negated))
     }
 }
 

@@ -930,6 +930,14 @@ fn exec_insert(
     schema: &SchemaManager,
     stmt: &InsertStmt,
 ) -> Result<ExecutionResult> {
+    let materialized;
+    let stmt = if insert_has_subquery(stmt) {
+        materialized = materialize_insert(stmt, &mut |sub| exec_subquery_read(db, schema, sub))?;
+        &materialized
+    } else {
+        stmt
+    };
+
     let lower_name = stmt.table.to_ascii_lowercase();
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
@@ -1012,11 +1020,264 @@ fn exec_insert(
     Ok(ExecutionResult::RowsAffected(count))
 }
 
+fn has_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => true,
+        Expr::BinaryOp { left, right, .. } => has_subquery(left) || has_subquery(right),
+        Expr::UnaryOp { expr, .. } => has_subquery(expr),
+        Expr::IsNull(e) | Expr::IsNotNull(e) => has_subquery(e),
+        Expr::InList { expr, list, .. } => {
+            has_subquery(expr) || list.iter().any(has_subquery)
+        }
+        Expr::InSet { expr, .. } => has_subquery(expr),
+        _ => false,
+    }
+}
+
+fn stmt_has_subquery(stmt: &SelectStmt) -> bool {
+    if let Some(ref w) = stmt.where_clause { if has_subquery(w) { return true; } }
+    if let Some(ref h) = stmt.having { if has_subquery(h) { return true; } }
+    for col in &stmt.columns {
+        if let SelectColumn::Expr { expr, .. } = col {
+            if has_subquery(expr) { return true; }
+        }
+    }
+    for ob in &stmt.order_by {
+        if has_subquery(&ob.expr) { return true; }
+    }
+    for join in &stmt.joins {
+        if let Some(ref on_expr) = join.on_clause {
+            if has_subquery(on_expr) { return true; }
+        }
+    }
+    false
+}
+
+fn materialize_expr(
+    expr: &Expr,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
+) -> Result<Expr> {
+    match expr {
+        Expr::InSubquery { expr: e, subquery, negated } => {
+            let inner = materialize_expr(e, exec_sub)?;
+            let qr = exec_sub(subquery)?;
+            if !qr.columns.is_empty() && qr.columns.len() != 1 {
+                return Err(SqlError::SubqueryMultipleColumns);
+            }
+            let mut values = std::collections::HashSet::new();
+            let mut has_null = false;
+            for row in &qr.rows {
+                if row[0].is_null() {
+                    has_null = true;
+                } else {
+                    values.insert(row[0].clone());
+                }
+            }
+            Ok(Expr::InSet {
+                expr: Box::new(inner),
+                values,
+                has_null,
+                negated: *negated,
+            })
+        }
+        Expr::ScalarSubquery(subquery) => {
+            let qr = exec_sub(subquery)?;
+            if qr.rows.len() > 1 {
+                return Err(SqlError::SubqueryMultipleRows);
+            }
+            let val = if qr.rows.is_empty() {
+                Value::Null
+            } else {
+                qr.rows[0][0].clone()
+            };
+            Ok(Expr::Literal(val))
+        }
+        Expr::Exists { subquery, negated } => {
+            let qr = exec_sub(subquery)?;
+            let exists = !qr.rows.is_empty();
+            let result = if *negated { !exists } else { exists };
+            Ok(Expr::Literal(Value::Boolean(result)))
+        }
+        Expr::InList { expr: e, list, negated } => {
+            let inner = materialize_expr(e, exec_sub)?;
+            let items = list.iter()
+                .map(|item| materialize_expr(item, exec_sub))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Expr::InList { expr: Box::new(inner), list: items, negated: *negated })
+        }
+        Expr::BinaryOp { left, op, right } => {
+            Ok(Expr::BinaryOp {
+                left: Box::new(materialize_expr(left, exec_sub)?),
+                op: *op,
+                right: Box::new(materialize_expr(right, exec_sub)?),
+            })
+        }
+        Expr::UnaryOp { op, expr: e } => {
+            Ok(Expr::UnaryOp {
+                op: *op,
+                expr: Box::new(materialize_expr(e, exec_sub)?),
+            })
+        }
+        Expr::IsNull(e) => Ok(Expr::IsNull(Box::new(materialize_expr(e, exec_sub)?))),
+        Expr::IsNotNull(e) => Ok(Expr::IsNotNull(Box::new(materialize_expr(e, exec_sub)?))),
+        Expr::InSet { expr: e, values, has_null, negated } => {
+            Ok(Expr::InSet {
+                expr: Box::new(materialize_expr(e, exec_sub)?),
+                values: values.clone(),
+                has_null: *has_null,
+                negated: *negated,
+            })
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+fn materialize_stmt(
+    stmt: &SelectStmt,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
+) -> Result<SelectStmt> {
+    let where_clause = stmt.where_clause.as_ref()
+        .map(|e| materialize_expr(e, exec_sub))
+        .transpose()?;
+    let having = stmt.having.as_ref()
+        .map(|e| materialize_expr(e, exec_sub))
+        .transpose()?;
+    let columns = stmt.columns.iter().map(|c| match c {
+        SelectColumn::AllColumns => Ok(SelectColumn::AllColumns),
+        SelectColumn::Expr { expr, alias } => {
+            Ok(SelectColumn::Expr {
+                expr: materialize_expr(expr, exec_sub)?,
+                alias: alias.clone(),
+            })
+        }
+    }).collect::<Result<Vec<_>>>()?;
+    let order_by = stmt.order_by.iter().map(|ob| {
+        Ok(OrderByItem {
+            expr: materialize_expr(&ob.expr, exec_sub)?,
+            descending: ob.descending,
+            nulls_first: ob.nulls_first,
+        })
+    }).collect::<Result<Vec<_>>>()?;
+    let joins = stmt.joins.iter().map(|j| {
+        let on_clause = j.on_clause.as_ref()
+            .map(|e| materialize_expr(e, exec_sub))
+            .transpose()?;
+        Ok(JoinClause {
+            join_type: j.join_type,
+            table: j.table.clone(),
+            on_clause,
+        })
+    }).collect::<Result<Vec<_>>>()?;
+    let group_by = stmt.group_by.iter()
+        .map(|e| materialize_expr(e, exec_sub))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(SelectStmt {
+        columns,
+        from: stmt.from.clone(),
+        from_alias: stmt.from_alias.clone(),
+        joins,
+        distinct: stmt.distinct,
+        where_clause,
+        order_by,
+        limit: stmt.limit.clone(),
+        offset: stmt.offset.clone(),
+        group_by,
+        having,
+    })
+}
+
+fn exec_subquery_read(
+    db: &Database,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+) -> Result<QueryResult> {
+    match exec_select(db, schema, stmt)? {
+        ExecutionResult::Query(qr) => Ok(qr),
+        _ => Ok(QueryResult { columns: vec![], rows: vec![] }),
+    }
+}
+
+fn exec_subquery_write(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+) -> Result<QueryResult> {
+    match exec_select_in_txn(wtx, schema, stmt)? {
+        ExecutionResult::Query(qr) => Ok(qr),
+        _ => Ok(QueryResult { columns: vec![], rows: vec![] }),
+    }
+}
+
+fn update_has_subquery(stmt: &UpdateStmt) -> bool {
+    stmt.where_clause.as_ref().map_or(false, has_subquery)
+        || stmt.assignments.iter().any(|(_, e)| has_subquery(e))
+}
+
+fn materialize_update(
+    stmt: &UpdateStmt,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
+) -> Result<UpdateStmt> {
+    let where_clause = stmt.where_clause.as_ref()
+        .map(|e| materialize_expr(e, exec_sub))
+        .transpose()?;
+    let assignments = stmt.assignments.iter()
+        .map(|(name, expr)| Ok((name.clone(), materialize_expr(expr, exec_sub)?)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(UpdateStmt {
+        table: stmt.table.clone(),
+        assignments,
+        where_clause,
+    })
+}
+
+fn delete_has_subquery(stmt: &DeleteStmt) -> bool {
+    stmt.where_clause.as_ref().map_or(false, has_subquery)
+}
+
+fn materialize_delete(
+    stmt: &DeleteStmt,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
+) -> Result<DeleteStmt> {
+    let where_clause = stmt.where_clause.as_ref()
+        .map(|e| materialize_expr(e, exec_sub))
+        .transpose()?;
+    Ok(DeleteStmt {
+        table: stmt.table.clone(),
+        where_clause,
+    })
+}
+
+fn insert_has_subquery(stmt: &InsertStmt) -> bool {
+    stmt.values.iter().any(|row| row.iter().any(has_subquery))
+}
+
+fn materialize_insert(
+    stmt: &InsertStmt,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
+) -> Result<InsertStmt> {
+    let values = stmt.values.iter()
+        .map(|row| row.iter().map(|e| materialize_expr(e, exec_sub)).collect::<Result<Vec<_>>>())
+        .collect::<Result<Vec<_>>>()?;
+    Ok(InsertStmt {
+        table: stmt.table.clone(),
+        columns: stmt.columns.clone(),
+        values,
+    })
+}
+
 fn exec_select(
     db: &Database,
     schema: &SchemaManager,
     stmt: &SelectStmt,
 ) -> Result<ExecutionResult> {
+    let materialized;
+    let stmt = if stmt_has_subquery(stmt) {
+        materialized = materialize_stmt(stmt, &mut |sub| exec_subquery_read(db, schema, sub))?;
+        &materialized
+    } else {
+        stmt
+    };
+
     let lower_name = stmt.from.to_ascii_lowercase();
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
@@ -1398,6 +1659,14 @@ fn exec_update(
     schema: &SchemaManager,
     stmt: &UpdateStmt,
 ) -> Result<ExecutionResult> {
+    let materialized;
+    let stmt = if update_has_subquery(stmt) {
+        materialized = materialize_update(stmt, &mut |sub| exec_subquery_read(db, schema, sub))?;
+        &materialized
+    } else {
+        stmt
+    };
+
     let lower_name = stmt.table.to_ascii_lowercase();
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
@@ -1547,6 +1816,14 @@ fn exec_delete(
     schema: &SchemaManager,
     stmt: &DeleteStmt,
 ) -> Result<ExecutionResult> {
+    let materialized;
+    let stmt = if delete_has_subquery(stmt) {
+        materialized = materialize_delete(stmt, &mut |sub| exec_subquery_read(db, schema, sub))?;
+        &materialized
+    } else {
+        stmt
+    };
+
     let lower_name = stmt.table.to_ascii_lowercase();
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
@@ -1589,6 +1866,14 @@ fn exec_insert_in_txn(
     schema: &SchemaManager,
     stmt: &InsertStmt,
 ) -> Result<ExecutionResult> {
+    let materialized;
+    let stmt = if insert_has_subquery(stmt) {
+        materialized = materialize_insert(stmt, &mut |sub| exec_subquery_write(wtx, schema, sub))?;
+        &materialized
+    } else {
+        stmt
+    };
+
     let lower_name = stmt.table.to_ascii_lowercase();
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
@@ -1674,6 +1959,14 @@ fn exec_select_in_txn(
     schema: &SchemaManager,
     stmt: &SelectStmt,
 ) -> Result<ExecutionResult> {
+    let materialized;
+    let stmt = if stmt_has_subquery(stmt) {
+        materialized = materialize_stmt(stmt, &mut |sub| exec_subquery_write(wtx, schema, sub))?;
+        &materialized
+    } else {
+        stmt
+    };
+
     if !stmt.joins.is_empty() {
         return exec_select_join_in_txn(wtx, schema, stmt);
     }
@@ -1691,6 +1984,14 @@ fn exec_update_in_txn(
     schema: &SchemaManager,
     stmt: &UpdateStmt,
 ) -> Result<ExecutionResult> {
+    let materialized;
+    let stmt = if update_has_subquery(stmt) {
+        materialized = materialize_update(stmt, &mut |sub| exec_subquery_write(wtx, schema, sub))?;
+        &materialized
+    } else {
+        stmt
+    };
+
     let lower_name = stmt.table.to_ascii_lowercase();
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
@@ -1837,6 +2138,14 @@ fn exec_delete_in_txn(
     schema: &SchemaManager,
     stmt: &DeleteStmt,
 ) -> Result<ExecutionResult> {
+    let materialized;
+    let stmt = if delete_has_subquery(stmt) {
+        materialized = materialize_delete(stmt, &mut |sub| exec_subquery_write(wtx, schema, sub))?;
+        &materialized
+    } else {
+        stmt
+    };
+
     let lower_name = stmt.table.to_ascii_lowercase();
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;

@@ -141,6 +141,11 @@ pub enum Expr {
     IsNotNull(Box<Expr>),
     Function { name: String, args: Vec<Expr> },
     CountStar,
+    InSubquery { expr: Box<Expr>, subquery: Box<SelectStmt>, negated: bool },
+    InList { expr: Box<Expr>, list: Vec<Expr>, negated: bool },
+    Exists { subquery: Box<SelectStmt>, negated: bool },
+    ScalarSubquery(Box<SelectStmt>),
+    InSet { expr: Box<Expr>, values: std::collections::HashSet<Value>, has_null: bool, negated: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,6 +348,13 @@ fn convert_insert(insert: sp::Insert) -> Result<Statement> {
         columns,
         values,
     }))
+}
+
+fn convert_subquery(query: &sp::Query) -> Result<SelectStmt> {
+    match convert_query(query.clone())? {
+        Statement::Select(s) => Ok(s),
+        _ => Err(SqlError::Unsupported("non-SELECT subquery".into())),
+    }
 }
 
 fn convert_query(query: sp::Query) -> Result<Statement> {
@@ -583,6 +595,35 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
         sp::Expr::IsNotNull(e) => Ok(Expr::IsNotNull(Box::new(convert_expr(e)?))),
         sp::Expr::Nested(e) => convert_expr(e),
         sp::Expr::Function(func) => convert_function(func),
+        sp::Expr::InSubquery { expr: e, subquery, negated } => {
+            let inner_expr = convert_expr(e)?;
+            let stmt = convert_subquery(subquery)?;
+            Ok(Expr::InSubquery {
+                expr: Box::new(inner_expr),
+                subquery: Box::new(stmt),
+                negated: *negated,
+            })
+        }
+        sp::Expr::InList { expr: e, list, negated } => {
+            let inner_expr = convert_expr(e)?;
+            let items = list.iter().map(convert_expr).collect::<Result<Vec<_>>>()?;
+            Ok(Expr::InList {
+                expr: Box::new(inner_expr),
+                list: items,
+                negated: *negated,
+            })
+        }
+        sp::Expr::Exists { subquery, negated } => {
+            let stmt = convert_subquery(subquery)?;
+            Ok(Expr::Exists {
+                subquery: Box::new(stmt),
+                negated: *negated,
+            })
+        }
+        sp::Expr::Subquery(query) => {
+            let stmt = convert_subquery(query)?;
+            Ok(Expr::ScalarSubquery(Box::new(stmt)))
+        }
         _ => Err(SqlError::Unsupported(format!("expression: {expr}"))),
     }
 }
