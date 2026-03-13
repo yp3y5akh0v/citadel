@@ -58,6 +58,7 @@ cipher = "0.4"
 
 # SQL
 sqlparser = "0.61"
+lru = "0.12"
 
 [profile.release]
 lto = "fat"

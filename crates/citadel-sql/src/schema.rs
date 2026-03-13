@@ -12,6 +12,7 @@ const SCHEMA_TABLE: &[u8] = b"_schema";
 /// Manages table schemas in memory, backed by the `_schema` table.
 pub struct SchemaManager {
     tables: HashMap<String, TableSchema>,
+    generation: u64,
 }
 
 impl SchemaManager {
@@ -38,7 +39,7 @@ impl SchemaManager {
             return Err(e);
         }
 
-        Ok(Self { tables })
+        Ok(Self { tables, generation: 0 })
     }
 
     pub fn get(&self, name: &str) -> Option<&TableSchema> {
@@ -51,14 +52,23 @@ impl SchemaManager {
         self.tables.contains_key(&lower)
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn register(&mut self, schema: TableSchema) {
         let lower = schema.name.to_ascii_lowercase();
         self.tables.insert(lower, schema);
+        self.generation += 1;
     }
 
     pub fn remove(&mut self, name: &str) -> Option<TableSchema> {
         let lower = name.to_ascii_lowercase();
-        self.tables.remove(&lower)
+        let result = self.tables.remove(&lower);
+        if result.is_some() {
+            self.generation += 1;
+        }
+        result
     }
 
     pub fn table_names(&self) -> Vec<&str> {

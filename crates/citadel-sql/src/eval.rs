@@ -123,6 +123,10 @@ pub fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Value]) -> Result<Va
                 "subquery not materialized (internal error)".into(),
             ))
         }
+
+        Expr::Parameter(n) => {
+            Err(SqlError::Parse(format!("unbound parameter ${n}")))
+        }
     }
 }
 

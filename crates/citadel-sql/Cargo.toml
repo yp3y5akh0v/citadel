@@ -12,6 +12,7 @@ citadel-txn = { workspace = true }
 citadel = { path = "../../citadel" }
 sqlparser = { workspace = true }
 thiserror = { workspace = true }
+lru = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

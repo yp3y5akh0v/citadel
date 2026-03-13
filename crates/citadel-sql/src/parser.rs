@@ -152,6 +152,7 @@ pub enum Expr {
     Case { operand: Option<Box<Expr>>, conditions: Vec<(Expr, Expr)>, else_result: Option<Box<Expr>> },
     Coalesce(Vec<Expr>),
     Cast { expr: Box<Expr>, data_type: DataType },
+    Parameter(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +183,283 @@ pub fn parse_sql(sql: &str) -> Result<Statement> {
     }
 
     convert_statement(stmts.into_iter().next().unwrap())
+}
+
+// ── Parameter utilities ─────────────────────────────────────────────
+
+/// Returns the number of distinct parameters in a statement (max $N found).
+pub fn count_params(stmt: &Statement) -> usize {
+    let mut max_idx = 0usize;
+    visit_exprs_stmt(stmt, &mut |e| {
+        if let Expr::Parameter(n) = e {
+            max_idx = max_idx.max(*n);
+        }
+    });
+    max_idx
+}
+
+/// Replace all `Expr::Parameter(n)` with `Expr::Literal(params[n-1])`.
+pub fn bind_params(stmt: &Statement, params: &[crate::types::Value]) -> crate::error::Result<Statement> {
+    bind_stmt(stmt, params)
+}
+
+fn bind_stmt(stmt: &Statement, params: &[crate::types::Value]) -> crate::error::Result<Statement> {
+    match stmt {
+        Statement::Select(sel) => Ok(Statement::Select(bind_select(sel, params)?)),
+        Statement::Insert(ins) => {
+            let values = ins.values.iter()
+                .map(|row| row.iter().map(|e| bind_expr(e, params)).collect::<crate::error::Result<Vec<_>>>())
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            Ok(Statement::Insert(InsertStmt {
+                table: ins.table.clone(),
+                columns: ins.columns.clone(),
+                values,
+            }))
+        }
+        Statement::Update(upd) => {
+            let assignments = upd.assignments.iter()
+                .map(|(col, e)| Ok((col.clone(), bind_expr(e, params)?)))
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            let where_clause = upd.where_clause.as_ref()
+                .map(|e| bind_expr(e, params)).transpose()?;
+            Ok(Statement::Update(UpdateStmt {
+                table: upd.table.clone(),
+                assignments,
+                where_clause,
+            }))
+        }
+        Statement::Delete(del) => {
+            let where_clause = del.where_clause.as_ref()
+                .map(|e| bind_expr(e, params)).transpose()?;
+            Ok(Statement::Delete(DeleteStmt {
+                table: del.table.clone(),
+                where_clause,
+            }))
+        }
+        Statement::Explain(inner) => Ok(Statement::Explain(Box::new(bind_stmt(inner, params)?))),
+        other => Ok(other.clone()),
+    }
+}
+
+fn bind_select(sel: &SelectStmt, params: &[crate::types::Value]) -> crate::error::Result<SelectStmt> {
+    let columns = sel.columns.iter().map(|c| match c {
+        SelectColumn::AllColumns => Ok(SelectColumn::AllColumns),
+        SelectColumn::Expr { expr, alias } => Ok(SelectColumn::Expr {
+            expr: bind_expr(expr, params)?,
+            alias: alias.clone(),
+        }),
+    }).collect::<crate::error::Result<Vec<_>>>()?;
+    let joins = sel.joins.iter().map(|j| {
+        let on_clause = j.on_clause.as_ref()
+            .map(|e| bind_expr(e, params)).transpose()?;
+        Ok(JoinClause {
+            join_type: j.join_type,
+            table: j.table.clone(),
+            on_clause,
+        })
+    }).collect::<crate::error::Result<Vec<_>>>()?;
+    let where_clause = sel.where_clause.as_ref()
+        .map(|e| bind_expr(e, params)).transpose()?;
+    let order_by = sel.order_by.iter().map(|o| {
+        Ok(OrderByItem {
+            expr: bind_expr(&o.expr, params)?,
+            descending: o.descending,
+            nulls_first: o.nulls_first,
+        })
+    }).collect::<crate::error::Result<Vec<_>>>()?;
+    let limit = sel.limit.as_ref().map(|e| bind_expr(e, params)).transpose()?;
+    let offset = sel.offset.as_ref().map(|e| bind_expr(e, params)).transpose()?;
+    let group_by = sel.group_by.iter()
+        .map(|e| bind_expr(e, params))
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    let having = sel.having.as_ref().map(|e| bind_expr(e, params)).transpose()?;
+
+    Ok(SelectStmt {
+        columns,
+        from: sel.from.clone(),
+        from_alias: sel.from_alias.clone(),
+        joins,
+        distinct: sel.distinct,
+        where_clause,
+        order_by,
+        limit,
+        offset,
+        group_by,
+        having,
+    })
+}
+
+fn bind_expr(expr: &Expr, params: &[crate::types::Value]) -> crate::error::Result<Expr> {
+    match expr {
+        Expr::Parameter(n) => {
+            if *n == 0 || *n > params.len() {
+                return Err(SqlError::ParameterCountMismatch {
+                    expected: *n,
+                    got: params.len(),
+                });
+            }
+            Ok(Expr::Literal(params[*n - 1].clone()))
+        }
+        Expr::Literal(_) | Expr::Column(_) | Expr::QualifiedColumn { .. }
+        | Expr::CountStar => Ok(expr.clone()),
+        Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
+            left: Box::new(bind_expr(left, params)?),
+            op: *op,
+            right: Box::new(bind_expr(right, params)?),
+        }),
+        Expr::UnaryOp { op, expr: e } => Ok(Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(bind_expr(e, params)?),
+        }),
+        Expr::IsNull(e) => Ok(Expr::IsNull(Box::new(bind_expr(e, params)?))),
+        Expr::IsNotNull(e) => Ok(Expr::IsNotNull(Box::new(bind_expr(e, params)?))),
+        Expr::Function { name, args } => {
+            let args = args.iter().map(|a| bind_expr(a, params))
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            Ok(Expr::Function { name: name.clone(), args })
+        }
+        Expr::InSubquery { expr: e, subquery, negated } => Ok(Expr::InSubquery {
+            expr: Box::new(bind_expr(e, params)?),
+            subquery: Box::new(bind_select(subquery, params)?),
+            negated: *negated,
+        }),
+        Expr::InList { expr: e, list, negated } => {
+            let list = list.iter().map(|l| bind_expr(l, params))
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            Ok(Expr::InList {
+                expr: Box::new(bind_expr(e, params)?),
+                list,
+                negated: *negated,
+            })
+        }
+        Expr::Exists { subquery, negated } => Ok(Expr::Exists {
+            subquery: Box::new(bind_select(subquery, params)?),
+            negated: *negated,
+        }),
+        Expr::ScalarSubquery(sq) => Ok(Expr::ScalarSubquery(
+            Box::new(bind_select(sq, params)?),
+        )),
+        Expr::InSet { expr: e, values, has_null, negated } => Ok(Expr::InSet {
+            expr: Box::new(bind_expr(e, params)?),
+            values: values.clone(),
+            has_null: *has_null,
+            negated: *negated,
+        }),
+        Expr::Between { expr: e, low, high, negated } => Ok(Expr::Between {
+            expr: Box::new(bind_expr(e, params)?),
+            low: Box::new(bind_expr(low, params)?),
+            high: Box::new(bind_expr(high, params)?),
+            negated: *negated,
+        }),
+        Expr::Like { expr: e, pattern, escape, negated } => Ok(Expr::Like {
+            expr: Box::new(bind_expr(e, params)?),
+            pattern: Box::new(bind_expr(pattern, params)?),
+            escape: escape.as_ref().map(|esc| bind_expr(esc, params).map(Box::new)).transpose()?,
+            negated: *negated,
+        }),
+        Expr::Case { operand, conditions, else_result } => {
+            let operand = operand.as_ref()
+                .map(|e| bind_expr(e, params).map(Box::new)).transpose()?;
+            let conditions = conditions.iter()
+                .map(|(cond, then)| Ok((bind_expr(cond, params)?, bind_expr(then, params)?)))
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            let else_result = else_result.as_ref()
+                .map(|e| bind_expr(e, params).map(Box::new)).transpose()?;
+            Ok(Expr::Case { operand, conditions, else_result })
+        }
+        Expr::Coalesce(args) => {
+            let args = args.iter().map(|a| bind_expr(a, params))
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            Ok(Expr::Coalesce(args))
+        }
+        Expr::Cast { expr: e, data_type } => Ok(Expr::Cast {
+            expr: Box::new(bind_expr(e, params)?),
+            data_type: data_type.clone(),
+        }),
+    }
+}
+
+fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
+    match stmt {
+        Statement::Select(sel) => visit_exprs_select(sel, visitor),
+        Statement::Insert(ins) => {
+            for row in &ins.values {
+                for e in row { visit_expr(e, visitor); }
+            }
+        }
+        Statement::Update(upd) => {
+            for (_, e) in &upd.assignments { visit_expr(e, visitor); }
+            if let Some(w) = &upd.where_clause { visit_expr(w, visitor); }
+        }
+        Statement::Delete(del) => {
+            if let Some(w) = &del.where_clause { visit_expr(w, visitor); }
+        }
+        Statement::Explain(inner) => visit_exprs_stmt(inner, visitor),
+        _ => {}
+    }
+}
+
+fn visit_exprs_select(sel: &SelectStmt, visitor: &mut impl FnMut(&Expr)) {
+    for col in &sel.columns {
+        if let SelectColumn::Expr { expr, .. } = col { visit_expr(expr, visitor); }
+    }
+    for j in &sel.joins {
+        if let Some(on) = &j.on_clause { visit_expr(on, visitor); }
+    }
+    if let Some(w) = &sel.where_clause { visit_expr(w, visitor); }
+    for o in &sel.order_by { visit_expr(&o.expr, visitor); }
+    if let Some(l) = &sel.limit { visit_expr(l, visitor); }
+    if let Some(o) = &sel.offset { visit_expr(o, visitor); }
+    for g in &sel.group_by { visit_expr(g, visitor); }
+    if let Some(h) = &sel.having { visit_expr(h, visitor); }
+}
+
+fn visit_expr(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
+    visitor(expr);
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            visit_expr(left, visitor);
+            visit_expr(right, visitor);
+        }
+        Expr::UnaryOp { expr: e, .. } | Expr::IsNull(e) | Expr::IsNotNull(e) => {
+            visit_expr(e, visitor);
+        }
+        Expr::Function { args, .. } | Expr::Coalesce(args) => {
+            for a in args { visit_expr(a, visitor); }
+        }
+        Expr::InSubquery { expr: e, subquery, .. } => {
+            visit_expr(e, visitor);
+            visit_exprs_select(subquery, visitor);
+        }
+        Expr::InList { expr: e, list, .. } => {
+            visit_expr(e, visitor);
+            for l in list { visit_expr(l, visitor); }
+        }
+        Expr::Exists { subquery, .. } => visit_exprs_select(subquery, visitor),
+        Expr::ScalarSubquery(sq) => visit_exprs_select(sq, visitor),
+        Expr::InSet { expr: e, .. } => visit_expr(e, visitor),
+        Expr::Between { expr: e, low, high, .. } => {
+            visit_expr(e, visitor);
+            visit_expr(low, visitor);
+            visit_expr(high, visitor);
+        }
+        Expr::Like { expr: e, pattern, escape, .. } => {
+            visit_expr(e, visitor);
+            visit_expr(pattern, visitor);
+            if let Some(esc) = escape { visit_expr(esc, visitor); }
+        }
+        Expr::Case { operand, conditions, else_result } => {
+            if let Some(op) = operand { visit_expr(op, visitor); }
+            for (cond, then) in conditions {
+                visit_expr(cond, visitor);
+                visit_expr(then, visitor);
+            }
+            if let Some(el) = else_result { visit_expr(el, visitor); }
+        }
+        Expr::Cast { expr: e, .. } => visit_expr(e, visitor),
+        Expr::Literal(_) | Expr::Column(_) | Expr::QualifiedColumn { .. }
+        | Expr::CountStar | Expr::Parameter(_) => {}
+    }
 }
 
 // ── Statement conversion ────────────────────────────────────────────
@@ -742,6 +1020,16 @@ fn convert_value(val: &sp::Value) -> Result<Expr> {
         sp::Value::SingleQuotedString(s) => Ok(Expr::Literal(Value::Text(s.clone()))),
         sp::Value::Boolean(b) => Ok(Expr::Literal(Value::Boolean(*b))),
         sp::Value::Null => Ok(Expr::Literal(Value::Null)),
+        sp::Value::Placeholder(s) => {
+            let idx_str = s.strip_prefix('$')
+                .ok_or_else(|| SqlError::Parse(format!("invalid placeholder: {s}")))?;
+            let idx: usize = idx_str.parse()
+                .map_err(|_| SqlError::Parse(format!("invalid placeholder index: {s}")))?;
+            if idx == 0 {
+                return Err(SqlError::Parse("placeholder index must be >= 1".into()));
+            }
+            Ok(Expr::Parameter(idx))
+        }
         _ => Err(SqlError::Unsupported(format!("value type: {val}"))),
     }
 }
@@ -1453,6 +1741,75 @@ mod tests {
     #[test]
     fn reject_explain_analyze() {
         assert!(parse_sql("EXPLAIN ANALYZE SELECT * FROM t").is_err());
+    }
+
+    #[test]
+    fn parse_parameter_placeholder() {
+        let stmt = parse_sql("SELECT * FROM t WHERE id = $1").unwrap();
+        match stmt {
+            Statement::Select(sel) => {
+                match &sel.where_clause {
+                    Some(Expr::BinaryOp { right, .. }) => {
+                        assert!(matches!(right.as_ref(), Expr::Parameter(1)));
+                    }
+                    other => panic!("expected BinaryOp with Parameter, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn parse_multiple_parameters() {
+        let stmt = parse_sql("INSERT INTO t (a, b) VALUES ($1, $2)").unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                assert!(matches!(ins.values[0][0], Expr::Parameter(1)));
+                assert!(matches!(ins.values[0][1], Expr::Parameter(2)));
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn reject_zero_parameter() {
+        assert!(parse_sql("SELECT $0 FROM t").is_err());
+    }
+
+    #[test]
+    fn count_params_basic() {
+        let stmt = parse_sql("SELECT * FROM t WHERE a = $1 AND b = $3").unwrap();
+        assert_eq!(count_params(&stmt), 3);
+    }
+
+    #[test]
+    fn count_params_none() {
+        let stmt = parse_sql("SELECT * FROM t WHERE a = 1").unwrap();
+        assert_eq!(count_params(&stmt), 0);
+    }
+
+    #[test]
+    fn bind_params_basic() {
+        let stmt = parse_sql("SELECT * FROM t WHERE id = $1").unwrap();
+        let bound = bind_params(&stmt, &[Value::Integer(42)]).unwrap();
+        match bound {
+            Statement::Select(sel) => {
+                match &sel.where_clause {
+                    Some(Expr::BinaryOp { right, .. }) => {
+                        assert!(matches!(right.as_ref(), Expr::Literal(Value::Integer(42))));
+                    }
+                    other => panic!("expected BinaryOp with Literal, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn bind_params_out_of_range() {
+        let stmt = parse_sql("SELECT * FROM t WHERE id = $2").unwrap();
+        let result = bind_params(&stmt, &[Value::Integer(1)]);
+        assert!(result.is_err());
     }
 
     #[test]

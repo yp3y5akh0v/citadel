@@ -73,6 +73,9 @@ pub enum SqlError {
     #[error("scalar subquery returned more than one row")]
     SubqueryMultipleRows,
 
+    #[error("parameter count mismatch: expected {expected}, got {got}")]
+    ParameterCountMismatch { expected: usize, got: usize },
+
     #[error("storage error: {0}")]
     Storage(#[from] citadel_core::Error),
 }
