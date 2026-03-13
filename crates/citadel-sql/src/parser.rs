@@ -22,6 +22,7 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    Explain(Box<Statement>),
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +225,13 @@ fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
         sp::Statement::StartTransaction { .. } => Ok(Statement::Begin),
         sp::Statement::Commit { .. } => Ok(Statement::Commit),
         sp::Statement::Rollback { .. } => Ok(Statement::Rollback),
+        sp::Statement::Explain { statement, analyze, .. } => {
+            if analyze {
+                return Err(SqlError::Unsupported("EXPLAIN ANALYZE".into()));
+            }
+            let inner = convert_statement(*statement)?;
+            Ok(Statement::Explain(Box::new(inner)))
+        }
         _ => Err(SqlError::Unsupported(format!(
             "statement type: {}",
             stmt
@@ -1423,6 +1431,28 @@ mod tests {
             }
             _ => panic!("expected DropIndex"),
         }
+    }
+
+    #[test]
+    fn parse_explain_select() {
+        let stmt = parse_sql("EXPLAIN SELECT * FROM users WHERE id = 1").unwrap();
+        match stmt {
+            Statement::Explain(inner) => {
+                assert!(matches!(*inner, Statement::Select(_)));
+            }
+            _ => panic!("expected Explain"),
+        }
+    }
+
+    #[test]
+    fn parse_explain_insert() {
+        let stmt = parse_sql("EXPLAIN INSERT INTO t (a) VALUES (1)").unwrap();
+        assert!(matches!(stmt, Statement::Explain(_)));
+    }
+
+    #[test]
+    fn reject_explain_analyze() {
+        assert!(parse_sql("EXPLAIN ANALYZE SELECT * FROM t").is_err());
     }
 
     #[test]

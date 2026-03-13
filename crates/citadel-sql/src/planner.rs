@@ -217,6 +217,68 @@ fn try_index_scan(
     }))
 }
 
+// ── Plan description for EXPLAIN ────────────────────────────────────
+
+pub fn describe_plan(plan: &ScanPlan, table_schema: &TableSchema) -> String {
+    match plan {
+        ScanPlan::SeqScan => String::new(),
+
+        ScanPlan::PkLookup { pk_values } => {
+            let pk_cols: Vec<&str> = table_schema.primary_key_columns.iter()
+                .map(|&idx| table_schema.columns[idx as usize].name.as_str())
+                .collect();
+            let conditions: Vec<String> = pk_cols.iter().zip(pk_values.iter())
+                .map(|(col, val)| format!("{col} = {}", format_value(val)))
+                .collect();
+            format!("USING PRIMARY KEY ({})", conditions.join(", "))
+        }
+
+        ScanPlan::IndexScan { index_name, num_prefix_cols, range_conds, index_columns, .. } => {
+            let mut conditions = Vec::new();
+            for i in 0..*num_prefix_cols {
+                let col_idx = index_columns[i] as usize;
+                let col_name = &table_schema.columns[col_idx].name;
+                conditions.push(format!("{col_name} = ?"));
+            }
+            if !range_conds.is_empty() && *num_prefix_cols < index_columns.len() {
+                let col_idx = index_columns[*num_prefix_cols] as usize;
+                let col_name = &table_schema.columns[col_idx].name;
+                for (op, _) in range_conds {
+                    conditions.push(format!("{col_name} {} ?", op_symbol(*op)));
+                }
+            }
+            if conditions.is_empty() {
+                format!("USING INDEX {index_name}")
+            } else {
+                format!("USING INDEX {index_name} ({})", conditions.join(", "))
+            }
+        }
+    }
+}
+
+fn format_value(val: &Value) -> String {
+    match val {
+        Value::Null => "NULL".into(),
+        Value::Integer(i) => i.to_string(),
+        Value::Real(f) => format!("{f}"),
+        Value::Text(s) => format!("'{s}'"),
+        Value::Blob(_) => "BLOB".into(),
+        Value::Boolean(b) => b.to_string(),
+    }
+}
+
+fn op_symbol(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Lt => "<",
+        BinOp::LtEq => "<=",
+        BinOp::Gt => ">",
+        BinOp::GtEq => ">=",
+        BinOp::Eq => "=",
+        BinOp::NotEq => "!=",
+        _ => "?",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

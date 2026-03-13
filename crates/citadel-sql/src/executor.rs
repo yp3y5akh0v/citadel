@@ -114,6 +114,7 @@ pub fn execute(
         Statement::Select(sel) => exec_select(db, schema, sel),
         Statement::Update(upd) => exec_update(db, schema, upd),
         Statement::Delete(del) => exec_delete(db, schema, del),
+        Statement::Explain(inner) => explain(schema, inner),
         Statement::Begin | Statement::Commit | Statement::Rollback => {
             Err(SqlError::Unsupported("transaction control in auto-commit mode".into()))
         }
@@ -135,9 +136,204 @@ pub fn execute_in_txn(
         Statement::Select(sel) => exec_select_in_txn(wtx, schema, sel),
         Statement::Update(upd) => exec_update_in_txn(wtx, schema, upd),
         Statement::Delete(del) => exec_delete_in_txn(wtx, schema, del),
+        Statement::Explain(inner) => explain(schema, inner),
         Statement::Begin | Statement::Commit | Statement::Rollback => {
             Err(SqlError::Unsupported("nested transaction control".into()))
         }
+    }
+}
+
+// ── EXPLAIN ──────────────────────────────────────────────────────────
+
+pub fn explain(
+    schema: &SchemaManager,
+    stmt: &Statement,
+) -> Result<ExecutionResult> {
+    let lines = match stmt {
+        Statement::Select(sel) => explain_select(schema, sel)?,
+        Statement::Insert(ins) => {
+            vec![format!("INSERT INTO {}", ins.table.to_ascii_lowercase())]
+        }
+        Statement::Update(upd) => explain_dml(schema, &upd.table, &upd.where_clause, "UPDATE")?,
+        Statement::Delete(del) => explain_dml(schema, &del.table, &del.where_clause, "DELETE FROM")?,
+        Statement::Explain(_) => {
+            return Err(SqlError::Unsupported("EXPLAIN EXPLAIN".into()));
+        }
+        _ => {
+            return Err(SqlError::Unsupported("EXPLAIN for this statement type".into()));
+        }
+    };
+
+    let rows = lines.into_iter()
+        .map(|line| vec![Value::Text(line)])
+        .collect();
+    Ok(ExecutionResult::Query(QueryResult {
+        columns: vec!["plan".into()],
+        rows,
+    }))
+}
+
+fn explain_dml(
+    schema: &SchemaManager,
+    table: &str,
+    where_clause: &Option<Expr>,
+    verb: &str,
+) -> Result<Vec<String>> {
+    let lower = table.to_ascii_lowercase();
+    let table_schema = schema.get(&lower)
+        .ok_or_else(|| SqlError::TableNotFound(table.to_string()))?;
+    let plan = planner::plan_select(table_schema, where_clause);
+    let scan_line = format_scan_line(&lower, &None, &plan, table_schema);
+    Ok(vec![format!("{verb} {}", scan_line)])
+}
+
+fn explain_select(
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+
+    if stmt.from.is_empty() {
+        lines.push("CONSTANT ROW".into());
+        return Ok(lines);
+    }
+
+    let lower_from = stmt.from.to_ascii_lowercase();
+    let from_schema = schema.get(&lower_from)
+        .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
+
+    if stmt.joins.is_empty() {
+        let plan = planner::plan_select(from_schema, &stmt.where_clause);
+        lines.push(format_scan_line(&lower_from, &stmt.from_alias, &plan, from_schema));
+    } else {
+        let from_plan = planner::plan_select(from_schema, &None);
+        lines.push(format_scan_line(&lower_from, &stmt.from_alias, &from_plan, from_schema));
+
+        for join in &stmt.joins {
+            let inner_lower = join.table.name.to_ascii_lowercase();
+            let inner_schema = schema.get(&inner_lower)
+                .ok_or_else(|| SqlError::TableNotFound(join.table.name.clone()))?;
+            let inner_plan = planner::plan_select(inner_schema, &None);
+            lines.push(format_scan_line(&inner_lower, &join.table.alias, &inner_plan, inner_schema));
+        }
+
+        let join_type_str = match stmt.joins.last().map(|j| j.join_type) {
+            Some(JoinType::Left) => "LEFT JOIN",
+            Some(JoinType::Right) => "RIGHT JOIN",
+            Some(JoinType::Cross) => "CROSS JOIN",
+            _ => "NESTED LOOP",
+        };
+        lines.push(join_type_str.into());
+    }
+
+    if stmt.where_clause.is_some() && stmt.joins.is_empty() {
+        let plan = planner::plan_select(from_schema, &stmt.where_clause);
+        if matches!(plan, ScanPlan::SeqScan) {
+            lines.push("FILTER".into());
+        }
+    }
+
+    if let Some(ref w) = stmt.where_clause {
+        if !stmt.joins.is_empty() && has_subquery(w) {
+            lines.push("SUBQUERY".into());
+        }
+    }
+
+    explain_subqueries(stmt, &mut lines);
+
+    if !stmt.group_by.is_empty() {
+        lines.push("GROUP BY".into());
+    }
+
+    if stmt.distinct {
+        lines.push("DISTINCT".into());
+    }
+
+    if !stmt.order_by.is_empty() {
+        lines.push("SORT".into());
+    }
+
+    if let Some(ref offset_expr) = stmt.offset {
+        if let Ok(n) = eval_const_int(offset_expr) {
+            lines.push(format!("OFFSET {n}"));
+        } else {
+            lines.push("OFFSET".into());
+        }
+    }
+
+    if let Some(ref limit_expr) = stmt.limit {
+        if let Ok(n) = eval_const_int(limit_expr) {
+            lines.push(format!("LIMIT {n}"));
+        } else {
+            lines.push("LIMIT".into());
+        }
+    }
+
+    Ok(lines)
+}
+
+fn explain_subqueries(stmt: &SelectStmt, lines: &mut Vec<String>) {
+    let mut count = 0;
+    if let Some(ref w) = stmt.where_clause { count += count_subqueries(w); }
+    if let Some(ref h) = stmt.having { count += count_subqueries(h); }
+    for col in &stmt.columns {
+        if let SelectColumn::Expr { expr, .. } = col {
+            count += count_subqueries(expr);
+        }
+    }
+    for _ in 0..count {
+        lines.push("SUBQUERY".into());
+    }
+}
+
+fn count_subqueries(expr: &Expr) -> usize {
+    match expr {
+        Expr::InSubquery { expr: e, .. } => 1 + count_subqueries(e),
+        Expr::ScalarSubquery(_) => 1,
+        Expr::Exists { .. } => 1,
+        Expr::BinaryOp { left, right, .. } => count_subqueries(left) + count_subqueries(right),
+        Expr::UnaryOp { expr: e, .. } => count_subqueries(e),
+        Expr::IsNull(e) | Expr::IsNotNull(e) => count_subqueries(e),
+        Expr::Function { args, .. } => args.iter().map(count_subqueries).sum(),
+        Expr::Between { expr: e, low, high, .. } => {
+            count_subqueries(e) + count_subqueries(low) + count_subqueries(high)
+        }
+        Expr::Like { expr: e, pattern, .. } => count_subqueries(e) + count_subqueries(pattern),
+        Expr::Case { operand, conditions, else_result } => {
+            let mut n = 0;
+            if let Some(op) = operand { n += count_subqueries(op); }
+            for (c, r) in conditions { n += count_subqueries(c) + count_subqueries(r); }
+            if let Some(el) = else_result { n += count_subqueries(el); }
+            n
+        }
+        Expr::Coalesce(args) => args.iter().map(count_subqueries).sum(),
+        Expr::Cast { expr: e, .. } => count_subqueries(e),
+        Expr::InList { expr: e, list, .. } => {
+            count_subqueries(e) + list.iter().map(count_subqueries).sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
+fn format_scan_line(
+    table_name: &str,
+    alias: &Option<String>,
+    plan: &ScanPlan,
+    table_schema: &TableSchema,
+) -> String {
+    let alias_part = match alias {
+        Some(a) if a.to_ascii_lowercase() != table_name.to_ascii_lowercase() => {
+            format!(" AS {}", a.to_ascii_lowercase())
+        }
+        _ => String::new(),
+    };
+
+    let desc = planner::describe_plan(plan, table_schema);
+
+    if desc.is_empty() {
+        format!("SCAN TABLE {table_name}{alias_part}")
+    } else {
+        format!("SEARCH TABLE {table_name}{alias_part} {desc}")
     }
 }
 
