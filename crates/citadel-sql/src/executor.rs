@@ -1030,6 +1030,20 @@ fn has_subquery(expr: &Expr) -> bool {
             has_subquery(expr) || list.iter().any(has_subquery)
         }
         Expr::InSet { expr, .. } => has_subquery(expr),
+        Expr::Between { expr, low, high, .. } => {
+            has_subquery(expr) || has_subquery(low) || has_subquery(high)
+        }
+        Expr::Like { expr, pattern, escape, .. } => {
+            has_subquery(expr) || has_subquery(pattern) || escape.as_ref().map_or(false, |e| has_subquery(e))
+        }
+        Expr::Case { operand, conditions, else_result } => {
+            operand.as_ref().map_or(false, |e| has_subquery(e))
+                || conditions.iter().any(|(c, r)| has_subquery(c) || has_subquery(r))
+                || else_result.as_ref().map_or(false, |e| has_subquery(e))
+        }
+        Expr::Coalesce(args) => args.iter().any(has_subquery),
+        Expr::Cast { expr, .. } => has_subquery(expr),
+        Expr::Function { args, .. } => args.iter().any(has_subquery),
         _ => false,
     }
 }
@@ -1127,6 +1141,55 @@ fn materialize_expr(
                 has_null: *has_null,
                 negated: *negated,
             })
+        }
+        Expr::Between { expr: e, low, high, negated } => {
+            Ok(Expr::Between {
+                expr: Box::new(materialize_expr(e, exec_sub)?),
+                low: Box::new(materialize_expr(low, exec_sub)?),
+                high: Box::new(materialize_expr(high, exec_sub)?),
+                negated: *negated,
+            })
+        }
+        Expr::Like { expr: e, pattern, escape, negated } => {
+            let esc = escape.as_ref()
+                .map(|es| materialize_expr(es, exec_sub).map(Box::new))
+                .transpose()?;
+            Ok(Expr::Like {
+                expr: Box::new(materialize_expr(e, exec_sub)?),
+                pattern: Box::new(materialize_expr(pattern, exec_sub)?),
+                escape: esc,
+                negated: *negated,
+            })
+        }
+        Expr::Case { operand, conditions, else_result } => {
+            let op = operand.as_ref()
+                .map(|e| materialize_expr(e, exec_sub).map(Box::new))
+                .transpose()?;
+            let conds = conditions.iter()
+                .map(|(c, r)| Ok((materialize_expr(c, exec_sub)?, materialize_expr(r, exec_sub)?)))
+                .collect::<Result<Vec<_>>>()?;
+            let else_r = else_result.as_ref()
+                .map(|e| materialize_expr(e, exec_sub).map(Box::new))
+                .transpose()?;
+            Ok(Expr::Case { operand: op, conditions: conds, else_result: else_r })
+        }
+        Expr::Coalesce(args) => {
+            let materialized = args.iter()
+                .map(|a| materialize_expr(a, exec_sub))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Expr::Coalesce(materialized))
+        }
+        Expr::Cast { expr: e, data_type } => {
+            Ok(Expr::Cast {
+                expr: Box::new(materialize_expr(e, exec_sub)?),
+                data_type: *data_type,
+            })
+        }
+        Expr::Function { name, args } => {
+            let materialized = args.iter()
+                .map(|a| materialize_expr(a, exec_sub))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Expr::Function { name: name.clone(), args: materialized })
         }
         other => Ok(other.clone()),
     }
@@ -1278,6 +1341,10 @@ fn exec_select(
         stmt
     };
 
+    if stmt.from.is_empty() {
+        return exec_select_no_from(stmt);
+    }
+
     let lower_name = stmt.from.to_ascii_lowercase();
     let table_schema = schema.get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
@@ -1288,6 +1355,16 @@ fn exec_select(
 
     let rows = collect_rows_read(db, table_schema, &stmt.where_clause)?;
     process_select(&table_schema.columns, rows, stmt)
+}
+
+fn exec_select_no_from(stmt: &SelectStmt) -> Result<ExecutionResult> {
+    let empty_cols: Vec<ColumnDef> = vec![];
+    let empty_row: Vec<Value> = vec![];
+    let (col_names, projected) = project_rows(&empty_cols, &stmt.columns, &[empty_row])?;
+    Ok(ExecutionResult::Query(QueryResult {
+        columns: col_names,
+        rows: projected,
+    }))
 }
 
 /// Shared SELECT processing: WHERE, aggregation, ORDER BY, LIMIT/OFFSET, projection.
@@ -1967,6 +2044,10 @@ fn exec_select_in_txn(
         stmt
     };
 
+    if stmt.from.is_empty() {
+        return exec_select_no_from(stmt);
+    }
+
     if !stmt.joins.is_empty() {
         return exec_select_join_in_txn(wtx, schema, stmt);
     }
@@ -2285,7 +2366,7 @@ fn eval_aggregate_expr(
     match expr {
         Expr::CountStar => Ok(Value::Integer(group_rows.len() as i64)),
 
-        Expr::Function { name, args } => {
+        Expr::Function { name, args } if is_aggregate_function(name, args.len()) => {
             let func = name.to_ascii_uppercase();
             if args.len() != 1 {
                 return Err(SqlError::Unsupported(format!(
@@ -2391,18 +2472,143 @@ fn eval_aggregate_expr(
             )
         }
 
+        Expr::UnaryOp { op, expr: e } => {
+            let v = eval_aggregate_expr(e, columns, group_rows)?;
+            crate::eval::eval_expr(
+                &Expr::UnaryOp { op: *op, expr: Box::new(Expr::Literal(v)) },
+                columns, &[],
+            )
+        }
+
+        Expr::IsNull(e) => {
+            let v = eval_aggregate_expr(e, columns, group_rows)?;
+            Ok(Value::Boolean(v.is_null()))
+        }
+
+        Expr::IsNotNull(e) => {
+            let v = eval_aggregate_expr(e, columns, group_rows)?;
+            Ok(Value::Boolean(!v.is_null()))
+        }
+
+        Expr::Cast { expr: e, data_type } => {
+            let v = eval_aggregate_expr(e, columns, group_rows)?;
+            crate::eval::eval_expr(
+                &Expr::Cast { expr: Box::new(Expr::Literal(v)), data_type: *data_type },
+                columns, &[],
+            )
+        }
+
+        Expr::Case { operand, conditions, else_result } => {
+            let op_val = operand.as_ref()
+                .map(|e| eval_aggregate_expr(e, columns, group_rows))
+                .transpose()?;
+            if let Some(ov) = &op_val {
+                for (cond, result) in conditions {
+                    let cv = eval_aggregate_expr(cond, columns, group_rows)?;
+                    if !ov.is_null() && !cv.is_null() && *ov == cv {
+                        return eval_aggregate_expr(result, columns, group_rows);
+                    }
+                }
+            } else {
+                for (cond, result) in conditions {
+                    let cv = eval_aggregate_expr(cond, columns, group_rows)?;
+                    if crate::eval::is_truthy(&cv) {
+                        return eval_aggregate_expr(result, columns, group_rows);
+                    }
+                }
+            }
+            match else_result {
+                Some(e) => eval_aggregate_expr(e, columns, group_rows),
+                None => Ok(Value::Null),
+            }
+        }
+
+        Expr::Coalesce(args) => {
+            for arg in args {
+                let v = eval_aggregate_expr(arg, columns, group_rows)?;
+                if !v.is_null() { return Ok(v); }
+            }
+            Ok(Value::Null)
+        }
+
+        Expr::Between { expr: e, low, high, negated } => {
+            let v = eval_aggregate_expr(e, columns, group_rows)?;
+            let lo = eval_aggregate_expr(low, columns, group_rows)?;
+            let hi = eval_aggregate_expr(high, columns, group_rows)?;
+            crate::eval::eval_expr(
+                &Expr::Between {
+                    expr: Box::new(Expr::Literal(v)),
+                    low: Box::new(Expr::Literal(lo)),
+                    high: Box::new(Expr::Literal(hi)),
+                    negated: *negated,
+                },
+                columns, &[],
+            )
+        }
+
+        Expr::Like { expr: e, pattern, escape, negated } => {
+            let v = eval_aggregate_expr(e, columns, group_rows)?;
+            let p = eval_aggregate_expr(pattern, columns, group_rows)?;
+            let esc = escape.as_ref()
+                .map(|es| eval_aggregate_expr(es, columns, group_rows))
+                .transpose()?;
+            let esc_box = esc.map(|v| Box::new(Expr::Literal(v)));
+            crate::eval::eval_expr(
+                &Expr::Like {
+                    expr: Box::new(Expr::Literal(v)),
+                    pattern: Box::new(Expr::Literal(p)),
+                    escape: esc_box,
+                    negated: *negated,
+                },
+                columns, &[],
+            )
+        }
+
+        Expr::Function { name, args } => {
+            let evaluated: Vec<Value> = args.iter()
+                .map(|a| eval_aggregate_expr(a, columns, group_rows))
+                .collect::<Result<_>>()?;
+            let literal_args: Vec<Expr> = evaluated.into_iter().map(Expr::Literal).collect();
+            crate::eval::eval_expr(
+                &Expr::Function { name: name.clone(), args: literal_args },
+                columns, &[],
+            )
+        }
+
         _ => Err(SqlError::Unsupported(format!("expression in aggregate: {expr:?}"))),
     }
+}
+
+fn is_aggregate_function(name: &str, arg_count: usize) -> bool {
+    let u = name.to_ascii_uppercase();
+    matches!(u.as_str(), "COUNT" | "SUM" | "AVG")
+        || (matches!(u.as_str(), "MIN" | "MAX") && arg_count == 1)
 }
 
 fn is_aggregate_expr(expr: &Expr) -> bool {
     match expr {
         Expr::CountStar => true,
-        Expr::Function { name, .. } => {
-            matches!(name.to_ascii_uppercase().as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+        Expr::Function { name, args } => {
+            is_aggregate_function(name, args.len())
+                || args.iter().any(is_aggregate_expr)
         }
         Expr::BinaryOp { left, right, .. } => {
             is_aggregate_expr(left) || is_aggregate_expr(right)
+        }
+        Expr::UnaryOp { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. } => is_aggregate_expr(expr),
+        Expr::Case { operand, conditions, else_result } => {
+            operand.as_ref().map_or(false, |e| is_aggregate_expr(e))
+                || conditions.iter().any(|(c, r)| is_aggregate_expr(c) || is_aggregate_expr(r))
+                || else_result.as_ref().map_or(false, |e| is_aggregate_expr(e))
+        }
+        Expr::Coalesce(args) => args.iter().any(is_aggregate_expr),
+        Expr::Between { expr, low, high, .. } => {
+            is_aggregate_expr(expr) || is_aggregate_expr(low) || is_aggregate_expr(high)
+        }
+        Expr::Like { expr, pattern, escape, .. } => {
+            is_aggregate_expr(expr) || is_aggregate_expr(pattern)
+                || escape.as_ref().map_or(false, |e| is_aggregate_expr(e))
         }
         _ => false,
     }
@@ -2437,22 +2643,7 @@ fn decode_full_row(
 
 /// Evaluate a constant expression (no column references).
 fn eval_const_expr(expr: &Expr) -> Result<Value> {
-    match expr {
-        Expr::Literal(v) => Ok(v.clone()),
-        Expr::UnaryOp { op: UnaryOp::Neg, expr } => {
-            let val = eval_const_expr(expr)?;
-            match val {
-                Value::Integer(i) => i.checked_neg()
-                    .map(Value::Integer)
-                    .ok_or(SqlError::IntegerOverflow),
-                Value::Real(r) => Ok(Value::Real(-r)),
-                _ => Err(SqlError::InvalidValue("cannot negate non-numeric".into())),
-            }
-        }
-        _ => Err(SqlError::InvalidValue(
-            "expected constant expression".into(),
-        )),
-    }
+    eval_expr(expr, &[], &[])
 }
 
 fn eval_const_int(expr: &Expr) -> Result<i64> {
@@ -2560,7 +2751,7 @@ fn op_symbol(op: &BinOp) -> &'static str {
         BinOp::Eq => "=", BinOp::NotEq => "<>",
         BinOp::Lt => "<", BinOp::Gt => ">",
         BinOp::LtEq => "<=", BinOp::GtEq => ">=",
-        BinOp::And => "AND", BinOp::Or => "OR",
+        BinOp::And => "AND", BinOp::Or => "OR", BinOp::Concat => "||",
     }
 }
 

@@ -146,13 +146,18 @@ pub enum Expr {
     Exists { subquery: Box<SelectStmt>, negated: bool },
     ScalarSubquery(Box<SelectStmt>),
     InSet { expr: Box<Expr>, values: std::collections::HashSet<Value>, has_null: bool, negated: bool },
+    Between { expr: Box<Expr>, low: Box<Expr>, high: Box<Expr>, negated: bool },
+    Like { expr: Box<Expr>, pattern: Box<Expr>, escape: Option<Box<Expr>>, negated: bool },
+    Case { operand: Option<Box<Expr>>, conditions: Vec<(Expr, Expr)>, else_result: Option<Box<Expr>> },
+    Coalesce(Vec<Expr>),
+    Cast { expr: Box<Expr>, data_type: DataType },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add, Sub, Mul, Div, Mod,
     Eq, NotEq, Lt, Gt, LtEq, GtEq,
-    And, Or,
+    And, Or, Concat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,26 +377,25 @@ fn convert_query(query: sp::Query) -> Result<Statement> {
     };
 
     // FROM clause
-    if select.from.len() != 1 {
-        if select.from.is_empty() {
-            return Err(SqlError::Parse("SELECT requires FROM".into()));
-        }
+    let (from, from_alias, joins) = if select.from.is_empty() {
+        (String::new(), None, vec![])
+    } else if select.from.len() == 1 {
+        let table_with_joins = &select.from[0];
+        let (name, alias) = match &table_with_joins.relation {
+            sp::TableFactor::Table { name, alias, .. } => {
+                let table_name = object_name_to_string(name);
+                let alias_str = alias.as_ref().map(|a| a.name.value.clone());
+                (table_name, alias_str)
+            }
+            _ => return Err(SqlError::Unsupported("non-table FROM source".into())),
+        };
+        let j = table_with_joins.joins.iter()
+            .map(|j| convert_join(j))
+            .collect::<Result<Vec<_>>>()?;
+        (name, alias, j)
+    } else {
         return Err(SqlError::Unsupported("comma-separated FROM tables".into()));
-    }
-
-    let table_with_joins = &select.from[0];
-    let (from, from_alias) = match &table_with_joins.relation {
-        sp::TableFactor::Table { name, alias, .. } => {
-            let table_name = object_name_to_string(name);
-            let alias_str = alias.as_ref().map(|a| a.name.value.clone());
-            (table_name, alias_str)
-        }
-        _ => return Err(SqlError::Unsupported("non-table FROM source".into())),
     };
-
-    let joins = table_with_joins.joins.iter()
-        .map(|j| convert_join(j))
-        .collect::<Result<Vec<_>>>()?;
 
     // Projection
     let columns: Vec<SelectColumn> = select.projection.iter()
@@ -624,6 +628,94 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
             let stmt = convert_subquery(query)?;
             Ok(Expr::ScalarSubquery(Box::new(stmt)))
         }
+        sp::Expr::Between { expr: e, negated, low, high } => {
+            Ok(Expr::Between {
+                expr: Box::new(convert_expr(e)?),
+                low: Box::new(convert_expr(low)?),
+                high: Box::new(convert_expr(high)?),
+                negated: *negated,
+            })
+        }
+        sp::Expr::Like { expr: e, negated, pattern, escape_char, .. } => {
+            let esc = escape_char.as_ref()
+                .map(|v| convert_escape_value(v))
+                .transpose()?
+                .map(Box::new);
+            Ok(Expr::Like {
+                expr: Box::new(convert_expr(e)?),
+                pattern: Box::new(convert_expr(pattern)?),
+                escape: esc,
+                negated: *negated,
+            })
+        }
+        sp::Expr::ILike { expr: e, negated, pattern, escape_char, .. } => {
+            let esc = escape_char.as_ref()
+                .map(|v| convert_escape_value(v))
+                .transpose()?
+                .map(Box::new);
+            Ok(Expr::Like {
+                expr: Box::new(convert_expr(e)?),
+                pattern: Box::new(convert_expr(pattern)?),
+                escape: esc,
+                negated: *negated,
+            })
+        }
+        sp::Expr::Case { operand, conditions, else_result, .. } => {
+            let op = operand.as_ref()
+                .map(|e| convert_expr(e))
+                .transpose()?
+                .map(Box::new);
+            let conds: Vec<(Expr, Expr)> = conditions.iter()
+                .map(|cw| Ok((convert_expr(&cw.condition)?, convert_expr(&cw.result)?)))
+                .collect::<Result<_>>()?;
+            let else_r = else_result.as_ref()
+                .map(|e| convert_expr(e))
+                .transpose()?
+                .map(Box::new);
+            Ok(Expr::Case { operand: op, conditions: conds, else_result: else_r })
+        }
+        sp::Expr::Cast { expr: e, data_type: dt, .. } => {
+            let target = convert_data_type(dt)?;
+            Ok(Expr::Cast {
+                expr: Box::new(convert_expr(e)?),
+                data_type: target,
+            })
+        }
+        sp::Expr::Substring { expr: e, substring_from, substring_for, .. } => {
+            let mut args = vec![convert_expr(e)?];
+            if let Some(from) = substring_from {
+                args.push(convert_expr(from)?);
+            }
+            if let Some(f) = substring_for {
+                args.push(convert_expr(f)?);
+            }
+            Ok(Expr::Function { name: "SUBSTR".into(), args })
+        }
+        sp::Expr::Trim { expr: e, trim_where, trim_what, trim_characters } => {
+            let fn_name = match trim_where {
+                Some(sp::TrimWhereField::Leading) => "LTRIM",
+                Some(sp::TrimWhereField::Trailing) => "RTRIM",
+                _ => "TRIM",
+            };
+            let mut args = vec![convert_expr(e)?];
+            if let Some(what) = trim_what {
+                args.push(convert_expr(what)?);
+            } else if let Some(chars) = trim_characters {
+                if let Some(first) = chars.first() {
+                    args.push(convert_expr(first)?);
+                }
+            }
+            Ok(Expr::Function { name: fn_name.into(), args })
+        }
+        sp::Expr::Ceil { expr: e, .. } => {
+            Ok(Expr::Function { name: "CEIL".into(), args: vec![convert_expr(e)?] })
+        }
+        sp::Expr::Floor { expr: e, .. } => {
+            Ok(Expr::Function { name: "FLOOR".into(), args: vec![convert_expr(e)?] })
+        }
+        sp::Expr::Position { expr: e, r#in } => {
+            Ok(Expr::Function { name: "INSTR".into(), args: vec![convert_expr(r#in)?, convert_expr(e)?] })
+        }
         _ => Err(SqlError::Unsupported(format!("expression: {expr}"))),
     }
 }
@@ -646,6 +738,13 @@ fn convert_value(val: &sp::Value) -> Result<Expr> {
     }
 }
 
+fn convert_escape_value(val: &sp::Value) -> Result<Expr> {
+    match val {
+        sp::Value::SingleQuotedString(s) => Ok(Expr::Literal(Value::Text(s.clone()))),
+        _ => Err(SqlError::Unsupported(format!("ESCAPE value: {val}"))),
+    }
+}
+
 fn convert_bin_op(op: &sp::BinaryOperator) -> Result<BinOp> {
     match op {
         sp::BinaryOperator::Plus => Ok(BinOp::Add),
@@ -661,6 +760,7 @@ fn convert_bin_op(op: &sp::BinaryOperator) -> Result<BinOp> {
         sp::BinaryOperator::GtEq => Ok(BinOp::GtEq),
         sp::BinaryOperator::And => Ok(BinOp::And),
         sp::BinaryOperator::Or => Ok(BinOp::Or),
+        sp::BinaryOperator::StringConcat => Ok(BinOp::Concat),
         _ => Err(SqlError::Unsupported(format!("binary op: {op}"))),
     }
 }
@@ -688,9 +788,43 @@ fn convert_function(func: &sp::Function) -> Result<Expr> {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            // If this is COUNT(*), the args will contain CountStar
             if name == "COUNT" && args.len() == 1 && matches!(args[0], Expr::CountStar) {
                 return Ok(Expr::CountStar);
+            }
+
+            if name == "COALESCE" {
+                if args.is_empty() {
+                    return Err(SqlError::Parse("COALESCE requires at least one argument".into()));
+                }
+                return Ok(Expr::Coalesce(args));
+            }
+
+            if name == "NULLIF" {
+                if args.len() != 2 {
+                    return Err(SqlError::Parse("NULLIF requires exactly two arguments".into()));
+                }
+                return Ok(Expr::Case {
+                    operand: None,
+                    conditions: vec![
+                        (Expr::BinaryOp {
+                            left: Box::new(args[0].clone()),
+                            op: BinOp::Eq,
+                            right: Box::new(args[1].clone()),
+                        }, Expr::Literal(Value::Null)),
+                    ],
+                    else_result: Some(Box::new(args[0].clone())),
+                });
+            }
+
+            if name == "IIF" {
+                if args.len() != 3 {
+                    return Err(SqlError::Parse("IIF requires exactly three arguments".into()));
+                }
+                return Ok(Expr::Case {
+                    operand: None,
+                    conditions: vec![(args[0].clone(), args[1].clone())],
+                    else_result: Some(Box::new(args[2].clone())),
+                });
             }
 
             Ok(Expr::Function { name, args })
