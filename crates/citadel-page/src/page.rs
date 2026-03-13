@@ -1,5 +1,6 @@
 use citadel_core::{
-    BODY_SIZE, CHECKSUM_SIZE, PAGE_HEADER_SIZE, USABLE_SIZE,
+    BODY_SIZE, CHECKSUM_SIZE, MERKLE_HASH_OFFSET, MERKLE_HASH_SIZE,
+    PAGE_HEADER_SIZE, USABLE_SIZE,
 };
 use citadel_core::types::{PageFlags, PageId, PageType, TxnId};
 
@@ -16,7 +17,7 @@ use citadel_core::types::{PageFlags, PageId, PageType, TxnId};
 /// [28..30]   free_space (u16)
 /// [30..34]   right_child (u32) — rightmost child (branch) / 0 (leaf/overflow)
 /// [34..36]   _reserved (u16)
-/// [36..64]   _padding
+/// [36..64]   merkle_hash (28B, BLAKE3 truncated) — Merkle tree hash for sync
 /// [64..8160] cell data area (slotted page)
 #[derive(Clone)]
 pub struct Page {
@@ -133,6 +134,18 @@ impl Page {
 
     pub fn set_right_child(&mut self, child: PageId) {
         self.data[30..34].copy_from_slice(&child.as_u32().to_le_bytes());
+    }
+
+    /// Get the Merkle hash stored in this page's header.
+    pub fn merkle_hash(&self) -> [u8; MERKLE_HASH_SIZE] {
+        let end = MERKLE_HASH_OFFSET + MERKLE_HASH_SIZE;
+        self.data[MERKLE_HASH_OFFSET..end].try_into().unwrap()
+    }
+
+    /// Set the Merkle hash in this page's header.
+    pub fn set_merkle_hash(&mut self, hash: &[u8; MERKLE_HASH_SIZE]) {
+        let end = MERKLE_HASH_OFFSET + MERKLE_HASH_SIZE;
+        self.data[MERKLE_HASH_OFFSET..end].copy_from_slice(hash);
     }
 
     // --- Slotted page operations ---

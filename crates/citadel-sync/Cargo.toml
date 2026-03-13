@@ -1,0 +1,19 @@
+[package]
+name = "citadel-sync"
+description = "Replication and sync layer for Citadel encrypted database"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+citadel-core = { workspace = true }
+citadel-page = { workspace = true }
+citadel-txn = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+citadel-io = { workspace = true }
+tempfile = "3"

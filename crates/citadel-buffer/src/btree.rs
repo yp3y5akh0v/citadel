@@ -277,7 +277,31 @@ fn split_leaf_with_insert(
     }
 
     let total = cells.len();
-    let split_point = total / 2;
+
+    // Size-aware split: ensure both halves fit within USABLE_SIZE.
+    // Simple midpoint-by-count fails when cell sizes vary significantly.
+    let usable = citadel_core::constants::USABLE_SIZE;
+    let mut cum: Vec<usize> = Vec::with_capacity(total + 1);
+    cum.push(0);
+    for (_, raw) in &cells {
+        cum.push(cum.last().unwrap() + raw.len());
+    }
+    let left_fits = |sp: usize| cum[sp] + sp * 2 <= usable;
+    let right_fits = |sp: usize| (cum[total] - cum[sp]) + (total - sp) * 2 <= usable;
+
+    let mut split_point = total / 2;
+    if !left_fits(split_point) || !right_fits(split_point) {
+        split_point = 1;
+        for sp in 1..total {
+            if left_fits(sp) && right_fits(sp) {
+                split_point = sp;
+                if sp >= total / 2 {
+                    break;
+                }
+            }
+        }
+    }
+
     let sep_key = cells[split_point].0.clone();
 
     // Rebuild left page with cells [0..split_point]
@@ -408,9 +432,34 @@ fn split_branch_with_insert(
         (result, final_rc)
     };
 
-    // Split at midpoint — the middle key is promoted
+    // Size-aware split — the middle key is promoted.
+    // Left = [0..split_point], promoted = [split_point], right = [split_point+1..total].
     let total = new_cells.len();
-    let split_point = total / 2;
+    let usable = citadel_core::constants::USABLE_SIZE;
+    let raw_sizes: Vec<usize> = new_cells.iter().map(|(_, key)| 6 + key.len()).collect();
+    let mut cum: Vec<usize> = Vec::with_capacity(total + 1);
+    cum.push(0);
+    for &sz in &raw_sizes {
+        cum.push(cum.last().unwrap() + sz);
+    }
+    let left_fits = |sp: usize| cum[sp] + sp * 2 <= usable;
+    let right_fits = |sp: usize| {
+        let right_count = total - sp - 1;
+        (cum[total] - cum[sp + 1]) + right_count * 2 <= usable
+    };
+
+    let mut split_point = total / 2;
+    if !left_fits(split_point) || !right_fits(split_point) {
+        split_point = 1;
+        for sp in 1..total.saturating_sub(1) {
+            if left_fits(sp) && right_fits(sp) {
+                split_point = sp;
+                if sp >= total / 2 {
+                    break;
+                }
+            }
+        }
+    }
 
     let promoted_sep = new_cells[split_point].1.clone();
     let promoted_child = new_cells[split_point].0;

@@ -206,26 +206,26 @@ fn delete_every_other_key() {
     let mut pages: HashMap<PageId, Page> = HashMap::new();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
-    let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
     let count = 1000u32;
     for i in 0..count {
         let key = format!("{i:06}");
         tree.insert(&mut pages, &mut alloc, TxnId(1), key.as_bytes(), ValueType::Inline, b"v").unwrap();
-        oracle.insert(key.into_bytes(), b"v".to_vec());
+        expected.insert(key.into_bytes(), b"v".to_vec());
     }
 
     for i in (0..count).step_by(2) {
         let key = format!("{i:06}");
         tree.delete(&mut pages, &mut alloc, TxnId(1), key.as_bytes()).unwrap();
-        oracle.remove(key.as_bytes());
+        expected.remove(key.as_bytes());
     }
 
-    assert_eq!(tree.entry_count, oracle.len() as u64);
+    assert_eq!(tree.entry_count, expected.len() as u64);
 
     let mut cursor = Cursor::first(&pages, tree.root).unwrap();
-    let oracle_entries: Vec<_> = oracle.into_iter().collect();
-    for (ok, _) in &oracle_entries {
+    let expected_entries: Vec<_> = expected.into_iter().collect();
+    for (ok, _) in &expected_entries {
         assert!(cursor.is_valid());
         let entry = cursor.current(&pages).unwrap();
         assert_eq!(&entry.key, ok);
@@ -716,24 +716,24 @@ fn interleaved_insert_pattern() {
     let mut pages: HashMap<PageId, Page> = HashMap::new();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
-    let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
     let count = 2000u32;
     for i in (0..count).step_by(2) {
         let key = format!("{i:08}");
         tree.insert(&mut pages, &mut alloc, TxnId(1), key.as_bytes(), ValueType::Inline, b"even").unwrap();
-        oracle.insert(key.into_bytes(), b"even".to_vec());
+        expected.insert(key.into_bytes(), b"even".to_vec());
     }
     for i in (1..count).step_by(2) {
         let key = format!("{i:08}");
         tree.insert(&mut pages, &mut alloc, TxnId(1), key.as_bytes(), ValueType::Inline, b"odd").unwrap();
-        oracle.insert(key.into_bytes(), b"odd".to_vec());
+        expected.insert(key.into_bytes(), b"odd".to_vec());
     }
 
-    assert_eq!(tree.entry_count, oracle.len() as u64);
+    assert_eq!(tree.entry_count, expected.len() as u64);
 
     let mut cursor = Cursor::first(&pages, tree.root).unwrap();
-    for (ok, ov) in &oracle {
+    for (ok, ov) in &expected {
         assert!(cursor.is_valid());
         let entry = cursor.current(&pages).unwrap();
         assert_eq!(&entry.key, ok);
@@ -782,15 +782,15 @@ fn empty_value_stress() {
 }
 
 // =========================================================================
-// Heavy oracle: 50K operations
+// Heavy randomized: 50K operations
 // =========================================================================
 
 #[test]
-fn heavy_oracle_50k_ops() {
+fn heavy_expected_50k_ops() {
     let mut pages: HashMap<PageId, Page> = HashMap::new();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
-    let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
     let mut rng = Rng::new(0xCAFE);
     let ops = 50_000;
@@ -806,22 +806,22 @@ fn heavy_oracle_50k_ops() {
                 &mut pages, &mut alloc, TxnId(1),
                 &key_bytes, ValueType::Inline, val.as_bytes(),
             ).unwrap();
-            let oracle_existed = oracle.insert(key_bytes, val.into_bytes()).is_some();
-            assert_eq!(tree_new, !oracle_existed, "insert mismatch at op {i}");
+            let expected_existed = expected.insert(key_bytes, val.into_bytes()).is_some();
+            assert_eq!(tree_new, !expected_existed, "insert mismatch at op {i}");
         } else if op < 8 {
             let tree_found = tree.delete(&mut pages, &mut alloc, TxnId(1), &key_bytes).unwrap();
-            let oracle_found = oracle.remove(&key_bytes).is_some();
-            assert_eq!(tree_found, oracle_found, "delete mismatch at op {i}");
+            let expected_found = expected.remove(&key_bytes).is_some();
+            assert_eq!(tree_found, expected_found, "delete mismatch at op {i}");
         } else {
             let tree_result = tree.search(&pages, &key_bytes).unwrap();
-            let oracle_result = oracle.get(&key_bytes);
-            match (&tree_result, oracle_result) {
+            let expected_result = expected.get(&key_bytes);
+            match (&tree_result, expected_result) {
                 (Some((_, tv)), Some(ov)) => assert_eq!(tv, ov, "value mismatch at op {i}"),
                 (None, None) => {}
                 _ => panic!("search mismatch at op {i}"),
             }
         }
-        assert_eq!(tree.entry_count, oracle.len() as u64, "count mismatch at op {i}");
+        assert_eq!(tree.entry_count, expected.len() as u64, "count mismatch at op {i}");
     }
 
     let mut cursor = Cursor::first(&pages, tree.root).unwrap();
@@ -832,14 +832,14 @@ fn heavy_oracle_50k_ops() {
         if let Some(ref pk) = prev_key {
             assert!(entry.key > *pk, "cursor order violated");
         }
-        let oracle_val = oracle.get(&entry.key);
-        assert!(oracle_val.is_some(), "cursor yielded key not in oracle");
-        assert_eq!(&entry.value, oracle_val.unwrap());
+        let expected_val = expected.get(&entry.key);
+        assert!(expected_val.is_some(), "cursor yielded key not in expected");
+        assert_eq!(&entry.value, expected_val.unwrap());
         prev_key = Some(entry.key);
         count += 1;
         cursor.next(&pages).unwrap();
     }
-    assert_eq!(count, oracle.len() as u64);
+    assert_eq!(count, expected.len() as u64);
 }
 
 // =========================================================================
@@ -965,7 +965,7 @@ fn entry_count_always_accurate() {
     let mut pages: HashMap<PageId, Page> = HashMap::new();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
-    let mut oracle: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
+    let mut expected: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
 
     let mut rng = Rng::new(77777);
     for i in 0..5000u32 {
@@ -973,13 +973,13 @@ fn entry_count_always_accurate() {
         let key_bytes = key.as_bytes().to_vec();
         if rng.next_range(3) < 2 {
             tree.insert(&mut pages, &mut alloc, TxnId(1), &key_bytes, ValueType::Inline, b"v").unwrap();
-            oracle.insert(key_bytes, ());
+            expected.insert(key_bytes, ());
         } else {
             tree.delete(&mut pages, &mut alloc, TxnId(1), &key_bytes).unwrap();
-            oracle.remove(&key_bytes);
+            expected.remove(&key_bytes);
         }
-        assert_eq!(tree.entry_count, oracle.len() as u64,
-            "entry_count mismatch at op {i}, tree={}, oracle={}", tree.entry_count, oracle.len());
+        assert_eq!(tree.entry_count, expected.len() as u64,
+            "entry_count mismatch at op {i}, tree={}, expected={}", tree.entry_count, expected.len());
     }
 }
 
@@ -1055,28 +1055,28 @@ fn monotonic_insert_with_periodic_bulk_delete() {
     let mut pages: HashMap<PageId, Page> = HashMap::new();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
-    let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
     let mut counter = 0u64;
     for _round in 0..10 {
         for _ in 0..200 {
             let key = format!("{counter:010}");
             tree.insert(&mut pages, &mut alloc, TxnId(1), key.as_bytes(), ValueType::Inline, b"v").unwrap();
-            oracle.insert(key.into_bytes(), b"v".to_vec());
+            expected.insert(key.into_bytes(), b"v".to_vec());
             counter += 1;
         }
 
-        let to_delete: Vec<Vec<u8>> = oracle.keys().take(100).cloned().collect();
+        let to_delete: Vec<Vec<u8>> = expected.keys().take(100).cloned().collect();
         for k in &to_delete {
             tree.delete(&mut pages, &mut alloc, TxnId(1), k).unwrap();
-            oracle.remove(k);
+            expected.remove(k);
         }
 
-        assert_eq!(tree.entry_count, oracle.len() as u64);
+        assert_eq!(tree.entry_count, expected.len() as u64);
     }
 
     let mut cursor = Cursor::first(&pages, tree.root).unwrap();
-    for (ok, _) in &oracle {
+    for (ok, _) in &expected {
         assert!(cursor.is_valid());
         let entry = cursor.current(&pages).unwrap();
         assert_eq!(&entry.key, ok);

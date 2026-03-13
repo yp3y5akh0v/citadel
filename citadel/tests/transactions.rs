@@ -1840,7 +1840,7 @@ fn interleaved_insert_delete_stress() {
         }
 
         assert_eq!(wtx.entry_count(), reference.len() as u64,
-            "entry count mismatch at txn {txn_num}: tree={} oracle={}",
+            "entry count mismatch at txn {txn_num}: tree={} expected={}",
             wtx.entry_count(), reference.len());
         wtx.commit().unwrap();
 
@@ -1875,14 +1875,14 @@ fn interleaved_insert_delete_stress() {
             Ok(())
         }).unwrap();
 
-        let oracle_entries: Vec<_> = reference.iter()
+        let expected_entries: Vec<_> = reference.iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        assert_eq!(collected.len(), oracle_entries.len(),
-            "final for_each count mismatch: tree={} oracle={}",
-            collected.len(), oracle_entries.len());
-        for ((tk, tv), (ok, ov)) in collected.iter().zip(oracle_entries.iter()) {
+        assert_eq!(collected.len(), expected_entries.len(),
+            "final for_each count mismatch: tree={} expected={}",
+            collected.len(), expected_entries.len());
+        for ((tk, tv), (ok, ov)) in collected.iter().zip(expected_entries.iter()) {
             assert_eq!(tk, ok, "key mismatch in final scan");
             assert_eq!(tv, ov, "value mismatch in final scan");
         }

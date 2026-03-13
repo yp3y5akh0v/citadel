@@ -28,11 +28,11 @@ impl Rng {
 }
 
 #[test]
-fn btree_vs_btreemap_oracle() {
+fn btree_vs_btreemap_expected() {
     let mut pages: HashMap<PageId, Page> = HashMap::new();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
-    let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
     let mut rng = Rng::new(42);
     let ops = 5000;
@@ -52,8 +52,8 @@ fn btree_vs_btreemap_oracle() {
                 key_bytes, ValueType::Inline, val_bytes,
             ).unwrap();
 
-            let oracle_existed = oracle.insert(key.clone().into_bytes(), value.into_bytes()).is_some();
-            assert_eq!(tree_is_new, !oracle_existed,
+            let expected_existed = expected.insert(key.clone().into_bytes(), value.into_bytes()).is_some();
+            assert_eq!(tree_is_new, !expected_existed,
                 "insert mismatch for key={key} at op {i}");
         } else if op < 8 {
             // DELETE (20% of operations)
@@ -61,28 +61,28 @@ fn btree_vs_btreemap_oracle() {
                 &mut pages, &mut alloc, TxnId(1), key_bytes,
             ).unwrap();
 
-            let oracle_found = oracle.remove(key.as_bytes()).is_some();
-            assert_eq!(tree_found, oracle_found,
+            let expected_found = expected.remove(key.as_bytes()).is_some();
+            assert_eq!(tree_found, expected_found,
                 "delete mismatch for key={key} at op {i}");
         } else {
             // SEARCH (20% of operations)
             let tree_result = tree.search(&pages, key_bytes).unwrap();
-            let oracle_result = oracle.get(key.as_bytes());
+            let expected_result = expected.get(key.as_bytes());
 
-            match (&tree_result, oracle_result) {
+            match (&tree_result, expected_result) {
                 (Some((_, tv)), Some(ov)) => {
                     assert_eq!(tv, ov, "value mismatch for key={key} at op {i}");
                 }
                 (None, None) => {}
                 _ => panic!(
-                    "search mismatch for key={key} at op {i}: tree={:?}, oracle={:?}",
-                    tree_result.is_some(), oracle_result.is_some()
+                    "search mismatch for key={key} at op {i}: tree={:?}, expected={:?}",
+                    tree_result.is_some(), expected_result.is_some()
                 ),
             }
         }
 
         // Verify entry count matches
-        assert_eq!(tree.entry_count, oracle.len() as u64,
+        assert_eq!(tree.entry_count, expected.len() as u64,
             "entry count mismatch at op {i}");
     }
 
@@ -95,11 +95,11 @@ fn btree_vs_btreemap_oracle() {
         cursor.next(&pages).unwrap();
     }
 
-    let oracle_entries: Vec<(Vec<u8>, Vec<u8>)> = oracle.into_iter().collect();
-    assert_eq!(tree_entries.len(), oracle_entries.len(),
-        "final entry count mismatch: tree={}, oracle={}", tree_entries.len(), oracle_entries.len());
+    let expected_entries: Vec<(Vec<u8>, Vec<u8>)> = expected.into_iter().collect();
+    assert_eq!(tree_entries.len(), expected_entries.len(),
+        "final entry count mismatch: tree={}, expected={}", tree_entries.len(), expected_entries.len());
 
-    for (i, ((tk, tv), (ok, ov))) in tree_entries.iter().zip(oracle_entries.iter()).enumerate() {
+    for (i, ((tk, tv), (ok, ov))) in tree_entries.iter().zip(expected_entries.iter()).enumerate() {
         assert_eq!(tk, ok, "key mismatch at position {i}");
         assert_eq!(tv, ov, "value mismatch at position {i}");
     }
@@ -475,12 +475,12 @@ fn btree_delete_until_empty_one_by_one() {
 }
 
 #[test]
-fn btree_heavy_random_oracle() {
+fn btree_heavy_random_expected() {
     // Heavier variant: 10K operations
     let mut pages: HashMap<PageId, Page> = HashMap::new();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
-    let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
     let mut rng = Rng::new(123456);
     let ops = 10000;
@@ -493,22 +493,22 @@ fn btree_heavy_random_oracle() {
         if op < 5 {
             let value = format!("v{i}");
             let tree_new = tree.insert(&mut pages, &mut alloc, TxnId(1), key_bytes, ValueType::Inline, value.as_bytes()).unwrap();
-            let oracle_existed = oracle.insert(key.into_bytes(), value.into_bytes()).is_some();
-            assert_eq!(tree_new, !oracle_existed, "insert mismatch at op {i}");
+            let expected_existed = expected.insert(key.into_bytes(), value.into_bytes()).is_some();
+            assert_eq!(tree_new, !expected_existed, "insert mismatch at op {i}");
         } else if op < 8 {
             let tree_found = tree.delete(&mut pages, &mut alloc, TxnId(1), key_bytes).unwrap();
-            let oracle_found = oracle.remove(key.as_bytes()).is_some();
-            assert_eq!(tree_found, oracle_found, "delete mismatch at op {i}");
+            let expected_found = expected.remove(key.as_bytes()).is_some();
+            assert_eq!(tree_found, expected_found, "delete mismatch at op {i}");
         } else {
             let tree_result = tree.search(&pages, key_bytes).unwrap();
-            let oracle_result = oracle.get(key.as_bytes());
-            match (&tree_result, oracle_result) {
+            let expected_result = expected.get(key.as_bytes());
+            match (&tree_result, expected_result) {
                 (Some((_, tv)), Some(ov)) => assert_eq!(tv, ov, "value mismatch at op {i}"),
                 (None, None) => {}
                 _ => panic!("search mismatch at op {i}"),
             }
         }
-        assert_eq!(tree.entry_count, oracle.len() as u64, "count mismatch at op {i}");
+        assert_eq!(tree.entry_count, expected.len() as u64, "count mismatch at op {i}");
     }
 
     // Final full iteration comparison
@@ -519,9 +519,9 @@ fn btree_heavy_random_oracle() {
         tree_entries.push((entry.key.clone(), entry.value.clone()));
         cursor.next(&pages).unwrap();
     }
-    let oracle_entries: Vec<_> = oracle.into_iter().collect();
-    assert_eq!(tree_entries.len(), oracle_entries.len());
-    for ((tk, tv), (ok, ov)) in tree_entries.iter().zip(oracle_entries.iter()) {
+    let expected_entries: Vec<_> = expected.into_iter().collect();
+    assert_eq!(tree_entries.len(), expected_entries.len());
+    for ((tk, tv), (ok, ov)) in tree_entries.iter().zip(expected_entries.iter()) {
         assert_eq!(tk, ok);
         assert_eq!(tv, ov);
     }
@@ -561,7 +561,7 @@ fn btree_variable_key_length_stress() {
     let mut pages: HashMap<PageId, Page> = HashMap::new();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
-    let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
     let mut rng = Rng::new(0xDEAD);
     let ops = 5000;
@@ -581,19 +581,19 @@ fn btree_variable_key_length_stress() {
                 &mut pages, &mut alloc, TxnId(1),
                 &key, ValueType::Inline, val.as_bytes(),
             ).unwrap();
-            let oracle_existed = oracle.insert(key, val.into_bytes()).is_some();
-            assert_eq!(tree_new, !oracle_existed,
+            let expected_existed = expected.insert(key, val.into_bytes()).is_some();
+            assert_eq!(tree_new, !expected_existed,
                 "insert mismatch at op {i} (key_len={key_len})");
         } else {
             // Delete
             let tree_found = tree.delete(
                 &mut pages, &mut alloc, TxnId(1), &key,
             ).unwrap();
-            let oracle_found = oracle.remove(&key).is_some();
-            assert_eq!(tree_found, oracle_found,
+            let expected_found = expected.remove(&key).is_some();
+            assert_eq!(tree_found, expected_found,
                 "delete mismatch at op {i} (key_len={key_len})");
         }
-        assert_eq!(tree.entry_count, oracle.len() as u64,
+        assert_eq!(tree.entry_count, expected.len() as u64,
             "count mismatch at op {i}");
     }
 
@@ -629,7 +629,7 @@ fn btree_variable_key_length_stress() {
         assert!(branch_count >= 1, "multi-level tree should have branch pages");
     }
 
-    // Full cursor scan must match oracle
+    // Full cursor scan must match expected
     let mut cursor = Cursor::first(&pages, tree.root).unwrap();
     let mut tree_entries = Vec::new();
     while cursor.is_valid() {
@@ -639,10 +639,10 @@ fn btree_variable_key_length_stress() {
         }
         cursor.next(&pages).unwrap();
     }
-    let oracle_entries: Vec<_> = oracle.into_iter().collect();
-    assert_eq!(tree_entries.len(), oracle_entries.len(),
+    let expected_entries: Vec<_> = expected.into_iter().collect();
+    assert_eq!(tree_entries.len(), expected_entries.len(),
         "final scan count mismatch");
-    for ((tk, tv), (ok, ov)) in tree_entries.iter().zip(oracle_entries.iter()) {
+    for ((tk, tv), (ok, ov)) in tree_entries.iter().zip(expected_entries.iter()) {
         assert_eq!(tk, ok, "key mismatch in final scan");
         assert_eq!(tv, ov, "value mismatch in final scan");
     }

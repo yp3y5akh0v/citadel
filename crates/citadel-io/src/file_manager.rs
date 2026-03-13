@@ -1,10 +1,10 @@
 use citadel_core::{
     COMMIT_SLOT_OFFSET, COMMIT_SLOT_SIZE, FILE_HEADER_SIZE, FILE_ID_OFFSET,
     FORMAT_VERSION, GOD_BIT_ACTIVE_SLOT, GOD_BIT_RECOVERY, GOD_BYTE_OFFSET,
-    MAGIC, MAC_SIZE, PAGE_SIZE,
+    MAGIC, MAC_SIZE, MERKLE_HASH_SIZE, PAGE_SIZE,
     SLOT_CHECKSUM, SLOT_DEK_ID, SLOT_ENCRYPTION_EPOCH, SLOT_HIGH_WATER_MARK,
-    SLOT_PENDING_FREE_ROOT, SLOT_TOTAL_PAGES, SLOT_TREE_DEPTH, SLOT_TREE_ENTRIES,
-    SLOT_TREE_ROOT, SLOT_TXN_ID, SLOT_CATALOG_ROOT,
+    SLOT_MERKLE_ROOT, SLOT_PENDING_FREE_ROOT, SLOT_TOTAL_PAGES, SLOT_TREE_DEPTH,
+    SLOT_TREE_ENTRIES, SLOT_TREE_ROOT, SLOT_TXN_ID, SLOT_CATALOG_ROOT,
     GROWTH_CHUNK_1MB, GROWTH_CHUNK_4MB, GROWTH_CHUNK_16MB,
     GROWTH_THRESHOLD_4MB, GROWTH_THRESHOLD_64MB, GROWTH_THRESHOLD_1GB,
 };
@@ -27,6 +27,7 @@ pub struct CommitSlot {
     pub encryption_epoch: u32,
     pub dek_id: [u8; MAC_SIZE],
     pub checksum: u64,
+    pub merkle_root: [u8; MERKLE_HASH_SIZE],
 }
 
 impl CommitSlot {
@@ -48,13 +49,19 @@ impl CommitSlot {
         // Compute checksum over bytes [0..76]
         let cs = xxhash_rust::xxh64::xxh64(&buf[..SLOT_CHECKSUM], 0);
         buf[SLOT_CHECKSUM..SLOT_CHECKSUM + 8].copy_from_slice(&cs.to_le_bytes());
-        // remaining bytes [84..240] are reserved/zeroed
+
+        // Merkle root at [84..112] (outside checksum range, verifiable by recomputation)
+        buf[SLOT_MERKLE_ROOT..SLOT_MERKLE_ROOT + MERKLE_HASH_SIZE]
+            .copy_from_slice(&self.merkle_root);
 
         buf
     }
 
     /// Deserialize from 240 bytes. Does NOT validate checksum.
     pub fn deserialize(buf: &[u8; COMMIT_SLOT_SIZE]) -> Self {
+        let mut merkle_root = [0u8; MERKLE_HASH_SIZE];
+        merkle_root.copy_from_slice(&buf[SLOT_MERKLE_ROOT..SLOT_MERKLE_ROOT + MERKLE_HASH_SIZE]);
+
         Self {
             txn_id: TxnId(u64::from_le_bytes(buf[SLOT_TXN_ID..SLOT_TXN_ID + 8].try_into().unwrap())),
             tree_root: PageId(u32::from_le_bytes(buf[SLOT_TREE_ROOT..SLOT_TREE_ROOT + 4].try_into().unwrap())),
@@ -67,6 +74,7 @@ impl CommitSlot {
             encryption_epoch: u32::from_le_bytes(buf[SLOT_ENCRYPTION_EPOCH..SLOT_ENCRYPTION_EPOCH + 4].try_into().unwrap()),
             dek_id: buf[SLOT_DEK_ID..SLOT_DEK_ID + MAC_SIZE].try_into().unwrap(),
             checksum: u64::from_le_bytes(buf[SLOT_CHECKSUM..SLOT_CHECKSUM + 8].try_into().unwrap()),
+            merkle_root,
         }
     }
 
@@ -164,6 +172,7 @@ impl FileHeader {
             encryption_epoch: 1,
             dek_id,
             checksum: 0, // will be computed during serialize
+            merkle_root: [0u8; MERKLE_HASH_SIZE],
         };
 
         Self {
@@ -332,6 +341,7 @@ mod tests {
             encryption_epoch: 1,
             dek_id: [0xAA; MAC_SIZE],
             checksum: 0,
+            merkle_root: [0xBB; MERKLE_HASH_SIZE],
         };
 
         let buf = slot.serialize();
@@ -347,6 +357,7 @@ mod tests {
         assert_eq!(slot2.pending_free_root, PageId(50));
         assert_eq!(slot2.encryption_epoch, 1);
         assert_eq!(slot2.dek_id, [0xAA; MAC_SIZE]);
+        assert_eq!(slot2.merkle_root, [0xBB; MERKLE_HASH_SIZE]);
     }
 
     #[test]
@@ -363,6 +374,7 @@ mod tests {
             encryption_epoch: 1,
             dek_id: [0; MAC_SIZE],
             checksum: 0,
+            merkle_root: [0; MERKLE_HASH_SIZE],
         };
 
         // After serialization, checksum field is populated

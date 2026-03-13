@@ -119,7 +119,33 @@ pub fn insert(page: &mut Page, key: &[u8], val_type: ValueType, value: &[u8]) ->
     };
 
     let cell = build_cell(key, val_type, value);
-    page.insert_cell_at(pos, &cell).is_some()
+    if page.insert_cell_at(pos, &cell).is_some() {
+        return true;
+    }
+
+    // Contiguous space exhausted but total free_space may suffice (holes from
+    // delete+reinsert cycles). Compact the page and retry.
+    let cell_len_with_ptr = cell.len() + 2;
+    if (page.free_space() as usize) >= cell_len_with_ptr {
+        compact_page(page);
+        return page.insert_cell_at(pos, &cell).is_some();
+    }
+
+    false
+}
+
+/// Compact a leaf page by rebuilding its cell data, eliminating holes.
+fn compact_page(page: &mut Page) {
+    let n = page.num_cells();
+    let cells: Vec<Vec<u8>> = (0..n)
+        .map(|i| {
+            let offset = page.cell_offset(i) as usize;
+            let sz = get_cell_size(page, i);
+            page.data[offset..offset + sz].to_vec()
+        })
+        .collect();
+    let refs: Vec<&[u8]> = cells.iter().map(|c| c.as_slice()).collect();
+    page.rebuild_cells(&refs);
 }
 
 /// Delete a key from the leaf page.

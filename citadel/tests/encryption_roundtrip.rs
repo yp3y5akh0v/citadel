@@ -161,6 +161,7 @@ fn file_header_and_recovery() {
         encryption_epoch: 1,
         dek_id,
         checksum: 0,
+        merkle_root: [0u8; citadel_core::MERKLE_HASH_SIZE],
     };
 
     write_commit_slot(&io, 1, &new_slot).unwrap(); // write to inactive slot 1

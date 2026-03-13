@@ -2,7 +2,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
-use citadel_core::{Error, Result, KEY_FILE_SIZE};
+use citadel_core::{Error, Result, KEY_FILE_SIZE, MERKLE_HASH_SIZE};
 use citadel_txn::integrity::IntegrityReport;
 use citadel_txn::manager::TxnManager;
 use citadel_txn::read_txn::ReadTxn;
@@ -16,6 +16,7 @@ pub struct DbStats {
     pub entry_count: u64,
     pub total_pages: u32,
     pub high_water_mark: u32,
+    pub merkle_root: [u8; MERKLE_HASH_SIZE],
 }
 
 /// An open Citadel database.
@@ -62,6 +63,7 @@ impl Database {
             entry_count: slot.tree_entries,
             total_pages: slot.total_pages,
             high_water_mark: slot.high_water_mark,
+            merkle_root: slot.merkle_root,
         }
     }
 
@@ -189,6 +191,13 @@ impl Database {
         fs::copy(&self.key_path, &dest_key_path)?;
 
         Ok(())
+    }
+}
+
+impl Database {
+    #[doc(hidden)]
+    pub fn manager(&self) -> &TxnManager {
+        &self.manager
     }
 }
 

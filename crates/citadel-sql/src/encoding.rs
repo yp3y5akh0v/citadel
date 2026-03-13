@@ -1,4 +1,4 @@
-//! Order-preserving key encoding (FoundationDB-style tuple layer)
+//! Order-preserving key encoding (tuple layer)
 //! and row encoding for non-PK column storage.
 
 use crate::error::{Result, SqlError};
@@ -76,7 +76,7 @@ pub fn decode_composite_key(data: &[u8], count: usize) -> Result<Vec<Value>> {
     Ok(values)
 }
 
-// ── Integer encoding (CockroachDB-style varint) ─────────────────────
+// ── Integer encoding (variable-width) ───────────────────────────────
 
 fn encode_integer(val: i64) -> Vec<u8> {
     let mut buf = vec![TAG_INTEGER];

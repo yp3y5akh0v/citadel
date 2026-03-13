@@ -7,6 +7,7 @@ members = [
     "crates/citadel-buffer",
     "crates/citadel-txn",
     "crates/citadel-sql",
+    "crates/citadel-sync",
     "citadel",
 ]
 resolver = "2"
@@ -25,6 +26,7 @@ citadel-io = { path = "crates/citadel-io" }
 citadel-page = { path = "crates/citadel-page" }
 citadel-buffer = { path = "crates/citadel-buffer" }
 citadel-txn = { path = "crates/citadel-txn" }
+citadel-sync = { path = "crates/citadel-sync" }
 
 # Crypto
 aes = "0.8"
@@ -42,6 +44,7 @@ rand = "0.8"
 
 # Hashing
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+blake3 = "1"
 
 # Error handling
 thiserror = "2.0"

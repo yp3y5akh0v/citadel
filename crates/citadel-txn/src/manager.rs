@@ -108,7 +108,16 @@ impl TxnManager {
 
         // Allocate and write the initial empty root page (leaf)
         let root_id = PageId(0);
-        let mut root_page = Page::new(root_id, citadel_core::types::PageType::Leaf, TxnId(1));
+        let root_page = Page::new(root_id, citadel_core::types::PageType::Leaf, TxnId(1));
+
+        // Compute Merkle hash before checksum (hash is inside checksummed region)
+        let mut init_pages = std::collections::HashMap::new();
+        init_pages.insert(root_id, root_page);
+        let merkle_root_hash = crate::merkle::compute_tree_merkle(
+            &mut init_pages, root_id, TxnId(1),
+            &|_| unreachable!("no clean pages for new database"),
+        )?;
+        let mut root_page = init_pages.remove(&root_id).unwrap();
         root_page.update_checksum();
 
         let offset = page_offset(root_id);
@@ -130,6 +139,7 @@ impl TxnManager {
             encryption_epoch: epoch,
             dek_id,
             checksum: 0,
+            merkle_root: merkle_root_hash,
         };
         write_commit_slot(&*io, 0, &slot)?;
         io.fsync()?;
@@ -235,6 +245,14 @@ impl TxnManager {
             oldest_active,
         )?;
 
+        // Compute Merkle hashes for main tree before checksums and encryption.
+        // This sets merkle_hash in dirty page headers at [36..64], which is
+        // inside the checksummed region — must happen before update_checksum().
+        let merkle_root_hash = crate::merkle::compute_tree_merkle(
+            pages, tree.root, txn_id,
+            &|page_id| self.read_page_from_disk(page_id),
+        )?;
+
         let mut encrypted_pages: Vec<(u64, [u8; PAGE_SIZE])> = Vec::new();
         for page in pages.values_mut() {
             if page.txn_id() == txn_id {
@@ -270,6 +288,7 @@ impl TxnManager {
             encryption_epoch: self.epoch,
             dek_id: old_slot.dek_id,
             checksum: 0, // computed during serialize
+            merkle_root: merkle_root_hash,
         };
         write_commit_slot(&*self.io, inactive_slot_idx, &new_slot)?;
 
@@ -429,6 +448,7 @@ impl TxnManager {
             + total_pages as u64 * PAGE_SIZE as u64;
         dest_io.truncate(needed_size)?;
 
+        let mut root_merkle = [0u8; citadel_core::MERKLE_HASH_SIZE];
         for (&old_id, &new_id) in &old_to_new {
             let mut page = self.read_page_from_disk(old_id)?;
 
@@ -476,6 +496,11 @@ impl TxnManager {
 
             page.update_checksum();
 
+            // Capture root page's Merkle hash (preserved from source)
+            if old_id == slot.tree_root {
+                root_merkle = page.merkle_hash();
+            }
+
             // Encrypt with fresh IV and write to new location
             let offset = page_offset(new_id);
             let mut encrypted = [0u8; PAGE_SIZE];
@@ -510,6 +535,7 @@ impl TxnManager {
             encryption_epoch: slot.encryption_epoch,
             dek_id: slot.dek_id,
             checksum: 0,
+            merkle_root: root_merkle,
         };
 
         header.slots = [new_slot.clone(), new_slot];

@@ -59,6 +59,11 @@ pub const OVERFLOW_DATA_PER_PAGE: usize = 8128; // 8160 - 32
 pub const PENDING_FREE_ENTRY_SIZE: usize = 12; // page_id(4) + freed_at_txn(8)
 pub const PENDING_FREE_ENTRIES_PER_PAGE: usize = USABLE_SIZE / PENDING_FREE_ENTRY_SIZE; // 674
 
+// Merkle hash (inline in page header, BLAKE3 truncated to 28 bytes = 224 bits)
+pub const MERKLE_HASH_SIZE: usize = 28;
+pub const MERKLE_HASH_OFFSET: usize = 36; // page header offset [36..64]
+pub const SLOT_MERKLE_ROOT: usize = 84;   // CommitSlot offset [84..112]
+
 // Buffer pool defaults
 pub const DEFAULT_BUFFER_POOL_SIZE: usize = 256; // pages (2 MiB decrypted)
 

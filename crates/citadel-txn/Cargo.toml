@@ -13,3 +13,4 @@ citadel-io = { workspace = true }
 citadel-page = { workspace = true }
 citadel-buffer = { workspace = true }
 parking_lot = { workspace = true }
+blake3 = { workspace = true }

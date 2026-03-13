@@ -1,0 +1,928 @@
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Hybrid Logical Clock timestamp.
+///
+/// Layout (12 bytes):
+/// - `wall_time`: `i64` — nanoseconds since Unix epoch (true nanosecond precision)
+/// - `logical`: `i32` — counter for events within the same nanosecond
+///
+/// Comparison: wall_time first, then logical (total order).
+/// Big-endian byte serialization preserves comparison order for non-negative values.
+///
+/// Range:
+/// - wall_time: covers ~292 years from epoch (until year 2262)
+/// - logical: up to 2,147,483,647 events per nanosecond
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HlcTimestamp {
+    wall_time: i64,
+    logical: i32,
+}
+
+/// Wire size of an HlcTimestamp in bytes.
+pub const HLC_TIMESTAMP_SIZE: usize = 12;
+
+impl HlcTimestamp {
+    pub const ZERO: Self = Self {
+        wall_time: 0,
+        logical: 0,
+    };
+
+    /// Create from wall-clock time in nanoseconds and logical counter.
+    #[inline]
+    pub fn new(wall_time_ns: i64, logical: i32) -> Self {
+        Self {
+            wall_time: wall_time_ns,
+            logical,
+        }
+    }
+
+    /// Wall-clock time in nanoseconds since Unix epoch.
+    #[inline]
+    pub fn wall_time(&self) -> i64 {
+        self.wall_time
+    }
+
+    /// Logical counter.
+    #[inline]
+    pub fn logical(&self) -> i32 {
+        self.logical
+    }
+
+    /// Serialize to 12 bytes big-endian (preserves comparison order for non-negative values).
+    #[inline]
+    pub fn to_bytes(&self) -> [u8; HLC_TIMESTAMP_SIZE] {
+        let mut buf = [0u8; HLC_TIMESTAMP_SIZE];
+        buf[0..8].copy_from_slice(&self.wall_time.to_be_bytes());
+        buf[8..12].copy_from_slice(&self.logical.to_be_bytes());
+        buf
+    }
+
+    /// Reconstruct from 12 bytes big-endian.
+    #[inline]
+    pub fn from_bytes(b: &[u8; HLC_TIMESTAMP_SIZE]) -> Self {
+        Self {
+            wall_time: i64::from_be_bytes(b[0..8].try_into().unwrap()),
+            logical: i32::from_be_bytes(b[8..12].try_into().unwrap()),
+        }
+    }
+
+    /// Returns `true` if this is the zero/uninitialized timestamp.
+    #[inline]
+    pub fn is_zero(&self) -> bool {
+        self.wall_time == 0 && self.logical == 0
+    }
+}
+
+impl PartialOrd for HlcTimestamp {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HlcTimestamp {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.wall_time
+            .cmp(&other.wall_time)
+            .then(self.logical.cmp(&other.logical))
+    }
+}
+
+impl std::fmt::Debug for HlcTimestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HLC({}ns:{})", self.wall_time, self.logical)
+    }
+}
+
+impl std::fmt::Display for HlcTimestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.wall_time, self.logical)
+    }
+}
+
+/// Errors from HLC clock operations.
+#[derive(Debug, thiserror::Error)]
+pub enum ClockError {
+    #[error(
+        "clock drift exceeded: remote_wall_time={remote_ns}ns, \
+         physical_now={physical_ns}ns, max_drift={max_drift_ns}ns"
+    )]
+    ClockDriftExceeded {
+        remote_ns: i64,
+        physical_ns: i64,
+        max_drift_ns: i64,
+    },
+
+    #[error("HLC counter overflow (>2^31-1 events in same nanosecond)")]
+    CounterOverflow,
+}
+
+/// Source of physical time for the HLC.
+///
+/// Abstracted as a trait to allow deterministic testing with [`ManualClock`].
+pub trait PhysicalClock: Send {
+    /// Current time in nanoseconds since Unix epoch.
+    fn now_ns(&self) -> i64;
+}
+
+/// Physical clock backed by the system clock.
+///
+/// On Linux: provides true nanosecond precision via `clock_gettime(CLOCK_REALTIME)`.
+/// On macOS: microsecond precision for wall clock.
+/// On Windows: ~100ns precision (system timer resolution).
+pub struct SystemClock;
+
+impl PhysicalClock for SystemClock {
+    fn now_ns(&self) -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_nanos() as i64
+    }
+}
+
+/// Manually controlled clock for deterministic testing.
+pub struct ManualClock {
+    time_ns: AtomicI64,
+}
+
+impl ManualClock {
+    /// Create a manual clock starting at `initial_ns` nanoseconds.
+    pub fn new(initial_ns: i64) -> Self {
+        Self {
+            time_ns: AtomicI64::new(initial_ns),
+        }
+    }
+
+    /// Set the clock to an absolute time in nanoseconds.
+    pub fn set(&self, time_ns: i64) {
+        self.time_ns.store(time_ns, Ordering::SeqCst);
+    }
+
+    /// Advance the clock by `delta_ns` nanoseconds.
+    pub fn advance(&self, delta_ns: i64) {
+        self.time_ns.fetch_add(delta_ns, Ordering::SeqCst);
+    }
+}
+
+impl PhysicalClock for ManualClock {
+    fn now_ns(&self) -> i64 {
+        self.time_ns.load(Ordering::SeqCst)
+    }
+}
+
+/// One second in nanoseconds.
+const SECOND_NS: i64 = 1_000_000_000;
+
+/// Default maximum clock drift: 5 seconds.
+const DEFAULT_MAX_DRIFT_NS: i64 = 5 * SECOND_NS;
+
+/// Hybrid Logical Clock state machine.
+///
+/// Two core operations:
+/// - [`now()`](HlcClock::now) — generate a timestamp for a local event
+/// - [`update()`](HlcClock::update) — merge a remote timestamp into local state
+///
+/// `now()` always returns a strictly increasing timestamp.
+/// `update()` advances the internal clock state without generating a new timestamp.
+/// Timestamps are only generated by local events; received timestamps only advance
+/// the clock.
+pub struct HlcClock<C: PhysicalClock = SystemClock> {
+    last: HlcTimestamp,
+    max_drift_ns: i64,
+    clock: C,
+}
+
+impl HlcClock<SystemClock> {
+    /// Create an HLC clock with the system clock and default max drift (5s).
+    pub fn new() -> Self {
+        Self {
+            last: HlcTimestamp::ZERO,
+            max_drift_ns: DEFAULT_MAX_DRIFT_NS,
+            clock: SystemClock,
+        }
+    }
+}
+
+impl<C: PhysicalClock> HlcClock<C> {
+    /// Create an HLC clock with a custom physical clock source.
+    pub fn with_clock(clock: C) -> Self {
+        Self {
+            last: HlcTimestamp::ZERO,
+            max_drift_ns: DEFAULT_MAX_DRIFT_NS,
+            clock,
+        }
+    }
+
+    /// Set the maximum allowed drift in nanoseconds.
+    pub fn set_max_drift_ns(&mut self, max_drift_ns: i64) {
+        self.max_drift_ns = max_drift_ns;
+    }
+
+    /// Seed the clock with a previously persisted timestamp.
+    ///
+    /// Call on startup to restore monotonicity after a restart.
+    /// The next `now()` will return a timestamp strictly greater than `ts`.
+    pub fn set_last(&mut self, ts: HlcTimestamp) {
+        self.last = ts;
+    }
+
+    /// Generate a timestamp for a local event.
+    ///
+    /// Guarantees:
+    /// - Monotonically increasing (never returns a value <= previous)
+    /// - Wall time tracks physical clock within `max_drift`
+    /// - Returns `ClockError::CounterOverflow` if counter saturates
+    /// - Returns `ClockError::ClockDriftExceeded` if wall time is too far
+    ///   ahead of physical time
+    pub fn now(&mut self) -> Result<HlcTimestamp, ClockError> {
+        let pt = self.clock.now_ns();
+
+        let ts = if self.last.wall_time >= pt {
+            // Physical clock hasn't advanced past stored wall time.
+            // Increment logical counter.
+            let new_logical = self
+                .last
+                .logical
+                .checked_add(1)
+                .ok_or(ClockError::CounterOverflow)?;
+
+            // Check drift: stored wall_time vs physical
+            self.check_drift(self.last.wall_time, pt)?;
+
+            HlcTimestamp::new(self.last.wall_time, new_logical)
+        } else {
+            // Physical clock advanced — use it, reset logical to 0.
+            HlcTimestamp::new(pt, 0)
+        };
+
+        self.last = ts;
+        Ok(ts)
+    }
+
+    /// Merge a remote timestamp into local clock state.
+    ///
+    /// Advances the internal state so that subsequent `now()` calls
+    /// will produce timestamps strictly greater than the remote.
+    /// Does NOT generate a new timestamp.
+    ///
+    /// Returns `ClockError::ClockDriftExceeded` if the remote wall time
+    /// is more than `max_drift` ahead of the local physical clock.
+    pub fn update(&mut self, remote: HlcTimestamp) -> Result<(), ClockError> {
+        let pt = self.clock.now_ns();
+
+        // Reject remote timestamps that are too far ahead
+        if remote.wall_time.saturating_sub(pt) > self.max_drift_ns {
+            return Err(ClockError::ClockDriftExceeded {
+                remote_ns: remote.wall_time,
+                physical_ns: pt,
+                max_drift_ns: self.max_drift_ns,
+            });
+        }
+
+        if remote.wall_time > self.last.wall_time {
+            // Remote is ahead: adopt its wall time and logical
+            self.last = remote;
+        } else if remote.wall_time == self.last.wall_time {
+            // Same wall time: take the max logical
+            if remote.logical > self.last.logical {
+                self.last = HlcTimestamp::new(self.last.wall_time, remote.logical);
+            }
+        }
+        // If remote.wall_time < self.last.wall_time: do nothing
+
+        Ok(())
+    }
+
+    /// Returns the last generated or merged timestamp.
+    pub fn last_timestamp(&self) -> HlcTimestamp {
+        self.last
+    }
+
+    /// Returns a reference to the underlying physical clock.
+    pub fn physical_clock(&self) -> &C {
+        &self.clock
+    }
+
+    fn check_drift(&self, wall_time_ns: i64, physical_ns: i64) -> Result<(), ClockError> {
+        if wall_time_ns.saturating_sub(physical_ns) > self.max_drift_ns {
+            return Err(ClockError::ClockDriftExceeded {
+                remote_ns: wall_time_ns,
+                physical_ns,
+                max_drift_ns: self.max_drift_ns,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECOND: i64 = 1_000_000_000;
+    const MS: i64 = 1_000_000;
+
+    // ── HlcTimestamp basics ───────────────────────────────────────────
+
+    #[test]
+    fn new_and_accessors() {
+        let ts = HlcTimestamp::new(1_000_000_000, 42);
+        assert_eq!(ts.wall_time(), 1_000_000_000);
+        assert_eq!(ts.logical(), 42);
+    }
+
+    #[test]
+    fn zero_timestamp() {
+        let ts = HlcTimestamp::ZERO;
+        assert_eq!(ts.wall_time(), 0);
+        assert_eq!(ts.logical(), 0);
+        assert!(ts.is_zero());
+    }
+
+    #[test]
+    fn non_zero_is_not_zero() {
+        let ts = HlcTimestamp::new(1, 0);
+        assert!(!ts.is_zero());
+        let ts2 = HlcTimestamp::new(0, 1);
+        assert!(!ts2.is_zero());
+    }
+
+    #[test]
+    fn ordering_wall_time_dominates() {
+        let a = HlcTimestamp::new(100, i32::MAX);
+        let b = HlcTimestamp::new(101, 0);
+        assert!(a < b);
+    }
+
+    #[test]
+    fn ordering_logical_tiebreaks() {
+        let a = HlcTimestamp::new(100, 5);
+        let b = HlcTimestamp::new(100, 6);
+        assert!(a < b);
+    }
+
+    #[test]
+    fn ordering_equality() {
+        let a = HlcTimestamp::new(100, 5);
+        let b = HlcTimestamp::new(100, 5);
+        assert_eq!(a, b);
+        assert!(a <= b);
+        assert!(a >= b);
+    }
+
+    #[test]
+    fn ordering_negative_wall_time() {
+        let a = HlcTimestamp::new(-100, 0);
+        let b = HlcTimestamp::new(0, 0);
+        let c = HlcTimestamp::new(100, 0);
+        assert!(a < b);
+        assert!(b < c);
+    }
+
+    // ── Byte serialization ────────────────────────────────────────────
+
+    #[test]
+    fn bytes_roundtrip() {
+        let ts = HlcTimestamp::new(123_456_789_000_000, 1000);
+        let bytes = ts.to_bytes();
+        assert_eq!(bytes.len(), 12);
+        let ts2 = HlcTimestamp::from_bytes(&bytes);
+        assert_eq!(ts, ts2);
+    }
+
+    #[test]
+    fn bytes_roundtrip_zero() {
+        let ts = HlcTimestamp::ZERO;
+        let bytes = ts.to_bytes();
+        let ts2 = HlcTimestamp::from_bytes(&bytes);
+        assert_eq!(ts, ts2);
+    }
+
+    #[test]
+    fn bytes_roundtrip_max() {
+        let ts = HlcTimestamp::new(i64::MAX, i32::MAX);
+        let bytes = ts.to_bytes();
+        let ts2 = HlcTimestamp::from_bytes(&bytes);
+        assert_eq!(ts, ts2);
+    }
+
+    #[test]
+    fn bytes_preserve_order_for_positive_values() {
+        let a = HlcTimestamp::new(100, 5);
+        let b = HlcTimestamp::new(100, 6);
+        let c = HlcTimestamp::new(101, 0);
+
+        let ba = a.to_bytes();
+        let bb = b.to_bytes();
+        let bc = c.to_bytes();
+
+        assert!(ba < bb);
+        assert!(bb < bc);
+    }
+
+    #[test]
+    fn bytes_wall_time_is_big_endian() {
+        let ts = HlcTimestamp::new(0x0102_0304_0506_0708, 0);
+        let bytes = ts.to_bytes();
+        assert_eq!(&bytes[0..8], &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+    }
+
+    #[test]
+    fn bytes_logical_is_big_endian() {
+        let ts = HlcTimestamp::new(0, 0x01020304);
+        let bytes = ts.to_bytes();
+        assert_eq!(&bytes[8..12], &[0x01, 0x02, 0x03, 0x04]);
+    }
+
+    // ── Display / Debug ───────────────────────────────────────────────
+
+    #[test]
+    fn display_format() {
+        let ts = HlcTimestamp::new(1_000_000_000, 5);
+        assert_eq!(format!("{ts}"), "1000000000:5");
+    }
+
+    #[test]
+    fn debug_format() {
+        let ts = HlcTimestamp::new(1_000_000_000, 5);
+        assert_eq!(format!("{ts:?}"), "HLC(1000000000ns:5)");
+    }
+
+    // ── ManualClock ───────────────────────────────────────────────────
+
+    #[test]
+    fn manual_clock_basic() {
+        let mc = ManualClock::new(100);
+        assert_eq!(mc.now_ns(), 100);
+        mc.advance(50);
+        assert_eq!(mc.now_ns(), 150);
+        mc.set(200);
+        assert_eq!(mc.now_ns(), 200);
+    }
+
+    // ── SystemClock ───────────────────────────────────────────────────
+
+    #[test]
+    fn system_clock_produces_reasonable_values() {
+        let sc = SystemClock;
+        let now = sc.now_ns();
+        // Should be after 2020-01-01 in nanoseconds
+        let jan_2020_ns: i64 = 1_577_836_800 * SECOND;
+        assert!(now > jan_2020_ns);
+        // Should fit in i64 (won't overflow until year 2262)
+        assert!(now > 0);
+    }
+
+    // ── HlcClock::now() ──────────────────────────────────────────────
+
+    #[test]
+    fn now_monotonic() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+
+        let t1 = clock.now().unwrap();
+        let t2 = clock.now().unwrap();
+        let t3 = clock.now().unwrap();
+
+        assert!(t1 < t2);
+        assert!(t2 < t3);
+    }
+
+    #[test]
+    fn now_same_physical_increments_logical() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+
+        let t1 = clock.now().unwrap();
+        let t2 = clock.now().unwrap();
+
+        assert_eq!(t1.wall_time(), 1000 * SECOND);
+        assert_eq!(t1.logical(), 0);
+        assert_eq!(t2.wall_time(), 1000 * SECOND);
+        assert_eq!(t2.logical(), 1);
+    }
+
+    #[test]
+    fn now_physical_advance_resets_logical() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+
+        let _t1 = clock.now().unwrap();
+        let _t2 = clock.now().unwrap();
+        assert_eq!(_t2.logical(), 1);
+
+        // Advance by 1 nanosecond
+        clock.physical_clock().advance(1);
+        let t3 = clock.now().unwrap();
+        assert_eq!(t3.wall_time(), 1000 * SECOND + 1);
+        assert_eq!(t3.logical(), 0);
+    }
+
+    #[test]
+    fn now_backward_jump_stays_at_high_watermark() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+
+        let t1 = clock.now().unwrap();
+        assert_eq!(t1.wall_time(), 1000 * SECOND);
+
+        // Jump backward by 2 seconds (within 5s default max drift)
+        clock.physical_clock().set(998 * SECOND);
+        let t2 = clock.now().unwrap();
+
+        // Should stay at high watermark, logical increments
+        assert_eq!(t2.wall_time(), 1000 * SECOND);
+        assert!(t2 > t1);
+    }
+
+    #[test]
+    fn now_counter_overflow() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+
+        // Seed near max logical
+        clock.set_last(HlcTimestamp::new(1000 * SECOND, i32::MAX - 1));
+
+        // One more should work
+        let t = clock.now().unwrap();
+        assert_eq!(t.logical(), i32::MAX);
+
+        // Next should overflow
+        let err = clock.now().unwrap_err();
+        assert!(matches!(err, ClockError::CounterOverflow));
+    }
+
+    #[test]
+    fn now_counter_overflow_recovery_via_time_advance() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+
+        // Max out counter
+        clock.set_last(HlcTimestamp::new(1000 * SECOND, i32::MAX));
+
+        // Overflow at same time
+        let err = clock.now().unwrap_err();
+        assert!(matches!(err, ClockError::CounterOverflow));
+
+        // Advance physical time — should recover
+        clock.physical_clock().advance(1);
+        let t = clock.now().unwrap();
+        assert_eq!(t.wall_time(), 1000 * SECOND + 1);
+        assert_eq!(t.logical(), 0);
+    }
+
+    #[test]
+    fn now_drift_protection() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+        clock.set_max_drift_ns(SECOND); // 1 second max drift
+
+        // Inject a far-future timestamp
+        clock.set_last(HlcTimestamp::new(1010 * SECOND, 0));
+
+        // now() should fail because wall_time is 10s ahead of physical
+        let err = clock.now().unwrap_err();
+        assert!(matches!(err, ClockError::ClockDriftExceeded { .. }));
+    }
+
+    // ── HlcClock::update() ───────────────────────────────────────────
+
+    #[test]
+    fn update_remote_behind() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+
+        let _t1 = clock.now().unwrap(); // (1000s, 0)
+
+        // Remote is behind
+        let remote = HlcTimestamp::new(500 * SECOND, 99);
+        clock.update(remote).unwrap();
+
+        // State unchanged — local was ahead
+        assert_eq!(clock.last_timestamp().wall_time(), 1000 * SECOND);
+        assert_eq!(clock.last_timestamp().logical(), 0);
+    }
+
+    #[test]
+    fn update_remote_ahead() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+
+        let _t1 = clock.now().unwrap(); // (1000s, 0)
+
+        // Remote is ahead (within drift)
+        let remote = HlcTimestamp::new(1002 * SECOND, 5);
+        clock.update(remote).unwrap();
+
+        // State adopted remote
+        assert_eq!(clock.last_timestamp().wall_time(), 1002 * SECOND);
+        assert_eq!(clock.last_timestamp().logical(), 5);
+
+        // Next now() is strictly after remote
+        let t2 = clock.now().unwrap();
+        assert!(t2 > remote);
+        assert_eq!(t2.wall_time(), 1002 * SECOND);
+        assert_eq!(t2.logical(), 6);
+    }
+
+    #[test]
+    fn update_remote_same_wall_time_higher_logical() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+
+        let _t1 = clock.now().unwrap(); // (1000s, 0)
+
+        // Remote has same wall time but higher logical
+        let remote = HlcTimestamp::new(1000 * SECOND, 10);
+        clock.update(remote).unwrap();
+
+        // State adopted higher logical
+        assert_eq!(clock.last_timestamp().logical(), 10);
+
+        // Next now() increments from merged state
+        let t2 = clock.now().unwrap();
+        assert_eq!(t2.logical(), 11);
+    }
+
+    #[test]
+    fn update_remote_same_wall_time_lower_logical() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+
+        // Generate several events
+        for _ in 0..5 {
+            clock.now().unwrap();
+        }
+        // State: (1000s, 4)
+
+        // Remote has same wall time but lower logical
+        let remote = HlcTimestamp::new(1000 * SECOND, 2);
+        clock.update(remote).unwrap();
+
+        // State unchanged — local logical was higher
+        assert_eq!(clock.last_timestamp().logical(), 4);
+    }
+
+    #[test]
+    fn update_drift_exceeded() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+        clock.set_max_drift_ns(SECOND); // 1 second
+
+        // Remote is 10 seconds ahead
+        let remote = HlcTimestamp::new(1010 * SECOND, 0);
+        let err = clock.update(remote).unwrap_err();
+        assert!(matches!(err, ClockError::ClockDriftExceeded { .. }));
+
+        // State unchanged after rejection
+        assert_eq!(clock.last_timestamp(), HlcTimestamp::ZERO);
+    }
+
+    #[test]
+    fn update_drift_boundary_exact() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+        clock.set_max_drift_ns(SECOND); // 1 second
+
+        // Remote exactly at boundary: should succeed
+        let remote = HlcTimestamp::new(1001 * SECOND, 0);
+        clock.update(remote).unwrap();
+        assert_eq!(clock.last_timestamp().wall_time(), 1001 * SECOND);
+
+        // One nanosecond past boundary: should fail
+        let mc2 = ManualClock::new(1000 * SECOND);
+        let mut clock2 = HlcClock::with_clock(mc2);
+        clock2.set_max_drift_ns(SECOND);
+
+        let remote2 = HlcTimestamp::new(1001 * SECOND + 1, 0);
+        let err = clock2.update(remote2).unwrap_err();
+        assert!(matches!(err, ClockError::ClockDriftExceeded { .. }));
+    }
+
+    #[test]
+    fn update_zero_timestamp_is_noop() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+        let _t1 = clock.now().unwrap();
+
+        clock.update(HlcTimestamp::ZERO).unwrap();
+
+        // State unchanged
+        assert_eq!(clock.last_timestamp().wall_time(), 1000 * SECOND);
+    }
+
+    // ── set_last (persistence) ────────────────────────────────────────
+
+    #[test]
+    fn set_last_restores_monotonicity() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+
+        let persisted = HlcTimestamp::new(1000 * SECOND, 50);
+        clock.set_last(persisted);
+
+        let t1 = clock.now().unwrap();
+        assert!(t1 > persisted);
+        assert_eq!(t1.logical(), 51);
+    }
+
+    // ── Two clocks syncing ────────────────────────────────────────────
+
+    #[test]
+    fn two_clocks_converge() {
+        let mc_a = ManualClock::new(1000 * SECOND);
+        let mc_b = ManualClock::new(1000 * SECOND + 50 * MS);
+
+        let mut clock_a = HlcClock::with_clock(mc_a);
+        let mut clock_b = HlcClock::with_clock(mc_b);
+
+        // A generates event
+        let ta1 = clock_a.now().unwrap();
+        assert_eq!(ta1.wall_time(), 1000 * SECOND);
+
+        // B generates event
+        let tb1 = clock_b.now().unwrap();
+        assert_eq!(tb1.wall_time(), 1000 * SECOND + 50 * MS);
+
+        // A receives B's timestamp via update, then generates its own
+        clock_a.update(tb1).unwrap();
+        let ta2 = clock_a.now().unwrap();
+        // A should advance to B's wall time with incremented logical
+        assert_eq!(ta2.wall_time(), 1000 * SECOND + 50 * MS);
+        assert_eq!(ta2.logical(), 1);
+
+        // B receives A's earlier timestamp — already behind, no effect
+        clock_b.update(ta1).unwrap();
+        let tb2 = clock_b.now().unwrap();
+        assert_eq!(tb2.wall_time(), 1000 * SECOND + 50 * MS);
+        assert!(tb2 > tb1);
+    }
+
+    #[test]
+    fn causal_ordering_preserved() {
+        let mc_a = ManualClock::new(1000 * SECOND);
+        let mc_b = ManualClock::new(1000 * SECOND);
+
+        let mut clock_a = HlcClock::with_clock(mc_a);
+        let mut clock_b = HlcClock::with_clock(mc_b);
+
+        // A: write X
+        let ta1 = clock_a.now().unwrap();
+
+        // B receives A's message (sees write X), then writes Y
+        clock_b.update(ta1).unwrap();
+        let tb1 = clock_b.now().unwrap();
+
+        // Causal chain: ta1 (write X) < tb1 (write Y after seeing X)
+        assert!(ta1 < tb1);
+    }
+
+    #[test]
+    fn physical_time_advance_during_sync() {
+        let mc_a = ManualClock::new(1000 * SECOND);
+        let mc_b = ManualClock::new(1000 * SECOND);
+
+        let mut clock_a = HlcClock::with_clock(mc_a);
+        let mut clock_b = HlcClock::with_clock(mc_b);
+
+        // Both generate local events at same physical time
+        let ta = clock_a.now().unwrap(); // (1000s, 0)
+        let tb = clock_b.now().unwrap(); // (1000s, 0) — same!
+
+        // Advance physical time on both
+        clock_a.physical_clock().advance(100 * MS);
+        clock_b.physical_clock().advance(100 * MS);
+
+        // A receives B's timestamp then generates event
+        clock_a.update(tb).unwrap();
+        let ta2 = clock_a.now().unwrap();
+
+        // Physical time advanced past stored wall_time, so logical resets
+        assert_eq!(ta2.wall_time(), 1000 * SECOND + 100 * MS);
+        assert_eq!(ta2.logical(), 0);
+        assert!(ta2 > ta);
+        assert!(ta2 > tb);
+    }
+
+    // ── Three-node ring sync ──────────────────────────────────────────
+
+    #[test]
+    fn three_node_ring_sync() {
+        let mc_a = ManualClock::new(1000 * SECOND);
+        let mc_b = ManualClock::new(1000 * SECOND + 10 * MS);
+        let mc_c = ManualClock::new(1000 * SECOND + 20 * MS);
+
+        let mut a = HlcClock::with_clock(mc_a);
+        let mut b = HlcClock::with_clock(mc_b);
+        let mut c = HlcClock::with_clock(mc_c);
+
+        // Each generates a local event
+        let ta = a.now().unwrap();
+        let tb = b.now().unwrap();
+        let tc = c.now().unwrap();
+
+        // A → B: B receives A's timestamp and generates event
+        b.update(ta).unwrap();
+        let tb2 = b.now().unwrap();
+        assert!(tb2 > tb);
+        assert!(tb2 > ta);
+
+        // B → C: C receives B's latest and generates event
+        c.update(tb2).unwrap();
+        let tc2 = c.now().unwrap();
+        assert!(tc2 > tc);
+        assert!(tc2 > tb2);
+
+        // C → A: A receives C's latest and generates event
+        a.update(tc2).unwrap();
+        let ta2 = a.now().unwrap();
+        assert!(ta2 > ta);
+        assert!(ta2 > tc2);
+    }
+
+    // ── Many events ───────────────────────────────────────────────────
+
+    #[test]
+    fn many_events_same_nanosecond() {
+        let mc = ManualClock::new(1000 * SECOND);
+        let mut clock = HlcClock::with_clock(mc);
+
+        for i in 0i32..1000 {
+            let t = clock.now().unwrap();
+            assert_eq!(t.logical(), i);
+        }
+    }
+
+    // ── Hash consistency ──────────────────────────────────────────────
+
+    #[test]
+    fn hash_consistency() {
+        use std::collections::HashSet;
+        let a = HlcTimestamp::new(100, 5);
+        let b = HlcTimestamp::new(100, 5);
+        let c = HlcTimestamp::new(100, 6);
+
+        let mut set = HashSet::new();
+        set.insert(a);
+        assert!(set.contains(&b));
+        assert!(!set.contains(&c));
+    }
+
+    // ── System clock integration ──────────────────────────────────────
+
+    #[test]
+    fn system_clock_hlc_integration() {
+        let mut clock = HlcClock::new();
+        let t1 = clock.now().unwrap();
+        let t2 = clock.now().unwrap();
+        assert!(t2 > t1);
+        assert!(!t1.is_zero());
+    }
+
+    // ── Nanosecond precision ──────────────────────────────────────────
+
+    #[test]
+    fn nanosecond_precision_preserved() {
+        let ts = HlcTimestamp::new(1_741_000_000_123_456_789, 0);
+        assert_eq!(ts.wall_time(), 1_741_000_000_123_456_789);
+
+        let bytes = ts.to_bytes();
+        let ts2 = HlcTimestamp::from_bytes(&bytes);
+        assert_eq!(ts2.wall_time(), 1_741_000_000_123_456_789);
+    }
+
+    #[test]
+    fn sub_millisecond_ordering() {
+        // Two events 1 microsecond apart
+        let a = HlcTimestamp::new(1000 * SECOND, 0);
+        let b = HlcTimestamp::new(1000 * SECOND + 1000, 0); // +1μs
+        assert!(a < b);
+
+        // Two events 1 nanosecond apart
+        let c = HlcTimestamp::new(1000 * SECOND, 0);
+        let d = HlcTimestamp::new(1000 * SECOND + 1, 0); // +1ns
+        assert!(c < d);
+    }
+
+    #[test]
+    fn i32_max_logical_counter() {
+        // i32::MAX = 2,147,483,647 — much more than u16's 65,535
+        let ts = HlcTimestamp::new(1000 * SECOND, i32::MAX);
+        assert_eq!(ts.logical(), i32::MAX);
+
+        let bytes = ts.to_bytes();
+        let ts2 = HlcTimestamp::from_bytes(&bytes);
+        assert_eq!(ts2.logical(), i32::MAX);
+    }
+
+    // ── Wire size constant ────────────────────────────────────────────
+
+    #[test]
+    fn wire_size_is_12() {
+        assert_eq!(HLC_TIMESTAMP_SIZE, 12);
+        assert_eq!(std::mem::size_of::<i64>() + std::mem::size_of::<i32>(), 12);
+    }
+}

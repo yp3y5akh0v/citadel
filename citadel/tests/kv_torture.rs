@@ -913,7 +913,7 @@ fn compact_then_continue_writing() {
 }
 
 // ============================================================
-// Oracle: deterministic random ops vs BTreeMap
+// Deterministic random ops vs BTreeMap
 // ============================================================
 
 struct SimpleRng(u32);
@@ -927,11 +927,11 @@ impl SimpleRng {
 }
 
 #[test]
-fn kv_oracle_500_transactions() {
+fn kv_expected_500_transactions() {
     let dir = tempfile::tempdir().unwrap();
     let db = fast_builder(&dir.path().join("test.db")).create().unwrap();
 
-    let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     let mut rng = SimpleRng(12345);
 
     for txn in 0..500u32 {
@@ -945,10 +945,10 @@ fn kv_oracle_500_transactions() {
             if rng.next() % 10 < 7 {
                 let val = format!("t{txn}-v{}", rng.next() % 100).into_bytes();
                 wtx.insert(&key, &val).unwrap();
-                oracle.insert(key, val);
-            } else if oracle.contains_key(&key) {
+                expected.insert(key, val);
+            } else if expected.contains_key(&key) {
                 wtx.delete(&key).unwrap();
-                oracle.remove(&key);
+                expected.remove(&key);
             }
         }
 
@@ -956,9 +956,9 @@ fn kv_oracle_500_transactions() {
 
             if txn % 100 == 99 {
             let mut rtx = db.begin_read();
-            assert_eq!(rtx.entry_count(), oracle.len() as u64,
+            assert_eq!(rtx.entry_count(), expected.len() as u64,
                 "count mismatch at txn {txn}");
-            for (k, v) in &oracle {
+            for (k, v) in &expected {
                 assert_eq!(rtx.get(k).unwrap(), Some(v.clone()),
                     "value mismatch for key {:?} at txn {txn}", String::from_utf8_lossy(k));
             }
@@ -966,16 +966,16 @@ fn kv_oracle_500_transactions() {
     }
 
     let mut rtx = db.begin_read();
-    assert_eq!(rtx.entry_count(), oracle.len() as u64);
+    assert_eq!(rtx.entry_count(), expected.len() as u64);
     let mut scan_entries = Vec::new();
     rtx.for_each(|k, v| {
         scan_entries.push((k.to_vec(), v.to_vec()));
         Ok(())
     }).unwrap();
 
-    let oracle_entries: Vec<_> = oracle.into_iter().collect();
-    assert_eq!(scan_entries.len(), oracle_entries.len());
-    for (s, o) in scan_entries.iter().zip(oracle_entries.iter()) {
+    let expected_entries: Vec<_> = expected.into_iter().collect();
+    assert_eq!(scan_entries.len(), expected_entries.len());
+    for (s, o) in scan_entries.iter().zip(expected_entries.iter()) {
         assert_eq!(s, o, "scan mismatch");
     }
 }
