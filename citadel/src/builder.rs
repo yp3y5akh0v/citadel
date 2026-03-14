@@ -37,6 +37,8 @@ pub struct DatabaseBuilder {
     cipher: CipherId,
     kdf_algorithm: KdfAlgorithm,
     pbkdf2_iterations: u32,
+    #[cfg(feature = "audit-log")]
+    audit_config: crate::audit::AuditConfig,
 }
 
 impl DatabaseBuilder {
@@ -50,6 +52,8 @@ impl DatabaseBuilder {
             cipher: CipherId::Aes256Ctr,
             kdf_algorithm: KdfAlgorithm::Argon2id,
             pbkdf2_iterations: PBKDF2_MIN_ITERATIONS,
+            #[cfg(feature = "audit-log")]
+            audit_config: crate::audit::AuditConfig::default(),
         }
     }
 
@@ -93,6 +97,15 @@ impl DatabaseBuilder {
     /// Default: 600,000 (OWASP 2024 minimum for PBKDF2-HMAC-SHA256).
     pub fn pbkdf2_iterations(mut self, iterations: u32) -> Self {
         self.pbkdf2_iterations = iterations;
+        self
+    }
+
+    /// Configure the audit log.
+    ///
+    /// Default: enabled with 10 MB max file size and 3 rotated files.
+    #[cfg(feature = "audit-log")]
+    pub fn audit_config(mut self, config: crate::audit::AuditConfig) -> Self {
+        self.audit_config = config;
         self
     }
 
@@ -147,6 +160,52 @@ impl DatabaseBuilder {
         Ok(())
     }
 
+    /// Build a `Database` from a `TxnManager`, optionally creating or opening
+    /// an audit log. Centralizes the audit-log feature gating.
+    #[cfg(feature = "audit-log")]
+    fn finish(
+        self,
+        manager: TxnManager,
+        key_path: PathBuf,
+        file_id: u64,
+        audit_key: [u8; citadel_core::KEY_SIZE],
+        initial_event: Option<(crate::audit::AuditEventType, Vec<u8>)>,
+    ) -> Result<Database> {
+        use crate::audit;
+
+        let audit_log = if self.audit_config.enabled && !self.path.as_os_str().is_empty() {
+            let audit_path = audit::resolve_audit_path(&self.path);
+            let log = if audit_path.exists() {
+                audit::AuditLog::open_existing(&audit_path, file_id, audit_key, self.audit_config)?
+            } else {
+                audit::AuditLog::create(&audit_path, file_id, audit_key, self.audit_config)?
+            };
+            Some(log)
+        } else {
+            None
+        };
+
+        let db = Database::new(manager, self.path, key_path, audit_log);
+
+        if let Some((event, detail)) = initial_event {
+            db.log_audit(event, &detail);
+        }
+
+        Ok(db)
+    }
+
+    #[cfg(not(feature = "audit-log"))]
+    fn finish(
+        self,
+        manager: TxnManager,
+        key_path: PathBuf,
+        _file_id: u64,
+        _audit_key: [u8; citadel_core::KEY_SIZE],
+        _initial_event: Option<((), Vec<u8>)>,
+    ) -> Result<Database> {
+        Ok(Database::new(manager, self.path, key_path))
+    }
+
     /// Create a new database. Fails if the data file already exists.
     pub fn create(self) -> Result<Database> {
         #[cfg(feature = "fips")]
@@ -196,14 +255,22 @@ impl DatabaseBuilder {
             self.cache_size,
         )?;
 
-        Ok(Database::new(manager, self.path, key_path))
+        #[cfg(feature = "audit-log")]
+        let event = {
+            let detail = vec![self.cipher as u8, self.kdf_algorithm as u8];
+            Some((crate::audit::AuditEventType::DatabaseCreated, detail))
+        };
+        #[cfg(not(feature = "audit-log"))]
+        let event: Option<((), Vec<u8>)> = None;
+
+        self.finish(manager, key_path, file_id, keys.audit_key, event)
     }
 
     /// Create a new in-memory database (volatile, no file I/O).
     ///
     /// Data exists only for the lifetime of the returned `Database`.
     /// Useful for testing, caching, and WASM environments.
-    pub fn create_in_memory(self) -> Result<Database> {
+    pub fn create_in_memory(mut self) -> Result<Database> {
         #[cfg(feature = "fips")]
         self.validate_fips()?;
 
@@ -238,7 +305,9 @@ impl DatabaseBuilder {
             self.cache_size,
         )?;
 
-        Ok(Database::new(manager, PathBuf::new(), PathBuf::new()))
+        // Clear path so finish() won't create an audit log file on disk
+        self.path = PathBuf::new();
+        self.finish(manager, PathBuf::new(), file_id, keys.audit_key, None)
     }
 
     /// Open an existing database. Fails if the data file does not exist.
@@ -293,6 +362,11 @@ impl DatabaseBuilder {
             return Err(Error::BadPassphrase);
         }
 
-        Ok(Database::new(manager, self.path, key_path))
+        #[cfg(feature = "audit-log")]
+        let event = Some((crate::audit::AuditEventType::DatabaseOpened, vec![]));
+        #[cfg(not(feature = "audit-log"))]
+        let event: Option<((), Vec<u8>)> = None;
+
+        self.finish(manager, key_path, header.file_id, keys.audit_key, event)
     }
 }

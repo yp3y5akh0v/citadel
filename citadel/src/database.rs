@@ -10,6 +10,9 @@ use citadel_txn::manager::TxnManager;
 use citadel_txn::read_txn::ReadTxn;
 use citadel_txn::write_txn::WriteTxn;
 
+#[cfg(feature = "audit-log")]
+use crate::audit::{AuditEventType, AuditLog};
+
 /// Database statistics read from the current commit slot.
 #[derive(Debug, Clone)]
 pub struct DbStats {
@@ -27,6 +30,8 @@ pub struct Database {
     manager: TxnManager,
     data_path: PathBuf,
     key_path: PathBuf,
+    #[cfg(feature = "audit-log")]
+    audit_log: Option<parking_lot::Mutex<AuditLog>>,
 }
 
 impl std::fmt::Debug for Database {
@@ -43,6 +48,22 @@ unsafe impl Send for Database {}
 unsafe impl Sync for Database {}
 
 impl Database {
+    #[cfg(feature = "audit-log")]
+    pub(crate) fn new(
+        manager: TxnManager,
+        data_path: PathBuf,
+        key_path: PathBuf,
+        audit_log: Option<AuditLog>,
+    ) -> Self {
+        Self {
+            manager,
+            data_path,
+            key_path,
+            audit_log: audit_log.map(parking_lot::Mutex::new),
+        }
+    }
+
+    #[cfg(not(feature = "audit-log"))]
     pub(crate) fn new(manager: TxnManager, data_path: PathBuf, key_path: PathBuf) -> Self {
         Self {
             manager,
@@ -135,12 +156,26 @@ impl Database {
 
         durable::atomic_write(&self.key_path, &new_kf.serialize())?;
 
+        #[cfg(feature = "audit-log")]
+        self.log_audit(AuditEventType::PassphraseChanged, &[]);
+
         Ok(())
     }
 
     /// Run an integrity check on the database.
     pub fn integrity_check(&self) -> Result<IntegrityReport> {
-        self.manager.integrity_check()
+        let report = self.manager.integrity_check()?;
+
+        #[cfg(feature = "audit-log")]
+        {
+            let error_count = report.errors.len() as u32;
+            self.log_audit(
+                AuditEventType::IntegrityCheckPerformed,
+                &error_count.to_le_bytes(),
+            );
+        }
+
+        Ok(report)
     }
 
     /// Create a hot backup via MVCC snapshot. Also copies the key file.
@@ -155,6 +190,9 @@ impl Database {
 
         let dest_key_path = resolve_key_path_for(dest_path);
         fs::copy(&self.key_path, &dest_key_path)?;
+
+        #[cfg(feature = "audit-log")]
+        self.log_audit_with_path(AuditEventType::BackupCreated, dest_path);
 
         Ok(())
     }
@@ -209,6 +247,9 @@ impl Database {
         )?;
 
         durable::write_and_sync(dest_path, &backup_data)?;
+
+        #[cfg(feature = "audit-log")]
+        self.log_audit_with_path(AuditEventType::KeyBackupExported, dest_path);
 
         Ok(())
     }
@@ -290,6 +331,9 @@ impl Database {
         let dest_key_path = resolve_key_path_for(dest_path);
         fs::copy(&self.key_path, &dest_key_path)?;
 
+        #[cfg(feature = "audit-log")]
+        self.log_audit_with_path(AuditEventType::CompactionPerformed, dest_path);
+
         Ok(())
     }
 }
@@ -298,6 +342,41 @@ impl Database {
     #[doc(hidden)]
     pub fn manager(&self) -> &TxnManager {
         &self.manager
+    }
+
+    /// Path to the audit log file, if audit logging is enabled.
+    #[cfg(feature = "audit-log")]
+    pub fn audit_log_path(&self) -> Option<PathBuf> {
+        if self.audit_log.is_some() && !self.data_path.as_os_str().is_empty() {
+            Some(crate::audit::resolve_audit_path(&self.data_path))
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "audit-log")]
+    pub(crate) fn log_audit(&self, event_type: AuditEventType, detail: &[u8]) {
+        if let Some(ref mutex) = self.audit_log {
+            let _ = mutex.lock().log(event_type, detail);
+        }
+    }
+
+    #[cfg(feature = "audit-log")]
+    fn log_audit_with_path(&self, event_type: AuditEventType, path: &Path) {
+        let path_str = path.to_string_lossy();
+        let path_bytes = path_str.as_bytes();
+        let len = (path_bytes.len() as u16).to_le_bytes();
+        let mut detail = Vec::with_capacity(2 + path_bytes.len());
+        detail.extend_from_slice(&len);
+        detail.extend_from_slice(path_bytes);
+        self.log_audit(event_type, &detail);
+    }
+}
+
+#[cfg(feature = "audit-log")]
+impl Drop for Database {
+    fn drop(&mut self) {
+        self.log_audit(AuditEventType::DatabaseClosed, &[]);
     }
 }
 

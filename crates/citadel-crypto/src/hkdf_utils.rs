@@ -3,17 +3,19 @@ use sha2::Sha256;
 use zeroize::Zeroize;
 
 use citadel_core::{DEK_SIZE, MAC_KEY_SIZE, KEY_SIZE};
-use citadel_core::{HKDF_INFO_DEK, HKDF_INFO_MAC_KEY, HKDF_INFO_KEYFILE_MAC, HKDF_INFO_KMS_MASTER, HKDF_KMS_SALT};
+use citadel_core::{HKDF_INFO_DEK, HKDF_INFO_MAC_KEY, HKDF_INFO_KEYFILE_MAC, HKDF_INFO_KMS_MASTER, HKDF_KMS_SALT, HKDF_INFO_AUDIT_KEY};
 
 pub struct DerivedKeys {
     pub dek: [u8; DEK_SIZE],
     pub mac_key: [u8; MAC_KEY_SIZE],
+    pub audit_key: [u8; KEY_SIZE],
 }
 
 impl Drop for DerivedKeys {
     fn drop(&mut self) {
         self.dek.zeroize();
         self.mac_key.zeroize();
+        self.audit_key.zeroize();
     }
 }
 
@@ -34,7 +36,12 @@ pub fn derive_keys_from_rek(rek: &[u8; KEY_SIZE]) -> DerivedKeys {
     hk.expand(HKDF_INFO_MAC_KEY, &mut mac_key)
         .expect("HKDF expand should not fail for 32-byte output");
 
-    DerivedKeys { dek, mac_key }
+    let hk = Hkdf::<Sha256>::new(Some(&salt), rek);
+    let mut audit_key = [0u8; KEY_SIZE];
+    hk.expand(HKDF_INFO_AUDIT_KEY, &mut audit_key)
+        .expect("HKDF expand should not fail for 32-byte output");
+
+    DerivedKeys { dek, mac_key, audit_key }
 }
 
 /// Derive the key file MAC key from the Master Key.
