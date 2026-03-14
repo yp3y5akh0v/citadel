@@ -487,11 +487,9 @@ fn apply_empty_then_full_then_incremental() {
     let source = fast_builder(&dir.path().join("s.db")).create().unwrap();
     let target = fast_builder(&dir.path().join("t.db")).create().unwrap();
 
-    // Phase 1: empty → empty
     let r1 = sync_push(&source, &target, 1, false);
     assert_eq!(r1, ApplyResult::empty());
 
-    // Phase 2: populate source, full sync
     {
         let mut wtx = source.begin_write().unwrap();
         for i in 0u32..200 {
@@ -504,7 +502,6 @@ fn apply_empty_then_full_then_incremental() {
     assert!(r2.entries_applied >= 200);
     assert_eq!(collect_all(&source), collect_all(&target));
 
-    // Phase 3: small change, incremental sync
     {
         let mut wtx = source.begin_write().unwrap();
         wtx.insert(&999u32.to_be_bytes(), b"new-entry").unwrap();

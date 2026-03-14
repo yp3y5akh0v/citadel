@@ -9,6 +9,7 @@ description = "Citadel: encrypted-first embedded database engine"
 [features]
 default = []
 io-uring = ["citadel-io/io-uring"]
+fips = ["citadel-crypto/fips"]
 
 [dependencies]
 citadel-core = { workspace = true }

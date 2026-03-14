@@ -2,10 +2,11 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
-use citadel_core::types::{Argon2Profile, CipherId};
-use citadel_core::{Error, Result, DEFAULT_BUFFER_POOL_SIZE, FILE_HEADER_SIZE, KEY_FILE_SIZE};
+use citadel_core::types::{Argon2Profile, CipherId, KdfAlgorithm};
+use citadel_core::{Error, Result, DEFAULT_BUFFER_POOL_SIZE, FILE_HEADER_SIZE, KEY_FILE_SIZE, PBKDF2_MIN_ITERATIONS};
 use citadel_crypto::key_manager::{create_key_file, open_key_file};
 use citadel_crypto::page_cipher::compute_dek_id;
+use citadel_io::durable;
 use citadel_io::file_lock;
 use citadel_io::file_manager::FileHeader;
 use citadel_io::sync_io::SyncPageIO;
@@ -34,6 +35,8 @@ pub struct DatabaseBuilder {
     argon2_profile: Argon2Profile,
     cache_size: usize,
     cipher: CipherId,
+    kdf_algorithm: KdfAlgorithm,
+    pbkdf2_iterations: u32,
 }
 
 impl DatabaseBuilder {
@@ -45,6 +48,8 @@ impl DatabaseBuilder {
             argon2_profile: Argon2Profile::Desktop,
             cache_size: DEFAULT_BUFFER_POOL_SIZE,
             cipher: CipherId::Aes256Ctr,
+            kdf_algorithm: KdfAlgorithm::Argon2id,
+            pbkdf2_iterations: PBKDF2_MIN_ITERATIONS,
         }
     }
 
@@ -73,6 +78,24 @@ impl DatabaseBuilder {
         self
     }
 
+    /// Set the key derivation function algorithm.
+    ///
+    /// Default: `Argon2id`. Use `Pbkdf2HmacSha256` for FIPS 140-3 compliance.
+    /// When using PBKDF2, the Argon2 profile is ignored and iterations are
+    /// controlled by `pbkdf2_iterations()`.
+    pub fn kdf_algorithm(mut self, algorithm: KdfAlgorithm) -> Self {
+        self.kdf_algorithm = algorithm;
+        self
+    }
+
+    /// Set the number of PBKDF2 iterations (only used when KDF is PBKDF2).
+    ///
+    /// Default: 600,000 (OWASP 2024 minimum for PBKDF2-HMAC-SHA256).
+    pub fn pbkdf2_iterations(mut self, iterations: u32) -> Self {
+        self.pbkdf2_iterations = iterations;
+        self
+    }
+
     /// Default key file path: `{data_path}.citadel-keys`
     fn resolve_key_path(&self) -> PathBuf {
         self.key_path.clone().unwrap_or_else(|| {
@@ -94,8 +117,41 @@ impl DatabaseBuilder {
         Box::new(SyncPageIO::new(file))
     }
 
+    /// Resolve KDF parameters: (m_cost, t_cost, p_cost) for Argon2id,
+    /// or (iterations, 0, 0) for PBKDF2.
+    fn resolve_kdf_params(&self) -> (u32, u32, u32) {
+        match self.kdf_algorithm {
+            KdfAlgorithm::Argon2id => {
+                let profile = self.argon2_profile;
+                (profile.m_cost(), profile.t_cost(), profile.p_cost())
+            }
+            KdfAlgorithm::Pbkdf2HmacSha256 => {
+                (self.pbkdf2_iterations, 0, 0)
+            }
+        }
+    }
+
+    /// Validate configuration against FIPS constraints (when fips feature enabled).
+    #[cfg(feature = "fips")]
+    fn validate_fips(&self) -> Result<()> {
+        if self.kdf_algorithm != KdfAlgorithm::Pbkdf2HmacSha256 {
+            return Err(Error::FipsViolation(
+                "FIPS mode requires PBKDF2-HMAC-SHA256 (Argon2id is not NIST approved)".into(),
+            ));
+        }
+        if self.cipher == CipherId::ChaCha20 {
+            return Err(Error::FipsViolation(
+                "FIPS mode requires AES-256-CTR (ChaCha20 is not NIST approved)".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Create a new database. Fails if the data file already exists.
     pub fn create(self) -> Result<Database> {
+        #[cfg(feature = "fips")]
+        self.validate_fips()?;
+
         let passphrase = self
             .passphrase
             .as_deref()
@@ -103,19 +159,20 @@ impl DatabaseBuilder {
 
         let key_path = self.resolve_key_path();
         let file_id: u64 = rand::random();
-        let profile = self.argon2_profile;
+        let (m_cost, t_cost, p_cost) = self.resolve_kdf_params();
 
         let (kf, keys) = create_key_file(
             passphrase,
             file_id,
             self.cipher,
-            profile.m_cost(),
-            profile.t_cost(),
-            profile.p_cost(),
+            self.kdf_algorithm,
+            m_cost,
+            t_cost,
+            p_cost,
         )?;
 
-        // Write key file to disk
-        fs::write(&key_path, kf.serialize())?;
+        // Write key file to disk with fsync + directory sync
+        durable::write_and_sync(&key_path, &kf.serialize())?;
 
         // Create data file (fail if exists)
         let file = OpenOptions::new()
@@ -147,21 +204,25 @@ impl DatabaseBuilder {
     /// Data exists only for the lifetime of the returned `Database`.
     /// Useful for testing, caching, and WASM environments.
     pub fn create_in_memory(self) -> Result<Database> {
+        #[cfg(feature = "fips")]
+        self.validate_fips()?;
+
         let passphrase = self
             .passphrase
             .as_deref()
             .ok_or(Error::PassphraseRequired)?;
 
         let file_id: u64 = rand::random();
-        let profile = self.argon2_profile;
+        let (m_cost, t_cost, p_cost) = self.resolve_kdf_params();
 
         let (_kf, keys) = create_key_file(
             passphrase,
             file_id,
             self.cipher,
-            profile.m_cost(),
-            profile.t_cost(),
-            profile.p_cost(),
+            self.kdf_algorithm,
+            m_cost,
+            t_cost,
+            p_cost,
         )?;
 
         let dek_id = compute_dek_id(&keys.mac_key, &keys.dek);

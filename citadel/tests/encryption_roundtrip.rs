@@ -29,6 +29,7 @@ fn full_encryption_roundtrip() {
         passphrase,
         file_id,
         CipherId::Aes256Ctr,
+        KdfAlgorithm::Argon2id,
         64, 1, 1, // minimal params for test speed
     ).unwrap();
     let key_buf = key_file.serialize();
@@ -209,7 +210,7 @@ fn wrong_epoch_detected_on_fetch() {
     let db_path = dir.path().join("epoch.citadel");
 
     let (key_file, keys) = create_key_file(
-        b"password", 0x1111, CipherId::Aes256Ctr, 64, 1, 1,
+        b"password", 0x1111, CipherId::Aes256Ctr, KdfAlgorithm::Argon2id, 64, 1, 1,
     ).unwrap();
     let _ = key_file;
 
@@ -247,7 +248,7 @@ fn buffer_pool_eviction_under_pressure() {
     let db_path = dir.path().join("pressure.citadel");
 
     let (_, keys) = create_key_file(
-        b"pass", 0x2222, CipherId::Aes256Ctr, 64, 1, 1,
+        b"pass", 0x2222, CipherId::Aes256Ctr, KdfAlgorithm::Argon2id, 64, 1, 1,
     ).unwrap();
 
     let file = File::options().read(true).write(true).create(true).open(&db_path).unwrap();
@@ -293,7 +294,7 @@ fn tamper_iv_region_detected() {
     let db_path = dir.path().join("tamper_iv.citadel");
 
     let (_, keys) = create_key_file(
-        b"pass", 0x3333, CipherId::Aes256Ctr, 64, 1, 1,
+        b"pass", 0x3333, CipherId::Aes256Ctr, KdfAlgorithm::Argon2id, 64, 1, 1,
     ).unwrap();
 
     let file = File::options().read(true).write(true).create(true).open(&db_path).unwrap();
@@ -330,7 +331,7 @@ fn tamper_mac_region_detected() {
     let db_path = dir.path().join("tamper_mac.citadel");
 
     let (_, keys) = create_key_file(
-        b"pass", 0x4444, CipherId::Aes256Ctr, 64, 1, 1,
+        b"pass", 0x4444, CipherId::Aes256Ctr, KdfAlgorithm::Argon2id, 64, 1, 1,
     ).unwrap();
 
     let file = File::options().read(true).write(true).create(true).open(&db_path).unwrap();
@@ -364,10 +365,10 @@ fn tamper_mac_region_detected() {
 #[test]
 fn different_keys_produce_different_ciphertext() {
     let (_, keys1) = create_key_file(
-        b"password1", 0x5555, CipherId::Aes256Ctr, 64, 1, 1,
+        b"password1", 0x5555, CipherId::Aes256Ctr, KdfAlgorithm::Argon2id, 64, 1, 1,
     ).unwrap();
     let (_, keys2) = create_key_file(
-        b"password2", 0x5555, CipherId::Aes256Ctr, 64, 1, 1,
+        b"password2", 0x5555, CipherId::Aes256Ctr, KdfAlgorithm::Argon2id, 64, 1, 1,
     ).unwrap();
 
     let mut page = Page::new(PageId(0), PageType::Leaf, TxnId(1));
@@ -389,7 +390,7 @@ fn different_keys_produce_different_ciphertext() {
 #[test]
 fn same_page_encrypted_differently_each_write() {
     let (_, keys) = create_key_file(
-        b"pass", 0x6666, CipherId::Aes256Ctr, 64, 1, 1,
+        b"pass", 0x6666, CipherId::Aes256Ctr, KdfAlgorithm::Argon2id, 64, 1, 1,
     ).unwrap();
 
     let mut page = Page::new(PageId(0), PageType::Leaf, TxnId(1));
@@ -412,7 +413,7 @@ fn cache_hit_returns_identical_data() {
     let db_path = dir.path().join("cache_hit.citadel");
 
     let (_, keys) = create_key_file(
-        b"pass", 0x7777, CipherId::Aes256Ctr, 64, 1, 1,
+        b"pass", 0x7777, CipherId::Aes256Ctr, KdfAlgorithm::Argon2id, 64, 1, 1,
     ).unwrap();
 
     let file = File::options().read(true).write(true).create(true).open(&db_path).unwrap();
@@ -451,7 +452,7 @@ fn multiple_page_types_all_encrypted() {
     let db_path = dir.path().join("types.citadel");
 
     let (_, keys) = create_key_file(
-        b"pass", 0x8888, CipherId::Aes256Ctr, 64, 1, 1,
+        b"pass", 0x8888, CipherId::Aes256Ctr, KdfAlgorithm::Argon2id, 64, 1, 1,
     ).unwrap();
 
     let file = File::options().read(true).write(true).create(true).open(&db_path).unwrap();
@@ -499,7 +500,7 @@ fn page_swap_attack_detected() {
     let db_path = dir.path().join("swap.citadel");
 
     let (_, keys) = create_key_file(
-        b"pass", 0xAAAA, CipherId::Aes256Ctr, 64, 1, 1,
+        b"pass", 0xAAAA, CipherId::Aes256Ctr, KdfAlgorithm::Argon2id, 64, 1, 1,
     ).unwrap();
 
     let file = File::options().read(true).write(true).create(true).open(&db_path).unwrap();
@@ -555,7 +556,7 @@ fn iv_uniqueness_across_many_writes() {
     // AES-CTR with the same IV and key produces the same keystream.
     // Verify that every encryption generates a unique random IV.
     let (_, keys) = create_key_file(
-        b"pass", 0xBBBB, CipherId::Aes256Ctr, 64, 1, 1,
+        b"pass", 0xBBBB, CipherId::Aes256Ctr, KdfAlgorithm::Argon2id, 64, 1, 1,
     ).unwrap();
 
     let mut page = Page::new(PageId(0), PageType::Leaf, TxnId(1));
@@ -585,7 +586,7 @@ fn ctr_bit_flip_caught_before_decrypt() {
     let db_path = dir.path().join("bitflip.citadel");
 
     let (_, keys) = create_key_file(
-        b"pass", 0xCCCC, CipherId::Aes256Ctr, 64, 1, 1,
+        b"pass", 0xCCCC, CipherId::Aes256Ctr, KdfAlgorithm::Argon2id, 64, 1, 1,
     ).unwrap();
 
     let file = File::options().read(true).write(true).create(true).open(&db_path).unwrap();

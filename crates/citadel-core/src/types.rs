@@ -141,6 +141,23 @@ impl ValueType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum KdfAlgorithm {
+    Argon2id = 0,
+    Pbkdf2HmacSha256 = 1,
+}
+
+impl KdfAlgorithm {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Argon2id),
+            1 => Some(Self::Pbkdf2HmacSha256),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Argon2Profile {
     Iot,
     Desktop,
@@ -218,6 +235,13 @@ mod tests {
         assert_eq!(CipherId::from_u8(0), Some(CipherId::Aes256Ctr));
         assert_eq!(CipherId::from_u8(1), Some(CipherId::ChaCha20));
         assert_eq!(CipherId::from_u8(2), None);
+    }
+
+    #[test]
+    fn kdf_algorithm_roundtrip() {
+        assert_eq!(KdfAlgorithm::from_u8(0), Some(KdfAlgorithm::Argon2id));
+        assert_eq!(KdfAlgorithm::from_u8(1), Some(KdfAlgorithm::Pbkdf2HmacSha256));
+        assert_eq!(KdfAlgorithm::from_u8(2), None);
     }
 
     #[test]

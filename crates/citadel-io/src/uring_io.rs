@@ -151,7 +151,9 @@ impl PageIO for UringPageIO {
     }
 
     fn fsync(&self) -> Result<()> {
-        let sqe = opcode::Fsync::new(types::Fd(self.fd)).build();
+        let sqe = opcode::Fsync::new(types::Fd(self.fd))
+            .flags(types::FsyncFlags::DATASYNC)
+            .build();
         self.submit_one(sqe)?;
         Ok(())
     }
@@ -214,8 +216,9 @@ impl PageIO for UringPageIO {
             Self::drain_cqes(&mut ring, chunk.len())?;
         }
 
-        // Final fsync
+        // Final fdatasync — flushes data and file size changes, skips timestamps
         let fsync_sqe = opcode::Fsync::new(types::Fd(self.fd))
+            .flags(types::FsyncFlags::DATASYNC)
             .build()
             .user_data(u64::MAX);
 

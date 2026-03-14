@@ -30,6 +30,7 @@ fn full_encryption_roundtrip() {
         passphrase,
         file_id,
         CipherId::Aes256Ctr,
+        KdfAlgorithm::Argon2id,
         64, 1, 1, // minimal params for test speed
     ).unwrap();
     let key_buf = key_file.serialize();

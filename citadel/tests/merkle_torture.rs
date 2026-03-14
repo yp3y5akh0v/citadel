@@ -1016,7 +1016,6 @@ fn integrity_check_after_complex_workload() {
     let dir = tempfile::tempdir().unwrap();
     let db = fast_builder(&dir.path().join("test.db")).create().unwrap();
 
-    // Phase 1: bulk insert
     let mut wtx = db.begin_write().unwrap();
     for i in 0..500u32 {
         wtx.insert(&i.to_be_bytes(), &format!("value-{i}").into_bytes()).unwrap();
@@ -1025,7 +1024,6 @@ fn integrity_check_after_complex_workload() {
     let r = db.integrity_check().unwrap();
     assert!(r.is_ok(), "after bulk insert: {:?}", r.errors);
 
-    // Phase 2: delete half
     let mut wtx = db.begin_write().unwrap();
     for i in (0..500u32).step_by(2) {
         wtx.delete(&i.to_be_bytes()).unwrap();
@@ -1034,7 +1032,6 @@ fn integrity_check_after_complex_workload() {
     let r = db.integrity_check().unwrap();
     assert!(r.is_ok(), "after bulk delete: {:?}", r.errors);
 
-    // Phase 3: update remaining
     let mut wtx = db.begin_write().unwrap();
     for i in (1..500u32).step_by(2) {
         wtx.insert(&i.to_be_bytes(), b"updated").unwrap();
@@ -1043,7 +1040,6 @@ fn integrity_check_after_complex_workload() {
     let r = db.integrity_check().unwrap();
     assert!(r.is_ok(), "after bulk update: {:?}", r.errors);
 
-    // Phase 4: reinsert deleted
     let mut wtx = db.begin_write().unwrap();
     for i in (0..500u32).step_by(2) {
         wtx.insert(&i.to_be_bytes(), b"reinserted").unwrap();

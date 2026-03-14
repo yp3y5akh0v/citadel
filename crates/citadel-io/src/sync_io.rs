@@ -56,7 +56,10 @@ impl PageIO for SyncPageIO {
 
     fn fsync(&self) -> Result<()> {
         let file = self.file.lock().unwrap();
-        file.sync_all()?;
+        // sync_data() maps to fdatasync() on Linux, F_FULLFSYNC on macOS,
+        // FlushFileBuffers on Windows. Skips unnecessary metadata (timestamps)
+        // while still flushing file size changes on Linux (POSIX requirement).
+        file.sync_data()?;
         Ok(())
     }
 

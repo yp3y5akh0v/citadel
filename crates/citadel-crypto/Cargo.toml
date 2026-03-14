@@ -26,10 +26,9 @@ optional = true
 
 [dependencies.pbkdf2]
 workspace = true
-optional = true
 
 [features]
 default = ["aes-cipher"]
 aes-cipher = []
 chacha = ["dep:chacha20"]
-fips = ["dep:pbkdf2"]
+fips = []

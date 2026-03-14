@@ -64,6 +64,12 @@ pub enum Error {
     #[error("unsupported cipher: {0}")]
     UnsupportedCipher(u8),
 
+    #[error("unsupported KDF algorithm: {0}")]
+    UnsupportedKdf(u8),
+
+    #[error("FIPS mode violation: {0}")]
+    FipsViolation(String),
+
     #[error("table not found: {0}")]
     TableNotFound(String),
 

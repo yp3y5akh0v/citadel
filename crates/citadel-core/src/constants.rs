@@ -46,6 +46,15 @@ pub const HKDF_INFO_KEYFILE_MAC: &[u8] = b"citadel-keyfile-mac";
 pub const HKDF_INFO_KMS_MASTER: &[u8] = b"citadel-master-key";
 pub const HKDF_KMS_SALT: &[u8] = b"citadel-v1";
 
+// PBKDF2 (FIPS mode)
+pub const PBKDF2_MIN_ITERATIONS: u32 = 600_000;
+
+// Key backup file
+pub const KEY_BACKUP_MAGIC: u32 = 0x4B45_5942; // "KEYB"
+pub const KEY_BACKUP_VERSION: u32 = 1;
+pub const KEY_BACKUP_SIZE: usize = 124;
+pub const HKDF_INFO_BACKUP_MAC: &[u8] = b"citadel-backup-mac";
+
 // B+ tree limits
 pub const MAX_KEY_SIZE: usize = 2048;
 pub const MAX_INLINE_VALUE_SIZE: usize = 1920;

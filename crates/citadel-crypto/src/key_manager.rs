@@ -8,10 +8,10 @@ use citadel_core::{
     ARGON2_SALT_SIZE, KEY_FILE_MAGIC, KEY_FILE_SIZE, KEY_FILE_VERSION, KEY_SIZE,
     MAC_SIZE, WRAPPED_KEY_SIZE,
 };
-use citadel_core::types::CipherId;
+use citadel_core::types::{CipherId, KdfAlgorithm};
 
 use crate::hkdf_utils::{derive_keyfile_mac_key, derive_keys_from_rek, DerivedKeys};
-use crate::kdf::derive_mk_argon2id;
+use crate::kdf::derive_mk;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -26,6 +26,7 @@ pub struct KeyFile {
     pub argon2_t_cost: u32,
     pub argon2_p_cost: u32,
     pub cipher_id: CipherId,
+    pub kdf_algorithm: KdfAlgorithm,
     pub wrapped_rek: [u8; WRAPPED_KEY_SIZE],
     pub current_epoch: u32,
     pub prev_wrapped_rek: [u8; WRAPPED_KEY_SIZE],
@@ -46,7 +47,8 @@ impl KeyFile {
         buf[36..40].copy_from_slice(&self.argon2_t_cost.to_le_bytes());
         buf[40..44].copy_from_slice(&self.argon2_p_cost.to_le_bytes());
         buf[44] = self.cipher_id as u8;
-        // [45..48] reserved
+        buf[45] = self.kdf_algorithm as u8;
+        // [46..48] reserved
         buf[48..88].copy_from_slice(&self.wrapped_rek);
         buf[88..92].copy_from_slice(&self.current_epoch.to_le_bytes());
         buf[92..132].copy_from_slice(&self.prev_wrapped_rek);
@@ -72,6 +74,11 @@ impl KeyFile {
         let cipher_id = CipherId::from_u8(buf[44])
             .ok_or(citadel_core::Error::UnsupportedCipher(buf[44]))?;
 
+        // Byte 45: KDF algorithm. 0x00 = Argon2id (backward compatible with
+        // existing key files where this byte was reserved/zero).
+        let kdf_algorithm = KdfAlgorithm::from_u8(buf[45])
+            .ok_or(citadel_core::Error::UnsupportedKdf(buf[45]))?;
+
         Ok(Self {
             magic,
             version,
@@ -81,6 +88,7 @@ impl KeyFile {
             argon2_t_cost: u32::from_le_bytes(buf[36..40].try_into().unwrap()),
             argon2_p_cost: u32::from_le_bytes(buf[40..44].try_into().unwrap()),
             cipher_id,
+            kdf_algorithm,
             wrapped_rek: buf[48..88].try_into().unwrap(),
             current_epoch: u32::from_le_bytes(buf[88..92].try_into().unwrap()),
             prev_wrapped_rek: buf[92..132].try_into().unwrap(),
@@ -138,31 +146,29 @@ pub fn unwrap_rek(mk: &[u8; KEY_SIZE], wrapped: &[u8; WRAPPED_KEY_SIZE]) -> cita
 }
 
 /// Create a new key file for a fresh database.
+///
+/// For Argon2id: m_cost, t_cost, p_cost are the standard Argon2 parameters.
+/// For PBKDF2: m_cost is the iteration count, t_cost and p_cost must be 0.
 pub fn create_key_file(
     passphrase: &[u8],
     file_id: u64,
     cipher_id: CipherId,
+    kdf_algorithm: KdfAlgorithm,
     m_cost: u32,
     t_cost: u32,
     p_cost: u32,
 ) -> citadel_core::Result<(KeyFile, DerivedKeys)> {
     use rand::RngCore;
 
-    // Generate random salt and REK
     let salt = crate::kdf::generate_salt();
     let mut rek = [0u8; KEY_SIZE];
     rand::thread_rng().fill_bytes(&mut rek);
 
-    // Derive MK from passphrase
-    let mk = derive_mk_argon2id(passphrase, &salt, m_cost, t_cost, p_cost)?;
+    let mk = derive_mk(kdf_algorithm, passphrase, &salt, m_cost, t_cost, p_cost)?;
 
-    // Wrap REK with MK
     let wrapped = wrap_rek(&mk, &rek);
-
-    // Derive DEK + MAC_KEY from REK
     let keys = derive_keys_from_rek(&rek);
 
-    // Build key file
     let mut kf = KeyFile {
         magic: KEY_FILE_MAGIC,
         version: KEY_FILE_VERSION,
@@ -172,6 +178,7 @@ pub fn create_key_file(
         argon2_t_cost: t_cost,
         argon2_p_cost: p_cost,
         cipher_id,
+        kdf_algorithm,
         wrapped_rek: wrapped,
         current_epoch: 1,
         prev_wrapped_rek: [0u8; WRAPPED_KEY_SIZE],
@@ -194,13 +201,13 @@ pub fn open_key_file(
 ) -> citadel_core::Result<(KeyFile, DerivedKeys)> {
     let kf = KeyFile::deserialize(buf)?;
 
-    // Check file_id cross-reference
     if kf.file_id != expected_file_id {
         return Err(citadel_core::Error::KeyFileMismatch);
     }
 
-    // Derive MK
-    let mk = derive_mk_argon2id(
+    // Derive MK using the KDF algorithm stored in the key file
+    let mk = derive_mk(
+        kf.kdf_algorithm,
         passphrase,
         &kf.argon2_salt,
         kf.argon2_m_cost,
@@ -208,14 +215,11 @@ pub fn open_key_file(
         kf.argon2_p_cost,
     )?;
 
-    // Verify key file MAC
     kf.verify_mac(&mk)?;
 
-    // Unwrap REK
     let mut rek = unwrap_rek(&mk, &kf.wrapped_rek)
         .map_err(|_| citadel_core::Error::BadPassphrase)?;
 
-    // Derive DEK + MAC_KEY
     let keys = derive_keys_from_rek(&rek);
     rek.zeroize();
 
@@ -232,6 +236,7 @@ mod tests {
             b"test-password",
             0x1234567890ABCDEF,
             CipherId::Aes256Ctr,
+            KdfAlgorithm::Argon2id,
             64, 1, 1,
         ).unwrap();
 
@@ -243,8 +248,45 @@ mod tests {
         assert_eq!(deserialized.version, KEY_FILE_VERSION);
         assert_eq!(deserialized.file_id, 0x1234567890ABCDEF);
         assert_eq!(deserialized.cipher_id, CipherId::Aes256Ctr);
+        assert_eq!(deserialized.kdf_algorithm, KdfAlgorithm::Argon2id);
         assert_eq!(deserialized.current_epoch, 1);
         assert!(!deserialized.rotation_active);
+    }
+
+    #[test]
+    fn key_file_serialize_deserialize_pbkdf2() {
+        let (kf, _keys) = create_key_file(
+            b"test-password",
+            0xDEAD,
+            CipherId::Aes256Ctr,
+            KdfAlgorithm::Pbkdf2HmacSha256,
+            600_000, 0, 0,
+        ).unwrap();
+
+        let serialized = kf.serialize();
+        let deserialized = KeyFile::deserialize(&serialized).unwrap();
+        assert_eq!(deserialized.kdf_algorithm, KdfAlgorithm::Pbkdf2HmacSha256);
+        assert_eq!(deserialized.argon2_m_cost, 600_000);
+        assert_eq!(deserialized.argon2_t_cost, 0);
+        assert_eq!(deserialized.argon2_p_cost, 0);
+    }
+
+    #[test]
+    fn backward_compat_zero_byte_is_argon2id() {
+        // Existing key files have 0x00 at byte 45 (was reserved).
+        // This must be interpreted as Argon2id.
+        let (kf, _) = create_key_file(
+            b"test",
+            42,
+            CipherId::Aes256Ctr,
+            KdfAlgorithm::Argon2id,
+            64, 1, 1,
+        ).unwrap();
+
+        let serialized = kf.serialize();
+        assert_eq!(serialized[45], 0x00); // Argon2id = 0
+        let deserialized = KeyFile::deserialize(&serialized).unwrap();
+        assert_eq!(deserialized.kdf_algorithm, KdfAlgorithm::Argon2id);
     }
 
     #[test]
@@ -253,10 +295,11 @@ mod tests {
             b"test-password",
             42,
             CipherId::Aes256Ctr,
+            KdfAlgorithm::Argon2id,
             64, 1, 1,
         ).unwrap();
 
-        let mk = derive_mk_argon2id(
+        let mk = crate::kdf::derive_mk_argon2id(
             b"test-password",
             &kf.argon2_salt,
             kf.argon2_m_cost,
@@ -266,7 +309,6 @@ mod tests {
 
         assert!(kf.verify_mac(&mk).is_ok());
 
-        // Wrong MK should fail
         let wrong_mk = [0xFFu8; KEY_SIZE];
         assert!(kf.verify_mac(&wrong_mk).is_err());
     }
@@ -301,13 +343,33 @@ mod tests {
             passphrase,
             file_id,
             CipherId::Aes256Ctr,
+            KdfAlgorithm::Argon2id,
             64, 1, 1,
         ).unwrap();
 
         let serialized = kf.serialize();
         let (_kf2, keys2) = open_key_file(&serialized, passphrase, file_id).unwrap();
 
-        // Same REK → same derived keys
+        assert_eq!(keys1.dek, keys2.dek);
+        assert_eq!(keys1.mac_key, keys2.mac_key);
+    }
+
+    #[test]
+    fn open_key_file_pbkdf2() {
+        let passphrase = b"pbkdf2-password";
+        let file_id = 0xBEEF;
+
+        let (kf, keys1) = create_key_file(
+            passphrase,
+            file_id,
+            CipherId::Aes256Ctr,
+            KdfAlgorithm::Pbkdf2HmacSha256,
+            600_000, 0, 0,
+        ).unwrap();
+
+        let serialized = kf.serialize();
+        let (_kf2, keys2) = open_key_file(&serialized, passphrase, file_id).unwrap();
+
         assert_eq!(keys1.dek, keys2.dek);
         assert_eq!(keys1.mac_key, keys2.mac_key);
     }
@@ -318,12 +380,12 @@ mod tests {
             b"correct-password",
             42,
             CipherId::Aes256Ctr,
+            KdfAlgorithm::Argon2id,
             64, 1, 1,
         ).unwrap();
 
         let serialized = kf.serialize();
         let result = open_key_file(&serialized, b"wrong-password", 42);
-        // Should fail with either KeyFileIntegrity or BadPassphrase
         assert!(result.is_err());
     }
 
@@ -333,6 +395,7 @@ mod tests {
             b"password",
             42,
             CipherId::Aes256Ctr,
+            KdfAlgorithm::Argon2id,
             64, 1, 1,
         ).unwrap();
 
@@ -355,14 +418,55 @@ mod tests {
             b"password",
             42,
             CipherId::Aes256Ctr,
+            KdfAlgorithm::Argon2id,
             64, 1, 1,
         ).unwrap();
 
         let mut serialized = kf.serialize();
-        // Tamper with wrapped_rek
         serialized[50] ^= 0x01;
 
         let result = open_key_file(&serialized, b"password", 42);
-        assert!(result.is_err()); // MAC or unwrap will fail
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_kdf_algorithm_rejected() {
+        let (kf, _) = create_key_file(
+            b"password",
+            42,
+            CipherId::Aes256Ctr,
+            KdfAlgorithm::Argon2id,
+            64, 1, 1,
+        ).unwrap();
+
+        let mut serialized = kf.serialize();
+        serialized[45] = 0xFF; // Invalid KDF algorithm
+        let result = KeyFile::deserialize(&serialized);
+        assert!(matches!(result, Err(citadel_core::Error::UnsupportedKdf(0xFF))));
+    }
+
+    #[test]
+    fn pbkdf2_different_keys_from_argon2id() {
+        let passphrase = b"same-password";
+        let file_id = 42;
+
+        let (_, keys_argon2) = create_key_file(
+            passphrase,
+            file_id,
+            CipherId::Aes256Ctr,
+            KdfAlgorithm::Argon2id,
+            64, 1, 1,
+        ).unwrap();
+
+        let (_, keys_pbkdf2) = create_key_file(
+            passphrase,
+            file_id,
+            CipherId::Aes256Ctr,
+            KdfAlgorithm::Pbkdf2HmacSha256,
+            600_000, 0, 0,
+        ).unwrap();
+
+        // Different KDF + random REK = different keys
+        assert_ne!(keys_argon2.dek, keys_pbkdf2.dek);
     }
 }
