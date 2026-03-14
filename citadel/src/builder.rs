@@ -142,6 +142,44 @@ impl DatabaseBuilder {
         Ok(Database::new(manager, self.path, key_path))
     }
 
+    /// Create a new in-memory database (volatile, no file I/O).
+    ///
+    /// Data exists only for the lifetime of the returned `Database`.
+    /// Useful for testing, caching, and WASM environments.
+    pub fn create_in_memory(self) -> Result<Database> {
+        let passphrase = self
+            .passphrase
+            .as_deref()
+            .ok_or(Error::PassphraseRequired)?;
+
+        let file_id: u64 = rand::random();
+        let profile = self.argon2_profile;
+
+        let (_kf, keys) = create_key_file(
+            passphrase,
+            file_id,
+            self.cipher,
+            profile.m_cost(),
+            profile.t_cost(),
+            profile.p_cost(),
+        )?;
+
+        let dek_id = compute_dek_id(&keys.mac_key, &keys.dek);
+        let io: Box<dyn PageIO> = Box::new(citadel_io::memory_io::MemoryPageIO::new());
+
+        let manager = TxnManager::create(
+            io,
+            keys.dek,
+            keys.mac_key,
+            1,
+            file_id,
+            dek_id,
+            self.cache_size,
+        )?;
+
+        Ok(Database::new(manager, PathBuf::new(), PathBuf::new()))
+    }
+
     /// Open an existing database. Fails if the data file does not exist.
     pub fn open(self) -> Result<Database> {
         let passphrase = self

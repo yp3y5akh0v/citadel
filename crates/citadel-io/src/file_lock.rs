@@ -90,6 +90,20 @@ mod platform {
     }
 }
 
+#[cfg(not(any(unix, windows)))]
+mod platform {
+    use std::fs::File;
+    use citadel_core::Result;
+
+    pub fn try_lock_exclusive(_file: &File) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn unlock(_file: &File) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,6 +8,8 @@ members = [
     "crates/citadel-txn",
     "crates/citadel-sql",
     "crates/citadel-sync",
+    "crates/citadel-ffi",
+    "crates/citadel-wasm",
     "citadel",
 ]
 resolver = "2"

@@ -1,0 +1,24 @@
+language = "C"
+include_guard = "CITADEL_H"
+tab_width = 4
+documentation_style = "doxy"
+style = "both"
+cpp_compat = true
+
+[defines]
+"feature = io-uring" = "CITADEL_IO_URING"
+
+[export]
+include = [
+    "citadel_error_t",
+    "CitadelConfig",
+]
+
+[export.rename]
+"CitadelError" = "citadel_error_t"
+
+[fn]
+prefix = "CITADEL_API"
+
+[parse]
+parse_deps = false

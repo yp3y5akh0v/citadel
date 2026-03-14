@@ -1495,7 +1495,7 @@ fn stress_many_to_many_join() {
 }
 
 #[test]
-fn stress_left_join_correctness_oracle() {
+fn stress_left_join_correctness() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut c = Connection::open(&db).unwrap();
