@@ -11,6 +11,7 @@ members = [
     "crates/citadel-ffi",
     "crates/citadel-wasm",
     "citadel",
+    "citadel-cli",
 ]
 resolver = "2"
 
@@ -64,6 +65,15 @@ cipher = "0.4"
 # SQL
 sqlparser = "0.61"
 lru = "0.12"
+
+# CLI
+rustyline = "17"
+comfy-table = "7"
+clap = { version = "4", features = ["derive"] }
+owo-colors = "4"
+rpassword = "7"
+dirs = "6"
+serde_json = "1"
 
 [profile.release]
 lto = "fat"

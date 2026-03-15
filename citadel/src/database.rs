@@ -354,6 +354,20 @@ impl Database {
         }
     }
 
+    /// Verify the audit log's HMAC chain integrity.
+    #[cfg(feature = "audit-log")]
+    pub fn verify_audit_log(&self) -> Result<crate::audit::AuditVerifyResult> {
+        let audit = self.audit_log.as_ref().ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "audit logging is not enabled",
+            ))
+        })?;
+        let guard = audit.lock();
+        let path = crate::audit::resolve_audit_path(&self.data_path);
+        crate::audit::verify_audit_log(&path, guard.audit_key())
+    }
+
     #[cfg(feature = "audit-log")]
     pub(crate) fn log_audit(&self, event_type: AuditEventType, detail: &[u8]) {
         if let Some(ref mutex) = self.audit_log {

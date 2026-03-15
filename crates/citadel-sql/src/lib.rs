@@ -10,4 +10,4 @@ pub mod connection;
 
 pub use connection::Connection;
 pub use error::{SqlError, Result};
-pub use types::{Value, DataType, QueryResult, ExecutionResult};
+pub use types::{Value, DataType, QueryResult, ExecutionResult, TableSchema, ColumnDef, IndexDef};

@@ -12,7 +12,7 @@ use crate::executor;
 use crate::parser;
 use crate::parser::Statement;
 use crate::schema::SchemaManager;
-use crate::types::{ExecutionResult, QueryResult, Value};
+use crate::types::{ExecutionResult, QueryResult, TableSchema, Value};
 
 const DEFAULT_CACHE_CAPACITY: usize = 64;
 
@@ -97,6 +97,11 @@ impl<'a> Connection<'a> {
     /// Returns true if an explicit transaction is active (BEGIN was issued).
     pub fn in_transaction(&self) -> bool {
         self.active_txn.is_some()
+    }
+
+    /// Get the schema for a named table.
+    pub fn table_schema(&self, name: &str) -> Option<&TableSchema> {
+        self.schema.get(name)
     }
 
     fn get_or_parse(&mut self, sql: &str) -> Result<(Statement, usize)> {

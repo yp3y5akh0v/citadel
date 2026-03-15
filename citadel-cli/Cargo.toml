@@ -1,0 +1,28 @@
+[package]
+name = "citadel-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Interactive SQL shell for Citadel encrypted database"
+
+[[bin]]
+name = "citadel"
+path = "src/main.rs"
+
+[features]
+default = ["audit-log"]
+audit-log = ["citadel/audit-log"]
+
+[dependencies]
+citadel = { path = "../citadel" }
+citadel-sql = { path = "../crates/citadel-sql" }
+citadel-core = { workspace = true }
+
+rustyline = { workspace = true }
+comfy-table = { workspace = true }
+clap = { workspace = true }
+owo-colors = { workspace = true }
+rpassword = { workspace = true }
+dirs = { workspace = true }
+serde_json = { workspace = true }

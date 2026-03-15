@@ -178,6 +178,10 @@ pub(crate) struct AuditLog {
 }
 
 impl AuditLog {
+    pub(crate) fn audit_key(&self) -> &[u8; KEY_SIZE] {
+        &self.audit_key
+    }
+
     /// Create a new audit log file.
     pub(crate) fn create(
         path: &Path,
@@ -399,7 +403,6 @@ pub fn read_audit_log(path: &Path) -> citadel_core::Result<Vec<AuditEntry>> {
     let mut entries = Vec::new();
 
     loop {
-        // Read entry sentinel magic
         let mut magic_buf = [0u8; 4];
         match file.read_exact(&mut magic_buf) {
             Ok(()) => {}
@@ -475,7 +478,6 @@ pub fn verify_audit_log(
     let mut entries_verified = 0u64;
 
     loop {
-        // Read entry sentinel magic
         let mut magic_buf = [0u8; 4];
         match file.read_exact(&mut magic_buf) {
             Ok(()) => {}
@@ -667,9 +669,9 @@ mod tests {
     #[test]
     fn entry_serialization_roundtrip() {
         let data = serialize_entry_data(999, 1, AuditEventType::DatabaseCreated, &[0x01, 0x02]);
-        assert_eq!(data.len(), 4 + 8 + 8 + 2 + 2 + 2); // entry_data without HMAC
+        assert_eq!(data.len(), 4 + 8 + 8 + 2 + 2 + 2);
         let entry_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-        assert_eq!(entry_len, 26 + MAC_SIZE); // 26 data bytes + 32 HMAC
+        assert_eq!(entry_len, 26 + MAC_SIZE);
     }
 
     #[test]
@@ -752,9 +754,6 @@ mod tests {
         log.log(AuditEventType::DatabaseOpened, &[]).unwrap();
         drop(log);
 
-        // Tamper: flip a byte in the first entry's timestamp area
-        // Layout: [header:64][magic:4][entry_len:4][timestamp:8]...
-        // Timestamp starts at offset 64 + 4 + 4 = 72
         let mut data = fs::read(&path).unwrap();
         data[AUDIT_HEADER_SIZE + 4 + 5] ^= 0x01;
         fs::write(&path, &data).unwrap();
@@ -811,7 +810,7 @@ mod tests {
 
         let config = AuditConfig {
             enabled: true,
-            max_file_size: 200, // tiny: triggers rotation quickly
+            max_file_size: 200,
             max_rotated_files: 2,
         };
 
@@ -821,10 +820,8 @@ mod tests {
         }
         drop(log);
 
-        // Rotated file should exist
         let rotated = rotated_path(&path, 1);
         assert!(rotated.exists());
-        // Current file should still exist
         assert!(path.exists());
     }
 
