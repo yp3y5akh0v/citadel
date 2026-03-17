@@ -387,6 +387,98 @@ impl Database {
     }
 }
 
+// --- Peer-to-peer sync ---
+
+use citadel_sync::transport::SyncTransport;
+
+/// Outcome of a sync operation.
+#[derive(Debug, Clone)]
+pub struct SyncOutcome {
+    /// Per-table results: `(table_name, entries_applied)`.
+    pub tables_synced: Vec<(Vec<u8>, u64)>,
+    /// Default tree sync result (if performed).
+    pub default_tree: Option<citadel_sync::SyncOutcome>,
+}
+
+const NODE_ID_KEY: &[u8] = b"__citadel_node_id";
+
+impl Database {
+    /// Get or create a persistent NodeId for this database.
+    pub fn node_id(&self) -> Result<citadel_sync::NodeId> {
+        let mut rtx = self.manager.begin_read();
+        if let Some(data) = rtx.get(NODE_ID_KEY)? {
+            if data.len() == 8 {
+                return Ok(citadel_sync::NodeId::from_bytes(
+                    data[..8].try_into().unwrap(),
+                ));
+            }
+        }
+        drop(rtx);
+
+        let node_id = citadel_sync::NodeId::random();
+        let mut wtx = self.manager.begin_write()?;
+        wtx.insert(NODE_ID_KEY, &node_id.to_bytes())?;
+        wtx.commit()?;
+        Ok(node_id)
+    }
+
+    /// Push local named tables to a remote peer.
+    pub fn sync_to(&self, addr: &str) -> Result<SyncOutcome> {
+        let node_id = self.node_id()?;
+        let transport = citadel_sync::TcpTransport::connect(addr)
+            .map_err(sync_err_to_core)?;
+        let session = citadel_sync::SyncSession::new(citadel_sync::SyncConfig {
+            node_id,
+            direction: citadel_sync::SyncDirection::Push,
+            crdt_aware: false,
+        });
+
+        let results = session
+            .sync_tables_as_initiator(&self.manager, &transport)
+            .map_err(sync_err_to_core)?;
+
+        transport.close().map_err(sync_err_to_core)?;
+
+        Ok(SyncOutcome {
+            tables_synced: results
+                .into_iter()
+                .map(|(name, r)| (name, r.entries_applied))
+                .collect(),
+            default_tree: None,
+        })
+    }
+
+    /// Handle an incoming sync session from a remote peer.
+    pub fn handle_sync(&self, stream: std::net::TcpStream) -> Result<SyncOutcome> {
+        let node_id = self.node_id()?;
+        let transport = citadel_sync::TcpTransport::from_stream(stream)
+            .map_err(sync_err_to_core)?;
+        let session = citadel_sync::SyncSession::new(citadel_sync::SyncConfig {
+            node_id,
+            direction: citadel_sync::SyncDirection::Push,
+            crdt_aware: false,
+        });
+
+        let results = session
+            .handle_table_sync_as_responder(&self.manager, &transport)
+            .map_err(sync_err_to_core)?;
+
+        transport.close().map_err(sync_err_to_core)?;
+
+        Ok(SyncOutcome {
+            tables_synced: results
+                .into_iter()
+                .map(|(name, r)| (name, r.entries_applied))
+                .collect(),
+            default_tree: None,
+        })
+    }
+}
+
+fn sync_err_to_core(e: citadel_sync::transport::SyncError) -> Error {
+    Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+}
+
 #[cfg(feature = "audit-log")]
 impl Drop for Database {
     fn drop(&mut self) {

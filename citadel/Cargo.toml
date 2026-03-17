@@ -19,6 +19,7 @@ citadel-io = { workspace = true }
 citadel-page = { workspace = true }
 citadel-buffer = { workspace = true }
 citadel-txn = { workspace = true }
+citadel-sync = { workspace = true }
 rand = { workspace = true }
 hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
@@ -27,4 +28,3 @@ parking_lot = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile = "3"
 blake3 = { workspace = true }
-citadel-sync = { workspace = true }

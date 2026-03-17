@@ -264,6 +264,7 @@ impl<'a> WriteTxn<'a> {
             &self.old_slot,
             &self.deferred_free,
             catalog_root,
+            &self.named_trees,
         )?;
         self.committed = true;
         Ok(())

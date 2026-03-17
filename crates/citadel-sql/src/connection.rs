@@ -104,6 +104,12 @@ impl<'a> Connection<'a> {
         self.schema.get(name)
     }
 
+    /// Reload schemas from the database.
+    pub fn refresh_schema(&mut self) -> Result<()> {
+        self.schema = SchemaManager::load(self.db)?;
+        Ok(())
+    }
+
     fn get_or_parse(&mut self, sql: &str) -> Result<(Statement, usize)> {
         let gen = self.schema.generation();
 

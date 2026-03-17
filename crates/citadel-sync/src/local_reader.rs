@@ -6,23 +6,41 @@ use citadel_txn::manager::TxnManager;
 use crate::diff::{DiffEntry, MerkleHash, PageDigest, TreeReader};
 
 /// `TreeReader` implementation for a local database.
-///
-/// Reads pages directly from the `TxnManager`, decrypting and
-/// verifying HMAC on each read.
 pub struct LocalTreeReader<'a> {
     manager: &'a TxnManager,
+    root_page: PageId,
+    root_hash: MerkleHash,
 }
 
 impl<'a> LocalTreeReader<'a> {
+    /// Create a reader for the default (main) tree.
     pub fn new(manager: &'a TxnManager) -> Self {
-        Self { manager }
+        let slot = manager.current_slot();
+        Self {
+            manager,
+            root_page: slot.tree_root,
+            root_hash: slot.merkle_root,
+        }
+    }
+
+    /// Create a reader for a named table's tree.
+    pub fn for_table(manager: &'a TxnManager, root_page: PageId) -> Result<Self> {
+        let root_hash = if root_page.is_valid() {
+            manager.read_page_from_disk(root_page)?.merkle_hash()
+        } else {
+            [0u8; MERKLE_HASH_SIZE]
+        };
+        Ok(Self {
+            manager,
+            root_page,
+            root_hash,
+        })
     }
 }
 
 impl<'a> TreeReader for LocalTreeReader<'a> {
     fn root_info(&self) -> Result<(PageId, MerkleHash)> {
-        let slot = self.manager.current_slot();
-        Ok((slot.tree_root, slot.merkle_root))
+        Ok((self.root_page, self.root_hash))
     }
 
     fn page_digest(&self, page_id: PageId) -> Result<PageDigest> {

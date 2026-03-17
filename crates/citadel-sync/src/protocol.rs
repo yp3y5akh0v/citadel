@@ -18,6 +18,18 @@ const MSG_DONE: u8 = 8;
 const MSG_ERROR: u8 = 9;
 const MSG_PULL_REQUEST: u8 = 10;
 const MSG_PULL_RESPONSE: u8 = 11;
+const MSG_TABLE_LIST_REQUEST: u8 = 12;
+const MSG_TABLE_LIST_RESPONSE: u8 = 13;
+const MSG_TABLE_SYNC_BEGIN: u8 = 14;
+const MSG_TABLE_SYNC_END: u8 = 15;
+
+/// Metadata about a named table for multi-table sync negotiation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableInfo {
+    pub name: Vec<u8>,
+    pub root_page: PageId,
+    pub root_hash: MerkleHash,
+}
 
 /// Sync protocol messages exchanged between initiator and responder.
 #[derive(Debug, Clone)]
@@ -71,6 +83,22 @@ pub enum SyncMessage {
     PullResponse {
         root_page: PageId,
         root_hash: MerkleHash,
+    },
+    /// Request list of named tables from the remote peer.
+    TableListRequest,
+    /// Response with the list of named tables.
+    TableListResponse {
+        tables: Vec<TableInfo>,
+    },
+    /// Begin syncing a specific named table.
+    TableSyncBegin {
+        table_name: Vec<u8>,
+        root_page: PageId,
+        root_hash: MerkleHash,
+    },
+    /// End syncing a specific named table.
+    TableSyncEnd {
+        table_name: Vec<u8>,
     },
 }
 
@@ -163,6 +191,34 @@ impl SyncMessage {
                 p.extend_from_slice(&root_page.0.to_le_bytes());
                 p.extend_from_slice(root_hash);
                 (MSG_PULL_RESPONSE, p)
+            }
+            SyncMessage::TableListRequest => {
+                (MSG_TABLE_LIST_REQUEST, Vec::new())
+            }
+            SyncMessage::TableListResponse { tables } => {
+                let mut p = Vec::new();
+                p.extend_from_slice(&(tables.len() as u32).to_le_bytes());
+                for t in tables {
+                    p.extend_from_slice(&(t.name.len() as u16).to_le_bytes());
+                    p.extend_from_slice(&t.name);
+                    p.extend_from_slice(&t.root_page.0.to_le_bytes());
+                    p.extend_from_slice(&t.root_hash);
+                }
+                (MSG_TABLE_LIST_RESPONSE, p)
+            }
+            SyncMessage::TableSyncBegin { table_name, root_page, root_hash } => {
+                let mut p = Vec::with_capacity(2 + table_name.len() + 4 + MERKLE_HASH_SIZE);
+                p.extend_from_slice(&(table_name.len() as u16).to_le_bytes());
+                p.extend_from_slice(table_name);
+                p.extend_from_slice(&root_page.0.to_le_bytes());
+                p.extend_from_slice(root_hash);
+                (MSG_TABLE_SYNC_BEGIN, p)
+            }
+            SyncMessage::TableSyncEnd { table_name } => {
+                let mut p = Vec::with_capacity(2 + table_name.len());
+                p.extend_from_slice(&(table_name.len() as u16).to_le_bytes());
+                p.extend_from_slice(table_name);
+                (MSG_TABLE_SYNC_END, p)
             }
         };
 
@@ -293,6 +349,54 @@ impl SyncMessage {
                 let mut root_hash = [0u8; MERKLE_HASH_SIZE];
                 root_hash.copy_from_slice(&payload[4..32]);
                 Ok(SyncMessage::PullResponse { root_page, root_hash })
+            }
+            MSG_TABLE_LIST_REQUEST => {
+                Ok(SyncMessage::TableListRequest)
+            }
+            MSG_TABLE_LIST_RESPONSE => {
+                ensure_len(payload, 4, "TableListResponse")?;
+                let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+                let mut pos = 4;
+                let mut tables = Vec::with_capacity(count);
+                for _ in 0..count {
+                    ensure_len(payload, pos + 2, "TableInfo name_len")?;
+                    let name_len = u16::from_le_bytes(
+                        payload[pos..pos + 2].try_into().unwrap(),
+                    ) as usize;
+                    pos += 2;
+                    ensure_len(payload, pos + name_len + 4 + MERKLE_HASH_SIZE, "TableInfo")?;
+                    let name = payload[pos..pos + name_len].to_vec();
+                    pos += name_len;
+                    let root_page = PageId(u32::from_le_bytes(
+                        payload[pos..pos + 4].try_into().unwrap(),
+                    ));
+                    pos += 4;
+                    let mut root_hash = [0u8; MERKLE_HASH_SIZE];
+                    root_hash.copy_from_slice(&payload[pos..pos + MERKLE_HASH_SIZE]);
+                    pos += MERKLE_HASH_SIZE;
+                    tables.push(TableInfo { name, root_page, root_hash });
+                }
+                Ok(SyncMessage::TableListResponse { tables })
+            }
+            MSG_TABLE_SYNC_BEGIN => {
+                ensure_len(payload, 2, "TableSyncBegin")?;
+                let name_len = u16::from_le_bytes(payload[0..2].try_into().unwrap()) as usize;
+                ensure_len(payload, 2 + name_len + 4 + MERKLE_HASH_SIZE, "TableSyncBegin")?;
+                let table_name = payload[2..2 + name_len].to_vec();
+                let off = 2 + name_len;
+                let root_page = PageId(u32::from_le_bytes(
+                    payload[off..off + 4].try_into().unwrap(),
+                ));
+                let mut root_hash = [0u8; MERKLE_HASH_SIZE];
+                root_hash.copy_from_slice(&payload[off + 4..off + 4 + MERKLE_HASH_SIZE]);
+                Ok(SyncMessage::TableSyncBegin { table_name, root_page, root_hash })
+            }
+            MSG_TABLE_SYNC_END => {
+                ensure_len(payload, 2, "TableSyncEnd")?;
+                let name_len = u16::from_le_bytes(payload[0..2].try_into().unwrap()) as usize;
+                ensure_len(payload, 2 + name_len, "TableSyncEnd")?;
+                let table_name = payload[2..2 + name_len].to_vec();
+                Ok(SyncMessage::TableSyncEnd { table_name })
             }
             _ => Err(ProtocolError::UnknownMessageType(msg_type)),
         }
@@ -631,6 +735,89 @@ mod tests {
         let decoded = SyncMessage::deserialize(&data).unwrap();
         match decoded {
             SyncMessage::DigestRequest { page_ids } => assert!(page_ids.is_empty()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn table_list_request_roundtrip() {
+        let data = SyncMessage::TableListRequest.serialize();
+        let decoded = SyncMessage::deserialize(&data).unwrap();
+        assert!(matches!(decoded, SyncMessage::TableListRequest));
+    }
+
+    #[test]
+    fn table_list_response_roundtrip() {
+        let msg = SyncMessage::TableListResponse {
+            tables: vec![
+                TableInfo {
+                    name: b"users".to_vec(),
+                    root_page: PageId(10),
+                    root_hash: sample_hash(),
+                },
+                TableInfo {
+                    name: b"orders".to_vec(),
+                    root_page: PageId(20),
+                    root_hash: [0xBB; MERKLE_HASH_SIZE],
+                },
+            ],
+        };
+        let data = msg.serialize();
+        let decoded = SyncMessage::deserialize(&data).unwrap();
+        match decoded {
+            SyncMessage::TableListResponse { tables } => {
+                assert_eq!(tables.len(), 2);
+                assert_eq!(tables[0].name, b"users");
+                assert_eq!(tables[0].root_page, PageId(10));
+                assert_eq!(tables[0].root_hash, sample_hash());
+                assert_eq!(tables[1].name, b"orders");
+                assert_eq!(tables[1].root_page, PageId(20));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn table_list_response_empty() {
+        let msg = SyncMessage::TableListResponse { tables: vec![] };
+        let data = msg.serialize();
+        let decoded = SyncMessage::deserialize(&data).unwrap();
+        match decoded {
+            SyncMessage::TableListResponse { tables } => assert!(tables.is_empty()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn table_sync_begin_roundtrip() {
+        let msg = SyncMessage::TableSyncBegin {
+            table_name: b"products".to_vec(),
+            root_page: PageId(77),
+            root_hash: sample_hash(),
+        };
+        let data = msg.serialize();
+        let decoded = SyncMessage::deserialize(&data).unwrap();
+        match decoded {
+            SyncMessage::TableSyncBegin { table_name, root_page, root_hash } => {
+                assert_eq!(table_name, b"products");
+                assert_eq!(root_page, PageId(77));
+                assert_eq!(root_hash, sample_hash());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn table_sync_end_roundtrip() {
+        let msg = SyncMessage::TableSyncEnd {
+            table_name: b"products".to_vec(),
+        };
+        let data = msg.serialize();
+        let decoded = SyncMessage::deserialize(&data).unwrap();
+        match decoded {
+            SyncMessage::TableSyncEnd { table_name } => {
+                assert_eq!(table_name, b"products");
+            }
             _ => panic!("wrong variant"),
         }
     }

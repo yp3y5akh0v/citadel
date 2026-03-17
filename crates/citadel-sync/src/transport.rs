@@ -136,5 +136,9 @@ pub(crate) fn msg_name(msg: &SyncMessage) -> &'static str {
         SyncMessage::Error { .. } => "Error",
         SyncMessage::PullRequest => "PullRequest",
         SyncMessage::PullResponse { .. } => "PullResponse",
+        SyncMessage::TableListRequest => "TableListRequest",
+        SyncMessage::TableListResponse { .. } => "TableListResponse",
+        SyncMessage::TableSyncBegin { .. } => "TableSyncBegin",
+        SyncMessage::TableSyncEnd { .. } => "TableSyncEnd",
     }
 }

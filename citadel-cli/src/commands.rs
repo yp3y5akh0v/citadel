@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::Write;
+use std::net::TcpListener;
 use std::path::Path;
 use std::time::Instant;
 
@@ -38,6 +39,9 @@ const DOT_COMMANDS: &[DotCommand] = &[
     DotCommand { name: ".open", args: "PATH", description: "Open a different database" },
     DotCommand { name: ".output", args: "[FILE]", description: "Redirect output to file (no arg = stdout)" },
     DotCommand { name: ".width", args: "N...", description: "Set column widths for box/table mode" },
+    DotCommand { name: ".sync", args: "HOST:PORT", description: "Push tables to a remote peer" },
+    DotCommand { name: ".listen", args: "[PORT]", description: "Listen for one incoming sync" },
+    DotCommand { name: ".nodeid", args: "", description: "Show this database's node ID" },
 ];
 
 pub enum Action {
@@ -144,6 +148,18 @@ pub fn execute_dot_command(
         }
         ".width" => {
             cmd_width(&args, settings, out);
+            Action::Continue
+        }
+        ".sync" => {
+            cmd_sync(&args, db, conn, out);
+            Action::Continue
+        }
+        ".listen" => {
+            cmd_listen(&args, db, conn, out);
+            Action::Continue
+        }
+        ".nodeid" => {
+            cmd_nodeid(db, out);
             Action::Continue
         }
         _ => {
@@ -724,6 +740,107 @@ fn cmd_width(args: &[&str], settings: &mut Settings, out: &mut dyn Write) {
         }
     }
     settings.column_widths = widths;
+}
+
+fn cmd_sync(args: &[&str], db: &Database, conn: &mut Connection<'_>, out: &mut dyn Write) {
+    let addr = match args.first() {
+        Some(a) => *a,
+        None => {
+            let _ = writeln!(out, "Usage: .sync HOST:PORT");
+            return;
+        }
+    };
+
+    let _ = writeln!(out, "Syncing to {addr}...");
+
+    match db.sync_to(addr) {
+        Ok(outcome) => {
+            print_sync_outcome(&outcome, out);
+            if let Err(e) = conn.refresh_schema() {
+                let _ = writeln!(out, "Warning: failed to refresh schema: {e}");
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(out, "Error: {e}");
+        }
+    }
+}
+
+fn cmd_listen(args: &[&str], db: &Database, conn: &mut Connection<'_>, out: &mut dyn Write) {
+    let port = match args.first() {
+        Some(p) => match p.parse::<u16>() {
+            Ok(port) => port,
+            Err(_) => {
+                let _ = writeln!(out, "Error: invalid port '{p}'");
+                return;
+            }
+        },
+        None => 4248,
+    };
+
+    let listener = match TcpListener::bind(("0.0.0.0", port)) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = writeln!(out, "Error binding port {port}: {e}");
+            return;
+        }
+    };
+
+    let addr = listener.local_addr().unwrap();
+    let _ = writeln!(out, "Listening on {addr}...");
+
+    let (stream, peer) = match listener.accept() {
+        Ok(pair) => pair,
+        Err(e) => {
+            let _ = writeln!(out, "Error accepting connection: {e}");
+            return;
+        }
+    };
+
+    let _ = writeln!(out, "Connection from {peer}");
+
+    match db.handle_sync(stream) {
+        Ok(outcome) => {
+            print_sync_outcome(&outcome, out);
+            if let Err(e) = conn.refresh_schema() {
+                let _ = writeln!(out, "Warning: failed to refresh schema: {e}");
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(out, "Error: {e}");
+        }
+    }
+}
+
+fn cmd_nodeid(db: &Database, out: &mut dyn Write) {
+    match db.node_id() {
+        Ok(id) => {
+            let _ = writeln!(out, "{id}");
+        }
+        Err(e) => {
+            let _ = writeln!(out, "Error: {e}");
+        }
+    }
+}
+
+fn print_sync_outcome(outcome: &citadel::SyncOutcome, out: &mut dyn Write) {
+    if outcome.tables_synced.is_empty() {
+        let _ = writeln!(out, "No tables synced.");
+        return;
+    }
+
+    let mut total: u64 = 0;
+    for (name_bytes, entries) in &outcome.tables_synced {
+        let name = String::from_utf8_lossy(name_bytes);
+        let _ = writeln!(out, "  {name}: {entries} entries");
+        total += entries;
+    }
+    let _ = writeln!(
+        out,
+        "Synced {} table(s), {} total entries.",
+        outcome.tables_synced.len(),
+        total,
+    );
 }
 
 pub fn execute_dot_command_mut(

@@ -5,12 +5,15 @@ pub mod hlc;
 pub mod local_reader;
 pub mod memory_transport;
 pub mod node_id;
+pub mod tcp_transport;
 pub mod patch;
 pub mod protocol;
 pub mod session;
 pub mod transport;
 
-pub use apply::{ApplyResult, apply_patch, apply_patch_to_txn};
+pub use apply::{
+    ApplyResult, apply_patch, apply_patch_to_table, apply_patch_to_table_txn, apply_patch_to_txn,
+};
 pub use crdt::{
     CrdtMeta, DecodeError, DecodedValue, EntryKind, MergeResult,
     CRDT_HEADER_SIZE, CRDT_META_SIZE,
@@ -26,8 +29,9 @@ pub use hlc::{
 };
 pub use local_reader::LocalTreeReader;
 pub use memory_transport::MemoryTransport;
+pub use tcp_transport::TcpTransport;
 pub use node_id::NodeId;
 pub use patch::{PatchEntry, PatchError, SyncPatch};
-pub use protocol::{ProtocolError, SyncMessage};
+pub use protocol::{ProtocolError, SyncMessage, TableInfo};
 pub use session::{SyncConfig, SyncDirection, SyncOutcome, SyncSession};
 pub use transport::{SyncError, SyncTransport};

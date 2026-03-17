@@ -221,6 +221,7 @@ impl TxnManager {
         old_slot: &CommitSlot,
         deferred_free: &[PageId],
         catalog_root: PageId,
+        named_trees: &std::collections::HashMap<Vec<u8>, BTree>,
     ) -> Result<()> {
         let mut state = self.state.lock();
 
@@ -252,6 +253,25 @@ impl TxnManager {
             pages, tree.root, txn_id,
             &|page_id| self.read_page_from_disk(page_id),
         )?;
+
+        // Compute Merkle hashes for named table trees
+        let read_clean = &|page_id| self.read_page_from_disk(page_id);
+        for (_, named_tree) in named_trees {
+            if named_tree.root != PageId::INVALID {
+                crate::merkle::compute_tree_merkle(
+                    pages, named_tree.root, txn_id, read_clean,
+                )?;
+            }
+        }
+
+        // Compute Merkle hash for catalog tree if it changed
+        if catalog_root != PageId::INVALID
+            && catalog_root != old_slot.catalog_root
+        {
+            crate::merkle::compute_tree_merkle(
+                pages, catalog_root, txn_id, read_clean,
+            )?;
+        }
 
         let mut encrypted_pages: Vec<(u64, [u8; PAGE_SIZE])> = Vec::new();
         for page in pages.values_mut() {
@@ -353,6 +373,88 @@ impl TxnManager {
     /// Get the number of active readers (for testing/inspection).
     pub fn reader_count(&self) -> usize {
         self.state.lock().reader_table.len()
+    }
+
+    /// List all named tables in the catalog.
+    pub fn list_tables(&self) -> Result<Vec<(Vec<u8>, TableDescriptor)>> {
+        use citadel_page::{branch_node, leaf_node};
+        use citadel_core::types::ValueType;
+
+        let slot = self.current_slot();
+        if !slot.catalog_root.is_valid() {
+            return Ok(Vec::new());
+        }
+
+        let mut tables = Vec::new();
+        let mut stack = vec![slot.catalog_root];
+        while let Some(page_id) = stack.pop() {
+            let page = self.read_page_from_disk(page_id)?;
+            match page.page_type() {
+                Some(citadel_core::types::PageType::Leaf) => {
+                    for i in 0..page.num_cells() {
+                        let cell = leaf_node::read_cell(&page, i);
+                        if cell.val_type != ValueType::Tombstone
+                            && cell.value.len() >= crate::catalog::TABLE_DESCRIPTOR_SIZE
+                        {
+                            let desc = TableDescriptor::deserialize(cell.value);
+                            tables.push((cell.key.to_vec(), desc));
+                        }
+                    }
+                }
+                Some(citadel_core::types::PageType::Branch) => {
+                    for i in 0..page.num_cells() as usize {
+                        stack.push(branch_node::get_child(&page, i));
+                    }
+                    let right = page.right_child();
+                    if right.is_valid() {
+                        stack.push(right);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(tables)
+    }
+
+    /// Look up a named table's root page by name.
+    pub fn table_root(&self, name: &[u8]) -> Result<Option<PageId>> {
+        use citadel_page::{branch_node, leaf_node};
+        use citadel_core::types::ValueType;
+
+        let slot = self.current_slot();
+        if !slot.catalog_root.is_valid() {
+            return Ok(None);
+        }
+
+        let mut stack = vec![slot.catalog_root];
+        while let Some(page_id) = stack.pop() {
+            let page = self.read_page_from_disk(page_id)?;
+            match page.page_type() {
+                Some(citadel_core::types::PageType::Leaf) => {
+                    for i in 0..page.num_cells() {
+                        let cell = leaf_node::read_cell(&page, i);
+                        if cell.key == name
+                            && cell.val_type != ValueType::Tombstone
+                            && cell.value.len() >= crate::catalog::TABLE_DESCRIPTOR_SIZE
+                        {
+                            let desc = TableDescriptor::deserialize(cell.value);
+                            return Ok(Some(desc.root_page));
+                        }
+                    }
+                }
+                Some(citadel_core::types::PageType::Branch) => {
+                    for i in 0..page.num_cells() as usize {
+                        stack.push(branch_node::get_child(&page, i));
+                    }
+                    let right = page.right_child();
+                    if right.is_valid() {
+                        stack.push(right);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
     }
 
     /// Run integrity check on the database.

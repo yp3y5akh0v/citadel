@@ -98,6 +98,68 @@ pub fn apply_patch_to_txn(
     Ok(result)
 }
 
+/// Apply a sync patch to a named table, creating it if needed.
+pub fn apply_patch_to_table(
+    manager: &TxnManager,
+    table_name: &[u8],
+    patch: &SyncPatch,
+) -> Result<ApplyResult> {
+    if patch.is_empty() {
+        return Ok(ApplyResult::empty());
+    }
+
+    let mut wtx = manager.begin_write()?;
+    match wtx.create_table(table_name) {
+        Ok(()) => {}
+        Err(citadel_core::Error::TableAlreadyExists(_)) => {}
+        Err(e) => return Err(e),
+    }
+    let result = apply_patch_to_table_txn(&mut wtx, table_name, patch)?;
+    wtx.commit()?;
+    Ok(result)
+}
+
+/// Apply a sync patch to a named table within an existing write transaction.
+pub fn apply_patch_to_table_txn(
+    wtx: &mut WriteTxn<'_>,
+    table_name: &[u8],
+    patch: &SyncPatch,
+) -> Result<ApplyResult> {
+    let mut result = ApplyResult::empty();
+
+    for entry in &patch.entries {
+        if patch.crdt_aware {
+            if let Some(ref remote_meta) = entry.crdt_meta {
+                let existing = wtx.table_get(table_name, &entry.key)?;
+                if let Some(local_data) = existing {
+                    if let Ok(local_decoded) = decode_lww_value(&local_data) {
+                        match lww_merge(&local_decoded.meta, remote_meta) {
+                            MergeResult::Local => {
+                                result.entries_skipped += 1;
+                                continue;
+                            }
+                            MergeResult::Equal => {
+                                result.entries_equal += 1;
+                                continue;
+                            }
+                            MergeResult::Remote => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        match entry.kind {
+            EntryKind::Put | EntryKind::Tombstone => {
+                wtx.table_insert(table_name, &entry.key, &entry.value)?;
+            }
+        }
+        result.entries_applied += 1;
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
