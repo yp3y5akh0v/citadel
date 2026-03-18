@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/logo.png" alt="Citadel" width="128">
+  <img src=".github/banner.png" alt="Citadel">
 </p>
 
 <h1 align="center">Citadel</h1>
