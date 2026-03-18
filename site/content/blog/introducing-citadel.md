@@ -34,4 +34,4 @@ Most databases use a write-ahead log for crash recovery. Citadel uses **shadow p
 
 ## What's next
 
-Citadel already supports full SQL (JOINs, subqueries, aggregates, indexes), ACID transactions, P2P encrypted sync, C FFI, and WebAssembly. Head over to the [playground](/demo/) to try it in your browser, or check out the <a href="https://github.com/yp3y5akh0v/citadel" target="_blank" rel="noopener">GitHub repo</a> for the source.
+Citadel already supports full SQL (JOINs, subqueries, aggregates, indexes), ACID transactions, P2P encrypted sync, C FFI, and WebAssembly. Head over to the [playground](@/demo/_index.md) to try it in your browser, or check out the <a href="https://github.com/yp3y5akh0v/citadel" target="_blank" rel="noopener">GitHub repo</a> for the source.
