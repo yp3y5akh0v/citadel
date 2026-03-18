@@ -7,6 +7,7 @@ pub mod audit;
 // Public API
 pub use builder::DatabaseBuilder;
 pub use database::{Database, DbStats, SyncOutcome};
+pub use citadel_sync::SyncKey;
 
 #[cfg(feature = "audit-log")]
 pub use audit::{

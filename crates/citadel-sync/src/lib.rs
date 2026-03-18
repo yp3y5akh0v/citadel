@@ -4,7 +4,9 @@ pub mod diff;
 pub mod hlc;
 pub mod local_reader;
 pub mod memory_transport;
+pub mod noise_transport;
 pub mod node_id;
+pub mod sync_key;
 pub mod tcp_transport;
 pub mod patch;
 pub mod protocol;
@@ -29,6 +31,8 @@ pub use hlc::{
 };
 pub use local_reader::LocalTreeReader;
 pub use memory_transport::MemoryTransport;
+pub use noise_transport::NoiseTransport;
+pub use sync_key::SyncKey;
 pub use tcp_transport::TcpTransport;
 pub use node_id::NodeId;
 pub use patch::{PatchEntry, PatchError, SyncPatch};

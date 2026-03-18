@@ -1,7 +1,7 @@
 use std::net::TcpListener;
 use std::thread;
 
-use citadel::{Argon2Profile, DatabaseBuilder};
+use citadel::{Argon2Profile, DatabaseBuilder, SyncKey};
 
 fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
     DatabaseBuilder::new(path)
@@ -15,6 +15,10 @@ fn listen_random_port() -> TcpListener {
 
 fn addr_of(listener: &TcpListener) -> String {
     listener.local_addr().unwrap().to_string()
+}
+
+fn test_sync_key() -> SyncKey {
+    SyncKey::from_bytes([0x42u8; 32])
 }
 
 // ============================================================
@@ -67,10 +71,10 @@ fn node_id_unique_per_database() {
 #[test]
 fn sync_to_pushes_kv_data() {
     let dir = tempfile::tempdir().unwrap();
+    let key = test_sync_key();
     let db_a = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db_b = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
-    // Insert data into A
     {
         let mut wtx = db_a.begin_write().unwrap();
         wtx.create_table(b"data").unwrap();
@@ -85,9 +89,9 @@ fn sync_to_pushes_kv_data() {
     thread::scope(|s| {
         s.spawn(|| {
             let (stream, _) = listener.accept().unwrap();
-            db_b.handle_sync(stream).unwrap();
+            db_b.handle_sync(stream, &key).unwrap();
         });
-        db_a.sync_to(&addr).unwrap();
+        db_a.sync_to(&addr, &key).unwrap();
     });
 
     // Verify B has the data
@@ -99,10 +103,10 @@ fn sync_to_pushes_kv_data() {
 #[test]
 fn sync_to_creates_missing_table_on_responder() {
     let dir = tempfile::tempdir().unwrap();
+    let key = test_sync_key();
     let db_a = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db_b = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
-    // A has a table that B doesn't
     {
         let mut wtx = db_a.begin_write().unwrap();
         wtx.create_table(b"only_a").unwrap();
@@ -116,9 +120,9 @@ fn sync_to_creates_missing_table_on_responder() {
     thread::scope(|s| {
         s.spawn(|| {
             let (stream, _) = listener.accept().unwrap();
-            db_b.handle_sync(stream).unwrap();
+            db_b.handle_sync(stream, &key).unwrap();
         });
-        let outcome = db_a.sync_to(&addr).unwrap();
+        let outcome = db_a.sync_to(&addr, &key).unwrap();
         assert!(!outcome.tables_synced.is_empty());
     });
 
@@ -129,6 +133,7 @@ fn sync_to_creates_missing_table_on_responder() {
 #[test]
 fn sync_identical_databases_no_changes() {
     let dir = tempfile::tempdir().unwrap();
+    let key = test_sync_key();
     let db_a = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db_b = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
@@ -146,9 +151,9 @@ fn sync_identical_databases_no_changes() {
     thread::scope(|s| {
         s.spawn(|| {
             let (stream, _) = listener.accept().unwrap();
-            db_b.handle_sync(stream).unwrap();
+            db_b.handle_sync(stream, &key).unwrap();
         });
-        let outcome = db_a.sync_to(&addr).unwrap();
+        let outcome = db_a.sync_to(&addr, &key).unwrap();
         assert!(outcome.tables_synced.is_empty());
     });
 }
@@ -156,6 +161,7 @@ fn sync_identical_databases_no_changes() {
 #[test]
 fn sync_multiple_tables_over_tcp() {
     let dir = tempfile::tempdir().unwrap();
+    let key = test_sync_key();
     let db_a = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db_b = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
@@ -174,9 +180,9 @@ fn sync_multiple_tables_over_tcp() {
     thread::scope(|s| {
         s.spawn(|| {
             let (stream, _) = listener.accept().unwrap();
-            db_b.handle_sync(stream).unwrap();
+            db_b.handle_sync(stream, &key).unwrap();
         });
-        let outcome = db_a.sync_to(&addr).unwrap();
+        let outcome = db_a.sync_to(&addr, &key).unwrap();
         assert_eq!(outcome.tables_synced.len(), 2);
     });
 
@@ -192,6 +198,7 @@ fn sync_multiple_tables_over_tcp() {
 #[test]
 fn sync_incremental_two_rounds() {
     let dir = tempfile::tempdir().unwrap();
+    let key = test_sync_key();
     let db_a = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db_b = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
@@ -209,9 +216,9 @@ fn sync_incremental_two_rounds() {
     thread::scope(|s| {
         s.spawn(|| {
             let (stream, _) = listener.accept().unwrap();
-            db_b.handle_sync(stream).unwrap();
+            db_b.handle_sync(stream, &key).unwrap();
         });
-        db_a.sync_to(&addr).unwrap();
+        db_a.sync_to(&addr, &key).unwrap();
     });
 
     // Round 2: add more data
@@ -227,9 +234,9 @@ fn sync_incremental_two_rounds() {
     thread::scope(|s| {
         s.spawn(|| {
             let (stream, _) = listener2.accept().unwrap();
-            db_b.handle_sync(stream).unwrap();
+            db_b.handle_sync(stream, &key).unwrap();
         });
-        db_a.sync_to(&addr2).unwrap();
+        db_a.sync_to(&addr2, &key).unwrap();
     });
 
     let mut rtx = db_b.begin_read();
@@ -244,6 +251,7 @@ fn sync_incremental_two_rounds() {
 #[test]
 fn sync_preserves_responder_data() {
     let dir = tempfile::tempdir().unwrap();
+    let key = test_sync_key();
     let db_a = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db_b = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
@@ -255,7 +263,6 @@ fn sync_preserves_responder_data() {
         wtx.commit().unwrap();
     }
 
-    // B has table "beta" and some default tree data
     {
         let mut wtx = db_b.begin_write().unwrap();
         wtx.create_table(b"beta").unwrap();
@@ -270,12 +277,11 @@ fn sync_preserves_responder_data() {
     thread::scope(|s| {
         s.spawn(|| {
             let (stream, _) = listener.accept().unwrap();
-            db_b.handle_sync(stream).unwrap();
+            db_b.handle_sync(stream, &key).unwrap();
         });
-        db_a.sync_to(&addr).unwrap();
+        db_a.sync_to(&addr, &key).unwrap();
     });
 
-    // B should have A's data AND keep its own
     let mut rtx = db_b.begin_read();
     assert_eq!(rtx.table_get(b"alpha", b"a1").unwrap().unwrap(), b"100");
     assert_eq!(rtx.table_get(b"beta", b"b1").unwrap().unwrap(), b"200");
@@ -289,6 +295,7 @@ fn sync_preserves_responder_data() {
 #[test]
 fn sync_skips_index_tables_over_tcp() {
     let dir = tempfile::tempdir().unwrap();
+    let key = test_sync_key();
     let db_a = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db_b = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
@@ -307,10 +314,9 @@ fn sync_skips_index_tables_over_tcp() {
     thread::scope(|s| {
         s.spawn(|| {
             let (stream, _) = listener.accept().unwrap();
-            db_b.handle_sync(stream).unwrap();
+            db_b.handle_sync(stream, &key).unwrap();
         });
-        let outcome = db_a.sync_to(&addr).unwrap();
-        // Should sync "data" but NOT "__idx_data_name"
+        let outcome = db_a.sync_to(&addr, &key).unwrap();
         assert!(outcome.tables_synced.iter().any(|(n, _)| n == b"data"));
         assert!(!outcome.tables_synced.iter().any(|(n, _)| n.starts_with(b"__idx_")));
     });
@@ -323,6 +329,7 @@ fn sync_skips_index_tables_over_tcp() {
 #[test]
 fn sync_persists_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
+    let key = test_sync_key();
     let path_a = dir.path().join("a.db");
     let path_b = dir.path().join("b.db");
 
@@ -341,9 +348,9 @@ fn sync_persists_across_reopen() {
         thread::scope(|s| {
             s.spawn(|| {
                 let (stream, _) = listener.accept().unwrap();
-                db_b.handle_sync(stream).unwrap();
+                db_b.handle_sync(stream, &key).unwrap();
             });
-            db_a.sync_to(&addr).unwrap();
+            db_a.sync_to(&addr, &key).unwrap();
         });
     }
 
@@ -362,8 +369,9 @@ fn sync_to_connection_refused() {
     let dir = tempfile::tempdir().unwrap();
     let db = fast_builder(&dir.path().join("test.db")).create().unwrap();
 
+    let key = test_sync_key();
     // No listener on this port
-    let result = db.sync_to("127.0.0.1:1");
+    let result = db.sync_to("127.0.0.1:1", &key);
     assert!(result.is_err());
 }
 
@@ -374,6 +382,7 @@ fn sync_to_connection_refused() {
 #[test]
 fn sync_empty_databases_no_crash() {
     let dir = tempfile::tempdir().unwrap();
+    let key = test_sync_key();
     let db_a = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db_b = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
@@ -383,9 +392,9 @@ fn sync_empty_databases_no_crash() {
     thread::scope(|s| {
         s.spawn(|| {
             let (stream, _) = listener.accept().unwrap();
-            db_b.handle_sync(stream).unwrap();
+            db_b.handle_sync(stream, &key).unwrap();
         });
-        let outcome = db_a.sync_to(&addr).unwrap();
+        let outcome = db_a.sync_to(&addr, &key).unwrap();
         assert!(outcome.tables_synced.is_empty());
     });
 }
@@ -397,13 +406,13 @@ fn sync_empty_databases_no_crash() {
 #[test]
 fn node_id_survives_sync() {
     let dir = tempfile::tempdir().unwrap();
+    let key = test_sync_key();
     let db_a = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db_b = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
     let id_a_before = db_a.node_id().unwrap();
     let id_b_before = db_b.node_id().unwrap();
 
-    // Insert data and sync
     {
         let mut wtx = db_a.begin_write().unwrap();
         wtx.create_table(b"t").unwrap();
@@ -417,12 +426,11 @@ fn node_id_survives_sync() {
     thread::scope(|s| {
         s.spawn(|| {
             let (stream, _) = listener.accept().unwrap();
-            db_b.handle_sync(stream).unwrap();
+            db_b.handle_sync(stream, &key).unwrap();
         });
-        db_a.sync_to(&addr).unwrap();
+        db_a.sync_to(&addr, &key).unwrap();
     });
 
-    // Node IDs should be unchanged
     assert_eq!(db_a.node_id().unwrap(), id_a_before);
     assert_eq!(db_b.node_id().unwrap(), id_b_before);
 }
@@ -434,6 +442,7 @@ fn node_id_survives_sync() {
 #[test]
 fn sync_large_table_100_entries() {
     let dir = tempfile::tempdir().unwrap();
+    let key = test_sync_key();
     let db_a = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db_b = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
@@ -441,9 +450,9 @@ fn sync_large_table_100_entries() {
         let mut wtx = db_a.begin_write().unwrap();
         wtx.create_table(b"big").unwrap();
         for i in 0..100u32 {
-            let key = format!("key-{:04}", i);
+            let k = format!("key-{:04}", i);
             let val = format!("value-{}", i * 7);
-            wtx.table_insert(b"big", key.as_bytes(), val.as_bytes()).unwrap();
+            wtx.table_insert(b"big", k.as_bytes(), val.as_bytes()).unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -454,14 +463,13 @@ fn sync_large_table_100_entries() {
     thread::scope(|s| {
         s.spawn(|| {
             let (stream, _) = listener.accept().unwrap();
-            db_b.handle_sync(stream).unwrap();
+            db_b.handle_sync(stream, &key).unwrap();
         });
-        let outcome = db_a.sync_to(&addr).unwrap();
+        let outcome = db_a.sync_to(&addr, &key).unwrap();
         let synced = outcome.tables_synced.iter().find(|(n, _)| n == b"big").unwrap();
         assert_eq!(synced.1, 100);
     });
 
-    // Spot-check a few entries
     let mut rtx = db_b.begin_read();
     assert_eq!(
         rtx.table_get(b"big", b"key-0000").unwrap().unwrap(),
@@ -480,6 +488,7 @@ fn sync_large_table_100_entries() {
 #[test]
 fn three_sync_rounds_over_tcp() {
     let dir = tempfile::tempdir().unwrap();
+    let key = test_sync_key();
     let db_a = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db_b = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
@@ -496,13 +505,12 @@ fn three_sync_rounds_over_tcp() {
         thread::scope(|s| {
             s.spawn(|| {
                 let (stream, _) = listener.accept().unwrap();
-                db_b.handle_sync(stream).unwrap();
+                db_b.handle_sync(stream, &key).unwrap();
             });
-            db_a.sync_to(&addr).unwrap();
+            db_a.sync_to(&addr, &key).unwrap();
         });
     }
 
-    // B should have all 3 tables
     let mut rtx = db_b.begin_read();
     for i in 0..3u32 {
         let table_name = format!("table_{}", i);
@@ -511,4 +519,41 @@ fn three_sync_rounds_over_tcp() {
             b"v"
         );
     }
+}
+
+// ============================================================
+// Wrong key rejected
+// ============================================================
+
+#[test]
+fn sync_wrong_key_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_a = fast_builder(&dir.path().join("a.db")).create().unwrap();
+    let db_b = fast_builder(&dir.path().join("b.db")).create().unwrap();
+
+    let key_a = SyncKey::from_bytes([0x01u8; 32]);
+    let key_b = SyncKey::from_bytes([0x02u8; 32]);
+
+    {
+        let mut wtx = db_a.begin_write().unwrap();
+        wtx.create_table(b"secret").unwrap();
+        wtx.table_insert(b"secret", b"k", b"v").unwrap();
+        wtx.commit().unwrap();
+    }
+
+    let listener = listen_random_port();
+    let addr = addr_of(&listener);
+
+    thread::scope(|s| {
+        let server = s.spawn(|| {
+            let (stream, _) = listener.accept().unwrap();
+            db_b.handle_sync(stream, &key_b)
+        });
+        let client_result = db_a.sync_to(&addr, &key_a);
+
+        assert!(
+            client_result.is_err() || server.join().unwrap().is_err(),
+            "mismatched keys should cause at least one side to fail"
+        );
+    });
 }

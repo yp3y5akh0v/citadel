@@ -423,9 +423,9 @@ impl Database {
     }
 
     /// Push local named tables to a remote peer.
-    pub fn sync_to(&self, addr: &str) -> Result<SyncOutcome> {
+    pub fn sync_to(&self, addr: &str, sync_key: &citadel_sync::SyncKey) -> Result<SyncOutcome> {
         let node_id = self.node_id()?;
-        let transport = citadel_sync::TcpTransport::connect(addr)
+        let transport = citadel_sync::NoiseTransport::connect(addr, sync_key)
             .map_err(sync_err_to_core)?;
         let session = citadel_sync::SyncSession::new(citadel_sync::SyncConfig {
             node_id,
@@ -449,9 +449,9 @@ impl Database {
     }
 
     /// Handle an incoming sync session from a remote peer.
-    pub fn handle_sync(&self, stream: std::net::TcpStream) -> Result<SyncOutcome> {
+    pub fn handle_sync(&self, stream: std::net::TcpStream, sync_key: &citadel_sync::SyncKey) -> Result<SyncOutcome> {
         let node_id = self.node_id()?;
-        let transport = citadel_sync::TcpTransport::from_stream(stream)
+        let transport = citadel_sync::NoiseTransport::accept(stream, sync_key)
             .map_err(sync_err_to_core)?;
         let session = citadel_sync::SyncSession::new(citadel_sync::SyncConfig {
             node_id,
@@ -476,7 +476,10 @@ impl Database {
 }
 
 fn sync_err_to_core(e: citadel_sync::transport::SyncError) -> Error {
-    Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    match e {
+        citadel_sync::transport::SyncError::Io(io) => Error::Io(io),
+        other => Error::Sync(other.to_string()),
+    }
 }
 
 #[cfg(feature = "audit-log")]

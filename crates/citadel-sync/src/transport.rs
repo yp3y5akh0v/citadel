@@ -26,13 +26,13 @@ pub enum SyncError {
 
     #[error("patch error: {0}")]
     Patch(#[from] crate::patch::PatchError),
+
+    #[error("handshake failed: {0}")]
+    Handshake(String),
 }
 
 /// Bidirectional message transport for sync protocol.
-///
-/// Methods take `&self` (not `&mut self`) to allow shared access between
-/// the `SyncSession` and `RemoteTreeReader` during Merkle diff computation.
-/// Implementations use interior mutability for stream state.
+/// Uses `&self` with interior mutability for shared access during Merkle diff.
 pub trait SyncTransport: Send {
     /// Send a message to the remote peer.
     fn send(&self, msg: &SyncMessage) -> std::result::Result<(), SyncError>;

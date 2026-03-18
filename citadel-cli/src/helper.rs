@@ -26,7 +26,7 @@ const DOT_COMMANDS: &[&str] = &[
     ".mode", ".headers", ".nullvalue", ".timer", ".changes",
     ".stats", ".backup", ".compact", ".verify", ".audit",
     ".rekey", ".dump", ".read", ".open", ".output", ".width",
-    ".sync", ".listen", ".nodeid",
+    ".sync", ".listen", ".keygen", ".nodeid",
 ];
 
 pub struct CitadelHelper {

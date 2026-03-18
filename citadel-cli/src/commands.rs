@@ -39,8 +39,9 @@ const DOT_COMMANDS: &[DotCommand] = &[
     DotCommand { name: ".open", args: "PATH", description: "Open a different database" },
     DotCommand { name: ".output", args: "[FILE]", description: "Redirect output to file (no arg = stdout)" },
     DotCommand { name: ".width", args: "N...", description: "Set column widths for box/table mode" },
-    DotCommand { name: ".sync", args: "HOST:PORT", description: "Push tables to a remote peer" },
-    DotCommand { name: ".listen", args: "[PORT]", description: "Listen for one incoming sync" },
+    DotCommand { name: ".sync", args: "HOST:PORT KEY", description: "Push tables to a remote peer" },
+    DotCommand { name: ".listen", args: "[PORT] KEY", description: "Listen for one incoming sync" },
+    DotCommand { name: ".keygen", args: "", description: "Generate a sync key" },
     DotCommand { name: ".nodeid", args: "", description: "Show this database's node ID" },
 ];
 
@@ -156,6 +157,10 @@ pub fn execute_dot_command(
         }
         ".listen" => {
             cmd_listen(&args, db, conn, out);
+            Action::Continue
+        }
+        ".keygen" => {
+            cmd_keygen(out);
             Action::Continue
         }
         ".nodeid" => {
@@ -743,17 +748,22 @@ fn cmd_width(args: &[&str], settings: &mut Settings, out: &mut dyn Write) {
 }
 
 fn cmd_sync(args: &[&str], db: &Database, conn: &mut Connection<'_>, out: &mut dyn Write) {
-    let addr = match args.first() {
-        Some(a) => *a,
-        None => {
-            let _ = writeln!(out, "Usage: .sync HOST:PORT");
+    if args.len() < 2 {
+        let _ = writeln!(out, "Usage: .sync HOST:PORT KEY");
+        return;
+    }
+    let addr = args[0];
+    let sync_key = match citadel::SyncKey::from_base64(args[1]) {
+        Ok(k) => k,
+        Err(e) => {
+            let _ = writeln!(out, "Error: {e}");
             return;
         }
     };
 
     let _ = writeln!(out, "Syncing to {addr}...");
 
-    match db.sync_to(addr) {
+    match db.sync_to(addr, &sync_key) {
         Ok(outcome) => {
             print_sync_outcome(&outcome, out);
             if let Err(e) = conn.refresh_schema() {
@@ -767,15 +777,29 @@ fn cmd_sync(args: &[&str], db: &Database, conn: &mut Connection<'_>, out: &mut d
 }
 
 fn cmd_listen(args: &[&str], db: &Database, conn: &mut Connection<'_>, out: &mut dyn Write) {
-    let port = match args.first() {
-        Some(p) => match p.parse::<u16>() {
-            Ok(port) => port,
+    if args.is_empty() {
+        let _ = writeln!(out, "Usage: .listen [PORT] KEY");
+        return;
+    }
+
+    let (port, key_str) = if args.len() >= 2 {
+        match args[0].parse::<u16>() {
+            Ok(p) => (p, args[1]),
             Err(_) => {
-                let _ = writeln!(out, "Error: invalid port '{p}'");
+                let _ = writeln!(out, "Error: invalid port '{}'", args[0]);
                 return;
             }
-        },
-        None => 4248,
+        }
+    } else {
+        (4248, args[0])
+    };
+
+    let sync_key = match citadel::SyncKey::from_base64(key_str) {
+        Ok(k) => k,
+        Err(e) => {
+            let _ = writeln!(out, "Error: {e}");
+            return;
+        }
     };
 
     let listener = match TcpListener::bind(("0.0.0.0", port)) {
@@ -799,7 +823,7 @@ fn cmd_listen(args: &[&str], db: &Database, conn: &mut Connection<'_>, out: &mut
 
     let _ = writeln!(out, "Connection from {peer}");
 
-    match db.handle_sync(stream) {
+    match db.handle_sync(stream, &sync_key) {
         Ok(outcome) => {
             print_sync_outcome(&outcome, out);
             if let Err(e) = conn.refresh_schema() {
@@ -810,6 +834,11 @@ fn cmd_listen(args: &[&str], db: &Database, conn: &mut Connection<'_>, out: &mut
             let _ = writeln!(out, "Error: {e}");
         }
     }
+}
+
+fn cmd_keygen(out: &mut dyn Write) {
+    let key = citadel::SyncKey::generate();
+    let _ = writeln!(out, "{}", key.to_base64());
 }
 
 fn cmd_nodeid(db: &Database, out: &mut dyn Write) {

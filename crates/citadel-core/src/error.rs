@@ -79,6 +79,9 @@ pub enum Error {
     #[error("passphrase is required")]
     PassphraseRequired,
 
+    #[error("sync error: {0}")]
+    Sync(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
