@@ -1,0 +1,19 @@
+base_url = "https://yp3y5akh0v.github.io/citadel"
+title = "Citadel"
+description = "An encrypted-first embedded database engine written in Rust"
+compile_sass = true
+build_search_index = false
+generate_feeds = true
+feed_filenames = ["rss.xml"]
+minify_html = true
+
+[markdown.highlighting]
+enabled = true
+theme = "one-dark-pro"
+
+[[taxonomies]]
+name = "tags"
+
+[extra]
+author = "Yuriy Peysakhov"
+github = "https://github.com/yp3y5akh0v/citadel"

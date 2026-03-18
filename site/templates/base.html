@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}{{ config.title }}{% endblock %}</title>
+    <meta name="description" content="{{ config.description }}">
+    <link rel="icon" href="/favicon.ico" sizes="any">
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+    <link rel="manifest" href="/site.webmanifest">
+    <link rel="stylesheet" href="{{ get_url(path='css/style.css', cachebust=true) }}">
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <nav class="nav">
+        <div class="nav-inner">
+            <a class="nav-logo" href="{{ config.base_url }}"><img src="/logo.png" alt="" width="56" height="56">Citadel</a>
+            <button class="nav-toggle" aria-label="Menu" onclick="this.classList.toggle('open');document.querySelector('.nav-links').classList.toggle('open')">
+                <span></span><span></span><span></span>
+            </button>
+            <div class="nav-links">
+                <a href="{{ get_url(path='@/blog/_index.md') }}">Blog</a>
+                <a href="{{ get_url(path='@/demo/_index.md') }}">Playground</a>
+                <a href="{{ get_url(path='@/about/_index.md') }}">About</a>
+                <a href="{{ config.extra.github }}" target="_blank" rel="noopener">GitHub</a>
+            </div>
+        </div>
+    </nav>
+    <main class="content">
+        {% block content %}{% endblock %}
+    </main>
+    <footer class="footer"></footer>
+</body>
+</html>

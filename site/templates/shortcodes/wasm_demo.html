@@ -1,0 +1,86 @@
+<div id="citadel-playground">
+    <div class="playground-status" id="playground-status">Loading WASM...</div>
+    <div class="playground-editor">
+        <textarea id="sql-editor" rows="6" placeholder="Enter SQL... Try: CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);" spellcheck="false"></textarea>
+        <div class="playground-buttons">
+            <button id="run-btn" onclick="runSQL()" disabled>Run</button>
+            <button id="clear-btn" onclick="clearOutput()">Clear</button>
+            <span class="playground-hint">Ctrl+Enter to run</span>
+        </div>
+    </div>
+    <pre id="sql-output"></pre>
+</div>
+
+<script type="module">
+    import init, { CitadelDb } from '/wasm/citadel_wasm.js';
+
+    let db = null;
+
+    async function boot() {
+        const status = document.getElementById('playground-status');
+        try {
+            await init({ module_or_path: '/wasm/citadel_wasm_bg.wasm' });
+            db = new CitadelDb("playground");
+            document.getElementById('run-btn').disabled = false;
+            status.textContent = 'Ready - encrypted database running in your browser';
+            status.classList.add('ready');
+        } catch (e) {
+            status.textContent = 'Failed to load WASM: ' + e;
+            status.classList.add('error');
+        }
+    }
+
+    function formatTable(result) {
+        if (!result.columns.length) return '(empty)';
+        const cols = result.columns;
+        const rows = result.rows;
+        const widths = cols.map((c, i) => {
+            let max = c.length;
+            for (const row of rows) {
+                const val = String(row[i] ?? 'NULL');
+                if (val.length > max) max = val.length;
+            }
+            return max;
+        });
+        const pad = (s, w) => s + ' '.repeat(Math.max(0, w - s.length));
+        const header = cols.map((c, i) => pad(c, widths[i])).join(' | ');
+        const sep = widths.map(w => '-'.repeat(w)).join('-+-');
+        const body = rows.map(row =>
+            row.map((v, i) => pad(String(v ?? 'NULL'), widths[i])).join(' | ')
+        ).join('\n');
+        return header + '\n' + sep + '\n' + body;
+    }
+
+    window.runSQL = function() {
+        const sql = document.getElementById('sql-editor').value.trim();
+        const output = document.getElementById('sql-output');
+        if (!sql) return;
+        try {
+            const upper = sql.toUpperCase().trimStart();
+            if (upper.startsWith('SELECT') || upper.startsWith('EXPLAIN')) {
+                const result = db.query(sql);
+                const table = formatTable(result);
+                output.textContent += '> ' + sql + '\n' + table + '\n\n';
+            } else {
+                const affected = db.execute(sql);
+                output.textContent += '> ' + sql + '\nOK' + (affected > 0 ? ' (' + affected + ' rows)' : '') + '\n\n';
+            }
+        } catch (e) {
+            output.textContent += '> ' + sql + '\nError: ' + e + '\n\n';
+        }
+        output.scrollTop = output.scrollHeight;
+    };
+
+    window.clearOutput = function() {
+        document.getElementById('sql-output').textContent = '';
+    };
+
+    document.getElementById('sql-editor').addEventListener('keydown', function(e) {
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+            e.preventDefault();
+            runSQL();
+        }
+    });
+
+    boot();
+</script>

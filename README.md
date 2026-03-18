@@ -14,7 +14,7 @@ An encrypted-first embedded database engine written in Rust. Every page is encry
 - **Audit logging** — HMAC-SHA256 chained tamper-evident log
 - **Hot backup** — Consistent snapshots via MVCC without blocking writes
 - **Large values** — Overflow pages handle values up to any size transparently
-- **Cross-platform** — Windows, Linux, macOS, iOS, Android. C FFI (35 functions) and WebAssembly bindings included
+- **Cross-platform** — Windows, Linux, macOS, and more. C FFI (35 functions) and WebAssembly bindings included
 - **2,100+ tests** — Unit, integration, and torture tests across all crates
 
 ## Quick Start

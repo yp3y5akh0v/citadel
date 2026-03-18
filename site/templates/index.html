@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+
+{% block title %}Citadel - Encrypted-First Embedded Database{% endblock %}
+
+{% block content %}
+<section class="hero">
+    <h1>Citadel</h1>
+    <p class="hero-tagline">An encrypted-first embedded database engine written in Rust.</p>
+    <p class="hero-sub">Every page is encrypted at rest. Encryption is not an afterthought - it's the foundation.</p>
+    <div class="hero-buttons">
+        <a href="{{ config.extra.github }}" class="btn btn-primary" target="_blank" rel="noopener">View on GitHub</a>
+        <a href="{{ get_url(path='@/demo/_index.md') }}" class="btn btn-secondary">Try in Browser</a>
+    </div>
+</section>
+
+<section class="features">
+    <div class="feature-grid">
+        <div class="feature">
+            <h3>Encrypted at Rest</h3>
+            <p>AES-256-CTR or ChaCha20, HMAC-SHA256 per page. No plaintext ever touches disk.</p>
+        </div>
+        <div class="feature">
+            <h3>Full SQL Engine</h3>
+            <p>CREATE/DROP TABLE, JOINs, subqueries, aggregates, indexes, parameterized queries.</p>
+        </div>
+        <div class="feature">
+            <h3>ACID Transactions</h3>
+            <p>Copy-on-Write B+ tree with shadow paging. Snapshot isolation, no WAL.</p>
+        </div>
+        <div class="feature">
+            <h3>P2P Encrypted Sync</h3>
+            <p>Merkle tree diffing over Noise protocol. Forward secrecy with ephemeral keys.</p>
+        </div>
+        <div class="feature">
+            <h3>Cross-Platform</h3>
+            <p>Windows, Linux, macOS, and more. C FFI and WebAssembly bindings.</p>
+        </div>
+        <div class="feature">
+            <h3>Self-Contained</h3>
+            <p>Single-file database. No external services, no runtime, no config.</p>
+        </div>
+    </div>
+</section>
+
+{{ section.content | safe }}
+
+{% set blog_section = get_section(path="blog/_index.md") %}
+{% if blog_section.pages | length > 0 %}
+<section class="recent-posts">
+    <h2>Recent Posts</h2>
+    <ul class="post-list">
+    {% for page in blog_section.pages | slice(end=3) %}
+        <li>
+            <a href="{{ page.permalink }}">{{ page.title }}</a>
+            <time>{{ page.date | date(format="%B %d, %Y") }}</time>
+        </li>
+    {% endfor %}
+    </ul>
+</section>
+{% endif %}
+{% endblock %}
