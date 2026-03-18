@@ -1,6 +1,10 @@
-# Citadel
+<p align="center">
+  <img src=".github/logo.png" alt="Citadel" width="128">
+</p>
 
-An encrypted-first embedded database engine written in Rust. Every page is encrypted at rest — encryption is not an afterthought, it's the foundation.
+<h1 align="center">Citadel</h1>
+
+<p align="center">An encrypted-first embedded database engine written in Rust.<br>Every page is encrypted at rest — encryption is not an afterthought, it's the foundation.</p>
 
 ## Features
 
