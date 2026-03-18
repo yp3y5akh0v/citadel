@@ -1,9 +1,10 @@
 [package]
-name = "citadel-wasm"
+name = "citadeldb-wasm"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 description = "WASM bindings for Citadel encrypted database"
 
 [package.metadata.wasm-pack.profile.release]
@@ -13,9 +14,9 @@ wasm-opt = ["--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-citadel = { path = "../../citadel" }
+citadel = { workspace = true }
 citadel-core = { workspace = true }
-citadel-sql = { path = "../citadel-sql" }
+citadel-sql = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

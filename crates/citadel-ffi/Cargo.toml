@@ -1,18 +1,19 @@
 [package]
-name = "citadel-ffi"
+name = "citadeldb-ffi"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 description = "C FFI bindings for Citadel encrypted database"
 
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-citadel = { path = "../../citadel" }
+citadel = { workspace = true }
 citadel-core = { workspace = true }
-citadel-sql = { path = "../citadel-sql" }
+citadel-sql = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

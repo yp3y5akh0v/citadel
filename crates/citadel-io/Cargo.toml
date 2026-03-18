@@ -1,10 +1,16 @@
 [package]
-name = "citadel-io"
+name = "citadeldb-io"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "I/O layer for Citadel: PageIO trait, sync I/O, file locking, file management"
+readme = "README.md"
 
 [features]
 default = []

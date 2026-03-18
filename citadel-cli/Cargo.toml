@@ -1,10 +1,16 @@
 [package]
-name = "citadel-cli"
+name = "citadeldb-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Interactive SQL shell for Citadel encrypted database"
+readme = "README.md"
 
 [[bin]]
 name = "citadel"
@@ -15,8 +21,8 @@ default = ["audit-log"]
 audit-log = ["citadel/audit-log"]
 
 [dependencies]
-citadel = { path = "../citadel" }
-citadel-sql = { path = "../crates/citadel-sql" }
+citadel = { workspace = true }
+citadel-sql = { workspace = true }
 citadel-core = { workspace = true }
 
 rustyline = { workspace = true }

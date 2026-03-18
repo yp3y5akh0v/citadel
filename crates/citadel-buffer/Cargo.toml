@@ -1,10 +1,16 @@
 [package]
-name = "citadel-buffer"
+name = "citadeldb-buffer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Buffer pool with SIEVE eviction and encrypt/decrypt pipeline for Citadel"
+readme = "README.md"
 
 [dependencies]
 citadel-core = { workspace = true }

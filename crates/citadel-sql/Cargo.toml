@@ -1,15 +1,21 @@
 [package]
-name = "citadel-sql"
+name = "citadeldb-sql"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "SQL engine for Citadel encrypted database"
+readme = "README.md"
 
 [dependencies]
 citadel-core = { workspace = true }
 citadel-txn = { workspace = true }
-citadel = { path = "../../citadel" }
+citadel = { workspace = true }
 sqlparser = { workspace = true }
 thiserror = { workspace = true }
 lru = { workspace = true }

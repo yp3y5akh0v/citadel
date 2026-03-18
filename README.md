@@ -12,7 +12,7 @@
 - **Full SQL engine** — CREATE/DROP TABLE, SELECT with JOINs, subqueries, aggregates, indexes
 - **ACID transactions** — Copy-on-Write B+ tree with shadow paging, no WAL. Snapshot isolation with concurrent readers
 - **P2P sync** — Merkle tree diffing over Noise-encrypted transport with PSK authentication
-- **Interactive CLI** — SQL shell with tab completion, syntax highlighting, 22 dot-commands
+- **Interactive CLI** — SQL shell with tab completion, syntax highlighting, 27 dot-commands
 - **Key hierarchy** — Passphrase → Argon2id → Master Key → AES-KW → REK → HKDF → DEK + MAC
 - **FIPS mode** — PBKDF2-HMAC-SHA256 + AES-256-CTR for compliance environments
 - **Audit logging** — HMAC-SHA256 chained tamper-evident log

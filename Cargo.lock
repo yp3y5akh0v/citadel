@@ -274,17 +274,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "citadel"
+name = "citadeldb"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "citadel-buffer",
- "citadel-core",
- "citadel-crypto",
- "citadel-io",
- "citadel-page",
- "citadel-sync",
- "citadel-txn",
+ "citadeldb-buffer",
+ "citadeldb-core",
+ "citadeldb-crypto",
+ "citadeldb-io",
+ "citadeldb-page",
+ "citadeldb-sync",
+ "citadeldb-txn",
  "hmac",
  "parking_lot",
  "rand",
@@ -293,23 +293,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "citadel-buffer"
+name = "citadeldb-buffer"
 version = "0.1.0"
 dependencies = [
- "citadel-core",
- "citadel-crypto",
- "citadel-io",
- "citadel-page",
+ "citadeldb-core",
+ "citadeldb-crypto",
+ "citadeldb-io",
+ "citadeldb-page",
  "parking_lot",
 ]
 
 [[package]]
-name = "citadel-cli"
+name = "citadeldb-cli"
 version = "0.1.0"
 dependencies = [
- "citadel",
- "citadel-core",
- "citadel-sql",
+ "citadeldb",
+ "citadeldb-core",
+ "citadeldb-sql",
  "clap",
  "comfy-table",
  "dirs",
@@ -320,14 +320,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "citadel-core"
+name = "citadeldb-core"
 version = "0.1.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
-name = "citadel-crypto"
+name = "citadeldb-crypto"
 version = "0.1.0"
 dependencies = [
  "aes",
@@ -335,7 +335,7 @@ dependencies = [
  "argon2",
  "chacha20",
  "cipher",
- "citadel-core",
+ "citadeldb-core",
  "ctr",
  "hkdf",
  "hmac",
@@ -347,21 +347,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "citadel-ffi"
+name = "citadeldb-ffi"
 version = "0.1.0"
 dependencies = [
  "cbindgen",
- "citadel",
- "citadel-core",
- "citadel-sql",
+ "citadeldb",
+ "citadeldb-core",
+ "citadeldb-sql",
  "tempfile",
 ]
 
 [[package]]
-name = "citadel-io"
+name = "citadeldb-io"
 version = "0.1.0"
 dependencies = [
- "citadel-core",
+ "citadeldb-core",
  "io-uring",
  "libc",
  "tempfile",
@@ -370,20 +370,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "citadel-page"
+name = "citadeldb-page"
 version = "0.1.0"
 dependencies = [
- "citadel-core",
+ "citadeldb-core",
  "xxhash-rust",
 ]
 
 [[package]]
-name = "citadel-sql"
+name = "citadeldb-sql"
 version = "0.1.0"
 dependencies = [
- "citadel",
- "citadel-core",
- "citadel-txn",
+ "citadeldb",
+ "citadeldb-core",
+ "citadeldb-txn",
  "lru",
  "sqlparser",
  "tempfile",
@@ -391,15 +391,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "citadel-sync"
+name = "citadeldb-sync"
 version = "0.1.0"
 dependencies = [
  "base64",
  "blake3",
- "citadel-core",
- "citadel-io",
- "citadel-page",
- "citadel-txn",
+ "citadeldb-core",
+ "citadeldb-io",
+ "citadeldb-page",
+ "citadeldb-txn",
  "rand",
  "snow",
  "tempfile",
@@ -408,25 +408,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "citadel-txn"
+name = "citadeldb-txn"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "citadel-buffer",
- "citadel-core",
- "citadel-crypto",
- "citadel-io",
- "citadel-page",
+ "citadeldb-buffer",
+ "citadeldb-core",
+ "citadeldb-crypto",
+ "citadeldb-io",
+ "citadeldb-page",
  "parking_lot",
 ]
 
 [[package]]
-name = "citadel-wasm"
+name = "citadeldb-wasm"
 version = "0.1.0"
 dependencies = [
- "citadel",
- "citadel-core",
- "citadel-sql",
+ "citadeldb",
+ "citadeldb-core",
+ "citadeldb-sql",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "js-sys",
