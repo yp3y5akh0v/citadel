@@ -120,10 +120,7 @@ fn change_passphrase_multiple_rotations() {
         .open()
         .unwrap();
     let mut rtx = db.begin_read();
-    assert_eq!(
-        rtx.get(b"persistent").unwrap(),
-        Some(b"data".to_vec())
-    );
+    assert_eq!(rtx.get(b"persistent").unwrap(), Some(b"data".to_vec()));
 }
 
 #[test]

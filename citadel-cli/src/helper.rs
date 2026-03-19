@@ -7,26 +7,42 @@ use rustyline::{Context, Helper};
 use citadel_sql::Connection;
 
 const SQL_KEYWORDS: &[&str] = &[
-    "SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES", "UPDATE", "SET",
-    "DELETE", "CREATE", "TABLE", "DROP", "ALTER", "INDEX", "PRIMARY", "KEY",
-    "NOT", "NULL", "INTEGER", "TEXT", "REAL", "BLOB", "BOOLEAN",
-    "AND", "OR", "IN", "EXISTS", "BETWEEN", "LIKE", "IS",
-    "ORDER", "BY", "ASC", "DESC", "LIMIT", "OFFSET",
-    "GROUP", "HAVING", "DISTINCT", "AS", "ON", "JOIN",
-    "INNER", "LEFT", "RIGHT", "CROSS", "OUTER",
-    "BEGIN", "COMMIT", "ROLLBACK",
-    "COUNT", "SUM", "AVG", "MIN", "MAX",
-    "CASE", "WHEN", "THEN", "ELSE", "END",
-    "COALESCE", "NULLIF", "CAST", "EXPLAIN",
-    "TRUE", "FALSE", "IF", "UNIQUE",
+    "SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE", "CREATE",
+    "TABLE", "DROP", "ALTER", "INDEX", "PRIMARY", "KEY", "NOT", "NULL", "INTEGER", "TEXT", "REAL",
+    "BLOB", "BOOLEAN", "AND", "OR", "IN", "EXISTS", "BETWEEN", "LIKE", "IS", "ORDER", "BY", "ASC",
+    "DESC", "LIMIT", "OFFSET", "GROUP", "HAVING", "DISTINCT", "AS", "ON", "JOIN", "INNER", "LEFT",
+    "RIGHT", "CROSS", "OUTER", "BEGIN", "COMMIT", "ROLLBACK", "COUNT", "SUM", "AVG", "MIN", "MAX",
+    "CASE", "WHEN", "THEN", "ELSE", "END", "COALESCE", "NULLIF", "CAST", "EXPLAIN", "TRUE",
+    "FALSE", "IF", "UNIQUE",
 ];
 
 const DOT_COMMANDS: &[&str] = &[
-    ".help", ".quit", ".exit", ".tables", ".schema", ".indexes",
-    ".mode", ".headers", ".nullvalue", ".timer", ".changes",
-    ".stats", ".backup", ".compact", ".verify", ".audit",
-    ".rekey", ".dump", ".read", ".open", ".output", ".width",
-    ".sync", ".listen", ".keygen", ".nodeid",
+    ".help",
+    ".quit",
+    ".exit",
+    ".tables",
+    ".schema",
+    ".indexes",
+    ".mode",
+    ".headers",
+    ".nullvalue",
+    ".timer",
+    ".changes",
+    ".stats",
+    ".backup",
+    ".compact",
+    ".verify",
+    ".audit",
+    ".rekey",
+    ".dump",
+    ".read",
+    ".open",
+    ".output",
+    ".width",
+    ".sync",
+    ".listen",
+    ".keygen",
+    ".nodeid",
 ];
 
 pub struct CitadelHelper {
@@ -104,7 +120,7 @@ impl Completer for CitadelHelper {
 
         for kw in SQL_KEYWORDS {
             if kw.starts_with(&upper) {
-                let replacement = if word.chars().next().map_or(false, |c| c.is_lowercase()) {
+                let replacement = if word.chars().next().is_some_and(|c| c.is_lowercase()) {
                     kw.to_ascii_lowercase()
                 } else {
                     kw.to_string()
@@ -126,13 +142,13 @@ impl Completer for CitadelHelper {
         }
 
         for c in &self.column_names {
-            if c.to_ascii_lowercase().starts_with(&lower) {
-                if !matches.iter().any(|m| m.replacement == *c) {
-                    matches.push(Pair {
-                        display: c.clone(),
-                        replacement: c.clone(),
-                    });
-                }
+            if c.to_ascii_lowercase().starts_with(&lower)
+                && !matches.iter().any(|m| m.replacement == *c)
+            {
+                matches.push(Pair {
+                    display: c.clone(),
+                    replacement: c.clone(),
+                });
             }
         }
 
@@ -187,9 +203,7 @@ impl Highlighter for CitadelHelper {
                 }
                 let end = chars.peek().map(|&(idx, _)| idx).unwrap_or(line.len());
                 let word = &line[start..end];
-                let is_keyword = SQL_KEYWORDS
-                    .iter()
-                    .any(|kw| kw.eq_ignore_ascii_case(word));
+                let is_keyword = SQL_KEYWORDS.iter().any(|kw| kw.eq_ignore_ascii_case(word));
 
                 result.push_str(&line[last_end..start]);
                 if is_keyword {

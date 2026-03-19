@@ -1,9 +1,7 @@
 use std::thread;
 
 use citadel::{Argon2Profile, DatabaseBuilder};
-use citadel_sync::{
-    MemoryTransport, NodeId, SyncConfig, SyncDirection, SyncSession,
-};
+use citadel_sync::{MemoryTransport, NodeId, SyncConfig, SyncDirection, SyncSession};
 
 fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
     DatabaseBuilder::new(path)
@@ -199,7 +197,8 @@ fn sync_skips_index_tables() {
     wtx.create_table(b"data").unwrap();
     wtx.create_table(b"__idx_data_name").unwrap();
     wtx.table_insert(b"data", b"k", b"v").unwrap();
-    wtx.table_insert(b"__idx_data_name", b"idx_k", b"idx_v").unwrap();
+    wtx.table_insert(b"__idx_data_name", b"idx_k", b"idx_v")
+        .unwrap();
     wtx.commit().unwrap();
 
     let mut wtx = db_b.begin_write().unwrap();
@@ -258,8 +257,14 @@ fn sync_preserves_unshared_data() {
 
     // B should have A's data AND keep its own
     let mut rtx = db_b.begin_read();
-    assert_eq!(rtx.table_get(b"shared", b"from_a").unwrap().unwrap(), b"val_a");
-    assert_eq!(rtx.table_get(b"shared", b"from_b").unwrap().unwrap(), b"val_b");
+    assert_eq!(
+        rtx.table_get(b"shared", b"from_a").unwrap().unwrap(),
+        b"val_a"
+    );
+    assert_eq!(
+        rtx.table_get(b"shared", b"from_b").unwrap().unwrap(),
+        b"val_b"
+    );
     // Default tree untouched
     assert_eq!(rtx.get(b"default_key").unwrap().unwrap(), b"default_val");
 }

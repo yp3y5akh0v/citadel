@@ -304,7 +304,8 @@ fn sync_skips_index_tables_over_tcp() {
         wtx.create_table(b"data").unwrap();
         wtx.create_table(b"__idx_data_name").unwrap();
         wtx.table_insert(b"data", b"k", b"v").unwrap();
-        wtx.table_insert(b"__idx_data_name", b"idx_k", b"idx_v").unwrap();
+        wtx.table_insert(b"__idx_data_name", b"idx_k", b"idx_v")
+            .unwrap();
         wtx.commit().unwrap();
     }
 
@@ -318,7 +319,10 @@ fn sync_skips_index_tables_over_tcp() {
         });
         let outcome = db_a.sync_to(&addr, &key).unwrap();
         assert!(outcome.tables_synced.iter().any(|(n, _)| n == b"data"));
-        assert!(!outcome.tables_synced.iter().any(|(n, _)| n.starts_with(b"__idx_")));
+        assert!(!outcome
+            .tables_synced
+            .iter()
+            .any(|(n, _)| n.starts_with(b"__idx_")));
     });
 }
 
@@ -452,7 +456,8 @@ fn sync_large_table_100_entries() {
         for i in 0..100u32 {
             let k = format!("key-{:04}", i);
             let val = format!("value-{}", i * 7);
-            wtx.table_insert(b"big", k.as_bytes(), val.as_bytes()).unwrap();
+            wtx.table_insert(b"big", k.as_bytes(), val.as_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -466,7 +471,11 @@ fn sync_large_table_100_entries() {
             db_b.handle_sync(stream, &key).unwrap();
         });
         let outcome = db_a.sync_to(&addr, &key).unwrap();
-        let synced = outcome.tables_synced.iter().find(|(n, _)| n == b"big").unwrap();
+        let synced = outcome
+            .tables_synced
+            .iter()
+            .find(|(n, _)| n == b"big")
+            .unwrap();
         assert_eq!(synced.1, 100);
     });
 

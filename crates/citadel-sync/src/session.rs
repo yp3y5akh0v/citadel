@@ -71,14 +71,19 @@ impl SyncSession {
         })?;
 
         let (remote_root, remote_hash, in_sync) = match transport.recv()? {
-            SyncMessage::HelloAck { root_page, root_hash, in_sync, .. } => {
-                (root_page, root_hash, in_sync)
-            }
+            SyncMessage::HelloAck {
+                root_page,
+                root_hash,
+                in_sync,
+                ..
+            } => (root_page, root_hash, in_sync),
             SyncMessage::Error { message } => return Err(SyncError::Remote(message)),
-            other => return Err(SyncError::UnexpectedMessage {
-                expected: "HelloAck".into(),
-                actual: msg_name(&other).into(),
-            }),
+            other => {
+                return Err(SyncError::UnexpectedMessage {
+                    expected: "HelloAck".into(),
+                    actual: msg_name(&other).into(),
+                })
+            }
         };
 
         if in_sync {
@@ -100,9 +105,7 @@ impl SyncSession {
         if self.config.direction == SyncDirection::Push
             || self.config.direction == SyncDirection::Bidirectional
         {
-            let result = self.initiator_push(
-                manager, transport, remote_root, remote_hash,
-            )?;
+            let result = self.initiator_push(manager, transport, remote_root, remote_hash)?;
             outcome.pushed = Some(result);
         }
 
@@ -114,22 +117,23 @@ impl SyncSession {
             let (pull_root, pull_hash) = if self.config.direction == SyncDirection::Bidirectional {
                 transport.send(&SyncMessage::PullRequest)?;
                 match transport.recv()? {
-                    SyncMessage::PullResponse { root_page, root_hash } => {
-                        (root_page, root_hash)
-                    }
+                    SyncMessage::PullResponse {
+                        root_page,
+                        root_hash,
+                    } => (root_page, root_hash),
                     SyncMessage::Error { message } => return Err(SyncError::Remote(message)),
-                    other => return Err(SyncError::UnexpectedMessage {
-                        expected: "PullResponse".into(),
-                        actual: msg_name(&other).into(),
-                    }),
+                    other => {
+                        return Err(SyncError::UnexpectedMessage {
+                            expected: "PullResponse".into(),
+                            actual: msg_name(&other).into(),
+                        })
+                    }
                 }
             } else {
                 (remote_root, remote_hash)
             };
 
-            let result = self.initiator_pull(
-                manager, transport, pull_root, pull_hash,
-            )?;
+            let result = self.initiator_pull(manager, transport, pull_root, pull_hash)?;
             outcome.pulled = Some(result);
         }
 
@@ -150,10 +154,12 @@ impl SyncSession {
         let remote_hash = match transport.recv()? {
             SyncMessage::Hello { root_hash, .. } => root_hash,
             SyncMessage::Error { message } => return Err(SyncError::Remote(message)),
-            other => return Err(SyncError::UnexpectedMessage {
-                expected: "Hello".into(),
-                actual: msg_name(&other).into(),
-            }),
+            other => {
+                return Err(SyncError::UnexpectedMessage {
+                    expected: "Hello".into(),
+                    actual: msg_name(&other).into(),
+                })
+            }
         };
 
         let in_sync = local_hash == remote_hash;
@@ -166,10 +172,7 @@ impl SyncSession {
         })?;
 
         if in_sync {
-            match transport.recv()? {
-                SyncMessage::Done => {}
-                _ => {}
-            }
+            let _ = transport.recv()?;
             return Ok(SyncOutcome {
                 pushed: None,
                 pulled: None,
@@ -227,9 +230,11 @@ impl SyncSession {
                 }
                 SyncMessage::PullRequest => {
                     let reader = LocalTreeReader::new(manager);
-                    let (root_page, root_hash) =
-                        reader.root_info().map_err(SyncError::Database)?;
-                    transport.send(&SyncMessage::PullResponse { root_page, root_hash })?;
+                    let (root_page, root_hash) = reader.root_info().map_err(SyncError::Database)?;
+                    transport.send(&SyncMessage::PullResponse {
+                        root_page,
+                        root_hash,
+                    })?;
                 }
                 SyncMessage::Done => {
                     break;
@@ -260,8 +265,7 @@ impl SyncSession {
         let remote_reader = RemoteTreeReader::new(transport, remote_root, remote_hash);
 
         // source = local, target = remote
-        let diff = merkle_diff(&local_reader, &remote_reader)
-            .map_err(SyncError::Database)?;
+        let diff = merkle_diff(&local_reader, &remote_reader).map_err(SyncError::Database)?;
 
         if diff.is_empty() {
             return Ok(ApplyResult::empty());
@@ -293,27 +297,25 @@ impl SyncSession {
         let remote_tables = match transport.recv()? {
             SyncMessage::TableListResponse { tables } => tables,
             SyncMessage::Error { message } => return Err(SyncError::Remote(message)),
-            other => return Err(SyncError::UnexpectedMessage {
-                expected: "TableListResponse".into(),
-                actual: msg_name(&other).into(),
-            }),
+            other => {
+                return Err(SyncError::UnexpectedMessage {
+                    expected: "TableListResponse".into(),
+                    actual: msg_name(&other).into(),
+                })
+            }
         };
 
         let local_tables = manager.list_tables().map_err(SyncError::Database)?;
 
         let mut all_names: Vec<Vec<u8>> = Vec::new();
         for (name, _) in &local_tables {
-            if !name.starts_with(b"__idx_") {
-                if !all_names.iter().any(|n| n == name) {
-                    all_names.push(name.clone());
-                }
+            if !name.starts_with(b"__idx_") && !all_names.contains(name) {
+                all_names.push(name.clone());
             }
         }
         for info in &remote_tables {
-            if !info.name.starts_with(b"__idx_") {
-                if !all_names.iter().any(|n| *n == info.name) {
-                    all_names.push(info.name.clone());
-                }
+            if !info.name.starts_with(b"__idx_") && !all_names.contains(&info.name) {
+                all_names.push(info.name.clone());
             }
         }
 
@@ -327,7 +329,8 @@ impl SyncSession {
                 .map(|(_, desc)| desc.root_page)
                 .unwrap_or(PageId::INVALID);
             let local_hash = if local_root.is_valid() {
-                manager.read_page_from_disk(local_root)
+                manager
+                    .read_page_from_disk(local_root)
                     .map(|p| p.merkle_hash())
                     .unwrap_or([0u8; citadel_core::MERKLE_HASH_SIZE])
             } else {
@@ -350,32 +353,36 @@ impl SyncSession {
             })?;
 
             if local_root.is_valid() && remote_root.is_valid() {
-                let local_reader = LocalTreeReader::for_table(manager, local_root)
-                    .map_err(SyncError::Database)?;
+                let local_reader =
+                    LocalTreeReader::for_table(manager, local_root).map_err(SyncError::Database)?;
                 let remote_reader = RemoteTreeReader::new(transport, remote_root, remote_hash);
-                let diff = merkle_diff(&local_reader, &remote_reader)
-                    .map_err(SyncError::Database)?;
+                let diff =
+                    merkle_diff(&local_reader, &remote_reader).map_err(SyncError::Database)?;
 
                 if !diff.is_empty() {
-                    let patch = SyncPatch::from_diff(
-                        self.config.node_id, &diff, self.config.crdt_aware,
-                    );
-                    transport.send(&SyncMessage::PatchData { data: patch.serialize() })?;
+                    let patch =
+                        SyncPatch::from_diff(self.config.node_id, &diff, self.config.crdt_aware);
+                    transport.send(&SyncMessage::PatchData {
+                        data: patch.serialize(),
+                    })?;
                     match transport.recv()? {
                         SyncMessage::PatchAck { result } => {
                             results.push((table_name.clone(), result));
                         }
                         SyncMessage::Error { message } => return Err(SyncError::Remote(message)),
-                        other => return Err(SyncError::UnexpectedMessage {
-                            expected: "PatchAck".into(),
-                            actual: msg_name(&other).into(),
-                        }),
+                        other => {
+                            return Err(SyncError::UnexpectedMessage {
+                                expected: "PatchAck".into(),
+                                actual: msg_name(&other).into(),
+                            })
+                        }
                     }
                 }
             } else if local_root.is_valid() {
-                let local_reader = LocalTreeReader::for_table(manager, local_root)
-                    .map_err(SyncError::Database)?;
-                let entries = local_reader.subtree_entries(local_root)
+                let local_reader =
+                    LocalTreeReader::for_table(manager, local_root).map_err(SyncError::Database)?;
+                let entries = local_reader
+                    .subtree_entries(local_root)
                     .map_err(SyncError::Database)?;
                 if !entries.is_empty() {
                     let diff = crate::diff::DiffResult {
@@ -383,19 +390,22 @@ impl SyncSession {
                         pages_compared: 0,
                         subtrees_skipped: 0,
                     };
-                    let patch = SyncPatch::from_diff(
-                        self.config.node_id, &diff, self.config.crdt_aware,
-                    );
-                    transport.send(&SyncMessage::PatchData { data: patch.serialize() })?;
+                    let patch =
+                        SyncPatch::from_diff(self.config.node_id, &diff, self.config.crdt_aware);
+                    transport.send(&SyncMessage::PatchData {
+                        data: patch.serialize(),
+                    })?;
                     match transport.recv()? {
                         SyncMessage::PatchAck { result } => {
                             results.push((table_name.clone(), result));
                         }
                         SyncMessage::Error { message } => return Err(SyncError::Remote(message)),
-                        other => return Err(SyncError::UnexpectedMessage {
-                            expected: "PatchAck".into(),
-                            actual: msg_name(&other).into(),
-                        }),
+                        other => {
+                            return Err(SyncError::UnexpectedMessage {
+                                expected: "PatchAck".into(),
+                                actual: msg_name(&other).into(),
+                            })
+                        }
                     }
                 }
             }
@@ -419,10 +429,12 @@ impl SyncSession {
             SyncMessage::TableListRequest => {}
             SyncMessage::Done => return Ok(Vec::new()),
             SyncMessage::Error { message } => return Err(SyncError::Remote(message)),
-            other => return Err(SyncError::UnexpectedMessage {
-                expected: "TableListRequest".into(),
-                actual: msg_name(&other).into(),
-            }),
+            other => {
+                return Err(SyncError::UnexpectedMessage {
+                    expected: "TableListRequest".into(),
+                    actual: msg_name(&other).into(),
+                })
+            }
         }
 
         let local_tables = manager.list_tables().map_err(SyncError::Database)?;
@@ -431,7 +443,8 @@ impl SyncSession {
             .filter(|(name, _)| !name.starts_with(b"__idx_"))
             .filter_map(|(name, desc)| {
                 if desc.root_page.is_valid() {
-                    let hash = manager.read_page_from_disk(desc.root_page)
+                    let hash = manager
+                        .read_page_from_disk(desc.root_page)
                         .map(|p| p.merkle_hash())
                         .unwrap_or([0u8; citadel_core::MERKLE_HASH_SIZE]);
                     Some(TableInfo {
@@ -444,7 +457,9 @@ impl SyncSession {
                 }
             })
             .collect();
-        transport.send(&SyncMessage::TableListResponse { tables: table_infos })?;
+        transport.send(&SyncMessage::TableListResponse {
+            tables: table_infos,
+        })?;
 
         let mut results = Vec::new();
         let mut current_table: Option<Vec<u8>> = None;
@@ -462,8 +477,7 @@ impl SyncSession {
                     let reader = if let Some(ref tname) = current_table {
                         let root = manager.table_root(tname).map_err(SyncError::Database)?;
                         if let Some(r) = root {
-                            LocalTreeReader::for_table(manager, r)
-                                .map_err(SyncError::Database)?
+                            LocalTreeReader::for_table(manager, r).map_err(SyncError::Database)?
                         } else {
                             LocalTreeReader::new(manager)
                         }
@@ -489,8 +503,7 @@ impl SyncSession {
                     let reader = if let Some(ref tname) = current_table {
                         let root = manager.table_root(tname).map_err(SyncError::Database)?;
                         if let Some(r) = root {
-                            LocalTreeReader::for_table(manager, r)
-                                .map_err(SyncError::Database)?
+                            LocalTreeReader::for_table(manager, r).map_err(SyncError::Database)?
                         } else {
                             LocalTreeReader::new(manager)
                         }
@@ -515,8 +528,7 @@ impl SyncSession {
                 SyncMessage::PatchData { data } => {
                     let patch = SyncPatch::deserialize(&data).map_err(SyncError::Patch)?;
                     let result = if let Some(ref tname) = current_table {
-                        apply_patch_to_table(manager, tname, &patch)
-                            .map_err(SyncError::Database)?
+                        apply_patch_to_table(manager, tname, &patch).map_err(SyncError::Database)?
                     } else {
                         apply_patch(manager, &patch).map_err(SyncError::Database)?
                     };
@@ -556,8 +568,7 @@ impl SyncSession {
         let remote_reader = RemoteTreeReader::new(transport, remote_root, remote_hash);
 
         // source = remote, target = local
-        let diff = merkle_diff(&remote_reader, &local_reader)
-            .map_err(SyncError::Database)?;
+        let diff = merkle_diff(&remote_reader, &local_reader).map_err(SyncError::Database)?;
 
         if diff.is_empty() {
             return Ok(ApplyResult::empty());

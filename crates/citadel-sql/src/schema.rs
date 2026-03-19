@@ -24,8 +24,12 @@ impl SchemaManager {
         let mut parse_err: Option<crate::error::SqlError> = None;
         let scan_result = rtx.table_for_each(SCHEMA_TABLE, |_key, value| {
             match TableSchema::deserialize(value) {
-                Ok(schema) => { tables.insert(schema.name.clone(), schema); }
-                Err(e) => { parse_err = Some(e); }
+                Ok(schema) => {
+                    tables.insert(schema.name.clone(), schema);
+                }
+                Err(e) => {
+                    parse_err = Some(e);
+                }
             }
             Ok(())
         });
@@ -39,7 +43,10 @@ impl SchemaManager {
             return Err(e);
         }
 
-        Ok(Self { tables, generation: 0 })
+        Ok(Self {
+            tables,
+            generation: 0,
+        })
     }
 
     pub fn get(&self, name: &str) -> Option<&TableSchema> {
@@ -87,25 +94,18 @@ impl SchemaManager {
     }
 
     /// Remove a schema from the _schema table (called within a write txn).
-    pub fn delete_schema(
-        wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
-        name: &str,
-    ) -> Result<()> {
+    pub fn delete_schema(wtx: &mut citadel_txn::write_txn::WriteTxn<'_>, name: &str) -> Result<()> {
         let lower = name.to_ascii_lowercase();
         wtx.table_delete(SCHEMA_TABLE, lower.as_bytes())
             .map_err(|e| match e {
-                citadel_core::Error::TableNotFound(_) => {
-                    SqlError::TableNotFound(name.into())
-                }
+                citadel_core::Error::TableNotFound(_) => SqlError::TableNotFound(name.into()),
                 other => SqlError::Storage(other),
             })?;
         Ok(())
     }
 
     /// Ensure the _schema table exists (called once per write).
-    pub fn ensure_schema_table(
-        wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
-    ) -> Result<()> {
+    pub fn ensure_schema_table(wtx: &mut citadel_txn::write_txn::WriteTxn<'_>) -> Result<()> {
         // Try to create; ignore if already exists
         match wtx.create_table(SCHEMA_TABLE) {
             Ok(()) => Ok(()),

@@ -12,6 +12,9 @@ categories.workspace = true
 description = "I/O layer for Citadel: PageIO trait, sync I/O, file locking, file management"
 readme = "README.md"
 
+[lib]
+name = "citadel_io"
+
 [features]
 default = []
 io-uring = ["dep:io-uring"]

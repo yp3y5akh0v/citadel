@@ -1,8 +1,7 @@
-use citadel_core::{
-    BODY_SIZE, CHECKSUM_SIZE, MERKLE_HASH_OFFSET, MERKLE_HASH_SIZE,
-    PAGE_HEADER_SIZE, USABLE_SIZE,
-};
 use citadel_core::types::{PageFlags, PageId, PageType, TxnId};
+use citadel_core::{
+    BODY_SIZE, CHECKSUM_SIZE, MERKLE_HASH_OFFSET, MERKLE_HASH_SIZE, PAGE_HEADER_SIZE, USABLE_SIZE,
+};
 
 /// Decrypted page body (8160 bytes).
 ///
@@ -26,7 +25,9 @@ pub struct Page {
 
 impl Default for Page {
     fn default() -> Self {
-        Self { data: [0u8; BODY_SIZE] }
+        Self {
+            data: [0u8; BODY_SIZE],
+        }
     }
 }
 

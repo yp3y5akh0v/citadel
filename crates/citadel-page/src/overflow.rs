@@ -9,9 +9,9 @@
 //! The chain forms a singly-linked list via next_page_id.
 //! Read: follow chain, concatenate data[0..data_len] from each page.
 
+use crate::page::Page;
 use citadel_core::types::PageId;
 use citadel_core::PAGE_HEADER_SIZE;
-use crate::page::Page;
 
 /// Maximum data payload per overflow page.
 /// 8160 (body) - 64 (header) - 4 (data_len field) = 8092 bytes.
@@ -35,7 +35,11 @@ pub fn set_next_page(page: &mut Page, next: PageId) {
 
 /// Get the data_len stored in this overflow page.
 pub fn data_len(page: &Page) -> u32 {
-    u32::from_le_bytes(page.data[DATA_LEN_OFFSET..DATA_LEN_OFFSET + 4].try_into().unwrap())
+    u32::from_le_bytes(
+        page.data[DATA_LEN_OFFSET..DATA_LEN_OFFSET + 4]
+            .try_into()
+            .unwrap(),
+    )
 }
 
 /// Set the data_len for this overflow page.
@@ -63,7 +67,7 @@ pub fn pages_needed(total_len: usize) -> usize {
     if total_len == 0 {
         return 1; // at least one page even for empty data
     }
-    (total_len + OVERFLOW_DATA_CAPACITY - 1) / OVERFLOW_DATA_CAPACITY
+    total_len.div_ceil(OVERFLOW_DATA_CAPACITY)
 }
 
 #[cfg(test)]

@@ -4,18 +4,20 @@
 //! against both the Citadel B+ tree and a standard BTreeMap, verifying
 //! that results match at every step.
 
-use std::collections::{BTreeMap, HashMap};
-use citadel_core::types::*;
 use citadel_buffer::allocator::PageAllocator;
 use citadel_buffer::btree::BTree;
 use citadel_buffer::cursor::Cursor;
-use citadel_page::page::Page;
+use citadel_core::types::*;
 use citadel_page::branch_node;
+use citadel_page::page::Page;
+use std::collections::{BTreeMap, HashMap};
 
 /// Simple deterministic PRNG (xorshift32) for reproducible tests.
 struct Rng(u32);
 impl Rng {
-    fn new(seed: u32) -> Self { Self(seed) }
+    fn new(seed: u32) -> Self {
+        Self(seed)
+    }
     fn next(&mut self) -> u32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 17;
@@ -47,23 +49,35 @@ fn btree_vs_btreemap_expected() {
             let value = format!("val-{i}");
             let val_bytes = value.as_bytes();
 
-            let tree_is_new = tree.insert(
-                &mut pages, &mut alloc, TxnId(1),
-                key_bytes, ValueType::Inline, val_bytes,
-            ).unwrap();
+            let tree_is_new = tree
+                .insert(
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    key_bytes,
+                    ValueType::Inline,
+                    val_bytes,
+                )
+                .unwrap();
 
-            let expected_existed = expected.insert(key.clone().into_bytes(), value.into_bytes()).is_some();
-            assert_eq!(tree_is_new, !expected_existed,
-                "insert mismatch for key={key} at op {i}");
+            let expected_existed = expected
+                .insert(key.clone().into_bytes(), value.into_bytes())
+                .is_some();
+            assert_eq!(
+                tree_is_new, !expected_existed,
+                "insert mismatch for key={key} at op {i}"
+            );
         } else if op < 8 {
             // DELETE (20% of operations)
-            let tree_found = tree.delete(
-                &mut pages, &mut alloc, TxnId(1), key_bytes,
-            ).unwrap();
+            let tree_found = tree
+                .delete(&mut pages, &mut alloc, TxnId(1), key_bytes)
+                .unwrap();
 
             let expected_found = expected.remove(key.as_bytes()).is_some();
-            assert_eq!(tree_found, expected_found,
-                "delete mismatch for key={key} at op {i}");
+            assert_eq!(
+                tree_found, expected_found,
+                "delete mismatch for key={key} at op {i}"
+            );
         } else {
             // SEARCH (20% of operations)
             let tree_result = tree.search(&pages, key_bytes).unwrap();
@@ -76,14 +90,18 @@ fn btree_vs_btreemap_expected() {
                 (None, None) => {}
                 _ => panic!(
                     "search mismatch for key={key} at op {i}: tree={:?}, expected={:?}",
-                    tree_result.is_some(), expected_result.is_some()
+                    tree_result.is_some(),
+                    expected_result.is_some()
                 ),
             }
         }
 
         // Verify entry count matches
-        assert_eq!(tree.entry_count, expected.len() as u64,
-            "entry count mismatch at op {i}");
+        assert_eq!(
+            tree.entry_count,
+            expected.len() as u64,
+            "entry count mismatch at op {i}"
+        );
     }
 
     // Final verification: iterate all entries and compare
@@ -96,8 +114,13 @@ fn btree_vs_btreemap_expected() {
     }
 
     let expected_entries: Vec<(Vec<u8>, Vec<u8>)> = expected.into_iter().collect();
-    assert_eq!(tree_entries.len(), expected_entries.len(),
-        "final entry count mismatch: tree={}, expected={}", tree_entries.len(), expected_entries.len());
+    assert_eq!(
+        tree_entries.len(),
+        expected_entries.len(),
+        "final entry count mismatch: tree={}, expected={}",
+        tree_entries.len(),
+        expected_entries.len()
+    );
 
     for (i, ((tk, tv), (ok, ov))) in tree_entries.iter().zip(expected_entries.iter()).enumerate() {
         assert_eq!(tk, ok, "key mismatch at position {i}");
@@ -115,7 +138,15 @@ fn btree_cursor_range_scan() {
     for i in 0..1000u32 {
         let key = format!("{i:06}");
         let val = format!("v{i}");
-        tree.insert(&mut pages, &mut alloc, TxnId(1), key.as_bytes(), ValueType::Inline, val.as_bytes()).unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            key.as_bytes(),
+            ValueType::Inline,
+            val.as_bytes(),
+        )
+        .unwrap();
     }
 
     // Range scan [000200, 000300)
@@ -142,7 +173,15 @@ fn btree_cursor_reverse_range() {
 
     for i in 0..100u32 {
         let key = format!("{i:04}");
-        tree.insert(&mut pages, &mut alloc, TxnId(1), key.as_bytes(), ValueType::Inline, b"x").unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            key.as_bytes(),
+            ValueType::Inline,
+            b"x",
+        )
+        .unwrap();
     }
 
     // Iterate backward from end
@@ -168,13 +207,37 @@ fn btree_cow_isolation() {
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
     // Insert some keys
-    tree.insert(&mut pages, &mut alloc, TxnId(1), b"a", ValueType::Inline, b"1").unwrap();
-    tree.insert(&mut pages, &mut alloc, TxnId(1), b"b", ValueType::Inline, b"2").unwrap();
+    tree.insert(
+        &mut pages,
+        &mut alloc,
+        TxnId(1),
+        b"a",
+        ValueType::Inline,
+        b"1",
+    )
+    .unwrap();
+    tree.insert(
+        &mut pages,
+        &mut alloc,
+        TxnId(1),
+        b"b",
+        ValueType::Inline,
+        b"2",
+    )
+    .unwrap();
 
     let root_v1 = tree.root;
 
     // Modify — should create new pages via CoW
-    tree.insert(&mut pages, &mut alloc, TxnId(2), b"c", ValueType::Inline, b"3").unwrap();
+    tree.insert(
+        &mut pages,
+        &mut alloc,
+        TxnId(2),
+        b"c",
+        ValueType::Inline,
+        b"3",
+    )
+    .unwrap();
     let root_v2 = tree.root;
 
     assert_ne!(root_v1, root_v2, "CoW should produce new root");
@@ -194,7 +257,15 @@ fn btree_large_values() {
     for i in 0..20u32 {
         let key = format!("bigkey-{i:04}");
         let val = vec![0xAB; 1800]; // 1800 bytes per value
-        tree.insert(&mut pages, &mut alloc, TxnId(1), key.as_bytes(), ValueType::Inline, &val).unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            key.as_bytes(),
+            ValueType::Inline,
+            &val,
+        )
+        .unwrap();
     }
 
     assert_eq!(tree.entry_count, 20);
@@ -217,7 +288,15 @@ fn btree_tombstone_values() {
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
     // Insert a tombstone
-    tree.insert(&mut pages, &mut alloc, TxnId(1), b"deleted", ValueType::Tombstone, b"").unwrap();
+    tree.insert(
+        &mut pages,
+        &mut alloc,
+        TxnId(1),
+        b"deleted",
+        ValueType::Tombstone,
+        b"",
+    )
+    .unwrap();
     let result = tree.search(&pages, b"deleted").unwrap();
     assert_eq!(result, Some((ValueType::Tombstone, vec![])));
 }
@@ -230,13 +309,29 @@ fn btree_max_key_length() {
 
     // 2048-byte key (max per plan)
     let big_key = vec![0x42; 2048];
-    tree.insert(&mut pages, &mut alloc, TxnId(1), &big_key, ValueType::Inline, b"big").unwrap();
+    tree.insert(
+        &mut pages,
+        &mut alloc,
+        TxnId(1),
+        &big_key,
+        ValueType::Inline,
+        b"big",
+    )
+    .unwrap();
 
     let result = tree.search(&pages, &big_key).unwrap();
     assert_eq!(result, Some((ValueType::Inline, b"big".to_vec())));
 
     // Small key should also work alongside
-    tree.insert(&mut pages, &mut alloc, TxnId(1), b"small", ValueType::Inline, b"tiny").unwrap();
+    tree.insert(
+        &mut pages,
+        &mut alloc,
+        TxnId(1),
+        b"small",
+        ValueType::Inline,
+        b"tiny",
+    )
+    .unwrap();
     assert_eq!(tree.entry_count, 2);
 }
 
@@ -247,11 +342,28 @@ fn btree_insert_delete_reinsert() {
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
     // Insert, delete, re-insert the same key
-    tree.insert(&mut pages, &mut alloc, TxnId(1), b"key", ValueType::Inline, b"v1").unwrap();
-    tree.delete(&mut pages, &mut alloc, TxnId(1), b"key").unwrap();
+    tree.insert(
+        &mut pages,
+        &mut alloc,
+        TxnId(1),
+        b"key",
+        ValueType::Inline,
+        b"v1",
+    )
+    .unwrap();
+    tree.delete(&mut pages, &mut alloc, TxnId(1), b"key")
+        .unwrap();
     assert_eq!(tree.search(&pages, b"key").unwrap(), None);
 
-    tree.insert(&mut pages, &mut alloc, TxnId(1), b"key", ValueType::Inline, b"v2").unwrap();
+    tree.insert(
+        &mut pages,
+        &mut alloc,
+        TxnId(1),
+        b"key",
+        ValueType::Inline,
+        b"v2",
+    )
+    .unwrap();
     assert_eq!(
         tree.search(&pages, b"key").unwrap(),
         Some((ValueType::Inline, b"v2".to_vec()))
@@ -266,7 +378,15 @@ fn btree_allocator_frees_pages_on_cow() {
 
     for i in 0..10u32 {
         let key = format!("k{i}");
-        tree.insert(&mut pages, &mut alloc, TxnId(1), key.as_bytes(), ValueType::Inline, b"v").unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            key.as_bytes(),
+            ValueType::Inline,
+            b"v",
+        )
+        .unwrap();
     }
 
     let freed_before = alloc.freed_count();
@@ -287,7 +407,15 @@ fn btree_single_entry() {
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
-    tree.insert(&mut pages, &mut alloc, TxnId(1), b"only", ValueType::Inline, b"one").unwrap();
+    tree.insert(
+        &mut pages,
+        &mut alloc,
+        TxnId(1),
+        b"only",
+        ValueType::Inline,
+        b"one",
+    )
+    .unwrap();
     assert_eq!(tree.entry_count, 1);
     assert_eq!(tree.depth, 1);
 
@@ -303,7 +431,8 @@ fn btree_single_entry() {
     assert!(!cursor.is_valid());
 
     // Delete the single entry
-    tree.delete(&mut pages, &mut alloc, TxnId(1), b"only").unwrap();
+    tree.delete(&mut pages, &mut alloc, TxnId(1), b"only")
+        .unwrap();
     assert_eq!(tree.entry_count, 0);
     assert_eq!(tree.search(&pages, b"only").unwrap(), None);
 }
@@ -319,13 +448,22 @@ fn btree_delete_all_and_reinsert() {
 
     // Insert all
     for k in &keys {
-        tree.insert(&mut pages, &mut alloc, TxnId(1), k.as_bytes(), ValueType::Inline, b"v").unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            k.as_bytes(),
+            ValueType::Inline,
+            b"v",
+        )
+        .unwrap();
     }
     assert_eq!(tree.entry_count, count as u64);
 
     // Delete all
     for k in &keys {
-        tree.delete(&mut pages, &mut alloc, TxnId(1), k.as_bytes()).unwrap();
+        tree.delete(&mut pages, &mut alloc, TxnId(1), k.as_bytes())
+            .unwrap();
     }
     assert_eq!(tree.entry_count, 0);
 
@@ -340,7 +478,15 @@ fn btree_delete_all_and_reinsert() {
 
     // Re-insert all with new values
     for k in &keys {
-        tree.insert(&mut pages, &mut alloc, TxnId(2), k.as_bytes(), ValueType::Inline, b"v2").unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(2),
+            k.as_bytes(),
+            ValueType::Inline,
+            b"v2",
+        )
+        .unwrap();
     }
     assert_eq!(tree.entry_count, count as u64);
 
@@ -363,14 +509,26 @@ fn btree_depth_grows_with_entries() {
     let mut prev_depth = tree.depth;
     for i in 0..3000u32 {
         let key = format!("{i:06}");
-        tree.insert(&mut pages, &mut alloc, TxnId(1), key.as_bytes(), ValueType::Inline, b"v").unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            key.as_bytes(),
+            ValueType::Inline,
+            b"v",
+        )
+        .unwrap();
         if tree.depth > prev_depth {
             prev_depth = tree.depth;
         }
     }
 
     // With 3000 entries, tree must be at least depth 2
-    assert!(tree.depth >= 2, "3000 entries should produce depth >= 2, got {}", tree.depth);
+    assert!(
+        tree.depth >= 2,
+        "3000 entries should produce depth >= 2, got {}",
+        tree.depth
+    );
     assert_eq!(tree.entry_count, 3000);
 }
 
@@ -385,7 +543,15 @@ fn btree_sequential_insert_stress() {
     for i in 0..count {
         let key = format!("{i:08}");
         let val = format!("v{i}");
-        tree.insert(&mut pages, &mut alloc, TxnId(1), key.as_bytes(), ValueType::Inline, val.as_bytes()).unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            key.as_bytes(),
+            ValueType::Inline,
+            val.as_bytes(),
+        )
+        .unwrap();
     }
     assert_eq!(tree.entry_count, count as u64);
 
@@ -424,7 +590,15 @@ fn btree_cursor_bidirectional() {
 
     for i in 0..100u32 {
         let key = format!("{i:04}");
-        tree.insert(&mut pages, &mut alloc, TxnId(1), key.as_bytes(), ValueType::Inline, b"v").unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            key.as_bytes(),
+            ValueType::Inline,
+            b"v",
+        )
+        .unwrap();
     }
 
     // Seek to middle
@@ -458,13 +632,23 @@ fn btree_delete_until_empty_one_by_one() {
     let keys: Vec<String> = (0..count).map(|i| format!("{i:04}")).collect();
 
     for k in &keys {
-        tree.insert(&mut pages, &mut alloc, TxnId(1), k.as_bytes(), ValueType::Inline, b"v").unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            k.as_bytes(),
+            ValueType::Inline,
+            b"v",
+        )
+        .unwrap();
     }
     assert_eq!(tree.entry_count, count as u64);
 
     // Delete one by one in random-ish order (reverse)
     for k in keys.iter().rev() {
-        let existed = tree.delete(&mut pages, &mut alloc, TxnId(1), k.as_bytes()).unwrap();
+        let existed = tree
+            .delete(&mut pages, &mut alloc, TxnId(1), k.as_bytes())
+            .unwrap();
         assert!(existed, "key {k} should exist before deletion");
     }
     assert_eq!(tree.entry_count, 0);
@@ -492,11 +676,24 @@ fn btree_heavy_random_expected() {
 
         if op < 5 {
             let value = format!("v{i}");
-            let tree_new = tree.insert(&mut pages, &mut alloc, TxnId(1), key_bytes, ValueType::Inline, value.as_bytes()).unwrap();
-            let expected_existed = expected.insert(key.into_bytes(), value.into_bytes()).is_some();
+            let tree_new = tree
+                .insert(
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    key_bytes,
+                    ValueType::Inline,
+                    value.as_bytes(),
+                )
+                .unwrap();
+            let expected_existed = expected
+                .insert(key.into_bytes(), value.into_bytes())
+                .is_some();
             assert_eq!(tree_new, !expected_existed, "insert mismatch at op {i}");
         } else if op < 8 {
-            let tree_found = tree.delete(&mut pages, &mut alloc, TxnId(1), key_bytes).unwrap();
+            let tree_found = tree
+                .delete(&mut pages, &mut alloc, TxnId(1), key_bytes)
+                .unwrap();
             let expected_found = expected.remove(key.as_bytes()).is_some();
             assert_eq!(tree_found, expected_found, "delete mismatch at op {i}");
         } else {
@@ -508,7 +705,11 @@ fn btree_heavy_random_expected() {
                 _ => panic!("search mismatch at op {i}"),
             }
         }
-        assert_eq!(tree.entry_count, expected.len() as u64, "count mismatch at op {i}");
+        assert_eq!(
+            tree.entry_count,
+            expected.len() as u64,
+            "count mismatch at op {i}"
+        );
     }
 
     // Final full iteration comparison
@@ -536,7 +737,16 @@ fn btree_duplicate_key_updates_value() {
     // Insert same key 10 times with different values
     for i in 0..10u32 {
         let val = format!("version-{i}");
-        let is_new = tree.insert(&mut pages, &mut alloc, TxnId(1), b"key", ValueType::Inline, val.as_bytes()).unwrap();
+        let is_new = tree
+            .insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                b"key",
+                ValueType::Inline,
+                val.as_bytes(),
+            )
+            .unwrap();
         if i == 0 {
             assert!(is_new);
         } else {
@@ -570,31 +780,42 @@ fn btree_variable_key_length_stress() {
         let op = rng.next_range(10);
         // Key length varies from 1 to 512 bytes
         let key_len = 1 + (rng.next_range(512)) as usize;
-        let key: Vec<u8> = (0..key_len).map(|j| {
-            ((rng.next_range(256)) as u8).wrapping_add(j as u8)
-        }).collect();
+        let key: Vec<u8> = (0..key_len)
+            .map(|j| ((rng.next_range(256)) as u8).wrapping_add(j as u8))
+            .collect();
 
         if op < 6 {
             // Insert with small value
             let val = format!("v{i}");
-            let tree_new = tree.insert(
-                &mut pages, &mut alloc, TxnId(1),
-                &key, ValueType::Inline, val.as_bytes(),
-            ).unwrap();
+            let tree_new = tree
+                .insert(
+                    &mut pages,
+                    &mut alloc,
+                    TxnId(1),
+                    &key,
+                    ValueType::Inline,
+                    val.as_bytes(),
+                )
+                .unwrap();
             let expected_existed = expected.insert(key, val.into_bytes()).is_some();
-            assert_eq!(tree_new, !expected_existed,
-                "insert mismatch at op {i} (key_len={key_len})");
+            assert_eq!(
+                tree_new, !expected_existed,
+                "insert mismatch at op {i} (key_len={key_len})"
+            );
         } else {
             // Delete
-            let tree_found = tree.delete(
-                &mut pages, &mut alloc, TxnId(1), &key,
-            ).unwrap();
+            let tree_found = tree.delete(&mut pages, &mut alloc, TxnId(1), &key).unwrap();
             let expected_found = expected.remove(&key).is_some();
-            assert_eq!(tree_found, expected_found,
-                "delete mismatch at op {i} (key_len={key_len})");
+            assert_eq!(
+                tree_found, expected_found,
+                "delete mismatch at op {i} (key_len={key_len})"
+            );
         }
-        assert_eq!(tree.entry_count, expected.len() as u64,
-            "count mismatch at op {i}");
+        assert_eq!(
+            tree.entry_count,
+            expected.len() as u64,
+            "count mismatch at op {i}"
+        );
     }
 
     // Verify all branch pages contain only branch cells and all leaf pages
@@ -626,7 +847,10 @@ fn btree_variable_key_length_stress() {
     assert!(leaf_count >= 1, "should have at least one leaf page");
     // If tree has depth > 1, should have branches
     if tree.depth > 1 {
-        assert!(branch_count >= 1, "multi-level tree should have branch pages");
+        assert!(
+            branch_count >= 1,
+            "multi-level tree should have branch pages"
+        );
     }
 
     // Full cursor scan must match expected
@@ -640,8 +864,11 @@ fn btree_variable_key_length_stress() {
         cursor.next(&pages).unwrap();
     }
     let expected_entries: Vec<_> = expected.into_iter().collect();
-    assert_eq!(tree_entries.len(), expected_entries.len(),
-        "final scan count mismatch");
+    assert_eq!(
+        tree_entries.len(),
+        expected_entries.len(),
+        "final scan count mismatch"
+    );
     for ((tk, tv), (ok, ov)) in tree_entries.iter().zip(expected_entries.iter()) {
         assert_eq!(tk, ok, "key mismatch in final scan");
         assert_eq!(tv, ov, "value mismatch in final scan");
@@ -659,22 +886,38 @@ fn btree_insert_delete_same_key_repeatedly() {
     // First populate the tree so the target key is in a multi-page tree
     for i in 0..200u32 {
         let key = format!("{i:04}");
-        tree.insert(&mut pages, &mut alloc, TxnId(1), key.as_bytes(), ValueType::Inline, b"v").unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            key.as_bytes(),
+            ValueType::Inline,
+            b"v",
+        )
+        .unwrap();
     }
 
     // Now repeatedly insert and delete the same key
     let target = b"0100";
     for round in 0..50u32 {
         // Delete it
-        let existed = tree.delete(&mut pages, &mut alloc, TxnId(1), target).unwrap();
+        let existed = tree
+            .delete(&mut pages, &mut alloc, TxnId(1), target)
+            .unwrap();
         assert!(existed, "key should exist before delete in round {round}");
         assert_eq!(tree.entry_count, 199);
 
         // Re-insert it
-        let is_new = tree.insert(
-            &mut pages, &mut alloc, TxnId(1),
-            target, ValueType::Inline, format!("round-{round}").as_bytes(),
-        ).unwrap();
+        let is_new = tree
+            .insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                target,
+                ValueType::Inline,
+                format!("round-{round}").as_bytes(),
+            )
+            .unwrap();
         assert!(is_new, "key should be new after delete in round {round}");
         assert_eq!(tree.entry_count, 200);
     }

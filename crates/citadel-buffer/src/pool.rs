@@ -1,8 +1,6 @@
-use citadel_core::{
-    BODY_SIZE, DEK_SIZE, MAC_KEY_SIZE, PAGE_SIZE,
-};
 use citadel_core::types::PageId;
 use citadel_core::{Error, Result};
+use citadel_core::{BODY_SIZE, DEK_SIZE, MAC_KEY_SIZE, PAGE_SIZE};
 
 use citadel_crypto::page_cipher;
 use citadel_io::file_manager::page_offset;
@@ -56,7 +54,8 @@ impl BufferPool {
         let page = self.read_and_decrypt(io, page_id, offset, dek, mac_key, encryption_epoch)?;
 
         // Insert into cache (may evict)
-        self.cache.insert(offset, page)
+        self.cache
+            .insert(offset, page)
             .map_err(|()| Error::BufferPoolFull)?;
 
         Ok(self.cache.get(offset).unwrap())
@@ -74,8 +73,10 @@ impl BufferPool {
         let offset = page_offset(page_id);
 
         if !self.cache.contains(offset) {
-            let page = self.read_and_decrypt(io, page_id, offset, dek, mac_key, encryption_epoch)?;
-            self.cache.insert(offset, page)
+            let page =
+                self.read_and_decrypt(io, page_id, offset, dek, mac_key, encryption_epoch)?;
+            self.cache
+                .insert(offset, page)
                 .map_err(|()| Error::BufferPoolFull)?;
         }
 
@@ -90,10 +91,14 @@ impl BufferPool {
         // Check if we'd exceed capacity with all dirty pages
         if self.cache.len() >= self.capacity && !self.cache.contains(offset) {
             // Try to insert (may evict a clean page)
-            self.cache.insert(offset, page)
-                .map_err(|()| Error::TransactionTooLarge { capacity: self.capacity })?;
+            self.cache
+                .insert(offset, page)
+                .map_err(|()| Error::TransactionTooLarge {
+                    capacity: self.capacity,
+                })?;
         } else {
-            self.cache.insert(offset, page)
+            self.cache
+                .insert(offset, page)
                 .map_err(|()| Error::BufferPoolFull)?;
         }
 
@@ -117,7 +122,9 @@ impl BufferPool {
         encryption_epoch: u32,
     ) -> Result<()> {
         // Collect dirty page offsets and data
-        let dirty: Vec<(u64, PageId, [u8; BODY_SIZE])> = self.cache.dirty_entries()
+        let dirty: Vec<(u64, PageId, [u8; BODY_SIZE])> = self
+            .cache
+            .dirty_entries()
             .map(|(offset, page)| {
                 let page_id = page.page_id();
                 let body = *page.as_bytes();
@@ -127,7 +134,14 @@ impl BufferPool {
 
         for (offset, page_id, body) in &dirty {
             let mut encrypted = [0u8; PAGE_SIZE];
-            page_cipher::encrypt_page(dek, mac_key, *page_id, encryption_epoch, body, &mut encrypted);
+            page_cipher::encrypt_page(
+                dek,
+                mac_key,
+                *page_id,
+                encryption_epoch,
+                body,
+                &mut encrypted,
+            );
             io.write_page(*offset, &encrypted)?;
         }
 
@@ -138,7 +152,9 @@ impl BufferPool {
     /// Discard all dirty pages (on transaction abort).
     /// Removes dirty entries from the cache.
     pub fn discard_dirty(&mut self) {
-        let dirty_offsets: Vec<u64> = self.cache.dirty_entries()
+        let dirty_offsets: Vec<u64> = self
+            .cache
+            .dirty_entries()
             .map(|(offset, _)| offset)
             .collect();
 
@@ -161,7 +177,14 @@ impl BufferPool {
 
         // INVARIANT: Verify HMAC BEFORE decryption
         let mut body = [0u8; BODY_SIZE];
-        page_cipher::decrypt_page(dek, mac_key, page_id, encryption_epoch, &encrypted, &mut body)?;
+        page_cipher::decrypt_page(
+            dek,
+            mac_key,
+            page_id,
+            encryption_epoch,
+            &encrypted,
+            &mut body,
+        )?;
 
         let page = Page::from_bytes(body);
 
@@ -176,6 +199,11 @@ impl BufferPool {
     /// Number of pages currently in the cache.
     pub fn len(&self) -> usize {
         self.cache.len()
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
     }
 
     /// Number of dirty pages.
@@ -213,7 +241,9 @@ mod tests {
 
     impl MockIO {
         fn new() -> Self {
-            Self { pages: std::sync::Mutex::new(std::collections::HashMap::new()) }
+            Self {
+                pages: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
         }
     }
 
@@ -236,11 +266,21 @@ mod tests {
             Ok(())
         }
 
-        fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<()> { Ok(()) }
-        fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<()> { Ok(()) }
-        fn fsync(&self) -> Result<()> { Ok(()) }
-        fn file_size(&self) -> Result<u64> { Ok(0) }
-        fn truncate(&self, _size: u64) -> Result<()> { Ok(()) }
+        fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<()> {
+            Ok(())
+        }
+        fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn fsync(&self) -> Result<()> {
+            Ok(())
+        }
+        fn file_size(&self) -> Result<u64> {
+            Ok(0)
+        }
+        fn truncate(&self, _size: u64) -> Result<()> {
+            Ok(())
+        }
     }
 
     fn test_keys() -> ([u8; DEK_SIZE], [u8; MAC_KEY_SIZE]) {
@@ -249,11 +289,24 @@ mod tests {
         (keys.dek, keys.mac_key)
     }
 
-    fn write_encrypted_page(io: &MockIO, page: &Page, dek: &[u8; DEK_SIZE], mac_key: &[u8; MAC_KEY_SIZE], epoch: u32) {
+    fn write_encrypted_page(
+        io: &MockIO,
+        page: &Page,
+        dek: &[u8; DEK_SIZE],
+        mac_key: &[u8; MAC_KEY_SIZE],
+        epoch: u32,
+    ) {
         let page_id = page.page_id();
         let offset = page_offset(page_id);
         let mut encrypted = [0u8; PAGE_SIZE];
-        page_cipher::encrypt_page(dek, mac_key, page_id, epoch, page.as_bytes(), &mut encrypted);
+        page_cipher::encrypt_page(
+            dek,
+            mac_key,
+            page_id,
+            epoch,
+            page.as_bytes(),
+            &mut encrypted,
+        );
         io.write_page(offset, &encrypted).unwrap();
     }
 

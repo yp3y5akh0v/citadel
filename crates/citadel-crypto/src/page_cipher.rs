@@ -4,8 +4,8 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
-use citadel_core::{BODY_SIZE, DEK_SIZE, IV_SIZE, MAC_KEY_SIZE, MAC_SIZE, PAGE_SIZE};
 use citadel_core::types::PageId;
+use citadel_core::{BODY_SIZE, DEK_SIZE, IV_SIZE, MAC_KEY_SIZE, MAC_SIZE, PAGE_SIZE};
 
 type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 type HmacSha256 = Hmac<Sha256>;
@@ -50,7 +50,13 @@ pub fn encrypt_page_with_iv(
     cipher.apply_keystream(&mut out[IV_SIZE..IV_SIZE + BODY_SIZE]);
 
     // Compute MAC = HMAC-SHA256(mac_key, epoch_le || page_id_le || iv || ciphertext)
-    let mac = compute_mac(mac_key, encryption_epoch, page_id, iv, &out[IV_SIZE..IV_SIZE + BODY_SIZE]);
+    let mac = compute_mac(
+        mac_key,
+        encryption_epoch,
+        page_id,
+        iv,
+        &out[IV_SIZE..IV_SIZE + BODY_SIZE],
+    );
     out[IV_SIZE + BODY_SIZE..].copy_from_slice(&mac);
 }
 
@@ -102,8 +108,7 @@ fn compute_mac(
     iv: &[u8; IV_SIZE],
     ciphertext: &[u8],
 ) -> [u8; MAC_SIZE] {
-    let mut mac = HmacSha256::new_from_slice(mac_key)
-        .expect("HMAC key size is always valid");
+    let mut mac = HmacSha256::new_from_slice(mac_key).expect("HMAC key size is always valid");
     mac.update(&epoch.to_le_bytes());
     mac.update(&page_id.as_u32().to_le_bytes());
     mac.update(iv);
@@ -116,8 +121,7 @@ fn compute_mac(
 
 /// Compute dek_id = HMAC-SHA256(MAC_KEY, DEK) for commit slot key commitment.
 pub fn compute_dek_id(mac_key: &[u8; MAC_KEY_SIZE], dek: &[u8; DEK_SIZE]) -> [u8; MAC_SIZE] {
-    let mut mac = HmacSha256::new_from_slice(mac_key)
-        .expect("HMAC key size is always valid");
+    let mut mac = HmacSha256::new_from_slice(mac_key).expect("HMAC key size is always valid");
     mac.update(dek);
     let result = mac.finalize().into_bytes();
     let mut out = [0u8; MAC_SIZE];
@@ -254,7 +258,14 @@ mod tests {
         encrypt_page(&_dek, &mac_key, page_id, epoch, &body, &mut encrypted);
 
         let mut decrypted = [0u8; BODY_SIZE];
-        let result = decrypt_page(&wrong_dek, &wrong_mac_key, page_id, epoch, &encrypted, &mut decrypted);
+        let result = decrypt_page(
+            &wrong_dek,
+            &wrong_mac_key,
+            page_id,
+            epoch,
+            &encrypted,
+            &mut decrypted,
+        );
         assert!(matches!(result, Err(citadel_core::Error::PageTampered(_))));
     }
 
@@ -289,7 +300,10 @@ mod tests {
         // IVs should differ (random)
         assert_ne!(&enc1[..IV_SIZE], &enc2[..IV_SIZE]);
         // Ciphertext should differ (different IVs)
-        assert_ne!(&enc1[IV_SIZE..IV_SIZE + BODY_SIZE], &enc2[IV_SIZE..IV_SIZE + BODY_SIZE]);
+        assert_ne!(
+            &enc1[IV_SIZE..IV_SIZE + BODY_SIZE],
+            &enc2[IV_SIZE..IV_SIZE + BODY_SIZE]
+        );
     }
 
     #[test]

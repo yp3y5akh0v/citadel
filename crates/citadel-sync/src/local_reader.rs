@@ -47,9 +47,7 @@ impl<'a> TreeReader for LocalTreeReader<'a> {
         let page = self.manager.read_page_from_disk(page_id)?;
         let page_type = page
             .page_type()
-            .ok_or_else(|| {
-                citadel_core::Error::InvalidPageType(page.page_type_raw(), page_id)
-            })?;
+            .ok_or_else(|| citadel_core::Error::InvalidPageType(page.page_type_raw(), page_id))?;
         let merkle_hash: [u8; MERKLE_HASH_SIZE] = page.merkle_hash();
         let mut children = Vec::new();
 

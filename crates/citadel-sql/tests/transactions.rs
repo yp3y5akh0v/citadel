@@ -19,7 +19,6 @@ fn open_db(dir: &std::path::Path) -> citadel::Database {
         .unwrap()
 }
 
-
 fn assert_ok(result: ExecutionResult) {
     match result {
         ExecutionResult::Ok => {}
@@ -42,14 +41,23 @@ fn begin_commit_basic() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     assert!(!conn.in_transaction());
     assert_ok(conn.execute("BEGIN").unwrap());
     assert!(conn.in_transaction());
 
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 'a')").unwrap(), 1);
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (2, 'b')").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (1, 'a')")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (2, 'b')")
+            .unwrap(),
+        1,
+    );
 
     assert_ok(conn.execute("COMMIT").unwrap());
     assert!(!conn.in_transaction());
@@ -66,12 +74,25 @@ fn begin_rollback_discards_changes() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 'original')").unwrap(), 1);
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (1, 'original')")
+            .unwrap(),
+        1,
+    );
 
     assert_ok(conn.execute("BEGIN").unwrap());
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (2, 'new')").unwrap(), 1);
-    assert_rows_affected(conn.execute("UPDATE t SET val = 'modified' WHERE id = 1").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (2, 'new')")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("UPDATE t SET val = 'modified' WHERE id = 1")
+            .unwrap(),
+        1,
+    );
     assert_ok(conn.execute("ROLLBACK").unwrap());
 
     let qr = conn.query("SELECT * FROM t ORDER BY id").unwrap();
@@ -100,17 +121,26 @@ fn read_your_writes_in_transaction() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 'hello')").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (1, 'hello')")
+            .unwrap(),
+        1,
+    );
 
     // SELECT within the same transaction should see the uncommitted insert
     let qr = conn.query("SELECT * FROM t").unwrap();
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][1], Value::Text("hello".into()));
 
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (2, 'world')").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (2, 'world')")
+            .unwrap(),
+        1,
+    );
 
     let qr = conn.query("SELECT * FROM t ORDER BY id").unwrap();
     assert_eq!(qr.rows.len(), 2);
@@ -124,11 +154,20 @@ fn read_after_update_in_transaction() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 'before')").unwrap(), 1);
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (1, 'before')")
+            .unwrap(),
+        1,
+    );
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute("UPDATE t SET val = 'after' WHERE id = 1").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE t SET val = 'after' WHERE id = 1")
+            .unwrap(),
+        1,
+    );
 
     let qr = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
     assert_eq!(qr.rows.len(), 1);
@@ -143,9 +182,18 @@ fn read_after_delete_in_transaction() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 'a')").unwrap(), 1);
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (2, 'b')").unwrap(), 1);
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (1, 'a')")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (2, 'b')")
+            .unwrap(),
+        1,
+    );
 
     conn.execute("BEGIN").unwrap();
     assert_rows_affected(conn.execute("DELETE FROM t WHERE id = 1").unwrap(), 1);
@@ -166,8 +214,13 @@ fn create_table_in_transaction_committed() {
     let mut conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 'test')").unwrap(), 1);
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (1, 'test')")
+            .unwrap(),
+        1,
+    );
     conn.execute("COMMIT").unwrap();
 
     let qr = conn.query("SELECT * FROM t").unwrap();
@@ -181,8 +234,13 @@ fn create_table_in_transaction_rolled_back() {
     let mut conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 'test')").unwrap(), 1);
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (1, 'test')")
+            .unwrap(),
+        1,
+    );
     conn.execute("ROLLBACK").unwrap();
 
     // Table should not exist after rollback
@@ -196,8 +254,13 @@ fn drop_table_in_transaction_rolled_back() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 'keep')").unwrap(), 1);
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (1, 'keep')")
+            .unwrap(),
+        1,
+    );
 
     conn.execute("BEGIN").unwrap();
     conn.execute("DROP TABLE t").unwrap();
@@ -216,7 +279,8 @@ fn create_and_drop_same_table_in_transaction() {
     let mut conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
     assert_rows_affected(conn.execute("INSERT INTO t (id) VALUES (1)").unwrap(), 1);
     conn.execute("DROP TABLE t").unwrap();
     conn.execute("COMMIT").unwrap();
@@ -268,13 +332,20 @@ fn statement_error_keeps_transaction_active() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT NOT NULL)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT NOT NULL)")
+        .unwrap();
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 'ok')").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (1, 'ok')")
+            .unwrap(),
+        1,
+    );
 
     // This should fail (NOT NULL violation) but not kill the transaction
-    let err = conn.execute("INSERT INTO t (id, val) VALUES (2, NULL)").unwrap_err();
+    let err = conn
+        .execute("INSERT INTO t (id, val) VALUES (2, NULL)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::NotNullViolation(_)));
     assert!(conn.in_transaction());
 
@@ -295,7 +366,8 @@ fn duplicate_key_error_in_transaction() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
 
     conn.execute("BEGIN").unwrap();
     assert_rows_affected(conn.execute("INSERT INTO t (id) VALUES (1)").unwrap(), 1);
@@ -317,13 +389,27 @@ fn multi_table_transaction() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)").unwrap();
-    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT)").unwrap();
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT)")
+        .unwrap();
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO orders (id, total) VALUES (1, 100)").unwrap(), 1);
-    assert_rows_affected(conn.execute("INSERT INTO items (id, order_id, name) VALUES (1, 1, 'Widget')").unwrap(), 1);
-    assert_rows_affected(conn.execute("INSERT INTO items (id, order_id, name) VALUES (2, 1, 'Gadget')").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO orders (id, total) VALUES (1, 100)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO items (id, order_id, name) VALUES (1, 1, 'Widget')")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO items (id, order_id, name) VALUES (2, 1, 'Gadget')")
+            .unwrap(),
+        1,
+    );
     conn.execute("COMMIT").unwrap();
 
     let qr = conn.query("SELECT * FROM orders").unwrap();
@@ -338,13 +424,27 @@ fn multi_table_transaction_rollback() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)").unwrap();
-    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT)").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO orders (id, total) VALUES (1, 50)").unwrap(), 1);
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER, name TEXT)")
+        .unwrap();
+    assert_rows_affected(
+        conn.execute("INSERT INTO orders (id, total) VALUES (1, 50)")
+            .unwrap(),
+        1,
+    );
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO orders (id, total) VALUES (2, 100)").unwrap(), 1);
-    assert_rows_affected(conn.execute("INSERT INTO items (id, order_id, name) VALUES (1, 2, 'Widget')").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO orders (id, total) VALUES (2, 100)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO items (id, order_id, name) VALUES (1, 2, 'Widget')")
+            .unwrap(),
+        1,
+    );
     conn.execute("ROLLBACK").unwrap();
 
     // Only the pre-transaction order should exist
@@ -365,10 +465,19 @@ fn committed_transaction_persists_across_reopen() {
         let db = create_db(dir.path());
         let mut conn = Connection::open(&db).unwrap();
 
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
         conn.execute("BEGIN").unwrap();
-        assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 'persisted')").unwrap(), 1);
-        assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (2, 'also persisted')").unwrap(), 1);
+        assert_rows_affected(
+            conn.execute("INSERT INTO t (id, val) VALUES (1, 'persisted')")
+                .unwrap(),
+            1,
+        );
+        assert_rows_affected(
+            conn.execute("INSERT INTO t (id, val) VALUES (2, 'also persisted')")
+                .unwrap(),
+            1,
+        );
         conn.execute("COMMIT").unwrap();
     }
 
@@ -388,11 +497,20 @@ fn rolled_back_transaction_not_persisted() {
         let db = create_db(dir.path());
         let mut conn = Connection::open(&db).unwrap();
 
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-        assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 'keep')").unwrap(), 1);
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        assert_rows_affected(
+            conn.execute("INSERT INTO t (id, val) VALUES (1, 'keep')")
+                .unwrap(),
+            1,
+        );
 
         conn.execute("BEGIN").unwrap();
-        assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (2, 'discard')").unwrap(), 1);
+        assert_rows_affected(
+            conn.execute("INSERT INTO t (id, val) VALUES (2, 'discard')")
+                .unwrap(),
+            1,
+        );
         conn.execute("ROLLBACK").unwrap();
     }
 
@@ -414,15 +532,24 @@ fn drop_connection_with_active_transaction_rolls_back() {
 
     {
         let mut conn = Connection::open(&db).unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-        assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 'keep')").unwrap(), 1);
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        assert_rows_affected(
+            conn.execute("INSERT INTO t (id, val) VALUES (1, 'keep')")
+                .unwrap(),
+            1,
+        );
     }
 
     {
         let mut conn = Connection::open(&db).unwrap();
 
         conn.execute("BEGIN").unwrap();
-        assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (2, 'should_disappear')").unwrap(), 1);
+        assert_rows_affected(
+            conn.execute("INSERT INTO t (id, val) VALUES (2, 'should_disappear')")
+                .unwrap(),
+            1,
+        );
         // Drop without COMMIT or ROLLBACK
     }
 
@@ -442,12 +569,25 @@ fn aggregation_in_transaction() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 10)").unwrap(), 1);
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (1, 10)")
+            .unwrap(),
+        1,
+    );
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (2, 20)").unwrap(), 1);
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (3, 30)").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (2, 20)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (3, 30)")
+            .unwrap(),
+        1,
+    );
 
     let qr = conn.query("SELECT COUNT(*), SUM(val) FROM t").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(3));
@@ -464,21 +604,34 @@ fn sequential_transactions() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     // Transaction 1: insert and commit
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 'first')").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (1, 'first')")
+            .unwrap(),
+        1,
+    );
     conn.execute("COMMIT").unwrap();
 
     // Transaction 2: insert and rollback
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (2, 'second')").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (2, 'second')")
+            .unwrap(),
+        1,
+    );
     conn.execute("ROLLBACK").unwrap();
 
     // Transaction 3: insert and commit
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (3, 'third')").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (3, 'third')")
+            .unwrap(),
+        1,
+    );
     conn.execute("COMMIT").unwrap();
 
     let qr = conn.query("SELECT * FROM t ORDER BY id").unwrap();
@@ -495,21 +648,45 @@ fn insert_update_delete_in_single_transaction() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 'a')").unwrap(), 1);
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (2, 'b')").unwrap(), 1);
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (3, 'c')").unwrap(), 1);
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (1, 'a')")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (2, 'b')")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (3, 'c')")
+            .unwrap(),
+        1,
+    );
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (4, 'd')").unwrap(), 1);
-    assert_rows_affected(conn.execute("UPDATE t SET val = 'updated' WHERE id = 2").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (4, 'd')")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("UPDATE t SET val = 'updated' WHERE id = 2")
+            .unwrap(),
+        1,
+    );
     assert_rows_affected(conn.execute("DELETE FROM t WHERE id = 3").unwrap(), 1);
     conn.execute("COMMIT").unwrap();
 
     let qr = conn.query("SELECT * FROM t ORDER BY id").unwrap();
     assert_eq!(qr.rows.len(), 3);
     assert_eq!(qr.rows[0], vec![Value::Integer(1), Value::Text("a".into())]);
-    assert_eq!(qr.rows[1], vec![Value::Integer(2), Value::Text("updated".into())]);
+    assert_eq!(
+        qr.rows[1],
+        vec![Value::Integer(2), Value::Text("updated".into())]
+    );
     assert_eq!(qr.rows[2], vec![Value::Integer(4), Value::Text("d".into())]);
 }
 
@@ -519,14 +696,18 @@ fn order_by_limit_in_transaction() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
 
     conn.execute("BEGIN").unwrap();
     for i in 1..=10 {
-        conn.execute(&format!("INSERT INTO t (id, val) VALUES ({i}, {})", i * 10)).unwrap();
+        conn.execute(&format!("INSERT INTO t (id, val) VALUES ({i}, {})", i * 10))
+            .unwrap();
     }
 
-    let qr = conn.query("SELECT * FROM t ORDER BY val DESC LIMIT 3").unwrap();
+    let qr = conn
+        .query("SELECT * FROM t ORDER BY val DESC LIMIT 3")
+        .unwrap();
     assert_eq!(qr.rows.len(), 3);
     assert_eq!(qr.rows[0][1], Value::Integer(100));
     assert_eq!(qr.rows[1][1], Value::Integer(90));
@@ -541,14 +722,20 @@ fn where_filter_in_transaction() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, status TEXT)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, status TEXT)")
+        .unwrap();
 
     conn.execute("BEGIN").unwrap();
-    conn.execute("INSERT INTO t (id, status) VALUES (1, 'active')").unwrap();
-    conn.execute("INSERT INTO t (id, status) VALUES (2, 'inactive')").unwrap();
-    conn.execute("INSERT INTO t (id, status) VALUES (3, 'active')").unwrap();
+    conn.execute("INSERT INTO t (id, status) VALUES (1, 'active')")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, status) VALUES (2, 'inactive')")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, status) VALUES (3, 'active')")
+        .unwrap();
 
-    let qr = conn.query("SELECT id FROM t WHERE status = 'active' ORDER BY id").unwrap();
+    let qr = conn
+        .query("SELECT id FROM t WHERE status = 'active' ORDER BY id")
+        .unwrap();
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
     assert_eq!(qr.rows[1][0], Value::Integer(3));
@@ -563,8 +750,13 @@ fn auto_commit_still_works() {
     let mut conn = Connection::open(&db).unwrap();
 
     // Without BEGIN, each statement is auto-committed
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    assert_rows_affected(conn.execute("INSERT INTO t (id, val) VALUES (1, 'auto')").unwrap(), 1);
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    assert_rows_affected(
+        conn.execute("INSERT INTO t (id, val) VALUES (1, 'auto')")
+            .unwrap(),
+        1,
+    );
 
     let qr = conn.query("SELECT * FROM t").unwrap();
     assert_eq!(qr.rows.len(), 1);
@@ -582,14 +774,20 @@ fn group_by_in_transaction() {
     ).unwrap();
 
     conn.execute("BEGIN").unwrap();
-    conn.execute("INSERT INTO sales (id, category, amount) VALUES (1, 'A', 10)").unwrap();
-    conn.execute("INSERT INTO sales (id, category, amount) VALUES (2, 'B', 20)").unwrap();
-    conn.execute("INSERT INTO sales (id, category, amount) VALUES (3, 'A', 30)").unwrap();
-    conn.execute("INSERT INTO sales (id, category, amount) VALUES (4, 'B', 40)").unwrap();
+    conn.execute("INSERT INTO sales (id, category, amount) VALUES (1, 'A', 10)")
+        .unwrap();
+    conn.execute("INSERT INTO sales (id, category, amount) VALUES (2, 'B', 20)")
+        .unwrap();
+    conn.execute("INSERT INTO sales (id, category, amount) VALUES (3, 'A', 30)")
+        .unwrap();
+    conn.execute("INSERT INTO sales (id, category, amount) VALUES (4, 'B', 40)")
+        .unwrap();
 
-    let qr = conn.query(
-        "SELECT category, SUM(amount) AS total FROM sales GROUP BY category ORDER BY category"
-    ).unwrap();
+    let qr = conn
+        .query(
+            "SELECT category, SUM(amount) AS total FROM sales GROUP BY category ORDER BY category",
+        )
+        .unwrap();
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Text("A".into()));
     assert_eq!(qr.rows[0][1], Value::Integer(40));
@@ -607,7 +805,8 @@ fn distinct_within_transaction() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER NOT NULL)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER NOT NULL)")
+        .unwrap();
 
     assert_ok(conn.execute("BEGIN").unwrap());
 
@@ -617,7 +816,9 @@ fn distinct_within_transaction() {
     conn.execute("INSERT INTO t VALUES (4, 20)").unwrap();
     conn.execute("INSERT INTO t VALUES (5, 30)").unwrap();
 
-    let qr = conn.query("SELECT DISTINCT val FROM t ORDER BY val").unwrap();
+    let qr = conn
+        .query("SELECT DISTINCT val FROM t ORDER BY val")
+        .unwrap();
     assert_eq!(qr.rows.len(), 3);
     assert_eq!(qr.rows[0][0], Value::Integer(10));
     assert_eq!(qr.rows[1][0], Value::Integer(20));
@@ -625,7 +826,9 @@ fn distinct_within_transaction() {
 
     assert_ok(conn.execute("COMMIT").unwrap());
 
-    let qr = conn.query("SELECT DISTINCT val FROM t ORDER BY val").unwrap();
+    let qr = conn
+        .query("SELECT DISTINCT val FROM t ORDER BY val")
+        .unwrap();
     assert_eq!(qr.rows.len(), 3);
 }
 
@@ -635,7 +838,8 @@ fn distinct_sees_uncommitted_within_txn() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, color TEXT NOT NULL)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, color TEXT NOT NULL)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'red')").unwrap();
 
     assert_ok(conn.execute("BEGIN").unwrap());
@@ -643,14 +847,18 @@ fn distinct_sees_uncommitted_within_txn() {
     conn.execute("INSERT INTO t VALUES (2, 'red')").unwrap();
     conn.execute("INSERT INTO t VALUES (3, 'blue')").unwrap();
 
-    let qr = conn.query("SELECT DISTINCT color FROM t ORDER BY color").unwrap();
+    let qr = conn
+        .query("SELECT DISTINCT color FROM t ORDER BY color")
+        .unwrap();
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Text("blue".into()));
     assert_eq!(qr.rows[1][0], Value::Text("red".into()));
 
     assert_ok(conn.execute("ROLLBACK").unwrap());
 
-    let qr = conn.query("SELECT DISTINCT color FROM t ORDER BY color").unwrap();
+    let qr = conn
+        .query("SELECT DISTINCT color FROM t ORDER BY color")
+        .unwrap();
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Text("red".into()));
 }

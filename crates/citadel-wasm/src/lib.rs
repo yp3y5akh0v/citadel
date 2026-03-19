@@ -1,6 +1,6 @@
-use citadel::{Database, DatabaseBuilder, Argon2Profile};
-use citadel_sql::Connection;
+use citadel::{Argon2Profile, Database, DatabaseBuilder};
 use citadel_sql::types::{ExecutionResult, Value};
+use citadel_sql::Connection;
 
 /// An in-memory encrypted Citadel database.
 ///
@@ -44,9 +44,11 @@ impl CitadelDb {
         let mut conn = Connection::open(&self.db).map_err(|e| format!("{e}"))?;
         let qr = conn.query(sql).map_err(|e| format!("{e}"))?;
 
-        let rows: Vec<Vec<CellValue>> = qr.rows.iter().map(|row| {
-            row.iter().map(CellValue::from_value).collect()
-        }).collect();
+        let rows: Vec<Vec<CellValue>> = qr
+            .rows
+            .iter()
+            .map(|row| row.iter().map(CellValue::from_value).collect())
+            .collect();
 
         Ok(QueryResultData {
             columns: qr.columns,
@@ -94,7 +96,8 @@ impl CitadelDb {
     /// Put a key-value pair into a named table.
     pub fn table_put(&self, table: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
         let mut wtx = self.db.begin_write().map_err(|e| format!("{e}"))?;
-        wtx.table_insert(table.as_bytes(), key, value).map_err(|e| format!("{e}"))?;
+        wtx.table_insert(table.as_bytes(), key, value)
+            .map_err(|e| format!("{e}"))?;
         wtx.commit().map_err(|e| format!("{e}"))?;
         Ok(())
     }
@@ -102,13 +105,16 @@ impl CitadelDb {
     /// Get a value by key from a named table.
     pub fn table_get(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
         let mut rtx = self.db.begin_read();
-        rtx.table_get(table.as_bytes(), key).map_err(|e| format!("{e}"))
+        rtx.table_get(table.as_bytes(), key)
+            .map_err(|e| format!("{e}"))
     }
 
     /// Delete a key from a named table.
     pub fn table_delete(&self, table: &str, key: &[u8]) -> Result<bool, String> {
         let mut wtx = self.db.begin_write().map_err(|e| format!("{e}"))?;
-        let existed = wtx.table_delete(table.as_bytes(), key).map_err(|e| format!("{e}"))?;
+        let existed = wtx
+            .table_delete(table.as_bytes(), key)
+            .map_err(|e| format!("{e}"))?;
         wtx.commit().map_err(|e| format!("{e}"))?;
         Ok(existed)
     }
@@ -219,9 +225,12 @@ mod tests {
     fn sql_create_and_query() {
         let db = CitadelDb::create("secret").unwrap();
 
-        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
-        db.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
-        db.execute("INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .unwrap();
+        db.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')")
+            .unwrap();
+        db.execute("INSERT INTO users (id, name) VALUES (2, 'Bob')")
+            .unwrap();
 
         let result = db.query("SELECT * FROM users ORDER BY id").unwrap();
         assert_eq!(result.columns, vec!["id", "name"]);
@@ -237,10 +246,14 @@ mod tests {
     fn sql_update_and_delete() {
         let db = CitadelDb::create("secret").unwrap();
 
-        db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER NOT NULL)").unwrap();
-        db.execute("INSERT INTO items (id, qty) VALUES (1, 10)").unwrap();
+        db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER NOT NULL)")
+            .unwrap();
+        db.execute("INSERT INTO items (id, qty) VALUES (1, 10)")
+            .unwrap();
 
-        let affected = db.execute("UPDATE items SET qty = 20 WHERE id = 1").unwrap();
+        let affected = db
+            .execute("UPDATE items SET qty = 20 WHERE id = 1")
+            .unwrap();
         assert_eq!(affected, 1);
 
         let result = db.query("SELECT qty FROM items WHERE id = 1").unwrap();
@@ -260,12 +273,18 @@ mod tests {
     fn sql_aggregation() {
         let db = CitadelDb::create("secret").unwrap();
 
-        db.execute("CREATE TABLE scores (id INTEGER PRIMARY KEY, score INTEGER NOT NULL)").unwrap();
-        db.execute("INSERT INTO scores (id, score) VALUES (1, 90)").unwrap();
-        db.execute("INSERT INTO scores (id, score) VALUES (2, 80)").unwrap();
-        db.execute("INSERT INTO scores (id, score) VALUES (3, 70)").unwrap();
+        db.execute("CREATE TABLE scores (id INTEGER PRIMARY KEY, score INTEGER NOT NULL)")
+            .unwrap();
+        db.execute("INSERT INTO scores (id, score) VALUES (1, 90)")
+            .unwrap();
+        db.execute("INSERT INTO scores (id, score) VALUES (2, 80)")
+            .unwrap();
+        db.execute("INSERT INTO scores (id, score) VALUES (3, 70)")
+            .unwrap();
 
-        let result = db.query("SELECT COUNT(*), SUM(score), AVG(score) FROM scores").unwrap();
+        let result = db
+            .query("SELECT COUNT(*), SUM(score), AVG(score) FROM scores")
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
 
         match &result.rows[0][0] {
@@ -278,11 +297,14 @@ mod tests {
     fn execute_batch() {
         let db = CitadelDb::create("secret").unwrap();
 
-        db.execute_batch("
+        db.execute_batch(
+            "
             CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);
             INSERT INTO t (id, v) VALUES (1, 'a');
             INSERT INTO t (id, v) VALUES (2, 'b');
-        ").unwrap();
+        ",
+        )
+        .unwrap();
 
         let result = db.query("SELECT COUNT(*) FROM t").unwrap();
         match &result.rows[0][0] {
@@ -320,12 +342,15 @@ mod tests {
     fn sql_subquery() {
         let db = CitadelDb::create("secret").unwrap();
 
-        db.execute_batch("
+        db.execute_batch(
+            "
             CREATE TABLE products (id INTEGER PRIMARY KEY, price INTEGER NOT NULL);
             INSERT INTO products (id, price) VALUES (1, 10);
             INSERT INTO products (id, price) VALUES (2, 20);
             INSERT INTO products (id, price) VALUES (3, 30);
-        ").unwrap();
+        ",
+        )
+        .unwrap();
 
         let result = db.query(
             "SELECT * FROM products WHERE price > (SELECT AVG(price) FROM products) ORDER BY id"
@@ -342,12 +367,14 @@ mod tests {
     fn many_entries() {
         let db = CitadelDb::create("secret").unwrap();
 
-        db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, val TEXT NOT NULL)").unwrap();
+        db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, val TEXT NOT NULL)")
+            .unwrap();
 
         for i in 0..200 {
             db.execute(&format!(
                 "INSERT INTO big (id, val) VALUES ({i}, 'value_{i}')"
-            )).unwrap();
+            ))
+            .unwrap();
         }
 
         let result = db.query("SELECT COUNT(*) FROM big").unwrap();
@@ -394,8 +421,10 @@ mod tests {
     fn sql_types() {
         let db = CitadelDb::create("secret").unwrap();
 
-        db.execute("CREATE TABLE types (id INTEGER PRIMARY KEY, r REAL, b BOOLEAN, t TEXT)").unwrap();
-        db.execute("INSERT INTO types (id, r, b, t) VALUES (1, 3.14, TRUE, 'hello')").unwrap();
+        db.execute("CREATE TABLE types (id INTEGER PRIMARY KEY, r REAL, b BOOLEAN, t TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO types (id, r, b, t) VALUES (1, 3.125, TRUE, 'hello')")
+            .unwrap();
 
         let result = db.query("SELECT * FROM types").unwrap();
         assert_eq!(result.rows.len(), 1);
@@ -406,7 +435,7 @@ mod tests {
             other => panic!("expected Integer, got {other:?}"),
         }
         match &row[1] {
-            CellValue::Real(r) => assert!((r - 3.14).abs() < f64::EPSILON),
+            CellValue::Real(r) => assert!((r - 3.125).abs() < f64::EPSILON),
             other => panic!("expected Real, got {other:?}"),
         }
         match &row[2] {
@@ -423,7 +452,8 @@ mod tests {
     fn sql_null_handling() {
         let db = CitadelDb::create("secret").unwrap();
 
-        db.execute("CREATE TABLE nullable (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("CREATE TABLE nullable (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
         db.execute("INSERT INTO nullable (id) VALUES (1)").unwrap();
 
         let result = db.query("SELECT val FROM nullable WHERE id = 1").unwrap();
@@ -432,7 +462,9 @@ mod tests {
             other => panic!("expected Null, got {other:?}"),
         }
 
-        let result = db.query("SELECT * FROM nullable WHERE val IS NULL").unwrap();
+        let result = db
+            .query("SELECT * FROM nullable WHERE val IS NULL")
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
     }
 
@@ -440,15 +472,20 @@ mod tests {
     fn sql_distinct_and_order() {
         let db = CitadelDb::create("secret").unwrap();
 
-        db.execute_batch("
+        db.execute_batch(
+            "
             CREATE TABLE dups (id INTEGER PRIMARY KEY, cat TEXT NOT NULL);
             INSERT INTO dups (id, cat) VALUES (1, 'b');
             INSERT INTO dups (id, cat) VALUES (2, 'a');
             INSERT INTO dups (id, cat) VALUES (3, 'b');
             INSERT INTO dups (id, cat) VALUES (4, 'a');
-        ").unwrap();
+        ",
+        )
+        .unwrap();
 
-        let result = db.query("SELECT DISTINCT cat FROM dups ORDER BY cat").unwrap();
+        let result = db
+            .query("SELECT DISTINCT cat FROM dups ORDER BY cat")
+            .unwrap();
         assert_eq!(result.rows.len(), 2);
         match &result.rows[0][0] {
             CellValue::Text(s) => assert_eq!(s, "a"),

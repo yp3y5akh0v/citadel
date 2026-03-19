@@ -43,9 +43,7 @@ fn pbkdf2_create_open_reopen() {
 
     // Wrong passphrase should fail
     {
-        let result = DatabaseBuilder::new(&db_path)
-            .passphrase(b"wrong")
-            .open();
+        let result = DatabaseBuilder::new(&db_path).passphrase(b"wrong").open();
         assert!(result.is_err());
     }
 }
@@ -72,8 +70,14 @@ fn pbkdf2_named_tables() {
     wtx.commit().unwrap();
 
     let mut rtx = db.begin_read();
-    assert_eq!(rtx.table_get(b"users", b"alice").unwrap(), Some(b"admin".to_vec()));
-    assert_eq!(rtx.table_get(b"logs", b"entry1").unwrap(), Some(b"logged in".to_vec()));
+    assert_eq!(
+        rtx.table_get(b"users", b"alice").unwrap(),
+        Some(b"admin".to_vec())
+    );
+    assert_eq!(
+        rtx.table_get(b"logs", b"entry1").unwrap(),
+        Some(b"logged in".to_vec())
+    );
 }
 
 /// PBKDF2 in-memory databases should work.
@@ -89,7 +93,8 @@ fn pbkdf2_in_memory() {
 
     let mut wtx = db.begin_write().unwrap();
     for i in 0..100u32 {
-        wtx.insert(&i.to_be_bytes(), &(i * 2).to_be_bytes()).unwrap();
+        wtx.insert(&i.to_be_bytes(), &(i * 2).to_be_bytes())
+            .unwrap();
     }
     wtx.commit().unwrap();
 
@@ -127,9 +132,7 @@ fn pbkdf2_change_passphrase() {
 
     // Old passphrase should fail
     {
-        let result = DatabaseBuilder::new(&db_path)
-            .passphrase(old_pass)
-            .open();
+        let result = DatabaseBuilder::new(&db_path).passphrase(old_pass).open();
         assert!(result.is_err());
     }
 
@@ -219,8 +222,11 @@ fn pbkdf2_and_argon2_produce_different_databases() {
 
     // Skip the 512-byte header, compare encrypted page data
     if raw_argon2.len() > 512 && raw_pbkdf2.len() > 512 {
-        assert_ne!(&raw_argon2[512..], &raw_pbkdf2[512..],
-            "different KDFs should produce different encryption keys and ciphertext");
+        assert_ne!(
+            &raw_argon2[512..],
+            &raw_pbkdf2[512..],
+            "different KDFs should produce different encryption keys and ciphertext"
+        );
     }
 }
 
@@ -241,7 +247,8 @@ fn pbkdf2_backup_and_integrity() {
 
     let mut wtx = db.begin_write().unwrap();
     for i in 0..50u32 {
-        wtx.insert(&i.to_be_bytes(), &format!("val-{i}").into_bytes()).unwrap();
+        wtx.insert(&i.to_be_bytes(), &format!("val-{i}").into_bytes())
+            .unwrap();
     }
     wtx.commit().unwrap();
 
@@ -269,8 +276,8 @@ fn pbkdf2_backup_and_integrity() {
 
 #[cfg(feature = "fips")]
 mod fips_tests {
-    use citadel::{DatabaseBuilder, KdfAlgorithm};
     use citadel::core::types::CipherId;
+    use citadel::{DatabaseBuilder, KdfAlgorithm};
 
     #[test]
     fn fips_rejects_argon2id() {

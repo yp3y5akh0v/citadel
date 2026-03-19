@@ -12,6 +12,9 @@ categories.workspace = true
 description = "Buffer pool with SIEVE eviction and encrypt/decrypt pipeline for Citadel"
 readme = "README.md"
 
+[lib]
+name = "citadel_buffer"
+
 [dependencies]
 citadel-core = { workspace = true }
 citadel-crypto = { workspace = true }

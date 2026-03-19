@@ -14,7 +14,9 @@ pub fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Value]) -> Result<Va
 
         Expr::Column(name) => {
             let lower = name.to_ascii_lowercase();
-            let matches: Vec<usize> = columns.iter().enumerate()
+            let matches: Vec<usize> = columns
+                .iter()
+                .enumerate()
                 .filter(|(_, c)| {
                     let cn = c.name.to_ascii_lowercase();
                     cn == lower || cn.ends_with(&format!(".{lower}"))
@@ -29,16 +31,27 @@ pub fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Value]) -> Result<Va
         }
 
         Expr::QualifiedColumn { table, column } => {
-            let qualified = format!("{}.{}", table.to_ascii_lowercase(), column.to_ascii_lowercase());
-            let idx = columns.iter()
+            let qualified = format!(
+                "{}.{}",
+                table.to_ascii_lowercase(),
+                column.to_ascii_lowercase()
+            );
+            let idx = columns
+                .iter()
                 .position(|c| c.name.to_ascii_lowercase() == qualified)
                 .or_else(|| {
                     let lower_col = column.to_ascii_lowercase();
-                    let matches: Vec<usize> = columns.iter().enumerate()
+                    let matches: Vec<usize> = columns
+                        .iter()
+                        .enumerate()
                         .filter(|(_, c)| c.name.to_ascii_lowercase() == lower_col)
                         .map(|(i, _)| i)
                         .collect();
-                    if matches.len() == 1 { Some(matches[0]) } else { None }
+                    if matches.len() == 1 {
+                        Some(matches[0])
+                    } else {
+                        None
+                    }
                 })
                 .ok_or_else(|| SqlError::ColumnNotFound(format!("{table}.{column}")))?;
             Ok(row[idx].clone())
@@ -65,43 +78,69 @@ pub fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Value]) -> Result<Va
             Ok(Value::Boolean(!val.is_null()))
         }
 
-        Expr::Function { name, args } => {
-            eval_scalar_function(name, args, columns, row)
-        }
+        Expr::Function { name, args } => eval_scalar_function(name, args, columns, row),
 
-        Expr::CountStar => {
-            Err(SqlError::Unsupported("COUNT(*) in non-aggregate context".into()))
-        }
+        Expr::CountStar => Err(SqlError::Unsupported(
+            "COUNT(*) in non-aggregate context".into(),
+        )),
 
-        Expr::InList { expr: e, list, negated } => {
+        Expr::InList {
+            expr: e,
+            list,
+            negated,
+        } => {
             let lhs = eval_expr(e, columns, row)?;
             eval_in_values(&lhs, list, columns, row, *negated)
         }
 
-        Expr::InSet { expr: e, values, has_null, negated } => {
+        Expr::InSet {
+            expr: e,
+            values,
+            has_null,
+            negated,
+        } => {
             let lhs = eval_expr(e, columns, row)?;
             eval_in_set(&lhs, values, *has_null, *negated)
         }
 
-        Expr::Between { expr: e, low, high, negated } => {
+        Expr::Between {
+            expr: e,
+            low,
+            high,
+            negated,
+        } => {
             let val = eval_expr(e, columns, row)?;
             let lo = eval_expr(low, columns, row)?;
             let hi = eval_expr(high, columns, row)?;
             eval_between(&val, &lo, &hi, *negated)
         }
 
-        Expr::Like { expr: e, pattern, escape, negated } => {
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            negated,
+        } => {
             let val = eval_expr(e, columns, row)?;
             let pat = eval_expr(pattern, columns, row)?;
-            let esc = escape.as_ref()
+            let esc = escape
+                .as_ref()
                 .map(|e| eval_expr(e, columns, row))
                 .transpose()?;
             eval_like(&val, &pat, esc.as_ref(), *negated)
         }
 
-        Expr::Case { operand, conditions, else_result } => {
-            eval_case(operand.as_deref(), conditions, else_result.as_deref(), columns, row)
-        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => eval_case(
+            operand.as_deref(),
+            conditions,
+            else_result.as_deref(),
+            columns,
+            row,
+        ),
 
         Expr::Coalesce(args) => {
             for arg in args {
@@ -118,15 +157,11 @@ pub fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Value]) -> Result<Va
             eval_cast(&val, *data_type)
         }
 
-        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => {
-            Err(SqlError::Unsupported(
-                "subquery not materialized (internal error)".into(),
-            ))
-        }
+        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => Err(
+            SqlError::Unsupported("subquery not materialized (internal error)".into()),
+        ),
 
-        Expr::Parameter(n) => {
-            Err(SqlError::Parse(format!("unbound parameter ${n}")))
-        }
+        Expr::Parameter(n) => Err(SqlError::Parse(format!("unbound parameter ${n}"))),
     }
 }
 
@@ -219,9 +254,9 @@ fn eval_arithmetic(
     real_op: fn(f64, f64) -> f64,
 ) -> Result<Value> {
     match (left, right) {
-        (Value::Integer(a), Value::Integer(b)) => {
-            int_op(*a, *b).map(Value::Integer).ok_or(SqlError::IntegerOverflow)
-        }
+        (Value::Integer(a), Value::Integer(b)) => int_op(*a, *b)
+            .map(Value::Integer)
+            .ok_or(SqlError::IntegerOverflow),
         (Value::Real(a), Value::Real(b)) => Ok(Value::Real(real_op(*a, *b))),
         (Value::Integer(a), Value::Real(b)) => Ok(Value::Real(real_op(*a as f64, *b))),
         (Value::Real(a), Value::Integer(b)) => Ok(Value::Real(real_op(*a, *b as f64))),
@@ -289,11 +324,10 @@ fn eval_unary_op(op: UnaryOp, val: &Value) -> Result<Value> {
     }
     match op {
         UnaryOp::Neg => match val {
-            Value::Integer(i) => {
-                i.checked_neg()
-                    .map(Value::Integer)
-                    .ok_or(SqlError::IntegerOverflow)
-            }
+            Value::Integer(i) => i
+                .checked_neg()
+                .map(Value::Integer)
+                .ok_or(SqlError::IntegerOverflow),
             Value::Real(r) => Ok(Value::Real(-r)),
             _ => Err(SqlError::TypeMismatch {
                 expected: "numeric".into(),
@@ -336,8 +370,16 @@ fn value_to_text(val: &Value) -> String {
 
 fn eval_between(val: &Value, low: &Value, high: &Value, negated: bool) -> Result<Value> {
     if val.is_null() || low.is_null() || high.is_null() {
-        let ge = if val.is_null() || low.is_null() { None } else { Some(*val >= *low) };
-        let le = if val.is_null() || high.is_null() { None } else { Some(*val <= *high) };
+        let ge = if val.is_null() || low.is_null() {
+            None
+        } else {
+            Some(*val >= *low)
+        };
+        let le = if val.is_null() || high.is_null() {
+            None
+        } else {
+            Some(*val <= *high)
+        };
 
         let result = match (ge, le) {
             (Some(false), _) | (_, Some(false)) => Some(false),
@@ -363,22 +405,27 @@ fn eval_like(val: &Value, pattern: &Value, escape: Option<&Value>, negated: bool
     }
     let text = match val {
         Value::Text(s) => s.as_str(),
-        _ => return Err(SqlError::TypeMismatch {
-            expected: "TEXT".into(),
-            got: val.data_type().to_string(),
-        }),
+        _ => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TEXT".into(),
+                got: val.data_type().to_string(),
+            })
+        }
     };
     let pat = match pattern {
         Value::Text(s) => s.as_str(),
-        _ => return Err(SqlError::TypeMismatch {
-            expected: "TEXT".into(),
-            got: pattern.data_type().to_string(),
-        }),
+        _ => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TEXT".into(),
+                got: pattern.data_type().to_string(),
+            })
+        }
     };
 
     if pat.len() > MAX_LIKE_PATTERN_LEN {
         return Err(SqlError::InvalidValue(format!(
-            "LIKE pattern too long ({} chars, max {MAX_LIKE_PATTERN_LEN})", pat.len()
+            "LIKE pattern too long ({} chars, max {MAX_LIKE_PATTERN_LEN})",
+            pat.len()
         )));
     }
 
@@ -389,15 +436,19 @@ fn eval_like(val: &Value, pattern: &Value, escape: Option<&Value>, negated: bool
                 SqlError::InvalidValue("ESCAPE must be a single character".into())
             })?;
             if chars.next().is_some() {
-                return Err(SqlError::InvalidValue("ESCAPE must be a single character".into()));
+                return Err(SqlError::InvalidValue(
+                    "ESCAPE must be a single character".into(),
+                ));
             }
             Some(c)
         }
         Some(Value::Null) => return Ok(Value::Null),
-        Some(_) => return Err(SqlError::TypeMismatch {
-            expected: "TEXT".into(),
-            got: "non-text".into(),
-        }),
+        Some(_) => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TEXT".into(),
+                got: "non-text".into(),
+            })
+        }
         None => None,
     };
 
@@ -411,7 +462,13 @@ fn like_match(text: &str, pattern: &str, escape: Option<char>) -> bool {
     like_match_impl(&t, &p, 0, 0, escape)
 }
 
-fn like_match_impl(t: &[char], p: &[char], mut ti: usize, mut pi: usize, esc: Option<char>) -> bool {
+fn like_match_impl(
+    t: &[char],
+    p: &[char],
+    mut ti: usize,
+    mut pi: usize,
+    esc: Option<char>,
+) -> bool {
     let mut star_pi: Option<usize> = None;
     let mut star_ti: usize = 0;
 
@@ -447,7 +504,7 @@ fn like_match_impl(t: &[char], p: &[char], mut ti: usize, mut pi: usize, esc: Op
                 ti += 1;
                 continue;
             }
-            if p[pi].to_ascii_lowercase() == t[ti].to_ascii_lowercase() {
+            if p[pi].eq_ignore_ascii_case(&t[ti]) {
                 pi += 1;
                 ti += 1;
                 continue;
@@ -506,20 +563,30 @@ fn eval_cast(val: &Value, target: DataType) -> Result<Value> {
             Value::Integer(_) => Ok(val.clone()),
             Value::Real(r) => Ok(Value::Integer(*r as i64)),
             Value::Boolean(b) => Ok(Value::Integer(if *b { 1 } else { 0 })),
-            Value::Text(s) => s.trim().parse::<i64>()
+            Value::Text(s) => s
+                .trim()
+                .parse::<i64>()
                 .map(Value::Integer)
                 .or_else(|_| s.trim().parse::<f64>().map(|f| Value::Integer(f as i64)))
                 .map_err(|_| SqlError::InvalidValue(format!("cannot cast '{s}' to INTEGER"))),
-            _ => Err(SqlError::InvalidValue(format!("cannot cast {} to INTEGER", val.data_type()))),
+            _ => Err(SqlError::InvalidValue(format!(
+                "cannot cast {} to INTEGER",
+                val.data_type()
+            ))),
         },
         DataType::Real => match val {
             Value::Real(_) => Ok(val.clone()),
             Value::Integer(i) => Ok(Value::Real(*i as f64)),
             Value::Boolean(b) => Ok(Value::Real(if *b { 1.0 } else { 0.0 })),
-            Value::Text(s) => s.trim().parse::<f64>()
+            Value::Text(s) => s
+                .trim()
+                .parse::<f64>()
                 .map(Value::Real)
                 .map_err(|_| SqlError::InvalidValue(format!("cannot cast '{s}' to REAL"))),
-            _ => Err(SqlError::InvalidValue(format!("cannot cast {} to REAL", val.data_type()))),
+            _ => Err(SqlError::InvalidValue(format!(
+                "cannot cast {} to REAL",
+                val.data_type()
+            ))),
         },
         DataType::Text => Ok(Value::Text(value_to_text(val))),
         DataType::Boolean => match val {
@@ -530,15 +597,23 @@ fn eval_cast(val: &Value, target: DataType) -> Result<Value> {
                 match lower.as_str() {
                     "true" | "1" | "yes" | "on" => Ok(Value::Boolean(true)),
                     "false" | "0" | "no" | "off" => Ok(Value::Boolean(false)),
-                    _ => Err(SqlError::InvalidValue(format!("cannot cast '{s}' to BOOLEAN"))),
+                    _ => Err(SqlError::InvalidValue(format!(
+                        "cannot cast '{s}' to BOOLEAN"
+                    ))),
                 }
             }
-            _ => Err(SqlError::InvalidValue(format!("cannot cast {} to BOOLEAN", val.data_type()))),
+            _ => Err(SqlError::InvalidValue(format!(
+                "cannot cast {} to BOOLEAN",
+                val.data_type()
+            ))),
         },
         DataType::Blob => match val {
             Value::Blob(_) => Ok(val.clone()),
             Value::Text(s) => Ok(Value::Blob(s.as_bytes().to_vec())),
-            _ => Err(SqlError::InvalidValue(format!("cannot cast {} to BLOB", val.data_type()))),
+            _ => Err(SqlError::InvalidValue(format!(
+                "cannot cast {} to BLOB",
+                val.data_type()
+            ))),
         },
         DataType::Null => Ok(Value::Null),
     }
@@ -550,7 +625,8 @@ fn eval_scalar_function(
     columns: &[ColumnDef],
     row: &[Value],
 ) -> Result<Value> {
-    let evaluated: Vec<Value> = args.iter()
+    let evaluated: Vec<Value> = args
+        .iter()
         .map(|a| eval_expr(a, columns, row))
         .collect::<Result<Vec<_>>>()?;
 
@@ -561,7 +637,9 @@ fn eval_scalar_function(
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => Ok(Value::Integer(s.chars().count() as i64)),
                 Value::Blob(b) => Ok(Value::Integer(b.len() as i64)),
-                _ => Ok(Value::Integer(value_to_text(&evaluated[0]).chars().count() as i64)),
+                _ => Ok(Value::Integer(
+                    value_to_text(&evaluated[0]).chars().count() as i64
+                )),
             }
         }
         "UPPER" => {
@@ -569,7 +647,9 @@ fn eval_scalar_function(
             match &evaluated[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => Ok(Value::Text(s.to_ascii_uppercase())),
-                _ => Ok(Value::Text(value_to_text(&evaluated[0]).to_ascii_uppercase())),
+                _ => Ok(Value::Text(
+                    value_to_text(&evaluated[0]).to_ascii_uppercase(),
+                )),
             }
         }
         "LOWER" => {
@@ -577,12 +657,16 @@ fn eval_scalar_function(
             match &evaluated[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => Ok(Value::Text(s.to_ascii_lowercase())),
-                _ => Ok(Value::Text(value_to_text(&evaluated[0]).to_ascii_lowercase())),
+                _ => Ok(Value::Text(
+                    value_to_text(&evaluated[0]).to_ascii_lowercase(),
+                )),
             }
         }
         "SUBSTR" | "SUBSTRING" => {
             if evaluated.len() < 2 || evaluated.len() > 3 {
-                return Err(SqlError::InvalidValue(format!("{name} requires 2 or 3 arguments")));
+                return Err(SqlError::InvalidValue(format!(
+                    "{name} requires 2 or 3 arguments"
+                )));
             }
             if evaluated.iter().any(|v| v.is_null()) {
                 return Ok(Value::Null);
@@ -591,20 +675,24 @@ fn eval_scalar_function(
             let chars: Vec<char> = s.chars().collect();
             let start = match &evaluated[1] {
                 Value::Integer(i) => *i,
-                _ => return Err(SqlError::TypeMismatch {
-                    expected: "INTEGER".into(),
-                    got: evaluated[1].data_type().to_string(),
-                }),
+                _ => {
+                    return Err(SqlError::TypeMismatch {
+                        expected: "INTEGER".into(),
+                        got: evaluated[1].data_type().to_string(),
+                    })
+                }
             };
             let len = chars.len() as i64;
 
             let (begin, count) = if evaluated.len() == 3 {
                 let cnt = match &evaluated[2] {
                     Value::Integer(i) => *i,
-                    _ => return Err(SqlError::TypeMismatch {
-                        expected: "INTEGER".into(),
-                        got: evaluated[2].data_type().to_string(),
-                    }),
+                    _ => {
+                        return Err(SqlError::TypeMismatch {
+                            expected: "INTEGER".into(),
+                            got: evaluated[2].data_type().to_string(),
+                        })
+                    }
                 };
                 if start >= 1 {
                     let b = (start - 1).min(len) as usize;
@@ -632,22 +720,32 @@ fn eval_scalar_function(
         }
         "TRIM" | "LTRIM" | "RTRIM" => {
             if evaluated.is_empty() || evaluated.len() > 2 {
-                return Err(SqlError::InvalidValue(format!("{name} requires 1 or 2 arguments")));
+                return Err(SqlError::InvalidValue(format!(
+                    "{name} requires 1 or 2 arguments"
+                )));
             }
             if evaluated[0].is_null() {
                 return Ok(Value::Null);
             }
             let s = value_to_text(&evaluated[0]);
             let trim_chars: Vec<char> = if evaluated.len() == 2 {
-                if evaluated[1].is_null() { return Ok(Value::Null); }
+                if evaluated[1].is_null() {
+                    return Ok(Value::Null);
+                }
                 value_to_text(&evaluated[1]).chars().collect()
             } else {
                 vec![' ']
             };
             let result = match name {
-                "TRIM" => s.trim_matches(|c: char| trim_chars.contains(&c)).to_string(),
-                "LTRIM" => s.trim_start_matches(|c: char| trim_chars.contains(&c)).to_string(),
-                "RTRIM" => s.trim_end_matches(|c: char| trim_chars.contains(&c)).to_string(),
+                "TRIM" => s
+                    .trim_matches(|c: char| trim_chars.contains(&c))
+                    .to_string(),
+                "LTRIM" => s
+                    .trim_start_matches(|c: char| trim_chars.contains(&c))
+                    .to_string(),
+                "RTRIM" => s
+                    .trim_end_matches(|c: char| trim_chars.contains(&c))
+                    .to_string(),
                 _ => unreachable!(),
             };
             Ok(Value::Text(result))
@@ -672,9 +770,10 @@ fn eval_scalar_function(
             }
             let haystack = value_to_text(&evaluated[0]);
             let needle = value_to_text(&evaluated[1]);
-            let pos = haystack.find(&needle).map(|i| {
-                haystack[..i].chars().count() as i64 + 1
-            }).unwrap_or(0);
+            let pos = haystack
+                .find(&needle)
+                .map(|i| haystack[..i].chars().count() as i64 + 1)
+                .unwrap_or(0);
             Ok(Value::Integer(pos))
         }
         "CONCAT" => {
@@ -694,7 +793,8 @@ fn eval_scalar_function(
             check_args(name, &evaluated, 1)?;
             match &evaluated[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Integer(i) => i.checked_abs()
+                Value::Integer(i) => i
+                    .checked_abs()
                     .map(Value::Integer)
                     .ok_or(SqlError::IntegerOverflow),
                 Value::Real(r) => Ok(Value::Real(r.abs())),
@@ -706,7 +806,9 @@ fn eval_scalar_function(
         }
         "ROUND" => {
             if evaluated.is_empty() || evaluated.len() > 2 {
-                return Err(SqlError::InvalidValue("ROUND requires 1 or 2 arguments".into()));
+                return Err(SqlError::InvalidValue(
+                    "ROUND requires 1 or 2 arguments".into(),
+                ));
             }
             if evaluated[0].is_null() {
                 return Ok(Value::Null);
@@ -714,19 +816,23 @@ fn eval_scalar_function(
             let val = match &evaluated[0] {
                 Value::Integer(i) => *i as f64,
                 Value::Real(r) => *r,
-                _ => return Err(SqlError::TypeMismatch {
-                    expected: "numeric".into(),
-                    got: evaluated[0].data_type().to_string(),
-                }),
+                _ => {
+                    return Err(SqlError::TypeMismatch {
+                        expected: "numeric".into(),
+                        got: evaluated[0].data_type().to_string(),
+                    })
+                }
             };
             let places = if evaluated.len() == 2 {
                 match &evaluated[1] {
                     Value::Null => return Ok(Value::Null),
                     Value::Integer(i) => *i,
-                    _ => return Err(SqlError::TypeMismatch {
-                        expected: "INTEGER".into(),
-                        got: evaluated[1].data_type().to_string(),
-                    }),
+                    _ => {
+                        return Err(SqlError::TypeMismatch {
+                            expected: "INTEGER".into(),
+                            got: evaluated[1].data_type().to_string(),
+                        })
+                    }
                 }
             } else {
                 0
@@ -765,9 +871,13 @@ fn eval_scalar_function(
                 Value::Null => Ok(Value::Null),
                 Value::Integer(i) => Ok(Value::Integer(i.signum())),
                 Value::Real(r) => {
-                    if *r > 0.0 { Ok(Value::Integer(1)) }
-                    else if *r < 0.0 { Ok(Value::Integer(-1)) }
-                    else { Ok(Value::Integer(0)) }
+                    if *r > 0.0 {
+                        Ok(Value::Integer(1))
+                    } else if *r < 0.0 {
+                        Ok(Value::Integer(-1))
+                    } else {
+                        Ok(Value::Integer(0))
+                    }
                 }
                 _ => Err(SqlError::TypeMismatch {
                     expected: "numeric".into(),
@@ -780,12 +890,18 @@ fn eval_scalar_function(
             match &evaluated[0] {
                 Value::Null => Ok(Value::Null),
                 Value::Integer(i) => {
-                    if *i < 0 { Ok(Value::Null) }
-                    else { Ok(Value::Real((*i as f64).sqrt())) }
+                    if *i < 0 {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::Real((*i as f64).sqrt()))
+                    }
                 }
                 Value::Real(r) => {
-                    if *r < 0.0 { Ok(Value::Null) }
-                    else { Ok(Value::Real(r.sqrt())) }
+                    if *r < 0.0 {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::Real(r.sqrt()))
+                    }
                 }
                 _ => Err(SqlError::TypeMismatch {
                     expected: "numeric".into(),
@@ -802,7 +918,9 @@ fn eval_scalar_function(
             SystemTime::now().hash(&mut hasher);
             std::thread::current().id().hash(&mut hasher);
             let mut val = hasher.finish() as i64;
-            if val == i64::MIN { val = i64::MAX; }
+            if val == i64::MIN {
+                val = i64::MAX;
+            }
             Ok(Value::Integer(val))
         }
         "TYPEOF" => {
@@ -819,8 +937,12 @@ fn eval_scalar_function(
         }
         "MIN" => {
             check_args(name, &evaluated, 2)?;
-            if evaluated[0].is_null() { return Ok(evaluated[1].clone()); }
-            if evaluated[1].is_null() { return Ok(evaluated[0].clone()); }
+            if evaluated[0].is_null() {
+                return Ok(evaluated[1].clone());
+            }
+            if evaluated[1].is_null() {
+                return Ok(evaluated[0].clone());
+            }
             if evaluated[0] <= evaluated[1] {
                 Ok(evaluated[0].clone())
             } else {
@@ -829,8 +951,12 @@ fn eval_scalar_function(
         }
         "MAX" => {
             check_args(name, &evaluated, 2)?;
-            if evaluated[0].is_null() { return Ok(evaluated[1].clone()); }
-            if evaluated[1].is_null() { return Ok(evaluated[0].clone()); }
+            if evaluated[0].is_null() {
+                return Ok(evaluated[1].clone());
+            }
+            if evaluated[1].is_null() {
+                return Ok(evaluated[0].clone());
+            }
             if evaluated[0] >= evaluated[1] {
                 Ok(evaluated[0].clone())
             } else {
@@ -843,27 +969,30 @@ fn eval_scalar_function(
                 Value::Null => Ok(Value::Null),
                 Value::Blob(b) => {
                     let mut s = String::with_capacity(b.len() * 2);
-                    for byte in b { s.push_str(&format!("{byte:02X}")); }
+                    for byte in b {
+                        s.push_str(&format!("{byte:02X}"));
+                    }
                     Ok(Value::Text(s))
                 }
                 Value::Text(s) => {
                     let mut r = String::with_capacity(s.len() * 2);
-                    for byte in s.as_bytes() { r.push_str(&format!("{byte:02X}")); }
+                    for byte in s.as_bytes() {
+                        r.push_str(&format!("{byte:02X}"));
+                    }
                     Ok(Value::Text(r))
                 }
                 _ => Ok(Value::Text(value_to_text(&evaluated[0]))),
             }
         }
-        _ => {
-            Err(SqlError::Unsupported(format!("scalar function: {name}")))
-        }
+        _ => Err(SqlError::Unsupported(format!("scalar function: {name}"))),
     }
 }
 
 fn check_args(name: &str, args: &[Value], expected: usize) -> Result<()> {
     if args.len() != expected {
         Err(SqlError::InvalidValue(format!(
-            "{name} requires {expected} argument(s), got {}", args.len()
+            "{name} requires {expected} argument(s), got {}",
+            args.len()
         )))
     } else {
         Ok(())
@@ -887,10 +1016,30 @@ mod tests {
 
     fn test_columns() -> Vec<ColumnDef> {
         vec![
-            ColumnDef { name: "id".into(), data_type: DataType::Integer, nullable: false, position: 0 },
-            ColumnDef { name: "name".into(), data_type: DataType::Text, nullable: true, position: 1 },
-            ColumnDef { name: "score".into(), data_type: DataType::Real, nullable: true, position: 2 },
-            ColumnDef { name: "active".into(), data_type: DataType::Boolean, nullable: false, position: 3 },
+            ColumnDef {
+                name: "id".into(),
+                data_type: DataType::Integer,
+                nullable: false,
+                position: 0,
+            },
+            ColumnDef {
+                name: "name".into(),
+                data_type: DataType::Text,
+                nullable: true,
+                position: 1,
+            },
+            ColumnDef {
+                name: "score".into(),
+                data_type: DataType::Real,
+                nullable: true,
+                position: 2,
+            },
+            ColumnDef {
+                name: "active".into(),
+                data_type: DataType::Boolean,
+                nullable: false,
+                position: 3,
+            },
         ]
     }
 
@@ -916,7 +1065,10 @@ mod tests {
         let cols = test_columns();
         let row = test_row();
         let expr = Expr::Column("name".into());
-        assert_eq!(eval_expr(&expr, &cols, &row).unwrap(), Value::Text("Alice".into()));
+        assert_eq!(
+            eval_expr(&expr, &cols, &row).unwrap(),
+            Value::Text("Alice".into())
+        );
     }
 
     #[test]
@@ -924,7 +1076,10 @@ mod tests {
         let cols = test_columns();
         let row = test_row();
         let expr = Expr::Column("NAME".into());
-        assert_eq!(eval_expr(&expr, &cols, &row).unwrap(), Value::Text("Alice".into()));
+        assert_eq!(
+            eval_expr(&expr, &cols, &row).unwrap(),
+            Value::Text("Alice".into())
+        );
     }
 
     #[test]
@@ -954,7 +1109,12 @@ mod tests {
     #[test]
     fn eval_null_propagation() {
         let cols = test_columns();
-        let row = vec![Value::Integer(1), Value::Null, Value::Null, Value::Boolean(true)];
+        let row = vec![
+            Value::Integer(1),
+            Value::Null,
+            Value::Null,
+            Value::Boolean(true),
+        ];
         let expr = Expr::BinaryOp {
             left: Box::new(Expr::Column("name".into())),
             op: BinOp::Eq,
@@ -966,7 +1126,12 @@ mod tests {
     #[test]
     fn eval_and_three_valued() {
         let cols = test_columns();
-        let row = vec![Value::Integer(1), Value::Null, Value::Null, Value::Boolean(true)];
+        let row = vec![
+            Value::Integer(1),
+            Value::Null,
+            Value::Null,
+            Value::Boolean(true),
+        ];
 
         // NULL AND false = false
         let expr = Expr::BinaryOp {
@@ -974,7 +1139,10 @@ mod tests {
             op: BinOp::And,
             right: Box::new(Expr::Literal(Value::Boolean(false))),
         };
-        assert_eq!(eval_expr(&expr, &cols, &row).unwrap(), Value::Boolean(false));
+        assert_eq!(
+            eval_expr(&expr, &cols, &row).unwrap(),
+            Value::Boolean(false)
+        );
 
         // NULL AND true = NULL
         let expr = Expr::BinaryOp {
@@ -988,7 +1156,12 @@ mod tests {
     #[test]
     fn eval_or_three_valued() {
         let cols = test_columns();
-        let row = vec![Value::Integer(1), Value::Null, Value::Null, Value::Boolean(true)];
+        let row = vec![
+            Value::Integer(1),
+            Value::Null,
+            Value::Null,
+            Value::Boolean(true),
+        ];
 
         // NULL OR true = true
         let expr = Expr::BinaryOp {
@@ -1010,7 +1183,12 @@ mod tests {
     #[test]
     fn eval_is_null() {
         let cols = test_columns();
-        let row = vec![Value::Integer(1), Value::Null, Value::Null, Value::Boolean(true)];
+        let row = vec![
+            Value::Integer(1),
+            Value::Null,
+            Value::Null,
+            Value::Boolean(true),
+        ];
         let expr = Expr::IsNull(Box::new(Expr::Column("name".into())));
         assert_eq!(eval_expr(&expr, &cols, &row).unwrap(), Value::Boolean(true));
 
@@ -1026,7 +1204,10 @@ mod tests {
             op: UnaryOp::Not,
             expr: Box::new(Expr::Column("active".into())),
         };
-        assert_eq!(eval_expr(&expr, &cols, &row).unwrap(), Value::Boolean(false));
+        assert_eq!(
+            eval_expr(&expr, &cols, &row).unwrap(),
+            Value::Boolean(false)
+        );
     }
 
     #[test]
@@ -1049,7 +1230,10 @@ mod tests {
             op: BinOp::Div,
             right: Box::new(Expr::Literal(Value::Integer(0))),
         };
-        assert!(matches!(eval_expr(&expr, &cols, &row), Err(SqlError::DivisionByZero)));
+        assert!(matches!(
+            eval_expr(&expr, &cols, &row),
+            Err(SqlError::DivisionByZero)
+        ));
     }
 
     #[test]

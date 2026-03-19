@@ -20,27 +20,37 @@ fn query_result(result: ExecutionResult) -> QueryResult {
 fn explain_lines(conn: &mut Connection<'_>, sql: &str) -> Vec<String> {
     let qr = query_result(conn.execute(sql).unwrap());
     assert_eq!(qr.columns, vec!["plan"]);
-    qr.rows.into_iter().map(|row| {
-        match &row[0] {
+    qr.rows
+        .into_iter()
+        .map(|row| match &row[0] {
             Value::Text(s) => s.clone(),
             other => panic!("expected Text, got {other:?}"),
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 fn setup_full_schema(conn: &mut Connection<'_>) {
     conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER, email TEXT, dept TEXT)").unwrap();
-    conn.execute("CREATE INDEX idx_name ON users (name)").unwrap();
-    conn.execute("CREATE INDEX idx_name_age ON users (name, age)").unwrap();
-    conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap();
-    conn.execute("CREATE INDEX idx_dept ON users (dept)").unwrap();
+    conn.execute("CREATE INDEX idx_name ON users (name)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_name_age ON users (name, age)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_dept ON users (dept)")
+        .unwrap();
     conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount REAL, status TEXT)").unwrap();
-    conn.execute("CREATE INDEX idx_user_id ON orders (user_id)").unwrap();
-    conn.execute("CREATE INDEX idx_status ON orders (status)").unwrap();
-    conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT NOT NULL, price REAL)").unwrap();
+    conn.execute("CREATE INDEX idx_user_id ON orders (user_id)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_status ON orders (status)")
+        .unwrap();
+    conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT NOT NULL, price REAL)")
+        .unwrap();
     conn.execute("CREATE TABLE order_items (id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, product_id INTEGER NOT NULL)").unwrap();
-    conn.execute("CREATE INDEX idx_order_id ON order_items (order_id)").unwrap();
-    conn.execute("CREATE INDEX idx_product_id ON order_items (product_id)").unwrap();
+    conn.execute("CREATE INDEX idx_order_id ON order_items (order_id)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_product_id ON order_items (product_id)")
+        .unwrap();
 }
 
 // ── Scan plan accuracy ──────────────────────────────────────────────
@@ -61,7 +71,8 @@ fn pk_lookup_text_value() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)").unwrap();
+    conn.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)")
+        .unwrap();
 
     let lines = explain_lines(&mut conn, "EXPLAIN SELECT * FROM kv WHERE k = 'hello'");
     assert!(lines[0].contains("SEARCH TABLE kv"));
@@ -74,9 +85,13 @@ fn composite_pk_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE assoc (a INTEGER, b INTEGER, val TEXT, PRIMARY KEY (a, b))").unwrap();
+    conn.execute("CREATE TABLE assoc (a INTEGER, b INTEGER, val TEXT, PRIMARY KEY (a, b))")
+        .unwrap();
 
-    let lines = explain_lines(&mut conn, "EXPLAIN SELECT * FROM assoc WHERE a = 1 AND b = 2");
+    let lines = explain_lines(
+        &mut conn,
+        "EXPLAIN SELECT * FROM assoc WHERE a = 1 AND b = 2",
+    );
     assert!(lines[0].contains("SEARCH TABLE assoc"));
     assert!(lines[0].contains("USING PRIMARY KEY"));
     assert!(lines[0].contains("a = 1"));
@@ -88,7 +103,8 @@ fn partial_composite_pk_is_seq_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE assoc (a INTEGER, b INTEGER, val TEXT, PRIMARY KEY (a, b))").unwrap();
+    conn.execute("CREATE TABLE assoc (a INTEGER, b INTEGER, val TEXT, PRIMARY KEY (a, b))")
+        .unwrap();
 
     let lines = explain_lines(&mut conn, "EXPLAIN SELECT * FROM assoc WHERE a = 1");
     assert!(lines[0].contains("SCAN TABLE assoc"));
@@ -101,7 +117,10 @@ fn index_equality_plus_range() {
     let mut conn = Connection::open(&db).unwrap();
     setup_full_schema(&mut conn);
 
-    let lines = explain_lines(&mut conn, "EXPLAIN SELECT * FROM users WHERE name = 'Alice' AND age > 20");
+    let lines = explain_lines(
+        &mut conn,
+        "EXPLAIN SELECT * FROM users WHERE name = 'Alice' AND age > 20",
+    );
     assert!(lines[0].contains("USING INDEX idx_name_age"));
     assert!(lines[0].contains("name = ?"));
     assert!(lines[0].contains("age > ?"));
@@ -126,7 +145,10 @@ fn or_forces_seq_scan() {
     let mut conn = Connection::open(&db).unwrap();
     setup_full_schema(&mut conn);
 
-    let lines = explain_lines(&mut conn, "EXPLAIN SELECT * FROM users WHERE name = 'A' OR name = 'B'");
+    let lines = explain_lines(
+        &mut conn,
+        "EXPLAIN SELECT * FROM users WHERE name = 'A' OR name = 'B'",
+    );
     assert!(lines[0].contains("SCAN TABLE users"));
 }
 
@@ -153,8 +175,10 @@ fn self_join_different_aliases() {
     let mut conn = Connection::open(&db).unwrap();
     setup_full_schema(&mut conn);
 
-    let lines = explain_lines(&mut conn,
-        "EXPLAIN SELECT * FROM users a JOIN users b ON a.id = b.id");
+    let lines = explain_lines(
+        &mut conn,
+        "EXPLAIN SELECT * FROM users a JOIN users b ON a.id = b.id",
+    );
     assert!(lines.iter().any(|l| l.contains("users AS a")));
     assert!(lines.iter().any(|l| l.contains("users AS b")));
 }
@@ -181,8 +205,10 @@ fn distinct_sort_limit_offset_all_present() {
     let mut conn = Connection::open(&db).unwrap();
     setup_full_schema(&mut conn);
 
-    let lines = explain_lines(&mut conn,
-        "EXPLAIN SELECT DISTINCT name FROM users ORDER BY name LIMIT 5 OFFSET 2");
+    let lines = explain_lines(
+        &mut conn,
+        "EXPLAIN SELECT DISTINCT name FROM users ORDER BY name LIMIT 5 OFFSET 2",
+    );
     let scan_pos = lines.iter().position(|l| l.contains("SCAN TABLE")).unwrap();
     let distinct_pos = lines.iter().position(|l| l == "DISTINCT").unwrap();
     let sort_pos = lines.iter().position(|l| l == "SORT").unwrap();
@@ -202,8 +228,10 @@ fn group_by_with_having() {
     let mut conn = Connection::open(&db).unwrap();
     setup_full_schema(&mut conn);
 
-    let lines = explain_lines(&mut conn,
-        "EXPLAIN SELECT dept, COUNT(*) FROM users GROUP BY dept HAVING COUNT(*) > 3");
+    let lines = explain_lines(
+        &mut conn,
+        "EXPLAIN SELECT dept, COUNT(*) FROM users GROUP BY dept HAVING COUNT(*) > 3",
+    );
     assert!(lines.contains(&"GROUP BY".to_string()));
 }
 
@@ -214,8 +242,10 @@ fn group_by_with_order_and_limit() {
     let mut conn = Connection::open(&db).unwrap();
     setup_full_schema(&mut conn);
 
-    let lines = explain_lines(&mut conn,
-        "EXPLAIN SELECT dept, COUNT(*) FROM users GROUP BY dept ORDER BY dept LIMIT 3");
+    let lines = explain_lines(
+        &mut conn,
+        "EXPLAIN SELECT dept, COUNT(*) FROM users GROUP BY dept ORDER BY dept LIMIT 3",
+    );
     assert!(lines.contains(&"GROUP BY".to_string()));
     assert!(lines.contains(&"SORT".to_string()));
     assert!(lines.contains(&"LIMIT 3".to_string()));
@@ -230,8 +260,10 @@ fn in_subquery_shows_subquery_line() {
     let mut conn = Connection::open(&db).unwrap();
     setup_full_schema(&mut conn);
 
-    let lines = explain_lines(&mut conn,
-        "EXPLAIN SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > 100)");
+    let lines = explain_lines(
+        &mut conn,
+        "EXPLAIN SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > 100)",
+    );
     assert!(lines.contains(&"SUBQUERY".to_string()));
 }
 
@@ -242,8 +274,10 @@ fn exists_subquery() {
     let mut conn = Connection::open(&db).unwrap();
     setup_full_schema(&mut conn);
 
-    let lines = explain_lines(&mut conn,
-        "EXPLAIN SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = 1)");
+    let lines = explain_lines(
+        &mut conn,
+        "EXPLAIN SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = 1)",
+    );
     assert!(lines.contains(&"SUBQUERY".to_string()));
 }
 
@@ -254,8 +288,10 @@ fn scalar_subquery_in_select() {
     let mut conn = Connection::open(&db).unwrap();
     setup_full_schema(&mut conn);
 
-    let lines = explain_lines(&mut conn,
-        "EXPLAIN SELECT name, (SELECT COUNT(*) FROM orders) FROM users");
+    let lines = explain_lines(
+        &mut conn,
+        "EXPLAIN SELECT name, (SELECT COUNT(*) FROM orders) FROM users",
+    );
     assert!(lines.contains(&"SUBQUERY".to_string()));
 }
 
@@ -281,7 +317,10 @@ fn update_with_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_full_schema(&mut conn);
 
-    let lines = explain_lines(&mut conn, "EXPLAIN UPDATE users SET age = 30 WHERE email = 'a@b.com'");
+    let lines = explain_lines(
+        &mut conn,
+        "EXPLAIN UPDATE users SET age = 30 WHERE email = 'a@b.com'",
+    );
     assert!(lines[0].contains("UPDATE"));
     assert!(lines[0].contains("SEARCH TABLE users"));
     assert!(lines[0].contains("USING INDEX idx_email"));
@@ -365,12 +404,16 @@ fn explain_in_txn_does_not_modify() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
     setup_full_schema(&mut conn);
-    conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
+    conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')")
+        .unwrap();
 
     conn.execute("BEGIN").unwrap();
-    conn.execute("EXPLAIN INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
-    conn.execute("EXPLAIN DELETE FROM users WHERE id = 1").unwrap();
-    conn.execute("EXPLAIN UPDATE users SET name = 'X' WHERE id = 1").unwrap();
+    conn.execute("EXPLAIN INSERT INTO users (id, name) VALUES (2, 'Bob')")
+        .unwrap();
+    conn.execute("EXPLAIN DELETE FROM users WHERE id = 1")
+        .unwrap();
+    conn.execute("EXPLAIN UPDATE users SET name = 'X' WHERE id = 1")
+        .unwrap();
     conn.execute("COMMIT").unwrap();
 
     let qr = query_result(conn.execute("SELECT COUNT(*) FROM users").unwrap());
@@ -384,7 +427,8 @@ fn explain_sees_uncommitted_schema() {
     let mut conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
-    conn.execute("CREATE TABLE temp (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    conn.execute("CREATE TABLE temp (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
     let lines = explain_lines(&mut conn, "EXPLAIN SELECT * FROM temp WHERE id = 1");
     assert!(lines[0].contains("SEARCH TABLE temp"));
     conn.execute("ROLLBACK").unwrap();
@@ -435,7 +479,10 @@ fn explain_with_between() {
     let mut conn = Connection::open(&db).unwrap();
     setup_full_schema(&mut conn);
 
-    let lines = explain_lines(&mut conn, "EXPLAIN SELECT * FROM users WHERE age BETWEEN 20 AND 30");
+    let lines = explain_lines(
+        &mut conn,
+        "EXPLAIN SELECT * FROM users WHERE age BETWEEN 20 AND 30",
+    );
     assert!(lines[0].contains("SCAN TABLE users"));
     assert!(lines.contains(&"FILTER".to_string()));
 }
@@ -447,7 +494,10 @@ fn explain_with_like() {
     let mut conn = Connection::open(&db).unwrap();
     setup_full_schema(&mut conn);
 
-    let lines = explain_lines(&mut conn, "EXPLAIN SELECT * FROM users WHERE name LIKE 'A%'");
+    let lines = explain_lines(
+        &mut conn,
+        "EXPLAIN SELECT * FROM users WHERE name LIKE 'A%'",
+    );
     assert!(lines[0].contains("SCAN TABLE users"));
     assert!(lines.contains(&"FILTER".to_string()));
 }
@@ -461,7 +511,9 @@ fn explain_via_query_method() {
     let mut conn = Connection::open(&db).unwrap();
     setup_full_schema(&mut conn);
 
-    let qr = conn.query("EXPLAIN SELECT * FROM users WHERE id = 1").unwrap();
+    let qr = conn
+        .query("EXPLAIN SELECT * FROM users WHERE id = 1")
+        .unwrap();
     assert_eq!(qr.columns, vec!["plan"]);
     assert!(!qr.rows.is_empty());
     match &qr.rows[0][0] {

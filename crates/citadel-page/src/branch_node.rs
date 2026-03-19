@@ -7,8 +7,8 @@
 //! - cell[i].child handles keys where key[i-1] <= k < key[i] (key[-1] = -∞)
 //! - right_child handles keys where key[n-1] <= k
 
-use citadel_core::types::PageId;
 use crate::page::Page;
+use citadel_core::types::PageId;
 
 /// Size of fixed fields in a branch cell (child: 4 + key_len: 2).
 const BRANCH_CELL_FIXED: usize = 6;
@@ -23,7 +23,8 @@ pub struct BranchCell<'a> {
 pub fn read_cell(page: &Page, i: u16) -> BranchCell<'_> {
     let offset = page.cell_offset(i) as usize;
     let child = u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap());
-    let key_len = u16::from_le_bytes(page.data[offset + 4..offset + 6].try_into().unwrap()) as usize;
+    let key_len =
+        u16::from_le_bytes(page.data[offset + 4..offset + 6].try_into().unwrap()) as usize;
     let key = &page.data[offset + 6..offset + 6 + key_len];
     BranchCell {
         child: PageId(child),
@@ -48,7 +49,8 @@ pub fn build_cell(child: PageId, key: &[u8]) -> Vec<u8> {
 /// Get the cell byte size for the cell at index `i`.
 pub fn get_cell_size(page: &Page, i: u16) -> usize {
     let offset = page.cell_offset(i) as usize;
-    let key_len = u16::from_le_bytes(page.data[offset + 4..offset + 6].try_into().unwrap()) as usize;
+    let key_len =
+        u16::from_le_bytes(page.data[offset + 4..offset + 6].try_into().unwrap()) as usize;
     BRANCH_CELL_FIXED + key_len
 }
 
@@ -231,12 +233,12 @@ mod tests {
             PageId(4),
         );
 
-        assert_eq!(search(&page, b"ant"), PageId(1));  // < "cat"
-        assert_eq!(search(&page, b"cat"), PageId(2));  // >= "cat", < "dog"
-        assert_eq!(search(&page, b"cow"), PageId(2));  // >= "cat", < "dog"
-        assert_eq!(search(&page, b"dog"), PageId(3));  // >= "dog", < "fox"
-        assert_eq!(search(&page, b"elk"), PageId(3));  // >= "dog", < "fox"
-        assert_eq!(search(&page, b"fox"), PageId(4));  // >= "fox"
+        assert_eq!(search(&page, b"ant"), PageId(1)); // < "cat"
+        assert_eq!(search(&page, b"cat"), PageId(2)); // >= "cat", < "dog"
+        assert_eq!(search(&page, b"cow"), PageId(2)); // >= "cat", < "dog"
+        assert_eq!(search(&page, b"dog"), PageId(3)); // >= "dog", < "fox"
+        assert_eq!(search(&page, b"elk"), PageId(3)); // >= "dog", < "fox"
+        assert_eq!(search(&page, b"fox"), PageId(4)); // >= "fox"
         assert_eq!(search(&page, b"zebra"), PageId(4)); // >= "fox"
     }
 
@@ -259,15 +261,12 @@ mod tests {
 
     #[test]
     fn insert_separator_middle() {
-        let mut page = make_branch_page(
-            &[b"b", b"f"],
-            &[PageId(1), PageId(2)],
-            PageId(3),
-        );
+        let mut page = make_branch_page(&[b"b", b"f"], &[PageId(1), PageId(2)], PageId(3));
 
         // Child at index 1 (PageId(2), handles [b, f)) splits with separator "d"
         let ok = insert_separator(
-            &mut page, 1,
+            &mut page,
+            1,
             PageId(20), // left child (CoW'd PageId(2))
             b"d",       // separator
             PageId(21), // right child (new page)
@@ -293,18 +292,15 @@ mod tests {
 
     #[test]
     fn insert_separator_right_child() {
-        let mut page = make_branch_page(
-            &[b"b"],
-            &[PageId(1)],
-            PageId(2),
-        );
+        let mut page = make_branch_page(&[b"b"], &[PageId(1)], PageId(2));
 
         // right_child (PageId(2)) splits with separator "e"
         let ok = insert_separator(
-            &mut page, 1, // child_idx == num_cells means right_child
-            PageId(20),    // left (CoW'd old right_child)
-            b"e",          // separator
-            PageId(21),    // new right_child
+            &mut page,
+            1,          // child_idx == num_cells means right_child
+            PageId(20), // left (CoW'd old right_child)
+            b"e",       // separator
+            PageId(21), // new right_child
         );
         assert!(ok);
 

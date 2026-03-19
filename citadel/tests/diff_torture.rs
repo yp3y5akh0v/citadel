@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
-use citadel_sync::{LocalTreeReader, merkle_diff};
+use citadel_sync::{merkle_diff, LocalTreeReader};
 
 fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
     DatabaseBuilder::new(path)
@@ -109,7 +109,10 @@ fn random_mutations_100_rounds_incremental() {
 
         // After apply, trees must be fully in sync
         let post_diff = diff(&db1, &db2);
-        assert!(post_diff.is_empty(), "round {round}: must be in sync after apply");
+        assert!(
+            post_diff.is_empty(),
+            "round {round}: must be in sync after apply"
+        );
     }
 
     assert_eq!(collect_all(&db1), collect_all(&db2));
@@ -329,7 +332,7 @@ fn alternating_insert_delete_stress() {
             for j in 0..3u32 {
                 let key = ((round - 1) * 100 + j).to_be_bytes();
                 wtx.delete(&key).unwrap();
-                expected.remove(&key.to_vec());
+                expected.remove(key.as_slice());
             }
         }
         wtx.commit().unwrap();
@@ -385,7 +388,10 @@ fn diff_symmetry_both_directions() {
 
     // After forward apply, diff db1→db2 should be empty (db2 matches db1's source pages)
     let post = diff(&db1, &db2);
-    assert!(post.is_empty(), "after forward apply, db1->db2 diff must be empty");
+    assert!(
+        post.is_empty(),
+        "after forward apply, db1->db2 diff must be empty"
+    );
 }
 
 #[test]
@@ -405,9 +411,12 @@ fn large_values_multi_page_diff() {
 
     // Change a few large values
     let mut wtx = db1.begin_write().unwrap();
-    wtx.insert(&5u32.to_be_bytes(), &vec![0xBB_u8; 1024]).unwrap();
-    wtx.insert(&25u32.to_be_bytes(), &vec![0xCC_u8; 1024]).unwrap();
-    wtx.insert(&45u32.to_be_bytes(), &vec![0xDD_u8; 1024]).unwrap();
+    wtx.insert(&5u32.to_be_bytes(), &vec![0xBB_u8; 1024])
+        .unwrap();
+    wtx.insert(&25u32.to_be_bytes(), &vec![0xCC_u8; 1024])
+        .unwrap();
+    wtx.insert(&45u32.to_be_bytes(), &vec![0xDD_u8; 1024])
+        .unwrap();
     wtx.commit().unwrap();
 
     let result = diff(&db1, &db2);
@@ -509,7 +518,10 @@ fn diff_empty_after_full_overwrite() {
 
     // Second diff should be empty
     let result2 = diff(&db1, &db2);
-    assert!(result2.is_empty(), "second diff must be empty after full sync");
+    assert!(
+        result2.is_empty(),
+        "second diff must be empty after full sync"
+    );
 }
 
 #[test]

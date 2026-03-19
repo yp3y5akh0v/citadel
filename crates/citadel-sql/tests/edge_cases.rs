@@ -30,10 +30,10 @@ fn i64_max_value() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 9223372036854775807)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 9223372036854775807)")
+        .unwrap();
 
     let qr = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(i64::MAX));
@@ -45,10 +45,10 @@ fn i64_max_minus_1() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 9223372036854775806)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 9223372036854775806)")
+        .unwrap();
 
     let qr = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(i64::MAX - 1));
@@ -61,10 +61,10 @@ fn i64_neg_max_as_negated_literal() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, -9223372036854775807)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, -9223372036854775807)")
+        .unwrap();
 
     let qr = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(i64::MIN + 1));
@@ -79,9 +79,8 @@ fn i64_min_literal_becomes_real() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
 
     // This will either:
     // (a) fail with type mismatch (Real -> Integer coercion truncates), or
@@ -97,12 +96,14 @@ fn i64_max_as_primary_key() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)"
-    ).unwrap();
-    conn.execute("INSERT INTO t VALUES (9223372036854775807)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (9223372036854775807)")
+        .unwrap();
 
-    let qr = conn.query("SELECT id FROM t WHERE id = 9223372036854775807").unwrap();
+    let qr = conn
+        .query("SELECT id FROM t WHERE id = 9223372036854775807")
+        .unwrap();
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Integer(i64::MAX));
 }
@@ -113,9 +114,8 @@ fn zero_as_pk() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (0)").unwrap();
 
     let qr = conn.query("SELECT id FROM t WHERE id = 0").unwrap();
@@ -134,15 +134,18 @@ fn arithmetic_overflow_add() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 9223372036854775807)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 9223372036854775807)")
+        .unwrap();
 
     let result = conn.query("SELECT val + 1 FROM t WHERE id = 1");
     // Correct behavior: return an overflow error
     // Bug: currently panics with 'attempt to add with overflow' in debug mode
-    assert!(result.is_err(), "i64::MAX + 1 should return error, not succeed or panic");
+    assert!(
+        result.is_err(),
+        "i64::MAX + 1 should return error, not succeed or panic"
+    );
 }
 
 #[test]
@@ -152,13 +155,16 @@ fn arithmetic_overflow_subtract() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, -9223372036854775807)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, -9223372036854775807)")
+        .unwrap();
 
     let result = conn.query("SELECT val - 2 FROM t WHERE id = 1");
-    assert!(result.is_err(), "i64::MIN+1 - 2 should return error, not succeed or panic");
+    assert!(
+        result.is_err(),
+        "i64::MIN+1 - 2 should return error, not succeed or panic"
+    );
 }
 
 #[test]
@@ -168,13 +174,16 @@ fn arithmetic_overflow_multiply() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 9223372036854775807)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 9223372036854775807)")
+        .unwrap();
 
     let result = conn.query("SELECT val * 2 FROM t WHERE id = 1");
-    assert!(result.is_err(), "i64::MAX * 2 should return error, not succeed or panic");
+    assert!(
+        result.is_err(),
+        "i64::MAX * 2 should return error, not succeed or panic"
+    );
 }
 
 #[test]
@@ -186,10 +195,10 @@ fn arithmetic_overflow_negate_min() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, -9223372036854775807)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, -9223372036854775807)")
+        .unwrap();
 
     // val - 1 = i64::MIN, then -i64::MIN overflows
     let result = conn.query("SELECT -(val - 1) FROM t WHERE id = 1");
@@ -207,9 +216,8 @@ fn division_by_zero_integer() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 42)").unwrap();
 
     let result = conn.query("SELECT val / 0 FROM t WHERE id = 1");
@@ -222,9 +230,8 @@ fn division_by_zero_real() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 5.0)").unwrap();
 
     let result = conn.query("SELECT val / 0.0 FROM t WHERE id = 1");
@@ -237,9 +244,8 @@ fn modulo_by_zero_integer() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 42)").unwrap();
 
     let result = conn.query("SELECT val % 0 FROM t WHERE id = 1");
@@ -254,14 +260,15 @@ fn modulo_by_zero_real() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 5.0)").unwrap();
 
     let result = conn.query("SELECT val % 0.0 FROM t WHERE id = 1");
-    assert!(result.is_err(),
-        "modulo by zero (real) should error, currently produces NaN");
+    assert!(
+        result.is_err(),
+        "modulo by zero (real) should error, currently produces NaN"
+    );
 }
 
 #[test]
@@ -270,9 +277,8 @@ fn integer_division_truncates() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 7)").unwrap();
 
     let qr = conn.query("SELECT val / 2 FROM t WHERE id = 1").unwrap();
@@ -285,9 +291,8 @@ fn negative_integer_division() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, -7)").unwrap();
 
     let qr = conn.query("SELECT val / 2 FROM t WHERE id = 1").unwrap();
@@ -300,9 +305,8 @@ fn negative_modulo() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, -7)").unwrap();
 
     let qr = conn.query("SELECT val % 3 FROM t WHERE id = 1").unwrap();
@@ -321,15 +325,16 @@ fn update_pk_change_to_existing_key() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'one')").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 'two')").unwrap();
 
     let result = conn.execute("UPDATE t SET id = 1 WHERE id = 2");
-    assert!(result.is_err(),
-        "UPDATE PK to existing key should fail with DuplicateKey, but it silently overwrites");
+    assert!(
+        result.is_err(),
+        "UPDATE PK to existing key should fail with DuplicateKey, but it silently overwrites"
+    );
 }
 
 #[test]
@@ -340,9 +345,8 @@ fn update_pk_shift_multiple_rows_data_integrity() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT NOT NULL)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT NOT NULL)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
     conn.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
@@ -363,8 +367,11 @@ fn update_pk_shift_multiple_rows_data_integrity() {
         Ok(_) => {
             // If it "succeeds", verify data integrity
             let qr = conn.query("SELECT COUNT(*) FROM t").unwrap();
-            assert_eq!(qr.rows[0][0], Value::Integer(3),
-                "UPDATE SET id = id+1 lost rows — data corruption bug");
+            assert_eq!(
+                qr.rows[0][0],
+                Value::Integer(3),
+                "UPDATE SET id = id+1 lost rows — data corruption bug"
+            );
         }
     }
 }
@@ -376,9 +383,8 @@ fn update_pk_swap() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT NOT NULL)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT NOT NULL)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 'second')").unwrap();
 
@@ -407,14 +413,17 @@ fn null_equality_is_null() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
 
     // WHERE val = NULL should match nothing (NULL = NULL is NULL, not true)
     let qr = conn.query("SELECT id FROM t WHERE val = NULL").unwrap();
-    assert_eq!(qr.rows.len(), 0, "NULL = NULL should be NULL (falsy), not true");
+    assert_eq!(
+        qr.rows.len(),
+        0,
+        "NULL = NULL should be NULL (falsy), not true"
+    );
 }
 
 #[test]
@@ -423,9 +432,8 @@ fn null_in_arithmetic() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
 
     // NULL + 1 should be NULL
@@ -439,9 +447,8 @@ fn null_in_comparison() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 5)").unwrap();
 
@@ -457,9 +464,8 @@ fn null_in_order_by() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 30)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
     conn.execute("INSERT INTO t VALUES (3, 10)").unwrap();
@@ -467,7 +473,9 @@ fn null_in_order_by() {
     conn.execute("INSERT INTO t VALUES (5, 20)").unwrap();
 
     // Default ASC: NULLs first
-    let qr = conn.query("SELECT id, val FROM t ORDER BY val ASC").unwrap();
+    let qr = conn
+        .query("SELECT id, val FROM t ORDER BY val ASC")
+        .unwrap();
     assert_eq!(qr.rows.len(), 5);
     // First two should be NULL
     assert!(qr.rows[0][1].is_null());
@@ -484,18 +492,17 @@ fn null_in_group_by() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, grp INTEGER, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, grp INTEGER, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 1, 10)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, NULL, 20)").unwrap();
     conn.execute("INSERT INTO t VALUES (3, 1, 30)").unwrap();
     conn.execute("INSERT INTO t VALUES (4, NULL, 40)").unwrap();
     conn.execute("INSERT INTO t VALUES (5, 2, 50)").unwrap();
 
-    let qr = conn.query(
-        "SELECT grp, COUNT(*), SUM(val) FROM t GROUP BY grp ORDER BY grp"
-    ).unwrap();
+    let qr = conn
+        .query("SELECT grp, COUNT(*), SUM(val) FROM t GROUP BY grp ORDER BY grp")
+        .unwrap();
 
     // NULLs should form their own group
     // Groups: NULL (count=2, sum=60), 1 (count=2, sum=40), 2 (count=1, sum=50)
@@ -517,21 +524,30 @@ fn aggregate_all_nulls() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
     conn.execute("INSERT INTO t VALUES (3, NULL)").unwrap();
 
-    let qr = conn.query("SELECT SUM(val), AVG(val), MIN(val), MAX(val), COUNT(val), COUNT(*) FROM t").unwrap();
+    let qr = conn
+        .query("SELECT SUM(val), AVG(val), MIN(val), MAX(val), COUNT(val), COUNT(*) FROM t")
+        .unwrap();
     // SUM of all NULLs should be NULL
     assert!(qr.rows[0][0].is_null(), "SUM of all NULLs should be NULL");
     assert!(qr.rows[0][1].is_null(), "AVG of all NULLs should be NULL");
     assert!(qr.rows[0][2].is_null(), "MIN of all NULLs should be NULL");
     assert!(qr.rows[0][3].is_null(), "MAX of all NULLs should be NULL");
-    assert_eq!(qr.rows[0][4], Value::Integer(0), "COUNT(col) of all NULLs should be 0");
-    assert_eq!(qr.rows[0][5], Value::Integer(3), "COUNT(*) should count all rows");
+    assert_eq!(
+        qr.rows[0][4],
+        Value::Integer(0),
+        "COUNT(col) of all NULLs should be 0"
+    );
+    assert_eq!(
+        qr.rows[0][5],
+        Value::Integer(3),
+        "COUNT(*) should count all rows"
+    );
 }
 
 #[test]
@@ -540,11 +556,12 @@ fn aggregate_empty_table() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
 
-    let qr = conn.query("SELECT COUNT(*), SUM(val), AVG(val) FROM t").unwrap();
+    let qr = conn
+        .query("SELECT COUNT(*), SUM(val), AVG(val) FROM t")
+        .unwrap();
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Integer(0));
     assert!(qr.rows[0][1].is_null(), "SUM of empty table should be NULL");
@@ -557,14 +574,15 @@ fn update_set_to_null_on_not_null_column() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
 
     let result = conn.execute("UPDATE t SET name = NULL WHERE id = 1");
-    assert!(matches!(result, Err(SqlError::NotNullViolation(_))),
-        "UPDATE SET NOT NULL column to NULL should error");
+    assert!(
+        matches!(result, Err(SqlError::NotNullViolation(_))),
+        "UPDATE SET NOT NULL column to NULL should error"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -577,9 +595,8 @@ fn empty_string_as_pk() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id TEXT NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id TEXT NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES ('', 42)").unwrap();
 
     let qr = conn.query("SELECT val FROM t WHERE id = ''").unwrap();
@@ -593,10 +610,10 @@ fn string_with_single_quotes_escaped() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
-    ).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'it''s a test')").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'it''s a test')")
+        .unwrap();
 
     let qr = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("it's a test".into()));
@@ -608,9 +625,8 @@ fn unicode_in_values() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     let tests = vec![
         (1, "Hello, World!"),
@@ -622,13 +638,19 @@ fn unicode_in_values() {
     ];
 
     for (id, text) in &tests {
-        conn.execute(&format!("INSERT INTO t VALUES ({id}, '{text}')")).unwrap();
+        conn.execute(&format!("INSERT INTO t VALUES ({id}, '{text}')"))
+            .unwrap();
     }
 
     for (id, expected) in &tests {
-        let qr = conn.query(&format!("SELECT val FROM t WHERE id = {id}")).unwrap();
-        assert_eq!(qr.rows[0][0], Value::Text(expected.to_string()),
-            "Unicode roundtrip failed for id={id}");
+        let qr = conn
+            .query(&format!("SELECT val FROM t WHERE id = {id}"))
+            .unwrap();
+        assert_eq!(
+            qr.rows[0][0],
+            Value::Text(expected.to_string()),
+            "Unicode roundtrip failed for id={id}"
+        );
     }
 }
 
@@ -639,10 +661,10 @@ fn unicode_persists_across_reopen() {
     {
         let db = create_db(dir.path());
         let mut conn = Connection::open(&db).unwrap();
-        conn.execute(
-            "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
-        ).unwrap();
-        conn.execute("INSERT INTO t VALUES (1, '🦀 Rust 数据库')").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, '🦀 Rust 数据库')")
+            .unwrap();
     }
 
     {
@@ -659,22 +681,29 @@ fn string_with_sql_keywords() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+        .unwrap();
 
-    let keyword_strings = vec![
-        "SELECT", "INSERT INTO", "DROP TABLE", "DELETE FROM",
-        "WHERE 1=1", "OR 1=1 --", "'; DROP TABLE t; --",
+    let keyword_strings = [
+        "SELECT",
+        "INSERT INTO",
+        "DROP TABLE",
+        "DELETE FROM",
+        "WHERE 1=1",
+        "OR 1=1 --",
+        "'; DROP TABLE t; --",
     ];
 
     for (i, kw) in keyword_strings.iter().enumerate() {
         let escaped = kw.replace('\'', "''");
-        conn.execute(&format!("INSERT INTO t VALUES ({}, '{escaped}')", i + 1)).unwrap();
+        conn.execute(&format!("INSERT INTO t VALUES ({}, '{escaped}')", i + 1))
+            .unwrap();
     }
 
     for (i, expected) in keyword_strings.iter().enumerate() {
-        let qr = conn.query(&format!("SELECT val FROM t WHERE id = {}", i + 1)).unwrap();
+        let qr = conn
+            .query(&format!("SELECT val FROM t WHERE id = {}", i + 1))
+            .unwrap();
         assert_eq!(qr.rows[0][0], Value::Text(expected.to_string()));
     }
 }
@@ -689,9 +718,8 @@ fn real_zero_positive_negative() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 0.0)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, -0.0)").unwrap();
 
@@ -713,11 +741,12 @@ fn real_very_small_values() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)"
-    ).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 0.000000001)").unwrap();
-    conn.execute("INSERT INTO t VALUES (2, -0.000000001)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 0.000000001)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, -0.000000001)")
+        .unwrap();
 
     let qr = conn.query("SELECT val FROM t ORDER BY val").unwrap();
     assert!(qr.rows[0][0] < qr.rows[1][0]);
@@ -729,9 +758,8 @@ fn real_scientific_notation() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 1.5e10)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 2.5e-5)").unwrap();
 
@@ -754,9 +782,8 @@ fn mixed_integer_real_comparison_in_where() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
     // Compare integer column with real literal
@@ -780,9 +807,8 @@ fn boolean_in_where_without_comparison() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, active BOOLEAN NOT NULL)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, active BOOLEAN NOT NULL)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, TRUE)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, FALSE)").unwrap();
 
@@ -798,28 +824,37 @@ fn boolean_and_or_three_valued_with_null() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a BOOLEAN, b BOOLEAN)"
-    ).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, TRUE, NULL)").unwrap();
-    conn.execute("INSERT INTO t VALUES (2, FALSE, NULL)").unwrap();
-    conn.execute("INSERT INTO t VALUES (3, NULL, TRUE)").unwrap();
-    conn.execute("INSERT INTO t VALUES (4, NULL, FALSE)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a BOOLEAN, b BOOLEAN)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, TRUE, NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, FALSE, NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (3, NULL, TRUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (4, NULL, FALSE)")
+        .unwrap();
 
     // TRUE AND NULL = NULL (falsy)
     let qr = conn.query("SELECT id FROM t WHERE a AND b").unwrap();
     assert_eq!(qr.rows.len(), 0, "TRUE AND NULL should be NULL (falsy)");
 
     // FALSE OR NULL = NULL (falsy)
-    let qr = conn.query("SELECT id FROM t WHERE id = 2 AND (a OR b)").unwrap();
+    let qr = conn
+        .query("SELECT id FROM t WHERE id = 2 AND (a OR b)")
+        .unwrap();
     assert_eq!(qr.rows.len(), 0, "FALSE OR NULL should be NULL (falsy)");
 
     // NULL OR TRUE = TRUE
-    let qr = conn.query("SELECT id FROM t WHERE id = 3 AND (a OR b)").unwrap();
+    let qr = conn
+        .query("SELECT id FROM t WHERE id = 3 AND (a OR b)")
+        .unwrap();
     assert_eq!(qr.rows.len(), 1, "NULL OR TRUE should be TRUE");
 
     // FALSE AND NULL = FALSE (falsy)
-    let qr = conn.query("SELECT id FROM t WHERE id = 2 AND (a AND b)").unwrap();
+    let qr = conn
+        .query("SELECT id FROM t WHERE id = 2 AND (a AND b)")
+        .unwrap();
     assert_eq!(qr.rows.len(), 0, "FALSE AND NULL should be FALSE");
 }
 
@@ -836,11 +871,16 @@ fn composite_pk_text_integer() {
     conn.execute(
         "CREATE TABLE t (name TEXT NOT NULL, version INTEGER NOT NULL, data TEXT, PRIMARY KEY (name, version))"
     ).unwrap();
-    conn.execute("INSERT INTO t VALUES ('foo', 1, 'first')").unwrap();
-    conn.execute("INSERT INTO t VALUES ('foo', 2, 'second')").unwrap();
-    conn.execute("INSERT INTO t VALUES ('bar', 1, 'bar_first')").unwrap();
+    conn.execute("INSERT INTO t VALUES ('foo', 1, 'first')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES ('foo', 2, 'second')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES ('bar', 1, 'bar_first')")
+        .unwrap();
 
-    let qr = conn.query("SELECT data FROM t WHERE name = 'foo' AND version = 2").unwrap();
+    let qr = conn
+        .query("SELECT data FROM t WHERE name = 'foo' AND version = 2")
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("second".into()));
 
     // Duplicate composite key
@@ -854,9 +894,8 @@ fn composite_pk_ordering() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (a, b))"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (a, b))")
+        .unwrap();
 
     // Insert in random order
     conn.execute("INSERT INTO t VALUES (2, 1)").unwrap();
@@ -882,7 +921,8 @@ fn select_nonexistent_column() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
     let result = conn.query("SELECT nonexistent FROM t");
@@ -895,9 +935,8 @@ fn select_duplicate_columns() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 42)").unwrap();
 
     // SELECT id, id, val — duplicate column reference is valid SQL
@@ -914,9 +953,8 @@ fn select_with_alias() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 42)").unwrap();
 
     let qr = conn.query("SELECT id AS pk, val AS value FROM t").unwrap();
@@ -931,7 +969,8 @@ fn select_count_star_empty_table() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
+        .unwrap();
 
     let qr = conn.query("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(qr.rows.len(), 1);
@@ -944,7 +983,8 @@ fn limit_zero() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
     conn.execute("INSERT INTO t VALUES (2)").unwrap();
 
@@ -958,7 +998,8 @@ fn offset_zero() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
     conn.execute("INSERT INTO t VALUES (2)").unwrap();
 
@@ -972,7 +1013,8 @@ fn limit_larger_than_rows() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
     let qr = conn.query("SELECT * FROM t LIMIT 1000").unwrap();
@@ -989,9 +1031,8 @@ fn integer_to_real_column_coercion() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)")
+        .unwrap();
     // Insert integer literal into REAL column
     conn.execute("INSERT INTO t VALUES (1, 42)").unwrap();
 
@@ -1005,9 +1046,8 @@ fn real_to_integer_column_coercion() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     // Insert real literal into INTEGER column — should truncate or error
     let result = conn.execute("INSERT INTO t VALUES (1, 42.7)");
 
@@ -1029,9 +1069,8 @@ fn boolean_integer_coercion() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, flag BOOLEAN)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, flag BOOLEAN)")
+        .unwrap();
     // Insert integer into BOOLEAN column
     let result = conn.execute("INSERT INTO t VALUES (1, 1)");
     match result {
@@ -1051,9 +1090,8 @@ fn type_mismatch_text_into_integer() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     let result = conn.execute("INSERT INTO t VALUES (1, 'not_a_number')");
     assert!(result.is_err(), "text into integer column should error");
 }
@@ -1068,7 +1106,8 @@ fn create_table_single_pk_column() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
     let qr = conn.query("SELECT * FROM t").unwrap();
@@ -1090,8 +1129,9 @@ fn create_table_all_types() {
             c_text TEXT,
             d_bool BOOLEAN,
             e_blob BLOB
-        )"
-    ).unwrap();
+        )",
+    )
+    .unwrap();
 
     // Insert with explicit NULLs (all nullable)
     conn.execute("INSERT INTO t (pk) VALUES (1)").unwrap();
@@ -1109,7 +1149,8 @@ fn drop_table_then_select_errors() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
+        .unwrap();
     conn.execute("DROP TABLE t").unwrap();
 
     let result = conn.query("SELECT * FROM t");
@@ -1122,9 +1163,7 @@ fn duplicate_column_names_in_create() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    let result = conn.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, name TEXT)"
-    );
+    let result = conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, name TEXT)");
     assert!(matches!(result, Err(SqlError::DuplicateColumn(_))));
 }
 
@@ -1138,9 +1177,8 @@ fn insert_explicit_null_in_nullable_column() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
 
     let qr = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
@@ -1153,9 +1191,8 @@ fn insert_wrong_column_count() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     let result = conn.execute("INSERT INTO t VALUES (1, 2, 3)");
     assert!(result.is_err(), "wrong column count should error");
 }
@@ -1167,12 +1204,15 @@ fn insert_too_few_columns() {
     let mut conn = Connection::open(&db).unwrap();
 
     conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL)"
-    ).unwrap();
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL)",
+    )
+    .unwrap();
     // Insert with only PK specified via column list, missing NOT NULL columns
     let result = conn.execute("INSERT INTO t (id) VALUES (1)");
-    assert!(matches!(result, Err(SqlError::NotNullViolation(_))),
-        "missing NOT NULL column should error");
+    assert!(
+        matches!(result, Err(SqlError::NotNullViolation(_))),
+        "missing NOT NULL column should error"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -1185,11 +1225,11 @@ fn update_all_rows_without_where() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     for i in 0..10 {
-        conn.execute(&format!("INSERT INTO t VALUES ({i}, 0)")).unwrap();
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, 0)"))
+            .unwrap();
     }
 
     match conn.execute("UPDATE t SET val = 999").unwrap() {
@@ -1197,7 +1237,9 @@ fn update_all_rows_without_where() {
         other => panic!("expected RowsAffected(10), got {other:?}"),
     }
 
-    let qr = conn.query("SELECT COUNT(*) FROM t WHERE val = 999").unwrap();
+    let qr = conn
+        .query("SELECT COUNT(*) FROM t WHERE val = 999")
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(10));
 }
 
@@ -1207,9 +1249,8 @@ fn update_nonexistent_column() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 0)").unwrap();
 
     let result = conn.execute("UPDATE t SET missing_col = 1 WHERE id = 1");
@@ -1222,9 +1263,8 @@ fn update_pk_to_free_value() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
 
     conn.execute("UPDATE t SET id = 100 WHERE id = 1").unwrap();
@@ -1244,9 +1284,8 @@ fn update_same_row_twice_sequentially() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 0)").unwrap();
 
     conn.execute("UPDATE t SET val = 10 WHERE id = 1").unwrap();
@@ -1267,7 +1306,8 @@ fn delete_nonexistent_row() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
     match conn.execute("DELETE FROM t WHERE id = 999").unwrap() {
@@ -1282,12 +1322,13 @@ fn delete_then_reinsert_same_key() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
-    ).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'original')").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'original')")
+        .unwrap();
     conn.execute("DELETE FROM t WHERE id = 1").unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'reinserted')").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'reinserted')")
+        .unwrap();
 
     let qr = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("reinserted".into()));
@@ -1299,15 +1340,22 @@ fn delete_with_complex_where() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, cat TEXT, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, cat TEXT, val INTEGER)")
+        .unwrap();
     for i in 0..20 {
-        let cat = if i % 3 == 0 { "a" } else if i % 3 == 1 { "b" } else { "c" };
-        conn.execute(&format!("INSERT INTO t VALUES ({i}, '{cat}', {i})")).unwrap();
+        let cat = if i % 3 == 0 {
+            "a"
+        } else if i % 3 == 1 {
+            "b"
+        } else {
+            "c"
+        };
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, '{cat}', {i})"))
+            .unwrap();
     }
 
-    conn.execute("DELETE FROM t WHERE cat = 'a' AND val > 10").unwrap();
+    conn.execute("DELETE FROM t WHERE cat = 'a' AND val > 10")
+        .unwrap();
 
     // cat='a' has ids 0,3,6,9,12,15,18
     // val > 10 removes: 12, 15, 18 (3 rows)
@@ -1325,14 +1373,13 @@ fn nested_parenthesized_expressions() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
 
-    let qr = conn.query(
-        "SELECT ((val + 5) * 2) - 10 FROM t WHERE id = 1"
-    ).unwrap();
+    let qr = conn
+        .query("SELECT ((val + 5) * 2) - 10 FROM t WHERE id = 1")
+        .unwrap();
     // (10 + 5) * 2 - 10 = 30 - 10 = 20
     assert_eq!(qr.rows[0][0], Value::Integer(20));
 }
@@ -1344,14 +1391,16 @@ fn deeply_nested_and_or() {
     let mut conn = Connection::open(&db).unwrap();
 
     conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)"
-    ).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 10, 20, 30)").unwrap();
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10, 20, 30)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (2, 5, 25, 35)").unwrap();
 
-    let qr = conn.query(
-        "SELECT id FROM t WHERE (a > 7 AND b < 25) OR (c > 32 AND a < 8)"
-    ).unwrap();
+    let qr = conn
+        .query("SELECT id FROM t WHERE (a > 7 AND b < 25) OR (c > 32 AND a < 8)")
+        .unwrap();
     // id=1: (10>7 AND 20<25)=true OR ... → true
     // id=2: (5>7)=false, (35>32 AND 5<8)=true → true
     assert_eq!(qr.rows.len(), 2);
@@ -1363,15 +1412,17 @@ fn chained_comparisons_in_where() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
+        .unwrap();
     for i in 1..=20 {
-        conn.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+        conn.execute(&format!("INSERT INTO t VALUES ({i})"))
+            .unwrap();
     }
 
     // Range query: id >= 5 AND id <= 15
-    let qr = conn.query("SELECT COUNT(*) FROM t WHERE id >= 5 AND id <= 15").unwrap();
+    let qr = conn
+        .query("SELECT COUNT(*) FROM t WHERE id >= 5 AND id <= 15")
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(11));
 }
 
@@ -1385,12 +1436,13 @@ fn aggregate_single_row() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 42)").unwrap();
 
-    let qr = conn.query("SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) FROM t").unwrap();
+    let qr = conn
+        .query("SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) FROM t")
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(1));
     assert_eq!(qr.rows[0][1], Value::Integer(42));
     assert_eq!(qr.rows[0][2], Value::Real(42.0));
@@ -1404,12 +1456,13 @@ fn sum_large_integers() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     // Insert values that when summed will be close to i64::MAX
-    conn.execute("INSERT INTO t VALUES (1, 4611686018427387903)").unwrap(); // ~i64::MAX/2
-    conn.execute("INSERT INTO t VALUES (2, 4611686018427387903)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 4611686018427387903)")
+        .unwrap(); // ~i64::MAX/2
+    conn.execute("INSERT INTO t VALUES (2, 4611686018427387903)")
+        .unwrap();
 
     let qr = conn.query("SELECT SUM(val) FROM t").unwrap();
     // Sum = 2 * (i64::MAX/2) = i64::MAX - 1 (approximately, due to integer division)
@@ -1422,9 +1475,8 @@ fn avg_returns_real() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 3)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 4)").unwrap();
 
@@ -1438,12 +1490,17 @@ fn group_by_empty_table() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, grp TEXT, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, grp TEXT, val INTEGER)")
+        .unwrap();
 
-    let qr = conn.query("SELECT grp, COUNT(*) FROM t GROUP BY grp").unwrap();
-    assert_eq!(qr.rows.len(), 0, "GROUP BY on empty table should return no groups");
+    let qr = conn
+        .query("SELECT grp, COUNT(*) FROM t GROUP BY grp")
+        .unwrap();
+    assert_eq!(
+        qr.rows.len(),
+        0,
+        "GROUP BY on empty table should return no groups"
+    );
 }
 
 #[test]
@@ -1452,9 +1509,8 @@ fn count_star_vs_count_column() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
     conn.execute("INSERT INTO t VALUES (3, 30)").unwrap();
@@ -1476,14 +1532,17 @@ fn order_by_multiple_columns() {
     let mut conn = Connection::open(&db).unwrap();
 
     conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, grp TEXT NOT NULL, val INTEGER)"
-    ).unwrap();
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, grp TEXT NOT NULL, val INTEGER)",
+    )
+    .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'b', 2)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 'a', 3)").unwrap();
     conn.execute("INSERT INTO t VALUES (3, 'a', 1)").unwrap();
     conn.execute("INSERT INTO t VALUES (4, 'b', 1)").unwrap();
 
-    let qr = conn.query("SELECT id FROM t ORDER BY grp ASC, val ASC").unwrap();
+    let qr = conn
+        .query("SELECT id FROM t ORDER BY grp ASC, val ASC")
+        .unwrap();
     // a,1 → a,3 → b,1 → b,2
     assert_eq!(qr.rows[0][0], Value::Integer(3)); // a,1
     assert_eq!(qr.rows[1][0], Value::Integer(2)); // a,3
@@ -1497,15 +1556,16 @@ fn order_by_desc_nulls_last() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 30)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
     conn.execute("INSERT INTO t VALUES (3, 10)").unwrap();
 
     // DESC: NULLs should come last by default
-    let qr = conn.query("SELECT id, val FROM t ORDER BY val DESC").unwrap();
+    let qr = conn
+        .query("SELECT id, val FROM t ORDER BY val DESC")
+        .unwrap();
     assert_eq!(qr.rows[0][1], Value::Integer(30));
     assert_eq!(qr.rows[1][1], Value::Integer(10));
     assert!(qr.rows[2][1].is_null());
@@ -1532,7 +1592,9 @@ fn sql_with_semicolons() {
     let mut conn = Connection::open(&db).unwrap();
 
     // Multiple statements separated by semicolons should error
-    let result = conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY); CREATE TABLE b (id INTEGER PRIMARY KEY)");
+    let result = conn.execute(
+        "CREATE TABLE a (id INTEGER PRIMARY KEY); CREATE TABLE b (id INTEGER PRIMARY KEY)",
+    );
     assert!(result.is_err(), "multiple statements should be rejected");
 }
 
@@ -1559,9 +1621,8 @@ fn read_own_writes_within_connection() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
 
     // Write then immediately read
     conn.execute("INSERT INTO t VALUES (1, 100)").unwrap();
@@ -1586,9 +1647,11 @@ fn all_comparison_operators_integer() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
+        .unwrap();
     for i in 1..=10 {
-        conn.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+        conn.execute(&format!("INSERT INTO t VALUES ({i})"))
+            .unwrap();
     }
 
     // (operator, threshold, expected_count)
@@ -1612,11 +1675,14 @@ fn all_comparison_operators_integer() {
     ];
 
     for (op, threshold, expected) in tests {
-        let qr = conn.query(&format!(
-            "SELECT COUNT(*) FROM t WHERE id {op} {threshold}"
-        )).unwrap();
-        assert_eq!(qr.rows[0][0], Value::Integer(expected),
-            "failed: id {op} {threshold} — expected {expected} rows");
+        let qr = conn
+            .query(&format!("SELECT COUNT(*) FROM t WHERE id {op} {threshold}"))
+            .unwrap();
+        assert_eq!(
+            qr.rows[0][0],
+            Value::Integer(expected),
+            "failed: id {op} {threshold} — expected {expected} rows"
+        );
     }
 }
 
@@ -1626,21 +1692,22 @@ fn all_arithmetic_operators() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, b INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, b INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 15, 4)").unwrap();
 
     let tests: Vec<(&str, Value)> = vec![
         ("a + b", Value::Integer(19)),
         ("a - b", Value::Integer(11)),
         ("a * b", Value::Integer(60)),
-        ("a / b", Value::Integer(3)),    // 15/4 = 3 (integer division)
-        ("a % b", Value::Integer(3)),    // 15%4 = 3
+        ("a / b", Value::Integer(3)), // 15/4 = 3 (integer division)
+        ("a % b", Value::Integer(3)), // 15%4 = 3
     ];
 
     for (expr, expected) in tests {
-        let qr = conn.query(&format!("SELECT {expr} FROM t WHERE id = 1")).unwrap();
+        let qr = conn
+            .query(&format!("SELECT {expr} FROM t WHERE id = 1"))
+            .unwrap();
         assert_eq!(qr.rows[0][0], expected, "failed: {expr}");
     }
 }
@@ -1651,21 +1718,25 @@ fn null_propagation_all_operators() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
 
     // All these should produce NULL due to NULL propagation
     let null_exprs = vec![
-        "val + 1", "val - 1", "val * 2", "val / 2", "val % 2",
-        "val = 0", "val <> 0", "val < 0", "val > 0", "val <= 0", "val >= 0",
+        "val + 1", "val - 1", "val * 2", "val / 2", "val % 2", "val = 0", "val <> 0", "val < 0",
+        "val > 0", "val <= 0", "val >= 0",
     ];
 
     for expr in null_exprs {
-        let qr = conn.query(&format!("SELECT {expr} FROM t WHERE id = 1")).unwrap();
-        assert!(qr.rows[0][0].is_null(),
-            "NULL propagation failed for: {expr} — got {:?}", qr.rows[0][0]);
+        let qr = conn
+            .query(&format!("SELECT {expr} FROM t WHERE id = 1"))
+            .unwrap();
+        assert!(
+            qr.rows[0][0].is_null(),
+            "NULL propagation failed for: {expr} — got {:?}",
+            qr.rows[0][0]
+        );
     }
 }
 
@@ -1690,20 +1761,28 @@ fn complex_workflow_integrity() {
     // Populate users
     for i in 1..=20 {
         let active = if i <= 15 { "TRUE" } else { "FALSE" };
-        conn.execute(&format!("INSERT INTO users VALUES ({i}, 'user_{i}', {active})")).unwrap();
+        conn.execute(&format!(
+            "INSERT INTO users VALUES ({i}, 'user_{i}', {active})"
+        ))
+        .unwrap();
     }
 
     // Populate scores (3 scores per user)
     let mut sid = 1;
     for uid in 1..=20 {
         for score in [80, 90, 100] {
-            conn.execute(&format!("INSERT INTO scores VALUES ({sid}, {uid}, {score})")).unwrap();
+            conn.execute(&format!(
+                "INSERT INTO scores VALUES ({sid}, {uid}, {score})"
+            ))
+            .unwrap();
             sid += 1;
         }
     }
 
     // Complex queries
-    let qr = conn.query("SELECT COUNT(*) FROM users WHERE active = TRUE").unwrap();
+    let qr = conn
+        .query("SELECT COUNT(*) FROM users WHERE active = TRUE")
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(15));
 
     let qr = conn.query("SELECT COUNT(*) FROM scores").unwrap();
@@ -1718,9 +1797,12 @@ fn complex_workflow_integrity() {
     assert_eq!(qr.rows[0][2], Value::Real(90.0));
 
     // Deactivate some users
-    conn.execute("UPDATE users SET active = FALSE WHERE id > 10").unwrap();
+    conn.execute("UPDATE users SET active = FALSE WHERE id > 10")
+        .unwrap();
 
-    let qr = conn.query("SELECT COUNT(*) FROM users WHERE active = TRUE").unwrap();
+    let qr = conn
+        .query("SELECT COUNT(*) FROM users WHERE active = TRUE")
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(10));
 
     // Delete low scores
@@ -1758,11 +1840,15 @@ fn persist_all_value_types() {
                 real_val REAL,
                 text_val TEXT,
                 bool_val BOOLEAN
-            )"
-        ).unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 42, 3.14, 'hello', TRUE)").unwrap();
-        conn.execute("INSERT INTO t VALUES (2, -100, -0.001, '', FALSE)").unwrap();
-        conn.execute("INSERT INTO t VALUES (3, NULL, NULL, NULL, NULL)").unwrap();
+            )",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 42, 3.15, 'hello', TRUE)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (2, -100, -0.001, '', FALSE)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (3, NULL, NULL, NULL, NULL)")
+            .unwrap();
     }
 
     {
@@ -1774,7 +1860,7 @@ fn persist_all_value_types() {
 
         // Row 1
         assert_eq!(qr.rows[0][1], Value::Integer(42));
-        assert_eq!(qr.rows[0][2], Value::Real(3.14));
+        assert_eq!(qr.rows[0][2], Value::Real(3.15));
         assert_eq!(qr.rows[0][3], Value::Text("hello".into()));
         assert_eq!(qr.rows[0][4], Value::Boolean(true));
 
@@ -1802,17 +1888,23 @@ fn persist_composite_pk_across_reopen() {
         let db = create_db(dir.path());
         let mut conn = Connection::open(&db).unwrap();
         conn.execute(
-            "CREATE TABLE t (a TEXT NOT NULL, b INTEGER NOT NULL, val TEXT, PRIMARY KEY (a, b))"
-        ).unwrap();
-        conn.execute("INSERT INTO t VALUES ('x', 1, 'first')").unwrap();
-        conn.execute("INSERT INTO t VALUES ('x', 2, 'second')").unwrap();
-        conn.execute("INSERT INTO t VALUES ('y', 1, 'third')").unwrap();
+            "CREATE TABLE t (a TEXT NOT NULL, b INTEGER NOT NULL, val TEXT, PRIMARY KEY (a, b))",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES ('x', 1, 'first')")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('x', 2, 'second')")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('y', 1, 'third')")
+            .unwrap();
     }
 
     {
         let db = open_db(dir.path());
         let mut conn = Connection::open(&db).unwrap();
-        let qr = conn.query("SELECT val FROM t WHERE a = 'x' AND b = 2").unwrap();
+        let qr = conn
+            .query("SELECT val FROM t WHERE a = 'x' AND b = 2")
+            .unwrap();
         assert_eq!(qr.rows[0][0], Value::Text("second".into()));
 
         let qr = conn.query("SELECT COUNT(*) FROM t").unwrap();
@@ -1831,9 +1923,8 @@ fn insert_and_select_real_as_integer_comparison() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
     conn.execute("INSERT INTO t VALUES (3, 30)").unwrap();
@@ -1843,7 +1934,9 @@ fn insert_and_select_real_as_integer_comparison() {
     assert_eq!(qr.rows.len(), 1);
 
     // val > 15.5 should match 20 and 30
-    let qr = conn.query("SELECT COUNT(*) FROM t WHERE val > 15.5").unwrap();
+    let qr = conn
+        .query("SELECT COUNT(*) FROM t WHERE val > 15.5")
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(2));
 }
 
@@ -1853,17 +1946,17 @@ fn select_star_column_order_matches_schema() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (z INTEGER NOT NULL PRIMARY KEY, a TEXT, m REAL)"
-    ).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'hello', 3.14)").unwrap();
+    conn.execute("CREATE TABLE t (z INTEGER NOT NULL PRIMARY KEY, a TEXT, m REAL)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'hello', 3.15)")
+        .unwrap();
 
     let qr = conn.query("SELECT * FROM t").unwrap();
     // Column order should match CREATE TABLE order: z, a, m
     assert_eq!(qr.columns, vec!["z", "a", "m"]);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
     assert_eq!(qr.rows[0][1], Value::Text("hello".into()));
-    assert_eq!(qr.rows[0][2], Value::Real(3.14));
+    assert_eq!(qr.rows[0][2], Value::Real(3.15));
 }
 
 #[test]
@@ -1872,7 +1965,8 @@ fn query_returns_rows_affected_for_dml() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
+        .unwrap();
 
     // query() on INSERT should return rows_affected as a result
     let qr = conn.query("INSERT INTO t VALUES (1)").unwrap();
@@ -1886,12 +1980,11 @@ fn order_by_expression() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, b INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, b INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 3, 10)").unwrap(); // a+b=13
-    conn.execute("INSERT INTO t VALUES (2, 1, 5)").unwrap();  // a+b=6
-    conn.execute("INSERT INTO t VALUES (3, 2, 8)").unwrap();  // a+b=10
+    conn.execute("INSERT INTO t VALUES (2, 1, 5)").unwrap(); // a+b=6
+    conn.execute("INSERT INTO t VALUES (3, 2, 8)").unwrap(); // a+b=10
 
     let qr = conn.query("SELECT id FROM t ORDER BY a + b").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(2)); // sum=6
@@ -1910,13 +2003,17 @@ fn distinct_integer_real_cross_type_dedup() {
     let mut conn = Connection::open(&db).unwrap();
 
     conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, int_val INTEGER, real_val REAL)"
-    ).unwrap();
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, int_val INTEGER, real_val REAL)",
+    )
+    .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 10, NULL)").unwrap();
-    conn.execute("INSERT INTO t VALUES (2, NULL, 10.0)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, NULL, 10.0)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (3, 20, NULL)").unwrap();
 
-    let qr = conn.query("SELECT DISTINCT int_val FROM t WHERE int_val IS NOT NULL").unwrap();
+    let qr = conn
+        .query("SELECT DISTINCT int_val FROM t WHERE int_val IS NOT NULL")
+        .unwrap();
     assert_eq!(qr.rows.len(), 2);
 }
 
@@ -1926,15 +2023,18 @@ fn distinct_null_equals_null() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
     conn.execute("INSERT INTO t VALUES (3, NULL)").unwrap();
 
     let qr = conn.query("SELECT DISTINCT val FROM t").unwrap();
-    assert_eq!(qr.rows.len(), 1, "multiple NULLs should collapse to one in DISTINCT");
+    assert_eq!(
+        qr.rows.len(),
+        1,
+        "multiple NULLs should collapse to one in DISTINCT"
+    );
     assert!(qr.rows[0][0].is_null());
 }
 
@@ -1944,9 +2044,8 @@ fn distinct_preserves_without_distinct() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 5)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 5)").unwrap();
     conn.execute("INSERT INTO t VALUES (3, 5)").unwrap();
@@ -1964,11 +2063,12 @@ fn distinct_multi_column_null_combinations() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, b INTEGER)"
-    ).unwrap();
-    conn.execute("INSERT INTO t VALUES (1, NULL, NULL)").unwrap();
-    conn.execute("INSERT INTO t VALUES (2, NULL, NULL)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, b INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, NULL, NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, NULL, NULL)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (3, NULL, 1)").unwrap();
     conn.execute("INSERT INTO t VALUES (4, 1, NULL)").unwrap();
     conn.execute("INSERT INTO t VALUES (5, 1, NULL)").unwrap();
@@ -1983,9 +2083,8 @@ fn distinct_single_row() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'only')").unwrap();
 
     let qr = conn.query("SELECT DISTINCT val FROM t").unwrap();
@@ -2000,17 +2099,18 @@ fn distinct_with_where_clause() {
     let mut conn = Connection::open(&db).unwrap();
 
     conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, cat TEXT NOT NULL, val INTEGER NOT NULL)"
-    ).unwrap();
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, cat TEXT NOT NULL, val INTEGER NOT NULL)",
+    )
+    .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'a', 10)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 'b', 10)").unwrap();
     conn.execute("INSERT INTO t VALUES (3, 'a', 20)").unwrap();
     conn.execute("INSERT INTO t VALUES (4, 'b', 20)").unwrap();
     conn.execute("INSERT INTO t VALUES (5, 'a', 10)").unwrap();
 
-    let qr = conn.query(
-        "SELECT DISTINCT val FROM t WHERE cat = 'a' ORDER BY val"
-    ).unwrap();
+    let qr = conn
+        .query("SELECT DISTINCT val FROM t WHERE cat = 'a' ORDER BY val")
+        .unwrap();
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Integer(10));
     assert_eq!(qr.rows[1][0], Value::Integer(20));
@@ -2022,9 +2122,8 @@ fn distinct_count_star_not_affected() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 5)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 5)").unwrap();
     conn.execute("INSERT INTO t VALUES (3, 5)").unwrap();
@@ -2039,14 +2138,15 @@ fn distinct_with_alias() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 10)").unwrap();
     conn.execute("INSERT INTO t VALUES (3, 20)").unwrap();
 
-    let qr = conn.query("SELECT DISTINCT val AS unique_val FROM t ORDER BY unique_val").unwrap();
+    let qr = conn
+        .query("SELECT DISTINCT val AS unique_val FROM t ORDER BY unique_val")
+        .unwrap();
     assert_eq!(qr.columns, vec!["unique_val"]);
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Integer(10));
@@ -2059,22 +2159,22 @@ fn distinct_all_types() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+        .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 'hello')").unwrap();
 
     let qr = conn.query("SELECT DISTINCT val FROM t").unwrap();
     assert_eq!(qr.rows.len(), 1);
 
-    conn.execute(
-        "CREATE TABLE t2 (id INTEGER NOT NULL PRIMARY KEY, val REAL NOT NULL)"
-    ).unwrap();
+    conn.execute("CREATE TABLE t2 (id INTEGER NOT NULL PRIMARY KEY, val REAL NOT NULL)")
+        .unwrap();
     conn.execute("INSERT INTO t2 VALUES (1, 3.14)").unwrap();
     conn.execute("INSERT INTO t2 VALUES (2, 3.14)").unwrap();
     conn.execute("INSERT INTO t2 VALUES (3, 2.71)").unwrap();
 
-    let qr = conn.query("SELECT DISTINCT val FROM t2 ORDER BY val").unwrap();
+    let qr = conn
+        .query("SELECT DISTINCT val FROM t2 ORDER BY val")
+        .unwrap();
     assert_eq!(qr.rows.len(), 2);
 }

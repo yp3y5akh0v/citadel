@@ -12,6 +12,9 @@ categories.workspace = true
 description = "Citadel: encrypted-first embedded database engine"
 readme = "../README.md"
 
+[lib]
+name = "citadel"
+
 [features]
 default = ["audit-log"]
 io-uring = ["citadel-io/io-uring"]

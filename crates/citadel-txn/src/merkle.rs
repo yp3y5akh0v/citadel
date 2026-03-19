@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use citadel_core::types::{PageId, PageType, TxnId};
-use citadel_core::{MERKLE_HASH_SIZE, Result};
+use citadel_core::{Result, MERKLE_HASH_SIZE};
 use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
 
@@ -38,9 +38,9 @@ fn compute_page_merkle(
     read_clean_page: &dyn Fn(PageId) -> Result<Page>,
 ) -> Result<[u8; MERKLE_HASH_SIZE]> {
     // Load page if not in HashMap
-    if !pages.contains_key(&page_id) {
+    if let std::collections::hash_map::Entry::Vacant(e) = pages.entry(page_id) {
         let page = read_clean_page(page_id)?;
-        pages.insert(page_id, page);
+        e.insert(page);
     }
 
     let page = pages.get(&page_id).unwrap();
@@ -185,10 +185,10 @@ mod tests {
         let mut pages: HashMap<PageId, Page> = HashMap::new();
         pages.insert(PageId(0), leaf);
 
-        let root_hash = compute_tree_merkle(
-            &mut pages, PageId(0), txn,
-            &|_| panic!("should not read disk"),
-        ).unwrap();
+        let root_hash = compute_tree_merkle(&mut pages, PageId(0), txn, &|_| {
+            panic!("should not read disk")
+        })
+        .unwrap();
 
         assert_ne!(root_hash, [0u8; MERKLE_HASH_SIZE]);
 
@@ -208,10 +208,10 @@ mod tests {
         pages.insert(PageId(1), left);
         pages.insert(PageId(2), right);
 
-        let root_hash = compute_tree_merkle(
-            &mut pages, PageId(0), txn,
-            &|_| panic!("should not read disk"),
-        ).unwrap();
+        let root_hash = compute_tree_merkle(&mut pages, PageId(0), txn, &|_| {
+            panic!("should not read disk")
+        })
+        .unwrap();
 
         assert_ne!(root_hash, [0u8; MERKLE_HASH_SIZE]);
 
@@ -235,10 +235,7 @@ mod tests {
         pages1.insert(PageId(1), left1);
         pages1.insert(PageId(2), right1);
 
-        let h1 = compute_tree_merkle(
-            &mut pages1, PageId(0), txn,
-            &|_| panic!("no disk"),
-        ).unwrap();
+        let h1 = compute_tree_merkle(&mut pages1, PageId(0), txn, &|_| panic!("no disk")).unwrap();
 
         // Tree 2: left has "a"="2" (different value)
         let left2 = make_leaf(PageId(1), txn, &[(b"a", b"2")]);
@@ -250,10 +247,7 @@ mod tests {
         pages2.insert(PageId(1), left2);
         pages2.insert(PageId(2), right2);
 
-        let h2 = compute_tree_merkle(
-            &mut pages2, PageId(0), txn,
-            &|_| panic!("no disk"),
-        ).unwrap();
+        let h2 = compute_tree_merkle(&mut pages2, PageId(0), txn, &|_| panic!("no disk")).unwrap();
 
         assert_ne!(h1, h2);
     }
@@ -279,10 +273,10 @@ mod tests {
         pages.insert(PageId(1), dirty_leaf);
         pages.insert(PageId(2), clean_leaf);
 
-        let root_hash = compute_tree_merkle(
-            &mut pages, PageId(0), dirty_txn,
-            &|_| panic!("should not read disk"),
-        ).unwrap();
+        let root_hash = compute_tree_merkle(&mut pages, PageId(0), dirty_txn, &|_| {
+            panic!("should not read disk")
+        })
+        .unwrap();
 
         assert_ne!(root_hash, [0u8; MERKLE_HASH_SIZE]);
 
@@ -309,13 +303,11 @@ mod tests {
         pages.insert(PageId(1), dirty_leaf);
         // PageId(2) NOT in pages — read_clean_page will be called
 
-        let root_hash = compute_tree_merkle(
-            &mut pages, PageId(0), dirty_txn,
-            &|page_id| {
-                assert_eq!(page_id, PageId(2));
-                Ok(clean_leaf.clone())
-            },
-        ).unwrap();
+        let root_hash = compute_tree_merkle(&mut pages, PageId(0), dirty_txn, &|page_id| {
+            assert_eq!(page_id, PageId(2));
+            Ok(clean_leaf.clone())
+        })
+        .unwrap();
 
         assert_ne!(root_hash, [0u8; MERKLE_HASH_SIZE]);
 
@@ -374,10 +366,10 @@ mod tests {
         pages.insert(PageId(5), l2);
         pages.insert(PageId(6), l3);
 
-        let root_hash = compute_tree_merkle(
-            &mut pages, PageId(0), txn,
-            &|_| panic!("no disk reads expected"),
-        ).unwrap();
+        let root_hash = compute_tree_merkle(&mut pages, PageId(0), txn, &|_| {
+            panic!("no disk reads expected")
+        })
+        .unwrap();
 
         assert_ne!(root_hash, [0u8; MERKLE_HASH_SIZE]);
 
@@ -394,11 +386,8 @@ mod tests {
     #[test]
     fn identical_trees_same_hash() {
         let txn = TxnId(1);
-        let entries: &[(&[u8], &[u8])] = &[
-            (b"alpha", b"one"),
-            (b"beta", b"two"),
-            (b"gamma", b"three"),
-        ];
+        let entries: &[(&[u8], &[u8])] =
+            &[(b"alpha", b"one"), (b"beta", b"two"), (b"gamma", b"three")];
 
         let leaf1 = make_leaf(PageId(0), txn, entries);
         let mut pages1: HashMap<PageId, Page> = HashMap::new();
@@ -448,9 +437,15 @@ mod tests {
     fn large_leaf_hash() {
         let txn = TxnId(1);
         let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..100u32)
-            .map(|i| (format!("key-{i:05}").into_bytes(), format!("val-{i:05}").into_bytes()))
+            .map(|i| {
+                (
+                    format!("key-{i:05}").into_bytes(),
+                    format!("val-{i:05}").into_bytes(),
+                )
+            })
             .collect();
-        let entry_refs: Vec<(&[u8], &[u8])> = entries.iter()
+        let entry_refs: Vec<(&[u8], &[u8])> = entries
+            .iter()
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
             .collect();
 
@@ -469,7 +464,10 @@ mod tests {
         let h1 = compute_tree_merkle(&mut pages, PageId(0), txn, &|_| panic!()).unwrap();
 
         // Reset hash and recompute
-        pages.get_mut(&PageId(0)).unwrap().set_merkle_hash(&[0u8; MERKLE_HASH_SIZE]);
+        pages
+            .get_mut(&PageId(0))
+            .unwrap()
+            .set_merkle_hash(&[0u8; MERKLE_HASH_SIZE]);
         // Page is still "dirty" (txn_id matches), so it will be recomputed
         let h2 = compute_tree_merkle(&mut pages, PageId(0), txn, &|_| panic!()).unwrap();
 

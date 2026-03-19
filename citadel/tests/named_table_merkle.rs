@@ -76,10 +76,12 @@ fn named_table_has_nonzero_merkle_hash() {
     wtx.table_insert(b"users", b"key1", b"val1").unwrap();
     wtx.commit().unwrap();
 
-    let root = find_table_root(db.manager(), b"users")
-        .expect("table should exist in catalog");
+    let root = find_table_root(db.manager(), b"users").expect("table should exist in catalog");
     let hash = read_merkle_hash(db.manager(), root);
-    assert_ne!(hash, ZERO_HASH, "named table root must have non-zero Merkle hash");
+    assert_ne!(
+        hash, ZERO_HASH,
+        "named table root must have non-zero Merkle hash"
+    );
 }
 
 #[test]
@@ -102,7 +104,10 @@ fn named_table_merkle_changes_on_update() {
     let root2 = find_table_root(db.manager(), b"data").unwrap();
     let hash2 = read_merkle_hash(db.manager(), root2);
 
-    assert_ne!(hash1, hash2, "Merkle hash must change when table data changes");
+    assert_ne!(
+        hash1, hash2,
+        "Merkle hash must change when table data changes"
+    );
 }
 
 #[test]
@@ -127,7 +132,10 @@ fn named_table_merkle_stable_when_unchanged() {
     let root2 = find_table_root(db.manager(), b"stable").unwrap();
     let hash2 = read_merkle_hash(db.manager(), root2);
 
-    assert_eq!(hash1, hash2, "Merkle hash must not change when table is untouched");
+    assert_eq!(
+        hash1, hash2,
+        "Merkle hash must not change when table is untouched"
+    );
 }
 
 #[test]
@@ -149,7 +157,10 @@ fn two_tables_different_merkle_hashes() {
 
     assert_ne!(hash_a, ZERO_HASH);
     assert_ne!(hash_b, ZERO_HASH);
-    assert_ne!(hash_a, hash_b, "tables with different data must have different hashes");
+    assert_ne!(
+        hash_a, hash_b,
+        "tables with different data must have different hashes"
+    );
 }
 
 #[test]
@@ -167,8 +178,11 @@ fn named_table_merkle_does_not_affect_default_tree() {
     wtx.table_insert(b"tbl", b"tk", b"tv").unwrap();
     wtx.commit().unwrap();
 
-    assert_eq!(db.stats().merkle_root, default_hash,
-        "named table operations must not change default tree merkle root");
+    assert_eq!(
+        db.stats().merkle_root,
+        default_hash,
+        "named table operations must not change default tree merkle root"
+    );
 }
 
 #[test]
@@ -182,7 +196,13 @@ fn catalog_tree_has_nonzero_merkle_hash() {
     wtx.commit().unwrap();
 
     let catalog_root = db.manager().current_slot().catalog_root;
-    assert!(catalog_root.is_valid(), "catalog root must be valid after creating a table");
+    assert!(
+        catalog_root.is_valid(),
+        "catalog root must be valid after creating a table"
+    );
     let catalog_hash = read_merkle_hash(db.manager(), catalog_root);
-    assert_ne!(catalog_hash, ZERO_HASH, "catalog tree root must have non-zero Merkle hash");
+    assert_ne!(
+        catalog_hash, ZERO_HASH,
+        "catalog tree root must have non-zero Merkle hash"
+    );
 }

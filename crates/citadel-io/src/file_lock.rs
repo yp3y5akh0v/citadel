@@ -1,5 +1,5 @@
-use std::fs::File;
 use citadel_core::Result;
+use std::fs::File;
 
 /// Try to acquire an exclusive lock on the file.
 /// Returns Ok(()) if lock acquired, Err(DatabaseLocked) if already locked.
@@ -14,9 +14,9 @@ pub fn unlock(file: &File) -> Result<()> {
 
 #[cfg(unix)]
 mod platform {
+    use citadel_core::Result;
     use std::fs::File;
     use std::os::unix::io::AsRawFd;
-    use citadel_core::Result;
 
     pub fn try_lock_exclusive(file: &File) -> Result<()> {
         let fd = file.as_raw_fd();
@@ -46,9 +46,9 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
+    use citadel_core::Result;
     use std::fs::File;
     use std::os::windows::io::AsRawHandle;
-    use citadel_core::Result;
 
     pub fn try_lock_exclusive(file: &File) -> Result<()> {
         use windows_sys::Win32::Storage::FileSystem::{
@@ -60,9 +60,7 @@ mod platform {
         let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
         let flags = LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY;
 
-        let result = unsafe {
-            LockFileEx(handle, flags, 0, 1, 0, &mut overlapped)
-        };
+        let result = unsafe { LockFileEx(handle, flags, 0, 1, 0, &mut overlapped) };
 
         if result != 0 {
             Ok(())
@@ -78,9 +76,7 @@ mod platform {
         let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
         let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
 
-        let result = unsafe {
-            UnlockFileEx(handle, 0, 1, 0, &mut overlapped)
-        };
+        let result = unsafe { UnlockFileEx(handle, 0, 1, 0, &mut overlapped) };
 
         if result != 0 {
             Ok(())
@@ -92,8 +88,8 @@ mod platform {
 
 #[cfg(not(any(unix, windows)))]
 mod platform {
-    use std::fs::File;
     use citadel_core::Result;
+    use std::fs::File;
 
     pub fn try_lock_exclusive(_file: &File) -> Result<()> {
         Ok(())
@@ -113,7 +109,13 @@ mod tests {
     fn lock_and_unlock() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lock_test.db");
-        let file = File::options().read(true).write(true).create(true).open(&path).unwrap();
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
 
         try_lock_exclusive(&file).unwrap();
         unlock(&file).unwrap();
@@ -123,7 +125,13 @@ mod tests {
     fn double_lock_fails() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lock_test2.db");
-        let file1 = File::options().read(true).write(true).create(true).open(&path).unwrap();
+        let file1 = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
         let file2 = File::options().read(true).write(true).open(&path).unwrap();
 
         try_lock_exclusive(&file1).unwrap();

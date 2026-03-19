@@ -8,10 +8,10 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
-use citadel::{Argon2Profile, DatabaseBuilder, Database};
-use citadel::core::MERKLE_HASH_SIZE;
 use citadel::core::types::{PageId, PageType};
+use citadel::core::MERKLE_HASH_SIZE;
 use citadel::page::{branch_node, leaf_node};
+use citadel::{Argon2Profile, Database, DatabaseBuilder};
 
 fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
     DatabaseBuilder::new(path)
@@ -232,7 +232,8 @@ fn identical_dbs_merkle_diff_returns_nothing() {
     for db in [&db1, &db2] {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..50u32 {
-            wtx.insert(&i.to_be_bytes(), &(i * 7).to_le_bytes()).unwrap();
+            wtx.insert(&i.to_be_bytes(), &(i * 7).to_le_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -240,7 +241,11 @@ fn identical_dbs_merkle_diff_returns_nothing() {
     assert_eq!(db1.stats().merkle_root, db2.stats().merkle_root);
 
     let diff = merkle_diff(&db1, &db2);
-    assert!(diff.is_empty(), "identical DBs must have zero diff, got {} entries", diff.len());
+    assert!(
+        diff.is_empty(),
+        "identical DBs must have zero diff, got {} entries",
+        diff.len()
+    );
 }
 
 #[test]
@@ -271,7 +276,9 @@ fn single_insert_detected_and_synced() {
     assert!(!diff.is_empty(), "diff must find changed entries");
 
     // The diff must contain our new key
-    let has_new_key = diff.iter().any(|(k, v)| k == b"new-key" && v == b"new-value");
+    let has_new_key = diff
+        .iter()
+        .any(|(k, v)| k == b"new-key" && v == b"new-value");
     assert!(has_new_key, "diff must contain the newly inserted key");
 
     // Apply the diff to db2
@@ -393,8 +400,14 @@ fn sync_with_splits_large_dataset() {
     assert_eq!(db1.stats().merkle_root, db2.stats().merkle_root);
 
     let tree = walk_tree(&db1);
-    let leaf_count = tree.iter().filter(|p| p.page_type == PageType::Leaf).count();
-    assert!(leaf_count >= 5, "need multiple leaf pages, got {leaf_count}");
+    let leaf_count = tree
+        .iter()
+        .filter(|p| p.page_type == PageType::Leaf)
+        .count();
+    assert!(
+        leaf_count >= 5,
+        "need multiple leaf pages, got {leaf_count}"
+    );
 
     // Modify entries in just 2 leaf pages
     let mut wtx = db1.begin_write().unwrap();
@@ -414,8 +427,14 @@ fn sync_with_splits_large_dataset() {
 
     // Changed keys must be in the diff
     let diff_keys: HashSet<Vec<u8>> = diff.iter().map(|(k, _)| k.clone()).collect();
-    assert!(diff_keys.contains(&5u32.to_be_bytes().to_vec()), "diff must contain key 5");
-    assert!(diff_keys.contains(&499u32.to_be_bytes().to_vec()), "diff must contain key 499");
+    assert!(
+        diff_keys.contains(5u32.to_be_bytes().as_slice()),
+        "diff must contain key 5"
+    );
+    assert!(
+        diff_keys.contains(499u32.to_be_bytes().as_slice()),
+        "diff must contain key 499"
+    );
 
     // Apply diff — data must converge
     apply_sync(&db2, &diff);
@@ -446,8 +465,14 @@ fn sync_efficiency_skips_matching_subtrees() {
 
     let tree = walk_tree(&db1);
     let total_pages = tree.len();
-    let leaf_count = tree.iter().filter(|p| p.page_type == PageType::Leaf).count();
-    assert!(total_pages > 5, "need multi-level tree, got {total_pages} pages");
+    let leaf_count = tree
+        .iter()
+        .filter(|p| p.page_type == PageType::Leaf)
+        .count();
+    assert!(
+        total_pages > 5,
+        "need multi-level tree, got {total_pages} pages"
+    );
     assert!(leaf_count > 5, "need multiple leaves, got {leaf_count}");
 
     // Change just 1 entry — should affect only 1 leaf page
@@ -491,7 +516,8 @@ fn every_leaf_hash_matches_independent_recomputation() {
 
     let mut wtx = db.begin_write().unwrap();
     for i in 0..300u32 {
-        wtx.insert(&i.to_be_bytes(), &format!("value-{i}").into_bytes()).unwrap();
+        wtx.insert(&i.to_be_bytes(), &format!("value-{i}").into_bytes())
+            .unwrap();
     }
     wtx.commit().unwrap();
 
@@ -516,26 +542,22 @@ fn every_branch_hash_matches_independent_recomputation() {
 
     let mut wtx = db.begin_write().unwrap();
     for i in 0..300u32 {
-        wtx.insert(&i.to_be_bytes(), &format!("value-{i}").into_bytes()).unwrap();
+        wtx.insert(&i.to_be_bytes(), &format!("value-{i}").into_bytes())
+            .unwrap();
     }
     wtx.commit().unwrap();
 
     let tree = walk_tree(&db);
 
     // Build a map of page_id -> merkle_hash for lookup
-    let hash_map: BTreeMap<PageId, [u8; MERKLE_HASH_SIZE]> = tree
-        .iter()
-        .map(|p| (p.page_id, p.merkle_hash))
-        .collect();
+    let hash_map: BTreeMap<PageId, [u8; MERKLE_HASH_SIZE]> =
+        tree.iter().map(|p| (p.page_id, p.merkle_hash)).collect();
 
     for page_info in &tree {
         if page_info.page_type == PageType::Branch {
             // Collect children's hashes in order
-            let child_hashes: Vec<[u8; MERKLE_HASH_SIZE]> = page_info
-                .children
-                .iter()
-                .map(|cid| hash_map[cid])
-                .collect();
+            let child_hashes: Vec<[u8; MERKLE_HASH_SIZE]> =
+                page_info.children.iter().map(|cid| hash_map[cid]).collect();
 
             let recomputed = recompute_branch_hash(&child_hashes);
             assert_eq!(
@@ -559,10 +581,13 @@ fn root_hash_matches_commit_slot() {
     wtx.commit().unwrap();
 
     let tree = walk_tree(&db);
-    let root = tree.iter().find(|p| {
-        let mgr = db.manager();
-        p.page_id == mgr.current_slot().tree_root
-    }).unwrap();
+    let root = tree
+        .iter()
+        .find(|p| {
+            let mgr = db.manager();
+            p.page_id == mgr.current_slot().tree_root
+        })
+        .unwrap();
 
     assert_eq!(
         root.merkle_hash,
@@ -601,18 +626,26 @@ fn hash_chain_is_complete_no_zero_hashes() {
 #[test]
 fn full_sync_scenario_diverge_and_converge() {
     let dir = tempfile::tempdir().unwrap();
-    let db_source = fast_builder(&dir.path().join("source.db")).create().unwrap();
-    let db_replica = fast_builder(&dir.path().join("replica.db")).create().unwrap();
+    let db_source = fast_builder(&dir.path().join("source.db"))
+        .create()
+        .unwrap();
+    let db_replica = fast_builder(&dir.path().join("replica.db"))
+        .create()
+        .unwrap();
 
     // Both start with same 200 entries
     for db in [&db_source, &db_replica] {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..200u32 {
-            wtx.insert(&i.to_be_bytes(), &format!("v{i}").into_bytes()).unwrap();
+            wtx.insert(&i.to_be_bytes(), &format!("v{i}").into_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
-    assert_eq!(db_source.stats().merkle_root, db_replica.stats().merkle_root);
+    assert_eq!(
+        db_source.stats().merkle_root,
+        db_replica.stats().merkle_root
+    );
 
     // Source makes several transactions of changes
     {
@@ -631,7 +664,10 @@ fn full_sync_scenario_diverge_and_converge() {
     }
 
     // Root hashes diverged
-    assert_ne!(db_source.stats().merkle_root, db_replica.stats().merkle_root);
+    assert_ne!(
+        db_source.stats().merkle_root,
+        db_replica.stats().merkle_root
+    );
 
     // Sync: diff + apply
     let diff = merkle_diff(&db_source, &db_replica);
@@ -729,7 +765,10 @@ fn no_diff_after_sync_is_complete() {
 
     // Second diff should be empty
     let diff2 = merkle_diff(&db1, &db2);
-    assert!(diff2.is_empty(), "after successful sync, second diff must be empty");
+    assert!(
+        diff2.is_empty(),
+        "after successful sync, second diff must be empty"
+    );
 }
 
 // ============================================================
@@ -742,6 +781,7 @@ fn collect_all_data(db: &Database) -> BTreeMap<Vec<u8>, Vec<u8>> {
     rtx.for_each(|k, v| {
         data.insert(k.to_vec(), v.to_vec());
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     data
 }

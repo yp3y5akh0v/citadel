@@ -1,0 +1,246 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.*"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate tag matches Cargo.toml version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$TAG" != "$CARGO_VER" ]; then
+            echo "::error::Tag v$TAG does not match Cargo.toml version $CARGO_VER"
+            exit 1
+          fi
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "$GITHUB_REF_NAME"
+
+  build-release:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Standard builds
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use-cross: true
+            cli: true
+            ffi: false
+            fips: false
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use-cross: false
+            cli: false
+            ffi: true
+            fips: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use-cross: true
+            cli: true
+            ffi: true
+            fips: false
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            use-cross: false
+            cli: true
+            ffi: true
+            fips: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use-cross: false
+            cli: true
+            ffi: true
+            fips: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use-cross: false
+            cli: true
+            ffi: true
+            fips: false
+
+          # FIPS builds
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use-cross: true
+            cli: true
+            ffi: false
+            fips: true
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use-cross: false
+            cli: false
+            ffi: true
+            fips: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use-cross: true
+            cli: true
+            ffi: true
+            fips: true
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            use-cross: false
+            cli: true
+            ffi: true
+            fips: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use-cross: false
+            cli: true
+            ffi: true
+            fips: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use-cross: false
+            cli: true
+            ffi: true
+            fips: true
+
+    runs-on: ${{ matrix.os }}
+    name: build ${{ matrix.fips && 'fips-' || '' }}${{ matrix.target }}
+    env:
+      CARGO: ${{ matrix.use-cross && 'cross' || 'cargo' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use-cross
+        run: cargo install cross --locked
+
+      - name: Determine features
+        id: features
+        shell: bash
+        run: |
+          FEATURES=""
+          IS_LINUX=${{ contains(matrix.target, 'linux') }}
+          if [ "$IS_LINUX" = "true" ]; then
+            FEATURES="--features citadeldb/io-uring"
+          fi
+          if [ "${{ matrix.fips }}" = "true" ]; then
+            if [ -n "$FEATURES" ]; then
+              FEATURES="$FEATURES,citadeldb/fips"
+            else
+              FEATURES="--features citadeldb/fips"
+            fi
+          fi
+          echo "flags=$FEATURES" >> "$GITHUB_OUTPUT"
+
+      - name: Build CLI
+        if: matrix.cli
+        run: ${{ env.CARGO }} build --release --locked --target ${{ matrix.target }} -p citadeldb-cli ${{ steps.features.outputs.flags }}
+
+      - name: Build FFI
+        if: matrix.ffi
+        run: |
+          ${{ env.CARGO }} build --release --locked --target ${{ matrix.target }} -p citadeldb-ffi ${{ steps.features.outputs.flags }}
+
+      - name: Package CLI (unix)
+        if: matrix.cli && runner.os != 'Windows'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          PREFIX=${{ matrix.fips && 'citadel-fips' || 'citadel' }}
+          ARCHIVE="${PREFIX}-${TAG}-${{ matrix.target }}.tar.gz"
+          STAGING=$(mktemp -d)
+          cp "target/${{ matrix.target }}/release/citadel" "$STAGING/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$STAGING/"
+          tar czf "$ARCHIVE" -C "$STAGING" .
+          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          echo "CLI_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Package CLI (windows)
+        if: matrix.cli && runner.os == 'Windows'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          PREFIX=${{ matrix.fips && 'citadel-fips' || 'citadel' }}
+          ARCHIVE="${PREFIX}-${TAG}-${{ matrix.target }}.zip"
+          STAGING=$(mktemp -d)
+          cp "target/${{ matrix.target }}/release/citadel.exe" "$STAGING/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$STAGING/"
+          cd "$STAGING" && 7z a -tzip "$OLDPWD/$ARCHIVE" . && cd "$OLDPWD"
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          echo "CLI_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Package FFI (linux)
+        if: matrix.ffi && runner.os == 'Linux'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          PREFIX=${{ matrix.fips && 'citadel-ffi-fips' || 'citadel-ffi' }}
+          ARCHIVE="${PREFIX}-${TAG}-${{ matrix.target }}.tar.gz"
+          STAGING=$(mktemp -d)
+          RELEASE="target/${{ matrix.target }}/release"
+          # Rename libs for clean user experience
+          [ -f "$RELEASE/libcitadeldb_ffi.so" ] && cp "$RELEASE/libcitadeldb_ffi.so" "$STAGING/libcitadel.so"
+          [ -f "$RELEASE/libcitadeldb_ffi.a" ] && cp "$RELEASE/libcitadeldb_ffi.a" "$STAGING/libcitadel.a"
+          cp crates/citadel-ffi/citadel.h "$STAGING/"
+          cp LICENSE-MIT LICENSE-APACHE "$STAGING/"
+          tar czf "$ARCHIVE" -C "$STAGING" .
+          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          echo "FFI_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Package FFI (macos)
+        if: matrix.ffi && runner.os == 'macOS'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          PREFIX=${{ matrix.fips && 'citadel-ffi-fips' || 'citadel-ffi' }}
+          ARCHIVE="${PREFIX}-${TAG}-${{ matrix.target }}.tar.gz"
+          STAGING=$(mktemp -d)
+          RELEASE="target/${{ matrix.target }}/release"
+          [ -f "$RELEASE/libcitadeldb_ffi.dylib" ] && cp "$RELEASE/libcitadeldb_ffi.dylib" "$STAGING/libcitadel.dylib"
+          [ -f "$RELEASE/libcitadeldb_ffi.a" ] && cp "$RELEASE/libcitadeldb_ffi.a" "$STAGING/libcitadel.a"
+          cp crates/citadel-ffi/citadel.h "$STAGING/"
+          cp LICENSE-MIT LICENSE-APACHE "$STAGING/"
+          tar czf "$ARCHIVE" -C "$STAGING" .
+          shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          echo "FFI_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Package FFI (windows)
+        if: matrix.ffi && runner.os == 'Windows'
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          PREFIX=${{ matrix.fips && 'citadel-ffi-fips' || 'citadel-ffi' }}
+          ARCHIVE="${PREFIX}-${TAG}-${{ matrix.target }}.zip"
+          STAGING=$(mktemp -d)
+          RELEASE="target/${{ matrix.target }}/release"
+          [ -f "$RELEASE/citadeldb_ffi.dll" ] && cp "$RELEASE/citadeldb_ffi.dll" "$STAGING/citadel.dll"
+          [ -f "$RELEASE/citadeldb_ffi.lib" ] && cp "$RELEASE/citadeldb_ffi.lib" "$STAGING/citadel.lib"
+          [ -f "$RELEASE/citadeldb_ffi.dll.lib" ] && cp "$RELEASE/citadeldb_ffi.dll.lib" "$STAGING/citadel.dll.lib"
+          cp crates/citadel-ffi/citadel.h "$STAGING/"
+          cp LICENSE-MIT LICENSE-APACHE "$STAGING/"
+          cd "$STAGING" && 7z a -tzip "$OLDPWD/$ARCHIVE" . && cd "$OLDPWD"
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          echo "FFI_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Upload CLI
+        if: matrix.cli
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" "${{ env.CLI_ARCHIVE }}" "${{ env.CLI_ARCHIVE }}.sha256"
+
+      - name: Upload FFI
+        if: matrix.ffi
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" "${{ env.FFI_ARCHIVE }}" "${{ env.FFI_ARCHIVE }}.sha256"

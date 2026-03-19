@@ -4,12 +4,12 @@
 //! Reads pages through the buffer pool (cached, decrypted).
 //! Auto-unregisters from the reader table on Drop (RAII).
 
-use std::collections::HashMap;
 use citadel_core::types::{PageId, PageType, TxnId, ValueType};
 use citadel_core::{Error, Result};
 use citadel_io::file_manager::CommitSlot;
 use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
+use std::collections::HashMap;
 
 use citadel_buffer::cursor::Cursor;
 
@@ -28,11 +28,7 @@ pub struct ReadTxn<'a> {
 }
 
 impl<'a> ReadTxn<'a> {
-    pub(crate) fn new(
-        manager: &'a TxnManager,
-        txn_id: TxnId,
-        snapshot: CommitSlot,
-    ) -> Self {
+    pub(crate) fn new(manager: &'a TxnManager, txn_id: TxnId, snapshot: CommitSlot) -> Self {
         Self {
             manager,
             txn_id,
@@ -133,10 +129,8 @@ impl<'a> ReadTxn<'a> {
         };
         while cursor.is_valid() {
             if let Some(entry) = cursor.current(&self.page_cache) {
-                if entry.val_type != ValueType::Tombstone {
-                    if !f(&entry.key, &entry.value)? {
-                        break;
-                    }
+                if entry.val_type != ValueType::Tombstone && !f(&entry.key, &entry.value)? {
+                    break;
                 }
             }
             cursor.next(&self.page_cache)?;
@@ -169,7 +163,7 @@ impl<'a> ReadTxn<'a> {
                                     String::from_utf8_lossy(name).into_owned(),
                                 ))
                             } else {
-                                Ok(TableDescriptor::deserialize(&cell.value))
+                                Ok(TableDescriptor::deserialize(cell.value))
                             }
                         }
                         Err(_) => Err(Error::TableNotFound(
@@ -373,7 +367,8 @@ mod tests {
         rtx.for_each(|k, v| {
             pairs.push((k.to_vec(), v.to_vec()));
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         assert_eq!(pairs.len(), 3);
         assert_eq!(pairs[0], (b"a".to_vec(), b"1".to_vec()));
@@ -386,7 +381,11 @@ mod tests {
         let mgr = create_test_manager();
         let mut rtx = mgr.begin_read();
         let mut count = 0;
-        rtx.for_each(|_, _| { count += 1; Ok(()) }).unwrap();
+        rtx.for_each(|_, _| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -408,7 +407,8 @@ mod tests {
         rtx.table_for_each(b"items", |k, v| {
             pairs.push((k.to_vec(), v.to_vec()));
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         assert_eq!(pairs.len(), 3);
         assert_eq!(pairs[0], (b"x".to_vec(), b"10".to_vec()));

@@ -39,9 +39,9 @@ impl std::fmt::Debug for NoiseState {
 impl NoiseTransport {
     /// Connect to a remote peer and perform Noise handshake (initiator).
     pub fn connect(addr: &str, key: &SyncKey) -> Result<Self, SyncError> {
-        let addr = addr.parse::<std::net::SocketAddr>().map_err(|e| {
-            SyncError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-        })?;
+        let addr = addr
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| SyncError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
         let mut stream = TcpStream::connect_timeout(&addr, DEFAULT_TIMEOUT)?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(DEFAULT_TIMEOUT))?;
@@ -228,9 +228,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let key_clone = key.clone();
-        let client = thread::spawn(move || {
-            NoiseTransport::connect(&addr.to_string(), &key_clone).unwrap()
-        });
+        let client =
+            thread::spawn(move || NoiseTransport::connect(&addr.to_string(), &key_clone).unwrap());
         let (stream, _) = listener.accept().unwrap();
         let server = NoiseTransport::accept(stream, key).unwrap();
         let client = client.join().unwrap();
@@ -252,7 +251,11 @@ mod tests {
         };
         client.send(&msg).unwrap();
         match server.recv().unwrap() {
-            SyncMessage::Hello { node_id, root_page, root_hash } => {
+            SyncMessage::Hello {
+                node_id,
+                root_page,
+                root_hash,
+            } => {
                 assert_eq!(node_id, NodeId::from_u64(42));
                 assert_eq!(root_page, PageId(10));
                 assert_eq!(root_hash, [1u8; MERKLE_HASH_SIZE]);
@@ -268,9 +271,8 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let client_handle = thread::spawn(move || {
-            NoiseTransport::connect(&addr.to_string(), &key_a)
-        });
+        let client_handle =
+            thread::spawn(move || NoiseTransport::connect(&addr.to_string(), &key_a));
         let (stream, _) = listener.accept().unwrap();
         let server_result = NoiseTransport::accept(stream, &key_b);
         let client_result = client_handle.join().unwrap();
@@ -301,7 +303,8 @@ mod tests {
         // Send/recv must run concurrently: ciphertext exceeds TCP send buffer
         thread::scope(|s| {
             s.spawn(|| {
-                a.send(&SyncMessage::PatchData { data: data_clone }).unwrap();
+                a.send(&SyncMessage::PatchData { data: data_clone })
+                    .unwrap();
             });
             match b.recv().unwrap() {
                 SyncMessage::PatchData { data: received } => {
@@ -318,7 +321,10 @@ mod tests {
         let key = test_key();
         let (a, _b) = loopback_pair(&key);
         a.close().unwrap();
-        assert!(matches!(a.send(&SyncMessage::Done).unwrap_err(), SyncError::Closed));
+        assert!(matches!(
+            a.send(&SyncMessage::Done).unwrap_err(),
+            SyncError::Closed
+        ));
     }
 
     #[test]
@@ -338,7 +344,8 @@ mod tests {
                 node_id: NodeId::from_u64(i),
                 root_page: PageId(0),
                 root_hash: [0u8; MERKLE_HASH_SIZE],
-            }).unwrap();
+            })
+            .unwrap();
         }
         for i in 0..100u64 {
             match b.recv().unwrap() {

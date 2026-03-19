@@ -26,12 +26,12 @@ pub const COMMIT_SLOT_SIZE: usize = 240;
 
 // God byte bits
 pub const GOD_BIT_ACTIVE_SLOT: u8 = 0x01; // bit 0: active commit slot (0 or 1)
-pub const GOD_BIT_RECOVERY: u8 = 0x02;    // bit 1: recovery_required flag
+pub const GOD_BIT_RECOVERY: u8 = 0x02; // bit 1: recovery_required flag
 
 // Key size constants
-pub const KEY_SIZE: usize = 32;    // AES-256 key = 32 bytes
-pub const REK_SIZE: usize = 32;    // Root Encryption Key
-pub const DEK_SIZE: usize = 32;    // Data Encryption Key
+pub const KEY_SIZE: usize = 32; // AES-256 key = 32 bytes
+pub const REK_SIZE: usize = 32; // Root Encryption Key
+pub const DEK_SIZE: usize = 32; // Data Encryption Key
 pub const MAC_KEY_SIZE: usize = 32; // HMAC key
 pub const WRAPPED_KEY_SIZE: usize = 40; // AES-KW(32B key) = 40B (32 + 8 integrity)
 pub const ARGON2_SALT_SIZE: usize = 16;
@@ -71,7 +71,7 @@ pub const PENDING_FREE_ENTRIES_PER_PAGE: usize = USABLE_SIZE / PENDING_FREE_ENTR
 // Merkle hash (inline in page header, BLAKE3 truncated to 28 bytes = 224 bits)
 pub const MERKLE_HASH_SIZE: usize = 28;
 pub const MERKLE_HASH_OFFSET: usize = 36; // page header offset [36..64]
-pub const SLOT_MERKLE_ROOT: usize = 84;   // CommitSlot offset [84..112]
+pub const SLOT_MERKLE_ROOT: usize = 84; // CommitSlot offset [84..112]
 
 // Audit log file
 pub const AUDIT_LOG_MAGIC: u32 = 0x4155_4454; // "AUDT"
@@ -134,7 +134,10 @@ mod tests {
     #[test]
     fn file_header_fits() {
         let needed = COMMIT_SLOT_OFFSET + 2 * COMMIT_SLOT_SIZE;
-        assert!(needed <= FILE_HEADER_SIZE, "commit slots must fit in header");
+        assert!(
+            needed <= FILE_HEADER_SIZE,
+            "commit slots must fit in header"
+        );
     }
 
     #[test]

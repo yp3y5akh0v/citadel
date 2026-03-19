@@ -11,6 +11,7 @@ description = "WASM bindings for Citadel encrypted database"
 wasm-opt = ["--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
 
 [lib]
+name = "citadel_wasm"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

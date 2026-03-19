@@ -12,7 +12,10 @@ use clap::Parser;
 use crate::formatter::OutputMode;
 
 #[derive(Parser)]
-#[command(name = "citadel", about = "Interactive SQL shell for Citadel encrypted database")]
+#[command(
+    name = "citadel",
+    about = "Interactive SQL shell for Citadel encrypted database"
+)]
 #[command(version)]
 struct Cli {
     /// Path to database file
@@ -225,7 +228,11 @@ fn run_piped(db: &citadel::Database, settings: &mut repl::Settings) {
     }
 }
 
-fn execute_and_display(conn: &mut citadel_sql::Connection<'_>, sql: &str, settings: &mut repl::Settings) {
+fn execute_and_display(
+    conn: &mut citadel_sql::Connection<'_>,
+    sql: &str,
+    settings: &mut repl::Settings,
+) {
     use std::time::Instant;
 
     let start = Instant::now();

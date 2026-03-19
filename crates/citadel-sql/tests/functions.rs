@@ -32,14 +32,22 @@ fn scalar(conn: &mut Connection, sql: &str) -> Value {
 }
 
 fn setup(conn: &mut Connection) {
-    assert_ok(conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, name TEXT, val INTEGER, score REAL)"
-    ).unwrap());
-    conn.execute("INSERT INTO t VALUES (1, 'alice', 10, 1.5)").unwrap();
-    conn.execute("INSERT INTO t VALUES (2, 'bob', 20, 2.5)").unwrap();
-    conn.execute("INSERT INTO t VALUES (3, 'charlie', 30, 3.5)").unwrap();
-    conn.execute("INSERT INTO t VALUES (4, 'diana', NULL, NULL)").unwrap();
-    conn.execute("INSERT INTO t VALUES (5, NULL, 50, 5.5)").unwrap();
+    assert_ok(
+        conn.execute(
+            "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
+        )
+        .unwrap(),
+    );
+    conn.execute("INSERT INTO t VALUES (1, 'alice', 10, 1.5)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'bob', 20, 2.5)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 'charlie', 30, 3.5)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (4, 'diana', NULL, NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (5, NULL, 50, 5.5)")
+        .unwrap();
 }
 
 // ── BETWEEN ─────────────────────────────────────────────────────────
@@ -51,7 +59,10 @@ fn between_basic() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let qr = query(&mut conn, "SELECT id FROM t WHERE val BETWEEN 15 AND 35 ORDER BY id");
+    let qr = query(
+        &mut conn,
+        "SELECT id FROM t WHERE val BETWEEN 15 AND 35 ORDER BY id",
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Integer(2));
     assert_eq!(qr.rows[1][0], Value::Integer(3));
@@ -64,7 +75,10 @@ fn between_inclusive() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let qr = query(&mut conn, "SELECT id FROM t WHERE val BETWEEN 10 AND 30 ORDER BY id");
+    let qr = query(
+        &mut conn,
+        "SELECT id FROM t WHERE val BETWEEN 10 AND 30 ORDER BY id",
+    );
     assert_eq!(qr.rows.len(), 3);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
     assert_eq!(qr.rows[2][0], Value::Integer(3));
@@ -77,7 +91,10 @@ fn not_between() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let qr = query(&mut conn, "SELECT id FROM t WHERE val NOT BETWEEN 15 AND 35 ORDER BY id");
+    let qr = query(
+        &mut conn,
+        "SELECT id FROM t WHERE val NOT BETWEEN 15 AND 35 ORDER BY id",
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
     assert_eq!(qr.rows[1][0], Value::Integer(5));
@@ -91,7 +108,10 @@ fn between_null_value() {
     setup(&mut conn);
 
     // NULL val BETWEEN 15 AND 35 → NULL → filtered out
-    let qr = query(&mut conn, "SELECT id FROM t WHERE val BETWEEN 15 AND 35 ORDER BY id");
+    let qr = query(
+        &mut conn,
+        "SELECT id FROM t WHERE val BETWEEN 15 AND 35 ORDER BY id",
+    );
     for row in &qr.rows {
         assert_ne!(row[0], Value::Integer(4));
     }
@@ -116,7 +136,10 @@ fn between_text() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let qr = query(&mut conn, "SELECT name FROM t WHERE name BETWEEN 'b' AND 'd' ORDER BY name");
+    let qr = query(
+        &mut conn,
+        "SELECT name FROM t WHERE name BETWEEN 'b' AND 'd' ORDER BY name",
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Text("bob".into()));
     assert_eq!(qr.rows[1][0], Value::Text("charlie".into()));
@@ -167,7 +190,10 @@ fn not_like() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let qr = query(&mut conn, "SELECT name FROM t WHERE name NOT LIKE '%ob' ORDER BY name");
+    let qr = query(
+        &mut conn,
+        "SELECT name FROM t WHERE name NOT LIKE '%ob' ORDER BY name",
+    );
     // alice, charlie, diana
     assert_eq!(qr.rows.len(), 3);
 }
@@ -190,14 +216,19 @@ fn like_escape() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE esc (id INTEGER NOT NULL PRIMARY KEY, txt TEXT)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE esc (id INTEGER NOT NULL PRIMARY KEY, txt TEXT)")
+            .unwrap(),
+    );
     conn.execute("INSERT INTO esc VALUES (1, '100%')").unwrap();
-    conn.execute("INSERT INTO esc VALUES (2, '100 percent')").unwrap();
+    conn.execute("INSERT INTO esc VALUES (2, '100 percent')")
+        .unwrap();
     conn.execute("INSERT INTO esc VALUES (3, '1000')").unwrap();
 
-    let qr = query(&mut conn, "SELECT id FROM esc WHERE txt LIKE '100!%' ESCAPE '!'");
+    let qr = query(
+        &mut conn,
+        "SELECT id FROM esc WHERE txt LIKE '100!%' ESCAPE '!'",
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 }
@@ -228,10 +259,10 @@ fn case_searched() {
          FROM t WHERE val IS NOT NULL ORDER BY id"
     );
     assert_eq!(qr.rows.len(), 4);
-    assert_eq!(qr.rows[0][1], Value::Text("low".into()));   // val=10
-    assert_eq!(qr.rows[1][1], Value::Text("mid".into()));   // val=20
-    assert_eq!(qr.rows[2][1], Value::Text("high".into()));  // val=30
-    assert_eq!(qr.rows[3][1], Value::Text("high".into()));  // val=50
+    assert_eq!(qr.rows[0][1], Value::Text("low".into())); // val=10
+    assert_eq!(qr.rows[1][1], Value::Text("mid".into())); // val=20
+    assert_eq!(qr.rows[2][1], Value::Text("high".into())); // val=30
+    assert_eq!(qr.rows[3][1], Value::Text("high".into())); // val=50
 }
 
 #[test]
@@ -241,9 +272,10 @@ fn case_simple() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let qr = query(&mut conn,
+    let qr = query(
+        &mut conn,
         "SELECT CASE name WHEN 'alice' THEN 'A' WHEN 'bob' THEN 'B' ELSE '?' END \
-         FROM t WHERE name IS NOT NULL ORDER BY id"
+         FROM t WHERE name IS NOT NULL ORDER BY id",
     );
     assert_eq!(qr.rows[0][0], Value::Text("A".into()));
     assert_eq!(qr.rows[1][0], Value::Text("B".into()));
@@ -257,8 +289,9 @@ fn case_no_else() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let qr = query(&mut conn,
-        "SELECT CASE WHEN val > 100 THEN 'big' END FROM t WHERE id = 1"
+    let qr = query(
+        &mut conn,
+        "SELECT CASE WHEN val > 100 THEN 'big' END FROM t WHERE id = 1",
     );
     assert_eq!(qr.rows[0][0], Value::Null);
 }
@@ -271,8 +304,9 @@ fn case_null_operand() {
     setup(&mut conn);
 
     // NULL = NULL is not TRUE, so CASE NULL WHEN NULL → no match → ELSE
-    let qr = query(&mut conn,
-        "SELECT CASE val WHEN NULL THEN 'matched' ELSE 'no match' END FROM t WHERE id = 4"
+    let qr = query(
+        &mut conn,
+        "SELECT CASE val WHEN NULL THEN 'matched' ELSE 'no match' END FROM t WHERE id = 4",
     );
     assert_eq!(qr.rows[0][0], Value::Text("no match".into()));
 }
@@ -286,9 +320,7 @@ fn coalesce_basic() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let qr = query(&mut conn,
-        "SELECT COALESCE(val, -1) FROM t WHERE id = 4"
-    );
+    let qr = query(&mut conn, "SELECT COALESCE(val, -1) FROM t WHERE id = 4");
     assert_eq!(qr.rows[0][0], Value::Integer(-1));
 }
 
@@ -299,9 +331,7 @@ fn coalesce_first_non_null() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let qr = query(&mut conn,
-        "SELECT COALESCE(NULL, NULL, 42)"
-    );
+    let qr = query(&mut conn, "SELECT COALESCE(NULL, NULL, 42)");
     assert_eq!(qr.rows[0][0], Value::Integer(42));
 }
 
@@ -430,7 +460,9 @@ fn cast_invalid_text_to_integer() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let err = conn.execute("SELECT CAST('abc' AS INTEGER) FROM t WHERE id = 1").unwrap_err();
+    let err = conn
+        .execute("SELECT CAST('abc' AS INTEGER) FROM t WHERE id = 1")
+        .unwrap_err();
     assert!(matches!(err, SqlError::InvalidValue(_)));
 }
 
@@ -466,7 +498,10 @@ fn concat_operator_with_column() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let qr = query(&mut conn, "SELECT name || ' #' || CAST(id AS TEXT) FROM t WHERE id = 1");
+    let qr = query(
+        &mut conn,
+        "SELECT name || ' #' || CAST(id AS TEXT) FROM t WHERE id = 1",
+    );
     assert_eq!(qr.rows[0][0], Value::Text("alice #1".into()));
 }
 
@@ -654,8 +689,8 @@ fn fn_abs_real() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let v = scalar(&mut conn, "SELECT ABS(-3.14)");
-    assert_eq!(v, Value::Real(3.14));
+    let v = scalar(&mut conn, "SELECT ABS(-3.15)");
+    assert_eq!(v, Value::Real(3.15));
 }
 
 #[test]
@@ -664,13 +699,17 @@ fn fn_abs_min_overflow() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE minval (id INTEGER NOT NULL PRIMARY KEY, v INTEGER NOT NULL)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE minval (id INTEGER NOT NULL PRIMARY KEY, v INTEGER NOT NULL)")
+            .unwrap(),
+    );
     // i64::MIN = -9223372036854775808 = -9223372036854775807 - 1
-    conn.execute("INSERT INTO minval VALUES (1, -9223372036854775807 - 1)").unwrap();
+    conn.execute("INSERT INTO minval VALUES (1, -9223372036854775807 - 1)")
+        .unwrap();
 
-    let err = conn.execute("SELECT ABS(v) FROM minval WHERE id = 1").unwrap_err();
+    let err = conn
+        .execute("SELECT ABS(v) FROM minval WHERE id = 1")
+        .unwrap_err();
     assert!(matches!(err, SqlError::IntegerOverflow));
 }
 
@@ -681,8 +720,8 @@ fn fn_round() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let v = scalar(&mut conn, "SELECT ROUND(3.14159, 2)");
-    assert_eq!(v, Value::Real(3.14));
+    let v = scalar(&mut conn, "SELECT ROUND(3.15159, 2)");
+    assert_eq!(v, Value::Real(3.15));
 }
 
 #[test]
@@ -775,11 +814,26 @@ fn fn_typeof() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    assert_eq!(scalar(&mut conn, "SELECT TYPEOF(42)"), Value::Text("integer".into()));
-    assert_eq!(scalar(&mut conn, "SELECT TYPEOF(3.14)"), Value::Text("real".into()));
-    assert_eq!(scalar(&mut conn, "SELECT TYPEOF('hi')"), Value::Text("text".into()));
-    assert_eq!(scalar(&mut conn, "SELECT TYPEOF(NULL)"), Value::Text("null".into()));
-    assert_eq!(scalar(&mut conn, "SELECT TYPEOF(TRUE)"), Value::Text("boolean".into()));
+    assert_eq!(
+        scalar(&mut conn, "SELECT TYPEOF(42)"),
+        Value::Text("integer".into())
+    );
+    assert_eq!(
+        scalar(&mut conn, "SELECT TYPEOF(3.14)"),
+        Value::Text("real".into())
+    );
+    assert_eq!(
+        scalar(&mut conn, "SELECT TYPEOF('hi')"),
+        Value::Text("text".into())
+    );
+    assert_eq!(
+        scalar(&mut conn, "SELECT TYPEOF(NULL)"),
+        Value::Text("null".into())
+    );
+    assert_eq!(
+        scalar(&mut conn, "SELECT TYPEOF(TRUE)"),
+        Value::Text("boolean".into())
+    );
 }
 
 #[test]
@@ -863,16 +917,17 @@ fn case_with_between() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let qr = query(&mut conn,
+    let qr = query(
+        &mut conn,
         "SELECT id, CASE WHEN val BETWEEN 1 AND 15 THEN 'low' \
                          WHEN val BETWEEN 16 AND 35 THEN 'mid' \
                          ELSE 'high' END \
-         FROM t WHERE val IS NOT NULL ORDER BY id"
+         FROM t WHERE val IS NOT NULL ORDER BY id",
     );
-    assert_eq!(qr.rows[0][1], Value::Text("low".into()));   // 10
-    assert_eq!(qr.rows[1][1], Value::Text("mid".into()));   // 20
-    assert_eq!(qr.rows[2][1], Value::Text("mid".into()));   // 30
-    assert_eq!(qr.rows[3][1], Value::Text("high".into()));  // 50
+    assert_eq!(qr.rows[0][1], Value::Text("low".into())); // 10
+    assert_eq!(qr.rows[1][1], Value::Text("mid".into())); // 20
+    assert_eq!(qr.rows[2][1], Value::Text("mid".into())); // 30
+    assert_eq!(qr.rows[3][1], Value::Text("high".into())); // 50
 }
 
 #[test]
@@ -893,7 +948,10 @@ fn function_in_where() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let qr = query(&mut conn, "SELECT id FROM t WHERE LENGTH(name) > 4 ORDER BY id");
+    let qr = query(
+        &mut conn,
+        "SELECT id FROM t WHERE LENGTH(name) > 4 ORDER BY id",
+    );
     assert_eq!(qr.rows.len(), 3); // alice (5), charlie (7), diana (5)
     assert_eq!(qr.rows[0][0], Value::Integer(1));
     assert_eq!(qr.rows[1][0], Value::Integer(3));
@@ -907,12 +965,13 @@ fn function_in_order_by() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let qr = query(&mut conn,
-        "SELECT name FROM t WHERE name IS NOT NULL ORDER BY LENGTH(name)"
+    let qr = query(
+        &mut conn,
+        "SELECT name FROM t WHERE name IS NOT NULL ORDER BY LENGTH(name)",
     );
-    assert_eq!(qr.rows[0][0], Value::Text("bob".into()));     // 3
-    assert_eq!(qr.rows[1][0], Value::Text("alice".into()));   // 5
-    assert_eq!(qr.rows[2][0], Value::Text("diana".into()));   // 5
+    assert_eq!(qr.rows[0][0], Value::Text("bob".into())); // 3
+    assert_eq!(qr.rows[1][0], Value::Text("alice".into())); // 5
+    assert_eq!(qr.rows[2][0], Value::Text("diana".into())); // 5
     assert_eq!(qr.rows[3][0], Value::Text("charlie".into())); // 7
 }
 
@@ -934,8 +993,9 @@ fn case_in_aggregate() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let qr = query(&mut conn,
-        "SELECT CASE WHEN SUM(val) > 100 THEN 'big' ELSE 'small' END FROM t"
+    let qr = query(
+        &mut conn,
+        "SELECT CASE WHEN SUM(val) > 100 THEN 'big' ELSE 'small' END FROM t",
     );
     // SUM(10+20+30+50) = 110 > 100
     assert_eq!(qr.rows[0][0], Value::Text("big".into()));
@@ -950,12 +1010,16 @@ fn function_with_group_by() {
     assert_ok(conn.execute(
         "CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, category TEXT NOT NULL, amount INTEGER NOT NULL)"
     ).unwrap());
-    conn.execute("INSERT INTO orders VALUES (1, 'food', 100)").unwrap();
-    conn.execute("INSERT INTO orders VALUES (2, 'food', 200)").unwrap();
-    conn.execute("INSERT INTO orders VALUES (3, 'drink', 50)").unwrap();
+    conn.execute("INSERT INTO orders VALUES (1, 'food', 100)")
+        .unwrap();
+    conn.execute("INSERT INTO orders VALUES (2, 'food', 200)")
+        .unwrap();
+    conn.execute("INSERT INTO orders VALUES (3, 'drink', 50)")
+        .unwrap();
 
-    let qr = query(&mut conn,
-        "SELECT UPPER(category), SUM(amount) FROM orders GROUP BY category ORDER BY category"
+    let qr = query(
+        &mut conn,
+        "SELECT UPPER(category), SUM(amount) FROM orders GROUP BY category ORDER BY category",
     );
     assert_eq!(qr.rows[0][0], Value::Text("DRINK".into()));
     assert_eq!(qr.rows[0][1], Value::Integer(50));
@@ -969,21 +1033,26 @@ fn like_with_join() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
+            .unwrap(),
+    );
     assert_ok(conn.execute(
         "CREATE TABLE emails (id INTEGER NOT NULL PRIMARY KEY, user_id INTEGER NOT NULL, addr TEXT NOT NULL)"
     ).unwrap());
 
-    conn.execute("INSERT INTO users VALUES (1, 'alice')").unwrap();
+    conn.execute("INSERT INTO users VALUES (1, 'alice')")
+        .unwrap();
     conn.execute("INSERT INTO users VALUES (2, 'bob')").unwrap();
-    conn.execute("INSERT INTO emails VALUES (1, 1, 'alice@gmail.com')").unwrap();
-    conn.execute("INSERT INTO emails VALUES (2, 2, 'bob@yahoo.com')").unwrap();
+    conn.execute("INSERT INTO emails VALUES (1, 1, 'alice@gmail.com')")
+        .unwrap();
+    conn.execute("INSERT INTO emails VALUES (2, 2, 'bob@yahoo.com')")
+        .unwrap();
 
-    let qr = query(&mut conn,
+    let qr = query(
+        &mut conn,
         "SELECT u.name, e.addr FROM users u JOIN emails e ON u.id = e.user_id \
-         WHERE e.addr LIKE '%gmail%'"
+         WHERE e.addr LIKE '%gmail%'",
     );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Text("alice".into()));
@@ -996,8 +1065,9 @@ fn between_with_subquery() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    let qr = query(&mut conn,
-        "SELECT id FROM t WHERE val BETWEEN (SELECT MIN(val) FROM t) AND 20 ORDER BY id"
+    let qr = query(
+        &mut conn,
+        "SELECT id FROM t WHERE val BETWEEN (SELECT MIN(val) FROM t) AND 20 ORDER BY id",
     );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
@@ -1010,9 +1080,10 @@ fn functions_persist_across_reopen() {
     let db = create_db(dir.path());
     {
         let mut conn = Connection::open(&db).unwrap();
-        assert_ok(conn.execute(
-            "CREATE TABLE p (id INTEGER NOT NULL PRIMARY KEY, name TEXT)"
-        ).unwrap());
+        assert_ok(
+            conn.execute("CREATE TABLE p (id INTEGER NOT NULL PRIMARY KEY, name TEXT)")
+                .unwrap(),
+        );
         conn.execute("INSERT INTO p VALUES (1, 'hello')").unwrap();
     }
     drop(db);

@@ -1,8 +1,8 @@
-use wasm_bindgen::prelude::*;
 use js_sys::{Array, Object, Reflect};
 use serde::Serialize;
+use wasm_bindgen::prelude::*;
 
-use crate::{CitadelDb as InnerDb, CellValue};
+use crate::{CellValue, CitadelDb as InnerDb};
 
 #[wasm_bindgen(js_name = "CitadelDb")]
 pub struct JsCitadelDb {
@@ -14,8 +14,7 @@ impl JsCitadelDb {
     /// Create a new in-memory encrypted database.
     #[wasm_bindgen(constructor)]
     pub fn new(passphrase: &str) -> Result<JsCitadelDb, JsValue> {
-        let inner = InnerDb::create(passphrase)
-            .map_err(|e| JsValue::from_str(&e))?;
+        let inner = InnerDb::create(passphrase).map_err(|e| JsValue::from_str(&e))?;
         Ok(Self { inner })
     }
 
@@ -32,9 +31,7 @@ impl JsCitadelDb {
     ///
     /// Returns `{ columns: string[], rows: any[][] }`.
     pub fn query(&self, sql: &str) -> Result<JsValue, JsValue> {
-        let result = self.inner
-            .query(sql)
-            .map_err(|e| JsValue::from_str(&e))?;
+        let result = self.inner.query(sql).map_err(|e| JsValue::from_str(&e))?;
 
         let obj = Object::new();
 
@@ -86,9 +83,7 @@ impl JsCitadelDb {
     /// Delete a key from the default table.
     /// Returns true if the key existed.
     pub fn delete(&self, key: &[u8]) -> Result<bool, JsValue> {
-        self.inner
-            .delete(key)
-            .map_err(|e| JsValue::from_str(&e))
+        self.inner.delete(key).map_err(|e| JsValue::from_str(&e))
     }
 
     /// Put a key-value pair into a named table.
@@ -103,7 +98,11 @@ impl JsCitadelDb {
     /// Returns null if not found.
     #[wasm_bindgen(js_name = "tableGet")]
     pub fn table_get(&self, table: &str, key: &[u8]) -> Result<JsValue, JsValue> {
-        match self.inner.table_get(table, key).map_err(|e| JsValue::from_str(&e))? {
+        match self
+            .inner
+            .table_get(table, key)
+            .map_err(|e| JsValue::from_str(&e))?
+        {
             Some(v) => Ok(js_sys::Uint8Array::from(v.as_slice()).into()),
             None => Ok(JsValue::NULL),
         }
@@ -123,9 +122,21 @@ impl JsCitadelDb {
     pub fn stats(&self) -> Result<JsValue, JsValue> {
         let s = self.inner.stats();
         let obj = Object::new();
-        Reflect::set(&obj, &JsValue::from_str("entryCount"), &JsValue::from_f64(s.entry_count as f64))?;
-        Reflect::set(&obj, &JsValue::from_str("totalPages"), &JsValue::from_f64(s.total_pages as f64))?;
-        Reflect::set(&obj, &JsValue::from_str("treeDepth"), &JsValue::from_f64(s.tree_depth as f64))?;
+        Reflect::set(
+            &obj,
+            &JsValue::from_str("entryCount"),
+            &JsValue::from_f64(s.entry_count as f64),
+        )?;
+        Reflect::set(
+            &obj,
+            &JsValue::from_str("totalPages"),
+            &JsValue::from_f64(s.total_pages as f64),
+        )?;
+        Reflect::set(
+            &obj,
+            &JsValue::from_str("treeDepth"),
+            &JsValue::from_f64(s.tree_depth as f64),
+        )?;
         Ok(obj.into())
     }
 }

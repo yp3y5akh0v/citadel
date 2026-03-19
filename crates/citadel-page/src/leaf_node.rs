@@ -8,8 +8,8 @@
 //! - Overflow (1): value is [first_overflow_page_id: u32][total_len: u32] = 8 bytes
 //! - Tombstone (2): no value data (val_len = 0)
 
-use citadel_core::types::{PageId, ValueType};
 use crate::page::Page;
+use citadel_core::types::{PageId, ValueType};
 
 /// Fixed-size fields in a leaf cell (key_len: 2 + val_len: 4 + val_type: 1).
 const LEAF_CELL_FIXED: usize = 7;
@@ -48,12 +48,17 @@ impl OverflowRef {
 pub fn read_cell(page: &Page, i: u16) -> LeafCell<'_> {
     let offset = page.cell_offset(i) as usize;
     let key_len = u16::from_le_bytes(page.data[offset..offset + 2].try_into().unwrap()) as usize;
-    let val_len = u32::from_le_bytes(page.data[offset + 2..offset + 6].try_into().unwrap()) as usize;
+    let val_len =
+        u32::from_le_bytes(page.data[offset + 2..offset + 6].try_into().unwrap()) as usize;
     let key = &page.data[offset + 6..offset + 6 + key_len];
     let val_type_byte = page.data[offset + 6 + key_len];
     let val_type = ValueType::from_u8(val_type_byte).unwrap_or(ValueType::Inline);
     let value = &page.data[offset + 6 + key_len + 1..offset + 6 + key_len + 1 + val_len];
-    LeafCell { key, val_type, value }
+    LeafCell {
+        key,
+        val_type,
+        value,
+    }
 }
 
 /// Get the total byte size of a leaf cell.
@@ -65,7 +70,8 @@ pub fn cell_size(key_len: usize, val_len: usize) -> usize {
 pub fn get_cell_size(page: &Page, i: u16) -> usize {
     let offset = page.cell_offset(i) as usize;
     let key_len = u16::from_le_bytes(page.data[offset..offset + 2].try_into().unwrap()) as usize;
-    let val_len = u32::from_le_bytes(page.data[offset + 2..offset + 6].try_into().unwrap()) as usize;
+    let val_len =
+        u32::from_le_bytes(page.data[offset + 2..offset + 6].try_into().unwrap()) as usize;
     LEAF_CELL_FIXED + key_len + val_len
 }
 

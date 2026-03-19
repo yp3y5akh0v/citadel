@@ -137,8 +137,7 @@ fn compute_entry_hmac(
     prev_hmac: &[u8; MAC_SIZE],
     entry_data: &[u8],
 ) -> [u8; MAC_SIZE] {
-    let mut mac = HmacSha256::new_from_slice(audit_key)
-        .expect("HMAC key size is always valid");
+    let mut mac = HmacSha256::new_from_slice(audit_key).expect("HMAC key size is always valid");
     mac.update(prev_hmac);
     mac.update(entry_data);
     let result = mac.finalize().into_bytes();
@@ -226,10 +225,7 @@ impl AuditLog {
         audit_key: [u8; KEY_SIZE],
         config: AuditConfig,
     ) -> citadel_core::Result<Self> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
 
         let mut header_buf = [0u8; AUDIT_HEADER_SIZE];
         file.read_exact(&mut header_buf)?;
@@ -320,7 +316,7 @@ impl AuditLog {
     }
 
     fn update_header(&mut self) -> citadel_core::Result<()> {
-        let pos = self.file.seek(SeekFrom::Current(0))?;
+        let pos = self.file.stream_position()?;
 
         self.file.seek(SeekFrom::Start(24))?;
         self.file.write_all(&self.entry_count.to_le_bytes())?;
@@ -570,7 +566,8 @@ pub fn scan_corrupted_audit_log(path: &Path) -> citadel_core::Result<ScanResult>
         if offset + 8 > data.len() {
             break;
         }
-        let entry_len = u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let entry_len =
+            u32::from_le_bytes(data[offset + 4..offset + 8].try_into().unwrap()) as usize;
         if entry_len < 56 || offset + 4 + entry_len > data.len() {
             if !in_corruption {
                 corruption_offsets.push(offset as u64);
@@ -583,12 +580,11 @@ pub fn scan_corrupted_audit_log(path: &Path) -> citadel_core::Result<ScanResult>
         let entry_start = offset + 8;
         let remaining = entry_len - 4;
 
-        let event_type_raw = u16::from_le_bytes(
-            data[entry_start + 16..entry_start + 18].try_into().unwrap(),
-        );
-        let detail_len = u16::from_le_bytes(
-            data[entry_start + 18..entry_start + 20].try_into().unwrap(),
-        ) as usize;
+        let event_type_raw =
+            u16::from_le_bytes(data[entry_start + 16..entry_start + 18].try_into().unwrap());
+        let detail_len =
+            u16::from_le_bytes(data[entry_start + 18..entry_start + 20].try_into().unwrap())
+                as usize;
 
         if AuditEventType::from_u16(event_type_raw).is_none()
             || 20 + detail_len + MAC_SIZE != remaining
@@ -602,9 +598,8 @@ pub fn scan_corrupted_audit_log(path: &Path) -> citadel_core::Result<ScanResult>
         }
 
         let timestamp = u64::from_le_bytes(data[entry_start..entry_start + 8].try_into().unwrap());
-        let sequence_no = u64::from_le_bytes(
-            data[entry_start + 8..entry_start + 16].try_into().unwrap(),
-        );
+        let sequence_no =
+            u64::from_le_bytes(data[entry_start + 8..entry_start + 16].try_into().unwrap());
         let event_type = AuditEventType::from_u16(event_type_raw).unwrap();
         let detail = data[entry_start + 20..entry_start + 20 + detail_len].to_vec();
         let mut hmac = [0u8; MAC_SIZE];
@@ -663,7 +658,10 @@ mod tests {
         let mut buf = [0u8; AUDIT_HEADER_SIZE];
         buf[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
         let result = AuditHeader::deserialize(&buf);
-        assert!(matches!(result, Err(citadel_core::Error::InvalidMagic { .. })));
+        assert!(matches!(
+            result,
+            Err(citadel_core::Error::InvalidMagic { .. })
+        ));
     }
 
     #[test]
@@ -712,7 +710,8 @@ mod tests {
         let key = [0x42u8; KEY_SIZE];
 
         let mut log = AuditLog::create(&path, 123, key, AuditConfig::default()).unwrap();
-        log.log(AuditEventType::DatabaseCreated, &[0x00, 0x00]).unwrap();
+        log.log(AuditEventType::DatabaseCreated, &[0x00, 0x00])
+            .unwrap();
         log.log(AuditEventType::DatabaseOpened, &[]).unwrap();
         drop(log);
 

@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
-use citadel_core::{Error, PAGE_SIZE, Result};
 use crate::traits::PageIO;
+use citadel_core::{Error, Result, PAGE_SIZE};
 
 /// In-memory page I/O backend.
 ///
@@ -194,10 +194,8 @@ mod tests {
         page1[0] = 0xBB;
 
         io.truncate(2 * PAGE_SIZE as u64).unwrap();
-        io.flush_pages(&[
-            (0, page0),
-            (PAGE_SIZE as u64, page1),
-        ]).unwrap();
+        io.flush_pages(&[(0, page0), (PAGE_SIZE as u64, page1)])
+            .unwrap();
 
         let mut read0 = [0u8; PAGE_SIZE];
         let mut read1 = [0u8; PAGE_SIZE];

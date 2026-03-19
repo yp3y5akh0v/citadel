@@ -12,5 +12,8 @@ categories.workspace = true
 description = "Core types, errors, and constants for Citadel encrypted database"
 readme = "README.md"
 
+[lib]
+name = "citadel_core"
+
 [dependencies]
 thiserror = { workspace = true }

@@ -41,7 +41,12 @@ impl<'a> Connection<'a> {
     pub fn open(db: &'a Database) -> Result<Self> {
         let schema = SchemaManager::load(db)?;
         let stmt_cache = LruCache::new(NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).unwrap());
-        Ok(Self { db, schema, active_txn: None, stmt_cache })
+        Ok(Self {
+            db,
+            schema,
+            active_txn: None,
+            stmt_cache,
+        })
     }
 
     /// Execute a SQL statement. Returns the result.
@@ -124,17 +129,24 @@ impl<'a> Connection<'a> {
 
         let cacheable = !matches!(
             stmt,
-            Statement::CreateTable(_) | Statement::DropTable(_)
-            | Statement::CreateIndex(_) | Statement::DropIndex(_)
-            | Statement::Begin | Statement::Commit | Statement::Rollback
+            Statement::CreateTable(_)
+                | Statement::DropTable(_)
+                | Statement::CreateIndex(_)
+                | Statement::DropIndex(_)
+                | Statement::Begin
+                | Statement::Commit
+                | Statement::Rollback
         );
 
         if cacheable {
-            self.stmt_cache.put(sql.to_string(), CacheEntry {
-                stmt: stmt.clone(),
-                schema_gen: gen,
-                param_count,
-            });
+            self.stmt_cache.put(
+                sql.to_string(),
+                CacheEntry {
+                    stmt: stmt.clone(),
+                    schema_gen: gen,
+                    param_count,
+                },
+            );
         }
 
         Ok((stmt, param_count))
@@ -151,13 +163,17 @@ impl<'a> Connection<'a> {
                 Ok(ExecutionResult::Ok)
             }
             Statement::Commit => {
-                let wtx = self.active_txn.take()
+                let wtx = self
+                    .active_txn
+                    .take()
                     .ok_or(SqlError::NoActiveTransaction)?;
                 wtx.commit().map_err(SqlError::Storage)?;
                 Ok(ExecutionResult::Ok)
             }
             Statement::Rollback => {
-                let wtx = self.active_txn.take()
+                let wtx = self
+                    .active_txn
+                    .take()
                     .ok_or(SqlError::NoActiveTransaction)?;
                 wtx.abort();
                 self.schema = SchemaManager::load(self.db)?;

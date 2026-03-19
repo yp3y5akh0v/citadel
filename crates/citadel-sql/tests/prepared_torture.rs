@@ -21,12 +21,16 @@ fn setup_and_populate(conn: &mut Connection<'_>) {
     conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, price REAL, active BOOLEAN)").unwrap();
     let sql = "INSERT INTO items (id, name, price, active) VALUES ($1, $2, $3, $4)";
     for i in 1..=100 {
-        conn.execute_params(sql, &[
-            Value::Integer(i),
-            Value::Text(format!("item_{i}")),
-            Value::Real(i as f64 * 1.5),
-            Value::Boolean(i % 3 != 0),
-        ]).unwrap();
+        conn.execute_params(
+            sql,
+            &[
+                Value::Integer(i),
+                Value::Text(format!("item_{i}")),
+                Value::Real(i as f64 * 1.5),
+                Value::Boolean(i % 3 != 0),
+            ],
+        )
+        .unwrap();
     }
 }
 
@@ -52,11 +56,13 @@ fn repeated_parameterized_insert() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     let sql = "INSERT INTO t (id, val) VALUES ($1, $2)";
     for i in 1..=200 {
-        conn.execute_params(sql, &[Value::Integer(i), Value::Text(format!("v{i}"))]).unwrap();
+        conn.execute_params(sql, &[Value::Integer(i), Value::Text(format!("v{i}"))])
+            .unwrap();
     }
 
     let qr = query_result(conn.execute("SELECT COUNT(*) FROM t").unwrap());
@@ -72,16 +78,19 @@ fn same_param_slot_different_types() {
     let mut conn = Connection::open(&db).unwrap();
     setup_and_populate(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT id FROM items WHERE id = $1",
-        &[Value::Integer(5)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params("SELECT id FROM items WHERE id = $1", &[Value::Integer(5)])
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT id FROM items WHERE name = $1",
-        &[Value::Text("item_5".into())],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT id FROM items WHERE name = $1",
+            &[Value::Text("item_5".into())],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
 }
 
@@ -92,14 +101,22 @@ fn interleave_insert_select_with_cache() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
 
     let insert_sql = "INSERT INTO t (id, name) VALUES ($1, $2)";
     let select_sql = "SELECT name FROM t WHERE id = $1";
 
     for i in 1..=10 {
-        conn.execute_params(insert_sql, &[Value::Integer(i), Value::Text(format!("n{i}"))]).unwrap();
-        let qr = query_result(conn.execute_params(select_sql, &[Value::Integer(i)]).unwrap());
+        conn.execute_params(
+            insert_sql,
+            &[Value::Integer(i), Value::Text(format!("n{i}"))],
+        )
+        .unwrap();
+        let qr = query_result(
+            conn.execute_params(select_sql, &[Value::Integer(i)])
+                .unwrap(),
+        );
         assert_eq!(qr.rows[0][0], Value::Text(format!("n{i}")));
     }
 }
@@ -109,18 +126,28 @@ fn all_dml_with_params() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
 
-    conn.execute_params("INSERT INTO t (id, val) VALUES ($1, $2)",
-        &[Value::Integer(1), Value::Text("a".into())]).unwrap();
-    conn.execute_params("UPDATE t SET val = $2 WHERE id = $1",
-        &[Value::Integer(1), Value::Text("b".into())]).unwrap();
+    conn.execute_params(
+        "INSERT INTO t (id, val) VALUES ($1, $2)",
+        &[Value::Integer(1), Value::Text("a".into())],
+    )
+    .unwrap();
+    conn.execute_params(
+        "UPDATE t SET val = $2 WHERE id = $1",
+        &[Value::Integer(1), Value::Text("b".into())],
+    )
+    .unwrap();
 
-    let qr = query_result(conn.execute_params("SELECT val FROM t WHERE id = $1",
-        &[Value::Integer(1)]).unwrap());
+    let qr = query_result(
+        conn.execute_params("SELECT val FROM t WHERE id = $1", &[Value::Integer(1)])
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Text("b".into()));
 
-    conn.execute_params("DELETE FROM t WHERE id = $1", &[Value::Integer(1)]).unwrap();
+    conn.execute_params("DELETE FROM t WHERE id = $1", &[Value::Integer(1)])
+        .unwrap();
     let qr = query_result(conn.execute("SELECT COUNT(*) FROM t").unwrap());
     assert_eq!(qr.rows[0][0], Value::Integer(0));
 }
@@ -153,8 +180,10 @@ fn cache_eviction_under_pressure() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
-    conn.execute("INSERT INTO t (id, val) VALUES (1, 100)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, val) VALUES (1, 100)")
+        .unwrap();
 
     for i in 0..70 {
         let sql = format!("SELECT val + {i} FROM t WHERE id = 1");
@@ -172,12 +201,17 @@ fn params_in_transaction_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    conn.execute("INSERT INTO t (id, val) VALUES (1, 'original')").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, val) VALUES (1, 'original')")
+        .unwrap();
 
     conn.execute("BEGIN").unwrap();
-    conn.execute_params("UPDATE t SET val = $1 WHERE id = $2",
-        &[Value::Text("changed".into()), Value::Integer(1)]).unwrap();
+    conn.execute_params(
+        "UPDATE t SET val = $1 WHERE id = $2",
+        &[Value::Text("changed".into()), Value::Integer(1)],
+    )
+    .unwrap();
     conn.execute("ROLLBACK").unwrap();
 
     let qr = query_result(conn.execute("SELECT val FROM t WHERE id = 1").unwrap());
@@ -189,14 +223,16 @@ fn params_in_multi_statement_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     conn.execute("BEGIN").unwrap();
     for i in 1..=5 {
         conn.execute_params(
             "INSERT INTO t (id, val) VALUES ($1, $2)",
             &[Value::Integer(i), Value::Text(format!("item{i}"))],
-        ).unwrap();
+        )
+        .unwrap();
     }
     conn.execute("COMMIT").unwrap();
 
@@ -211,16 +247,24 @@ fn param_with_in_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
-    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL)").unwrap();
-    conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
-    conn.execute("INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
-    conn.execute("INSERT INTO orders (id, user_id, amount) VALUES (1, 1, 100.0)").unwrap();
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        .unwrap();
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL)")
+        .unwrap();
+    conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')")
+        .unwrap();
+    conn.execute("INSERT INTO users (id, name) VALUES (2, 'Bob')")
+        .unwrap();
+    conn.execute("INSERT INTO orders (id, user_id, amount) VALUES (1, 1, 100.0)")
+        .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > $1)",
-        &[Value::Real(50.0)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > $1)",
+            &[Value::Real(50.0)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Text("Alice".into()));
 }
@@ -234,10 +278,13 @@ fn param_in_case_expression() {
     let mut conn = Connection::open(&db).unwrap();
     setup_and_populate(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT CASE WHEN price > $1 THEN 'expensive' ELSE 'cheap' END FROM items WHERE id = 1",
-        &[Value::Real(100.0)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT CASE WHEN price > $1 THEN 'expensive' ELSE 'cheap' END FROM items WHERE id = 1",
+            &[Value::Real(100.0)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Text("cheap".into()));
 }
 
@@ -246,13 +293,18 @@ fn param_in_coalesce() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    conn.execute("INSERT INTO t (id, val) VALUES (1, NULL)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, val) VALUES (1, NULL)")
+        .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT COALESCE(val, $1) FROM t WHERE id = 1",
-        &[Value::Text("default".into())],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT COALESCE(val, $1) FROM t WHERE id = 1",
+            &[Value::Text("default".into())],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Text("default".into()));
 }
 
@@ -263,13 +315,18 @@ fn param_in_cast() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL)").unwrap();
-    conn.execute("INSERT INTO t (id, val) VALUES (1, 3.14)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, val) VALUES (1, 3.14)")
+        .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT CAST($1 AS REAL) FROM t WHERE id = 1",
-        &[Value::Integer(42)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT CAST($1 AS REAL) FROM t WHERE id = 1",
+            &[Value::Integer(42)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Real(42.0));
 }
 
@@ -282,11 +339,14 @@ fn param_in_having() {
     let mut conn = Connection::open(&db).unwrap();
     setup_and_populate(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT active, COUNT(*) FROM items GROUP BY active HAVING COUNT(*) > $1",
-        &[Value::Integer(30)],
-    ).unwrap());
-    assert!(qr.rows.len() >= 1);
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT active, COUNT(*) FROM items GROUP BY active HAVING COUNT(*) > $1",
+            &[Value::Integer(30)],
+        )
+        .unwrap(),
+    );
+    assert!(!qr.rows.is_empty());
 }
 
 // ── Persistence ─────────────────────────────────────────────────────
@@ -297,18 +357,20 @@ fn params_persist_across_reopen() {
     let db = create_db(dir.path());
     {
         let mut conn = Connection::open(&db).unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
         conn.execute_params(
             "INSERT INTO t (id, name) VALUES ($1, $2)",
             &[Value::Integer(1), Value::Text("persisted".into())],
-        ).unwrap();
+        )
+        .unwrap();
     }
     {
         let mut conn = Connection::open(&db).unwrap();
-        let qr = query_result(conn.execute_params(
-            "SELECT name FROM t WHERE id = $1",
-            &[Value::Integer(1)],
-        ).unwrap());
+        let qr = query_result(
+            conn.execute_params("SELECT name FROM t WHERE id = $1", &[Value::Integer(1)])
+                .unwrap(),
+        );
         assert_eq!(qr.rows[0][0], Value::Text("persisted".into()));
     }
 }
@@ -322,10 +384,13 @@ fn mixed_params_and_literals() {
     let mut conn = Connection::open(&db).unwrap();
     setup_and_populate(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT name FROM items WHERE price > $1 AND active = true AND id < 10",
-        &[Value::Real(5.0)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT name FROM items WHERE price > $1 AND active = true AND id < 10",
+            &[Value::Real(5.0)],
+        )
+        .unwrap(),
+    );
     assert!(!qr.rows.is_empty());
 }
 
@@ -336,8 +401,10 @@ fn duplicate_key_with_params() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
-    conn.execute_params("INSERT INTO t (id) VALUES ($1)", &[Value::Integer(1)]).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute_params("INSERT INTO t (id) VALUES ($1)", &[Value::Integer(1)])
+        .unwrap();
     let result = conn.execute_params("INSERT INTO t (id) VALUES ($1)", &[Value::Integer(1)]);
     assert!(result.is_err());
 }
@@ -350,10 +417,10 @@ fn select_param_no_table() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT $1 + $2",
-        &[Value::Integer(3), Value::Integer(4)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params("SELECT $1 + $2", &[Value::Integer(3), Value::Integer(4)])
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(7));
 }
 
@@ -366,10 +433,13 @@ fn boolean_param() {
     let mut conn = Connection::open(&db).unwrap();
     setup_and_populate(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT COUNT(*) FROM items WHERE active = $1",
-        &[Value::Boolean(true)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT COUNT(*) FROM items WHERE active = $1",
+            &[Value::Boolean(true)],
+        )
+        .unwrap(),
+    );
     assert!(matches!(qr.rows[0][0], Value::Integer(n) if n > 0));
 }
 
@@ -380,7 +450,8 @@ fn not_null_violation_with_params() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        .unwrap();
 
     let result = conn.execute_params(
         "INSERT INTO t (id, name) VALUES ($1, $2)",
@@ -396,14 +467,17 @@ fn cache_invalidated_by_create_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    conn.execute("INSERT INTO t1 (id, val) VALUES (1, 'hello')").unwrap();
+    conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t1 (id, val) VALUES (1, 'hello')")
+        .unwrap();
 
     let sql = "SELECT val FROM t1 WHERE id = $1";
     let qr = query_result(conn.execute_params(sql, &[Value::Integer(1)]).unwrap());
     assert_eq!(qr.rows[0][0], Value::Text("hello".into()));
 
-    conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY)")
+        .unwrap();
 
     let qr = query_result(conn.execute_params(sql, &[Value::Integer(1)]).unwrap());
     assert_eq!(qr.rows[0][0], Value::Text("hello".into()));
@@ -414,17 +488,25 @@ fn cache_invalidated_by_drop_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
     conn.execute("CREATE INDEX idx_name ON t (name)").unwrap();
-    conn.execute("INSERT INTO t (id, name) VALUES (1, 'Alice')").unwrap();
+    conn.execute("INSERT INTO t (id, name) VALUES (1, 'Alice')")
+        .unwrap();
 
     let sql = "SELECT id FROM t WHERE name = $1";
-    let qr = query_result(conn.execute_params(sql, &[Value::Text("Alice".into())]).unwrap());
+    let qr = query_result(
+        conn.execute_params(sql, &[Value::Text("Alice".into())])
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 
     conn.execute("DROP INDEX idx_name ON t").unwrap();
 
-    let qr = query_result(conn.execute_params(sql, &[Value::Text("Alice".into())]).unwrap());
+    let qr = query_result(
+        conn.execute_params(sql, &[Value::Text("Alice".into())])
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 }
 
@@ -433,8 +515,10 @@ fn multiple_ddl_operations_all_invalidate_cache() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, score INTEGER)").unwrap();
-    conn.execute("INSERT INTO t (id, val, score) VALUES (1, 'x', 42)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, score INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, val, score) VALUES (1, 'x', 42)")
+        .unwrap();
 
     let sql = "SELECT score FROM t WHERE id = $1";
     let qr = query_result(conn.execute_params(sql, &[Value::Integer(1)]).unwrap());
@@ -462,9 +546,12 @@ fn cache_survives_drop_of_unrelated_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY)").unwrap();
-    conn.execute("INSERT INTO t1 (id, val) VALUES (1, 'kept')").unwrap();
+    conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t1 (id, val) VALUES (1, 'kept')")
+        .unwrap();
 
     let sql = "SELECT val FROM t1 WHERE id = $1";
     let qr = query_result(conn.execute_params(sql, &[Value::Integer(1)]).unwrap());
@@ -482,15 +569,18 @@ fn rollback_ddl_invalidates_cache() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    conn.execute("INSERT INTO t (id, val) VALUES (1, 'original')").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, val) VALUES (1, 'original')")
+        .unwrap();
 
     let sql = "SELECT val FROM t WHERE id = $1";
     let qr = query_result(conn.execute_params(sql, &[Value::Integer(1)]).unwrap());
     assert_eq!(qr.rows[0][0], Value::Text("original".into()));
 
     conn.execute("BEGIN").unwrap();
-    conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY)")
+        .unwrap();
     conn.execute("ROLLBACK").unwrap();
 
     let qr = query_result(conn.execute_params(sql, &[Value::Integer(1)]).unwrap());
@@ -504,14 +594,20 @@ fn same_param_used_twice() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, lo INTEGER, hi INTEGER)").unwrap();
-    conn.execute("INSERT INTO t (id, lo, hi) VALUES (1, 5, 15)").unwrap();
-    conn.execute("INSERT INTO t (id, lo, hi) VALUES (2, 20, 30)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, lo INTEGER, hi INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, lo, hi) VALUES (1, 5, 15)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, lo, hi) VALUES (2, 20, 30)")
+        .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT id FROM t WHERE lo <= $1 AND hi >= $1",
-        &[Value::Integer(10)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT id FROM t WHERE lo <= $1 AND hi >= $1",
+            &[Value::Integer(10)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 }
@@ -521,13 +617,18 @@ fn param_gap_in_indices() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)").unwrap();
-    conn.execute("INSERT INTO t (id, a, b) VALUES (1, 10, 20)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, a, b) VALUES (1, 10, 20)")
+        .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT id FROM t WHERE a = $1 AND b = $3",
-        &[Value::Integer(10), Value::Integer(999), Value::Integer(20)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT id FROM t WHERE a = $1 AND b = $3",
+            &[Value::Integer(10), Value::Integer(999), Value::Integer(20)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 }
@@ -539,16 +640,24 @@ fn param_in_exists_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
-    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL)").unwrap();
-    conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
-    conn.execute("INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
-    conn.execute("INSERT INTO orders (id, user_id, total) VALUES (1, 1, 200.0)").unwrap();
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL)")
+        .unwrap();
+    conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')")
+        .unwrap();
+    conn.execute("INSERT INTO users (id, name) VALUES (2, 'Bob')")
+        .unwrap();
+    conn.execute("INSERT INTO orders (id, user_id, total) VALUES (1, 1, 200.0)")
+        .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE total > $1)",
-        &[Value::Real(100.0)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE total > $1)",
+            &[Value::Real(100.0)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
 }
 
@@ -557,16 +666,24 @@ fn param_in_not_exists_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
-    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER)").unwrap();
-    conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
-    conn.execute("INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
-    conn.execute("INSERT INTO orders (id, user_id) VALUES (1, 1)").unwrap();
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')")
+        .unwrap();
+    conn.execute("INSERT INTO users (id, name) VALUES (2, 'Bob')")
+        .unwrap();
+    conn.execute("INSERT INTO orders (id, user_id) VALUES (1, 1)")
+        .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT name FROM users WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.id > $1)",
-        &[Value::Integer(999)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT name FROM users WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.id > $1)",
+            &[Value::Integer(999)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
 }
 
@@ -575,18 +692,28 @@ fn param_in_not_in_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
-    conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, ref_val INTEGER)").unwrap();
-    conn.execute("INSERT INTO t1 (id, val) VALUES (1, 10)").unwrap();
-    conn.execute("INSERT INTO t1 (id, val) VALUES (2, 20)").unwrap();
-    conn.execute("INSERT INTO t1 (id, val) VALUES (3, 30)").unwrap();
-    conn.execute("INSERT INTO t2 (id, ref_val) VALUES (1, 10)").unwrap();
-    conn.execute("INSERT INTO t2 (id, ref_val) VALUES (2, 30)").unwrap();
+    conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, ref_val INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t1 (id, val) VALUES (1, 10)")
+        .unwrap();
+    conn.execute("INSERT INTO t1 (id, val) VALUES (2, 20)")
+        .unwrap();
+    conn.execute("INSERT INTO t1 (id, val) VALUES (3, 30)")
+        .unwrap();
+    conn.execute("INSERT INTO t2 (id, ref_val) VALUES (1, 10)")
+        .unwrap();
+    conn.execute("INSERT INTO t2 (id, ref_val) VALUES (2, 30)")
+        .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT val FROM t1 WHERE val NOT IN (SELECT ref_val FROM t2 WHERE ref_val > $1)",
-        &[Value::Integer(5)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT val FROM t1 WHERE val NOT IN (SELECT ref_val FROM t2 WHERE ref_val > $1)",
+            &[Value::Integer(5)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Integer(20));
 }
@@ -596,15 +723,22 @@ fn param_in_scalar_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
-    conn.execute("INSERT INTO t (id, val) VALUES (1, 100)").unwrap();
-    conn.execute("INSERT INTO t (id, val) VALUES (2, 200)").unwrap();
-    conn.execute("INSERT INTO t (id, val) VALUES (3, 300)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, val) VALUES (1, 100)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, val) VALUES (2, 200)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, val) VALUES (3, 300)")
+        .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT id FROM t WHERE val > (SELECT val FROM t WHERE id = $1)",
-        &[Value::Integer(1)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT id FROM t WHERE val > (SELECT val FROM t WHERE id = $1)",
+            &[Value::Integer(1)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
 }
 
@@ -615,15 +749,22 @@ fn param_in_in_list_values() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
-    conn.execute("INSERT INTO t (id, name) VALUES (1, 'a')").unwrap();
-    conn.execute("INSERT INTO t (id, name) VALUES (2, 'b')").unwrap();
-    conn.execute("INSERT INTO t (id, name) VALUES (3, 'c')").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, name) VALUES (1, 'a')")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, name) VALUES (2, 'b')")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, name) VALUES (3, 'c')")
+        .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT name FROM t WHERE id IN ($1, $2) ORDER BY id",
-        &[Value::Integer(1), Value::Integer(3)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT name FROM t WHERE id IN ($1, $2) ORDER BY id",
+            &[Value::Integer(1), Value::Integer(3)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Text("a".into()));
     assert_eq!(qr.rows[1][0], Value::Text("c".into()));
@@ -636,13 +777,15 @@ fn param_in_arithmetic_negation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
-    conn.execute("INSERT INTO t (id, val) VALUES (1, 42)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, val) VALUES (1, 42)")
+        .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT -$1 FROM t WHERE id = 1",
-        &[Value::Integer(10)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params("SELECT -$1 FROM t WHERE id = 1", &[Value::Integer(10)])
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(-10));
 }
 
@@ -653,11 +796,17 @@ fn param_in_not_expression() {
     let mut conn = Connection::open(&db).unwrap();
     setup_and_populate(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT COUNT(*) FROM items WHERE NOT (active = $1)",
-        &[Value::Boolean(true)],
-    ).unwrap());
-    let count = match qr.rows[0][0] { Value::Integer(n) => n, _ => panic!() };
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT COUNT(*) FROM items WHERE NOT (active = $1)",
+            &[Value::Boolean(true)],
+        )
+        .unwrap(),
+    );
+    let count = match qr.rows[0][0] {
+        Value::Integer(n) => n,
+        _ => panic!(),
+    };
     assert!(count > 0);
 }
 
@@ -670,10 +819,13 @@ fn param_in_distinct_query() {
     let mut conn = Connection::open(&db).unwrap();
     setup_and_populate(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT DISTINCT active FROM items WHERE price > $1",
-        &[Value::Real(0.0)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT DISTINCT active FROM items WHERE price > $1",
+            &[Value::Real(0.0)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
 }
 
@@ -684,13 +836,20 @@ fn param_in_join_on_and_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
-    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL)").unwrap();
-    conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
-    conn.execute("INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
-    conn.execute("INSERT INTO orders (id, user_id, amount) VALUES (1, 1, 50.0)").unwrap();
-    conn.execute("INSERT INTO orders (id, user_id, amount) VALUES (2, 1, 150.0)").unwrap();
-    conn.execute("INSERT INTO orders (id, user_id, amount) VALUES (3, 2, 75.0)").unwrap();
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL)")
+        .unwrap();
+    conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')")
+        .unwrap();
+    conn.execute("INSERT INTO users (id, name) VALUES (2, 'Bob')")
+        .unwrap();
+    conn.execute("INSERT INTO orders (id, user_id, amount) VALUES (1, 1, 50.0)")
+        .unwrap();
+    conn.execute("INSERT INTO orders (id, user_id, amount) VALUES (2, 1, 150.0)")
+        .unwrap();
+    conn.execute("INSERT INTO orders (id, user_id, amount) VALUES (3, 2, 75.0)")
+        .unwrap();
 
     let qr = query_result(conn.execute_params(
         "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > $1 AND u.id = $2",
@@ -708,14 +867,18 @@ fn empty_string_param() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    conn.execute_params("INSERT INTO t (id, val) VALUES ($1, $2)",
-        &[Value::Integer(1), Value::Text(String::new())]).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute_params(
+        "INSERT INTO t (id, val) VALUES ($1, $2)",
+        &[Value::Integer(1), Value::Text(String::new())],
+    )
+    .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT val FROM t WHERE id = $1",
-        &[Value::Integer(1)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params("SELECT val FROM t WHERE id = $1", &[Value::Integer(1)])
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Text(String::new()));
 }
 
@@ -724,16 +887,20 @@ fn large_integer_param() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, big INTEGER)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, big INTEGER)")
+        .unwrap();
 
     let big = i64::MAX;
-    conn.execute_params("INSERT INTO t (id, big) VALUES ($1, $2)",
-        &[Value::Integer(1), Value::Integer(big)]).unwrap();
+    conn.execute_params(
+        "INSERT INTO t (id, big) VALUES ($1, $2)",
+        &[Value::Integer(1), Value::Integer(big)],
+    )
+    .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT big FROM t WHERE id = $1",
-        &[Value::Integer(1)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params("SELECT big FROM t WHERE id = $1", &[Value::Integer(1)])
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(big));
 }
 
@@ -743,10 +910,10 @@ fn negative_real_param() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT $1 + $2",
-        &[Value::Real(-3.14), Value::Real(3.14)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params("SELECT $1 + $2", &[Value::Real(-3.15), Value::Real(3.15)])
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Real(0.0));
 }
 
@@ -758,8 +925,12 @@ fn independent_caches_per_connection() {
     let db = create_db(dir.path());
 
     let mut conn1 = Connection::open(&db).unwrap();
-    conn1.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    conn1.execute("INSERT INTO t (id, val) VALUES (1, 'hello')").unwrap();
+    conn1
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn1
+        .execute("INSERT INTO t (id, val) VALUES (1, 'hello')")
+        .unwrap();
 
     let sql = "SELECT val FROM t WHERE id = $1";
     let qr = query_result(conn1.execute_params(sql, &[Value::Integer(1)]).unwrap());
@@ -777,8 +948,10 @@ fn ddl_in_transaction_invalidates_cache() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    conn.execute("INSERT INTO t (id, val) VALUES (1, 'x')").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, val) VALUES (1, 'x')")
+        .unwrap();
 
     let sql = "SELECT val FROM t WHERE id = $1";
     let qr = query_result(conn.execute_params(sql, &[Value::Integer(1)]).unwrap());
@@ -799,18 +972,27 @@ fn evicted_query_re_parsed_correctly() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
-    conn.execute("INSERT INTO t (id, val) VALUES (1, 42)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, val) VALUES (1, 42)")
+        .unwrap();
 
     let target_sql = "SELECT val FROM t WHERE id = $1";
-    let qr = query_result(conn.execute_params(target_sql, &[Value::Integer(1)]).unwrap());
+    let qr = query_result(
+        conn.execute_params(target_sql, &[Value::Integer(1)])
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(42));
 
     for i in 0..70 {
-        conn.execute(&format!("SELECT val + {i} FROM t WHERE id = 1")).unwrap();
+        conn.execute(&format!("SELECT val + {i} FROM t WHERE id = 1"))
+            .unwrap();
     }
 
-    let qr = query_result(conn.execute_params(target_sql, &[Value::Integer(1)]).unwrap());
+    let qr = query_result(
+        conn.execute_params(target_sql, &[Value::Integer(1)])
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(42));
 }
 
@@ -823,11 +1005,17 @@ fn param_in_not_between() {
     let mut conn = Connection::open(&db).unwrap();
     setup_and_populate(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT COUNT(*) FROM items WHERE id NOT BETWEEN $1 AND $2",
-        &[Value::Integer(10), Value::Integer(90)],
-    ).unwrap());
-    let count = match qr.rows[0][0] { Value::Integer(n) => n, _ => panic!() };
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT COUNT(*) FROM items WHERE id NOT BETWEEN $1 AND $2",
+            &[Value::Integer(10), Value::Integer(90)],
+        )
+        .unwrap(),
+    );
+    let count = match qr.rows[0][0] {
+        Value::Integer(n) => n,
+        _ => panic!(),
+    };
     assert_eq!(count, 19);
 }
 
@@ -838,15 +1026,22 @@ fn param_in_not_like() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
-    conn.execute("INSERT INTO t (id, name) VALUES (1, 'Alice')").unwrap();
-    conn.execute("INSERT INTO t (id, name) VALUES (2, 'Bob')").unwrap();
-    conn.execute("INSERT INTO t (id, name) VALUES (3, 'Carol')").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, name) VALUES (1, 'Alice')")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, name) VALUES (2, 'Bob')")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, name) VALUES (3, 'Carol')")
+        .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT name FROM t WHERE name NOT LIKE $1 ORDER BY id",
-        &[Value::Text("A%".into())],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT name FROM t WHERE name NOT LIKE $1 ORDER BY id",
+            &[Value::Text("A%".into())],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Text("Bob".into()));
     assert_eq!(qr.rows[1][0], Value::Text("Carol".into()));
@@ -861,10 +1056,13 @@ fn param_in_limit_and_offset() {
     let mut conn = Connection::open(&db).unwrap();
     setup_and_populate(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT id FROM items ORDER BY id LIMIT $1 OFFSET $2",
-        &[Value::Integer(3), Value::Integer(5)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT id FROM items ORDER BY id LIMIT $1 OFFSET $2",
+            &[Value::Integer(3), Value::Integer(5)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 3);
     assert_eq!(qr.rows[0][0], Value::Integer(6));
     assert_eq!(qr.rows[1][0], Value::Integer(7));
@@ -878,14 +1076,23 @@ fn explain_with_multiple_params() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "EXPLAIN SELECT * FROM t WHERE id = $1 AND val > $2",
-        &[Value::Integer(1), Value::Integer(50)],
-    ).unwrap());
-    let plan: Vec<String> = qr.rows.iter()
-        .map(|r| match &r[0] { Value::Text(s) => s.clone(), _ => panic!() })
+    let qr = query_result(
+        conn.execute_params(
+            "EXPLAIN SELECT * FROM t WHERE id = $1 AND val > $2",
+            &[Value::Integer(1), Value::Integer(50)],
+        )
+        .unwrap(),
+    );
+    let plan: Vec<String> = qr
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.clone(),
+            _ => panic!(),
+        })
         .collect();
     assert!(plan[0].contains("SEARCH TABLE t"));
 }
@@ -897,8 +1104,10 @@ fn rapid_cache_alternation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)").unwrap();
-    conn.execute("INSERT INTO t (id, a, b) VALUES (1, 10, 'hello')").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, a, b) VALUES (1, 10, 'hello')")
+        .unwrap();
 
     let sql_a = "SELECT a FROM t WHERE id = $1";
     let sql_b = "SELECT b FROM t WHERE id = $1";
@@ -920,10 +1129,18 @@ fn deeply_nested_param_expressions() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT ($1 + $2) * ($3 - $4)",
-        &[Value::Integer(2), Value::Integer(3), Value::Integer(10), Value::Integer(4)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT ($1 + $2) * ($3 - $4)",
+            &[
+                Value::Integer(2),
+                Value::Integer(3),
+                Value::Integer(10),
+                Value::Integer(4),
+            ],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(30));
 }
 
@@ -934,20 +1151,34 @@ fn param_in_update_set_and_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, score INTEGER, label TEXT)").unwrap();
-    conn.execute("INSERT INTO t (id, score, label) VALUES (1, 10, 'old')").unwrap();
-    conn.execute("INSERT INTO t (id, score, label) VALUES (2, 20, 'old')").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, score INTEGER, label TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, score, label) VALUES (1, 10, 'old')")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, score, label) VALUES (2, 20, 'old')")
+        .unwrap();
 
     conn.execute_params(
         "UPDATE t SET score = $1, label = $2 WHERE id = $3",
-        &[Value::Integer(99), Value::Text("new".into()), Value::Integer(1)],
-    ).unwrap();
+        &[
+            Value::Integer(99),
+            Value::Text("new".into()),
+            Value::Integer(1),
+        ],
+    )
+    .unwrap();
 
-    let qr = query_result(conn.execute("SELECT score, label FROM t WHERE id = 1").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT score, label FROM t WHERE id = 1")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(99));
     assert_eq!(qr.rows[0][1], Value::Text("new".into()));
 
-    let qr = query_result(conn.execute("SELECT score, label FROM t WHERE id = 2").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT score, label FROM t WHERE id = 2")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(20));
     assert_eq!(qr.rows[0][1], Value::Text("old".into()));
 }
@@ -964,10 +1195,14 @@ fn param_in_delete_complex_where() {
     conn.execute_params(
         "DELETE FROM items WHERE price > $1 AND active = $2 AND id < $3",
         &[Value::Real(50.0), Value::Boolean(true), Value::Integer(50)],
-    ).unwrap();
+    )
+    .unwrap();
 
     let qr = query_result(conn.execute("SELECT COUNT(*) FROM items").unwrap());
-    let remaining = match qr.rows[0][0] { Value::Integer(n) => n, _ => panic!() };
+    let remaining = match qr.rows[0][0] {
+        Value::Integer(n) => n,
+        _ => panic!(),
+    };
     assert!(remaining < 100);
 }
 
@@ -978,13 +1213,17 @@ fn null_param_in_coalesce_chain() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
     conn.execute("INSERT INTO t (id) VALUES (1)").unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT COALESCE($1, $2, $3) FROM t WHERE id = 1",
-        &[Value::Null, Value::Null, Value::Text("fallback".into())],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT COALESCE($1, $2, $3) FROM t WHERE id = 1",
+            &[Value::Null, Value::Null, Value::Text("fallback".into())],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Text("fallback".into()));
 }
 
@@ -993,14 +1232,20 @@ fn null_param_in_is_null_check() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    conn.execute("INSERT INTO t (id, val) VALUES (1, NULL)").unwrap();
-    conn.execute("INSERT INTO t (id, val) VALUES (2, 'x')").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, val) VALUES (1, NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, val) VALUES (2, 'x')")
+        .unwrap();
 
-    let qr = query_result(conn.execute_params(
-        "SELECT id FROM t WHERE val IS NULL AND id >= $1",
-        &[Value::Integer(1)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT id FROM t WHERE val IS NULL AND id >= $1",
+            &[Value::Integer(1)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 }
@@ -1014,10 +1259,16 @@ fn param_in_case_inside_aggregate() {
     let mut conn = Connection::open(&db).unwrap();
     setup_and_populate(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT SUM(CASE WHEN price > $1 THEN 1 ELSE 0 END) FROM items",
-        &[Value::Real(75.0)],
-    ).unwrap());
-    let count = match qr.rows[0][0] { Value::Integer(n) => n, _ => panic!() };
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT SUM(CASE WHEN price > $1 THEN 1 ELSE 0 END) FROM items",
+            &[Value::Real(75.0)],
+        )
+        .unwrap(),
+    );
+    let count = match qr.rows[0][0] {
+        Value::Integer(n) => n,
+        _ => panic!(),
+    };
     assert_eq!(count, 50);
 }

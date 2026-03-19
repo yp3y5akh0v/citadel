@@ -1,5 +1,5 @@
-use citadel_core::types::PageId;
 use citadel_buffer::btree::BTree;
+use citadel_core::types::PageId;
 
 pub const TABLE_DESCRIPTOR_SIZE: usize = 20;
 

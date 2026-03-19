@@ -254,7 +254,8 @@ fn insert_delete_half_verify_remaining() {
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..count {
-            wtx.insert(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes()).unwrap();
+            wtx.insert(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -272,7 +273,11 @@ fn insert_delete_half_verify_remaining() {
     for i in (1..count).step_by(2) {
         let key = format!("k{i:04}");
         let val = format!("v{i:04}");
-        assert_eq!(rtx.get(key.as_bytes()).unwrap(), Some(val.into_bytes()), "key {key}");
+        assert_eq!(
+            rtx.get(key.as_bytes()).unwrap(),
+            Some(val.into_bytes()),
+            "key {key}"
+        );
     }
     for i in (0..count).step_by(2) {
         let key = format!("k{i:04}");
@@ -326,7 +331,8 @@ fn reopen_with_delete_and_reinsert() {
         let db = fast_builder(&db_path).create().unwrap();
         let mut wtx = db.begin_write().unwrap();
         for i in 0..200u32 {
-            wtx.insert(format!("k{i:04}").as_bytes(), b"original").unwrap();
+            wtx.insert(format!("k{i:04}").as_bytes(), b"original")
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -339,7 +345,8 @@ fn reopen_with_delete_and_reinsert() {
             wtx.delete(format!("k{i:04}").as_bytes()).unwrap();
         }
         for i in 0..100u32 {
-            wtx.insert(format!("k{i:04}").as_bytes(), b"reinserted").unwrap();
+            wtx.insert(format!("k{i:04}").as_bytes(), b"reinserted")
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -351,11 +358,19 @@ fn reopen_with_delete_and_reinsert() {
         let mut rtx = db.begin_read();
         for i in 0..100u32 {
             let key = format!("k{i:04}");
-            assert_eq!(rtx.get(key.as_bytes()).unwrap(), Some(b"reinserted".to_vec()), "key {key}");
+            assert_eq!(
+                rtx.get(key.as_bytes()).unwrap(),
+                Some(b"reinserted".to_vec()),
+                "key {key}"
+            );
         }
         for i in 100..200u32 {
             let key = format!("k{i:04}");
-            assert_eq!(rtx.get(key.as_bytes()).unwrap(), Some(b"original".to_vec()), "key {key}");
+            assert_eq!(
+                rtx.get(key.as_bytes()).unwrap(),
+                Some(b"original".to_vec()),
+                "key {key}"
+            );
         }
     }
 }
@@ -377,7 +392,10 @@ fn table_and_default_same_keys() {
 
     let mut rtx = db.begin_read();
     assert_eq!(rtx.get(b"key").unwrap(), Some(b"default-val".to_vec()));
-    assert_eq!(rtx.table_get(b"t", b"key").unwrap(), Some(b"table-val".to_vec()));
+    assert_eq!(
+        rtx.table_get(b"t", b"key").unwrap(),
+        Some(b"table-val".to_vec())
+    );
 }
 
 #[test]
@@ -408,7 +426,8 @@ fn create_drop_recreate_table() {
         let mut wtx = db.begin_write().unwrap();
         wtx.create_table(b"ephemeral").unwrap();
         let val = format!("round-{round}");
-        wtx.table_insert(b"ephemeral", b"key", val.as_bytes()).unwrap();
+        wtx.table_insert(b"ephemeral", b"key", val.as_bytes())
+            .unwrap();
         wtx.commit().unwrap();
 
         let mut rtx = db.begin_read();
@@ -435,7 +454,8 @@ fn many_tables_create_drop_subset() {
         for t in 0..30u32 {
             let name = format!("t{t:03}");
             wtx.create_table(name.as_bytes()).unwrap();
-            wtx.table_insert(name.as_bytes(), b"k", format!("v{t}").as_bytes()).unwrap();
+            wtx.table_insert(name.as_bytes(), b"k", format!("v{t}").as_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -462,10 +482,13 @@ fn many_tables_create_drop_subset() {
     }
     for t in (0..30u32).step_by(2) {
         let name = format!("t{t:03}");
-        assert!(matches!(
-            rtx.table_get(name.as_bytes(), b"k"),
-            Err(Error::TableNotFound(_))
-        ), "dropped table {name}");
+        assert!(
+            matches!(
+                rtx.table_get(name.as_bytes(), b"k"),
+                Err(Error::TableNotFound(_))
+            ),
+            "dropped table {name}"
+        );
     }
 }
 
@@ -480,7 +503,8 @@ fn table_for_each_correctness() {
         for i in 0..100u32 {
             let key = format!("k{i:04}");
             let val = format!("v{i:04}");
-            wtx.table_insert(b"scan", key.as_bytes(), val.as_bytes()).unwrap();
+            wtx.table_insert(b"scan", key.as_bytes(), val.as_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -490,7 +514,8 @@ fn table_for_each_correctness() {
     rtx.table_for_each(b"scan", |k, v| {
         entries.push((k.to_vec(), v.to_vec()));
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
 
     assert_eq!(entries.len(), 100);
     // Verify sorted order
@@ -509,7 +534,8 @@ fn named_table_persist_across_reopen() {
         let mut wtx = db.begin_write().unwrap();
         wtx.create_table(b"persist").unwrap();
         for i in 0..500u32 {
-            wtx.table_insert(b"persist", format!("k{i:04}").as_bytes(), b"v").unwrap();
+            wtx.table_insert(b"persist", format!("k{i:04}").as_bytes(), b"v")
+                .unwrap();
         }
         wtx.insert(b"default-key", b"default-val").unwrap();
         wtx.commit().unwrap();
@@ -518,7 +544,10 @@ fn named_table_persist_across_reopen() {
     {
         let db = fast_builder(&db_path).open().unwrap();
         let mut rtx = db.begin_read();
-        assert_eq!(rtx.get(b"default-key").unwrap(), Some(b"default-val".to_vec()));
+        assert_eq!(
+            rtx.get(b"default-key").unwrap(),
+            Some(b"default-val".to_vec())
+        );
         for i in 0..500u32 {
             let key = format!("k{i:04}");
             assert!(
@@ -543,7 +572,8 @@ fn concurrent_readers_threaded() {
         let db = fast_builder(&db_path).create().unwrap();
         let mut wtx = db.begin_write().unwrap();
         for i in 0..count {
-            wtx.insert(format!("k{i:05}").as_bytes(), format!("v{i:05}").as_bytes()).unwrap();
+            wtx.insert(format!("k{i:05}").as_bytes(), format!("v{i:05}").as_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -584,7 +614,8 @@ fn reader_while_writer_threaded() {
         let db = fast_builder(&db_path).create().unwrap();
         let mut wtx = db.begin_write().unwrap();
         for i in 0..100u32 {
-            wtx.insert(format!("k{i:03}").as_bytes(), b"initial").unwrap();
+            wtx.insert(format!("k{i:03}").as_bytes(), b"initial")
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -619,12 +650,15 @@ fn reader_while_writer_threaded() {
 #[test]
 fn small_cache_forces_eviction() {
     let dir = tempfile::tempdir().unwrap();
-    let db = fast_builder_cache(&dir.path().join("test.db"), 16).create().unwrap();
+    let db = fast_builder_cache(&dir.path().join("test.db"), 16)
+        .create()
+        .unwrap();
 
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..500u32 {
-            wtx.insert(format!("k{i:04}").as_bytes(), b"value-data").unwrap();
+            wtx.insert(format!("k{i:04}").as_bytes(), b"value-data")
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -639,7 +673,9 @@ fn small_cache_forces_eviction() {
 #[test]
 fn small_cache_multi_txn() {
     let dir = tempfile::tempdir().unwrap();
-    let db = fast_builder_cache(&dir.path().join("test.db"), 8).create().unwrap();
+    let db = fast_builder_cache(&dir.path().join("test.db"), 8)
+        .create()
+        .unwrap();
 
     for batch in 0..20u32 {
         let mut wtx = db.begin_write().unwrap();
@@ -667,7 +703,11 @@ fn for_each_empty() {
 
     let mut rtx = db.begin_read();
     let mut count = 0u32;
-    rtx.for_each(|_, _| { count += 1; Ok(()) }).unwrap();
+    rtx.for_each(|_, _| {
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(count, 0);
 }
 
@@ -694,7 +734,8 @@ fn for_each_sorted_order() {
         prev = Some(k.to_vec());
         count += 1;
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(count, 200);
 }
 
@@ -721,7 +762,11 @@ fn for_each_after_delete() {
 
     let mut rtx = db.begin_read();
     let mut entries = Vec::new();
-    rtx.for_each(|k, _| { entries.push(k.to_vec()); Ok(()) }).unwrap();
+    rtx.for_each(|k, _| {
+        entries.push(k.to_vec());
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(entries.len(), 50);
 }
 
@@ -761,7 +806,11 @@ fn snapshot_sees_consistent_state_during_heavy_writes() {
     assert_eq!(rtx.entry_count(), snapshot_count);
     for i in 0..200u32 {
         let key = format!("k{i:04}");
-        assert_eq!(rtx.get(key.as_bytes()).unwrap(), Some(b"v1".to_vec()), "key {key}");
+        assert_eq!(
+            rtx.get(key.as_bytes()).unwrap(),
+            Some(b"v1".to_vec()),
+            "key {key}"
+        );
     }
 }
 
@@ -863,7 +912,11 @@ fn backup_after_heavy_churn() {
 
     assert_eq!(backup.stats().entry_count, db.stats().entry_count);
     let report = backup.integrity_check().unwrap();
-    assert!(report.is_ok(), "backup integrity errors: {:?}", report.errors);
+    assert!(
+        report.is_ok(),
+        "backup integrity errors: {:?}",
+        report.errors
+    );
 }
 
 #[test]
@@ -877,7 +930,8 @@ fn compact_then_continue_writing() {
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..500u32 {
-            wtx.insert(format!("k{i:04}").as_bytes(), b"original").unwrap();
+            wtx.insert(format!("k{i:04}").as_bytes(), b"original")
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -902,7 +956,8 @@ fn compact_then_continue_writing() {
     {
         let mut wtx = compact_db.begin_write().unwrap();
         for i in 0..200u32 {
-            wtx.insert(format!("new{i:04}").as_bytes(), b"added").unwrap();
+            wtx.insert(format!("new{i:04}").as_bytes(), b"added")
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -954,13 +1009,20 @@ fn kv_expected_500_transactions() {
 
         wtx.commit().unwrap();
 
-            if txn % 100 == 99 {
+        if txn % 100 == 99 {
             let mut rtx = db.begin_read();
-            assert_eq!(rtx.entry_count(), expected.len() as u64,
-                "count mismatch at txn {txn}");
+            assert_eq!(
+                rtx.entry_count(),
+                expected.len() as u64,
+                "count mismatch at txn {txn}"
+            );
             for (k, v) in &expected {
-                assert_eq!(rtx.get(k).unwrap(), Some(v.clone()),
-                    "value mismatch for key {:?} at txn {txn}", String::from_utf8_lossy(k));
+                assert_eq!(
+                    rtx.get(k).unwrap(),
+                    Some(v.clone()),
+                    "value mismatch for key {:?} at txn {txn}",
+                    String::from_utf8_lossy(k)
+                );
             }
         }
     }
@@ -971,7 +1033,8 @@ fn kv_expected_500_transactions() {
     rtx.for_each(|k, v| {
         scan_entries.push((k.to_vec(), v.to_vec()));
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
 
     let expected_entries: Vec<_> = expected.into_iter().collect();
     assert_eq!(scan_entries.len(), expected_entries.len());
@@ -1022,7 +1085,8 @@ fn integrity_after_insert_delete_compact_more_writes() {
     {
         let mut wtx = cdb.begin_write().unwrap();
         for i in 0..300u32 {
-            wtx.insert(format!("post-{i:04}").as_bytes(), b"new").unwrap();
+            wtx.insert(format!("post-{i:04}").as_bytes(), b"new")
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -1044,7 +1108,8 @@ fn rapid_overwrite_100_txns() {
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..50u32 {
-            wtx.insert(format!("k{i:02}").as_bytes(), b"original").unwrap();
+            wtx.insert(format!("k{i:02}").as_bytes(), b"original")
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -1053,7 +1118,8 @@ fn rapid_overwrite_100_txns() {
         let mut wtx = db.begin_write().unwrap();
         let val = format!("round{round:03}");
         for i in 0..50u32 {
-            wtx.insert(format!("k{i:02}").as_bytes(), val.as_bytes()).unwrap();
+            wtx.insert(format!("k{i:02}").as_bytes(), val.as_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -1081,7 +1147,8 @@ fn rapid_overwrite_reopen_verify() {
             let mut wtx = db.begin_write().unwrap();
             let val = format!("v{round:03}");
             for i in 0..20u32 {
-                wtx.insert(format!("k{i:02}").as_bytes(), val.as_bytes()).unwrap();
+                wtx.insert(format!("k{i:02}").as_bytes(), val.as_bytes())
+                    .unwrap();
             }
             wtx.commit().unwrap();
         }
@@ -1175,9 +1242,15 @@ fn abort_with_named_table_modifications() {
     }
 
     let mut rtx = db.begin_read();
-    assert_eq!(rtx.table_get(b"committed", b"k").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(
+        rtx.table_get(b"committed", b"k").unwrap(),
+        Some(b"v".to_vec())
+    );
     assert_eq!(rtx.table_get(b"committed", b"new-k").unwrap(), None);
-    assert!(matches!(rtx.table_get(b"aborted_table", b"x"), Err(Error::TableNotFound(_))));
+    assert!(matches!(
+        rtx.table_get(b"aborted_table", b"x"),
+        Err(Error::TableNotFound(_))
+    ));
 }
 
 // ============================================================
@@ -1228,7 +1301,11 @@ fn many_large_values() {
     assert_eq!(rtx.entry_count(), 100);
     for i in 0..100u32 {
         let key = format!("k{i:04}");
-        assert_eq!(rtx.get(key.as_bytes()).unwrap(), Some(big_val.clone()), "key {key}");
+        assert_eq!(
+            rtx.get(key.as_bytes()).unwrap(),
+            Some(big_val.clone()),
+            "key {key}"
+        );
     }
 }
 
@@ -1252,7 +1329,11 @@ fn large_values_persist_across_reopen() {
         let mut rtx = db.begin_read();
         for i in 0..50u32 {
             let key = format!("k{i:03}");
-            assert_eq!(rtx.get(key.as_bytes()).unwrap(), Some(big_val.clone()), "key {key}");
+            assert_eq!(
+                rtx.get(key.as_bytes()).unwrap(),
+                Some(big_val.clone()),
+                "key {key}"
+            );
         }
     }
 }

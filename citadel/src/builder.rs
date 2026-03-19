@@ -3,7 +3,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 use citadel_core::types::{Argon2Profile, CipherId, KdfAlgorithm};
-use citadel_core::{Error, Result, DEFAULT_BUFFER_POOL_SIZE, FILE_HEADER_SIZE, KEY_FILE_SIZE, PBKDF2_MIN_ITERATIONS};
+use citadel_core::{
+    Error, Result, DEFAULT_BUFFER_POOL_SIZE, FILE_HEADER_SIZE, KEY_FILE_SIZE, PBKDF2_MIN_ITERATIONS,
+};
 use citadel_crypto::key_manager::{create_key_file, open_key_file};
 use citadel_crypto::page_cipher::compute_dek_id;
 use citadel_io::durable;
@@ -138,9 +140,7 @@ impl DatabaseBuilder {
                 let profile = self.argon2_profile;
                 (profile.m_cost(), profile.t_cost(), profile.p_cost())
             }
-            KdfAlgorithm::Pbkdf2HmacSha256 => {
-                (self.pbkdf2_iterations, 0, 0)
-            }
+            KdfAlgorithm::Pbkdf2HmacSha256 => (self.pbkdf2_iterations, 0, 0),
         }
     }
 
@@ -320,10 +320,7 @@ impl DatabaseBuilder {
         let key_path = self.resolve_key_path();
 
         // Open data file
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.path)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
 
         file_lock::try_lock_exclusive(&file)?;
 

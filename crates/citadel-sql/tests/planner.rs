@@ -39,9 +39,7 @@ fn assert_plan(db: &citadel::Database, sql: &str, expected: &str) {
     let schema_mgr = SchemaManager::load(db).unwrap();
     let stmt = parse_sql(sql).unwrap();
     let (table_name, where_clause) = match &stmt {
-        citadel_sql::parser::Statement::Select(s) => {
-            (s.from.to_ascii_lowercase(), &s.where_clause)
-        }
+        citadel_sql::parser::Statement::Select(s) => (s.from.to_ascii_lowercase(), &s.where_clause),
         citadel_sql::parser::Statement::Update(u) => {
             (u.table.to_ascii_lowercase(), &u.where_clause)
         }
@@ -50,7 +48,8 @@ fn assert_plan(db: &citadel::Database, sql: &str, expected: &str) {
         }
         _ => panic!("assert_plan only works with SELECT/UPDATE/DELETE"),
     };
-    let table_schema = schema_mgr.get(&table_name)
+    let table_schema = schema_mgr
+        .get(&table_name)
         .unwrap_or_else(|| panic!("table '{table_name}' not found in schema"));
     let plan = plan_select(table_schema, where_clause);
     let plan_name = match &plan {
@@ -58,32 +57,38 @@ fn assert_plan(db: &citadel::Database, sql: &str, expected: &str) {
         ScanPlan::PkLookup { .. } => "PkLookup",
         ScanPlan::IndexScan { index_name, .. } => {
             // Return the index name as part of the match
-            if expected.starts_with("IndexScan:") {
-                let expected_idx = &expected["IndexScan:".len()..];
-                assert_eq!(index_name, expected_idx,
-                    "Expected IndexScan on '{expected_idx}', got IndexScan on '{index_name}'");
+            if let Some(expected_idx) = expected.strip_prefix("IndexScan:") {
+                assert_eq!(
+                    index_name, expected_idx,
+                    "Expected IndexScan on '{expected_idx}', got IndexScan on '{index_name}'"
+                );
                 return;
             }
             "IndexScan"
         }
     };
-    assert_eq!(plan_name, expected,
-        "For query: {sql}\nExpected plan: {expected}, got: {plan_name}");
+    assert_eq!(
+        plan_name, expected,
+        "For query: {sql}\nExpected plan: {expected}, got: {plan_name}"
+    );
 }
 
 fn setup_products(conn: &mut Connection) {
     assert_ok(conn.execute(
         "CREATE TABLE products (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL, category TEXT, price REAL, stock INTEGER)"
     ).unwrap());
-    assert_ok(conn.execute(
-        "CREATE INDEX idx_category ON products (category)"
-    ).unwrap());
-    assert_ok(conn.execute(
-        "CREATE UNIQUE INDEX idx_name ON products (name)"
-    ).unwrap());
-    assert_ok(conn.execute(
-        "CREATE INDEX idx_cat_price ON products (category, price)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_category ON products (category)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_name ON products (name)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE INDEX idx_cat_price ON products (category, price)")
+            .unwrap(),
+    );
 
     let inserts = [
         "INSERT INTO products VALUES (1, 'Widget', 'Electronics', 29.99, 100)",
@@ -131,7 +136,11 @@ fn plan_unique_index_chosen_for_name_equality() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_plan(&db, "SELECT * FROM products WHERE name = 'Widget'", "IndexScan:idx_name");
+    assert_plan(
+        &db,
+        "SELECT * FROM products WHERE name = 'Widget'",
+        "IndexScan:idx_name",
+    );
 }
 
 #[test]
@@ -144,7 +153,11 @@ fn plan_non_unique_index_chosen_for_category_equality() {
     // Should pick idx_cat_price (2 cols) or idx_category (1 col); both have
     // 1 equality column, but idx_cat_price has more columns so could score higher
     // if range is added. With just equality on category, both have same equality count.
-    assert_plan(&db, "SELECT * FROM products WHERE category = 'Toys'", "IndexScan");
+    assert_plan(
+        &db,
+        "SELECT * FROM products WHERE category = 'Toys'",
+        "IndexScan",
+    );
 }
 
 #[test]
@@ -154,9 +167,10 @@ fn plan_composite_index_chosen_for_two_column_equality() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_plan(&db,
+    assert_plan(
+        &db,
         "SELECT * FROM products WHERE category = 'Electronics' AND price = 49.99",
-        "IndexScan:idx_cat_price"
+        "IndexScan:idx_cat_price",
     );
 }
 
@@ -167,9 +181,10 @@ fn plan_composite_index_chosen_for_equality_plus_range() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_plan(&db,
+    assert_plan(
+        &db,
         "SELECT * FROM products WHERE category = 'Electronics' AND price > 30.0",
-        "IndexScan:idx_cat_price"
+        "IndexScan:idx_cat_price",
     );
 }
 
@@ -190,9 +205,10 @@ fn plan_seq_scan_for_or_condition() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_plan(&db,
+    assert_plan(
+        &db,
         "SELECT * FROM products WHERE category = 'Toys' OR category = 'Tools'",
-        "SeqScan"
+        "SeqScan",
     );
 }
 
@@ -224,7 +240,11 @@ fn plan_index_scan_for_range_on_leading_column() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_plan(&db, "SELECT * FROM products WHERE category > 'T'", "IndexScan");
+    assert_plan(
+        &db,
+        "SELECT * FROM products WHERE category > 'T'",
+        "IndexScan",
+    );
 }
 
 #[test]
@@ -234,7 +254,11 @@ fn plan_pk_lookup_for_update() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_plan(&db, "UPDATE products SET stock = 0 WHERE id = 1", "PkLookup");
+    assert_plan(
+        &db,
+        "UPDATE products SET stock = 0 WHERE id = 1",
+        "PkLookup",
+    );
 }
 
 #[test]
@@ -244,7 +268,11 @@ fn plan_index_scan_for_delete() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_plan(&db, "DELETE FROM products WHERE name = 'Widget'", "IndexScan:idx_name");
+    assert_plan(
+        &db,
+        "DELETE FROM products WHERE name = 'Widget'",
+        "IndexScan:idx_name",
+    );
 }
 
 #[test]
@@ -264,9 +292,10 @@ fn plan_index_scan_for_update_by_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_plan(&db,
+    assert_plan(
+        &db,
         "UPDATE products SET stock = 0 WHERE category = 'Tools'",
-        "IndexScan"
+        "IndexScan",
     );
 }
 
@@ -297,7 +326,10 @@ fn pk_lookup_nonexistent_returns_empty() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute("SELECT * FROM products WHERE id = 999").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT * FROM products WHERE id = 999")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 0);
 }
 
@@ -308,7 +340,10 @@ fn pk_lookup_reversed_operands_returns_correct() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute("SELECT name FROM products WHERE 5 = id").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT name FROM products WHERE 5 = id")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Text("Gizmo".into()));
 }
@@ -324,9 +359,10 @@ fn unique_index_returns_correct_row() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute(
-        "SELECT id, price FROM products WHERE name = 'Gadget'"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id, price FROM products WHERE name = 'Gadget'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Integer(2));
     assert_eq!(qr.rows[0][1], Value::Real(49.99));
@@ -339,9 +375,10 @@ fn unique_index_no_match_returns_empty() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute(
-        "SELECT * FROM products WHERE name = 'NoSuchProduct'"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT * FROM products WHERE name = 'NoSuchProduct'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 0);
 }
 
@@ -356,9 +393,10 @@ fn non_unique_index_returns_all_matches() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute(
-        "SELECT id FROM products WHERE category = 'Electronics' ORDER BY id"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM products WHERE category = 'Electronics' ORDER BY id")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 4);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
     assert_eq!(qr.rows[1][0], Value::Integer(2));
@@ -373,9 +411,10 @@ fn non_unique_index_no_match_returns_empty() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute(
-        "SELECT * FROM products WHERE category = 'Food'"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT * FROM products WHERE category = 'Food'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 0);
 }
 
@@ -390,9 +429,10 @@ fn composite_full_equality_returns_correct() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute(
-        "SELECT name FROM products WHERE category = 'Electronics' AND price = 49.99"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT name FROM products WHERE category = 'Electronics' AND price = 49.99")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Text("Gadget".into()));
 }
@@ -450,9 +490,10 @@ fn composite_leading_eq_no_range_returns_all_in_prefix() {
     setup_products(&mut conn);
 
     // category = 'Toys' via idx_cat_price returns all Toys regardless of price
-    let qr = query_result(conn.execute(
-        "SELECT name FROM products WHERE category = 'Toys' ORDER BY name"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT name FROM products WHERE category = 'Toys' ORDER BY name")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Text("Doohickey".into()));
     assert_eq!(qr.rows[1][0], Value::Text("Thingamajig".into()));
@@ -469,9 +510,12 @@ fn range_gt_on_leading_column() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute(
-        "SELECT DISTINCT category FROM products WHERE category > 'T' ORDER BY category"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute(
+            "SELECT DISTINCT category FROM products WHERE category > 'T' ORDER BY category",
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Text("Tools".into()));
     assert_eq!(qr.rows[1][0], Value::Text("Toys".into()));
@@ -484,9 +528,12 @@ fn range_lt_on_leading_column() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute(
-        "SELECT DISTINCT category FROM products WHERE category < 'T' ORDER BY category"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute(
+            "SELECT DISTINCT category FROM products WHERE category < 'T' ORDER BY category",
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Text("Electronics".into()));
 }
@@ -498,9 +545,12 @@ fn range_gte_on_leading_column() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute(
-        "SELECT DISTINCT category FROM products WHERE category >= 'Tools' ORDER BY category"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute(
+            "SELECT DISTINCT category FROM products WHERE category >= 'Tools' ORDER BY category",
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Text("Tools".into()));
     assert_eq!(qr.rows[1][0], Value::Text("Toys".into()));
@@ -531,9 +581,12 @@ fn index_scan_with_residual_and_predicate() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute(
-        "SELECT name FROM products WHERE category = 'Electronics' AND stock > 50 ORDER BY name"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute(
+            "SELECT name FROM products WHERE category = 'Electronics' AND stock > 50 ORDER BY name",
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Text("Mechanism".into()));
     assert_eq!(qr.rows[1][0], Value::Text("Widget".into()));
@@ -547,9 +600,10 @@ fn pk_lookup_with_additional_predicate_that_fails() {
     setup_products(&mut conn);
 
     // PK lookup finds id=1, but stock != 999 → residual WHERE eliminates it
-    let qr = query_result(conn.execute(
-        "SELECT * FROM products WHERE id = 1 AND stock = 999"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT * FROM products WHERE id = 1 AND stock = 999")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 0);
 }
 
@@ -560,9 +614,10 @@ fn pk_lookup_with_additional_predicate_that_passes() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute(
-        "SELECT name FROM products WHERE id = 1 AND stock = 100"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT name FROM products WHERE id = 1 AND stock = 100")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Text("Widget".into()));
 }
@@ -578,12 +633,21 @@ fn update_via_pk_lookup() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_plan(&db, "UPDATE products SET price = 24.99 WHERE id = 1", "PkLookup");
-    assert_rows_affected(conn.execute(
-        "UPDATE products SET price = 24.99 WHERE id = 1"
-    ).unwrap(), 1);
+    assert_plan(
+        &db,
+        "UPDATE products SET price = 24.99 WHERE id = 1",
+        "PkLookup",
+    );
+    assert_rows_affected(
+        conn.execute("UPDATE products SET price = 24.99 WHERE id = 1")
+            .unwrap(),
+        1,
+    );
 
-    let qr = query_result(conn.execute("SELECT price FROM products WHERE id = 1").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT price FROM products WHERE id = 1")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Real(24.99));
 }
 
@@ -594,12 +658,21 @@ fn update_via_unique_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_plan(&db, "UPDATE products SET stock = 999 WHERE name = 'Gizmo'", "IndexScan:idx_name");
-    assert_rows_affected(conn.execute(
-        "UPDATE products SET stock = 999 WHERE name = 'Gizmo'"
-    ).unwrap(), 1);
+    assert_plan(
+        &db,
+        "UPDATE products SET stock = 999 WHERE name = 'Gizmo'",
+        "IndexScan:idx_name",
+    );
+    assert_rows_affected(
+        conn.execute("UPDATE products SET stock = 999 WHERE name = 'Gizmo'")
+            .unwrap(),
+        1,
+    );
 
-    let qr = query_result(conn.execute("SELECT stock FROM products WHERE id = 5").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT stock FROM products WHERE id = 5")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(999));
 }
 
@@ -610,13 +683,16 @@ fn update_via_non_unique_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_rows_affected(conn.execute(
-        "UPDATE products SET stock = 0 WHERE category = 'Toys'"
-    ).unwrap(), 2);
+    assert_rows_affected(
+        conn.execute("UPDATE products SET stock = 0 WHERE category = 'Toys'")
+            .unwrap(),
+        2,
+    );
 
-    let qr = query_result(conn.execute(
-        "SELECT stock FROM products WHERE category = 'Toys' ORDER BY id"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT stock FROM products WHERE category = 'Toys' ORDER BY id")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Integer(0));
     assert_eq!(qr.rows[1][0], Value::Integer(0));
@@ -630,21 +706,25 @@ fn update_indexed_column_maintains_index_consistency() {
     setup_products(&mut conn);
 
     // Move a product to a different category
-    assert_rows_affected(conn.execute(
-        "UPDATE products SET category = 'Tools' WHERE name = 'Widget'"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE products SET category = 'Tools' WHERE name = 'Widget'")
+            .unwrap(),
+        1,
+    );
 
     // Widget should no longer appear in Electronics
-    let qr = query_result(conn.execute(
-        "SELECT name FROM products WHERE category = 'Electronics' ORDER BY name"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT name FROM products WHERE category = 'Electronics' ORDER BY name")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 3);
     assert!(!qr.rows.iter().any(|r| r[0] == Value::Text("Widget".into())));
 
     // Widget should appear in Tools
-    let qr = query_result(conn.execute(
-        "SELECT name FROM products WHERE category = 'Tools' ORDER BY name"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT name FROM products WHERE category = 'Tools' ORDER BY name")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 3);
     assert!(qr.rows.iter().any(|r| r[0] == Value::Text("Widget".into())));
 }
@@ -656,9 +736,11 @@ fn update_nonexistent_via_pk_lookup() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_rows_affected(conn.execute(
-        "UPDATE products SET stock = 0 WHERE id = 999"
-    ).unwrap(), 0);
+    assert_rows_affected(
+        conn.execute("UPDATE products SET stock = 0 WHERE id = 999")
+            .unwrap(),
+        0,
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -673,7 +755,10 @@ fn delete_via_pk_lookup() {
     setup_products(&mut conn);
 
     assert_plan(&db, "DELETE FROM products WHERE id = 4", "PkLookup");
-    assert_rows_affected(conn.execute("DELETE FROM products WHERE id = 4").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("DELETE FROM products WHERE id = 4").unwrap(),
+        1,
+    );
     let qr = query_result(conn.execute("SELECT COUNT(*) FROM products").unwrap());
     assert_eq!(qr.rows[0][0], Value::Integer(7));
 }
@@ -685,12 +770,21 @@ fn delete_via_unique_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_plan(&db, "DELETE FROM products WHERE name = 'Apparatus'", "IndexScan:idx_name");
-    assert_rows_affected(conn.execute(
-        "DELETE FROM products WHERE name = 'Apparatus'"
-    ).unwrap(), 1);
+    assert_plan(
+        &db,
+        "DELETE FROM products WHERE name = 'Apparatus'",
+        "IndexScan:idx_name",
+    );
+    assert_rows_affected(
+        conn.execute("DELETE FROM products WHERE name = 'Apparatus'")
+            .unwrap(),
+        1,
+    );
 
-    let qr = query_result(conn.execute("SELECT * FROM products WHERE name = 'Apparatus'").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT * FROM products WHERE name = 'Apparatus'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 0);
 }
 
@@ -701,16 +795,19 @@ fn delete_via_non_unique_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_rows_affected(conn.execute(
-        "DELETE FROM products WHERE category = 'Electronics'"
-    ).unwrap(), 4);
+    assert_rows_affected(
+        conn.execute("DELETE FROM products WHERE category = 'Electronics'")
+            .unwrap(),
+        4,
+    );
 
     let qr = query_result(conn.execute("SELECT COUNT(*) FROM products").unwrap());
     assert_eq!(qr.rows[0][0], Value::Integer(4));
 
-    let qr = query_result(conn.execute(
-        "SELECT DISTINCT category FROM products ORDER BY category"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT DISTINCT category FROM products ORDER BY category")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Text("Tools".into()));
     assert_eq!(qr.rows[1][0], Value::Text("Toys".into()));
@@ -723,9 +820,10 @@ fn delete_nonexistent_via_pk_lookup() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_rows_affected(conn.execute(
-        "DELETE FROM products WHERE id = 999"
-    ).unwrap(), 0);
+    assert_rows_affected(
+        conn.execute("DELETE FROM products WHERE id = 999").unwrap(),
+        0,
+    );
 }
 
 #[test]
@@ -735,9 +833,11 @@ fn delete_nonexistent_via_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_rows_affected(conn.execute(
-        "DELETE FROM products WHERE name = 'NoSuchProduct'"
-    ).unwrap(), 0);
+    assert_rows_affected(
+        conn.execute("DELETE FROM products WHERE name = 'NoSuchProduct'")
+            .unwrap(),
+        0,
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -752,16 +852,19 @@ fn select_via_index_in_transaction() {
     setup_products(&mut conn);
 
     conn.execute("BEGIN").unwrap();
-    let qr = query_result(conn.execute(
-        "SELECT name FROM products WHERE category = 'Tools' ORDER BY name"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT name FROM products WHERE category = 'Tools' ORDER BY name")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Text("Apparatus".into()));
 
-    conn.execute("INSERT INTO products VALUES (9, 'Wrench', 'Tools', 12.99, 500)").unwrap();
-    let qr = query_result(conn.execute(
-        "SELECT name FROM products WHERE category = 'Tools' ORDER BY name"
-    ).unwrap());
+    conn.execute("INSERT INTO products VALUES (9, 'Wrench', 'Tools', 12.99, 500)")
+        .unwrap();
+    let qr = query_result(
+        conn.execute("SELECT name FROM products WHERE category = 'Tools' ORDER BY name")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 3);
     assert_eq!(qr.rows[2][0], Value::Text("Wrench".into()));
     conn.execute("COMMIT").unwrap();
@@ -775,14 +878,22 @@ fn update_via_index_in_transaction() {
     setup_products(&mut conn);
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute(
-        "UPDATE products SET price = 0.0 WHERE name = 'Widget'"
-    ).unwrap(), 1);
-    let qr = query_result(conn.execute("SELECT price FROM products WHERE id = 1").unwrap());
+    assert_rows_affected(
+        conn.execute("UPDATE products SET price = 0.0 WHERE name = 'Widget'")
+            .unwrap(),
+        1,
+    );
+    let qr = query_result(
+        conn.execute("SELECT price FROM products WHERE id = 1")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Real(0.0));
     conn.execute("COMMIT").unwrap();
 
-    let qr = query_result(conn.execute("SELECT price FROM products WHERE id = 1").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT price FROM products WHERE id = 1")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Real(0.0));
 }
 
@@ -794,9 +905,11 @@ fn delete_via_index_in_transaction() {
     setup_products(&mut conn);
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute(
-        "DELETE FROM products WHERE category = 'Toys'"
-    ).unwrap(), 2);
+    assert_rows_affected(
+        conn.execute("DELETE FROM products WHERE category = 'Toys'")
+            .unwrap(),
+        2,
+    );
     let qr = query_result(conn.execute("SELECT COUNT(*) FROM products").unwrap());
     assert_eq!(qr.rows[0][0], Value::Integer(6));
     conn.execute("COMMIT").unwrap();
@@ -813,16 +926,21 @@ fn rollback_undoes_index_assisted_delete() {
     setup_products(&mut conn);
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute(
-        "DELETE FROM products WHERE name = 'Gizmo'"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("DELETE FROM products WHERE name = 'Gizmo'")
+            .unwrap(),
+        1,
+    );
     let qr = query_result(conn.execute("SELECT COUNT(*) FROM products").unwrap());
     assert_eq!(qr.rows[0][0], Value::Integer(7));
     conn.execute("ROLLBACK").unwrap();
 
     let qr = query_result(conn.execute("SELECT COUNT(*) FROM products").unwrap());
     assert_eq!(qr.rows[0][0], Value::Integer(8));
-    let qr = query_result(conn.execute("SELECT id FROM products WHERE name = 'Gizmo'").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM products WHERE name = 'Gizmo'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(5));
 }
 
@@ -834,13 +952,18 @@ fn rollback_undoes_index_assisted_update() {
     setup_products(&mut conn);
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute(
-        "UPDATE products SET price = 0.0 WHERE category = 'Electronics'"
-    ).unwrap(), 4);
+    assert_rows_affected(
+        conn.execute("UPDATE products SET price = 0.0 WHERE category = 'Electronics'")
+            .unwrap(),
+        4,
+    );
     conn.execute("ROLLBACK").unwrap();
 
     // Prices should be unchanged
-    let qr = query_result(conn.execute("SELECT price FROM products WHERE id = 1").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT price FROM products WHERE id = 1")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Real(29.99));
 }
 
@@ -854,28 +977,42 @@ fn index_scan_matches_full_scan_equality() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, val TEXT, score INTEGER)"
-    ).unwrap());
+    assert_ok(
+        conn.execute(
+            "CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, val TEXT, score INTEGER)",
+        )
+        .unwrap(),
+    );
 
     for i in 0..50 {
         conn.execute(&format!(
-            "INSERT INTO items VALUES ({i}, 'item_{i}', {})", i % 10
-        )).unwrap();
+            "INSERT INTO items VALUES ({i}, 'item_{i}', {})",
+            i % 10
+        ))
+        .unwrap();
     }
 
     // Full scan result (no index)
-    let full_scan = query_result(conn.execute(
-        "SELECT id FROM items WHERE score = 5 ORDER BY id"
-    ).unwrap());
+    let full_scan = query_result(
+        conn.execute("SELECT id FROM items WHERE score = 5 ORDER BY id")
+            .unwrap(),
+    );
 
     // Create index, now it uses index scan
-    assert_ok(conn.execute("CREATE INDEX idx_score ON items (score)").unwrap());
-    assert_plan(&db, "SELECT id FROM items WHERE score = 5 ORDER BY id", "IndexScan:idx_score");
+    assert_ok(
+        conn.execute("CREATE INDEX idx_score ON items (score)")
+            .unwrap(),
+    );
+    assert_plan(
+        &db,
+        "SELECT id FROM items WHERE score = 5 ORDER BY id",
+        "IndexScan:idx_score",
+    );
 
-    let index_scan = query_result(conn.execute(
-        "SELECT id FROM items WHERE score = 5 ORDER BY id"
-    ).unwrap());
+    let index_scan = query_result(
+        conn.execute("SELECT id FROM items WHERE score = 5 ORDER BY id")
+            .unwrap(),
+    );
 
     assert_eq!(full_scan.rows, index_scan.rows);
     assert_eq!(index_scan.rows.len(), 5);
@@ -887,27 +1024,38 @@ fn index_range_scan_matches_full_scan() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE scores (id INTEGER NOT NULL PRIMARY KEY, grade INTEGER NOT NULL)"
-    ).unwrap());
+    assert_ok(
+        conn.execute(
+            "CREATE TABLE scores (id INTEGER NOT NULL PRIMARY KEY, grade INTEGER NOT NULL)",
+        )
+        .unwrap(),
+    );
 
     for i in 1..=20 {
-        conn.execute(&format!(
-            "INSERT INTO scores VALUES ({i}, {})", i * 5
-        )).unwrap();
+        conn.execute(&format!("INSERT INTO scores VALUES ({i}, {})", i * 5))
+            .unwrap();
     }
 
     // Full scan
-    let full_scan = query_result(conn.execute(
-        "SELECT id FROM scores WHERE grade >= 50 AND grade < 80 ORDER BY id"
-    ).unwrap());
+    let full_scan = query_result(
+        conn.execute("SELECT id FROM scores WHERE grade >= 50 AND grade < 80 ORDER BY id")
+            .unwrap(),
+    );
 
-    assert_ok(conn.execute("CREATE INDEX idx_grade ON scores (grade)").unwrap());
-    assert_plan(&db, "SELECT id FROM scores WHERE grade >= 50 AND grade < 80 ORDER BY id", "IndexScan:idx_grade");
+    assert_ok(
+        conn.execute("CREATE INDEX idx_grade ON scores (grade)")
+            .unwrap(),
+    );
+    assert_plan(
+        &db,
+        "SELECT id FROM scores WHERE grade >= 50 AND grade < 80 ORDER BY id",
+        "IndexScan:idx_grade",
+    );
 
-    let index_scan = query_result(conn.execute(
-        "SELECT id FROM scores WHERE grade >= 50 AND grade < 80 ORDER BY id"
-    ).unwrap());
+    let index_scan = query_result(
+        conn.execute("SELECT id FROM scores WHERE grade >= 50 AND grade < 80 ORDER BY id")
+            .unwrap(),
+    );
 
     assert_eq!(full_scan.rows, index_scan.rows);
     // grade 50..79 → ids: 10(50), 11(55), 12(60), 13(65), 14(70), 15(75)
@@ -927,21 +1075,31 @@ fn scale_1000_rows_index_equality() {
     assert_ok(conn.execute(
         "CREATE TABLE big (id INTEGER NOT NULL PRIMARY KEY, bucket INTEGER NOT NULL, data TEXT)"
     ).unwrap());
-    assert_ok(conn.execute("CREATE INDEX idx_bucket ON big (bucket)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_bucket ON big (bucket)")
+            .unwrap(),
+    );
 
     conn.execute("BEGIN").unwrap();
     for i in 0..1000 {
         conn.execute(&format!(
-            "INSERT INTO big VALUES ({i}, {}, 'row_{i}')", i % 20
-        )).unwrap();
+            "INSERT INTO big VALUES ({i}, {}, 'row_{i}')",
+            i % 20
+        ))
+        .unwrap();
     }
     conn.execute("COMMIT").unwrap();
 
-    assert_plan(&db, "SELECT id FROM big WHERE bucket = 7", "IndexScan:idx_bucket");
+    assert_plan(
+        &db,
+        "SELECT id FROM big WHERE bucket = 7",
+        "IndexScan:idx_bucket",
+    );
 
-    let qr = query_result(conn.execute(
-        "SELECT id FROM big WHERE bucket = 7 ORDER BY id"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM big WHERE bucket = 7 ORDER BY id")
+            .unwrap(),
+    );
     // bucket=7: ids 7, 27, 47, ... 987 → 50 rows
     assert_eq!(qr.rows.len(), 50);
     assert_eq!(qr.rows[0][0], Value::Integer(7));
@@ -961,22 +1119,29 @@ fn scale_1000_rows_index_range() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE big (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE big (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("CREATE INDEX idx_val ON big (val)").unwrap());
 
     conn.execute("BEGIN").unwrap();
     for i in 0..1000 {
-        conn.execute(&format!("INSERT INTO big VALUES ({i}, {i})")).unwrap();
+        conn.execute(&format!("INSERT INTO big VALUES ({i}, {i})"))
+            .unwrap();
     }
     conn.execute("COMMIT").unwrap();
 
-    assert_plan(&db, "SELECT id FROM big WHERE val >= 500 AND val < 510", "IndexScan:idx_val");
+    assert_plan(
+        &db,
+        "SELECT id FROM big WHERE val >= 500 AND val < 510",
+        "IndexScan:idx_val",
+    );
 
-    let qr = query_result(conn.execute(
-        "SELECT id FROM big WHERE val >= 500 AND val < 510 ORDER BY id"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM big WHERE val >= 500 AND val < 510 ORDER BY id")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 10);
     for (i, row) in qr.rows.iter().enumerate() {
         assert_eq!(row[0], Value::Integer(500 + i as i64));
@@ -989,13 +1154,15 @@ fn scale_1000_rows_pk_lookup() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE big (id INTEGER NOT NULL PRIMARY KEY, data TEXT NOT NULL)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE big (id INTEGER NOT NULL PRIMARY KEY, data TEXT NOT NULL)")
+            .unwrap(),
+    );
 
     conn.execute("BEGIN").unwrap();
     for i in 0..1000 {
-        conn.execute(&format!("INSERT INTO big VALUES ({i}, 'row_{i}')")).unwrap();
+        conn.execute(&format!("INSERT INTO big VALUES ({i}, 'row_{i}')"))
+            .unwrap();
     }
     conn.execute("COMMIT").unwrap();
 
@@ -1012,27 +1179,36 @@ fn scale_1000_rows_delete_via_index() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE big (id INTEGER NOT NULL PRIMARY KEY, bucket INTEGER NOT NULL)"
-    ).unwrap());
-    assert_ok(conn.execute("CREATE INDEX idx_bucket ON big (bucket)").unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE big (id INTEGER NOT NULL PRIMARY KEY, bucket INTEGER NOT NULL)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE INDEX idx_bucket ON big (bucket)")
+            .unwrap(),
+    );
 
     conn.execute("BEGIN").unwrap();
     for i in 0..1000 {
-        conn.execute(&format!("INSERT INTO big VALUES ({i}, {})", i % 10)).unwrap();
+        conn.execute(&format!("INSERT INTO big VALUES ({i}, {})", i % 10))
+            .unwrap();
     }
     conn.execute("COMMIT").unwrap();
 
     // Delete all rows with bucket=3 (100 rows)
-    assert_rows_affected(conn.execute(
-        "DELETE FROM big WHERE bucket = 3"
-    ).unwrap(), 100);
+    assert_rows_affected(
+        conn.execute("DELETE FROM big WHERE bucket = 3").unwrap(),
+        100,
+    );
 
     let qr = query_result(conn.execute("SELECT COUNT(*) FROM big").unwrap());
     assert_eq!(qr.rows[0][0], Value::Integer(900));
 
     // Verify no rows with bucket=3 remain
-    let qr = query_result(conn.execute("SELECT COUNT(*) FROM big WHERE bucket = 3").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT COUNT(*) FROM big WHERE bucket = 3")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(0));
 }
 
@@ -1045,22 +1221,29 @@ fn scale_1000_rows_update_via_index() {
     assert_ok(conn.execute(
         "CREATE TABLE big (id INTEGER NOT NULL PRIMARY KEY, bucket INTEGER NOT NULL, val INTEGER)"
     ).unwrap());
-    assert_ok(conn.execute("CREATE INDEX idx_bucket ON big (bucket)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_bucket ON big (bucket)")
+            .unwrap(),
+    );
 
     conn.execute("BEGIN").unwrap();
     for i in 0..1000 {
-        conn.execute(&format!("INSERT INTO big VALUES ({i}, {}, 0)", i % 10)).unwrap();
+        conn.execute(&format!("INSERT INTO big VALUES ({i}, {}, 0)", i % 10))
+            .unwrap();
     }
     conn.execute("COMMIT").unwrap();
 
     // Update all rows with bucket=5 (100 rows)
-    assert_rows_affected(conn.execute(
-        "UPDATE big SET val = 999 WHERE bucket = 5"
-    ).unwrap(), 100);
+    assert_rows_affected(
+        conn.execute("UPDATE big SET val = 999 WHERE bucket = 5")
+            .unwrap(),
+        100,
+    );
 
-    let qr = query_result(conn.execute(
-        "SELECT COUNT(*) FROM big WHERE bucket = 5 AND val = 999"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT COUNT(*) FROM big WHERE bucket = 5 AND val = 999")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(100));
 }
 
@@ -1074,9 +1257,10 @@ fn empty_table_with_index() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE empty (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE empty (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("CREATE INDEX idx_val ON empty (val)").unwrap());
 
     let qr = query_result(conn.execute("SELECT * FROM empty WHERE val = 'x'").unwrap());
@@ -1092,9 +1276,10 @@ fn index_on_column_with_nulls() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE data (id INTEGER NOT NULL PRIMARY KEY, tag TEXT)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE data (id INTEGER NOT NULL PRIMARY KEY, tag TEXT)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("CREATE INDEX idx_tag ON data (tag)").unwrap());
 
     conn.execute("INSERT INTO data VALUES (1, 'a')").unwrap();
@@ -1103,9 +1288,10 @@ fn index_on_column_with_nulls() {
     conn.execute("INSERT INTO data VALUES (4, NULL)").unwrap();
     conn.execute("INSERT INTO data VALUES (5, 'a')").unwrap();
 
-    let qr = query_result(conn.execute(
-        "SELECT id FROM data WHERE tag = 'a' ORDER BY id"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM data WHERE tag = 'a' ORDER BY id")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
     assert_eq!(qr.rows[1][0], Value::Integer(5));
@@ -1117,17 +1303,24 @@ fn unique_index_with_null_values() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE data (id INTEGER NOT NULL PRIMARY KEY, code TEXT)"
-    ).unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_code ON data (code)").unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE data (id INTEGER NOT NULL PRIMARY KEY, code TEXT)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_code ON data (code)")
+            .unwrap(),
+    );
 
     // Multiple NULLs allowed in unique index
     conn.execute("INSERT INTO data VALUES (1, NULL)").unwrap();
     conn.execute("INSERT INTO data VALUES (2, NULL)").unwrap();
     conn.execute("INSERT INTO data VALUES (3, 'abc')").unwrap();
 
-    let qr = query_result(conn.execute("SELECT id FROM data WHERE code = 'abc'").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM data WHERE code = 'abc'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Integer(3));
 }
@@ -1141,15 +1334,23 @@ fn composite_pk_lookup() {
     assert_ok(conn.execute(
         "CREATE TABLE orders (cust INTEGER NOT NULL, ord INTEGER NOT NULL, amount REAL, PRIMARY KEY (cust, ord))"
     ).unwrap());
-    conn.execute("INSERT INTO orders VALUES (1, 100, 50.0)").unwrap();
-    conn.execute("INSERT INTO orders VALUES (1, 101, 75.0)").unwrap();
-    conn.execute("INSERT INTO orders VALUES (2, 100, 30.0)").unwrap();
+    conn.execute("INSERT INTO orders VALUES (1, 100, 50.0)")
+        .unwrap();
+    conn.execute("INSERT INTO orders VALUES (1, 101, 75.0)")
+        .unwrap();
+    conn.execute("INSERT INTO orders VALUES (2, 100, 30.0)")
+        .unwrap();
 
-    assert_plan(&db, "SELECT amount FROM orders WHERE cust = 1 AND ord = 101", "PkLookup");
+    assert_plan(
+        &db,
+        "SELECT amount FROM orders WHERE cust = 1 AND ord = 101",
+        "PkLookup",
+    );
 
-    let qr = query_result(conn.execute(
-        "SELECT amount FROM orders WHERE cust = 1 AND ord = 101"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT amount FROM orders WHERE cust = 1 AND ord = 101")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Real(75.0));
 }
@@ -1163,14 +1364,20 @@ fn partial_composite_pk_is_not_pk_lookup() {
     assert_ok(conn.execute(
         "CREATE TABLE orders (cust INTEGER NOT NULL, ord INTEGER NOT NULL, amount REAL, PRIMARY KEY (cust, ord))"
     ).unwrap());
-    conn.execute("INSERT INTO orders VALUES (1, 100, 50.0)").unwrap();
-    conn.execute("INSERT INTO orders VALUES (1, 101, 75.0)").unwrap();
-    conn.execute("INSERT INTO orders VALUES (2, 100, 30.0)").unwrap();
+    conn.execute("INSERT INTO orders VALUES (1, 100, 50.0)")
+        .unwrap();
+    conn.execute("INSERT INTO orders VALUES (1, 101, 75.0)")
+        .unwrap();
+    conn.execute("INSERT INTO orders VALUES (2, 100, 30.0)")
+        .unwrap();
 
     // Only one PK column specified — can't do PK lookup
     assert_plan(&db, "SELECT * FROM orders WHERE cust = 1", "SeqScan");
 
-    let qr = query_result(conn.execute("SELECT amount FROM orders WHERE cust = 1 ORDER BY ord").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT amount FROM orders WHERE cust = 1 ORDER BY ord")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Real(50.0));
     assert_eq!(qr.rows[1][0], Value::Real(75.0));
@@ -1184,14 +1391,18 @@ fn or_condition_correct_with_indexes_present() {
     setup_products(&mut conn);
 
     // OR falls back to SeqScan but results must still be correct
-    assert_plan(&db,
+    assert_plan(
+        &db,
         "SELECT name FROM products WHERE category = 'Toys' OR category = 'Tools' ORDER BY name",
-        "SeqScan"
+        "SeqScan",
     );
 
-    let qr = query_result(conn.execute(
-        "SELECT name FROM products WHERE category = 'Toys' OR category = 'Tools' ORDER BY name"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute(
+            "SELECT name FROM products WHERE category = 'Toys' OR category = 'Tools' ORDER BY name",
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 4);
     assert_eq!(qr.rows[0][0], Value::Text("Apparatus".into()));
     assert_eq!(qr.rows[1][0], Value::Text("Contraption".into()));
@@ -1205,10 +1416,12 @@ fn single_row_table_pk_lookup() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE single (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
-    ).unwrap());
-    conn.execute("INSERT INTO single VALUES (1, 'only')").unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE single (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+            .unwrap(),
+    );
+    conn.execute("INSERT INTO single VALUES (1, 'only')")
+        .unwrap();
 
     let qr = query_result(conn.execute("SELECT val FROM single WHERE id = 1").unwrap());
     assert_eq!(qr.rows.len(), 1);
@@ -1224,17 +1437,28 @@ fn single_row_table_index_scan() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE single (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
-    ).unwrap());
-    assert_ok(conn.execute("CREATE INDEX idx_val ON single (val)").unwrap());
-    conn.execute("INSERT INTO single VALUES (1, 'only')").unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE single (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE INDEX idx_val ON single (val)")
+            .unwrap(),
+    );
+    conn.execute("INSERT INTO single VALUES (1, 'only')")
+        .unwrap();
 
-    let qr = query_result(conn.execute("SELECT id FROM single WHERE val = 'only'").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM single WHERE val = 'only'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 
-    let qr = query_result(conn.execute("SELECT id FROM single WHERE val = 'none'").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM single WHERE val = 'none'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 0);
 }
 
@@ -1244,9 +1468,10 @@ fn delete_all_via_index_then_reinsert() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, cat TEXT)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, cat TEXT)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("CREATE INDEX idx_cat ON t (cat)").unwrap());
     conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 'a')").unwrap();
@@ -1276,9 +1501,10 @@ fn aggregate_sum_with_index_prefilter() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute(
-        "SELECT SUM(price) FROM products WHERE category = 'Electronics'"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT SUM(price) FROM products WHERE category = 'Electronics'")
+            .unwrap(),
+    );
     match &qr.rows[0][0] {
         Value::Real(sum) => {
             let expected = 29.99 + 49.99 + 99.99 + 19.99;
@@ -1295,9 +1521,10 @@ fn aggregate_count_with_index_prefilter() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute(
-        "SELECT COUNT(*) FROM products WHERE category = 'Toys'"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT COUNT(*) FROM products WHERE category = 'Toys'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(2));
 }
 
@@ -1308,9 +1535,10 @@ fn aggregate_min_max_with_index_prefilter() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute(
-        "SELECT MIN(price), MAX(price) FROM products WHERE category = 'Electronics'"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT MIN(price), MAX(price) FROM products WHERE category = 'Electronics'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Real(19.99));
     assert_eq!(qr.rows[0][1], Value::Real(99.99));
 }
@@ -1322,9 +1550,12 @@ fn distinct_with_index_prefilter() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute(
-        "SELECT DISTINCT stock FROM products WHERE category = 'Electronics' ORDER BY stock"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute(
+            "SELECT DISTINCT stock FROM products WHERE category = 'Electronics' ORDER BY stock",
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 4);
     assert_eq!(qr.rows[0][0], Value::Integer(25));
     assert_eq!(qr.rows[1][0], Value::Integer(50));
@@ -1339,9 +1570,12 @@ fn order_by_limit_with_index_prefilter() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    let qr = query_result(conn.execute(
-        "SELECT name FROM products WHERE category = 'Electronics' ORDER BY price LIMIT 2"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute(
+            "SELECT name FROM products WHERE category = 'Electronics' ORDER BY price LIMIT 2",
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Text("Mechanism".into()));
     assert_eq!(qr.rows[1][0], Value::Text("Widget".into()));
@@ -1374,32 +1608,45 @@ fn index_consistent_after_insert_update_delete_cycle() {
     setup_products(&mut conn);
 
     // Insert — index should include new row
-    conn.execute("INSERT INTO products VALUES (9, 'Sprocket', 'Electronics', 5.99, 1000)").unwrap();
-    let qr = query_result(conn.execute(
-        "SELECT COUNT(*) FROM products WHERE category = 'Electronics'"
-    ).unwrap());
+    conn.execute("INSERT INTO products VALUES (9, 'Sprocket', 'Electronics', 5.99, 1000)")
+        .unwrap();
+    let qr = query_result(
+        conn.execute("SELECT COUNT(*) FROM products WHERE category = 'Electronics'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(5));
-    let qr = query_result(conn.execute("SELECT id FROM products WHERE name = 'Sprocket'").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM products WHERE name = 'Sprocket'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(9));
 
     // Update category — old index entry removed, new one added
-    conn.execute("UPDATE products SET category = 'Tools' WHERE name = 'Sprocket'").unwrap();
-    let qr = query_result(conn.execute(
-        "SELECT COUNT(*) FROM products WHERE category = 'Electronics'"
-    ).unwrap());
+    conn.execute("UPDATE products SET category = 'Tools' WHERE name = 'Sprocket'")
+        .unwrap();
+    let qr = query_result(
+        conn.execute("SELECT COUNT(*) FROM products WHERE category = 'Electronics'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(4));
-    let qr = query_result(conn.execute(
-        "SELECT COUNT(*) FROM products WHERE category = 'Tools'"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT COUNT(*) FROM products WHERE category = 'Tools'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(3));
 
     // Delete — index entry removed
-    conn.execute("DELETE FROM products WHERE name = 'Sprocket'").unwrap();
-    let qr = query_result(conn.execute(
-        "SELECT COUNT(*) FROM products WHERE category = 'Tools'"
-    ).unwrap());
+    conn.execute("DELETE FROM products WHERE name = 'Sprocket'")
+        .unwrap();
+    let qr = query_result(
+        conn.execute("SELECT COUNT(*) FROM products WHERE category = 'Tools'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(2));
-    let qr = query_result(conn.execute("SELECT * FROM products WHERE name = 'Sprocket'").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT * FROM products WHERE name = 'Sprocket'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 0);
 }
 
@@ -1422,17 +1669,23 @@ fn index_scan_after_reopen() {
     let mut conn = Connection::open(&db).unwrap();
 
     // Plan should still use index
-    assert_plan(&db, "SELECT * FROM products WHERE name = 'Widget'", "IndexScan:idx_name");
+    assert_plan(
+        &db,
+        "SELECT * FROM products WHERE name = 'Widget'",
+        "IndexScan:idx_name",
+    );
 
-    let qr = query_result(conn.execute(
-        "SELECT id FROM products WHERE name = 'Widget'"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM products WHERE name = 'Widget'")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 
-    let qr = query_result(conn.execute(
-        "SELECT id FROM products WHERE category = 'Electronics' ORDER BY id"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM products WHERE category = 'Electronics' ORDER BY id")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 4);
 }
 
@@ -1446,16 +1699,20 @@ fn index_scan_with_empty_string() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("CREATE INDEX idx_val ON t (val)").unwrap());
 
     conn.execute("INSERT INTO t VALUES (1, '')").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 'abc')").unwrap();
     conn.execute("INSERT INTO t VALUES (3, '')").unwrap();
 
-    let qr = query_result(conn.execute("SELECT id FROM t WHERE val = '' ORDER BY id").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM t WHERE val = '' ORDER BY id")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
     assert_eq!(qr.rows[1][0], Value::Integer(3));
@@ -1467,9 +1724,10 @@ fn index_scan_with_negative_integers() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("CREATE INDEX idx_val ON t (val)").unwrap());
 
     conn.execute("INSERT INTO t VALUES (1, -100)").unwrap();
@@ -1477,12 +1735,18 @@ fn index_scan_with_negative_integers() {
     conn.execute("INSERT INTO t VALUES (3, 100)").unwrap();
     conn.execute("INSERT INTO t VALUES (4, -100)").unwrap();
 
-    let qr = query_result(conn.execute("SELECT id FROM t WHERE val = -100 ORDER BY id").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM t WHERE val = -100 ORDER BY id")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
     assert_eq!(qr.rows[1][0], Value::Integer(4));
 
-    let qr = query_result(conn.execute("SELECT id FROM t WHERE val > -50 ORDER BY id").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM t WHERE val > -50 ORDER BY id")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Integer(2));
     assert_eq!(qr.rows[1][0], Value::Integer(3));
@@ -1494,16 +1758,20 @@ fn index_scan_with_zero() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("CREATE INDEX idx_val ON t (val)").unwrap());
 
     conn.execute("INSERT INTO t VALUES (1, 0)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 1)").unwrap();
     conn.execute("INSERT INTO t VALUES (3, 0)").unwrap();
 
-    let qr = query_result(conn.execute("SELECT id FROM t WHERE val = 0 ORDER BY id").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM t WHERE val = 0 ORDER BY id")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
 }
 
@@ -1513,14 +1781,17 @@ fn pk_lookup_with_large_integer() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
-    ).unwrap());
-    conn.execute("INSERT INTO t VALUES (9223372036854775807, 'max_i64')").unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+            .unwrap(),
+    );
+    conn.execute("INSERT INTO t VALUES (9223372036854775807, 'max_i64')")
+        .unwrap();
 
-    let qr = query_result(conn.execute(
-        "SELECT val FROM t WHERE id = 9223372036854775807"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT val FROM t WHERE id = 9223372036854775807")
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Text("max_i64".into()));
 }
@@ -1531,18 +1802,22 @@ fn index_scan_with_real_boundary() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("CREATE INDEX idx_val ON t (val)").unwrap());
 
     conn.execute("INSERT INTO t VALUES (1, 0.0)").unwrap();
     conn.execute("INSERT INTO t VALUES (2, -0.0)").unwrap();
     conn.execute("INSERT INTO t VALUES (3, 0.1)").unwrap();
 
-    let qr = query_result(conn.execute("SELECT id FROM t WHERE val = 0.0 ORDER BY id").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM t WHERE val = 0.0 ORDER BY id")
+            .unwrap(),
+    );
     // 0.0 and -0.0 should both match
-    assert!(qr.rows.len() >= 1);
+    assert!(!qr.rows.is_empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1555,15 +1830,23 @@ fn prefers_unique_over_non_unique() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, code TEXT NOT NULL)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, code TEXT NOT NULL)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("CREATE INDEX idx_code ON t (code)").unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_code_uniq ON t (code)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_code_uniq ON t (code)")
+            .unwrap(),
+    );
 
     conn.execute("INSERT INTO t VALUES (1, 'X')").unwrap();
 
-    assert_plan(&db, "SELECT * FROM t WHERE code = 'X'", "IndexScan:idx_code_uniq");
+    assert_plan(
+        &db,
+        "SELECT * FROM t WHERE code = 'X'",
+        "IndexScan:idx_code_uniq",
+    );
 
     let qr = query_result(conn.execute("SELECT id FROM t WHERE code = 'X'").unwrap());
     assert_eq!(qr.rows.len(), 1);
@@ -1579,9 +1862,10 @@ fn prefers_more_equality_columns_composite() {
 
     // WHERE category = 'X' AND price = Y
     // idx_category has 1 eq col, idx_cat_price has 2 eq cols → pick idx_cat_price
-    assert_plan(&db,
+    assert_plan(
+        &db,
         "SELECT * FROM products WHERE category = 'Electronics' AND price = 29.99",
-        "IndexScan:idx_cat_price"
+        "IndexScan:idx_cat_price",
     );
 }
 
@@ -1613,7 +1897,11 @@ fn is_null_falls_back_to_seq_scan() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_plan(&db, "SELECT * FROM products WHERE category IS NULL", "SeqScan");
+    assert_plan(
+        &db,
+        "SELECT * FROM products WHERE category IS NULL",
+        "SeqScan",
+    );
 }
 
 #[test]
@@ -1623,7 +1911,11 @@ fn is_not_null_falls_back_to_seq_scan() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_plan(&db, "SELECT * FROM products WHERE category IS NOT NULL", "SeqScan");
+    assert_plan(
+        &db,
+        "SELECT * FROM products WHERE category IS NOT NULL",
+        "SeqScan",
+    );
 }
 
 #[test]
@@ -1633,7 +1925,11 @@ fn not_equal_falls_back_to_seq_scan() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    assert_plan(&db, "SELECT * FROM products WHERE category <> 'Toys'", "SeqScan");
+    assert_plan(
+        &db,
+        "SELECT * FROM products WHERE category <> 'Toys'",
+        "SeqScan",
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1646,22 +1942,35 @@ fn index_on_boolean_column() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE flags (id INTEGER NOT NULL PRIMARY KEY, active BOOLEAN NOT NULL)"
-    ).unwrap());
-    assert_ok(conn.execute("CREATE INDEX idx_active ON flags (active)").unwrap());
+    assert_ok(
+        conn.execute(
+            "CREATE TABLE flags (id INTEGER NOT NULL PRIMARY KEY, active BOOLEAN NOT NULL)",
+        )
+        .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE INDEX idx_active ON flags (active)")
+            .unwrap(),
+    );
 
     for i in 0..20 {
         conn.execute(&format!(
-            "INSERT INTO flags VALUES ({i}, {})", if i % 3 == 0 { "TRUE" } else { "FALSE" }
-        )).unwrap();
+            "INSERT INTO flags VALUES ({i}, {})",
+            if i % 3 == 0 { "TRUE" } else { "FALSE" }
+        ))
+        .unwrap();
     }
 
-    assert_plan(&db, "SELECT id FROM flags WHERE active = TRUE", "IndexScan:idx_active");
+    assert_plan(
+        &db,
+        "SELECT id FROM flags WHERE active = TRUE",
+        "IndexScan:idx_active",
+    );
 
-    let qr = query_result(conn.execute(
-        "SELECT id FROM flags WHERE active = TRUE ORDER BY id"
-    ).unwrap());
+    let qr = query_result(
+        conn.execute("SELECT id FROM flags WHERE active = TRUE ORDER BY id")
+            .unwrap(),
+    );
     // ids 0, 3, 6, 9, 12, 15, 18 → 7 rows
     assert_eq!(qr.rows.len(), 7);
     assert_eq!(qr.rows[0][0], Value::Integer(0));

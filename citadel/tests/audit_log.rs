@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use citadel::{
-    AuditConfig, AuditEventType, Database, DatabaseBuilder, KdfAlgorithm,
-    read_audit_log, verify_audit_log, scan_corrupted_audit_log,
+    read_audit_log, scan_corrupted_audit_log, verify_audit_log, AuditConfig, AuditEventType,
+    Database, DatabaseBuilder, KdfAlgorithm,
 };
 
 fn create_test_db(dir: &Path, passphrase: &[u8]) -> Database {
@@ -30,8 +30,8 @@ fn audit_path(dir: &Path) -> std::path::PathBuf {
 }
 
 fn get_audit_key(dir: &Path, passphrase: &[u8]) -> [u8; 32] {
-    use citadel::crypto::key_manager::open_key_file;
     use citadel::core::KEY_FILE_SIZE;
+    use citadel::crypto::key_manager::open_key_file;
 
     let key_path = dir.join("test.citadel.citadel-keys");
     let key_data = std::fs::read(&key_path).unwrap();
@@ -119,7 +119,8 @@ fn audit_log_key_backup_export() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_test_db(dir.path(), b"pass");
     let backup_path = dir.path().join("backup.citadel-key-backup");
-    db.export_key_backup(b"pass", b"backup-pass", &backup_path).unwrap();
+    db.export_key_backup(b"pass", b"backup-pass", &backup_path)
+        .unwrap();
     drop(db);
 
     let entries = read_audit_log(&audit_path(dir.path())).unwrap();
@@ -494,7 +495,8 @@ fn scenario_full_lifecycle_audit_trail() {
     db.backup(&backup_path).unwrap();
 
     let key_backup_path = dir.path().join("key.backup");
-    db.export_key_backup(pass, b"backup-pw", &key_backup_path).unwrap();
+    db.export_key_backup(pass, b"backup-pw", &key_backup_path)
+        .unwrap();
 
     let compact_path = dir.path().join("compact.citadel");
     db.compact(&compact_path).unwrap();
@@ -684,9 +686,18 @@ fn scenario_multiple_sessions_chain_continuity() {
         assert_eq!(entry.sequence_no, (i + 1) as u64);
     }
 
-    let created = entries.iter().filter(|e| e.event_type == AuditEventType::DatabaseCreated).count();
-    let opened = entries.iter().filter(|e| e.event_type == AuditEventType::DatabaseOpened).count();
-    let closed = entries.iter().filter(|e| e.event_type == AuditEventType::DatabaseClosed).count();
+    let created = entries
+        .iter()
+        .filter(|e| e.event_type == AuditEventType::DatabaseCreated)
+        .count();
+    let opened = entries
+        .iter()
+        .filter(|e| e.event_type == AuditEventType::DatabaseOpened)
+        .count();
+    let closed = entries
+        .iter()
+        .filter(|e| e.event_type == AuditEventType::DatabaseClosed)
+        .count();
 
     assert_eq!(created, 1);
     assert_eq!(opened, 3);
@@ -806,7 +817,11 @@ fn scenario_zeroed_magic_recovery() {
 
     let recovered_seq: Vec<u64> = scan.entries.iter().map(|e| e.sequence_no).collect();
     for seq in 3..=total as u64 {
-        assert!(recovered_seq.contains(&seq), "entry {} should be recovered", seq);
+        assert!(
+            recovered_seq.contains(&seq),
+            "entry {} should be recovered",
+            seq
+        );
     }
 }
 

@@ -11,16 +11,15 @@
 //! - Reopen-and-verify persistence
 //! - Multiple sequential transactions
 
-use std::sync::Mutex;
 use citadel_core::{
-    Error, Result, PAGE_SIZE, DEK_SIZE, MAC_KEY_SIZE,
-    GOD_BIT_ACTIVE_SLOT, GOD_BIT_RECOVERY,
+    Error, Result, DEK_SIZE, GOD_BIT_ACTIVE_SLOT, GOD_BIT_RECOVERY, MAC_KEY_SIZE, PAGE_SIZE,
 };
 use citadel_crypto::hkdf_utils::derive_keys_from_rek;
 use citadel_crypto::page_cipher::compute_dek_id;
-use citadel_io::traits::PageIO;
 use citadel_io::file_manager;
+use citadel_io::traits::PageIO;
 use citadel_txn::manager::TxnManager;
+use std::sync::Mutex;
 
 /// Shared in-memory storage that persists across TxnManager instances (simulates a file).
 struct SharedStorage {
@@ -29,7 +28,9 @@ struct SharedStorage {
 
 impl SharedStorage {
     fn new(size: usize) -> Self {
-        Self { data: Mutex::new(vec![0u8; size]) }
+        Self {
+            data: Mutex::new(vec![0u8; size]),
+        }
     }
 
     #[allow(dead_code)]
@@ -56,7 +57,8 @@ impl PageIO for SharedIO {
         let end = start + PAGE_SIZE;
         if end > data.len() {
             return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof, "read past end",
+                std::io::ErrorKind::UnexpectedEof,
+                "read past end",
             )));
         }
         buf.copy_from_slice(&data[start..end]);
@@ -67,7 +69,9 @@ impl PageIO for SharedIO {
         let mut data = self.storage.data.lock().unwrap();
         let start = offset as usize;
         let end = start + PAGE_SIZE;
-        if end > data.len() { data.resize(end, 0); }
+        if end > data.len() {
+            data.resize(end, 0);
+        }
         data[start..end].copy_from_slice(buf);
         Ok(())
     }
@@ -78,7 +82,9 @@ impl PageIO for SharedIO {
         let end = start + buf.len();
         if end > data.len() {
             let available = data.len().saturating_sub(start);
-            if available > 0 { buf[..available].copy_from_slice(&data[start..start + available]); }
+            if available > 0 {
+                buf[..available].copy_from_slice(&data[start..start + available]);
+            }
             buf[available..].fill(0);
             return Ok(());
         }
@@ -90,12 +96,16 @@ impl PageIO for SharedIO {
         let mut data = self.storage.data.lock().unwrap();
         let start = offset as usize;
         let end = start + buf.len();
-        if end > data.len() { data.resize(end, 0); }
+        if end > data.len() {
+            data.resize(end, 0);
+        }
         data[start..end].copy_from_slice(buf);
         Ok(())
     }
 
-    fn fsync(&self) -> Result<()> { Ok(()) }
+    fn fsync(&self) -> Result<()> {
+        Ok(())
+    }
 
     fn file_size(&self) -> Result<u64> {
         Ok(self.storage.data.lock().unwrap().len() as u64)
@@ -191,8 +201,11 @@ fn persist_across_reopen() {
         for i in 0..100u32 {
             let key = format!("key-{i:04}");
             let val = format!("val-{i:04}");
-            assert_eq!(rtx.get(key.as_bytes()).unwrap(), Some(val.into_bytes()),
-                "key {key} should be present after reopen");
+            assert_eq!(
+                rtx.get(key.as_bytes()).unwrap(),
+                Some(val.into_bytes()),
+                "key {key} should be present after reopen"
+            );
         }
     }
 }
@@ -267,8 +280,14 @@ fn snapshot_isolation_read_during_write() {
 
     // New read should see everything
     let mut rtx_after = mgr.begin_read();
-    assert_eq!(rtx_after.get(b"stable").unwrap(), Some(b"modified".to_vec()));
-    assert_eq!(rtx_after.get(b"new_key").unwrap(), Some(b"new_val".to_vec()));
+    assert_eq!(
+        rtx_after.get(b"stable").unwrap(),
+        Some(b"modified".to_vec())
+    );
+    assert_eq!(
+        rtx_after.get(b"new_key").unwrap(),
+        Some(b"new_val".to_vec())
+    );
 }
 
 // === Abort Semantics ===
@@ -366,7 +385,11 @@ fn recovery_flag_cleared_after_commit() {
     // After commit, recovery flag (bit 1) should be 0
     let io = SharedIO::new(storage.clone());
     let god = file_manager::read_god_byte(&io).unwrap();
-    assert_eq!(god & GOD_BIT_RECOVERY, 0, "recovery flag should be cleared after commit");
+    assert_eq!(
+        god & GOD_BIT_RECOVERY,
+        0,
+        "recovery flag should be cleared after commit"
+    );
 }
 
 // === Recovery Simulation ===
@@ -519,8 +542,10 @@ fn pending_free_pages_accumulate() {
 
     // HWM should have grown (CoW allocated new pages for deletion path)
     let hwm_after_delete = mgr.current_slot().high_water_mark;
-    assert!(hwm_after_delete >= hwm_after_insert,
-        "HWM should not shrink: before={hwm_after_insert} after={hwm_after_delete}");
+    assert!(
+        hwm_after_delete >= hwm_after_insert,
+        "HWM should not shrink: before={hwm_after_insert} after={hwm_after_delete}"
+    );
 
     // Pending-free chain should exist
     let pf_root = mgr.current_slot().pending_free_root;
@@ -666,11 +691,12 @@ impl PageIO for FailingIO {
         SharedIO::new(self.storage.clone()).write_at(offset, buf)
     }
     fn fsync(&self) -> Result<()> {
-        let n = self.fsync_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let n = self
+            .fsync_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         if n == self.fail_on_fsync {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other, "simulated fsync failure",
-            )));
+            return Err(Error::Io(std::io::Error::other("simulated fsync failure")));
         }
         Ok(())
     }
@@ -707,14 +733,20 @@ fn failed_commit_releases_writer_lock() {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"new_key", b"new_val").unwrap();
         let result = wtx.commit();
-        assert!(result.is_err(), "commit should fail due to simulated fsync failure");
+        assert!(
+            result.is_err(),
+            "commit should fail due to simulated fsync failure"
+        );
         // WriteTxn is dropped here — Drop should call abort_write() because committed=false
     }
 
     // The critical test: can we begin a new write transaction?
     // Before the fix, this would fail with WriteTransactionActive.
     let result = mgr.begin_write();
-    assert!(result.is_ok(), "writer lock should be released after failed commit");
+    assert!(
+        result.is_ok(),
+        "writer lock should be released after failed commit"
+    );
 }
 
 // --- BUG #2 Regression: for_each must work on multi-leaf trees ---
@@ -746,21 +778,30 @@ fn for_each_multi_leaf_tree() {
         wtx.for_each(|k, v| {
             collected.push((k.to_vec(), v.to_vec()));
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
-        assert_eq!(collected.len(), count as usize,
-            "for_each should visit all {count} entries");
+        assert_eq!(
+            collected.len(),
+            count as usize,
+            "for_each should visit all {count} entries"
+        );
 
         // Verify sorted order
         for i in 1..collected.len() {
-            assert!(collected[i].0 > collected[i-1].0,
-                "for_each must return entries in sorted order");
+            assert!(
+                collected[i].0 > collected[i - 1].0,
+                "for_each must return entries in sorted order"
+            );
         }
 
         // Verify first and last
         assert_eq!(collected[0].0, b"key-000000");
         assert_eq!(collected[0].1, b"val-000000");
-        assert_eq!(collected[count as usize - 1].0, format!("key-{:06}", count - 1).as_bytes());
+        assert_eq!(
+            collected[count as usize - 1].0,
+            format!("key-{:06}", count - 1).as_bytes()
+        );
 
         wtx.abort();
     }
@@ -782,11 +823,16 @@ fn reclaimed_pages_reused() {
     }
     let hwm_after_insert = mgr.current_slot().high_water_mark;
     let initial_hwm = mgr.current_slot().high_water_mark;
-    assert!(initial_hwm >= 1, "initial HWM should include at least the root page");
+    assert!(
+        initial_hwm >= 1,
+        "initial HWM should include at least the root page"
+    );
 
     // The insert of 200 small keys should have grown HWM beyond the initial root
-    assert!(hwm_after_insert > 1,
-        "inserting 200 keys should allocate multiple pages, HWM={hwm_after_insert}");
+    assert!(
+        hwm_after_insert > 1,
+        "inserting 200 keys should allocate multiple pages, HWM={hwm_after_insert}"
+    );
 
     // Delete all 200 keys (CoW frees pages)
     {
@@ -825,9 +871,11 @@ fn reclaimed_pages_reused() {
     // The HWM growth should be much less than 100 pages because reclaimed pages
     // should be reused. Without the fix, HWM would grow by ~100+ pages.
     let growth = hwm_after_reuse - hwm_before_reuse;
-    assert!(growth < 50,
+    assert!(
+        growth < 50,
         "reclaimed pages should be reused, but HWM grew by {growth} \
-         (before={hwm_before_reuse}, after={hwm_after_reuse})");
+         (before={hwm_before_reuse}, after={hwm_after_reuse})"
+    );
 }
 
 // --- for_each edge cases ---
@@ -842,7 +890,8 @@ fn for_each_empty_tree() {
     wtx.for_each(|_, _| {
         count += 1;
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(count, 0);
     wtx.abort();
 }
@@ -864,7 +913,8 @@ fn for_each_single_entry() {
         wtx.for_each(|k, v| {
             entries.push((k.to_vec(), v.to_vec()));
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, b"only-key");
         assert_eq!(entries[0].1, b"only-val");
@@ -900,7 +950,8 @@ fn for_each_filters_tombstones() {
         wtx.for_each(|k, v| {
             entries.push((k.to_vec(), v.to_vec()));
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         // Should only see the 5 remaining keys (tombstones filtered)
         assert_eq!(entries.len(), 5, "for_each should filter tombstones");
@@ -940,9 +991,14 @@ fn for_each_after_mixed_operations() {
         wtx.for_each(|k, v| {
             entries.push((k.to_vec(), v.to_vec()));
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
-        assert_eq!(entries.len(), 10, "should have 10 entries after deleting evens");
+        assert_eq!(
+            entries.len(),
+            10,
+            "should have 10 entries after deleting evens"
+        );
         for (_, v) in &entries {
             assert_eq!(v.as_slice(), b"updated");
         }
@@ -989,8 +1045,16 @@ fn write_txn_sees_own_deletes() {
         let mut wtx = mgr.begin_write().unwrap();
         // Delete and verify immediately
         wtx.delete(b"b").unwrap();
-        assert_eq!(wtx.get(b"b").unwrap(), None, "deleted key should not be visible");
-        assert_eq!(wtx.get(b"a").unwrap(), Some(b"1".to_vec()), "non-deleted should be visible");
+        assert_eq!(
+            wtx.get(b"b").unwrap(),
+            None,
+            "deleted key should not be visible"
+        );
+        assert_eq!(
+            wtx.get(b"a").unwrap(),
+            Some(b"1".to_vec()),
+            "non-deleted should be visible"
+        );
         assert_eq!(wtx.get(b"c").unwrap(), Some(b"3".to_vec()));
         wtx.commit().unwrap();
     }
@@ -1093,8 +1157,11 @@ fn three_session_persistence() {
         // Session 1 data intact
         for i in 0..50u32 {
             let key = format!("s1-{i:03}");
-            assert_eq!(rtx.get(key.as_bytes()).unwrap(), Some(b"session1".to_vec()),
-                "session 1 key {key} should persist through 3 sessions");
+            assert_eq!(
+                rtx.get(key.as_bytes()).unwrap(),
+                Some(b"session1".to_vec()),
+                "session 1 key {key} should persist through 3 sessions"
+            );
         }
         // Session 2 data intact
         for i in 0..30u32 {
@@ -1199,14 +1266,20 @@ fn large_batch_delete_and_verify() {
 
         for i in 0..500u32 {
             let key = format!("d{i:06}");
-            assert_eq!(rtx.get(key.as_bytes()).unwrap(), None,
-                "deleted key d{i:06} should not be present");
+            assert_eq!(
+                rtx.get(key.as_bytes()).unwrap(),
+                None,
+                "deleted key d{i:06} should not be present"
+            );
         }
         for i in 500..1000u32 {
             let key = format!("d{i:06}");
             let val = format!("v{i:06}");
-            assert_eq!(rtx.get(key.as_bytes()).unwrap(), Some(val.into_bytes()),
-                "surviving key d{i:06} should be present");
+            assert_eq!(
+                rtx.get(key.as_bytes()).unwrap(),
+                Some(val.into_bytes()),
+                "surviving key d{i:06} should be present"
+            );
         }
     }
 }
@@ -1232,8 +1305,10 @@ fn hwm_tracking_across_transactions() {
     }
 
     let hwm_after_insert = mgr.current_slot().high_water_mark;
-    assert!(hwm_after_insert > initial_hwm,
-        "HWM should grow after inserts: initial={initial_hwm} after={hwm_after_insert}");
+    assert!(
+        hwm_after_insert > initial_hwm,
+        "HWM should grow after inserts: initial={initial_hwm} after={hwm_after_insert}"
+    );
 
     // HWM never decreases (even after deletes)
     {
@@ -1274,12 +1349,16 @@ fn oldest_reader_blocks_reclamation() {
 
     let hwm_after_insert = mgr.current_slot().high_water_mark;
     let initial_hwm = 1u32; // DB starts with root page at HWM=1
-    assert!(hwm_after_insert > initial_hwm,
+    assert!(
+        hwm_after_insert > initial_hwm,
         "inserting 80 large-value entries should grow HWM significantly: \
-         initial={initial_hwm}, after_insert={hwm_after_insert}");
+         initial={initial_hwm}, after_insert={hwm_after_insert}"
+    );
     // With ~1800B values, each leaf holds ~4 entries, so 80 entries ≈ 20 leaves + branches ≈ 25+ pages
-    assert!(hwm_after_insert >= 20,
-        "80 entries with 1800B values should need at least 20 pages, got HWM={hwm_after_insert}");
+    assert!(
+        hwm_after_insert >= 20,
+        "80 entries with 1800B values should need at least 20 pages, got HWM={hwm_after_insert}"
+    );
 
     // Start a reader AFTER insert — this pins the current snapshot.
     // Pages freed in future txns (freed_at_txn >= reader's txn) can't be reclaimed.
@@ -1319,16 +1398,21 @@ fn oldest_reader_blocks_reclamation() {
 
     let hwm_after_blocked = mgr.current_slot().high_water_mark;
     let growth_with_reader = hwm_after_blocked - hwm_with_reader;
-    assert!(growth_with_reader > 10,
+    assert!(
+        growth_with_reader > 10,
         "with reader blocking reclamation, HWM must grow significantly \
          (grew by {growth_with_reader}, expected >10). \
-         hwm_with_reader={hwm_with_reader}, hwm_after_blocked={hwm_after_blocked}");
+         hwm_with_reader={hwm_with_reader}, hwm_after_blocked={hwm_after_blocked}"
+    );
 
     // Old reader still sees its original data (MVCC correctness)
     for i in 0..80u32 {
         let key = format!("o{i:04}");
-        assert_eq!(old_reader.get(key.as_bytes()).unwrap(), Some(big_val.clone()),
-            "old reader must see original data for key o{i:04}");
+        assert_eq!(
+            old_reader.get(key.as_bytes()).unwrap(),
+            Some(big_val.clone()),
+            "old reader must see original data for key o{i:04}"
+        );
     }
 
     // Drop the old reader — now pages become reclaimable
@@ -1358,9 +1442,11 @@ fn oldest_reader_blocks_reclamation() {
     let growth_without_reader = hwm_after_reuse - hwm_after_reclaim_trigger;
 
     // With reclaimed pages available, growth should be significantly less
-    assert!(growth_without_reader < growth_with_reader,
+    assert!(
+        growth_without_reader < growth_with_reader,
         "after reader dropped, reclaimed pages should be reused. \
-         growth_with_reader={growth_with_reader}, growth_without_reader={growth_without_reader}");
+         growth_with_reader={growth_with_reader}, growth_without_reader={growth_without_reader}"
+    );
 }
 
 // --- Write after abort ---
@@ -1410,7 +1496,11 @@ fn entry_count_mixed_operations_single_txn() {
         wtx.insert(b"e0", b"updated").unwrap();
         wtx.insert(b"e1", b"updated").unwrap();
         wtx.insert(b"e2", b"updated").unwrap();
-        assert_eq!(wtx.entry_count(), 10, "updates should not change entry count");
+        assert_eq!(
+            wtx.entry_count(),
+            10,
+            "updates should not change entry count"
+        );
 
         // Delete 2 keys
         wtx.delete(b"e8").unwrap();
@@ -1462,13 +1552,18 @@ fn deleted_keys_stay_deleted_after_reopen() {
         assert_eq!(rtx.entry_count(), 10);
         for i in 0..10u32 {
             let key = format!("dk-{i:03}");
-            assert_eq!(rtx.get(key.as_bytes()).unwrap(), None,
-                "deleted key {key} should stay deleted after reopen");
+            assert_eq!(
+                rtx.get(key.as_bytes()).unwrap(),
+                None,
+                "deleted key {key} should stay deleted after reopen"
+            );
         }
         for i in 10..20u32 {
             let key = format!("dk-{i:03}");
-            assert!(rtx.get(key.as_bytes()).unwrap().is_some(),
-                "surviving key {key} should be present after reopen");
+            assert!(
+                rtx.get(key.as_bytes()).unwrap().is_some(),
+                "surviving key {key} should be present after reopen"
+            );
         }
     }
 }
@@ -1531,8 +1626,8 @@ fn torn_commit_slot_falls_back_to_active() {
 
     // Corrupt the inactive slot: overwrite its bytes with garbage
     // This simulates a torn write where only part of the slot was written
-    let inactive_offset = citadel_core::COMMIT_SLOT_OFFSET
-        + inactive_slot_idx * citadel_core::COMMIT_SLOT_SIZE;
+    let inactive_offset =
+        citadel_core::COMMIT_SLOT_OFFSET + inactive_slot_idx * citadel_core::COMMIT_SLOT_SIZE;
     let garbage = vec![0xDE; citadel_core::COMMIT_SLOT_SIZE];
     io.write_at(inactive_offset as u64, &garbage).unwrap();
 
@@ -1543,11 +1638,18 @@ fn torn_commit_slot_falls_back_to_active() {
     // Reopen — recovery should use the active slot (old commit)
     let mgr = open_shared_manager(&storage);
     let mut rtx = mgr.begin_read();
-    assert_eq!(rtx.entry_count(), 50, "recovery should use active slot with 50 entries");
+    assert_eq!(
+        rtx.entry_count(),
+        50,
+        "recovery should use active slot with 50 entries"
+    );
     for i in 0..50u32 {
         let key = format!("torn-{i:03}");
-        assert_eq!(rtx.get(key.as_bytes()).unwrap(), Some(b"committed".to_vec()),
-            "key {key} should survive torn commit slot recovery");
+        assert_eq!(
+            rtx.get(key.as_bytes()).unwrap(),
+            Some(b"committed".to_vec()),
+            "key {key} should survive torn commit slot recovery"
+        );
     }
 }
 
@@ -1570,8 +1672,7 @@ fn both_slots_corrupted_returns_error() {
     // Corrupt BOTH commit slots
     let io = SharedIO::new(storage.clone());
     for slot_idx in 0..2 {
-        let offset = citadel_core::COMMIT_SLOT_OFFSET
-            + slot_idx * citadel_core::COMMIT_SLOT_SIZE;
+        let offset = citadel_core::COMMIT_SLOT_OFFSET + slot_idx * citadel_core::COMMIT_SLOT_SIZE;
         let garbage = vec![0xFF; citadel_core::COMMIT_SLOT_SIZE];
         io.write_at(offset as u64, &garbage).unwrap();
     }
@@ -1580,7 +1681,10 @@ fn both_slots_corrupted_returns_error() {
     let (dek, mac_key, _) = test_keys();
     let io = Box::new(SharedIO::new(storage.clone()));
     let result = TxnManager::open(io, dek, mac_key, 1, 256);
-    assert!(result.is_err(), "opening with both corrupted slots should fail");
+    assert!(
+        result.is_err(),
+        "opening with both corrupted slots should fail"
+    );
 }
 
 // --- Rapid key overwrite: file size stabilizes ---
@@ -1620,13 +1724,18 @@ fn rapid_key_overwrite_file_stabilizes() {
     // - Each overwrite only CoW's ~2-3 pages (leaf + ancestors)
     // - Freed pages are reclaimed by subsequent transactions
     // - 200 txns should NOT allocate 200+ new pages
-    assert!(growth < 50,
+    assert!(
+        growth < 50,
         "HWM should stabilize with page reclamation: warmup_hwm={hwm_after_warmup} \
-         stress_hwm={hwm_after_stress} growth={growth}");
+         stress_hwm={hwm_after_stress} growth={growth}"
+    );
 
     // Final value should be correct
     let mut rtx = mgr.begin_read();
-    assert_eq!(rtx.get(b"hot-key").unwrap(), Some(b"version-00249".to_vec()));
+    assert_eq!(
+        rtx.get(b"hot-key").unwrap(),
+        Some(b"version-00249".to_vec())
+    );
     assert_eq!(rtx.entry_count(), 1);
 }
 
@@ -1675,8 +1784,11 @@ fn transient_io_error_does_not_corrupt_database() {
     assert_eq!(rtx.entry_count(), 100);
     for i in 0..100u32 {
         let key = format!("safe-{i:04}");
-        assert_eq!(rtx.get(key.as_bytes()).unwrap(), Some(b"committed".to_vec()),
-            "key {key} should have original value after failed commit + reopen");
+        assert_eq!(
+            rtx.get(key.as_bytes()).unwrap(),
+            Some(b"committed".to_vec()),
+            "key {key} should have original value after failed commit + reopen"
+        );
     }
 }
 
@@ -1711,16 +1823,24 @@ fn cow_produces_new_root_each_commit() {
     }
 
     let root_v2 = mgr.current_slot().tree_root;
-    assert_ne!(root_v1, root_v2,
-        "CoW must produce a new root page: v1={root_v1:?} v2={root_v2:?}");
+    assert_ne!(
+        root_v1, root_v2,
+        "CoW must produce a new root page: v1={root_v1:?} v2={root_v2:?}"
+    );
 
     // Reader v1 should still see the old data through the old root
-    assert_eq!(reader_v1.get(b"cow-0000").unwrap(), Some(b"v1".to_vec()),
-        "old reader must see old value through old root");
+    assert_eq!(
+        reader_v1.get(b"cow-0000").unwrap(),
+        Some(b"v1".to_vec()),
+        "old reader must see old value through old root"
+    );
 
     // New reader should see modified data through new root
     let mut reader_v2 = mgr.begin_read();
-    assert_eq!(reader_v2.get(b"cow-0000").unwrap(), Some(b"modified".to_vec()));
+    assert_eq!(
+        reader_v2.get(b"cow-0000").unwrap(),
+        Some(b"modified".to_vec())
+    );
 
     // Commit 3: another modification — another new root
     {
@@ -1730,19 +1850,32 @@ fn cow_produces_new_root_each_commit() {
     }
 
     let root_v3 = mgr.current_slot().tree_root;
-    assert_ne!(root_v2, root_v3,
-        "each commit must produce a new root: v2={root_v2:?} v3={root_v3:?}");
-    assert_ne!(root_v1, root_v3,
-        "root v3 must differ from v1: v1={root_v1:?} v3={root_v3:?}");
+    assert_ne!(
+        root_v2, root_v3,
+        "each commit must produce a new root: v2={root_v2:?} v3={root_v3:?}"
+    );
+    assert_ne!(
+        root_v1, root_v3,
+        "root v3 must differ from v1: v1={root_v1:?} v3={root_v3:?}"
+    );
 
     // All readers still see their correct snapshots
-    assert_eq!(reader_v1.get(b"cow-0050").unwrap(), Some(b"v1".to_vec()),
-        "v1 reader must still see deleted key");
-    assert_eq!(reader_v2.get(b"cow-0050").unwrap(), Some(b"v1".to_vec()),
-        "v2 reader must still see deleted key");
+    assert_eq!(
+        reader_v1.get(b"cow-0050").unwrap(),
+        Some(b"v1".to_vec()),
+        "v1 reader must still see deleted key"
+    );
+    assert_eq!(
+        reader_v2.get(b"cow-0050").unwrap(),
+        Some(b"v1".to_vec()),
+        "v2 reader must still see deleted key"
+    );
     let mut reader_v3 = mgr.begin_read();
-    assert_eq!(reader_v3.get(b"cow-0050").unwrap(), None,
-        "v3 reader should not see deleted key");
+    assert_eq!(
+        reader_v3.get(b"cow-0050").unwrap(),
+        None,
+        "v3 reader should not see deleted key"
+    );
 }
 
 // --- Pages freed at reader's txn_id are NOT reclaimable (off-by-one guard) ---
@@ -1791,9 +1924,12 @@ fn pages_freed_at_reader_txn_not_reclaimable() {
     // Reader MUST still see all 60 entries (pages must not have been reclaimed/reused)
     for i in 0..60u32 {
         let key = format!("ofb-{i:04}");
-        assert_eq!(reader.get(key.as_bytes()).unwrap(), Some(big_val.clone()),
+        assert_eq!(
+            reader.get(key.as_bytes()).unwrap(),
+            Some(big_val.clone()),
             "reader must still see key {key} — freed pages must not be reclaimed \
-             while reader at that txn_id is active");
+             while reader at that txn_id is active"
+        );
     }
 
     drop(reader);
@@ -1809,7 +1945,8 @@ fn interleaved_insert_delete_stress() {
     let storage = std::sync::Arc::new(SharedStorage::new(16 * 1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
-    let mut reference: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut reference: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     let mut rng = SimpleRng(42);
     let mut next_unique = 0u32; // Ensures insert keys are unique across all txns
 
@@ -1839,20 +1976,26 @@ fn interleaved_insert_delete_stress() {
             }
         }
 
-        assert_eq!(wtx.entry_count(), reference.len() as u64,
+        assert_eq!(
+            wtx.entry_count(),
+            reference.len() as u64,
             "entry count mismatch at txn {txn_num}: tree={} expected={}",
-            wtx.entry_count(), reference.len());
+            wtx.entry_count(),
+            reference.len()
+        );
         wtx.commit().unwrap();
 
         // Every 50 txns, verify a read transaction sees the correct state
         if txn_num % 50 == 49 {
             let mut rtx = mgr.begin_read();
-            assert_eq!(rtx.entry_count(), reference.len() as u64,
-                "read txn entry count mismatch at txn {txn_num}");
+            assert_eq!(
+                rtx.entry_count(),
+                reference.len() as u64,
+                "read txn entry count mismatch at txn {txn_num}"
+            );
             // Spot-check 20 keys from the reference
             let keys: Vec<_> = reference.keys().cloned().collect();
-            for i in 0..std::cmp::min(20, keys.len()) {
-                let key = &keys[i];
+            for key in keys.iter().take(std::cmp::min(20, keys.len())) {
                 let expected = reference.get(key).unwrap();
                 assert_eq!(
                     rtx.get(key.as_bytes()).unwrap(),
@@ -1873,15 +2016,21 @@ fn interleaved_insert_delete_stress() {
                 String::from_utf8(v.to_vec()).unwrap(),
             ));
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
-        let expected_entries: Vec<_> = reference.iter()
+        let expected_entries: Vec<_> = reference
+            .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        assert_eq!(collected.len(), expected_entries.len(),
+        assert_eq!(
+            collected.len(),
+            expected_entries.len(),
             "final for_each count mismatch: tree={} expected={}",
-            collected.len(), expected_entries.len());
+            collected.len(),
+            expected_entries.len()
+        );
         for ((tk, tv), (ok, ov)) in collected.iter().zip(expected_entries.iter()) {
             assert_eq!(tk, ok, "key mismatch in final scan");
             assert_eq!(tv, ov, "value mismatch in final scan");

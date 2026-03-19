@@ -140,44 +140,53 @@ impl Hash for Value {
                 1u8.hash(state);
                 r.to_bits().hash(state);
             }
-            Value::Text(s) => { 2u8.hash(state); s.hash(state); }
-            Value::Blob(b) => { 3u8.hash(state); b.hash(state); }
-            Value::Boolean(b) => { 4u8.hash(state); b.hash(state); }
+            Value::Text(s) => {
+                2u8.hash(state);
+                s.hash(state);
+            }
+            Value::Blob(b) => {
+                3u8.hash(state);
+                b.hash(state);
+            }
+            Value::Boolean(b) => {
+                4u8.hash(state);
+                b.hash(state);
+            }
         }
     }
 }
 
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // NULL < BOOLEAN < INTEGER/REAL (numeric) < TEXT < BLOB
-        match (self, other) {
-            (Value::Null, Value::Null) => Some(Ordering::Equal),
-            (Value::Null, _) => Some(Ordering::Less),
-            (_, Value::Null) => Some(Ordering::Greater),
-
-            (Value::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
-            (Value::Boolean(_), _) => Some(Ordering::Less),
-            (_, Value::Boolean(_)) => Some(Ordering::Greater),
-
-            // Numeric: Integer and Real are comparable
-            (Value::Integer(_) | Value::Real(_), Value::Integer(_) | Value::Real(_)) => {
-                self.numeric_cmp(other)
-            }
-            (Value::Integer(_) | Value::Real(_), _) => Some(Ordering::Less),
-            (_, Value::Integer(_) | Value::Real(_)) => Some(Ordering::Greater),
-
-            (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
-            (Value::Text(_), _) => Some(Ordering::Less),
-            (_, Value::Text(_)) => Some(Ordering::Greater),
-
-            (Value::Blob(a), Value::Blob(b)) => Some(a.cmp(b)),
-        }
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        // NULL < BOOLEAN < INTEGER/REAL (numeric) < TEXT < BLOB
+        match (self, other) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => Ordering::Less,
+            (_, Value::Null) => Ordering::Greater,
+
+            (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
+            (Value::Boolean(_), _) => Ordering::Less,
+            (_, Value::Boolean(_)) => Ordering::Greater,
+
+            // Numeric: Integer and Real are comparable
+            (Value::Integer(_) | Value::Real(_), Value::Integer(_) | Value::Real(_)) => {
+                self.numeric_cmp(other).unwrap_or(Ordering::Equal)
+            }
+            (Value::Integer(_) | Value::Real(_), _) => Ordering::Less,
+            (_, Value::Integer(_) | Value::Real(_)) => Ordering::Greater,
+
+            (Value::Text(a), Value::Text(b)) => a.cmp(b),
+            (Value::Text(_), _) => Ordering::Less,
+            (_, Value::Text(_)) => Ordering::Greater,
+
+            (Value::Blob(a), Value::Blob(b)) => a.cmp(b),
+        }
     }
 }
 
@@ -352,7 +361,11 @@ impl TableSchema {
                 }
                 let unique = data[pos] != 0;
                 pos += 1;
-                idxs.push(IndexDef { name: idx_name, columns: cols, unique });
+                idxs.push(IndexDef {
+                    name: idx_name,
+                    columns: cols,
+                    unique,
+                });
             }
             idxs
         } else {
@@ -371,7 +384,9 @@ impl TableSchema {
     /// Get column index by name (case-insensitive).
     pub fn column_index(&self, name: &str) -> Option<usize> {
         let lower = name.to_ascii_lowercase();
-        self.columns.iter().position(|c| c.name.to_ascii_lowercase() == lower)
+        self.columns
+            .iter()
+            .position(|c| c.name.to_ascii_lowercase() == lower)
     }
 
     /// Get indices of non-PK columns (columns stored in the B+ tree value).
@@ -383,7 +398,10 @@ impl TableSchema {
 
     /// Get the PK column indices as usize.
     pub fn pk_indices(&self) -> Vec<usize> {
-        self.primary_key_columns.iter().map(|&i| i as usize).collect()
+        self.primary_key_columns
+            .iter()
+            .map(|&i| i as usize)
+            .collect()
     }
 
     /// Get index definition by name (case-insensitive).
@@ -441,7 +459,7 @@ mod tests {
     fn value_display() {
         assert_eq!(format!("{}", Value::Null), "NULL");
         assert_eq!(format!("{}", Value::Integer(42)), "42");
-        assert_eq!(format!("{}", Value::Real(3.14)), "3.14");
+        assert_eq!(format!("{}", Value::Real(3.15)), "3.15");
         assert_eq!(format!("{}", Value::Real(1.0)), "1.0");
         assert_eq!(format!("{}", Value::Text("hello".into())), "hello");
         assert_eq!(format!("{}", Value::Blob(vec![0xDE, 0xAD])), "X'DEAD'");
@@ -459,14 +477,8 @@ mod tests {
             Value::Boolean(true).coerce_to(DataType::Integer),
             Some(Value::Integer(1))
         );
-        assert_eq!(
-            Value::Null.coerce_to(DataType::Integer),
-            Some(Value::Null)
-        );
-        assert_eq!(
-            Value::Text("x".into()).coerce_to(DataType::Integer),
-            None
-        );
+        assert_eq!(Value::Null.coerce_to(DataType::Integer), Some(Value::Null));
+        assert_eq!(Value::Text("x".into()).coerce_to(DataType::Integer), None);
     }
 
     #[test]
@@ -474,9 +486,24 @@ mod tests {
         let schema = TableSchema {
             name: "users".into(),
             columns: vec![
-                ColumnDef { name: "id".into(), data_type: DataType::Integer, nullable: false, position: 0 },
-                ColumnDef { name: "name".into(), data_type: DataType::Text, nullable: true, position: 1 },
-                ColumnDef { name: "active".into(), data_type: DataType::Boolean, nullable: false, position: 2 },
+                ColumnDef {
+                    name: "id".into(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "name".into(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    position: 1,
+                },
+                ColumnDef {
+                    name: "active".into(),
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                    position: 2,
+                },
             ],
             primary_key_columns: vec![0],
             indices: vec![],
@@ -503,14 +530,37 @@ mod tests {
         let schema = TableSchema {
             name: "orders".into(),
             columns: vec![
-                ColumnDef { name: "id".into(), data_type: DataType::Integer, nullable: false, position: 0 },
-                ColumnDef { name: "customer".into(), data_type: DataType::Text, nullable: false, position: 1 },
-                ColumnDef { name: "amount".into(), data_type: DataType::Real, nullable: true, position: 2 },
+                ColumnDef {
+                    name: "id".into(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "customer".into(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    position: 1,
+                },
+                ColumnDef {
+                    name: "amount".into(),
+                    data_type: DataType::Real,
+                    nullable: true,
+                    position: 2,
+                },
             ],
             primary_key_columns: vec![0],
             indices: vec![
-                IndexDef { name: "idx_customer".into(), columns: vec![1], unique: false },
-                IndexDef { name: "idx_amount_uniq".into(), columns: vec![2], unique: true },
+                IndexDef {
+                    name: "idx_customer".into(),
+                    columns: vec![1],
+                    unique: false,
+                },
+                IndexDef {
+                    name: "idx_amount_uniq".into(),
+                    columns: vec![2],
+                    unique: true,
+                },
             ],
         };
 
@@ -530,9 +580,12 @@ mod tests {
     fn schema_v1_backward_compat() {
         let old_schema = TableSchema {
             name: "test".into(),
-            columns: vec![
-                ColumnDef { name: "id".into(), data_type: DataType::Integer, nullable: false, position: 0 },
-            ],
+            columns: vec![ColumnDef {
+                name: "id".into(),
+                data_type: DataType::Integer,
+                nullable: false,
+                position: 0,
+            }],
             primary_key_columns: vec![0],
             indices: vec![],
         };

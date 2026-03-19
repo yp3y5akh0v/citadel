@@ -17,32 +17,136 @@ struct DotCommand {
 }
 
 const DOT_COMMANDS: &[DotCommand] = &[
-    DotCommand { name: ".help", args: "[CMD]", description: "Show help for dot-commands" },
-    DotCommand { name: ".quit", args: "", description: "Exit the shell" },
-    DotCommand { name: ".exit", args: "", description: "Exit the shell" },
-    DotCommand { name: ".tables", args: "", description: "List all tables" },
-    DotCommand { name: ".schema", args: "[TABLE]", description: "Show CREATE TABLE statement" },
-    DotCommand { name: ".indexes", args: "[TABLE]", description: "Show indexes" },
-    DotCommand { name: ".mode", args: "MODE", description: "Set output mode (box/table/csv/json/line)" },
-    DotCommand { name: ".headers", args: "on|off", description: "Toggle column headers" },
-    DotCommand { name: ".nullvalue", args: "STRING", description: "Set NULL display string" },
-    DotCommand { name: ".timer", args: "on|off", description: "Toggle query timing" },
-    DotCommand { name: ".changes", args: "on|off", description: "Toggle 'N row(s) affected' display" },
-    DotCommand { name: ".stats", args: "", description: "Show database statistics" },
-    DotCommand { name: ".backup", args: "PATH", description: "Create a hot backup" },
-    DotCommand { name: ".compact", args: "PATH", description: "Compact database to a new file" },
-    DotCommand { name: ".verify", args: "", description: "Run integrity check" },
-    DotCommand { name: ".audit", args: "[verify]", description: "Show or verify audit log" },
-    DotCommand { name: ".rekey", args: "", description: "Change database passphrase" },
-    DotCommand { name: ".dump", args: "[TABLE]", description: "Dump CREATE + INSERT statements" },
-    DotCommand { name: ".read", args: "FILE", description: "Execute SQL from a file" },
-    DotCommand { name: ".open", args: "PATH", description: "Open a different database" },
-    DotCommand { name: ".output", args: "[FILE]", description: "Redirect output to file (no arg = stdout)" },
-    DotCommand { name: ".width", args: "N...", description: "Set column widths for box/table mode" },
-    DotCommand { name: ".sync", args: "HOST:PORT KEY", description: "Push tables to a remote peer" },
-    DotCommand { name: ".listen", args: "[PORT] KEY", description: "Listen for one incoming sync" },
-    DotCommand { name: ".keygen", args: "", description: "Generate a sync key" },
-    DotCommand { name: ".nodeid", args: "", description: "Show this database's node ID" },
+    DotCommand {
+        name: ".help",
+        args: "[CMD]",
+        description: "Show help for dot-commands",
+    },
+    DotCommand {
+        name: ".quit",
+        args: "",
+        description: "Exit the shell",
+    },
+    DotCommand {
+        name: ".exit",
+        args: "",
+        description: "Exit the shell",
+    },
+    DotCommand {
+        name: ".tables",
+        args: "",
+        description: "List all tables",
+    },
+    DotCommand {
+        name: ".schema",
+        args: "[TABLE]",
+        description: "Show CREATE TABLE statement",
+    },
+    DotCommand {
+        name: ".indexes",
+        args: "[TABLE]",
+        description: "Show indexes",
+    },
+    DotCommand {
+        name: ".mode",
+        args: "MODE",
+        description: "Set output mode (box/table/csv/json/line)",
+    },
+    DotCommand {
+        name: ".headers",
+        args: "on|off",
+        description: "Toggle column headers",
+    },
+    DotCommand {
+        name: ".nullvalue",
+        args: "STRING",
+        description: "Set NULL display string",
+    },
+    DotCommand {
+        name: ".timer",
+        args: "on|off",
+        description: "Toggle query timing",
+    },
+    DotCommand {
+        name: ".changes",
+        args: "on|off",
+        description: "Toggle 'N row(s) affected' display",
+    },
+    DotCommand {
+        name: ".stats",
+        args: "",
+        description: "Show database statistics",
+    },
+    DotCommand {
+        name: ".backup",
+        args: "PATH",
+        description: "Create a hot backup",
+    },
+    DotCommand {
+        name: ".compact",
+        args: "PATH",
+        description: "Compact database to a new file",
+    },
+    DotCommand {
+        name: ".verify",
+        args: "",
+        description: "Run integrity check",
+    },
+    DotCommand {
+        name: ".audit",
+        args: "[verify]",
+        description: "Show or verify audit log",
+    },
+    DotCommand {
+        name: ".rekey",
+        args: "",
+        description: "Change database passphrase",
+    },
+    DotCommand {
+        name: ".dump",
+        args: "[TABLE]",
+        description: "Dump CREATE + INSERT statements",
+    },
+    DotCommand {
+        name: ".read",
+        args: "FILE",
+        description: "Execute SQL from a file",
+    },
+    DotCommand {
+        name: ".open",
+        args: "PATH",
+        description: "Open a different database",
+    },
+    DotCommand {
+        name: ".output",
+        args: "[FILE]",
+        description: "Redirect output to file (no arg = stdout)",
+    },
+    DotCommand {
+        name: ".width",
+        args: "N...",
+        description: "Set column widths for box/table mode",
+    },
+    DotCommand {
+        name: ".sync",
+        args: "HOST:PORT KEY",
+        description: "Push tables to a remote peer",
+    },
+    DotCommand {
+        name: ".listen",
+        args: "[PORT] KEY",
+        description: "Listen for one incoming sync",
+    },
+    DotCommand {
+        name: ".keygen",
+        args: "",
+        description: "Generate a sync key",
+    },
+    DotCommand {
+        name: ".nodeid",
+        args: "",
+        description: "Show this database's node ID",
+    },
 ];
 
 pub enum Action {
@@ -59,7 +163,10 @@ pub fn execute_dot_command(
     out: &mut dyn Write,
 ) -> Action {
     let parts: Vec<&str> = input.split_whitespace().collect();
-    let cmd = parts.first().map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+    let cmd = parts
+        .first()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
     let args: Vec<&str> = parts[1..].to_vec();
 
     match cmd.as_str() {
@@ -168,7 +275,10 @@ pub fn execute_dot_command(
             Action::Continue
         }
         _ => {
-            let _ = writeln!(out, "Unknown command: {cmd}. Use .help for available commands.");
+            let _ = writeln!(
+                out,
+                "Unknown command: {cmd}. Use .help for available commands."
+            );
             Action::Continue
         }
     }
@@ -275,7 +385,10 @@ fn cmd_mode(args: &[&str], settings: &mut Settings, out: &mut dyn Write) {
         if let Some(mode) = OutputMode::from_str_opt(mode_str) {
             settings.mode = mode;
         } else {
-            let _ = writeln!(out, "Unknown mode: {mode_str}. Use: box, table, csv, json, line");
+            let _ = writeln!(
+                out,
+                "Unknown mode: {mode_str}. Use: box, table, csv, json, line"
+            );
         }
     } else {
         let _ = writeln!(out, "Current mode: {}", settings.mode);
@@ -588,7 +701,7 @@ pub fn dump_data(
             match conn.query(&sql) {
                 Ok(qr) => {
                     for row in &qr.rows {
-                        let values: Vec<String> = row.iter().map(|v| sql_literal(v)).collect();
+                        let values: Vec<String> = row.iter().map(sql_literal).collect();
                         let _ = writeln!(
                             out,
                             "INSERT INTO {} ({}) VALUES ({});",
@@ -880,7 +993,10 @@ pub fn execute_dot_command_mut(
     out: &mut dyn Write,
 ) -> Action {
     let parts: Vec<&str> = input.split_whitespace().collect();
-    let cmd = parts.first().map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+    let cmd = parts
+        .first()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
 
     match cmd.as_str() {
         ".dump" => {

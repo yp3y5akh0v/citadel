@@ -296,11 +296,8 @@ fn insert_delete_half_verify_remaining() {
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..500u32 {
-            wtx.insert(
-                format!("k{i:04}").as_bytes(),
-                format!("v{i:04}").as_bytes(),
-            )
-            .unwrap();
+            wtx.insert(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -446,11 +443,7 @@ fn named_tables_reference() {
         .unwrap();
 
         let expected: Vec<_> = exp.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        assert_eq!(
-            actual.len(),
-            expected.len(),
-            "table {table} count mismatch"
-        );
+        assert_eq!(actual.len(), expected.len(), "table {table} count mismatch");
         for (a, e) in actual.iter().zip(expected.iter()) {
             assert_eq!(a, e, "table {table} data mismatch");
         }
@@ -465,8 +458,12 @@ fn create_drop_recreate_30_tables() {
         let mut wtx = db.begin_write().unwrap();
         for t in 0..30u32 {
             wtx.create_table(format!("t{t:03}").as_bytes()).unwrap();
-            wtx.table_insert(format!("t{t:03}").as_bytes(), b"k", format!("v{t}").as_bytes())
-                .unwrap();
+            wtx.table_insert(
+                format!("t{t:03}").as_bytes(),
+                b"k",
+                format!("v{t}").as_bytes(),
+            )
+            .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -509,11 +506,8 @@ fn concurrent_readers_threaded() {
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..1000u32 {
-            wtx.insert(
-                format!("k{i:05}").as_bytes(),
-                format!("v{i:05}").as_bytes(),
-            )
-            .unwrap();
+            wtx.insert(format!("k{i:05}").as_bytes(), format!("v{i:05}").as_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -772,11 +766,8 @@ fn integrity_small_cache_after_churn() {
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..300u32 {
-            wtx.insert(
-                format!("k{i:04}").as_bytes(),
-                format!("v{i:04}").as_bytes(),
-            )
-            .unwrap();
+            wtx.insert(format!("k{i:04}").as_bytes(), format!("v{i:04}").as_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -810,8 +801,7 @@ fn large_values_near_overflow_threshold() {
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..100u32 {
-            wtx.insert(format!("k{i:04}").as_bytes(), &big_val)
-                .unwrap();
+            wtx.insert(format!("k{i:04}").as_bytes(), &big_val).unwrap();
         }
         wtx.commit().unwrap();
     }

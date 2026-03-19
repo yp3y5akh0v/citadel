@@ -134,10 +134,7 @@ fn multiple_transactions() {
     let mut rtx = db.begin_read();
     assert_eq!(rtx.get(b"key-0000").unwrap(), Some(b"updated".to_vec()));
     assert_eq!(rtx.get(b"key-0050").unwrap(), None);
-    assert_eq!(
-        rtx.get(b"key-0001").unwrap(),
-        Some(b"val-0001".to_vec())
-    );
+    assert_eq!(rtx.get(b"key-0001").unwrap(), Some(b"val-0001".to_vec()));
 }
 
 #[test]

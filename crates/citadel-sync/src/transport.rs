@@ -55,12 +55,12 @@ pub struct RemoteTreeReader<'a> {
 }
 
 impl<'a> RemoteTreeReader<'a> {
-    pub fn new(
-        transport: &'a dyn SyncTransport,
-        root_page: PageId,
-        root_hash: MerkleHash,
-    ) -> Self {
-        Self { transport, root_page, root_hash }
+    pub fn new(transport: &'a dyn SyncTransport, root_page: PageId, root_hash: MerkleHash) -> Self {
+        Self {
+            transport,
+            root_page,
+            root_hash,
+        }
     }
 }
 
@@ -70,25 +70,21 @@ impl TreeReader for RemoteTreeReader<'_> {
     }
 
     fn page_digest(&self, page_id: PageId) -> citadel_core::Result<PageDigest> {
-        self.transport.send(&SyncMessage::DigestRequest {
-            page_ids: vec![page_id],
-        }).map_err(sync_to_core)?;
+        self.transport
+            .send(&SyncMessage::DigestRequest {
+                page_ids: vec![page_id],
+            })
+            .map_err(sync_to_core)?;
 
         match self.transport.recv().map_err(sync_to_core)? {
             SyncMessage::DigestResponse { mut digests } if !digests.is_empty() => {
                 Ok(digests.remove(0))
             }
-            SyncMessage::DigestResponse { .. } => {
-                Err(citadel_core::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "empty digest response",
-                )))
-            }
+            SyncMessage::DigestResponse { .. } => Err(citadel_core::Error::Io(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "empty digest response"),
+            )),
             SyncMessage::Error { message } => {
-                Err(citadel_core::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    message,
-                )))
+                Err(citadel_core::Error::Io(std::io::Error::other(message)))
             }
             other => Err(citadel_core::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -98,17 +94,16 @@ impl TreeReader for RemoteTreeReader<'_> {
     }
 
     fn leaf_entries(&self, page_id: PageId) -> citadel_core::Result<Vec<DiffEntry>> {
-        self.transport.send(&SyncMessage::EntriesRequest {
-            page_ids: vec![page_id],
-        }).map_err(sync_to_core)?;
+        self.transport
+            .send(&SyncMessage::EntriesRequest {
+                page_ids: vec![page_id],
+            })
+            .map_err(sync_to_core)?;
 
         match self.transport.recv().map_err(sync_to_core)? {
             SyncMessage::EntriesResponse { entries } => Ok(entries),
             SyncMessage::Error { message } => {
-                Err(citadel_core::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    message,
-                )))
+                Err(citadel_core::Error::Io(std::io::Error::other(message)))
             }
             other => Err(citadel_core::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -119,7 +114,7 @@ impl TreeReader for RemoteTreeReader<'_> {
 }
 
 fn sync_to_core(e: SyncError) -> citadel_core::Error {
-    citadel_core::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    citadel_core::Error::Io(std::io::Error::other(e.to_string()))
 }
 
 pub(crate) fn msg_name(msg: &SyncMessage) -> &'static str {

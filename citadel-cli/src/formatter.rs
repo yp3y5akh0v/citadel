@@ -65,7 +65,10 @@ pub fn format_query(qr: &QueryResult, settings: &Settings) -> String {
 
     let count = qr.rows.len();
     if matches!(settings.mode, OutputMode::Box | OutputMode::Table) {
-        format!("{result}\n({count} row{})", if count == 1 { "" } else { "s" })
+        format!(
+            "{result}\n({count} row{})",
+            if count == 1 { "" } else { "s" }
+        )
     } else {
         result
     }
@@ -102,7 +105,7 @@ fn apply_column_widths(table: &mut comfy_table::Table, settings: &Settings) {
 }
 
 fn format_box(qr: &QueryResult, settings: &Settings) -> String {
-    use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
+    use comfy_table::{presets::UTF8_FULL, ContentArrangement, Table};
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
@@ -125,7 +128,7 @@ fn format_box(qr: &QueryResult, settings: &Settings) -> String {
 }
 
 fn format_table(qr: &QueryResult, settings: &Settings) -> String {
-    use comfy_table::{ContentArrangement, Table, presets::ASCII_FULL};
+    use comfy_table::{presets::ASCII_FULL, ContentArrangement, Table};
 
     let mut table = Table::new();
     table.load_preset(ASCII_FULL);
@@ -186,11 +189,7 @@ fn format_json(qr: &QueryResult, settings: &Settings) -> String {
     for row in &qr.rows {
         let mut obj = serde_json::Map::new();
         for (i, val) in row.iter().enumerate() {
-            let col_name = qr
-                .columns
-                .get(i)
-                .map(|s| s.as_str())
-                .unwrap_or("?");
+            let col_name = qr.columns.get(i).map(|s| s.as_str()).unwrap_or("?");
             let json_val = value_to_json(val, settings);
             obj.insert(col_name.to_string(), json_val);
         }
@@ -204,11 +203,9 @@ fn value_to_json(v: &Value, _settings: &Settings) -> serde_json::Value {
     match v {
         Value::Null => serde_json::Value::Null,
         Value::Integer(n) => serde_json::Value::Number((*n).into()),
-        Value::Real(r) => {
-            serde_json::Number::from_f64(*r)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }
+        Value::Real(r) => serde_json::Number::from_f64(*r)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         Value::Text(s) => serde_json::Value::String(s.clone()),
         Value::Boolean(b) => serde_json::Value::Bool(*b),
         Value::Blob(b) => {
@@ -235,7 +232,11 @@ fn format_line(qr: &QueryResult, settings: &Settings) -> String {
         for (j, val) in row.iter().enumerate() {
             let col = qr.columns.get(j).map(|s| s.as_str()).unwrap_or("?");
             let val_str = value_to_string(val, settings);
-            out.push_str(&format!("{:>width$} = {val_str}\n", col, width = max_col_len));
+            out.push_str(&format!(
+                "{:>width$} = {val_str}\n",
+                col,
+                width = max_col_len
+            ));
         }
     }
 

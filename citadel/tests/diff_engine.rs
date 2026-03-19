@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
-use citadel_sync::{LocalTreeReader, TreeReader, merkle_diff};
+use citadel_sync::{merkle_diff, LocalTreeReader, TreeReader};
 
 fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
     DatabaseBuilder::new(path)
@@ -47,7 +47,8 @@ fn identical_dbs_empty_diff() {
     for db in [&db1, &db2] {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..50u32 {
-            wtx.insert(&i.to_be_bytes(), &(i * 3).to_le_bytes()).unwrap();
+            wtx.insert(&i.to_be_bytes(), &(i * 3).to_le_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -88,7 +89,10 @@ fn single_insert_detected() {
     let result = diff(&db1, &db2);
     assert!(!result.is_empty());
 
-    let has_new = result.entries.iter().any(|e| e.key == b"new-key" && e.value == b"new-value");
+    let has_new = result
+        .entries
+        .iter()
+        .any(|e| e.key == b"new-key" && e.value == b"new-value");
     assert!(has_new);
 
     apply(&db2, &result);
@@ -179,7 +183,10 @@ fn large_dataset_skips_matching_subtrees() {
         "should skip matching subtrees: got {} entries out of 500",
         result.len()
     );
-    assert!(result.subtrees_skipped > 0, "must skip at least one subtree");
+    assert!(
+        result.subtrees_skipped > 0,
+        "must skip at least one subtree"
+    );
     assert!(result.entries.iter().any(|e| e.key == 42u32.to_be_bytes()));
 }
 
@@ -293,7 +300,8 @@ fn incremental_diff_3_rounds() {
     for round in 0..3u32 {
         let mut wtx = db1.begin_write().unwrap();
         let key = (200 + round).to_be_bytes();
-        wtx.insert(&key, &format!("round-{round}").into_bytes()).unwrap();
+        wtx.insert(&key, &format!("round-{round}").into_bytes())
+            .unwrap();
         wtx.commit().unwrap();
 
         let result = diff(&db1, &db2);
@@ -352,7 +360,8 @@ fn large_values_diff() {
     }
 
     let mut wtx = db1.begin_write().unwrap();
-    wtx.insert(&10u32.to_be_bytes(), &vec![0xBB_u8; 512]).unwrap();
+    wtx.insert(&10u32.to_be_bytes(), &vec![0xBB_u8; 512])
+        .unwrap();
     wtx.commit().unwrap();
 
     let result = diff(&db1, &db2);

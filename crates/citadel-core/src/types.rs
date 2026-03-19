@@ -240,7 +240,10 @@ mod tests {
     #[test]
     fn kdf_algorithm_roundtrip() {
         assert_eq!(KdfAlgorithm::from_u8(0), Some(KdfAlgorithm::Argon2id));
-        assert_eq!(KdfAlgorithm::from_u8(1), Some(KdfAlgorithm::Pbkdf2HmacSha256));
+        assert_eq!(
+            KdfAlgorithm::from_u8(1),
+            Some(KdfAlgorithm::Pbkdf2HmacSha256)
+        );
         assert_eq!(KdfAlgorithm::from_u8(2), None);
     }
 

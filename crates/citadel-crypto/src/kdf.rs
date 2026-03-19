@@ -2,8 +2,8 @@ use hmac::Hmac;
 use sha2::Sha256;
 use zeroize::Zeroize;
 
-use citadel_core::{Argon2Profile, KEY_SIZE, ARGON2_SALT_SIZE, PBKDF2_MIN_ITERATIONS};
 use citadel_core::types::KdfAlgorithm;
+use citadel_core::{Argon2Profile, ARGON2_SALT_SIZE, KEY_SIZE, PBKDF2_MIN_ITERATIONS};
 
 /// Derive a Master Key from a passphrase using Argon2id.
 pub fn derive_mk_argon2id(
@@ -19,7 +19,8 @@ pub fn derive_mk_argon2id(
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
     let mut mk = [0u8; KEY_SIZE];
-    argon2.hash_password_into(passphrase, salt, &mut mk)
+    argon2
+        .hash_password_into(passphrase, salt, &mut mk)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
 
     Ok(mk)
@@ -31,7 +32,13 @@ pub fn derive_mk_with_profile(
     salt: &[u8; ARGON2_SALT_SIZE],
     profile: Argon2Profile,
 ) -> citadel_core::Result<[u8; KEY_SIZE]> {
-    derive_mk_argon2id(passphrase, salt, profile.m_cost(), profile.t_cost(), profile.p_cost())
+    derive_mk_argon2id(
+        passphrase,
+        salt,
+        profile.m_cost(),
+        profile.t_cost(),
+        profile.p_cost(),
+    )
 }
 
 /// Derive a Master Key using PBKDF2-HMAC-SHA256 (FIPS 140-3 approved).
@@ -68,7 +75,9 @@ pub fn derive_mk(
     kdf_param3: u32,
 ) -> citadel_core::Result<[u8; KEY_SIZE]> {
     match algorithm {
-        KdfAlgorithm::Argon2id => derive_mk_argon2id(passphrase, salt, kdf_param1, kdf_param2, kdf_param3),
+        KdfAlgorithm::Argon2id => {
+            derive_mk_argon2id(passphrase, salt, kdf_param1, kdf_param2, kdf_param3)
+        }
         KdfAlgorithm::Pbkdf2HmacSha256 => derive_mk_pbkdf2(passphrase, salt, kdf_param1),
     }
 }
@@ -189,14 +198,20 @@ mod tests {
         let salt = [0x42u8; ARGON2_SALT_SIZE];
 
         let mk_direct = derive_mk_argon2id(passphrase, &salt, 64, 1, 1).unwrap();
-        let mk_via_dispatch = derive_mk(KdfAlgorithm::Argon2id, passphrase, &salt, 64, 1, 1).unwrap();
+        let mk_via_dispatch =
+            derive_mk(KdfAlgorithm::Argon2id, passphrase, &salt, 64, 1, 1).unwrap();
         assert_eq!(mk_direct, mk_via_dispatch);
 
         let mk_pbkdf2_direct = derive_mk_pbkdf2(passphrase, &salt, PBKDF2_MIN_ITERATIONS).unwrap();
         let mk_pbkdf2_dispatch = derive_mk(
-            KdfAlgorithm::Pbkdf2HmacSha256, passphrase, &salt,
-            PBKDF2_MIN_ITERATIONS, 0, 0,
-        ).unwrap();
+            KdfAlgorithm::Pbkdf2HmacSha256,
+            passphrase,
+            &salt,
+            PBKDF2_MIN_ITERATIONS,
+            0,
+            0,
+        )
+        .unwrap();
         assert_eq!(mk_pbkdf2_direct, mk_pbkdf2_dispatch);
     }
 

@@ -3,8 +3,8 @@ use std::thread;
 
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
 use citadel_sync::{
-    CrdtMeta, EntryKind, HlcTimestamp, MemoryTransport, NodeId, SyncConfig, SyncDirection,
-    SyncOutcome, SyncSession, decode_lww_value, encode_lww_value,
+    decode_lww_value, encode_lww_value, CrdtMeta, EntryKind, HlcTimestamp, MemoryTransport, NodeId,
+    SyncConfig, SyncDirection, SyncOutcome, SyncSession,
 };
 
 const NS: i64 = 1_000_000_000;
@@ -36,7 +36,10 @@ fn insert_range(db: &Database, start: u32, end: u32) {
 }
 
 fn meta(secs: i64, logical: i32, node: u64) -> CrdtMeta {
-    CrdtMeta::new(HlcTimestamp::new(secs * NS, logical), NodeId::from_u64(node))
+    CrdtMeta::new(
+        HlcTimestamp::new(secs * NS, logical),
+        NodeId::from_u64(node),
+    )
 }
 
 fn sync_session(

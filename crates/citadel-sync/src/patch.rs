@@ -186,11 +186,10 @@ impl SyncPatch {
             }
 
             let key_len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
-            let value_len =
-                u32::from_le_bytes(data[pos + 2..pos + 6].try_into().unwrap()) as usize;
+            let value_len = u32::from_le_bytes(data[pos + 2..pos + 6].try_into().unwrap()) as usize;
             let kind_byte = data[pos + 6];
-            let kind = EntryKind::from_u8(kind_byte)
-                .ok_or(PatchError::InvalidEntryKind(kind_byte))?;
+            let kind =
+                EntryKind::from_u8(kind_byte).ok_or(PatchError::InvalidEntryKind(kind_byte))?;
             pos += 7;
 
             let crdt_meta = if crdt_aware {

@@ -1,4 +1,4 @@
-use citadel_core::{PAGE_SIZE, Result};
+use citadel_core::{Result, PAGE_SIZE};
 
 /// Trait for page-level I/O operations.
 ///

@@ -3,11 +3,11 @@
 //! Uses a saved root-to-leaf path stack (no sibling pointers needed).
 //! Supports forward and backward iteration across leaf boundaries.
 
-use std::collections::HashMap;
-use citadel_core::{Error, Result};
 use citadel_core::types::{PageId, PageType, ValueType};
+use citadel_core::{Error, Result};
 use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
+use std::collections::HashMap;
 
 /// A key-value entry returned by the cursor.
 pub struct CursorEntry {
@@ -32,18 +32,13 @@ pub struct Cursor {
 impl Cursor {
     /// Position the cursor at the first key >= `key` (seek).
     /// If `key` is empty, positions at the first entry in the tree.
-    pub fn seek(
-        pages: &HashMap<PageId, Page>,
-        root: PageId,
-        key: &[u8],
-    ) -> Result<Self> {
+    pub fn seek(pages: &HashMap<PageId, Page>, root: PageId, key: &[u8]) -> Result<Self> {
         let mut path = Vec::new();
         let mut current = root;
 
         // Walk to the leaf
         loop {
-            let page = pages.get(&current)
-                .ok_or(Error::PageOutOfBounds(current))?;
+            let page = pages.get(&current).ok_or(Error::PageOutOfBounds(current))?;
             match page.page_type() {
                 Some(PageType::Leaf) => break,
                 Some(PageType::Branch) => {
@@ -65,7 +60,12 @@ impl Cursor {
 
         let valid = cell_idx < page.num_cells();
 
-        let mut cursor = Self { path, leaf: current, cell_idx, valid };
+        let mut cursor = Self {
+            path,
+            leaf: current,
+            cell_idx,
+            valid,
+        };
 
         // If we landed past the end of this leaf, advance to next leaf
         if !valid && page.num_cells() > 0 {
@@ -78,17 +78,13 @@ impl Cursor {
     }
 
     /// Position the cursor at the first entry in the tree.
-    pub fn first(
-        pages: &HashMap<PageId, Page>,
-        root: PageId,
-    ) -> Result<Self> {
+    pub fn first(pages: &HashMap<PageId, Page>, root: PageId) -> Result<Self> {
         let mut path = Vec::new();
         let mut current = root;
 
         // Walk to the leftmost leaf
         loop {
-            let page = pages.get(&current)
-                .ok_or(Error::PageOutOfBounds(current))?;
+            let page = pages.get(&current).ok_or(Error::PageOutOfBounds(current))?;
             match page.page_type() {
                 Some(PageType::Leaf) => break,
                 Some(PageType::Branch) => {
@@ -103,21 +99,22 @@ impl Cursor {
         let page = pages.get(&current).unwrap();
         let valid = page.num_cells() > 0;
 
-        Ok(Self { path, leaf: current, cell_idx: 0, valid })
+        Ok(Self {
+            path,
+            leaf: current,
+            cell_idx: 0,
+            valid,
+        })
     }
 
     /// Position the cursor at the last entry in the tree.
-    pub fn last(
-        pages: &HashMap<PageId, Page>,
-        root: PageId,
-    ) -> Result<Self> {
+    pub fn last(pages: &HashMap<PageId, Page>, root: PageId) -> Result<Self> {
         let mut path = Vec::new();
         let mut current = root;
 
         // Walk to the rightmost leaf
         loop {
-            let page = pages.get(&current)
-                .ok_or(Error::PageOutOfBounds(current))?;
+            let page = pages.get(&current).ok_or(Error::PageOutOfBounds(current))?;
             match page.page_type() {
                 Some(PageType::Leaf) => break,
                 Some(PageType::Branch) => {
@@ -135,7 +132,12 @@ impl Cursor {
         let valid = n > 0;
         let cell_idx = if valid { n - 1 } else { 0 };
 
-        Ok(Self { path, leaf: current, cell_idx, valid })
+        Ok(Self {
+            path,
+            leaf: current,
+            cell_idx,
+            valid,
+        })
     }
 
     /// Whether the cursor is at a valid position.
@@ -163,7 +165,8 @@ impl Cursor {
             return Ok(false);
         }
 
-        let page = pages.get(&self.leaf)
+        let page = pages
+            .get(&self.leaf)
             .ok_or(Error::PageOutOfBounds(self.leaf))?;
 
         if self.cell_idx + 1 < page.num_cells() {
@@ -194,7 +197,8 @@ impl Cursor {
     fn advance_leaf(&mut self, pages: &HashMap<PageId, Page>) -> Result<bool> {
         // Walk up the path to find a parent where we can go right
         while let Some((parent_id, child_idx)) = self.path.pop() {
-            let parent = pages.get(&parent_id)
+            let parent = pages
+                .get(&parent_id)
                 .ok_or(Error::PageOutOfBounds(parent_id))?;
             let n = parent.num_cells() as usize;
 
@@ -207,8 +211,7 @@ impl Cursor {
                 // Walk down to the leftmost leaf of this subtree
                 let mut current = next_child;
                 loop {
-                    let page = pages.get(&current)
-                        .ok_or(Error::PageOutOfBounds(current))?;
+                    let page = pages.get(&current).ok_or(Error::PageOutOfBounds(current))?;
                     match page.page_type() {
                         Some(PageType::Leaf) => {
                             self.leaf = current;
@@ -240,7 +243,8 @@ impl Cursor {
             if child_idx > 0 {
                 // There's a sibling to the left: child_idx - 1
                 let prev_child_idx = child_idx - 1;
-                let parent = pages.get(&parent_id)
+                let parent = pages
+                    .get(&parent_id)
                     .ok_or(Error::PageOutOfBounds(parent_id))?;
                 let prev_child = branch_node::get_child(parent, prev_child_idx);
                 self.path.push((parent_id, prev_child_idx));
@@ -248,8 +252,7 @@ impl Cursor {
                 // Walk down to the rightmost leaf of this subtree
                 let mut current = prev_child;
                 loop {
-                    let page = pages.get(&current)
-                        .ok_or(Error::PageOutOfBounds(current))?;
+                    let page = pages.get(&current).ok_or(Error::PageOutOfBounds(current))?;
                     match page.page_type() {
                         Some(PageType::Leaf) => {
                             self.leaf = current;
@@ -293,7 +296,8 @@ mod tests {
         let mut alloc = PageAllocator::new(0);
         let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
         for k in keys {
-            tree.insert(&mut pages, &mut alloc, TxnId(1), k, ValueType::Inline, *k).unwrap();
+            tree.insert(&mut pages, &mut alloc, TxnId(1), k, ValueType::Inline, k)
+                .unwrap();
         }
         (pages, tree)
     }

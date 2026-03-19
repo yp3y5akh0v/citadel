@@ -5,8 +5,7 @@ fn main() {
     let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_dir = PathBuf::from(&crate_dir);
 
-    let config = cbindgen::Config::from_file(out_dir.join("cbindgen.toml"))
-        .unwrap_or_default();
+    let config = cbindgen::Config::from_file(out_dir.join("cbindgen.toml")).unwrap_or_default();
 
     if let Ok(bindings) = cbindgen::Builder::new()
         .with_crate(&crate_dir)

@@ -81,10 +81,7 @@ pub trait TreeReader {
 /// Returns entries from `source` that are different from or missing in `target`.
 /// Walks both trees in parallel using BFS, skipping entire subtrees when
 /// Merkle hashes match.
-pub fn merkle_diff(
-    source: &dyn TreeReader,
-    target: &dyn TreeReader,
-) -> Result<DiffResult> {
+pub fn merkle_diff(source: &dyn TreeReader, target: &dyn TreeReader) -> Result<DiffResult> {
     let (src_root, src_root_hash) = source.root_info()?;
     let (tgt_root, tgt_root_hash) = target.root_info()?;
 

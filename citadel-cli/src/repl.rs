@@ -42,13 +42,11 @@ pub fn run_interactive(
     init_file: Option<PathBuf>,
     init_cmd: Option<String>,
 ) {
-    let config = Config::builder()
-        .auto_add_history(true)
-        .build();
+    let config = Config::builder().auto_add_history(true).build();
 
     let history_path = history_file_path();
-    let mut rl: Editor<CitadelHelper, DefaultHistory> = Editor::with_config(config)
-        .expect("failed to create editor");
+    let mut rl: Editor<CitadelHelper, DefaultHistory> =
+        Editor::with_config(config).expect("failed to create editor");
 
     if let Some(ref path) = history_path {
         let _ = rl.load_history(path);
@@ -98,13 +96,14 @@ pub fn run_interactive(
                         ) {
                             Action::Quit => break 'outer,
                             Action::Reopen(new_path) => {
-                                let new_pass = match rpassword::prompt_password("Enter passphrase: ") {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        eprintln!("Error: {e}");
-                                        continue;
-                                    }
-                                };
+                                let new_pass =
+                                    match rpassword::prompt_password("Enter passphrase: ") {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            eprintln!("Error: {e}");
+                                            continue;
+                                        }
+                                    };
 
                                 drop(conn);
 
@@ -129,7 +128,9 @@ pub fn run_interactive(
                                                 continue 'outer;
                                             }
                                             Err(e2) => {
-                                                eprintln!("Fatal: cannot reopen original database: {e2}");
+                                                eprintln!(
+                                                    "Fatal: cannot reopen original database: {e2}"
+                                                );
                                                 break 'outer;
                                             }
                                         }
@@ -207,12 +208,7 @@ fn execute_sql(conn: &mut Connection<'_>, _db: &Database, sql: &str, settings: &
     }
 }
 
-fn execute_single(
-    conn: &mut Connection<'_>,
-    db: &Database,
-    input: &str,
-    settings: &mut Settings,
-) {
+fn execute_single(conn: &mut Connection<'_>, db: &Database, input: &str, settings: &mut Settings) {
     let trimmed = input.trim();
     if trimmed.starts_with('.') {
         commands::execute_dot_command_mut(trimmed, db, conn, settings, &mut std::io::stdout());

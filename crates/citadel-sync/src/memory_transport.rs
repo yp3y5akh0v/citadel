@@ -109,7 +109,8 @@ mod tests {
                 node_id: NodeId::from_u64(i),
                 root_page: PageId(0),
                 root_hash: [0u8; MERKLE_HASH_SIZE],
-            }).unwrap();
+            })
+            .unwrap();
         }
         for i in 0..10u64 {
             match b.recv().unwrap() {

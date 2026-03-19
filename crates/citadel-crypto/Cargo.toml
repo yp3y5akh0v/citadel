@@ -12,6 +12,9 @@ categories.workspace = true
 description = "Cryptographic primitives for Citadel: AES-256-CTR + HMAC-SHA256, key management, Argon2id"
 readme = "README.md"
 
+[lib]
+name = "citadel_crypto"
+
 [dependencies]
 citadel-core = { workspace = true }
 aes = { workspace = true }

@@ -169,7 +169,11 @@ fn backup_integrity_check() {
         .open()
         .unwrap();
     let report = backup.integrity_check().unwrap();
-    assert!(report.is_ok(), "backup integrity errors: {:?}", report.errors);
+    assert!(
+        report.is_ok(),
+        "backup integrity errors: {:?}",
+        report.errors
+    );
 }
 
 #[test]

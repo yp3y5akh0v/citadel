@@ -249,13 +249,7 @@ fn compact_then_writable() {
     }
 
     let mut rtx = compacted.begin_read();
-    assert_eq!(
-        rtx.get(b"new_key").unwrap(),
-        Some(b"new_value".to_vec())
-    );
-    assert_eq!(
-        rtx.get(b"k0000").unwrap(),
-        Some(b"original".to_vec())
-    );
+    assert_eq!(rtx.get(b"new_key").unwrap(), Some(b"new_value".to_vec()));
+    assert_eq!(rtx.get(b"k0000").unwrap(), Some(b"original".to_vec()));
     assert_eq!(compacted.stats().entry_count, 201);
 }

@@ -1,9 +1,9 @@
 use std::fs::File;
-use std::io::{Read, Write, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Mutex;
 
-use citadel_core::{PAGE_SIZE, Result};
 use crate::traits::PageIO;
+use citadel_core::{Result, PAGE_SIZE};
 
 /// Synchronous page I/O using standard file operations.
 ///
@@ -83,7 +83,13 @@ mod tests {
     fn read_write_page_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let file = File::options().read(true).write(true).create(true).open(&path).unwrap();
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
         let io = SyncPageIO::new(file);
 
         let mut page = [0u8; PAGE_SIZE];
@@ -101,7 +107,13 @@ mod tests {
     fn read_write_at() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let file = File::options().read(true).write(true).create(true).open(&path).unwrap();
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
         let io = SyncPageIO::new(file);
 
         let header = [0x42u8; 512];
@@ -116,7 +128,13 @@ mod tests {
     fn file_size_and_truncate() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
-        let file = File::options().read(true).write(true).create(true).open(&path).unwrap();
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
         let io = SyncPageIO::new(file);
 
         assert_eq!(io.file_size().unwrap(), 0);

@@ -40,12 +40,20 @@ fn setup_users_table(conn: &mut Connection) {
 }
 
 fn insert_users(conn: &mut Connection) {
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@test.com', 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@test.com', 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@test.com', 30)",
+        )
+        .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@test.com', 25)",
+        )
+        .unwrap(),
+        1,
+    );
     assert_rows_affected(conn.execute(
         "INSERT INTO users (id, name, email, age) VALUES (3, 'Charlie', 'charlie@test.com', 35)"
     ).unwrap(), 1);
@@ -63,7 +71,10 @@ fn create_non_unique_index() {
     setup_users_table(&mut conn);
     insert_users(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -74,7 +85,10 @@ fn create_unique_index() {
     setup_users_table(&mut conn);
     insert_users(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -84,11 +98,18 @@ fn create_index_on_empty_table() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@test.com', 30)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@test.com', 30)",
+        )
+        .unwrap(),
+        1,
+    );
 
     let qr = conn.query("SELECT * FROM users").unwrap();
     assert_eq!(qr.rows.len(), 1);
@@ -102,7 +123,10 @@ fn create_multi_column_index() {
     setup_users_table(&mut conn);
     insert_users(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name_age ON users (name, age)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name_age ON users (name, age)")
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -113,7 +137,10 @@ fn create_unique_multi_column_index() {
     setup_users_table(&mut conn);
     insert_users(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_name_email ON users (name, email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_name_email ON users (name, email)")
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -123,8 +150,14 @@ fn create_index_if_not_exists_on_existing() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
-    assert_ok(conn.execute("CREATE INDEX IF NOT EXISTS idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_name ON users (name)")
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -134,7 +167,10 @@ fn create_index_if_not_exists_new() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX IF NOT EXISTS idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_name ON users (name)")
+            .unwrap(),
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -147,7 +183,9 @@ fn create_index_on_nonexistent_table() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    let err = conn.execute("CREATE INDEX idx_name ON ghost (name)").unwrap_err();
+    let err = conn
+        .execute("CREATE INDEX idx_name ON ghost (name)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::TableNotFound(_)));
 }
 
@@ -158,7 +196,9 @@ fn create_index_on_nonexistent_column() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    let err = conn.execute("CREATE INDEX idx_bad ON users (nonexistent)").unwrap_err();
+    let err = conn
+        .execute("CREATE INDEX idx_bad ON users (nonexistent)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::ColumnNotFound(_)));
 }
 
@@ -169,8 +209,13 @@ fn create_duplicate_index_name() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
-    let err = conn.execute("CREATE INDEX idx_name ON users (name)").unwrap_err();
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
+    let err = conn
+        .execute("CREATE INDEX idx_name ON users (name)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::IndexAlreadyExists(_)));
 }
 
@@ -181,14 +226,24 @@ fn create_unique_index_violates_existing_data() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'same@test.com', 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'same@test.com', 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'same@test.com', 30)",
+        )
+        .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'same@test.com', 25)",
+        )
+        .unwrap(),
+        1,
+    );
 
-    let err = conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap_err();
+    let err = conn
+        .execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -199,14 +254,21 @@ fn create_unique_index_allows_null_duplicates_in_existing_data() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', NULL, 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', NULL, 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', NULL, 30)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', NULL, 25)")
+            .unwrap(),
+        1,
+    );
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -216,8 +278,13 @@ fn create_index_case_insensitive_name() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX IDX_NAME ON users (name)").unwrap());
-    let err = conn.execute("CREATE INDEX idx_name ON users (name)").unwrap_err();
+    assert_ok(
+        conn.execute("CREATE INDEX IDX_NAME ON users (name)")
+            .unwrap(),
+    );
+    let err = conn
+        .execute("CREATE INDEX idx_name ON users (name)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::IndexAlreadyExists(_)));
 }
 
@@ -232,7 +299,10 @@ fn drop_index_basic() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("DROP INDEX idx_name").unwrap());
 }
 
@@ -264,7 +334,10 @@ fn drop_index_if_exists_existing() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("DROP INDEX IF EXISTS idx_name").unwrap());
 }
 
@@ -276,9 +349,15 @@ fn drop_and_recreate_index() {
     setup_users_table(&mut conn);
     insert_users(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("DROP INDEX idx_name").unwrap());
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -288,7 +367,10 @@ fn drop_index_case_insensitive() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("DROP INDEX IDX_NAME").unwrap());
 }
 
@@ -304,13 +386,25 @@ fn drop_table_cascades_indexes() {
     setup_users_table(&mut conn);
     insert_users(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("DROP TABLE users").unwrap());
 
     setup_users_table(&mut conn);
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -320,7 +414,10 @@ fn drop_table_if_exists_with_indexes() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("DROP TABLE IF EXISTS users").unwrap());
     assert_ok(conn.execute("DROP TABLE IF EXISTS users").unwrap());
 }
@@ -336,16 +433,25 @@ fn insert_populates_non_unique_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Alice', 'b@t.com', 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Alice', 'b@t.com', 25)")
+            .unwrap(),
+        1,
+    );
 
-    let qr = conn.query("SELECT * FROM users WHERE name = 'Alice'").unwrap();
+    let qr = conn
+        .query("SELECT * FROM users WHERE name = 'Alice'")
+        .unwrap();
     assert_eq!(qr.rows.len(), 2);
 }
 
@@ -356,14 +462,23 @@ fn insert_populates_unique_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@t.com', 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@t.com', 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@t.com', 30)",
+        )
+        .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@t.com', 25)")
+            .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -373,15 +488,22 @@ fn insert_violates_unique_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'same@t.com', 30)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'same@t.com', 30)",
+        )
+        .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'same@t.com', 25)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'same@t.com', 25)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -392,16 +514,25 @@ fn insert_null_in_unique_index_allowed() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', NULL, 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', NULL, 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', NULL, 30)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', NULL, 25)")
+            .unwrap(),
+        1,
+    );
 
-    let qr = conn.query("SELECT * FROM users WHERE email IS NULL").unwrap();
+    let qr = conn
+        .query("SELECT * FROM users WHERE email IS NULL")
+        .unwrap();
     assert_eq!(qr.rows.len(), 2);
 }
 
@@ -412,12 +543,19 @@ fn insert_multiple_nulls_unique_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     for i in 1..=10 {
-        assert_rows_affected(conn.execute(
-            &format!("INSERT INTO users (id, name, email, age) VALUES ({i}, 'User{i}', NULL, {i})")
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "INSERT INTO users (id, name, email, age) VALUES ({i}, 'User{i}', NULL, {i})"
+            ))
+            .unwrap(),
+            1,
+        );
     }
 
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
@@ -431,8 +569,14 @@ fn insert_with_multiple_indexes_on_same_table() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("CREATE INDEX idx_age ON users (age)").unwrap());
 
     insert_users(&mut conn);
@@ -448,26 +592,35 @@ fn insert_unique_violation_on_multicolumn_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_name_age ON users (name, age)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_name_age ON users (name, age)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)")
+            .unwrap(),
+        1,
+    );
 
     // Different name, same age — OK
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'b@t.com', 30)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'b@t.com', 30)")
+            .unwrap(),
+        1,
+    );
 
     // Same name, different age — OK
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (3, 'Alice', 'c@t.com', 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (3, 'Alice', 'c@t.com', 25)")
+            .unwrap(),
+        1,
+    );
 
     // Same name AND age — VIOLATION
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'Alice', 'd@t.com', 30)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (4, 'Alice', 'd@t.com', 30)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -478,14 +631,21 @@ fn insert_multicolumn_unique_allows_partial_null() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_name_email ON users (name, email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_name_email ON users (name, email)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', NULL, 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Alice', NULL, 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', NULL, 30)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Alice', NULL, 25)")
+            .unwrap(),
+        1,
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -499,14 +659,21 @@ fn delete_removes_index_entries() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
     assert_rows_affected(conn.execute("DELETE FROM users WHERE id = 1").unwrap(), 1);
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+        )
+        .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -516,7 +683,10 @@ fn delete_all_rows_cleans_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
     assert_rows_affected(conn.execute("DELETE FROM users").unwrap(), 3);
@@ -533,18 +703,25 @@ fn delete_with_where_cleans_correct_entries() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
     assert_rows_affected(conn.execute("DELETE FROM users WHERE age < 30").unwrap(), 1);
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'bob@test.com', 40)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'bob@test.com', 40)",
+        )
+        .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (5, 'Eve', 'alice@test.com', 22)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (5, 'Eve', 'alice@test.com', 22)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -555,16 +732,26 @@ fn delete_with_multiple_indexes() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("CREATE INDEX idx_age ON users (age)").unwrap());
 
     insert_users(&mut conn);
     assert_rows_affected(conn.execute("DELETE FROM users WHERE id = 2").unwrap(), 1);
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@test.com', 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@test.com', 25)",
+        )
+        .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -574,11 +761,16 @@ fn delete_null_indexed_value() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', NULL, 30)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', NULL, 30)")
+            .unwrap(),
+        1,
+    );
 
     assert_rows_affected(conn.execute("DELETE FROM users WHERE id = 1").unwrap(), 1);
 
@@ -597,14 +789,23 @@ fn update_non_indexed_column_no_index_change() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
-    assert_rows_affected(conn.execute("UPDATE users SET age = 99 WHERE id = 1").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE users SET age = 99 WHERE id = 1")
+            .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-    ).unwrap_err();
+    let err = conn
+        .execute(
+            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+        )
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -615,20 +816,31 @@ fn update_indexed_column_updates_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET email = 'newalice@test.com' WHERE id = 1"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE users SET email = 'newalice@test.com' WHERE id = 1")
+            .unwrap(),
+        1,
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+        )
+        .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (5, 'Eve', 'newalice@test.com', 22)"
-    ).unwrap_err();
+    let err = conn
+        .execute(
+            "INSERT INTO users (id, name, email, age) VALUES (5, 'Eve', 'newalice@test.com', 22)",
+        )
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -639,12 +851,15 @@ fn update_causes_unique_violation() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
-    let err = conn.execute(
-        "UPDATE users SET email = 'bob@test.com' WHERE id = 1"
-    ).unwrap_err();
+    let err = conn
+        .execute("UPDATE users SET email = 'bob@test.com' WHERE id = 1")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -655,17 +870,28 @@ fn update_pk_column_updates_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
-    assert_rows_affected(conn.execute("UPDATE users SET id = 100 WHERE id = 1").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE users SET id = 100 WHERE id = 1")
+            .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (200, 'Dave', 'alice@test.com', 40)"
-    ).unwrap_err();
+    let err = conn
+        .execute(
+            "INSERT INTO users (id, name, email, age) VALUES (200, 'Dave', 'alice@test.com', 40)",
+        )
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 
-    let qr = conn.query("SELECT id, email FROM users WHERE id = 100").unwrap();
+    let qr = conn
+        .query("SELECT id, email FROM users WHERE id = 100")
+        .unwrap();
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][1], Value::Text("alice@test.com".into()));
 }
@@ -677,16 +903,25 @@ fn update_sets_indexed_column_to_null() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET email = NULL WHERE id = 1"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE users SET email = NULL WHERE id = 1")
+            .unwrap(),
+        1,
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+        )
+        .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -696,23 +931,34 @@ fn update_from_null_to_value_unique_check() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', NULL, 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@test.com', 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', NULL, 30)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@test.com', 25)",
+        )
+        .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "UPDATE users SET email = 'bob@test.com' WHERE id = 1"
-    ).unwrap_err();
+    let err = conn
+        .execute("UPDATE users SET email = 'bob@test.com' WHERE id = 1")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET email = 'alice@test.com' WHERE id = 1"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE users SET email = 'alice@test.com' WHERE id = 1")
+            .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -722,10 +968,16 @@ fn update_multiple_rows_indexed_column() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
-    assert_rows_affected(conn.execute("UPDATE users SET name = 'Everyone'").unwrap(), 3);
+    assert_rows_affected(
+        conn.execute("UPDATE users SET name = 'Everyone'").unwrap(),
+        3,
+    );
 
     let qr = conn.query("SELECT name FROM users").unwrap();
     for row in &qr.rows {
@@ -740,10 +992,15 @@ fn update_multiple_rows_unique_violation() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
-    let err = conn.execute("UPDATE users SET email = 'same@test.com'").unwrap_err();
+    let err = conn
+        .execute("UPDATE users SET email = 'same@test.com'")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -754,19 +1011,33 @@ fn update_with_multiple_indexes() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("CREATE INDEX idx_age ON users (age)").unwrap());
 
     insert_users(&mut conn);
 
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET name = 'Alicia', email = 'alicia@test.com', age = 31 WHERE id = 1"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "UPDATE users SET name = 'Alicia', email = 'alicia@test.com', age = 31 WHERE id = 1",
+        )
+        .unwrap(),
+        1,
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+        )
+        .unwrap(),
+        1,
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -781,20 +1052,29 @@ fn index_persists_across_reopen() {
         let mut conn = Connection::open(&db).unwrap();
         setup_users_table(&mut conn);
         insert_users(&mut conn);
-        assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+        assert_ok(
+            conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+                .unwrap(),
+        );
     }
     {
         let db = open_db(dir.path());
         let mut conn = Connection::open(&db).unwrap();
 
-        let err = conn.execute(
-            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-        ).unwrap_err();
+        let err = conn
+            .execute(
+                "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+            )
+            .unwrap_err();
         assert!(matches!(err, SqlError::UniqueViolation(_)));
 
-        assert_rows_affected(conn.execute(
-            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'dave@test.com', 40)"
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(
+                "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'dave@test.com', 40)",
+            )
+            .unwrap(),
+            1,
+        );
     }
 }
 
@@ -805,7 +1085,10 @@ fn index_data_persists_after_insert_reopen() {
         let db = create_db(dir.path());
         let mut conn = Connection::open(&db).unwrap();
         setup_users_table(&mut conn);
-        assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+        assert_ok(
+            conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+                .unwrap(),
+        );
         insert_users(&mut conn);
     }
     {
@@ -815,9 +1098,11 @@ fn index_data_persists_after_insert_reopen() {
         let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
         assert_eq!(qr.rows[0][0], Value::Integer(3));
 
-        let err = conn.execute(
-            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'bob@test.com', 40)"
-        ).unwrap_err();
+        let err = conn
+            .execute(
+                "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'bob@test.com', 40)",
+            )
+            .unwrap_err();
         assert!(matches!(err, SqlError::UniqueViolation(_)));
     }
 }
@@ -829,8 +1114,14 @@ fn create_index_reopen_then_insert() {
         let db = create_db(dir.path());
         let mut conn = Connection::open(&db).unwrap();
         setup_users_table(&mut conn);
-        assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
-        assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+        assert_ok(
+            conn.execute("CREATE INDEX idx_name ON users (name)")
+                .unwrap(),
+        );
+        assert_ok(
+            conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+                .unwrap(),
+        );
     }
     {
         let db = open_db(dir.path());
@@ -838,9 +1129,11 @@ fn create_index_reopen_then_insert() {
 
         insert_users(&mut conn);
 
-        let err = conn.execute(
-            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-        ).unwrap_err();
+        let err = conn
+            .execute(
+                "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+            )
+            .unwrap_err();
         assert!(matches!(err, SqlError::UniqueViolation(_)));
     }
 }
@@ -853,7 +1146,10 @@ fn create_index_reopen_then_drop_index() {
         let mut conn = Connection::open(&db).unwrap();
         setup_users_table(&mut conn);
         insert_users(&mut conn);
-        assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+        assert_ok(
+            conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+                .unwrap(),
+        );
     }
     {
         let db = open_db(dir.path());
@@ -861,9 +1157,13 @@ fn create_index_reopen_then_drop_index() {
 
         assert_ok(conn.execute("DROP INDEX idx_email").unwrap());
 
-        assert_rows_affected(conn.execute(
-            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(
+                "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+            )
+            .unwrap(),
+            1,
+        );
     }
 }
 
@@ -879,14 +1179,21 @@ fn multiple_reopens_with_index_operations() {
     {
         let db = open_db(dir.path());
         let mut conn = Connection::open(&db).unwrap();
-        assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+        assert_ok(
+            conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+                .unwrap(),
+        );
     }
     {
         let db = open_db(dir.path());
         let mut conn = Connection::open(&db).unwrap();
-        assert_rows_affected(conn.execute(
-            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'dave@test.com', 40)"
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(
+                "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'dave@test.com', 40)",
+            )
+            .unwrap(),
+            1,
+        );
     }
     {
         let db = open_db(dir.path());
@@ -894,9 +1201,11 @@ fn multiple_reopens_with_index_operations() {
         let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
         assert_eq!(qr.rows[0][0], Value::Integer(4));
 
-        let err = conn.execute(
-            "INSERT INTO users (id, name, email, age) VALUES (5, 'Eve', 'dave@test.com', 22)"
-        ).unwrap_err();
+        let err = conn
+            .execute(
+                "INSERT INTO users (id, name, email, age) VALUES (5, 'Eve', 'dave@test.com', 22)",
+            )
+            .unwrap_err();
         assert!(matches!(err, SqlError::UniqueViolation(_)));
     }
 }
@@ -914,12 +1223,17 @@ fn create_index_in_transaction_commit() {
     insert_users(&mut conn);
 
     conn.execute("BEGIN").unwrap();
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     conn.execute("COMMIT").unwrap();
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-    ).unwrap_err();
+    let err = conn
+        .execute(
+            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+        )
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -932,10 +1246,16 @@ fn create_index_in_transaction_rollback() {
     insert_users(&mut conn);
 
     conn.execute("BEGIN").unwrap();
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
     conn.execute("ROLLBACK").unwrap();
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -946,15 +1266,20 @@ fn drop_index_in_transaction_rollback() {
     setup_users_table(&mut conn);
     insert_users(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     conn.execute("BEGIN").unwrap();
     assert_ok(conn.execute("DROP INDEX idx_email").unwrap());
     conn.execute("ROLLBACK").unwrap();
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-    ).unwrap_err();
+    let err = conn
+        .execute(
+            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+        )
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -965,17 +1290,28 @@ fn insert_with_index_in_transaction_rollback() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@t.com', 30)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@t.com', 30)",
+        )
+        .unwrap(),
+        1,
+    );
     conn.execute("ROLLBACK").unwrap();
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@t.com', 30)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@t.com', 30)",
+        )
+        .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -985,18 +1321,27 @@ fn update_with_index_in_transaction_commit() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET email = 'newalice@test.com' WHERE id = 1"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE users SET email = 'newalice@test.com' WHERE id = 1")
+            .unwrap(),
+        1,
+    );
     conn.execute("COMMIT").unwrap();
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+        )
+        .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -1006,16 +1351,23 @@ fn delete_with_index_in_transaction_commit() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
     conn.execute("BEGIN").unwrap();
     assert_rows_affected(conn.execute("DELETE FROM users WHERE id = 1").unwrap(), 1);
     conn.execute("COMMIT").unwrap();
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+        )
+        .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -1026,13 +1378,22 @@ fn mixed_ddl_dml_in_transaction() {
     setup_users_table(&mut conn);
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@t.com', 30)"
-    ).unwrap(), 1);
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@t.com', 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@t.com', 30)",
+        )
+        .unwrap(),
+        1,
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@t.com', 25)")
+            .unwrap(),
+        1,
+    );
     conn.execute("COMMIT").unwrap();
 
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
@@ -1047,14 +1408,19 @@ fn create_index_then_unique_violation_in_txn() {
     setup_users_table(&mut conn);
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)"
-    ).unwrap(), 1);
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)")
+            .unwrap(),
+        1,
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'a@t.com', 25)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'a@t.com', 25)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -1070,16 +1436,28 @@ fn drop_table_cascade_in_transaction_commit() {
     setup_users_table(&mut conn);
     insert_users(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     conn.execute("BEGIN").unwrap();
     assert_ok(conn.execute("DROP TABLE users").unwrap());
     conn.execute("COMMIT").unwrap();
 
     setup_users_table(&mut conn);
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -1090,7 +1468,10 @@ fn drop_table_cascade_in_transaction_rollback() {
     setup_users_table(&mut conn);
     insert_users(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     conn.execute("BEGIN").unwrap();
     assert_ok(conn.execute("DROP TABLE users").unwrap());
@@ -1099,9 +1480,11 @@ fn drop_table_cascade_in_transaction_rollback() {
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(3));
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-    ).unwrap_err();
+    let err = conn
+        .execute(
+            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+        )
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -1116,12 +1499,15 @@ fn index_on_integer_column() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_age ON users (age)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_age ON users (age)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'd@t.com', 30)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'd@t.com', 30)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -1131,23 +1517,37 @@ fn index_on_boolean_column() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE flags (id INTEGER NOT NULL PRIMARY KEY, active BOOLEAN NOT NULL)"
-    ).unwrap());
+    assert_ok(
+        conn.execute(
+            "CREATE TABLE flags (id INTEGER NOT NULL PRIMARY KEY, active BOOLEAN NOT NULL)",
+        )
+        .unwrap(),
+    );
 
-    assert_ok(conn.execute("CREATE INDEX idx_active ON flags (active)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_active ON flags (active)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO flags (id, active) VALUES (1, TRUE)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO flags (id, active) VALUES (2, FALSE)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO flags (id, active) VALUES (3, TRUE)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO flags (id, active) VALUES (1, TRUE)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO flags (id, active) VALUES (2, FALSE)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO flags (id, active) VALUES (3, TRUE)")
+            .unwrap(),
+        1,
+    );
 
-    let qr = conn.query("SELECT COUNT(*) FROM flags WHERE active = TRUE").unwrap();
+    let qr = conn
+        .query("SELECT COUNT(*) FROM flags WHERE active = TRUE")
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(2));
 }
 
@@ -1157,22 +1557,30 @@ fn index_on_real_column() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE measurements (id INTEGER NOT NULL PRIMARY KEY, value REAL)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE measurements (id INTEGER NOT NULL PRIMARY KEY, value REAL)")
+            .unwrap(),
+    );
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_value ON measurements (value)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_value ON measurements (value)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO measurements (id, value) VALUES (1, 3.14)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO measurements (id, value) VALUES (2, 2.71)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO measurements (id, value) VALUES (1, 3.14)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO measurements (id, value) VALUES (2, 2.71)")
+            .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO measurements (id, value) VALUES (3, 3.14)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO measurements (id, value) VALUES (3, 3.14)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -1183,15 +1591,20 @@ fn index_on_text_column() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)")
+            .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Alice', 'b@t.com', 25)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Alice', 'b@t.com', 25)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -1202,29 +1615,42 @@ fn index_on_nullable_text_with_mixed_values() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'A', 'a@t.com', 20)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'B', NULL, 25)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (3, 'C', 'c@t.com', 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'D', NULL, 35)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'A', 'a@t.com', 20)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'B', NULL, 25)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (3, 'C', 'c@t.com', 30)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (4, 'D', NULL, 35)")
+            .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (5, 'E', 'a@t.com', 40)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (5, 'E', 'a@t.com', 40)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (5, 'E', NULL, 40)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (5, 'E', NULL, 40)")
+            .unwrap(),
+        1,
+    );
 
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(5));
@@ -1237,15 +1663,20 @@ fn index_on_empty_string() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, '', 'a@t.com', 30)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, '', 'a@t.com', 30)")
+            .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, '', 'b@t.com', 25)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (2, '', 'b@t.com', 25)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -1260,14 +1691,22 @@ fn multiple_indexes_on_same_column() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name1 ON users (name)").unwrap());
-    assert_ok(conn.execute("CREATE INDEX idx_name2 ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name1 ON users (name)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name2 ON users (name)")
+            .unwrap(),
+    );
 
     insert_users(&mut conn);
 
     assert_ok(conn.execute("DROP INDEX idx_name1").unwrap());
 
-    let qr = conn.query("SELECT * FROM users WHERE name = 'Alice'").unwrap();
+    let qr = conn
+        .query("SELECT * FROM users WHERE name = 'Alice'")
+        .unwrap();
     assert_eq!(qr.rows.len(), 1);
 }
 
@@ -1278,21 +1717,34 @@ fn index_across_multiple_tables() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute(
-        "CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, user_id INTEGER, total REAL)"
-    ).unwrap());
+    assert_ok(
+        conn.execute(
+            "CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, user_id INTEGER, total REAL)",
+        )
+        .unwrap(),
+    );
 
-    assert_ok(conn.execute("CREATE INDEX idx_user_name ON users (name)").unwrap());
-    assert_ok(conn.execute("CREATE INDEX idx_order_user ON orders (user_id)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_user_name ON users (name)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE INDEX idx_order_user ON orders (user_id)")
+            .unwrap(),
+    );
 
     insert_users(&mut conn);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO orders (id, user_id, total) VALUES (1, 1, 99.99)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO orders (id, user_id, total) VALUES (1, 1, 99.99)")
+            .unwrap(),
+        1,
+    );
 
     assert_ok(conn.execute("DROP TABLE orders").unwrap());
 
-    let qr = conn.query("SELECT * FROM users WHERE name = 'Bob'").unwrap();
+    let qr = conn
+        .query("SELECT * FROM users WHERE name = 'Bob'")
+        .unwrap();
     assert_eq!(qr.rows.len(), 1);
 }
 
@@ -1304,11 +1756,17 @@ fn create_drop_create_same_name_cycle() {
     setup_users_table(&mut conn);
 
     for _ in 0..5 {
-        assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+        assert_ok(
+            conn.execute("CREATE INDEX idx_name ON users (name)")
+                .unwrap(),
+        );
         assert_ok(conn.execute("DROP INDEX idx_name").unwrap());
     }
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -1318,23 +1776,36 @@ fn insert_delete_cycle_with_unique_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     for i in 0..20 {
-        assert_rows_affected(conn.execute(
-            &format!("INSERT INTO users (id, name, email, age) VALUES ({i}, 'User', 'u@t.com', {i})")
-        ).unwrap(), 1);
-        assert_rows_affected(conn.execute(
-            &format!("DELETE FROM users WHERE id = {i}")
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "INSERT INTO users (id, name, email, age) VALUES ({i}, 'User', 'u@t.com', {i})"
+            ))
+            .unwrap(),
+            1,
+        );
+        assert_rows_affected(
+            conn.execute(&format!("DELETE FROM users WHERE id = {i}"))
+                .unwrap(),
+            1,
+        );
     }
 
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(0));
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (100, 'Final', 'u@t.com', 99)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (100, 'Final', 'u@t.com', 99)",
+        )
+        .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -1344,24 +1815,37 @@ fn update_swap_indexed_values() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'b@t.com', 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'b@t.com', 25)")
+            .unwrap(),
+        1,
+    );
 
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET email = 'temp@t.com' WHERE id = 1"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET email = 'a@t.com' WHERE id = 2"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET email = 'b@t.com' WHERE id = 1"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE users SET email = 'temp@t.com' WHERE id = 1")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("UPDATE users SET email = 'a@t.com' WHERE id = 2")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("UPDATE users SET email = 'b@t.com' WHERE id = 1")
+            .unwrap(),
+        1,
+    );
 
     let qr = conn.query("SELECT email FROM users WHERE id = 1").unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("b@t.com".into()));
@@ -1376,14 +1860,21 @@ fn index_on_single_column_pk_table() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE simple (id INTEGER NOT NULL PRIMARY KEY)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE simple (id INTEGER NOT NULL PRIMARY KEY)")
+            .unwrap(),
+    );
 
     assert_ok(conn.execute("CREATE INDEX idx_id ON simple (id)").unwrap());
 
-    assert_rows_affected(conn.execute("INSERT INTO simple (id) VALUES (1)").unwrap(), 1);
-    assert_rows_affected(conn.execute("INSERT INTO simple (id) VALUES (2)").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO simple (id) VALUES (1)").unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO simple (id) VALUES (2)").unwrap(),
+        1,
+    );
     assert_rows_affected(conn.execute("DELETE FROM simple WHERE id = 1").unwrap(), 1);
 
     let qr = conn.query("SELECT COUNT(*) FROM simple").unwrap();
@@ -1397,13 +1888,19 @@ fn unique_index_on_pk_column() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_pk ON users (id)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_pk ON users (id)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Dup', 'dup@t.com', 99)"
-    ).unwrap_err();
-    assert!(matches!(err, SqlError::DuplicateKey | SqlError::UniqueViolation(_)));
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Dup', 'dup@t.com', 99)")
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        SqlError::DuplicateKey | SqlError::UniqueViolation(_)
+    ));
 }
 
 #[test]
@@ -1413,20 +1910,31 @@ fn index_with_all_null_values() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     for i in 1..=5 {
-        assert_rows_affected(conn.execute(
-            &format!("INSERT INTO users (id, name, email, age) VALUES ({i}, 'User{i}', NULL, {i})")
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "INSERT INTO users (id, name, email, age) VALUES ({i}, 'User{i}', NULL, {i})"
+            ))
+            .unwrap(),
+            1,
+        );
     }
 
     assert_rows_affected(conn.execute("DELETE FROM users").unwrap(), 5);
 
     for i in 1..=5 {
-        assert_rows_affected(conn.execute(
-            &format!("INSERT INTO users (id, name, email, age) VALUES ({i}, 'User{i}', NULL, {i})")
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "INSERT INTO users (id, name, email, age) VALUES ({i}, 'User{i}', NULL, {i})"
+            ))
+            .unwrap(),
+            1,
+        );
     }
 }
 
@@ -1441,7 +1949,10 @@ fn stress_many_rows_with_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("CREATE INDEX idx_age ON users (age)").unwrap());
 
     for i in 0..200 {
@@ -1453,9 +1964,9 @@ fn stress_many_rows_with_index() {
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(200));
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (999, 'Dup', 'u0@t.com', 0)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (999, 'Dup', 'u0@t.com', 0)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -1466,17 +1977,33 @@ fn stress_many_indexes_on_one_table() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("CREATE INDEX idx_age ON users (age)").unwrap());
-    assert_ok(conn.execute("CREATE INDEX idx_name_age ON users (name, age)").unwrap());
-    assert_ok(conn.execute("CREATE INDEX idx_email_name ON users (email, name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name_age ON users (name, age)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE INDEX idx_email_name ON users (email, name)")
+            .unwrap(),
+    );
 
     insert_users(&mut conn);
 
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET name = 'Alicia', email = 'alicia@t.com', age = 31 WHERE id = 1"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "UPDATE users SET name = 'Alicia', email = 'alicia@t.com', age = 31 WHERE id = 1",
+        )
+        .unwrap(),
+        1,
+    );
 
     assert_rows_affected(conn.execute("DELETE FROM users WHERE id = 2").unwrap(), 1);
 
@@ -1491,7 +2018,10 @@ fn stress_interleaved_crud_with_indexes() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     for i in 0..50 {
         assert_rows_affected(conn.execute(
@@ -1500,21 +2030,32 @@ fn stress_interleaved_crud_with_indexes() {
     }
 
     for i in (0..50).step_by(2) {
-        assert_rows_affected(conn.execute(
-            &format!("DELETE FROM users WHERE id = {i}")
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!("DELETE FROM users WHERE id = {i}"))
+                .unwrap(),
+            1,
+        );
     }
 
     for i in (1..50).step_by(2) {
-        assert_rows_affected(conn.execute(
-            &format!("UPDATE users SET email = 'updated{i}@t.com' WHERE id = {i}")
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "UPDATE users SET email = 'updated{i}@t.com' WHERE id = {i}"
+            ))
+            .unwrap(),
+            1,
+        );
     }
 
     for i in (0..50).step_by(2) {
-        assert_rows_affected(conn.execute(
-            &format!("INSERT INTO users (id, name, email, age) VALUES ({i}, 'New{i}', 'u{i}@t.com', {})", i + 100)
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "INSERT INTO users (id, name, email, age) VALUES ({i}, 'New{i}', 'u{i}@t.com', {})",
+                i + 100
+            ))
+            .unwrap(),
+            1,
+        );
     }
 
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
@@ -1535,11 +2076,14 @@ fn stress_create_populate_drop_cycle() {
     }
 
     for _ in 0..5 {
-        assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+        assert_ok(
+            conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+                .unwrap(),
+        );
 
-        let err = conn.execute(
-            "INSERT INTO users (id, name, email, age) VALUES (999, 'Dup', 'u0@t.com', 0)"
-        ).unwrap_err();
+        let err = conn
+            .execute("INSERT INTO users (id, name, email, age) VALUES (999, 'Dup', 'u0@t.com', 0)")
+            .unwrap_err();
         assert!(matches!(err, SqlError::UniqueViolation(_)));
 
         assert_ok(conn.execute("DROP INDEX idx_email").unwrap());
@@ -1553,7 +2097,10 @@ fn stress_index_with_transactions() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     for batch in 0..10 {
         conn.execute("BEGIN").unwrap();
@@ -1578,7 +2125,10 @@ fn stress_index_persistence_cycle() {
         let db = create_db(dir.path());
         let mut conn = Connection::open(&db).unwrap();
         setup_users_table(&mut conn);
-        assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+        assert_ok(
+            conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+                .unwrap(),
+        );
 
         for i in 0..20 {
             assert_rows_affected(conn.execute(
@@ -1617,27 +2167,37 @@ fn composite_unique_index_enforces_full_combination() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE products (id INTEGER NOT NULL PRIMARY KEY, category TEXT, sku TEXT)"
-    ).unwrap());
+    assert_ok(
+        conn.execute(
+            "CREATE TABLE products (id INTEGER NOT NULL PRIMARY KEY, category TEXT, sku TEXT)",
+        )
+        .unwrap(),
+    );
 
-    assert_ok(conn.execute(
-        "CREATE UNIQUE INDEX idx_cat_sku ON products (category, sku)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_cat_sku ON products (category, sku)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO products (id, category, sku) VALUES (1, 'electronics', 'ABC')"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO products (id, category, sku) VALUES (2, 'electronics', 'DEF')"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO products (id, category, sku) VALUES (3, 'clothing', 'ABC')"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO products (id, category, sku) VALUES (1, 'electronics', 'ABC')")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO products (id, category, sku) VALUES (2, 'electronics', 'DEF')")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO products (id, category, sku) VALUES (3, 'clothing', 'ABC')")
+            .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO products (id, category, sku) VALUES (4, 'electronics', 'ABC')"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO products (id, category, sku) VALUES (4, 'electronics', 'ABC')")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -1647,18 +2207,26 @@ fn composite_non_unique_index_allows_duplicates() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE events (id INTEGER NOT NULL PRIMARY KEY, year INTEGER, month INTEGER)"
-    ).unwrap());
+    assert_ok(
+        conn.execute(
+            "CREATE TABLE events (id INTEGER NOT NULL PRIMARY KEY, year INTEGER, month INTEGER)",
+        )
+        .unwrap(),
+    );
 
-    assert_ok(conn.execute(
-        "CREATE INDEX idx_ym ON events (year, month)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_ym ON events (year, month)")
+            .unwrap(),
+    );
 
     for i in 0..10 {
-        assert_rows_affected(conn.execute(
-            &format!("INSERT INTO events (id, year, month) VALUES ({i}, 2024, 1)")
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "INSERT INTO events (id, year, month) VALUES ({i}, 2024, 1)"
+            ))
+            .unwrap(),
+            1,
+        );
     }
 
     let qr = conn.query("SELECT COUNT(*) FROM events").unwrap();
@@ -1676,8 +2244,14 @@ fn full_lifecycle_correctness() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     insert_users(&mut conn);
 
@@ -1687,30 +2261,44 @@ fn full_lifecycle_correctness() {
     assert_eq!(qr.rows[1][1], Value::Text("Bob".into()));
     assert_eq!(qr.rows[2][1], Value::Text("Charlie".into()));
 
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET name = 'Alicia', email = 'alicia@test.com' WHERE id = 1"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE users SET name = 'Alicia', email = 'alicia@test.com' WHERE id = 1")
+            .unwrap(),
+        1,
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+        )
+        .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (5, 'Eve', 'alicia@test.com', 22)"
-    ).unwrap_err();
+    let err = conn
+        .execute(
+            "INSERT INTO users (id, name, email, age) VALUES (5, 'Eve', 'alicia@test.com', 22)",
+        )
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 
     assert_rows_affected(conn.execute("DELETE FROM users WHERE id = 2").unwrap(), 1);
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (5, 'Eve', 'bob@test.com', 22)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (5, 'Eve', 'bob@test.com', 22)",
+        )
+        .unwrap(),
+        1,
+    );
 
     assert_ok(conn.execute("DROP INDEX idx_name").unwrap());
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (6, 'Frank', 'charlie@test.com', 50)"
-    ).unwrap_err();
+    let err = conn
+        .execute(
+            "INSERT INTO users (id, name, email, age) VALUES (6, 'Frank', 'charlie@test.com', 50)",
+        )
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
@@ -1725,7 +2313,10 @@ fn full_lifecycle_with_persistence() {
         let db = create_db(dir.path());
         let mut conn = Connection::open(&db).unwrap();
         setup_users_table(&mut conn);
-        assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+        assert_ok(
+            conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+                .unwrap(),
+        );
         insert_users(&mut conn);
     }
 
@@ -1733,9 +2324,11 @@ fn full_lifecycle_with_persistence() {
         let db = open_db(dir.path());
         let mut conn = Connection::open(&db).unwrap();
 
-        assert_rows_affected(conn.execute(
-            "UPDATE users SET email = 'newalice@test.com' WHERE id = 1"
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute("UPDATE users SET email = 'newalice@test.com' WHERE id = 1")
+                .unwrap(),
+            1,
+        );
 
         assert_rows_affected(conn.execute("DELETE FROM users WHERE id = 2").unwrap(), 1);
     }
@@ -1747,13 +2340,21 @@ fn full_lifecycle_with_persistence() {
         let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
         assert_eq!(qr.rows[0][0], Value::Integer(2));
 
-        assert_rows_affected(conn.execute(
-            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(
+                "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+            )
+            .unwrap(),
+            1,
+        );
 
-        assert_rows_affected(conn.execute(
-            "INSERT INTO users (id, name, email, age) VALUES (5, 'Eve', 'bob@test.com', 22)"
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(
+                "INSERT INTO users (id, name, email, age) VALUES (5, 'Eve', 'bob@test.com', 22)",
+            )
+            .unwrap(),
+            1,
+        );
 
         let err = conn.execute(
             "INSERT INTO users (id, name, email, age) VALUES (6, 'Frank', 'newalice@test.com', 50)"
@@ -1778,14 +2379,21 @@ fn composite_unique_null_in_first_column() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_name_email ON users (name, email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_name_email ON users (name, email)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, NULL, 'a@t.com', 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, NULL, 'a@t.com', 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, NULL, 'a@t.com', 30)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, NULL, 'a@t.com', 25)")
+            .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -1795,14 +2403,21 @@ fn composite_unique_null_in_second_column() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_name_email ON users (name, email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_name_email ON users (name, email)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', NULL, 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Alice', NULL, 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', NULL, 30)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Alice', NULL, 25)")
+            .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -1812,14 +2427,21 @@ fn composite_unique_both_null() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_name_email ON users (name, email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_name_email ON users (name, email)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, NULL, NULL, 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, NULL, NULL, 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, NULL, NULL, 30)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, NULL, NULL, 25)")
+            .unwrap(),
+        1,
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1834,7 +2456,10 @@ fn select_with_index_returns_correct_data() {
     setup_users_table(&mut conn);
 
     assert_ok(conn.execute("CREATE INDEX idx_age ON users (age)").unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     insert_users(&mut conn);
 
@@ -1856,7 +2481,9 @@ fn aggregation_with_index_present() {
     assert_ok(conn.execute("CREATE INDEX idx_age ON users (age)").unwrap());
     insert_users(&mut conn);
 
-    let qr = conn.query("SELECT COUNT(*), SUM(age), AVG(age) FROM users").unwrap();
+    let qr = conn
+        .query("SELECT COUNT(*), SUM(age), AVG(age) FROM users")
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(3));
     assert_eq!(qr.rows[0][1], Value::Integer(90));
     assert_eq!(qr.rows[0][2], Value::Real(30.0));
@@ -1871,17 +2498,27 @@ fn distinct_with_index_present() {
 
     assert_ok(conn.execute("CREATE INDEX idx_age ON users (age)").unwrap());
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'b@t.com', 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (3, 'Charlie', 'c@t.com', 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'b@t.com', 30)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (3, 'Charlie', 'c@t.com', 25)",
+        )
+        .unwrap(),
+        1,
+    );
 
-    let qr = conn.query("SELECT DISTINCT age FROM users ORDER BY age").unwrap();
+    let qr = conn
+        .query("SELECT DISTINCT age FROM users ORDER BY age")
+        .unwrap();
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Integer(25));
     assert_eq!(qr.rows[1][0], Value::Integer(30));
@@ -1894,7 +2531,10 @@ fn order_by_with_index_present() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
     let qr = conn.query("SELECT name FROM users ORDER BY name").unwrap();
@@ -1914,27 +2554,36 @@ fn state_consistent_after_unique_violation_on_insert() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)")
+            .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'a@t.com', 25)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'a@t.com', 25)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(1));
     assert_eq!(
-        conn.query("SELECT name FROM users WHERE id = 1").unwrap().rows[0][0],
+        conn.query("SELECT name FROM users WHERE id = 1")
+            .unwrap()
+            .rows[0][0],
         Value::Text("Alice".into())
     );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'b@t.com', 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'b@t.com', 25)")
+            .unwrap(),
+        1,
+    );
 
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(2));
@@ -1947,12 +2596,15 @@ fn state_consistent_after_unique_violation_on_update() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
-    let err = conn.execute(
-        "UPDATE users SET email = 'bob@test.com' WHERE id = 1"
-    ).unwrap_err();
+    let err = conn
+        .execute("UPDATE users SET email = 'bob@test.com' WHERE id = 1")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 
     let qr = conn.query("SELECT email FROM users WHERE id = 1").unwrap();
@@ -1961,9 +2613,11 @@ fn state_consistent_after_unique_violation_on_update() {
     let qr = conn.query("SELECT email FROM users WHERE id = 2").unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("bob@test.com".into()));
 
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET email = 'newalice@test.com' WHERE id = 1"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE users SET email = 'newalice@test.com' WHERE id = 1")
+            .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -1973,24 +2627,41 @@ fn state_consistent_after_create_unique_index_failure() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'same@t.com', 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'same@t.com', 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'same@t.com', 30)",
+        )
+        .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'same@t.com', 25)",
+        )
+        .unwrap(),
+        1,
+    );
 
-    let err = conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap_err();
+    let err = conn
+        .execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(2));
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (3, 'Charlie', 'same@t.com', 35)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (3, 'Charlie', 'same@t.com', 35)",
+        )
+        .unwrap(),
+        1,
+    );
 
-    assert_ok(conn.execute("CREATE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -2000,25 +2671,34 @@ fn multiple_violations_dont_corrupt_state() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'a@t.com', 30)")
+            .unwrap(),
+        1,
+    );
 
     for i in 2..12 {
-        let err = conn.execute(
-            &format!("INSERT INTO users (id, name, email, age) VALUES ({i}, 'X', 'a@t.com', {i})")
-        ).unwrap_err();
+        let err = conn
+            .execute(&format!(
+                "INSERT INTO users (id, name, email, age) VALUES ({i}, 'X', 'a@t.com', {i})"
+            ))
+            .unwrap_err();
         assert!(matches!(err, SqlError::UniqueViolation(_)));
     }
 
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'b@t.com', 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'b@t.com', 25)")
+            .unwrap(),
+        1,
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2032,29 +2712,47 @@ fn update_pk_and_indexed_column_simultaneously() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET id = 100, name = 'Alicia', email = 'alicia@t.com' WHERE id = 1"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "UPDATE users SET id = 100, name = 'Alicia', email = 'alicia@t.com' WHERE id = 1",
+        )
+        .unwrap(),
+        1,
+    );
 
-    let qr = conn.query("SELECT COUNT(*) FROM users WHERE id = 1").unwrap();
+    let qr = conn
+        .query("SELECT COUNT(*) FROM users WHERE id = 1")
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(0));
 
-    let qr = conn.query("SELECT name, email FROM users WHERE id = 100").unwrap();
+    let qr = conn
+        .query("SELECT name, email FROM users WHERE id = 100")
+        .unwrap();
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Text("Alicia".into()));
     assert_eq!(qr.rows[0][1], Value::Text("alicia@t.com".into()));
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'alice@test.com', 40)",
+        )
+        .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (5, 'Eve', 'alicia@t.com', 22)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (5, 'Eve', 'alicia@t.com', 22)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -2065,7 +2763,10 @@ fn multi_row_insert_with_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     assert_rows_affected(conn.execute(
         "INSERT INTO users (id, name, email, age) VALUES (1, 'A', 'a@t.com', 20), (2, 'B', 'b@t.com', 25), (3, 'C', 'c@t.com', 30)"
@@ -2074,9 +2775,9 @@ fn multi_row_insert_with_index() {
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(3));
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'D', 'a@t.com', 35)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (4, 'D', 'a@t.com', 35)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -2087,7 +2788,10 @@ fn multi_row_insert_duplicate_within_batch() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     let err = conn.execute(
         "INSERT INTO users (id, name, email, age) VALUES (1, 'A', 'same@t.com', 20), (2, 'B', 'same@t.com', 25)"
@@ -2102,7 +2806,10 @@ fn delete_no_matching_rows_with_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
     assert_rows_affected(conn.execute("DELETE FROM users WHERE id = 999").unwrap(), 0);
@@ -2118,12 +2825,17 @@ fn update_no_matching_rows_with_index() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET email = 'new@t.com' WHERE id = 999"
-    ).unwrap(), 0);
+    assert_rows_affected(
+        conn.execute("UPDATE users SET email = 'new@t.com' WHERE id = 999")
+            .unwrap(),
+        0,
+    );
 
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(3));
@@ -2136,12 +2848,17 @@ fn update_to_same_value_no_change() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     insert_users(&mut conn);
 
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET email = 'alice@test.com' WHERE id = 1"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE users SET email = 'alice@test.com' WHERE id = 1")
+            .unwrap(),
+        1,
+    );
 
     let qr = conn.query("SELECT email FROM users WHERE id = 1").unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("alice@test.com".into()));
@@ -2158,24 +2875,47 @@ fn complex_transaction_with_mixed_operations() {
     assert_ok(conn.execute(
         "CREATE TABLE products (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL, sku TEXT, price REAL)"
     ).unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_sku ON products (sku)").unwrap());
-    assert_ok(conn.execute("CREATE INDEX idx_price ON products (price)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_sku ON products (sku)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE INDEX idx_price ON products (price)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO products (id, name, sku, price) VALUES (1, 'Widget', 'WGT-001', 9.99)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO products (id, name, sku, price) VALUES (2, 'Gadget', 'GDG-001', 19.99)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO products (id, name, sku, price) VALUES (3, 'Doohickey', 'DHK-001', 29.99)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO products (id, name, sku, price) VALUES (1, 'Widget', 'WGT-001', 9.99)",
+        )
+        .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO products (id, name, sku, price) VALUES (2, 'Gadget', 'GDG-001', 19.99)",
+        )
+        .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO products (id, name, sku, price) VALUES (3, 'Doohickey', 'DHK-001', 29.99)",
+        )
+        .unwrap(),
+        1,
+    );
 
-    assert_rows_affected(conn.execute(
-        "UPDATE products SET price = 12.99 WHERE sku = 'WGT-001'"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE products SET price = 12.99 WHERE sku = 'WGT-001'")
+            .unwrap(),
+        1,
+    );
 
-    assert_rows_affected(conn.execute("DELETE FROM products WHERE id = 2").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("DELETE FROM products WHERE id = 2").unwrap(),
+        1,
+    );
 
     assert_rows_affected(conn.execute(
         "INSERT INTO products (id, name, sku, price) VALUES (4, 'Thingamajig', 'GDG-001', 39.99)"
@@ -2186,12 +2926,14 @@ fn complex_transaction_with_mixed_operations() {
     let qr = conn.query("SELECT COUNT(*) FROM products").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(3));
 
-    let qr = conn.query("SELECT name FROM products WHERE id = 1").unwrap();
+    let qr = conn
+        .query("SELECT name FROM products WHERE id = 1")
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("Widget".into()));
 
-    let err = conn.execute(
-        "INSERT INTO products (id, name, sku, price) VALUES (5, 'Copy', 'WGT-001', 1.99)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO products (id, name, sku, price) VALUES (5, 'Copy', 'WGT-001', 1.99)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -2202,22 +2944,37 @@ fn complex_transaction_rollback_undoes_everything() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@t.com', 30)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@t.com', 30)",
+        )
+        .unwrap(),
+        1,
+    );
 
     conn.execute("BEGIN").unwrap();
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@t.com', 25)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET email = 'newalice@t.com' WHERE id = 1"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (3, 'Charlie', 'charlie@t.com', 35)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@t.com', 25)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("UPDATE users SET email = 'newalice@t.com' WHERE id = 1")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (3, 'Charlie', 'charlie@t.com', 35)",
+        )
+        .unwrap(),
+        1,
+    );
     conn.execute("ROLLBACK").unwrap();
 
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
@@ -2226,12 +2983,18 @@ fn complex_transaction_rollback_undoes_everything() {
     let qr = conn.query("SELECT email FROM users WHERE id = 1").unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("alice@t.com".into()));
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@t.com', 25)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (3, 'Charlie', 'charlie@t.com', 35)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@t.com', 25)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (3, 'Charlie', 'charlie@t.com', 35)",
+        )
+        .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -2240,49 +3003,73 @@ fn multiple_tables_independent_index_operations() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, email TEXT)"
-    ).unwrap());
-    assert_ok(conn.execute(
-        "CREATE TABLE products (id INTEGER NOT NULL PRIMARY KEY, sku TEXT)"
-    ).unwrap());
-    assert_ok(conn.execute(
-        "CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, ref_code TEXT)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, email TEXT)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE TABLE products (id INTEGER NOT NULL PRIMARY KEY, sku TEXT)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, ref_code TEXT)")
+            .unwrap(),
+    );
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_user_email ON users (email)").unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_product_sku ON products (sku)").unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_order_ref ON orders (ref_code)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_user_email ON users (email)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_product_sku ON products (sku)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_order_ref ON orders (ref_code)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, email) VALUES (1, 'user@t.com')"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO products (id, sku) VALUES (1, 'SKU-001')"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO orders (id, ref_code) VALUES (1, 'ORD-001')"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, email) VALUES (1, 'user@t.com')")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO products (id, sku) VALUES (1, 'SKU-001')")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO orders (id, ref_code) VALUES (1, 'ORD-001')")
+            .unwrap(),
+        1,
+    );
 
     assert_ok(conn.execute("DROP TABLE products").unwrap());
 
-    let err = conn.execute(
-        "INSERT INTO users (id, email) VALUES (2, 'user@t.com')"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, email) VALUES (2, 'user@t.com')")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 
-    let err = conn.execute(
-        "INSERT INTO orders (id, ref_code) VALUES (2, 'ORD-001')"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO orders (id, ref_code) VALUES (2, 'ORD-001')")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 
-    assert_ok(conn.execute(
-        "CREATE TABLE products (id INTEGER NOT NULL PRIMARY KEY, sku TEXT)"
-    ).unwrap());
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_product_sku ON products (sku)").unwrap());
-    assert_rows_affected(conn.execute(
-        "INSERT INTO products (id, sku) VALUES (1, 'SKU-001')"
-    ).unwrap(), 1);
+    assert_ok(
+        conn.execute("CREATE TABLE products (id INTEGER NOT NULL PRIMARY KEY, sku TEXT)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_product_sku ON products (sku)")
+            .unwrap(),
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO products (id, sku) VALUES (1, 'SKU-001')")
+            .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -2292,7 +3079,10 @@ fn index_correctness_after_bulk_update() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     for i in 0..20 {
         assert_rows_affected(conn.execute(
@@ -2301,9 +3091,13 @@ fn index_correctness_after_bulk_update() {
     }
 
     for i in 0..20 {
-        assert_rows_affected(conn.execute(
-            &format!("UPDATE users SET email = 'new{i}@t.com' WHERE id = {i}")
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "UPDATE users SET email = 'new{i}@t.com' WHERE id = {i}"
+            ))
+            .unwrap(),
+            1,
+        );
     }
 
     for i in 0..20 {
@@ -2313,9 +3107,12 @@ fn index_correctness_after_bulk_update() {
     }
 
     for i in 0..20 {
-        let err = conn.execute(
-            &format!("INSERT INTO users (id, name, email, age) VALUES ({}, 'Dup', 'new{i}@t.com', 99)", 200 + i)
-        ).unwrap_err();
+        let err = conn
+            .execute(&format!(
+                "INSERT INTO users (id, name, email, age) VALUES ({}, 'Dup', 'new{i}@t.com', 99)",
+                200 + i
+            ))
+            .unwrap_err();
         assert!(matches!(err, SqlError::UniqueViolation(_)));
     }
 
@@ -2330,7 +3127,10 @@ fn index_correctness_after_selective_delete() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     for i in 0..30 {
         assert_rows_affected(conn.execute(
@@ -2339,21 +3139,31 @@ fn index_correctness_after_selective_delete() {
     }
 
     for i in (0..30).filter(|x| x % 3 == 0) {
-        assert_rows_affected(conn.execute(
-            &format!("DELETE FROM users WHERE id = {i}")
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!("DELETE FROM users WHERE id = {i}"))
+                .unwrap(),
+            1,
+        );
     }
 
     for i in (0..30).filter(|x| x % 3 == 0) {
-        assert_rows_affected(conn.execute(
-            &format!("INSERT INTO users (id, name, email, age) VALUES ({}, 'Reuse', 'u{i}@t.com', 99)", 100 + i)
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "INSERT INTO users (id, name, email, age) VALUES ({}, 'Reuse', 'u{i}@t.com', 99)",
+                100 + i
+            ))
+            .unwrap(),
+            1,
+        );
     }
 
     for i in (0..30).filter(|x| x % 3 != 0) {
-        let err = conn.execute(
-            &format!("INSERT INTO users (id, name, email, age) VALUES ({}, 'Dup', 'u{i}@t.com', 99)", 200 + i)
-        ).unwrap_err();
+        let err = conn
+            .execute(&format!(
+                "INSERT INTO users (id, name, email, age) VALUES ({}, 'Dup', 'u{i}@t.com', 99)",
+                200 + i
+            ))
+            .unwrap_err();
         assert!(matches!(err, SqlError::UniqueViolation(_)));
     }
 }
@@ -2365,35 +3175,48 @@ fn transition_null_to_non_null_and_back() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', NULL, 30)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', NULL, 25)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', NULL, 30)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', NULL, 25)")
+            .unwrap(),
+        1,
+    );
 
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET email = 'a@t.com' WHERE id = 1"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE users SET email = 'a@t.com' WHERE id = 1")
+            .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (3, 'C', 'a@t.com', 20)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (3, 'C', 'a@t.com', 20)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 
-    assert_rows_affected(conn.execute(
-        "UPDATE users SET email = NULL WHERE id = 1"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE users SET email = NULL WHERE id = 1")
+            .unwrap(),
+        1,
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (3, 'C', 'a@t.com', 20)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (3, 'C', 'a@t.com', 20)")
+            .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "UPDATE users SET email = 'a@t.com' WHERE id = 1"
-    ).unwrap_err();
+    let err = conn
+        .execute("UPDATE users SET email = 'a@t.com' WHERE id = 1")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -2404,31 +3227,40 @@ fn index_with_negative_and_zero_integers() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_age ON users (age)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_age ON users (age)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (1, 'A', 'a@t.com', -100)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (2, 'B', 'b@t.com', 0)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (3, 'C', 'c@t.com', 100)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'A', 'a@t.com', -100)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'B', 'b@t.com', 0)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users (id, name, email, age) VALUES (3, 'C', 'c@t.com', 100)")
+            .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (4, 'D', 'd@t.com', -100)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (4, 'D', 'd@t.com', -100)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (5, 'E', 'e@t.com', 0)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (5, 'E', 'e@t.com', 0)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (6, 'F', 'f@t.com', 100)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (6, 'F', 'f@t.com', 100)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -2438,18 +3270,40 @@ fn index_with_float_edge_values() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE data (id INTEGER NOT NULL PRIMARY KEY, val REAL)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE data (id INTEGER NOT NULL PRIMARY KEY, val REAL)")
+            .unwrap(),
+    );
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_val ON data (val)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_val ON data (val)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute("INSERT INTO data (id, val) VALUES (1, 0.0)").unwrap(), 1);
-    assert_rows_affected(conn.execute("INSERT INTO data (id, val) VALUES (2, -0.001)").unwrap(), 1);
-    assert_rows_affected(conn.execute("INSERT INTO data (id, val) VALUES (3, 0.001)").unwrap(), 1);
-    assert_rows_affected(conn.execute("INSERT INTO data (id, val) VALUES (4, 999999.999)").unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO data (id, val) VALUES (1, 0.0)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO data (id, val) VALUES (2, -0.001)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO data (id, val) VALUES (3, 0.001)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO data (id, val) VALUES (4, 999999.999)")
+            .unwrap(),
+        1,
+    );
 
-    let err = conn.execute("INSERT INTO data (id, val) VALUES (5, 0.0)").unwrap_err();
+    let err = conn
+        .execute("INSERT INTO data (id, val) VALUES (5, 0.0)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -2459,25 +3313,39 @@ fn index_with_very_long_text() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    assert_ok(conn.execute(
-        "CREATE TABLE data (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
-    ).unwrap());
+    assert_ok(
+        conn.execute("CREATE TABLE data (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+            .unwrap(),
+    );
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_val ON data (val)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_val ON data (val)")
+            .unwrap(),
+    );
 
     let long_a = "a".repeat(500);
     let long_b = "b".repeat(500);
 
-    assert_rows_affected(conn.execute(
-        &format!("INSERT INTO data (id, val) VALUES (1, '{long_a}')")
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        &format!("INSERT INTO data (id, val) VALUES (2, '{long_b}')")
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(&format!(
+            "INSERT INTO data (id, val) VALUES (1, '{long_a}')"
+        ))
+        .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute(&format!(
+            "INSERT INTO data (id, val) VALUES (2, '{long_b}')"
+        ))
+        .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        &format!("INSERT INTO data (id, val) VALUES (3, '{long_a}')")
-    ).unwrap_err();
+    let err = conn
+        .execute(&format!(
+            "INSERT INTO data (id, val) VALUES (3, '{long_a}')"
+        ))
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
@@ -2492,8 +3360,14 @@ fn stress_500_rows_full_crud_cycle_with_indexes() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
-    assert_ok(conn.execute("CREATE INDEX idx_name ON users (name)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE INDEX idx_name ON users (name)")
+            .unwrap(),
+    );
 
     for i in 0..500 {
         assert_rows_affected(conn.execute(
@@ -2505,24 +3379,36 @@ fn stress_500_rows_full_crud_cycle_with_indexes() {
     assert_eq!(qr.rows[0][0], Value::Integer(500));
 
     for i in 0..100 {
-        assert_rows_affected(conn.execute(
-            &format!("DELETE FROM users WHERE id = {i}")
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!("DELETE FROM users WHERE id = {i}"))
+                .unwrap(),
+            1,
+        );
     }
 
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(400));
 
     for i in 100..200 {
-        assert_rows_affected(conn.execute(
-            &format!("UPDATE users SET email = 'updated{i}@t.com' WHERE id = {i}")
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "UPDATE users SET email = 'updated{i}@t.com' WHERE id = {i}"
+            ))
+            .unwrap(),
+            1,
+        );
     }
 
     for i in 0..100 {
-        assert_rows_affected(conn.execute(
-            &format!("INSERT INTO users (id, name, email, age) VALUES ({}, 'New{i}', 'u{i}@t.com', {})", 500 + i, i % 80)
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "INSERT INTO users (id, name, email, age) VALUES ({}, 'New{i}', 'u{i}@t.com', {})",
+                500 + i,
+                i % 80
+            ))
+            .unwrap(),
+            1,
+        );
     }
 
     for i in 100..110 {
@@ -2533,9 +3419,14 @@ fn stress_500_rows_full_crud_cycle_with_indexes() {
     }
 
     for i in 100..110 {
-        assert_rows_affected(conn.execute(
-            &format!("INSERT INTO users (id, name, email, age) VALUES ({}, 'Freed', 'u{i}@t.com', 99)", 800 + i)
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "INSERT INTO users (id, name, email, age) VALUES ({}, 'Freed', 'u{i}@t.com', 99)",
+                800 + i
+            ))
+            .unwrap(),
+            1,
+        );
     }
 
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
@@ -2549,7 +3440,10 @@ fn stress_transaction_batches_with_index_verification() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
     assert_ok(conn.execute("CREATE INDEX idx_age ON users (age)").unwrap());
 
     for batch in 0..20 {
@@ -2605,30 +3499,60 @@ fn stress_multiple_tables_multiple_indexes_persistence() {
         let db = create_db(dir.path());
         let mut conn = Connection::open(&db).unwrap();
 
-        assert_ok(conn.execute(
-            "CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, email TEXT, dept TEXT)"
-        ).unwrap());
+        assert_ok(
+            conn.execute(
+                "CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, email TEXT, dept TEXT)",
+            )
+            .unwrap(),
+        );
         assert_ok(conn.execute(
             "CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, user_id INTEGER, status TEXT)"
         ).unwrap());
 
-        assert_ok(conn.execute("CREATE UNIQUE INDEX idx_user_email ON users (email)").unwrap());
-        assert_ok(conn.execute("CREATE INDEX idx_user_dept ON users (dept)").unwrap());
-        assert_ok(conn.execute("CREATE INDEX idx_order_status ON orders (status)").unwrap());
-        assert_ok(conn.execute("CREATE INDEX idx_order_user ON orders (user_id)").unwrap());
+        assert_ok(
+            conn.execute("CREATE UNIQUE INDEX idx_user_email ON users (email)")
+                .unwrap(),
+        );
+        assert_ok(
+            conn.execute("CREATE INDEX idx_user_dept ON users (dept)")
+                .unwrap(),
+        );
+        assert_ok(
+            conn.execute("CREATE INDEX idx_order_status ON orders (status)")
+                .unwrap(),
+        );
+        assert_ok(
+            conn.execute("CREATE INDEX idx_order_user ON orders (user_id)")
+                .unwrap(),
+        );
 
         for i in 0..50 {
-            assert_rows_affected(conn.execute(
-                &format!("INSERT INTO users (id, email, dept) VALUES ({i}, 'u{i}@t.com', 'dept{}')", i % 5)
-            ).unwrap(), 1);
+            assert_rows_affected(
+                conn.execute(&format!(
+                    "INSERT INTO users (id, email, dept) VALUES ({i}, 'u{i}@t.com', 'dept{}')",
+                    i % 5
+                ))
+                .unwrap(),
+                1,
+            );
         }
 
         for i in 0..100 {
-            assert_rows_affected(conn.execute(
-                &format!("INSERT INTO orders (id, user_id, status) VALUES ({i}, {}, '{}')",
+            assert_rows_affected(
+                conn.execute(&format!(
+                    "INSERT INTO orders (id, user_id, status) VALUES ({i}, {}, '{}')",
                     i % 50,
-                    if i % 3 == 0 { "complete" } else if i % 3 == 1 { "pending" } else { "cancelled" })
-            ).unwrap(), 1);
+                    if i % 3 == 0 {
+                        "complete"
+                    } else if i % 3 == 1 {
+                        "pending"
+                    } else {
+                        "cancelled"
+                    }
+                ))
+                .unwrap(),
+                1,
+            );
         }
     }
 
@@ -2645,13 +3569,22 @@ fn stress_multiple_tables_multiple_indexes_persistence() {
             Value::Integer(100)
         );
 
-        let err = conn.execute("INSERT INTO users (id, email, dept) VALUES (999, 'u0@t.com', 'x')").unwrap_err();
+        let err = conn
+            .execute("INSERT INTO users (id, email, dept) VALUES (999, 'u0@t.com', 'x')")
+            .unwrap_err();
         assert!(matches!(err, SqlError::UniqueViolation(_)));
 
         assert_ok(conn.execute("DROP INDEX idx_order_status").unwrap());
 
-        assert_rows_affected(conn.execute("DELETE FROM orders WHERE id < 10").unwrap(), 10);
-        assert_rows_affected(conn.execute("UPDATE users SET dept = 'fired' WHERE id < 5").unwrap(), 5);
+        assert_rows_affected(
+            conn.execute("DELETE FROM orders WHERE id < 10").unwrap(),
+            10,
+        );
+        assert_rows_affected(
+            conn.execute("UPDATE users SET dept = 'fired' WHERE id < 5")
+                .unwrap(),
+            5,
+        );
     }
 
     {
@@ -2667,13 +3600,20 @@ fn stress_multiple_tables_multiple_indexes_persistence() {
             Value::Integer(90)
         );
 
-        let qr = conn.query("SELECT COUNT(*) FROM users WHERE dept = 'fired'").unwrap();
+        let qr = conn
+            .query("SELECT COUNT(*) FROM users WHERE dept = 'fired'")
+            .unwrap();
         assert_eq!(qr.rows[0][0], Value::Integer(5));
 
-        let err = conn.execute("INSERT INTO users (id, email, dept) VALUES (999, 'u10@t.com', 'x')").unwrap_err();
+        let err = conn
+            .execute("INSERT INTO users (id, email, dept) VALUES (999, 'u10@t.com', 'x')")
+            .unwrap_err();
         assert!(matches!(err, SqlError::UniqueViolation(_)));
 
-        assert_ok(conn.execute("CREATE INDEX idx_order_status ON orders (status)").unwrap());
+        assert_ok(
+            conn.execute("CREATE INDEX idx_order_status ON orders (status)")
+                .unwrap(),
+        );
     }
 }
 
@@ -2685,21 +3625,33 @@ fn index_population_from_existing_large_dataset() {
     setup_users_table(&mut conn);
 
     for i in 0..300 {
-        assert_rows_affected(conn.execute(
-            &format!("INSERT INTO users (id, name, email, age) VALUES ({i}, 'U{i}', 'u{i}@t.com', {})", i % 60)
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "INSERT INTO users (id, name, email, age) VALUES ({i}, 'U{i}', 'u{i}@t.com', {})",
+                i % 60
+            ))
+            .unwrap(),
+            1,
+        );
     }
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
-    let err = conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (999, 'Dup', 'u0@t.com', 0)"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO users (id, name, email, age) VALUES (999, 'Dup', 'u0@t.com', 0)")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO users (id, name, email, age) VALUES (300, 'New', 'new@t.com', 0)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO users (id, name, email, age) VALUES (300, 'New', 'new@t.com', 0)",
+        )
+        .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -2709,28 +3661,47 @@ fn update_all_rows_shifts_indexes() {
     let mut conn = Connection::open(&db).unwrap();
     setup_users_table(&mut conn);
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
+            .unwrap(),
+    );
 
     for i in 0..20 {
-        assert_rows_affected(conn.execute(
-            &format!("INSERT INTO users (id, name, email, age) VALUES ({i}, 'U{i}', 'u{i}@t.com', {i})")
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "INSERT INTO users (id, name, email, age) VALUES ({i}, 'U{i}', 'u{i}@t.com', {i})"
+            ))
+            .unwrap(),
+            1,
+        );
     }
 
     for i in 0..20 {
-        assert_rows_affected(conn.execute(
-            &format!("UPDATE users SET email = 'new_u{i}@t.com' WHERE id = {i}")
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "UPDATE users SET email = 'new_u{i}@t.com' WHERE id = {i}"
+            ))
+            .unwrap(),
+            1,
+        );
     }
 
     for i in 0..20 {
-        assert_rows_affected(conn.execute(
-            &format!("INSERT INTO users (id, name, email, age) VALUES ({}, 'Old', 'u{i}@t.com', 99)", 100 + i)
-        ).unwrap(), 1);
+        assert_rows_affected(
+            conn.execute(&format!(
+                "INSERT INTO users (id, name, email, age) VALUES ({}, 'Old', 'u{i}@t.com', 99)",
+                100 + i
+            ))
+            .unwrap(),
+            1,
+        );
 
-        let err = conn.execute(
-            &format!("INSERT INTO users (id, name, email, age) VALUES ({}, 'Dup', 'new_u{i}@t.com', 99)", 200 + i)
-        ).unwrap_err();
+        let err = conn
+            .execute(&format!(
+                "INSERT INTO users (id, name, email, age) VALUES ({}, 'Dup', 'new_u{i}@t.com', 99)",
+                200 + i
+            ))
+            .unwrap_err();
         assert!(matches!(err, SqlError::UniqueViolation(_)));
     }
 }
@@ -2749,26 +3720,41 @@ fn index_on_composite_pk_table() {
         "CREATE TABLE enrollments (student_id INTEGER NOT NULL, course_id INTEGER NOT NULL, grade TEXT, PRIMARY KEY (student_id, course_id))"
     ).unwrap());
 
-    assert_ok(conn.execute("CREATE INDEX idx_grade ON enrollments (grade)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_grade ON enrollments (grade)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO enrollments (student_id, course_id, grade) VALUES (1, 101, 'A')"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO enrollments (student_id, course_id, grade) VALUES (1, 102, 'B')"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO enrollments (student_id, course_id, grade) VALUES (2, 101, 'A')"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO enrollments (student_id, course_id, grade) VALUES (1, 101, 'A')")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO enrollments (student_id, course_id, grade) VALUES (1, 102, 'B')")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO enrollments (student_id, course_id, grade) VALUES (2, 101, 'A')")
+            .unwrap(),
+        1,
+    );
 
-    let qr = conn.query("SELECT COUNT(*) FROM enrollments WHERE grade = 'A'").unwrap();
+    let qr = conn
+        .query("SELECT COUNT(*) FROM enrollments WHERE grade = 'A'")
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(2));
 
-    assert_rows_affected(conn.execute(
-        "DELETE FROM enrollments WHERE student_id = 1 AND course_id = 101"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("DELETE FROM enrollments WHERE student_id = 1 AND course_id = 101")
+            .unwrap(),
+        1,
+    );
 
-    let qr = conn.query("SELECT COUNT(*) FROM enrollments WHERE grade = 'A'").unwrap();
+    let qr = conn
+        .query("SELECT COUNT(*) FROM enrollments WHERE grade = 'A'")
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 }
 
@@ -2782,23 +3768,36 @@ fn unique_index_on_composite_pk_table() {
         "CREATE TABLE enrollments (student_id INTEGER NOT NULL, course_id INTEGER NOT NULL, grade TEXT, PRIMARY KEY (student_id, course_id))"
     ).unwrap());
 
-    assert_ok(conn.execute("CREATE UNIQUE INDEX idx_grade ON enrollments (grade)").unwrap());
+    assert_ok(
+        conn.execute("CREATE UNIQUE INDEX idx_grade ON enrollments (grade)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO enrollments (student_id, course_id, grade) VALUES (1, 101, 'A')"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO enrollments (student_id, course_id, grade) VALUES (1, 101, 'A')")
+            .unwrap(),
+        1,
+    );
 
-    let err = conn.execute(
-        "INSERT INTO enrollments (student_id, course_id, grade) VALUES (2, 101, 'A')"
-    ).unwrap_err();
+    let err = conn
+        .execute("INSERT INTO enrollments (student_id, course_id, grade) VALUES (2, 101, 'A')")
+        .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO enrollments (student_id, course_id, grade) VALUES (2, 101, NULL)"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO enrollments (student_id, course_id, grade) VALUES (3, 101, NULL)"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO enrollments (student_id, course_id, grade) VALUES (2, 101, NULL)",
+        )
+        .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO enrollments (student_id, course_id, grade) VALUES (3, 101, NULL)",
+        )
+        .unwrap(),
+        1,
+    );
 }
 
 #[test]
@@ -2811,26 +3810,43 @@ fn update_composite_pk_with_index() {
         "CREATE TABLE enrollments (student_id INTEGER NOT NULL, course_id INTEGER NOT NULL, grade TEXT, PRIMARY KEY (student_id, course_id))"
     ).unwrap());
 
-    assert_ok(conn.execute("CREATE INDEX idx_grade ON enrollments (grade)").unwrap());
+    assert_ok(
+        conn.execute("CREATE INDEX idx_grade ON enrollments (grade)")
+            .unwrap(),
+    );
 
-    assert_rows_affected(conn.execute(
-        "INSERT INTO enrollments (student_id, course_id, grade) VALUES (1, 101, 'B')"
-    ).unwrap(), 1);
-    assert_rows_affected(conn.execute(
-        "INSERT INTO enrollments (student_id, course_id, grade) VALUES (1, 102, 'C')"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("INSERT INTO enrollments (student_id, course_id, grade) VALUES (1, 101, 'B')")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO enrollments (student_id, course_id, grade) VALUES (1, 102, 'C')")
+            .unwrap(),
+        1,
+    );
 
-    assert_rows_affected(conn.execute(
-        "UPDATE enrollments SET grade = 'A' WHERE student_id = 1 AND course_id = 101"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute("UPDATE enrollments SET grade = 'A' WHERE student_id = 1 AND course_id = 101")
+            .unwrap(),
+        1,
+    );
 
-    let qr = conn.query("SELECT grade FROM enrollments WHERE student_id = 1 AND course_id = 101").unwrap();
+    let qr = conn
+        .query("SELECT grade FROM enrollments WHERE student_id = 1 AND course_id = 101")
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("A".into()));
 
-    assert_rows_affected(conn.execute(
-        "UPDATE enrollments SET student_id = 2 WHERE student_id = 1 AND course_id = 101"
-    ).unwrap(), 1);
+    assert_rows_affected(
+        conn.execute(
+            "UPDATE enrollments SET student_id = 2 WHERE student_id = 1 AND course_id = 101",
+        )
+        .unwrap(),
+        1,
+    );
 
-    let qr = conn.query("SELECT COUNT(*) FROM enrollments WHERE student_id = 2").unwrap();
+    let qr = conn
+        .query("SELECT COUNT(*) FROM enrollments WHERE student_id = 2")
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 }

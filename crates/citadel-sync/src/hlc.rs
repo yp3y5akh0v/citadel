@@ -195,6 +195,12 @@ pub struct HlcClock<C: PhysicalClock = SystemClock> {
     clock: C,
 }
 
+impl Default for HlcClock<SystemClock> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HlcClock<SystemClock> {
     /// Create an HLC clock with the system clock and default max drift (5s).
     pub fn new() -> Self {
@@ -427,7 +433,10 @@ mod tests {
     fn bytes_wall_time_is_big_endian() {
         let ts = HlcTimestamp::new(0x0102_0304_0506_0708, 0);
         let bytes = ts.to_bytes();
-        assert_eq!(&bytes[0..8], &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        assert_eq!(
+            &bytes[0..8],
+            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+        );
     }
 
     #[test]

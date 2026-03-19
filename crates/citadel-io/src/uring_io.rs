@@ -3,10 +3,10 @@ use std::io;
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::sync::Mutex;
 
-use io_uring::{IoUring, opcode, types};
+use io_uring::{opcode, types, IoUring};
 
-use citadel_core::{PAGE_SIZE, Error, Result};
 use crate::traits::PageIO;
+use citadel_core::{Error, Result, PAGE_SIZE};
 
 /// io_uring-backed page I/O for Linux.
 ///
@@ -33,11 +33,7 @@ impl UringPageIO {
             .setup_coop_taskrun()
             .setup_clamp()
             .build(256)
-            .or_else(|_| {
-                IoUring::builder()
-                    .setup_clamp()
-                    .build(256)
-            });
+            .or_else(|_| IoUring::builder().setup_clamp().build(256));
 
         match ring {
             Ok(ring) => Some(Self {
@@ -45,7 +41,9 @@ impl UringPageIO {
                 fd,
             }),
             Err(_) => {
-                unsafe { libc::close(fd); }
+                unsafe {
+                    libc::close(fd);
+                }
                 None
             }
         }
@@ -70,18 +68,15 @@ impl UringPageIO {
         let mut ring = self.ring.lock().unwrap();
 
         unsafe {
-            ring.submission()
-                .push(&sqe)
-                .map_err(|_| sq_full_err())?;
+            ring.submission().push(&sqe).map_err(|_| sq_full_err())?;
         }
 
         ring.submit_and_wait(1)?;
 
-        let cqe = ring.completion()
+        let cqe = ring
+            .completion()
             .next()
-            .ok_or_else(|| Error::Io(io::Error::new(
-                io::ErrorKind::Other, "missing completion",
-            )))?;
+            .ok_or_else(|| Error::Io(io::Error::new(io::ErrorKind::Other, "missing completion")))?;
 
         let result = cqe.result();
         if result < 0 {
@@ -93,7 +88,9 @@ impl UringPageIO {
 
 impl Drop for UringPageIO {
     fn drop(&mut self) {
-        unsafe { libc::close(self.fd); }
+        unsafe {
+            libc::close(self.fd);
+        }
     }
 }
 
@@ -105,7 +102,8 @@ impl PageIO for UringPageIO {
         let n = self.submit_one(sqe)? as usize;
         if n < PAGE_SIZE {
             return Err(Error::Io(io::Error::new(
-                io::ErrorKind::UnexpectedEof, "short read",
+                io::ErrorKind::UnexpectedEof,
+                "short read",
             )));
         }
         Ok(())
@@ -118,7 +116,8 @@ impl PageIO for UringPageIO {
         let n = self.submit_one(sqe)? as usize;
         if n < PAGE_SIZE {
             return Err(Error::Io(io::Error::new(
-                io::ErrorKind::WriteZero, "short write",
+                io::ErrorKind::WriteZero,
+                "short write",
             )));
         }
         Ok(())
@@ -131,7 +130,8 @@ impl PageIO for UringPageIO {
         let n = self.submit_one(sqe)? as usize;
         if n < buf.len() {
             return Err(Error::Io(io::Error::new(
-                io::ErrorKind::UnexpectedEof, "short read",
+                io::ErrorKind::UnexpectedEof,
+                "short read",
             )));
         }
         Ok(())
@@ -144,7 +144,8 @@ impl PageIO for UringPageIO {
         let n = self.submit_one(sqe)? as usize;
         if n < buf.len() {
             return Err(Error::Io(io::Error::new(
-                io::ErrorKind::WriteZero, "short write",
+                io::ErrorKind::WriteZero,
+                "short write",
             )));
         }
         Ok(())
@@ -178,7 +179,8 @@ impl PageIO for UringPageIO {
             return Ok(());
         }
 
-        let max_end = pages.iter()
+        let max_end = pages
+            .iter()
             .map(|(offset, _)| offset + PAGE_SIZE as u64)
             .max()
             .unwrap();
@@ -196,19 +198,13 @@ impl PageIO for UringPageIO {
         // Submit writes in batches that fit the SQ
         for chunk in pages.chunks(batch_size) {
             for (i, (offset, buf)) in chunk.iter().enumerate() {
-                let sqe = opcode::Write::new(
-                    types::Fd(self.fd),
-                    buf.as_ptr(),
-                    PAGE_SIZE as u32,
-                )
-                .offset(*offset)
-                .build()
-                .user_data(i as u64);
+                let sqe = opcode::Write::new(types::Fd(self.fd), buf.as_ptr(), PAGE_SIZE as u32)
+                    .offset(*offset)
+                    .build()
+                    .user_data(i as u64);
 
                 unsafe {
-                    ring.submission()
-                        .push(&sqe)
-                        .map_err(|_| sq_full_err())?;
+                    ring.submission().push(&sqe).map_err(|_| sq_full_err())?;
                 }
             }
 
@@ -236,7 +232,10 @@ impl PageIO for UringPageIO {
 }
 
 fn sq_full_err() -> Error {
-    Error::Io(io::Error::new(io::ErrorKind::Other, "submission queue full"))
+    Error::Io(io::Error::new(
+        io::ErrorKind::Other,
+        "submission queue full",
+    ))
 }
 
 #[cfg(test)]

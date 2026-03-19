@@ -2,9 +2,7 @@ use std::collections::BTreeMap;
 use std::thread;
 
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
-use citadel_sync::{
-    MemoryTransport, NodeId, SyncConfig, SyncDirection, SyncOutcome, SyncSession,
-};
+use citadel_sync::{MemoryTransport, NodeId, SyncConfig, SyncDirection, SyncOutcome, SyncSession};
 
 fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
     DatabaseBuilder::new(path)
@@ -32,10 +30,7 @@ fn insert_range(db: &Database, start: u32, end: u32) {
     wtx.commit().unwrap();
 }
 
-fn sync_push(
-    initiator_db: &Database,
-    responder_db: &Database,
-) -> (SyncOutcome, SyncOutcome) {
+fn sync_push(initiator_db: &Database, responder_db: &Database) -> (SyncOutcome, SyncOutcome) {
     let (t_init, t_resp) = MemoryTransport::pair();
 
     let init_session = SyncSession::new(SyncConfig {
@@ -59,10 +54,7 @@ fn sync_push(
     })
 }
 
-fn sync_pull(
-    initiator_db: &Database,
-    responder_db: &Database,
-) -> (SyncOutcome, SyncOutcome) {
+fn sync_pull(initiator_db: &Database, responder_db: &Database) -> (SyncOutcome, SyncOutcome) {
     let (t_init, t_resp) = MemoryTransport::pair();
 
     let init_session = SyncSession::new(SyncConfig {
@@ -86,10 +78,7 @@ fn sync_pull(
     })
 }
 
-fn sync_bidi(
-    initiator_db: &Database,
-    responder_db: &Database,
-) -> (SyncOutcome, SyncOutcome) {
+fn sync_bidi(initiator_db: &Database, responder_db: &Database) -> (SyncOutcome, SyncOutcome) {
     let (t_init, t_resp) = MemoryTransport::pair();
 
     let init_session = SyncSession::new(SyncConfig {

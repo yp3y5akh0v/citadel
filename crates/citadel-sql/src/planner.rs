@@ -34,9 +34,13 @@ struct SimplePredicate {
     value: Value,
 }
 
-fn flatten_and<'a>(expr: &'a Expr) -> Vec<&'a Expr> {
+fn flatten_and(expr: &Expr) -> Vec<&Expr> {
     match expr {
-        Expr::BinaryOp { left, op: BinOp::And, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
             let mut v = flatten_and(left);
             v.extend(flatten_and(right));
             v
@@ -46,7 +50,10 @@ fn flatten_and<'a>(expr: &'a Expr) -> Vec<&'a Expr> {
 }
 
 fn is_comparison(op: BinOp) -> bool {
-    matches!(op, BinOp::Eq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq)
+    matches!(
+        op,
+        BinOp::Eq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
+    )
 }
 
 fn is_range_op(op: BinOp) -> bool {
@@ -63,7 +70,7 @@ fn flip_op(op: BinOp) -> BinOp {
     }
 }
 
-fn resolve_column_name<'a>(expr: &'a Expr) -> Option<&'a str> {
+fn resolve_column_name(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Column(name) => Some(name.as_str()),
         Expr::QualifiedColumn { column, .. } => Some(column.as_str()),
@@ -76,11 +83,19 @@ fn extract_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<SimpleP
         Expr::BinaryOp { left, op, right } if is_comparison(*op) => {
             if let (Some(name), Expr::Literal(val)) = (resolve_column_name(left), right.as_ref()) {
                 let col_idx = schema.column_index(name)?;
-                return Some(SimplePredicate { col_idx, op: *op, value: val.clone() });
+                return Some(SimplePredicate {
+                    col_idx,
+                    op: *op,
+                    value: val.clone(),
+                });
             }
             if let (Expr::Literal(val), Some(name)) = (left.as_ref(), resolve_column_name(right)) {
                 let col_idx = schema.column_index(name)?;
-                return Some(SimplePredicate { col_idx, op: flip_op(*op), value: val.clone() });
+                return Some(SimplePredicate {
+                    col_idx,
+                    op: flip_op(*op),
+                    value: val.clone(),
+                });
             }
             None
         }
@@ -97,7 +112,8 @@ pub fn plan_select(schema: &TableSchema, where_clause: &Option<Expr>) -> ScanPla
     };
 
     let predicates = flatten_and(where_expr);
-    let simple: Vec<Option<SimplePredicate>> = predicates.iter()
+    let simple: Vec<Option<SimplePredicate>> = predicates
+        .iter()
         .map(|p| extract_simple_predicate(p, schema))
         .collect();
 
@@ -141,7 +157,10 @@ struct IndexScore {
     is_unique: bool,
 }
 
-fn try_best_index(schema: &TableSchema, predicates: &[Option<SimplePredicate>]) -> Option<ScanPlan> {
+fn try_best_index(
+    schema: &TableSchema,
+    predicates: &[Option<SimplePredicate>],
+) -> Option<ScanPlan> {
     let mut best_score: Option<IndexScore> = None;
     let mut best_plan: Option<ScanPlan> = None;
 
@@ -169,7 +188,9 @@ fn try_index_scan(
     for &col_idx in &idx.columns {
         let mut found_eq = false;
         for (i, pred) in predicates.iter().enumerate() {
-            if used.contains(&i) { continue; }
+            if used.contains(&i) {
+                continue;
+            }
             if let Some(sp) = pred {
                 if sp.col_idx == col_idx as usize && sp.op == BinOp::Eq {
                     equality_values.push(sp.value.clone());
@@ -181,7 +202,9 @@ fn try_index_scan(
         }
         if !found_eq {
             for (i, pred) in predicates.iter().enumerate() {
-                if used.contains(&i) { continue; }
+                if used.contains(&i) {
+                    continue;
+                }
                 if let Some(sp) = pred {
                     if sp.col_idx == col_idx as usize && is_range_op(sp.op) {
                         range_conds.push((sp.op, sp.value.clone()));
@@ -206,15 +229,18 @@ fn try_index_scan(
     let prefix = encode_composite_key(&equality_values);
     let idx_table = TableSchema::index_table_name(&schema.name, &idx.name);
 
-    Some((score, ScanPlan::IndexScan {
-        index_name: idx.name.clone(),
-        idx_table,
-        prefix,
-        num_prefix_cols: equality_values.len(),
-        range_conds,
-        is_unique: idx.unique,
-        index_columns: idx.columns.clone(),
-    }))
+    Some((
+        score,
+        ScanPlan::IndexScan {
+            index_name: idx.name.clone(),
+            idx_table,
+            prefix,
+            num_prefix_cols: equality_values.len(),
+            range_conds,
+            is_unique: idx.unique,
+            index_columns: idx.columns.clone(),
+        },
+    ))
 }
 
 // ── Plan description for EXPLAIN ────────────────────────────────────
@@ -224,19 +250,29 @@ pub fn describe_plan(plan: &ScanPlan, table_schema: &TableSchema) -> String {
         ScanPlan::SeqScan => String::new(),
 
         ScanPlan::PkLookup { pk_values } => {
-            let pk_cols: Vec<&str> = table_schema.primary_key_columns.iter()
+            let pk_cols: Vec<&str> = table_schema
+                .primary_key_columns
+                .iter()
                 .map(|&idx| table_schema.columns[idx as usize].name.as_str())
                 .collect();
-            let conditions: Vec<String> = pk_cols.iter().zip(pk_values.iter())
+            let conditions: Vec<String> = pk_cols
+                .iter()
+                .zip(pk_values.iter())
                 .map(|(col, val)| format!("{col} = {}", format_value(val)))
                 .collect();
             format!("USING PRIMARY KEY ({})", conditions.join(", "))
         }
 
-        ScanPlan::IndexScan { index_name, num_prefix_cols, range_conds, index_columns, .. } => {
+        ScanPlan::IndexScan {
+            index_name,
+            num_prefix_cols,
+            range_conds,
+            index_columns,
+            ..
+        } => {
             let mut conditions = Vec::new();
-            for i in 0..*num_prefix_cols {
-                let col_idx = index_columns[i] as usize;
+            for &col in index_columns.iter().take(*num_prefix_cols) {
+                let col_idx = col as usize;
                 let col_name = &table_schema.columns[col_idx].name;
                 conditions.push(format!("{col_name} = ?"));
             }
@@ -288,16 +324,48 @@ mod tests {
         TableSchema {
             name: "users".into(),
             columns: vec![
-                ColumnDef { name: "id".into(), data_type: DataType::Integer, nullable: false, position: 0 },
-                ColumnDef { name: "name".into(), data_type: DataType::Text, nullable: true, position: 1 },
-                ColumnDef { name: "age".into(), data_type: DataType::Integer, nullable: true, position: 2 },
-                ColumnDef { name: "email".into(), data_type: DataType::Text, nullable: true, position: 3 },
+                ColumnDef {
+                    name: "id".into(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "name".into(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    position: 1,
+                },
+                ColumnDef {
+                    name: "age".into(),
+                    data_type: DataType::Integer,
+                    nullable: true,
+                    position: 2,
+                },
+                ColumnDef {
+                    name: "email".into(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    position: 3,
+                },
             ],
             primary_key_columns: vec![0],
             indices: vec![
-                IndexDef { name: "idx_name".into(), columns: vec![1], unique: false },
-                IndexDef { name: "idx_email".into(), columns: vec![3], unique: true },
-                IndexDef { name: "idx_name_age".into(), columns: vec![1, 2], unique: false },
+                IndexDef {
+                    name: "idx_name".into(),
+                    columns: vec![1],
+                    unique: false,
+                },
+                IndexDef {
+                    name: "idx_email".into(),
+                    columns: vec![3],
+                    unique: true,
+                },
+                IndexDef {
+                    name: "idx_name_age".into(),
+                    columns: vec![1, 2],
+                    unique: false,
+                },
             ],
         }
     }
@@ -336,7 +404,12 @@ mod tests {
         });
         let plan = plan_select(&schema, &where_clause);
         match plan {
-            ScanPlan::IndexScan { index_name, is_unique, num_prefix_cols, .. } => {
+            ScanPlan::IndexScan {
+                index_name,
+                is_unique,
+                num_prefix_cols,
+                ..
+            } => {
                 assert_eq!(index_name, "idx_email");
                 assert!(is_unique);
                 assert_eq!(num_prefix_cols, 1);
@@ -355,7 +428,11 @@ mod tests {
         });
         let plan = plan_select(&schema, &where_clause);
         match plan {
-            ScanPlan::IndexScan { index_name, num_prefix_cols, .. } => {
+            ScanPlan::IndexScan {
+                index_name,
+                num_prefix_cols,
+                ..
+            } => {
                 assert!(index_name == "idx_name" || index_name == "idx_name_age");
                 assert_eq!(num_prefix_cols, 1);
             }
@@ -381,7 +458,11 @@ mod tests {
         });
         let plan = plan_select(&schema, &where_clause);
         match plan {
-            ScanPlan::IndexScan { index_name, num_prefix_cols, .. } => {
+            ScanPlan::IndexScan {
+                index_name,
+                num_prefix_cols,
+                ..
+            } => {
                 assert_eq!(index_name, "idx_name_age");
                 assert_eq!(num_prefix_cols, 2);
             }
@@ -399,7 +480,11 @@ mod tests {
         });
         let plan = plan_select(&schema, &where_clause);
         match plan {
-            ScanPlan::IndexScan { range_conds, num_prefix_cols, .. } => {
+            ScanPlan::IndexScan {
+                range_conds,
+                num_prefix_cols,
+                ..
+            } => {
                 assert_eq!(num_prefix_cols, 0);
                 assert_eq!(range_conds.len(), 1);
                 assert_eq!(range_conds[0].0, BinOp::Gt);
@@ -426,7 +511,12 @@ mod tests {
         });
         let plan = plan_select(&schema, &where_clause);
         match plan {
-            ScanPlan::IndexScan { index_name, num_prefix_cols, range_conds, .. } => {
+            ScanPlan::IndexScan {
+                index_name,
+                num_prefix_cols,
+                range_conds,
+                ..
+            } => {
                 assert_eq!(index_name, "idx_name_age");
                 assert_eq!(num_prefix_cols, 1);
                 assert_eq!(range_conds.len(), 1);
@@ -501,13 +591,31 @@ mod tests {
         let schema = TableSchema {
             name: "t".into(),
             columns: vec![
-                ColumnDef { name: "id".into(), data_type: DataType::Integer, nullable: false, position: 0 },
-                ColumnDef { name: "code".into(), data_type: DataType::Text, nullable: false, position: 1 },
+                ColumnDef {
+                    name: "id".into(),
+                    data_type: DataType::Integer,
+                    nullable: false,
+                    position: 0,
+                },
+                ColumnDef {
+                    name: "code".into(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    position: 1,
+                },
             ],
             primary_key_columns: vec![0],
             indices: vec![
-                IndexDef { name: "idx_code".into(), columns: vec![1], unique: false },
-                IndexDef { name: "idx_code_uniq".into(), columns: vec![1], unique: true },
+                IndexDef {
+                    name: "idx_code".into(),
+                    columns: vec![1],
+                    unique: false,
+                },
+                IndexDef {
+                    name: "idx_code_uniq".into(),
+                    columns: vec![1],
+                    unique: true,
+                },
             ],
         };
         let where_clause = Some(Expr::BinaryOp {
@@ -517,7 +625,11 @@ mod tests {
         });
         let plan = plan_select(&schema, &where_clause);
         match plan {
-            ScanPlan::IndexScan { index_name, is_unique, .. } => {
+            ScanPlan::IndexScan {
+                index_name,
+                is_unique,
+                ..
+            } => {
                 assert_eq!(index_name, "idx_code_uniq");
                 assert!(is_unique);
             }
@@ -543,7 +655,11 @@ mod tests {
         });
         let plan = plan_select(&schema, &where_clause);
         match plan {
-            ScanPlan::IndexScan { index_name, num_prefix_cols, .. } => {
+            ScanPlan::IndexScan {
+                index_name,
+                num_prefix_cols,
+                ..
+            } => {
                 assert_eq!(index_name, "idx_name_age");
                 assert_eq!(num_prefix_cols, 2);
             }

@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
 use citadel_sync::{
-    ApplyResult, CrdtMeta, EntryKind, HlcTimestamp, LocalTreeReader, NodeId, SyncPatch,
-    apply_patch, decode_lww_value, encode_lww_value, merkle_diff,
+    apply_patch, decode_lww_value, encode_lww_value, merkle_diff, ApplyResult, CrdtMeta, EntryKind,
+    HlcTimestamp, LocalTreeReader, NodeId, SyncPatch,
 };
 use rand::Rng;
 
@@ -16,7 +16,10 @@ fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
 }
 
 fn meta(secs: i64, logical: i32, node: u64) -> CrdtMeta {
-    CrdtMeta::new(HlcTimestamp::new(secs * NS, logical), NodeId::from_u64(node))
+    CrdtMeta::new(
+        HlcTimestamp::new(secs * NS, logical),
+        NodeId::from_u64(node),
+    )
 }
 
 fn collect_all(db: &Database) -> BTreeMap<Vec<u8>, Vec<u8>> {
@@ -43,7 +46,9 @@ fn assert_crdt_converged(db1: &Database, db2: &Database) {
     let data2 = collect_all(db2);
     assert_eq!(data1.len(), data2.len(), "entry count mismatch");
     for (k, v1) in &data1 {
-        let v2 = data2.get(k).unwrap_or_else(|| panic!("key missing from db2"));
+        let v2 = data2
+            .get(k)
+            .unwrap_or_else(|| panic!("key missing from db2"));
         let d1 = decode_lww_value(v1).unwrap();
         let d2 = decode_lww_value(v2).unwrap();
         assert_eq!(d1.user_value, d2.user_value, "value mismatch");
@@ -135,9 +140,17 @@ fn many_conflicts_lww_alternating_winner() {
     for i in 0u32..50 {
         let decoded = decode_lww_value(&data[&i.to_be_bytes().to_vec()]).unwrap();
         if i % 2 == 0 {
-            assert_eq!(decoded.user_value, format!("n1-{i}").as_bytes(), "even key {i}");
+            assert_eq!(
+                decoded.user_value,
+                format!("n1-{i}").as_bytes(),
+                "even key {i}"
+            );
         } else {
-            assert_eq!(decoded.user_value, format!("n2-{i}").as_bytes(), "odd key {i}");
+            assert_eq!(
+                decoded.user_value,
+                format!("n2-{i}").as_bytes(),
+                "odd key {i}"
+            );
         }
     }
 }
@@ -302,7 +315,11 @@ fn serialize_roundtrip_500_entries() {
                 key,
                 value,
                 kind,
-                crdt_meta: Some(meta(rng.gen_range(1..10000), rng.gen_range(0..100), rng.gen())),
+                crdt_meta: Some(meta(
+                    rng.gen_range(1..10000),
+                    rng.gen_range(0..100),
+                    rng.gen(),
+                )),
             }
         })
         .collect();
@@ -336,14 +353,16 @@ fn disjoint_patches_from_different_sources() {
     {
         let mut wtx = src_a.begin_write().unwrap();
         for i in 0u32..10 {
-            wtx.insert(&[0, i as u8], format!("a-{i}").as_bytes()).unwrap();
+            wtx.insert(&[0, i as u8], format!("a-{i}").as_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
     {
         let mut wtx = src_b.begin_write().unwrap();
         for i in 0u32..10 {
-            wtx.insert(&[1, i as u8], format!("b-{i}").as_bytes()).unwrap();
+            wtx.insert(&[1, i as u8], format!("b-{i}").as_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }

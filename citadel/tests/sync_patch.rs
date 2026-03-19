@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
 use citadel_sync::{
-    ApplyResult, CrdtMeta, EntryKind, HlcTimestamp, LocalTreeReader, NodeId, SyncPatch,
-    apply_patch, decode_lww_value, encode_lww_value, merkle_diff,
+    apply_patch, decode_lww_value, encode_lww_value, merkle_diff, ApplyResult, CrdtMeta, EntryKind,
+    HlcTimestamp, LocalTreeReader, NodeId, SyncPatch,
 };
 
 const NS: i64 = 1_000_000_000;
@@ -15,7 +15,10 @@ fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
 }
 
 fn meta(secs: i64, logical: i32, node: u64) -> CrdtMeta {
-    CrdtMeta::new(HlcTimestamp::new(secs * NS, logical), NodeId::from_u64(node))
+    CrdtMeta::new(
+        HlcTimestamp::new(secs * NS, logical),
+        NodeId::from_u64(node),
+    )
 }
 
 fn collect_all(db: &Database) -> BTreeMap<Vec<u8>, Vec<u8>> {
@@ -278,10 +281,10 @@ fn bidirectional_disjoint_changes() {
     let data1 = collect_all(&db1);
     let data2 = collect_all(&db2);
 
-    assert!(data1.contains_key(&b"key-a".to_vec()));
-    assert!(data1.contains_key(&b"key-b".to_vec()));
-    assert!(data2.contains_key(&b"key-a".to_vec()));
-    assert!(data2.contains_key(&b"key-b".to_vec()));
+    assert!(data1.contains_key(b"key-a".as_slice()));
+    assert!(data1.contains_key(b"key-b".as_slice()));
+    assert!(data2.contains_key(b"key-a".as_slice()));
+    assert!(data2.contains_key(b"key-b".as_slice()));
 
     let d1_a = decode_lww_value(&data1[&b"key-a".to_vec()]).unwrap();
     let d2_a = decode_lww_value(&data2[&b"key-a".to_vec()]).unwrap();
@@ -423,7 +426,10 @@ fn persistence_across_reopen() {
     let data = collect_all(&target);
     assert_eq!(data.len(), 100);
     for i in 0u32..100 {
-        assert_eq!(data[&i.to_be_bytes().to_vec()], format!("persistent-{i}").as_bytes());
+        assert_eq!(
+            data[&i.to_be_bytes().to_vec()],
+            format!("persistent-{i}").as_bytes()
+        );
     }
 }
 
@@ -535,6 +541,16 @@ fn mixed_crdt_conflicts_and_new_keys() {
     assert!(result.entries_applied >= 2);
 
     let data = collect_all(&target);
-    assert_eq!(decode_lww_value(&data[&b"key1".to_vec()]).unwrap().user_value, b"updated");
-    assert_eq!(decode_lww_value(&data[&b"key2".to_vec()]).unwrap().user_value, b"brand-new");
+    assert_eq!(
+        decode_lww_value(&data[&b"key1".to_vec()])
+            .unwrap()
+            .user_value,
+        b"updated"
+    );
+    assert_eq!(
+        decode_lww_value(&data[&b"key2".to_vec()])
+            .unwrap()
+            .user_value,
+        b"brand-new"
+    );
 }

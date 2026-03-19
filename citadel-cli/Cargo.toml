@@ -19,6 +19,8 @@ path = "src/main.rs"
 [features]
 default = ["audit-log"]
 audit-log = ["citadel/audit-log"]
+fips = ["citadel/fips"]
+io-uring = ["citadel/io-uring"]
 
 [dependencies]
 citadel = { workspace = true }

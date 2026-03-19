@@ -111,8 +111,8 @@ impl Database {
 
     /// Change the database passphrase (re-wraps REK, no page re-encryption).
     pub fn change_passphrase(&self, old_passphrase: &[u8], new_passphrase: &[u8]) -> Result<()> {
-        use citadel_crypto::key_manager::{KeyFile, wrap_rek, unwrap_rek};
         use citadel_crypto::kdf::{derive_mk, generate_salt};
+        use citadel_crypto::key_manager::{unwrap_rek, wrap_rek, KeyFile};
 
         let key_data = fs::read(&self.key_path)?;
         if key_data.len() != KEY_FILE_SIZE {
@@ -134,8 +134,7 @@ impl Database {
         )?;
         kf.verify_mac(&old_mk)?;
 
-        let rek = unwrap_rek(&old_mk, &kf.wrapped_rek)
-            .map_err(|_| Error::BadPassphrase)?;
+        let rek = unwrap_rek(&old_mk, &kf.wrapped_rek).map_err(|_| Error::BadPassphrase)?;
 
         let new_salt = generate_salt();
         let new_mk = derive_mk(
@@ -207,9 +206,9 @@ impl Database {
         backup_passphrase: &[u8],
         dest_path: &Path,
     ) -> Result<()> {
-        use citadel_crypto::key_manager::{KeyFile, unwrap_rek};
-        use citadel_crypto::key_backup::create_key_backup;
         use citadel_crypto::kdf::derive_mk;
+        use citadel_crypto::key_backup::create_key_backup;
+        use citadel_crypto::key_manager::{unwrap_rek, KeyFile};
 
         let key_data = fs::read(&self.key_path)?;
         if key_data.len() != KEY_FILE_SIZE {
@@ -231,8 +230,7 @@ impl Database {
         )?;
         kf.verify_mac(&mk)?;
 
-        let rek = unwrap_rek(&mk, &kf.wrapped_rek)
-            .map_err(|_| Error::BadPassphrase)?;
+        let rek = unwrap_rek(&mk, &kf.wrapped_rek).map_err(|_| Error::BadPassphrase)?;
 
         let backup_data = create_key_backup(
             &rek,
@@ -264,11 +262,13 @@ impl Database {
         new_db_passphrase: &[u8],
         db_path: &Path,
     ) -> Result<()> {
+        use citadel_core::{
+            KEY_BACKUP_SIZE, KEY_FILE_MAGIC, KEY_FILE_VERSION, MAC_SIZE, WRAPPED_KEY_SIZE,
+        };
+        use citadel_crypto::kdf::{derive_mk, generate_salt};
         use citadel_crypto::key_backup::restore_rek_from_backup;
         use citadel_crypto::key_manager::wrap_rek;
         use citadel_crypto::key_manager::KeyFile;
-        use citadel_crypto::kdf::{derive_mk, generate_salt};
-        use citadel_core::{KEY_BACKUP_SIZE, KEY_FILE_MAGIC, KEY_FILE_VERSION, MAC_SIZE, WRAPPED_KEY_SIZE};
 
         let backup_data = fs::read(backup_path)?;
         if backup_data.len() != KEY_BACKUP_SIZE {
@@ -357,12 +357,10 @@ impl Database {
     /// Verify the audit log's HMAC chain integrity.
     #[cfg(feature = "audit-log")]
     pub fn verify_audit_log(&self) -> Result<crate::audit::AuditVerifyResult> {
-        let audit = self.audit_log.as_ref().ok_or_else(|| {
-            Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "audit logging is not enabled",
-            ))
-        })?;
+        let audit = self
+            .audit_log
+            .as_ref()
+            .ok_or_else(|| Error::Io(std::io::Error::other("audit logging is not enabled")))?;
         let guard = audit.lock();
         let path = crate::audit::resolve_audit_path(&self.data_path);
         crate::audit::verify_audit_log(&path, guard.audit_key())
@@ -425,8 +423,8 @@ impl Database {
     /// Push local named tables to a remote peer.
     pub fn sync_to(&self, addr: &str, sync_key: &citadel_sync::SyncKey) -> Result<SyncOutcome> {
         let node_id = self.node_id()?;
-        let transport = citadel_sync::NoiseTransport::connect(addr, sync_key)
-            .map_err(sync_err_to_core)?;
+        let transport =
+            citadel_sync::NoiseTransport::connect(addr, sync_key).map_err(sync_err_to_core)?;
         let session = citadel_sync::SyncSession::new(citadel_sync::SyncConfig {
             node_id,
             direction: citadel_sync::SyncDirection::Push,
@@ -449,10 +447,14 @@ impl Database {
     }
 
     /// Handle an incoming sync session from a remote peer.
-    pub fn handle_sync(&self, stream: std::net::TcpStream, sync_key: &citadel_sync::SyncKey) -> Result<SyncOutcome> {
+    pub fn handle_sync(
+        &self,
+        stream: std::net::TcpStream,
+        sync_key: &citadel_sync::SyncKey,
+    ) -> Result<SyncOutcome> {
         let node_id = self.node_id()?;
-        let transport = citadel_sync::NoiseTransport::accept(stream, sync_key)
-            .map_err(sync_err_to_core)?;
+        let transport =
+            citadel_sync::NoiseTransport::accept(stream, sync_key).map_err(sync_err_to_core)?;
         let session = citadel_sync::SyncSession::new(citadel_sync::SyncConfig {
             node_id,
             direction: citadel_sync::SyncDirection::Push,

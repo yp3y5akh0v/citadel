@@ -137,10 +137,7 @@ fn table_update_and_delete() {
         Some(b"updated".to_vec())
     );
     assert_eq!(rtx.table_get(b"items", b"b").unwrap(), None);
-    assert_eq!(
-        rtx.table_get(b"items", b"c").unwrap(),
-        Some(b"3".to_vec())
-    );
+    assert_eq!(rtx.table_get(b"items", b"c").unwrap(), Some(b"3".to_vec()));
 }
 
 #[test]
@@ -274,7 +271,8 @@ fn many_tables_stress() {
             let key = format!("k{i:03}");
             let val = format!("t{t}_v{i}");
             assert_eq!(
-                rtx.table_get(table_name.as_bytes(), key.as_bytes()).unwrap(),
+                rtx.table_get(table_name.as_bytes(), key.as_bytes())
+                    .unwrap(),
                 Some(val.into_bytes()),
                 "mismatch at {table_name}/{key}"
             );

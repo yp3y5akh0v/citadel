@@ -213,7 +213,9 @@ fn decode_null_escaped(data: &[u8]) -> Result<(Vec<u8>, usize)> {
             i += 1;
         }
     }
-    Err(SqlError::InvalidValue("unterminated null-escaped string".into()))
+    Err(SqlError::InvalidValue(
+        "unterminated null-escaped string".into(),
+    ))
 }
 
 // ── Row encoding (for B+ tree values — non-PK columns) ─────────────
@@ -222,7 +224,7 @@ fn decode_null_escaped(data: &[u8]) -> Result<(Vec<u8>, usize)> {
 /// Format: [col_count: u16][null_bitmap][per-column: data_type(u8) + data_len(u32) + data]
 pub fn encode_row(values: &[Value]) -> Vec<u8> {
     let col_count = values.len();
-    let bitmap_bytes = (col_count + 7) / 8;
+    let bitmap_bytes = col_count.div_ceil(8);
     let mut buf = Vec::new();
 
     // Column count
@@ -282,7 +284,7 @@ pub fn decode_row(data: &[u8]) -> Result<Vec<Value>> {
         return Err(SqlError::InvalidValue("row data too short".into()));
     }
     let col_count = u16::from_le_bytes([data[0], data[1]]) as usize;
-    let bitmap_bytes = (col_count + 7) / 8;
+    let bitmap_bytes = col_count.div_ceil(8);
     let mut pos = 2;
 
     if data.len() < pos + bitmap_bytes {
@@ -304,7 +306,8 @@ pub fn decode_row(data: &[u8]) -> Result<Vec<Value>> {
         }
         let type_tag = data[pos];
         pos += 1;
-        let data_len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let data_len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
 
         if pos + data_len > data.len() {
@@ -325,10 +328,12 @@ pub fn decode_row(data: &[u8]) -> Result<Vec<Value>> {
                 let s = String::from_utf8_lossy(&data[pos..pos + data_len]).into_owned();
                 Value::Text(s)
             }
-            Some(DataType::Blob) => {
-                Value::Blob(data[pos..pos + data_len].to_vec())
+            Some(DataType::Blob) => Value::Blob(data[pos..pos + data_len].to_vec()),
+            _ => {
+                return Err(SqlError::InvalidValue(format!(
+                    "unknown column type tag: {type_tag}"
+                )))
             }
-            _ => return Err(SqlError::InvalidValue(format!("unknown column type tag: {type_tag}"))),
         };
         pos += data_len;
         values.push(value);
@@ -366,8 +371,19 @@ mod tests {
     #[test]
     fn key_integer_roundtrip() {
         let test_values = [
-            i64::MIN, -1_000_000, -256, -1, 0, 1, 127, 128, 255, 256,
-            65535, 1_000_000, i64::MAX,
+            i64::MIN,
+            -1_000_000,
+            -256,
+            -1,
+            0,
+            1,
+            127,
+            128,
+            255,
+            256,
+            65535,
+            1_000_000,
+            i64::MAX,
         ];
         for &v in &test_values {
             let encoded = encode_key_value(&Value::Integer(v));
@@ -378,10 +394,9 @@ mod tests {
 
     #[test]
     fn key_integer_sort_order() {
-        let values: Vec<i64> = vec![
-            i64::MIN, -1_000_000, -1, 0, 1, 1_000_000, i64::MAX,
-        ];
-        let encoded: Vec<Vec<u8>> = values.iter()
+        let values: Vec<i64> = vec![i64::MIN, -1_000_000, -1, 0, 1, 1_000_000, i64::MAX];
+        let encoded: Vec<Vec<u8>> = values
+            .iter()
             .map(|&v| encode_key_value(&Value::Integer(v)))
             .collect();
 
@@ -389,7 +404,8 @@ mod tests {
             assert!(
                 encoded[i] < encoded[i + 1],
                 "sort order broken: {} vs {}",
-                values[i], values[i + 1]
+                values[i],
+                values[i + 1]
             );
         }
     }
@@ -397,8 +413,17 @@ mod tests {
     #[test]
     fn key_real_roundtrip() {
         let test_values = [
-            f64::NEG_INFINITY, -1e100, -1.0, -f64::MIN_POSITIVE, -0.0,
-            0.0, f64::MIN_POSITIVE, 0.5, 1.0, 1e100, f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1e100,
+            -1.0,
+            -f64::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            f64::MIN_POSITIVE,
+            0.5,
+            1.0,
+            1e100,
+            f64::INFINITY,
         ];
         for &v in &test_values {
             let encoded = encode_key_value(&Value::Real(v));
@@ -417,11 +442,18 @@ mod tests {
 
     #[test]
     fn key_real_sort_order() {
-        let values = vec![
-            f64::NEG_INFINITY, -100.0, -1.0, -0.0,
-            0.0, 1.0, 100.0, f64::INFINITY,
+        let values = [
+            f64::NEG_INFINITY,
+            -100.0,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            100.0,
+            f64::INFINITY,
         ];
-        let encoded: Vec<Vec<u8>> = values.iter()
+        let encoded: Vec<Vec<u8>> = values
+            .iter()
             .map(|&v| encode_key_value(&Value::Real(v)))
             .collect();
 
@@ -429,7 +461,8 @@ mod tests {
             assert!(
                 encoded[i] <= encoded[i + 1],
                 "sort order broken: {} vs {}",
-                values[i], values[i + 1]
+                values[i],
+                values[i + 1]
             );
         }
     }
@@ -446,8 +479,9 @@ mod tests {
 
     #[test]
     fn key_text_sort_order() {
-        let values = vec!["", "a", "ab", "b", "ba", "z"];
-        let encoded: Vec<Vec<u8>> = values.iter()
+        let values = ["", "a", "ab", "b", "ba", "z"];
+        let encoded: Vec<Vec<u8>> = values
+            .iter()
             .map(|&v| encode_key_value(&Value::Text(v.into())))
             .collect();
 
@@ -455,7 +489,8 @@ mod tests {
             assert!(
                 encoded[i] < encoded[i + 1],
                 "sort order broken: {:?} vs {:?}",
-                values[i], values[i + 1]
+                values[i],
+                values[i + 1]
             );
         }
     }
@@ -463,7 +498,10 @@ mod tests {
     #[test]
     fn key_blob_roundtrip() {
         let test_values: Vec<Vec<u8>> = vec![
-            vec![], vec![0x00], vec![0x00, 0xFF], vec![0xFF, 0x00],
+            vec![],
+            vec![0x00],
+            vec![0x00, 0xFF],
+            vec![0xFF, 0x00],
             vec![0x00, 0x00, 0x00],
         ];
         for v in &test_values {
@@ -557,7 +595,7 @@ mod tests {
     fn row_roundtrip_all_types() {
         let values = vec![
             Value::Integer(-100),
-            Value::Real(3.14),
+            Value::Real(3.15),
             Value::Text("hello world".into()),
             Value::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),
             Value::Boolean(false),
@@ -567,7 +605,7 @@ mod tests {
         let decoded = decode_row(&encoded).unwrap();
         assert_eq!(decoded.len(), 6);
         assert_eq!(decoded[0], Value::Integer(-100));
-        assert_eq!(decoded[1], Value::Real(3.14));
+        assert_eq!(decoded[1], Value::Real(3.15));
         assert_eq!(decoded[2], Value::Text("hello world".into()));
         assert_eq!(decoded[3], Value::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]));
         assert_eq!(decoded[4], Value::Boolean(false));

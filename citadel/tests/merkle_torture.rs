@@ -11,8 +11,8 @@
 
 use std::collections::BTreeMap;
 
-use citadel::{Argon2Profile, DatabaseBuilder};
 use citadel::core::MERKLE_HASH_SIZE;
+use citadel::{Argon2Profile, DatabaseBuilder};
 
 fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
     DatabaseBuilder::new(path)
@@ -65,7 +65,8 @@ fn single_leaf_hash_matches() {
 
     let expected_hash = expected_leaf_hash(&expected);
     assert_eq!(
-        db.stats().merkle_root, expected_hash,
+        db.stats().merkle_root,
+        expected_hash,
         "single-leaf hash must match db merkle_root"
     );
 }
@@ -78,7 +79,8 @@ fn empty_db_hash_matches() {
     let empty = BTreeMap::new();
     let expected_hash = expected_leaf_hash(&empty);
     assert_eq!(
-        db.stats().merkle_root, expected_hash,
+        db.stats().merkle_root,
+        expected_hash,
         "empty db hash must match"
     );
 }
@@ -103,7 +105,8 @@ fn delete_all_hash_matches_empty() {
     wtx.commit().unwrap();
 
     assert_eq!(
-        db.stats().merkle_root, empty_hash,
+        db.stats().merkle_root,
+        empty_hash,
         "deleting all entries must restore empty db hash"
     );
 }
@@ -145,7 +148,8 @@ fn single_txn_vs_many_txns_same_hash() {
     {
         let mut wtx = db1.begin_write().unwrap();
         for i in 0..50u32 {
-            wtx.insert(&i.to_be_bytes(), &(i * 7).to_le_bytes()).unwrap();
+            wtx.insert(&i.to_be_bytes(), &(i * 7).to_le_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -154,7 +158,8 @@ fn single_txn_vs_many_txns_same_hash() {
     let db2 = fast_builder(&dir.path().join("b.db")).create().unwrap();
     for i in 0..50u32 {
         let mut wtx = db2.begin_write().unwrap();
-        wtx.insert(&i.to_be_bytes(), &(i * 7).to_le_bytes()).unwrap();
+        wtx.insert(&i.to_be_bytes(), &(i * 7).to_le_bytes())
+            .unwrap();
         wtx.commit().unwrap();
     }
 
@@ -232,7 +237,11 @@ fn many_inserts_force_splits_hash_changes() {
 
     // Integrity check must still pass
     let report = db.integrity_check().unwrap();
-    assert!(report.is_ok(), "integrity check after splits: {:?}", report.errors);
+    assert!(
+        report.is_ok(),
+        "integrity check after splits: {:?}",
+        report.errors
+    );
 }
 
 #[test]
@@ -250,7 +259,8 @@ fn split_same_order_different_txn_granularity() {
     // DB1: all 500 in one txn
     let mut wtx = db1.begin_write().unwrap();
     for i in 0..500u32 {
-        wtx.insert(&i.to_be_bytes(), &(i * 3).to_le_bytes()).unwrap();
+        wtx.insert(&i.to_be_bytes(), &(i * 3).to_le_bytes())
+            .unwrap();
     }
     wtx.commit().unwrap();
 
@@ -259,7 +269,8 @@ fn split_same_order_different_txn_granularity() {
         let mut wtx = db2.begin_write().unwrap();
         for i in 0..25u32 {
             let key = (batch * 25 + i).to_be_bytes();
-            wtx.insert(&key, &((batch * 25 + i) * 3).to_le_bytes()).unwrap();
+            wtx.insert(&key, &((batch * 25 + i) * 3).to_le_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -305,7 +316,10 @@ fn delete_half_then_reinsert_restores_hash() {
     wtx.commit().unwrap();
     let restored_hash = db.stats().merkle_root;
 
-    assert_eq!(full_hash, restored_hash, "reinserting deleted entries must restore hash");
+    assert_eq!(
+        full_hash, restored_hash,
+        "reinserting deleted entries must restore hash"
+    );
 }
 
 // ============================================================
@@ -380,9 +394,13 @@ fn random_ops_maintain_consistency() {
     rtx.for_each(|k, v| {
         db_entries.insert(k.to_vec(), v.to_vec());
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
 
-    assert_eq!(expected, db_entries, "expected and db must match after random ops");
+    assert_eq!(
+        expected, db_entries,
+        "expected and db must match after random ops"
+    );
 }
 
 #[test]
@@ -403,7 +421,8 @@ fn random_ops_two_dbs_converge() {
     {
         let mut wtx = db1.begin_write().unwrap();
         for i in (0..50u32).step_by(3) {
-            wtx.insert(&i.to_be_bytes(), &(i * 100).to_le_bytes()).unwrap();
+            wtx.insert(&i.to_be_bytes(), &(i * 100).to_le_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -420,7 +439,8 @@ fn random_ops_two_dbs_converge() {
     {
         let mut wtx = db2.begin_write().unwrap();
         for i in (0..50u32).step_by(3) {
-            wtx.insert(&i.to_be_bytes(), &(i * 100).to_le_bytes()).unwrap();
+            wtx.insert(&i.to_be_bytes(), &(i * 100).to_le_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -455,7 +475,8 @@ fn different_passphrase_same_merkle_root() {
     for db in [&db1, &db2] {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..100u32 {
-            wtx.insert(&i.to_be_bytes(), &(i * 7).to_le_bytes()).unwrap();
+            wtx.insert(&i.to_be_bytes(), &(i * 7).to_le_bytes())
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
@@ -493,7 +514,7 @@ fn merkle_root_survives_many_reopen_cycles() {
 
             let mut wtx = db.begin_write().unwrap();
             for i in 0..10u32 {
-                let key = ((round * 10 + i) as u32).to_be_bytes();
+                let key = (round * 10 + i).to_be_bytes();
                 wtx.insert(&key, b"round-data").unwrap();
             }
             wtx.commit().unwrap();
@@ -503,7 +524,11 @@ fn merkle_root_survives_many_reopen_cycles() {
 
     // All hashes should be unique
     let unique: std::collections::HashSet<_> = hashes.iter().collect();
-    assert_eq!(unique.len(), hashes.len(), "each round must produce unique hash");
+    assert_eq!(
+        unique.len(),
+        hashes.len(),
+        "each round must produce unique hash"
+    );
 }
 
 // ============================================================
@@ -633,7 +658,10 @@ fn many_single_byte_keys_unique_hashes() {
         let mut wtx = db.begin_write().unwrap();
         wtx.insert(&[b], &[b]).unwrap();
         wtx.commit().unwrap();
-        assert!(seen.insert(db.stats().merkle_root), "byte {b} must produce unique hash");
+        assert!(
+            seen.insert(db.stats().merkle_root),
+            "byte {b} must produce unique hash"
+        );
     }
 }
 
@@ -676,7 +704,10 @@ fn large_values() {
     wtx.commit().unwrap();
     let h2 = db.stats().merkle_root;
 
-    assert_ne!(h1, h2, "different large values must produce different hashes");
+    assert_ne!(
+        h1, h2,
+        "different large values must produce different hashes"
+    );
 }
 
 #[test]
@@ -715,7 +746,10 @@ fn empty_key_and_value() {
         db2.stats().merkle_root
     };
 
-    assert_ne!(h, empty_db_hash, "empty-key entry must differ from no entries");
+    assert_ne!(
+        h, empty_db_hash,
+        "empty-key entry must differ from no entries"
+    );
 }
 
 // ============================================================
@@ -877,14 +911,22 @@ fn multiple_aborts_then_commit() {
         wtx.abort();
     }
 
-    assert_eq!(db.stats().merkle_root, initial, "aborts must not change hash");
+    assert_eq!(
+        db.stats().merkle_root,
+        initial,
+        "aborts must not change hash"
+    );
 
     // Now a real commit
     let mut wtx = db.begin_write().unwrap();
     wtx.insert(b"committed", b"data").unwrap();
     wtx.commit().unwrap();
 
-    assert_ne!(db.stats().merkle_root, initial, "commit after aborts must change hash");
+    assert_ne!(
+        db.stats().merkle_root,
+        initial,
+        "commit after aborts must change hash"
+    );
 }
 
 // ============================================================
@@ -919,11 +961,16 @@ fn reader_sees_consistent_hash_during_writes() {
         assert_eq!(v, b"first", "reader must see snapshot data");
         count += 1;
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(count, 50);
 
     // DB stats reflect the new write
-    assert_ne!(db.stats().merkle_root, snapshot_hash, "new write must change hash");
+    assert_ne!(
+        db.stats().merkle_root,
+        snapshot_hash,
+        "new write must change hash"
+    );
     drop(rtx);
 }
 
@@ -947,13 +994,15 @@ fn named_table_churn_does_not_affect_default_hash() {
         let mut wtx = db.begin_write().unwrap();
         wtx.create_table(name.as_bytes()).unwrap();
         for i in 0..50u32 {
-            wtx.table_insert(name.as_bytes(), &i.to_be_bytes(), &[round as u8; 32]).unwrap();
+            wtx.table_insert(name.as_bytes(), &i.to_be_bytes(), &[round as u8; 32])
+                .unwrap();
         }
         wtx.commit().unwrap();
     }
 
     assert_eq!(
-        db.stats().merkle_root, h_before,
+        db.stats().merkle_root,
+        h_before,
         "named table operations must not affect default tree merkle root"
     );
 
@@ -966,7 +1015,8 @@ fn named_table_churn_does_not_affect_default_hash() {
     }
 
     assert_eq!(
-        db.stats().merkle_root, h_before,
+        db.stats().merkle_root,
+        h_before,
         "dropping named tables must not affect default tree merkle root"
     );
 }
@@ -991,7 +1041,11 @@ fn rapid_insert_delete_cycles() {
         }
         wtx.commit().unwrap();
 
-        assert_ne!(db.stats().merkle_root, empty_hash, "cycle {cycle}: non-empty must differ");
+        assert_ne!(
+            db.stats().merkle_root,
+            empty_hash,
+            "cycle {cycle}: non-empty must differ"
+        );
 
         let mut wtx = db.begin_write().unwrap();
         for i in 0..20u32 {
@@ -1002,7 +1056,8 @@ fn rapid_insert_delete_cycles() {
     }
 
     assert_eq!(
-        db.stats().merkle_root, empty_hash,
+        db.stats().merkle_root,
+        empty_hash,
         "after all insert-delete cycles, must return to empty hash"
     );
 }
@@ -1018,7 +1073,8 @@ fn integrity_check_after_complex_workload() {
 
     let mut wtx = db.begin_write().unwrap();
     for i in 0..500u32 {
-        wtx.insert(&i.to_be_bytes(), &format!("value-{i}").into_bytes()).unwrap();
+        wtx.insert(&i.to_be_bytes(), &format!("value-{i}").into_bytes())
+            .unwrap();
     }
     wtx.commit().unwrap();
     let r = db.integrity_check().unwrap();
@@ -1059,7 +1115,9 @@ fn single_bit_value_difference() {
 
     let mut hashes = Vec::new();
     for bit in 0..8u8 {
-        let db = fast_builder(&dir.path().join(format!("bit{bit}.db"))).create().unwrap();
+        let db = fast_builder(&dir.path().join(format!("bit{bit}.db")))
+            .create()
+            .unwrap();
         let mut wtx = db.begin_write().unwrap();
         let val = [1u8 << bit];
         wtx.insert(b"key", &val).unwrap();
@@ -1069,7 +1127,11 @@ fn single_bit_value_difference() {
 
     // All hashes must be unique
     let unique: std::collections::HashSet<_> = hashes.iter().collect();
-    assert_eq!(unique.len(), 8, "each single-bit value must produce unique hash");
+    assert_eq!(
+        unique.len(),
+        8,
+        "each single-bit value must produce unique hash"
+    );
 }
 
 #[test]
@@ -1078,7 +1140,9 @@ fn single_bit_key_difference() {
 
     let mut hashes = Vec::new();
     for bit in 0..8u8 {
-        let db = fast_builder(&dir.path().join(format!("kbit{bit}.db"))).create().unwrap();
+        let db = fast_builder(&dir.path().join(format!("kbit{bit}.db")))
+            .create()
+            .unwrap();
         let mut wtx = db.begin_write().unwrap();
         let key = [1u8 << bit];
         wtx.insert(&key, b"same-value").unwrap();
@@ -1087,5 +1151,9 @@ fn single_bit_key_difference() {
     }
 
     let unique: std::collections::HashSet<_> = hashes.iter().collect();
-    assert_eq!(unique.len(), 8, "each single-bit key must produce unique hash");
+    assert_eq!(
+        unique.len(),
+        8,
+        "each single-bit key must produce unique hash"
+    );
 }

@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use citadel_core::types::{PageId, PageType, ValueType};
 use citadel_core::Result;
-use citadel_page::{branch_node, leaf_node};
 use citadel_page::page::Page;
+use citadel_page::{branch_node, leaf_node};
 
 use crate::catalog::TableDescriptor;
 use crate::manager::TxnManager;
@@ -22,11 +22,23 @@ impl IntegrityReport {
 
 #[derive(Debug)]
 pub enum IntegrityError {
-    PageReadFailed { page: PageId, error: String },
-    KeyOrderViolation { page: PageId, index: usize },
+    PageReadFailed {
+        page: PageId,
+        error: String,
+    },
+    KeyOrderViolation {
+        page: PageId,
+        index: usize,
+    },
     DuplicatePageRef(PageId),
-    EntryCountMismatch { expected: u64, actual: u64 },
-    InvalidPageType { page: PageId, expected: &'static str },
+    EntryCountMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    InvalidPageType {
+        page: PageId,
+        expected: &'static str,
+    },
 }
 
 pub(crate) fn run_integrity_check(mgr: &TxnManager) -> Result<IntegrityReport> {
@@ -37,7 +49,11 @@ pub(crate) fn run_integrity_check(mgr: &TxnManager) -> Result<IntegrityReport> {
 
     // Walk the default tree
     let default_count = walk_tree(
-        mgr, slot.tree_root, &mut visited, &mut errors, &mut pages_checked,
+        mgr,
+        slot.tree_root,
+        &mut visited,
+        &mut errors,
+        &mut pages_checked,
     );
 
     // Check default table entry count
@@ -51,18 +67,29 @@ pub(crate) fn run_integrity_check(mgr: &TxnManager) -> Result<IntegrityReport> {
     // Walk catalog tree and named tables
     if slot.catalog_root.is_valid() {
         walk_catalog(
-            mgr, slot.catalog_root, &mut visited, &mut errors, &mut pages_checked,
+            mgr,
+            slot.catalog_root,
+            &mut visited,
+            &mut errors,
+            &mut pages_checked,
         );
     }
 
     // Walk pending-free chain
     if slot.pending_free_root.is_valid() {
         walk_chain(
-            mgr, slot.pending_free_root, &mut visited, &mut errors, &mut pages_checked,
+            mgr,
+            slot.pending_free_root,
+            &mut visited,
+            &mut errors,
+            &mut pages_checked,
         );
     }
 
-    Ok(IntegrityReport { pages_checked, errors })
+    Ok(IntegrityReport {
+        pages_checked,
+        errors,
+    })
 }
 
 fn walk_tree(

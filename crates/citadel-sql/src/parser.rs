@@ -16,7 +16,7 @@ pub enum Statement {
     CreateIndex(CreateIndexStmt),
     DropIndex(DropIndexStmt),
     Insert(InsertStmt),
-    Select(SelectStmt),
+    Select(Box<SelectStmt>),
     Update(UpdateStmt),
     Delete(DeleteStmt),
     Begin,
@@ -135,31 +135,88 @@ pub struct OrderByItem {
 pub enum Expr {
     Literal(Value),
     Column(String),
-    QualifiedColumn { table: String, column: String },
-    BinaryOp { left: Box<Expr>, op: BinOp, right: Box<Expr> },
-    UnaryOp { op: UnaryOp, expr: Box<Expr> },
+    QualifiedColumn {
+        table: String,
+        column: String,
+    },
+    BinaryOp {
+        left: Box<Expr>,
+        op: BinOp,
+        right: Box<Expr>,
+    },
+    UnaryOp {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
     IsNull(Box<Expr>),
     IsNotNull(Box<Expr>),
-    Function { name: String, args: Vec<Expr> },
+    Function {
+        name: String,
+        args: Vec<Expr>,
+    },
     CountStar,
-    InSubquery { expr: Box<Expr>, subquery: Box<SelectStmt>, negated: bool },
-    InList { expr: Box<Expr>, list: Vec<Expr>, negated: bool },
-    Exists { subquery: Box<SelectStmt>, negated: bool },
+    InSubquery {
+        expr: Box<Expr>,
+        subquery: Box<SelectStmt>,
+        negated: bool,
+    },
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
+    Exists {
+        subquery: Box<SelectStmt>,
+        negated: bool,
+    },
     ScalarSubquery(Box<SelectStmt>),
-    InSet { expr: Box<Expr>, values: std::collections::HashSet<Value>, has_null: bool, negated: bool },
-    Between { expr: Box<Expr>, low: Box<Expr>, high: Box<Expr>, negated: bool },
-    Like { expr: Box<Expr>, pattern: Box<Expr>, escape: Option<Box<Expr>>, negated: bool },
-    Case { operand: Option<Box<Expr>>, conditions: Vec<(Expr, Expr)>, else_result: Option<Box<Expr>> },
+    InSet {
+        expr: Box<Expr>,
+        values: std::collections::HashSet<Value>,
+        has_null: bool,
+        negated: bool,
+    },
+    Between {
+        expr: Box<Expr>,
+        low: Box<Expr>,
+        high: Box<Expr>,
+        negated: bool,
+    },
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        escape: Option<Box<Expr>>,
+        negated: bool,
+    },
+    Case {
+        operand: Option<Box<Expr>>,
+        conditions: Vec<(Expr, Expr)>,
+        else_result: Option<Box<Expr>>,
+    },
     Coalesce(Vec<Expr>),
-    Cast { expr: Box<Expr>, data_type: DataType },
+    Cast {
+        expr: Box<Expr>,
+        data_type: DataType,
+    },
     Parameter(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
-    Add, Sub, Mul, Div, Mod,
-    Eq, NotEq, Lt, Gt, LtEq, GtEq,
-    And, Or, Concat,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Eq,
+    NotEq,
+    Lt,
+    Gt,
+    LtEq,
+    GtEq,
+    And,
+    Or,
+    Concat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,8 +229,7 @@ pub enum UnaryOp {
 
 pub fn parse_sql(sql: &str) -> Result<Statement> {
     let dialect = GenericDialect {};
-    let stmts = Parser::parse_sql(&dialect, sql)
-        .map_err(|e| SqlError::Parse(e.to_string()))?;
+    let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| SqlError::Parse(e.to_string()))?;
 
     if stmts.is_empty() {
         return Err(SqlError::Parse("empty SQL".into()));
@@ -199,16 +255,25 @@ pub fn count_params(stmt: &Statement) -> usize {
 }
 
 /// Replace all `Expr::Parameter(n)` with `Expr::Literal(params[n-1])`.
-pub fn bind_params(stmt: &Statement, params: &[crate::types::Value]) -> crate::error::Result<Statement> {
+pub fn bind_params(
+    stmt: &Statement,
+    params: &[crate::types::Value],
+) -> crate::error::Result<Statement> {
     bind_stmt(stmt, params)
 }
 
 fn bind_stmt(stmt: &Statement, params: &[crate::types::Value]) -> crate::error::Result<Statement> {
     match stmt {
-        Statement::Select(sel) => Ok(Statement::Select(bind_select(sel, params)?)),
+        Statement::Select(sel) => Ok(Statement::Select(Box::new(bind_select(sel, params)?))),
         Statement::Insert(ins) => {
-            let values = ins.values.iter()
-                .map(|row| row.iter().map(|e| bind_expr(e, params)).collect::<crate::error::Result<Vec<_>>>())
+            let values = ins
+                .values
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|e| bind_expr(e, params))
+                        .collect::<crate::error::Result<Vec<_>>>()
+                })
                 .collect::<crate::error::Result<Vec<_>>>()?;
             Ok(Statement::Insert(InsertStmt {
                 table: ins.table.clone(),
@@ -217,11 +282,16 @@ fn bind_stmt(stmt: &Statement, params: &[crate::types::Value]) -> crate::error::
             }))
         }
         Statement::Update(upd) => {
-            let assignments = upd.assignments.iter()
+            let assignments = upd
+                .assignments
+                .iter()
                 .map(|(col, e)| Ok((col.clone(), bind_expr(e, params)?)))
                 .collect::<crate::error::Result<Vec<_>>>()?;
-            let where_clause = upd.where_clause.as_ref()
-                .map(|e| bind_expr(e, params)).transpose()?;
+            let where_clause = upd
+                .where_clause
+                .as_ref()
+                .map(|e| bind_expr(e, params))
+                .transpose()?;
             Ok(Statement::Update(UpdateStmt {
                 table: upd.table.clone(),
                 assignments,
@@ -229,8 +299,11 @@ fn bind_stmt(stmt: &Statement, params: &[crate::types::Value]) -> crate::error::
             }))
         }
         Statement::Delete(del) => {
-            let where_clause = del.where_clause.as_ref()
-                .map(|e| bind_expr(e, params)).transpose()?;
+            let where_clause = del
+                .where_clause
+                .as_ref()
+                .map(|e| bind_expr(e, params))
+                .transpose()?;
             Ok(Statement::Delete(DeleteStmt {
                 table: del.table.clone(),
                 where_clause,
@@ -241,38 +314,73 @@ fn bind_stmt(stmt: &Statement, params: &[crate::types::Value]) -> crate::error::
     }
 }
 
-fn bind_select(sel: &SelectStmt, params: &[crate::types::Value]) -> crate::error::Result<SelectStmt> {
-    let columns = sel.columns.iter().map(|c| match c {
-        SelectColumn::AllColumns => Ok(SelectColumn::AllColumns),
-        SelectColumn::Expr { expr, alias } => Ok(SelectColumn::Expr {
-            expr: bind_expr(expr, params)?,
-            alias: alias.clone(),
-        }),
-    }).collect::<crate::error::Result<Vec<_>>>()?;
-    let joins = sel.joins.iter().map(|j| {
-        let on_clause = j.on_clause.as_ref()
-            .map(|e| bind_expr(e, params)).transpose()?;
-        Ok(JoinClause {
-            join_type: j.join_type,
-            table: j.table.clone(),
-            on_clause,
+fn bind_select(
+    sel: &SelectStmt,
+    params: &[crate::types::Value],
+) -> crate::error::Result<SelectStmt> {
+    let columns = sel
+        .columns
+        .iter()
+        .map(|c| match c {
+            SelectColumn::AllColumns => Ok(SelectColumn::AllColumns),
+            SelectColumn::Expr { expr, alias } => Ok(SelectColumn::Expr {
+                expr: bind_expr(expr, params)?,
+                alias: alias.clone(),
+            }),
         })
-    }).collect::<crate::error::Result<Vec<_>>>()?;
-    let where_clause = sel.where_clause.as_ref()
-        .map(|e| bind_expr(e, params)).transpose()?;
-    let order_by = sel.order_by.iter().map(|o| {
-        Ok(OrderByItem {
-            expr: bind_expr(&o.expr, params)?,
-            descending: o.descending,
-            nulls_first: o.nulls_first,
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    let joins = sel
+        .joins
+        .iter()
+        .map(|j| {
+            let on_clause = j
+                .on_clause
+                .as_ref()
+                .map(|e| bind_expr(e, params))
+                .transpose()?;
+            Ok(JoinClause {
+                join_type: j.join_type,
+                table: j.table.clone(),
+                on_clause,
+            })
         })
-    }).collect::<crate::error::Result<Vec<_>>>()?;
-    let limit = sel.limit.as_ref().map(|e| bind_expr(e, params)).transpose()?;
-    let offset = sel.offset.as_ref().map(|e| bind_expr(e, params)).transpose()?;
-    let group_by = sel.group_by.iter()
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    let where_clause = sel
+        .where_clause
+        .as_ref()
+        .map(|e| bind_expr(e, params))
+        .transpose()?;
+    let order_by = sel
+        .order_by
+        .iter()
+        .map(|o| {
+            Ok(OrderByItem {
+                expr: bind_expr(&o.expr, params)?,
+                descending: o.descending,
+                nulls_first: o.nulls_first,
+            })
+        })
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    let limit = sel
+        .limit
+        .as_ref()
+        .map(|e| bind_expr(e, params))
+        .transpose()?;
+    let offset = sel
+        .offset
+        .as_ref()
+        .map(|e| bind_expr(e, params))
+        .transpose()?;
+    let group_by = sel
+        .group_by
+        .iter()
         .map(|e| bind_expr(e, params))
         .collect::<crate::error::Result<Vec<_>>>()?;
-    let having = sel.having.as_ref().map(|e| bind_expr(e, params)).transpose()?;
+    let having = sel
+        .having
+        .as_ref()
+        .map(|e| bind_expr(e, params))
+        .transpose()?;
 
     Ok(SelectStmt {
         columns,
@@ -300,8 +408,9 @@ fn bind_expr(expr: &Expr, params: &[crate::types::Value]) -> crate::error::Resul
             }
             Ok(Expr::Literal(params[*n - 1].clone()))
         }
-        Expr::Literal(_) | Expr::Column(_) | Expr::QualifiedColumn { .. }
-        | Expr::CountStar => Ok(expr.clone()),
+        Expr::Literal(_) | Expr::Column(_) | Expr::QualifiedColumn { .. } | Expr::CountStar => {
+            Ok(expr.clone())
+        }
         Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
             left: Box::new(bind_expr(left, params)?),
             op: *op,
@@ -314,17 +423,32 @@ fn bind_expr(expr: &Expr, params: &[crate::types::Value]) -> crate::error::Resul
         Expr::IsNull(e) => Ok(Expr::IsNull(Box::new(bind_expr(e, params)?))),
         Expr::IsNotNull(e) => Ok(Expr::IsNotNull(Box::new(bind_expr(e, params)?))),
         Expr::Function { name, args } => {
-            let args = args.iter().map(|a| bind_expr(a, params))
+            let args = args
+                .iter()
+                .map(|a| bind_expr(a, params))
                 .collect::<crate::error::Result<Vec<_>>>()?;
-            Ok(Expr::Function { name: name.clone(), args })
+            Ok(Expr::Function {
+                name: name.clone(),
+                args,
+            })
         }
-        Expr::InSubquery { expr: e, subquery, negated } => Ok(Expr::InSubquery {
+        Expr::InSubquery {
+            expr: e,
+            subquery,
+            negated,
+        } => Ok(Expr::InSubquery {
             expr: Box::new(bind_expr(e, params)?),
             subquery: Box::new(bind_select(subquery, params)?),
             negated: *negated,
         }),
-        Expr::InList { expr: e, list, negated } => {
-            let list = list.iter().map(|l| bind_expr(l, params))
+        Expr::InList {
+            expr: e,
+            list,
+            negated,
+        } => {
+            let list = list
+                .iter()
+                .map(|l| bind_expr(l, params))
                 .collect::<crate::error::Result<Vec<_>>>()?;
             Ok(Expr::InList {
                 expr: Box::new(bind_expr(e, params)?),
@@ -336,45 +460,76 @@ fn bind_expr(expr: &Expr, params: &[crate::types::Value]) -> crate::error::Resul
             subquery: Box::new(bind_select(subquery, params)?),
             negated: *negated,
         }),
-        Expr::ScalarSubquery(sq) => Ok(Expr::ScalarSubquery(
-            Box::new(bind_select(sq, params)?),
-        )),
-        Expr::InSet { expr: e, values, has_null, negated } => Ok(Expr::InSet {
+        Expr::ScalarSubquery(sq) => Ok(Expr::ScalarSubquery(Box::new(bind_select(sq, params)?))),
+        Expr::InSet {
+            expr: e,
+            values,
+            has_null,
+            negated,
+        } => Ok(Expr::InSet {
             expr: Box::new(bind_expr(e, params)?),
             values: values.clone(),
             has_null: *has_null,
             negated: *negated,
         }),
-        Expr::Between { expr: e, low, high, negated } => Ok(Expr::Between {
+        Expr::Between {
+            expr: e,
+            low,
+            high,
+            negated,
+        } => Ok(Expr::Between {
             expr: Box::new(bind_expr(e, params)?),
             low: Box::new(bind_expr(low, params)?),
             high: Box::new(bind_expr(high, params)?),
             negated: *negated,
         }),
-        Expr::Like { expr: e, pattern, escape, negated } => Ok(Expr::Like {
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            negated,
+        } => Ok(Expr::Like {
             expr: Box::new(bind_expr(e, params)?),
             pattern: Box::new(bind_expr(pattern, params)?),
-            escape: escape.as_ref().map(|esc| bind_expr(esc, params).map(Box::new)).transpose()?,
+            escape: escape
+                .as_ref()
+                .map(|esc| bind_expr(esc, params).map(Box::new))
+                .transpose()?,
             negated: *negated,
         }),
-        Expr::Case { operand, conditions, else_result } => {
-            let operand = operand.as_ref()
-                .map(|e| bind_expr(e, params).map(Box::new)).transpose()?;
-            let conditions = conditions.iter()
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            let operand = operand
+                .as_ref()
+                .map(|e| bind_expr(e, params).map(Box::new))
+                .transpose()?;
+            let conditions = conditions
+                .iter()
                 .map(|(cond, then)| Ok((bind_expr(cond, params)?, bind_expr(then, params)?)))
                 .collect::<crate::error::Result<Vec<_>>>()?;
-            let else_result = else_result.as_ref()
-                .map(|e| bind_expr(e, params).map(Box::new)).transpose()?;
-            Ok(Expr::Case { operand, conditions, else_result })
+            let else_result = else_result
+                .as_ref()
+                .map(|e| bind_expr(e, params).map(Box::new))
+                .transpose()?;
+            Ok(Expr::Case {
+                operand,
+                conditions,
+                else_result,
+            })
         }
         Expr::Coalesce(args) => {
-            let args = args.iter().map(|a| bind_expr(a, params))
+            let args = args
+                .iter()
+                .map(|a| bind_expr(a, params))
                 .collect::<crate::error::Result<Vec<_>>>()?;
             Ok(Expr::Coalesce(args))
         }
         Expr::Cast { expr: e, data_type } => Ok(Expr::Cast {
             expr: Box::new(bind_expr(e, params)?),
-            data_type: data_type.clone(),
+            data_type: *data_type,
         }),
     }
 }
@@ -384,15 +539,23 @@ fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
         Statement::Select(sel) => visit_exprs_select(sel, visitor),
         Statement::Insert(ins) => {
             for row in &ins.values {
-                for e in row { visit_expr(e, visitor); }
+                for e in row {
+                    visit_expr(e, visitor);
+                }
             }
         }
         Statement::Update(upd) => {
-            for (_, e) in &upd.assignments { visit_expr(e, visitor); }
-            if let Some(w) = &upd.where_clause { visit_expr(w, visitor); }
+            for (_, e) in &upd.assignments {
+                visit_expr(e, visitor);
+            }
+            if let Some(w) = &upd.where_clause {
+                visit_expr(w, visitor);
+            }
         }
         Statement::Delete(del) => {
-            if let Some(w) = &del.where_clause { visit_expr(w, visitor); }
+            if let Some(w) = &del.where_clause {
+                visit_expr(w, visitor);
+            }
         }
         Statement::Explain(inner) => visit_exprs_stmt(inner, visitor),
         _ => {}
@@ -401,17 +564,33 @@ fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
 
 fn visit_exprs_select(sel: &SelectStmt, visitor: &mut impl FnMut(&Expr)) {
     for col in &sel.columns {
-        if let SelectColumn::Expr { expr, .. } = col { visit_expr(expr, visitor); }
+        if let SelectColumn::Expr { expr, .. } = col {
+            visit_expr(expr, visitor);
+        }
     }
     for j in &sel.joins {
-        if let Some(on) = &j.on_clause { visit_expr(on, visitor); }
+        if let Some(on) = &j.on_clause {
+            visit_expr(on, visitor);
+        }
     }
-    if let Some(w) = &sel.where_clause { visit_expr(w, visitor); }
-    for o in &sel.order_by { visit_expr(&o.expr, visitor); }
-    if let Some(l) = &sel.limit { visit_expr(l, visitor); }
-    if let Some(o) = &sel.offset { visit_expr(o, visitor); }
-    for g in &sel.group_by { visit_expr(g, visitor); }
-    if let Some(h) = &sel.having { visit_expr(h, visitor); }
+    if let Some(w) = &sel.where_clause {
+        visit_expr(w, visitor);
+    }
+    for o in &sel.order_by {
+        visit_expr(&o.expr, visitor);
+    }
+    if let Some(l) = &sel.limit {
+        visit_expr(l, visitor);
+    }
+    if let Some(o) = &sel.offset {
+        visit_expr(o, visitor);
+    }
+    for g in &sel.group_by {
+        visit_expr(g, visitor);
+    }
+    if let Some(h) = &sel.having {
+        visit_expr(h, visitor);
+    }
 }
 
 fn visit_expr(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
@@ -425,40 +604,66 @@ fn visit_expr(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
             visit_expr(e, visitor);
         }
         Expr::Function { args, .. } | Expr::Coalesce(args) => {
-            for a in args { visit_expr(a, visitor); }
+            for a in args {
+                visit_expr(a, visitor);
+            }
         }
-        Expr::InSubquery { expr: e, subquery, .. } => {
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => {
             visit_expr(e, visitor);
             visit_exprs_select(subquery, visitor);
         }
         Expr::InList { expr: e, list, .. } => {
             visit_expr(e, visitor);
-            for l in list { visit_expr(l, visitor); }
+            for l in list {
+                visit_expr(l, visitor);
+            }
         }
         Expr::Exists { subquery, .. } => visit_exprs_select(subquery, visitor),
         Expr::ScalarSubquery(sq) => visit_exprs_select(sq, visitor),
         Expr::InSet { expr: e, .. } => visit_expr(e, visitor),
-        Expr::Between { expr: e, low, high, .. } => {
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
             visit_expr(e, visitor);
             visit_expr(low, visitor);
             visit_expr(high, visitor);
         }
-        Expr::Like { expr: e, pattern, escape, .. } => {
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
             visit_expr(e, visitor);
             visit_expr(pattern, visitor);
-            if let Some(esc) = escape { visit_expr(esc, visitor); }
+            if let Some(esc) = escape {
+                visit_expr(esc, visitor);
+            }
         }
-        Expr::Case { operand, conditions, else_result } => {
-            if let Some(op) = operand { visit_expr(op, visitor); }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                visit_expr(op, visitor);
+            }
             for (cond, then) in conditions {
                 visit_expr(cond, visitor);
                 visit_expr(then, visitor);
             }
-            if let Some(el) = else_result { visit_expr(el, visitor); }
+            if let Some(el) = else_result {
+                visit_expr(el, visitor);
+            }
         }
         Expr::Cast { expr: e, .. } => visit_expr(e, visitor),
-        Expr::Literal(_) | Expr::Column(_) | Expr::QualifiedColumn { .. }
-        | Expr::CountStar | Expr::Parameter(_) => {}
+        Expr::Literal(_)
+        | Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::CountStar
+        | Expr::Parameter(_) => {}
     }
 }
 
@@ -503,17 +708,16 @@ fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
         sp::Statement::StartTransaction { .. } => Ok(Statement::Begin),
         sp::Statement::Commit { .. } => Ok(Statement::Commit),
         sp::Statement::Rollback { .. } => Ok(Statement::Rollback),
-        sp::Statement::Explain { statement, analyze, .. } => {
+        sp::Statement::Explain {
+            statement, analyze, ..
+        } => {
             if analyze {
                 return Err(SqlError::Unsupported("EXPLAIN ANALYZE".into()));
             }
             let inner = convert_statement(*statement)?;
             Ok(Statement::Explain(Box::new(inner)))
         }
-        _ => Err(SqlError::Unsupported(format!(
-            "statement type: {}",
-            stmt
-        ))),
+        _ => Err(SqlError::Unsupported(format!("statement type: {}", stmt))),
     }
 }
 
@@ -580,22 +784,27 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
 }
 
 fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
-    let index_name = ci.name
+    let index_name = ci
+        .name
         .as_ref()
         .map(object_name_to_string)
         .ok_or_else(|| SqlError::Parse("index name required".into()))?;
 
     let table_name = object_name_to_string(&ci.table_name);
 
-    let columns: Vec<String> = ci.columns.iter().map(|idx_col| {
-        match &idx_col.column.expr {
+    let columns: Vec<String> = ci
+        .columns
+        .iter()
+        .map(|idx_col| match &idx_col.column.expr {
             sp::Expr::Identifier(ident) => Ok(ident.value.clone()),
             other => Err(SqlError::Unsupported(format!("expression index: {other}"))),
-        }
-    }).collect::<Result<_>>()?;
+        })
+        .collect::<Result<_>>()?;
 
     if columns.is_empty() {
-        return Err(SqlError::Parse("index must have at least one column".into()));
+        return Err(SqlError::Parse(
+            "index must have at least one column".into(),
+        ));
     }
 
     Ok(Statement::CreateIndex(CreateIndexStmt {
@@ -615,9 +824,9 @@ fn convert_insert(insert: sp::Insert) -> Result<Statement> {
 
     let columns: Vec<String> = insert.columns.iter().map(|c| c.value.clone()).collect();
 
-    let source = insert.source.ok_or_else(|| {
-        SqlError::Parse("INSERT requires VALUES".into())
-    })?;
+    let source = insert
+        .source
+        .ok_or_else(|| SqlError::Parse("INSERT requires VALUES".into()))?;
 
     let values = match *source.body {
         sp::SetExpr::Values(sp::Values { rows, .. }) => {
@@ -643,7 +852,7 @@ fn convert_insert(insert: sp::Insert) -> Result<Statement> {
 
 fn convert_subquery(query: &sp::Query) -> Result<SelectStmt> {
     match convert_query(query.clone())? {
-        Statement::Select(s) => Ok(s),
+        Statement::Select(s) => Ok(*s),
         _ => Err(SqlError::Unsupported("non-SELECT subquery".into())),
     }
 }
@@ -675,8 +884,10 @@ fn convert_query(query: sp::Query) -> Result<Statement> {
             }
             _ => return Err(SqlError::Unsupported("non-table FROM source".into())),
         };
-        let j = table_with_joins.joins.iter()
-            .map(|j| convert_join(j))
+        let j = table_with_joins
+            .joins
+            .iter()
+            .map(convert_join)
             .collect::<Result<Vec<_>>>()?;
         (name, alias, j)
     } else {
@@ -684,21 +895,22 @@ fn convert_query(query: sp::Query) -> Result<Statement> {
     };
 
     // Projection
-    let columns: Vec<SelectColumn> = select.projection.iter()
+    let columns: Vec<SelectColumn> = select
+        .projection
+        .iter()
         .map(convert_select_item)
         .collect::<Result<_>>()?;
 
     // WHERE
-    let where_clause = select.selection.as_ref()
-        .map(convert_expr)
-        .transpose()?;
+    let where_clause = select.selection.as_ref().map(convert_expr).transpose()?;
 
     // ORDER BY
     let order_by = if let Some(ref ob) = query.order_by {
         match &ob.kind {
-            sp::OrderByKind::Expressions(exprs) => {
-                exprs.iter().map(convert_order_by_expr).collect::<Result<_>>()?
-            }
+            sp::OrderByKind::Expressions(exprs) => exprs
+                .iter()
+                .map(convert_order_by_expr)
+                .collect::<Result<_>>()?,
             sp::OrderByKind::All { .. } => {
                 return Err(SqlError::Unsupported("ORDER BY ALL".into()));
             }
@@ -711,7 +923,10 @@ fn convert_query(query: sp::Query) -> Result<Statement> {
     let (limit, offset) = match &query.limit_clause {
         Some(sp::LimitClause::LimitOffset { limit, offset, .. }) => {
             let l = limit.as_ref().map(convert_expr).transpose()?;
-            let o = offset.as_ref().map(|o| convert_expr(&o.value)).transpose()?;
+            let o = offset
+                .as_ref()
+                .map(|o| convert_expr(&o.value))
+                .transpose()?;
             (l, o)
         }
         Some(sp::LimitClause::OffsetCommaLimit { limit, offset }) => {
@@ -735,7 +950,7 @@ fn convert_query(query: sp::Query) -> Result<Statement> {
     // HAVING
     let having = select.having.as_ref().map(convert_expr).transpose()?;
 
-    Ok(Statement::Select(SelectStmt {
+    Ok(Statement::Select(Box::new(SelectStmt {
         columns,
         from,
         from_alias,
@@ -747,7 +962,7 @@ fn convert_query(query: sp::Query) -> Result<Statement> {
         offset,
         group_by,
         having,
-    }))
+    })))
 }
 
 fn convert_join(join: &sp::Join) -> Result<JoinClause> {
@@ -792,7 +1007,9 @@ fn convert_update(update: sp::Update) -> Result<Statement> {
         _ => return Err(SqlError::Unsupported("non-table UPDATE target".into())),
     };
 
-    let assignments = update.assignments.iter()
+    let assignments = update
+        .assignments
+        .iter()
         .map(|a| {
             let col = match &a.target {
                 sp::AssignmentTarget::ColumnName(name) => object_name_to_string(name),
@@ -803,9 +1020,7 @@ fn convert_update(update: sp::Update) -> Result<Statement> {
         })
         .collect::<Result<_>>()?;
 
-    let where_clause = update.selection.as_ref()
-        .map(convert_expr)
-        .transpose()?;
+    let where_clause = update.selection.as_ref().map(convert_expr).transpose()?;
 
     Ok(Statement::Update(UpdateStmt {
         table,
@@ -836,9 +1051,7 @@ fn convert_delete(delete: sp::Delete) -> Result<Statement> {
         }
     };
 
-    let where_clause = delete.selection.as_ref()
-        .map(convert_expr)
-        .transpose()?;
+    let where_clause = delete.selection.as_ref().map(convert_expr).transpose()?;
 
     Ok(Statement::Delete(DeleteStmt {
         table: table_name,
@@ -885,7 +1098,11 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
         sp::Expr::IsNotNull(e) => Ok(Expr::IsNotNull(Box::new(convert_expr(e)?))),
         sp::Expr::Nested(e) => convert_expr(e),
         sp::Expr::Function(func) => convert_function(func),
-        sp::Expr::InSubquery { expr: e, subquery, negated } => {
+        sp::Expr::InSubquery {
+            expr: e,
+            subquery,
+            negated,
+        } => {
             let inner_expr = convert_expr(e)?;
             let stmt = convert_subquery(subquery)?;
             Ok(Expr::InSubquery {
@@ -894,7 +1111,11 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
                 negated: *negated,
             })
         }
-        sp::Expr::InList { expr: e, list, negated } => {
+        sp::Expr::InList {
+            expr: e,
+            list,
+            negated,
+        } => {
             let inner_expr = convert_expr(e)?;
             let items = list.iter().map(convert_expr).collect::<Result<Vec<_>>>()?;
             Ok(Expr::InList {
@@ -914,17 +1135,27 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
             let stmt = convert_subquery(query)?;
             Ok(Expr::ScalarSubquery(Box::new(stmt)))
         }
-        sp::Expr::Between { expr: e, negated, low, high } => {
-            Ok(Expr::Between {
-                expr: Box::new(convert_expr(e)?),
-                low: Box::new(convert_expr(low)?),
-                high: Box::new(convert_expr(high)?),
-                negated: *negated,
-            })
-        }
-        sp::Expr::Like { expr: e, negated, pattern, escape_char, .. } => {
-            let esc = escape_char.as_ref()
-                .map(|v| convert_escape_value(v))
+        sp::Expr::Between {
+            expr: e,
+            negated,
+            low,
+            high,
+        } => Ok(Expr::Between {
+            expr: Box::new(convert_expr(e)?),
+            low: Box::new(convert_expr(low)?),
+            high: Box::new(convert_expr(high)?),
+            negated: *negated,
+        }),
+        sp::Expr::Like {
+            expr: e,
+            negated,
+            pattern,
+            escape_char,
+            ..
+        } => {
+            let esc = escape_char
+                .as_ref()
+                .map(convert_escape_value)
                 .transpose()?
                 .map(Box::new);
             Ok(Expr::Like {
@@ -934,9 +1165,16 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
                 negated: *negated,
             })
         }
-        sp::Expr::ILike { expr: e, negated, pattern, escape_char, .. } => {
-            let esc = escape_char.as_ref()
-                .map(|v| convert_escape_value(v))
+        sp::Expr::ILike {
+            expr: e,
+            negated,
+            pattern,
+            escape_char,
+            ..
+        } => {
+            let esc = escape_char
+                .as_ref()
+                .map(convert_escape_value)
                 .transpose()?
                 .map(Box::new);
             Ok(Expr::Like {
@@ -946,28 +1184,49 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
                 negated: *negated,
             })
         }
-        sp::Expr::Case { operand, conditions, else_result, .. } => {
-            let op = operand.as_ref()
+        sp::Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            let op = operand
+                .as_ref()
                 .map(|e| convert_expr(e))
                 .transpose()?
                 .map(Box::new);
-            let conds: Vec<(Expr, Expr)> = conditions.iter()
+            let conds: Vec<(Expr, Expr)> = conditions
+                .iter()
                 .map(|cw| Ok((convert_expr(&cw.condition)?, convert_expr(&cw.result)?)))
                 .collect::<Result<_>>()?;
-            let else_r = else_result.as_ref()
+            let else_r = else_result
+                .as_ref()
                 .map(|e| convert_expr(e))
                 .transpose()?
                 .map(Box::new);
-            Ok(Expr::Case { operand: op, conditions: conds, else_result: else_r })
+            Ok(Expr::Case {
+                operand: op,
+                conditions: conds,
+                else_result: else_r,
+            })
         }
-        sp::Expr::Cast { expr: e, data_type: dt, .. } => {
+        sp::Expr::Cast {
+            expr: e,
+            data_type: dt,
+            ..
+        } => {
             let target = convert_data_type(dt)?;
             Ok(Expr::Cast {
                 expr: Box::new(convert_expr(e)?),
                 data_type: target,
             })
         }
-        sp::Expr::Substring { expr: e, substring_from, substring_for, .. } => {
+        sp::Expr::Substring {
+            expr: e,
+            substring_from,
+            substring_for,
+            ..
+        } => {
             let mut args = vec![convert_expr(e)?];
             if let Some(from) = substring_from {
                 args.push(convert_expr(from)?);
@@ -975,9 +1234,17 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
             if let Some(f) = substring_for {
                 args.push(convert_expr(f)?);
             }
-            Ok(Expr::Function { name: "SUBSTR".into(), args })
+            Ok(Expr::Function {
+                name: "SUBSTR".into(),
+                args,
+            })
         }
-        sp::Expr::Trim { expr: e, trim_where, trim_what, trim_characters } => {
+        sp::Expr::Trim {
+            expr: e,
+            trim_where,
+            trim_what,
+            trim_characters,
+        } => {
             let fn_name = match trim_where {
                 Some(sp::TrimWhereField::Leading) => "LTRIM",
                 Some(sp::TrimWhereField::Trailing) => "RTRIM",
@@ -991,17 +1258,23 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
                     args.push(convert_expr(first)?);
                 }
             }
-            Ok(Expr::Function { name: fn_name.into(), args })
+            Ok(Expr::Function {
+                name: fn_name.into(),
+                args,
+            })
         }
-        sp::Expr::Ceil { expr: e, .. } => {
-            Ok(Expr::Function { name: "CEIL".into(), args: vec![convert_expr(e)?] })
-        }
-        sp::Expr::Floor { expr: e, .. } => {
-            Ok(Expr::Function { name: "FLOOR".into(), args: vec![convert_expr(e)?] })
-        }
-        sp::Expr::Position { expr: e, r#in } => {
-            Ok(Expr::Function { name: "INSTR".into(), args: vec![convert_expr(r#in)?, convert_expr(e)?] })
-        }
+        sp::Expr::Ceil { expr: e, .. } => Ok(Expr::Function {
+            name: "CEIL".into(),
+            args: vec![convert_expr(e)?],
+        }),
+        sp::Expr::Floor { expr: e, .. } => Ok(Expr::Function {
+            name: "FLOOR".into(),
+            args: vec![convert_expr(e)?],
+        }),
+        sp::Expr::Position { expr: e, r#in } => Ok(Expr::Function {
+            name: "INSTR".into(),
+            args: vec![convert_expr(r#in)?, convert_expr(e)?],
+        }),
         _ => Err(SqlError::Unsupported(format!("expression: {expr}"))),
     }
 }
@@ -1021,9 +1294,11 @@ fn convert_value(val: &sp::Value) -> Result<Expr> {
         sp::Value::Boolean(b) => Ok(Expr::Literal(Value::Boolean(*b))),
         sp::Value::Null => Ok(Expr::Literal(Value::Null)),
         sp::Value::Placeholder(s) => {
-            let idx_str = s.strip_prefix('$')
+            let idx_str = s
+                .strip_prefix('$')
                 .ok_or_else(|| SqlError::Parse(format!("invalid placeholder: {s}")))?;
-            let idx: usize = idx_str.parse()
+            let idx: usize = idx_str
+                .parse()
                 .map_err(|_| SqlError::Parse(format!("invalid placeholder index: {s}")))?;
             if idx == 0 {
                 return Err(SqlError::Parse("placeholder index must be >= 1".into()));
@@ -1070,7 +1345,9 @@ fn convert_function(func: &sp::Function) -> Result<Expr> {
             if list.args.is_empty() && name == "COUNT" {
                 return Ok(Expr::CountStar);
             }
-            let args = list.args.iter()
+            let args = list
+                .args
+                .iter()
                 .map(|arg| match arg {
                     sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => convert_expr(e),
                     sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Wildcard) => {
@@ -1080,7 +1357,9 @@ fn convert_function(func: &sp::Function) -> Result<Expr> {
                             Err(SqlError::Unsupported(format!("{name}(*)")))
                         }
                     }
-                    _ => Err(SqlError::Unsupported(format!("function arg type in {name}"))),
+                    _ => Err(SqlError::Unsupported(format!(
+                        "function arg type in {name}"
+                    ))),
                 })
                 .collect::<Result<Vec<_>>>()?;
 
@@ -1090,31 +1369,38 @@ fn convert_function(func: &sp::Function) -> Result<Expr> {
 
             if name == "COALESCE" {
                 if args.is_empty() {
-                    return Err(SqlError::Parse("COALESCE requires at least one argument".into()));
+                    return Err(SqlError::Parse(
+                        "COALESCE requires at least one argument".into(),
+                    ));
                 }
                 return Ok(Expr::Coalesce(args));
             }
 
             if name == "NULLIF" {
                 if args.len() != 2 {
-                    return Err(SqlError::Parse("NULLIF requires exactly two arguments".into()));
+                    return Err(SqlError::Parse(
+                        "NULLIF requires exactly two arguments".into(),
+                    ));
                 }
                 return Ok(Expr::Case {
                     operand: None,
-                    conditions: vec![
-                        (Expr::BinaryOp {
+                    conditions: vec![(
+                        Expr::BinaryOp {
                             left: Box::new(args[0].clone()),
                             op: BinOp::Eq,
                             right: Box::new(args[1].clone()),
-                        }, Expr::Literal(Value::Null)),
-                    ],
+                        },
+                        Expr::Literal(Value::Null),
+                    )],
                     else_result: Some(Box::new(args[0].clone())),
                 });
             }
 
             if name == "IIF" {
                 if args.len() != 3 {
-                    return Err(SqlError::Parse("IIF requires exactly three arguments".into()));
+                    return Err(SqlError::Parse(
+                        "IIF requires exactly three arguments".into(),
+                    ));
                 }
                 return Ok(Expr::Case {
                     operand: None,
@@ -1196,8 +1482,7 @@ fn convert_data_type(dt: &sp::DataType) -> Result<DataType> {
         | sp::DataType::Character(_)
         | sp::DataType::String(_) => Ok(DataType::Text),
 
-        sp::DataType::Blob(_)
-        | sp::DataType::Bytea => Ok(DataType::Blob),
+        sp::DataType::Blob(_) | sp::DataType::Bytea => Ok(DataType::Blob),
 
         sp::DataType::Boolean | sp::DataType::Bool => Ok(DataType::Boolean),
 
@@ -1225,8 +1510,9 @@ mod tests {
     #[test]
     fn parse_create_table() {
         let stmt = parse_sql(
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)"
-        ).unwrap();
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)",
+        )
+        .unwrap();
 
         match stmt {
             Statement::CreateTable(ct) => {
@@ -1279,9 +1565,8 @@ mod tests {
 
     #[test]
     fn parse_insert() {
-        let stmt = parse_sql(
-            "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')"
-        ).unwrap();
+        let stmt =
+            parse_sql("INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
 
         match stmt {
             Statement::Insert(ins) => {
@@ -1322,9 +1607,7 @@ mod tests {
 
     #[test]
     fn parse_select_order_limit() {
-        let stmt = parse_sql(
-            "SELECT * FROM users ORDER BY name ASC LIMIT 10 OFFSET 5"
-        ).unwrap();
+        let stmt = parse_sql("SELECT * FROM users ORDER BY name ASC LIMIT 10 OFFSET 5").unwrap();
         match stmt {
             Statement::Select(sel) => {
                 assert_eq!(sel.order_by.len(), 1);
@@ -1369,7 +1652,10 @@ mod tests {
             Statement::Select(sel) => {
                 assert_eq!(sel.columns.len(), 2);
                 match &sel.columns[0] {
-                    SelectColumn::Expr { expr: Expr::CountStar, .. } => {}
+                    SelectColumn::Expr {
+                        expr: Expr::CountStar,
+                        ..
+                    } => {}
                     other => panic!("expected CountStar, got {other:?}"),
                 }
             }
@@ -1380,8 +1666,9 @@ mod tests {
     #[test]
     fn parse_group_by_having() {
         let stmt = parse_sql(
-            "SELECT department, COUNT(*) FROM employees GROUP BY department HAVING COUNT(*) > 5"
-        ).unwrap();
+            "SELECT department, COUNT(*) FROM employees GROUP BY department HAVING COUNT(*) > 5",
+        )
+        .unwrap();
         match stmt {
             Statement::Select(sel) => {
                 assert_eq!(sel.group_by.len(), 1);
@@ -1399,17 +1686,32 @@ mod tests {
                 assert_eq!(sel.columns.len(), 3);
                 // id + 1
                 match &sel.columns[0] {
-                    SelectColumn::Expr { expr: Expr::BinaryOp { op: BinOp::Add, .. }, .. } => {}
+                    SelectColumn::Expr {
+                        expr: Expr::BinaryOp { op: BinOp::Add, .. },
+                        ..
+                    } => {}
                     other => panic!("expected BinaryOp Add, got {other:?}"),
                 }
                 // -price
                 match &sel.columns[1] {
-                    SelectColumn::Expr { expr: Expr::UnaryOp { op: UnaryOp::Neg, .. }, .. } => {}
+                    SelectColumn::Expr {
+                        expr:
+                            Expr::UnaryOp {
+                                op: UnaryOp::Neg, ..
+                            },
+                        ..
+                    } => {}
                     other => panic!("expected UnaryOp Neg, got {other:?}"),
                 }
                 // NOT active
                 match &sel.columns[2] {
-                    SelectColumn::Expr { expr: Expr::UnaryOp { op: UnaryOp::Not, .. }, .. } => {}
+                    SelectColumn::Expr {
+                        expr:
+                            Expr::UnaryOp {
+                                op: UnaryOp::Not, ..
+                            },
+                        ..
+                    } => {}
                     other => panic!("expected UnaryOp Not, got {other:?}"),
                 }
             }
@@ -1496,9 +1798,8 @@ mod tests {
 
     #[test]
     fn parse_multi_join() {
-        let stmt = parse_sql(
-            "SELECT * FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id"
-        ).unwrap();
+        let stmt =
+            parse_sql("SELECT * FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id").unwrap();
         match stmt {
             Statement::Select(sel) => {
                 assert_eq!(sel.joins.len(), 2);
@@ -1511,15 +1812,16 @@ mod tests {
     fn parse_qualified_column() {
         let stmt = parse_sql("SELECT u.id, u.name FROM users u").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                match &sel.columns[0] {
-                    SelectColumn::Expr { expr: Expr::QualifiedColumn { table, column }, .. } => {
-                        assert_eq!(table, "u");
-                        assert_eq!(column, "id");
-                    }
-                    other => panic!("expected QualifiedColumn, got {other:?}"),
+            Statement::Select(sel) => match &sel.columns[0] {
+                SelectColumn::Expr {
+                    expr: Expr::QualifiedColumn { table, column },
+                    ..
+                } => {
+                    assert_eq!(table, "u");
+                    assert_eq!(column, "id");
                 }
-            }
+                other => panic!("expected QualifiedColumn, got {other:?}"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -1539,12 +1841,12 @@ mod tests {
                 assert_eq!(ct.columns[0].data_type, DataType::Integer); // INT
                 assert_eq!(ct.columns[1].data_type, DataType::Integer); // BIGINT
                 assert_eq!(ct.columns[2].data_type, DataType::Integer); // SMALLINT
-                assert_eq!(ct.columns[3].data_type, DataType::Real);    // REAL
-                assert_eq!(ct.columns[4].data_type, DataType::Real);    // DOUBLE
-                assert_eq!(ct.columns[5].data_type, DataType::Text);    // VARCHAR
+                assert_eq!(ct.columns[3].data_type, DataType::Real); // REAL
+                assert_eq!(ct.columns[4].data_type, DataType::Real); // DOUBLE
+                assert_eq!(ct.columns[5].data_type, DataType::Text); // VARCHAR
                 assert_eq!(ct.columns[6].data_type, DataType::Boolean); // BOOLEAN
-                assert_eq!(ct.columns[7].data_type, DataType::Blob);    // BLOB
-                assert_eq!(ct.columns[8].data_type, DataType::Blob);    // BYTEA
+                assert_eq!(ct.columns[7].data_type, DataType::Blob); // BLOB
+                assert_eq!(ct.columns[8].data_type, DataType::Blob); // BYTEA
             }
             _ => panic!("expected CreateTable"),
         }
@@ -1555,8 +1857,14 @@ mod tests {
         let stmt = parse_sql("INSERT INTO t (a, b) VALUES (true, false)").unwrap();
         match stmt {
             Statement::Insert(ins) => {
-                assert!(matches!(ins.values[0][0], Expr::Literal(Value::Boolean(true))));
-                assert!(matches!(ins.values[0][1], Expr::Literal(Value::Boolean(false))));
+                assert!(matches!(
+                    ins.values[0][0],
+                    Expr::Literal(Value::Boolean(true))
+                ));
+                assert!(matches!(
+                    ins.values[0][1],
+                    Expr::Literal(Value::Boolean(false))
+                ));
             }
             _ => panic!("expected Insert"),
         }
@@ -1577,12 +1885,10 @@ mod tests {
     fn parse_alias() {
         let stmt = parse_sql("SELECT id AS user_id FROM users").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                match &sel.columns[0] {
-                    SelectColumn::Expr { alias: Some(a), .. } => assert_eq!(a, "user_id"),
-                    other => panic!("expected alias, got {other:?}"),
-                }
-            }
+            Statement::Select(sel) => match &sel.columns[0] {
+                SelectColumn::Expr { alias: Some(a), .. } => assert_eq!(a, "user_id"),
+                other => panic!("expected alias, got {other:?}"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -1747,14 +2053,12 @@ mod tests {
     fn parse_parameter_placeholder() {
         let stmt = parse_sql("SELECT * FROM t WHERE id = $1").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                match &sel.where_clause {
-                    Some(Expr::BinaryOp { right, .. }) => {
-                        assert!(matches!(right.as_ref(), Expr::Parameter(1)));
-                    }
-                    other => panic!("expected BinaryOp with Parameter, got {other:?}"),
+            Statement::Select(sel) => match &sel.where_clause {
+                Some(Expr::BinaryOp { right, .. }) => {
+                    assert!(matches!(right.as_ref(), Expr::Parameter(1)));
                 }
-            }
+                other => panic!("expected BinaryOp with Parameter, got {other:?}"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -1793,14 +2097,12 @@ mod tests {
         let stmt = parse_sql("SELECT * FROM t WHERE id = $1").unwrap();
         let bound = bind_params(&stmt, &[Value::Integer(42)]).unwrap();
         match bound {
-            Statement::Select(sel) => {
-                match &sel.where_clause {
-                    Some(Expr::BinaryOp { right, .. }) => {
-                        assert!(matches!(right.as_ref(), Expr::Literal(Value::Integer(42))));
-                    }
-                    other => panic!("expected BinaryOp with Literal, got {other:?}"),
+            Statement::Select(sel) => match &sel.where_clause {
+                Some(Expr::BinaryOp { right, .. }) => {
+                    assert!(matches!(right.as_ref(), Expr::Literal(Value::Integer(42))));
                 }
-            }
+                other => panic!("expected BinaryOp with Literal, got {other:?}"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -1814,9 +2116,7 @@ mod tests {
 
     #[test]
     fn parse_table_constraint_pk() {
-        let stmt = parse_sql(
-            "CREATE TABLE t (a INTEGER, b TEXT, PRIMARY KEY (a))"
-        ).unwrap();
+        let stmt = parse_sql("CREATE TABLE t (a INTEGER, b TEXT, PRIMARY KEY (a))").unwrap();
         match stmt {
             Statement::CreateTable(ct) => {
                 assert_eq!(ct.primary_key, vec!["a"]);

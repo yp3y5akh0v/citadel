@@ -31,10 +31,7 @@ impl ApplyResult {
 /// Opens a write transaction, applies entries, and commits.
 /// For CRDT-aware patches: reads existing values and uses LWW merge.
 /// For non-CRDT patches: unconditionally writes all entries.
-pub fn apply_patch(
-    manager: &TxnManager,
-    patch: &SyncPatch,
-) -> Result<ApplyResult> {
+pub fn apply_patch(manager: &TxnManager, patch: &SyncPatch) -> Result<ApplyResult> {
     if patch.is_empty() {
         return Ok(ApplyResult::empty());
     }
@@ -48,10 +45,7 @@ pub fn apply_patch(
 /// Apply a sync patch within an existing write transaction.
 ///
 /// The caller is responsible for committing or aborting the transaction.
-pub fn apply_patch_to_txn(
-    wtx: &mut WriteTxn<'_>,
-    patch: &SyncPatch,
-) -> Result<ApplyResult> {
+pub fn apply_patch_to_txn(wtx: &mut WriteTxn<'_>, patch: &SyncPatch) -> Result<ApplyResult> {
     let mut result = ApplyResult::empty();
 
     for entry in &patch.entries {
@@ -163,7 +157,7 @@ pub fn apply_patch_to_table_txn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crdt::{CrdtMeta, EntryKind, encode_lww_value};
+    use crate::crdt::{encode_lww_value, CrdtMeta, EntryKind};
     use crate::hlc::HlcTimestamp;
     use crate::node_id::NodeId;
     use crate::patch::PatchEntry;

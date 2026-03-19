@@ -28,11 +28,11 @@ impl TcpTransport {
 
     /// Connect with a custom timeout.
     pub fn connect_timeout(addr: &str, timeout: Duration) -> Result<Self, SyncError> {
-        let addr = addr.parse::<std::net::SocketAddr>().map_err(|e| {
-            SyncError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-        })?;
+        let addr = addr
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| SyncError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
         let stream = TcpStream::connect_timeout(&addr, timeout)?;
-        Ok(Self::from_stream(stream)?)
+        Self::from_stream(stream)
     }
 
     /// Wrap an existing TCP stream.
@@ -103,9 +103,7 @@ mod tests {
     fn loopback_pair() -> (TcpTransport, TcpTransport) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let client = thread::spawn(move || {
-            TcpTransport::connect(&addr.to_string()).unwrap()
-        });
+        let client = thread::spawn(move || TcpTransport::connect(&addr.to_string()).unwrap());
         let (stream, _) = listener.accept().unwrap();
         let server = TcpTransport::from_stream(stream).unwrap();
         let client = client.join().unwrap();
@@ -122,7 +120,11 @@ mod tests {
         };
         client.send(&msg).unwrap();
         match server.recv().unwrap() {
-            SyncMessage::Hello { node_id, root_page, root_hash } => {
+            SyncMessage::Hello {
+                node_id,
+                root_page,
+                root_hash,
+            } => {
                 assert_eq!(node_id, NodeId::from_u64(42));
                 assert_eq!(root_page, PageId(10));
                 assert_eq!(root_hash, [1u8; MERKLE_HASH_SIZE]);
@@ -157,9 +159,15 @@ mod tests {
                 root_hash: [2u8; MERKLE_HASH_SIZE],
                 in_sync: false,
             },
-            SyncMessage::DigestRequest { page_ids: vec![PageId(1), PageId(2)] },
-            SyncMessage::EntriesRequest { page_ids: vec![PageId(3)] },
-            SyncMessage::PatchData { data: vec![1, 2, 3, 4, 5] },
+            SyncMessage::DigestRequest {
+                page_ids: vec![PageId(1), PageId(2)],
+            },
+            SyncMessage::EntriesRequest {
+                page_ids: vec![PageId(3)],
+            },
+            SyncMessage::PatchData {
+                data: vec![1, 2, 3, 4, 5],
+            },
             SyncMessage::PatchAck {
                 result: crate::apply::ApplyResult {
                     entries_applied: 5,
@@ -168,7 +176,9 @@ mod tests {
                 },
             },
             SyncMessage::Done,
-            SyncMessage::Error { message: "test error".into() },
+            SyncMessage::Error {
+                message: "test error".into(),
+            },
             SyncMessage::PullRequest,
             SyncMessage::PullResponse {
                 root_page: PageId(99),
@@ -192,7 +202,8 @@ mod tests {
     fn large_payload() {
         let (a, b) = loopback_pair();
         let data = vec![0xABu8; 1024 * 1024]; // 1 MiB
-        a.send(&SyncMessage::PatchData { data: data.clone() }).unwrap();
+        a.send(&SyncMessage::PatchData { data: data.clone() })
+            .unwrap();
         match b.recv().unwrap() {
             SyncMessage::PatchData { data: received } => {
                 assert_eq!(received.len(), data.len());
@@ -232,7 +243,8 @@ mod tests {
                 node_id: NodeId::from_u64(i),
                 root_page: PageId(0),
                 root_hash: [0u8; MERKLE_HASH_SIZE],
-            }).unwrap();
+            })
+            .unwrap();
         }
         for i in 0..100u64 {
             match b.recv().unwrap() {

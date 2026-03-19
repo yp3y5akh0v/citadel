@@ -83,6 +83,7 @@ impl<V: Default> SieveCache<V> {
     /// if an entry was evicted.
     ///
     /// Returns Err(()) if the cache is full and all entries are dirty (pinned).
+    #[allow(clippy::result_unit_err)]
     pub fn insert(&mut self, key: u64, value: V) -> Result<Option<(u64, V)>, ()> {
         // If already present, just update
         if let Some(&idx) = self.index.get(&key) {
@@ -187,21 +188,24 @@ impl<V: Default> SieveCache<V> {
 
     /// Check if an entry is dirty.
     pub fn is_dirty(&self, key: u64) -> bool {
-        self.index.get(&key)
+        self.index
+            .get(&key)
             .map(|&idx| self.entries[idx].dirty)
             .unwrap_or(false)
     }
 
     /// Iterate over all dirty entries. Returns (key, &value) pairs.
     pub fn dirty_entries(&self) -> impl Iterator<Item = (u64, &V)> {
-        self.entries.iter()
+        self.entries
+            .iter()
             .filter(|e| e.occupied && e.dirty)
             .map(|e| (e.key, &e.value))
     }
 
     /// Iterate mutably over all dirty entries.
     pub fn dirty_entries_mut(&mut self) -> impl Iterator<Item = (u64, &mut V)> {
-        self.entries.iter_mut()
+        self.entries
+            .iter_mut()
             .filter(|e| e.occupied && e.dirty)
             .map(|e| (e.key, &mut e.value))
     }
@@ -241,7 +245,10 @@ impl<V: Default> SieveCache<V> {
 
     /// Count dirty entries.
     pub fn dirty_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.occupied && e.dirty).count()
+        self.entries
+            .iter()
+            .filter(|e| e.occupied && e.dirty)
+            .count()
     }
 
     /// Remove all entries from the cache.

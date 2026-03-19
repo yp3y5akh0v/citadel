@@ -1,15 +1,13 @@
-use citadel_core::{
-    COMMIT_SLOT_OFFSET, COMMIT_SLOT_SIZE, FILE_HEADER_SIZE, FILE_ID_OFFSET,
-    FORMAT_VERSION, GOD_BIT_ACTIVE_SLOT, GOD_BIT_RECOVERY, GOD_BYTE_OFFSET,
-    MAGIC, MAC_SIZE, MERKLE_HASH_SIZE, PAGE_SIZE,
-    SLOT_CHECKSUM, SLOT_DEK_ID, SLOT_ENCRYPTION_EPOCH, SLOT_HIGH_WATER_MARK,
-    SLOT_MERKLE_ROOT, SLOT_PENDING_FREE_ROOT, SLOT_TOTAL_PAGES, SLOT_TREE_DEPTH,
-    SLOT_TREE_ENTRIES, SLOT_TREE_ROOT, SLOT_TXN_ID, SLOT_CATALOG_ROOT,
-    GROWTH_CHUNK_1MB, GROWTH_CHUNK_4MB, GROWTH_CHUNK_16MB,
-    GROWTH_THRESHOLD_4MB, GROWTH_THRESHOLD_64MB, GROWTH_THRESHOLD_1GB,
-};
 use citadel_core::types::{PageId, TxnId};
 use citadel_core::{Error, Result};
+use citadel_core::{
+    COMMIT_SLOT_OFFSET, COMMIT_SLOT_SIZE, FILE_HEADER_SIZE, FILE_ID_OFFSET, FORMAT_VERSION,
+    GOD_BIT_ACTIVE_SLOT, GOD_BIT_RECOVERY, GOD_BYTE_OFFSET, GROWTH_CHUNK_16MB, GROWTH_CHUNK_1MB,
+    GROWTH_CHUNK_4MB, GROWTH_THRESHOLD_1GB, GROWTH_THRESHOLD_4MB, GROWTH_THRESHOLD_64MB, MAC_SIZE,
+    MAGIC, MERKLE_HASH_SIZE, PAGE_SIZE, SLOT_CATALOG_ROOT, SLOT_CHECKSUM, SLOT_DEK_ID,
+    SLOT_ENCRYPTION_EPOCH, SLOT_HIGH_WATER_MARK, SLOT_MERKLE_ROOT, SLOT_PENDING_FREE_ROOT,
+    SLOT_TOTAL_PAGES, SLOT_TREE_DEPTH, SLOT_TREE_ENTRIES, SLOT_TREE_ROOT, SLOT_TXN_ID,
+};
 
 use crate::traits::PageIO;
 
@@ -35,15 +33,22 @@ impl CommitSlot {
     pub fn serialize(&self) -> [u8; COMMIT_SLOT_SIZE] {
         let mut buf = [0u8; COMMIT_SLOT_SIZE];
         buf[SLOT_TXN_ID..SLOT_TXN_ID + 8].copy_from_slice(&self.txn_id.as_u64().to_le_bytes());
-        buf[SLOT_TREE_ROOT..SLOT_TREE_ROOT + 4].copy_from_slice(&self.tree_root.as_u32().to_le_bytes());
+        buf[SLOT_TREE_ROOT..SLOT_TREE_ROOT + 4]
+            .copy_from_slice(&self.tree_root.as_u32().to_le_bytes());
         buf[SLOT_TREE_DEPTH..SLOT_TREE_DEPTH + 2].copy_from_slice(&self.tree_depth.to_le_bytes());
         // 2 bytes padding at offset 14
-        buf[SLOT_TREE_ENTRIES..SLOT_TREE_ENTRIES + 8].copy_from_slice(&self.tree_entries.to_le_bytes());
-        buf[SLOT_CATALOG_ROOT..SLOT_CATALOG_ROOT + 4].copy_from_slice(&self.catalog_root.as_u32().to_le_bytes());
-        buf[SLOT_TOTAL_PAGES..SLOT_TOTAL_PAGES + 4].copy_from_slice(&self.total_pages.to_le_bytes());
-        buf[SLOT_HIGH_WATER_MARK..SLOT_HIGH_WATER_MARK + 4].copy_from_slice(&self.high_water_mark.to_le_bytes());
-        buf[SLOT_PENDING_FREE_ROOT..SLOT_PENDING_FREE_ROOT + 4].copy_from_slice(&self.pending_free_root.as_u32().to_le_bytes());
-        buf[SLOT_ENCRYPTION_EPOCH..SLOT_ENCRYPTION_EPOCH + 4].copy_from_slice(&self.encryption_epoch.to_le_bytes());
+        buf[SLOT_TREE_ENTRIES..SLOT_TREE_ENTRIES + 8]
+            .copy_from_slice(&self.tree_entries.to_le_bytes());
+        buf[SLOT_CATALOG_ROOT..SLOT_CATALOG_ROOT + 4]
+            .copy_from_slice(&self.catalog_root.as_u32().to_le_bytes());
+        buf[SLOT_TOTAL_PAGES..SLOT_TOTAL_PAGES + 4]
+            .copy_from_slice(&self.total_pages.to_le_bytes());
+        buf[SLOT_HIGH_WATER_MARK..SLOT_HIGH_WATER_MARK + 4]
+            .copy_from_slice(&self.high_water_mark.to_le_bytes());
+        buf[SLOT_PENDING_FREE_ROOT..SLOT_PENDING_FREE_ROOT + 4]
+            .copy_from_slice(&self.pending_free_root.as_u32().to_le_bytes());
+        buf[SLOT_ENCRYPTION_EPOCH..SLOT_ENCRYPTION_EPOCH + 4]
+            .copy_from_slice(&self.encryption_epoch.to_le_bytes());
         buf[SLOT_DEK_ID..SLOT_DEK_ID + MAC_SIZE].copy_from_slice(&self.dek_id);
 
         // Compute checksum over bytes [0..76]
@@ -63,15 +68,47 @@ impl CommitSlot {
         merkle_root.copy_from_slice(&buf[SLOT_MERKLE_ROOT..SLOT_MERKLE_ROOT + MERKLE_HASH_SIZE]);
 
         Self {
-            txn_id: TxnId(u64::from_le_bytes(buf[SLOT_TXN_ID..SLOT_TXN_ID + 8].try_into().unwrap())),
-            tree_root: PageId(u32::from_le_bytes(buf[SLOT_TREE_ROOT..SLOT_TREE_ROOT + 4].try_into().unwrap())),
-            tree_depth: u16::from_le_bytes(buf[SLOT_TREE_DEPTH..SLOT_TREE_DEPTH + 2].try_into().unwrap()),
-            tree_entries: u64::from_le_bytes(buf[SLOT_TREE_ENTRIES..SLOT_TREE_ENTRIES + 8].try_into().unwrap()),
-            catalog_root: PageId(u32::from_le_bytes(buf[SLOT_CATALOG_ROOT..SLOT_CATALOG_ROOT + 4].try_into().unwrap())),
-            total_pages: u32::from_le_bytes(buf[SLOT_TOTAL_PAGES..SLOT_TOTAL_PAGES + 4].try_into().unwrap()),
-            high_water_mark: u32::from_le_bytes(buf[SLOT_HIGH_WATER_MARK..SLOT_HIGH_WATER_MARK + 4].try_into().unwrap()),
-            pending_free_root: PageId(u32::from_le_bytes(buf[SLOT_PENDING_FREE_ROOT..SLOT_PENDING_FREE_ROOT + 4].try_into().unwrap())),
-            encryption_epoch: u32::from_le_bytes(buf[SLOT_ENCRYPTION_EPOCH..SLOT_ENCRYPTION_EPOCH + 4].try_into().unwrap()),
+            txn_id: TxnId(u64::from_le_bytes(
+                buf[SLOT_TXN_ID..SLOT_TXN_ID + 8].try_into().unwrap(),
+            )),
+            tree_root: PageId(u32::from_le_bytes(
+                buf[SLOT_TREE_ROOT..SLOT_TREE_ROOT + 4].try_into().unwrap(),
+            )),
+            tree_depth: u16::from_le_bytes(
+                buf[SLOT_TREE_DEPTH..SLOT_TREE_DEPTH + 2]
+                    .try_into()
+                    .unwrap(),
+            ),
+            tree_entries: u64::from_le_bytes(
+                buf[SLOT_TREE_ENTRIES..SLOT_TREE_ENTRIES + 8]
+                    .try_into()
+                    .unwrap(),
+            ),
+            catalog_root: PageId(u32::from_le_bytes(
+                buf[SLOT_CATALOG_ROOT..SLOT_CATALOG_ROOT + 4]
+                    .try_into()
+                    .unwrap(),
+            )),
+            total_pages: u32::from_le_bytes(
+                buf[SLOT_TOTAL_PAGES..SLOT_TOTAL_PAGES + 4]
+                    .try_into()
+                    .unwrap(),
+            ),
+            high_water_mark: u32::from_le_bytes(
+                buf[SLOT_HIGH_WATER_MARK..SLOT_HIGH_WATER_MARK + 4]
+                    .try_into()
+                    .unwrap(),
+            ),
+            pending_free_root: PageId(u32::from_le_bytes(
+                buf[SLOT_PENDING_FREE_ROOT..SLOT_PENDING_FREE_ROOT + 4]
+                    .try_into()
+                    .unwrap(),
+            )),
+            encryption_epoch: u32::from_le_bytes(
+                buf[SLOT_ENCRYPTION_EPOCH..SLOT_ENCRYPTION_EPOCH + 4]
+                    .try_into()
+                    .unwrap(),
+            ),
             dek_id: buf[SLOT_DEK_ID..SLOT_DEK_ID + MAC_SIZE].try_into().unwrap(),
             checksum: u64::from_le_bytes(buf[SLOT_CHECKSUM..SLOT_CHECKSUM + 8].try_into().unwrap()),
             merkle_root,
@@ -137,10 +174,14 @@ impl FileHeader {
             return Err(Error::UnsupportedVersion(format_version));
         }
 
-        let slot0_buf: [u8; COMMIT_SLOT_SIZE] = buf[COMMIT_SLOT_OFFSET..COMMIT_SLOT_OFFSET + COMMIT_SLOT_SIZE]
-            .try_into().unwrap();
-        let slot1_buf: [u8; COMMIT_SLOT_SIZE] = buf[COMMIT_SLOT_OFFSET + COMMIT_SLOT_SIZE..COMMIT_SLOT_OFFSET + 2 * COMMIT_SLOT_SIZE]
-            .try_into().unwrap();
+        let slot0_buf: [u8; COMMIT_SLOT_SIZE] = buf
+            [COMMIT_SLOT_OFFSET..COMMIT_SLOT_OFFSET + COMMIT_SLOT_SIZE]
+            .try_into()
+            .unwrap();
+        let slot1_buf: [u8; COMMIT_SLOT_SIZE] = buf
+            [COMMIT_SLOT_OFFSET + COMMIT_SLOT_SIZE..COMMIT_SLOT_OFFSET + 2 * COMMIT_SLOT_SIZE]
+            .try_into()
+            .unwrap();
 
         Ok(Self {
             magic,
@@ -150,7 +191,9 @@ impl FileHeader {
             min_reader_ver: u16::from_le_bytes(buf[16..18].try_into().unwrap()),
             min_writer_ver: u16::from_le_bytes(buf[18..20].try_into().unwrap()),
             god_byte: buf[GOD_BYTE_OFFSET],
-            file_id: u64::from_le_bytes(buf[FILE_ID_OFFSET..FILE_ID_OFFSET + 8].try_into().unwrap()),
+            file_id: u64::from_le_bytes(
+                buf[FILE_ID_OFFSET..FILE_ID_OFFSET + 8].try_into().unwrap(),
+            ),
             slots: [
                 CommitSlot::deserialize(&slot0_buf),
                 CommitSlot::deserialize(&slot1_buf),
@@ -442,8 +485,14 @@ mod tests {
     #[test]
     fn page_offset_calculation() {
         assert_eq!(page_offset(PageId(0)), FILE_HEADER_SIZE as u64);
-        assert_eq!(page_offset(PageId(1)), FILE_HEADER_SIZE as u64 + PAGE_SIZE as u64);
-        assert_eq!(page_offset(PageId(10)), FILE_HEADER_SIZE as u64 + 10 * PAGE_SIZE as u64);
+        assert_eq!(
+            page_offset(PageId(1)),
+            FILE_HEADER_SIZE as u64 + PAGE_SIZE as u64
+        );
+        assert_eq!(
+            page_offset(PageId(10)),
+            FILE_HEADER_SIZE as u64 + 10 * PAGE_SIZE as u64
+        );
     }
 
     #[test]
@@ -453,6 +502,9 @@ mod tests {
         assert_eq!(growth_chunk(GROWTH_THRESHOLD_4MB), GROWTH_CHUNK_4MB);
         assert_eq!(growth_chunk(GROWTH_THRESHOLD_64MB), GROWTH_CHUNK_16MB);
         assert_eq!(growth_chunk(GROWTH_THRESHOLD_1GB), GROWTH_CHUNK_16MB);
-        assert_eq!(growth_chunk(10 * GROWTH_THRESHOLD_1GB), 10 * GROWTH_THRESHOLD_1GB / 100);
+        assert_eq!(
+            growth_chunk(10 * GROWTH_THRESHOLD_1GB),
+            10 * GROWTH_THRESHOLD_1GB / 100
+        );
     }
 }

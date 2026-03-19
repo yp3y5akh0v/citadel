@@ -12,6 +12,9 @@ categories.workspace = true
 description = "Page format, serialization, and checksum for Citadel B+ tree pages"
 readme = "README.md"
 
+[lib]
+name = "citadel_page"
+
 [dependencies]
 citadel-core = { workspace = true }
 xxhash-rust = { workspace = true }

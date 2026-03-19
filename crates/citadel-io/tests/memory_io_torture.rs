@@ -66,7 +66,10 @@ fn overwrite_all_pages() {
         let offset = i * PAGE_SIZE as u64;
         let mut buf = [0u8; PAGE_SIZE];
         io.read_page(offset, &mut buf).unwrap();
-        assert!(buf.iter().all(|&b| b == 4), "page {i} should have round 4 value");
+        assert!(
+            buf.iter().all(|&b| b == 4),
+            "page {i} should have round 4 value"
+        );
     }
 }
 
@@ -171,8 +174,10 @@ fn concurrent_read_write_threads() {
     for i in 0..10u64 {
         let mut buf = [0u8; PAGE_SIZE];
         io.read_page(i * PAGE_SIZE as u64, &mut buf).unwrap();
-        assert!(buf[8..PAGE_SIZE].iter().all(|&b| b == 49),
-            "page {i} should have final round value");
+        assert!(
+            buf[8..PAGE_SIZE].iter().all(|&b| b == 49),
+            "page {i} should have final round value"
+        );
     }
 }
 

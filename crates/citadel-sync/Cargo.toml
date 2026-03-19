@@ -12,6 +12,9 @@ categories.workspace = true
 description = "Replication and sync layer for Citadel encrypted database"
 readme = "README.md"
 
+[lib]
+name = "citadel_sync"
+
 [dependencies]
 citadel-core = { workspace = true }
 citadel-page = { workspace = true }

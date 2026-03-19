@@ -4,23 +4,22 @@
 //! - Reader registration for oldest_active_reader tracking
 //! - Interior mutability via parking_lot::Mutex for concurrent access
 
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use parking_lot::Mutex;
 
-use citadel_core::types::{PageId, TxnId};
-use citadel_core::{
-    DEK_SIZE, MAC_KEY_SIZE, PAGE_SIZE, BODY_SIZE,
-    GOD_BIT_ACTIVE_SLOT, GOD_BIT_RECOVERY,
-    Error, Result,
-};
 use citadel_buffer::allocator::PageAllocator;
 use citadel_buffer::btree::BTree;
 use citadel_buffer::pool::BufferPool;
+use citadel_core::types::{PageId, TxnId};
+use citadel_core::{
+    Error, Result, BODY_SIZE, DEK_SIZE, GOD_BIT_ACTIVE_SLOT, GOD_BIT_RECOVERY, MAC_KEY_SIZE,
+    PAGE_SIZE,
+};
 use citadel_crypto::page_cipher;
 use citadel_io::file_manager::{
-    self, CommitSlot, page_offset, read_god_byte, write_god_byte,
-    write_commit_slot, ensure_file_size,
+    self, ensure_file_size, page_offset, read_god_byte, write_commit_slot, write_god_byte,
+    CommitSlot,
 };
 use citadel_io::traits::PageIO;
 use citadel_page::page::Page;
@@ -113,17 +112,24 @@ impl TxnManager {
         // Compute Merkle hash before checksum (hash is inside checksummed region)
         let mut init_pages = std::collections::HashMap::new();
         init_pages.insert(root_id, root_page);
-        let merkle_root_hash = crate::merkle::compute_tree_merkle(
-            &mut init_pages, root_id, TxnId(1),
-            &|_| unreachable!("no clean pages for new database"),
-        )?;
+        let merkle_root_hash =
+            crate::merkle::compute_tree_merkle(&mut init_pages, root_id, TxnId(1), &|_| {
+                unreachable!("no clean pages for new database")
+            })?;
         let mut root_page = init_pages.remove(&root_id).unwrap();
         root_page.update_checksum();
 
         let offset = page_offset(root_id);
         ensure_file_size(&*io, offset)?;
         let mut encrypted = [0u8; PAGE_SIZE];
-        page_cipher::encrypt_page(&dek, &mac_key, root_id, epoch, root_page.as_bytes(), &mut encrypted);
+        page_cipher::encrypt_page(
+            &dek,
+            &mac_key,
+            root_id,
+            epoch,
+            root_page.as_bytes(),
+            &mut encrypted,
+        );
         io.write_page(offset, &encrypted)?;
 
         // Write initial commit slot (slot 0)
@@ -176,7 +182,11 @@ impl TxnManager {
 
     /// Begin a write transaction. Only one can be active at a time.
     pub fn begin_write(&self) -> Result<WriteTxn<'_>> {
-        if self.write_active.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        if self
+            .write_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return Err(Error::WriteTransactionActive);
         }
 
@@ -195,7 +205,11 @@ impl TxnManager {
         }
 
         // Initialize BTree from snapshot
-        let tree = BTree::from_existing(snapshot.tree_root, snapshot.tree_depth, snapshot.tree_entries);
+        let tree = BTree::from_existing(
+            snapshot.tree_root,
+            snapshot.tree_depth,
+            snapshot.tree_entries,
+        );
 
         Ok(WriteTxn::new(self, txn_id, snapshot, tree, alloc, deferred))
     }
@@ -212,6 +226,7 @@ impl TxnManager {
     /// Sets recovery flag, processes pending-free chain, flushes dirty pages,
     /// writes the inactive commit slot, fsyncs, flips the god byte, and fsyncs
     /// again. Returns success only after the final fsync completes.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_write(
         &self,
         txn_id: TxnId,
@@ -239,7 +254,9 @@ impl TxnManager {
         self.load_pending_free_chain(pages, old_slot.pending_free_root)?;
 
         let (new_pf_root, reclaimed, old_chain_pages) = pending_free::process_chain(
-            pages, alloc, txn_id,
+            pages,
+            alloc,
+            txn_id,
             old_slot.pending_free_root,
             &freed_this_txn,
             deferred_free,
@@ -249,28 +266,22 @@ impl TxnManager {
         // Compute Merkle hashes for main tree before checksums and encryption.
         // This sets merkle_hash in dirty page headers at [36..64], which is
         // inside the checksummed region — must happen before update_checksum().
-        let merkle_root_hash = crate::merkle::compute_tree_merkle(
-            pages, tree.root, txn_id,
-            &|page_id| self.read_page_from_disk(page_id),
-        )?;
+        let merkle_root_hash =
+            crate::merkle::compute_tree_merkle(pages, tree.root, txn_id, &|page_id| {
+                self.read_page_from_disk(page_id)
+            })?;
 
         // Compute Merkle hashes for named table trees
         let read_clean = &|page_id| self.read_page_from_disk(page_id);
-        for (_, named_tree) in named_trees {
+        for named_tree in named_trees.values() {
             if named_tree.root != PageId::INVALID {
-                crate::merkle::compute_tree_merkle(
-                    pages, named_tree.root, txn_id, read_clean,
-                )?;
+                crate::merkle::compute_tree_merkle(pages, named_tree.root, txn_id, read_clean)?;
             }
         }
 
         // Compute Merkle hash for catalog tree if it changed
-        if catalog_root != PageId::INVALID
-            && catalog_root != old_slot.catalog_root
-        {
-            crate::merkle::compute_tree_merkle(
-                pages, catalog_root, txn_id, read_clean,
-            )?;
+        if catalog_root != PageId::INVALID && catalog_root != old_slot.catalog_root {
+            crate::merkle::compute_tree_merkle(pages, catalog_root, txn_id, read_clean)?;
         }
 
         let mut encrypted_pages: Vec<(u64, [u8; PAGE_SIZE])> = Vec::new();
@@ -283,8 +294,12 @@ impl TxnManager {
 
                 let mut encrypted = [0u8; PAGE_SIZE];
                 page_cipher::encrypt_page(
-                    &self.dek, &self.mac_key, page_id,
-                    self.epoch, page.as_bytes(), &mut encrypted,
+                    &self.dek,
+                    &self.mac_key,
+                    page_id,
+                    self.epoch,
+                    page.as_bytes(),
+                    &mut encrypted,
                 );
                 encrypted_pages.push((offset, encrypted));
             }
@@ -360,9 +375,12 @@ impl TxnManager {
     }
 
     fn oldest_active_reader_locked(&self, state: &ManagerState) -> TxnId {
-        state.reader_table.keys().next().copied().unwrap_or(
-            TxnId(self.next_txn_id.load(Ordering::SeqCst))
-        )
+        state
+            .reader_table
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(TxnId(self.next_txn_id.load(Ordering::SeqCst)))
     }
 
     /// Get the current active commit slot (for testing/inspection).
@@ -377,8 +395,8 @@ impl TxnManager {
 
     /// List all named tables in the catalog.
     pub fn list_tables(&self) -> Result<Vec<(Vec<u8>, TableDescriptor)>> {
-        use citadel_page::{branch_node, leaf_node};
         use citadel_core::types::ValueType;
+        use citadel_page::{branch_node, leaf_node};
 
         let slot = self.current_slot();
         if !slot.catalog_root.is_valid() {
@@ -418,8 +436,8 @@ impl TxnManager {
 
     /// Look up a named table's root page by name.
     pub fn table_root(&self, name: &[u8]) -> Result<Option<PageId>> {
-        use citadel_page::{branch_node, leaf_node};
         use citadel_core::types::ValueType;
+        use citadel_page::{branch_node, leaf_node};
 
         let slot = self.current_slot();
         if !slot.catalog_root.is_valid() {
@@ -493,8 +511,8 @@ impl TxnManager {
 
         // Calculate needed file size
         let max_page = reachable.iter().map(|p| p.as_u32()).max().unwrap_or(0);
-        let needed_size = citadel_core::FILE_HEADER_SIZE as u64
-            + (max_page as u64 + 1) * PAGE_SIZE as u64;
+        let needed_size =
+            citadel_core::FILE_HEADER_SIZE as u64 + (max_page as u64 + 1) * PAGE_SIZE as u64;
         dest_io.truncate(needed_size)?;
 
         // Write header
@@ -514,10 +532,10 @@ impl TxnManager {
 
     /// Compact the database into a new file with sequential page IDs.
     pub fn compact_to(&self, dest_io: &dyn PageIO) -> Result<()> {
+        use citadel_core::types::ValueType;
+        use citadel_page::{branch_node, leaf_node};
         use std::collections::HashMap as StdMap;
         use std::collections::HashSet;
-        use citadel_page::{branch_node, leaf_node};
-        use citadel_core::types::ValueType;
 
         let slot = self.current_slot();
         let mut next_id: u32 = 0;
@@ -530,8 +548,7 @@ impl TxnManager {
         if slot.catalog_root.is_valid() {
             let table_roots = {
                 let mut reachable = HashSet::new();
-                let roots = self.collect_catalog_pages(slot.catalog_root, &mut reachable)?;
-                roots
+                self.collect_catalog_pages(slot.catalog_root, &mut reachable)?
             };
 
             self.assign_new_ids(slot.catalog_root, &mut old_to_new, &mut next_id)?;
@@ -546,8 +563,8 @@ impl TxnManager {
 
         // Copy each page with remapped IDs
         let total_pages = next_id;
-        let needed_size = citadel_core::FILE_HEADER_SIZE as u64
-            + total_pages as u64 * PAGE_SIZE as u64;
+        let needed_size =
+            citadel_core::FILE_HEADER_SIZE as u64 + total_pages as u64 * PAGE_SIZE as u64;
         dest_io.truncate(needed_size)?;
 
         let mut root_merkle = [0u8; citadel_core::MERKLE_HASH_SIZE];
@@ -607,8 +624,12 @@ impl TxnManager {
             let offset = page_offset(new_id);
             let mut encrypted = [0u8; PAGE_SIZE];
             page_cipher::encrypt_page(
-                &self.dek, &self.mac_key, new_id, self.epoch,
-                page.as_bytes(), &mut encrypted,
+                &self.dek,
+                &self.mac_key,
+                new_id,
+                self.epoch,
+                page.as_bytes(),
+                &mut encrypted,
             );
             dest_io.write_page(offset, &encrypted)?;
         }
@@ -618,9 +639,15 @@ impl TxnManager {
         self.io.read_at(0, &mut header_buf)?;
         let mut header = file_manager::FileHeader::deserialize(&header_buf)?;
 
-        let new_tree_root = old_to_new.get(&slot.tree_root).copied().unwrap_or(PageId(0));
+        let new_tree_root = old_to_new
+            .get(&slot.tree_root)
+            .copied()
+            .unwrap_or(PageId(0));
         let new_catalog_root = if slot.catalog_root.is_valid() {
-            old_to_new.get(&slot.catalog_root).copied().unwrap_or(PageId::INVALID)
+            old_to_new
+                .get(&slot.catalog_root)
+                .copied()
+                .unwrap_or(PageId::INVALID)
         } else {
             PageId::INVALID
         };
@@ -682,8 +709,8 @@ impl TxnManager {
         catalog_root: PageId,
         reachable: &mut std::collections::HashSet<PageId>,
     ) -> Result<Vec<PageId>> {
-        use citadel_page::{branch_node, leaf_node};
         use citadel_core::types::ValueType;
+        use citadel_page::{branch_node, leaf_node};
 
         let mut table_roots = Vec::new();
         let mut stack = vec![catalog_root];
@@ -809,10 +836,10 @@ impl TxnManager {
 
         let mut current = root;
         while current.is_valid() {
-            if !pages.contains_key(&current) {
+            if let std::collections::hash_map::Entry::Vacant(e) = pages.entry(current) {
                 let page = self.read_page_from_disk(current)?;
                 let next = page.right_child();
-                pages.insert(current, page);
+                e.insert(page);
                 if !next.is_valid() {
                     break;
                 }
@@ -837,8 +864,12 @@ impl TxnManager {
 
         let mut body = [0u8; BODY_SIZE];
         page_cipher::decrypt_page(
-            &self.dek, &self.mac_key, page_id, self.epoch,
-            &encrypted, &mut body,
+            &self.dek,
+            &self.mac_key,
+            page_id,
+            self.epoch,
+            &encrypted,
+            &mut body,
         )?;
 
         let page = Page::from_bytes(body);
@@ -864,7 +895,9 @@ pub(crate) mod tests {
 
     impl MemIO {
         pub fn new(size: usize) -> Self {
-            Self { data: StdMutex::new(vec![0u8; size]) }
+            Self {
+                data: StdMutex::new(vec![0u8; size]),
+            }
         }
     }
 
@@ -921,7 +954,9 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        fn fsync(&self) -> Result<()> { Ok(()) }
+        fn fsync(&self) -> Result<()> {
+            Ok(())
+        }
 
         fn file_size(&self) -> Result<u64> {
             Ok(self.data.lock().unwrap().len() as u64)

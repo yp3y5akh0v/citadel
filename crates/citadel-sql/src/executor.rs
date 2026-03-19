@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use citadel::Database;
 
-use crate::encoding::{decode_composite_key, decode_key_value, decode_row, encode_composite_key, encode_row};
+use crate::encoding::{
+    decode_composite_key, decode_key_value, decode_row, encode_composite_key, encode_row,
+};
 use crate::error::{Result, SqlError};
 use crate::eval::{eval_expr, is_truthy};
 use crate::parser::*;
@@ -14,12 +16,10 @@ use crate::types::*;
 
 // ── Index helpers ────────────────────────────────────────────────────
 
-fn encode_index_key(
-    idx: &IndexDef,
-    row: &[Value],
-    pk_values: &[Value],
-) -> Vec<u8> {
-    let indexed_values: Vec<Value> = idx.columns.iter()
+fn encode_index_key(idx: &IndexDef, row: &[Value], pk_values: &[Value]) -> Vec<u8> {
+    let indexed_values: Vec<Value> = idx
+        .columns
+        .iter()
         .map(|&col_idx| row[col_idx as usize].clone())
         .collect();
 
@@ -35,13 +35,11 @@ fn encode_index_key(
     encode_composite_key(&all_values)
 }
 
-fn encode_index_value(
-    idx: &IndexDef,
-    row: &[Value],
-    pk_values: &[Value],
-) -> Vec<u8> {
+fn encode_index_value(idx: &IndexDef, row: &[Value], pk_values: &[Value]) -> Vec<u8> {
     if idx.unique {
-        let indexed_values: Vec<Value> = idx.columns.iter()
+        let indexed_values: Vec<Value> = idx
+            .columns
+            .iter()
             .map(|&col_idx| row[col_idx as usize].clone())
             .collect();
         let any_null = indexed_values.iter().any(|v| v.is_null());
@@ -63,11 +61,14 @@ fn insert_index_entries(
         let key = encode_index_key(idx, row, pk_values);
         let value = encode_index_value(idx, row, pk_values);
 
-        let is_new = wtx.table_insert(&idx_table, &key, &value)
+        let is_new = wtx
+            .table_insert(&idx_table, &key, &value)
             .map_err(SqlError::Storage)?;
 
         if idx.unique && !is_new {
-            let indexed_values: Vec<Value> = idx.columns.iter()
+            let indexed_values: Vec<Value> = idx
+                .columns
+                .iter()
                 .map(|&col_idx| row[col_idx as usize].clone())
                 .collect();
             let any_null = indexed_values.iter().any(|v| v.is_null());
@@ -88,15 +89,16 @@ fn delete_index_entries(
     for idx in &table_schema.indices {
         let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
         let key = encode_index_key(idx, row, pk_values);
-        wtx.table_delete(&idx_table, &key).map_err(SqlError::Storage)?;
+        wtx.table_delete(&idx_table, &key)
+            .map_err(SqlError::Storage)?;
     }
     Ok(())
 }
 
 fn index_columns_changed(idx: &IndexDef, old_row: &[Value], new_row: &[Value]) -> bool {
-    idx.columns.iter().any(|&col_idx| {
-        old_row[col_idx as usize] != new_row[col_idx as usize]
-    })
+    idx.columns
+        .iter()
+        .any(|&col_idx| old_row[col_idx as usize] != new_row[col_idx as usize])
 }
 
 /// Execute a parsed SQL statement in auto-commit mode.
@@ -115,9 +117,9 @@ pub fn execute(
         Statement::Update(upd) => exec_update(db, schema, upd),
         Statement::Delete(del) => exec_delete(db, schema, del),
         Statement::Explain(inner) => explain(schema, inner),
-        Statement::Begin | Statement::Commit | Statement::Rollback => {
-            Err(SqlError::Unsupported("transaction control in auto-commit mode".into()))
-        }
+        Statement::Begin | Statement::Commit | Statement::Rollback => Err(SqlError::Unsupported(
+            "transaction control in auto-commit mode".into(),
+        )),
     }
 }
 
@@ -145,26 +147,28 @@ pub fn execute_in_txn(
 
 // ── EXPLAIN ──────────────────────────────────────────────────────────
 
-pub fn explain(
-    schema: &SchemaManager,
-    stmt: &Statement,
-) -> Result<ExecutionResult> {
+pub fn explain(schema: &SchemaManager, stmt: &Statement) -> Result<ExecutionResult> {
     let lines = match stmt {
         Statement::Select(sel) => explain_select(schema, sel)?,
         Statement::Insert(ins) => {
             vec![format!("INSERT INTO {}", ins.table.to_ascii_lowercase())]
         }
         Statement::Update(upd) => explain_dml(schema, &upd.table, &upd.where_clause, "UPDATE")?,
-        Statement::Delete(del) => explain_dml(schema, &del.table, &del.where_clause, "DELETE FROM")?,
+        Statement::Delete(del) => {
+            explain_dml(schema, &del.table, &del.where_clause, "DELETE FROM")?
+        }
         Statement::Explain(_) => {
             return Err(SqlError::Unsupported("EXPLAIN EXPLAIN".into()));
         }
         _ => {
-            return Err(SqlError::Unsupported("EXPLAIN for this statement type".into()));
+            return Err(SqlError::Unsupported(
+                "EXPLAIN for this statement type".into(),
+            ));
         }
     };
 
-    let rows = lines.into_iter()
+    let rows = lines
+        .into_iter()
         .map(|line| vec![Value::Text(line)])
         .collect();
     Ok(ExecutionResult::Query(QueryResult {
@@ -180,17 +184,15 @@ fn explain_dml(
     verb: &str,
 ) -> Result<Vec<String>> {
     let lower = table.to_ascii_lowercase();
-    let table_schema = schema.get(&lower)
+    let table_schema = schema
+        .get(&lower)
         .ok_or_else(|| SqlError::TableNotFound(table.to_string()))?;
     let plan = planner::plan_select(table_schema, where_clause);
     let scan_line = format_scan_line(&lower, &None, &plan, table_schema);
     Ok(vec![format!("{verb} {}", scan_line)])
 }
 
-fn explain_select(
-    schema: &SchemaManager,
-    stmt: &SelectStmt,
-) -> Result<Vec<String>> {
+fn explain_select(schema: &SchemaManager, stmt: &SelectStmt) -> Result<Vec<String>> {
     let mut lines = Vec::new();
 
     if stmt.from.is_empty() {
@@ -199,22 +201,39 @@ fn explain_select(
     }
 
     let lower_from = stmt.from.to_ascii_lowercase();
-    let from_schema = schema.get(&lower_from)
+    let from_schema = schema
+        .get(&lower_from)
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
 
     if stmt.joins.is_empty() {
         let plan = planner::plan_select(from_schema, &stmt.where_clause);
-        lines.push(format_scan_line(&lower_from, &stmt.from_alias, &plan, from_schema));
+        lines.push(format_scan_line(
+            &lower_from,
+            &stmt.from_alias,
+            &plan,
+            from_schema,
+        ));
     } else {
         let from_plan = planner::plan_select(from_schema, &None);
-        lines.push(format_scan_line(&lower_from, &stmt.from_alias, &from_plan, from_schema));
+        lines.push(format_scan_line(
+            &lower_from,
+            &stmt.from_alias,
+            &from_plan,
+            from_schema,
+        ));
 
         for join in &stmt.joins {
             let inner_lower = join.table.name.to_ascii_lowercase();
-            let inner_schema = schema.get(&inner_lower)
+            let inner_schema = schema
+                .get(&inner_lower)
                 .ok_or_else(|| SqlError::TableNotFound(join.table.name.clone()))?;
             let inner_plan = planner::plan_select(inner_schema, &None);
-            lines.push(format_scan_line(&inner_lower, &join.table.alias, &inner_plan, inner_schema));
+            lines.push(format_scan_line(
+                &inner_lower,
+                &join.table.alias,
+                &inner_plan,
+                inner_schema,
+            ));
         }
 
         let join_type_str = match stmt.joins.last().map(|j| j.join_type) {
@@ -274,8 +293,12 @@ fn explain_select(
 
 fn explain_subqueries(stmt: &SelectStmt, lines: &mut Vec<String>) {
     let mut count = 0;
-    if let Some(ref w) = stmt.where_clause { count += count_subqueries(w); }
-    if let Some(ref h) = stmt.having { count += count_subqueries(h); }
+    if let Some(ref w) = stmt.where_clause {
+        count += count_subqueries(w);
+    }
+    if let Some(ref h) = stmt.having {
+        count += count_subqueries(h);
+    }
     for col in &stmt.columns {
         if let SelectColumn::Expr { expr, .. } = col {
             count += count_subqueries(expr);
@@ -295,15 +318,27 @@ fn count_subqueries(expr: &Expr) -> usize {
         Expr::UnaryOp { expr: e, .. } => count_subqueries(e),
         Expr::IsNull(e) | Expr::IsNotNull(e) => count_subqueries(e),
         Expr::Function { args, .. } => args.iter().map(count_subqueries).sum(),
-        Expr::Between { expr: e, low, high, .. } => {
-            count_subqueries(e) + count_subqueries(low) + count_subqueries(high)
-        }
-        Expr::Like { expr: e, pattern, .. } => count_subqueries(e) + count_subqueries(pattern),
-        Expr::Case { operand, conditions, else_result } => {
+        Expr::Between {
+            expr: e, low, high, ..
+        } => count_subqueries(e) + count_subqueries(low) + count_subqueries(high),
+        Expr::Like {
+            expr: e, pattern, ..
+        } => count_subqueries(e) + count_subqueries(pattern),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
             let mut n = 0;
-            if let Some(op) = operand { n += count_subqueries(op); }
-            for (c, r) in conditions { n += count_subqueries(c) + count_subqueries(r); }
-            if let Some(el) = else_result { n += count_subqueries(el); }
+            if let Some(op) = operand {
+                n += count_subqueries(op);
+            }
+            for (c, r) in conditions {
+                n += count_subqueries(c) + count_subqueries(r);
+            }
+            if let Some(el) = else_result {
+                n += count_subqueries(el);
+            }
             n
         }
         Expr::Coalesce(args) => args.iter().map(count_subqueries).sum(),
@@ -322,7 +357,7 @@ fn format_scan_line(
     table_schema: &TableSchema,
 ) -> String {
     let alias_part = match alias {
-        Some(a) if a.to_ascii_lowercase() != table_name.to_ascii_lowercase() => {
+        Some(a) if !a.eq_ignore_ascii_case(table_name) => {
             format!(" AS {}", a.to_ascii_lowercase())
         }
         _ => String::new(),
@@ -365,21 +400,30 @@ fn exec_create_table(
         }
     }
 
-    let columns: Vec<ColumnDef> = stmt.columns.iter().enumerate().map(|(i, c)| {
-        ColumnDef {
+    let columns: Vec<ColumnDef> = stmt
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| ColumnDef {
             name: c.name.to_ascii_lowercase(),
             data_type: c.data_type,
             nullable: c.nullable,
             position: i as u16,
-        }
-    }).collect();
+        })
+        .collect();
 
-    let primary_key_columns: Vec<u16> = stmt.primary_key.iter().map(|pk_name| {
-        let lower = pk_name.to_ascii_lowercase();
-        columns.iter().position(|c| c.name == lower)
-            .map(|i| i as u16)
-            .ok_or_else(|| SqlError::ColumnNotFound(pk_name.clone()))
-    }).collect::<Result<_>>()?;
+    let primary_key_columns: Vec<u16> = stmt
+        .primary_key
+        .iter()
+        .map(|pk_name| {
+            let lower = pk_name.to_ascii_lowercase();
+            columns
+                .iter()
+                .position(|c| c.name == lower)
+                .map(|i| i as u16)
+                .ok_or_else(|| SqlError::ColumnNotFound(pk_name.clone()))
+        })
+        .collect::<Result<_>>()?;
 
     let table_schema = TableSchema {
         name: lower_name.clone(),
@@ -390,7 +434,8 @@ fn exec_create_table(
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     SchemaManager::ensure_schema_table(&mut wtx)?;
-    wtx.create_table(lower_name.as_bytes()).map_err(SqlError::Storage)?;
+    wtx.create_table(lower_name.as_bytes())
+        .map_err(SqlError::Storage)?;
     SchemaManager::save_schema(&mut wtx, &table_schema)?;
     wtx.commit().map_err(SqlError::Storage)?;
 
@@ -413,7 +458,9 @@ fn exec_drop_table(
     }
 
     let table_schema = schema.get(&lower_name).unwrap();
-    let idx_tables: Vec<Vec<u8>> = table_schema.indices.iter()
+    let idx_tables: Vec<Vec<u8>> = table_schema
+        .indices
+        .iter()
         .map(|idx| TableSchema::index_table_name(&lower_name, &idx.name))
         .collect();
 
@@ -421,7 +468,8 @@ fn exec_drop_table(
     for idx_table in &idx_tables {
         wtx.drop_table(idx_table).map_err(SqlError::Storage)?;
     }
-    wtx.drop_table(lower_name.as_bytes()).map_err(SqlError::Storage)?;
+    wtx.drop_table(lower_name.as_bytes())
+        .map_err(SqlError::Storage)?;
     SchemaManager::delete_schema(&mut wtx, &lower_name)?;
     wtx.commit().map_err(SqlError::Storage)?;
 
@@ -455,21 +503,30 @@ fn exec_create_table_in_txn(
         }
     }
 
-    let columns: Vec<ColumnDef> = stmt.columns.iter().enumerate().map(|(i, c)| {
-        ColumnDef {
+    let columns: Vec<ColumnDef> = stmt
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| ColumnDef {
             name: c.name.to_ascii_lowercase(),
             data_type: c.data_type,
             nullable: c.nullable,
             position: i as u16,
-        }
-    }).collect();
+        })
+        .collect();
 
-    let primary_key_columns: Vec<u16> = stmt.primary_key.iter().map(|pk_name| {
-        let lower = pk_name.to_ascii_lowercase();
-        columns.iter().position(|c| c.name == lower)
-            .map(|i| i as u16)
-            .ok_or_else(|| SqlError::ColumnNotFound(pk_name.clone()))
-    }).collect::<Result<_>>()?;
+    let primary_key_columns: Vec<u16> = stmt
+        .primary_key
+        .iter()
+        .map(|pk_name| {
+            let lower = pk_name.to_ascii_lowercase();
+            columns
+                .iter()
+                .position(|c| c.name == lower)
+                .map(|i| i as u16)
+                .ok_or_else(|| SqlError::ColumnNotFound(pk_name.clone()))
+        })
+        .collect::<Result<_>>()?;
 
     let table_schema = TableSchema {
         name: lower_name.clone(),
@@ -479,7 +536,8 @@ fn exec_create_table_in_txn(
     };
 
     SchemaManager::ensure_schema_table(wtx)?;
-    wtx.create_table(lower_name.as_bytes()).map_err(SqlError::Storage)?;
+    wtx.create_table(lower_name.as_bytes())
+        .map_err(SqlError::Storage)?;
     SchemaManager::save_schema(wtx, &table_schema)?;
 
     schema.register(table_schema);
@@ -501,14 +559,17 @@ fn exec_drop_table_in_txn(
     }
 
     let table_schema = schema.get(&lower_name).unwrap();
-    let idx_tables: Vec<Vec<u8>> = table_schema.indices.iter()
+    let idx_tables: Vec<Vec<u8>> = table_schema
+        .indices
+        .iter()
         .map(|idx| TableSchema::index_table_name(&lower_name, &idx.name))
         .collect();
 
     for idx_table in &idx_tables {
         wtx.drop_table(idx_table).map_err(SqlError::Storage)?;
     }
-    wtx.drop_table(lower_name.as_bytes()).map_err(SqlError::Storage)?;
+    wtx.drop_table(lower_name.as_bytes())
+        .map_err(SqlError::Storage)?;
     SchemaManager::delete_schema(wtx, &lower_name)?;
 
     schema.remove(&lower_name);
@@ -523,7 +584,8 @@ fn exec_create_index(
     let lower_table = stmt.table_name.to_ascii_lowercase();
     let lower_idx = stmt.index_name.to_ascii_lowercase();
 
-    let table_schema = schema.get(&lower_table)
+    let table_schema = schema
+        .get(&lower_table)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table_name.clone()))?;
 
     if table_schema.index_by_name(&lower_idx).is_some() {
@@ -533,12 +595,17 @@ fn exec_create_index(
         return Err(SqlError::IndexAlreadyExists(stmt.index_name.clone()));
     }
 
-    let col_indices: Vec<u16> = stmt.columns.iter().map(|col_name| {
-        let lower = col_name.to_ascii_lowercase();
-        table_schema.column_index(&lower)
-            .map(|i| i as u16)
-            .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))
-    }).collect::<Result<_>>()?;
+    let col_indices: Vec<u16> = stmt
+        .columns
+        .iter()
+        .map(|col_name| {
+            let lower = col_name.to_ascii_lowercase();
+            table_schema
+                .column_index(&lower)
+                .map(|i| i as u16)
+                .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))
+        })
+        .collect::<Result<_>>()?;
 
     let idx_def = IndexDef {
         name: lower_idx.clone(),
@@ -563,18 +630,24 @@ fn exec_create_index(
                 Err(e) => scan_err = Some(e),
             }
             Ok(())
-        }).map_err(SqlError::Storage)?;
-        if let Some(e) = scan_err { return Err(e); }
+        })
+        .map_err(SqlError::Storage)?;
+        if let Some(e) = scan_err {
+            return Err(e);
+        }
     }
 
     for row in &rows {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
         let key = encode_index_key(&idx_def, row, &pk_values);
         let value = encode_index_value(&idx_def, row, &pk_values);
-        let is_new = wtx.table_insert(&idx_table, &key, &value)
+        let is_new = wtx
+            .table_insert(&idx_table, &key, &value)
             .map_err(SqlError::Storage)?;
         if idx_def.unique && !is_new {
-            let indexed_values: Vec<Value> = idx_def.columns.iter()
+            let indexed_values: Vec<Value> = idx_def
+                .columns
+                .iter()
                 .map(|&col_idx| row[col_idx as usize].clone())
                 .collect();
             let any_null = indexed_values.iter().any(|v| v.is_null());
@@ -633,7 +706,8 @@ fn exec_create_index_in_txn(
     let lower_table = stmt.table_name.to_ascii_lowercase();
     let lower_idx = stmt.index_name.to_ascii_lowercase();
 
-    let table_schema = schema.get(&lower_table)
+    let table_schema = schema
+        .get(&lower_table)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table_name.clone()))?;
 
     if table_schema.index_by_name(&lower_idx).is_some() {
@@ -643,12 +717,17 @@ fn exec_create_index_in_txn(
         return Err(SqlError::IndexAlreadyExists(stmt.index_name.clone()));
     }
 
-    let col_indices: Vec<u16> = stmt.columns.iter().map(|col_name| {
-        let lower = col_name.to_ascii_lowercase();
-        table_schema.column_index(&lower)
-            .map(|i| i as u16)
-            .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))
-    }).collect::<Result<_>>()?;
+    let col_indices: Vec<u16> = stmt
+        .columns
+        .iter()
+        .map(|col_name| {
+            let lower = col_name.to_ascii_lowercase();
+            table_schema
+                .column_index(&lower)
+                .map(|i| i as u16)
+                .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))
+        })
+        .collect::<Result<_>>()?;
 
     let idx_def = IndexDef {
         name: lower_idx.clone(),
@@ -671,18 +750,24 @@ fn exec_create_index_in_txn(
                 Err(e) => scan_err = Some(e),
             }
             Ok(())
-        }).map_err(SqlError::Storage)?;
-        if let Some(e) = scan_err { return Err(e); }
+        })
+        .map_err(SqlError::Storage)?;
+        if let Some(e) = scan_err {
+            return Err(e);
+        }
     }
 
     for row in &rows {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
         let key = encode_index_key(&idx_def, row, &pk_values);
         let value = encode_index_value(&idx_def, row, &pk_values);
-        let is_new = wtx.table_insert(&idx_table, &key, &value)
+        let is_new = wtx
+            .table_insert(&idx_table, &key, &value)
             .map_err(SqlError::Storage)?;
         if idx_def.unique && !is_new {
-            let indexed_values: Vec<Value> = idx_def.columns.iter()
+            let indexed_values: Vec<Value> = idx_def
+                .columns
+                .iter()
                 .map(|&col_idx| row[col_idx as usize].clone())
                 .collect();
             let any_null = indexed_values.iter().any(|v| v.is_null());
@@ -787,10 +872,26 @@ fn check_range_conditions(
 
     for (op, val) in range_conds {
         match op {
-            BinOp::Lt => { if range_val >= *val { exceeds_upper = true; } }
-            BinOp::LtEq => { if range_val > *val { exceeds_upper = true; } }
-            BinOp::Gt => { if range_val <= *val { below_lower = true; } }
-            BinOp::GtEq => { if range_val < *val { below_lower = true; } }
+            BinOp::Lt => {
+                if range_val >= *val {
+                    exceeds_upper = true;
+                }
+            }
+            BinOp::LtEq => {
+                if range_val > *val {
+                    exceeds_upper = true;
+                }
+            }
+            BinOp::Gt => {
+                if range_val <= *val {
+                    below_lower = true;
+                }
+            }
+            BinOp::GtEq => {
+                if range_val < *val {
+                    below_lower = true;
+                }
+            }
             _ => {}
         }
     }
@@ -830,15 +931,21 @@ fn collect_rows_read(
                     Err(e) => scan_err = Some(e),
                 }
                 Ok(())
-            }).map_err(SqlError::Storage)?;
-            if let Some(e) = scan_err { return Err(e); }
+            })
+            .map_err(SqlError::Storage)?;
+            if let Some(e) = scan_err {
+                return Err(e);
+            }
             Ok(rows)
         }
 
         ScanPlan::PkLookup { pk_values } => {
             let key = encode_composite_key(&pk_values);
             let mut rtx = db.begin_read();
-            match rtx.table_get(lower_name.as_bytes(), &key).map_err(SqlError::Storage)? {
+            match rtx
+                .table_get(lower_name.as_bytes(), &key)
+                .map_err(SqlError::Storage)?
+            {
                 Some(value) => {
                     let row = decode_full_row(table_schema, &key, &value)?;
                     Ok(vec![row])
@@ -848,8 +955,13 @@ fn collect_rows_read(
         }
 
         ScanPlan::IndexScan {
-            idx_table, prefix, num_prefix_cols,
-            range_conds, is_unique, index_columns, ..
+            idx_table,
+            prefix,
+            num_prefix_cols,
+            range_conds,
+            is_unique,
+            index_columns,
+            ..
         } => {
             let num_pk_cols = table_schema.primary_key_columns.len();
             let num_index_cols = index_columns.len();
@@ -862,25 +974,38 @@ fn collect_rows_read(
                     if !key.starts_with(&prefix) {
                         return Ok(false);
                     }
-                    match check_range_conditions(key, num_prefix_cols, &range_conds, num_index_cols) {
+                    match check_range_conditions(key, num_prefix_cols, &range_conds, num_index_cols)
+                    {
                         Ok(RangeCheck::ExceedsUpper) => return Ok(false),
                         Ok(RangeCheck::BelowLower) => return Ok(true),
                         Ok(RangeCheck::Match) => {}
-                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return Ok(false);
+                        }
                     }
                     match extract_pk_key(key, value, is_unique, num_index_cols, num_pk_cols) {
                         Ok(pk) => pk_keys.push(pk),
-                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return Ok(false);
+                        }
                     }
                     Ok(true)
-                }).map_err(SqlError::Storage)?;
-                if let Some(e) = scan_err { return Err(e); }
+                })
+                .map_err(SqlError::Storage)?;
+                if let Some(e) = scan_err {
+                    return Err(e);
+                }
             }
 
             let mut rows = Vec::new();
             let mut rtx = db.begin_read();
             for pk_key in &pk_keys {
-                if let Some(value) = rtx.table_get(lower_name.as_bytes(), pk_key).map_err(SqlError::Storage)? {
+                if let Some(value) = rtx
+                    .table_get(lower_name.as_bytes(), pk_key)
+                    .map_err(SqlError::Storage)?
+                {
                     rows.push(decode_full_row(table_schema, pk_key, &value)?);
                 }
             }
@@ -908,14 +1033,20 @@ fn collect_rows_write(
                     Err(e) => scan_err = Some(e),
                 }
                 Ok(())
-            }).map_err(SqlError::Storage)?;
-            if let Some(e) = scan_err { return Err(e); }
+            })
+            .map_err(SqlError::Storage)?;
+            if let Some(e) = scan_err {
+                return Err(e);
+            }
             Ok(rows)
         }
 
         ScanPlan::PkLookup { pk_values } => {
             let key = encode_composite_key(&pk_values);
-            match wtx.table_get(lower_name.as_bytes(), &key).map_err(SqlError::Storage)? {
+            match wtx
+                .table_get(lower_name.as_bytes(), &key)
+                .map_err(SqlError::Storage)?
+            {
                 Some(value) => {
                     let row = decode_full_row(table_schema, &key, &value)?;
                     Ok(vec![row])
@@ -925,8 +1056,13 @@ fn collect_rows_write(
         }
 
         ScanPlan::IndexScan {
-            idx_table, prefix, num_prefix_cols,
-            range_conds, is_unique, index_columns, ..
+            idx_table,
+            prefix,
+            num_prefix_cols,
+            range_conds,
+            is_unique,
+            index_columns,
+            ..
         } => {
             let num_pk_cols = table_schema.primary_key_columns.len();
             let num_index_cols = index_columns.len();
@@ -938,24 +1074,37 @@ fn collect_rows_write(
                     if !key.starts_with(&prefix) {
                         return Ok(false);
                     }
-                    match check_range_conditions(key, num_prefix_cols, &range_conds, num_index_cols) {
+                    match check_range_conditions(key, num_prefix_cols, &range_conds, num_index_cols)
+                    {
                         Ok(RangeCheck::ExceedsUpper) => return Ok(false),
                         Ok(RangeCheck::BelowLower) => return Ok(true),
                         Ok(RangeCheck::Match) => {}
-                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return Ok(false);
+                        }
                     }
                     match extract_pk_key(key, value, is_unique, num_index_cols, num_pk_cols) {
                         Ok(pk) => pk_keys.push(pk),
-                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return Ok(false);
+                        }
                     }
                     Ok(true)
-                }).map_err(SqlError::Storage)?;
-                if let Some(e) = scan_err { return Err(e); }
+                })
+                .map_err(SqlError::Storage)?;
+                if let Some(e) = scan_err {
+                    return Err(e);
+                }
             }
 
             let mut rows = Vec::new();
             for pk_key in &pk_keys {
-                if let Some(value) = wtx.table_get(lower_name.as_bytes(), pk_key).map_err(SqlError::Storage)? {
+                if let Some(value) = wtx
+                    .table_get(lower_name.as_bytes(), pk_key)
+                    .map_err(SqlError::Storage)?
+                {
                     rows.push(decode_full_row(table_schema, pk_key, &value)?);
                 }
             }
@@ -985,15 +1134,21 @@ fn collect_keyed_rows_read(
                     Err(e) => scan_err = Some(e),
                 }
                 Ok(())
-            }).map_err(SqlError::Storage)?;
-            if let Some(e) = scan_err { return Err(e); }
+            })
+            .map_err(SqlError::Storage)?;
+            if let Some(e) = scan_err {
+                return Err(e);
+            }
             Ok(rows)
         }
 
         ScanPlan::PkLookup { pk_values } => {
             let key = encode_composite_key(&pk_values);
             let mut rtx = db.begin_read();
-            match rtx.table_get(lower_name.as_bytes(), &key).map_err(SqlError::Storage)? {
+            match rtx
+                .table_get(lower_name.as_bytes(), &key)
+                .map_err(SqlError::Storage)?
+            {
                 Some(value) => {
                     let row = decode_full_row(table_schema, &key, &value)?;
                     Ok(vec![(key, row)])
@@ -1003,8 +1158,13 @@ fn collect_keyed_rows_read(
         }
 
         ScanPlan::IndexScan {
-            idx_table, prefix, num_prefix_cols,
-            range_conds, is_unique, index_columns, ..
+            idx_table,
+            prefix,
+            num_prefix_cols,
+            range_conds,
+            is_unique,
+            index_columns,
+            ..
         } => {
             let num_pk_cols = table_schema.primary_key_columns.len();
             let num_index_cols = index_columns.len();
@@ -1017,26 +1177,42 @@ fn collect_keyed_rows_read(
                     if !key.starts_with(&prefix) {
                         return Ok(false);
                     }
-                    match check_range_conditions(key, num_prefix_cols, &range_conds, num_index_cols) {
+                    match check_range_conditions(key, num_prefix_cols, &range_conds, num_index_cols)
+                    {
                         Ok(RangeCheck::ExceedsUpper) => return Ok(false),
                         Ok(RangeCheck::BelowLower) => return Ok(true),
                         Ok(RangeCheck::Match) => {}
-                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return Ok(false);
+                        }
                     }
                     match extract_pk_key(key, value, is_unique, num_index_cols, num_pk_cols) {
                         Ok(pk) => pk_keys.push(pk),
-                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return Ok(false);
+                        }
                     }
                     Ok(true)
-                }).map_err(SqlError::Storage)?;
-                if let Some(e) = scan_err { return Err(e); }
+                })
+                .map_err(SqlError::Storage)?;
+                if let Some(e) = scan_err {
+                    return Err(e);
+                }
             }
 
             let mut rows = Vec::new();
             let mut rtx = db.begin_read();
             for pk_key in &pk_keys {
-                if let Some(value) = rtx.table_get(lower_name.as_bytes(), pk_key).map_err(SqlError::Storage)? {
-                    rows.push((pk_key.clone(), decode_full_row(table_schema, pk_key, &value)?));
+                if let Some(value) = rtx
+                    .table_get(lower_name.as_bytes(), pk_key)
+                    .map_err(SqlError::Storage)?
+                {
+                    rows.push((
+                        pk_key.clone(),
+                        decode_full_row(table_schema, pk_key, &value)?,
+                    ));
                 }
             }
             Ok(rows)
@@ -1063,14 +1239,20 @@ fn collect_keyed_rows_write(
                     Err(e) => scan_err = Some(e),
                 }
                 Ok(())
-            }).map_err(SqlError::Storage)?;
-            if let Some(e) = scan_err { return Err(e); }
+            })
+            .map_err(SqlError::Storage)?;
+            if let Some(e) = scan_err {
+                return Err(e);
+            }
             Ok(rows)
         }
 
         ScanPlan::PkLookup { pk_values } => {
             let key = encode_composite_key(&pk_values);
-            match wtx.table_get(lower_name.as_bytes(), &key).map_err(SqlError::Storage)? {
+            match wtx
+                .table_get(lower_name.as_bytes(), &key)
+                .map_err(SqlError::Storage)?
+            {
                 Some(value) => {
                     let row = decode_full_row(table_schema, &key, &value)?;
                     Ok(vec![(key, row)])
@@ -1080,8 +1262,13 @@ fn collect_keyed_rows_write(
         }
 
         ScanPlan::IndexScan {
-            idx_table, prefix, num_prefix_cols,
-            range_conds, is_unique, index_columns, ..
+            idx_table,
+            prefix,
+            num_prefix_cols,
+            range_conds,
+            is_unique,
+            index_columns,
+            ..
         } => {
             let num_pk_cols = table_schema.primary_key_columns.len();
             let num_index_cols = index_columns.len();
@@ -1093,25 +1280,41 @@ fn collect_keyed_rows_write(
                     if !key.starts_with(&prefix) {
                         return Ok(false);
                     }
-                    match check_range_conditions(key, num_prefix_cols, &range_conds, num_index_cols) {
+                    match check_range_conditions(key, num_prefix_cols, &range_conds, num_index_cols)
+                    {
                         Ok(RangeCheck::ExceedsUpper) => return Ok(false),
                         Ok(RangeCheck::BelowLower) => return Ok(true),
                         Ok(RangeCheck::Match) => {}
-                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return Ok(false);
+                        }
                     }
                     match extract_pk_key(key, value, is_unique, num_index_cols, num_pk_cols) {
                         Ok(pk) => pk_keys.push(pk),
-                        Err(e) => { scan_err = Some(e); return Ok(false); }
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return Ok(false);
+                        }
                     }
                     Ok(true)
-                }).map_err(SqlError::Storage)?;
-                if let Some(e) = scan_err { return Err(e); }
+                })
+                .map_err(SqlError::Storage)?;
+                if let Some(e) = scan_err {
+                    return Err(e);
+                }
             }
 
             let mut rows = Vec::new();
             for pk_key in &pk_keys {
-                if let Some(value) = wtx.table_get(lower_name.as_bytes(), pk_key).map_err(SqlError::Storage)? {
-                    rows.push((pk_key.clone(), decode_full_row(table_schema, pk_key, &value)?));
+                if let Some(value) = wtx
+                    .table_get(lower_name.as_bytes(), pk_key)
+                    .map_err(SqlError::Storage)?
+                {
+                    rows.push((
+                        pk_key.clone(),
+                        decode_full_row(table_schema, pk_key, &value)?,
+                    ));
                 }
             }
             Ok(rows)
@@ -1135,19 +1338,31 @@ fn exec_insert(
     };
 
     let lower_name = stmt.table.to_ascii_lowercase();
-    let table_schema = schema.get(&lower_name)
+    let table_schema = schema
+        .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
     let insert_columns = if stmt.columns.is_empty() {
-        table_schema.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        table_schema
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>()
     } else {
-        stmt.columns.iter().map(|c| c.to_ascii_lowercase()).collect()
+        stmt.columns
+            .iter()
+            .map(|c| c.to_ascii_lowercase())
+            .collect()
     };
 
-    let col_indices: Vec<usize> = insert_columns.iter().map(|name| {
-        table_schema.column_index(name)
-            .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))
-    }).collect::<Result<_>>()?;
+    let col_indices: Vec<usize> = insert_columns
+        .iter()
+        .map(|name| {
+            table_schema
+                .column_index(name)
+                .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))
+        })
+        .collect::<Result<_>>()?;
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     let mut count: u64 = 0;
@@ -1170,10 +1385,11 @@ fn exec_insert(
             let coerced = if val.is_null() {
                 Value::Null
             } else {
-                val.coerce_to(col.data_type).ok_or_else(|| SqlError::TypeMismatch {
-                    expected: col.data_type.to_string(),
-                    got: val.data_type().to_string(),
-                })?
+                val.coerce_to(col.data_type)
+                    .ok_or_else(|| SqlError::TypeMismatch {
+                        expected: col.data_type.to_string(),
+                        got: val.data_type().to_string(),
+                    })?
             };
 
             row[col_idx] = coerced;
@@ -1185,7 +1401,8 @@ fn exec_insert(
             }
         }
 
-        let pk_values: Vec<Value> = table_schema.pk_indices()
+        let pk_values: Vec<Value> = table_schema
+            .pk_indices()
             .iter()
             .map(|&i| row[i].clone())
             .collect();
@@ -1196,13 +1413,20 @@ fn exec_insert(
         let value = encode_row(&value_values);
 
         if key.len() > citadel_core::MAX_KEY_SIZE {
-            return Err(SqlError::KeyTooLarge { size: key.len(), max: citadel_core::MAX_KEY_SIZE });
+            return Err(SqlError::KeyTooLarge {
+                size: key.len(),
+                max: citadel_core::MAX_KEY_SIZE,
+            });
         }
         if value.len() > citadel_core::MAX_INLINE_VALUE_SIZE {
-            return Err(SqlError::RowTooLarge { size: value.len(), max: citadel_core::MAX_INLINE_VALUE_SIZE });
+            return Err(SqlError::RowTooLarge {
+                size: value.len(),
+                max: citadel_core::MAX_INLINE_VALUE_SIZE,
+            });
         }
 
-        let is_new = wtx.table_insert(lower_name.as_bytes(), &key, &value)
+        let is_new = wtx
+            .table_insert(lower_name.as_bytes(), &key, &value)
             .map_err(SqlError::Storage)?;
         if !is_new {
             return Err(SqlError::DuplicateKey);
@@ -1222,20 +1446,31 @@ fn has_subquery(expr: &Expr) -> bool {
         Expr::BinaryOp { left, right, .. } => has_subquery(left) || has_subquery(right),
         Expr::UnaryOp { expr, .. } => has_subquery(expr),
         Expr::IsNull(e) | Expr::IsNotNull(e) => has_subquery(e),
-        Expr::InList { expr, list, .. } => {
-            has_subquery(expr) || list.iter().any(has_subquery)
-        }
+        Expr::InList { expr, list, .. } => has_subquery(expr) || list.iter().any(has_subquery),
         Expr::InSet { expr, .. } => has_subquery(expr),
-        Expr::Between { expr, low, high, .. } => {
-            has_subquery(expr) || has_subquery(low) || has_subquery(high)
+        Expr::Between {
+            expr, low, high, ..
+        } => has_subquery(expr) || has_subquery(low) || has_subquery(high),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            has_subquery(expr)
+                || has_subquery(pattern)
+                || escape.as_ref().is_some_and(|e| has_subquery(e))
         }
-        Expr::Like { expr, pattern, escape, .. } => {
-            has_subquery(expr) || has_subquery(pattern) || escape.as_ref().map_or(false, |e| has_subquery(e))
-        }
-        Expr::Case { operand, conditions, else_result } => {
-            operand.as_ref().map_or(false, |e| has_subquery(e))
-                || conditions.iter().any(|(c, r)| has_subquery(c) || has_subquery(r))
-                || else_result.as_ref().map_or(false, |e| has_subquery(e))
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand.as_ref().is_some_and(|e| has_subquery(e))
+                || conditions
+                    .iter()
+                    .any(|(c, r)| has_subquery(c) || has_subquery(r))
+                || else_result.as_ref().is_some_and(|e| has_subquery(e))
         }
         Expr::Coalesce(args) => args.iter().any(has_subquery),
         Expr::Cast { expr, .. } => has_subquery(expr),
@@ -1245,19 +1480,33 @@ fn has_subquery(expr: &Expr) -> bool {
 }
 
 fn stmt_has_subquery(stmt: &SelectStmt) -> bool {
-    if let Some(ref w) = stmt.where_clause { if has_subquery(w) { return true; } }
-    if let Some(ref h) = stmt.having { if has_subquery(h) { return true; } }
+    if let Some(ref w) = stmt.where_clause {
+        if has_subquery(w) {
+            return true;
+        }
+    }
+    if let Some(ref h) = stmt.having {
+        if has_subquery(h) {
+            return true;
+        }
+    }
     for col in &stmt.columns {
         if let SelectColumn::Expr { expr, .. } = col {
-            if has_subquery(expr) { return true; }
+            if has_subquery(expr) {
+                return true;
+            }
         }
     }
     for ob in &stmt.order_by {
-        if has_subquery(&ob.expr) { return true; }
+        if has_subquery(&ob.expr) {
+            return true;
+        }
     }
     for join in &stmt.joins {
         if let Some(ref on_expr) = join.on_clause {
-            if has_subquery(on_expr) { return true; }
+            if has_subquery(on_expr) {
+                return true;
+            }
         }
     }
     false
@@ -1268,7 +1517,11 @@ fn materialize_expr(
     exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
 ) -> Result<Expr> {
     match expr {
-        Expr::InSubquery { expr: e, subquery, negated } => {
+        Expr::InSubquery {
+            expr: e,
+            subquery,
+            negated,
+        } => {
             let inner = materialize_expr(e, exec_sub)?;
             let qr = exec_sub(subquery)?;
             if !qr.columns.is_empty() && qr.columns.len() != 1 {
@@ -1308,46 +1561,63 @@ fn materialize_expr(
             let result = if *negated { !exists } else { exists };
             Ok(Expr::Literal(Value::Boolean(result)))
         }
-        Expr::InList { expr: e, list, negated } => {
+        Expr::InList {
+            expr: e,
+            list,
+            negated,
+        } => {
             let inner = materialize_expr(e, exec_sub)?;
-            let items = list.iter()
+            let items = list
+                .iter()
                 .map(|item| materialize_expr(item, exec_sub))
                 .collect::<Result<Vec<_>>>()?;
-            Ok(Expr::InList { expr: Box::new(inner), list: items, negated: *negated })
-        }
-        Expr::BinaryOp { left, op, right } => {
-            Ok(Expr::BinaryOp {
-                left: Box::new(materialize_expr(left, exec_sub)?),
-                op: *op,
-                right: Box::new(materialize_expr(right, exec_sub)?),
+            Ok(Expr::InList {
+                expr: Box::new(inner),
+                list: items,
+                negated: *negated,
             })
         }
-        Expr::UnaryOp { op, expr: e } => {
-            Ok(Expr::UnaryOp {
-                op: *op,
-                expr: Box::new(materialize_expr(e, exec_sub)?),
-            })
-        }
+        Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
+            left: Box::new(materialize_expr(left, exec_sub)?),
+            op: *op,
+            right: Box::new(materialize_expr(right, exec_sub)?),
+        }),
+        Expr::UnaryOp { op, expr: e } => Ok(Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(materialize_expr(e, exec_sub)?),
+        }),
         Expr::IsNull(e) => Ok(Expr::IsNull(Box::new(materialize_expr(e, exec_sub)?))),
         Expr::IsNotNull(e) => Ok(Expr::IsNotNull(Box::new(materialize_expr(e, exec_sub)?))),
-        Expr::InSet { expr: e, values, has_null, negated } => {
-            Ok(Expr::InSet {
-                expr: Box::new(materialize_expr(e, exec_sub)?),
-                values: values.clone(),
-                has_null: *has_null,
-                negated: *negated,
-            })
-        }
-        Expr::Between { expr: e, low, high, negated } => {
-            Ok(Expr::Between {
-                expr: Box::new(materialize_expr(e, exec_sub)?),
-                low: Box::new(materialize_expr(low, exec_sub)?),
-                high: Box::new(materialize_expr(high, exec_sub)?),
-                negated: *negated,
-            })
-        }
-        Expr::Like { expr: e, pattern, escape, negated } => {
-            let esc = escape.as_ref()
+        Expr::InSet {
+            expr: e,
+            values,
+            has_null,
+            negated,
+        } => Ok(Expr::InSet {
+            expr: Box::new(materialize_expr(e, exec_sub)?),
+            values: values.clone(),
+            has_null: *has_null,
+            negated: *negated,
+        }),
+        Expr::Between {
+            expr: e,
+            low,
+            high,
+            negated,
+        } => Ok(Expr::Between {
+            expr: Box::new(materialize_expr(e, exec_sub)?),
+            low: Box::new(materialize_expr(low, exec_sub)?),
+            high: Box::new(materialize_expr(high, exec_sub)?),
+            negated: *negated,
+        }),
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            negated,
+        } => {
+            let esc = escape
+                .as_ref()
                 .map(|es| materialize_expr(es, exec_sub).map(Box::new))
                 .transpose()?;
             Ok(Expr::Like {
@@ -1357,35 +1627,54 @@ fn materialize_expr(
                 negated: *negated,
             })
         }
-        Expr::Case { operand, conditions, else_result } => {
-            let op = operand.as_ref()
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            let op = operand
+                .as_ref()
                 .map(|e| materialize_expr(e, exec_sub).map(Box::new))
                 .transpose()?;
-            let conds = conditions.iter()
-                .map(|(c, r)| Ok((materialize_expr(c, exec_sub)?, materialize_expr(r, exec_sub)?)))
+            let conds = conditions
+                .iter()
+                .map(|(c, r)| {
+                    Ok((
+                        materialize_expr(c, exec_sub)?,
+                        materialize_expr(r, exec_sub)?,
+                    ))
+                })
                 .collect::<Result<Vec<_>>>()?;
-            let else_r = else_result.as_ref()
+            let else_r = else_result
+                .as_ref()
                 .map(|e| materialize_expr(e, exec_sub).map(Box::new))
                 .transpose()?;
-            Ok(Expr::Case { operand: op, conditions: conds, else_result: else_r })
+            Ok(Expr::Case {
+                operand: op,
+                conditions: conds,
+                else_result: else_r,
+            })
         }
         Expr::Coalesce(args) => {
-            let materialized = args.iter()
+            let materialized = args
+                .iter()
                 .map(|a| materialize_expr(a, exec_sub))
                 .collect::<Result<Vec<_>>>()?;
             Ok(Expr::Coalesce(materialized))
         }
-        Expr::Cast { expr: e, data_type } => {
-            Ok(Expr::Cast {
-                expr: Box::new(materialize_expr(e, exec_sub)?),
-                data_type: *data_type,
-            })
-        }
+        Expr::Cast { expr: e, data_type } => Ok(Expr::Cast {
+            expr: Box::new(materialize_expr(e, exec_sub)?),
+            data_type: *data_type,
+        }),
         Expr::Function { name, args } => {
-            let materialized = args.iter()
+            let materialized = args
+                .iter()
                 .map(|a| materialize_expr(a, exec_sub))
                 .collect::<Result<Vec<_>>>()?;
-            Ok(Expr::Function { name: name.clone(), args: materialized })
+            Ok(Expr::Function {
+                name: name.clone(),
+                args: materialized,
+            })
         }
         other => Ok(other.clone()),
     }
@@ -1395,39 +1684,57 @@ fn materialize_stmt(
     stmt: &SelectStmt,
     exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
 ) -> Result<SelectStmt> {
-    let where_clause = stmt.where_clause.as_ref()
+    let where_clause = stmt
+        .where_clause
+        .as_ref()
         .map(|e| materialize_expr(e, exec_sub))
         .transpose()?;
-    let having = stmt.having.as_ref()
+    let having = stmt
+        .having
+        .as_ref()
         .map(|e| materialize_expr(e, exec_sub))
         .transpose()?;
-    let columns = stmt.columns.iter().map(|c| match c {
-        SelectColumn::AllColumns => Ok(SelectColumn::AllColumns),
-        SelectColumn::Expr { expr, alias } => {
-            Ok(SelectColumn::Expr {
+    let columns = stmt
+        .columns
+        .iter()
+        .map(|c| match c {
+            SelectColumn::AllColumns => Ok(SelectColumn::AllColumns),
+            SelectColumn::Expr { expr, alias } => Ok(SelectColumn::Expr {
                 expr: materialize_expr(expr, exec_sub)?,
                 alias: alias.clone(),
+            }),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let order_by = stmt
+        .order_by
+        .iter()
+        .map(|ob| {
+            Ok(OrderByItem {
+                expr: materialize_expr(&ob.expr, exec_sub)?,
+                descending: ob.descending,
+                nulls_first: ob.nulls_first,
             })
-        }
-    }).collect::<Result<Vec<_>>>()?;
-    let order_by = stmt.order_by.iter().map(|ob| {
-        Ok(OrderByItem {
-            expr: materialize_expr(&ob.expr, exec_sub)?,
-            descending: ob.descending,
-            nulls_first: ob.nulls_first,
         })
-    }).collect::<Result<Vec<_>>>()?;
-    let joins = stmt.joins.iter().map(|j| {
-        let on_clause = j.on_clause.as_ref()
-            .map(|e| materialize_expr(e, exec_sub))
-            .transpose()?;
-        Ok(JoinClause {
-            join_type: j.join_type,
-            table: j.table.clone(),
-            on_clause,
+        .collect::<Result<Vec<_>>>()?;
+    let joins = stmt
+        .joins
+        .iter()
+        .map(|j| {
+            let on_clause = j
+                .on_clause
+                .as_ref()
+                .map(|e| materialize_expr(e, exec_sub))
+                .transpose()?;
+            Ok(JoinClause {
+                join_type: j.join_type,
+                table: j.table.clone(),
+                on_clause,
+            })
         })
-    }).collect::<Result<Vec<_>>>()?;
-    let group_by = stmt.group_by.iter()
+        .collect::<Result<Vec<_>>>()?;
+    let group_by = stmt
+        .group_by
+        .iter()
         .map(|e| materialize_expr(e, exec_sub))
         .collect::<Result<Vec<_>>>()?;
     Ok(SelectStmt {
@@ -1452,7 +1759,10 @@ fn exec_subquery_read(
 ) -> Result<QueryResult> {
     match exec_select(db, schema, stmt)? {
         ExecutionResult::Query(qr) => Ok(qr),
-        _ => Ok(QueryResult { columns: vec![], rows: vec![] }),
+        _ => Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        }),
     }
 }
 
@@ -1463,12 +1773,15 @@ fn exec_subquery_write(
 ) -> Result<QueryResult> {
     match exec_select_in_txn(wtx, schema, stmt)? {
         ExecutionResult::Query(qr) => Ok(qr),
-        _ => Ok(QueryResult { columns: vec![], rows: vec![] }),
+        _ => Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        }),
     }
 }
 
 fn update_has_subquery(stmt: &UpdateStmt) -> bool {
-    stmt.where_clause.as_ref().map_or(false, has_subquery)
+    stmt.where_clause.as_ref().is_some_and(has_subquery)
         || stmt.assignments.iter().any(|(_, e)| has_subquery(e))
 }
 
@@ -1476,10 +1789,14 @@ fn materialize_update(
     stmt: &UpdateStmt,
     exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
 ) -> Result<UpdateStmt> {
-    let where_clause = stmt.where_clause.as_ref()
+    let where_clause = stmt
+        .where_clause
+        .as_ref()
         .map(|e| materialize_expr(e, exec_sub))
         .transpose()?;
-    let assignments = stmt.assignments.iter()
+    let assignments = stmt
+        .assignments
+        .iter()
         .map(|(name, expr)| Ok((name.clone(), materialize_expr(expr, exec_sub)?)))
         .collect::<Result<Vec<_>>>()?;
     Ok(UpdateStmt {
@@ -1490,14 +1807,16 @@ fn materialize_update(
 }
 
 fn delete_has_subquery(stmt: &DeleteStmt) -> bool {
-    stmt.where_clause.as_ref().map_or(false, has_subquery)
+    stmt.where_clause.as_ref().is_some_and(has_subquery)
 }
 
 fn materialize_delete(
     stmt: &DeleteStmt,
     exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
 ) -> Result<DeleteStmt> {
-    let where_clause = stmt.where_clause.as_ref()
+    let where_clause = stmt
+        .where_clause
+        .as_ref()
         .map(|e| materialize_expr(e, exec_sub))
         .transpose()?;
     Ok(DeleteStmt {
@@ -1514,8 +1833,14 @@ fn materialize_insert(
     stmt: &InsertStmt,
     exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
 ) -> Result<InsertStmt> {
-    let values = stmt.values.iter()
-        .map(|row| row.iter().map(|e| materialize_expr(e, exec_sub)).collect::<Result<Vec<_>>>())
+    let values = stmt
+        .values
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|e| materialize_expr(e, exec_sub))
+                .collect::<Result<Vec<_>>>()
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(InsertStmt {
         table: stmt.table.clone(),
@@ -1542,7 +1867,8 @@ fn exec_select(
     }
 
     let lower_name = stmt.from.to_ascii_lowercase();
-    let table_schema = schema.get(&lower_name)
+    let table_schema = schema
+        .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
 
     if !stmt.joins.is_empty() {
@@ -1570,11 +1896,9 @@ fn process_select(
     stmt: &SelectStmt,
 ) -> Result<ExecutionResult> {
     if let Some(ref where_expr) = stmt.where_clause {
-        rows.retain(|row| {
-            match eval_expr(where_expr, columns, row) {
-                Ok(val) => is_truthy(&val),
-                Err(_) => false,
-            }
+        rows.retain(|row| match eval_expr(where_expr, columns, row) {
+            Ok(val) => is_truthy(&val),
+            Err(_) => false,
         });
     }
 
@@ -1644,19 +1968,14 @@ fn process_select(
     }))
 }
 
-
-fn resolve_table_name<'a>(
-    schema: &'a SchemaManager,
-    name: &str,
-) -> Result<&'a TableSchema> {
+fn resolve_table_name<'a>(schema: &'a SchemaManager, name: &str) -> Result<&'a TableSchema> {
     let lower = name.to_ascii_lowercase();
-    schema.get(&lower)
+    schema
+        .get(&lower)
         .ok_or_else(|| SqlError::TableNotFound(name.to_string()))
 }
 
-fn build_joined_columns(
-    tables: &[(String, &TableSchema)],
-) -> Vec<ColumnDef> {
+fn build_joined_columns(tables: &[(String, &TableSchema)]) -> Vec<ColumnDef> {
     let mut result = Vec::new();
     let mut pos: u16 = 0;
 
@@ -1676,13 +1995,13 @@ fn build_joined_columns(
 }
 
 fn table_alias_or_name(name: &str, alias: &Option<String>) -> String {
-    alias.as_ref().unwrap_or(&name.to_string()).to_ascii_lowercase()
+    alias
+        .as_ref()
+        .unwrap_or(&name.to_string())
+        .to_ascii_lowercase()
 }
 
-fn collect_all_rows_read(
-    db: &Database,
-    table_schema: &TableSchema,
-) -> Result<Vec<Vec<Value>>> {
+fn collect_all_rows_read(db: &Database, table_schema: &TableSchema) -> Result<Vec<Vec<Value>>> {
     collect_rows_read(db, table_schema, &None)
 }
 
@@ -1719,10 +2038,8 @@ fn exec_select_join(
             JoinType::Inner | JoinType::Cross => {
                 for outer in &outer_rows {
                     for inner in &inner_rows {
-                        let combined: Vec<Value> = outer.iter()
-                            .chain(inner.iter())
-                            .cloned()
-                            .collect();
+                        let combined: Vec<Value> =
+                            outer.iter().chain(inner.iter()).cloned().collect();
                         if let Some(ref on_expr) = join.on_clause {
                             match eval_expr(on_expr, &combined_cols, &combined) {
                                 Ok(val) if is_truthy(&val) => new_rows.push(combined),
@@ -1739,10 +2056,8 @@ fn exec_select_join(
                 for outer in &outer_rows {
                     let mut matched = false;
                     for inner in &inner_rows {
-                        let combined: Vec<Value> = outer.iter()
-                            .chain(inner.iter())
-                            .cloned()
-                            .collect();
+                        let combined: Vec<Value> =
+                            outer.iter().chain(inner.iter()).cloned().collect();
                         if let Some(ref on_expr) = join.on_clause {
                             match eval_expr(on_expr, &combined_cols, &combined) {
                                 Ok(val) if is_truthy(&val) => {
@@ -1772,10 +2087,8 @@ fn exec_select_join(
                 let mut inner_matched = vec![false; inner_rows.len()];
                 for outer in &outer_rows {
                     for (j, inner) in inner_rows.iter().enumerate() {
-                        let combined: Vec<Value> = outer.iter()
-                            .chain(inner.iter())
-                            .cloned()
-                            .collect();
+                        let combined: Vec<Value> =
+                            outer.iter().chain(inner.iter()).cloned().collect();
                         if let Some(ref on_expr) = join.on_clause {
                             match eval_expr(on_expr, &combined_cols, &combined) {
                                 Ok(val) if is_truthy(&val) => {
@@ -1836,10 +2149,8 @@ fn exec_select_join_in_txn(
             JoinType::Inner | JoinType::Cross => {
                 for outer in &outer_rows {
                     for inner in &inner_rows {
-                        let combined: Vec<Value> = outer.iter()
-                            .chain(inner.iter())
-                            .cloned()
-                            .collect();
+                        let combined: Vec<Value> =
+                            outer.iter().chain(inner.iter()).cloned().collect();
                         if let Some(ref on_expr) = join.on_clause {
                             match eval_expr(on_expr, &combined_cols, &combined) {
                                 Ok(val) if is_truthy(&val) => new_rows.push(combined),
@@ -1856,10 +2167,8 @@ fn exec_select_join_in_txn(
                 for outer in &outer_rows {
                     let mut matched = false;
                     for inner in &inner_rows {
-                        let combined: Vec<Value> = outer.iter()
-                            .chain(inner.iter())
-                            .cloned()
-                            .collect();
+                        let combined: Vec<Value> =
+                            outer.iter().chain(inner.iter()).cloned().collect();
                         if let Some(ref on_expr) = join.on_clause {
                             match eval_expr(on_expr, &combined_cols, &combined) {
                                 Ok(val) if is_truthy(&val) => {
@@ -1889,10 +2198,8 @@ fn exec_select_join_in_txn(
                 let mut inner_matched = vec![false; inner_rows.len()];
                 for outer in &outer_rows {
                     for (j, inner) in inner_rows.iter().enumerate() {
-                        let combined: Vec<Value> = outer.iter()
-                            .chain(inner.iter())
-                            .cloned()
-                            .collect();
+                        let combined: Vec<Value> =
+                            outer.iter().chain(inner.iter()).cloned().collect();
                         if let Some(ref on_expr) = join.on_clause {
                             match eval_expr(on_expr, &combined_cols, &combined) {
                                 Ok(val) if is_truthy(&val) => {
@@ -1941,21 +2248,19 @@ fn exec_update(
     };
 
     let lower_name = stmt.table.to_ascii_lowercase();
-    let table_schema = schema.get(&lower_name)
+    let table_schema = schema
+        .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
     let all_candidates = collect_keyed_rows_read(db, table_schema, &stmt.where_clause)?;
-    let matching_rows: Vec<(Vec<u8>, Vec<Value>)> = all_candidates.into_iter()
-        .filter(|(_, row)| {
-            match &stmt.where_clause {
-                Some(where_expr) => {
-                    match eval_expr(where_expr, &table_schema.columns, row) {
-                        Ok(val) => is_truthy(&val),
-                        Err(_) => false,
-                    }
-                }
-                None => true,
-            }
+    let matching_rows: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
+        .into_iter()
+        .filter(|(_, row)| match &stmt.where_clause {
+            Some(where_expr) => match eval_expr(where_expr, &table_schema.columns, row) {
+                Ok(val) => is_truthy(&val),
+                Err(_) => false,
+            },
+            None => true,
         })
         .collect();
 
@@ -1979,7 +2284,8 @@ fn exec_update(
         let mut new_row = row.clone();
         let mut pk_changed = false;
         for (col_name, expr) in &stmt.assignments {
-            let col_idx = table_schema.column_index(col_name)
+            let col_idx = table_schema
+                .column_index(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
             let new_val = eval_expr(expr, &table_schema.columns, &new_row)?;
             let col = &table_schema.columns[col_idx];
@@ -1990,10 +2296,12 @@ fn exec_update(
                 }
                 Value::Null
             } else {
-                new_val.coerce_to(col.data_type).ok_or_else(|| SqlError::TypeMismatch {
-                    expected: col.data_type.to_string(),
-                    got: new_val.data_type().to_string(),
-                })?
+                new_val
+                    .coerce_to(col.data_type)
+                    .ok_or_else(|| SqlError::TypeMismatch {
+                        expected: col.data_type.to_string(),
+                        got: new_val.data_type().to_string(),
+                    })?
             };
 
             if table_schema.primary_key_columns.contains(&(col_idx as u16)) {
@@ -2010,8 +2318,12 @@ fn exec_update(
         let new_value = encode_row(&value_values);
 
         changes.push(UpdateChange {
-            old_key: old_key.clone(), new_key, new_value, pk_changed,
-            old_row: row.clone(), new_row,
+            old_key: old_key.clone(),
+            new_key,
+            new_value,
+            pk_changed,
+            old_row: row.clone(),
+            new_row,
         });
     }
 
@@ -2019,10 +2331,8 @@ fn exec_update(
         use std::collections::HashSet;
         let mut new_keys: HashSet<Vec<u8>> = HashSet::new();
         for c in &changes {
-            if c.pk_changed && c.new_key != c.old_key {
-                if !new_keys.insert(c.new_key.clone()) {
-                    return Err(SqlError::DuplicateKey);
-                }
+            if c.pk_changed && c.new_key != c.old_key && !new_keys.insert(c.new_key.clone()) {
+                return Err(SqlError::DuplicateKey);
             }
         }
     }
@@ -2036,12 +2346,14 @@ fn exec_update(
             if index_columns_changed(idx, &c.old_row, &c.new_row) || c.pk_changed {
                 let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
                 let old_idx_key = encode_index_key(idx, &c.old_row, &old_pk);
-                wtx.table_delete(&idx_table, &old_idx_key).map_err(SqlError::Storage)?;
+                wtx.table_delete(&idx_table, &old_idx_key)
+                    .map_err(SqlError::Storage)?;
             }
         }
 
         if c.pk_changed {
-            wtx.table_delete(lower_name.as_bytes(), &c.old_key).map_err(SqlError::Storage)?;
+            wtx.table_delete(lower_name.as_bytes(), &c.old_key)
+                .map_err(SqlError::Storage)?;
         }
     }
 
@@ -2049,7 +2361,8 @@ fn exec_update(
         let new_pk: Vec<Value> = pk_indices.iter().map(|&i| c.new_row[i].clone()).collect();
 
         if c.pk_changed {
-            let is_new = wtx.table_insert(lower_name.as_bytes(), &c.new_key, &c.new_value)
+            let is_new = wtx
+                .table_insert(lower_name.as_bytes(), &c.new_key, &c.new_value)
                 .map_err(SqlError::Storage)?;
             if !is_new {
                 return Err(SqlError::DuplicateKey);
@@ -2064,10 +2377,13 @@ fn exec_update(
                 let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
                 let new_idx_key = encode_index_key(idx, &c.new_row, &new_pk);
                 let new_idx_val = encode_index_value(idx, &c.new_row, &new_pk);
-                let is_new = wtx.table_insert(&idx_table, &new_idx_key, &new_idx_val)
+                let is_new = wtx
+                    .table_insert(&idx_table, &new_idx_key, &new_idx_val)
                     .map_err(SqlError::Storage)?;
                 if idx.unique && !is_new {
-                    let indexed_values: Vec<Value> = idx.columns.iter()
+                    let indexed_values: Vec<Value> = idx
+                        .columns
+                        .iter()
                         .map(|&col_idx| c.new_row[col_idx as usize].clone())
                         .collect();
                     let any_null = indexed_values.iter().any(|v| v.is_null());
@@ -2098,21 +2414,19 @@ fn exec_delete(
     };
 
     let lower_name = stmt.table.to_ascii_lowercase();
-    let table_schema = schema.get(&lower_name)
+    let table_schema = schema
+        .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
     let all_candidates = collect_keyed_rows_read(db, table_schema, &stmt.where_clause)?;
-    let rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = all_candidates.into_iter()
-        .filter(|(_, row)| {
-            match &stmt.where_clause {
-                Some(where_expr) => {
-                    match eval_expr(where_expr, &table_schema.columns, row) {
-                        Ok(val) => is_truthy(&val),
-                        Err(_) => false,
-                    }
-                }
-                None => true,
-            }
+    let rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
+        .into_iter()
+        .filter(|(_, row)| match &stmt.where_clause {
+            Some(where_expr) => match eval_expr(where_expr, &table_schema.columns, row) {
+                Ok(val) => is_truthy(&val),
+                Err(_) => false,
+            },
+            None => true,
         })
         .collect();
 
@@ -2125,7 +2439,8 @@ fn exec_delete(
     for (key, row) in &rows_to_delete {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
         delete_index_entries(&mut wtx, table_schema, row, &pk_values)?;
-        wtx.table_delete(lower_name.as_bytes(), key).map_err(SqlError::Storage)?;
+        wtx.table_delete(lower_name.as_bytes(), key)
+            .map_err(SqlError::Storage)?;
     }
     let count = rows_to_delete.len() as u64;
     wtx.commit().map_err(SqlError::Storage)?;
@@ -2148,19 +2463,31 @@ fn exec_insert_in_txn(
     };
 
     let lower_name = stmt.table.to_ascii_lowercase();
-    let table_schema = schema.get(&lower_name)
+    let table_schema = schema
+        .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
     let insert_columns = if stmt.columns.is_empty() {
-        table_schema.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
+        table_schema
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>()
     } else {
-        stmt.columns.iter().map(|c| c.to_ascii_lowercase()).collect()
+        stmt.columns
+            .iter()
+            .map(|c| c.to_ascii_lowercase())
+            .collect()
     };
 
-    let col_indices: Vec<usize> = insert_columns.iter().map(|name| {
-        table_schema.column_index(name)
-            .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))
-    }).collect::<Result<_>>()?;
+    let col_indices: Vec<usize> = insert_columns
+        .iter()
+        .map(|name| {
+            table_schema
+                .column_index(name)
+                .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))
+        })
+        .collect::<Result<_>>()?;
 
     let mut count: u64 = 0;
 
@@ -2182,10 +2509,11 @@ fn exec_insert_in_txn(
             let coerced = if val.is_null() {
                 Value::Null
             } else {
-                val.coerce_to(col.data_type).ok_or_else(|| SqlError::TypeMismatch {
-                    expected: col.data_type.to_string(),
-                    got: val.data_type().to_string(),
-                })?
+                val.coerce_to(col.data_type)
+                    .ok_or_else(|| SqlError::TypeMismatch {
+                        expected: col.data_type.to_string(),
+                        got: val.data_type().to_string(),
+                    })?
             };
 
             row[col_idx] = coerced;
@@ -2197,7 +2525,8 @@ fn exec_insert_in_txn(
             }
         }
 
-        let pk_values: Vec<Value> = table_schema.pk_indices()
+        let pk_values: Vec<Value> = table_schema
+            .pk_indices()
             .iter()
             .map(|&i| row[i].clone())
             .collect();
@@ -2208,13 +2537,20 @@ fn exec_insert_in_txn(
         let value = encode_row(&value_values);
 
         if key.len() > citadel_core::MAX_KEY_SIZE {
-            return Err(SqlError::KeyTooLarge { size: key.len(), max: citadel_core::MAX_KEY_SIZE });
+            return Err(SqlError::KeyTooLarge {
+                size: key.len(),
+                max: citadel_core::MAX_KEY_SIZE,
+            });
         }
         if value.len() > citadel_core::MAX_INLINE_VALUE_SIZE {
-            return Err(SqlError::RowTooLarge { size: value.len(), max: citadel_core::MAX_INLINE_VALUE_SIZE });
+            return Err(SqlError::RowTooLarge {
+                size: value.len(),
+                max: citadel_core::MAX_INLINE_VALUE_SIZE,
+            });
         }
 
-        let is_new = wtx.table_insert(lower_name.as_bytes(), &key, &value)
+        let is_new = wtx
+            .table_insert(lower_name.as_bytes(), &key, &value)
             .map_err(SqlError::Storage)?;
         if !is_new {
             return Err(SqlError::DuplicateKey);
@@ -2249,7 +2585,8 @@ fn exec_select_in_txn(
     }
 
     let lower_name = stmt.from.to_ascii_lowercase();
-    let table_schema = schema.get(&lower_name)
+    let table_schema = schema
+        .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
 
     let rows = collect_rows_write(wtx, table_schema, &stmt.where_clause)?;
@@ -2270,21 +2607,19 @@ fn exec_update_in_txn(
     };
 
     let lower_name = stmt.table.to_ascii_lowercase();
-    let table_schema = schema.get(&lower_name)
+    let table_schema = schema
+        .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
     let all_candidates = collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?;
-    let matching_rows: Vec<(Vec<u8>, Vec<Value>)> = all_candidates.into_iter()
-        .filter(|(_, row)| {
-            match &stmt.where_clause {
-                Some(where_expr) => {
-                    match eval_expr(where_expr, &table_schema.columns, row) {
-                        Ok(val) => is_truthy(&val),
-                        Err(_) => false,
-                    }
-                }
-                None => true,
-            }
+    let matching_rows: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
+        .into_iter()
+        .filter(|(_, row)| match &stmt.where_clause {
+            Some(where_expr) => match eval_expr(where_expr, &table_schema.columns, row) {
+                Ok(val) => is_truthy(&val),
+                Err(_) => false,
+            },
+            None => true,
         })
         .collect();
 
@@ -2308,7 +2643,8 @@ fn exec_update_in_txn(
         let mut new_row = row.clone();
         let mut pk_changed = false;
         for (col_name, expr) in &stmt.assignments {
-            let col_idx = table_schema.column_index(col_name)
+            let col_idx = table_schema
+                .column_index(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
             let new_val = eval_expr(expr, &table_schema.columns, &new_row)?;
             let col = &table_schema.columns[col_idx];
@@ -2319,10 +2655,12 @@ fn exec_update_in_txn(
                 }
                 Value::Null
             } else {
-                new_val.coerce_to(col.data_type).ok_or_else(|| SqlError::TypeMismatch {
-                    expected: col.data_type.to_string(),
-                    got: new_val.data_type().to_string(),
-                })?
+                new_val
+                    .coerce_to(col.data_type)
+                    .ok_or_else(|| SqlError::TypeMismatch {
+                        expected: col.data_type.to_string(),
+                        got: new_val.data_type().to_string(),
+                    })?
             };
 
             if table_schema.primary_key_columns.contains(&(col_idx as u16)) {
@@ -2339,8 +2677,12 @@ fn exec_update_in_txn(
         let new_value = encode_row(&value_values);
 
         changes.push(UpdateChange {
-            old_key: old_key.clone(), new_key, new_value, pk_changed,
-            old_row: row.clone(), new_row,
+            old_key: old_key.clone(),
+            new_key,
+            new_value,
+            pk_changed,
+            old_row: row.clone(),
+            new_row,
         });
     }
 
@@ -2348,10 +2690,8 @@ fn exec_update_in_txn(
         use std::collections::HashSet;
         let mut new_keys: HashSet<Vec<u8>> = HashSet::new();
         for c in &changes {
-            if c.pk_changed && c.new_key != c.old_key {
-                if !new_keys.insert(c.new_key.clone()) {
-                    return Err(SqlError::DuplicateKey);
-                }
+            if c.pk_changed && c.new_key != c.old_key && !new_keys.insert(c.new_key.clone()) {
+                return Err(SqlError::DuplicateKey);
             }
         }
     }
@@ -2363,12 +2703,14 @@ fn exec_update_in_txn(
             if index_columns_changed(idx, &c.old_row, &c.new_row) || c.pk_changed {
                 let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
                 let old_idx_key = encode_index_key(idx, &c.old_row, &old_pk);
-                wtx.table_delete(&idx_table, &old_idx_key).map_err(SqlError::Storage)?;
+                wtx.table_delete(&idx_table, &old_idx_key)
+                    .map_err(SqlError::Storage)?;
             }
         }
 
         if c.pk_changed {
-            wtx.table_delete(lower_name.as_bytes(), &c.old_key).map_err(SqlError::Storage)?;
+            wtx.table_delete(lower_name.as_bytes(), &c.old_key)
+                .map_err(SqlError::Storage)?;
         }
     }
 
@@ -2376,7 +2718,8 @@ fn exec_update_in_txn(
         let new_pk: Vec<Value> = pk_indices.iter().map(|&i| c.new_row[i].clone()).collect();
 
         if c.pk_changed {
-            let is_new = wtx.table_insert(lower_name.as_bytes(), &c.new_key, &c.new_value)
+            let is_new = wtx
+                .table_insert(lower_name.as_bytes(), &c.new_key, &c.new_value)
                 .map_err(SqlError::Storage)?;
             if !is_new {
                 return Err(SqlError::DuplicateKey);
@@ -2391,10 +2734,13 @@ fn exec_update_in_txn(
                 let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
                 let new_idx_key = encode_index_key(idx, &c.new_row, &new_pk);
                 let new_idx_val = encode_index_value(idx, &c.new_row, &new_pk);
-                let is_new = wtx.table_insert(&idx_table, &new_idx_key, &new_idx_val)
+                let is_new = wtx
+                    .table_insert(&idx_table, &new_idx_key, &new_idx_val)
                     .map_err(SqlError::Storage)?;
                 if idx.unique && !is_new {
-                    let indexed_values: Vec<Value> = idx.columns.iter()
+                    let indexed_values: Vec<Value> = idx
+                        .columns
+                        .iter()
                         .map(|&col_idx| c.new_row[col_idx as usize].clone())
                         .collect();
                     let any_null = indexed_values.iter().any(|v| v.is_null());
@@ -2424,21 +2770,19 @@ fn exec_delete_in_txn(
     };
 
     let lower_name = stmt.table.to_ascii_lowercase();
-    let table_schema = schema.get(&lower_name)
+    let table_schema = schema
+        .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
     let all_candidates = collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?;
-    let rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = all_candidates.into_iter()
-        .filter(|(_, row)| {
-            match &stmt.where_clause {
-                Some(where_expr) => {
-                    match eval_expr(where_expr, &table_schema.columns, row) {
-                        Ok(val) => is_truthy(&val),
-                        Err(_) => false,
-                    }
-                }
-                None => true,
-            }
+    let rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
+        .into_iter()
+        .filter(|(_, row)| match &stmt.where_clause {
+            Some(where_expr) => match eval_expr(where_expr, &table_schema.columns, row) {
+                Ok(val) => is_truthy(&val),
+                Err(_) => false,
+            },
+            None => true,
         })
         .collect();
 
@@ -2450,7 +2794,8 @@ fn exec_delete_in_txn(
     for (key, row) in &rows_to_delete {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
         delete_index_entries(wtx, table_schema, row, &pk_values)?;
-        wtx.table_delete(lower_name.as_bytes(), key).map_err(SqlError::Storage)?;
+        wtx.table_delete(lower_name.as_bytes(), key)
+            .map_err(SqlError::Storage)?;
     }
     let count = rows_to_delete.len() as u64;
     Ok(ExecutionResult::RowsAffected(count))
@@ -2470,7 +2815,9 @@ fn exec_aggregate(
     } else {
         let mut m: BTreeMap<Vec<Value>, Vec<&Vec<Value>>> = BTreeMap::new();
         for row in rows {
-            let group_key: Vec<Value> = stmt.group_by.iter()
+            let group_key: Vec<Value> = stmt
+                .group_by
+                .iter()
                 .map(|expr| eval_expr(expr, columns, row))
                 .collect::<Result<_>>()?;
             m.entry(group_key).or_default().push(row);
@@ -2481,20 +2828,16 @@ fn exec_aggregate(
     let mut result_rows = Vec::new();
     let output_cols = build_output_columns(&stmt.columns, columns);
 
-    for (_group_key, group_rows) in &groups {
+    for group_rows in groups.values() {
         let mut result_row = Vec::new();
 
         for sel_col in &stmt.columns {
             match sel_col {
                 SelectColumn::AllColumns => {
-                    return Err(SqlError::Unsupported(
-                        "SELECT * with GROUP BY".into()
-                    ));
+                    return Err(SqlError::Unsupported("SELECT * with GROUP BY".into()));
                 }
                 SelectColumn::Expr { expr, .. } => {
-                    let val = eval_aggregate_expr(
-                        expr, columns, group_rows,
-                    )?;
+                    let val = eval_aggregate_expr(expr, columns, group_rows)?;
                     result_row.push(val);
                 }
             }
@@ -2542,11 +2885,15 @@ fn exec_aggregate(
         result_rows.truncate(limit);
     }
 
-    let col_names = stmt.columns.iter().map(|c| match c {
-        SelectColumn::AllColumns => "*".into(),
-        SelectColumn::Expr { alias: Some(a), .. } => a.clone(),
-        SelectColumn::Expr { expr, .. } => expr_display_name(expr),
-    }).collect();
+    let col_names = stmt
+        .columns
+        .iter()
+        .map(|c| match c {
+            SelectColumn::AllColumns => "*".into(),
+            SelectColumn::Expr { alias: Some(a), .. } => a.clone(),
+            SelectColumn::Expr { expr, .. } => expr_display_name(expr),
+        })
+        .collect();
 
     Ok(ExecutionResult::Query(QueryResult {
         columns: col_names,
@@ -2566,11 +2913,13 @@ fn eval_aggregate_expr(
             let func = name.to_ascii_uppercase();
             if args.len() != 1 {
                 return Err(SqlError::Unsupported(format!(
-                    "{func} with {} args", args.len()
+                    "{func} with {} args",
+                    args.len()
                 )));
             }
             let arg = &args[0];
-            let values: Vec<Value> = group_rows.iter()
+            let values: Vec<Value> = group_rows
+                .iter()
                 .map(|row| eval_expr(arg, columns, row))
                 .collect::<Result<_>>()?;
 
@@ -2586,16 +2935,27 @@ fn eval_aggregate_expr(
                     let mut all_null = true;
                     for v in &values {
                         match v {
-                            Value::Integer(i) => { int_sum += i; all_null = false; }
-                            Value::Real(r) => { real_sum += r; has_real = true; all_null = false; }
+                            Value::Integer(i) => {
+                                int_sum += i;
+                                all_null = false;
+                            }
+                            Value::Real(r) => {
+                                real_sum += r;
+                                has_real = true;
+                                all_null = false;
+                            }
                             Value::Null => {}
-                            _ => return Err(SqlError::TypeMismatch {
-                                expected: "numeric".into(),
-                                got: v.data_type().to_string(),
-                            }),
+                            _ => {
+                                return Err(SqlError::TypeMismatch {
+                                    expected: "numeric".into(),
+                                    got: v.data_type().to_string(),
+                                })
+                            }
                         }
                     }
-                    if all_null { return Ok(Value::Null); }
+                    if all_null {
+                        return Ok(Value::Null);
+                    }
                     if has_real {
                         Ok(Value::Real(real_sum + int_sum as f64))
                     } else {
@@ -2607,24 +2967,44 @@ fn eval_aggregate_expr(
                     let mut count: i64 = 0;
                     for v in &values {
                         match v {
-                            Value::Integer(i) => { sum += *i as f64; count += 1; }
-                            Value::Real(r) => { sum += r; count += 1; }
+                            Value::Integer(i) => {
+                                sum += *i as f64;
+                                count += 1;
+                            }
+                            Value::Real(r) => {
+                                sum += r;
+                                count += 1;
+                            }
                             Value::Null => {}
-                            _ => return Err(SqlError::TypeMismatch {
-                                expected: "numeric".into(),
-                                got: v.data_type().to_string(),
-                            }),
+                            _ => {
+                                return Err(SqlError::TypeMismatch {
+                                    expected: "numeric".into(),
+                                    got: v.data_type().to_string(),
+                                })
+                            }
                         }
                     }
-                    if count == 0 { Ok(Value::Null) } else { Ok(Value::Real(sum / count as f64)) }
+                    if count == 0 {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::Real(sum / count as f64))
+                    }
                 }
                 "MIN" => {
                     let mut min: Option<&Value> = None;
                     for v in &values {
-                        if v.is_null() { continue; }
+                        if v.is_null() {
+                            continue;
+                        }
                         min = Some(match min {
                             None => v,
-                            Some(m) => if v < m { v } else { m },
+                            Some(m) => {
+                                if v < m {
+                                    v
+                                } else {
+                                    m
+                                }
+                            }
                         });
                     }
                     Ok(min.cloned().unwrap_or(Value::Null))
@@ -2632,10 +3012,18 @@ fn eval_aggregate_expr(
                 "MAX" => {
                     let mut max: Option<&Value> = None;
                     for v in &values {
-                        if v.is_null() { continue; }
+                        if v.is_null() {
+                            continue;
+                        }
                         max = Some(match max {
                             None => v,
-                            Some(m) => if v > m { v } else { m },
+                            Some(m) => {
+                                if v > m {
+                                    v
+                                } else {
+                                    m
+                                }
+                            }
                         });
                     }
                     Ok(max.cloned().unwrap_or(Value::Null))
@@ -2671,8 +3059,12 @@ fn eval_aggregate_expr(
         Expr::UnaryOp { op, expr: e } => {
             let v = eval_aggregate_expr(e, columns, group_rows)?;
             crate::eval::eval_expr(
-                &Expr::UnaryOp { op: *op, expr: Box::new(Expr::Literal(v)) },
-                columns, &[],
+                &Expr::UnaryOp {
+                    op: *op,
+                    expr: Box::new(Expr::Literal(v)),
+                },
+                columns,
+                &[],
             )
         }
 
@@ -2689,13 +3081,22 @@ fn eval_aggregate_expr(
         Expr::Cast { expr: e, data_type } => {
             let v = eval_aggregate_expr(e, columns, group_rows)?;
             crate::eval::eval_expr(
-                &Expr::Cast { expr: Box::new(Expr::Literal(v)), data_type: *data_type },
-                columns, &[],
+                &Expr::Cast {
+                    expr: Box::new(Expr::Literal(v)),
+                    data_type: *data_type,
+                },
+                columns,
+                &[],
             )
         }
 
-        Expr::Case { operand, conditions, else_result } => {
-            let op_val = operand.as_ref()
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            let op_val = operand
+                .as_ref()
                 .map(|e| eval_aggregate_expr(e, columns, group_rows))
                 .transpose()?;
             if let Some(ov) = &op_val {
@@ -2722,12 +3123,19 @@ fn eval_aggregate_expr(
         Expr::Coalesce(args) => {
             for arg in args {
                 let v = eval_aggregate_expr(arg, columns, group_rows)?;
-                if !v.is_null() { return Ok(v); }
+                if !v.is_null() {
+                    return Ok(v);
+                }
             }
             Ok(Value::Null)
         }
 
-        Expr::Between { expr: e, low, high, negated } => {
+        Expr::Between {
+            expr: e,
+            low,
+            high,
+            negated,
+        } => {
             let v = eval_aggregate_expr(e, columns, group_rows)?;
             let lo = eval_aggregate_expr(low, columns, group_rows)?;
             let hi = eval_aggregate_expr(high, columns, group_rows)?;
@@ -2738,14 +3146,21 @@ fn eval_aggregate_expr(
                     high: Box::new(Expr::Literal(hi)),
                     negated: *negated,
                 },
-                columns, &[],
+                columns,
+                &[],
             )
         }
 
-        Expr::Like { expr: e, pattern, escape, negated } => {
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            negated,
+        } => {
             let v = eval_aggregate_expr(e, columns, group_rows)?;
             let p = eval_aggregate_expr(pattern, columns, group_rows)?;
-            let esc = escape.as_ref()
+            let esc = escape
+                .as_ref()
                 .map(|es| eval_aggregate_expr(es, columns, group_rows))
                 .transpose()?;
             let esc_box = esc.map(|v| Box::new(Expr::Literal(v)));
@@ -2756,22 +3171,30 @@ fn eval_aggregate_expr(
                     escape: esc_box,
                     negated: *negated,
                 },
-                columns, &[],
+                columns,
+                &[],
             )
         }
 
         Expr::Function { name, args } => {
-            let evaluated: Vec<Value> = args.iter()
+            let evaluated: Vec<Value> = args
+                .iter()
                 .map(|a| eval_aggregate_expr(a, columns, group_rows))
                 .collect::<Result<_>>()?;
             let literal_args: Vec<Expr> = evaluated.into_iter().map(Expr::Literal).collect();
             crate::eval::eval_expr(
-                &Expr::Function { name: name.clone(), args: literal_args },
-                columns, &[],
+                &Expr::Function {
+                    name: name.clone(),
+                    args: literal_args,
+                },
+                columns,
+                &[],
             )
         }
 
-        _ => Err(SqlError::Unsupported(format!("expression in aggregate: {expr:?}"))),
+        _ => Err(SqlError::Unsupported(format!(
+            "expression in aggregate: {expr:?}"
+        ))),
     }
 }
 
@@ -2785,26 +3208,37 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
     match expr {
         Expr::CountStar => true,
         Expr::Function { name, args } => {
-            is_aggregate_function(name, args.len())
-                || args.iter().any(is_aggregate_expr)
+            is_aggregate_function(name, args.len()) || args.iter().any(is_aggregate_expr)
         }
-        Expr::BinaryOp { left, right, .. } => {
-            is_aggregate_expr(left) || is_aggregate_expr(right)
-        }
-        Expr::UnaryOp { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr)
+        Expr::BinaryOp { left, right, .. } => is_aggregate_expr(left) || is_aggregate_expr(right),
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
         | Expr::Cast { expr, .. } => is_aggregate_expr(expr),
-        Expr::Case { operand, conditions, else_result } => {
-            operand.as_ref().map_or(false, |e| is_aggregate_expr(e))
-                || conditions.iter().any(|(c, r)| is_aggregate_expr(c) || is_aggregate_expr(r))
-                || else_result.as_ref().map_or(false, |e| is_aggregate_expr(e))
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand.as_ref().is_some_and(|e| is_aggregate_expr(e))
+                || conditions
+                    .iter()
+                    .any(|(c, r)| is_aggregate_expr(c) || is_aggregate_expr(r))
+                || else_result.as_ref().is_some_and(|e| is_aggregate_expr(e))
         }
         Expr::Coalesce(args) => args.iter().any(is_aggregate_expr),
-        Expr::Between { expr, low, high, .. } => {
-            is_aggregate_expr(expr) || is_aggregate_expr(low) || is_aggregate_expr(high)
-        }
-        Expr::Like { expr, pattern, escape, .. } => {
-            is_aggregate_expr(expr) || is_aggregate_expr(pattern)
-                || escape.as_ref().map_or(false, |e| is_aggregate_expr(e))
+        Expr::Between {
+            expr, low, high, ..
+        } => is_aggregate_expr(expr) || is_aggregate_expr(low) || is_aggregate_expr(high),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            is_aggregate_expr(expr)
+                || is_aggregate_expr(pattern)
+                || escape.as_ref().is_some_and(|e| is_aggregate_expr(e))
         }
         _ => false,
     }
@@ -2813,11 +3247,7 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /// Decode a full row from B+ tree key + value.
-fn decode_full_row(
-    schema: &TableSchema,
-    key: &[u8],
-    value: &[u8],
-) -> Result<Vec<Value>> {
+fn decode_full_row(schema: &TableSchema, key: &[u8], value: &[u8]) -> Result<Vec<Value>> {
     let pk_values = decode_composite_key(key, schema.primary_key_columns.len())?;
     let non_pk_values = decode_row(value)?;
 
@@ -2867,14 +3297,26 @@ fn sort_rows(
             let ord = match (a_val.is_null(), b_val.is_null()) {
                 (true, true) => std::cmp::Ordering::Equal,
                 (true, false) => {
-                    if nulls_first { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater }
+                    if nulls_first {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Greater
+                    }
                 }
                 (false, true) => {
-                    if nulls_first { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less }
+                    if nulls_first {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    }
                 }
                 (false, false) => {
                     let cmp = a_val.cmp(&b_val);
-                    if item.descending { cmp.reverse() } else { cmp }
+                    if item.descending {
+                        cmp.reverse()
+                    } else {
+                        cmp
+                    }
                 }
             };
 
@@ -2893,7 +3335,8 @@ fn project_rows(
     rows: &[Vec<Value>],
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
     let mut col_names = Vec::new();
-    let mut projectors: Vec<Box<dyn Fn(&[Value]) -> Result<Value>>> = Vec::new();
+    type Projector = Box<dyn Fn(&[Value]) -> Result<Value>>;
+    let mut projectors: Vec<Projector> = Vec::new();
 
     for sel_col in select_cols {
         match sel_col {
@@ -2916,9 +3359,15 @@ fn project_rows(
         }
     }
 
-    let projected = rows.iter().map(|row| {
-        projectors.iter().map(|p| p(row)).collect::<Result<Vec<_>>>()
-    }).collect::<Result<Vec<_>>>()?;
+    let projected = rows
+        .iter()
+        .map(|row| {
+            projectors
+                .iter()
+                .map(|p| p(row))
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok((col_names, projected))
 }
@@ -2934,7 +3383,12 @@ fn expr_display_name(expr: &Expr) -> String {
             format!("{name}({})", arg_strs.join(", "))
         }
         Expr::BinaryOp { left, op, right } => {
-            format!("{} {} {}", expr_display_name(left), op_symbol(op), expr_display_name(right))
+            format!(
+                "{} {} {}",
+                expr_display_name(left),
+                op_symbol(op),
+                expr_display_name(right)
+            )
         }
         _ => "?".into(),
     }
@@ -2942,26 +3396,32 @@ fn expr_display_name(expr: &Expr) -> String {
 
 fn op_symbol(op: &BinOp) -> &'static str {
     match op {
-        BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*",
-        BinOp::Div => "/", BinOp::Mod => "%",
-        BinOp::Eq => "=", BinOp::NotEq => "<>",
-        BinOp::Lt => "<", BinOp::Gt => ">",
-        BinOp::LtEq => "<=", BinOp::GtEq => ">=",
-        BinOp::And => "AND", BinOp::Or => "OR", BinOp::Concat => "||",
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        BinOp::Eq => "=",
+        BinOp::NotEq => "<>",
+        BinOp::Lt => "<",
+        BinOp::Gt => ">",
+        BinOp::LtEq => "<=",
+        BinOp::GtEq => ">=",
+        BinOp::And => "AND",
+        BinOp::Or => "OR",
+        BinOp::Concat => "||",
     }
 }
 
-fn build_output_columns(
-    select_cols: &[SelectColumn],
-    columns: &[ColumnDef],
-) -> Vec<ColumnDef> {
+fn build_output_columns(select_cols: &[SelectColumn], columns: &[ColumnDef]) -> Vec<ColumnDef> {
     let mut out = Vec::new();
     for (i, col) in select_cols.iter().enumerate() {
         let (name, data_type) = match col {
             SelectColumn::AllColumns => (format!("col{i}"), DataType::Null),
-            SelectColumn::Expr { alias: Some(a), expr } => {
-                (a.clone(), infer_expr_type(expr, columns))
-            }
+            SelectColumn::Expr {
+                alias: Some(a),
+                expr,
+            } => (a.clone(), infer_expr_type(expr, columns)),
             SelectColumn::Expr { expr, .. } => {
                 (expr_display_name(expr), infer_expr_type(expr, columns))
             }
@@ -2980,28 +3440,32 @@ fn infer_expr_type(expr: &Expr, columns: &[ColumnDef]) -> DataType {
     match expr {
         Expr::Column(name) => {
             let lower = name.to_ascii_lowercase();
-            columns.iter()
+            columns
+                .iter()
                 .find(|c| c.name.to_ascii_lowercase() == lower)
                 .map(|c| c.data_type)
                 .unwrap_or(DataType::Null)
         }
         Expr::QualifiedColumn { table, column } => {
-            let qualified = format!("{}.{}", table.to_ascii_lowercase(), column.to_ascii_lowercase());
-            columns.iter()
+            let qualified = format!(
+                "{}.{}",
+                table.to_ascii_lowercase(),
+                column.to_ascii_lowercase()
+            );
+            columns
+                .iter()
                 .find(|c| c.name.to_ascii_lowercase() == qualified)
                 .map(|c| c.data_type)
                 .unwrap_or(DataType::Null)
         }
         Expr::Literal(v) => v.data_type(),
         Expr::CountStar => DataType::Integer,
-        Expr::Function { name, .. } => {
-            match name.to_ascii_uppercase().as_str() {
-                "COUNT" => DataType::Integer,
-                "AVG" => DataType::Real,
-                "SUM" | "MIN" | "MAX" => DataType::Null,
-                _ => DataType::Null,
-            }
-        }
+        Expr::Function { name, .. } => match name.to_ascii_uppercase().as_str() {
+            "COUNT" => DataType::Integer,
+            "AVG" => DataType::Real,
+            "SUM" | "MIN" | "MAX" => DataType::Null,
+            _ => DataType::Null,
+        },
         _ => DataType::Null,
     }
 }

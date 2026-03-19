@@ -528,7 +528,7 @@ mod tests {
         // kind=0, pad=[0,0,0], HLC=8B+4B, NodeId=8B, value=2B
         assert_eq!(encoded[0], 0x00); // Put
         assert_eq!(&encoded[1..4], &[0, 0, 0]); // padding
-        // HLC wall_time big-endian
+                                                // HLC wall_time big-endian
         assert_eq!(
             &encoded[4..12],
             &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
@@ -562,9 +562,8 @@ mod tests {
 
         let mut winner = entries[0];
         for e in &entries[1..] {
-            match lww_merge(&winner, e) {
-                MergeResult::Remote => winner = *e,
-                _ => {}
+            if lww_merge(&winner, e) == MergeResult::Remote {
+                winner = *e;
             }
         }
 
@@ -582,18 +581,16 @@ mod tests {
         // Forward merge
         let mut fwd_winner = entries[0];
         for e in &entries[1..] {
-            match lww_merge(&fwd_winner, e) {
-                MergeResult::Remote => fwd_winner = *e,
-                _ => {}
+            if lww_merge(&fwd_winner, e) == MergeResult::Remote {
+                fwd_winner = *e;
             }
         }
 
         // Reverse merge
         let mut rev_winner = entries[99];
         for e in entries[..99].iter().rev() {
-            match lww_merge(&rev_winner, e) {
-                MergeResult::Remote => rev_winner = *e,
-                _ => {}
+            if lww_merge(&rev_winner, e) == MergeResult::Remote {
+                rev_winner = *e;
             }
         }
 
@@ -610,24 +607,23 @@ mod tests {
             .collect();
 
         // Find absolute winner (max by lww_cmp)
-        let expected = entries
-            .iter()
-            .max_by(|a, b| a.lww_cmp(b))
-            .unwrap();
+        let expected = entries.iter().max_by(|a, b| a.lww_cmp(b)).unwrap();
 
         // Merge in original order
         let mut winner = entries[0];
         for e in &entries[1..] {
-            match lww_merge(&winner, e) {
-                MergeResult::Remote => winner = *e,
-                _ => {}
+            if lww_merge(&winner, e) == MergeResult::Remote {
+                winner = *e;
             }
         }
 
         assert_eq!(winner, *expected);
 
         // Merge in BTreeSet-sorted order (different from insertion order)
-        let sorted: BTreeSet<u64> = entries.iter().map(|e| e.timestamp.wall_time() as u64).collect();
+        let sorted: BTreeSet<u64> = entries
+            .iter()
+            .map(|e| e.timestamp.wall_time() as u64)
+            .collect();
         assert!(sorted.len() <= entries.len()); // some might collide, that's fine
     }
 }

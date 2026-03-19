@@ -12,6 +12,9 @@ categories.workspace = true
 description = "Transaction manager with MVCC, commit protocol, and pending-free chain for Citadel"
 readme = "README.md"
 
+[lib]
+name = "citadel_txn"
+
 [dependencies]
 citadel-core = { workspace = true }
 citadel-crypto = { workspace = true }

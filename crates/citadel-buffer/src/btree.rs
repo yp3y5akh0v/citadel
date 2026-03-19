@@ -6,12 +6,12 @@
 //!
 //! The tree uses `HashMap<PageId, Page>` as the in-memory page store.
 
-use std::collections::HashMap;
-use citadel_core::{Error, Result};
+use crate::allocator::PageAllocator;
 use citadel_core::types::{PageId, PageType, TxnId, ValueType};
+use citadel_core::{Error, Result};
 use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
-use crate::allocator::PageAllocator;
+use std::collections::HashMap;
 
 /// B+ tree metadata. Lightweight struct — pages are stored externally.
 #[derive(Clone)]
@@ -40,7 +40,11 @@ impl BTree {
 
     /// Create a BTree from existing metadata (e.g., loaded from commit slot).
     pub fn from_existing(root: PageId, depth: u16, entry_count: u64) -> Self {
-        Self { root, depth, entry_count }
+        Self {
+            root,
+            depth,
+            entry_count,
+        }
     }
 
     /// Search for a key. Returns `Some((val_type, value))` if found, `None` otherwise.
@@ -51,8 +55,7 @@ impl BTree {
     ) -> Result<Option<(ValueType, Vec<u8>)>> {
         let mut current = self.root;
         loop {
-            let page = pages.get(&current)
-                .ok_or(Error::PageOutOfBounds(current))?;
+            let page = pages.get(&current).ok_or(Error::PageOutOfBounds(current))?;
             match page.page_type() {
                 Some(PageType::Leaf) => {
                     return match leaf_node::search(page, key) {
@@ -112,13 +115,18 @@ impl BTree {
         }
 
         // Leaf is full — split
-        let (sep_key, right_id) = split_leaf_with_insert(
-            pages, alloc, txn_id, new_leaf_id, key, val_type, value,
-        );
+        let (sep_key, right_id) =
+            split_leaf_with_insert(pages, alloc, txn_id, new_leaf_id, key, val_type, value);
 
         // Propagate split up through ancestors
         self.root = propagate_split_up(
-            pages, alloc, txn_id, &path, new_leaf_id, &sep_key, right_id,
+            pages,
+            alloc,
+            txn_id,
+            &path,
+            new_leaf_id,
+            &sep_key,
+            right_id,
             &mut self.depth,
         );
 
@@ -170,9 +178,7 @@ impl BTree {
         pages.remove(&new_leaf_id);
 
         // Walk up, handling the removal
-        self.root = propagate_remove_up(
-            pages, alloc, txn_id, &path, &mut self.depth,
-        );
+        self.root = propagate_remove_up(pages, alloc, txn_id, &path, &mut self.depth);
         self.entry_count -= 1;
         Ok(true)
     }
@@ -187,8 +193,7 @@ impl BTree {
         let mut path = Vec::with_capacity(self.depth as usize);
         let mut current = self.root;
         loop {
-            let page = pages.get(&current)
-                .ok_or(Error::PageOutOfBounds(current))?;
+            let page = pages.get(&current).ok_or(Error::PageOutOfBounds(current))?;
             match page.page_type() {
                 Some(PageType::Leaf) => return Ok((path, current)),
                 Some(PageType::Branch) => {
@@ -262,11 +267,13 @@ fn split_leaf_with_insert(
     let mut cells: Vec<(Vec<u8>, Vec<u8>)> = {
         let page = pages.get(&leaf_id).unwrap();
         let n = page.num_cells() as usize;
-        (0..n).map(|i| {
-            let cell = leaf_node::read_cell(page, i as u16);
-            let raw = leaf_node::read_cell_bytes(page, i as u16);
-            (cell.key.to_vec(), raw)
-        }).collect()
+        (0..n)
+            .map(|i| {
+                let cell = leaf_node::read_cell(page, i as u16);
+                let raw = leaf_node::read_cell_bytes(page, i as u16);
+                (cell.key.to_vec(), raw)
+            })
+            .collect()
     };
 
     // Insert or update the new cell in sorted position
@@ -306,8 +313,10 @@ fn split_leaf_with_insert(
 
     // Rebuild left page with cells [0..split_point]
     {
-        let left_refs: Vec<&[u8]> = cells[..split_point].iter()
-            .map(|(_, raw)| raw.as_slice()).collect();
+        let left_refs: Vec<&[u8]> = cells[..split_point]
+            .iter()
+            .map(|(_, raw)| raw.as_slice())
+            .collect();
         let page = pages.get_mut(&leaf_id).unwrap();
         page.rebuild_cells(&left_refs);
     }
@@ -316,8 +325,10 @@ fn split_leaf_with_insert(
     let right_id = alloc.allocate();
     {
         let mut right_page = Page::new(right_id, PageType::Leaf, txn_id);
-        let right_refs: Vec<&[u8]> = cells[split_point..].iter()
-            .map(|(_, raw)| raw.as_slice()).collect();
+        let right_refs: Vec<&[u8]> = cells[split_point..]
+            .iter()
+            .map(|(_, raw)| raw.as_slice())
+            .collect();
         right_page.rebuild_cells(&right_refs);
         pages.insert(right_id, right_page);
     }
@@ -327,6 +338,7 @@ fn split_leaf_with_insert(
 
 /// Propagate a split upward through the ancestor chain.
 /// Returns the new root page ID.
+#[allow(clippy::too_many_arguments)]
 fn propagate_split_up(
     pages: &mut HashMap<PageId, Page>,
     alloc: &mut PageAllocator,
@@ -346,9 +358,7 @@ fn propagate_split_up(
         if pending_split {
             let ok = {
                 let page = pages.get_mut(&new_ancestor).unwrap();
-                branch_node::insert_separator(
-                    page, child_idx, left_child, &sep_key, right_child,
-                )
+                branch_node::insert_separator(page, child_idx, left_child, &sep_key, right_child)
             };
 
             if ok {
@@ -357,8 +367,14 @@ fn propagate_split_up(
             } else {
                 // Branch also full — split it
                 let (new_sep, new_right) = split_branch_with_insert(
-                    pages, alloc, txn_id, new_ancestor, child_idx,
-                    left_child, &sep_key, right_child,
+                    pages,
+                    alloc,
+                    txn_id,
+                    new_ancestor,
+                    child_idx,
+                    left_child,
+                    &sep_key,
+                    right_child,
                 );
                 left_child = new_ancestor;
                 sep_key = new_sep;
@@ -389,6 +405,7 @@ fn propagate_split_up(
 /// Split a full branch and insert a separator.
 /// Returns (promoted_separator_key, right_branch_page_id).
 /// The left branch is `branch_id` (rebuilt in place).
+#[allow(clippy::too_many_arguments)]
 fn split_branch_with_insert(
     pages: &mut HashMap<PageId, Page>,
     alloc: &mut PageAllocator,
@@ -403,10 +420,12 @@ fn split_branch_with_insert(
     let (new_cells, final_right_child) = {
         let page = pages.get(&branch_id).unwrap();
         let n = page.num_cells() as usize;
-        let cells: Vec<(PageId, Vec<u8>)> = (0..n).map(|i| {
-            let cell = branch_node::read_cell(page, i as u16);
-            (cell.child, cell.key.to_vec())
-        }).collect();
+        let cells: Vec<(PageId, Vec<u8>)> = (0..n)
+            .map(|i| {
+                let cell = branch_node::read_cell(page, i as u16);
+                (cell.child, cell.key.to_vec())
+            })
+            .collect();
         let old_rc = page.right_child();
 
         let mut result = Vec::with_capacity(n + 1);
@@ -466,7 +485,8 @@ fn split_branch_with_insert(
 
     // Rebuild left branch with cells [0..split_point], right_child = promoted_child
     {
-        let left_raw: Vec<Vec<u8>> = new_cells[..split_point].iter()
+        let left_raw: Vec<Vec<u8>> = new_cells[..split_point]
+            .iter()
             .map(|(child, key)| branch_node::build_cell(*child, key))
             .collect();
         let left_refs: Vec<&[u8]> = left_raw.iter().map(|c| c.as_slice()).collect();
@@ -479,7 +499,8 @@ fn split_branch_with_insert(
     let right_branch_id = alloc.allocate();
     {
         let mut right_page = Page::new(right_branch_id, PageType::Branch, txn_id);
-        let right_raw: Vec<Vec<u8>> = new_cells[split_point + 1..].iter()
+        let right_raw: Vec<Vec<u8>> = new_cells[split_point + 1..]
+            .iter()
             .map(|(child, key)| branch_node::build_cell(*child, key))
             .collect();
         let right_refs: Vec<&[u8]> = right_raw.iter().map(|c| c.as_slice()).collect();
@@ -593,7 +614,16 @@ mod tests {
     #[test]
     fn insert_and_search_single() {
         let (mut pages, mut alloc, mut tree) = new_tree();
-        let is_new = tree.insert(&mut pages, &mut alloc, TxnId(1), b"hello", ValueType::Inline, b"world").unwrap();
+        let is_new = tree
+            .insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                b"hello",
+                ValueType::Inline,
+                b"world",
+            )
+            .unwrap();
         assert!(is_new);
         assert_eq!(tree.entry_count, 1);
 
@@ -604,8 +634,25 @@ mod tests {
     #[test]
     fn insert_update_existing() {
         let (mut pages, mut alloc, mut tree) = new_tree();
-        tree.insert(&mut pages, &mut alloc, TxnId(1), b"key", ValueType::Inline, b"v1").unwrap();
-        let is_new = tree.insert(&mut pages, &mut alloc, TxnId(1), b"key", ValueType::Inline, b"v2").unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            b"key",
+            ValueType::Inline,
+            b"v1",
+        )
+        .unwrap();
+        let is_new = tree
+            .insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                b"key",
+                ValueType::Inline,
+                b"v2",
+            )
+            .unwrap();
         assert!(!is_new);
         assert_eq!(tree.entry_count, 1);
 
@@ -618,7 +665,8 @@ mod tests {
         let (mut pages, mut alloc, mut tree) = new_tree();
         let keys = [b"dog", b"ant", b"cat", b"fox", b"bat", b"eel"];
         for k in &keys {
-            tree.insert(&mut pages, &mut alloc, TxnId(1), *k, ValueType::Inline, *k).unwrap();
+            tree.insert(&mut pages, &mut alloc, TxnId(1), *k, ValueType::Inline, *k)
+                .unwrap();
         }
         assert_eq!(tree.entry_count, 6);
 
@@ -646,13 +694,22 @@ mod tests {
             let key = format!("key-{i:05}");
             let val = format!("val-{i:05}");
             tree.insert(
-                &mut pages, &mut alloc, TxnId(1),
-                key.as_bytes(), ValueType::Inline, val.as_bytes(),
-            ).unwrap();
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                key.as_bytes(),
+                ValueType::Inline,
+                val.as_bytes(),
+            )
+            .unwrap();
         }
 
         assert_eq!(tree.entry_count, count);
-        assert!(tree.depth >= 2, "tree should have split (depth={})", tree.depth);
+        assert!(
+            tree.depth >= 2,
+            "tree should have split (depth={})",
+            tree.depth
+        );
 
         // Verify all keys present
         for i in 0..count {
@@ -666,22 +723,60 @@ mod tests {
     #[test]
     fn delete_existing_key() {
         let (mut pages, mut alloc, mut tree) = new_tree();
-        tree.insert(&mut pages, &mut alloc, TxnId(1), b"a", ValueType::Inline, b"1").unwrap();
-        tree.insert(&mut pages, &mut alloc, TxnId(1), b"b", ValueType::Inline, b"2").unwrap();
-        tree.insert(&mut pages, &mut alloc, TxnId(1), b"c", ValueType::Inline, b"3").unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            b"a",
+            ValueType::Inline,
+            b"1",
+        )
+        .unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            b"b",
+            ValueType::Inline,
+            b"2",
+        )
+        .unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            b"c",
+            ValueType::Inline,
+            b"3",
+        )
+        .unwrap();
 
         let found = tree.delete(&mut pages, &mut alloc, TxnId(1), b"b").unwrap();
         assert!(found);
         assert_eq!(tree.entry_count, 2);
         assert_eq!(tree.search(&pages, b"b").unwrap(), None);
-        assert_eq!(tree.search(&pages, b"a").unwrap(), Some((ValueType::Inline, b"1".to_vec())));
-        assert_eq!(tree.search(&pages, b"c").unwrap(), Some((ValueType::Inline, b"3".to_vec())));
+        assert_eq!(
+            tree.search(&pages, b"a").unwrap(),
+            Some((ValueType::Inline, b"1".to_vec()))
+        );
+        assert_eq!(
+            tree.search(&pages, b"c").unwrap(),
+            Some((ValueType::Inline, b"3".to_vec()))
+        );
     }
 
     #[test]
     fn delete_nonexistent_key() {
         let (mut pages, mut alloc, mut tree) = new_tree();
-        tree.insert(&mut pages, &mut alloc, TxnId(1), b"a", ValueType::Inline, b"1").unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            b"a",
+            ValueType::Inline,
+            b"1",
+        )
+        .unwrap();
         let found = tree.delete(&mut pages, &mut alloc, TxnId(1), b"z").unwrap();
         assert!(!found);
         assert_eq!(tree.entry_count, 1);
@@ -690,7 +785,15 @@ mod tests {
     #[test]
     fn delete_all_from_root_leaf() {
         let (mut pages, mut alloc, mut tree) = new_tree();
-        tree.insert(&mut pages, &mut alloc, TxnId(1), b"x", ValueType::Inline, b"1").unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            b"x",
+            ValueType::Inline,
+            b"1",
+        )
+        .unwrap();
         tree.delete(&mut pages, &mut alloc, TxnId(1), b"x").unwrap();
         assert_eq!(tree.entry_count, 0);
 
@@ -705,7 +808,15 @@ mod tests {
         let (mut pages, mut alloc, mut tree) = new_tree();
         let root_before = tree.root;
 
-        tree.insert(&mut pages, &mut alloc, TxnId(2), b"key", ValueType::Inline, b"val").unwrap();
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(2),
+            b"key",
+            ValueType::Inline,
+            b"val",
+        )
+        .unwrap();
         let root_after = tree.root;
 
         // Root should have changed (CoW)
@@ -723,14 +834,24 @@ mod tests {
         for i in 0..count {
             let key = format!("k{i:06}");
             let val = format!("v{i:06}");
-            tree.insert(&mut pages, &mut alloc, TxnId(1), key.as_bytes(), ValueType::Inline, val.as_bytes()).unwrap();
+            tree.insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                key.as_bytes(),
+                ValueType::Inline,
+                val.as_bytes(),
+            )
+            .unwrap();
         }
         assert_eq!(tree.entry_count, count);
 
         // Delete every other key
         for i in (0..count).step_by(2) {
             let key = format!("k{i:06}");
-            let found = tree.delete(&mut pages, &mut alloc, TxnId(1), key.as_bytes()).unwrap();
+            let found = tree
+                .delete(&mut pages, &mut alloc, TxnId(1), key.as_bytes())
+                .unwrap();
             assert!(found);
         }
         assert_eq!(tree.entry_count, count / 2);
@@ -756,7 +877,15 @@ mod tests {
         let count = 2000u64;
         for i in 0..count {
             let key = format!("{i:08}");
-            tree.insert(&mut pages, &mut alloc, TxnId(1), key.as_bytes(), ValueType::Inline, b"v").unwrap();
+            tree.insert(
+                &mut pages,
+                &mut alloc,
+                TxnId(1),
+                key.as_bytes(),
+                ValueType::Inline,
+                b"v",
+            )
+            .unwrap();
         }
         assert!(tree.depth >= 2, "depth={} expected >= 2", tree.depth);
         assert_eq!(tree.entry_count, count);
@@ -764,7 +893,9 @@ mod tests {
         // Delete all
         for i in 0..count {
             let key = format!("{i:08}");
-            let found = tree.delete(&mut pages, &mut alloc, TxnId(1), key.as_bytes()).unwrap();
+            let found = tree
+                .delete(&mut pages, &mut alloc, TxnId(1), key.as_bytes())
+                .unwrap();
             assert!(found, "key {key} should be deletable");
         }
         assert_eq!(tree.entry_count, 0);

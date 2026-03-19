@@ -12,6 +12,9 @@ categories.workspace = true
 description = "SQL engine for Citadel encrypted database"
 readme = "README.md"
 
+[lib]
+name = "citadel_sql"
+
 [dependencies]
 citadel-core = { workspace = true }
 citadel-txn = { workspace = true }

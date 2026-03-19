@@ -1,13 +1,13 @@
-pub mod error;
-pub mod types;
-pub mod encoding;
-pub mod parser;
-pub mod eval;
-pub mod schema;
-pub mod planner;
-pub mod executor;
 pub mod connection;
+pub mod encoding;
+pub mod error;
+pub mod eval;
+pub mod executor;
+pub mod parser;
+pub mod planner;
+pub mod schema;
+pub mod types;
 
 pub use connection::Connection;
-pub use error::{SqlError, Result};
-pub use types::{Value, DataType, QueryResult, ExecutionResult, TableSchema, ColumnDef, IndexDef};
+pub use error::{Result, SqlError};
+pub use types::{ColumnDef, DataType, ExecutionResult, IndexDef, QueryResult, TableSchema, Value};

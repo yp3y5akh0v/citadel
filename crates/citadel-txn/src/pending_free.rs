@@ -9,11 +9,11 @@
 //! - Phase B: write new chain with remaining + newly freed entries
 //! - Old chain pages are deferred to the NEXT commit (breaks circular dependency)
 
-use std::collections::HashMap;
+use citadel_buffer::allocator::PageAllocator;
 use citadel_core::types::{PageId, PageType, TxnId};
 use citadel_core::{Error, Result, PAGE_HEADER_SIZE, PENDING_FREE_ENTRY_SIZE, USABLE_SIZE};
 use citadel_page::page::Page;
-use citadel_buffer::allocator::PageAllocator;
+use std::collections::HashMap;
 
 /// A pending-free entry: a page that was freed at a specific transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,10 +27,7 @@ pub struct PendingFreeEntry {
 const MAX_ENTRIES_PER_PAGE: usize = (USABLE_SIZE - 4) / PENDING_FREE_ENTRY_SIZE;
 
 /// Read all entries from the pending-free chain stored in the page map.
-pub fn read_chain(
-    pages: &HashMap<PageId, Page>,
-    root: PageId,
-) -> Result<Vec<PendingFreeEntry>> {
+pub fn read_chain(pages: &HashMap<PageId, Page>, root: PageId) -> Result<Vec<PendingFreeEntry>> {
     if !root.is_valid() {
         return Ok(Vec::new());
     }
@@ -39,8 +36,7 @@ pub fn read_chain(
     let mut current = root;
 
     while current.is_valid() {
-        let page = pages.get(&current)
-            .ok_or(Error::PageOutOfBounds(current))?;
+        let page = pages.get(&current).ok_or(Error::PageOutOfBounds(current))?;
 
         let entry_count = read_entry_count(page);
         let data_start = PAGE_HEADER_SIZE + 4;
@@ -73,7 +69,7 @@ pub fn write_chain(
         return PageId::INVALID;
     }
 
-    let num_pages = (entries.len() + MAX_ENTRIES_PER_PAGE - 1) / MAX_ENTRIES_PER_PAGE;
+    let num_pages = entries.len().div_ceil(MAX_ENTRIES_PER_PAGE);
 
     // Allocate all pages first so we can link them
     let page_ids: Vec<PageId> = (0..num_pages).map(|_| alloc.allocate()).collect();
@@ -112,10 +108,7 @@ pub fn write_chain(
 }
 
 /// Collect all page IDs that form the chain (for deferred freeing after write).
-pub fn collect_chain_page_ids(
-    pages: &HashMap<PageId, Page>,
-    root: PageId,
-) -> Result<Vec<PageId>> {
+pub fn collect_chain_page_ids(pages: &HashMap<PageId, Page>, root: PageId) -> Result<Vec<PageId>> {
     if !root.is_valid() {
         return Ok(Vec::new());
     }
@@ -125,8 +118,7 @@ pub fn collect_chain_page_ids(
 
     while current.is_valid() {
         ids.push(current);
-        let page = pages.get(&current)
-            .ok_or(Error::PageOutOfBounds(current))?;
+        let page = pages.get(&current).ok_or(Error::PageOutOfBounds(current))?;
         current = page.right_child();
         if !current.is_valid() {
             break;
@@ -197,14 +189,20 @@ pub fn process_chain(
 
 fn read_entry_count(page: &Page) -> usize {
     u32::from_le_bytes(
-        page.data[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 4].try_into().unwrap()
+        page.data[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 4]
+            .try_into()
+            .unwrap(),
     ) as usize
 }
 
 fn read_entry_at(data: &[u8], offset: usize) -> PendingFreeEntry {
     PendingFreeEntry {
-        page_id: PageId(u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())),
-        freed_at_txn: TxnId(u64::from_le_bytes(data[offset + 4..offset + 12].try_into().unwrap())),
+        page_id: PageId(u32::from_le_bytes(
+            data[offset..offset + 4].try_into().unwrap(),
+        )),
+        freed_at_txn: TxnId(u64::from_le_bytes(
+            data[offset + 4..offset + 12].try_into().unwrap(),
+        )),
     }
 }
 
@@ -230,9 +228,18 @@ mod tests {
         let mut alloc = PageAllocator::new(0);
 
         let entries = vec![
-            PendingFreeEntry { page_id: PageId(10), freed_at_txn: TxnId(1) },
-            PendingFreeEntry { page_id: PageId(20), freed_at_txn: TxnId(2) },
-            PendingFreeEntry { page_id: PageId(30), freed_at_txn: TxnId(3) },
+            PendingFreeEntry {
+                page_id: PageId(10),
+                freed_at_txn: TxnId(1),
+            },
+            PendingFreeEntry {
+                page_id: PageId(20),
+                freed_at_txn: TxnId(2),
+            },
+            PendingFreeEntry {
+                page_id: PageId(30),
+                freed_at_txn: TxnId(3),
+            },
         ];
 
         let root = write_chain(&mut pages, &mut alloc, TxnId(5), &entries);
@@ -252,12 +259,12 @@ mod tests {
 
         // Create enough entries to span multiple pages
         let count = MAX_ENTRIES_PER_PAGE + 10;
-        let entries: Vec<PendingFreeEntry> = (0..count).map(|i| {
-            PendingFreeEntry {
+        let entries: Vec<PendingFreeEntry> = (0..count)
+            .map(|i| PendingFreeEntry {
                 page_id: PageId(100 + i as u32),
                 freed_at_txn: TxnId(i as u64),
-            }
-        }).collect();
+            })
+            .collect();
 
         let root = write_chain(&mut pages, &mut alloc, TxnId(999), &entries);
         let read_back = read_chain(&pages, root).unwrap();
@@ -283,12 +290,12 @@ mod tests {
         let mut pages = HashMap::new();
         let mut alloc = PageAllocator::new(0);
 
-        let entries: Vec<PendingFreeEntry> = (0..MAX_ENTRIES_PER_PAGE + 10).map(|i| {
-            PendingFreeEntry {
+        let entries: Vec<PendingFreeEntry> = (0..MAX_ENTRIES_PER_PAGE + 10)
+            .map(|i| PendingFreeEntry {
                 page_id: PageId(100 + i as u32),
                 freed_at_txn: TxnId(1),
-            }
-        }).collect();
+            })
+            .collect();
 
         let root = write_chain(&mut pages, &mut alloc, TxnId(1), &entries);
         let chain_pages = collect_chain_page_ids(&pages, root).unwrap();
@@ -302,9 +309,18 @@ mod tests {
 
         // Write initial chain with entries at txn 1, 2, 3
         let initial_entries = vec![
-            PendingFreeEntry { page_id: PageId(10), freed_at_txn: TxnId(1) },
-            PendingFreeEntry { page_id: PageId(20), freed_at_txn: TxnId(2) },
-            PendingFreeEntry { page_id: PageId(30), freed_at_txn: TxnId(3) },
+            PendingFreeEntry {
+                page_id: PageId(10),
+                freed_at_txn: TxnId(1),
+            },
+            PendingFreeEntry {
+                page_id: PageId(20),
+                freed_at_txn: TxnId(2),
+            },
+            PendingFreeEntry {
+                page_id: PageId(30),
+                freed_at_txn: TxnId(3),
+            },
         ];
         let root = write_chain(&mut pages, &mut alloc, TxnId(3), &initial_entries);
 
@@ -312,9 +328,15 @@ mod tests {
         // Entries at txn 1 and 2 should be reclaimed
         let freed_this_txn = vec![PageId(40)];
         let (new_root, reclaimed, old_chain) = process_chain(
-            &mut pages, &mut alloc, TxnId(4),
-            root, &freed_this_txn, &[], TxnId(3),
-        ).unwrap();
+            &mut pages,
+            &mut alloc,
+            TxnId(4),
+            root,
+            &freed_this_txn,
+            &[],
+            TxnId(3),
+        )
+        .unwrap();
 
         // Reclaimed: pages freed at txn 1, 2 (< oldest_active_reader 3)
         assert_eq!(reclaimed.len(), 2);
@@ -338,9 +360,15 @@ mod tests {
         let deferred = vec![PageId(50), PageId(51)];
         let freed = vec![PageId(60)];
         let (new_root, reclaimed, old_chain) = process_chain(
-            &mut pages, &mut alloc, TxnId(1),
-            PageId::INVALID, &freed, &deferred, TxnId(1),
-        ).unwrap();
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            PageId::INVALID,
+            &freed,
+            &deferred,
+            TxnId(1),
+        )
+        .unwrap();
 
         assert!(reclaimed.is_empty());
         assert!(old_chain.is_empty());

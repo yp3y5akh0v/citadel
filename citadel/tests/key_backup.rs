@@ -33,7 +33,8 @@ fn export_and_restore_roundtrip() {
     wtx.insert(b"key2", b"value2").unwrap();
     wtx.commit().unwrap();
 
-    db.export_key_backup(db_pass, backup_pass, &backup_path).unwrap();
+    db.export_key_backup(db_pass, backup_pass, &backup_path)
+        .unwrap();
     drop(db);
 
     let key_path = dir.path().join("test.citadel.citadel-keys");
@@ -45,7 +46,8 @@ fn export_and_restore_roundtrip() {
         backup_pass,
         new_pass,
         &dir.path().join("test.citadel"),
-    ).unwrap();
+    )
+    .unwrap();
 
     let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
         .passphrase(new_pass)
@@ -73,7 +75,8 @@ fn restore_wrong_backup_passphrase() {
     let db = create_test_db(dir.path(), b"db-pass");
     let backup_path = dir.path().join("backup.bin");
 
-    db.export_key_backup(b"db-pass", b"correct-backup", &backup_path).unwrap();
+    db.export_key_backup(b"db-pass", b"correct-backup", &backup_path)
+        .unwrap();
     drop(db);
 
     let result = Database::restore_key_from_backup(
@@ -91,7 +94,8 @@ fn backup_file_tamper_detected() {
     let db = create_test_db(dir.path(), b"db-pass");
     let backup_path = dir.path().join("backup.bin");
 
-    db.export_key_backup(b"db-pass", b"backup-pass", &backup_path).unwrap();
+    db.export_key_backup(b"db-pass", b"backup-pass", &backup_path)
+        .unwrap();
     drop(db);
 
     let mut data = std::fs::read(&backup_path).unwrap();
@@ -120,7 +124,8 @@ fn backup_different_passphrase_from_db() {
     wtx.insert(b"secret", b"data").unwrap();
     wtx.commit().unwrap();
 
-    db.export_key_backup(db_pass, backup_pass, &backup_path).unwrap();
+    db.export_key_backup(db_pass, backup_pass, &backup_path)
+        .unwrap();
     drop(db);
 
     let key_path = dir.path().join("test.citadel.citadel-keys");
@@ -131,7 +136,8 @@ fn backup_different_passphrase_from_db() {
         backup_pass,
         b"yet-another-pass",
         &dir.path().join("test.citadel"),
-    ).unwrap();
+    )
+    .unwrap();
 
     let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
         .passphrase(b"yet-another-pass")
@@ -149,7 +155,8 @@ fn restore_with_new_passphrase_old_fails() {
     let backup_path = dir.path().join("backup.bin");
 
     let db = create_test_db(dir.path(), db_pass);
-    db.export_key_backup(db_pass, b"backup", &backup_path).unwrap();
+    db.export_key_backup(db_pass, b"backup", &backup_path)
+        .unwrap();
     drop(db);
 
     let key_path = dir.path().join("test.citadel.citadel-keys");
@@ -161,7 +168,8 @@ fn restore_with_new_passphrase_old_fails() {
         b"backup",
         new_pass,
         &dir.path().join("test.citadel"),
-    ).unwrap();
+    )
+    .unwrap();
 
     let result = DatabaseBuilder::new(dir.path().join("test.citadel"))
         .passphrase(db_pass)
@@ -182,7 +190,8 @@ fn backup_preserves_file_id() {
     let backup_path = dir.path().join("backup.bin");
 
     let db = create_test_db(dir.path(), db_pass);
-    db.export_key_backup(db_pass, b"backup", &backup_path).unwrap();
+    db.export_key_backup(db_pass, b"backup", &backup_path)
+        .unwrap();
     drop(db);
 
     let key_path = dir.path().join("test.citadel.citadel-keys");
@@ -193,7 +202,8 @@ fn backup_preserves_file_id() {
         b"backup",
         b"new-pass",
         &dir.path().join("test.citadel"),
-    ).unwrap();
+    )
+    .unwrap();
 
     let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
         .passphrase(b"new-pass")
@@ -220,7 +230,8 @@ fn backup_pbkdf2_database() {
     wtx.insert(b"key", b"val").unwrap();
     wtx.commit().unwrap();
 
-    db.export_key_backup(db_pass, b"backup", &backup_path).unwrap();
+    db.export_key_backup(db_pass, b"backup", &backup_path)
+        .unwrap();
     drop(db);
 
     let key_path = dir.path().join("test.citadel.citadel-keys");
@@ -231,7 +242,8 @@ fn backup_pbkdf2_database() {
         b"backup",
         b"new-pass",
         &dir.path().join("test.citadel"),
-    ).unwrap();
+    )
+    .unwrap();
 
     let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
         .passphrase(b"new-pass")
@@ -255,7 +267,8 @@ fn backup_argon2_database() {
     wtx.insert(b"key", b"val").unwrap();
     wtx.commit().unwrap();
 
-    db.export_key_backup(db_pass, b"backup", &backup_path).unwrap();
+    db.export_key_backup(db_pass, b"backup", &backup_path)
+        .unwrap();
     drop(db);
 
     let key_path = dir.path().join("test.citadel.citadel-keys");
@@ -266,7 +279,8 @@ fn backup_argon2_database() {
         b"backup",
         b"new-pass",
         &dir.path().join("test.citadel"),
-    ).unwrap();
+    )
+    .unwrap();
 
     let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
         .passphrase(b"new-pass")
@@ -290,8 +304,10 @@ fn multiple_backups_same_db() {
     wtx.insert(b"key", b"value").unwrap();
     wtx.commit().unwrap();
 
-    db.export_key_backup(db_pass, b"backup-pass-1", &backup1_path).unwrap();
-    db.export_key_backup(db_pass, b"backup-pass-2", &backup2_path).unwrap();
+    db.export_key_backup(db_pass, b"backup-pass-1", &backup1_path)
+        .unwrap();
+    db.export_key_backup(db_pass, b"backup-pass-2", &backup2_path)
+        .unwrap();
     drop(db);
 
     let key_path = dir.path().join("test.citadel.citadel-keys");
@@ -302,7 +318,8 @@ fn multiple_backups_same_db() {
         b"backup-pass-1",
         b"restored-pass-1",
         &dir.path().join("test.citadel"),
-    ).unwrap();
+    )
+    .unwrap();
     let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
         .passphrase(b"restored-pass-1")
         .open()
@@ -318,7 +335,8 @@ fn multiple_backups_same_db() {
         b"backup-pass-2",
         b"restored-pass-2",
         &dir.path().join("test.citadel"),
-    ).unwrap();
+    )
+    .unwrap();
     let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
         .passphrase(b"restored-pass-2")
         .open()
@@ -342,7 +360,8 @@ fn backup_after_passphrase_change() {
 
     db.change_passphrase(old_pass, new_pass).unwrap();
 
-    db.export_key_backup(new_pass, b"backup-pass", &backup_path).unwrap();
+    db.export_key_backup(new_pass, b"backup-pass", &backup_path)
+        .unwrap();
     drop(db);
 
     let key_path = dir.path().join("test.citadel.citadel-keys");
@@ -353,7 +372,8 @@ fn backup_after_passphrase_change() {
         b"backup-pass",
         b"restored-pass",
         &dir.path().join("test.citadel"),
-    ).unwrap();
+    )
+    .unwrap();
 
     let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
         .passphrase(b"restored-pass")
@@ -370,7 +390,8 @@ fn backup_file_size_exact() {
     let db = create_test_db(dir.path(), b"pass");
     let backup_path = dir.path().join("backup.bin");
 
-    db.export_key_backup(b"pass", b"backup", &backup_path).unwrap();
+    db.export_key_backup(b"pass", b"backup", &backup_path)
+        .unwrap();
 
     let data = std::fs::read(&backup_path).unwrap();
     assert_eq!(data.len(), 124);
@@ -382,7 +403,8 @@ fn backup_binary_format_magic() {
     let db = create_test_db(dir.path(), b"pass");
     let backup_path = dir.path().join("backup.bin");
 
-    db.export_key_backup(b"pass", b"backup", &backup_path).unwrap();
+    db.export_key_backup(b"pass", b"backup", &backup_path)
+        .unwrap();
 
     let data = std::fs::read(&backup_path).unwrap();
     let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
@@ -395,7 +417,8 @@ fn backup_empty_db() {
     let db = create_test_db(dir.path(), b"pass");
     let backup_path = dir.path().join("backup.bin");
 
-    db.export_key_backup(b"pass", b"backup", &backup_path).unwrap();
+    db.export_key_backup(b"pass", b"backup", &backup_path)
+        .unwrap();
     drop(db);
 
     let key_path = dir.path().join("test.citadel.citadel-keys");
@@ -406,7 +429,8 @@ fn backup_empty_db() {
         b"backup",
         b"new-pass",
         &dir.path().join("test.citadel"),
-    ).unwrap();
+    )
+    .unwrap();
 
     let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
         .passphrase(b"new-pass")
@@ -424,11 +448,13 @@ fn backup_large_db() {
 
     let mut wtx = db.begin_write().unwrap();
     for i in 0..1000u32 {
-        wtx.insert(&i.to_be_bytes(), &format!("val-{i}").into_bytes()).unwrap();
+        wtx.insert(&i.to_be_bytes(), &format!("val-{i}").into_bytes())
+            .unwrap();
     }
     wtx.commit().unwrap();
 
-    db.export_key_backup(b"pass", b"backup", &backup_path).unwrap();
+    db.export_key_backup(b"pass", b"backup", &backup_path)
+        .unwrap();
     drop(db);
 
     let key_path = dir.path().join("test.citadel.citadel-keys");
@@ -439,7 +465,8 @@ fn backup_large_db() {
         b"backup",
         b"new-pass",
         &dir.path().join("test.citadel"),
-    ).unwrap();
+    )
+    .unwrap();
 
     let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
         .passphrase(b"new-pass")
@@ -463,7 +490,8 @@ fn restore_overwrite_existing_key_file() {
     wtx.insert(b"key", b"val").unwrap();
     wtx.commit().unwrap();
 
-    db.export_key_backup(b"pass", b"backup", &backup_path).unwrap();
+    db.export_key_backup(b"pass", b"backup", &backup_path)
+        .unwrap();
     drop(db);
 
     Database::restore_key_from_backup(
@@ -471,7 +499,8 @@ fn restore_overwrite_existing_key_file() {
         b"backup",
         b"new-pass",
         &dir.path().join("test.citadel"),
-    ).unwrap();
+    )
+    .unwrap();
 
     let result = DatabaseBuilder::new(dir.path().join("test.citadel"))
         .passphrase(b"pass")
@@ -530,7 +559,8 @@ fn backup_named_tables_roundtrip() {
     wtx.table_insert(b"logs", b"entry1", b"logged in").unwrap();
     wtx.commit().unwrap();
 
-    db.export_key_backup(db_pass, b"backup", &backup_path).unwrap();
+    db.export_key_backup(db_pass, b"backup", &backup_path)
+        .unwrap();
     drop(db);
 
     let key_path = dir.path().join("test.citadel.citadel-keys");
@@ -541,7 +571,8 @@ fn backup_named_tables_roundtrip() {
         b"backup",
         b"new-pass",
         &dir.path().join("test.citadel"),
-    ).unwrap();
+    )
+    .unwrap();
 
     let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
         .passphrase(b"new-pass")
@@ -549,6 +580,12 @@ fn backup_named_tables_roundtrip() {
         .unwrap();
 
     let mut rtx = db.begin_read();
-    assert_eq!(rtx.table_get(b"users", b"alice").unwrap(), Some(b"admin".to_vec()));
-    assert_eq!(rtx.table_get(b"logs", b"entry1").unwrap(), Some(b"logged in".to_vec()));
+    assert_eq!(
+        rtx.table_get(b"users", b"alice").unwrap(),
+        Some(b"admin".to_vec())
+    );
+    assert_eq!(
+        rtx.table_get(b"logs", b"entry1").unwrap(),
+        Some(b"logged in".to_vec())
+    );
 }

@@ -5,12 +5,12 @@
 //! On commit, executes the 6-step god byte commit protocol.
 //! On Drop without commit, automatically aborts.
 
-use std::collections::HashMap;
 use citadel_core::types::{PageId, PageType, TxnId, ValueType};
-use citadel_core::{Error, Result, MAX_KEY_SIZE, MAX_INLINE_VALUE_SIZE};
+use citadel_core::{Error, Result, MAX_INLINE_VALUE_SIZE, MAX_KEY_SIZE};
 use citadel_io::file_manager::CommitSlot;
-use citadel_page::page::Page;
 use citadel_page::branch_node;
+use citadel_page::page::Page;
+use std::collections::HashMap;
 
 use citadel_buffer::allocator::PageAllocator;
 use citadel_buffer::btree::BTree;
@@ -86,15 +86,20 @@ impl<'a> WriteTxn<'a> {
         Self::validate_key_value(key, value)?;
         self.preload_path(self.tree.root, key)?;
         self.tree.insert(
-            &mut self.pages, &mut self.alloc, self.txn_id,
-            key, ValueType::Inline, value,
+            &mut self.pages,
+            &mut self.alloc,
+            self.txn_id,
+            key,
+            ValueType::Inline,
+            value,
         )
     }
 
     /// Delete a key from the default table. Returns true if the key existed.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         self.preload_path(self.tree.root, key)?;
-        self.tree.delete(&mut self.pages, &mut self.alloc, self.txn_id, key)
+        self.tree
+            .delete(&mut self.pages, &mut self.alloc, self.txn_id, key)
     }
 
     /// Iterate all key-value pairs in the default table in sorted order.
@@ -151,10 +156,8 @@ impl<'a> WriteTxn<'a> {
         };
         while cursor.is_valid() {
             if let Some(entry) = cursor.current(&self.pages) {
-                if entry.val_type != ValueType::Tombstone {
-                    if !f(&entry.key, &entry.value)? {
-                        break;
-                    }
+                if entry.val_type != ValueType::Tombstone && !f(&entry.key, &entry.value)? {
+                    break;
                 }
             }
             cursor.next(&self.pages)?;
@@ -210,7 +213,10 @@ impl<'a> WriteTxn<'a> {
         let catalog_root = self.catalog.as_ref().unwrap().root;
         self.preload_path(catalog_root, name)?;
         self.catalog.as_mut().unwrap().delete(
-            &mut self.pages, &mut self.alloc, self.txn_id, name,
+            &mut self.pages,
+            &mut self.alloc,
+            self.txn_id,
+            name,
         )?;
         self.catalog_dirty = true;
         Ok(())
@@ -226,8 +232,12 @@ impl<'a> WriteTxn<'a> {
 
         let tree = self.named_trees.get_mut(table).unwrap();
         tree.insert(
-            &mut self.pages, &mut self.alloc, self.txn_id,
-            key, ValueType::Inline, value,
+            &mut self.pages,
+            &mut self.alloc,
+            self.txn_id,
+            key,
+            ValueType::Inline,
+            value,
         )
     }
 
@@ -280,10 +290,16 @@ impl<'a> WriteTxn<'a> {
 
     fn validate_key_value(key: &[u8], value: &[u8]) -> Result<()> {
         if key.len() > MAX_KEY_SIZE {
-            return Err(Error::KeyTooLarge { size: key.len(), max: MAX_KEY_SIZE });
+            return Err(Error::KeyTooLarge {
+                size: key.len(),
+                max: MAX_KEY_SIZE,
+            });
         }
         if value.len() > MAX_INLINE_VALUE_SIZE {
-            return Err(Error::ValueTooLarge { size: value.len(), max: MAX_INLINE_VALUE_SIZE });
+            return Err(Error::ValueTooLarge {
+                size: value.len(),
+                max: MAX_INLINE_VALUE_SIZE,
+            });
         }
         Ok(())
     }
@@ -308,7 +324,9 @@ impl<'a> WriteTxn<'a> {
             self.preload_path(self.old_slot.catalog_root, &[])?;
             let slot = self.catalog_slot_from_disk()?;
             self.catalog = Some(BTree::from_existing(
-                slot.root_page, slot.depth, slot.entry_count,
+                slot.root_page,
+                slot.depth,
+                slot.entry_count,
             ));
         } else {
             // Create a new empty catalog
@@ -552,8 +570,8 @@ mod tests {
         let mgr = create_test_manager();
 
         let mut wtx = mgr.begin_write().unwrap();
-        assert!(wtx.insert(b"key", b"v1").unwrap());   // new
-        assert!(!wtx.insert(b"key", b"v2").unwrap());  // update
+        assert!(wtx.insert(b"key", b"v1").unwrap()); // new
+        assert!(!wtx.insert(b"key", b"v2").unwrap()); // update
         assert_eq!(wtx.get(b"key").unwrap(), Some(b"v2".to_vec()));
         wtx.commit().unwrap();
 
@@ -764,7 +782,8 @@ mod tests {
         wtx.table_for_each(b"data", |k, v| {
             pairs.push((k.to_vec(), v.to_vec()));
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
 
         assert_eq!(pairs.len(), 3);
         assert_eq!(pairs[0], (b"a".to_vec(), b"1".to_vec()));
@@ -773,6 +792,6 @@ mod tests {
         wtx.commit().unwrap();
     }
 
-    use citadel_core::MAX_KEY_SIZE;
     use citadel_core::MAX_INLINE_VALUE_SIZE;
+    use citadel_core::MAX_KEY_SIZE;
 }

@@ -18,14 +18,19 @@ fn query_result(result: ExecutionResult) -> QueryResult {
 }
 
 fn setup_schema(conn: &mut Connection<'_>) {
-    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)").unwrap();
-    conn.execute("CREATE INDEX idx_name ON users (name)").unwrap();
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_name ON users (name)")
+        .unwrap();
 }
 
 fn insert_users(conn: &mut Connection<'_>) {
-    conn.execute("INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)").unwrap();
-    conn.execute("INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)").unwrap();
-    conn.execute("INSERT INTO users (id, name, age) VALUES (3, 'Carol', 35)").unwrap();
+    conn.execute("INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
+        .unwrap();
+    conn.execute("INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)")
+        .unwrap();
+    conn.execute("INSERT INTO users (id, name, age) VALUES (3, 'Carol', 35)")
+        .unwrap();
 }
 
 // ── Basic parameter parsing ─────────────────────────────────────────
@@ -38,10 +43,10 @@ fn select_with_pk_param() {
     setup_schema(&mut conn);
     insert_users(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT name FROM users WHERE id = $1",
-        &[Value::Integer(2)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params("SELECT name FROM users WHERE id = $1", &[Value::Integer(2)])
+            .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Text("Bob".into()));
 }
@@ -54,10 +59,13 @@ fn select_with_multiple_params() {
     setup_schema(&mut conn);
     insert_users(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT * FROM users WHERE age > $1 AND age < $2",
-        &[Value::Integer(26), Value::Integer(34)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT * FROM users WHERE age > $1 AND age < $2",
+            &[Value::Integer(26), Value::Integer(34)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][1], Value::Text("Alice".into()));
 }
@@ -71,10 +79,18 @@ fn insert_with_params() {
 
     conn.execute_params(
         "INSERT INTO users (id, name, age) VALUES ($1, $2, $3)",
-        &[Value::Integer(10), Value::Text("Dave".into()), Value::Integer(40)],
-    ).unwrap();
+        &[
+            Value::Integer(10),
+            Value::Text("Dave".into()),
+            Value::Integer(40),
+        ],
+    )
+    .unwrap();
 
-    let qr = query_result(conn.execute("SELECT name FROM users WHERE id = 10").unwrap());
+    let qr = query_result(
+        conn.execute("SELECT name FROM users WHERE id = 10")
+            .unwrap(),
+    );
     assert_eq!(qr.rows[0][0], Value::Text("Dave".into()));
 }
 
@@ -89,7 +105,8 @@ fn update_with_params() {
     conn.execute_params(
         "UPDATE users SET name = $2 WHERE id = $1",
         &[Value::Integer(1), Value::Text("Alicia".into())],
-    ).unwrap();
+    )
+    .unwrap();
 
     let qr = query_result(conn.execute("SELECT name FROM users WHERE id = 1").unwrap());
     assert_eq!(qr.rows[0][0], Value::Text("Alicia".into()));
@@ -103,10 +120,8 @@ fn delete_with_params() {
     setup_schema(&mut conn);
     insert_users(&mut conn);
 
-    conn.execute_params(
-        "DELETE FROM users WHERE id = $1",
-        &[Value::Integer(2)],
-    ).unwrap();
+    conn.execute_params("DELETE FROM users WHERE id = $1", &[Value::Integer(2)])
+        .unwrap();
 
     let qr = query_result(conn.execute("SELECT COUNT(*) FROM users").unwrap());
     assert_eq!(qr.rows[0][0], Value::Integer(2));
@@ -152,10 +167,7 @@ fn no_params_with_execute_params() {
     setup_schema(&mut conn);
     insert_users(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT * FROM users",
-        &[],
-    ).unwrap());
+    let qr = query_result(conn.execute_params("SELECT * FROM users", &[]).unwrap());
     assert_eq!(qr.rows.len(), 3);
 }
 
@@ -204,14 +216,18 @@ fn schema_invalidation_on_drop_table() {
     setup_schema(&mut conn);
     insert_users(&mut conn);
 
-    conn.execute_params("SELECT * FROM users WHERE id = $1", &[Value::Integer(1)]).unwrap();
+    conn.execute_params("SELECT * FROM users WHERE id = $1", &[Value::Integer(1)])
+        .unwrap();
 
     conn.execute("DROP TABLE users").unwrap();
-    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)").unwrap();
-    conn.execute("INSERT INTO users (id, name, age) VALUES (1, 'NewAlice', 99)").unwrap();
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO users (id, name, age) VALUES (1, 'NewAlice', 99)")
+        .unwrap();
 
     let qr = query_result(
-        conn.execute_params("SELECT name FROM users WHERE id = $1", &[Value::Integer(1)]).unwrap()
+        conn.execute_params("SELECT name FROM users WHERE id = $1", &[Value::Integer(1)])
+            .unwrap(),
     );
     assert_eq!(qr.rows[0][0], Value::Text("NewAlice".into()));
 }
@@ -228,7 +244,8 @@ fn null_parameter() {
     conn.execute_params(
         "INSERT INTO users (id, name, age) VALUES ($1, $2, $3)",
         &[Value::Integer(1), Value::Text("Eve".into()), Value::Null],
-    ).unwrap();
+    )
+    .unwrap();
 
     let qr = query_result(conn.execute("SELECT age FROM users WHERE id = 1").unwrap());
     assert_eq!(qr.rows[0][0], Value::Null);
@@ -242,10 +259,13 @@ fn param_in_between() {
     setup_schema(&mut conn);
     insert_users(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT name FROM users WHERE age BETWEEN $1 AND $2",
-        &[Value::Integer(26), Value::Integer(34)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT name FROM users WHERE age BETWEEN $1 AND $2",
+            &[Value::Integer(26), Value::Integer(34)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Text("Alice".into()));
 }
@@ -258,10 +278,13 @@ fn param_in_like() {
     setup_schema(&mut conn);
     insert_users(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT name FROM users WHERE name LIKE $1",
-        &[Value::Text("A%".into())],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT name FROM users WHERE name LIKE $1",
+            &[Value::Text("A%".into())],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Text("Alice".into()));
 }
@@ -274,10 +297,13 @@ fn param_in_in_list() {
     setup_schema(&mut conn);
     insert_users(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT name FROM users WHERE id IN ($1, $2) ORDER BY id",
-        &[Value::Integer(1), Value::Integer(3)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT name FROM users WHERE id IN ($1, $2) ORDER BY id",
+            &[Value::Integer(1), Value::Integer(3)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Text("Alice".into()));
     assert_eq!(qr.rows[1][0], Value::Text("Carol".into()));
@@ -293,8 +319,13 @@ fn param_in_transaction() {
     conn.execute("BEGIN").unwrap();
     conn.execute_params(
         "INSERT INTO users (id, name, age) VALUES ($1, $2, $3)",
-        &[Value::Integer(1), Value::Text("TxnUser".into()), Value::Integer(20)],
-    ).unwrap();
+        &[
+            Value::Integer(1),
+            Value::Text("TxnUser".into()),
+            Value::Integer(20),
+        ],
+    )
+    .unwrap();
     conn.execute("COMMIT").unwrap();
 
     let qr = query_result(conn.execute("SELECT name FROM users WHERE id = 1").unwrap());
@@ -308,12 +339,20 @@ fn explain_with_param() {
     let mut conn = Connection::open(&db).unwrap();
     setup_schema(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "EXPLAIN SELECT * FROM users WHERE id = $1",
-        &[Value::Integer(5)],
-    ).unwrap());
-    let plan: Vec<String> = qr.rows.iter()
-        .map(|r| match &r[0] { Value::Text(s) => s.clone(), _ => panic!() })
+    let qr = query_result(
+        conn.execute_params(
+            "EXPLAIN SELECT * FROM users WHERE id = $1",
+            &[Value::Integer(5)],
+        )
+        .unwrap(),
+    );
+    let plan: Vec<String> = qr
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.clone(),
+            _ => panic!(),
+        })
         .collect();
     assert!(plan[0].contains("SEARCH TABLE users"));
     assert!(plan[0].contains("USING PRIMARY KEY"));
@@ -327,10 +366,9 @@ fn query_params_convenience() {
     setup_schema(&mut conn);
     insert_users(&mut conn);
 
-    let qr = conn.query_params(
-        "SELECT name FROM users WHERE id = $1",
-        &[Value::Integer(2)],
-    ).unwrap();
+    let qr = conn
+        .query_params("SELECT name FROM users WHERE id = $1", &[Value::Integer(2)])
+        .unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("Bob".into()));
 }
 
@@ -342,10 +380,13 @@ fn param_in_order_by_expression() {
     setup_schema(&mut conn);
     insert_users(&mut conn);
 
-    let qr = query_result(conn.execute_params(
-        "SELECT name FROM users ORDER BY name LIMIT $1",
-        &[Value::Integer(2)],
-    ).unwrap());
+    let qr = query_result(
+        conn.execute_params(
+            "SELECT name FROM users ORDER BY name LIMIT $1",
+            &[Value::Integer(2)],
+        )
+        .unwrap(),
+    );
     assert_eq!(qr.rows.len(), 2);
 }
 
@@ -368,8 +409,10 @@ fn param_in_join_on_clause() {
     let mut conn = Connection::open(&db).unwrap();
     setup_schema(&mut conn);
     insert_users(&mut conn);
-    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL)").unwrap();
-    conn.execute("INSERT INTO orders (id, user_id, amount) VALUES (1, 1, 99.0)").unwrap();
+    conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL)")
+        .unwrap();
+    conn.execute("INSERT INTO orders (id, user_id, amount) VALUES (1, 1, 99.0)")
+        .unwrap();
 
     let qr = query_result(conn.execute_params(
         "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > $1",

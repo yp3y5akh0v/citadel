@@ -48,35 +48,21 @@ pub enum SyncMessage {
         in_sync: bool,
     },
     /// Request page digests from the remote tree.
-    DigestRequest {
-        page_ids: Vec<PageId>,
-    },
+    DigestRequest { page_ids: Vec<PageId> },
     /// Response with page digests.
-    DigestResponse {
-        digests: Vec<PageDigest>,
-    },
+    DigestResponse { digests: Vec<PageDigest> },
     /// Request leaf entries from remote pages.
-    EntriesRequest {
-        page_ids: Vec<PageId>,
-    },
+    EntriesRequest { page_ids: Vec<PageId> },
     /// Response with leaf entries.
-    EntriesResponse {
-        entries: Vec<DiffEntry>,
-    },
+    EntriesResponse { entries: Vec<DiffEntry> },
     /// Serialized SyncPatch data.
-    PatchData {
-        data: Vec<u8>,
-    },
+    PatchData { data: Vec<u8> },
     /// Acknowledgment after applying a patch.
-    PatchAck {
-        result: ApplyResult,
-    },
+    PatchAck { result: ApplyResult },
     /// Session complete.
     Done,
     /// Error during sync.
-    Error {
-        message: String,
-    },
+    Error { message: String },
     /// Request updated root info for pull phase after push.
     PullRequest,
     /// Response with updated root info for pull phase.
@@ -87,9 +73,7 @@ pub enum SyncMessage {
     /// Request list of named tables from the remote peer.
     TableListRequest,
     /// Response with the list of named tables.
-    TableListResponse {
-        tables: Vec<TableInfo>,
-    },
+    TableListResponse { tables: Vec<TableInfo> },
     /// Begin syncing a specific named table.
     TableSyncBegin {
         table_name: Vec<u8>,
@@ -97,16 +81,18 @@ pub enum SyncMessage {
         root_hash: MerkleHash,
     },
     /// End syncing a specific named table.
-    TableSyncEnd {
-        table_name: Vec<u8>,
-    },
+    TableSyncEnd { table_name: Vec<u8> },
 }
 
 /// Errors from sync message serialization/deserialization.
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
     #[error("{context}: expected at least {expected} bytes, got {actual}")]
-    Truncated { context: String, expected: usize, actual: usize },
+    Truncated {
+        context: String,
+        expected: usize,
+        actual: usize,
+    },
 
     #[error("unknown message type: {0}")]
     UnknownMessageType(u8),
@@ -116,14 +102,23 @@ impl SyncMessage {
     /// Serialize to wire format: `[msg_type: u8][payload_len: u32 LE][payload]`.
     pub fn serialize(&self) -> Vec<u8> {
         let (msg_type, payload) = match self {
-            SyncMessage::Hello { node_id, root_page, root_hash } => {
+            SyncMessage::Hello {
+                node_id,
+                root_page,
+                root_hash,
+            } => {
                 let mut p = Vec::with_capacity(40);
                 p.extend_from_slice(&node_id.to_bytes());
                 p.extend_from_slice(&root_page.0.to_le_bytes());
                 p.extend_from_slice(root_hash);
                 (MSG_HELLO, p)
             }
-            SyncMessage::HelloAck { node_id, root_page, root_hash, in_sync } => {
+            SyncMessage::HelloAck {
+                node_id,
+                root_page,
+                root_hash,
+                in_sync,
+            } => {
                 let mut p = Vec::with_capacity(41);
                 p.extend_from_slice(&node_id.to_bytes());
                 p.extend_from_slice(&root_page.0.to_le_bytes());
@@ -163,9 +158,7 @@ impl SyncMessage {
                 }
                 (MSG_ENTRIES_RESPONSE, p)
             }
-            SyncMessage::PatchData { data } => {
-                (MSG_PATCH_DATA, data.clone())
-            }
+            SyncMessage::PatchData { data } => (MSG_PATCH_DATA, data.clone()),
             SyncMessage::PatchAck { result } => {
                 let mut p = Vec::with_capacity(24);
                 p.extend_from_slice(&result.entries_applied.to_le_bytes());
@@ -173,9 +166,7 @@ impl SyncMessage {
                 p.extend_from_slice(&result.entries_equal.to_le_bytes());
                 (MSG_PATCH_ACK, p)
             }
-            SyncMessage::Done => {
-                (MSG_DONE, Vec::new())
-            }
+            SyncMessage::Done => (MSG_DONE, Vec::new()),
             SyncMessage::Error { message } => {
                 let bytes = message.as_bytes();
                 let mut p = Vec::with_capacity(4 + bytes.len());
@@ -183,18 +174,17 @@ impl SyncMessage {
                 p.extend_from_slice(bytes);
                 (MSG_ERROR, p)
             }
-            SyncMessage::PullRequest => {
-                (MSG_PULL_REQUEST, Vec::new())
-            }
-            SyncMessage::PullResponse { root_page, root_hash } => {
+            SyncMessage::PullRequest => (MSG_PULL_REQUEST, Vec::new()),
+            SyncMessage::PullResponse {
+                root_page,
+                root_hash,
+            } => {
                 let mut p = Vec::with_capacity(32);
                 p.extend_from_slice(&root_page.0.to_le_bytes());
                 p.extend_from_slice(root_hash);
                 (MSG_PULL_RESPONSE, p)
             }
-            SyncMessage::TableListRequest => {
-                (MSG_TABLE_LIST_REQUEST, Vec::new())
-            }
+            SyncMessage::TableListRequest => (MSG_TABLE_LIST_REQUEST, Vec::new()),
             SyncMessage::TableListResponse { tables } => {
                 let mut p = Vec::new();
                 p.extend_from_slice(&(tables.len() as u32).to_le_bytes());
@@ -206,7 +196,11 @@ impl SyncMessage {
                 }
                 (MSG_TABLE_LIST_RESPONSE, p)
             }
-            SyncMessage::TableSyncBegin { table_name, root_page, root_hash } => {
+            SyncMessage::TableSyncBegin {
+                table_name,
+                root_page,
+                root_hash,
+            } => {
                 let mut p = Vec::with_capacity(2 + table_name.len() + 4 + MERKLE_HASH_SIZE);
                 p.extend_from_slice(&(table_name.len() as u16).to_le_bytes());
                 p.extend_from_slice(table_name);
@@ -259,7 +253,11 @@ impl SyncMessage {
                 let root_page = PageId(u32::from_le_bytes(payload[8..12].try_into().unwrap()));
                 let mut root_hash = [0u8; MERKLE_HASH_SIZE];
                 root_hash.copy_from_slice(&payload[12..40]);
-                Ok(SyncMessage::Hello { node_id, root_page, root_hash })
+                Ok(SyncMessage::Hello {
+                    node_id,
+                    root_page,
+                    root_hash,
+                })
             }
             MSG_HELLO_ACK => {
                 ensure_len(payload, 41, "HelloAck")?;
@@ -268,7 +266,12 @@ impl SyncMessage {
                 let mut root_hash = [0u8; MERKLE_HASH_SIZE];
                 root_hash.copy_from_slice(&payload[12..40]);
                 let in_sync = payload[40] != 0;
-                Ok(SyncMessage::HelloAck { node_id, root_page, root_hash, in_sync })
+                Ok(SyncMessage::HelloAck {
+                    node_id,
+                    root_page,
+                    root_hash,
+                    in_sync,
+                })
             }
             MSG_DIGEST_REQUEST => {
                 ensure_len(payload, 4, "DigestRequest")?;
@@ -277,7 +280,9 @@ impl SyncMessage {
                 let page_ids = (0..count)
                     .map(|i| {
                         let off = 4 + i * 4;
-                        PageId(u32::from_le_bytes(payload[off..off + 4].try_into().unwrap()))
+                        PageId(u32::from_le_bytes(
+                            payload[off..off + 4].try_into().unwrap(),
+                        ))
                     })
                     .collect();
                 Ok(SyncMessage::DigestRequest { page_ids })
@@ -301,7 +306,9 @@ impl SyncMessage {
                 let page_ids = (0..count)
                     .map(|i| {
                         let off = 4 + i * 4;
-                        PageId(u32::from_le_bytes(payload[off..off + 4].try_into().unwrap()))
+                        PageId(u32::from_le_bytes(
+                            payload[off..off + 4].try_into().unwrap(),
+                        ))
                     })
                     .collect();
                 Ok(SyncMessage::EntriesRequest { page_ids })
@@ -318,21 +325,23 @@ impl SyncMessage {
                 }
                 Ok(SyncMessage::EntriesResponse { entries })
             }
-            MSG_PATCH_DATA => {
-                Ok(SyncMessage::PatchData { data: payload.to_vec() })
-            }
+            MSG_PATCH_DATA => Ok(SyncMessage::PatchData {
+                data: payload.to_vec(),
+            }),
             MSG_PATCH_ACK => {
                 ensure_len(payload, 24, "PatchAck")?;
                 let entries_applied = u64::from_le_bytes(payload[0..8].try_into().unwrap());
                 let entries_skipped = u64::from_le_bytes(payload[8..16].try_into().unwrap());
                 let entries_equal = u64::from_le_bytes(payload[16..24].try_into().unwrap());
                 Ok(SyncMessage::PatchAck {
-                    result: ApplyResult { entries_applied, entries_skipped, entries_equal },
+                    result: ApplyResult {
+                        entries_applied,
+                        entries_skipped,
+                        entries_equal,
+                    },
                 })
             }
-            MSG_DONE => {
-                Ok(SyncMessage::Done)
-            }
+            MSG_DONE => Ok(SyncMessage::Done),
             MSG_ERROR => {
                 ensure_len(payload, 4, "Error")?;
                 let msg_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
@@ -340,19 +349,18 @@ impl SyncMessage {
                 let message = String::from_utf8_lossy(&payload[4..4 + msg_len]).into_owned();
                 Ok(SyncMessage::Error { message })
             }
-            MSG_PULL_REQUEST => {
-                Ok(SyncMessage::PullRequest)
-            }
+            MSG_PULL_REQUEST => Ok(SyncMessage::PullRequest),
             MSG_PULL_RESPONSE => {
                 ensure_len(payload, 32, "PullResponse")?;
                 let root_page = PageId(u32::from_le_bytes(payload[0..4].try_into().unwrap()));
                 let mut root_hash = [0u8; MERKLE_HASH_SIZE];
                 root_hash.copy_from_slice(&payload[4..32]);
-                Ok(SyncMessage::PullResponse { root_page, root_hash })
+                Ok(SyncMessage::PullResponse {
+                    root_page,
+                    root_hash,
+                })
             }
-            MSG_TABLE_LIST_REQUEST => {
-                Ok(SyncMessage::TableListRequest)
-            }
+            MSG_TABLE_LIST_REQUEST => Ok(SyncMessage::TableListRequest),
             MSG_TABLE_LIST_RESPONSE => {
                 ensure_len(payload, 4, "TableListResponse")?;
                 let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
@@ -360,9 +368,8 @@ impl SyncMessage {
                 let mut tables = Vec::with_capacity(count);
                 for _ in 0..count {
                     ensure_len(payload, pos + 2, "TableInfo name_len")?;
-                    let name_len = u16::from_le_bytes(
-                        payload[pos..pos + 2].try_into().unwrap(),
-                    ) as usize;
+                    let name_len =
+                        u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
                     pos += 2;
                     ensure_len(payload, pos + name_len + 4 + MERKLE_HASH_SIZE, "TableInfo")?;
                     let name = payload[pos..pos + name_len].to_vec();
@@ -374,14 +381,22 @@ impl SyncMessage {
                     let mut root_hash = [0u8; MERKLE_HASH_SIZE];
                     root_hash.copy_from_slice(&payload[pos..pos + MERKLE_HASH_SIZE]);
                     pos += MERKLE_HASH_SIZE;
-                    tables.push(TableInfo { name, root_page, root_hash });
+                    tables.push(TableInfo {
+                        name,
+                        root_page,
+                        root_hash,
+                    });
                 }
                 Ok(SyncMessage::TableListResponse { tables })
             }
             MSG_TABLE_SYNC_BEGIN => {
                 ensure_len(payload, 2, "TableSyncBegin")?;
                 let name_len = u16::from_le_bytes(payload[0..2].try_into().unwrap()) as usize;
-                ensure_len(payload, 2 + name_len + 4 + MERKLE_HASH_SIZE, "TableSyncBegin")?;
+                ensure_len(
+                    payload,
+                    2 + name_len + 4 + MERKLE_HASH_SIZE,
+                    "TableSyncBegin",
+                )?;
                 let table_name = payload[2..2 + name_len].to_vec();
                 let off = 2 + name_len;
                 let root_page = PageId(u32::from_le_bytes(
@@ -389,7 +404,11 @@ impl SyncMessage {
                 ));
                 let mut root_hash = [0u8; MERKLE_HASH_SIZE];
                 root_hash.copy_from_slice(&payload[off + 4..off + 4 + MERKLE_HASH_SIZE]);
-                Ok(SyncMessage::TableSyncBegin { table_name, root_page, root_hash })
+                Ok(SyncMessage::TableSyncBegin {
+                    table_name,
+                    root_page,
+                    root_hash,
+                })
             }
             MSG_TABLE_SYNC_END => {
                 ensure_len(payload, 2, "TableSyncEnd")?;
@@ -425,7 +444,10 @@ fn serialize_page_digest(buf: &mut Vec<u8>, d: &PageDigest) {
     }
 }
 
-fn deserialize_page_digest(data: &[u8], offset: usize) -> Result<(PageDigest, usize), ProtocolError> {
+fn deserialize_page_digest(
+    data: &[u8],
+    offset: usize,
+) -> Result<(PageDigest, usize), ProtocolError> {
     // page_id(4) + page_type(2) + merkle_hash(28) + child_count(4) = 38
     let min = 38;
     if data.len() < offset + min {
@@ -436,13 +458,16 @@ fn deserialize_page_digest(data: &[u8], offset: usize) -> Result<(PageDigest, us
         });
     }
 
-    let page_id = PageId(u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()));
+    let page_id = PageId(u32::from_le_bytes(
+        data[offset..offset + 4].try_into().unwrap(),
+    ));
     let page_type_raw = u16::from_le_bytes(data[offset + 4..offset + 6].try_into().unwrap());
     let page_type = citadel_core::types::PageType::from_u16(page_type_raw)
         .unwrap_or(citadel_core::types::PageType::Leaf);
     let mut merkle_hash = [0u8; MERKLE_HASH_SIZE];
     merkle_hash.copy_from_slice(&data[offset + 6..offset + 34]);
-    let child_count = u32::from_le_bytes(data[offset + 34..offset + 38].try_into().unwrap()) as usize;
+    let child_count =
+        u32::from_le_bytes(data[offset + 34..offset + 38].try_into().unwrap()) as usize;
 
     if data.len() < offset + min + child_count * 4 {
         return Err(ProtocolError::Truncated {
@@ -460,7 +485,12 @@ fn deserialize_page_digest(data: &[u8], offset: usize) -> Result<(PageDigest, us
         .collect();
 
     Ok((
-        PageDigest { page_id, page_type, merkle_hash, children },
+        PageDigest {
+            page_id,
+            page_type,
+            merkle_hash,
+            children,
+        },
         min + child_count * 4,
     ))
 }
@@ -500,7 +530,14 @@ fn deserialize_diff_entry(data: &[u8], offset: usize) -> Result<(DiffEntry, usiz
     let key = data[offset + 7..offset + 7 + key_len].to_vec();
     let value = data[offset + 7 + key_len..offset + 7 + key_len + val_len].to_vec();
 
-    Ok((DiffEntry { key, value, val_type }, total))
+    Ok((
+        DiffEntry {
+            key,
+            value,
+            val_type,
+        },
+        total,
+    ))
 }
 
 #[cfg(test)]
@@ -510,8 +547,8 @@ mod tests {
 
     fn sample_hash() -> MerkleHash {
         let mut h = [0u8; MERKLE_HASH_SIZE];
-        for i in 0..MERKLE_HASH_SIZE {
-            h[i] = i as u8;
+        for (i, byte) in h.iter_mut().enumerate() {
+            *byte = i as u8;
         }
         h
     }
@@ -526,7 +563,11 @@ mod tests {
         let data = msg.serialize();
         let decoded = SyncMessage::deserialize(&data).unwrap();
         match decoded {
-            SyncMessage::Hello { node_id, root_page, root_hash } => {
+            SyncMessage::Hello {
+                node_id,
+                root_page,
+                root_hash,
+            } => {
                 assert_eq!(node_id, NodeId::from_u64(42));
                 assert_eq!(root_page, PageId(7));
                 assert_eq!(root_hash, sample_hash());
@@ -546,7 +587,12 @@ mod tests {
         let data = msg.serialize();
         let decoded = SyncMessage::deserialize(&data).unwrap();
         match decoded {
-            SyncMessage::HelloAck { node_id, root_page, root_hash, in_sync } => {
+            SyncMessage::HelloAck {
+                node_id,
+                root_page,
+                root_hash,
+                in_sync,
+            } => {
                 assert_eq!(node_id, NodeId::from_u64(99));
                 assert_eq!(root_page, PageId(3));
                 assert_eq!(root_hash, sample_hash());
@@ -621,8 +667,16 @@ mod tests {
     fn entries_response_roundtrip() {
         let msg = SyncMessage::EntriesResponse {
             entries: vec![
-                DiffEntry { key: b"k1".to_vec(), value: b"v1".to_vec(), val_type: 0 },
-                DiffEntry { key: b"k2".to_vec(), value: b"v2".to_vec(), val_type: 1 },
+                DiffEntry {
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                    val_type: 0,
+                },
+                DiffEntry {
+                    key: b"k2".to_vec(),
+                    value: b"v2".to_vec(),
+                    val_type: 1,
+                },
             ],
         };
         let data = msg.serialize();
@@ -639,7 +693,9 @@ mod tests {
 
     #[test]
     fn patch_data_roundtrip() {
-        let msg = SyncMessage::PatchData { data: vec![1, 2, 3, 4, 5] };
+        let msg = SyncMessage::PatchData {
+            data: vec![1, 2, 3, 4, 5],
+        };
         let data = msg.serialize();
         let decoded = SyncMessage::deserialize(&data).unwrap();
         match decoded {
@@ -680,7 +736,9 @@ mod tests {
 
     #[test]
     fn error_roundtrip() {
-        let msg = SyncMessage::Error { message: "something broke".into() };
+        let msg = SyncMessage::Error {
+            message: "something broke".into(),
+        };
         let data = msg.serialize();
         let decoded = SyncMessage::deserialize(&data).unwrap();
         match decoded {
@@ -707,7 +765,10 @@ mod tests {
         let data = msg.serialize();
         let decoded = SyncMessage::deserialize(&data).unwrap();
         match decoded {
-            SyncMessage::PullResponse { root_page, root_hash } => {
+            SyncMessage::PullResponse {
+                root_page,
+                root_hash,
+            } => {
                 assert_eq!(root_page, PageId(15));
                 assert_eq!(root_hash, sample_hash());
             }
@@ -798,7 +859,11 @@ mod tests {
         let data = msg.serialize();
         let decoded = SyncMessage::deserialize(&data).unwrap();
         match decoded {
-            SyncMessage::TableSyncBegin { table_name, root_page, root_hash } => {
+            SyncMessage::TableSyncBegin {
+                table_name,
+                root_page,
+                root_hash,
+            } => {
                 assert_eq!(table_name, b"products");
                 assert_eq!(root_page, PageId(77));
                 assert_eq!(root_hash, sample_hash());

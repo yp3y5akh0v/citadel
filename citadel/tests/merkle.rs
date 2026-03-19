@@ -23,7 +23,10 @@ fn empty_db_has_nonzero_merkle_root() {
     let dir = tempfile::tempdir().unwrap();
     let db = fast_builder(&dir.path().join("test.db")).create().unwrap();
     let stats = db.stats();
-    assert_ne!(stats.merkle_root, ZERO_HASH, "empty DB must have a hash (BLAKE3 of empty leaf)");
+    assert_ne!(
+        stats.merkle_root, ZERO_HASH,
+        "empty DB must have a hash (BLAKE3 of empty leaf)"
+    );
 }
 
 #[test]
@@ -155,10 +158,7 @@ fn different_keys_produce_different_merkle_root() {
     wtx.insert(b"keyB", b"value").unwrap();
     wtx.commit().unwrap();
 
-    assert_ne!(
-        db1.stats().merkle_root,
-        db2.stats().merkle_root,
-    );
+    assert_ne!(db1.stats().merkle_root, db2.stats().merkle_root,);
 }
 
 #[test]
@@ -355,8 +355,10 @@ fn delete_then_reinsert_restores_merkle_root() {
     wtx.commit().unwrap();
     let h_restored = db.stats().merkle_root;
 
-    assert_eq!(h_with, h_restored,
-        "deleting and reinserting same key-value must restore the merkle root");
+    assert_eq!(
+        h_with, h_restored,
+        "deleting and reinserting same key-value must restore the merkle root"
+    );
 }
 
 // ============================================================
@@ -381,8 +383,10 @@ fn named_table_operations_do_not_affect_default_merkle_root() {
     let h_after = db.stats().merkle_root;
 
     // The merkle_root in CommitSlot tracks the default tree only
-    assert_eq!(h_before, h_after,
-        "named table changes must not affect default tree merkle root");
+    assert_eq!(
+        h_before, h_after,
+        "named table changes must not affect default tree merkle root"
+    );
 }
 
 // ============================================================
@@ -432,10 +436,15 @@ fn integrity_check_passes_with_merkle_hashes() {
 
     let mut wtx = db.begin_write().unwrap();
     for i in 0..200u32 {
-        wtx.insert(&i.to_be_bytes(), &format!("value-{i}").into_bytes()).unwrap();
+        wtx.insert(&i.to_be_bytes(), &format!("value-{i}").into_bytes())
+            .unwrap();
     }
     wtx.commit().unwrap();
 
     let report = db.integrity_check().unwrap();
-    assert!(report.is_ok(), "integrity check must pass: {:?}", report.errors);
+    assert!(
+        report.is_ok(),
+        "integrity check must pass: {:?}",
+        report.errors
+    );
 }

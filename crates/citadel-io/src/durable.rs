@@ -3,9 +3,9 @@
 //! Provides helpers for crash-safe file operations: atomic writes via
 //! temp-file-then-rename with proper fsync ordering.
 
-use std::fs::{self, OpenOptions};
 #[cfg(unix)]
 use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 

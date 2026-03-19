@@ -3,11 +3,11 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
-use citadel_core::{
-    ARGON2_SALT_SIZE, KEY_BACKUP_MAGIC, KEY_BACKUP_SIZE, KEY_BACKUP_VERSION,
-    KEY_SIZE, MAC_SIZE, WRAPPED_KEY_SIZE, HKDF_INFO_BACKUP_MAC,
-};
 use citadel_core::types::{CipherId, KdfAlgorithm};
+use citadel_core::{
+    ARGON2_SALT_SIZE, HKDF_INFO_BACKUP_MAC, KEY_BACKUP_MAGIC, KEY_BACKUP_SIZE, KEY_BACKUP_VERSION,
+    KEY_SIZE, MAC_SIZE, WRAPPED_KEY_SIZE,
+};
 
 use crate::hkdf_utils::derive_keys_from_rek;
 use crate::kdf::derive_mk;
@@ -67,11 +67,11 @@ impl KeyBackup {
             return Err(citadel_core::Error::UnsupportedVersion(version));
         }
 
-        let cipher_id = CipherId::from_u8(buf[16])
-            .ok_or(citadel_core::Error::UnsupportedCipher(buf[16]))?;
+        let cipher_id =
+            CipherId::from_u8(buf[16]).ok_or(citadel_core::Error::UnsupportedCipher(buf[16]))?;
 
-        let kdf_algorithm = KdfAlgorithm::from_u8(buf[17])
-            .ok_or(citadel_core::Error::UnsupportedKdf(buf[17]))?;
+        let kdf_algorithm =
+            KdfAlgorithm::from_u8(buf[17]).ok_or(citadel_core::Error::UnsupportedKdf(buf[17]))?;
 
         Ok(Self {
             magic,
@@ -119,8 +119,7 @@ fn derive_backup_mac_key(bek: &[u8; KEY_SIZE]) -> [u8; KEY_SIZE] {
 }
 
 fn compute_backup_mac(mac_key: &[u8; KEY_SIZE], data: &[u8]) -> [u8; MAC_SIZE] {
-    let mut mac = HmacSha256::new_from_slice(mac_key)
-        .expect("HMAC key size is always valid");
+    let mut mac = HmacSha256::new_from_slice(mac_key).expect("HMAC key size is always valid");
     mac.update(data);
     let result = mac.finalize().into_bytes();
     let mut out = [0u8; MAC_SIZE];
@@ -129,6 +128,7 @@ fn compute_backup_mac(mac_key: &[u8; KEY_SIZE], data: &[u8]) -> [u8; MAC_SIZE] {
 }
 
 /// Create a key backup, wrapping the REK under a BEK derived from `backup_passphrase`.
+#[allow(clippy::too_many_arguments)]
 pub fn create_key_backup(
     rek: &[u8; KEY_SIZE],
     backup_passphrase: &[u8],
@@ -191,8 +191,8 @@ pub fn restore_rek_from_backup(
 
     backup.verify_hmac(&bek)?;
 
-    let mut rek = unwrap_rek(&bek, &backup.wrapped_rek)
-        .map_err(|_| citadel_core::Error::BadPassphrase)?;
+    let mut rek =
+        unwrap_rek(&bek, &backup.wrapped_rek).map_err(|_| citadel_core::Error::BadPassphrase)?;
     bek.zeroize();
 
     let keys = derive_keys_from_rek(&rek);
@@ -245,9 +245,12 @@ mod tests {
             0xDEAD_BEEF,
             CipherId::Aes256Ctr,
             KdfAlgorithm::Argon2id,
-            64, 1, 1,
+            64,
             1,
-        ).unwrap();
+            1,
+            1,
+        )
+        .unwrap();
 
         assert_eq!(backup_data.len(), KEY_BACKUP_SIZE);
 
@@ -269,9 +272,12 @@ mod tests {
             42,
             CipherId::Aes256Ctr,
             KdfAlgorithm::Pbkdf2HmacSha256,
-            600_000, 0, 0,
+            600_000,
+            0,
+            0,
             1,
-        ).unwrap();
+        )
+        .unwrap();
 
         let backup = KeyBackup::deserialize(&backup_data).unwrap();
         assert_eq!(backup.kdf_algorithm, KdfAlgorithm::Pbkdf2HmacSha256);
@@ -283,7 +289,10 @@ mod tests {
         let mut buf = [0u8; KEY_BACKUP_SIZE];
         buf[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
         let result = KeyBackup::deserialize(&buf);
-        assert!(matches!(result, Err(citadel_core::Error::InvalidMagic { .. })));
+        assert!(matches!(
+            result,
+            Err(citadel_core::Error::InvalidMagic { .. })
+        ));
     }
 
     #[test]
@@ -292,7 +301,10 @@ mod tests {
         buf[0..4].copy_from_slice(&KEY_BACKUP_MAGIC.to_le_bytes());
         buf[4..8].copy_from_slice(&99u32.to_le_bytes());
         let result = KeyBackup::deserialize(&buf);
-        assert!(matches!(result, Err(citadel_core::Error::UnsupportedVersion(99))));
+        assert!(matches!(
+            result,
+            Err(citadel_core::Error::UnsupportedVersion(99))
+        ));
     }
 
     #[test]
@@ -304,17 +316,23 @@ mod tests {
             42,
             CipherId::Aes256Ctr,
             KdfAlgorithm::Argon2id,
-            64, 1, 1,
+            64,
             1,
-        ).unwrap();
+            1,
+            1,
+        )
+        .unwrap();
 
         let backup = KeyBackup::deserialize(&backup_data).unwrap();
         let bek = derive_mk(
             KdfAlgorithm::Argon2id,
             b"backup-pass",
             &backup.backup_salt,
-            64, 1, 1,
-        ).unwrap();
+            64,
+            1,
+            1,
+        )
+        .unwrap();
         assert!(backup.verify_hmac(&bek).is_ok());
 
         let wrong_bek = [0xFF; KEY_SIZE];
@@ -330,9 +348,12 @@ mod tests {
             42,
             CipherId::Aes256Ctr,
             KdfAlgorithm::Argon2id,
-            64, 1, 1,
+            64,
             1,
-        ).unwrap();
+            1,
+            1,
+        )
+        .unwrap();
 
         backup_data[60] ^= 0x01;
 
@@ -347,15 +368,21 @@ mod tests {
             0xCAFE,
             CipherId::Aes256Ctr,
             KdfAlgorithm::Argon2id,
-            64, 1, 1,
-        ).unwrap();
+            64,
+            1,
+            1,
+        )
+        .unwrap();
 
         let mk = crate::kdf::derive_mk(
             KdfAlgorithm::Argon2id,
             b"db-pass",
             &kf.argon2_salt,
-            64, 1, 1,
-        ).unwrap();
+            64,
+            1,
+            1,
+        )
+        .unwrap();
         let rek = unwrap_rek(&mk, &kf.wrapped_rek).unwrap();
 
         let backup_data = create_key_backup(
@@ -368,7 +395,8 @@ mod tests {
             kf.argon2_t_cost,
             kf.argon2_p_cost,
             kf.current_epoch,
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = restore_rek_from_backup(&backup_data, b"backup-pass").unwrap();
         assert_eq!(result.file_id, 0xCAFE);
@@ -387,9 +415,12 @@ mod tests {
             42,
             CipherId::Aes256Ctr,
             KdfAlgorithm::Argon2id,
-            64, 1, 1,
+            64,
             1,
-        ).unwrap();
+            1,
+            1,
+        )
+        .unwrap();
 
         let result = restore_rek_from_backup(&backup_data, b"wrong-pass");
         assert!(result.is_err());
@@ -405,9 +436,12 @@ mod tests {
             file_id,
             CipherId::Aes256Ctr,
             KdfAlgorithm::Argon2id,
-            64, 1, 1,
+            64,
+            1,
+            1,
             5,
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = restore_rek_from_backup(&backup_data, b"pass").unwrap();
         assert_eq!(result.file_id, file_id);
@@ -423,9 +457,12 @@ mod tests {
             42,
             CipherId::Aes256Ctr,
             KdfAlgorithm::Argon2id,
-            64, 1, 1,
+            64,
             1,
-        ).unwrap();
+            1,
+            1,
+        )
+        .unwrap();
         assert_eq!(backup_data.len(), 124);
     }
 
@@ -438,9 +475,12 @@ mod tests {
             42,
             CipherId::Aes256Ctr,
             KdfAlgorithm::Argon2id,
-            64, 1, 1,
+            64,
             1,
-        ).unwrap();
+            1,
+            1,
+        )
+        .unwrap();
 
         let magic = u32::from_le_bytes(backup_data[0..4].try_into().unwrap());
         assert_eq!(magic, 0x4B45_5942);
