@@ -22,8 +22,8 @@ rust-version = "1.75"
 license = "MIT OR Apache-2.0"
 authors = ["Yuriy Peysakhov"]
 repository = "https://github.com/yp3y5akh0v/citadel"
-homepage = "https://github.com/yp3y5akh0v/citadel"
-keywords = ["database", "embedded-database", "encryption", "encrypted-database", "b-plus-tree"]
+homepage = "https://citadeldb.dev"
+keywords = ["database", "embedded-database", "encryption", "sql", "encrypted-database"]
 categories = ["database-implementations", "cryptography"]
 
 [workspace.dependencies]
