@@ -1,5 +1,4 @@
 use js_sys::{Array, Object, Reflect};
-use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 use crate::{CellValue, CitadelDb as InnerDb};
