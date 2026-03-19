@@ -3,7 +3,7 @@
 //! B+ tree, transactions, named tables, backup, compact, and integrity.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 use citadel::{Argon2Profile, DatabaseBuilder, Error};
@@ -621,10 +621,13 @@ fn reader_while_writer_threaded() {
     }
 
     let db = Arc::new(fast_builder(&db_path).open().unwrap());
+    let barrier = Arc::new(Barrier::new(2));
 
     let db_reader = db.clone();
+    let b = barrier.clone();
     let reader = thread::spawn(move || {
         let mut rtx = db_reader.begin_read();
+        b.wait();
         assert_eq!(rtx.entry_count(), 100);
         for i in 0..100u32 {
             let key = format!("k{i:03}");
@@ -632,6 +635,7 @@ fn reader_while_writer_threaded() {
         }
     });
 
+    barrier.wait();
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 100..200u32 {

@@ -18,7 +18,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -32,8 +32,8 @@ jobs:
         run: |
           wasm-pack build crates/citadel-wasm --target web --release
           mkdir -p site/static/wasm
-          cp crates/citadel-wasm/pkg/citadeldb_wasm_bg.wasm site/static/wasm/
-          cp crates/citadel-wasm/pkg/citadeldb_wasm.js site/static/wasm/
+          cp crates/citadel-wasm/pkg/citadel_wasm_bg.wasm site/static/wasm/
+          cp crates/citadel-wasm/pkg/citadel_wasm.js site/static/wasm/
 
       - name: Install Zola
         run: |

@@ -12,14 +12,14 @@
 </div>
 
 <script type="module">
-    import init, { CitadelDb } from '{{ get_url(path="wasm/citadeldb_wasm.js") | safe }}';
+    import init, { CitadelDb } from '{{ get_url(path="wasm/citadel_wasm.js") | safe }}';
 
     let db = null;
 
     async function boot() {
         const status = document.getElementById('playground-status');
         try {
-            await init({ module_or_path: '{{ get_url(path="wasm/citadeldb_wasm_bg.wasm") | safe }}' });
+            await init({ module_or_path: '{{ get_url(path="wasm/citadel_wasm_bg.wasm") | safe }}' });
             db = new CitadelDb("playground");
             document.getElementById('run-btn').disabled = false;
             status.textContent = 'Ready - encrypted database running in your browser';
