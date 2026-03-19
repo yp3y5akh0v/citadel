@@ -47,6 +47,25 @@ impl TcpTransport {
     }
 }
 
+/// `write_all` that retries on `WouldBlock` and `Interrupted`.
+fn write_all_retry(stream: &mut TcpStream, mut buf: &[u8]) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match stream.write(buf) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "write returned 0",
+                ));
+            }
+            Ok(n) => buf = &buf[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 impl SyncTransport for TcpTransport {
     fn send(&self, msg: &SyncMessage) -> Result<(), SyncError> {
         if self.closed.load(Ordering::Relaxed) {
@@ -55,8 +74,8 @@ impl SyncTransport for TcpTransport {
         let data = msg.serialize();
         let len = data.len() as u32;
         let mut stream = self.stream.lock().unwrap();
-        stream.write_all(&len.to_le_bytes())?;
-        stream.write_all(&data)?;
+        write_all_retry(&mut stream, &len.to_le_bytes())?;
+        write_all_retry(&mut stream, &data)?;
         stream.flush()?;
         Ok(())
     }
