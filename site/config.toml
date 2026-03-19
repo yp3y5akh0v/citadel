@@ -1,4 +1,4 @@
-base_url = "https://yp3y5akh0v.github.io/citadel"
+base_url = "https://citadeldb.dev"
 title = "Citadel"
 description = "An encrypted-first embedded database engine written in Rust"
 compile_sass = true
