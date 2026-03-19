@@ -125,32 +125,32 @@ jobs:
         if: matrix.use-cross
         run: cargo install cross --locked
 
-      - name: Determine features
-        id: features
+      - name: Build CLI
+        if: matrix.cli
         shell: bash
         run: |
           FEATURES=""
-          IS_LINUX=${{ contains(matrix.target, 'linux') }}
-          if [ "$IS_LINUX" = "true" ]; then
-            FEATURES="--features citadeldb/io-uring"
+          if [ "${{ contains(matrix.target, 'linux') }}" = "true" ]; then
+            FEATURES="--features io-uring"
           fi
           if [ "${{ matrix.fips }}" = "true" ]; then
             if [ -n "$FEATURES" ]; then
-              FEATURES="$FEATURES,citadeldb/fips"
+              FEATURES="$FEATURES,fips"
             else
-              FEATURES="--features citadeldb/fips"
+              FEATURES="--features fips"
             fi
           fi
-          echo "flags=$FEATURES" >> "$GITHUB_OUTPUT"
-
-      - name: Build CLI
-        if: matrix.cli
-        run: ${{ env.CARGO }} build --release --locked --target ${{ matrix.target }} -p citadeldb-cli ${{ steps.features.outputs.flags }}
+          ${{ env.CARGO }} build --release --locked --target ${{ matrix.target }} -p citadeldb-cli $FEATURES
 
       - name: Build FFI
         if: matrix.ffi
+        shell: bash
         run: |
-          ${{ env.CARGO }} build --release --locked --target ${{ matrix.target }} -p citadeldb-ffi ${{ steps.features.outputs.flags }}
+          FEATURES=""
+          if [ "${{ matrix.fips }}" = "true" ]; then
+            FEATURES="--features fips"
+          fi
+          ${{ env.CARGO }} build --release --locked --target ${{ matrix.target }} -p citadeldb-ffi $FEATURES
 
       - name: Package CLI (unix)
         if: matrix.cli && runner.os != 'Windows'
