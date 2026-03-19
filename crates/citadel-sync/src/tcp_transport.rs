@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::protocol::SyncMessage;
 use crate::transport::{SyncError, SyncTransport};
@@ -10,8 +10,8 @@ use crate::transport::{SyncError, SyncTransport};
 /// Maximum message size: 64 MiB.
 const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 
-/// Default read/write timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const SEND_DEADLINE: Duration = Duration::from_secs(120);
 
 /// TCP transport for sync sessions.
 #[derive(Debug)]
@@ -47,8 +47,12 @@ impl TcpTransport {
     }
 }
 
-/// `write_all` that retries on `WouldBlock` and `Interrupted`.
-fn write_all_retry(stream: &mut TcpStream, mut buf: &[u8]) -> std::io::Result<()> {
+/// `write_all` with bounded retries on `WouldBlock` and `Interrupted`.
+fn write_all_with_deadline(
+    stream: &mut TcpStream,
+    mut buf: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
     while !buf.is_empty() {
         match stream.write(buf) {
             Ok(0) => {
@@ -58,8 +62,17 @@ fn write_all_retry(stream: &mut TcpStream, mut buf: &[u8]) -> std::io::Result<()
                 ));
             }
             Ok(n) => buf = &buf[n..],
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "send deadline exceeded",
+                    ));
+                }
+            }
             Err(e) => return Err(e),
         }
     }
@@ -73,9 +86,10 @@ impl SyncTransport for TcpTransport {
         }
         let data = msg.serialize();
         let len = data.len() as u32;
+        let deadline = Instant::now() + SEND_DEADLINE;
         let mut stream = self.stream.lock().unwrap();
-        write_all_retry(&mut stream, &len.to_le_bytes())?;
-        write_all_retry(&mut stream, &data)?;
+        write_all_with_deadline(&mut stream, &len.to_le_bytes(), deadline)?;
+        write_all_with_deadline(&mut stream, &data, deadline)?;
         stream.flush()?;
         Ok(())
     }
@@ -221,8 +235,10 @@ mod tests {
     fn large_payload() {
         let (a, b) = loopback_pair();
         let data = vec![0xABu8; 1024 * 1024]; // 1 MiB
-        a.send(&SyncMessage::PatchData { data: data.clone() })
-            .unwrap();
+        let send_data = data.clone();
+        let sender = thread::spawn(move || {
+            a.send(&SyncMessage::PatchData { data: send_data }).unwrap();
+        });
         match b.recv().unwrap() {
             SyncMessage::PatchData { data: received } => {
                 assert_eq!(received.len(), data.len());
@@ -230,6 +246,7 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+        sender.join().unwrap();
     }
 
     #[test]
