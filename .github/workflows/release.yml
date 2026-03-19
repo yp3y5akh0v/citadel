@@ -189,9 +189,9 @@ jobs:
           ARCHIVE="${PREFIX}-${TAG}-${{ matrix.target }}.tar.gz"
           STAGING=$(mktemp -d)
           RELEASE="target/${{ matrix.target }}/release"
-          # Rename libs for clean user experience
-          [ -f "$RELEASE/libcitadeldb_ffi.so" ] && cp "$RELEASE/libcitadeldb_ffi.so" "$STAGING/libcitadel.so"
-          [ -f "$RELEASE/libcitadeldb_ffi.a" ] && cp "$RELEASE/libcitadeldb_ffi.a" "$STAGING/libcitadel.a"
+          [ -f "$RELEASE/libcitadel_ffi.so" ] && cp "$RELEASE/libcitadel_ffi.so" "$STAGING/libcitadel.so"
+          [ -f "$RELEASE/libcitadel_ffi.a" ] && cp "$RELEASE/libcitadel_ffi.a" "$STAGING/libcitadel.a"
+          ls "$STAGING"/libcitadel.* >/dev/null 2>&1 || { echo "::error::No FFI libraries found"; exit 1; }
           cp crates/citadel-ffi/citadel.h "$STAGING/"
           cp LICENSE-MIT LICENSE-APACHE "$STAGING/"
           tar czf "$ARCHIVE" -C "$STAGING" .
@@ -207,8 +207,9 @@ jobs:
           ARCHIVE="${PREFIX}-${TAG}-${{ matrix.target }}.tar.gz"
           STAGING=$(mktemp -d)
           RELEASE="target/${{ matrix.target }}/release"
-          [ -f "$RELEASE/libcitadeldb_ffi.dylib" ] && cp "$RELEASE/libcitadeldb_ffi.dylib" "$STAGING/libcitadel.dylib"
-          [ -f "$RELEASE/libcitadeldb_ffi.a" ] && cp "$RELEASE/libcitadeldb_ffi.a" "$STAGING/libcitadel.a"
+          [ -f "$RELEASE/libcitadel_ffi.dylib" ] && cp "$RELEASE/libcitadel_ffi.dylib" "$STAGING/libcitadel.dylib"
+          [ -f "$RELEASE/libcitadel_ffi.a" ] && cp "$RELEASE/libcitadel_ffi.a" "$STAGING/libcitadel.a"
+          ls "$STAGING"/libcitadel.* >/dev/null 2>&1 || { echo "::error::No FFI libraries found"; exit 1; }
           cp crates/citadel-ffi/citadel.h "$STAGING/"
           cp LICENSE-MIT LICENSE-APACHE "$STAGING/"
           tar czf "$ARCHIVE" -C "$STAGING" .
@@ -224,9 +225,10 @@ jobs:
           ARCHIVE="${PREFIX}-${TAG}-${{ matrix.target }}.zip"
           STAGING=$(mktemp -d)
           RELEASE="target/${{ matrix.target }}/release"
-          [ -f "$RELEASE/citadeldb_ffi.dll" ] && cp "$RELEASE/citadeldb_ffi.dll" "$STAGING/citadel.dll"
-          [ -f "$RELEASE/citadeldb_ffi.lib" ] && cp "$RELEASE/citadeldb_ffi.lib" "$STAGING/citadel.lib"
-          [ -f "$RELEASE/citadeldb_ffi.dll.lib" ] && cp "$RELEASE/citadeldb_ffi.dll.lib" "$STAGING/citadel.dll.lib"
+          [ -f "$RELEASE/citadel_ffi.dll" ] && cp "$RELEASE/citadel_ffi.dll" "$STAGING/citadel.dll"
+          [ -f "$RELEASE/citadel_ffi.lib" ] && cp "$RELEASE/citadel_ffi.lib" "$STAGING/citadel.lib"
+          [ -f "$RELEASE/citadel_ffi.dll.lib" ] && cp "$RELEASE/citadel_ffi.dll.lib" "$STAGING/citadel.dll.lib"
+          ls "$STAGING"/citadel.{dll,lib,dll.lib} >/dev/null 2>&1 || { echo "::error::No FFI libraries found"; exit 1; }
           cp crates/citadel-ffi/citadel.h "$STAGING/"
           cp LICENSE-MIT LICENSE-APACHE "$STAGING/"
           cd "$STAGING" && 7z a -tzip "$OLDPWD/$ARCHIVE" . && cd "$OLDPWD"
