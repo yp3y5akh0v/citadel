@@ -4,22 +4,29 @@
 
 <h1 align="center">Citadel</h1>
 
-<p align="center">An encrypted-first embedded database engine written in Rust.<br>Every page is encrypted at rest — encryption is not an afterthought, it's the foundation.</p>
+<p align="center">An encrypted-first embedded database engine written in Rust.<br>Every page is encrypted at rest - encryption is not an afterthought, it's the foundation.</p>
+
+<p align="center">
+  <a href="https://crates.io/crates/citadeldb"><img src="https://img.shields.io/crates/v/citadeldb" alt="crates.io"></a>
+  <a href="https://www.npmjs.com/package/@citadeldb/wasm"><img src="https://img.shields.io/npm/v/@citadeldb/wasm" alt="npm"></a>
+  <a href="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml"><img src="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
+</p>
 
 ## Features
 
-- **Encrypted at rest** — AES-256-CTR or ChaCha20, HMAC-SHA256 per page, verified before decryption
-- **Full SQL engine** — CREATE/DROP TABLE, SELECT with JOINs, subqueries, aggregates, indexes
-- **ACID transactions** — Copy-on-Write B+ tree with shadow paging, no WAL. Snapshot isolation with concurrent readers
-- **P2P sync** — Merkle tree diffing over Noise-encrypted transport with PSK authentication
-- **Interactive CLI** — SQL shell with tab completion, syntax highlighting, 27 dot-commands
-- **Key hierarchy** — Passphrase → Argon2id → Master Key → AES-KW → REK → HKDF → DEK + MAC
-- **FIPS mode** — PBKDF2-HMAC-SHA256 + AES-256-CTR for compliance environments
-- **Audit logging** — HMAC-SHA256 chained tamper-evident log
-- **Hot backup** — Consistent snapshots via MVCC without blocking writes
-- **Large values** — Overflow pages handle values up to any size transparently
-- **Cross-platform** — Windows, Linux, macOS, and more. C FFI (37 functions) and WebAssembly bindings included
-- **2,100+ tests** — Unit, integration, and torture tests across all crates
+- **Encrypted at rest** - AES-256-CTR or ChaCha20, HMAC-SHA256 per page, verified before decryption
+- **Full SQL engine** - CREATE/DROP TABLE, SELECT with JOINs, subqueries, aggregates, indexes
+- **ACID transactions** - Copy-on-Write B+ tree with shadow paging, no WAL. Snapshot isolation with concurrent readers
+- **P2P sync** - Merkle tree diffing over Noise-encrypted transport with PSK authentication
+- **Interactive CLI** - SQL shell with tab completion, syntax highlighting, 27 dot-commands
+- **Key hierarchy** - Passphrase -> Argon2id -> Master Key -> AES-KW -> REK -> HKDF -> DEK + MAC
+- **FIPS mode** - PBKDF2-HMAC-SHA256 + AES-256-CTR for compliance environments
+- **Audit logging** - HMAC-SHA256 chained tamper-evident log
+- **Hot backup** - Consistent snapshots via MVCC without blocking writes
+- **Large values** - Overflow pages handle values up to any size transparently
+- **Cross-platform** - Windows, Linux, macOS, and more. C FFI (37 functions) and WebAssembly bindings included
+- **2,100+ tests** - Unit, integration, and torture tests across all crates
 
 ## Quick Start
 
@@ -107,13 +114,13 @@ citadel> .sync 127.0.0.1:4248 <KEY> # Terminal B: push tables
 
 ## Security
 
-**No plaintext on disk.** Every page is encrypted before writing and authenticated before reading. There is no "unencrypted mode" — the database file is always opaque.
+**No plaintext on disk.** Every page is encrypted before writing and authenticated before reading. There is no "unencrypted mode" - the database file is always opaque.
 
-**Separate key file.** Encryption keys live in `{dbname}.citadel-keys`, not inside the database. The passphrase never touches disk — it derives a master key in memory via Argon2id (or PBKDF2 in FIPS mode).
+**Separate key file.** Encryption keys live in `{dbname}.citadel-keys`, not inside the database. The passphrase never touches disk - it derives a master key in memory via Argon2id (or PBKDF2 in FIPS mode).
 
 **Key backup.** Export an encrypted key backup with a separate recovery passphrase. If the original passphrase is lost, restore access without re-encrypting the database.
 
-**Passphrase change.** Re-wraps the root encryption key with the new passphrase. No page re-encryption needed — instant regardless of database size.
+**Passphrase change.** Re-wraps the root encryption key with the new passphrase. No page re-encryption needed - instant regardless of database size.
 
 **Encrypted sync.** P2P sync uses the Noise protocol (`NNpsk0_25519_ChaChaPoly_BLAKE2s`). Both peers must share a 256-bit pre-shared key. Each session generates ephemeral Curve25519 keys for forward secrecy. No data is sent in plaintext.
 
@@ -149,7 +156,7 @@ Every page gets a fresh random IV. HMAC is verified before decryption to prevent
 
 ### Commit Protocol
 
-Shadow paging with a god byte — a single byte controls which of two commit slots is active. Commits are atomic without a write-ahead log:
+Shadow paging with a god byte - a single byte controls which of two commit slots is active. Commits are atomic without a write-ahead log:
 
 1. Write dirty pages to new locations (CoW)
 2. Compute Merkle hashes bottom-up
