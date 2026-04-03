@@ -179,8 +179,7 @@ pub extern "C" fn citadel_last_error_message() -> *const c_char {
 /// Returns a pointer to a static null-terminated string.
 #[no_mangle]
 pub extern "C" fn citadel_version() -> *const c_char {
-    static VERSION: &[u8] = b"0.1.0\0";
-    VERSION.as_ptr() as *const c_char
+    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
 }
 
 // ── Database lifecycle ─────────────────────────────────────────────
@@ -1666,7 +1665,7 @@ mod tests {
         let v = citadel_version();
         assert!(!v.is_null());
         let s = unsafe { CStr::from_ptr(v) }.to_str().unwrap();
-        assert_eq!(s, "0.1.0");
+        assert_eq!(s, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
