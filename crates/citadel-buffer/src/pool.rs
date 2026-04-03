@@ -222,6 +222,12 @@ impl BufferPool {
         self.cache.contains(offset)
     }
 
+    /// Remove a single page from the cache (e.g. after CoW overwrites it).
+    pub fn invalidate(&mut self, page_id: PageId) {
+        let offset = page_offset(page_id);
+        self.cache.remove(offset);
+    }
+
     /// Clear all entries from the cache.
     pub fn clear(&mut self) {
         self.cache.clear();

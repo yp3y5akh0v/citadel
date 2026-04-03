@@ -238,7 +238,12 @@ impl TxnManager {
         catalog_root: PageId,
         named_trees: &std::collections::HashMap<Vec<u8>, BTree>,
     ) -> Result<()> {
-        let mut state = self.state.lock();
+        // Snapshot state under brief lock — I/O below runs unlocked
+        let (active_slot, oldest_active) = {
+            let state = self.state.lock();
+            (state.active_slot, self.oldest_active_reader_locked(&state))
+        };
+        let inactive_slot_idx = 1 - active_slot;
 
         // Set recovery flag
         let current_god_byte = read_god_byte(&*self.io)?;
@@ -248,9 +253,7 @@ impl TxnManager {
 
         // Process pending-free chain (GC + write new chain)
         let freed_this_txn = alloc.commit();
-        let oldest_active = self.oldest_active_reader_locked(&state);
 
-        // Load existing pending-free chain pages into the HashMap for reading
         self.load_pending_free_chain(pages, old_slot.pending_free_root)?;
 
         let (new_pf_root, reclaimed, old_chain_pages) = pending_free::process_chain(
@@ -263,15 +266,12 @@ impl TxnManager {
             oldest_active,
         )?;
 
-        // Compute Merkle hashes for main tree before checksums and encryption.
-        // This sets merkle_hash in dirty page headers at [36..64], which is
-        // inside the checksummed region — must happen before update_checksum().
+        // Merkle hashes must be computed before update_checksum()
         let merkle_root_hash =
             crate::merkle::compute_tree_merkle(pages, tree.root, txn_id, &|page_id| {
                 self.read_page_from_disk(page_id)
             })?;
 
-        // Compute Merkle hashes for named table trees
         let read_clean = &|page_id| self.read_page_from_disk(page_id);
         for named_tree in named_trees.values() {
             if named_tree.root != PageId::INVALID {
@@ -279,11 +279,11 @@ impl TxnManager {
             }
         }
 
-        // Compute Merkle hash for catalog tree if it changed
         if catalog_root != PageId::INVALID && catalog_root != old_slot.catalog_root {
             crate::merkle::compute_tree_merkle(pages, catalog_root, txn_id, read_clean)?;
         }
 
+        let mut written_page_ids: Vec<PageId> = Vec::new();
         let mut encrypted_pages: Vec<(u64, [u8; PAGE_SIZE])> = Vec::new();
         for page in pages.values_mut() {
             if page.txn_id() == txn_id {
@@ -302,6 +302,7 @@ impl TxnManager {
                     &mut encrypted,
                 );
                 encrypted_pages.push((offset, encrypted));
+                written_page_ids.push(page_id);
             }
         }
 
@@ -309,8 +310,6 @@ impl TxnManager {
             self.io.flush_pages(&encrypted_pages)?;
         }
 
-        // Write new commit slot to inactive slot
-        let inactive_slot_idx = 1 - state.active_slot;
         let new_slot = CommitSlot {
             txn_id,
             tree_root: tree.root,
@@ -322,7 +321,7 @@ impl TxnManager {
             pending_free_root: new_pf_root,
             encryption_epoch: self.epoch,
             dek_id: old_slot.dek_id,
-            checksum: 0, // computed during serialize
+            checksum: 0,
             merkle_root: merkle_root_hash,
         };
         write_commit_slot(&*self.io, inactive_slot_idx, &new_slot)?;
@@ -333,18 +332,24 @@ impl TxnManager {
         let new_god_byte = inactive_slot_idx as u8 & GOD_BIT_ACTIVE_SLOT;
         write_god_byte(&*self.io, new_god_byte)?;
 
-        // Final fsync — commit is durable after this returns
         self.io.fsync()?;
 
-        // Update manager state
-        state.active_slot = inactive_slot_idx;
-        state.current_slot = new_slot;
-        state.deferred_free = old_chain_pages;
-        state.reclaimed_pages = reclaimed;
+        // Invalidate before state update so readers never see stale cache
+        {
+            let mut pool = self.pool.lock();
+            for &page_id in &written_page_ids {
+                pool.invalidate(page_id);
+            }
+        }
 
-        // Clear buffer pool — CoW may have reused freed page IDs with new content,
-        // making cached entries stale.
-        self.pool.lock().clear();
+        // Make new snapshot visible (brief lock)
+        {
+            let mut state = self.state.lock();
+            state.active_slot = inactive_slot_idx;
+            state.current_slot = new_slot;
+            state.deferred_free = old_chain_pages;
+            state.reclaimed_pages = reclaimed;
+        }
 
         self.write_active.store(false, Ordering::SeqCst);
 
