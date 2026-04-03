@@ -203,6 +203,7 @@ fn recovery_rejects_tree_root_at_high_water_mark() {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&db_path)
         .unwrap();
     let io = SyncPageIO::new(file);
@@ -247,6 +248,7 @@ fn recovery_rejects_pending_free_at_high_water_mark() {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&db_path)
         .unwrap();
     let io = SyncPageIO::new(file);
