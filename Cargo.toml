@@ -16,7 +16,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"
@@ -28,15 +28,15 @@ categories = ["database-implementations", "cryptography"]
 
 [workspace.dependencies]
 # Internal crates (package = crates.io name, key = Rust alias)
-citadel-core = { package = "citadeldb-core", path = "crates/citadel-core", version = "0.2.1" }
-citadel-crypto = { package = "citadeldb-crypto", path = "crates/citadel-crypto", version = "0.2.1" }
-citadel-io = { package = "citadeldb-io", path = "crates/citadel-io", version = "0.2.1" }
-citadel-page = { package = "citadeldb-page", path = "crates/citadel-page", version = "0.2.1" }
-citadel-buffer = { package = "citadeldb-buffer", path = "crates/citadel-buffer", version = "0.2.1" }
-citadel-txn = { package = "citadeldb-txn", path = "crates/citadel-txn", version = "0.2.1" }
-citadel-sync = { package = "citadeldb-sync", path = "crates/citadel-sync", version = "0.2.1" }
-citadel = { package = "citadeldb", path = "citadel", version = "0.2.1" }
-citadel-sql = { package = "citadeldb-sql", path = "crates/citadel-sql", version = "0.2.1" }
+citadel-core = { package = "citadeldb-core", path = "crates/citadel-core", version = "0.2.2" }
+citadel-crypto = { package = "citadeldb-crypto", path = "crates/citadel-crypto", version = "0.2.2" }
+citadel-io = { package = "citadeldb-io", path = "crates/citadel-io", version = "0.2.2" }
+citadel-page = { package = "citadeldb-page", path = "crates/citadel-page", version = "0.2.2" }
+citadel-buffer = { package = "citadeldb-buffer", path = "crates/citadel-buffer", version = "0.2.2" }
+citadel-txn = { package = "citadeldb-txn", path = "crates/citadel-txn", version = "0.2.2" }
+citadel-sync = { package = "citadeldb-sync", path = "crates/citadel-sync", version = "0.2.2" }
+citadel = { package = "citadeldb", path = "citadel", version = "0.2.2" }
+citadel-sql = { package = "citadeldb-sql", path = "crates/citadel-sql", version = "0.2.2" }
 
 # Crypto
 aes = "0.8"
