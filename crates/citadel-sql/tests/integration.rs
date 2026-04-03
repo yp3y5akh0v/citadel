@@ -233,6 +233,19 @@ fn limit_and_offset() {
         .query("SELECT id FROM nums ORDER BY id OFFSET 100")
         .unwrap();
     assert_eq!(qr.rows.len(), 0);
+
+    // Negative LIMIT clamped to 0
+    let qr = conn
+        .query("SELECT id FROM nums ORDER BY id LIMIT -1")
+        .unwrap();
+    assert_eq!(qr.rows.len(), 0);
+
+    // Negative OFFSET clamped to 0
+    let qr = conn
+        .query("SELECT id FROM nums ORDER BY id LIMIT 3 OFFSET -5")
+        .unwrap();
+    assert_eq!(qr.rows.len(), 3);
+    assert_eq!(qr.rows[0][0], Value::Integer(1));
 }
 
 // ── Aggregation ────────────────────────────────────────────────────
@@ -462,6 +475,30 @@ fn update_multiple_columns() {
         .unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("Alicia".into()));
     assert_eq!(qr.rows[0][1], Value::Integer(200));
+}
+
+// ── UPDATE evaluates SET against original row (SQL standard) ──────
+
+#[test]
+fn update_set_evaluates_against_original_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let mut conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, b INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10, 20)").unwrap();
+
+    // SET a = b, b = a should swap (both evaluated against original row)
+    assert_rows_affected(
+        conn.execute("UPDATE t SET a = b, b = a WHERE id = 1")
+            .unwrap(),
+        1,
+    );
+
+    let qr = conn.query("SELECT a, b FROM t WHERE id = 1").unwrap();
+    assert_eq!(qr.rows[0][0], Value::Integer(20)); // a was 10, now has b's original value
+    assert_eq!(qr.rows[0][1], Value::Integer(10)); // b was 20, now has a's original value
 }
 
 // ── UPDATE with no matches ─────────────────────────────────────────

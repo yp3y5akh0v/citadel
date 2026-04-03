@@ -1923,7 +1923,7 @@ fn process_select(
         }
 
         if let Some(ref offset_expr) = stmt.offset {
-            let offset = eval_const_int(offset_expr)? as usize;
+            let offset = eval_const_int(offset_expr)?.max(0) as usize;
             if offset < projected.len() {
                 projected = projected.split_off(offset);
             } else {
@@ -1932,7 +1932,7 @@ fn process_select(
         }
 
         if let Some(ref limit_expr) = stmt.limit {
-            let limit = eval_const_int(limit_expr)? as usize;
+            let limit = eval_const_int(limit_expr)?.max(0) as usize;
             projected.truncate(limit);
         }
 
@@ -1947,7 +1947,7 @@ fn process_select(
     }
 
     if let Some(ref offset_expr) = stmt.offset {
-        let offset = eval_const_int(offset_expr)? as usize;
+        let offset = eval_const_int(offset_expr)?.max(0) as usize;
         if offset < rows.len() {
             rows = rows.split_off(offset);
         } else {
@@ -1956,7 +1956,7 @@ fn process_select(
     }
 
     if let Some(ref limit_expr) = stmt.limit {
-        let limit = eval_const_int(limit_expr)? as usize;
+        let limit = eval_const_int(limit_expr)?.max(0) as usize;
         rows.truncate(limit);
     }
 
@@ -2283,11 +2283,14 @@ fn exec_update(
     for (old_key, row) in &matching_rows {
         let mut new_row = row.clone();
         let mut pk_changed = false;
+
+        // Evaluate all SET expressions against the original row (SQL standard).
+        let mut evaluated: Vec<(usize, Value)> = Vec::with_capacity(stmt.assignments.len());
         for (col_name, expr) in &stmt.assignments {
             let col_idx = table_schema
                 .column_index(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-            let new_val = eval_expr(expr, &table_schema.columns, &new_row)?;
+            let new_val = eval_expr(expr, &table_schema.columns, row)?;
             let col = &table_schema.columns[col_idx];
 
             let coerced = if new_val.is_null() {
@@ -2304,6 +2307,10 @@ fn exec_update(
                     })?
             };
 
+            evaluated.push((col_idx, coerced));
+        }
+
+        for (col_idx, coerced) in evaluated {
             if table_schema.primary_key_columns.contains(&(col_idx as u16)) {
                 pk_changed = true;
             }
@@ -2642,11 +2649,14 @@ fn exec_update_in_txn(
     for (old_key, row) in &matching_rows {
         let mut new_row = row.clone();
         let mut pk_changed = false;
+
+        // Evaluate all SET expressions against the original row (SQL standard).
+        let mut evaluated: Vec<(usize, Value)> = Vec::with_capacity(stmt.assignments.len());
         for (col_name, expr) in &stmt.assignments {
             let col_idx = table_schema
                 .column_index(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-            let new_val = eval_expr(expr, &table_schema.columns, &new_row)?;
+            let new_val = eval_expr(expr, &table_schema.columns, row)?;
             let col = &table_schema.columns[col_idx];
 
             let coerced = if new_val.is_null() {
@@ -2663,6 +2673,10 @@ fn exec_update_in_txn(
                     })?
             };
 
+            evaluated.push((col_idx, coerced));
+        }
+
+        for (col_idx, coerced) in evaluated {
             if table_schema.primary_key_columns.contains(&(col_idx as u16)) {
                 pk_changed = true;
             }
@@ -2873,7 +2887,7 @@ fn exec_aggregate(
     }
 
     if let Some(ref offset_expr) = stmt.offset {
-        let offset = eval_const_int(offset_expr)? as usize;
+        let offset = eval_const_int(offset_expr)?.max(0) as usize;
         if offset < result_rows.len() {
             result_rows = result_rows.split_off(offset);
         } else {
@@ -2881,7 +2895,7 @@ fn exec_aggregate(
         }
     }
     if let Some(ref limit_expr) = stmt.limit {
-        let limit = eval_const_int(limit_expr)? as usize;
+        let limit = eval_const_int(limit_expr)?.max(0) as usize;
         result_rows.truncate(limit);
     }
 

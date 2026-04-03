@@ -508,7 +508,8 @@ impl<'a> WriteTxn<'a> {
             match page.page_type() {
                 Some(PageType::Leaf) => return Ok(()),
                 Some(PageType::Branch) => {
-                    current = branch_node::search(page, key);
+                    let idx = branch_node::search_child_index(page, key);
+                    current = branch_node::get_child(page, idx);
                 }
                 _ => return Err(Error::InvalidPageType(page.page_type_raw(), current)),
             }

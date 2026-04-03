@@ -60,10 +60,6 @@ pub const MAX_KEY_SIZE: usize = 2048;
 pub const MAX_INLINE_VALUE_SIZE: usize = 1920;
 pub const OVERFLOW_THRESHOLD: usize = MAX_INLINE_VALUE_SIZE;
 
-// Overflow page
-pub const OVERFLOW_HEADER_SIZE: usize = 32; // standard 64B header but we use 32B for overflow-specific fields
-pub const OVERFLOW_DATA_PER_PAGE: usize = 8128; // 8160 - 32
-
 // Pending-free entry size
 pub const PENDING_FREE_ENTRY_SIZE: usize = 12; // page_id(4) + freed_at_txn(8)
 pub const PENDING_FREE_ENTRIES_PER_PAGE: usize = USABLE_SIZE / PENDING_FREE_ENTRY_SIZE; // 674
@@ -143,10 +139,5 @@ mod tests {
     #[test]
     fn pending_free_entries_per_page() {
         assert_eq!(PENDING_FREE_ENTRIES_PER_PAGE, 674);
-    }
-
-    #[test]
-    fn overflow_data_per_page() {
-        assert_eq!(OVERFLOW_DATA_PER_PAGE, 8128);
     }
 }

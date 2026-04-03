@@ -67,7 +67,8 @@ impl BTree {
                     };
                 }
                 Some(PageType::Branch) => {
-                    current = branch_node::search(page, key);
+                    let idx = branch_node::search_child_index(page, key);
+                    current = branch_node::get_child(page, idx);
                 }
                 _ => {
                     return Err(Error::InvalidPageType(page.page_type_raw(), current));

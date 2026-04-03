@@ -195,6 +195,94 @@ fn file_header_and_recovery() {
 }
 
 #[test]
+fn recovery_rejects_tree_root_at_high_water_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("hwm.citadel");
+
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&db_path)
+        .unwrap();
+    let io = SyncPageIO::new(file);
+
+    let dek_id = [0xBBu8; MAC_SIZE];
+    let header = FileHeader::new(0x99, dek_id);
+    write_file_header(&io, &header).unwrap();
+    io.fsync().unwrap();
+
+    // HWM is one past highest allocated, so tree_root == HWM is out of bounds
+    let slot = CommitSlot {
+        txn_id: TxnId(1),
+        tree_root: PageId(5),
+        tree_depth: 1,
+        tree_entries: 10,
+        catalog_root: PageId(0),
+        total_pages: 5,
+        high_water_mark: 5,
+        pending_free_root: PageId::INVALID,
+        encryption_epoch: 1,
+        dek_id,
+        checksum: 0,
+        merkle_root: [0u8; citadel_core::MERKLE_HASH_SIZE],
+    };
+
+    write_commit_slot(&io, 0, &slot).unwrap();
+    io.fsync().unwrap();
+
+    let result = recover(&io);
+    assert!(
+        matches!(result, Err(Error::PageOutOfBounds(PageId(5)))),
+        "tree_root == high_water_mark should be rejected, got: {result:?}"
+    );
+}
+
+#[test]
+fn recovery_rejects_pending_free_at_high_water_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("hwm2.citadel");
+
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&db_path)
+        .unwrap();
+    let io = SyncPageIO::new(file);
+
+    let dek_id = [0xCCu8; MAC_SIZE];
+    let header = FileHeader::new(0xAA, dek_id);
+    write_file_header(&io, &header).unwrap();
+    io.fsync().unwrap();
+
+    // pending_free_root == high_water_mark is invalid
+    let slot = CommitSlot {
+        txn_id: TxnId(1),
+        tree_root: PageId(1),
+        tree_depth: 1,
+        tree_entries: 10,
+        catalog_root: PageId(0),
+        total_pages: 8,
+        high_water_mark: 8,
+        pending_free_root: PageId(8),
+        encryption_epoch: 1,
+        dek_id,
+        checksum: 0,
+        merkle_root: [0u8; citadel_core::MERKLE_HASH_SIZE],
+    };
+
+    write_commit_slot(&io, 0, &slot).unwrap();
+    io.fsync().unwrap();
+
+    let result = recover(&io);
+    assert!(
+        matches!(result, Err(Error::PageOutOfBounds(PageId(8)))),
+        "pending_free_root == high_water_mark should be rejected, got: {result:?}"
+    );
+}
+
+#[test]
 fn sieve_eviction_dirty_never_evicted() {
     use citadel_buffer::sieve::SieveCache;
 

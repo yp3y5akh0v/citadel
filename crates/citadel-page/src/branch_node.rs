@@ -54,22 +54,6 @@ pub fn get_cell_size(page: &Page, i: u16) -> usize {
     BRANCH_CELL_FIXED + key_len
 }
 
-/// Binary search for the child to descend to for a given search key.
-///
-/// Returns the PageId of the child whose subtree contains the search key.
-/// For keys < cell[0].key → cell[0].child
-/// For keys >= cell[n-1].key → right_child
-pub fn search(page: &Page, search_key: &[u8]) -> PageId {
-    let n = page.num_cells();
-    for i in 0..n {
-        let cell = read_cell(page, i);
-        if search_key < cell.key {
-            return cell.child;
-        }
-    }
-    page.right_child()
-}
-
 /// Binary search returning the child index (0..=num_cells).
 /// Index num_cells means right_child.
 pub fn search_child_index(page: &Page, search_key: &[u8]) -> usize {
@@ -233,13 +217,14 @@ mod tests {
             PageId(4),
         );
 
-        assert_eq!(search(&page, b"ant"), PageId(1)); // < "cat"
-        assert_eq!(search(&page, b"cat"), PageId(2)); // >= "cat", < "dog"
-        assert_eq!(search(&page, b"cow"), PageId(2)); // >= "cat", < "dog"
-        assert_eq!(search(&page, b"dog"), PageId(3)); // >= "dog", < "fox"
-        assert_eq!(search(&page, b"elk"), PageId(3)); // >= "dog", < "fox"
-        assert_eq!(search(&page, b"fox"), PageId(4)); // >= "fox"
-        assert_eq!(search(&page, b"zebra"), PageId(4)); // >= "fox"
+        let find = |key: &[u8]| get_child(&page, search_child_index(&page, key));
+        assert_eq!(find(b"ant"), PageId(1)); // < "cat"
+        assert_eq!(find(b"cat"), PageId(2)); // >= "cat", < "dog"
+        assert_eq!(find(b"cow"), PageId(2)); // >= "cat", < "dog"
+        assert_eq!(find(b"dog"), PageId(3)); // >= "dog", < "fox"
+        assert_eq!(find(b"elk"), PageId(3)); // >= "dog", < "fox"
+        assert_eq!(find(b"fox"), PageId(4)); // >= "fox"
+        assert_eq!(find(b"zebra"), PageId(4)); // >= "fox"
     }
 
     #[test]

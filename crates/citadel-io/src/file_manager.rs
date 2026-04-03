@@ -319,12 +319,12 @@ pub fn recover(io: &dyn PageIO) -> Result<(usize, CommitSlot)> {
     // Validate slot: tree_root and pending_free_root within bounds
     if chosen_slot.high_water_mark > 0 {
         if chosen_slot.tree_root.as_u32() > 0
-            && chosen_slot.tree_root.as_u32() > chosen_slot.high_water_mark
+            && chosen_slot.tree_root.as_u32() >= chosen_slot.high_water_mark
         {
             return Err(Error::PageOutOfBounds(chosen_slot.tree_root));
         }
         if chosen_slot.pending_free_root != PageId::INVALID
-            && chosen_slot.pending_free_root.as_u32() > chosen_slot.high_water_mark
+            && chosen_slot.pending_free_root.as_u32() >= chosen_slot.high_water_mark
         {
             return Err(Error::PageOutOfBounds(chosen_slot.pending_free_root));
         }
