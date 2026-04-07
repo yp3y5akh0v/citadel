@@ -1,6 +1,6 @@
 # @citadeldb/wasm
 
-WebAssembly bindings for [Citadel](https://github.com/yp3y5akh0v/citadel) — an encrypted-first embedded database engine.
+WebAssembly bindings for [Citadel](https://github.com/yp3y5akh0v/citadel) — an encrypted-first embedded database engine that outperforms unencrypted SQLite.
 
 Every value is encrypted at rest with AES-256-CTR + HMAC-SHA256. Runs entirely in the browser or Node.js with no server required.
 

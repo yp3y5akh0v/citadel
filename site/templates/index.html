@@ -5,8 +5,8 @@
 {% block content %}
 <section class="hero">
     <h1>Citadel</h1>
-    <p class="hero-tagline">An encrypted-first embedded database engine written in Rust.</p>
-    <p class="hero-sub">Every page is encrypted at rest. Encryption is not an afterthought - it's the foundation.</p>
+    <p class="hero-tagline">Encrypted-first embedded database engine that outperforms unencrypted SQLite.</p>
+    <p class="hero-sub">AES-256-CTR + HMAC-SHA256 on every page. Written in Rust.</p>
     <div class="hero-buttons">
         <a href="{{ config.extra.github }}" class="btn btn-primary" target="_blank" rel="noopener">View on GitHub</a>
         <a href="{{ get_url(path='@/demo/_index.md') }}" class="btn btn-secondary">Try in Browser</a>

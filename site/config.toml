@@ -1,6 +1,6 @@
 base_url = "https://citadeldb.dev"
 title = "Citadel"
-description = "An encrypted-first embedded database engine written in Rust"
+description = "Encrypted-first embedded database engine that outperforms unencrypted SQLite"
 compile_sass = true
 build_search_index = false
 generate_feeds = true
