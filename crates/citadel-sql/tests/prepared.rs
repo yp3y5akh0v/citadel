@@ -350,7 +350,7 @@ fn explain_with_param() {
         .rows
         .iter()
         .map(|r| match &r[0] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => s.to_string(),
             _ => panic!(),
         })
         .collect();

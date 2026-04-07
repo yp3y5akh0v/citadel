@@ -26,13 +26,15 @@ pub trait PageIO: Send + Sync {
     /// Extend the file to the given size.
     fn truncate(&self, size: u64) -> Result<()>;
 
-    /// Batch-write multiple pages and fsync.
-    ///
-    /// Default: sequential `write_page` calls followed by `fsync`.
-    fn flush_pages(&self, pages: &[(u64, [u8; PAGE_SIZE])]) -> Result<()> {
+    fn write_pages(&self, pages: &[(u64, [u8; PAGE_SIZE])]) -> Result<()> {
         for (offset, buf) in pages {
             self.write_page(*offset, buf)?;
         }
+        Ok(())
+    }
+
+    fn flush_pages(&self, pages: &[(u64, [u8; PAGE_SIZE])]) -> Result<()> {
+        self.write_pages(pages)?;
         self.fsync()
     }
 }

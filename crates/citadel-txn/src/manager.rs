@@ -1,12 +1,10 @@
-//! Transaction manager: coordinates read/write transactions with MVCC.
-//!
-//! - Single writer, multiple concurrent readers
-//! - Reader registration for oldest_active_reader tracking
-//! - Interior mutability via parking_lot::Mutex for concurrent access
+//! Transaction manager: single-writer MVCC with shadow-paging commit.
 
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use std::sync::Arc;
 
 use citadel_buffer::allocator::PageAllocator;
 use citadel_buffer::btree::BTree;
@@ -18,8 +16,7 @@ use citadel_core::{
 };
 use citadel_crypto::page_cipher;
 use citadel_io::file_manager::{
-    self, ensure_file_size, page_offset, read_god_byte, write_commit_slot, write_god_byte,
-    CommitSlot,
+    self, ensure_file_size, page_offset, write_commit_slot, write_god_byte, CommitSlot,
 };
 use citadel_io::traits::PageIO;
 use citadel_page::page::Page;
@@ -30,10 +27,6 @@ use crate::pending_free;
 use crate::read_txn::ReadTxn;
 use crate::write_txn::WriteTxn;
 
-/// Transaction manager for the Citadel database engine.
-///
-/// Provides MVCC with single-writer / multi-reader concurrency.
-/// All state is protected by fine-grained locks for concurrent access.
 pub struct TxnManager {
     io: Box<dyn PageIO>,
     dek: [u8; DEK_SIZE],
@@ -43,23 +36,20 @@ pub struct TxnManager {
     next_txn_id: AtomicU64,
     write_active: AtomicBool,
     state: Mutex<ManagerState>,
+    sync_mode: citadel_core::types::SyncMode,
 }
 
 struct ManagerState {
     active_slot: usize,
     current_slot: CommitSlot,
+    cached_god_byte: u8,
+    cached_file_size: u64,
     reader_table: BTreeMap<TxnId, usize>,
     deferred_free: Vec<PageId>,
-    /// Pages reclaimed from pending-free chain during the last commit.
-    /// Fed to the next writer's allocator so they're actually reused.
     reclaimed_pages: Vec<PageId>,
 }
 
 impl TxnManager {
-    /// Open a TxnManager on an existing database file.
-    ///
-    /// Runs the recovery state machine to determine the active commit slot,
-    /// then initializes the buffer pool and allocator state.
     pub fn open(
         io: Box<dyn PageIO>,
         dek: [u8; DEK_SIZE],
@@ -67,7 +57,19 @@ impl TxnManager {
         epoch: u32,
         cache_size: usize,
     ) -> Result<Self> {
+        Self::open_with_sync(io, dek, mac_key, epoch, cache_size, Default::default())
+    }
+
+    pub fn open_with_sync(
+        io: Box<dyn PageIO>,
+        dek: [u8; DEK_SIZE],
+        mac_key: [u8; MAC_KEY_SIZE],
+        epoch: u32,
+        cache_size: usize,
+        sync_mode: citadel_core::types::SyncMode,
+    ) -> Result<Self> {
         let (active_slot, slot) = file_manager::recover(&*io)?;
+        let file_size = io.file_size()?;
 
         let next_txn_id = slot.txn_id.as_u64() + 1;
 
@@ -82,16 +84,16 @@ impl TxnManager {
             state: Mutex::new(ManagerState {
                 active_slot,
                 current_slot: slot,
+                cached_god_byte: active_slot as u8 & GOD_BIT_ACTIVE_SLOT,
+                cached_file_size: file_size,
                 reader_table: BTreeMap::new(),
                 deferred_free: Vec::new(),
                 reclaimed_pages: Vec::new(),
             }),
+            sync_mode,
         })
     }
 
-    /// Create a TxnManager for a brand new (empty) database.
-    ///
-    /// Writes the initial file header and empty root page.
     pub fn create(
         io: Box<dyn PageIO>,
         dek: [u8; DEK_SIZE],
@@ -101,15 +103,26 @@ impl TxnManager {
         dek_id: [u8; 32],
         cache_size: usize,
     ) -> Result<Self> {
-        // Write file header
+        Self::create_with_sync(io, dek, mac_key, epoch, file_id, dek_id, cache_size, Default::default())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_sync(
+        io: Box<dyn PageIO>,
+        dek: [u8; DEK_SIZE],
+        mac_key: [u8; MAC_KEY_SIZE],
+        epoch: u32,
+        file_id: u64,
+        dek_id: [u8; 32],
+        cache_size: usize,
+        sync_mode: citadel_core::types::SyncMode,
+    ) -> Result<Self> {
         let header = file_manager::FileHeader::new(file_id, dek_id);
         file_manager::write_file_header(&*io, &header)?;
 
-        // Allocate and write the initial empty root page (leaf)
         let root_id = PageId(0);
         let root_page = Page::new(root_id, citadel_core::types::PageType::Leaf, TxnId(1));
 
-        // Compute Merkle hash before checksum (hash is inside checksummed region)
         let mut init_pages = std::collections::HashMap::new();
         init_pages.insert(root_id, root_page);
         let merkle_root_hash =
@@ -132,7 +145,6 @@ impl TxnManager {
         );
         io.write_page(offset, &encrypted)?;
 
-        // Write initial commit slot (slot 0)
         let slot = CommitSlot {
             txn_id: TxnId(1),
             tree_root: root_id,
@@ -146,9 +158,11 @@ impl TxnManager {
             dek_id,
             checksum: 0,
             merkle_root: merkle_root_hash,
+            named_table_entries: Vec::new(),
         };
         write_commit_slot(&*io, 0, &slot)?;
         io.fsync()?;
+        let file_size = io.file_size()?;
 
         Ok(Self {
             io,
@@ -161,26 +175,26 @@ impl TxnManager {
             state: Mutex::new(ManagerState {
                 active_slot: 0,
                 current_slot: slot,
+                cached_god_byte: 0,
+                cached_file_size: file_size,
                 reader_table: BTreeMap::new(),
                 deferred_free: Vec::new(),
                 reclaimed_pages: Vec::new(),
             }),
+            sync_mode,
         })
     }
 
-    /// Begin a read transaction. Snapshots the current commit slot.
     pub fn begin_read(&self) -> ReadTxn<'_> {
         let mut state = self.state.lock();
         let txn_id = TxnId(self.next_txn_id.fetch_add(1, Ordering::SeqCst));
         let snapshot = state.current_slot.clone();
 
-        // Register reader
         *state.reader_table.entry(txn_id).or_insert(0) += 1;
 
         ReadTxn::new(self, txn_id, snapshot)
     }
 
-    /// Begin a write transaction. Only one can be active at a time.
     pub fn begin_write(&self) -> Result<WriteTxn<'_>> {
         if self
             .write_active
@@ -197,14 +211,11 @@ impl TxnManager {
         let reclaimed = std::mem::take(&mut state.reclaimed_pages);
         drop(state);
 
-        // Initialize allocator from current commit slot state
         let mut alloc = PageAllocator::new(snapshot.high_water_mark);
-        // Feed previously reclaimed pages so they're actually reused
         if !reclaimed.is_empty() {
             alloc.add_ready_to_use(reclaimed);
         }
 
-        // Initialize BTree from snapshot
         let tree = BTree::from_existing(
             snapshot.tree_root,
             snapshot.tree_depth,
@@ -214,18 +225,27 @@ impl TxnManager {
         Ok(WriteTxn::new(self, txn_id, snapshot, tree, alloc, deferred))
     }
 
-    /// Fetch a decrypted page from the buffer pool (for read transactions).
-    pub(crate) fn fetch_page(&self, page_id: PageId) -> Result<Page> {
-        let mut pool = self.pool.lock();
-        let page = pool.fetch(&*self.io, page_id, &self.dek, &self.mac_key, self.epoch)?;
-        Ok(page.clone())
+    pub(crate) fn fetch_page(&self, page_id: PageId) -> Result<Arc<Page>> {
+        if let Some(arc) = self.pool.lock().get_cached(page_id) {
+            return Ok(arc);
+        }
+
+        let offset = page_offset(page_id);
+        let page = citadel_buffer::pool::read_and_decrypt(
+            &*self.io,
+            page_id,
+            offset,
+            &self.dek,
+            &self.mac_key,
+            self.epoch,
+        )?;
+
+        let arc = Arc::new(page);
+        self.pool.lock().insert_if_absent(page_id, Arc::clone(&arc));
+
+        Ok(arc)
     }
 
-    /// Commit a write transaction using the shadow-paging commit protocol.
-    ///
-    /// Sets recovery flag, processes pending-free chain, flushes dirty pages,
-    /// writes the inactive commit slot, fsyncs, flips the god byte, and fsyncs
-    /// again. Returns success only after the final fsync completes.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_write(
         &self,
@@ -238,77 +258,142 @@ impl TxnManager {
         catalog_root: PageId,
         named_trees: &std::collections::HashMap<Vec<u8>, BTree>,
     ) -> Result<()> {
-        // Snapshot state under brief lock — I/O below runs unlocked
-        let (active_slot, oldest_active) = {
+        let (active_slot, oldest_active, current_god_byte, cached_file_size) = {
             let state = self.state.lock();
-            (state.active_slot, self.oldest_active_reader_locked(&state))
+            (
+                state.active_slot,
+                self.oldest_active_reader_locked(&state),
+                state.cached_god_byte,
+                state.cached_file_size,
+            )
         };
         let inactive_slot_idx = 1 - active_slot;
 
-        // Set recovery flag
-        let current_god_byte = read_god_byte(&*self.io)?;
-        let recovery_god_byte = current_god_byte | GOD_BIT_RECOVERY;
-        write_god_byte(&*self.io, recovery_god_byte)?;
-        self.io.fsync()?;
+        if self.sync_mode != citadel_core::types::SyncMode::Off {
+            let recovery_god_byte = current_god_byte | GOD_BIT_RECOVERY;
+            write_god_byte(&*self.io, recovery_god_byte)?;
+        }
 
-        // Process pending-free chain (GC + write new chain)
         let freed_this_txn = alloc.commit();
 
-        self.load_pending_free_chain(pages, old_slot.pending_free_root)?;
+        let (new_pf_root, reclaimed, old_chain_pages) =
+            if self.sync_mode == citadel_core::types::SyncMode::Off {
+                let mut reclaimed: Vec<PageId> = deferred_free.to_vec();
+                if old_slot.pending_free_root.is_valid() {
+                    self.load_pending_free_chain(pages, old_slot.pending_free_root)?;
+                    let existing = pending_free::read_chain(pages, old_slot.pending_free_root)?;
+                    reclaimed.extend(existing.iter().map(|e| e.page_id));
+                    let chain_pages =
+                        pending_free::collect_chain_page_ids(pages, old_slot.pending_free_root)?;
+                    reclaimed.extend(chain_pages);
+                }
+                (PageId::INVALID, reclaimed, freed_this_txn)
+            } else {
+                self.load_pending_free_chain(pages, old_slot.pending_free_root)?;
+                pending_free::process_chain(
+                    pages,
+                    alloc,
+                    txn_id,
+                    old_slot.pending_free_root,
+                    &freed_this_txn,
+                    deferred_free,
+                    oldest_active,
+                )?
+            };
 
-        let (new_pf_root, reclaimed, old_chain_pages) = pending_free::process_chain(
-            pages,
-            alloc,
-            txn_id,
-            old_slot.pending_free_root,
-            &freed_this_txn,
-            deferred_free,
-            oldest_active,
-        )?;
+        let merkle_root_hash = if self.sync_mode != citadel_core::types::SyncMode::Off {
+            let hash =
+                crate::merkle::compute_tree_merkle(pages, tree.root, txn_id, &|page_id| {
+                    self.fetch_merkle_hash(page_id)
+                })?;
 
-        // Merkle hashes must be computed before update_checksum()
-        let merkle_root_hash =
-            crate::merkle::compute_tree_merkle(pages, tree.root, txn_id, &|page_id| {
-                self.read_page_from_disk(page_id)
-            })?;
-
-        let read_clean = &|page_id| self.read_page_from_disk(page_id);
-        for named_tree in named_trees.values() {
-            if named_tree.root != PageId::INVALID {
-                crate::merkle::compute_tree_merkle(pages, named_tree.root, txn_id, read_clean)?;
+            let read_hash = &|page_id| self.fetch_merkle_hash(page_id);
+            for named_tree in named_trees.values() {
+                if named_tree.root != PageId::INVALID {
+                    crate::merkle::compute_tree_merkle(
+                        pages,
+                        named_tree.root,
+                        txn_id,
+                        read_hash,
+                    )?;
+                }
             }
-        }
 
-        if catalog_root != PageId::INVALID && catalog_root != old_slot.catalog_root {
-            crate::merkle::compute_tree_merkle(pages, catalog_root, txn_id, read_clean)?;
-        }
+            if catalog_root != PageId::INVALID && catalog_root != old_slot.catalog_root {
+                crate::merkle::compute_tree_merkle(pages, catalog_root, txn_id, read_hash)?;
+            }
+            hash
+        } else {
+            [0u8; citadel_core::MERKLE_HASH_SIZE]
+        };
 
-        let mut written_page_ids: Vec<PageId> = Vec::new();
-        let mut encrypted_pages: Vec<(u64, [u8; PAGE_SIZE])> = Vec::new();
+        let mut dirty_page_info: Vec<(u64, PageId)> = Vec::with_capacity(pages.len());
+        let mut max_offset = 0u64;
         for page in pages.values_mut() {
             if page.txn_id() == txn_id {
                 page.update_checksum();
                 let page_id = page.page_id();
                 let offset = page_offset(page_id);
-                ensure_file_size(&*self.io, offset)?;
-
-                let mut encrypted = [0u8; PAGE_SIZE];
-                page_cipher::encrypt_page(
-                    &self.dek,
-                    &self.mac_key,
-                    page_id,
-                    self.epoch,
-                    page.as_bytes(),
-                    &mut encrypted,
-                );
-                encrypted_pages.push((offset, encrypted));
-                written_page_ids.push(page_id);
+                max_offset = max_offset.max(offset);
+                dirty_page_info.push((offset, page_id));
+            }
+        }
+        let mut new_file_size = cached_file_size;
+        if !dirty_page_info.is_empty() {
+            let needed = max_offset + PAGE_SIZE as u64;
+            if cached_file_size < needed {
+                ensure_file_size(&*self.io, max_offset)?;
+                new_file_size = self.io.file_size()?;
             }
         }
 
-        if !encrypted_pages.is_empty() {
-            self.io.flush_pages(&encrypted_pages)?;
+        let hmac_state = page_cipher::HmacState::new(&self.mac_key, self.epoch);
+        #[cfg(feature = "parallel")]
+        {
+            let encrypt_one = |&(offset, page_id): &(u64, PageId)| -> (u64, [u8; PAGE_SIZE]) {
+                let page = &pages[&page_id];
+                let mut encrypted = [0u8; PAGE_SIZE];
+                page_cipher::encrypt_page_with_hmac(
+                    &self.dek,
+                    &hmac_state,
+                    page_id,
+                    page.as_bytes(),
+                    &mut encrypted,
+                );
+                (offset, encrypted)
+            };
+            use rayon::prelude::*;
+            let encrypted_pages: Vec<(u64, [u8; PAGE_SIZE])> =
+                dirty_page_info.par_iter().map(encrypt_one).collect();
+            if !encrypted_pages.is_empty() {
+                self.io.write_pages(&encrypted_pages)?;
+            }
         }
+        #[cfg(not(feature = "parallel"))]
+        {
+            let mut encrypted = [0u8; PAGE_SIZE];
+            for &(offset, page_id) in &dirty_page_info {
+                let page = &pages[&page_id];
+                page_cipher::encrypt_page_with_hmac(
+                    &self.dek,
+                    &hmac_state,
+                    page_id,
+                    page.as_bytes(),
+                    &mut encrypted,
+                );
+                self.io.write_page(offset, &encrypted)?;
+            }
+        }
+
+        let named_table_entries: Vec<(u32, u64)> = named_trees
+            .iter()
+            .map(|(name, tree)| {
+                (
+                    file_manager::table_name_hash(name),
+                    tree.entry_count,
+                )
+            })
+            .collect();
 
         let new_slot = CommitSlot {
             txn_id,
@@ -323,30 +408,41 @@ impl TxnManager {
             dek_id: old_slot.dek_id,
             checksum: 0,
             merkle_root: merkle_root_hash,
+            named_table_entries,
         };
         write_commit_slot(&*self.io, inactive_slot_idx, &new_slot)?;
 
-        self.io.fsync()?;
+        if self.sync_mode != citadel_core::types::SyncMode::Off {
+            self.io.fsync()?;
+        }
 
-        // Flip god byte (atomic commit point)
         let new_god_byte = inactive_slot_idx as u8 & GOD_BIT_ACTIVE_SLOT;
         write_god_byte(&*self.io, new_god_byte)?;
 
-        self.io.fsync()?;
-
-        // Invalidate before state update so readers never see stale cache
-        {
-            let mut pool = self.pool.lock();
-            for &page_id in &written_page_ids {
-                pool.invalidate(page_id);
+        if self.sync_mode == citadel_core::types::SyncMode::Full {
+            if let Err(e) = self.io.fsync() {
+                let _ = write_god_byte(&*self.io, current_god_byte);
+                let _ = self.io.fsync();
+                return Err(e);
             }
         }
 
-        // Make new snapshot visible (brief lock)
+        {
+            let mut pool = self.pool.lock();
+            for &(_, page_id) in &dirty_page_info {
+                pool.invalidate(page_id);
+                if let Some(page) = pages.remove(&page_id) {
+                    pool.insert_if_absent(page_id, Arc::new(page));
+                }
+            }
+        }
+
         {
             let mut state = self.state.lock();
             state.active_slot = inactive_slot_idx;
             state.current_slot = new_slot;
+            state.cached_god_byte = new_god_byte;
+            state.cached_file_size = new_file_size;
             state.deferred_free = old_chain_pages;
             state.reclaimed_pages = reclaimed;
         }
@@ -356,12 +452,10 @@ impl TxnManager {
         Ok(())
     }
 
-    /// Abort a write transaction — just release the write lock.
     pub(crate) fn abort_write(&self) {
         self.write_active.store(false, Ordering::SeqCst);
     }
 
-    /// Unregister a reader from the reader table.
     pub(crate) fn unregister_reader(&self, txn_id: TxnId) {
         let mut state = self.state.lock();
         if let Some(count) = state.reader_table.get_mut(&txn_id) {
@@ -372,8 +466,6 @@ impl TxnManager {
         }
     }
 
-    /// Get the oldest active reader's txn_id.
-    /// If no readers, returns current txn_id (all freed pages are reclaimable).
     pub fn oldest_active_reader(&self) -> TxnId {
         let state = self.state.lock();
         self.oldest_active_reader_locked(&state)
@@ -388,17 +480,14 @@ impl TxnManager {
             .unwrap_or(TxnId(self.next_txn_id.load(Ordering::SeqCst)))
     }
 
-    /// Get the current active commit slot (for testing/inspection).
     pub fn current_slot(&self) -> CommitSlot {
         self.state.lock().current_slot.clone()
     }
 
-    /// Get the number of active readers (for testing/inspection).
     pub fn reader_count(&self) -> usize {
         self.state.lock().reader_table.len()
     }
 
-    /// List all named tables in the catalog.
     pub fn list_tables(&self) -> Result<Vec<(Vec<u8>, TableDescriptor)>> {
         use citadel_core::types::ValueType;
         use citadel_page::{branch_node, leaf_node};
@@ -439,7 +528,6 @@ impl TxnManager {
         Ok(tables)
     }
 
-    /// Look up a named table's root page by name.
     pub fn table_root(&self, name: &[u8]) -> Result<Option<PageId>> {
         use citadel_core::types::ValueType;
         use citadel_page::{branch_node, leaf_node};
@@ -480,17 +568,14 @@ impl TxnManager {
         Ok(None)
     }
 
-    /// Run integrity check on the database.
     pub fn integrity_check(&self) -> Result<IntegrityReport> {
         integrity::run_integrity_check(self)
     }
 
-    /// Copy a consistent snapshot to the destination I/O.
     pub fn backup_to(&self, dest_io: &dyn PageIO) -> Result<()> {
         use std::collections::HashSet;
         let slot = self.current_slot();
 
-        // Collect all reachable pages
         let mut reachable = HashSet::new();
         self.collect_tree_pages(slot.tree_root, &mut reachable)?;
 
@@ -505,25 +590,18 @@ impl TxnManager {
             self.collect_chain_pages(slot.pending_free_root, &mut reachable)?;
         }
 
-        // Read source file header
         let mut header_buf = [0u8; citadel_core::FILE_HEADER_SIZE];
         self.io.read_at(0, &mut header_buf)?;
         let mut header = file_manager::FileHeader::deserialize(&header_buf)?;
-
-        // Set both commit slots to the snapshot, slot 0 active
         header.slots = [slot.clone(), slot];
         header.god_byte = 0;
 
-        // Calculate needed file size
         let max_page = reachable.iter().map(|p| p.as_u32()).max().unwrap_or(0);
         let needed_size =
             citadel_core::FILE_HEADER_SIZE as u64 + (max_page as u64 + 1) * PAGE_SIZE as u64;
         dest_io.truncate(needed_size)?;
-
-        // Write header
         dest_io.write_at(0, &header.serialize())?;
 
-        // Copy all reachable pages (raw encrypted bytes — no decrypt/re-encrypt)
         for &page_id in &reachable {
             let offset = page_offset(page_id);
             let mut buf = [0u8; PAGE_SIZE];
@@ -535,7 +613,6 @@ impl TxnManager {
         Ok(())
     }
 
-    /// Compact the database into a new file with sequential page IDs.
     pub fn compact_to(&self, dest_io: &dyn PageIO) -> Result<()> {
         use citadel_core::types::ValueType;
         use citadel_page::{branch_node, leaf_node};
@@ -547,7 +624,6 @@ impl TxnManager {
         let mut old_to_new: StdMap<PageId, PageId> = StdMap::new();
         let mut catalog_leaves: HashSet<PageId> = HashSet::new();
 
-        // Walk all trees, assign new sequential page IDs
         self.assign_new_ids(slot.tree_root, &mut old_to_new, &mut next_id)?;
 
         if slot.catalog_root.is_valid() {
@@ -558,7 +634,6 @@ impl TxnManager {
 
             self.assign_new_ids(slot.catalog_root, &mut old_to_new, &mut next_id)?;
 
-            // Collect catalog leaf page IDs (they contain TableDescriptors that need fixup)
             self.collect_catalog_leaf_pages(slot.catalog_root, &mut catalog_leaves)?;
 
             for root in &table_roots {
@@ -566,7 +641,6 @@ impl TxnManager {
             }
         }
 
-        // Copy each page with remapped IDs
         let total_pages = next_id;
         let needed_size =
             citadel_core::FILE_HEADER_SIZE as u64 + total_pages as u64 * PAGE_SIZE as u64;
@@ -576,10 +650,8 @@ impl TxnManager {
         for (&old_id, &new_id) in &old_to_new {
             let mut page = self.read_page_from_disk(old_id)?;
 
-            // Update page_id
             page.set_page_id(new_id);
 
-            // Remap child pointers in branch pages
             if page.page_type() == Some(citadel_core::types::PageType::Branch) {
                 for i in 0..page.num_cells() as usize {
                     let old_child = branch_node::get_child(&page, i);
@@ -597,7 +669,6 @@ impl TxnManager {
                 }
             }
 
-            // Remap table root pages in catalog leaf cells
             if catalog_leaves.contains(&old_id) {
                 for i in 0..page.num_cells() {
                     let cell = leaf_node::read_cell(&page, i);
@@ -620,12 +691,10 @@ impl TxnManager {
 
             page.update_checksum();
 
-            // Capture root page's Merkle hash (preserved from source)
             if old_id == slot.tree_root {
                 root_merkle = page.merkle_hash();
             }
 
-            // Encrypt with fresh IV and write to new location
             let offset = page_offset(new_id);
             let mut encrypted = [0u8; PAGE_SIZE];
             page_cipher::encrypt_page(
@@ -639,7 +708,6 @@ impl TxnManager {
             dest_io.write_page(offset, &encrypted)?;
         }
 
-        // Write file header
         let mut header_buf = [0u8; citadel_core::FILE_HEADER_SIZE];
         self.io.read_at(0, &mut header_buf)?;
         let mut header = file_manager::FileHeader::deserialize(&header_buf)?;
@@ -670,6 +738,7 @@ impl TxnManager {
             dek_id: slot.dek_id,
             checksum: 0,
             merkle_root: root_merkle,
+            named_table_entries: slot.named_table_entries.clone(),
         };
 
         header.slots = [new_slot.clone(), new_slot];
@@ -681,7 +750,6 @@ impl TxnManager {
         Ok(())
     }
 
-    /// Collect all page IDs in a B+ tree.
     fn collect_tree_pages(
         &self,
         root: PageId,
@@ -708,7 +776,6 @@ impl TxnManager {
         Ok(())
     }
 
-    /// Collect catalog pages and return named table root pages.
     fn collect_catalog_pages(
         &self,
         catalog_root: PageId,
@@ -751,7 +818,6 @@ impl TxnManager {
         Ok(table_roots)
     }
 
-    /// Collect pending-free chain page IDs.
     fn collect_chain_pages(
         &self,
         root: PageId,
@@ -768,7 +834,6 @@ impl TxnManager {
         Ok(())
     }
 
-    /// Collect catalog leaf page IDs (pages that contain TableDescriptor values).
     fn collect_catalog_leaf_pages(
         &self,
         catalog_root: PageId,
@@ -798,7 +863,6 @@ impl TxnManager {
         Ok(())
     }
 
-    /// Walk a tree depth-first, assigning new sequential page IDs.
     fn assign_new_ids(
         &self,
         root: PageId,
@@ -829,7 +893,6 @@ impl TxnManager {
         Ok(())
     }
 
-    /// Load pending-free chain pages from disk into the HashMap.
     fn load_pending_free_chain(
         &self,
         pages: &mut std::collections::HashMap<PageId, Page>,
@@ -842,7 +905,7 @@ impl TxnManager {
         let mut current = root;
         while current.is_valid() {
             if let std::collections::hash_map::Entry::Vacant(e) = pages.entry(current) {
-                let page = self.read_page_from_disk(current)?;
+                let page = self.fetch_page_owned(current)?;
                 let next = page.right_child();
                 e.insert(page);
                 if !next.is_valid() {
@@ -861,7 +924,30 @@ impl TxnManager {
         Ok(())
     }
 
-    /// Read and decrypt a single page from disk.
+    pub(crate) fn fetch_page_owned(&self, page_id: PageId) -> Result<Page> {
+        {
+            let mut pool = self.pool.lock();
+            if let Some(arc) = pool.get_cached(page_id) {
+                return Ok((*arc).clone());
+            }
+        }
+        self.read_page_from_disk(page_id)
+    }
+
+    pub(crate) fn fetch_merkle_hash(
+        &self,
+        page_id: PageId,
+    ) -> Result<[u8; citadel_core::MERKLE_HASH_SIZE]> {
+        {
+            let mut pool = self.pool.lock();
+            if let Some(arc) = pool.get_cached(page_id) {
+                return Ok(arc.merkle_hash());
+            }
+        }
+        let page = self.read_page_from_disk(page_id)?;
+        Ok(page.merkle_hash())
+    }
+
     pub fn read_page_from_disk(&self, page_id: PageId) -> Result<Page> {
         let offset = page_offset(page_id);
         let mut encrypted = [0u8; PAGE_SIZE];
@@ -893,7 +979,6 @@ pub(crate) mod tests {
     use citadel_crypto::page_cipher::compute_dek_id;
     use std::sync::Mutex as StdMutex;
 
-    /// In-memory PageIO for testing.
     pub struct MemIO {
         data: StdMutex<Vec<u8>>,
     }

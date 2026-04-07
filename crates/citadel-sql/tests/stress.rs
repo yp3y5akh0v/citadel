@@ -170,7 +170,7 @@ fn create_drop_cycle_50_times() {
         let qr = conn
             .query(&format!("SELECT val FROM {name} WHERE id = 1"))
             .unwrap();
-        assert_eq!(qr.rows[0][0], Value::Text(format!("round_{i}")));
+        assert_eq!(qr.rows[0][0], Value::Text(format!("round_{i}").into()));
 
         conn.execute(&format!("DROP TABLE {name}")).unwrap();
     }

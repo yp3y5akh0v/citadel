@@ -50,13 +50,25 @@ impl SchemaManager {
     }
 
     pub fn get(&self, name: &str) -> Option<&TableSchema> {
-        let lower = name.to_ascii_lowercase();
-        self.tables.get(&lower)
+        if let Some(s) = self.tables.get(name) {
+            return Some(s);
+        }
+        if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.tables.get(&name.to_ascii_lowercase())
+        } else {
+            None
+        }
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        let lower = name.to_ascii_lowercase();
-        self.tables.contains_key(&lower)
+        if self.tables.contains_key(name) {
+            return true;
+        }
+        if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.tables.contains_key(&name.to_ascii_lowercase())
+        } else {
+            false
+        }
     }
 
     pub fn generation(&self) -> u64 {

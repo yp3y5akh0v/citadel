@@ -818,11 +818,15 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
 
 fn convert_insert(insert: sp::Insert) -> Result<Statement> {
     let table = match &insert.table {
-        sp::TableObject::TableName(name) => object_name_to_string(name),
+        sp::TableObject::TableName(name) => object_name_to_string(name).to_ascii_lowercase(),
         _ => return Err(SqlError::Unsupported("INSERT into non-table object".into())),
     };
 
-    let columns: Vec<String> = insert.columns.iter().map(|c| c.value.clone()).collect();
+    let columns: Vec<String> = insert
+        .columns
+        .iter()
+        .map(|c| c.value.to_ascii_lowercase())
+        .collect();
 
     let source = insert
         .source
@@ -1064,15 +1068,15 @@ fn convert_delete(delete: sp::Delete) -> Result<Statement> {
 fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
     match expr {
         sp::Expr::Value(v) => convert_value(&v.value),
-        sp::Expr::Identifier(ident) => Ok(Expr::Column(ident.value.clone())),
+        sp::Expr::Identifier(ident) => Ok(Expr::Column(ident.value.to_ascii_lowercase())),
         sp::Expr::CompoundIdentifier(parts) => {
             if parts.len() == 2 {
                 Ok(Expr::QualifiedColumn {
-                    table: parts[0].value.clone(),
-                    column: parts[1].value.clone(),
+                    table: parts[0].value.to_ascii_lowercase(),
+                    column: parts[1].value.to_ascii_lowercase(),
                 })
             } else {
-                Ok(Expr::Column(parts.last().unwrap().value.clone()))
+                Ok(Expr::Column(parts.last().unwrap().value.to_ascii_lowercase()))
             }
         }
         sp::Expr::BinaryOp { left, op, right } => {
@@ -1290,7 +1294,7 @@ fn convert_value(val: &sp::Value) -> Result<Expr> {
                 Err(SqlError::InvalidValue(format!("cannot parse number: {n}")))
             }
         }
-        sp::Value::SingleQuotedString(s) => Ok(Expr::Literal(Value::Text(s.clone()))),
+        sp::Value::SingleQuotedString(s) => Ok(Expr::Literal(Value::Text(s.as_str().into()))),
         sp::Value::Boolean(b) => Ok(Expr::Literal(Value::Boolean(*b))),
         sp::Value::Null => Ok(Expr::Literal(Value::Null)),
         sp::Value::Placeholder(s) => {
@@ -1311,7 +1315,7 @@ fn convert_value(val: &sp::Value) -> Result<Expr> {
 
 fn convert_escape_value(val: &sp::Value) -> Result<Expr> {
     match val {
-        sp::Value::SingleQuotedString(s) => Ok(Expr::Literal(Value::Text(s.clone()))),
+        sp::Value::SingleQuotedString(s) => Ok(Expr::Literal(Value::Text(s.as_str().into()))),
         _ => Err(SqlError::Unsupported(format!("ESCAPE value: {val}"))),
     }
 }

@@ -157,6 +157,17 @@ impl KdfAlgorithm {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncMode {
+    /// Two fsyncs per commit. Crash-safe against power loss.
+    #[default]
+    Full,
+    /// One fsync per commit. Previous commit always recoverable.
+    Normal,
+    /// No fsyncs. Process-crash safe but not power-loss safe.
+    Off,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Argon2Profile {
     Iot,

@@ -79,7 +79,7 @@ fn value_to_string(v: &Value, settings: &Settings) -> String {
         Value::Null => settings.null_display.clone(),
         Value::Integer(n) => n.to_string(),
         Value::Real(r) => r.to_string(),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         Value::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Blob(b) => {
             let mut s = String::with_capacity(2 + b.len() * 2);
@@ -206,7 +206,7 @@ fn value_to_json(v: &Value, _settings: &Settings) -> serde_json::Value {
         Value::Real(r) => serde_json::Number::from_f64(*r)
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
-        Value::Text(s) => serde_json::Value::String(s.clone()),
+        Value::Text(s) => serde_json::Value::String(s.to_string()),
         Value::Boolean(b) => serde_json::Value::Bool(*b),
         Value::Blob(b) => {
             let mut hex = String::with_capacity(b.len() * 2);

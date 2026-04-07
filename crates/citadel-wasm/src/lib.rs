@@ -147,7 +147,7 @@ impl CellValue {
             Value::Null => CellValue::Null,
             Value::Integer(i) => CellValue::Integer(*i),
             Value::Real(r) => CellValue::Real(*r),
-            Value::Text(s) => CellValue::Text(s.clone()),
+            Value::Text(s) => CellValue::Text(s.to_string()),
             Value::Blob(b) => CellValue::Blob(b.clone()),
             Value::Boolean(b) => CellValue::Boolean(*b),
         }

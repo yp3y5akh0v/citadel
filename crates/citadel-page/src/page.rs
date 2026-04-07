@@ -251,6 +251,34 @@ impl Page {
         Some(new_start as u16)
     }
 
+    pub fn insert_cell_direct<F>(&mut self, idx: u16, cell_len: usize, write_fn: F) -> Option<u16>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        if self.available_space() < cell_len {
+            return None;
+        }
+
+        let new_start = self.cell_area_start() as usize - cell_len;
+        write_fn(&mut self.data[new_start..new_start + cell_len]);
+        self.set_cell_area_start(new_start as u16);
+
+        let n = self.num_cells();
+        if idx < n {
+            let src_start = Self::cell_ptr_offset(idx);
+            let src_end = Self::cell_ptr_offset(n);
+            self.data.copy_within(src_start..src_end, src_start + 2);
+        }
+
+        self.set_cell_offset(idx, new_start as u16);
+        self.set_num_cells(n + 1);
+
+        let free = self.free_space() as usize - cell_len - 2;
+        self.set_free_space(free as u16);
+
+        Some(new_start as u16)
+    }
+
     /// Delete cell at position `idx`. Shifts pointers left.
     /// The cell data becomes a hole (not reclaimed until compact).
     /// `cell_len` is the size of the cell data being removed.

@@ -759,7 +759,7 @@ fn substr_start_beyond_length() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
     let v = scalar(&mut conn, "SELECT SUBSTR('abc', 10, 5)");
-    assert_eq!(v, Value::Text(String::new()));
+    assert_eq!(v, Value::Text("".into()));
 }
 
 #[test]
@@ -768,7 +768,7 @@ fn substr_length_zero() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
     let v = scalar(&mut conn, "SELECT SUBSTR('abc', 1, 0)");
-    assert_eq!(v, Value::Text(String::new()));
+    assert_eq!(v, Value::Text("".into()));
 }
 
 #[test]
@@ -838,7 +838,7 @@ fn trim_all_chars() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
     let v = scalar(&mut conn, "SELECT TRIM('aaa', 'a')");
-    assert_eq!(v, Value::Text(String::new()));
+    assert_eq!(v, Value::Text("".into()));
 }
 
 #[test]
@@ -1581,7 +1581,7 @@ fn concat_fn_zero_args() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
     let v = scalar(&mut conn, "SELECT CONCAT()");
-    assert_eq!(v, Value::Text(String::new()));
+    assert_eq!(v, Value::Text("".into()));
 }
 
 #[test]

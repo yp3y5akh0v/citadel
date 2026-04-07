@@ -710,9 +710,7 @@ impl PageIO for FailingIO {
 
 #[test]
 fn failed_commit_releases_writer_lock() {
-    // BUG #1 regression: if commit_write fails, the writer must be released.
-    // We use FailingIO that fails on the 2nd fsync (the first fsync is for
-    // the recovery flag, the second is for data+slot durability).
+    // FailingIO fails on second fsync — commit must still release writer lock.
     let storage = std::sync::Arc::new(SharedStorage::new(4 * 1024 * 1024));
 
     // First, create a valid database with normal I/O
@@ -1759,7 +1757,7 @@ fn transient_io_error_does_not_corrupt_database() {
         wtx.commit().unwrap();
     }
 
-    // Open with FailingIO — commit will fail
+    // FailingIO fails on second fsync — god byte flip lost, old slot stays active.
     let (dek, mac_key, _) = test_keys();
     let failing_io = Box::new(FailingIO::new(storage.clone(), 2));
     let mgr = TxnManager::open(failing_io, dek, mac_key, 1, 256).unwrap();

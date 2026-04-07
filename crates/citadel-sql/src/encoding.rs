@@ -2,7 +2,7 @@
 //! and row encoding for non-PK column storage.
 
 use crate::error::{Result, SqlError};
-use crate::types::{DataType, Value};
+use crate::types::{CompactString, DataType, Value};
 
 // ── Key encoding (order-preserving) ─────────────────────────────────
 
@@ -35,6 +35,79 @@ pub fn encode_composite_key(values: &[Value]) -> Vec<u8> {
     buf
 }
 
+pub fn encode_composite_key_into(values: &[Value], buf: &mut Vec<u8>) {
+    buf.clear();
+    for v in values {
+        encode_key_value_into(v, buf);
+    }
+}
+
+fn encode_key_value_into(value: &Value, buf: &mut Vec<u8>) {
+    match value {
+        Value::Null => buf.push(TAG_NULL),
+        Value::Boolean(b) => {
+            buf.push(TAG_BOOLEAN);
+            buf.push(if *b { 0x01 } else { 0x00 });
+        }
+        Value::Integer(i) => encode_integer_into(*i, buf),
+        Value::Real(r) => encode_real_into(*r, buf),
+        Value::Text(s) => encode_bytes_into(TAG_TEXT, s.as_bytes(), buf),
+        Value::Blob(b) => encode_bytes_into(TAG_BLOB, b, buf),
+    }
+}
+
+fn encode_integer_into(val: i64, buf: &mut Vec<u8>) {
+    buf.push(TAG_INTEGER);
+    if val == 0 {
+        buf.push(0x80);
+        return;
+    }
+    if val > 0 {
+        let bytes = val.to_be_bytes();
+        let start = bytes.iter().position(|&b| b != 0).unwrap();
+        let byte_count = (8 - start) as u8;
+        buf.push(0x80 + byte_count);
+        buf.extend_from_slice(&bytes[start..]);
+    } else {
+        let abs_val = if val == i64::MIN {
+            u64::MAX / 2 + 1
+        } else {
+            (-val) as u64
+        };
+        let bytes = abs_val.to_be_bytes();
+        let start = bytes.iter().position(|&b| b != 0).unwrap();
+        let byte_count = (8 - start) as u8;
+        buf.push(0x80 - byte_count);
+        for &b in &bytes[start..] {
+            buf.push(!b);
+        }
+    }
+}
+
+fn encode_real_into(val: f64, buf: &mut Vec<u8>) {
+    buf.push(TAG_REAL);
+    let bits = val.to_bits();
+    let encoded = if val.is_sign_negative() {
+        !bits
+    } else {
+        bits ^ (1u64 << 63)
+    };
+    buf.extend_from_slice(&encoded.to_be_bytes());
+}
+
+fn encode_bytes_into(tag: u8, data: &[u8], buf: &mut Vec<u8>) {
+    buf.push(tag);
+    for &b in data {
+        if b == 0x00 {
+            buf.push(0x00);
+            buf.push(0xFF);
+        } else {
+            buf.push(b);
+        }
+    }
+    buf.push(0x00);
+}
+
 /// Decode a single key value, returning the value and the number of bytes consumed.
 pub fn decode_key_value(data: &[u8]) -> Result<(Value, usize)> {
     if data.is_empty() {
@@ -54,7 +127,7 @@ pub fn decode_key_value(data: &[u8]) -> Result<(Value, usize)> {
             let (bytes, n) = decode_null_escaped(&data[1..])?;
             let s = String::from_utf8(bytes)
                 .map_err(|_| SqlError::InvalidValue("invalid UTF-8 in key".into()))?;
-            Ok((Value::Text(s), n + 1))
+            Ok((Value::Text(CompactString::from(s)), n + 1))
         }
         TAG_BLOB => {
             let (bytes, n) = decode_null_escaped(&data[1..])?;
@@ -278,25 +351,93 @@ pub fn encode_row(values: &[Value]) -> Vec<u8> {
     buf
 }
 
-/// Decode a row into non-PK column values.
-pub fn decode_row(data: &[u8]) -> Result<Vec<Value>> {
+pub fn encode_row_into(values: &[Value], buf: &mut Vec<u8>) {
+    buf.clear();
+    let col_count = values.len();
+    let bitmap_bytes = col_count.div_ceil(8);
+
+    buf.extend_from_slice(&(col_count as u16).to_le_bytes());
+
+    let bitmap_start = buf.len();
+    buf.resize(buf.len() + bitmap_bytes, 0);
+
+    for (i, v) in values.iter().enumerate() {
+        if v.is_null() {
+            buf[bitmap_start + i / 8] |= 1 << (i % 8);
+            continue;
+        }
+        match v {
+            Value::Integer(val) => {
+                buf.push(DataType::Integer.type_tag());
+                buf.extend_from_slice(&8u32.to_le_bytes());
+                buf.extend_from_slice(&val.to_le_bytes());
+            }
+            Value::Real(r) => {
+                buf.push(DataType::Real.type_tag());
+                buf.extend_from_slice(&8u32.to_le_bytes());
+                buf.extend_from_slice(&r.to_le_bytes());
+            }
+            Value::Boolean(b) => {
+                buf.push(DataType::Boolean.type_tag());
+                buf.extend_from_slice(&1u32.to_le_bytes());
+                buf.push(if *b { 1 } else { 0 });
+            }
+            Value::Text(s) => {
+                let bytes = s.as_bytes();
+                buf.push(DataType::Text.type_tag());
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            Value::Blob(data) => {
+                buf.push(DataType::Blob.type_tag());
+                buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                buf.extend_from_slice(data);
+            }
+            Value::Null => unreachable!(),
+        }
+    }
+}
+
+fn decode_value(type_tag: u8, data: &[u8]) -> Result<Value> {
+    match DataType::from_tag(type_tag) {
+        Some(DataType::Integer) => {
+            Ok(Value::Integer(i64::from_le_bytes(data[..8].try_into().unwrap())))
+        }
+        Some(DataType::Real) => {
+            Ok(Value::Real(f64::from_le_bytes(data[..8].try_into().unwrap())))
+        }
+        Some(DataType::Boolean) => Ok(Value::Boolean(data[0] != 0)),
+        Some(DataType::Text) => {
+            let s = std::str::from_utf8(data)
+                .map_err(|_| SqlError::InvalidValue("invalid UTF-8 in column".into()))?;
+            Ok(Value::Text(CompactString::from(s)))
+        }
+        Some(DataType::Blob) => Ok(Value::Blob(data.to_vec())),
+        _ => Err(SqlError::InvalidValue(format!(
+            "unknown column type tag: {type_tag}"
+        ))),
+    }
+}
+
+fn parse_row_header(data: &[u8]) -> Result<(usize, &[u8], usize)> {
     if data.len() < 2 {
         return Err(SqlError::InvalidValue("row data too short".into()));
     }
     let col_count = u16::from_le_bytes([data[0], data[1]]) as usize;
     let bitmap_bytes = col_count.div_ceil(8);
-    let mut pos = 2;
-
+    let pos = 2;
     if data.len() < pos + bitmap_bytes {
         return Err(SqlError::InvalidValue("truncated null bitmap".into()));
     }
-    let bitmap = &data[pos..pos + bitmap_bytes];
-    pos += bitmap_bytes;
+    Ok((col_count, &data[pos..pos + bitmap_bytes], pos + bitmap_bytes))
+}
+
+pub fn decode_row(data: &[u8]) -> Result<Vec<Value>> {
+    let (col_count, bitmap, mut pos) = parse_row_header(data)?;
 
     let mut values = Vec::with_capacity(col_count);
     for i in 0..col_count {
-        let is_null = bitmap[i / 8] & (1 << (i % 8)) != 0;
-        if is_null {
+        if bitmap[i / 8] & (1 << (i % 8)) != 0 {
             values.push(Value::Null);
             continue;
         }
@@ -314,32 +455,323 @@ pub fn decode_row(data: &[u8]) -> Result<Vec<Value>> {
             return Err(SqlError::InvalidValue("truncated column value".into()));
         }
 
-        let value = match DataType::from_tag(type_tag) {
-            Some(DataType::Integer) => {
-                let i = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-                Value::Integer(i)
-            }
-            Some(DataType::Real) => {
-                let r = f64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-                Value::Real(r)
-            }
-            Some(DataType::Boolean) => Value::Boolean(data[pos] != 0),
-            Some(DataType::Text) => {
-                let s = String::from_utf8_lossy(&data[pos..pos + data_len]).into_owned();
-                Value::Text(s)
-            }
-            Some(DataType::Blob) => Value::Blob(data[pos..pos + data_len].to_vec()),
-            _ => {
-                return Err(SqlError::InvalidValue(format!(
-                    "unknown column type tag: {type_tag}"
-                )))
-            }
-        };
+        values.push(decode_value(type_tag, &data[pos..pos + data_len])?);
         pos += data_len;
-        values.push(value);
     }
 
     Ok(values)
+}
+
+pub fn decode_row_into(data: &[u8], out: &mut [Value], col_mapping: &[usize]) -> Result<()> {
+    let (col_count, bitmap, mut pos) = parse_row_header(data)?;
+
+    for i in 0..col_count {
+        if bitmap[i / 8] & (1 << (i % 8)) != 0 {
+            continue;
+        }
+
+        if pos + 5 > data.len() {
+            return Err(SqlError::InvalidValue("truncated column data".into()));
+        }
+        let type_tag = data[pos];
+        pos += 1;
+        let data_len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+
+        if pos + data_len > data.len() {
+            return Err(SqlError::InvalidValue("truncated column value".into()));
+        }
+
+        if i < col_mapping.len() {
+            out[col_mapping[i]] = decode_value(type_tag, &data[pos..pos + data_len])?;
+        }
+        pos += data_len;
+    }
+
+    Ok(())
+}
+
+pub fn decode_pk_into(
+    key: &[u8],
+    count: usize,
+    out: &mut [Value],
+    pk_mapping: &[usize],
+) -> Result<()> {
+    let mut pos = 0;
+    for i in 0..count {
+        let (v, n) = decode_key_value(&key[pos..])?;
+        if i < pk_mapping.len() {
+            out[pk_mapping[i]] = v;
+        }
+        pos += n;
+    }
+    Ok(())
+}
+
+pub fn decode_columns(data: &[u8], targets: &[usize]) -> Result<Vec<Value>> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (col_count, bitmap, mut pos) = parse_row_header(data)?;
+    if *targets.last().unwrap() >= col_count {
+        return Err(SqlError::InvalidValue("column index out of bounds".into()));
+    }
+
+    let mut results = Vec::with_capacity(targets.len());
+    let mut ti = 0;
+
+    for col in 0..col_count {
+        if ti >= targets.len() {
+            break;
+        }
+        let is_null = bitmap[col / 8] & (1 << (col % 8)) != 0;
+
+        if col == targets[ti] {
+            if is_null {
+                results.push(Value::Null);
+            } else {
+                if pos + 5 > data.len() {
+                    return Err(SqlError::InvalidValue("truncated column data".into()));
+                }
+                let type_tag = data[pos];
+                pos += 1;
+                let data_len = u32::from_le_bytes([
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                ]) as usize;
+                pos += 4;
+                if pos + data_len > data.len() {
+                    return Err(SqlError::InvalidValue("truncated column value".into()));
+                }
+                results.push(decode_value(type_tag, &data[pos..pos + data_len])?);
+                pos += data_len;
+            }
+            ti += 1;
+        } else if !is_null {
+            if pos + 5 > data.len() {
+                return Err(SqlError::InvalidValue("truncated column data".into()));
+            }
+            let data_len = u32::from_le_bytes([
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+            ]) as usize;
+            pos += 5 + data_len;
+        }
+    }
+
+    Ok(results)
+}
+
+pub fn decode_columns_into(
+    data: &[u8],
+    targets: &[usize],
+    schema_cols: &[usize],
+    row: &mut [Value],
+) -> Result<()> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let (col_count, bitmap, mut pos) = parse_row_header(data)?;
+    if *targets.last().unwrap() >= col_count {
+        return Err(SqlError::InvalidValue("column index out of bounds".into()));
+    }
+
+    let mut ti = 0;
+    for col in 0..col_count {
+        if ti >= targets.len() {
+            break;
+        }
+        let is_null = bitmap[col / 8] & (1 << (col % 8)) != 0;
+
+        if col == targets[ti] {
+            if is_null {
+                row[schema_cols[ti]] = Value::Null;
+            } else {
+                if pos + 5 > data.len() {
+                    return Err(SqlError::InvalidValue("truncated column data".into()));
+                }
+                let type_tag = data[pos];
+                pos += 1;
+                let data_len = u32::from_le_bytes([
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                ]) as usize;
+                pos += 4;
+                if pos + data_len > data.len() {
+                    return Err(SqlError::InvalidValue("truncated column value".into()));
+                }
+                row[schema_cols[ti]] = decode_value(type_tag, &data[pos..pos + data_len])?;
+                pos += data_len;
+            }
+            ti += 1;
+        } else if !is_null {
+            if pos + 5 > data.len() {
+                return Err(SqlError::InvalidValue("truncated column data".into()));
+            }
+            let data_len = u32::from_le_bytes([
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+            ]) as usize;
+            pos += 5 + data_len;
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RawColumn<'a> {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Boolean(bool),
+    Text(&'a str),
+    Blob(&'a [u8]),
+}
+
+impl<'a> RawColumn<'a> {
+    pub fn to_value(self) -> Value {
+        match self {
+            RawColumn::Null => Value::Null,
+            RawColumn::Integer(i) => Value::Integer(i),
+            RawColumn::Real(r) => Value::Real(r),
+            RawColumn::Boolean(b) => Value::Boolean(b),
+            RawColumn::Text(s) => Value::Text(CompactString::from(s)),
+            RawColumn::Blob(b) => Value::Blob(b.to_vec()),
+        }
+    }
+
+    pub fn cmp_value(&self, other: &Value) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (RawColumn::Null, Value::Null) => Some(Ordering::Equal),
+            (RawColumn::Null, _) | (_, Value::Null) => None,
+            (RawColumn::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
+            (RawColumn::Integer(a), Value::Real(b)) => (*a as f64).partial_cmp(b),
+            (RawColumn::Real(a), Value::Real(b)) => a.partial_cmp(b),
+            (RawColumn::Real(a), Value::Integer(b)) => a.partial_cmp(&(*b as f64)),
+            (RawColumn::Text(a), Value::Text(b)) => Some((*a).cmp(b.as_str())),
+            (RawColumn::Blob(a), Value::Blob(b)) => Some((*a).cmp(b.as_slice())),
+            (RawColumn::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
+            _ => None,
+        }
+    }
+
+    pub fn eq_value(&self, other: &Value) -> bool {
+        match (self, other) {
+            (RawColumn::Null, Value::Null) => true,
+            (RawColumn::Integer(a), Value::Integer(b)) => a == b,
+            (RawColumn::Integer(a), Value::Real(b)) => (*a as f64) == *b,
+            (RawColumn::Real(a), Value::Real(b)) => a == b,
+            (RawColumn::Real(a), Value::Integer(b)) => *a == (*b as f64),
+            (RawColumn::Text(a), Value::Text(b)) => *a == b.as_str(),
+            (RawColumn::Blob(a), Value::Blob(b)) => *a == b.as_slice(),
+            (RawColumn::Boolean(a), Value::Boolean(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            RawColumn::Integer(i) => Some(*i as f64),
+            RawColumn::Real(r) => Some(*r),
+            _ => None,
+        }
+    }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            RawColumn::Integer(i) => Some(*i),
+            _ => None,
+        }
+    }
+}
+
+fn decode_value_raw(type_tag: u8, data: &[u8]) -> Result<RawColumn<'_>> {
+    match DataType::from_tag(type_tag) {
+        Some(DataType::Integer) => Ok(RawColumn::Integer(i64::from_le_bytes(
+            data[..8].try_into().unwrap(),
+        ))),
+        Some(DataType::Real) => Ok(RawColumn::Real(f64::from_le_bytes(
+            data[..8].try_into().unwrap(),
+        ))),
+        Some(DataType::Boolean) => Ok(RawColumn::Boolean(data[0] != 0)),
+        Some(DataType::Text) => {
+            let s = std::str::from_utf8(data)
+                .map_err(|_| SqlError::InvalidValue("invalid UTF-8 in column".into()))?;
+            Ok(RawColumn::Text(s))
+        }
+        Some(DataType::Blob) => Ok(RawColumn::Blob(data)),
+        _ => Err(SqlError::InvalidValue(format!(
+            "unknown column type tag: {type_tag}"
+        ))),
+    }
+}
+
+pub fn decode_column_raw(data: &[u8], target: usize) -> Result<RawColumn<'_>> {
+    let (col_count, bitmap, mut pos) = parse_row_header(data)?;
+    if target >= col_count {
+        return Err(SqlError::InvalidValue("column index out of bounds".into()));
+    }
+
+    for col in 0..=target {
+        let is_null = bitmap[col / 8] & (1 << (col % 8)) != 0;
+
+        if col == target {
+            if is_null {
+                return Ok(RawColumn::Null);
+            }
+            if pos + 5 > data.len() {
+                return Err(SqlError::InvalidValue("truncated column data".into()));
+            }
+            let type_tag = data[pos];
+            pos += 1;
+            let data_len = u32::from_le_bytes([
+                data[pos],
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+            ]) as usize;
+            pos += 4;
+            if pos + data_len > data.len() {
+                return Err(SqlError::InvalidValue("truncated column value".into()));
+            }
+            return decode_value_raw(type_tag, &data[pos..pos + data_len]);
+        } else if !is_null {
+            if pos + 5 > data.len() {
+                return Err(SqlError::InvalidValue("truncated column data".into()));
+            }
+            let data_len = u32::from_le_bytes([
+                data[pos + 1],
+                data[pos + 2],
+                data[pos + 3],
+                data[pos + 4],
+            ]) as usize;
+            pos += 5 + data_len;
+        }
+    }
+
+    unreachable!()
+}
+
+pub fn decode_pk_integer(key: &[u8]) -> Result<i64> {
+    if key.is_empty() || key[0] != TAG_INTEGER {
+        return Err(SqlError::InvalidValue("not an integer key".into()));
+    }
+    let (val, _) = decode_integer(&key[1..])?;
+    match val {
+        Value::Integer(i) => Ok(i),
+        _ => unreachable!(),
+    }
 }
 
 #[cfg(test)]
@@ -627,6 +1059,214 @@ mod tests {
             let (decoded, n) = decode_key_value(&encoded).unwrap();
             assert_eq!(n, encoded.len());
             assert_eq!(decoded, Value::Integer(v), "edge case failed for {v}");
+        }
+    }
+
+    #[test]
+    fn decode_columns_single() {
+        let values = vec![
+            Value::Integer(42),
+            Value::Text("hello".into()),
+            Value::Boolean(true),
+        ];
+        let encoded = encode_row(&values);
+        let cols = decode_columns(&encoded, &[1]).unwrap();
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0], Value::Text("hello".into()));
+    }
+
+    #[test]
+    fn decode_columns_multiple() {
+        let values = vec![
+            Value::Integer(1),
+            Value::Real(2.5),
+            Value::Text("skip".into()),
+            Value::Boolean(false),
+            Value::Blob(vec![0xAB]),
+        ];
+        let encoded = encode_row(&values);
+        let cols = decode_columns(&encoded, &[0, 3, 4]).unwrap();
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0], Value::Integer(1));
+        assert_eq!(cols[1], Value::Boolean(false));
+        assert_eq!(cols[2], Value::Blob(vec![0xAB]));
+    }
+
+    #[test]
+    fn decode_columns_with_nulls() {
+        let values = vec![
+            Value::Integer(10),
+            Value::Null,
+            Value::Text("after_null".into()),
+            Value::Null,
+            Value::Boolean(true),
+        ];
+        let encoded = encode_row(&values);
+        let cols = decode_columns(&encoded, &[1, 2, 4]).unwrap();
+        assert_eq!(cols.len(), 3);
+        assert!(cols[0].is_null());
+        assert_eq!(cols[1], Value::Text("after_null".into()));
+        assert_eq!(cols[2], Value::Boolean(true));
+    }
+
+    #[test]
+    fn decode_columns_first_and_last() {
+        let values = vec![
+            Value::Text("first".into()),
+            Value::Integer(99),
+            Value::Boolean(false),
+            Value::Real(3.125),
+        ];
+        let encoded = encode_row(&values);
+        let cols = decode_columns(&encoded, &[0, 3]).unwrap();
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0], Value::Text("first".into()));
+        assert_eq!(cols[1], Value::Real(3.125));
+    }
+
+    #[test]
+    fn decode_columns_empty_targets() {
+        let values = vec![Value::Integer(1)];
+        let encoded = encode_row(&values);
+        let cols = decode_columns(&encoded, &[]).unwrap();
+        assert!(cols.is_empty());
+    }
+
+    #[test]
+    fn decode_columns_all_matches_full_decode() {
+        let values = vec![
+            Value::Integer(-100),
+            Value::Real(3.15),
+            Value::Text("hello world".into()),
+            Value::Blob(vec![0xDE, 0xAD]),
+            Value::Boolean(false),
+            Value::Null,
+        ];
+        let encoded = encode_row(&values);
+        let full = decode_row(&encoded).unwrap();
+        let selective = decode_columns(&encoded, &[0, 1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(full, selective);
+    }
+
+    #[test]
+    fn raw_column_integer() {
+        let values = vec![Value::Integer(42), Value::Text("hello".into())];
+        let encoded = encode_row(&values);
+        let raw = decode_column_raw(&encoded, 0).unwrap();
+        assert!(matches!(raw, RawColumn::Integer(42)));
+        assert_eq!(raw.to_value(), Value::Integer(42));
+    }
+
+    #[test]
+    fn raw_column_text_borrows() {
+        let values = vec![Value::Integer(1), Value::Text("hello".into())];
+        let encoded = encode_row(&values);
+        let raw = decode_column_raw(&encoded, 1).unwrap();
+        match raw {
+            RawColumn::Text(s) => assert_eq!(s, "hello"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_column_null() {
+        let values = vec![Value::Integer(1), Value::Null, Value::Boolean(true)];
+        let encoded = encode_row(&values);
+        let raw = decode_column_raw(&encoded, 1).unwrap();
+        assert!(matches!(raw, RawColumn::Null));
+    }
+
+    #[test]
+    fn raw_column_last() {
+        let values = vec![Value::Integer(1), Value::Text("skip".into()), Value::Real(3.14)];
+        let encoded = encode_row(&values);
+        let raw = decode_column_raw(&encoded, 2).unwrap();
+        match raw {
+            RawColumn::Real(r) => assert!((r - 3.14).abs() < 1e-10),
+            other => panic!("expected Real, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_column_out_of_bounds() {
+        let values = vec![Value::Integer(1)];
+        let encoded = encode_row(&values);
+        assert!(decode_column_raw(&encoded, 1).is_err());
+    }
+
+    #[test]
+    fn raw_column_eq_value() {
+        let raw_int = RawColumn::Integer(42);
+        assert!(raw_int.eq_value(&Value::Integer(42)));
+        assert!(!raw_int.eq_value(&Value::Integer(43)));
+        assert!(raw_int.eq_value(&Value::Real(42.0)));
+
+        let raw_text = RawColumn::Text("hello");
+        assert!(raw_text.eq_value(&Value::Text("hello".into())));
+        assert!(!raw_text.eq_value(&Value::Text("world".into())));
+    }
+
+    #[test]
+    fn raw_column_cmp_value() {
+        use std::cmp::Ordering;
+        let raw = RawColumn::Integer(42);
+        assert_eq!(raw.cmp_value(&Value::Integer(42)), Some(Ordering::Equal));
+        assert_eq!(raw.cmp_value(&Value::Integer(50)), Some(Ordering::Less));
+        assert_eq!(raw.cmp_value(&Value::Integer(10)), Some(Ordering::Greater));
+        assert_eq!(raw.cmp_value(&Value::Null), None);
+    }
+
+    #[test]
+    fn raw_column_as_numeric() {
+        assert_eq!(RawColumn::Integer(42).as_i64(), Some(42));
+        assert_eq!(RawColumn::Integer(42).as_f64(), Some(42.0));
+        assert_eq!(RawColumn::Real(3.14).as_f64(), Some(3.14));
+        assert_eq!(RawColumn::Real(3.14).as_i64(), None);
+        assert_eq!(RawColumn::Text("x").as_f64(), None);
+        assert_eq!(RawColumn::Null.as_i64(), None);
+    }
+
+    #[test]
+    fn decode_pk_integer_roundtrip() {
+        for v in [0i64, 1, -1, 42, -1000, i64::MIN, i64::MAX] {
+            let encoded = encode_key_value(&Value::Integer(v));
+            let decoded = decode_pk_integer(&encoded).unwrap();
+            assert_eq!(decoded, v);
+        }
+    }
+
+    #[test]
+    fn decode_pk_integer_rejects_non_integer() {
+        let encoded = encode_key_value(&Value::Text("hello".into()));
+        assert!(decode_pk_integer(&encoded).is_err());
+    }
+
+    #[test]
+    fn raw_column_blob() {
+        let values = vec![Value::Blob(vec![0xDE, 0xAD])];
+        let encoded = encode_row(&values);
+        let raw = decode_column_raw(&encoded, 0).unwrap();
+        match raw {
+            RawColumn::Blob(b) => assert_eq!(b, &[0xDE, 0xAD]),
+            other => panic!("expected Blob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_column_matches_full_decode() {
+        let values = vec![
+            Value::Integer(-100),
+            Value::Real(3.15),
+            Value::Text("hello world".into()),
+            Value::Blob(vec![0xDE, 0xAD]),
+            Value::Boolean(false),
+            Value::Null,
+        ];
+        let encoded = encode_row(&values);
+        let full = decode_row(&encoded).unwrap();
+        for (i, expected) in full.iter().enumerate() {
+            let raw = decode_column_raw(&encoded, i).unwrap();
+            assert_eq!(raw.to_value(), *expected, "mismatch at column {i}");
         }
     }
 }

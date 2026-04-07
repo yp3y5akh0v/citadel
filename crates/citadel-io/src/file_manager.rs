@@ -5,13 +5,13 @@ use citadel_core::{
     GOD_BIT_ACTIVE_SLOT, GOD_BIT_RECOVERY, GOD_BYTE_OFFSET, GROWTH_CHUNK_16MB, GROWTH_CHUNK_1MB,
     GROWTH_CHUNK_4MB, GROWTH_THRESHOLD_1GB, GROWTH_THRESHOLD_4MB, GROWTH_THRESHOLD_64MB, MAC_SIZE,
     MAGIC, MERKLE_HASH_SIZE, PAGE_SIZE, SLOT_CATALOG_ROOT, SLOT_CHECKSUM, SLOT_DEK_ID,
-    SLOT_ENCRYPTION_EPOCH, SLOT_HIGH_WATER_MARK, SLOT_MERKLE_ROOT, SLOT_PENDING_FREE_ROOT,
-    SLOT_TOTAL_PAGES, SLOT_TREE_DEPTH, SLOT_TREE_ENTRIES, SLOT_TREE_ROOT, SLOT_TXN_ID,
+    SLOT_ENCRYPTION_EPOCH, SLOT_HIGH_WATER_MARK, SLOT_MERKLE_ROOT, SLOT_NAMED_ENTRIES,
+    SLOT_NAMED_ENTRY_SIZE, SLOT_NAMED_MAX_ENTRIES, SLOT_PENDING_FREE_ROOT, SLOT_TOTAL_PAGES,
+    SLOT_TREE_DEPTH, SLOT_TREE_ENTRIES, SLOT_TREE_ROOT, SLOT_TXN_ID,
 };
 
 use crate::traits::PageIO;
 
-/// Represents one of the two commit slots in the file header.
 #[derive(Debug, Clone, Default)]
 pub struct CommitSlot {
     pub txn_id: TxnId,
@@ -26,17 +26,16 @@ pub struct CommitSlot {
     pub dek_id: [u8; MAC_SIZE],
     pub checksum: u64,
     pub merkle_root: [u8; MERKLE_HASH_SIZE],
+    pub named_table_entries: Vec<(u32, u64)>,
 }
 
 impl CommitSlot {
-    /// Serialize to 240 bytes.
     pub fn serialize(&self) -> [u8; COMMIT_SLOT_SIZE] {
         let mut buf = [0u8; COMMIT_SLOT_SIZE];
         buf[SLOT_TXN_ID..SLOT_TXN_ID + 8].copy_from_slice(&self.txn_id.as_u64().to_le_bytes());
         buf[SLOT_TREE_ROOT..SLOT_TREE_ROOT + 4]
             .copy_from_slice(&self.tree_root.as_u32().to_le_bytes());
         buf[SLOT_TREE_DEPTH..SLOT_TREE_DEPTH + 2].copy_from_slice(&self.tree_depth.to_le_bytes());
-        // 2 bytes padding at offset 14
         buf[SLOT_TREE_ENTRIES..SLOT_TREE_ENTRIES + 8]
             .copy_from_slice(&self.tree_entries.to_le_bytes());
         buf[SLOT_CATALOG_ROOT..SLOT_CATALOG_ROOT + 4]
@@ -51,18 +50,23 @@ impl CommitSlot {
             .copy_from_slice(&self.encryption_epoch.to_le_bytes());
         buf[SLOT_DEK_ID..SLOT_DEK_ID + MAC_SIZE].copy_from_slice(&self.dek_id);
 
-        // Compute checksum over bytes [0..76]
         let cs = xxhash_rust::xxh64::xxh64(&buf[..SLOT_CHECKSUM], 0);
         buf[SLOT_CHECKSUM..SLOT_CHECKSUM + 8].copy_from_slice(&cs.to_le_bytes());
-
-        // Merkle root at [84..112] (outside checksum range, verifiable by recomputation)
         buf[SLOT_MERKLE_ROOT..SLOT_MERKLE_ROOT + MERKLE_HASH_SIZE]
             .copy_from_slice(&self.merkle_root);
+
+        let n = self.named_table_entries.len().min(SLOT_NAMED_MAX_ENTRIES);
+        buf[SLOT_NAMED_ENTRIES..SLOT_NAMED_ENTRIES + 2]
+            .copy_from_slice(&(n as u16).to_le_bytes());
+        for (i, &(hash, count)) in self.named_table_entries.iter().take(n).enumerate() {
+            let off = SLOT_NAMED_ENTRIES + 2 + i * SLOT_NAMED_ENTRY_SIZE;
+            buf[off..off + 4].copy_from_slice(&hash.to_le_bytes());
+            buf[off + 4..off + 12].copy_from_slice(&count.to_le_bytes());
+        }
 
         buf
     }
 
-    /// Deserialize from 240 bytes. Does NOT validate checksum.
     pub fn deserialize(buf: &[u8; COMMIT_SLOT_SIZE]) -> Self {
         let mut merkle_root = [0u8; MERKLE_HASH_SIZE];
         merkle_root.copy_from_slice(&buf[SLOT_MERKLE_ROOT..SLOT_MERKLE_ROOT + MERKLE_HASH_SIZE]);
@@ -112,18 +116,45 @@ impl CommitSlot {
             dek_id: buf[SLOT_DEK_ID..SLOT_DEK_ID + MAC_SIZE].try_into().unwrap(),
             checksum: u64::from_le_bytes(buf[SLOT_CHECKSUM..SLOT_CHECKSUM + 8].try_into().unwrap()),
             merkle_root,
+            named_table_entries: {
+                let n = u16::from_le_bytes(
+                    buf[SLOT_NAMED_ENTRIES..SLOT_NAMED_ENTRIES + 2]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                let n = n.min(SLOT_NAMED_MAX_ENTRIES);
+                let mut entries = Vec::with_capacity(n);
+                for i in 0..n {
+                    let off = SLOT_NAMED_ENTRIES + 2 + i * SLOT_NAMED_ENTRY_SIZE;
+                    let hash = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                    let count =
+                        u64::from_le_bytes(buf[off + 4..off + 12].try_into().unwrap());
+                    entries.push((hash, count));
+                }
+                entries
+            },
         }
     }
 
-    /// Validate the checksum of this slot.
     pub fn verify_checksum(&self) -> bool {
         let buf = self.serialize();
         let computed = xxhash_rust::xxh64::xxh64(&buf[..SLOT_CHECKSUM], 0);
         self.checksum == computed
     }
+
+    pub fn named_entry_count(&self, name: &[u8]) -> Option<u64> {
+        let h = table_name_hash(name);
+        self.named_table_entries
+            .iter()
+            .find(|&&(hash, _)| hash == h)
+            .map(|&(_, count)| count)
+    }
 }
 
-/// File header operations.
+pub fn table_name_hash(name: &[u8]) -> u32 {
+    xxhash_rust::xxh64::xxh64(name, 0x7461626C) as u32
+}
+
 pub struct FileHeader {
     pub magic: u32,
     pub format_version: u32,
@@ -137,7 +168,6 @@ pub struct FileHeader {
 }
 
 impl FileHeader {
-    /// Serialize to FILE_HEADER_SIZE bytes.
     pub fn serialize(&self) -> [u8; FILE_HEADER_SIZE] {
         let mut buf = [0u8; FILE_HEADER_SIZE];
         buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
@@ -147,7 +177,6 @@ impl FileHeader {
         buf[16..18].copy_from_slice(&self.min_reader_ver.to_le_bytes());
         buf[18..20].copy_from_slice(&self.min_writer_ver.to_le_bytes());
         buf[GOD_BYTE_OFFSET] = self.god_byte;
-        // [21..24] reserved
         buf[FILE_ID_OFFSET..FILE_ID_OFFSET + 8].copy_from_slice(&self.file_id.to_le_bytes());
 
         let slot0 = self.slots[0].serialize();
@@ -159,7 +188,6 @@ impl FileHeader {
         buf
     }
 
-    /// Deserialize from FILE_HEADER_SIZE bytes.
     pub fn deserialize(buf: &[u8; FILE_HEADER_SIZE]) -> Result<Self> {
         let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         if magic != MAGIC {
@@ -201,7 +229,6 @@ impl FileHeader {
         })
     }
 
-    /// Create a new empty file header for a fresh database.
     pub fn new(file_id: u64, dek_id: [u8; MAC_SIZE]) -> Self {
         let slot = CommitSlot {
             txn_id: TxnId(0),
@@ -214,8 +241,9 @@ impl FileHeader {
             pending_free_root: PageId::INVALID,
             encryption_epoch: 1,
             dek_id,
-            checksum: 0, // will be computed during serialize
+            checksum: 0,
             merkle_root: [0u8; MERKLE_HASH_SIZE],
+            named_table_entries: Vec::new(),
         };
 
         Self {
@@ -225,64 +253,55 @@ impl FileHeader {
             body_size: citadel_core::BODY_SIZE as u32,
             min_reader_ver: 1,
             min_writer_ver: 1,
-            god_byte: 0, // slot 0 active, no recovery needed
+            god_byte: 0,
             file_id,
             slots: [slot.clone(), slot],
         }
     }
 
-    /// Get the active commit slot index (0 or 1).
     #[inline]
     pub fn active_slot(&self) -> usize {
         (self.god_byte & GOD_BIT_ACTIVE_SLOT) as usize
     }
 
-    /// Get the inactive commit slot index.
     #[inline]
     pub fn inactive_slot(&self) -> usize {
         1 - self.active_slot()
     }
 
-    /// Check if recovery is required (bit 1 of god_byte).
     #[inline]
     pub fn recovery_required(&self) -> bool {
         self.god_byte & GOD_BIT_RECOVERY != 0
     }
 }
 
-/// Read the god byte from the I/O layer.
 pub fn read_god_byte(io: &dyn PageIO) -> Result<u8> {
     let mut buf = [0u8; 1];
     io.read_at(GOD_BYTE_OFFSET as u64, &mut buf)?;
     Ok(buf[0])
 }
 
-/// Write the god byte (single-byte atomic write).
 pub fn write_god_byte(io: &dyn PageIO, value: u8) -> Result<()> {
     io.write_at(GOD_BYTE_OFFSET as u64, &[value])
 }
 
-/// Read the full file header.
 pub fn read_file_header(io: &dyn PageIO) -> Result<FileHeader> {
     let mut buf = [0u8; FILE_HEADER_SIZE];
     io.read_at(0, &mut buf)?;
     FileHeader::deserialize(&buf)
 }
 
-/// Write the full file header.
 pub fn write_file_header(io: &dyn PageIO, header: &FileHeader) -> Result<()> {
     let buf = header.serialize();
     io.write_at(0, &buf)
 }
 
-/// Write a commit slot to the given slot index (0 or 1).
 pub fn write_commit_slot(io: &dyn PageIO, slot_index: usize, slot: &CommitSlot) -> Result<()> {
     let offset = COMMIT_SLOT_OFFSET + slot_index * COMMIT_SLOT_SIZE;
     let buf = slot.serialize();
     io.write_at(offset as u64, &buf)
 }
 
-/// Read a commit slot from the given slot index (0 or 1).
 pub fn read_commit_slot(io: &dyn PageIO, slot_index: usize) -> Result<CommitSlot> {
     let offset = COMMIT_SLOT_OFFSET + slot_index * COMMIT_SLOT_SIZE;
     let mut buf = [0u8; COMMIT_SLOT_SIZE];
@@ -290,15 +309,11 @@ pub fn read_commit_slot(io: &dyn PageIO, slot_index: usize) -> Result<CommitSlot
     Ok(CommitSlot::deserialize(&buf))
 }
 
-/// Calculate the file offset of page N.
 #[inline]
 pub fn page_offset(page_id: PageId) -> u64 {
     FILE_HEADER_SIZE as u64 + page_id.as_u32() as u64 * PAGE_SIZE as u64
 }
 
-/// Recovery state machine — determine which commit slot to use on open.
-///
-/// Returns the active slot index and the validated CommitSlot.
 pub fn recover(io: &dyn PageIO) -> Result<(usize, CommitSlot)> {
     let god_byte = read_god_byte(io)?;
     let active = (god_byte & GOD_BIT_ACTIVE_SLOT) as usize;
@@ -316,7 +331,6 @@ pub fn recover(io: &dyn PageIO) -> Result<(usize, CommitSlot)> {
         (false, false) => return Err(Error::DatabaseCorrupted),
     };
 
-    // Validate slot: tree_root and pending_free_root within bounds
     if chosen_slot.high_water_mark > 0 {
         if chosen_slot.tree_root.as_u32() > 0
             && chosen_slot.tree_root.as_u32() >= chosen_slot.high_water_mark
@@ -330,7 +344,6 @@ pub fn recover(io: &dyn PageIO) -> Result<(usize, CommitSlot)> {
         }
     }
 
-    // Clear recovery flag if set
     if god_byte & GOD_BIT_RECOVERY != 0 {
         let new_god_byte = (chosen_slot_idx as u8) & GOD_BIT_ACTIVE_SLOT; // clear bit 1
         write_god_byte(io, new_god_byte)?;
@@ -340,7 +353,6 @@ pub fn recover(io: &dyn PageIO) -> Result<(usize, CommitSlot)> {
     Ok((chosen_slot_idx, chosen_slot))
 }
 
-/// Calculate growth chunk size for file extension.
 pub fn growth_chunk(current_size: u64) -> u64 {
     if current_size < GROWTH_THRESHOLD_4MB {
         GROWTH_CHUNK_1MB
@@ -349,12 +361,10 @@ pub fn growth_chunk(current_size: u64) -> u64 {
     } else if current_size < GROWTH_THRESHOLD_1GB {
         GROWTH_CHUNK_16MB
     } else {
-        // 1% of file size, minimum 16MB
         std::cmp::max(GROWTH_CHUNK_16MB, current_size / 100)
     }
 }
 
-/// Ensure the file is large enough to hold page at the given offset.
 pub fn ensure_file_size(io: &dyn PageIO, needed_offset: u64) -> Result<()> {
     let current_size = io.file_size()?;
     let needed_size = needed_offset + PAGE_SIZE as u64;
@@ -385,6 +395,7 @@ mod tests {
             dek_id: [0xAA; MAC_SIZE],
             checksum: 0,
             merkle_root: [0xBB; MERKLE_HASH_SIZE],
+            named_table_entries: vec![(0x12345678, 500)],
         };
 
         let buf = slot.serialize();
@@ -401,6 +412,7 @@ mod tests {
         assert_eq!(slot2.encryption_epoch, 1);
         assert_eq!(slot2.dek_id, [0xAA; MAC_SIZE]);
         assert_eq!(slot2.merkle_root, [0xBB; MERKLE_HASH_SIZE]);
+        assert_eq!(slot2.named_table_entries, vec![(0x12345678, 500)]);
     }
 
     #[test]
@@ -418,14 +430,13 @@ mod tests {
             dek_id: [0; MAC_SIZE],
             checksum: 0,
             merkle_root: [0; MERKLE_HASH_SIZE],
+            named_table_entries: Vec::new(),
         };
 
-        // After serialization, checksum field is populated
         let buf = slot.serialize();
         let slot2 = CommitSlot::deserialize(&buf);
         assert!(slot2.verify_checksum());
 
-        // Tamper with a byte
         let mut tampered = buf;
         tampered[0] ^= 0x01;
         let slot3 = CommitSlot::deserialize(&tampered);

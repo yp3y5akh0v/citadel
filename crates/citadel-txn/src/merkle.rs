@@ -14,38 +14,28 @@ use citadel_core::{Result, MERKLE_HASH_SIZE};
 use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
 
-/// Compute and store Merkle hashes for all dirty pages in the tree.
-///
-/// Returns the root page's Merkle hash (28 bytes, BLAKE3 truncated).
-///
-/// For dirty pages (txn_id == current), the hash is computed fresh and stored
-/// in the page header. For clean pages, the existing hash from the header is used.
-///
-/// The `read_clean_page` closure reads a page from disk when it's not in the HashMap.
 pub fn compute_tree_merkle(
     pages: &mut HashMap<PageId, Page>,
     root: PageId,
     txn_id: TxnId,
-    read_clean_page: &dyn Fn(PageId) -> Result<Page>,
+    read_clean_hash: &dyn Fn(PageId) -> Result<[u8; MERKLE_HASH_SIZE]>,
 ) -> Result<[u8; MERKLE_HASH_SIZE]> {
-    compute_page_merkle(pages, root, txn_id, read_clean_page)
+    compute_page_merkle(pages, root, txn_id, read_clean_hash)
 }
 
 fn compute_page_merkle(
     pages: &mut HashMap<PageId, Page>,
     page_id: PageId,
     txn_id: TxnId,
-    read_clean_page: &dyn Fn(PageId) -> Result<Page>,
+    read_clean_hash: &dyn Fn(PageId) -> Result<[u8; MERKLE_HASH_SIZE]>,
 ) -> Result<[u8; MERKLE_HASH_SIZE]> {
-    // Load page if not in HashMap
-    if let std::collections::hash_map::Entry::Vacant(e) = pages.entry(page_id) {
-        let page = read_clean_page(page_id)?;
-        e.insert(page);
-    }
+    // Page not in write set — it's clean, just read its hash
+    let page = match pages.get(&page_id) {
+        Some(page) => page,
+        None => return read_clean_hash(page_id),
+    };
 
-    let page = pages.get(&page_id).unwrap();
-
-    // Clean page — hash already valid in header
+    // Clean page in HashMap — hash already valid in header
     if page.txn_id() != txn_id {
         return Ok(page.merkle_hash());
     }
@@ -69,7 +59,7 @@ fn compute_page_merkle(
             // Recursively compute children's hashes
             let mut hasher = blake3::Hasher::new();
             for child_id in children {
-                let child_hash = compute_page_merkle(pages, child_id, txn_id, read_clean_page)?;
+                let child_hash = compute_page_merkle(pages, child_id, txn_id, read_clean_hash)?;
                 hasher.update(&child_hash);
             }
             truncate_hash(&hasher.finalize())
@@ -285,11 +275,11 @@ mod tests {
     }
 
     #[test]
-    fn reads_clean_page_from_disk() {
+    fn reads_clean_hash_from_pool() {
         let dirty_txn = TxnId(5);
         let clean_txn = TxnId(3);
 
-        // Clean leaf NOT in HashMap — must be read from "disk"
+        // Clean leaf NOT in HashMap — hash fetched via callback
         let mut clean_leaf = make_leaf(PageId(2), clean_txn, &[(b"x", b"y")]);
         let precomputed_hash = compute_leaf_hash(&clean_leaf);
         clean_leaf.set_merkle_hash(&precomputed_hash);
@@ -301,18 +291,18 @@ mod tests {
         let mut pages: HashMap<PageId, Page> = HashMap::new();
         pages.insert(PageId(0), branch);
         pages.insert(PageId(1), dirty_leaf);
-        // PageId(2) NOT in pages — read_clean_page will be called
+        // PageId(2) NOT in pages — read_clean_hash will be called
 
         let root_hash = compute_tree_merkle(&mut pages, PageId(0), dirty_txn, &|page_id| {
             assert_eq!(page_id, PageId(2));
-            Ok(clean_leaf.clone())
+            Ok(precomputed_hash)
         })
         .unwrap();
 
         assert_ne!(root_hash, [0u8; MERKLE_HASH_SIZE]);
 
-        // Clean leaf should now be in the HashMap (cached after read)
-        assert!(pages.contains_key(&PageId(2)));
+        // Clean page should NOT be loaded into the HashMap (hash-only fetch)
+        assert!(!pages.contains_key(&PageId(2)));
     }
 
     #[test]

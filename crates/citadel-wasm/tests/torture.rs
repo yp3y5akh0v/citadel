@@ -702,7 +702,7 @@ fn sql_prepared_params_small_cache() {
             "INSERT INTO params (id, val) VALUES ($1, $2)",
             &[
                 citadel_sql::types::Value::Integer(i),
-                citadel_sql::types::Value::Text(format!("val_{i}")),
+                citadel_sql::types::Value::Text(format!("val_{i}").into()),
             ],
         )
         .unwrap();
@@ -718,7 +718,7 @@ fn sql_prepared_params_small_cache() {
         assert_eq!(qr.rows.len(), 1);
         assert_eq!(
             qr.rows[0][0],
-            citadel_sql::types::Value::Text(format!("val_{i}"))
+            citadel_sql::types::Value::Text(format!("val_{i}").into())
         );
     }
 }

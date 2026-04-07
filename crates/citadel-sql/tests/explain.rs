@@ -23,7 +23,7 @@ fn explain_lines(conn: &mut Connection<'_>, sql: &str) -> Vec<String> {
     qr.rows
         .into_iter()
         .map(|row| match &row[0] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => s.to_string(),
             other => panic!("expected Text, got {other:?}"),
         })
         .collect()

@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "SQL engine for Citadel encrypted database"
+description = "SQL parser, planner, and executor for Citadel encrypted database"
 readme = "README.md"
 
 [lib]
@@ -22,6 +22,16 @@ citadel = { workspace = true }
 sqlparser = { workspace = true }
 thiserror = { workspace = true }
 lru = { workspace = true }
+compact_str = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { workspace = true }
+citadel-crypto = { workspace = true }
+rand = { workspace = true }
+rusqlite = { workspace = true }
+mimalloc = { workspace = true }
+
+[[bench]]
+name = "h2h_bench"
+harness = false

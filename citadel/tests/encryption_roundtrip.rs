@@ -180,6 +180,7 @@ fn file_header_and_recovery() {
         dek_id,
         checksum: 0,
         merkle_root: [0u8; citadel_core::MERKLE_HASH_SIZE],
+        named_table_entries: Vec::new(),
     };
 
     write_commit_slot(&io, 1, &new_slot).unwrap(); // write to inactive slot 1
@@ -227,6 +228,7 @@ fn recovery_rejects_tree_root_at_high_water_mark() {
         dek_id,
         checksum: 0,
         merkle_root: [0u8; citadel_core::MERKLE_HASH_SIZE],
+        named_table_entries: Vec::new(),
     };
 
     write_commit_slot(&io, 0, &slot).unwrap();
@@ -272,6 +274,7 @@ fn recovery_rejects_pending_free_at_high_water_mark() {
         dek_id,
         checksum: 0,
         merkle_root: [0u8; citadel_core::MERKLE_HASH_SIZE],
+        named_table_entries: Vec::new(),
     };
 
     write_commit_slot(&io, 0, &slot).unwrap();

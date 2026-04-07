@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use citadel_core::types::PageId;
 use citadel_core::{Error, Result};
 use citadel_core::{BODY_SIZE, DEK_SIZE, MAC_KEY_SIZE, PAGE_SIZE};
@@ -9,6 +11,36 @@ use citadel_page::page::Page;
 
 use crate::sieve::SieveCache;
 
+pub fn read_and_decrypt(
+    io: &dyn PageIO,
+    page_id: PageId,
+    offset: u64,
+    dek: &[u8; DEK_SIZE],
+    mac_key: &[u8; MAC_KEY_SIZE],
+    encryption_epoch: u32,
+) -> Result<Page> {
+    let mut encrypted = [0u8; PAGE_SIZE];
+    io.read_page(offset, &mut encrypted)?;
+
+    let mut body = [0u8; BODY_SIZE];
+    page_cipher::decrypt_page(
+        dek,
+        mac_key,
+        page_id,
+        encryption_epoch,
+        &encrypted,
+        &mut body,
+    )?;
+
+    let page = Page::from_bytes(body);
+
+    if !page.verify_checksum() {
+        return Err(Error::ChecksumMismatch(page_id));
+    }
+
+    Ok(page)
+}
+
 /// Buffer pool: caches decrypted pages in memory with SIEVE eviction.
 ///
 /// Keyed by physical disk offset (not logical page_id) because under CoW/MVCC
@@ -19,7 +51,7 @@ use crate::sieve::SieveCache;
 /// - Dirty pages are PINNED and never evictable until commit.
 /// - Transaction size is bounded by buffer pool capacity.
 pub struct BufferPool {
-    cache: SieveCache<Page>,
+    cache: SieveCache<Arc<Page>>,
     capacity: usize,
 }
 
@@ -51,11 +83,11 @@ impl BufferPool {
         }
 
         // Cache miss: read from disk
-        let page = self.read_and_decrypt(io, page_id, offset, dek, mac_key, encryption_epoch)?;
+        let page = read_and_decrypt(io, page_id, offset, dek, mac_key, encryption_epoch)?;
 
         // Insert into cache (may evict)
         self.cache
-            .insert(offset, page)
+            .insert(offset, Arc::new(page))
             .map_err(|()| Error::BufferPoolFull)?;
 
         Ok(self.cache.get(offset).unwrap())
@@ -74,13 +106,13 @@ impl BufferPool {
 
         if !self.cache.contains(offset) {
             let page =
-                self.read_and_decrypt(io, page_id, offset, dek, mac_key, encryption_epoch)?;
+                read_and_decrypt(io, page_id, offset, dek, mac_key, encryption_epoch)?;
             self.cache
-                .insert(offset, page)
+                .insert(offset, Arc::new(page))
                 .map_err(|()| Error::BufferPoolFull)?;
         }
 
-        Ok(self.cache.get_mut(offset).unwrap())
+        Ok(Arc::make_mut(self.cache.get_mut(offset).unwrap()))
     }
 
     /// Insert a new page directly into the buffer pool (for newly allocated pages).
@@ -92,13 +124,13 @@ impl BufferPool {
         if self.cache.len() >= self.capacity && !self.cache.contains(offset) {
             // Try to insert (may evict a clean page)
             self.cache
-                .insert(offset, page)
+                .insert(offset, Arc::new(page))
                 .map_err(|()| Error::TransactionTooLarge {
                     capacity: self.capacity,
                 })?;
         } else {
             self.cache
-                .insert(offset, page)
+                .insert(offset, Arc::new(page))
                 .map_err(|()| Error::BufferPoolFull)?;
         }
 
@@ -125,9 +157,9 @@ impl BufferPool {
         let dirty: Vec<(u64, PageId, [u8; BODY_SIZE])> = self
             .cache
             .dirty_entries()
-            .map(|(offset, page)| {
-                let page_id = page.page_id();
-                let body = *page.as_bytes();
+            .map(|(offset, arc)| {
+                let page_id = arc.page_id();
+                let body = *arc.as_bytes();
                 (offset, page_id, body)
             })
             .collect();
@@ -163,37 +195,16 @@ impl BufferPool {
         }
     }
 
-    fn read_and_decrypt(
-        &self,
-        io: &dyn PageIO,
-        page_id: PageId,
-        offset: u64,
-        dek: &[u8; DEK_SIZE],
-        mac_key: &[u8; MAC_KEY_SIZE],
-        encryption_epoch: u32,
-    ) -> Result<Page> {
-        let mut encrypted = [0u8; PAGE_SIZE];
-        io.read_page(offset, &mut encrypted)?;
+    pub fn get_cached(&mut self, page_id: PageId) -> Option<Arc<Page>> {
+        let offset = page_offset(page_id);
+        self.cache.get(offset).map(Arc::clone)
+    }
 
-        // INVARIANT: Verify HMAC BEFORE decryption
-        let mut body = [0u8; BODY_SIZE];
-        page_cipher::decrypt_page(
-            dek,
-            mac_key,
-            page_id,
-            encryption_epoch,
-            &encrypted,
-            &mut body,
-        )?;
-
-        let page = Page::from_bytes(body);
-
-        // Defense-in-depth: verify xxHash64 checksum
-        if !page.verify_checksum() {
-            return Err(Error::ChecksumMismatch(page_id));
+    pub fn insert_if_absent(&mut self, page_id: PageId, page: Arc<Page>) {
+        let offset = page_offset(page_id);
+        if !self.cache.contains(offset) {
+            let _ = self.cache.insert(offset, page);
         }
-
-        Ok(page)
     }
 
     /// Number of pages currently in the cache.

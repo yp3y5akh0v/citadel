@@ -1,14 +1,16 @@
 //! SQL executor: DDL and DML operations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use citadel::Database;
 
 use crate::encoding::{
-    decode_composite_key, decode_key_value, decode_row, encode_composite_key, encode_row,
+    decode_column_raw, decode_columns, decode_columns_into, decode_composite_key, decode_key_value, decode_pk_integer,
+    decode_pk_into, decode_row_into, encode_composite_key, encode_composite_key_into, encode_row,
+    encode_row_into, RawColumn,
 };
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy};
+use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap};
 use crate::parser::*;
 use crate::planner::{self, ScanPlan};
 use crate::schema::SchemaManager;
@@ -106,13 +108,14 @@ pub fn execute(
     db: &Database,
     schema: &mut SchemaManager,
     stmt: &Statement,
+    params: &[Value],
 ) -> Result<ExecutionResult> {
     match stmt {
         Statement::CreateTable(ct) => exec_create_table(db, schema, ct),
         Statement::DropTable(dt) => exec_drop_table(db, schema, dt),
         Statement::CreateIndex(ci) => exec_create_index(db, schema, ci),
         Statement::DropIndex(di) => exec_drop_index(db, schema, di),
-        Statement::Insert(ins) => exec_insert(db, schema, ins),
+        Statement::Insert(ins) => exec_insert(db, schema, ins, params),
         Statement::Select(sel) => exec_select(db, schema, sel),
         Statement::Update(upd) => exec_update(db, schema, upd),
         Statement::Delete(del) => exec_delete(db, schema, del),
@@ -128,13 +131,17 @@ pub fn execute_in_txn(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &mut SchemaManager,
     stmt: &Statement,
+    params: &[Value],
 ) -> Result<ExecutionResult> {
     match stmt {
         Statement::CreateTable(ct) => exec_create_table_in_txn(wtx, schema, ct),
         Statement::DropTable(dt) => exec_drop_table_in_txn(wtx, schema, dt),
         Statement::CreateIndex(ci) => exec_create_index_in_txn(wtx, schema, ci),
         Statement::DropIndex(di) => exec_drop_index_in_txn(wtx, schema, di),
-        Statement::Insert(ins) => exec_insert_in_txn(wtx, schema, ins),
+        Statement::Insert(ins) => {
+            let mut bufs = InsertBufs::new();
+            exec_insert_in_txn(wtx, schema, ins, params, &mut bufs)
+        }
         Statement::Select(sel) => exec_select_in_txn(wtx, schema, sel),
         Statement::Update(upd) => exec_update_in_txn(wtx, schema, upd),
         Statement::Delete(del) => exec_delete_in_txn(wtx, schema, del),
@@ -169,7 +176,7 @@ pub fn explain(schema: &SchemaManager, stmt: &Statement) -> Result<ExecutionResu
 
     let rows = lines
         .into_iter()
-        .map(|line| vec![Value::Text(line)])
+        .map(|line| vec![Value::Text(line.into())])
         .collect();
     Ok(ExecutionResult::Query(QueryResult {
         columns: vec!["plan".into()],
@@ -425,12 +432,7 @@ fn exec_create_table(
         })
         .collect::<Result<_>>()?;
 
-    let table_schema = TableSchema {
-        name: lower_name.clone(),
-        columns,
-        primary_key_columns,
-        indices: vec![],
-    };
+    let table_schema = TableSchema::new(lower_name.clone(), columns, primary_key_columns, vec![]);
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     SchemaManager::ensure_schema_table(&mut wtx)?;
@@ -528,12 +530,7 @@ fn exec_create_table_in_txn(
         })
         .collect::<Result<_>>()?;
 
-    let table_schema = TableSchema {
-        name: lower_name.clone(),
-        columns,
-        primary_key_columns,
-        indices: vec![],
-    };
+    let table_schema = TableSchema::new(lower_name.clone(), columns, primary_key_columns, vec![]);
 
     SchemaManager::ensure_schema_table(wtx)?;
     wtx.create_table(lower_name.as_bytes())
@@ -916,27 +913,95 @@ fn collect_rows_read(
     db: &Database,
     table_schema: &TableSchema,
     where_clause: &Option<Expr>,
-) -> Result<Vec<Vec<Value>>> {
+    limit: Option<usize>,
+) -> Result<(Vec<Vec<Value>>, bool)> {
     let plan = planner::plan_select(table_schema, where_clause);
     let lower_name = &table_schema.name;
+    let columns = &table_schema.columns;
 
     match plan {
         ScanPlan::SeqScan => {
-            let mut rows = Vec::new();
-            let mut rtx = db.begin_read();
-            let mut scan_err: Option<SqlError> = None;
-            rtx.table_for_each(lower_name.as_bytes(), |key, value| {
-                match decode_full_row(table_schema, key, value) {
-                    Ok(row) => rows.push(row),
-                    Err(e) => scan_err = Some(e),
+            let simple_pred = where_clause.as_ref().and_then(|expr| {
+                try_simple_predicate(expr, table_schema)
+            });
+
+            if let Some(ref pred) = simple_pred {
+                let mut rtx = db.begin_read();
+                let entry_count = rtx.table_entry_count(lower_name.as_bytes())
+                    .unwrap_or(0) as usize;
+                let mut rows = Vec::with_capacity(entry_count / 4);
+                let mut scan_err: Option<SqlError> = None;
+                rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
+                    match pred.matches_raw(key, value) {
+                        Ok(true) => match decode_full_row(table_schema, key, value) {
+                            Ok(row) => rows.push(row),
+                            Err(e) => { scan_err = Some(e); return false; }
+                        },
+                        Ok(false) => {}
+                        Err(e) => { scan_err = Some(e); return false; }
+                    }
+                    scan_err.is_none() && limit.map_or(true, |n| rows.len() < n)
+                }).map_err(SqlError::Storage)?;
+                if let Some(e) = scan_err {
+                    return Err(e);
                 }
-                Ok(())
+                return Ok((rows, true));
+            }
+
+            let mut rtx = db.begin_read();
+            let entry_count = rtx.table_entry_count(lower_name.as_bytes())
+                .unwrap_or(0) as usize;
+            let capacity = if where_clause.is_some() { entry_count / 4 } else { entry_count };
+            let mut rows = Vec::with_capacity(capacity);
+            let mut scan_err: Option<SqlError> = None;
+
+            let col_map = ColumnMap::new(columns);
+            let partial_ctx = where_clause.as_ref().and_then(|expr| {
+                let needed = referenced_columns(expr, columns);
+                if needed.len() < columns.len() {
+                    Some(PartialDecodeCtx::new(table_schema, &needed))
+                } else {
+                    None
+                }
+            });
+
+            rtx.table_scan_from(lower_name.as_bytes(), b"", |key, value| {
+                match (&where_clause, &partial_ctx) {
+                    (Some(expr), Some(ctx)) => match ctx.decode(key, value) {
+                        Ok(partial) => match eval_expr(expr, &col_map, &partial) {
+                            Ok(val) if is_truthy(&val) => {
+                                match ctx.complete(partial, key, value) {
+                                    Ok(row) => rows.push(row),
+                                    Err(e) => scan_err = Some(e),
+                                }
+                            }
+                            Err(e) => scan_err = Some(e),
+                            _ => {}
+                        },
+                        Err(e) => scan_err = Some(e),
+                    },
+                    (Some(expr), None) => match decode_full_row(table_schema, key, value) {
+                        Ok(row) => match eval_expr(expr, &col_map, &row) {
+                            Ok(val) if is_truthy(&val) => rows.push(row),
+                            Err(e) => scan_err = Some(e),
+                            _ => {}
+                        },
+                        Err(e) => scan_err = Some(e),
+                    },
+                    _ => match decode_full_row(table_schema, key, value) {
+                        Ok(row) => rows.push(row),
+                        Err(e) => scan_err = Some(e),
+                    },
+                }
+                let keep_going = scan_err.is_none()
+                    && limit.map_or(true, |n| rows.len() < n);
+                Ok(keep_going)
             })
             .map_err(SqlError::Storage)?;
             if let Some(e) = scan_err {
                 return Err(e);
             }
-            Ok(rows)
+            Ok((rows, where_clause.is_some()))
         }
 
         ScanPlan::PkLookup { pk_values } => {
@@ -948,9 +1013,17 @@ fn collect_rows_read(
             {
                 Some(value) => {
                     let row = decode_full_row(table_schema, &key, &value)?;
-                    Ok(vec![row])
+                    if let Some(ref expr) = where_clause {
+                        let col_map = ColumnMap::new(columns);
+                        match eval_expr(expr, &col_map, &row) {
+                            Ok(val) if is_truthy(&val) => Ok((vec![row], true)),
+                            _ => Ok((vec![], true)),
+                        }
+                    } else {
+                        Ok((vec![row], false))
+                    }
                 }
-                None => Ok(vec![]),
+                None => Ok((vec![], true)),
             }
         }
 
@@ -1001,15 +1074,24 @@ fn collect_rows_read(
 
             let mut rows = Vec::new();
             let mut rtx = db.begin_read();
+            let col_map = ColumnMap::new(columns);
             for pk_key in &pk_keys {
                 if let Some(value) = rtx
                     .table_get(lower_name.as_bytes(), pk_key)
                     .map_err(SqlError::Storage)?
                 {
-                    rows.push(decode_full_row(table_schema, pk_key, &value)?);
+                    let row = decode_full_row(table_schema, pk_key, &value)?;
+                    if let Some(ref expr) = where_clause {
+                        match eval_expr(expr, &col_map, &row) {
+                            Ok(val) if is_truthy(&val) => rows.push(row),
+                            _ => {}
+                        }
+                    } else {
+                        rows.push(row);
+                    }
                 }
             }
-            Ok(rows)
+            Ok((rows, where_clause.is_some()))
         }
     }
 }
@@ -1019,26 +1101,90 @@ fn collect_rows_write(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     table_schema: &TableSchema,
     where_clause: &Option<Expr>,
-) -> Result<Vec<Vec<Value>>> {
+    limit: Option<usize>,
+) -> Result<(Vec<Vec<Value>>, bool)> {
     let plan = planner::plan_select(table_schema, where_clause);
     let lower_name = &table_schema.name;
+    let columns = &table_schema.columns;
 
     match plan {
         ScanPlan::SeqScan => {
+            let simple_pred = where_clause.as_ref().and_then(|expr| {
+                try_simple_predicate(expr, table_schema)
+            });
+
+            if let Some(ref pred) = simple_pred {
+                let mut rows = Vec::new();
+                let mut scan_err: Option<SqlError> = None;
+                wtx.table_scan_from(lower_name.as_bytes(), b"", |key, value| {
+                    match pred.matches_raw(key, value) {
+                        Ok(true) => match decode_full_row(table_schema, key, value) {
+                            Ok(row) => rows.push(row),
+                            Err(e) => scan_err = Some(e),
+                        },
+                        Ok(false) => {}
+                        Err(e) => scan_err = Some(e),
+                    }
+                    let keep_going = scan_err.is_none()
+                        && limit.map_or(true, |n| rows.len() < n);
+                    Ok(keep_going)
+                }).map_err(SqlError::Storage)?;
+                if let Some(e) = scan_err {
+                    return Err(e);
+                }
+                return Ok((rows, true));
+            }
+
             let mut rows = Vec::new();
             let mut scan_err: Option<SqlError> = None;
-            wtx.table_for_each(lower_name.as_bytes(), |key, value| {
-                match decode_full_row(table_schema, key, value) {
-                    Ok(row) => rows.push(row),
-                    Err(e) => scan_err = Some(e),
+
+            let col_map = ColumnMap::new(columns);
+            let partial_ctx = where_clause.as_ref().and_then(|expr| {
+                let needed = referenced_columns(expr, columns);
+                if needed.len() < columns.len() {
+                    Some(PartialDecodeCtx::new(table_schema, &needed))
+                } else {
+                    None
                 }
-                Ok(())
+            });
+
+            wtx.table_scan_from(lower_name.as_bytes(), b"", |key, value| {
+                match (&where_clause, &partial_ctx) {
+                    (Some(expr), Some(ctx)) => match ctx.decode(key, value) {
+                        Ok(partial) => match eval_expr(expr, &col_map, &partial) {
+                            Ok(val) if is_truthy(&val) => {
+                                match ctx.complete(partial, key, value) {
+                                    Ok(row) => rows.push(row),
+                                    Err(e) => scan_err = Some(e),
+                                }
+                            }
+                            Err(e) => scan_err = Some(e),
+                            _ => {}
+                        },
+                        Err(e) => scan_err = Some(e),
+                    },
+                    (Some(expr), None) => match decode_full_row(table_schema, key, value) {
+                        Ok(row) => match eval_expr(expr, &col_map, &row) {
+                            Ok(val) if is_truthy(&val) => rows.push(row),
+                            Err(e) => scan_err = Some(e),
+                            _ => {}
+                        },
+                        Err(e) => scan_err = Some(e),
+                    },
+                    _ => match decode_full_row(table_schema, key, value) {
+                        Ok(row) => rows.push(row),
+                        Err(e) => scan_err = Some(e),
+                    },
+                }
+                let keep_going = scan_err.is_none()
+                    && limit.map_or(true, |n| rows.len() < n);
+                Ok(keep_going)
             })
             .map_err(SqlError::Storage)?;
             if let Some(e) = scan_err {
                 return Err(e);
             }
-            Ok(rows)
+            Ok((rows, where_clause.is_some()))
         }
 
         ScanPlan::PkLookup { pk_values } => {
@@ -1049,9 +1195,17 @@ fn collect_rows_write(
             {
                 Some(value) => {
                     let row = decode_full_row(table_schema, &key, &value)?;
-                    Ok(vec![row])
+                    if let Some(ref expr) = where_clause {
+                        let col_map = ColumnMap::new(columns);
+                        match eval_expr(expr, &col_map, &row) {
+                            Ok(val) if is_truthy(&val) => Ok((vec![row], true)),
+                            _ => Ok((vec![], true)),
+                        }
+                    } else {
+                        Ok((vec![row], false))
+                    }
                 }
-                None => Ok(vec![]),
+                None => Ok((vec![], true)),
             }
         }
 
@@ -1100,15 +1254,24 @@ fn collect_rows_write(
             }
 
             let mut rows = Vec::new();
+            let col_map = ColumnMap::new(columns);
             for pk_key in &pk_keys {
                 if let Some(value) = wtx
                     .table_get(lower_name.as_bytes(), pk_key)
                     .map_err(SqlError::Storage)?
                 {
-                    rows.push(decode_full_row(table_schema, pk_key, &value)?);
+                    let row = decode_full_row(table_schema, pk_key, &value)?;
+                    if let Some(ref expr) = where_clause {
+                        match eval_expr(expr, &col_map, &row) {
+                            Ok(val) if is_truthy(&val) => rows.push(row),
+                            _ => {}
+                        }
+                    } else {
+                        rows.push(row);
+                    }
                 }
             }
-            Ok(rows)
+            Ok((rows, where_clause.is_some()))
         }
     }
 }
@@ -1328,6 +1491,7 @@ fn exec_insert(
     db: &Database,
     schema: &SchemaManager,
     stmt: &InsertStmt,
+    params: &[Value],
 ) -> Result<ExecutionResult> {
     let materialized;
     let stmt = if insert_has_subquery(stmt) {
@@ -1367,6 +1531,14 @@ fn exec_insert(
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     let mut count: u64 = 0;
 
+    let pk_indices = table_schema.pk_indices();
+    let non_pk = table_schema.non_pk_indices();
+    let mut row = vec![Value::Null; table_schema.columns.len()];
+    let mut pk_values: Vec<Value> = vec![Value::Null; pk_indices.len()];
+    let mut value_values: Vec<Value> = vec![Value::Null; non_pk.len()];
+    let mut key_buf: Vec<u8> = Vec::with_capacity(64);
+    let mut value_buf: Vec<u8> = Vec::with_capacity(256);
+
     for value_row in &stmt.values {
         if value_row.len() != insert_columns.len() {
             return Err(SqlError::InvalidValue(format!(
@@ -1376,23 +1548,29 @@ fn exec_insert(
             )));
         }
 
-        let mut row = vec![Value::Null; table_schema.columns.len()];
+        for v in row.iter_mut() { *v = Value::Null; }
+
         for (i, expr) in value_row.iter().enumerate() {
-            let val = eval_const_expr(expr)?;
+            let val = if let Expr::Parameter(n) = expr {
+                params.get(n - 1).cloned().ok_or_else(|| {
+                    SqlError::Parse(format!("unbound parameter ${n}"))
+                })?
+            } else {
+                eval_const_expr(expr)?
+            };
             let col_idx = col_indices[i];
             let col = &table_schema.columns[col_idx];
 
-            let coerced = if val.is_null() {
+            let got_type = val.data_type();
+            row[col_idx] = if val.is_null() {
                 Value::Null
             } else {
-                val.coerce_to(col.data_type)
+                val.coerce_into(col.data_type)
                     .ok_or_else(|| SqlError::TypeMismatch {
                         expected: col.data_type.to_string(),
-                        got: val.data_type().to_string(),
+                        got: got_type.to_string(),
                     })?
             };
-
-            row[col_idx] = coerced;
         }
 
         for col in &table_schema.columns {
@@ -1401,38 +1579,45 @@ fn exec_insert(
             }
         }
 
-        let pk_values: Vec<Value> = table_schema
-            .pk_indices()
-            .iter()
-            .map(|&i| row[i].clone())
-            .collect();
-        let key = encode_composite_key(&pk_values);
+        for (j, &i) in pk_indices.iter().enumerate() {
+            pk_values[j] = std::mem::replace(&mut row[i], Value::Null);
+        }
+        encode_composite_key_into(&pk_values, &mut key_buf);
 
-        let non_pk = table_schema.non_pk_indices();
-        let value_values: Vec<Value> = non_pk.iter().map(|&i| row[i].clone()).collect();
-        let value = encode_row(&value_values);
+        for (j, &i) in non_pk.iter().enumerate() {
+            value_values[j] = std::mem::replace(&mut row[i], Value::Null);
+        }
+        encode_row_into(&value_values, &mut value_buf);
 
-        if key.len() > citadel_core::MAX_KEY_SIZE {
+        if key_buf.len() > citadel_core::MAX_KEY_SIZE {
             return Err(SqlError::KeyTooLarge {
-                size: key.len(),
+                size: key_buf.len(),
                 max: citadel_core::MAX_KEY_SIZE,
             });
         }
-        if value.len() > citadel_core::MAX_INLINE_VALUE_SIZE {
+        if value_buf.len() > citadel_core::MAX_INLINE_VALUE_SIZE {
             return Err(SqlError::RowTooLarge {
-                size: value.len(),
+                size: value_buf.len(),
                 max: citadel_core::MAX_INLINE_VALUE_SIZE,
             });
         }
 
         let is_new = wtx
-            .table_insert(lower_name.as_bytes(), &key, &value)
+            .table_insert(stmt.table.as_bytes(), &key_buf, &value_buf)
             .map_err(SqlError::Storage)?;
         if !is_new {
             return Err(SqlError::DuplicateKey);
         }
 
-        insert_index_entries(&mut wtx, table_schema, &row, &pk_values)?;
+        if !table_schema.indices.is_empty() {
+            for (j, &i) in pk_indices.iter().enumerate() {
+                row[i] = pk_values[j].clone();
+            }
+            for (j, &i) in non_pk.iter().enumerate() {
+                row[i] = std::mem::replace(&mut value_values[j], Value::Null);
+            }
+            insert_index_entries(&mut wtx, table_schema, &row, &pk_values)?;
+        }
         count += 1;
     }
 
@@ -1875,31 +2060,1033 @@ fn exec_select(
         return exec_select_join(db, schema, stmt);
     }
 
-    let rows = collect_rows_read(db, table_schema, &stmt.where_clause)?;
-    process_select(&table_schema.columns, rows, stmt)
+    if let Some(result) = try_count_star_shortcut(stmt, || {
+        let mut rtx = db.begin_read();
+        rtx.table_entry_count(lower_name.as_bytes())
+            .map_err(SqlError::Storage)
+    })? {
+        return Ok(result);
+    }
+
+    if let Some(plan) = StreamAggPlan::try_new(stmt, table_schema)? {
+        let mut states: Vec<AggState> = plan.ops.iter().map(|(op, _)| AggState::new(op)).collect();
+        let mut scan_err: Option<SqlError> = None;
+        let mut rtx = db.begin_read();
+        if stmt.where_clause.is_none() {
+            rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
+                plan.feed_row_raw(key, value, &mut states, &mut scan_err)
+            }).map_err(SqlError::Storage)?;
+        } else {
+            let col_map = ColumnMap::new(&table_schema.columns);
+            rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
+                plan.feed_row(key, value, table_schema, &col_map, &stmt.where_clause, &mut states, &mut scan_err)
+            }).map_err(SqlError::Storage)?;
+        }
+        if let Some(e) = scan_err {
+            return Err(e);
+        }
+        return Ok(plan.finish(states));
+    }
+
+    if let Some(plan) = StreamGroupByPlan::try_new(stmt, table_schema)? {
+        let lower = lower_name.clone();
+        let mut rtx = db.begin_read();
+        return plan.execute_scan(|cb| {
+            rtx.table_scan_raw(lower.as_bytes(), |key, value| cb(key, value))
+        });
+    }
+
+    if let Some(plan) = TopKScanPlan::try_new(stmt, table_schema)? {
+        let lower = lower_name.clone();
+        let mut rtx = db.begin_read();
+        return plan.execute_scan(table_schema, stmt, |cb| {
+            rtx.table_scan_raw(lower.as_bytes(), |key, value| cb(key, value))
+        });
+    }
+
+    let scan_limit = compute_scan_limit(stmt);
+    let (rows, predicate_applied) =
+        collect_rows_read(db, table_schema, &stmt.where_clause, scan_limit)?;
+    process_select(&table_schema.columns, rows, stmt, predicate_applied)
+}
+
+fn compute_scan_limit(stmt: &SelectStmt) -> Option<usize> {
+    if !stmt.order_by.is_empty() || !stmt.group_by.is_empty() || stmt.distinct
+        || stmt.having.is_some()
+    {
+        return None;
+    }
+    let has_aggregates = stmt.columns.iter().any(|c| match c {
+        SelectColumn::Expr { expr, .. } => is_aggregate_expr(expr),
+        _ => false,
+    });
+    if has_aggregates {
+        return None;
+    }
+    let limit = stmt.limit.as_ref()?;
+    let limit_val = eval_const_int(limit).ok()?.max(0) as usize;
+    let offset_val = stmt
+        .offset
+        .as_ref()
+        .and_then(|e| eval_const_int(e).ok())
+        .unwrap_or(0)
+        .max(0) as usize;
+    Some(limit_val.saturating_add(offset_val))
+}
+
+fn try_count_star_shortcut(
+    stmt: &SelectStmt,
+    get_count: impl FnOnce() -> Result<u64>,
+) -> Result<Option<ExecutionResult>> {
+    if stmt.columns.len() != 1 || stmt.where_clause.is_some() || !stmt.group_by.is_empty()
+        || stmt.having.is_some()
+    {
+        return Ok(None);
+    }
+    let col = match &stmt.columns[0] {
+        SelectColumn::Expr { expr, alias } => (expr, alias),
+        _ => return Ok(None),
+    };
+    if !matches!(col.0, Expr::CountStar) {
+        return Ok(None);
+    }
+    let count = get_count()? as i64;
+    let col_name = col.1.as_deref().unwrap_or("COUNT(*)").to_string();
+    Ok(Some(ExecutionResult::Query(QueryResult {
+        columns: vec![col_name],
+        rows: vec![vec![Value::Integer(count)]],
+    })))
+}
+
+enum StreamAgg {
+    CountStar,
+    Count(usize),
+    Sum(usize),
+    Avg(usize),
+    Min(usize),
+    Max(usize),
+}
+
+enum RawAggTarget {
+    CountStar,
+    Pk(usize),
+    NonPk(usize),
+}
+
+enum AggState {
+    CountStar(i64),
+    Count(i64),
+    Sum { int_sum: i64, real_sum: f64, has_real: bool, all_null: bool },
+    Avg { sum: f64, count: i64 },
+    Min(Option<Value>),
+    Max(Option<Value>),
+}
+
+impl AggState {
+    fn new(op: &StreamAgg) -> Self {
+        match op {
+            StreamAgg::CountStar => AggState::CountStar(0),
+            StreamAgg::Count(_) => AggState::Count(0),
+            StreamAgg::Sum(_) => AggState::Sum { int_sum: 0, real_sum: 0.0, has_real: false, all_null: true },
+            StreamAgg::Avg(_) => AggState::Avg { sum: 0.0, count: 0 },
+            StreamAgg::Min(_) => AggState::Min(None),
+            StreamAgg::Max(_) => AggState::Max(None),
+        }
+    }
+
+    fn feed_val(&mut self, val: &Value) -> Result<()> {
+        match self {
+            AggState::CountStar(c) => { *c += 1; }
+            AggState::Count(c) => {
+                if !val.is_null() { *c += 1; }
+            }
+            AggState::Sum { int_sum, real_sum, has_real, all_null } => match val {
+                Value::Integer(i) => { *int_sum += i; *all_null = false; }
+                Value::Real(r) => { *real_sum += r; *has_real = true; *all_null = false; }
+                Value::Null => {}
+                _ => return Err(SqlError::TypeMismatch { expected: "numeric".into(), got: val.data_type().to_string() }),
+            },
+            AggState::Avg { sum, count } => match val {
+                Value::Integer(i) => { *sum += *i as f64; *count += 1; }
+                Value::Real(r) => { *sum += r; *count += 1; }
+                Value::Null => {}
+                _ => return Err(SqlError::TypeMismatch { expected: "numeric".into(), got: val.data_type().to_string() }),
+            },
+            AggState::Min(cur) => {
+                if !val.is_null() {
+                    *cur = Some(match cur.take() {
+                        None => val.clone(),
+                        Some(m) => if val < &m { val.clone() } else { m },
+                    });
+                }
+            }
+            AggState::Max(cur) => {
+                if !val.is_null() {
+                    *cur = Some(match cur.take() {
+                        None => val.clone(),
+                        Some(m) => if val > &m { val.clone() } else { m },
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn feed_raw(&mut self, raw: &RawColumn) -> Result<()> {
+        match self {
+            AggState::CountStar(c) => { *c += 1; }
+            AggState::Count(c) => {
+                if !matches!(raw, RawColumn::Null) { *c += 1; }
+            }
+            AggState::Sum { int_sum, real_sum, has_real, all_null } => match raw {
+                RawColumn::Integer(i) => { *int_sum += i; *all_null = false; }
+                RawColumn::Real(r) => { *real_sum += r; *has_real = true; *all_null = false; }
+                RawColumn::Null => {}
+                _ => return Err(SqlError::TypeMismatch { expected: "numeric".into(), got: "non-numeric".into() }),
+            },
+            AggState::Avg { sum, count } => match raw {
+                RawColumn::Integer(i) => { *sum += *i as f64; *count += 1; }
+                RawColumn::Real(r) => { *sum += r; *count += 1; }
+                RawColumn::Null => {}
+                _ => return Err(SqlError::TypeMismatch { expected: "numeric".into(), got: "non-numeric".into() }),
+            },
+            AggState::Min(cur) => {
+                if !matches!(raw, RawColumn::Null) {
+                    let val = raw.to_value();
+                    *cur = Some(match cur.take() {
+                        None => val,
+                        Some(m) => if val < m { val } else { m },
+                    });
+                }
+            }
+            AggState::Max(cur) => {
+                if !matches!(raw, RawColumn::Null) {
+                    let val = raw.to_value();
+                    *cur = Some(match cur.take() {
+                        None => val,
+                        Some(m) => if val > m { val } else { m },
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Value {
+        match self {
+            AggState::CountStar(c) | AggState::Count(c) => Value::Integer(c),
+            AggState::Sum { int_sum, real_sum, has_real, all_null } => {
+                if all_null { Value::Null }
+                else if has_real { Value::Real(real_sum + int_sum as f64) }
+                else { Value::Integer(int_sum) }
+            }
+            AggState::Avg { sum, count } => {
+                if count == 0 { Value::Null } else { Value::Real(sum / count as f64) }
+            }
+            AggState::Min(v) | AggState::Max(v) => v.unwrap_or(Value::Null),
+        }
+    }
+}
+
+struct StreamAggPlan {
+    ops: Vec<(StreamAgg, String)>,
+    partial_ctx: Option<PartialDecodeCtx>,
+    raw_targets: Vec<RawAggTarget>,
+    num_pk_cols: usize,
+}
+
+impl StreamAggPlan {
+    fn try_new(stmt: &SelectStmt, table_schema: &TableSchema) -> Result<Option<Self>> {
+        if !stmt.group_by.is_empty() || stmt.having.is_some() || !stmt.joins.is_empty() {
+            return Ok(None);
+        }
+
+        let col_map = ColumnMap::new(&table_schema.columns);
+        let mut ops: Vec<(StreamAgg, String)> = Vec::new();
+        for sel_col in &stmt.columns {
+            let (expr, alias) = match sel_col {
+                SelectColumn::Expr { expr, alias } => (expr, alias),
+                _ => return Ok(None),
+            };
+            let name = alias.as_deref().unwrap_or(&expr_display_name(expr)).to_string();
+            match expr {
+                Expr::CountStar => ops.push((StreamAgg::CountStar, name)),
+                Expr::Function { name: func_name, args } if args.len() == 1 => {
+                    let func = func_name.to_ascii_uppercase();
+                    let col_idx = match resolve_simple_col(&args[0], &col_map) {
+                        Some(idx) => idx,
+                        None => return Ok(None),
+                    };
+                    match func.as_str() {
+                        "COUNT" => ops.push((StreamAgg::Count(col_idx), name)),
+                        "SUM" => ops.push((StreamAgg::Sum(col_idx), name)),
+                        "AVG" => ops.push((StreamAgg::Avg(col_idx), name)),
+                        "MIN" => ops.push((StreamAgg::Min(col_idx), name)),
+                        "MAX" => ops.push((StreamAgg::Max(col_idx), name)),
+                        _ => return Ok(None),
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        let mut needed: Vec<usize> = ops.iter().filter_map(|(op, _)| match op {
+            StreamAgg::CountStar => None,
+            StreamAgg::Count(i) | StreamAgg::Sum(i) | StreamAgg::Avg(i)
+            | StreamAgg::Min(i) | StreamAgg::Max(i) => Some(*i),
+        }).collect();
+        if let Some(ref where_expr) = stmt.where_clause {
+            needed.extend(referenced_columns(where_expr, &table_schema.columns));
+        }
+        needed.sort_unstable();
+        needed.dedup();
+
+        let partial_ctx = if needed.len() < table_schema.columns.len() {
+            Some(PartialDecodeCtx::new(table_schema, &needed))
+        } else {
+            None
+        };
+
+        let non_pk = table_schema.non_pk_indices();
+        let raw_targets: Vec<RawAggTarget> = ops.iter().map(|(op, _)| {
+            match op {
+                StreamAgg::CountStar => RawAggTarget::CountStar,
+                StreamAgg::Count(idx) | StreamAgg::Sum(idx) | StreamAgg::Avg(idx)
+                | StreamAgg::Min(idx) | StreamAgg::Max(idx) => {
+                    if let Some(pk_pos) = table_schema.primary_key_columns.iter().position(|&i| i as usize == *idx) {
+                        RawAggTarget::Pk(pk_pos)
+                    } else {
+                        let nonpk_idx = non_pk.iter().position(|&i| i == *idx).unwrap();
+                        RawAggTarget::NonPk(nonpk_idx)
+                    }
+                }
+            }
+        }).collect();
+
+        let num_pk_cols = table_schema.primary_key_columns.len();
+
+        Ok(Some(Self { ops, partial_ctx, raw_targets, num_pk_cols }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn feed_row(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        table_schema: &TableSchema,
+        col_map: &ColumnMap,
+        where_clause: &Option<Expr>,
+        states: &mut [AggState],
+        scan_err: &mut Option<SqlError>,
+    ) -> bool {
+        let row = match &self.partial_ctx {
+            Some(ctx) => match ctx.decode(key, value) {
+                Ok(r) => r,
+                Err(e) => { *scan_err = Some(e); return false; }
+            },
+            None => match decode_full_row(table_schema, key, value) {
+                Ok(r) => r,
+                Err(e) => { *scan_err = Some(e); return false; }
+            },
+        };
+
+        if let Some(expr) = where_clause {
+            match eval_expr(expr, col_map, &row) {
+                Ok(val) if !is_truthy(&val) => return true,
+                Err(e) => { *scan_err = Some(e); return false; }
+                _ => {}
+            }
+        }
+
+        for (i, (op, _)) in self.ops.iter().enumerate() {
+            let val = match op {
+                StreamAgg::CountStar => &Value::Null,
+                StreamAgg::Count(idx) | StreamAgg::Sum(idx) | StreamAgg::Avg(idx)
+                | StreamAgg::Min(idx) | StreamAgg::Max(idx) => &row[*idx],
+            };
+            if let Err(e) = states[i].feed_val(val) {
+                *scan_err = Some(e);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn feed_row_raw(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        states: &mut [AggState],
+        scan_err: &mut Option<SqlError>,
+    ) -> bool {
+        for (i, target) in self.raw_targets.iter().enumerate() {
+            let raw = match target {
+                RawAggTarget::CountStar => {
+                    if let Err(e) = states[i].feed_raw(&RawColumn::Null) {
+                        *scan_err = Some(e);
+                        return false;
+                    }
+                    continue;
+                }
+                RawAggTarget::Pk(pk_pos) => {
+                    if self.num_pk_cols == 1 && *pk_pos == 0 {
+                        match decode_pk_integer(key) {
+                            Ok(v) => RawColumn::Integer(v),
+                            Err(e) => { *scan_err = Some(e); return false; }
+                        }
+                    } else {
+                        match decode_composite_key(key, self.num_pk_cols) {
+                            Ok(pk) => RawColumn::Integer(match &pk[*pk_pos] {
+                                Value::Integer(i) => *i,
+                                _ => { *scan_err = Some(SqlError::InvalidValue("PK not integer".into())); return false; }
+                            }),
+                            Err(e) => { *scan_err = Some(e); return false; }
+                        }
+                    }
+                }
+                RawAggTarget::NonPk(idx) => {
+                    match decode_column_raw(value, *idx) {
+                        Ok(v) => v,
+                        Err(e) => { *scan_err = Some(e); return false; }
+                    }
+                }
+            };
+            if let Err(e) = states[i].feed_raw(&raw) {
+                *scan_err = Some(e);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn finish(self, states: Vec<AggState>) -> ExecutionResult {
+        let col_names: Vec<String> = self.ops.iter().map(|(_, name)| name.clone()).collect();
+        let result_row: Vec<Value> = states.into_iter().map(|s| s.finish()).collect();
+        ExecutionResult::Query(QueryResult {
+            columns: col_names,
+            rows: vec![result_row],
+        })
+    }
+}
+
+fn resolve_simple_col(expr: &Expr, col_map: &ColumnMap) -> Option<usize> {
+    match expr {
+        Expr::Column(name) => col_map.resolve(name).ok(),
+        Expr::QualifiedColumn { table, column } => col_map.resolve_qualified(table, column).ok(),
+        _ => None,
+    }
+}
+
+enum GroupByOutputCol {
+    GroupKey,
+    Agg(usize),
+}
+
+struct StreamGroupByPlan {
+    group_target: RawAggTarget,
+    num_pk_cols: usize,
+    agg_ops: Vec<StreamAgg>,
+    raw_targets: Vec<RawAggTarget>,
+    output: Vec<(GroupByOutputCol, String)>,
+}
+
+impl StreamGroupByPlan {
+    fn try_new(stmt: &SelectStmt, schema: &TableSchema) -> Result<Option<Self>> {
+        if stmt.group_by.len() != 1 || stmt.having.is_some() || !stmt.joins.is_empty()
+            || stmt.where_clause.is_some() || !stmt.order_by.is_empty() || stmt.limit.is_some()
+        {
+            return Ok(None);
+        }
+
+        let col_map = ColumnMap::new(&schema.columns);
+
+        let group_col_idx = match &stmt.group_by[0] {
+            Expr::Column(name) => col_map.resolve(name).ok(),
+            _ => None,
+        };
+        let group_col_idx = match group_col_idx {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+
+        if schema.columns[group_col_idx].data_type != DataType::Integer {
+            return Ok(None);
+        }
+
+        let non_pk = schema.non_pk_indices();
+        let group_target = if let Some(pk_pos) = schema.primary_key_columns.iter().position(|&i| i as usize == group_col_idx) {
+            RawAggTarget::Pk(pk_pos)
+        } else {
+            let nonpk_idx = non_pk.iter().position(|&i| i == group_col_idx).unwrap();
+            RawAggTarget::NonPk(nonpk_idx)
+        };
+
+        let mut agg_ops = Vec::new();
+        let mut raw_targets = Vec::new();
+        let mut output = Vec::new();
+
+        for sel_col in &stmt.columns {
+            let (expr, alias) = match sel_col {
+                SelectColumn::Expr { expr, alias } => (expr, alias),
+                _ => return Ok(None),
+            };
+            let name = alias.as_deref().unwrap_or(&expr_display_name(expr)).to_string();
+
+            if let Some(idx) = resolve_simple_col(expr, &col_map) {
+                if idx == group_col_idx {
+                    output.push((GroupByOutputCol::GroupKey, name));
+                    continue;
+                }
+            }
+
+            match expr {
+                Expr::CountStar => {
+                    let agg_idx = agg_ops.len();
+                    agg_ops.push(StreamAgg::CountStar);
+                    raw_targets.push(RawAggTarget::CountStar);
+                    output.push((GroupByOutputCol::Agg(agg_idx), name));
+                }
+                Expr::Function { name: func_name, args } if args.len() == 1 => {
+                    let func = func_name.to_ascii_uppercase();
+                    let col_idx = match resolve_simple_col(&args[0], &col_map) {
+                        Some(idx) => idx,
+                        None => return Ok(None),
+                    };
+                    let target = if let Some(pk_pos) = schema.primary_key_columns.iter().position(|&i| i as usize == col_idx) {
+                        RawAggTarget::Pk(pk_pos)
+                    } else {
+                        let nonpk_idx = non_pk.iter().position(|&i| i == col_idx).unwrap();
+                        RawAggTarget::NonPk(nonpk_idx)
+                    };
+                    let agg_idx = agg_ops.len();
+                    match func.as_str() {
+                        "COUNT" => agg_ops.push(StreamAgg::Count(col_idx)),
+                        "SUM" => agg_ops.push(StreamAgg::Sum(col_idx)),
+                        "AVG" => agg_ops.push(StreamAgg::Avg(col_idx)),
+                        "MIN" => agg_ops.push(StreamAgg::Min(col_idx)),
+                        "MAX" => agg_ops.push(StreamAgg::Max(col_idx)),
+                        _ => return Ok(None),
+                    }
+                    raw_targets.push(target);
+                    output.push((GroupByOutputCol::Agg(agg_idx), name));
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        Ok(Some(Self {
+            group_target,
+            num_pk_cols: schema.primary_key_columns.len(),
+            agg_ops,
+            raw_targets,
+            output,
+        }))
+    }
+
+    fn execute_scan(
+        &self,
+        scan: impl FnOnce(&mut dyn FnMut(&[u8], &[u8]) -> bool) -> std::result::Result<(), citadel::Error>,
+    ) -> Result<ExecutionResult> {
+        let mut groups: HashMap<i64, Vec<AggState>> = HashMap::new();
+        let mut null_group: Option<Vec<AggState>> = None;
+        let mut scan_err: Option<SqlError> = None;
+
+        scan(&mut |key, value| {
+            let group_key: Option<i64> = match &self.group_target {
+                RawAggTarget::Pk(pk_pos) => {
+                    if self.num_pk_cols == 1 && *pk_pos == 0 {
+                        match decode_pk_integer(key) {
+                            Ok(v) => Some(v),
+                            Err(e) => { scan_err = Some(e); return false; }
+                        }
+                    } else {
+                        match decode_composite_key(key, self.num_pk_cols) {
+                            Ok(pk) => match &pk[*pk_pos] {
+                                Value::Integer(i) => Some(*i),
+                                Value::Null => None,
+                                _ => { scan_err = Some(SqlError::InvalidValue("GROUP BY key not integer".into())); return false; }
+                            },
+                            Err(e) => { scan_err = Some(e); return false; }
+                        }
+                    }
+                }
+                RawAggTarget::NonPk(idx) => {
+                    match decode_column_raw(value, *idx) {
+                        Ok(RawColumn::Integer(i)) => Some(i),
+                        Ok(RawColumn::Null) => None,
+                        Ok(_) => { scan_err = Some(SqlError::InvalidValue("GROUP BY key not integer".into())); return false; }
+                        Err(e) => { scan_err = Some(e); return false; }
+                    }
+                }
+                RawAggTarget::CountStar => unreachable!(),
+            };
+
+            let states = match group_key {
+                Some(k) => groups.entry(k).or_insert_with(|| {
+                    self.agg_ops.iter().map(AggState::new).collect()
+                }),
+                None => null_group.get_or_insert_with(|| {
+                    self.agg_ops.iter().map(AggState::new).collect()
+                }),
+            };
+
+            for (i, target) in self.raw_targets.iter().enumerate() {
+                let raw = match target {
+                    RawAggTarget::CountStar => {
+                        if let Err(e) = states[i].feed_raw(&RawColumn::Null) {
+                            scan_err = Some(e);
+                            return false;
+                        }
+                        continue;
+                    }
+                    RawAggTarget::Pk(pk_pos) => {
+                        if self.num_pk_cols == 1 && *pk_pos == 0 {
+                            match decode_pk_integer(key) {
+                                Ok(v) => RawColumn::Integer(v),
+                                Err(e) => { scan_err = Some(e); return false; }
+                            }
+                        } else {
+                            match decode_composite_key(key, self.num_pk_cols) {
+                                Ok(pk) => match &pk[*pk_pos] {
+                                    Value::Integer(i) => RawColumn::Integer(*i),
+                                    _ => { scan_err = Some(SqlError::InvalidValue("agg column not integer".into())); return false; }
+                                },
+                                Err(e) => { scan_err = Some(e); return false; }
+                            }
+                        }
+                    }
+                    RawAggTarget::NonPk(idx) => {
+                        match decode_column_raw(value, *idx) {
+                            Ok(v) => v,
+                            Err(e) => { scan_err = Some(e); return false; }
+                        }
+                    }
+                };
+                if let Err(e) = states[i].feed_raw(&raw) {
+                    scan_err = Some(e);
+                    return false;
+                }
+            }
+            true
+        }).map_err(SqlError::Storage)?;
+
+        if let Some(e) = scan_err {
+            return Err(e);
+        }
+
+        let col_names: Vec<String> = self.output.iter().map(|(_, name)| name.clone()).collect();
+        let null_extra = if null_group.is_some() { 1 } else { 0 };
+        let mut result_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len() + null_extra);
+        if let Some(states) = null_group {
+            let mut row = Vec::with_capacity(self.output.len());
+            let finished: Vec<Value> = states.into_iter().map(|s| s.finish()).collect();
+            for (col, _) in &self.output {
+                match col {
+                    GroupByOutputCol::GroupKey => row.push(Value::Null),
+                    GroupByOutputCol::Agg(idx) => row.push(finished[*idx].clone()),
+                }
+            }
+            result_rows.push(row);
+        }
+        for (group_key, states) in groups {
+            let mut row = Vec::with_capacity(self.output.len());
+            let finished: Vec<Value> = states.into_iter().map(|s| s.finish()).collect();
+            for (col, _) in &self.output {
+                match col {
+                    GroupByOutputCol::GroupKey => row.push(Value::Integer(group_key)),
+                    GroupByOutputCol::Agg(idx) => row.push(finished[*idx].clone()),
+                }
+            }
+            result_rows.push(row);
+        }
+
+        Ok(ExecutionResult::Query(QueryResult {
+            columns: col_names,
+            rows: result_rows,
+        }))
+    }
+}
+
+struct TopKScanPlan {
+    sort_target: RawAggTarget,
+    num_pk_cols: usize,
+    descending: bool,
+    nulls_first: bool,
+    keep: usize,
+}
+
+impl TopKScanPlan {
+    fn try_new(stmt: &SelectStmt, schema: &TableSchema) -> Result<Option<Self>> {
+        if stmt.order_by.len() != 1 || stmt.limit.is_none()
+            || stmt.where_clause.is_some() || !stmt.group_by.is_empty()
+            || stmt.having.is_some() || !stmt.joins.is_empty() || stmt.distinct
+        {
+            return Ok(None);
+        }
+
+        let has_aggregates = stmt.columns.iter().any(|c| match c {
+            SelectColumn::Expr { expr, .. } => is_aggregate_expr(expr),
+            _ => false,
+        });
+        if has_aggregates {
+            return Ok(None);
+        }
+
+        let ob = &stmt.order_by[0];
+        let col_map = ColumnMap::new(&schema.columns);
+        let col_idx = match resolve_simple_col(&ob.expr, &col_map) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+
+        let non_pk = schema.non_pk_indices();
+        let sort_target = if let Some(pk_pos) = schema.primary_key_columns.iter().position(|&i| i as usize == col_idx) {
+            RawAggTarget::Pk(pk_pos)
+        } else {
+            let nonpk_idx = non_pk.iter().position(|&i| i == col_idx).unwrap();
+            RawAggTarget::NonPk(nonpk_idx)
+        };
+
+        let limit = eval_const_int(stmt.limit.as_ref().unwrap())?.max(0) as usize;
+        let offset = stmt.offset.as_ref()
+            .map(eval_const_int)
+            .transpose()?
+            .unwrap_or(0)
+            .max(0) as usize;
+        let keep = limit.saturating_add(offset);
+        if keep == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            sort_target,
+            num_pk_cols: schema.primary_key_columns.len(),
+            descending: ob.descending,
+            nulls_first: ob.nulls_first.unwrap_or(!ob.descending),
+            keep,
+        }))
+    }
+
+    fn execute_scan(
+        &self,
+        schema: &TableSchema,
+        stmt: &SelectStmt,
+        scan: impl FnOnce(&mut dyn FnMut(&[u8], &[u8]) -> bool) -> std::result::Result<(), citadel::Error>,
+    ) -> Result<ExecutionResult> {
+        use std::cmp::Ordering;
+        use std::collections::BinaryHeap;
+
+        struct Candidate {
+            sort_key: Value,
+            raw_key: Vec<u8>,
+            raw_value: Vec<u8>,
+        }
+
+        struct CandWrapper {
+            c: Candidate,
+            descending: bool,
+            nulls_first: bool,
+        }
+
+        impl PartialEq for CandWrapper {
+            fn eq(&self, other: &Self) -> bool {
+                self.cmp(other) == Ordering::Equal
+            }
+        }
+        impl Eq for CandWrapper {}
+
+        impl PartialOrd for CandWrapper {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        // Max-heap: worst candidate on top for eviction.
+        impl Ord for CandWrapper {
+            fn cmp(&self, other: &Self) -> Ordering {
+                let ord = match (self.c.sort_key.is_null(), other.c.sort_key.is_null()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => if self.nulls_first { Ordering::Less } else { Ordering::Greater },
+                    (false, true) => if self.nulls_first { Ordering::Greater } else { Ordering::Less },
+                    (false, false) => self.c.sort_key.cmp(&other.c.sort_key),
+                };
+                if self.descending { ord.reverse() } else { ord }
+            }
+        }
+
+        let k = self.keep;
+        let mut heap: BinaryHeap<CandWrapper> = BinaryHeap::with_capacity(k + 1);
+        let mut scan_err: Option<SqlError> = None;
+
+        scan(&mut |key, value| {
+            let sort_key: Value = match &self.sort_target {
+                RawAggTarget::Pk(pk_pos) => {
+                    if self.num_pk_cols == 1 && *pk_pos == 0 {
+                        match decode_pk_integer(key) {
+                            Ok(v) => Value::Integer(v),
+                            Err(e) => { scan_err = Some(e); return false; }
+                        }
+                    } else {
+                        match decode_composite_key(key, self.num_pk_cols) {
+                            Ok(mut pk) => std::mem::replace(&mut pk[*pk_pos], Value::Null),
+                            Err(e) => { scan_err = Some(e); return false; }
+                        }
+                    }
+                }
+                RawAggTarget::NonPk(idx) => {
+                    match decode_column_raw(value, *idx) {
+                        Ok(raw) => raw.to_value(),
+                        Err(e) => { scan_err = Some(e); return false; }
+                    }
+                }
+                RawAggTarget::CountStar => unreachable!(),
+            };
+
+            // Heap full and can't beat worst — skip
+            if heap.len() >= k {
+                if let Some(top) = heap.peek() {
+                    let ord = match (sort_key.is_null(), top.c.sort_key.is_null()) {
+                        (true, true) => Ordering::Equal,
+                        (true, false) => if self.nulls_first { Ordering::Less } else { Ordering::Greater },
+                        (false, true) => if self.nulls_first { Ordering::Greater } else { Ordering::Less },
+                        (false, false) => sort_key.cmp(&top.c.sort_key),
+                    };
+                    let cmp = if self.descending { ord.reverse() } else { ord };
+                    if cmp != Ordering::Less {
+                        return true;
+                    }
+                }
+            }
+
+            let cand = CandWrapper {
+                c: Candidate {
+                    sort_key,
+                    raw_key: key.to_vec(),
+                    raw_value: value.to_vec(),
+                },
+                descending: self.descending,
+                nulls_first: self.nulls_first,
+            };
+
+            if heap.len() < k {
+                heap.push(cand);
+            } else if let Some(mut top) = heap.peek_mut() {
+                *top = cand;
+            }
+
+            true
+        }).map_err(SqlError::Storage)?;
+
+        if let Some(e) = scan_err {
+            return Err(e);
+        }
+
+        let mut winners: Vec<CandWrapper> = heap.into_vec();
+        winners.sort();
+
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(winners.len());
+        for w in &winners {
+            rows.push(decode_full_row(schema, &w.c.raw_key, &w.c.raw_value)?);
+        }
+
+        if let Some(ref offset_expr) = stmt.offset {
+            let offset = eval_const_int(offset_expr)?.max(0) as usize;
+            if offset < rows.len() {
+                rows = rows.split_off(offset);
+            } else {
+                rows.clear();
+            }
+        }
+        if let Some(ref limit_expr) = stmt.limit {
+            let limit = eval_const_int(limit_expr)?.max(0) as usize;
+            rows.truncate(limit);
+        }
+
+        let (col_names, projected) = project_rows(&schema.columns, &stmt.columns, rows)?;
+        Ok(ExecutionResult::Query(QueryResult {
+            columns: col_names,
+            rows: projected,
+        }))
+    }
+}
+
+struct SimplePredicate {
+    is_pk: bool,
+    pk_pos: usize,
+    nonpk_idx: usize,
+    op: BinOp,
+    literal: Value,
+    num_pk_cols: usize,
+    precomputed_int: Option<i64>,
+}
+
+impl SimplePredicate {
+    fn matches_raw(&self, key: &[u8], value: &[u8]) -> Result<bool> {
+        if let Some(target) = self.precomputed_int {
+            return Ok(self.match_nonpk_int_inline(value, target));
+        }
+        let raw = if self.is_pk {
+            if self.num_pk_cols == 1 {
+                RawColumn::Integer(decode_pk_integer(key)?)
+            } else {
+                let pk = decode_composite_key(key, self.num_pk_cols)?;
+                match &pk[self.pk_pos] {
+                    Value::Integer(i) => RawColumn::Integer(*i),
+                    Value::Real(r) => RawColumn::Real(*r),
+                    Value::Boolean(b) => RawColumn::Boolean(*b),
+                    _ => return Ok(raw_matches_op_value(&pk[self.pk_pos], self.op, &self.literal)),
+                }
+            }
+        } else {
+            decode_column_raw(value, self.nonpk_idx)?
+        };
+        Ok(raw_matches_op(&raw, self.op, &self.literal))
+    }
+
+    #[inline(always)]
+    fn match_nonpk_int_inline(&self, data: &[u8], target: i64) -> bool {
+        let col_count = u16::from_le_bytes(data[0..2].try_into().unwrap()) as usize;
+        let bm_bytes = col_count.div_ceil(8);
+
+        // NULL → false (SQL NULL semantics)
+        if data[2 + self.nonpk_idx / 8] & (1 << (self.nonpk_idx % 8)) != 0 {
+            return false;
+        }
+
+        let mut pos = 2 + bm_bytes;
+
+        // Skip preceding non-null columns by reading their length
+        for col in 0..self.nonpk_idx {
+            if data[2 + col / 8] & (1 << (col % 8)) == 0 {
+                let len = u32::from_le_bytes(data[pos + 1..pos + 5].try_into().unwrap()) as usize;
+                pos += 5 + len;
+            }
+        }
+
+        // Read i64 directly: skip type_tag(1) + len(4), read 8 bytes
+        let v = i64::from_le_bytes(data[pos + 5..pos + 13].try_into().unwrap());
+
+        match self.op {
+            BinOp::Eq => v == target,
+            BinOp::NotEq => v != target,
+            BinOp::Lt => v < target,
+            BinOp::Gt => v > target,
+            BinOp::LtEq => v <= target,
+            BinOp::GtEq => v >= target,
+            _ => false,
+        }
+    }
+}
+
+fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<SimplePredicate> {
+    let (col_name, op, literal) = match expr {
+        Expr::BinaryOp { left, op, right } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Column(name), Expr::Literal(lit)) => (name.as_str(), *op, lit),
+            (Expr::Literal(lit), Expr::Column(name)) => (name.as_str(), flip_cmp_op(*op)?, lit),
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    if !matches!(op, BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq) {
+        return None;
+    }
+
+    let col_idx = schema.column_index(col_name)?;
+    let non_pk = schema.non_pk_indices();
+
+    if let Some(pk_pos) = schema.primary_key_columns.iter().position(|&i| i as usize == col_idx) {
+        Some(SimplePredicate {
+            is_pk: true,
+            pk_pos,
+            nonpk_idx: 0,
+            op,
+            literal: literal.clone(),
+            num_pk_cols: schema.primary_key_columns.len(),
+            precomputed_int: None,
+        })
+    } else {
+        let nonpk_idx = non_pk.iter().position(|&i| i == col_idx)?;
+        let precomputed_int = match literal {
+            Value::Integer(i) => Some(*i),
+            _ => None,
+        };
+        Some(SimplePredicate {
+            is_pk: false,
+            pk_pos: 0,
+            nonpk_idx,
+            op,
+            literal: literal.clone(),
+            num_pk_cols: schema.primary_key_columns.len(),
+            precomputed_int,
+        })
+    }
+}
+
+fn flip_cmp_op(op: BinOp) -> Option<BinOp> {
+    match op {
+        BinOp::Eq => Some(BinOp::Eq),
+        BinOp::NotEq => Some(BinOp::NotEq),
+        BinOp::Lt => Some(BinOp::Gt),
+        BinOp::Gt => Some(BinOp::Lt),
+        BinOp::LtEq => Some(BinOp::GtEq),
+        BinOp::GtEq => Some(BinOp::LtEq),
+        _ => None,
+    }
+}
+
+fn raw_matches_op(raw: &RawColumn, op: BinOp, literal: &Value) -> bool {
+    // SQL NULL semantics: any comparison involving NULL yields NULL (falsy)
+    if matches!(raw, RawColumn::Null) || literal.is_null() {
+        return false;
+    }
+    match op {
+        BinOp::Eq => raw.eq_value(literal),
+        BinOp::NotEq => !raw.eq_value(literal),
+        BinOp::Lt => raw.cmp_value(literal) == Some(std::cmp::Ordering::Less),
+        BinOp::Gt => raw.cmp_value(literal) == Some(std::cmp::Ordering::Greater),
+        BinOp::LtEq => raw.cmp_value(literal).is_some_and(|o| o != std::cmp::Ordering::Greater),
+        BinOp::GtEq => raw.cmp_value(literal).is_some_and(|o| o != std::cmp::Ordering::Less),
+        _ => false,
+    }
+}
+
+fn raw_matches_op_value(val: &Value, op: BinOp, literal: &Value) -> bool {
+    match op {
+        BinOp::Eq => val == literal,
+        BinOp::NotEq => val != literal && !val.is_null(),
+        BinOp::Lt => val < literal,
+        BinOp::Gt => val > literal,
+        BinOp::LtEq => val <= literal,
+        BinOp::GtEq => val >= literal,
+        _ => false,
+    }
 }
 
 fn exec_select_no_from(stmt: &SelectStmt) -> Result<ExecutionResult> {
     let empty_cols: Vec<ColumnDef> = vec![];
     let empty_row: Vec<Value> = vec![];
-    let (col_names, projected) = project_rows(&empty_cols, &stmt.columns, &[empty_row])?;
+    let (col_names, projected) = project_rows(&empty_cols, &stmt.columns, vec![empty_row])?;
     Ok(ExecutionResult::Query(QueryResult {
         columns: col_names,
         rows: projected,
     }))
 }
 
-/// Shared SELECT processing: WHERE, aggregation, ORDER BY, LIMIT/OFFSET, projection.
 fn process_select(
     columns: &[ColumnDef],
     mut rows: Vec<Vec<Value>>,
     stmt: &SelectStmt,
+    predicate_applied: bool,
 ) -> Result<ExecutionResult> {
-    if let Some(ref where_expr) = stmt.where_clause {
-        rows.retain(|row| match eval_expr(where_expr, columns, row) {
-            Ok(val) => is_truthy(&val),
-            Err(_) => false,
-        });
+    if !predicate_applied {
+        if let Some(ref where_expr) = stmt.where_clause {
+            let col_map = ColumnMap::new(columns);
+            rows.retain(|row| match eval_expr(where_expr, &col_map, row) {
+                Ok(val) => is_truthy(&val),
+                Err(_) => false,
+            });
+        }
     }
 
     let has_aggregates = stmt.columns.iter().any(|c| match c {
@@ -1912,7 +3099,7 @@ fn process_select(
     }
 
     if stmt.distinct {
-        let (col_names, mut projected) = project_rows(columns, &stmt.columns, &rows)?;
+        let (col_names, mut projected) = project_rows(columns, &stmt.columns, rows)?;
 
         let mut seen = std::collections::HashSet::new();
         projected.retain(|row| seen.insert(row.clone()));
@@ -1943,7 +3130,24 @@ fn process_select(
     }
 
     if !stmt.order_by.is_empty() {
-        sort_rows(&mut rows, &stmt.order_by, columns)?;
+        if let Some(ref limit_expr) = stmt.limit {
+            let limit = eval_const_int(limit_expr)?.max(0) as usize;
+            let offset = match stmt.offset {
+                Some(ref e) => eval_const_int(e)?.max(0) as usize,
+                None => 0,
+            };
+            let keep = limit.saturating_add(offset);
+            if keep == 0 {
+                rows.clear();
+            } else if keep < rows.len() {
+                topk_rows(&mut rows, &stmt.order_by, columns, keep)?;
+                rows.truncate(keep);
+            } else {
+                sort_rows(&mut rows, &stmt.order_by, columns)?;
+            }
+        } else {
+            sort_rows(&mut rows, &stmt.order_by, columns)?;
+        }
     }
 
     if let Some(ref offset_expr) = stmt.offset {
@@ -1960,7 +3164,7 @@ fn process_select(
         rows.truncate(limit);
     }
 
-    let (col_names, projected) = project_rows(columns, &stmt.columns, &rows)?;
+    let (col_names, projected) = project_rows(columns, &stmt.columns, rows)?;
 
     Ok(ExecutionResult::Query(QueryResult {
         columns: col_names,
@@ -1969,9 +3173,8 @@ fn process_select(
 }
 
 fn resolve_table_name<'a>(schema: &'a SchemaManager, name: &str) -> Result<&'a TableSchema> {
-    let lower = name.to_ascii_lowercase();
     schema
-        .get(&lower)
+        .get(name)
         .ok_or_else(|| SqlError::TableNotFound(name.to_string()))
 }
 
@@ -1994,22 +3197,790 @@ fn build_joined_columns(tables: &[(String, &TableSchema)]) -> Vec<ColumnDef> {
     result
 }
 
-fn table_alias_or_name(name: &str, alias: &Option<String>) -> String {
-    alias
-        .as_ref()
-        .unwrap_or(&name.to_string())
-        .to_ascii_lowercase()
+fn extract_equi_join_keys(
+    on_expr: &Expr,
+    combined_cols: &[ColumnDef],
+    outer_col_count: usize,
+) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+
+    fn flatten<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match e {
+            Expr::BinaryOp {
+                left,
+                op: BinOp::And,
+                right,
+            } => {
+                flatten(left, out);
+                flatten(right, out);
+            }
+            _ => out.push(e),
+        }
+    }
+    let mut conjuncts = Vec::new();
+    flatten(on_expr, &mut conjuncts);
+
+    for expr in conjuncts {
+        if let Expr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } = expr
+        {
+            if let (Some(l_idx), Some(r_idx)) =
+                (resolve_col_idx(left, combined_cols), resolve_col_idx(right, combined_cols))
+            {
+                if l_idx < outer_col_count && r_idx >= outer_col_count {
+                    pairs.push((l_idx, r_idx - outer_col_count));
+                } else if r_idx < outer_col_count && l_idx >= outer_col_count {
+                    pairs.push((r_idx, l_idx - outer_col_count));
+                }
+            }
+        }
+    }
+
+    pairs
 }
 
-fn collect_all_rows_read(db: &Database, table_schema: &TableSchema) -> Result<Vec<Vec<Value>>> {
-    collect_rows_read(db, table_schema, &None)
+fn resolve_col_idx(expr: &Expr, columns: &[ColumnDef]) -> Option<usize> {
+    match expr {
+        Expr::Column(name) => {
+            let matches: Vec<usize> = columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    c.name == *name
+                        || (c.name.len() > name.len()
+                            && c.name.as_bytes()[c.name.len() - name.len() - 1] == b'.'
+                            && c.name.ends_with(name.as_str()))
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if matches.len() == 1 {
+                Some(matches[0])
+            } else {
+                None
+            }
+        }
+        Expr::QualifiedColumn { table, column } => {
+            let qualified = format!("{table}.{column}");
+            columns.iter().position(|c| c.name == qualified)
+        }
+        _ => None,
+    }
+}
+
+fn hash_key(row: &[Value], col_indices: &[usize]) -> Vec<Value> {
+    col_indices.iter().map(|&i| row[i].clone()).collect()
+}
+
+fn count_conjuncts(expr: &Expr) -> usize {
+    match expr {
+        Expr::BinaryOp {
+            op: BinOp::And,
+            left,
+            right,
+        } => count_conjuncts(left) + count_conjuncts(right),
+        _ => 1,
+    }
+}
+
+fn combine_row(outer: &[Value], inner: &[Value], cap: usize) -> Vec<Value> {
+    let mut combined = Vec::with_capacity(cap);
+    combined.extend(outer.iter().cloned());
+    combined.extend(inner.iter().cloned());
+    combined
+}
+
+struct CombineProjection {
+    slots: Vec<(usize, bool)>,
+}
+
+fn combine_row_projected(
+    outer: &[Value],
+    inner: &[Value],
+    proj: &CombineProjection,
+) -> Vec<Value> {
+    proj.slots
+        .iter()
+        .map(|&(idx, is_inner)| {
+            if is_inner {
+                inner[idx].clone()
+            } else {
+                outer[idx].clone()
+            }
+        })
+        .collect()
+}
+
+fn build_combine_projection(
+    needed_combined: &[usize],
+    outer_col_count: usize,
+) -> CombineProjection {
+    CombineProjection {
+        slots: needed_combined
+            .iter()
+            .map(|&ci| {
+                if ci < outer_col_count {
+                    (ci, false)
+                } else {
+                    (ci - outer_col_count, true)
+                }
+            })
+            .collect(),
+    }
+}
+
+fn build_projected_columns(
+    full_cols: &[ColumnDef],
+    needed_combined: &[usize],
+) -> Vec<ColumnDef> {
+    needed_combined
+        .iter()
+        .enumerate()
+        .map(|(new_pos, &old_pos)| {
+            let orig = &full_cols[old_pos];
+            ColumnDef {
+                name: orig.name.clone(),
+                data_type: orig.data_type,
+                nullable: orig.nullable,
+                position: new_pos as u16,
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_integer_join(
+    outer_rows: Vec<Vec<Value>>,
+    inner_rows: &[Vec<Value>],
+    join_type: &JoinType,
+    outer_key_col: usize,
+    inner_key_col: usize,
+    outer_col_count: usize,
+    inner_col_count: usize,
+    outer_is_sorted: bool,
+    projection: Option<&CombineProjection>,
+) -> std::result::Result<Vec<Vec<Value>>, Vec<Vec<Value>>> {
+    let cap = projection.map_or(outer_col_count + inner_col_count, |p| p.slots.len());
+
+    if outer_is_sorted && matches!(join_type, JoinType::Inner | JoinType::Cross) {
+        let mut sorted_inner: Vec<(i64, usize)> = Vec::with_capacity(inner_rows.len());
+        let mut needs_sort = false;
+        let mut prev = i64::MIN;
+        for (i, r) in inner_rows.iter().enumerate() {
+            match r[inner_key_col] {
+                Value::Integer(k) => {
+                    if k < prev { needs_sort = true; }
+                    prev = k;
+                    sorted_inner.push((k, i));
+                }
+                Value::Null => {}
+                _ => return Err(outer_rows),
+            }
+        }
+        if needs_sort {
+            sorted_inner.sort_unstable_by_key(|&(k, _)| k);
+        }
+
+        let mut result = Vec::with_capacity(outer_rows.len());
+        let mut j = 0;
+        for mut outer in outer_rows {
+            let ok = match outer[outer_key_col] {
+                Value::Integer(i) => i,
+                _ => continue,
+            };
+            while j < sorted_inner.len() && sorted_inner[j].0 < ok {
+                j += 1;
+            }
+            let mut kk = j;
+            while kk < sorted_inner.len() && sorted_inner[kk].0 == ok {
+                let is_last = kk + 1 >= sorted_inner.len() || sorted_inner[kk + 1].0 != ok;
+                let inner = &inner_rows[sorted_inner[kk].1];
+                if let Some(proj) = projection {
+                    if is_last {
+                        result.push(proj.slots.iter().map(|&(idx, is_inner)| {
+                            if is_inner { inner[idx].clone() } else { std::mem::take(&mut outer[idx]) }
+                        }).collect());
+                    } else {
+                        result.push(combine_row_projected(&outer, inner, proj));
+                    }
+                } else if is_last {
+                    outer.extend(inner.iter().cloned());
+                    result.push(outer);
+                    break;
+                } else {
+                    result.push(combine_row(&outer, inner, cap));
+                }
+                kk += 1;
+            }
+        }
+        return Ok(result);
+    }
+
+    let mut inner_map: HashMap<i64, Vec<usize>> = HashMap::with_capacity(inner_rows.len());
+    for (idx, inner) in inner_rows.iter().enumerate() {
+        match &inner[inner_key_col] {
+            Value::Integer(k) => inner_map.entry(*k).or_default().push(idx),
+            Value::Null => {}
+            _ => return Err(outer_rows),
+        }
+    }
+
+    let mut result = Vec::with_capacity(inner_rows.len());
+
+    match join_type {
+        JoinType::Inner | JoinType::Cross => {
+            for mut outer in outer_rows {
+                if let Value::Integer(k) = outer[outer_key_col] {
+                    if let Some(indices) = inner_map.get(&k) {
+                        if let Some(proj) = projection {
+                            for &idx in indices {
+                                result.push(combine_row_projected(&outer, &inner_rows[idx], proj));
+                            }
+                        } else {
+                            for &idx in &indices[..indices.len() - 1] {
+                                result.push(combine_row(&outer, &inner_rows[idx], cap));
+                            }
+                            let last_idx = *indices.last().unwrap();
+                            outer.extend(inner_rows[last_idx].iter().cloned());
+                            result.push(outer);
+                        }
+                    }
+                }
+            }
+        }
+        JoinType::Left => {
+            for mut outer in outer_rows {
+                if let Value::Integer(k) = outer[outer_key_col] {
+                    if let Some(indices) = inner_map.get(&k) {
+                        if let Some(proj) = projection {
+                            for &idx in indices {
+                                result.push(combine_row_projected(&outer, &inner_rows[idx], proj));
+                            }
+                        } else {
+                            for &idx in &indices[..indices.len() - 1] {
+                                result.push(combine_row(&outer, &inner_rows[idx], cap));
+                            }
+                            let last_idx = *indices.last().unwrap();
+                            outer.extend(inner_rows[last_idx].iter().cloned());
+                            result.push(outer);
+                        }
+                        continue;
+                    }
+                }
+                if let Some(proj) = projection {
+                    let null_inner = vec![Value::Null; inner_col_count];
+                    result.push(combine_row_projected(&outer, &null_inner, proj));
+                } else {
+                    outer.resize(cap, Value::Null);
+                    result.push(outer);
+                }
+            }
+        }
+        JoinType::Right => {
+            let mut inner_matched = vec![false; inner_rows.len()];
+            for mut outer in outer_rows {
+                if let Value::Integer(k) = outer[outer_key_col] {
+                    if let Some(indices) = inner_map.get(&k) {
+                        if let Some(proj) = projection {
+                            for &idx in indices {
+                                result.push(combine_row_projected(&outer, &inner_rows[idx], proj));
+                                inner_matched[idx] = true;
+                            }
+                        } else {
+                            for &idx in &indices[..indices.len() - 1] {
+                                result.push(combine_row(&outer, &inner_rows[idx], cap));
+                                inner_matched[idx] = true;
+                            }
+                            let last_idx = *indices.last().unwrap();
+                            inner_matched[last_idx] = true;
+                            outer.extend(inner_rows[last_idx].iter().cloned());
+                            result.push(outer);
+                        }
+                    }
+                }
+            }
+            for (j, inner) in inner_rows.iter().enumerate() {
+                if !inner_matched[j] {
+                    if let Some(proj) = projection {
+                        let null_outer = vec![Value::Null; outer_col_count];
+                        result.push(combine_row_projected(&null_outer, inner, proj));
+                    } else {
+                        let mut padded = Vec::with_capacity(cap);
+                        padded.resize(outer_col_count, Value::Null);
+                        padded.extend(inner.iter().cloned());
+                        result.push(padded);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exec_join_step(
+    mut outer_rows: Vec<Vec<Value>>,
+    inner_rows: &[Vec<Value>],
+    join: &JoinClause,
+    combined_cols: &[ColumnDef],
+    outer_col_count: usize,
+    inner_col_count: usize,
+    outer_pk_col: Option<usize>,
+    projection: Option<&CombineProjection>,
+) -> Vec<Vec<Value>> {
+    let equi_pairs = join
+        .on_clause
+        .as_ref()
+        .map(|on| extract_equi_join_keys(on, combined_cols, outer_col_count))
+        .unwrap_or_default();
+
+    let is_pure_equi = join.on_clause.as_ref().map_or(true, |on| {
+        !equi_pairs.is_empty() && count_conjuncts(on) == equi_pairs.len()
+    });
+
+    let effective_proj = if is_pure_equi { projection } else { None };
+
+    if equi_pairs.len() == 1 && is_pure_equi {
+        let (outer_key_col, inner_key_col) = equi_pairs[0];
+        let outer_is_sorted = outer_pk_col == Some(outer_key_col);
+        match try_integer_join(
+            outer_rows,
+            inner_rows,
+            &join.join_type,
+            outer_key_col,
+            inner_key_col,
+            outer_col_count,
+            inner_col_count,
+            outer_is_sorted,
+            effective_proj,
+        ) {
+            Ok(result) => return result,
+            Err(rows) => outer_rows = rows,
+        }
+    }
+
+    let outer_key_cols: Vec<usize> = equi_pairs.iter().map(|&(o, _)| o).collect();
+    let inner_key_cols: Vec<usize> = equi_pairs.iter().map(|&(_, i)| i).collect();
+
+    let mut inner_map: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
+    for (idx, inner) in inner_rows.iter().enumerate() {
+        inner_map
+            .entry(hash_key(inner, &inner_key_cols))
+            .or_default()
+            .push(idx);
+    }
+
+    let cap = effective_proj.map_or(outer_col_count + inner_col_count, |p| p.slots.len());
+    let mut result = Vec::new();
+
+    if is_pure_equi {
+        match join.join_type {
+            JoinType::Inner | JoinType::Cross => {
+                for mut outer in outer_rows {
+                    let key = hash_key(&outer, &outer_key_cols);
+                    if let Some(indices) = inner_map.get(&key) {
+                        if let Some(proj) = effective_proj {
+                            for &idx in indices {
+                                result.push(combine_row_projected(&outer, &inner_rows[idx], proj));
+                            }
+                        } else {
+                            for &idx in &indices[..indices.len() - 1] {
+                                result.push(combine_row(&outer, &inner_rows[idx], cap));
+                            }
+                            let last_idx = *indices.last().unwrap();
+                            outer.extend(inner_rows[last_idx].iter().cloned());
+                            result.push(outer);
+                        }
+                    }
+                }
+            }
+            JoinType::Left => {
+                for mut outer in outer_rows {
+                    let key = hash_key(&outer, &outer_key_cols);
+                    if let Some(indices) = inner_map.get(&key) {
+                        if let Some(proj) = effective_proj {
+                            for &idx in indices {
+                                result.push(combine_row_projected(&outer, &inner_rows[idx], proj));
+                            }
+                        } else {
+                            for &idx in &indices[..indices.len() - 1] {
+                                result.push(combine_row(&outer, &inner_rows[idx], cap));
+                            }
+                            let last_idx = *indices.last().unwrap();
+                            outer.extend(inner_rows[last_idx].iter().cloned());
+                            result.push(outer);
+                        }
+                    } else if let Some(proj) = effective_proj {
+                        let null_inner = vec![Value::Null; inner_col_count];
+                        result.push(combine_row_projected(&outer, &null_inner, proj));
+                    } else {
+                        outer.resize(cap, Value::Null);
+                        result.push(outer);
+                    }
+                }
+            }
+            JoinType::Right => {
+                let mut inner_matched = vec![false; inner_rows.len()];
+                for mut outer in outer_rows {
+                    let key = hash_key(&outer, &outer_key_cols);
+                    if let Some(indices) = inner_map.get(&key) {
+                        if let Some(proj) = effective_proj {
+                            for &idx in indices {
+                                result.push(combine_row_projected(&outer, &inner_rows[idx], proj));
+                                inner_matched[idx] = true;
+                            }
+                        } else {
+                            for &idx in &indices[..indices.len() - 1] {
+                                result.push(combine_row(&outer, &inner_rows[idx], cap));
+                                inner_matched[idx] = true;
+                            }
+                            let last_idx = *indices.last().unwrap();
+                            inner_matched[last_idx] = true;
+                            outer.extend(inner_rows[last_idx].iter().cloned());
+                            result.push(outer);
+                        }
+                    }
+                }
+                for (j, inner) in inner_rows.iter().enumerate() {
+                    if !inner_matched[j] {
+                        if let Some(proj) = effective_proj {
+                            let null_outer = vec![Value::Null; outer_col_count];
+                            result.push(combine_row_projected(&null_outer, inner, proj));
+                        } else {
+                            let mut padded = Vec::with_capacity(cap);
+                            padded.resize(outer_col_count, Value::Null);
+                            padded.extend(inner.iter().cloned());
+                            result.push(padded);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        let combined_map = ColumnMap::new(combined_cols);
+        let on_matches = |combined: &[Value]| -> bool {
+            match join.on_clause {
+                Some(ref on_expr) => eval_expr(on_expr, &combined_map, combined)
+                    .map(|v| is_truthy(&v))
+                    .unwrap_or(false),
+                None => true,
+            }
+        };
+
+        match join.join_type {
+            JoinType::Inner | JoinType::Cross => {
+                for outer in &outer_rows {
+                    let key = hash_key(outer, &outer_key_cols);
+                    if let Some(indices) = inner_map.get(&key) {
+                        for &idx in indices {
+                            let combined = combine_row(outer, &inner_rows[idx], cap);
+                            if on_matches(&combined) {
+                                result.push(combined);
+                            }
+                        }
+                    }
+                }
+            }
+            JoinType::Left => {
+                for outer in &outer_rows {
+                    let key = hash_key(outer, &outer_key_cols);
+                    let mut matched = false;
+                    if let Some(indices) = inner_map.get(&key) {
+                        for &idx in indices {
+                            let combined = combine_row(outer, &inner_rows[idx], cap);
+                            if on_matches(&combined) {
+                                result.push(combined);
+                                matched = true;
+                            }
+                        }
+                    }
+                    if !matched {
+                        let mut padded = Vec::with_capacity(cap);
+                        padded.extend(outer.iter().cloned());
+                        padded.resize(cap, Value::Null);
+                        result.push(padded);
+                    }
+                }
+            }
+            JoinType::Right => {
+                let mut inner_matched = vec![false; inner_rows.len()];
+                for outer in &outer_rows {
+                    let key = hash_key(outer, &outer_key_cols);
+                    if let Some(indices) = inner_map.get(&key) {
+                        for &idx in indices {
+                            let combined = combine_row(outer, &inner_rows[idx], cap);
+                            if on_matches(&combined) {
+                                result.push(combined);
+                                inner_matched[idx] = true;
+                            }
+                        }
+                    }
+                }
+                for (j, inner) in inner_rows.iter().enumerate() {
+                    if !inner_matched[j] {
+                        let mut padded = Vec::with_capacity(cap);
+                        padded.resize(outer_col_count, Value::Null);
+                        padded.extend(inner.iter().cloned());
+                        result.push(padded);
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
+fn table_alias_or_name(name: &str, alias: &Option<String>) -> String {
+    match alias {
+        Some(a) => a.to_ascii_lowercase(),
+        None => name.to_ascii_lowercase(),
+    }
+}
+
+fn collect_all_rows_raw(
+    rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
+    table_schema: &TableSchema,
+) -> Result<Vec<Vec<Value>>> {
+    let lower_name = &table_schema.name;
+    let entry_count = rtx
+        .table_entry_count(lower_name.as_bytes())
+        .unwrap_or(0) as usize;
+    let mut rows = Vec::with_capacity(entry_count);
+    let mut scan_err: Option<SqlError> = None;
+    rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
+        match decode_full_row(table_schema, key, value) {
+            Ok(row) => rows.push(row),
+            Err(e) => {
+                scan_err = Some(e);
+                return false;
+            }
+        }
+        true
+    })
+    .map_err(SqlError::Storage)?;
+    if let Some(e) = scan_err {
+        return Err(e);
+    }
+    Ok(rows)
 }
 
 fn collect_all_rows_write(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     table_schema: &TableSchema,
 ) -> Result<Vec<Vec<Value>>> {
-    collect_rows_write(wtx, table_schema, &None)
+    collect_rows_write(wtx, table_schema, &None, None).map(|(rows, _)| rows)
+}
+
+fn has_ambiguous_bare_ref(expr: &Expr, columns: &[ColumnDef]) -> bool {
+    match expr {
+        Expr::Column(name) => {
+            let lower = name.to_ascii_lowercase();
+            columns
+                .iter()
+                .filter(|c| c.name == lower || c.name.ends_with(&format!(".{lower}")))
+                .count()
+                > 1
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            has_ambiguous_bare_ref(left, columns) || has_ambiguous_bare_ref(right, columns)
+        }
+        Expr::UnaryOp { expr: inner, .. } | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            has_ambiguous_bare_ref(inner, columns)
+        }
+        Expr::Function { args, .. } | Expr::Coalesce(args) => {
+            args.iter().any(|a| has_ambiguous_bare_ref(a, columns))
+        }
+        Expr::Between {
+            expr: e,
+            low,
+            high,
+            ..
+        } => {
+            has_ambiguous_bare_ref(e, columns)
+                || has_ambiguous_bare_ref(low, columns)
+                || has_ambiguous_bare_ref(high, columns)
+        }
+        Expr::InList { expr: e, list, .. } => {
+            has_ambiguous_bare_ref(e, columns)
+                || list.iter().any(|a| has_ambiguous_bare_ref(a, columns))
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            has_ambiguous_bare_ref(e, columns)
+                || has_ambiguous_bare_ref(pattern, columns)
+                || escape
+                    .as_ref()
+                    .is_some_and(|esc| has_ambiguous_bare_ref(esc, columns))
+        }
+        Expr::Cast { expr: inner, .. } => has_ambiguous_bare_ref(inner, columns),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|o| has_ambiguous_bare_ref(o, columns))
+                || conditions.iter().any(|(w, t)| {
+                    has_ambiguous_bare_ref(w, columns) || has_ambiguous_bare_ref(t, columns)
+                })
+                || else_result
+                    .as_ref()
+                    .is_some_and(|e| has_ambiguous_bare_ref(e, columns))
+        }
+        _ => false,
+    }
+}
+
+struct JoinColumnPlan {
+    per_table: Vec<Vec<usize>>,
+    output_combined: Vec<usize>,
+}
+
+fn compute_join_needed_columns(
+    stmt: &SelectStmt,
+    tables: &[(String, &TableSchema)],
+) -> Option<JoinColumnPlan> {
+    for sel in &stmt.columns {
+        if matches!(sel, SelectColumn::AllColumns) {
+            return None;
+        }
+    }
+
+    let combined_cols = build_joined_columns(tables);
+
+    for sel in &stmt.columns {
+        if let SelectColumn::Expr { expr, .. } = sel {
+            if has_ambiguous_bare_ref(expr, &combined_cols) {
+                return None;
+            }
+        }
+    }
+
+    let mut output_combined: Vec<usize> = Vec::new();
+    for sel in &stmt.columns {
+        if let SelectColumn::Expr { expr, .. } = sel {
+            output_combined.extend(referenced_columns(expr, &combined_cols));
+        }
+    }
+    if let Some(w) = &stmt.where_clause {
+        output_combined.extend(referenced_columns(w, &combined_cols));
+    }
+    for ob in &stmt.order_by {
+        output_combined.extend(referenced_columns(&ob.expr, &combined_cols));
+    }
+    for gb in &stmt.group_by {
+        output_combined.extend(referenced_columns(gb, &combined_cols));
+    }
+    if let Some(h) = &stmt.having {
+        output_combined.extend(referenced_columns(h, &combined_cols));
+    }
+    output_combined.sort_unstable();
+    output_combined.dedup();
+
+    let mut needed_combined = output_combined.clone();
+    for join in &stmt.joins {
+        if let Some(on_expr) = &join.on_clause {
+            needed_combined.extend(referenced_columns(on_expr, &combined_cols));
+        }
+    }
+    needed_combined.sort_unstable();
+    needed_combined.dedup();
+
+    let mut offsets = Vec::with_capacity(tables.len() + 1);
+    offsets.push(0usize);
+    for (_, s) in tables {
+        offsets.push(offsets.last().unwrap() + s.columns.len());
+    }
+
+    let mut per_table: Vec<Vec<usize>> = tables.iter().map(|_| Vec::new()).collect();
+    for &ci in &needed_combined {
+        for (t, _) in tables.iter().enumerate() {
+            let start = offsets[t];
+            let end = offsets[t + 1];
+            if ci >= start && ci < end {
+                per_table[t].push(ci - start);
+                break;
+            }
+        }
+    }
+
+    Some(JoinColumnPlan {
+        per_table,
+        output_combined,
+    })
+}
+
+fn collect_rows_partial(
+    rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
+    table_schema: &TableSchema,
+    needed: &[usize],
+) -> Result<Vec<Vec<Value>>> {
+    if needed.is_empty() || needed.len() == table_schema.columns.len() {
+        return collect_all_rows_raw(rtx, table_schema);
+    }
+    let ctx = PartialDecodeCtx::new(table_schema, needed);
+    let lower_name = &table_schema.name;
+    let entry_count = rtx
+        .table_entry_count(lower_name.as_bytes())
+        .unwrap_or(0) as usize;
+    let mut rows = Vec::with_capacity(entry_count);
+    let mut scan_err: Option<SqlError> = None;
+    rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
+        match ctx.decode(key, value) {
+            Ok(row) => rows.push(row),
+            Err(e) => {
+                scan_err = Some(e);
+                return false;
+            }
+        }
+        true
+    })
+    .map_err(SqlError::Storage)?;
+    if let Some(e) = scan_err {
+        return Err(e);
+    }
+    Ok(rows)
+}
+
+fn collect_rows_partial_write(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    table_schema: &TableSchema,
+    needed: &[usize],
+) -> Result<Vec<Vec<Value>>> {
+    if needed.is_empty() || needed.len() == table_schema.columns.len() {
+        return collect_all_rows_write(wtx, table_schema);
+    }
+    let ctx = PartialDecodeCtx::new(table_schema, needed);
+    let lower_name = &table_schema.name;
+    let entry_count = wtx
+        .table_entry_count(lower_name.as_bytes())
+        .unwrap_or(0) as usize;
+    let mut rows = Vec::with_capacity(entry_count);
+    let mut scan_err: Option<SqlError> = None;
+    wtx.table_scan_from(lower_name.as_bytes(), b"", |key, value| {
+        match ctx.decode(key, value) {
+            Ok(row) => rows.push(row),
+            Err(e) => {
+                scan_err = Some(e);
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })
+    .map_err(SqlError::Storage)?;
+    if let Some(e) = scan_err {
+        return Err(e);
+    }
+    Ok(rows)
 }
 
 fn exec_select_join(
@@ -2019,108 +3990,88 @@ fn exec_select_join(
 ) -> Result<ExecutionResult> {
     let from_schema = resolve_table_name(schema, &stmt.from)?;
     let from_alias = table_alias_or_name(&stmt.from, &stmt.from_alias);
-    let mut outer_rows = collect_all_rows_read(db, from_schema)?;
 
-    let mut tables: Vec<(String, &TableSchema)> = vec![(from_alias.clone(), from_schema)];
-
+    let mut all_tables: Vec<(String, &TableSchema)> = vec![(from_alias.clone(), from_schema)];
     for join in &stmt.joins {
         let inner_schema = resolve_table_name(schema, &join.table.name)?;
         let inner_alias = table_alias_or_name(&join.table.name, &join.table.alias);
-        let inner_rows = collect_all_rows_read(db, inner_schema)?;
+        all_tables.push((inner_alias, inner_schema));
+    }
+    let (needed_per_table, output_combined) =
+        match compute_join_needed_columns(stmt, &all_tables) {
+            Some(plan) => (Some(plan.per_table), Some(plan.output_combined)),
+            None => (None, None),
+        };
+
+    let mut rtx = db.begin_read();
+    let mut outer_rows = match &needed_per_table {
+        Some(n) if !n.is_empty() => collect_rows_partial(&mut rtx, from_schema, &n[0])?,
+        _ => collect_all_rows_raw(&mut rtx, from_schema)?,
+    };
+
+    let mut tables: Vec<(String, &TableSchema)> = vec![(from_alias.clone(), from_schema)];
+    let mut cur_outer_pk_col: Option<usize> =
+        if from_schema.primary_key_columns.len() == 1 {
+            Some(from_schema.primary_key_columns[0] as usize)
+        } else {
+            None
+        };
+
+    let num_joins = stmt.joins.len();
+    let mut last_combined_cols: Option<Vec<ColumnDef>> = None;
+    for (ji, join) in stmt.joins.iter().enumerate() {
+        let inner_schema = resolve_table_name(schema, &join.table.name)?;
+        let inner_alias = table_alias_or_name(&join.table.name, &join.table.alias);
+        let inner_rows = match &needed_per_table {
+            Some(n) if ji + 1 < n.len() => collect_rows_partial(&mut rtx, inner_schema, &n[ji + 1])?,
+            _ => collect_all_rows_raw(&mut rtx, inner_schema)?,
+        };
 
         let mut preview_tables = tables.clone();
         preview_tables.push((inner_alias.clone(), inner_schema));
         let combined_cols = build_joined_columns(&preview_tables);
 
-        let mut new_rows = Vec::new();
+        let outer_col_count = if outer_rows.is_empty() {
+            tables.iter().map(|(_, s)| s.columns.len()).sum()
+        } else {
+            outer_rows[0].len()
+        };
+        let inner_col_count = inner_schema.columns.len();
 
-        match join.join_type {
-            JoinType::Inner | JoinType::Cross => {
-                for outer in &outer_rows {
-                    for inner in &inner_rows {
-                        let combined: Vec<Value> =
-                            outer.iter().chain(inner.iter()).cloned().collect();
-                        if let Some(ref on_expr) = join.on_clause {
-                            match eval_expr(on_expr, &combined_cols, &combined) {
-                                Ok(val) if is_truthy(&val) => new_rows.push(combined),
-                                _ => {}
-                            }
-                        } else {
-                            new_rows.push(combined);
-                        }
-                    }
-                }
-            }
-            JoinType::Left => {
-                let inner_col_count = inner_schema.columns.len();
-                for outer in &outer_rows {
-                    let mut matched = false;
-                    for inner in &inner_rows {
-                        let combined: Vec<Value> =
-                            outer.iter().chain(inner.iter()).cloned().collect();
-                        if let Some(ref on_expr) = join.on_clause {
-                            match eval_expr(on_expr, &combined_cols, &combined) {
-                                Ok(val) if is_truthy(&val) => {
-                                    new_rows.push(combined);
-                                    matched = true;
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            new_rows.push(combined);
-                            matched = true;
-                        }
-                    }
-                    if !matched {
-                        let mut padded = outer.clone();
-                        padded.extend(std::iter::repeat(Value::Null).take(inner_col_count));
-                        new_rows.push(padded);
-                    }
-                }
-            }
-            JoinType::Right => {
-                let outer_col_count = if outer_rows.is_empty() {
-                    tables.iter().map(|(_, s)| s.columns.len()).sum()
-                } else {
-                    outer_rows[0].len()
-                };
-                let mut inner_matched = vec![false; inner_rows.len()];
-                for outer in &outer_rows {
-                    for (j, inner) in inner_rows.iter().enumerate() {
-                        let combined: Vec<Value> =
-                            outer.iter().chain(inner.iter()).cloned().collect();
-                        if let Some(ref on_expr) = join.on_clause {
-                            match eval_expr(on_expr, &combined_cols, &combined) {
-                                Ok(val) if is_truthy(&val) => {
-                                    new_rows.push(combined);
-                                    inner_matched[j] = true;
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            new_rows.push(combined);
-                            inner_matched[j] = true;
-                        }
-                    }
-                }
-                for (j, inner) in inner_rows.iter().enumerate() {
-                    if !inner_matched[j] {
-                        let mut padded: Vec<Value> = std::iter::repeat(Value::Null)
-                            .take(outer_col_count)
-                            .collect();
-                        padded.extend(inner.iter().cloned());
-                        new_rows.push(padded);
-                    }
-                }
-            }
-        }
+        let is_last = ji == num_joins - 1;
+        let proj = if is_last {
+            output_combined
+                .as_ref()
+                .map(|oc| build_combine_projection(oc, outer_col_count))
+        } else {
+            None
+        };
 
+        outer_rows = exec_join_step(
+            outer_rows,
+            &inner_rows,
+            join,
+            &combined_cols,
+            outer_col_count,
+            inner_col_count,
+            cur_outer_pk_col,
+            proj.as_ref(),
+        );
+        last_combined_cols = Some(combined_cols);
         tables.push((inner_alias, inner_schema));
-        outer_rows = new_rows;
+        cur_outer_pk_col = None;
     }
+    drop(rtx);
 
-    let joined_cols = build_joined_columns(&tables);
-    process_select(&joined_cols, outer_rows, stmt)
+    let joined_cols = last_combined_cols.unwrap_or_else(|| build_joined_columns(&tables));
+    if let Some(ref oc) = output_combined {
+        let actual_width = outer_rows.first().map_or(0, |r| r.len());
+        if actual_width == oc.len() {
+            let projected_cols = build_projected_columns(&joined_cols, oc);
+            return process_select(&projected_cols, outer_rows, stmt, false);
+        }
+    }
+    process_select(&joined_cols, outer_rows, stmt, false)
 }
 
 fn exec_select_join_in_txn(
@@ -2130,108 +4081,84 @@ fn exec_select_join_in_txn(
 ) -> Result<ExecutionResult> {
     let from_schema = resolve_table_name(schema, &stmt.from)?;
     let from_alias = table_alias_or_name(&stmt.from, &stmt.from_alias);
-    let mut outer_rows = collect_all_rows_write(wtx, from_schema)?;
 
-    let mut tables: Vec<(String, &TableSchema)> = vec![(from_alias.clone(), from_schema)];
-
+    let mut all_tables: Vec<(String, &TableSchema)> = vec![(from_alias.clone(), from_schema)];
     for join in &stmt.joins {
         let inner_schema = resolve_table_name(schema, &join.table.name)?;
         let inner_alias = table_alias_or_name(&join.table.name, &join.table.alias);
-        let inner_rows = collect_all_rows_write(wtx, inner_schema)?;
+        all_tables.push((inner_alias, inner_schema));
+    }
+    let (needed_per_table, output_combined) =
+        match compute_join_needed_columns(stmt, &all_tables) {
+            Some(plan) => (Some(plan.per_table), Some(plan.output_combined)),
+            None => (None, None),
+        };
+
+    let mut outer_rows = match &needed_per_table {
+        Some(n) if !n.is_empty() => collect_rows_partial_write(wtx, from_schema, &n[0])?,
+        _ => collect_all_rows_write(wtx, from_schema)?,
+    };
+
+    let mut tables: Vec<(String, &TableSchema)> = vec![(from_alias.clone(), from_schema)];
+    let mut cur_outer_pk_col: Option<usize> =
+        if from_schema.primary_key_columns.len() == 1 {
+            Some(from_schema.primary_key_columns[0] as usize)
+        } else {
+            None
+        };
+
+    let num_joins = stmt.joins.len();
+    for (ji, join) in stmt.joins.iter().enumerate() {
+        let inner_schema = resolve_table_name(schema, &join.table.name)?;
+        let inner_alias = table_alias_or_name(&join.table.name, &join.table.alias);
+        let inner_rows = match &needed_per_table {
+            Some(n) if ji + 1 < n.len() => collect_rows_partial_write(wtx, inner_schema, &n[ji + 1])?,
+            _ => collect_all_rows_write(wtx, inner_schema)?,
+        };
 
         let mut preview_tables = tables.clone();
         preview_tables.push((inner_alias.clone(), inner_schema));
         let combined_cols = build_joined_columns(&preview_tables);
 
-        let mut new_rows = Vec::new();
+        let outer_col_count = if outer_rows.is_empty() {
+            tables.iter().map(|(_, s)| s.columns.len()).sum()
+        } else {
+            outer_rows[0].len()
+        };
+        let inner_col_count = inner_schema.columns.len();
 
-        match join.join_type {
-            JoinType::Inner | JoinType::Cross => {
-                for outer in &outer_rows {
-                    for inner in &inner_rows {
-                        let combined: Vec<Value> =
-                            outer.iter().chain(inner.iter()).cloned().collect();
-                        if let Some(ref on_expr) = join.on_clause {
-                            match eval_expr(on_expr, &combined_cols, &combined) {
-                                Ok(val) if is_truthy(&val) => new_rows.push(combined),
-                                _ => {}
-                            }
-                        } else {
-                            new_rows.push(combined);
-                        }
-                    }
-                }
-            }
-            JoinType::Left => {
-                let inner_col_count = inner_schema.columns.len();
-                for outer in &outer_rows {
-                    let mut matched = false;
-                    for inner in &inner_rows {
-                        let combined: Vec<Value> =
-                            outer.iter().chain(inner.iter()).cloned().collect();
-                        if let Some(ref on_expr) = join.on_clause {
-                            match eval_expr(on_expr, &combined_cols, &combined) {
-                                Ok(val) if is_truthy(&val) => {
-                                    new_rows.push(combined);
-                                    matched = true;
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            new_rows.push(combined);
-                            matched = true;
-                        }
-                    }
-                    if !matched {
-                        let mut padded = outer.clone();
-                        padded.extend(std::iter::repeat(Value::Null).take(inner_col_count));
-                        new_rows.push(padded);
-                    }
-                }
-            }
-            JoinType::Right => {
-                let outer_col_count = if outer_rows.is_empty() {
-                    tables.iter().map(|(_, s)| s.columns.len()).sum()
-                } else {
-                    outer_rows[0].len()
-                };
-                let mut inner_matched = vec![false; inner_rows.len()];
-                for outer in &outer_rows {
-                    for (j, inner) in inner_rows.iter().enumerate() {
-                        let combined: Vec<Value> =
-                            outer.iter().chain(inner.iter()).cloned().collect();
-                        if let Some(ref on_expr) = join.on_clause {
-                            match eval_expr(on_expr, &combined_cols, &combined) {
-                                Ok(val) if is_truthy(&val) => {
-                                    new_rows.push(combined);
-                                    inner_matched[j] = true;
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            new_rows.push(combined);
-                            inner_matched[j] = true;
-                        }
-                    }
-                }
-                for (j, inner) in inner_rows.iter().enumerate() {
-                    if !inner_matched[j] {
-                        let mut padded: Vec<Value> = std::iter::repeat(Value::Null)
-                            .take(outer_col_count)
-                            .collect();
-                        padded.extend(inner.iter().cloned());
-                        new_rows.push(padded);
-                    }
-                }
-            }
-        }
+        let is_last = ji == num_joins - 1;
+        let proj = if is_last {
+            output_combined
+                .as_ref()
+                .map(|oc| build_combine_projection(oc, outer_col_count))
+        } else {
+            None
+        };
 
+        outer_rows = exec_join_step(
+            outer_rows,
+            &inner_rows,
+            join,
+            &combined_cols,
+            outer_col_count,
+            inner_col_count,
+            cur_outer_pk_col,
+            proj.as_ref(),
+        );
         tables.push((inner_alias, inner_schema));
-        outer_rows = new_rows;
+        cur_outer_pk_col = None;
     }
 
     let joined_cols = build_joined_columns(&tables);
-    process_select(&joined_cols, outer_rows, stmt)
+    if let Some(ref oc) = output_combined {
+        let actual_width = outer_rows.first().map_or(0, |r| r.len());
+        if actual_width == oc.len() {
+            let projected_cols = build_projected_columns(&joined_cols, oc);
+            return process_select(&projected_cols, outer_rows, stmt, false);
+        }
+    }
+    process_select(&joined_cols, outer_rows, stmt, false)
 }
 
 fn exec_update(
@@ -2252,11 +4179,12 @@ fn exec_update(
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
+    let col_map = ColumnMap::new(&table_schema.columns);
     let all_candidates = collect_keyed_rows_read(db, table_schema, &stmt.where_clause)?;
     let matching_rows: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
         .into_iter()
         .filter(|(_, row)| match &stmt.where_clause {
-            Some(where_expr) => match eval_expr(where_expr, &table_schema.columns, row) {
+            Some(where_expr) => match eval_expr(where_expr, &col_map, row) {
                 Ok(val) => is_truthy(&val),
                 Err(_) => false,
             },
@@ -2290,9 +4218,10 @@ fn exec_update(
             let col_idx = table_schema
                 .column_index(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-            let new_val = eval_expr(expr, &table_schema.columns, row)?;
+            let new_val = eval_expr(expr, &col_map, row)?;
             let col = &table_schema.columns[col_idx];
 
+            let got_type = new_val.data_type();
             let coerced = if new_val.is_null() {
                 if !col.nullable {
                     return Err(SqlError::NotNullViolation(col.name.clone()));
@@ -2300,10 +4229,10 @@ fn exec_update(
                 Value::Null
             } else {
                 new_val
-                    .coerce_to(col.data_type)
+                    .coerce_into(col.data_type)
                     .ok_or_else(|| SqlError::TypeMismatch {
                         expected: col.data_type.to_string(),
-                        got: new_val.data_type().to_string(),
+                        got: got_type.to_string(),
                     })?
             };
 
@@ -2425,11 +4354,12 @@ fn exec_delete(
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
+    let col_map = ColumnMap::new(&table_schema.columns);
     let all_candidates = collect_keyed_rows_read(db, table_schema, &stmt.where_clause)?;
     let rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
         .into_iter()
         .filter(|(_, row)| match &stmt.where_clause {
-            Some(where_expr) => match eval_expr(where_expr, &table_schema.columns, row) {
+            Some(where_expr) => match eval_expr(where_expr, &col_map, row) {
                 Ok(val) => is_truthy(&val),
                 Err(_) => false,
             },
@@ -2454,12 +4384,35 @@ fn exec_delete(
     Ok(ExecutionResult::RowsAffected(count))
 }
 
-// ── DML (in-transaction) ────────────────────────────────────────────
+#[derive(Default)]
+pub struct InsertBufs {
+    row: Vec<Value>,
+    pk_values: Vec<Value>,
+    value_values: Vec<Value>,
+    key_buf: Vec<u8>,
+    value_buf: Vec<u8>,
+    col_indices: Vec<usize>,
+}
 
-fn exec_insert_in_txn(
+impl InsertBufs {
+    pub fn new() -> Self {
+        Self {
+            row: Vec::new(),
+            pk_values: Vec::new(),
+            value_values: Vec::new(),
+            key_buf: Vec::with_capacity(64),
+            value_buf: Vec::with_capacity(256),
+            col_indices: Vec::new(),
+        }
+    }
+}
+
+pub fn exec_insert_in_txn(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &SchemaManager,
     stmt: &InsertStmt,
+    params: &[Value],
+    bufs: &mut InsertBufs,
 ) -> Result<ExecutionResult> {
     let materialized;
     let stmt = if insert_has_subquery(stmt) {
@@ -2469,32 +4422,37 @@ fn exec_insert_in_txn(
         stmt
     };
 
-    let lower_name = stmt.table.to_ascii_lowercase();
     let table_schema = schema
-        .get(&lower_name)
+        .get(&stmt.table)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
-    let insert_columns = if stmt.columns.is_empty() {
-        table_schema
+    let default_columns;
+    let insert_columns: &[String] = if stmt.columns.is_empty() {
+        default_columns = table_schema
             .columns
             .iter()
             .map(|c| c.name.clone())
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        &default_columns
     } else {
-        stmt.columns
-            .iter()
-            .map(|c| c.to_ascii_lowercase())
-            .collect()
+        &stmt.columns
     };
 
-    let col_indices: Vec<usize> = insert_columns
-        .iter()
-        .map(|name| {
+    bufs.col_indices.clear();
+    for name in insert_columns {
+        bufs.col_indices.push(
             table_schema
                 .column_index(name)
-                .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))
-        })
-        .collect::<Result<_>>()?;
+                .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))?,
+        );
+    }
+
+    let pk_indices = table_schema.pk_indices();
+    let non_pk = table_schema.non_pk_indices();
+
+    bufs.row.resize(table_schema.columns.len(), Value::Null);
+    bufs.pk_values.resize(pk_indices.len(), Value::Null);
+    bufs.value_values.resize(non_pk.len(), Value::Null);
 
     let mut count: u64 = 0;
 
@@ -2507,63 +4465,78 @@ fn exec_insert_in_txn(
             )));
         }
 
-        let mut row = vec![Value::Null; table_schema.columns.len()];
+        for v in bufs.row.iter_mut() {
+            *v = Value::Null;
+        }
+
         for (i, expr) in value_row.iter().enumerate() {
-            let val = eval_const_expr(expr)?;
-            let col_idx = col_indices[i];
+            let val = if let Expr::Parameter(n) = expr {
+                params.get(n - 1).cloned().ok_or_else(|| {
+                    SqlError::Parse(format!("unbound parameter ${n}"))
+                })?
+            } else {
+                eval_const_expr(expr)?
+            };
+            let col_idx = bufs.col_indices[i];
             let col = &table_schema.columns[col_idx];
 
-            let coerced = if val.is_null() {
+            let got_type = val.data_type();
+            bufs.row[col_idx] = if val.is_null() {
                 Value::Null
             } else {
-                val.coerce_to(col.data_type)
+                val.coerce_into(col.data_type)
                     .ok_or_else(|| SqlError::TypeMismatch {
                         expected: col.data_type.to_string(),
-                        got: val.data_type().to_string(),
+                        got: got_type.to_string(),
                     })?
             };
-
-            row[col_idx] = coerced;
         }
 
         for col in &table_schema.columns {
-            if !col.nullable && row[col.position as usize].is_null() {
+            if !col.nullable && bufs.row[col.position as usize].is_null() {
                 return Err(SqlError::NotNullViolation(col.name.clone()));
             }
         }
 
-        let pk_values: Vec<Value> = table_schema
-            .pk_indices()
-            .iter()
-            .map(|&i| row[i].clone())
-            .collect();
-        let key = encode_composite_key(&pk_values);
+        for (j, &i) in pk_indices.iter().enumerate() {
+            bufs.pk_values[j] = std::mem::replace(&mut bufs.row[i], Value::Null);
+        }
+        encode_composite_key_into(&bufs.pk_values, &mut bufs.key_buf);
 
-        let non_pk = table_schema.non_pk_indices();
-        let value_values: Vec<Value> = non_pk.iter().map(|&i| row[i].clone()).collect();
-        let value = encode_row(&value_values);
+        for (j, &i) in non_pk.iter().enumerate() {
+            bufs.value_values[j] = std::mem::replace(&mut bufs.row[i], Value::Null);
+        }
+        encode_row_into(&bufs.value_values, &mut bufs.value_buf);
 
-        if key.len() > citadel_core::MAX_KEY_SIZE {
+        if bufs.key_buf.len() > citadel_core::MAX_KEY_SIZE {
             return Err(SqlError::KeyTooLarge {
-                size: key.len(),
+                size: bufs.key_buf.len(),
                 max: citadel_core::MAX_KEY_SIZE,
             });
         }
-        if value.len() > citadel_core::MAX_INLINE_VALUE_SIZE {
+        if bufs.value_buf.len() > citadel_core::MAX_INLINE_VALUE_SIZE {
             return Err(SqlError::RowTooLarge {
-                size: value.len(),
+                size: bufs.value_buf.len(),
                 max: citadel_core::MAX_INLINE_VALUE_SIZE,
             });
         }
 
         let is_new = wtx
-            .table_insert(lower_name.as_bytes(), &key, &value)
+            .table_insert(stmt.table.as_bytes(), &bufs.key_buf, &bufs.value_buf)
             .map_err(SqlError::Storage)?;
         if !is_new {
             return Err(SqlError::DuplicateKey);
         }
 
-        insert_index_entries(wtx, table_schema, &row, &pk_values)?;
+        if !table_schema.indices.is_empty() {
+            for (j, &i) in pk_indices.iter().enumerate() {
+                bufs.row[i] = bufs.pk_values[j].clone();
+            }
+            for (j, &i) in non_pk.iter().enumerate() {
+                bufs.row[i] = std::mem::replace(&mut bufs.value_values[j], Value::Null);
+            }
+            insert_index_entries(wtx, table_schema, &bufs.row, &bufs.pk_values)?;
+        }
         count += 1;
     }
 
@@ -2596,8 +4569,50 @@ fn exec_select_in_txn(
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
 
-    let rows = collect_rows_write(wtx, table_schema, &stmt.where_clause)?;
-    process_select(&table_schema.columns, rows, stmt)
+    if let Some(result) = try_count_star_shortcut(stmt, || {
+        wtx.table_entry_count(lower_name.as_bytes())
+            .map_err(SqlError::Storage)
+    })? {
+        return Ok(result);
+    }
+
+    if let Some(plan) = StreamAggPlan::try_new(stmt, table_schema)? {
+        let mut states: Vec<AggState> = plan.ops.iter().map(|(op, _)| AggState::new(op)).collect();
+        let mut scan_err: Option<SqlError> = None;
+        if stmt.where_clause.is_none() {
+            wtx.table_scan_from(lower_name.as_bytes(), b"", |key, value| {
+                Ok(plan.feed_row_raw(key, value, &mut states, &mut scan_err))
+            }).map_err(SqlError::Storage)?;
+        } else {
+            let col_map = ColumnMap::new(&table_schema.columns);
+            wtx.table_scan_from(lower_name.as_bytes(), b"", |key, value| {
+                Ok(plan.feed_row(key, value, table_schema, &col_map, &stmt.where_clause, &mut states, &mut scan_err))
+            }).map_err(SqlError::Storage)?;
+        }
+        if let Some(e) = scan_err {
+            return Err(e);
+        }
+        return Ok(plan.finish(states));
+    }
+
+    if let Some(plan) = StreamGroupByPlan::try_new(stmt, table_schema)? {
+        let lower = lower_name.clone();
+        return plan.execute_scan(|cb| {
+            wtx.table_scan_from(lower.as_bytes(), b"", |key, value| Ok(cb(key, value)))
+        });
+    }
+
+    if let Some(plan) = TopKScanPlan::try_new(stmt, table_schema)? {
+        let lower = lower_name.clone();
+        return plan.execute_scan(table_schema, stmt, |cb| {
+            wtx.table_scan_from(lower.as_bytes(), b"", |key, value| Ok(cb(key, value)))
+        });
+    }
+
+    let scan_limit = compute_scan_limit(stmt);
+    let (rows, predicate_applied) =
+        collect_rows_write(wtx, table_schema, &stmt.where_clause, scan_limit)?;
+    process_select(&table_schema.columns, rows, stmt, predicate_applied)
 }
 
 fn exec_update_in_txn(
@@ -2618,11 +4633,12 @@ fn exec_update_in_txn(
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
+    let col_map = ColumnMap::new(&table_schema.columns);
     let all_candidates = collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?;
     let matching_rows: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
         .into_iter()
         .filter(|(_, row)| match &stmt.where_clause {
-            Some(where_expr) => match eval_expr(where_expr, &table_schema.columns, row) {
+            Some(where_expr) => match eval_expr(where_expr, &col_map, row) {
                 Ok(val) => is_truthy(&val),
                 Err(_) => false,
             },
@@ -2656,9 +4672,10 @@ fn exec_update_in_txn(
             let col_idx = table_schema
                 .column_index(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-            let new_val = eval_expr(expr, &table_schema.columns, row)?;
+            let new_val = eval_expr(expr, &col_map, row)?;
             let col = &table_schema.columns[col_idx];
 
+            let got_type = new_val.data_type();
             let coerced = if new_val.is_null() {
                 if !col.nullable {
                     return Err(SqlError::NotNullViolation(col.name.clone()));
@@ -2666,10 +4683,10 @@ fn exec_update_in_txn(
                 Value::Null
             } else {
                 new_val
-                    .coerce_to(col.data_type)
+                    .coerce_into(col.data_type)
                     .ok_or_else(|| SqlError::TypeMismatch {
                         expected: col.data_type.to_string(),
-                        got: new_val.data_type().to_string(),
+                        got: got_type.to_string(),
                     })?
             };
 
@@ -2788,11 +4805,12 @@ fn exec_delete_in_txn(
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
+    let col_map = ColumnMap::new(&table_schema.columns);
     let all_candidates = collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?;
     let rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
         .into_iter()
         .filter(|(_, row)| match &stmt.where_clause {
-            Some(where_expr) => match eval_expr(where_expr, &table_schema.columns, row) {
+            Some(where_expr) => match eval_expr(where_expr, &col_map, row) {
                 Ok(val) => is_truthy(&val),
                 Err(_) => false,
             },
@@ -2822,6 +4840,7 @@ fn exec_aggregate(
     rows: &[Vec<Value>],
     stmt: &SelectStmt,
 ) -> Result<ExecutionResult> {
+    let col_map = ColumnMap::new(columns);
     let groups: BTreeMap<Vec<Value>, Vec<&Vec<Value>>> = if stmt.group_by.is_empty() {
         let mut m = BTreeMap::new();
         m.insert(vec![], rows.iter().collect());
@@ -2832,7 +4851,7 @@ fn exec_aggregate(
             let group_key: Vec<Value> = stmt
                 .group_by
                 .iter()
-                .map(|expr| eval_expr(expr, columns, row))
+                .map(|expr| eval_expr(expr, &col_map, row))
                 .collect::<Result<_>>()?;
             m.entry(group_key).or_default().push(row);
         }
@@ -2851,17 +4870,18 @@ fn exec_aggregate(
                     return Err(SqlError::Unsupported("SELECT * with GROUP BY".into()));
                 }
                 SelectColumn::Expr { expr, .. } => {
-                    let val = eval_aggregate_expr(expr, columns, group_rows)?;
+                    let val = eval_aggregate_expr(expr, &col_map, group_rows)?;
                     result_row.push(val);
                 }
             }
         }
 
         if let Some(ref having) = stmt.having {
-            let passes = match eval_aggregate_expr(having, columns, group_rows) {
+            let passes = match eval_aggregate_expr(having, &col_map, group_rows) {
                 Ok(val) => is_truthy(&val),
                 Err(SqlError::ColumnNotFound(_)) => {
-                    match eval_expr(having, &output_cols, &result_row) {
+                    let output_map = ColumnMap::new(&output_cols);
+                    match eval_expr(having, &output_map, &result_row) {
                         Ok(val) => is_truthy(&val),
                         Err(_) => false,
                     }
@@ -2917,7 +4937,7 @@ fn exec_aggregate(
 
 fn eval_aggregate_expr(
     expr: &Expr,
-    columns: &[ColumnDef],
+    col_map: &ColumnMap,
     group_rows: &[&Vec<Value>],
 ) -> Result<Value> {
     match expr {
@@ -2934,7 +4954,7 @@ fn eval_aggregate_expr(
             let arg = &args[0];
             let values: Vec<Value> = group_rows
                 .iter()
-                .map(|row| eval_expr(arg, columns, row))
+                .map(|row| eval_expr(arg, col_map, row))
                 .collect::<Result<_>>()?;
 
             match func.as_str() {
@@ -3048,7 +5068,7 @@ fn eval_aggregate_expr(
 
         Expr::Column(_) | Expr::QualifiedColumn { .. } => {
             if let Some(first) = group_rows.first() {
-                eval_expr(expr, columns, first)
+                eval_expr(expr, col_map, first)
             } else {
                 Ok(Value::Null)
             }
@@ -3057,49 +5077,49 @@ fn eval_aggregate_expr(
         Expr::Literal(v) => Ok(v.clone()),
 
         Expr::BinaryOp { left, op, right } => {
-            let l = eval_aggregate_expr(left, columns, group_rows)?;
-            let r = eval_aggregate_expr(right, columns, group_rows)?;
-            crate::eval::eval_expr(
+            let l = eval_aggregate_expr(left, col_map, group_rows)?;
+            let r = eval_aggregate_expr(right, col_map, group_rows)?;
+            eval_expr(
                 &Expr::BinaryOp {
                     left: Box::new(Expr::Literal(l)),
                     op: *op,
                     right: Box::new(Expr::Literal(r)),
                 },
-                columns,
+                col_map,
                 &[],
             )
         }
 
         Expr::UnaryOp { op, expr: e } => {
-            let v = eval_aggregate_expr(e, columns, group_rows)?;
-            crate::eval::eval_expr(
+            let v = eval_aggregate_expr(e, col_map, group_rows)?;
+            eval_expr(
                 &Expr::UnaryOp {
                     op: *op,
                     expr: Box::new(Expr::Literal(v)),
                 },
-                columns,
+                col_map,
                 &[],
             )
         }
 
         Expr::IsNull(e) => {
-            let v = eval_aggregate_expr(e, columns, group_rows)?;
+            let v = eval_aggregate_expr(e, col_map, group_rows)?;
             Ok(Value::Boolean(v.is_null()))
         }
 
         Expr::IsNotNull(e) => {
-            let v = eval_aggregate_expr(e, columns, group_rows)?;
+            let v = eval_aggregate_expr(e, col_map, group_rows)?;
             Ok(Value::Boolean(!v.is_null()))
         }
 
         Expr::Cast { expr: e, data_type } => {
-            let v = eval_aggregate_expr(e, columns, group_rows)?;
-            crate::eval::eval_expr(
+            let v = eval_aggregate_expr(e, col_map, group_rows)?;
+            eval_expr(
                 &Expr::Cast {
                     expr: Box::new(Expr::Literal(v)),
                     data_type: *data_type,
                 },
-                columns,
+                col_map,
                 &[],
             )
         }
@@ -3111,32 +5131,32 @@ fn eval_aggregate_expr(
         } => {
             let op_val = operand
                 .as_ref()
-                .map(|e| eval_aggregate_expr(e, columns, group_rows))
+                .map(|e| eval_aggregate_expr(e, col_map, group_rows))
                 .transpose()?;
             if let Some(ov) = &op_val {
                 for (cond, result) in conditions {
-                    let cv = eval_aggregate_expr(cond, columns, group_rows)?;
+                    let cv = eval_aggregate_expr(cond, col_map, group_rows)?;
                     if !ov.is_null() && !cv.is_null() && *ov == cv {
-                        return eval_aggregate_expr(result, columns, group_rows);
+                        return eval_aggregate_expr(result, col_map, group_rows);
                     }
                 }
             } else {
                 for (cond, result) in conditions {
-                    let cv = eval_aggregate_expr(cond, columns, group_rows)?;
-                    if crate::eval::is_truthy(&cv) {
-                        return eval_aggregate_expr(result, columns, group_rows);
+                    let cv = eval_aggregate_expr(cond, col_map, group_rows)?;
+                    if is_truthy(&cv) {
+                        return eval_aggregate_expr(result, col_map, group_rows);
                     }
                 }
             }
             match else_result {
-                Some(e) => eval_aggregate_expr(e, columns, group_rows),
+                Some(e) => eval_aggregate_expr(e, col_map, group_rows),
                 None => Ok(Value::Null),
             }
         }
 
         Expr::Coalesce(args) => {
             for arg in args {
-                let v = eval_aggregate_expr(arg, columns, group_rows)?;
+                let v = eval_aggregate_expr(arg, col_map, group_rows)?;
                 if !v.is_null() {
                     return Ok(v);
                 }
@@ -3150,17 +5170,17 @@ fn eval_aggregate_expr(
             high,
             negated,
         } => {
-            let v = eval_aggregate_expr(e, columns, group_rows)?;
-            let lo = eval_aggregate_expr(low, columns, group_rows)?;
-            let hi = eval_aggregate_expr(high, columns, group_rows)?;
-            crate::eval::eval_expr(
+            let v = eval_aggregate_expr(e, col_map, group_rows)?;
+            let lo = eval_aggregate_expr(low, col_map, group_rows)?;
+            let hi = eval_aggregate_expr(high, col_map, group_rows)?;
+            eval_expr(
                 &Expr::Between {
                     expr: Box::new(Expr::Literal(v)),
                     low: Box::new(Expr::Literal(lo)),
                     high: Box::new(Expr::Literal(hi)),
                     negated: *negated,
                 },
-                columns,
+                col_map,
                 &[],
             )
         }
@@ -3171,21 +5191,21 @@ fn eval_aggregate_expr(
             escape,
             negated,
         } => {
-            let v = eval_aggregate_expr(e, columns, group_rows)?;
-            let p = eval_aggregate_expr(pattern, columns, group_rows)?;
+            let v = eval_aggregate_expr(e, col_map, group_rows)?;
+            let p = eval_aggregate_expr(pattern, col_map, group_rows)?;
             let esc = escape
                 .as_ref()
-                .map(|es| eval_aggregate_expr(es, columns, group_rows))
+                .map(|es| eval_aggregate_expr(es, col_map, group_rows))
                 .transpose()?;
             let esc_box = esc.map(|v| Box::new(Expr::Literal(v)));
-            crate::eval::eval_expr(
+            eval_expr(
                 &Expr::Like {
                     expr: Box::new(Expr::Literal(v)),
                     pattern: Box::new(Expr::Literal(p)),
                     escape: esc_box,
                     negated: *negated,
                 },
-                columns,
+                col_map,
                 &[],
             )
         }
@@ -3193,15 +5213,15 @@ fn eval_aggregate_expr(
         Expr::Function { name, args } => {
             let evaluated: Vec<Value> = args
                 .iter()
-                .map(|a| eval_aggregate_expr(a, columns, group_rows))
+                .map(|a| eval_aggregate_expr(a, col_map, group_rows))
                 .collect::<Result<_>>()?;
             let literal_args: Vec<Expr> = evaluated.into_iter().map(Expr::Literal).collect();
-            crate::eval::eval_expr(
+            eval_expr(
                 &Expr::Function {
                     name: name.clone(),
                     args: literal_args,
                 },
-                columns,
+                col_map,
                 &[],
             )
         }
@@ -3260,30 +5280,115 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-/// Decode a full row from B+ tree key + value.
-fn decode_full_row(schema: &TableSchema, key: &[u8], value: &[u8]) -> Result<Vec<Value>> {
-    let pk_values = decode_composite_key(key, schema.primary_key_columns.len())?;
-    let non_pk_values = decode_row(value)?;
+struct PartialDecodeCtx {
+    pk_positions: Vec<(usize, usize)>,
+    nonpk_targets: Vec<usize>,
+    nonpk_schema: Vec<usize>,
+    num_cols: usize,
+    num_pk_cols: usize,
+    remaining_pk: Vec<(usize, usize)>,
+    remaining_nonpk_targets: Vec<usize>,
+    remaining_nonpk_schema: Vec<usize>,
+}
 
-    let mut row = vec![Value::Null; schema.columns.len()];
+impl PartialDecodeCtx {
+    fn new(schema: &TableSchema, needed: &[usize]) -> Self {
+        let non_pk = schema.non_pk_indices();
+        let mut pk_positions = Vec::new();
+        let mut nonpk_targets = Vec::new();
+        let mut nonpk_schema = Vec::new();
 
-    for (i, &col_idx) in schema.primary_key_columns.iter().enumerate() {
-        row[col_idx as usize] = pk_values[i].clone();
-    }
+        for &col in needed {
+            if let Some(pk_pos) = schema
+                .primary_key_columns
+                .iter()
+                .position(|&i| i as usize == col)
+            {
+                pk_positions.push((pk_pos, col));
+            } else if let Some(nonpk_idx) = non_pk.iter().position(|&i| i == col) {
+                nonpk_targets.push(nonpk_idx);
+                nonpk_schema.push(col);
+            }
+        }
 
-    let non_pk = schema.non_pk_indices();
-    for (i, &col_idx) in non_pk.iter().enumerate() {
-        if i < non_pk_values.len() {
-            row[col_idx] = non_pk_values[i].clone();
+        let needed_set: std::collections::HashSet<usize> = needed.iter().copied().collect();
+        let mut remaining_pk = Vec::new();
+        for (pk_pos, &pk_col) in schema.primary_key_columns.iter().enumerate() {
+            if !needed_set.contains(&(pk_col as usize)) {
+                remaining_pk.push((pk_pos, pk_col as usize));
+            }
+        }
+        let mut remaining_nonpk_targets = Vec::new();
+        let mut remaining_nonpk_schema = Vec::new();
+        for (nonpk_idx, &col) in non_pk.iter().enumerate() {
+            if !needed_set.contains(&col) {
+                remaining_nonpk_targets.push(nonpk_idx);
+                remaining_nonpk_schema.push(col);
+            }
+        }
+
+        Self {
+            pk_positions,
+            nonpk_targets,
+            nonpk_schema,
+            num_cols: schema.columns.len(),
+            num_pk_cols: schema.primary_key_columns.len(),
+            remaining_pk,
+            remaining_nonpk_targets,
+            remaining_nonpk_schema,
         }
     }
 
+    fn decode(&self, key: &[u8], value: &[u8]) -> Result<Vec<Value>> {
+        let mut row = vec![Value::Null; self.num_cols];
+
+        if self.pk_positions.len() == 1 && self.num_pk_cols == 1 {
+            let (_, schema_col) = self.pk_positions[0];
+            let (v, _) = decode_key_value(key)?;
+            row[schema_col] = v;
+        } else if !self.pk_positions.is_empty() {
+            let mut pk_values = decode_composite_key(key, self.num_pk_cols)?;
+            for &(pk_pos, schema_col) in &self.pk_positions {
+                row[schema_col] = std::mem::take(&mut pk_values[pk_pos]);
+            }
+        }
+
+        if !self.nonpk_targets.is_empty() {
+            decode_columns_into(value, &self.nonpk_targets, &self.nonpk_schema, &mut row)?;
+        }
+
+        Ok(row)
+    }
+
+    fn complete(&self, mut row: Vec<Value>, key: &[u8], value: &[u8]) -> Result<Vec<Value>> {
+        if !self.remaining_pk.is_empty() {
+            let mut pk_values = decode_composite_key(key, self.num_pk_cols)?;
+            for &(pk_pos, schema_col) in &self.remaining_pk {
+                row[schema_col] = std::mem::take(&mut pk_values[pk_pos]);
+            }
+        }
+        if !self.remaining_nonpk_targets.is_empty() {
+            let mut values = decode_columns(value, &self.remaining_nonpk_targets)?;
+            for (i, &schema_col) in self.remaining_nonpk_schema.iter().enumerate() {
+                row[schema_col] = std::mem::take(&mut values[i]);
+            }
+        }
+        Ok(row)
+    }
+}
+
+fn decode_full_row(schema: &TableSchema, key: &[u8], value: &[u8]) -> Result<Vec<Value>> {
+    let mut row = vec![Value::Null; schema.columns.len()];
+    decode_pk_into(key, schema.primary_key_columns.len(), &mut row, schema.pk_indices())?;
+    decode_row_into(value, &mut row, schema.non_pk_indices())?;
     Ok(row)
 }
 
 /// Evaluate a constant expression (no column references).
 fn eval_const_expr(expr: &Expr) -> Result<Value> {
-    eval_expr(expr, &[], &[])
+    static EMPTY: std::sync::OnceLock<ColumnMap> = std::sync::OnceLock::new();
+    let empty = EMPTY.get_or_init(|| ColumnMap::new(&[]));
+    eval_expr(expr, empty, &[])
 }
 
 fn eval_const_int(expr: &Expr) -> Result<i64> {
@@ -3301,56 +5406,193 @@ fn sort_rows(
     order_by: &[OrderByItem],
     columns: &[ColumnDef],
 ) -> Result<()> {
-    rows.sort_by(|a, b| {
-        for item in order_by {
-            let a_val = eval_expr(&item.expr, columns, a).unwrap_or(Value::Null);
-            let b_val = eval_expr(&item.expr, columns, b).unwrap_or(Value::Null);
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let col_map = ColumnMap::new(columns);
+    let mut indices: Vec<usize> = (0..rows.len()).collect();
 
-            let nulls_first = item.nulls_first.unwrap_or(!item.descending);
+    if let Some(col_idx) = try_resolve_flat_sort_col(order_by, &col_map) {
+        let desc = order_by[0].descending;
+        let nulls_first = order_by[0].nulls_first.unwrap_or(!desc);
+        indices.sort_by(|&a, &b| compare_flat_key(&rows[a][col_idx], &rows[b][col_idx], desc, nulls_first));
+    } else {
+        let keys = extract_sort_keys(rows, order_by, &col_map);
+        indices.sort_by(|&a, &b| compare_sort_keys(&keys[a], &keys[b], order_by));
+    }
 
-            let ord = match (a_val.is_null(), b_val.is_null()) {
-                (true, true) => std::cmp::Ordering::Equal,
-                (true, false) => {
-                    if nulls_first {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Greater
-                    }
-                }
-                (false, true) => {
-                    if nulls_first {
-                        std::cmp::Ordering::Greater
-                    } else {
-                        std::cmp::Ordering::Less
-                    }
-                }
-                (false, false) => {
-                    let cmp = a_val.cmp(&b_val);
-                    if item.descending {
-                        cmp.reverse()
-                    } else {
-                        cmp
-                    }
-                }
-            };
+    let sorted: Vec<Vec<Value>> = indices.iter().map(|&i| std::mem::take(&mut rows[i])).collect();
+    rows.iter_mut().zip(sorted).for_each(|(slot, row)| *slot = row);
+    Ok(())
+}
 
-            if ord != std::cmp::Ordering::Equal {
-                return ord;
+fn topk_rows(
+    rows: &mut [Vec<Value>],
+    order_by: &[OrderByItem],
+    columns: &[ColumnDef],
+    k: usize,
+) -> Result<()> {
+    let col_map = ColumnMap::new(columns);
+    let mut indices: Vec<usize> = (0..rows.len()).collect();
+
+    if let Some(col_idx) = try_resolve_flat_sort_col(order_by, &col_map) {
+        let desc = order_by[0].descending;
+        let nulls_first = order_by[0].nulls_first.unwrap_or(!desc);
+        let cmp = |&a: &usize, &b: &usize| compare_flat_key(&rows[a][col_idx], &rows[b][col_idx], desc, nulls_first);
+        indices.select_nth_unstable_by(k - 1, cmp);
+        indices[..k].sort_by(cmp);
+    } else {
+        let keys = extract_sort_keys(rows, order_by, &col_map);
+        let cmp = |&a: &usize, &b: &usize| compare_sort_keys(&keys[a], &keys[b], order_by);
+        indices.select_nth_unstable_by(k - 1, cmp);
+        indices[..k].sort_by(cmp);
+    }
+
+    let sorted: Vec<Vec<Value>> = indices[..k].iter().map(|&i| std::mem::take(&mut rows[i])).collect();
+    rows[..k].iter_mut().zip(sorted).for_each(|(slot, row)| *slot = row);
+    Ok(())
+}
+
+fn try_resolve_flat_sort_col(
+    order_by: &[OrderByItem],
+    col_map: &ColumnMap,
+) -> Option<usize> {
+    if order_by.len() != 1 {
+        return None;
+    }
+    match &order_by[0].expr {
+        Expr::Column(name) => col_map.resolve(&name.to_ascii_lowercase()).ok(),
+        _ => None,
+    }
+}
+
+fn compare_flat_key(a: &Value, b: &Value, desc: bool, nulls_first: bool) -> std::cmp::Ordering {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => if nulls_first { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater },
+        (false, true) => if nulls_first { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less },
+        (false, false) => {
+            let cmp = a.cmp(b);
+            if desc { cmp.reverse() } else { cmp }
+        }
+    }
+}
+
+fn extract_sort_keys(rows: &[Vec<Value>], order_by: &[OrderByItem], col_map: &ColumnMap) -> Vec<Vec<Value>> {
+    rows.iter()
+        .map(|row| {
+            order_by
+                .iter()
+                .map(|item| eval_expr(&item.expr, col_map, row).unwrap_or(Value::Null))
+                .collect()
+        })
+        .collect()
+}
+
+fn compare_sort_keys(a: &[Value], b: &[Value], order_by: &[OrderByItem]) -> std::cmp::Ordering {
+    for (i, item) in order_by.iter().enumerate() {
+        let nulls_first = item.nulls_first.unwrap_or(!item.descending);
+        let ord = match (a[i].is_null(), b[i].is_null()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => {
+                if nulls_first {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if nulls_first {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            }
+            (false, false) => {
+                let cmp = a[i].cmp(&b[i]);
+                if item.descending {
+                    cmp.reverse()
+                } else {
+                    cmp
+                }
+            }
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn try_build_index_map(
+    select_cols: &[SelectColumn],
+    columns: &[ColumnDef],
+) -> Option<Vec<(String, usize)>> {
+    let col_map = ColumnMap::new(columns);
+    let mut map = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for sel in select_cols {
+        match sel {
+            SelectColumn::AllColumns => {
+                for col in columns {
+                    let idx = col.position as usize;
+                    if !seen.insert(idx) {
+                        return None;
+                    }
+                    map.push((col.name.clone(), idx));
+                }
+            }
+            SelectColumn::Expr { expr, alias } => {
+                let idx = match expr {
+                    Expr::Column(name) => col_map.resolve(name).ok()?,
+                    Expr::QualifiedColumn { table, column } => {
+                        col_map.resolve_qualified(table, column).ok()?
+                    }
+                    _ => return None,
+                };
+                if !seen.insert(idx) {
+                    return None;
+                }
+                let name = alias.clone().unwrap_or_else(|| expr_display_name(expr));
+                map.push((name, idx));
             }
         }
-        std::cmp::Ordering::Equal
-    });
-    Ok(())
+    }
+    Some(map)
 }
 
 fn project_rows(
     columns: &[ColumnDef],
     select_cols: &[SelectColumn],
-    rows: &[Vec<Value>],
+    mut rows: Vec<Vec<Value>>,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    // Fast path: SELECT * — zero clones
+    if select_cols.len() == 1 && matches!(select_cols[0], SelectColumn::AllColumns) {
+        let col_names = columns.iter().map(|c| c.name.clone()).collect();
+        return Ok((col_names, rows));
+    }
+
+    // Fast path: all simple column refs — use mem::take, zero clones
+    if let Some(map) = try_build_index_map(select_cols, columns) {
+        let col_names: Vec<String> = map.iter().map(|(n, _)| n.clone()).collect();
+        // Identity: columns already in the right order — return as-is
+        if map.len() == columns.len()
+            && map.iter().enumerate().all(|(i, &(_, idx))| idx == i)
+        {
+            return Ok((col_names, rows));
+        }
+        let projected = rows
+            .iter_mut()
+            .map(|row| map.iter().map(|&(_, idx)| std::mem::take(&mut row[idx])).collect())
+            .collect();
+        return Ok((col_names, projected));
+    }
+
+    // Fallback: expression evaluation (requires cloning)
     let mut col_names = Vec::new();
     type Projector = Box<dyn Fn(&[Value]) -> Result<Value>>;
     let mut projectors: Vec<Projector> = Vec::new();
+    let col_map = std::sync::Arc::new(ColumnMap::new(columns));
 
     for sel_col in select_cols {
         match sel_col {
@@ -3365,9 +5607,9 @@ fn project_rows(
                 let name = alias.clone().unwrap_or_else(|| expr_display_name(expr));
                 col_names.push(name);
                 let expr = expr.clone();
-                let owned_cols = columns.to_vec();
+                let map = col_map.clone();
                 projectors.push(Box::new(move |row: &[Value]| {
-                    eval_expr(&expr, &owned_cols, row)
+                    eval_expr(&expr, &map, row)
                 }));
             }
         }
@@ -3452,23 +5694,16 @@ fn build_output_columns(select_cols: &[SelectColumn], columns: &[ColumnDef]) -> 
 
 fn infer_expr_type(expr: &Expr, columns: &[ColumnDef]) -> DataType {
     match expr {
-        Expr::Column(name) => {
-            let lower = name.to_ascii_lowercase();
-            columns
-                .iter()
-                .find(|c| c.name.to_ascii_lowercase() == lower)
-                .map(|c| c.data_type)
-                .unwrap_or(DataType::Null)
-        }
+        Expr::Column(name) => columns
+            .iter()
+            .find(|c| c.name == *name)
+            .map(|c| c.data_type)
+            .unwrap_or(DataType::Null),
         Expr::QualifiedColumn { table, column } => {
-            let qualified = format!(
-                "{}.{}",
-                table.to_ascii_lowercase(),
-                column.to_ascii_lowercase()
-            );
+            let qualified = format!("{table}.{column}");
             columns
                 .iter()
-                .find(|c| c.name.to_ascii_lowercase() == qualified)
+                .find(|c| c.name == qualified)
                 .map(|c| c.data_type)
                 .unwrap_or(DataType::Null)
         }

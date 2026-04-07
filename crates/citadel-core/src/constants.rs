@@ -92,6 +92,11 @@ pub const SLOT_ENCRYPTION_EPOCH: usize = 40;
 pub const SLOT_DEK_ID: usize = 44;
 pub const SLOT_CHECKSUM: usize = 76;
 
+// Named table entry counts in CommitSlot [112..240]
+pub const SLOT_NAMED_ENTRIES: usize = 112;
+pub const SLOT_NAMED_ENTRY_SIZE: usize = 12;
+pub const SLOT_NAMED_MAX_ENTRIES: usize = (COMMIT_SLOT_SIZE - SLOT_NAMED_ENTRIES - 2) / SLOT_NAMED_ENTRY_SIZE;
+
 // File growth chunk sizes
 pub const GROWTH_CHUNK_1MB: u64 = 1024 * 1024;
 pub const GROWTH_CHUNK_4MB: u64 = 4 * 1024 * 1024;

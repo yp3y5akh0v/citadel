@@ -1,84 +1,103 @@
 //! Expression evaluator with SQL three-valued logic.
 
+use std::collections::HashMap;
+
 use crate::error::{Result, SqlError};
 use crate::parser::{BinOp, Expr, UnaryOp};
-use crate::types::{ColumnDef, DataType, Value};
+use crate::types::{ColumnDef, CompactString, DataType, Value};
 
-/// Evaluate an expression against a row.
-///
-/// `columns` maps column names to their positions.
-/// `row` is the full row of values (all columns).
-pub fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Value]) -> Result<Value> {
+pub struct ColumnMap {
+    exact: HashMap<String, usize>,
+    short: HashMap<String, ShortMatch>,
+}
+
+enum ShortMatch {
+    Unique(usize),
+    Ambiguous,
+}
+
+impl ColumnMap {
+    pub fn new(columns: &[ColumnDef]) -> Self {
+        let mut exact = HashMap::with_capacity(columns.len() * 2);
+        let mut short: HashMap<String, ShortMatch> = HashMap::with_capacity(columns.len());
+
+        for (i, col) in columns.iter().enumerate() {
+            let lower = col.name.to_ascii_lowercase();
+            exact.insert(lower.clone(), i);
+
+            let unqualified = if let Some(dot) = lower.rfind('.') {
+                &lower[dot + 1..]
+            } else {
+                &lower
+            };
+            short
+                .entry(unqualified.to_string())
+                .and_modify(|e| *e = ShortMatch::Ambiguous)
+                .or_insert(ShortMatch::Unique(i));
+        }
+
+        Self { exact, short }
+    }
+
+    pub(crate) fn resolve(&self, name: &str) -> Result<usize> {
+        if let Some(&idx) = self.exact.get(name) {
+            return Ok(idx);
+        }
+        match self.short.get(name) {
+            Some(ShortMatch::Unique(idx)) => Ok(*idx),
+            Some(ShortMatch::Ambiguous) => Err(SqlError::AmbiguousColumn(name.to_string())),
+            None => Err(SqlError::ColumnNotFound(name.to_string())),
+        }
+    }
+
+    pub(crate) fn resolve_qualified(&self, table: &str, column: &str) -> Result<usize> {
+        let qualified = format!("{table}.{column}");
+        if let Some(&idx) = self.exact.get(&qualified) {
+            return Ok(idx);
+        }
+        match self.short.get(column) {
+            Some(ShortMatch::Unique(idx)) => Ok(*idx),
+            _ => Err(SqlError::ColumnNotFound(format!("{table}.{column}"))),
+        }
+    }
+}
+
+pub fn eval_expr(expr: &Expr, col_map: &ColumnMap, row: &[Value]) -> Result<Value> {
     match expr {
         Expr::Literal(v) => Ok(v.clone()),
 
         Expr::Column(name) => {
-            let lower = name.to_ascii_lowercase();
-            let matches: Vec<usize> = columns
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| {
-                    let cn = c.name.to_ascii_lowercase();
-                    cn == lower || cn.ends_with(&format!(".{lower}"))
-                })
-                .map(|(i, _)| i)
-                .collect();
-            match matches.len() {
-                0 => Err(SqlError::ColumnNotFound(name.clone())),
-                1 => Ok(row[matches[0]].clone()),
-                _ => Err(SqlError::AmbiguousColumn(name.clone())),
-            }
+            let idx = col_map.resolve(name)?;
+            Ok(row[idx].clone())
         }
 
         Expr::QualifiedColumn { table, column } => {
-            let qualified = format!(
-                "{}.{}",
-                table.to_ascii_lowercase(),
-                column.to_ascii_lowercase()
-            );
-            let idx = columns
-                .iter()
-                .position(|c| c.name.to_ascii_lowercase() == qualified)
-                .or_else(|| {
-                    let lower_col = column.to_ascii_lowercase();
-                    let matches: Vec<usize> = columns
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| c.name.to_ascii_lowercase() == lower_col)
-                        .map(|(i, _)| i)
-                        .collect();
-                    if matches.len() == 1 {
-                        Some(matches[0])
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| SqlError::ColumnNotFound(format!("{table}.{column}")))?;
+            let idx = col_map.resolve_qualified(table, column)?;
             Ok(row[idx].clone())
         }
 
         Expr::BinaryOp { left, op, right } => {
-            let lval = eval_expr(left, columns, row)?;
-            let rval = eval_expr(right, columns, row)?;
+            let lval = eval_expr(left, col_map, row)?;
+            let rval = eval_expr(right, col_map, row)?;
             eval_binary_op(&lval, *op, &rval)
         }
 
         Expr::UnaryOp { op, expr } => {
-            let val = eval_expr(expr, columns, row)?;
+            let val = eval_expr(expr, col_map, row)?;
             eval_unary_op(*op, &val)
         }
 
         Expr::IsNull(e) => {
-            let val = eval_expr(e, columns, row)?;
+            let val = eval_expr(e, col_map, row)?;
             Ok(Value::Boolean(val.is_null()))
         }
 
         Expr::IsNotNull(e) => {
-            let val = eval_expr(e, columns, row)?;
+            let val = eval_expr(e, col_map, row)?;
             Ok(Value::Boolean(!val.is_null()))
         }
 
-        Expr::Function { name, args } => eval_scalar_function(name, args, columns, row),
+        Expr::Function { name, args } => eval_scalar_function(name, args, col_map, row),
 
         Expr::CountStar => Err(SqlError::Unsupported(
             "COUNT(*) in non-aggregate context".into(),
@@ -89,8 +108,8 @@ pub fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Value]) -> Result<Va
             list,
             negated,
         } => {
-            let lhs = eval_expr(e, columns, row)?;
-            eval_in_values(&lhs, list, columns, row, *negated)
+            let lhs = eval_expr(e, col_map, row)?;
+            eval_in_values(&lhs, list, col_map, row, *negated)
         }
 
         Expr::InSet {
@@ -99,7 +118,7 @@ pub fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Value]) -> Result<Va
             has_null,
             negated,
         } => {
-            let lhs = eval_expr(e, columns, row)?;
+            let lhs = eval_expr(e, col_map, row)?;
             eval_in_set(&lhs, values, *has_null, *negated)
         }
 
@@ -109,9 +128,9 @@ pub fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Value]) -> Result<Va
             high,
             negated,
         } => {
-            let val = eval_expr(e, columns, row)?;
-            let lo = eval_expr(low, columns, row)?;
-            let hi = eval_expr(high, columns, row)?;
+            let val = eval_expr(e, col_map, row)?;
+            let lo = eval_expr(low, col_map, row)?;
+            let hi = eval_expr(high, col_map, row)?;
             eval_between(&val, &lo, &hi, *negated)
         }
 
@@ -121,11 +140,11 @@ pub fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Value]) -> Result<Va
             escape,
             negated,
         } => {
-            let val = eval_expr(e, columns, row)?;
-            let pat = eval_expr(pattern, columns, row)?;
+            let val = eval_expr(e, col_map, row)?;
+            let pat = eval_expr(pattern, col_map, row)?;
             let esc = escape
                 .as_ref()
-                .map(|e| eval_expr(e, columns, row))
+                .map(|e| eval_expr(e, col_map, row))
                 .transpose()?;
             eval_like(&val, &pat, esc.as_ref(), *negated)
         }
@@ -138,13 +157,13 @@ pub fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Value]) -> Result<Va
             operand.as_deref(),
             conditions,
             else_result.as_deref(),
-            columns,
+            col_map,
             row,
         ),
 
         Expr::Coalesce(args) => {
             for arg in args {
-                let val = eval_expr(arg, columns, row)?;
+                let val = eval_expr(arg, col_map, row)?;
                 if !val.is_null() {
                     return Ok(val);
                 }
@@ -153,7 +172,7 @@ pub fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Value]) -> Result<Va
         }
 
         Expr::Cast { expr: e, data_type } => {
-            let val = eval_expr(e, columns, row)?;
+            let val = eval_expr(e, col_map, row)?;
             eval_cast(&val, *data_type)
         }
 
@@ -207,7 +226,7 @@ fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
         BinOp::Concat => {
             let ls = value_to_text(left);
             let rs = value_to_text(right);
-            Ok(Value::Text(format!("{ls}{rs}")))
+            Ok(Value::Text(format!("{ls}{rs}").into()))
         }
         BinOp::And | BinOp::Or => unreachable!(),
     }
@@ -270,7 +289,7 @@ fn eval_arithmetic(
 fn eval_in_values(
     lhs: &Value,
     list: &[Expr],
-    columns: &[ColumnDef],
+    col_map: &ColumnMap,
     row: &[Value],
     negated: bool,
 ) -> Result<Value> {
@@ -282,7 +301,7 @@ fn eval_in_values(
     }
     let mut has_null = false;
     for item in list {
-        let rhs = eval_expr(item, columns, row)?;
+        let rhs = eval_expr(item, col_map, row)?;
         if rhs.is_null() {
             has_null = true;
         } else if lhs == &rhs {
@@ -347,7 +366,7 @@ fn eval_unary_op(op: UnaryOp, val: &Value) -> Result<Value> {
 
 fn value_to_text(val: &Value) -> String {
     match val {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         Value::Integer(i) => i.to_string(),
         Value::Real(r) => {
             if r.fract() == 0.0 && r.is_finite() {
@@ -529,27 +548,27 @@ fn eval_case(
     operand: Option<&Expr>,
     conditions: &[(Expr, Expr)],
     else_result: Option<&Expr>,
-    columns: &[ColumnDef],
+    col_map: &ColumnMap,
     row: &[Value],
 ) -> Result<Value> {
     if let Some(op_expr) = operand {
-        let op_val = eval_expr(op_expr, columns, row)?;
+        let op_val = eval_expr(op_expr, col_map, row)?;
         for (cond, result) in conditions {
-            let cond_val = eval_expr(cond, columns, row)?;
+            let cond_val = eval_expr(cond, col_map, row)?;
             if !op_val.is_null() && !cond_val.is_null() && op_val == cond_val {
-                return eval_expr(result, columns, row);
+                return eval_expr(result, col_map, row);
             }
         }
     } else {
         for (cond, result) in conditions {
-            let cond_val = eval_expr(cond, columns, row)?;
+            let cond_val = eval_expr(cond, col_map, row)?;
             if is_truthy(&cond_val) {
-                return eval_expr(result, columns, row);
+                return eval_expr(result, col_map, row);
             }
         }
     }
     match else_result {
-        Some(e) => eval_expr(e, columns, row),
+        Some(e) => eval_expr(e, col_map, row),
         None => Ok(Value::Null),
     }
 }
@@ -588,7 +607,7 @@ fn eval_cast(val: &Value, target: DataType) -> Result<Value> {
                 val.data_type()
             ))),
         },
-        DataType::Text => Ok(Value::Text(value_to_text(val))),
+        DataType::Text => Ok(Value::Text(value_to_text(val).into())),
         DataType::Boolean => match val {
             Value::Boolean(_) => Ok(val.clone()),
             Value::Integer(i) => Ok(Value::Boolean(*i != 0)),
@@ -622,12 +641,12 @@ fn eval_cast(val: &Value, target: DataType) -> Result<Value> {
 fn eval_scalar_function(
     name: &str,
     args: &[Expr],
-    columns: &[ColumnDef],
+    col_map: &ColumnMap,
     row: &[Value],
 ) -> Result<Value> {
     let evaluated: Vec<Value> = args
         .iter()
-        .map(|a| eval_expr(a, columns, row))
+        .map(|a| eval_expr(a, col_map, row))
         .collect::<Result<Vec<_>>>()?;
 
     match name {
@@ -648,7 +667,7 @@ fn eval_scalar_function(
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => Ok(Value::Text(s.to_ascii_uppercase())),
                 _ => Ok(Value::Text(
-                    value_to_text(&evaluated[0]).to_ascii_uppercase(),
+                    value_to_text(&evaluated[0]).to_ascii_uppercase().into(),
                 )),
             }
         }
@@ -658,7 +677,7 @@ fn eval_scalar_function(
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => Ok(Value::Text(s.to_ascii_lowercase())),
                 _ => Ok(Value::Text(
-                    value_to_text(&evaluated[0]).to_ascii_lowercase(),
+                    value_to_text(&evaluated[0]).to_ascii_lowercase().into(),
                 )),
             }
         }
@@ -716,7 +735,7 @@ fn eval_scalar_function(
             };
 
             let result: String = chars.iter().skip(begin).take(count).collect();
-            Ok(Value::Text(result))
+            Ok(Value::Text(result.into()))
         }
         "TRIM" | "LTRIM" | "RTRIM" => {
             if evaluated.is_empty() || evaluated.len() > 2 {
@@ -748,7 +767,7 @@ fn eval_scalar_function(
                     .to_string(),
                 _ => unreachable!(),
             };
-            Ok(Value::Text(result))
+            Ok(Value::Text(result.into()))
         }
         "REPLACE" => {
             check_args(name, &evaluated, 3)?;
@@ -759,9 +778,9 @@ fn eval_scalar_function(
             let from = value_to_text(&evaluated[1]);
             let to = value_to_text(&evaluated[2]);
             if from.is_empty() {
-                return Ok(Value::Text(s));
+                return Ok(Value::Text(s.into()));
             }
-            Ok(Value::Text(s.replace(&from, &to)))
+            Ok(Value::Text(s.replace(&from, &to).into()))
         }
         "INSTR" => {
             check_args(name, &evaluated, 2)?;
@@ -778,7 +797,7 @@ fn eval_scalar_function(
         }
         "CONCAT" => {
             if evaluated.is_empty() {
-                return Ok(Value::Text(String::new()));
+                return Ok(Value::Text(CompactString::default()));
             }
             let mut result = String::new();
             for v in &evaluated {
@@ -787,7 +806,7 @@ fn eval_scalar_function(
                     _ => result.push_str(&value_to_text(v)),
                 }
             }
-            Ok(Value::Text(result))
+            Ok(Value::Text(result.into()))
         }
         "ABS" => {
             check_args(name, &evaluated, 1)?;
@@ -972,16 +991,16 @@ fn eval_scalar_function(
                     for byte in b {
                         s.push_str(&format!("{byte:02X}"));
                     }
-                    Ok(Value::Text(s))
+                    Ok(Value::Text(s.into()))
                 }
                 Value::Text(s) => {
                     let mut r = String::with_capacity(s.len() * 2);
                     for byte in s.as_bytes() {
                         r.push_str(&format!("{byte:02X}"));
                     }
-                    Ok(Value::Text(r))
+                    Ok(Value::Text(r.into()))
                 }
-                _ => Ok(Value::Text(value_to_text(&evaluated[0]))),
+                _ => Ok(Value::Text(value_to_text(&evaluated[0]).into())),
             }
         }
         _ => Err(SqlError::Unsupported(format!("scalar function: {name}"))),
@@ -996,6 +1015,118 @@ fn check_args(name: &str, args: &[Value], expected: usize) -> Result<()> {
         )))
     } else {
         Ok(())
+    }
+}
+
+pub fn referenced_columns(expr: &Expr, columns: &[ColumnDef]) -> Vec<usize> {
+    let mut indices = Vec::new();
+    collect_column_refs(expr, columns, &mut indices);
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
+fn collect_column_refs(expr: &Expr, columns: &[ColumnDef], out: &mut Vec<usize>) {
+    match expr {
+        Expr::Column(name) => {
+            for (i, c) in columns.iter().enumerate() {
+                if c.name == *name || c.name.ends_with(&format!(".{name}")) {
+                    out.push(i);
+                    break;
+                }
+            }
+        }
+        Expr::QualifiedColumn { table, column } => {
+            let qualified = format!("{table}.{column}");
+            if let Some(idx) = columns.iter().position(|c| c.name == qualified) {
+                out.push(idx);
+            } else {
+                let matches: Vec<usize> = columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.name == *column)
+                    .map(|(i, _)| i)
+                    .collect();
+                if matches.len() == 1 {
+                    out.push(matches[0]);
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_column_refs(left, columns, out);
+            collect_column_refs(right, columns, out);
+        }
+        Expr::UnaryOp { expr, .. } => {
+            collect_column_refs(expr, columns, out);
+        }
+        Expr::IsNull(e) | Expr::IsNotNull(e) => {
+            collect_column_refs(e, columns, out);
+        }
+        Expr::Function { args, .. } => {
+            for arg in args {
+                collect_column_refs(arg, columns, out);
+            }
+        }
+        Expr::InSubquery { expr, .. } => {
+            collect_column_refs(expr, columns, out);
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_column_refs(expr, columns, out);
+            for item in list {
+                collect_column_refs(item, columns, out);
+            }
+        }
+        Expr::InSet { expr, .. } => {
+            collect_column_refs(expr, columns, out);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_column_refs(expr, columns, out);
+            collect_column_refs(low, columns, out);
+            collect_column_refs(high, columns, out);
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_column_refs(expr, columns, out);
+            collect_column_refs(pattern, columns, out);
+            if let Some(esc) = escape {
+                collect_column_refs(esc, columns, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                collect_column_refs(op, columns, out);
+            }
+            for (when, then) in conditions {
+                collect_column_refs(when, columns, out);
+                collect_column_refs(then, columns, out);
+            }
+            if let Some(e) = else_result {
+                collect_column_refs(e, columns, out);
+            }
+        }
+        Expr::Coalesce(args) => {
+            for arg in args {
+                collect_column_refs(arg, columns, out);
+            }
+        }
+        Expr::Cast { expr, .. } => {
+            collect_column_refs(expr, columns, out);
+        }
+        Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::CountStar
+        | Expr::Exists { .. }
+        | Expr::ScalarSubquery(_) => {}
     }
 }
 
@@ -1055,18 +1186,20 @@ mod tests {
     #[test]
     fn eval_literal() {
         let cols = test_columns();
+        let cm = ColumnMap::new(&cols);
         let row = test_row();
         let expr = Expr::Literal(Value::Integer(42));
-        assert_eq!(eval_expr(&expr, &cols, &row).unwrap(), Value::Integer(42));
+        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Integer(42));
     }
 
     #[test]
     fn eval_column_ref() {
         let cols = test_columns();
+        let cm = ColumnMap::new(&cols);
         let row = test_row();
         let expr = Expr::Column("name".into());
         assert_eq!(
-            eval_expr(&expr, &cols, &row).unwrap(),
+            eval_expr(&expr, &cm, &row).unwrap(),
             Value::Text("Alice".into())
         );
     }
@@ -1074,10 +1207,11 @@ mod tests {
     #[test]
     fn eval_column_case_insensitive() {
         let cols = test_columns();
+        let cm = ColumnMap::new(&cols);
         let row = test_row();
-        let expr = Expr::Column("NAME".into());
+        let expr = Expr::Column("name".into());
         assert_eq!(
-            eval_expr(&expr, &cols, &row).unwrap(),
+            eval_expr(&expr, &cm, &row).unwrap(),
             Value::Text("Alice".into())
         );
     }
@@ -1085,30 +1219,33 @@ mod tests {
     #[test]
     fn eval_arithmetic_int() {
         let cols = test_columns();
+        let cm = ColumnMap::new(&cols);
         let row = test_row();
         let expr = Expr::BinaryOp {
             left: Box::new(Expr::Column("id".into())),
             op: BinOp::Add,
             right: Box::new(Expr::Literal(Value::Integer(10))),
         };
-        assert_eq!(eval_expr(&expr, &cols, &row).unwrap(), Value::Integer(11));
+        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Integer(11));
     }
 
     #[test]
     fn eval_comparison() {
         let cols = test_columns();
+        let cm = ColumnMap::new(&cols);
         let row = test_row();
         let expr = Expr::BinaryOp {
             left: Box::new(Expr::Column("score".into())),
             op: BinOp::Gt,
             right: Box::new(Expr::Literal(Value::Real(90.0))),
         };
-        assert_eq!(eval_expr(&expr, &cols, &row).unwrap(), Value::Boolean(true));
+        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Boolean(true));
     }
 
     #[test]
     fn eval_null_propagation() {
         let cols = test_columns();
+        let cm = ColumnMap::new(&cols);
         let row = vec![
             Value::Integer(1),
             Value::Null,
@@ -1120,12 +1257,13 @@ mod tests {
             op: BinOp::Eq,
             right: Box::new(Expr::Literal(Value::Text("test".into()))),
         };
-        assert!(eval_expr(&expr, &cols, &row).unwrap().is_null());
+        assert!(eval_expr(&expr, &cm, &row).unwrap().is_null());
     }
 
     #[test]
     fn eval_and_three_valued() {
         let cols = test_columns();
+        let cm = ColumnMap::new(&cols);
         let row = vec![
             Value::Integer(1),
             Value::Null,
@@ -1140,7 +1278,7 @@ mod tests {
             right: Box::new(Expr::Literal(Value::Boolean(false))),
         };
         assert_eq!(
-            eval_expr(&expr, &cols, &row).unwrap(),
+            eval_expr(&expr, &cm, &row).unwrap(),
             Value::Boolean(false)
         );
 
@@ -1150,12 +1288,13 @@ mod tests {
             op: BinOp::And,
             right: Box::new(Expr::Literal(Value::Boolean(true))),
         };
-        assert!(eval_expr(&expr, &cols, &row).unwrap().is_null());
+        assert!(eval_expr(&expr, &cm, &row).unwrap().is_null());
     }
 
     #[test]
     fn eval_or_three_valued() {
         let cols = test_columns();
+        let cm = ColumnMap::new(&cols);
         let row = vec![
             Value::Integer(1),
             Value::Null,
@@ -1169,7 +1308,7 @@ mod tests {
             op: BinOp::Or,
             right: Box::new(Expr::Literal(Value::Boolean(true))),
         };
-        assert_eq!(eval_expr(&expr, &cols, &row).unwrap(), Value::Boolean(true));
+        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Boolean(true));
 
         // NULL OR false = NULL
         let expr = Expr::BinaryOp {
@@ -1177,12 +1316,13 @@ mod tests {
             op: BinOp::Or,
             right: Box::new(Expr::Literal(Value::Boolean(false))),
         };
-        assert!(eval_expr(&expr, &cols, &row).unwrap().is_null());
+        assert!(eval_expr(&expr, &cm, &row).unwrap().is_null());
     }
 
     #[test]
     fn eval_is_null() {
         let cols = test_columns();
+        let cm = ColumnMap::new(&cols);
         let row = vec![
             Value::Integer(1),
             Value::Null,
@@ -1190,22 +1330,23 @@ mod tests {
             Value::Boolean(true),
         ];
         let expr = Expr::IsNull(Box::new(Expr::Column("name".into())));
-        assert_eq!(eval_expr(&expr, &cols, &row).unwrap(), Value::Boolean(true));
+        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Boolean(true));
 
         let expr = Expr::IsNotNull(Box::new(Expr::Column("id".into())));
-        assert_eq!(eval_expr(&expr, &cols, &row).unwrap(), Value::Boolean(true));
+        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Boolean(true));
     }
 
     #[test]
     fn eval_not() {
         let cols = test_columns();
+        let cm = ColumnMap::new(&cols);
         let row = test_row();
         let expr = Expr::UnaryOp {
             op: UnaryOp::Not,
             expr: Box::new(Expr::Column("active".into())),
         };
         assert_eq!(
-            eval_expr(&expr, &cols, &row).unwrap(),
+            eval_expr(&expr, &cm, &row).unwrap(),
             Value::Boolean(false)
         );
     }
@@ -1213,17 +1354,19 @@ mod tests {
     #[test]
     fn eval_neg() {
         let cols = test_columns();
+        let cm = ColumnMap::new(&cols);
         let row = test_row();
         let expr = Expr::UnaryOp {
             op: UnaryOp::Neg,
             expr: Box::new(Expr::Column("id".into())),
         };
-        assert_eq!(eval_expr(&expr, &cols, &row).unwrap(), Value::Integer(-1));
+        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Integer(-1));
     }
 
     #[test]
     fn eval_division_by_zero() {
         let cols = test_columns();
+        let cm = ColumnMap::new(&cols);
         let row = test_row();
         let expr = Expr::BinaryOp {
             left: Box::new(Expr::Column("id".into())),
@@ -1231,7 +1374,7 @@ mod tests {
             right: Box::new(Expr::Literal(Value::Integer(0))),
         };
         assert!(matches!(
-            eval_expr(&expr, &cols, &row),
+            eval_expr(&expr, &cm, &row),
             Err(SqlError::DivisionByZero)
         ));
     }
@@ -1239,6 +1382,7 @@ mod tests {
     #[test]
     fn eval_mixed_numeric() {
         let cols = test_columns();
+        let cm = ColumnMap::new(&cols);
         let row = test_row();
         // id (int 1) + score (real 95.5) = real 96.5
         let expr = Expr::BinaryOp {
@@ -1246,7 +1390,7 @@ mod tests {
             op: BinOp::Add,
             right: Box::new(Expr::Column("score".into())),
         };
-        assert_eq!(eval_expr(&expr, &cols, &row).unwrap(), Value::Real(96.5));
+        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Real(96.5));
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub struct BTree {
     pub root: PageId,
     pub depth: u16,
     pub entry_count: u64,
+    last_insert: Option<(Vec<(PageId, usize)>, PageId)>,
 }
 
 impl BTree {
@@ -35,6 +36,7 @@ impl BTree {
             root: root_id,
             depth: 1,
             entry_count: 0,
+            last_insert: None,
         }
     }
 
@@ -44,6 +46,7 @@ impl BTree {
             root,
             depth,
             entry_count,
+            last_insert: None,
         }
     }
 
@@ -77,6 +80,16 @@ impl BTree {
         }
     }
 
+    pub fn lil_would_hit(&self, pages: &HashMap<PageId, Page>, key: &[u8]) -> bool {
+        if let Some((_, cached_leaf)) = &self.last_insert {
+            if let Some(page) = pages.get(cached_leaf) {
+                let n = page.num_cells();
+                return n > 0 && key > leaf_node::read_cell(page, n - 1).key;
+            }
+        }
+        false
+    }
+
     /// Insert a key-value pair. Returns `true` if a new entry was added,
     /// `false` if an existing key was updated.
     pub fn insert(
@@ -88,47 +101,84 @@ impl BTree {
         val_type: ValueType,
         value: &[u8],
     ) -> Result<bool> {
-        // Walk root to leaf, recording path
+        // LIL cache: skip walk_to_leaf for sequential appends to the rightmost leaf.
+        if let Some((cached_path, cached_leaf)) = self.last_insert.take() {
+            let hit = {
+                let page = pages.get(&cached_leaf).ok_or(Error::PageOutOfBounds(cached_leaf))?;
+                let n = page.num_cells();
+                n > 0 && key > leaf_node::read_cell(page, n - 1).key
+            };
+            if hit {
+                let cow_id = cow_page(pages, alloc, cached_leaf, txn_id);
+                let ok = {
+                    let page = pages.get_mut(&cow_id).unwrap();
+                    leaf_node::insert_direct(page, key, val_type, value)
+                };
+                if ok {
+                    if cow_id != cached_leaf {
+                        self.root = propagate_cow_up(pages, alloc, txn_id, &cached_path, cow_id);
+                    }
+                    self.entry_count += 1;
+                    self.last_insert = Some((cached_path, cow_id));
+                    return Ok(true);
+                }
+                let (sep_key, right_id) =
+                    split_leaf_with_insert(pages, alloc, txn_id, cow_id, key, val_type, value);
+                self.root = propagate_split_up(
+                    pages, alloc, txn_id, &cached_path, cow_id, &sep_key, right_id, &mut self.depth,
+                );
+                self.last_insert = None;
+                self.entry_count += 1;
+                return Ok(true);
+            }
+        }
+
         let (path, leaf_id) = self.walk_to_leaf(pages, key)?;
 
-        // Check if key already exists
         let key_exists = {
             let page = pages.get(&leaf_id).unwrap();
             leaf_node::search(page, key).is_ok()
         };
 
-        // CoW the leaf
         let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
 
-        // Try to insert into CoW'd leaf
         let leaf_ok = {
             let page = pages.get_mut(&new_leaf_id).unwrap();
-            leaf_node::insert(page, key, val_type, value)
+            leaf_node::insert_direct(page, key, val_type, value)
         };
 
         if leaf_ok {
-            // No split needed — propagate CoW up
-            self.root = propagate_cow_up(pages, alloc, txn_id, &path, new_leaf_id);
+            let mut child = new_leaf_id;
+            let mut is_rightmost = true;
+            let mut new_path = path;
+            for i in (0..new_path.len()).rev() {
+                let (ancestor_id, child_idx) = new_path[i];
+                let new_ancestor = cow_page(pages, alloc, ancestor_id, txn_id);
+                let page = pages.get_mut(&new_ancestor).unwrap();
+                update_branch_child(page, child_idx, child);
+                if child_idx != page.num_cells() as usize {
+                    is_rightmost = false;
+                }
+                new_path[i] = (new_ancestor, child_idx);
+                child = new_ancestor;
+            }
+            self.root = child;
+
+            if is_rightmost {
+                self.last_insert = Some((new_path, new_leaf_id));
+            }
+
             if !key_exists {
                 self.entry_count += 1;
             }
             return Ok(!key_exists);
         }
 
-        // Leaf is full — split
+        self.last_insert = None;
         let (sep_key, right_id) =
             split_leaf_with_insert(pages, alloc, txn_id, new_leaf_id, key, val_type, value);
-
-        // Propagate split up through ancestors
         self.root = propagate_split_up(
-            pages,
-            alloc,
-            txn_id,
-            &path,
-            new_leaf_id,
-            &sep_key,
-            right_id,
-            &mut self.depth,
+            pages, alloc, txn_id, &path, new_leaf_id, &sep_key, right_id, &mut self.depth,
         );
 
         if !key_exists {
@@ -145,7 +195,7 @@ impl BTree {
         txn_id: TxnId,
         key: &[u8],
     ) -> Result<bool> {
-        // Walk root to leaf
+        self.last_insert = None;
         let (path, leaf_id) = self.walk_to_leaf(pages, key)?;
 
         // Check if key exists
@@ -210,12 +260,16 @@ impl BTree {
 }
 
 /// Copy-on-Write: clone a page to a new page ID, free the old one.
+/// If the page already belongs to this transaction, return it as-is.
 fn cow_page(
     pages: &mut HashMap<PageId, Page>,
     alloc: &mut PageAllocator,
     old_id: PageId,
     txn_id: TxnId,
 ) -> PageId {
+    if pages.get(&old_id).unwrap().txn_id() == txn_id {
+        return old_id;
+    }
     let new_id = alloc.allocate();
     let mut new_page = pages.get(&old_id).unwrap().clone();
     new_page.set_page_id(new_id);

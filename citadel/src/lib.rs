@@ -15,7 +15,7 @@ pub use audit::{
     AuditEventType, AuditVerifyResult, ScanResult,
 };
 pub use citadel_core::error::{Error, Result};
-pub use citadel_core::types::{Argon2Profile, CipherId, KdfAlgorithm};
+pub use citadel_core::types::{Argon2Profile, CipherId, KdfAlgorithm, SyncMode};
 pub use citadel_txn::integrity::{IntegrityError, IntegrityReport};
 
 // Internal crate re-exports (used by integration tests and advanced usage)

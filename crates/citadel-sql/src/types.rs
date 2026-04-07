@@ -2,6 +2,8 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+pub use compact_str::CompactString;
+
 /// SQL data types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
@@ -52,12 +54,13 @@ impl fmt::Display for DataType {
 }
 
 /// SQL value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum Value {
+    #[default]
     Null,
     Integer(i64),
     Real(f64),
-    Text(String),
+    Text(CompactString),
     Blob(Vec<u8>),
     Boolean(bool),
 }
@@ -92,6 +95,22 @@ impl Value {
             (Value::Boolean(b), DataType::Boolean) => Some(Value::Boolean(*b)),
             (Value::Boolean(b), DataType::Integer) => Some(Value::Integer(if *b { 1 } else { 0 })),
             (Value::Integer(i), DataType::Boolean) => Some(Value::Boolean(*i != 0)),
+            _ => None,
+        }
+    }
+
+    pub fn coerce_into(self, target: DataType) -> Option<Value> {
+        if self.is_null() || target == DataType::Null {
+            return Some(Value::Null);
+        }
+        if self.data_type() == target {
+            return Some(self);
+        }
+        match (self, target) {
+            (Value::Integer(i), DataType::Real) => Some(Value::Real(i as f64)),
+            (Value::Real(r), DataType::Integer) => Some(Value::Integer(r as i64)),
+            (Value::Boolean(b), DataType::Integer) => Some(Value::Integer(if b { 1 } else { 0 })),
+            (Value::Integer(i), DataType::Boolean) => Some(Value::Boolean(i != 0)),
             _ => None,
         }
     }
@@ -241,6 +260,30 @@ pub struct TableSchema {
     pub columns: Vec<ColumnDef>,
     pub primary_key_columns: Vec<u16>,
     pub indices: Vec<IndexDef>,
+    pk_idx_cache: Vec<usize>,
+    non_pk_idx_cache: Vec<usize>,
+}
+
+impl TableSchema {
+    pub fn new(
+        name: String,
+        columns: Vec<ColumnDef>,
+        primary_key_columns: Vec<u16>,
+        indices: Vec<IndexDef>,
+    ) -> Self {
+        let pk_idx_cache: Vec<usize> = primary_key_columns.iter().map(|&i| i as usize).collect();
+        let non_pk_idx_cache: Vec<usize> = (0..columns.len())
+            .filter(|i| !primary_key_columns.contains(&(*i as u16)))
+            .collect();
+        Self {
+            name,
+            columns,
+            primary_key_columns,
+            indices,
+            pk_idx_cache,
+            non_pk_idx_cache,
+        }
+    }
 }
 
 const SCHEMA_VERSION: u8 = 2;
@@ -373,35 +416,24 @@ impl TableSchema {
         };
         let _ = pos;
 
-        Ok(Self {
-            name,
-            columns,
-            primary_key_columns,
-            indices,
-        })
+        Ok(Self::new(name, columns, primary_key_columns, indices))
     }
 
     /// Get column index by name (case-insensitive).
     pub fn column_index(&self, name: &str) -> Option<usize> {
-        let lower = name.to_ascii_lowercase();
         self.columns
             .iter()
-            .position(|c| c.name.to_ascii_lowercase() == lower)
+            .position(|c| c.name.eq_ignore_ascii_case(name))
     }
 
     /// Get indices of non-PK columns (columns stored in the B+ tree value).
-    pub fn non_pk_indices(&self) -> Vec<usize> {
-        (0..self.columns.len())
-            .filter(|i| !self.primary_key_columns.contains(&(*i as u16)))
-            .collect()
+    pub fn non_pk_indices(&self) -> &[usize] {
+        &self.non_pk_idx_cache
     }
 
     /// Get the PK column indices as usize.
-    pub fn pk_indices(&self) -> Vec<usize> {
-        self.primary_key_columns
-            .iter()
-            .map(|&i| i as usize)
-            .collect()
+    pub fn pk_indices(&self) -> &[usize] {
+        &self.pk_idx_cache
     }
 
     /// Get index definition by name (case-insensitive).
@@ -483,9 +515,9 @@ mod tests {
 
     #[test]
     fn schema_roundtrip() {
-        let schema = TableSchema {
-            name: "users".into(),
-            columns: vec![
+        let schema = TableSchema::new(
+            "users".into(),
+            vec![
                 ColumnDef {
                     name: "id".into(),
                     data_type: DataType::Integer,
@@ -505,9 +537,9 @@ mod tests {
                     position: 2,
                 },
             ],
-            primary_key_columns: vec![0],
-            indices: vec![],
-        };
+            vec![0],
+            vec![],
+        );
 
         let data = schema.serialize();
         let restored = TableSchema::deserialize(&data).unwrap();
@@ -527,9 +559,9 @@ mod tests {
 
     #[test]
     fn schema_roundtrip_with_indices() {
-        let schema = TableSchema {
-            name: "orders".into(),
-            columns: vec![
+        let schema = TableSchema::new(
+            "orders".into(),
+            vec![
                 ColumnDef {
                     name: "id".into(),
                     data_type: DataType::Integer,
@@ -549,8 +581,8 @@ mod tests {
                     position: 2,
                 },
             ],
-            primary_key_columns: vec![0],
-            indices: vec![
+            vec![0],
+            vec![
                 IndexDef {
                     name: "idx_customer".into(),
                     columns: vec![1],
@@ -562,7 +594,7 @@ mod tests {
                     unique: true,
                 },
             ],
-        };
+        );
 
         let data = schema.serialize();
         let restored = TableSchema::deserialize(&data).unwrap();
@@ -578,17 +610,17 @@ mod tests {
 
     #[test]
     fn schema_v1_backward_compat() {
-        let old_schema = TableSchema {
-            name: "test".into(),
-            columns: vec![ColumnDef {
+        let old_schema = TableSchema::new(
+            "test".into(),
+            vec![ColumnDef {
                 name: "id".into(),
                 data_type: DataType::Integer,
                 nullable: false,
                 position: 0,
             }],
-            primary_key_columns: vec![0],
-            indices: vec![],
-        };
+            vec![0],
+            vec![],
+        );
         let mut data = old_schema.serialize();
         // Patch to v1 format: replace version byte and truncate index data
         data[0] = 1;

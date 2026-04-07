@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Citadel: encrypted-first embedded database engine"
+description = "Citadel: encrypted-first embedded database engine that outperforms unencrypted SQLite"
 readme = "../README.md"
 
 [lib]
@@ -37,3 +37,8 @@ parking_lot = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile = "3"
 blake3 = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "kv_bench"
+harness = false

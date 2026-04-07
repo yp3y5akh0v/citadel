@@ -36,8 +36,15 @@ optional = true
 [dependencies.pbkdf2]
 workspace = true
 
+[dev-dependencies]
+criterion = { workspace = true }
+
 [features]
 default = ["aes-cipher"]
 aes-cipher = []
 chacha = ["dep:chacha20"]
 fips = []
+
+[[bench]]
+name = "crypto_bench"
+harness = false

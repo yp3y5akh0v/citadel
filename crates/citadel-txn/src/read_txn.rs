@@ -4,12 +4,14 @@
 //! Reads pages through the buffer pool (cached, decrypted).
 //! Auto-unregisters from the reader table on Drop (RAII).
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use citadel_core::types::{PageId, PageType, TxnId, ValueType};
 use citadel_core::{Error, Result};
 use citadel_io::file_manager::CommitSlot;
 use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
-use std::collections::HashMap;
 
 use citadel_buffer::cursor::Cursor;
 
@@ -24,7 +26,7 @@ pub struct ReadTxn<'a> {
     manager: &'a TxnManager,
     txn_id: TxnId,
     snapshot: CommitSlot,
-    page_cache: HashMap<PageId, Page>,
+    page_cache: HashMap<PageId, Arc<Page>>,
 }
 
 impl<'a> ReadTxn<'a> {
@@ -72,9 +74,9 @@ impl<'a> ReadTxn<'a> {
         self.preload_all_pages(self.snapshot.tree_root)?;
         let mut cursor = Cursor::first(&self.page_cache, self.snapshot.tree_root)?;
         while cursor.is_valid() {
-            if let Some(entry) = cursor.current(&self.page_cache) {
+            if let Some(entry) = cursor.current_ref(&self.page_cache) {
                 if entry.val_type != ValueType::Tombstone {
-                    f(&entry.key, &entry.value)?;
+                    f(entry.key, entry.value)?;
                 }
             }
             cursor.next(&self.page_cache)?;
@@ -83,6 +85,10 @@ impl<'a> ReadTxn<'a> {
     }
 
     // ── Named table operations ────────────────────────────────────────
+
+    pub fn table_entry_count(&mut self, table: &[u8]) -> Result<u64> {
+        Ok(self.lookup_table(table)?.entry_count)
+    }
 
     /// Look up a key in a named table.
     pub fn table_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -104,9 +110,9 @@ impl<'a> ReadTxn<'a> {
         self.preload_all_pages(desc.root_page)?;
         let mut cursor = Cursor::first(&self.page_cache, desc.root_page)?;
         while cursor.is_valid() {
-            if let Some(entry) = cursor.current(&self.page_cache) {
+            if let Some(entry) = cursor.current_ref(&self.page_cache) {
                 if entry.val_type != ValueType::Tombstone {
-                    f(&entry.key, &entry.value)?;
+                    f(entry.key, entry.value)?;
                 }
             }
             cursor.next(&self.page_cache)?;
@@ -128,12 +134,32 @@ impl<'a> ReadTxn<'a> {
             Cursor::seek(&self.page_cache, desc.root_page, start_key)?
         };
         while cursor.is_valid() {
-            if let Some(entry) = cursor.current(&self.page_cache) {
-                if entry.val_type != ValueType::Tombstone && !f(&entry.key, &entry.value)? {
+            if let Some(entry) = cursor.current_ref(&self.page_cache) {
+                if entry.val_type != ValueType::Tombstone && !f(entry.key, entry.value)? {
                     break;
                 }
             }
             cursor.next(&self.page_cache)?;
+        }
+        Ok(())
+    }
+
+    /// Full table scan via direct leaf iteration. Callback returns `false` to stop.
+    pub fn table_scan_raw<F>(&mut self, table: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> bool,
+    {
+        let desc = self.lookup_table(table)?;
+        self.preload_all_pages(desc.root_page)?;
+        let leaves = self.collect_leaves_ordered(desc.root_page)?;
+        for page in &leaves {
+            let n = page.num_cells();
+            for i in 0..n {
+                let cell = leaf_node::read_cell(page, i);
+                if cell.val_type != ValueType::Tombstone && !f(cell.key, cell.value) {
+                    return Ok(());
+                }
+            }
         }
         Ok(())
     }
@@ -213,20 +239,55 @@ impl<'a> ReadTxn<'a> {
 
     fn load_page(&mut self, page_id: PageId) -> Result<&Page> {
         if !self.page_cache.contains_key(&page_id) {
-            let page = self.manager.fetch_page(page_id)?;
-            self.page_cache.insert(page_id, page);
+            let arc = self.manager.fetch_page(page_id)?;
+            self.page_cache.insert(page_id, arc);
         }
         Ok(self.page_cache.get(&page_id).unwrap())
+    }
+
+    fn collect_leaves_ordered(&self, root: PageId) -> Result<Vec<Arc<Page>>> {
+        let mut leaves = Vec::new();
+        self.collect_leaves_recursive(root, &mut leaves)?;
+        Ok(leaves)
+    }
+
+    fn collect_leaves_recursive(
+        &self,
+        page_id: PageId,
+        leaves: &mut Vec<Arc<Page>>,
+    ) -> Result<()> {
+        let page = self
+            .page_cache
+            .get(&page_id)
+            .ok_or(Error::PageOutOfBounds(page_id))?;
+        match page.page_type() {
+            Some(PageType::Leaf) => {
+                leaves.push(Arc::clone(page));
+            }
+            Some(PageType::Branch) => {
+                let n = page.num_cells() as usize;
+                for i in 0..n {
+                    let child = branch_node::get_child(page, i);
+                    self.collect_leaves_recursive(child, leaves)?;
+                }
+                let right = page.right_child();
+                if right.is_valid() {
+                    self.collect_leaves_recursive(right, leaves)?;
+                }
+            }
+            _ => return Err(Error::InvalidPageType(page.page_type_raw(), page_id)),
+        }
+        Ok(())
     }
 
     fn preload_all_pages(&mut self, root: PageId) -> Result<()> {
         let mut stack = vec![root];
         while let Some(current) = stack.pop() {
             if !self.page_cache.contains_key(&current) {
-                let page = self.manager.fetch_page(current)?;
-                self.page_cache.insert(current, page);
+                let arc = self.manager.fetch_page(current)?;
+                self.page_cache.insert(current, arc);
             }
-            let page = self.page_cache.get(&current).unwrap();
+            let page: &Page = self.page_cache.get(&current).unwrap();
             match page.page_type() {
                 Some(PageType::Branch) => {
                     let num_cells = page.num_cells() as usize;

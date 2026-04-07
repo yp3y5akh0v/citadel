@@ -174,7 +174,7 @@ impl PageIO for UringPageIO {
         Ok(())
     }
 
-    fn flush_pages(&self, pages: &[(u64, [u8; PAGE_SIZE])]) -> Result<()> {
+    fn write_pages(&self, pages: &[(u64, [u8; PAGE_SIZE])]) -> Result<()> {
         if pages.is_empty() {
             return Ok(());
         }
@@ -189,13 +189,9 @@ impl PageIO for UringPageIO {
         }
 
         let mut ring = self.ring.lock().unwrap();
-
-        // Query actual SQ capacity — kernel may clamp below our requested size
         let sq_cap = ring.submission().capacity();
-        // Reserve 1 slot for fsync in the last batch
         let batch_size = sq_cap.saturating_sub(1).max(1);
 
-        // Submit writes in batches that fit the SQ
         for chunk in pages.chunks(batch_size) {
             for (i, (offset, buf)) in chunk.iter().enumerate() {
                 let sqe = opcode::Write::new(types::Fd(self.fd), buf.as_ptr(), PAGE_SIZE as u32)
@@ -212,22 +208,12 @@ impl PageIO for UringPageIO {
             Self::drain_cqes(&mut ring, chunk.len())?;
         }
 
-        // Final fdatasync — flushes data and file size changes, skips timestamps
-        let fsync_sqe = opcode::Fsync::new(types::Fd(self.fd))
-            .flags(types::FsyncFlags::DATASYNC)
-            .build()
-            .user_data(u64::MAX);
-
-        unsafe {
-            ring.submission()
-                .push(&fsync_sqe)
-                .map_err(|_| sq_full_err())?;
-        }
-
-        ring.submit_and_wait(1)?;
-        Self::drain_cqes(&mut ring, 1)?;
-
         Ok(())
+    }
+
+    fn flush_pages(&self, pages: &[(u64, [u8; PAGE_SIZE])]) -> Result<()> {
+        self.write_pages(pages)?;
+        self.fsync()
     }
 }
 

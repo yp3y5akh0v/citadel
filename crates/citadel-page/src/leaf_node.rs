@@ -111,6 +111,49 @@ pub fn search(page: &Page, search_key: &[u8]) -> Result<u16, u16> {
     Err(lo)
 }
 
+#[inline]
+fn write_cell_into(slot: &mut [u8], key: &[u8], val_type: ValueType, value: &[u8]) {
+    slot[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+    slot[2..6].copy_from_slice(&(value.len() as u32).to_le_bytes());
+    slot[6..6 + key.len()].copy_from_slice(key);
+    slot[6 + key.len()] = val_type as u8;
+    slot[7 + key.len()..7 + key.len() + value.len()].copy_from_slice(value);
+}
+
+pub fn insert_direct(page: &mut Page, key: &[u8], val_type: ValueType, value: &[u8]) -> bool {
+    let pos = match search(page, key) {
+        Ok(idx) => {
+            let old_size = get_cell_size(page, idx);
+            page.delete_cell_at(idx, old_size);
+            idx
+        }
+        Err(idx) => idx,
+    };
+
+    let total = LEAF_CELL_FIXED + key.len() + value.len();
+
+    if page
+        .insert_cell_direct(pos, total, |slot| {
+            write_cell_into(slot, key, val_type, value);
+        })
+        .is_some()
+    {
+        return true;
+    }
+
+    let cell_len_with_ptr = total + 2;
+    if (page.free_space() as usize) >= cell_len_with_ptr {
+        compact_page(page);
+        return page
+            .insert_cell_direct(pos, total, |slot| {
+                write_cell_into(slot, key, val_type, value);
+            })
+            .is_some();
+    }
+
+    false
+}
+
 /// Insert a key-value pair into the leaf page at the correct sorted position.
 /// Returns true if successful, false if not enough space.
 pub fn insert(page: &mut Page, key: &[u8], val_type: ValueType, value: &[u8]) -> bool {

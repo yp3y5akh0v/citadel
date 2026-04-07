@@ -2,7 +2,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
-use citadel_core::types::{Argon2Profile, CipherId, KdfAlgorithm};
+use citadel_core::types::{Argon2Profile, CipherId, KdfAlgorithm, SyncMode};
 use citadel_core::{
     Error, Result, DEFAULT_BUFFER_POOL_SIZE, FILE_HEADER_SIZE, KEY_FILE_SIZE, PBKDF2_MIN_ITERATIONS,
 };
@@ -39,6 +39,7 @@ pub struct DatabaseBuilder {
     cipher: CipherId,
     kdf_algorithm: KdfAlgorithm,
     pbkdf2_iterations: u32,
+    sync_mode: SyncMode,
     #[cfg(feature = "audit-log")]
     audit_config: crate::audit::AuditConfig,
 }
@@ -54,6 +55,7 @@ impl DatabaseBuilder {
             cipher: CipherId::Aes256Ctr,
             kdf_algorithm: KdfAlgorithm::Argon2id,
             pbkdf2_iterations: PBKDF2_MIN_ITERATIONS,
+            sync_mode: SyncMode::Full,
             #[cfg(feature = "audit-log")]
             audit_config: crate::audit::AuditConfig::default(),
         }
@@ -99,6 +101,11 @@ impl DatabaseBuilder {
     /// Default: 600,000 (OWASP 2024 minimum for PBKDF2-HMAC-SHA256).
     pub fn pbkdf2_iterations(mut self, iterations: u32) -> Self {
         self.pbkdf2_iterations = iterations;
+        self
+    }
+
+    pub fn sync_mode(mut self, mode: SyncMode) -> Self {
+        self.sync_mode = mode;
         self
     }
 
@@ -245,7 +252,7 @@ impl DatabaseBuilder {
         let dek_id = compute_dek_id(&keys.mac_key, &keys.dek);
         let io = Self::create_page_io(file);
 
-        let manager = TxnManager::create(
+        let manager = TxnManager::create_with_sync(
             io,
             keys.dek,
             keys.mac_key,
@@ -253,6 +260,7 @@ impl DatabaseBuilder {
             file_id,
             dek_id,
             self.cache_size,
+            self.sync_mode,
         )?;
 
         #[cfg(feature = "audit-log")]
@@ -295,7 +303,7 @@ impl DatabaseBuilder {
         let dek_id = compute_dek_id(&keys.mac_key, &keys.dek);
         let io: Box<dyn PageIO> = Box::new(citadel_io::memory_io::MemoryPageIO::new());
 
-        let manager = TxnManager::create(
+        let manager = TxnManager::create_with_sync(
             io,
             keys.dek,
             keys.mac_key,
@@ -303,6 +311,7 @@ impl DatabaseBuilder {
             file_id,
             dek_id,
             self.cache_size,
+            self.sync_mode,
         )?;
 
         // Clear path so finish() won't create an audit log file on disk
@@ -345,12 +354,13 @@ impl DatabaseBuilder {
 
         let io = Self::create_page_io(file);
 
-        let manager = TxnManager::open(
+        let manager = TxnManager::open_with_sync(
             io,
             keys.dek,
             keys.mac_key,
             kf.current_epoch,
             self.cache_size,
+            self.sync_mode,
         )?;
 
         // Verify dek_id against the recovered commit slot

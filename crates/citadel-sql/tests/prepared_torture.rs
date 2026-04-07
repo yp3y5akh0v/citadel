@@ -25,7 +25,7 @@ fn setup_and_populate(conn: &mut Connection<'_>) {
             sql,
             &[
                 Value::Integer(i),
-                Value::Text(format!("item_{i}")),
+                Value::Text(format!("item_{i}").into()),
                 Value::Real(i as f64 * 1.5),
                 Value::Boolean(i % 3 != 0),
             ],
@@ -47,7 +47,7 @@ fn repeated_parameterized_select_1000() {
     for i in 1..=100 {
         let qr = query_result(conn.execute_params(sql, &[Value::Integer(i)]).unwrap());
         assert_eq!(qr.rows.len(), 1);
-        assert_eq!(qr.rows[0][0], Value::Text(format!("item_{i}")));
+        assert_eq!(qr.rows[0][0], Value::Text(format!("item_{i}").into()));
     }
 }
 
@@ -61,7 +61,7 @@ fn repeated_parameterized_insert() {
 
     let sql = "INSERT INTO t (id, val) VALUES ($1, $2)";
     for i in 1..=200 {
-        conn.execute_params(sql, &[Value::Integer(i), Value::Text(format!("v{i}"))])
+        conn.execute_params(sql, &[Value::Integer(i), Value::Text(format!("v{i}").into())])
             .unwrap();
     }
 
@@ -110,14 +110,14 @@ fn interleave_insert_select_with_cache() {
     for i in 1..=10 {
         conn.execute_params(
             insert_sql,
-            &[Value::Integer(i), Value::Text(format!("n{i}"))],
+            &[Value::Integer(i), Value::Text(format!("n{i}").into())],
         )
         .unwrap();
         let qr = query_result(
             conn.execute_params(select_sql, &[Value::Integer(i)])
                 .unwrap(),
         );
-        assert_eq!(qr.rows[0][0], Value::Text(format!("n{i}")));
+        assert_eq!(qr.rows[0][0], Value::Text(format!("n{i}").into()));
     }
 }
 
@@ -163,7 +163,7 @@ fn twenty_params_in_insert() {
 
     let sql = "INSERT INTO wide (id, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)";
     let params: Vec<Value> = std::iter::once(Value::Integer(1))
-        .chain((1..=10).map(|i| Value::Text(format!("val{i}"))))
+        .chain((1..=10).map(|i| Value::Text(format!("val{i}").into())))
         .collect();
     conn.execute_params(sql, &params).unwrap();
 
@@ -230,7 +230,7 @@ fn params_in_multi_statement_transaction() {
     for i in 1..=5 {
         conn.execute_params(
             "INSERT INTO t (id, val) VALUES ($1, $2)",
-            &[Value::Integer(i), Value::Text(format!("item{i}"))],
+            &[Value::Integer(i), Value::Text(format!("item{i}").into())],
         )
         .unwrap();
     }
@@ -871,7 +871,7 @@ fn empty_string_param() {
         .unwrap();
     conn.execute_params(
         "INSERT INTO t (id, val) VALUES ($1, $2)",
-        &[Value::Integer(1), Value::Text(String::new())],
+        &[Value::Integer(1), Value::Text("".into())],
     )
     .unwrap();
 
@@ -879,7 +879,7 @@ fn empty_string_param() {
         conn.execute_params("SELECT val FROM t WHERE id = $1", &[Value::Integer(1)])
             .unwrap(),
     );
-    assert_eq!(qr.rows[0][0], Value::Text(String::new()));
+    assert_eq!(qr.rows[0][0], Value::Text("".into()));
 }
 
 #[test]
@@ -1090,7 +1090,7 @@ fn explain_with_multiple_params() {
         .rows
         .iter()
         .map(|r| match &r[0] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => s.to_string(),
             _ => panic!(),
         })
         .collect();

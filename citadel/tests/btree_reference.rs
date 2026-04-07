@@ -376,6 +376,7 @@ fn btree_allocator_frees_pages_on_cow() {
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
+    // Same-txn inserts reuse pages (no CoW needed)
     for i in 0..10u32 {
         let key = format!("k{i}");
         tree.insert(
@@ -388,12 +389,22 @@ fn btree_allocator_frees_pages_on_cow() {
         )
         .unwrap();
     }
+    assert_eq!(alloc.freed_count(), 0, "same-txn inserts should not free pages");
+    let freed = alloc.commit();
+    assert!(freed.is_empty());
 
-    let freed_before = alloc.freed_count();
-    // Each insert after the first CoWs the root, so many pages should be freed
-    assert!(freed_before > 0, "CoW should free old pages");
+    // Cross-txn insert triggers CoW, freeing old pages
+    tree.insert(
+        &mut pages,
+        &mut alloc,
+        TxnId(2),
+        b"cross",
+        ValueType::Inline,
+        b"v",
+    )
+    .unwrap();
+    assert!(alloc.freed_count() > 0, "cross-txn insert should CoW and free old pages");
 
-    // After commit, freed pages should be cleared
     let freed = alloc.commit();
     assert!(!freed.is_empty());
     assert_eq!(alloc.freed_count(), 0);

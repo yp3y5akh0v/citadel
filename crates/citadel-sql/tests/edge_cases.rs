@@ -648,7 +648,7 @@ fn unicode_in_values() {
             .unwrap();
         assert_eq!(
             qr.rows[0][0],
-            Value::Text(expected.to_string()),
+            Value::Text(expected.to_string().into()),
             "Unicode roundtrip failed for id={id}"
         );
     }
@@ -704,7 +704,7 @@ fn string_with_sql_keywords() {
         let qr = conn
             .query(&format!("SELECT val FROM t WHERE id = {}", i + 1))
             .unwrap();
-        assert_eq!(qr.rows[0][0], Value::Text(expected.to_string()));
+        assert_eq!(qr.rows[0][0], Value::Text(expected.to_string().into()));
     }
 }
 

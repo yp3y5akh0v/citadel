@@ -321,9 +321,9 @@ mod tests {
     use crate::types::{ColumnDef, DataType};
 
     fn test_schema() -> TableSchema {
-        TableSchema {
-            name: "users".into(),
-            columns: vec![
+        TableSchema::new(
+            "users".into(),
+            vec![
                 ColumnDef {
                     name: "id".into(),
                     data_type: DataType::Integer,
@@ -349,8 +349,8 @@ mod tests {
                     position: 3,
                 },
             ],
-            primary_key_columns: vec![0],
-            indices: vec![
+            vec![0],
+            vec![
                 IndexDef {
                     name: "idx_name".into(),
                     columns: vec![1],
@@ -367,7 +367,7 @@ mod tests {
                     unique: false,
                 },
             ],
-        }
+        )
     }
 
     #[test]
@@ -588,9 +588,9 @@ mod tests {
 
     #[test]
     fn prefers_unique_index() {
-        let schema = TableSchema {
-            name: "t".into(),
-            columns: vec![
+        let schema = TableSchema::new(
+            "t".into(),
+            vec![
                 ColumnDef {
                     name: "id".into(),
                     data_type: DataType::Integer,
@@ -604,8 +604,8 @@ mod tests {
                     position: 1,
                 },
             ],
-            primary_key_columns: vec![0],
-            indices: vec![
+            vec![0],
+            vec![
                 IndexDef {
                     name: "idx_code".into(),
                     columns: vec![1],
@@ -617,7 +617,7 @@ mod tests {
                     unique: true,
                 },
             ],
-        };
+        );
         let where_clause = Some(Expr::BinaryOp {
             left: Box::new(Expr::Column("code".into())),
             op: BinOp::Eq,
