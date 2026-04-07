@@ -287,7 +287,10 @@ fn h2h_group_by(c: &mut Criterion) {
     sqlite_100k(&sc);
 
     g.bench_function(BenchmarkId::new("citadel", ""), |b| {
-        b.iter(|| cc.query("SELECT age, COUNT(*) FROM t GROUP BY age").unwrap());
+        b.iter(|| {
+            cc.query("SELECT age, COUNT(*) FROM t GROUP BY age")
+                .unwrap()
+        });
     });
     g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
         b.iter(|| sqlite_collect(&sc, "SELECT age, COUNT(*) FROM t GROUP BY age"));

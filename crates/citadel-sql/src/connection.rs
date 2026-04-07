@@ -22,23 +22,35 @@ fn try_normalize_insert(sql: &str) -> Option<(String, Vec<Value>)> {
     let len = bytes.len();
     let mut i = 0;
 
-    while i < len && bytes[i].is_ascii_whitespace() { i += 1; }
-    if i + 6 > len || !bytes[i..i+6].eq_ignore_ascii_case(b"INSERT") { return None; }
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i + 6 > len || !bytes[i..i + 6].eq_ignore_ascii_case(b"INSERT") {
+        return None;
+    }
     i += 6;
-    if i >= len || !bytes[i].is_ascii_whitespace() { return None; }
-    while i < len && bytes[i].is_ascii_whitespace() { i += 1; }
+    if i >= len || !bytes[i].is_ascii_whitespace() {
+        return None;
+    }
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
 
-    if i + 4 > len || !bytes[i..i+4].eq_ignore_ascii_case(b"INTO") { return None; }
+    if i + 4 > len || !bytes[i..i + 4].eq_ignore_ascii_case(b"INTO") {
+        return None;
+    }
     i += 4;
-    if i >= len || !bytes[i].is_ascii_whitespace() { return None; }
+    if i >= len || !bytes[i].is_ascii_whitespace() {
+        return None;
+    }
 
     let prefix_start = 0;
     let mut values_pos = None;
     let mut j = i;
     while j + 6 <= len {
-        if bytes[j..j+6].eq_ignore_ascii_case(b"VALUES")
-            && (j == 0 || !bytes[j-1].is_ascii_alphanumeric() && bytes[j-1] != b'_')
-            && (j + 6 >= len || !bytes[j+6].is_ascii_alphanumeric() && bytes[j+6] != b'_')
+        if bytes[j..j + 6].eq_ignore_ascii_case(b"VALUES")
+            && (j == 0 || !bytes[j - 1].is_ascii_alphanumeric() && bytes[j - 1] != b'_')
+            && (j + 6 >= len || !bytes[j + 6].is_ascii_alphanumeric() && bytes[j + 6] != b'_')
         {
             values_pos = Some(j);
             break;
@@ -50,8 +62,12 @@ fn try_normalize_insert(sql: &str) -> Option<(String, Vec<Value>)> {
     let prefix = &sql[prefix_start..values_pos + 6];
     let mut pos = values_pos + 6;
 
-    while pos < len && bytes[pos].is_ascii_whitespace() { pos += 1; }
-    if pos >= len || bytes[pos] != b'(' { return None; }
+    while pos < len && bytes[pos].is_ascii_whitespace() {
+        pos += 1;
+    }
+    if pos >= len || bytes[pos] != b'(' {
+        return None;
+    }
     pos += 1;
 
     let mut values = Vec::new();
@@ -60,18 +76,26 @@ fn try_normalize_insert(sql: &str) -> Option<(String, Vec<Value>)> {
     normalized.push_str(" (");
 
     loop {
-        while pos < len && bytes[pos].is_ascii_whitespace() { pos += 1; }
-        if pos >= len { return None; }
+        while pos < len && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= len {
+            return None;
+        }
 
         let param_idx = values.len() + 1;
-        if param_idx > 1 { normalized.push_str(", "); }
+        if param_idx > 1 {
+            normalized.push_str(", ");
+        }
 
         if bytes[pos] == b'\'' {
             pos += 1;
             let mut seg_start = pos;
             let mut s = String::new();
             loop {
-                if pos >= len { return None; }
+                if pos >= len {
+                    return None;
+                }
                 if bytes[pos] == b'\'' {
                     s.push_str(std::str::from_utf8(&bytes[seg_start..pos]).ok()?);
                     pos += 1;
@@ -89,18 +113,24 @@ fn try_normalize_insert(sql: &str) -> Option<(String, Vec<Value>)> {
             values.push(Value::Text(s.into()));
         } else if bytes[pos] == b'-' || bytes[pos].is_ascii_digit() {
             let start = pos;
-            if bytes[pos] == b'-' { pos += 1; }
-            while pos < len && bytes[pos].is_ascii_digit() { pos += 1; }
+            if bytes[pos] == b'-' {
+                pos += 1;
+            }
+            while pos < len && bytes[pos].is_ascii_digit() {
+                pos += 1;
+            }
             if pos < len && bytes[pos] == b'.' {
                 pos += 1;
-                while pos < len && bytes[pos].is_ascii_digit() { pos += 1; }
+                while pos < len && bytes[pos].is_ascii_digit() {
+                    pos += 1;
+                }
                 let num: f64 = std::str::from_utf8(&bytes[start..pos]).ok()?.parse().ok()?;
                 values.push(Value::Real(num));
             } else {
                 let num: i64 = std::str::from_utf8(&bytes[start..pos]).ok()?.parse().ok()?;
                 values.push(Value::Integer(num));
             }
-        } else if pos + 4 <= len && bytes[pos..pos+4].eq_ignore_ascii_case(b"NULL") {
+        } else if pos + 4 <= len && bytes[pos..pos + 4].eq_ignore_ascii_case(b"NULL") {
             let after = if pos + 4 < len { bytes[pos + 4] } else { b')' };
             if !after.is_ascii_alphanumeric() && after != b'_' {
                 pos += 4;
@@ -108,7 +138,7 @@ fn try_normalize_insert(sql: &str) -> Option<(String, Vec<Value>)> {
             } else {
                 return None;
             }
-        } else if pos + 4 <= len && bytes[pos..pos+4].eq_ignore_ascii_case(b"TRUE") {
+        } else if pos + 4 <= len && bytes[pos..pos + 4].eq_ignore_ascii_case(b"TRUE") {
             let after = if pos + 4 < len { bytes[pos + 4] } else { b')' };
             if !after.is_ascii_alphanumeric() && after != b'_' {
                 pos += 4;
@@ -116,7 +146,7 @@ fn try_normalize_insert(sql: &str) -> Option<(String, Vec<Value>)> {
             } else {
                 return None;
             }
-        } else if pos + 5 <= len && bytes[pos..pos+5].eq_ignore_ascii_case(b"FALSE") {
+        } else if pos + 5 <= len && bytes[pos..pos + 5].eq_ignore_ascii_case(b"FALSE") {
             let after = if pos + 5 < len { bytes[pos + 5] } else { b')' };
             if !after.is_ascii_alphanumeric() && after != b'_' {
                 pos += 5;
@@ -131,8 +161,12 @@ fn try_normalize_insert(sql: &str) -> Option<(String, Vec<Value>)> {
         normalized.push('$');
         normalized.push_str(&param_idx.to_string());
 
-        while pos < len && bytes[pos].is_ascii_whitespace() { pos += 1; }
-        if pos >= len { return None; }
+        while pos < len && bytes[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+        if pos >= len {
+            return None;
+        }
 
         if bytes[pos] == b',' {
             pos += 1;
@@ -146,10 +180,16 @@ fn try_normalize_insert(sql: &str) -> Option<(String, Vec<Value>)> {
 
     normalized.push(')');
 
-    while pos < len && (bytes[pos].is_ascii_whitespace() || bytes[pos] == b';') { pos += 1; }
-    if pos != len { return None; }
+    while pos < len && (bytes[pos].is_ascii_whitespace() || bytes[pos] == b';') {
+        pos += 1;
+    }
+    if pos != len {
+        return None;
+    }
 
-    if values.is_empty() { return None; }
+    if values.is_empty() {
+        return None;
+    }
 
     Some((normalized, values))
 }
@@ -350,13 +390,7 @@ impl<'a> Connection<'a> {
             }
             Statement::Insert(ins) if self.active_txn.is_some() => {
                 let wtx = self.active_txn.as_mut().unwrap();
-                executor::exec_insert_in_txn(
-                    wtx,
-                    &self.schema,
-                    ins,
-                    params,
-                    &mut self.insert_bufs,
-                )
+                executor::exec_insert_in_txn(wtx, &self.schema, ins, params, &mut self.insert_bufs)
             }
             _ => {
                 if let Some(ref mut wtx) = self.active_txn {

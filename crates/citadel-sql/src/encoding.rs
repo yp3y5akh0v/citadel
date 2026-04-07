@@ -400,12 +400,12 @@ pub fn encode_row_into(values: &[Value], buf: &mut Vec<u8>) {
 
 fn decode_value(type_tag: u8, data: &[u8]) -> Result<Value> {
     match DataType::from_tag(type_tag) {
-        Some(DataType::Integer) => {
-            Ok(Value::Integer(i64::from_le_bytes(data[..8].try_into().unwrap())))
-        }
-        Some(DataType::Real) => {
-            Ok(Value::Real(f64::from_le_bytes(data[..8].try_into().unwrap())))
-        }
+        Some(DataType::Integer) => Ok(Value::Integer(i64::from_le_bytes(
+            data[..8].try_into().unwrap(),
+        ))),
+        Some(DataType::Real) => Ok(Value::Real(f64::from_le_bytes(
+            data[..8].try_into().unwrap(),
+        ))),
         Some(DataType::Boolean) => Ok(Value::Boolean(data[0] != 0)),
         Some(DataType::Text) => {
             let s = std::str::from_utf8(data)
@@ -429,7 +429,11 @@ fn parse_row_header(data: &[u8]) -> Result<(usize, &[u8], usize)> {
     if data.len() < pos + bitmap_bytes {
         return Err(SqlError::InvalidValue("truncated null bitmap".into()));
     }
-    Ok((col_count, &data[pos..pos + bitmap_bytes], pos + bitmap_bytes))
+    Ok((
+        col_count,
+        &data[pos..pos + bitmap_bytes],
+        pos + bitmap_bytes,
+    ))
 }
 
 pub fn decode_row(data: &[u8]) -> Result<Vec<Value>> {
@@ -536,12 +540,9 @@ pub fn decode_columns(data: &[u8], targets: &[usize]) -> Result<Vec<Value>> {
                 }
                 let type_tag = data[pos];
                 pos += 1;
-                let data_len = u32::from_le_bytes([
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                ]) as usize;
+                let data_len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
                 if pos + data_len > data.len() {
                     return Err(SqlError::InvalidValue("truncated column value".into()));
@@ -554,12 +555,9 @@ pub fn decode_columns(data: &[u8], targets: &[usize]) -> Result<Vec<Value>> {
             if pos + 5 > data.len() {
                 return Err(SqlError::InvalidValue("truncated column data".into()));
             }
-            let data_len = u32::from_le_bytes([
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-                data[pos + 4],
-            ]) as usize;
+            let data_len =
+                u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
+                    as usize;
             pos += 5 + data_len;
         }
     }
@@ -597,12 +595,9 @@ pub fn decode_columns_into(
                 }
                 let type_tag = data[pos];
                 pos += 1;
-                let data_len = u32::from_le_bytes([
-                    data[pos],
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                ]) as usize;
+                let data_len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
                 pos += 4;
                 if pos + data_len > data.len() {
                     return Err(SqlError::InvalidValue("truncated column value".into()));
@@ -615,12 +610,9 @@ pub fn decode_columns_into(
             if pos + 5 > data.len() {
                 return Err(SqlError::InvalidValue("truncated column data".into()));
             }
-            let data_len = u32::from_le_bytes([
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-                data[pos + 4],
-            ]) as usize;
+            let data_len =
+                u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
+                    as usize;
             pos += 5 + data_len;
         }
     }
@@ -735,12 +727,9 @@ pub fn decode_column_raw(data: &[u8], target: usize) -> Result<RawColumn<'_>> {
             }
             let type_tag = data[pos];
             pos += 1;
-            let data_len = u32::from_le_bytes([
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-            ]) as usize;
+            let data_len =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                    as usize;
             pos += 4;
             if pos + data_len > data.len() {
                 return Err(SqlError::InvalidValue("truncated column value".into()));
@@ -750,12 +739,9 @@ pub fn decode_column_raw(data: &[u8], target: usize) -> Result<RawColumn<'_>> {
             if pos + 5 > data.len() {
                 return Err(SqlError::InvalidValue("truncated column data".into()));
             }
-            let data_len = u32::from_le_bytes([
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-                data[pos + 4],
-            ]) as usize;
+            let data_len =
+                u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
+                    as usize;
             pos += 5 + data_len;
         }
     }
@@ -1178,11 +1164,15 @@ mod tests {
 
     #[test]
     fn raw_column_last() {
-        let values = vec![Value::Integer(1), Value::Text("skip".into()), Value::Real(3.14)];
+        let values = vec![
+            Value::Integer(1),
+            Value::Text("skip".into()),
+            Value::Real(3.15),
+        ];
         let encoded = encode_row(&values);
         let raw = decode_column_raw(&encoded, 2).unwrap();
         match raw {
-            RawColumn::Real(r) => assert!((r - 3.14).abs() < 1e-10),
+            RawColumn::Real(r) => assert!((r - 3.15).abs() < 1e-10),
             other => panic!("expected Real, got {other:?}"),
         }
     }
@@ -1220,8 +1210,8 @@ mod tests {
     fn raw_column_as_numeric() {
         assert_eq!(RawColumn::Integer(42).as_i64(), Some(42));
         assert_eq!(RawColumn::Integer(42).as_f64(), Some(42.0));
-        assert_eq!(RawColumn::Real(3.14).as_f64(), Some(3.14));
-        assert_eq!(RawColumn::Real(3.14).as_i64(), None);
+        assert_eq!(RawColumn::Real(3.15).as_f64(), Some(3.15));
+        assert_eq!(RawColumn::Real(3.15).as_i64(), None);
         assert_eq!(RawColumn::Text("x").as_f64(), None);
         assert_eq!(RawColumn::Null.as_i64(), None);
     }

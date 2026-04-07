@@ -1277,10 +1277,7 @@ mod tests {
             op: BinOp::And,
             right: Box::new(Expr::Literal(Value::Boolean(false))),
         };
-        assert_eq!(
-            eval_expr(&expr, &cm, &row).unwrap(),
-            Value::Boolean(false)
-        );
+        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Boolean(false));
 
         // NULL AND true = NULL
         let expr = Expr::BinaryOp {
@@ -1345,10 +1342,7 @@ mod tests {
             op: UnaryOp::Not,
             expr: Box::new(Expr::Column("active".into())),
         };
-        assert_eq!(
-            eval_expr(&expr, &cm, &row).unwrap(),
-            Value::Boolean(false)
-        );
+        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Boolean(false));
     }
 
     #[test]

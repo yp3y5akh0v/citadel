@@ -251,11 +251,7 @@ impl<'a> ReadTxn<'a> {
         Ok(leaves)
     }
 
-    fn collect_leaves_recursive(
-        &self,
-        page_id: PageId,
-        leaves: &mut Vec<Arc<Page>>,
-    ) -> Result<()> {
+    fn collect_leaves_recursive(&self, page_id: PageId, leaves: &mut Vec<Arc<Page>>) -> Result<()> {
         let page = self
             .page_cache
             .get(&page_id)

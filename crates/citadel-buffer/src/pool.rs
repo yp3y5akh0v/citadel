@@ -105,8 +105,7 @@ impl BufferPool {
         let offset = page_offset(page_id);
 
         if !self.cache.contains(offset) {
-            let page =
-                read_and_decrypt(io, page_id, offset, dek, mac_key, encryption_epoch)?;
+            let page = read_and_decrypt(io, page_id, offset, dek, mac_key, encryption_epoch)?;
             self.cache
                 .insert(offset, Arc::new(page))
                 .map_err(|()| Error::BufferPoolFull)?;

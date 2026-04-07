@@ -389,7 +389,11 @@ fn btree_allocator_frees_pages_on_cow() {
         )
         .unwrap();
     }
-    assert_eq!(alloc.freed_count(), 0, "same-txn inserts should not free pages");
+    assert_eq!(
+        alloc.freed_count(),
+        0,
+        "same-txn inserts should not free pages"
+    );
     let freed = alloc.commit();
     assert!(freed.is_empty());
 
@@ -403,7 +407,10 @@ fn btree_allocator_frees_pages_on_cow() {
         b"v",
     )
     .unwrap();
-    assert!(alloc.freed_count() > 0, "cross-txn insert should CoW and free old pages");
+    assert!(
+        alloc.freed_count() > 0,
+        "cross-txn insert should CoW and free old pages"
+    );
 
     let freed = alloc.commit();
     assert!(!freed.is_empty());

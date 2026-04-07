@@ -104,7 +104,9 @@ impl BTree {
         // LIL cache: skip walk_to_leaf for sequential appends to the rightmost leaf.
         if let Some((cached_path, cached_leaf)) = self.last_insert.take() {
             let hit = {
-                let page = pages.get(&cached_leaf).ok_or(Error::PageOutOfBounds(cached_leaf))?;
+                let page = pages
+                    .get(&cached_leaf)
+                    .ok_or(Error::PageOutOfBounds(cached_leaf))?;
                 let n = page.num_cells();
                 n > 0 && key > leaf_node::read_cell(page, n - 1).key
             };
@@ -125,7 +127,14 @@ impl BTree {
                 let (sep_key, right_id) =
                     split_leaf_with_insert(pages, alloc, txn_id, cow_id, key, val_type, value);
                 self.root = propagate_split_up(
-                    pages, alloc, txn_id, &cached_path, cow_id, &sep_key, right_id, &mut self.depth,
+                    pages,
+                    alloc,
+                    txn_id,
+                    &cached_path,
+                    cow_id,
+                    &sep_key,
+                    right_id,
+                    &mut self.depth,
                 );
                 self.last_insert = None;
                 self.entry_count += 1;
@@ -178,7 +187,14 @@ impl BTree {
         let (sep_key, right_id) =
             split_leaf_with_insert(pages, alloc, txn_id, new_leaf_id, key, val_type, value);
         self.root = propagate_split_up(
-            pages, alloc, txn_id, &path, new_leaf_id, &sep_key, right_id, &mut self.depth,
+            pages,
+            alloc,
+            txn_id,
+            &path,
+            new_leaf_id,
+            &sep_key,
+            right_id,
+            &mut self.depth,
         );
 
         if !key_exists {

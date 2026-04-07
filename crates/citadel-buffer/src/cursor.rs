@@ -56,7 +56,9 @@ impl Cursor {
 
         // Walk to the leaf
         loop {
-            let page = pages.get_page(&current).ok_or(Error::PageOutOfBounds(current))?;
+            let page = pages
+                .get_page(&current)
+                .ok_or(Error::PageOutOfBounds(current))?;
             match page.page_type() {
                 Some(PageType::Leaf) => break,
                 Some(PageType::Branch) => {
@@ -102,7 +104,9 @@ impl Cursor {
 
         // Walk to the leftmost leaf
         loop {
-            let page = pages.get_page(&current).ok_or(Error::PageOutOfBounds(current))?;
+            let page = pages
+                .get_page(&current)
+                .ok_or(Error::PageOutOfBounds(current))?;
             match page.page_type() {
                 Some(PageType::Leaf) => break,
                 Some(PageType::Branch) => {
@@ -132,7 +136,9 @@ impl Cursor {
 
         // Walk to the rightmost leaf
         loop {
-            let page = pages.get_page(&current).ok_or(Error::PageOutOfBounds(current))?;
+            let page = pages
+                .get_page(&current)
+                .ok_or(Error::PageOutOfBounds(current))?;
             match page.page_type() {
                 Some(PageType::Leaf) => break,
                 Some(PageType::Branch) => {
@@ -236,7 +242,9 @@ impl Cursor {
                 // Walk down to the leftmost leaf of this subtree
                 let mut current = next_child;
                 loop {
-                    let page = pages.get_page(&current).ok_or(Error::PageOutOfBounds(current))?;
+                    let page = pages
+                        .get_page(&current)
+                        .ok_or(Error::PageOutOfBounds(current))?;
                     match page.page_type() {
                         Some(PageType::Leaf) => {
                             self.leaf = current;
@@ -277,7 +285,9 @@ impl Cursor {
                 // Walk down to the rightmost leaf of this subtree
                 let mut current = prev_child;
                 loop {
-                    let page = pages.get_page(&current).ok_or(Error::PageOutOfBounds(current))?;
+                    let page = pages
+                        .get_page(&current)
+                        .ok_or(Error::PageOutOfBounds(current))?;
                     match page.page_type() {
                         Some(PageType::Leaf) => {
                             self.leaf = current;

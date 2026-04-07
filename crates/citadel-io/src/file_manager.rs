@@ -56,8 +56,7 @@ impl CommitSlot {
             .copy_from_slice(&self.merkle_root);
 
         let n = self.named_table_entries.len().min(SLOT_NAMED_MAX_ENTRIES);
-        buf[SLOT_NAMED_ENTRIES..SLOT_NAMED_ENTRIES + 2]
-            .copy_from_slice(&(n as u16).to_le_bytes());
+        buf[SLOT_NAMED_ENTRIES..SLOT_NAMED_ENTRIES + 2].copy_from_slice(&(n as u16).to_le_bytes());
         for (i, &(hash, count)) in self.named_table_entries.iter().take(n).enumerate() {
             let off = SLOT_NAMED_ENTRIES + 2 + i * SLOT_NAMED_ENTRY_SIZE;
             buf[off..off + 4].copy_from_slice(&hash.to_le_bytes());
@@ -127,8 +126,7 @@ impl CommitSlot {
                 for i in 0..n {
                     let off = SLOT_NAMED_ENTRIES + 2 + i * SLOT_NAMED_ENTRY_SIZE;
                     let hash = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-                    let count =
-                        u64::from_le_bytes(buf[off + 4..off + 12].try_into().unwrap());
+                    let count = u64::from_le_bytes(buf[off + 4..off + 12].try_into().unwrap());
                     entries.push((hash, count));
                 }
                 entries

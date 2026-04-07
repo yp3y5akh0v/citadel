@@ -61,8 +61,11 @@ fn repeated_parameterized_insert() {
 
     let sql = "INSERT INTO t (id, val) VALUES ($1, $2)";
     for i in 1..=200 {
-        conn.execute_params(sql, &[Value::Integer(i), Value::Text(format!("v{i}").into())])
-            .unwrap();
+        conn.execute_params(
+            sql,
+            &[Value::Integer(i), Value::Text(format!("v{i}").into())],
+        )
+        .unwrap();
     }
 
     let qr = query_result(conn.execute("SELECT COUNT(*) FROM t").unwrap());

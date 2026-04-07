@@ -197,7 +197,6 @@ mod tests {
         let mut encrypted = [0u8; PAGE_SIZE];
         encrypt_page(&dek, &mac_key, page_id, epoch, &body, &mut encrypted);
 
-
         encrypted[IV_SIZE + 100] ^= 0x01;
 
         let mut decrypted = [0u8; BODY_SIZE];
@@ -214,7 +213,6 @@ mod tests {
 
         let mut encrypted = [0u8; PAGE_SIZE];
         encrypt_page(&dek, &mac_key, page_id, epoch, &body, &mut encrypted);
-
 
         encrypted[0] ^= 0x01;
 
@@ -233,7 +231,6 @@ mod tests {
         let mut encrypted = [0u8; PAGE_SIZE];
         encrypt_page(&dek, &mac_key, page_id, epoch, &body, &mut encrypted);
 
-
         encrypted[PAGE_SIZE - 1] ^= 0x01;
 
         let mut decrypted = [0u8; BODY_SIZE];
@@ -250,7 +247,6 @@ mod tests {
         let mut encrypted = [0u8; PAGE_SIZE];
         encrypt_page(&dek, &mac_key, PageId(1), epoch, &body, &mut encrypted);
 
-
         let mut decrypted = [0u8; BODY_SIZE];
         let result = decrypt_page(&dek, &mac_key, PageId(2), epoch, &encrypted, &mut decrypted);
         assert!(matches!(result, Err(citadel_core::Error::PageTampered(_))));
@@ -264,7 +260,6 @@ mod tests {
 
         let mut encrypted = [0u8; PAGE_SIZE];
         encrypt_page(&dek, &mac_key, page_id, 1, &body, &mut encrypted);
-
 
         let mut decrypted = [0u8; BODY_SIZE];
         let result = decrypt_page(&dek, &mac_key, page_id, 2, &encrypted, &mut decrypted);
@@ -322,7 +317,6 @@ mod tests {
         let mut enc2 = [0u8; PAGE_SIZE];
         encrypt_page(&dek, &mac_key, page_id, epoch, &body, &mut enc1);
         encrypt_page(&dek, &mac_key, page_id, epoch, &body, &mut enc2);
-
 
         assert_ne!(&enc1[..IV_SIZE], &enc2[..IV_SIZE]);
 

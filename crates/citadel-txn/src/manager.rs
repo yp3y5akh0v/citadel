@@ -103,7 +103,16 @@ impl TxnManager {
         dek_id: [u8; 32],
         cache_size: usize,
     ) -> Result<Self> {
-        Self::create_with_sync(io, dek, mac_key, epoch, file_id, dek_id, cache_size, Default::default())
+        Self::create_with_sync(
+            io,
+            dek,
+            mac_key,
+            epoch,
+            file_id,
+            dek_id,
+            cache_size,
+            Default::default(),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -302,20 +311,14 @@ impl TxnManager {
             };
 
         let merkle_root_hash = if self.sync_mode != citadel_core::types::SyncMode::Off {
-            let hash =
-                crate::merkle::compute_tree_merkle(pages, tree.root, txn_id, &|page_id| {
-                    self.fetch_merkle_hash(page_id)
-                })?;
+            let hash = crate::merkle::compute_tree_merkle(pages, tree.root, txn_id, &|page_id| {
+                self.fetch_merkle_hash(page_id)
+            })?;
 
             let read_hash = &|page_id| self.fetch_merkle_hash(page_id);
             for named_tree in named_trees.values() {
                 if named_tree.root != PageId::INVALID {
-                    crate::merkle::compute_tree_merkle(
-                        pages,
-                        named_tree.root,
-                        txn_id,
-                        read_hash,
-                    )?;
+                    crate::merkle::compute_tree_merkle(pages, named_tree.root, txn_id, read_hash)?;
                 }
             }
 
@@ -387,12 +390,7 @@ impl TxnManager {
 
         let named_table_entries: Vec<(u32, u64)> = named_trees
             .iter()
-            .map(|(name, tree)| {
-                (
-                    file_manager::table_name_hash(name),
-                    tree.entry_count,
-                )
-            })
+            .map(|(name, tree)| (file_manager::table_name_hash(name), tree.entry_count))
             .collect();
 
         let new_slot = CommitSlot {

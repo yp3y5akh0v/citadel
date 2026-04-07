@@ -1076,7 +1076,9 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
                     column: parts[1].value.to_ascii_lowercase(),
                 })
             } else {
-                Ok(Expr::Column(parts.last().unwrap().value.to_ascii_lowercase()))
+                Ok(Expr::Column(
+                    parts.last().unwrap().value.to_ascii_lowercase(),
+                ))
             }
         }
         sp::Expr::BinaryOp { left, op, right } => {
