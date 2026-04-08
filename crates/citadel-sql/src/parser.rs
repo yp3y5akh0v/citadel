@@ -31,6 +31,23 @@ pub struct CreateTableStmt {
     pub columns: Vec<ColumnSpec>,
     pub primary_key: Vec<String>,
     pub if_not_exists: bool,
+    pub check_constraints: Vec<TableCheckConstraint>,
+    pub foreign_keys: Vec<ForeignKeyDef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TableCheckConstraint {
+    pub name: Option<String>,
+    pub expr: Expr,
+    pub sql: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForeignKeyDef {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+    pub foreign_table: String,
+    pub referred_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +56,11 @@ pub struct ColumnSpec {
     pub data_type: DataType,
     pub nullable: bool,
     pub is_primary_key: bool,
+    pub default_expr: Option<Expr>,
+    pub default_sql: Option<String>,
+    pub check_expr: Option<Expr>,
+    pub check_sql: Option<String>,
+    pub check_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +245,59 @@ pub enum BinOp {
 pub enum UnaryOp {
     Neg,
     Not,
+}
+
+// ── Expression utilities ────────────────────────────────────────────
+
+pub fn has_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => true,
+        Expr::BinaryOp { left, right, .. } => has_subquery(left) || has_subquery(right),
+        Expr::UnaryOp { expr, .. } => has_subquery(expr),
+        Expr::IsNull(e) | Expr::IsNotNull(e) => has_subquery(e),
+        Expr::InList { expr, list, .. } => has_subquery(expr) || list.iter().any(has_subquery),
+        Expr::InSet { expr, .. } => has_subquery(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => has_subquery(expr) || has_subquery(low) || has_subquery(high),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            has_subquery(expr)
+                || has_subquery(pattern)
+                || escape.as_ref().is_some_and(|e| has_subquery(e))
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand.as_ref().is_some_and(|e| has_subquery(e))
+                || conditions
+                    .iter()
+                    .any(|(c, r)| has_subquery(c) || has_subquery(r))
+                || else_result.as_ref().is_some_and(|e| has_subquery(e))
+        }
+        Expr::Coalesce(args) | Expr::Function { args, .. } => args.iter().any(has_subquery),
+        Expr::Cast { expr, .. } => has_subquery(expr),
+        _ => false,
+    }
+}
+
+/// Parse a SQL expression string back into an internal Expr.
+/// Used for deserializing stored DEFAULT/CHECK expressions from schema.
+pub fn parse_sql_expr(sql: &str) -> Result<Expr> {
+    let dialect = GenericDialect {};
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(sql)
+        .map_err(|e| SqlError::Parse(e.to_string()))?;
+    let sp_expr = parser
+        .parse_expr()
+        .map_err(|e| SqlError::Parse(e.to_string()))?;
+    convert_expr(&sp_expr)
 }
 
 // ── Parser entry point ──────────────────────────────────────────────
@@ -727,12 +802,18 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
 
     let mut columns = Vec::new();
     let mut inline_pk: Vec<String> = Vec::new();
+    let mut foreign_keys: Vec<ForeignKeyDef> = Vec::new();
 
     for col_def in &ct.columns {
         let col_name = col_def.name.value.clone();
         let data_type = convert_data_type(&col_def.data_type)?;
         let mut nullable = true;
         let mut is_primary_key = false;
+        let mut default_expr = None;
+        let mut default_sql = None;
+        let mut check_expr = None;
+        let mut check_sql = None;
+        let mut check_name = None;
 
         for opt in &col_def.options {
             match &opt.option {
@@ -743,6 +824,34 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
                     nullable = false;
                     inline_pk.push(col_name.clone());
                 }
+                sp::ColumnOption::Default(expr) => {
+                    default_sql = Some(expr.to_string());
+                    default_expr = Some(convert_expr(expr)?);
+                }
+                sp::ColumnOption::Check(check) => {
+                    check_sql = Some(check.expr.to_string());
+                    let converted = convert_expr(&check.expr)?;
+                    if has_subquery(&converted) {
+                        return Err(SqlError::Unsupported("subquery in CHECK constraint".into()));
+                    }
+                    check_expr = Some(converted);
+                    check_name = check.name.as_ref().map(|n| n.value.clone());
+                }
+                sp::ColumnOption::ForeignKey(fk) => {
+                    convert_fk_actions(&fk.on_delete, &fk.on_update)?;
+                    let ftable = object_name_to_string(&fk.foreign_table).to_ascii_lowercase();
+                    let referred: Vec<String> = fk
+                        .referred_columns
+                        .iter()
+                        .map(|i| i.value.to_ascii_lowercase())
+                        .collect();
+                    foreign_keys.push(ForeignKeyDef {
+                        name: fk.name.as_ref().map(|n| n.value.clone()),
+                        columns: vec![col_name.to_ascii_lowercase()],
+                        foreign_table: ftable,
+                        referred_columns: referred,
+                    });
+                }
                 _ => {}
             }
         }
@@ -752,26 +861,67 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
             data_type,
             nullable,
             is_primary_key,
+            default_expr,
+            default_sql,
+            check_expr,
+            check_sql,
+            check_name,
         });
     }
 
-    // Check table-level constraints for PRIMARY KEY
+    // Check table-level constraints
+    let mut check_constraints: Vec<TableCheckConstraint> = Vec::new();
+
     for constraint in &ct.constraints {
-        if let sp::TableConstraint::PrimaryKey(pk_constraint) = constraint {
-            for idx_col in &pk_constraint.columns {
-                // IndexColumn has a `column: OrderByExpr` field; extract ident from the expr
-                let col_name = match &idx_col.column.expr {
-                    sp::Expr::Identifier(ident) => ident.value.clone(),
-                    _ => continue,
-                };
-                if !inline_pk.contains(&col_name) {
-                    inline_pk.push(col_name.clone());
-                }
-                if let Some(col) = columns.iter_mut().find(|c| c.name == col_name) {
-                    col.nullable = false;
-                    col.is_primary_key = true;
+        match constraint {
+            sp::TableConstraint::PrimaryKey(pk_constraint) => {
+                for idx_col in &pk_constraint.columns {
+                    let col_name = match &idx_col.column.expr {
+                        sp::Expr::Identifier(ident) => ident.value.clone(),
+                        _ => continue,
+                    };
+                    if !inline_pk.contains(&col_name) {
+                        inline_pk.push(col_name.clone());
+                    }
+                    if let Some(col) = columns.iter_mut().find(|c| c.name == col_name) {
+                        col.nullable = false;
+                        col.is_primary_key = true;
+                    }
                 }
             }
+            sp::TableConstraint::Check(check) => {
+                let sql = check.expr.to_string();
+                let converted = convert_expr(&check.expr)?;
+                if has_subquery(&converted) {
+                    return Err(SqlError::Unsupported("subquery in CHECK constraint".into()));
+                }
+                check_constraints.push(TableCheckConstraint {
+                    name: check.name.as_ref().map(|n| n.value.clone()),
+                    expr: converted,
+                    sql,
+                });
+            }
+            sp::TableConstraint::ForeignKey(fk) => {
+                convert_fk_actions(&fk.on_delete, &fk.on_update)?;
+                let cols: Vec<String> = fk
+                    .columns
+                    .iter()
+                    .map(|i| i.value.to_ascii_lowercase())
+                    .collect();
+                let ftable = object_name_to_string(&fk.foreign_table).to_ascii_lowercase();
+                let referred: Vec<String> = fk
+                    .referred_columns
+                    .iter()
+                    .map(|i| i.value.to_ascii_lowercase())
+                    .collect();
+                foreign_keys.push(ForeignKeyDef {
+                    name: fk.name.as_ref().map(|n| n.value.clone()),
+                    columns: cols,
+                    foreign_table: ftable,
+                    referred_columns: referred,
+                });
+            }
+            _ => {}
         }
     }
 
@@ -780,7 +930,28 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
         columns,
         primary_key: inline_pk,
         if_not_exists,
+        check_constraints,
+        foreign_keys,
     }))
+}
+
+fn convert_fk_actions(
+    on_delete: &Option<sp::ReferentialAction>,
+    on_update: &Option<sp::ReferentialAction>,
+) -> Result<()> {
+    for action in [on_delete, on_update] {
+        match action {
+            None
+            | Some(sp::ReferentialAction::Restrict)
+            | Some(sp::ReferentialAction::NoAction) => {}
+            Some(other) => {
+                return Err(SqlError::Unsupported(format!(
+                    "FOREIGN KEY action: {other}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {

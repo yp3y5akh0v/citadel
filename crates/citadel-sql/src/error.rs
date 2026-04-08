@@ -61,6 +61,12 @@ pub enum SqlError {
     #[error("unique constraint violated on index '{0}'")]
     UniqueViolation(String),
 
+    #[error("CHECK constraint failed: {0}")]
+    CheckViolation(String),
+
+    #[error("FOREIGN KEY constraint violated: {0}")]
+    ForeignKeyViolation(String),
+
     #[error("transaction already active")]
     TransactionAlreadyActive,
 

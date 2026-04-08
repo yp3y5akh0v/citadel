@@ -379,6 +379,106 @@ fn format_scan_line(
     }
 }
 
+// ── FK validation helper ────────────────────────────────────────────
+
+/// Validate FK references at DDL time: parent table must exist,
+/// referred columns must match PK or be covered by a UNIQUE index.
+fn validate_foreign_keys(
+    schema: &SchemaManager,
+    table_schema: &TableSchema,
+    foreign_keys: &[ForeignKeySchemaEntry],
+) -> Result<()> {
+    for fk in foreign_keys {
+        // Self-referencing FK: parent is the table being created
+        let parent = if fk.foreign_table == table_schema.name {
+            table_schema
+        } else {
+            schema.get(&fk.foreign_table).ok_or_else(|| {
+                SqlError::Unsupported(format!(
+                    "FOREIGN KEY references non-existent table '{}'",
+                    fk.foreign_table
+                ))
+            })?
+        };
+
+        // Collect referred column indices in parent
+        let ref_col_indices: Vec<u16> = fk
+            .referred_columns
+            .iter()
+            .map(|rc| {
+                parent
+                    .column_index(rc)
+                    .map(|i| i as u16)
+                    .ok_or_else(|| SqlError::ColumnNotFound(rc.clone()))
+            })
+            .collect::<Result<_>>()?;
+
+        if fk.columns.len() != ref_col_indices.len() {
+            return Err(SqlError::Unsupported(format!(
+                "FOREIGN KEY on '{}': column count mismatch",
+                table_schema.name
+            )));
+        }
+
+        // Check if referred columns are the PK
+        let is_pk = parent.primary_key_columns == ref_col_indices;
+
+        // Or covered by a UNIQUE index
+        let has_unique = !is_pk
+            && parent
+                .indices
+                .iter()
+                .any(|idx| idx.unique && idx.columns == ref_col_indices);
+
+        if !is_pk && !has_unique {
+            return Err(SqlError::Unsupported(format!(
+                "FOREIGN KEY on '{}': referred columns in '{}' are not PRIMARY KEY or UNIQUE",
+                table_schema.name, fk.foreign_table
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Create auto-index on child FK columns. Returns updated schema with new indices.
+fn create_fk_auto_indices(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    mut table_schema: TableSchema,
+) -> Result<TableSchema> {
+    let fks: Vec<(Vec<u16>, String)> = table_schema
+        .foreign_keys
+        .iter()
+        .enumerate()
+        .map(|(i, fk)| {
+            let name = fk
+                .name
+                .as_ref()
+                .map(|n| format!("__fk_{}_{}", table_schema.name, n))
+                .unwrap_or_else(|| format!("__fk_{}_{}", table_schema.name, i));
+            (fk.columns.clone(), name)
+        })
+        .collect();
+
+    for (cols, idx_name) in fks {
+        // Skip if an index already covers these columns
+        let already_covered = table_schema.indices.iter().any(|idx| idx.columns == cols);
+        if already_covered {
+            continue;
+        }
+
+        let idx_def = IndexDef {
+            name: idx_name.clone(),
+            columns: cols,
+            unique: false,
+        };
+        let idx_table = TableSchema::index_table_name(&table_schema.name, &idx_name);
+        wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
+        // Table is empty at CREATE TABLE time — no rows to populate
+        table_schema.indices.push(idx_def);
+    }
+    Ok(table_schema)
+}
+
 // ── DDL ─────────────────────────────────────────────────────────────
 
 fn exec_create_table(
@@ -416,6 +516,11 @@ fn exec_create_table(
             data_type: c.data_type,
             nullable: c.nullable,
             position: i as u16,
+            default_expr: c.default_expr.clone(),
+            default_sql: c.default_sql.clone(),
+            check_expr: c.check_expr.clone(),
+            check_sql: c.check_sql.clone(),
+            check_name: c.check_name.clone(),
         })
         .collect();
 
@@ -432,12 +537,65 @@ fn exec_create_table(
         })
         .collect::<Result<_>>()?;
 
-    let table_schema = TableSchema::new(lower_name.clone(), columns, primary_key_columns, vec![]);
+    let check_constraints: Vec<TableCheckDef> = stmt
+        .check_constraints
+        .iter()
+        .map(|tc| TableCheckDef {
+            name: tc.name.clone(),
+            expr: tc.expr.clone(),
+            sql: tc.sql.clone(),
+        })
+        .collect();
+
+    let foreign_keys: Vec<ForeignKeySchemaEntry> = stmt
+        .foreign_keys
+        .iter()
+        .map(|fk| {
+            let col_indices: Vec<u16> = fk
+                .columns
+                .iter()
+                .map(|cn| {
+                    let lower = cn.to_ascii_lowercase();
+                    columns
+                        .iter()
+                        .position(|c| c.name == lower)
+                        .map(|i| i as u16)
+                        .ok_or_else(|| SqlError::ColumnNotFound(cn.clone()))
+                })
+                .collect::<Result<_>>()?;
+            Ok(ForeignKeySchemaEntry {
+                name: fk.name.clone(),
+                columns: col_indices,
+                foreign_table: fk.foreign_table.to_ascii_lowercase(),
+                referred_columns: fk
+                    .referred_columns
+                    .iter()
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect(),
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    let table_schema = TableSchema::new(
+        lower_name.clone(),
+        columns,
+        primary_key_columns,
+        vec![],
+        check_constraints,
+        foreign_keys,
+    );
+
+    // Validate FK references at DDL time
+    validate_foreign_keys(schema, &table_schema, &table_schema.foreign_keys)?;
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     SchemaManager::ensure_schema_table(&mut wtx)?;
     wtx.create_table(lower_name.as_bytes())
         .map_err(SqlError::Storage)?;
+
+    // Auto-create FK indices on child columns
+    let table_schema = create_fk_auto_indices(&mut wtx, table_schema)?;
+
     SchemaManager::save_schema(&mut wtx, &table_schema)?;
     wtx.commit().map_err(SqlError::Storage)?;
 
@@ -457,6 +615,16 @@ fn exec_drop_table(
             return Ok(ExecutionResult::Ok);
         }
         return Err(SqlError::TableNotFound(stmt.name.clone()));
+    }
+
+    // FK guard: reject if another table's FK references this table
+    for (child_table, _fk) in schema.child_fks_for(&lower_name) {
+        if child_table != lower_name {
+            return Err(SqlError::ForeignKeyViolation(format!(
+                "cannot drop table '{}': referenced by foreign key in '{}'",
+                lower_name, child_table
+            )));
+        }
     }
 
     let table_schema = schema.get(&lower_name).unwrap();
@@ -514,6 +682,11 @@ fn exec_create_table_in_txn(
             data_type: c.data_type,
             nullable: c.nullable,
             position: i as u16,
+            default_expr: c.default_expr.clone(),
+            default_sql: c.default_sql.clone(),
+            check_expr: c.check_expr.clone(),
+            check_sql: c.check_sql.clone(),
+            check_name: c.check_name.clone(),
         })
         .collect();
 
@@ -530,11 +703,62 @@ fn exec_create_table_in_txn(
         })
         .collect::<Result<_>>()?;
 
-    let table_schema = TableSchema::new(lower_name.clone(), columns, primary_key_columns, vec![]);
+    let check_constraints: Vec<TableCheckDef> = stmt
+        .check_constraints
+        .iter()
+        .map(|tc| TableCheckDef {
+            name: tc.name.clone(),
+            expr: tc.expr.clone(),
+            sql: tc.sql.clone(),
+        })
+        .collect();
+
+    let foreign_keys: Vec<ForeignKeySchemaEntry> = stmt
+        .foreign_keys
+        .iter()
+        .map(|fk| {
+            let col_indices: Vec<u16> = fk
+                .columns
+                .iter()
+                .map(|cn| {
+                    let lower = cn.to_ascii_lowercase();
+                    columns
+                        .iter()
+                        .position(|c| c.name == lower)
+                        .map(|i| i as u16)
+                        .ok_or_else(|| SqlError::ColumnNotFound(cn.clone()))
+                })
+                .collect::<Result<_>>()?;
+            Ok(ForeignKeySchemaEntry {
+                name: fk.name.clone(),
+                columns: col_indices,
+                foreign_table: fk.foreign_table.to_ascii_lowercase(),
+                referred_columns: fk
+                    .referred_columns
+                    .iter()
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect(),
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    let table_schema = TableSchema::new(
+        lower_name.clone(),
+        columns,
+        primary_key_columns,
+        vec![],
+        check_constraints,
+        foreign_keys,
+    );
+
+    validate_foreign_keys(schema, &table_schema, &table_schema.foreign_keys)?;
 
     SchemaManager::ensure_schema_table(wtx)?;
     wtx.create_table(lower_name.as_bytes())
         .map_err(SqlError::Storage)?;
+
+    let table_schema = create_fk_auto_indices(wtx, table_schema)?;
+
     SchemaManager::save_schema(wtx, &table_schema)?;
 
     schema.register(table_schema);
@@ -553,6 +777,16 @@ fn exec_drop_table_in_txn(
             return Ok(ExecutionResult::Ok);
         }
         return Err(SqlError::TableNotFound(stmt.name.clone()));
+    }
+
+    // FK guard
+    for (child_table, _fk) in schema.child_fks_for(&lower_name) {
+        if child_table != lower_name {
+            return Err(SqlError::ForeignKeyViolation(format!(
+                "cannot drop table '{}': referenced by foreign key in '{}'",
+                lower_name, child_table
+            )));
+        }
     }
 
     let table_schema = schema.get(&lower_name).unwrap();
@@ -1532,6 +1766,22 @@ fn exec_insert(
         })
         .collect::<Result<_>>()?;
 
+    // Pre-compute defaults: (column_position, default_expr) for columns NOT in insert list
+    let defaults: Vec<(usize, &Expr)> = table_schema
+        .columns
+        .iter()
+        .filter(|c| c.default_expr.is_some() && !col_indices.contains(&(c.position as usize)))
+        .map(|c| (c.position as usize, c.default_expr.as_ref().unwrap()))
+        .collect();
+
+    // Pre-build ColumnMap for CHECK evaluation
+    let has_checks = table_schema.has_checks();
+    let check_col_map = if has_checks {
+        Some(ColumnMap::new(&table_schema.columns))
+    } else {
+        None
+    };
+
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     let mut count: u64 = 0;
 
@@ -1542,6 +1792,7 @@ fn exec_insert(
     let mut value_values: Vec<Value> = vec![Value::Null; non_pk.len()];
     let mut key_buf: Vec<u8> = Vec::with_capacity(64);
     let mut value_buf: Vec<u8> = Vec::with_capacity(256);
+    let mut fk_key_buf: Vec<u8> = Vec::with_capacity(64);
 
     for value_row in &stmt.values {
         if value_row.len() != insert_columns.len() {
@@ -1580,9 +1831,68 @@ fn exec_insert(
             };
         }
 
+        // Apply DEFAULT for omitted columns
+        for &(pos, def_expr) in &defaults {
+            let val = eval_const_expr(def_expr)?;
+            let col = &table_schema.columns[pos];
+            if val.is_null() {
+                // row[pos] already Null from init
+            } else {
+                let got_type = val.data_type();
+                row[pos] =
+                    val.coerce_into(col.data_type)
+                        .ok_or_else(|| SqlError::TypeMismatch {
+                            expected: col.data_type.to_string(),
+                            got: got_type.to_string(),
+                        })?;
+            }
+        }
+
         for col in &table_schema.columns {
             if !col.nullable && row[col.position as usize].is_null() {
                 return Err(SqlError::NotNullViolation(col.name.clone()));
+            }
+        }
+
+        // CHECK constraints
+        if let Some(ref col_map) = check_col_map {
+            for col in &table_schema.columns {
+                if let Some(ref check) = col.check_expr {
+                    let result = eval_expr(check, col_map, &row)?;
+                    if !is_truthy(&result) && !result.is_null() {
+                        let name = col.check_name.as_deref().unwrap_or(&col.name);
+                        return Err(SqlError::CheckViolation(name.to_string()));
+                    }
+                }
+            }
+            for tc in &table_schema.check_constraints {
+                let result = eval_expr(&tc.expr, col_map, &row)?;
+                if !is_truthy(&result) && !result.is_null() {
+                    let name = tc.name.as_deref().unwrap_or(&tc.sql);
+                    return Err(SqlError::CheckViolation(name.to_string()));
+                }
+            }
+        }
+
+        // FK child-side validation
+        for fk in &table_schema.foreign_keys {
+            let any_null = fk.columns.iter().any(|&ci| row[ci as usize].is_null());
+            if any_null {
+                continue; // MATCH SIMPLE: skip if any FK col is NULL
+            }
+            let fk_vals: Vec<Value> = fk
+                .columns
+                .iter()
+                .map(|&ci| row[ci as usize].clone())
+                .collect();
+            fk_key_buf.clear();
+            encode_composite_key_into(&fk_vals, &mut fk_key_buf);
+            let found = wtx
+                .table_get(fk.foreign_table.as_bytes(), &fk_key_buf)
+                .map_err(SqlError::Storage)?;
+            if found.is_none() {
+                let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
+                return Err(SqlError::ForeignKeyViolation(name.to_string()));
             }
         }
 
@@ -1633,42 +1943,7 @@ fn exec_insert(
 }
 
 fn has_subquery(expr: &Expr) -> bool {
-    match expr {
-        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => true,
-        Expr::BinaryOp { left, right, .. } => has_subquery(left) || has_subquery(right),
-        Expr::UnaryOp { expr, .. } => has_subquery(expr),
-        Expr::IsNull(e) | Expr::IsNotNull(e) => has_subquery(e),
-        Expr::InList { expr, list, .. } => has_subquery(expr) || list.iter().any(has_subquery),
-        Expr::InSet { expr, .. } => has_subquery(expr),
-        Expr::Between {
-            expr, low, high, ..
-        } => has_subquery(expr) || has_subquery(low) || has_subquery(high),
-        Expr::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            has_subquery(expr)
-                || has_subquery(pattern)
-                || escape.as_ref().is_some_and(|e| has_subquery(e))
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-        } => {
-            operand.as_ref().is_some_and(|e| has_subquery(e))
-                || conditions
-                    .iter()
-                    .any(|(c, r)| has_subquery(c) || has_subquery(r))
-                || else_result.as_ref().is_some_and(|e| has_subquery(e))
-        }
-        Expr::Coalesce(args) => args.iter().any(has_subquery),
-        Expr::Cast { expr, .. } => has_subquery(expr),
-        Expr::Function { args, .. } => args.iter().any(has_subquery),
-        _ => false,
-    }
+    crate::parser::has_subquery(expr)
 }
 
 fn stmt_has_subquery(stmt: &SelectStmt) -> bool {
@@ -3483,6 +3758,11 @@ fn build_joined_columns(tables: &[(String, &TableSchema)]) -> Vec<ColumnDef> {
                 data_type: col.data_type,
                 nullable: col.nullable,
                 position: pos,
+                default_expr: None,
+                default_sql: None,
+                check_expr: None,
+                check_sql: None,
+                check_name: None,
             });
             pos += 1;
         }
@@ -3633,6 +3913,11 @@ fn build_projected_columns(full_cols: &[ColumnDef], needed_combined: &[usize]) -
                 data_type: orig.data_type,
                 nullable: orig.nullable,
                 position: new_pos as u16,
+                default_expr: None,
+                default_sql: None,
+                check_expr: None,
+                check_sql: None,
+                check_name: None,
             }
         })
         .collect()
@@ -4536,6 +4821,26 @@ fn exec_update(
             new_row[col_idx] = coerced;
         }
 
+        // CHECK constraints on new_row
+        if table_schema.has_checks() {
+            for col in &table_schema.columns {
+                if let Some(ref check) = col.check_expr {
+                    let result = eval_expr(check, &col_map, &new_row)?;
+                    if !is_truthy(&result) && !result.is_null() {
+                        let name = col.check_name.as_deref().unwrap_or(&col.name);
+                        return Err(SqlError::CheckViolation(name.to_string()));
+                    }
+                }
+            }
+            for tc in &table_schema.check_constraints {
+                let result = eval_expr(&tc.expr, &col_map, &new_row)?;
+                if !is_truthy(&result) && !result.is_null() {
+                    let name = tc.name.as_deref().unwrap_or(&tc.sql);
+                    return Err(SqlError::CheckViolation(name.to_string()));
+                }
+            }
+        }
+
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| new_row[i].clone()).collect();
         let new_key = encode_composite_key(&pk_values);
 
@@ -4564,6 +4869,79 @@ fn exec_update(
     }
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+
+    // FK child-side: validate new FK values exist in parent
+    if !table_schema.foreign_keys.is_empty() {
+        for c in &changes {
+            for fk in &table_schema.foreign_keys {
+                let fk_changed = fk
+                    .columns
+                    .iter()
+                    .any(|&ci| c.old_row[ci as usize] != c.new_row[ci as usize]);
+                if !fk_changed {
+                    continue;
+                }
+                let any_null = fk
+                    .columns
+                    .iter()
+                    .any(|&ci| c.new_row[ci as usize].is_null());
+                if any_null {
+                    continue;
+                }
+                let fk_vals: Vec<Value> = fk
+                    .columns
+                    .iter()
+                    .map(|&ci| c.new_row[ci as usize].clone())
+                    .collect();
+                let fk_key = encode_composite_key(&fk_vals);
+                let found = wtx
+                    .table_get(fk.foreign_table.as_bytes(), &fk_key)
+                    .map_err(SqlError::Storage)?;
+                if found.is_none() {
+                    let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
+                    return Err(SqlError::ForeignKeyViolation(name.to_string()));
+                }
+            }
+        }
+    }
+
+    // FK parent-side: if PK changed, check no child references old PK
+    let child_fks = schema.child_fks_for(&lower_name);
+    if !child_fks.is_empty() {
+        for c in &changes {
+            if !c.pk_changed {
+                continue;
+            }
+            let old_pk: Vec<Value> = pk_indices.iter().map(|&i| c.old_row[i].clone()).collect();
+            let old_pk_key = encode_composite_key(&old_pk);
+            for &(child_table, fk) in &child_fks {
+                let child_schema = schema.get(child_table).unwrap();
+                let fk_idx = child_schema
+                    .indices
+                    .iter()
+                    .find(|idx| idx.columns == fk.columns);
+                if let Some(idx) = fk_idx {
+                    let idx_table = TableSchema::index_table_name(child_table, &idx.name);
+                    let mut has_child = false;
+                    wtx.table_scan_from(&idx_table, &old_pk_key, |key, _| {
+                        if key.starts_with(&old_pk_key) {
+                            has_child = true;
+                            Ok(false) // stop scanning
+                        } else {
+                            Ok(false) // past prefix, stop
+                        }
+                    })
+                    .map_err(SqlError::Storage)?;
+                    if has_child {
+                        return Err(SqlError::ForeignKeyViolation(format!(
+                            "cannot update PK in '{}': referenced by '{}'",
+                            lower_name, child_table
+                        )));
+                    }
+                }
+            }
+        }
+    }
 
     for c in &changes {
         let old_pk: Vec<Value> = pk_indices.iter().map(|&i| c.old_row[i].clone()).collect();
@@ -4663,6 +5041,42 @@ fn exec_delete(
 
     let pk_indices = table_schema.pk_indices();
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+
+    // FK parent-side: check no child rows reference deleted PKs
+    let child_fks = schema.child_fks_for(&lower_name);
+    if !child_fks.is_empty() {
+        for (_key, row) in &rows_to_delete {
+            let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
+            let pk_key = encode_composite_key(&pk_values);
+            for &(child_table, fk) in &child_fks {
+                let child_schema = schema.get(child_table).unwrap();
+                let fk_idx = child_schema
+                    .indices
+                    .iter()
+                    .find(|idx| idx.columns == fk.columns);
+                if let Some(idx) = fk_idx {
+                    let idx_table = TableSchema::index_table_name(child_table, &idx.name);
+                    let mut has_child = false;
+                    wtx.table_scan_from(&idx_table, &pk_key, |key, _| {
+                        if key.starts_with(&pk_key) {
+                            has_child = true;
+                            Ok(false)
+                        } else {
+                            Ok(false)
+                        }
+                    })
+                    .map_err(SqlError::Storage)?;
+                    if has_child {
+                        return Err(SqlError::ForeignKeyViolation(format!(
+                            "cannot delete from '{}': referenced by '{}'",
+                            lower_name, child_table
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
     for (key, row) in &rows_to_delete {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
         delete_index_entries(&mut wtx, table_schema, row, &pk_values)?;
@@ -4682,6 +5096,7 @@ pub struct InsertBufs {
     key_buf: Vec<u8>,
     value_buf: Vec<u8>,
     col_indices: Vec<usize>,
+    fk_key_buf: Vec<u8>,
 }
 
 impl InsertBufs {
@@ -4693,6 +5108,7 @@ impl InsertBufs {
             key_buf: Vec::with_capacity(64),
             value_buf: Vec::with_capacity(256),
             col_indices: Vec::new(),
+            fk_key_buf: Vec::with_capacity(64),
         }
     }
 }
@@ -4736,6 +5152,21 @@ pub fn exec_insert_in_txn(
                 .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))?,
         );
     }
+
+    // Pre-compute defaults
+    let defaults: Vec<(usize, &Expr)> = table_schema
+        .columns
+        .iter()
+        .filter(|c| c.default_expr.is_some() && !bufs.col_indices.contains(&(c.position as usize)))
+        .map(|c| (c.position as usize, c.default_expr.as_ref().unwrap()))
+        .collect();
+
+    let has_checks = table_schema.has_checks();
+    let check_col_map = if has_checks {
+        Some(ColumnMap::new(&table_schema.columns))
+    } else {
+        None
+    };
 
     let pk_indices = table_schema.pk_indices();
     let non_pk = table_schema.non_pk_indices();
@@ -4783,9 +5214,68 @@ pub fn exec_insert_in_txn(
             };
         }
 
+        // Apply DEFAULT for omitted columns
+        for &(pos, def_expr) in &defaults {
+            let val = eval_const_expr(def_expr)?;
+            let col = &table_schema.columns[pos];
+            if val.is_null() {
+                // bufs.row[pos] already Null from init
+            } else {
+                let got_type = val.data_type();
+                bufs.row[pos] =
+                    val.coerce_into(col.data_type)
+                        .ok_or_else(|| SqlError::TypeMismatch {
+                            expected: col.data_type.to_string(),
+                            got: got_type.to_string(),
+                        })?;
+            }
+        }
+
         for col in &table_schema.columns {
             if !col.nullable && bufs.row[col.position as usize].is_null() {
                 return Err(SqlError::NotNullViolation(col.name.clone()));
+            }
+        }
+
+        // CHECK constraints
+        if let Some(ref col_map) = check_col_map {
+            for col in &table_schema.columns {
+                if let Some(ref check) = col.check_expr {
+                    let result = eval_expr(check, col_map, &bufs.row)?;
+                    if !is_truthy(&result) && !result.is_null() {
+                        let name = col.check_name.as_deref().unwrap_or(&col.name);
+                        return Err(SqlError::CheckViolation(name.to_string()));
+                    }
+                }
+            }
+            for tc in &table_schema.check_constraints {
+                let result = eval_expr(&tc.expr, col_map, &bufs.row)?;
+                if !is_truthy(&result) && !result.is_null() {
+                    let name = tc.name.as_deref().unwrap_or(&tc.sql);
+                    return Err(SqlError::CheckViolation(name.to_string()));
+                }
+            }
+        }
+
+        // FK child-side validation
+        for fk in &table_schema.foreign_keys {
+            let any_null = fk.columns.iter().any(|&ci| bufs.row[ci as usize].is_null());
+            if any_null {
+                continue;
+            }
+            let fk_vals: Vec<Value> = fk
+                .columns
+                .iter()
+                .map(|&ci| bufs.row[ci as usize].clone())
+                .collect();
+            bufs.fk_key_buf.clear();
+            encode_composite_key_into(&fk_vals, &mut bufs.fk_key_buf);
+            let found = wtx
+                .table_get(fk.foreign_table.as_bytes(), &bufs.fk_key_buf)
+                .map_err(SqlError::Storage)?;
+            if found.is_none() {
+                let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
+                return Err(SqlError::ForeignKeyViolation(name.to_string()));
             }
         }
 
@@ -5001,6 +5491,26 @@ fn exec_update_in_txn(
             new_row[col_idx] = coerced;
         }
 
+        // CHECK constraints on new_row
+        if table_schema.has_checks() {
+            for col in &table_schema.columns {
+                if let Some(ref check) = col.check_expr {
+                    let result = eval_expr(check, &col_map, &new_row)?;
+                    if !is_truthy(&result) && !result.is_null() {
+                        let name = col.check_name.as_deref().unwrap_or(&col.name);
+                        return Err(SqlError::CheckViolation(name.to_string()));
+                    }
+                }
+            }
+            for tc in &table_schema.check_constraints {
+                let result = eval_expr(&tc.expr, &col_map, &new_row)?;
+                if !is_truthy(&result) && !result.is_null() {
+                    let name = tc.name.as_deref().unwrap_or(&tc.sql);
+                    return Err(SqlError::CheckViolation(name.to_string()));
+                }
+            }
+        }
+
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| new_row[i].clone()).collect();
         let new_key = encode_composite_key(&pk_values);
 
@@ -5024,6 +5534,79 @@ fn exec_update_in_txn(
         for c in &changes {
             if c.pk_changed && c.new_key != c.old_key && !new_keys.insert(c.new_key.clone()) {
                 return Err(SqlError::DuplicateKey);
+            }
+        }
+    }
+
+    // FK child-side: validate new FK values exist in parent
+    if !table_schema.foreign_keys.is_empty() {
+        for c in &changes {
+            for fk in &table_schema.foreign_keys {
+                let fk_changed = fk
+                    .columns
+                    .iter()
+                    .any(|&ci| c.old_row[ci as usize] != c.new_row[ci as usize]);
+                if !fk_changed {
+                    continue;
+                }
+                let any_null = fk
+                    .columns
+                    .iter()
+                    .any(|&ci| c.new_row[ci as usize].is_null());
+                if any_null {
+                    continue;
+                }
+                let fk_vals: Vec<Value> = fk
+                    .columns
+                    .iter()
+                    .map(|&ci| c.new_row[ci as usize].clone())
+                    .collect();
+                let fk_key = encode_composite_key(&fk_vals);
+                let found = wtx
+                    .table_get(fk.foreign_table.as_bytes(), &fk_key)
+                    .map_err(SqlError::Storage)?;
+                if found.is_none() {
+                    let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
+                    return Err(SqlError::ForeignKeyViolation(name.to_string()));
+                }
+            }
+        }
+    }
+
+    // FK parent-side: if PK changed, check no child references old PK
+    let child_fks = schema.child_fks_for(&lower_name);
+    if !child_fks.is_empty() {
+        for c in &changes {
+            if !c.pk_changed {
+                continue;
+            }
+            let old_pk: Vec<Value> = pk_indices.iter().map(|&i| c.old_row[i].clone()).collect();
+            let old_pk_key = encode_composite_key(&old_pk);
+            for &(child_table, fk) in &child_fks {
+                let child_schema = schema.get(child_table).unwrap();
+                let fk_idx = child_schema
+                    .indices
+                    .iter()
+                    .find(|idx| idx.columns == fk.columns);
+                if let Some(idx) = fk_idx {
+                    let idx_table = TableSchema::index_table_name(child_table, &idx.name);
+                    let mut has_child = false;
+                    wtx.table_scan_from(&idx_table, &old_pk_key, |key, _| {
+                        if key.starts_with(&old_pk_key) {
+                            has_child = true;
+                            Ok(false)
+                        } else {
+                            Ok(false)
+                        }
+                    })
+                    .map_err(SqlError::Storage)?;
+                    if has_child {
+                        return Err(SqlError::ForeignKeyViolation(format!(
+                            "cannot update PK in '{}': referenced by '{}'",
+                            lower_name, child_table
+                        )));
+                    }
+                }
             }
         }
     }
@@ -5124,6 +5707,42 @@ fn exec_delete_in_txn(
     }
 
     let pk_indices = table_schema.pk_indices();
+
+    // FK parent-side: check no child rows reference deleted PKs
+    let child_fks = schema.child_fks_for(&lower_name);
+    if !child_fks.is_empty() {
+        for (_key, row) in &rows_to_delete {
+            let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
+            let pk_key = encode_composite_key(&pk_values);
+            for &(child_table, fk) in &child_fks {
+                let child_schema = schema.get(child_table).unwrap();
+                let fk_idx = child_schema
+                    .indices
+                    .iter()
+                    .find(|idx| idx.columns == fk.columns);
+                if let Some(idx) = fk_idx {
+                    let idx_table = TableSchema::index_table_name(child_table, &idx.name);
+                    let mut has_child = false;
+                    wtx.table_scan_from(&idx_table, &pk_key, |key, _| {
+                        if key.starts_with(&pk_key) {
+                            has_child = true;
+                            Ok(false)
+                        } else {
+                            Ok(false)
+                        }
+                    })
+                    .map_err(SqlError::Storage)?;
+                    if has_child {
+                        return Err(SqlError::ForeignKeyViolation(format!(
+                            "cannot delete from '{}': referenced by '{}'",
+                            lower_name, child_table
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
     for (key, row) in &rows_to_delete {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
         delete_index_entries(wtx, table_schema, row, &pk_values)?;
@@ -6025,6 +6644,11 @@ fn build_output_columns(select_cols: &[SelectColumn], columns: &[ColumnDef]) -> 
             data_type,
             nullable: true,
             position: i as u16,
+            default_expr: None,
+            default_sql: None,
+            check_expr: None,
+            check_sql: None,
+            check_name: None,
         });
     }
     out

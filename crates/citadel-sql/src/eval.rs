@@ -1145,32 +1145,26 @@ mod tests {
     use super::*;
     use crate::types::DataType;
 
+    fn col(name: &str, dt: DataType, nullable: bool, pos: u16) -> ColumnDef {
+        ColumnDef {
+            name: name.into(),
+            data_type: dt,
+            nullable,
+            position: pos,
+            default_expr: None,
+            default_sql: None,
+            check_expr: None,
+            check_sql: None,
+            check_name: None,
+        }
+    }
+
     fn test_columns() -> Vec<ColumnDef> {
         vec![
-            ColumnDef {
-                name: "id".into(),
-                data_type: DataType::Integer,
-                nullable: false,
-                position: 0,
-            },
-            ColumnDef {
-                name: "name".into(),
-                data_type: DataType::Text,
-                nullable: true,
-                position: 1,
-            },
-            ColumnDef {
-                name: "score".into(),
-                data_type: DataType::Real,
-                nullable: true,
-                position: 2,
-            },
-            ColumnDef {
-                name: "active".into(),
-                data_type: DataType::Boolean,
-                nullable: false,
-                position: 3,
-            },
+            col("id", DataType::Integer, false, 0),
+            col("name", DataType::Text, true, 1),
+            col("score", DataType::Real, true, 2),
+            col("active", DataType::Boolean, false, 3),
         ]
     }
 

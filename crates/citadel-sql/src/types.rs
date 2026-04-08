@@ -4,6 +4,8 @@ use std::hash::{Hash, Hasher};
 
 pub use compact_str::CompactString;
 
+use crate::parser::Expr;
+
 /// SQL data types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
@@ -243,6 +245,11 @@ pub struct ColumnDef {
     pub data_type: DataType,
     pub nullable: bool,
     pub position: u16,
+    pub default_expr: Option<Expr>,
+    pub default_sql: Option<String>,
+    pub check_expr: Option<Expr>,
+    pub check_sql: Option<String>,
+    pub check_name: Option<String>,
 }
 
 /// Index definition stored as part of the table schema.
@@ -253,6 +260,23 @@ pub struct IndexDef {
     pub unique: bool,
 }
 
+/// Table-level CHECK constraint stored in schema.
+#[derive(Debug, Clone)]
+pub struct TableCheckDef {
+    pub name: Option<String>,
+    pub expr: Expr,
+    pub sql: String,
+}
+
+/// Foreign key definition stored in schema.
+#[derive(Debug, Clone)]
+pub struct ForeignKeySchemaEntry {
+    pub name: Option<String>,
+    pub columns: Vec<u16>,
+    pub foreign_table: String,
+    pub referred_columns: Vec<String>,
+}
+
 /// Table schema stored in the _schema table.
 #[derive(Debug, Clone)]
 pub struct TableSchema {
@@ -260,6 +284,8 @@ pub struct TableSchema {
     pub columns: Vec<ColumnDef>,
     pub primary_key_columns: Vec<u16>,
     pub indices: Vec<IndexDef>,
+    pub check_constraints: Vec<TableCheckDef>,
+    pub foreign_keys: Vec<ForeignKeySchemaEntry>,
     pk_idx_cache: Vec<usize>,
     non_pk_idx_cache: Vec<usize>,
 }
@@ -270,6 +296,8 @@ impl TableSchema {
         columns: Vec<ColumnDef>,
         primary_key_columns: Vec<u16>,
         indices: Vec<IndexDef>,
+        check_constraints: Vec<TableCheckDef>,
+        foreign_keys: Vec<ForeignKeySchemaEntry>,
     ) -> Self {
         let pk_idx_cache: Vec<usize> = primary_key_columns.iter().map(|&i| i as usize).collect();
         let non_pk_idx_cache: Vec<usize> = (0..columns.len())
@@ -280,13 +308,51 @@ impl TableSchema {
             columns,
             primary_key_columns,
             indices,
+            check_constraints,
+            foreign_keys,
             pk_idx_cache,
             non_pk_idx_cache,
         }
     }
+
+    /// Returns true if any column-level or table-level CHECK constraints exist.
+    pub fn has_checks(&self) -> bool {
+        !self.check_constraints.is_empty() || self.columns.iter().any(|c| c.check_expr.is_some())
+    }
 }
 
-const SCHEMA_VERSION: u8 = 2;
+const SCHEMA_VERSION: u8 = 3;
+
+fn write_opt_string(buf: &mut Vec<u8>, s: &Option<String>) {
+    match s {
+        Some(s) => {
+            let bytes = s.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        None => buf.extend_from_slice(&0u16.to_le_bytes()),
+    }
+}
+
+fn read_opt_string(data: &[u8], pos: &mut usize) -> Option<String> {
+    let len = u16::from_le_bytes([data[*pos], data[*pos + 1]]) as usize;
+    *pos += 2;
+    if len == 0 {
+        None
+    } else {
+        let s = String::from_utf8_lossy(&data[*pos..*pos + len]).into_owned();
+        *pos += len;
+        Some(s)
+    }
+}
+
+fn read_string(data: &[u8], pos: &mut usize) -> String {
+    let len = u16::from_le_bytes([data[*pos], data[*pos + 1]]) as usize;
+    *pos += 2;
+    let s = String::from_utf8_lossy(&data[*pos..*pos + len]).into_owned();
+    *pos += len;
+    s
+}
 
 impl TableSchema {
     pub fn serialize(&self) -> Vec<u8> {
@@ -301,7 +367,7 @@ impl TableSchema {
         // Column count
         buf.extend_from_slice(&(self.columns.len() as u16).to_le_bytes());
 
-        // Columns
+        // Columns (v1/v2 core fields)
         for col in &self.columns {
             let col_name = col.name.as_bytes();
             buf.extend_from_slice(&(col_name.len() as u16).to_le_bytes());
@@ -330,13 +396,64 @@ impl TableSchema {
             buf.push(if idx.unique { 1 } else { 0 });
         }
 
+        // ── v3: per-column defaults and checks ──
+        for col in &self.columns {
+            let mut flags: u8 = 0;
+            if col.default_sql.is_some() {
+                flags |= 1;
+            }
+            if col.check_sql.is_some() {
+                flags |= 2;
+            }
+            buf.push(flags);
+            if let Some(ref sql) = col.default_sql {
+                let bytes = sql.as_bytes();
+                buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            if let Some(ref sql) = col.check_sql {
+                let bytes = sql.as_bytes();
+                buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(bytes);
+                write_opt_string(&mut buf, &col.check_name);
+            }
+        }
+
+        // ── v3: table-level check constraints ──
+        buf.extend_from_slice(&(self.check_constraints.len() as u16).to_le_bytes());
+        for chk in &self.check_constraints {
+            write_opt_string(&mut buf, &chk.name);
+            let sql_bytes = chk.sql.as_bytes();
+            buf.extend_from_slice(&(sql_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(sql_bytes);
+        }
+
+        // ── v3: foreign keys ──
+        buf.extend_from_slice(&(self.foreign_keys.len() as u16).to_le_bytes());
+        for fk in &self.foreign_keys {
+            write_opt_string(&mut buf, &fk.name);
+            buf.extend_from_slice(&(fk.columns.len() as u16).to_le_bytes());
+            for &col_idx in &fk.columns {
+                buf.extend_from_slice(&col_idx.to_le_bytes());
+            }
+            let ft_bytes = fk.foreign_table.as_bytes();
+            buf.extend_from_slice(&(ft_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(ft_bytes);
+            buf.extend_from_slice(&(fk.referred_columns.len() as u16).to_le_bytes());
+            for rc in &fk.referred_columns {
+                let rc_bytes = rc.as_bytes();
+                buf.extend_from_slice(&(rc_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(rc_bytes);
+            }
+        }
+
         buf
     }
 
     pub fn deserialize(data: &[u8]) -> crate::error::Result<Self> {
         let mut pos = 0;
 
-        if data.is_empty() || (data[0] != SCHEMA_VERSION && data[0] != 1) {
+        if data.is_empty() || (data[0] != SCHEMA_VERSION && data[0] != 1 && data[0] != 2) {
             return Err(crate::error::SqlError::InvalidValue(
                 "invalid schema version".into(),
             ));
@@ -373,6 +490,11 @@ impl TableSchema {
                 data_type,
                 nullable,
                 position,
+                default_expr: None,
+                default_sql: None,
+                check_expr: None,
+                check_sql: None,
+                check_name: None,
             });
         }
 
@@ -385,6 +507,8 @@ impl TableSchema {
             pos += 2;
             primary_key_columns.push(pk_idx);
         }
+
+        // Indices (v2+)
         let indices = if version >= 2 && pos + 2 <= data.len() {
             let idx_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
@@ -414,9 +538,88 @@ impl TableSchema {
         } else {
             vec![]
         };
+
+        // v3: per-column defaults and checks
+        let mut check_constraints = Vec::new();
+        let mut foreign_keys = Vec::new();
+
+        if version >= 3 && pos < data.len() {
+            for col in &mut columns {
+                let flags = data[pos];
+                pos += 1;
+                if flags & 1 != 0 {
+                    let sql = read_string(data, &mut pos);
+                    col.default_expr = Some(crate::parser::parse_sql_expr(&sql).map_err(|_| {
+                        crate::error::SqlError::InvalidValue(format!(
+                            "cannot parse DEFAULT expression: {sql}"
+                        ))
+                    })?);
+                    col.default_sql = Some(sql);
+                }
+                if flags & 2 != 0 {
+                    let sql = read_string(data, &mut pos);
+                    col.check_expr = Some(crate::parser::parse_sql_expr(&sql).map_err(|_| {
+                        crate::error::SqlError::InvalidValue(format!(
+                            "cannot parse CHECK expression: {sql}"
+                        ))
+                    })?);
+                    col.check_sql = Some(sql);
+                    col.check_name = read_opt_string(data, &mut pos);
+                }
+            }
+
+            // Table-level check constraints
+            let chk_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            for _ in 0..chk_count {
+                let name = read_opt_string(data, &mut pos);
+                let sql = read_string(data, &mut pos);
+                let expr = crate::parser::parse_sql_expr(&sql).map_err(|_| {
+                    crate::error::SqlError::InvalidValue(format!(
+                        "cannot parse CHECK expression: {sql}"
+                    ))
+                })?;
+                check_constraints.push(TableCheckDef { name, expr, sql });
+            }
+
+            // Foreign keys
+            let fk_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            for _ in 0..fk_count {
+                let name = read_opt_string(data, &mut pos);
+                let col_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                pos += 2;
+                let mut cols = Vec::with_capacity(col_count);
+                for _ in 0..col_count {
+                    let col_idx = u16::from_le_bytes([data[pos], data[pos + 1]]);
+                    pos += 2;
+                    cols.push(col_idx);
+                }
+                let foreign_table = read_string(data, &mut pos);
+                let ref_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                pos += 2;
+                let mut referred_columns = Vec::with_capacity(ref_count);
+                for _ in 0..ref_count {
+                    referred_columns.push(read_string(data, &mut pos));
+                }
+                foreign_keys.push(ForeignKeySchemaEntry {
+                    name,
+                    columns: cols,
+                    foreign_table,
+                    referred_columns,
+                });
+            }
+        }
         let _ = pos;
 
-        Ok(Self::new(name, columns, primary_key_columns, indices))
+        Ok(Self::new(
+            name,
+            columns,
+            primary_key_columns,
+            indices,
+            check_constraints,
+            foreign_keys,
+        ))
     }
 
     /// Get column index by name (case-insensitive).
@@ -513,31 +716,32 @@ mod tests {
         assert_eq!(Value::Text("x".into()).coerce_to(DataType::Integer), None);
     }
 
+    fn col(name: &str, dt: DataType, nullable: bool, pos: u16) -> ColumnDef {
+        ColumnDef {
+            name: name.into(),
+            data_type: dt,
+            nullable,
+            position: pos,
+            default_expr: None,
+            default_sql: None,
+            check_expr: None,
+            check_sql: None,
+            check_name: None,
+        }
+    }
+
     #[test]
     fn schema_roundtrip() {
         let schema = TableSchema::new(
             "users".into(),
             vec![
-                ColumnDef {
-                    name: "id".into(),
-                    data_type: DataType::Integer,
-                    nullable: false,
-                    position: 0,
-                },
-                ColumnDef {
-                    name: "name".into(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    position: 1,
-                },
-                ColumnDef {
-                    name: "active".into(),
-                    data_type: DataType::Boolean,
-                    nullable: false,
-                    position: 2,
-                },
+                col("id", DataType::Integer, false, 0),
+                col("name", DataType::Text, true, 1),
+                col("active", DataType::Boolean, false, 2),
             ],
             vec![0],
+            vec![],
+            vec![],
             vec![],
         );
 
@@ -562,24 +766,9 @@ mod tests {
         let schema = TableSchema::new(
             "orders".into(),
             vec![
-                ColumnDef {
-                    name: "id".into(),
-                    data_type: DataType::Integer,
-                    nullable: false,
-                    position: 0,
-                },
-                ColumnDef {
-                    name: "customer".into(),
-                    data_type: DataType::Text,
-                    nullable: false,
-                    position: 1,
-                },
-                ColumnDef {
-                    name: "amount".into(),
-                    data_type: DataType::Real,
-                    nullable: true,
-                    position: 2,
-                },
+                col("id", DataType::Integer, false, 0),
+                col("customer", DataType::Text, false, 1),
+                col("amount", DataType::Real, true, 2),
             ],
             vec![0],
             vec![
@@ -594,6 +783,8 @@ mod tests {
                     unique: true,
                 },
             ],
+            vec![],
+            vec![],
         );
 
         let data = schema.serialize();
@@ -612,24 +803,130 @@ mod tests {
     fn schema_v1_backward_compat() {
         let old_schema = TableSchema::new(
             "test".into(),
-            vec![ColumnDef {
-                name: "id".into(),
-                data_type: DataType::Integer,
-                nullable: false,
-                position: 0,
-            }],
+            vec![col("id", DataType::Integer, false, 0)],
             vec![0],
+            vec![],
+            vec![],
             vec![],
         );
         let mut data = old_schema.serialize();
-        // Patch to v1 format: replace version byte and truncate index data
+        // Patch to v1 format: replace version byte and truncate everything after PK
         data[0] = 1;
-        // Remove the last 2 bytes (index count = 0)
-        data.truncate(data.len() - 2);
+        // v1 has no indices or v3 data — truncate after PK columns
+        // Header(1) + name_len(2) + "test"(4) + col_count(2) + col("id": name_len(2)+"id"(2)+type(1)+nullable(1)+position(2)) + pk_count(2) + pk(2)
+        let v1_len = 1 + 2 + 4 + 2 + (2 + 2 + 1 + 1 + 2) + 2 + 2;
+        data.truncate(v1_len);
 
         let restored = TableSchema::deserialize(&data).unwrap();
         assert_eq!(restored.name, "test");
         assert!(restored.indices.is_empty());
+        assert!(restored.check_constraints.is_empty());
+        assert!(restored.foreign_keys.is_empty());
+    }
+
+    #[test]
+    fn schema_v2_backward_compat() {
+        let schema = TableSchema::new(
+            "test".into(),
+            vec![col("id", DataType::Integer, false, 0)],
+            vec![0],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let mut data = schema.serialize();
+        // Patch version to 2 and truncate v3 data
+        data[0] = 2;
+        // v2 ends after indices section: find the v3 start and truncate
+        // Header(1) + name_len(2) + "test"(4) + col_count(2) + col(8) + pk_count(2) + pk(2) + idx_count(2)
+        let v2_len = 1 + 2 + 4 + 2 + 8 + 2 + 2 + 2;
+        data.truncate(v2_len);
+
+        let restored = TableSchema::deserialize(&data).unwrap();
+        assert_eq!(restored.name, "test");
+        assert!(restored.check_constraints.is_empty());
+        assert!(restored.foreign_keys.is_empty());
+        assert!(restored.columns[0].default_expr.is_none());
+        assert!(restored.columns[0].check_expr.is_none());
+    }
+
+    #[test]
+    fn schema_roundtrip_with_defaults_and_checks() {
+        use crate::parser::parse_sql_expr;
+
+        let mut columns = vec![
+            col("id", DataType::Integer, false, 0),
+            col("val", DataType::Integer, true, 1),
+            col("name", DataType::Text, true, 2),
+        ];
+        columns[1].default_sql = Some("42".into());
+        columns[1].default_expr = Some(parse_sql_expr("42").unwrap());
+        columns[2].check_sql = Some("LENGTH(name) > 0".into());
+        columns[2].check_expr = Some(parse_sql_expr("LENGTH(name) > 0").unwrap());
+        columns[2].check_name = Some("chk_name_len".into());
+
+        let schema = TableSchema::new(
+            "t".into(),
+            columns,
+            vec![0],
+            vec![],
+            vec![TableCheckDef {
+                name: Some("chk_val_pos".into()),
+                expr: parse_sql_expr("val > 0").unwrap(),
+                sql: "val > 0".into(),
+            }],
+            vec![],
+        );
+
+        let data = schema.serialize();
+        let restored = TableSchema::deserialize(&data).unwrap();
+
+        assert_eq!(restored.columns[1].default_sql.as_deref(), Some("42"));
+        assert!(restored.columns[1].default_expr.is_some());
+        assert_eq!(
+            restored.columns[2].check_sql.as_deref(),
+            Some("LENGTH(name) > 0")
+        );
+        assert!(restored.columns[2].check_expr.is_some());
+        assert_eq!(
+            restored.columns[2].check_name.as_deref(),
+            Some("chk_name_len")
+        );
+        assert_eq!(restored.check_constraints.len(), 1);
+        assert_eq!(
+            restored.check_constraints[0].name.as_deref(),
+            Some("chk_val_pos")
+        );
+        assert_eq!(restored.check_constraints[0].sql, "val > 0");
+    }
+
+    #[test]
+    fn schema_roundtrip_with_foreign_keys() {
+        let schema = TableSchema::new(
+            "orders".into(),
+            vec![
+                col("id", DataType::Integer, false, 0),
+                col("user_id", DataType::Integer, false, 1),
+            ],
+            vec![0],
+            vec![],
+            vec![],
+            vec![ForeignKeySchemaEntry {
+                name: Some("fk_user".into()),
+                columns: vec![1],
+                foreign_table: "users".into(),
+                referred_columns: vec!["id".into()],
+            }],
+        );
+
+        let data = schema.serialize();
+        let restored = TableSchema::deserialize(&data).unwrap();
+
+        assert_eq!(restored.foreign_keys.len(), 1);
+        assert_eq!(restored.foreign_keys[0].name.as_deref(), Some("fk_user"));
+        assert_eq!(restored.foreign_keys[0].columns, vec![1]);
+        assert_eq!(restored.foreign_keys[0].foreign_table, "users");
+        assert_eq!(restored.foreign_keys[0].referred_columns, vec!["id"]);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use citadel::Database;
 
 use crate::error::{Result, SqlError};
-use crate::types::TableSchema;
+use crate::types::{ForeignKeySchemaEntry, TableSchema};
 
 const SCHEMA_TABLE: &[u8] = b"_schema";
 
@@ -92,6 +92,25 @@ impl SchemaManager {
 
     pub fn table_names(&self) -> Vec<&str> {
         self.tables.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Returns all table schemas.
+    pub fn all_schemas(&self) -> impl Iterator<Item = &TableSchema> {
+        self.tables.values()
+    }
+
+    /// Find all FKs in other tables that reference `parent` table.
+    pub fn child_fks_for(&self, parent: &str) -> Vec<(&str, &ForeignKeySchemaEntry)> {
+        self.tables
+            .iter()
+            .flat_map(|(name, schema)| {
+                schema
+                    .foreign_keys
+                    .iter()
+                    .filter(|fk| fk.foreign_table == parent)
+                    .map(move |fk| (name.as_str(), fk))
+            })
+            .collect()
     }
 
     /// Persist a schema to the _schema table (called within a write txn).

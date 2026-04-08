@@ -320,34 +320,28 @@ mod tests {
     use super::*;
     use crate::types::{ColumnDef, DataType};
 
+    fn col(name: &str, dt: DataType, nullable: bool, pos: u16) -> ColumnDef {
+        ColumnDef {
+            name: name.into(),
+            data_type: dt,
+            nullable,
+            position: pos,
+            default_expr: None,
+            default_sql: None,
+            check_expr: None,
+            check_sql: None,
+            check_name: None,
+        }
+    }
+
     fn test_schema() -> TableSchema {
         TableSchema::new(
             "users".into(),
             vec![
-                ColumnDef {
-                    name: "id".into(),
-                    data_type: DataType::Integer,
-                    nullable: false,
-                    position: 0,
-                },
-                ColumnDef {
-                    name: "name".into(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    position: 1,
-                },
-                ColumnDef {
-                    name: "age".into(),
-                    data_type: DataType::Integer,
-                    nullable: true,
-                    position: 2,
-                },
-                ColumnDef {
-                    name: "email".into(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    position: 3,
-                },
+                col("id", DataType::Integer, false, 0),
+                col("name", DataType::Text, true, 1),
+                col("age", DataType::Integer, true, 2),
+                col("email", DataType::Text, true, 3),
             ],
             vec![0],
             vec![
@@ -367,6 +361,8 @@ mod tests {
                     unique: false,
                 },
             ],
+            vec![],
+            vec![],
         )
     }
 
@@ -591,18 +587,8 @@ mod tests {
         let schema = TableSchema::new(
             "t".into(),
             vec![
-                ColumnDef {
-                    name: "id".into(),
-                    data_type: DataType::Integer,
-                    nullable: false,
-                    position: 0,
-                },
-                ColumnDef {
-                    name: "code".into(),
-                    data_type: DataType::Text,
-                    nullable: false,
-                    position: 1,
-                },
+                col("id", DataType::Integer, false, 0),
+                col("code", DataType::Text, false, 1),
             ],
             vec![0],
             vec![
@@ -617,6 +603,8 @@ mod tests {
                     unique: true,
                 },
             ],
+            vec![],
+            vec![],
         );
         let where_clause = Some(Expr::BinaryOp {
             left: Box::new(Expr::Column("code".into())),
