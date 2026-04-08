@@ -18,7 +18,7 @@ Every page is encrypted and authenticated before it hits disk. The database file
 ## Features
 
 - **Encrypted at rest** - AES-256-CTR + HMAC-SHA256 per page, verified before decryption
-- **SQL** - CREATE/DROP TABLE, SELECT with JOINs, subqueries, aggregates, indexes, prepared statements
+- **SQL** - CREATE/DROP TABLE, SELECT with JOINs, subqueries, aggregates, indexes, prepared statements, DEFAULT, CHECK, FOREIGN KEY
 - **ACID** - Copy-on-Write B+ tree, shadow paging, no WAL. Snapshot isolation with concurrent readers
 - **P2P sync** - Merkle-based table diffing over Noise-encrypted channels with PSK auth
 - **CLI** - SQL shell with tab completion, syntax highlighting, dot-commands (.backup, .verify, .rekey, .sync, .dump, ...)
@@ -28,7 +28,7 @@ Every page is encrypted and authenticated before it hits disk. The database file
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. C FFI (37 functions), WebAssembly bindings
-- **2,100+ tests** - Unit, integration, torture tests across 10 crates
+- **2,200+ tests** - Unit, integration, torture tests across 10 crates
 
 ## Benchmarks
 
@@ -37,15 +37,15 @@ Citadel vs SQLite on 100K rows (INTEGER, TEXT, INTEGER), single-threaded:
 ```
 Benchmark          Citadel        SQLite         Ratio
 -----------------------------------------------------
-count              171 ns         33.2 us        194x
-point              1.01 us        14.3 us        14.2x
-group_by           2.13 ms        10.6 ms        5.0x
-filter             764 us         1.96 ms        2.6x
-sort               1.29 ms        2.83 ms        2.2x
-scan               7.89 ms        13.6 ms        1.7x
-insert             77 us          133 us         1.7x
-join               92 us          120 us         1.3x
-sum                1.40 ms        2.04 ms        1.5x
+count              186 ns         37.1 us        200x
+point              1.10 us        16.6 us        15.1x
+group_by           2.53 ms        12.1 ms        4.8x
+filter             936 us         2.28 ms        2.4x
+sort               1.46 ms        3.09 ms        2.1x
+insert             94.8 us        164 us         1.7x
+scan               9.42 ms        15.1 ms        1.6x
+sum                1.68 ms        2.34 ms        1.4x
+join               107 us         133 us         1.2x
 ```
 
 <details>
@@ -139,6 +139,8 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 ## SQL
 
 **Statements** - CREATE/DROP TABLE, CREATE/DROP INDEX, INSERT, SELECT, UPDATE, DELETE, BEGIN/COMMIT/ROLLBACK, EXPLAIN
+
+**Constraints** - PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK (column + table level), FOREIGN KEY (RESTRICT/NO ACTION)
 
 **Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN
 

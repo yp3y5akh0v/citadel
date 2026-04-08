@@ -76,14 +76,14 @@ fn default_literal_real() {
     let mut conn = Connection::open(&db).unwrap();
 
     assert_ok(
-        conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, score REAL DEFAULT 3.14)")
+        conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, score REAL DEFAULT 2.72)")
             .unwrap(),
     );
     assert_rows_affected(conn.execute("INSERT INTO t (id) VALUES (1)").unwrap(), 1);
 
     let qr = conn.query("SELECT score FROM t WHERE id = 1").unwrap();
     match &qr.rows[0][0] {
-        Value::Real(r) => assert!((*r - 3.14).abs() < 1e-10),
+        Value::Real(r) => assert!((*r - 2.72).abs() < 1e-10),
         other => panic!("expected Real, got {other:?}"),
     }
 }
