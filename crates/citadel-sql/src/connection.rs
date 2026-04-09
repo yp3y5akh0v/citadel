@@ -11,7 +11,7 @@ use citadel_txn::write_txn::WriteTxn;
 use crate::error::{Result, SqlError};
 use crate::executor;
 use crate::parser;
-use crate::parser::Statement;
+use crate::parser::{InsertSource, Statement};
 use crate::schema::SchemaManager;
 use crate::types::{ExecutionResult, QueryResult, TableSchema, Value};
 
@@ -259,7 +259,9 @@ impl<'a> Connection<'a> {
             });
         }
 
-        if param_count > 0 && matches!(*stmt, Statement::Insert(_)) {
+        if param_count > 0
+            && matches!(*stmt, Statement::Insert(ref ins) if matches!(ins.source, InsertSource::Values(_)))
+        {
             self.dispatch(&stmt, params)
         } else if param_count > 0 {
             let bound = parser::bind_params(&stmt, params)?;

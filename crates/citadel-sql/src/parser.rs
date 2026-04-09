@@ -112,10 +112,16 @@ pub struct DropIndexStmt {
 }
 
 #[derive(Debug, Clone)]
+pub enum InsertSource {
+    Values(Vec<Vec<Expr>>),
+    Select(Box<SelectStmt>),
+}
+
+#[derive(Debug, Clone)]
 pub struct InsertStmt {
     pub table: String,
     pub columns: Vec<String>,
-    pub values: Vec<Vec<Expr>>,
+    pub source: InsertSource,
 }
 
 #[derive(Debug, Clone)]
@@ -368,19 +374,26 @@ fn bind_stmt(stmt: &Statement, params: &[crate::types::Value]) -> crate::error::
     match stmt {
         Statement::Select(sel) => Ok(Statement::Select(Box::new(bind_select(sel, params)?))),
         Statement::Insert(ins) => {
-            let values = ins
-                .values
-                .iter()
-                .map(|row| {
-                    row.iter()
-                        .map(|e| bind_expr(e, params))
-                        .collect::<crate::error::Result<Vec<_>>>()
-                })
-                .collect::<crate::error::Result<Vec<_>>>()?;
+            let source = match &ins.source {
+                InsertSource::Values(rows) => {
+                    let bound = rows
+                        .iter()
+                        .map(|row| {
+                            row.iter()
+                                .map(|e| bind_expr(e, params))
+                                .collect::<crate::error::Result<Vec<_>>>()
+                        })
+                        .collect::<crate::error::Result<Vec<_>>>()?;
+                    InsertSource::Values(bound)
+                }
+                InsertSource::Select(sel) => {
+                    InsertSource::Select(Box::new(bind_select(sel, params)?))
+                }
+            };
             Ok(Statement::Insert(InsertStmt {
                 table: ins.table.clone(),
                 columns: ins.columns.clone(),
-                values,
+                source,
             }))
         }
         Statement::Update(upd) => {
@@ -639,13 +652,16 @@ fn bind_expr(expr: &Expr, params: &[crate::types::Value]) -> crate::error::Resul
 fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
     match stmt {
         Statement::Select(sel) => visit_exprs_select(sel, visitor),
-        Statement::Insert(ins) => {
-            for row in &ins.values {
-                for e in row {
-                    visit_expr(e, visitor);
+        Statement::Insert(ins) => match &ins.source {
+            InsertSource::Values(rows) => {
+                for row in rows {
+                    for e in row {
+                        visit_expr(e, visitor);
+                    }
                 }
             }
-        }
+            InsertSource::Select(sel) => visit_exprs_select(sel, visitor),
+        },
         Statement::Update(upd) => {
             for (_, e) in &upd.assignments {
                 visit_expr(e, visitor);
@@ -1105,11 +1121,11 @@ fn convert_insert(insert: sp::Insert) -> Result<Statement> {
         .map(|c| c.value.to_ascii_lowercase())
         .collect();
 
-    let source = insert
+    let query = insert
         .source
-        .ok_or_else(|| SqlError::Parse("INSERT requires VALUES".into()))?;
+        .ok_or_else(|| SqlError::Parse("INSERT requires VALUES or SELECT".into()))?;
 
-    let values = match *source.body {
+    let source = match *query.body {
         sp::SetExpr::Values(sp::Values { rows, .. }) => {
             let mut result = Vec::new();
             for row in rows {
@@ -1119,15 +1135,20 @@ fn convert_insert(insert: sp::Insert) -> Result<Statement> {
                 }
                 result.push(exprs);
             }
-            result
+            InsertSource::Values(result)
         }
-        _ => return Err(SqlError::Unsupported("INSERT ... SELECT".into())),
+        sp::SetExpr::Select(_) => InsertSource::Select(Box::new(convert_subquery(&query)?)),
+        _ => {
+            return Err(SqlError::Unsupported(
+                "INSERT ... UNION/INTERSECT/EXCEPT".into(),
+            ))
+        }
     };
 
     Ok(Statement::Insert(InsertStmt {
         table,
         columns,
-        values,
+        source,
     }))
 }
 
@@ -1855,9 +1876,13 @@ mod tests {
             Statement::Insert(ins) => {
                 assert_eq!(ins.table, "users");
                 assert_eq!(ins.columns, vec!["id", "name"]);
-                assert_eq!(ins.values.len(), 2);
-                assert!(matches!(ins.values[0][0], Expr::Literal(Value::Integer(1))));
-                assert!(matches!(&ins.values[0][1], Expr::Literal(Value::Text(s)) if s == "Alice"));
+                let values = match &ins.source {
+                    InsertSource::Values(v) => v,
+                    _ => panic!("expected Values"),
+                };
+                assert_eq!(values.len(), 2);
+                assert!(matches!(values[0][0], Expr::Literal(Value::Integer(1))));
+                assert!(matches!(&values[0][1], Expr::Literal(Value::Text(s)) if s == "Alice"));
             }
             _ => panic!("expected Insert"),
         }
@@ -2140,14 +2165,12 @@ mod tests {
         let stmt = parse_sql("INSERT INTO t (a, b) VALUES (true, false)").unwrap();
         match stmt {
             Statement::Insert(ins) => {
-                assert!(matches!(
-                    ins.values[0][0],
-                    Expr::Literal(Value::Boolean(true))
-                ));
-                assert!(matches!(
-                    ins.values[0][1],
-                    Expr::Literal(Value::Boolean(false))
-                ));
+                let values = match &ins.source {
+                    InsertSource::Values(v) => v,
+                    _ => panic!("expected Values"),
+                };
+                assert!(matches!(values[0][0], Expr::Literal(Value::Boolean(true))));
+                assert!(matches!(values[0][1], Expr::Literal(Value::Boolean(false))));
             }
             _ => panic!("expected Insert"),
         }
@@ -2158,7 +2181,11 @@ mod tests {
         let stmt = parse_sql("INSERT INTO t (a) VALUES (NULL)").unwrap();
         match stmt {
             Statement::Insert(ins) => {
-                assert!(matches!(ins.values[0][0], Expr::Literal(Value::Null)));
+                let values = match &ins.source {
+                    InsertSource::Values(v) => v,
+                    _ => panic!("expected Values"),
+                };
+                assert!(matches!(values[0][0], Expr::Literal(Value::Null)));
             }
             _ => panic!("expected Insert"),
         }
@@ -2351,8 +2378,46 @@ mod tests {
         let stmt = parse_sql("INSERT INTO t (a, b) VALUES ($1, $2)").unwrap();
         match stmt {
             Statement::Insert(ins) => {
-                assert!(matches!(ins.values[0][0], Expr::Parameter(1)));
-                assert!(matches!(ins.values[0][1], Expr::Parameter(2)));
+                let values = match &ins.source {
+                    InsertSource::Values(v) => v,
+                    _ => panic!("expected Values"),
+                };
+                assert!(matches!(values[0][0], Expr::Parameter(1)));
+                assert!(matches!(values[0][1], Expr::Parameter(2)));
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_select() {
+        let stmt =
+            parse_sql("INSERT INTO t2 (id, name) SELECT id, name FROM t1 WHERE id > 5").unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                assert_eq!(ins.table, "t2");
+                assert_eq!(ins.columns, vec!["id", "name"]);
+                match &ins.source {
+                    InsertSource::Select(sel) => {
+                        assert_eq!(sel.from, "t1");
+                        assert_eq!(sel.columns.len(), 2);
+                        assert!(sel.where_clause.is_some());
+                    }
+                    _ => panic!("expected Select"),
+                }
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_insert_select_no_columns() {
+        let stmt = parse_sql("INSERT INTO t2 SELECT * FROM t1").unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                assert_eq!(ins.table, "t2");
+                assert!(ins.columns.is_empty());
+                assert!(matches!(&ins.source, InsertSource::Select(_)));
             }
             _ => panic!("expected Insert"),
         }

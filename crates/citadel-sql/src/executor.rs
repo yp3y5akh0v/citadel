@@ -159,9 +159,23 @@ pub fn execute_in_txn(
 pub fn explain(schema: &SchemaManager, stmt: &Statement) -> Result<ExecutionResult> {
     let lines = match stmt {
         Statement::Select(sel) => explain_select(schema, sel)?,
-        Statement::Insert(ins) => {
-            vec![format!("INSERT INTO {}", ins.table.to_ascii_lowercase())]
-        }
+        Statement::Insert(ins) => match &ins.source {
+            InsertSource::Values(rows) => {
+                vec![format!(
+                    "INSERT INTO {} ({} rows)",
+                    ins.table.to_ascii_lowercase(),
+                    rows.len()
+                )]
+            }
+            InsertSource::Select(sel) => {
+                let mut lines = vec![format!(
+                    "INSERT INTO {} ... SELECT",
+                    ins.table.to_ascii_lowercase()
+                )];
+                lines.extend(explain_select(schema, sel)?);
+                lines
+            }
+        },
         Statement::Update(upd) => explain_dml(schema, &upd.table, &upd.where_clause, "UPDATE")?,
         Statement::Delete(del) => {
             explain_dml(schema, &del.table, &del.where_clause, "DELETE FROM")?
@@ -2170,6 +2184,14 @@ fn exec_insert(
         None
     };
 
+    let select_rows = match &stmt.source {
+        InsertSource::Select(sel) => {
+            let qr = exec_subquery_read(db, schema, sel)?;
+            Some(qr.rows)
+        }
+        InsertSource::Values(_) => None,
+    };
+
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     let mut count: u64 = 0;
 
@@ -2184,41 +2206,81 @@ fn exec_insert(
     let mut value_buf: Vec<u8> = Vec::with_capacity(256);
     let mut fk_key_buf: Vec<u8> = Vec::with_capacity(64);
 
-    for value_row in &stmt.values {
-        if value_row.len() != insert_columns.len() {
+    let values = match &stmt.source {
+        InsertSource::Values(rows) => Some(rows.as_slice()),
+        InsertSource::Select(_) => None,
+    };
+    let sel_rows = select_rows.as_deref();
+
+    let total = match (values, sel_rows) {
+        (Some(rows), _) => rows.len(),
+        (_, Some(rows)) => rows.len(),
+        _ => 0,
+    };
+
+    if let Some(sel) = sel_rows {
+        if !sel.is_empty() && sel[0].len() != insert_columns.len() {
             return Err(SqlError::InvalidValue(format!(
-                "expected {} values, got {}",
+                "INSERT ... SELECT column count mismatch: expected {}, got {}",
                 insert_columns.len(),
-                value_row.len()
+                sel[0].len()
             )));
         }
+    }
 
+    for idx in 0..total {
         for v in row.iter_mut() {
             *v = Value::Null;
         }
 
-        for (i, expr) in value_row.iter().enumerate() {
-            let val = if let Expr::Parameter(n) = expr {
-                params
-                    .get(n - 1)
-                    .cloned()
-                    .ok_or_else(|| SqlError::Parse(format!("unbound parameter ${n}")))?
-            } else {
-                eval_const_expr(expr)?
-            };
-            let col_idx = col_indices[i];
-            let col = &table_schema.columns[col_idx];
-
-            let got_type = val.data_type();
-            row[col_idx] = if val.is_null() {
-                Value::Null
-            } else {
-                val.coerce_into(col.data_type)
-                    .ok_or_else(|| SqlError::TypeMismatch {
-                        expected: col.data_type.to_string(),
-                        got: got_type.to_string(),
+        if let Some(value_rows) = values {
+            let value_row = &value_rows[idx];
+            if value_row.len() != insert_columns.len() {
+                return Err(SqlError::InvalidValue(format!(
+                    "expected {} values, got {}",
+                    insert_columns.len(),
+                    value_row.len()
+                )));
+            }
+            for (i, expr) in value_row.iter().enumerate() {
+                let val = if let Expr::Parameter(n) = expr {
+                    params
+                        .get(n - 1)
+                        .cloned()
+                        .ok_or_else(|| SqlError::Parse(format!("unbound parameter ${n}")))?
+                } else {
+                    eval_const_expr(expr)?
+                };
+                let col_idx = col_indices[i];
+                let col = &table_schema.columns[col_idx];
+                let got_type = val.data_type();
+                row[col_idx] = if val.is_null() {
+                    Value::Null
+                } else {
+                    val.coerce_into(col.data_type)
+                        .ok_or_else(|| SqlError::TypeMismatch {
+                            expected: col.data_type.to_string(),
+                            got: got_type.to_string(),
+                        })?
+                };
+            }
+        } else if let Some(sel) = sel_rows {
+            let sel_row = &sel[idx];
+            for (i, val) in sel_row.iter().enumerate() {
+                let col_idx = col_indices[i];
+                let col = &table_schema.columns[col_idx];
+                let got_type = val.data_type();
+                row[col_idx] = if val.is_null() {
+                    Value::Null
+                } else {
+                    val.clone().coerce_into(col.data_type).ok_or_else(|| {
+                        SqlError::TypeMismatch {
+                            expected: col.data_type.to_string(),
+                            got: got_type.to_string(),
+                        }
                     })?
-            };
+                };
+            }
         }
 
         // Apply DEFAULT for omitted columns
@@ -2683,26 +2745,36 @@ fn materialize_delete(
 }
 
 fn insert_has_subquery(stmt: &InsertStmt) -> bool {
-    stmt.values.iter().any(|row| row.iter().any(has_subquery))
+    match &stmt.source {
+        InsertSource::Values(rows) => rows.iter().any(|row| row.iter().any(has_subquery)),
+        InsertSource::Select(sel) => stmt_has_subquery(sel),
+    }
 }
 
 fn materialize_insert(
     stmt: &InsertStmt,
     exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
 ) -> Result<InsertStmt> {
-    let values = stmt
-        .values
-        .iter()
-        .map(|row| {
-            row.iter()
-                .map(|e| materialize_expr(e, exec_sub))
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let source = match &stmt.source {
+        InsertSource::Values(rows) => {
+            let mat = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|e| materialize_expr(e, exec_sub))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            InsertSource::Values(mat)
+        }
+        InsertSource::Select(sel) => {
+            InsertSource::Select(Box::new(materialize_stmt(sel, exec_sub)?))
+        }
+    };
     Ok(InsertStmt {
         table: stmt.table.clone(),
         columns: stmt.columns.clone(),
-        values,
+        source,
     })
 }
 
@@ -5647,43 +5719,91 @@ pub fn exec_insert_in_txn(
     bufs.pk_values.resize(pk_indices.len(), Value::Null);
     bufs.value_values.resize(phys_count, Value::Null);
 
+    let select_rows = match &stmt.source {
+        InsertSource::Select(sel) => {
+            let qr = exec_subquery_write(wtx, schema, sel)?;
+            Some(qr.rows)
+        }
+        InsertSource::Values(_) => None,
+    };
+
     let mut count: u64 = 0;
 
-    for value_row in &stmt.values {
-        if value_row.len() != insert_columns.len() {
+    let values = match &stmt.source {
+        InsertSource::Values(rows) => Some(rows.as_slice()),
+        InsertSource::Select(_) => None,
+    };
+    let sel_rows = select_rows.as_deref();
+
+    let total = match (values, sel_rows) {
+        (Some(rows), _) => rows.len(),
+        (_, Some(rows)) => rows.len(),
+        _ => 0,
+    };
+
+    if let Some(sel) = sel_rows {
+        if !sel.is_empty() && sel[0].len() != insert_columns.len() {
             return Err(SqlError::InvalidValue(format!(
-                "expected {} values, got {}",
+                "INSERT ... SELECT column count mismatch: expected {}, got {}",
                 insert_columns.len(),
-                value_row.len()
+                sel[0].len()
             )));
         }
+    }
 
+    for idx in 0..total {
         for v in bufs.row.iter_mut() {
             *v = Value::Null;
         }
 
-        for (i, expr) in value_row.iter().enumerate() {
-            let val = if let Expr::Parameter(n) = expr {
-                params
-                    .get(n - 1)
-                    .cloned()
-                    .ok_or_else(|| SqlError::Parse(format!("unbound parameter ${n}")))?
-            } else {
-                eval_const_expr(expr)?
-            };
-            let col_idx = bufs.col_indices[i];
-            let col = &table_schema.columns[col_idx];
-
-            let got_type = val.data_type();
-            bufs.row[col_idx] = if val.is_null() {
-                Value::Null
-            } else {
-                val.coerce_into(col.data_type)
-                    .ok_or_else(|| SqlError::TypeMismatch {
-                        expected: col.data_type.to_string(),
-                        got: got_type.to_string(),
+        if let Some(value_rows) = values {
+            let value_row = &value_rows[idx];
+            if value_row.len() != insert_columns.len() {
+                return Err(SqlError::InvalidValue(format!(
+                    "expected {} values, got {}",
+                    insert_columns.len(),
+                    value_row.len()
+                )));
+            }
+            for (i, expr) in value_row.iter().enumerate() {
+                let val = if let Expr::Parameter(n) = expr {
+                    params
+                        .get(n - 1)
+                        .cloned()
+                        .ok_or_else(|| SqlError::Parse(format!("unbound parameter ${n}")))?
+                } else {
+                    eval_const_expr(expr)?
+                };
+                let col_idx = bufs.col_indices[i];
+                let col = &table_schema.columns[col_idx];
+                let got_type = val.data_type();
+                bufs.row[col_idx] = if val.is_null() {
+                    Value::Null
+                } else {
+                    val.coerce_into(col.data_type)
+                        .ok_or_else(|| SqlError::TypeMismatch {
+                            expected: col.data_type.to_string(),
+                            got: got_type.to_string(),
+                        })?
+                };
+            }
+        } else if let Some(sel) = sel_rows {
+            let sel_row = &sel[idx];
+            for (i, val) in sel_row.iter().enumerate() {
+                let col_idx = bufs.col_indices[i];
+                let col = &table_schema.columns[col_idx];
+                let got_type = val.data_type();
+                bufs.row[col_idx] = if val.is_null() {
+                    Value::Null
+                } else {
+                    val.clone().coerce_into(col.data_type).ok_or_else(|| {
+                        SqlError::TypeMismatch {
+                            expected: col.data_type.to_string(),
+                            got: got_type.to_string(),
+                        }
                     })?
-            };
+                };
+            }
         }
 
         // Apply DEFAULT for omitted columns
