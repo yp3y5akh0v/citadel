@@ -15,6 +15,7 @@ pub enum Statement {
     DropTable(DropTableStmt),
     CreateIndex(CreateIndexStmt),
     DropIndex(DropIndexStmt),
+    AlterTable(Box<AlterTableStmt>),
     Insert(InsertStmt),
     Select(Box<SelectStmt>),
     Update(UpdateStmt),
@@ -23,6 +24,32 @@ pub enum Statement {
     Commit,
     Rollback,
     Explain(Box<Statement>),
+}
+
+#[derive(Debug, Clone)]
+pub struct AlterTableStmt {
+    pub table: String,
+    pub op: AlterTableOp,
+}
+
+#[derive(Debug, Clone)]
+pub enum AlterTableOp {
+    AddColumn {
+        column: Box<ColumnSpec>,
+        foreign_key: Option<ForeignKeyDef>,
+        if_not_exists: bool,
+    },
+    DropColumn {
+        name: String,
+        if_exists: bool,
+    },
+    RenameColumn {
+        old_name: String,
+        new_name: String,
+    },
+    RenameTable {
+        new_name: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -776,6 +803,7 @@ fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
                 if_exists,
             }))
         }
+        sp::Statement::AlterTable(at) => convert_alter_table(at),
         sp::Statement::Insert(insert) => convert_insert(insert),
         sp::Statement::Query(query) => convert_query(*query),
         sp::Statement::Update(update) => convert_update(update),
@@ -796,6 +824,76 @@ fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
     }
 }
 
+/// Parse column options (NOT NULL, DEFAULT, CHECK, FK) from a sqlparser ColumnDef.
+/// Returns (ColumnSpec, Option<ForeignKeyDef>, was_inline_pk).
+fn convert_column_def(
+    col_def: &sp::ColumnDef,
+) -> Result<(ColumnSpec, Option<ForeignKeyDef>, bool)> {
+    let col_name = col_def.name.value.clone();
+    let data_type = convert_data_type(&col_def.data_type)?;
+    let mut nullable = true;
+    let mut is_primary_key = false;
+    let mut default_expr = None;
+    let mut default_sql = None;
+    let mut check_expr = None;
+    let mut check_sql = None;
+    let mut check_name = None;
+    let mut fk_def = None;
+
+    for opt in &col_def.options {
+        match &opt.option {
+            sp::ColumnOption::NotNull => nullable = false,
+            sp::ColumnOption::Null => nullable = true,
+            sp::ColumnOption::PrimaryKey(_) => {
+                is_primary_key = true;
+                nullable = false;
+            }
+            sp::ColumnOption::Default(expr) => {
+                default_sql = Some(expr.to_string());
+                default_expr = Some(convert_expr(expr)?);
+            }
+            sp::ColumnOption::Check(check) => {
+                check_sql = Some(check.expr.to_string());
+                let converted = convert_expr(&check.expr)?;
+                if has_subquery(&converted) {
+                    return Err(SqlError::Unsupported("subquery in CHECK constraint".into()));
+                }
+                check_expr = Some(converted);
+                check_name = check.name.as_ref().map(|n| n.value.clone());
+            }
+            sp::ColumnOption::ForeignKey(fk) => {
+                convert_fk_actions(&fk.on_delete, &fk.on_update)?;
+                let ftable = object_name_to_string(&fk.foreign_table).to_ascii_lowercase();
+                let referred: Vec<String> = fk
+                    .referred_columns
+                    .iter()
+                    .map(|i| i.value.to_ascii_lowercase())
+                    .collect();
+                fk_def = Some(ForeignKeyDef {
+                    name: fk.name.as_ref().map(|n| n.value.clone()),
+                    columns: vec![col_name.to_ascii_lowercase()],
+                    foreign_table: ftable,
+                    referred_columns: referred,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let spec = ColumnSpec {
+        name: col_name,
+        data_type,
+        nullable,
+        is_primary_key,
+        default_expr,
+        default_sql,
+        check_expr,
+        check_sql,
+        check_name,
+    };
+    Ok((spec, fk_def, is_primary_key))
+}
+
 fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
     let name = object_name_to_string(&ct.name);
     let if_not_exists = ct.if_not_exists;
@@ -805,68 +903,14 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
     let mut foreign_keys: Vec<ForeignKeyDef> = Vec::new();
 
     for col_def in &ct.columns {
-        let col_name = col_def.name.value.clone();
-        let data_type = convert_data_type(&col_def.data_type)?;
-        let mut nullable = true;
-        let mut is_primary_key = false;
-        let mut default_expr = None;
-        let mut default_sql = None;
-        let mut check_expr = None;
-        let mut check_sql = None;
-        let mut check_name = None;
-
-        for opt in &col_def.options {
-            match &opt.option {
-                sp::ColumnOption::NotNull => nullable = false,
-                sp::ColumnOption::Null => nullable = true,
-                sp::ColumnOption::PrimaryKey(_) => {
-                    is_primary_key = true;
-                    nullable = false;
-                    inline_pk.push(col_name.clone());
-                }
-                sp::ColumnOption::Default(expr) => {
-                    default_sql = Some(expr.to_string());
-                    default_expr = Some(convert_expr(expr)?);
-                }
-                sp::ColumnOption::Check(check) => {
-                    check_sql = Some(check.expr.to_string());
-                    let converted = convert_expr(&check.expr)?;
-                    if has_subquery(&converted) {
-                        return Err(SqlError::Unsupported("subquery in CHECK constraint".into()));
-                    }
-                    check_expr = Some(converted);
-                    check_name = check.name.as_ref().map(|n| n.value.clone());
-                }
-                sp::ColumnOption::ForeignKey(fk) => {
-                    convert_fk_actions(&fk.on_delete, &fk.on_update)?;
-                    let ftable = object_name_to_string(&fk.foreign_table).to_ascii_lowercase();
-                    let referred: Vec<String> = fk
-                        .referred_columns
-                        .iter()
-                        .map(|i| i.value.to_ascii_lowercase())
-                        .collect();
-                    foreign_keys.push(ForeignKeyDef {
-                        name: fk.name.as_ref().map(|n| n.value.clone()),
-                        columns: vec![col_name.to_ascii_lowercase()],
-                        foreign_table: ftable,
-                        referred_columns: referred,
-                    });
-                }
-                _ => {}
-            }
+        let (spec, fk_def, was_pk) = convert_column_def(col_def)?;
+        if was_pk {
+            inline_pk.push(spec.name.clone());
         }
-
-        columns.push(ColumnSpec {
-            name: col_name,
-            data_type,
-            nullable,
-            is_primary_key,
-            default_expr,
-            default_sql,
-            check_expr,
-            check_sql,
-            check_name,
-        });
+        if let Some(fk) = fk_def {
+            foreign_keys.push(fk);
+        }
+        columns.push(spec);
     }
 
     // Check table-level constraints
@@ -933,6 +977,68 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
         check_constraints,
         foreign_keys,
     }))
+}
+
+fn convert_alter_table(at: sp::AlterTable) -> Result<Statement> {
+    let table = object_name_to_string(&at.name);
+    if at.operations.len() != 1 {
+        return Err(SqlError::Unsupported(
+            "ALTER TABLE with multiple operations".into(),
+        ));
+    }
+    let op = match at.operations.into_iter().next().unwrap() {
+        sp::AlterTableOperation::AddColumn {
+            column_def,
+            if_not_exists,
+            ..
+        } => {
+            let (spec, fk, _was_pk) = convert_column_def(&column_def)?;
+            AlterTableOp::AddColumn {
+                column: Box::new(spec),
+                foreign_key: fk,
+                if_not_exists,
+            }
+        }
+        sp::AlterTableOperation::DropColumn {
+            column_names,
+            if_exists,
+            ..
+        } => {
+            if column_names.len() != 1 {
+                return Err(SqlError::Unsupported(
+                    "DROP COLUMN with multiple columns".into(),
+                ));
+            }
+            AlterTableOp::DropColumn {
+                name: column_names.into_iter().next().unwrap().value,
+                if_exists,
+            }
+        }
+        sp::AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => AlterTableOp::RenameColumn {
+            old_name: old_column_name.value,
+            new_name: new_column_name.value,
+        },
+        sp::AlterTableOperation::RenameTable { table_name } => {
+            let new_name = match table_name {
+                sp::RenameTableNameKind::To(name) | sp::RenameTableNameKind::As(name) => {
+                    object_name_to_string(&name)
+                }
+            };
+            AlterTableOp::RenameTable { new_name }
+        }
+        other => {
+            return Err(SqlError::Unsupported(format!(
+                "ALTER TABLE operation: {other}"
+            )));
+        }
+    };
+    Ok(Statement::AlterTable(Box::new(AlterTableStmt {
+        table,
+        op,
+    })))
 }
 
 fn convert_fk_actions(

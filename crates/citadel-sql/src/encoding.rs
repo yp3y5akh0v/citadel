@@ -466,6 +466,12 @@ pub fn decode_row(data: &[u8]) -> Result<Vec<Value>> {
     Ok(values)
 }
 
+/// Returns the number of non-PK columns stored in a row value blob.
+#[inline]
+pub fn row_non_pk_count(data: &[u8]) -> usize {
+    u16::from_le_bytes([data[0], data[1]]) as usize
+}
+
 pub fn decode_row_into(data: &[u8], out: &mut [Value], col_mapping: &[usize]) -> Result<()> {
     let (col_count, bitmap, mut pos) = parse_row_header(data)?;
 
@@ -487,7 +493,7 @@ pub fn decode_row_into(data: &[u8], out: &mut [Value], col_mapping: &[usize]) ->
             return Err(SqlError::InvalidValue("truncated column value".into()));
         }
 
-        if i < col_mapping.len() {
+        if i < col_mapping.len() && col_mapping[i] != usize::MAX {
             out[col_mapping[i]] = decode_value(type_tag, &data[pos..pos + data_len])?;
         }
         pos += data_len;
@@ -518,9 +524,6 @@ pub fn decode_columns(data: &[u8], targets: &[usize]) -> Result<Vec<Value>> {
         return Ok(Vec::new());
     }
     let (col_count, bitmap, mut pos) = parse_row_header(data)?;
-    if *targets.last().unwrap() >= col_count {
-        return Err(SqlError::InvalidValue("column index out of bounds".into()));
-    }
 
     let mut results = Vec::with_capacity(targets.len());
     let mut ti = 0;
@@ -562,6 +565,12 @@ pub fn decode_columns(data: &[u8], targets: &[usize]) -> Result<Vec<Value>> {
         }
     }
 
+    // Targets beyond stored column count get Null
+    while ti < targets.len() {
+        results.push(Value::Null);
+        ti += 1;
+    }
+
     Ok(results)
 }
 
@@ -575,9 +584,6 @@ pub fn decode_columns_into(
         return Ok(());
     }
     let (col_count, bitmap, mut pos) = parse_row_header(data)?;
-    if *targets.last().unwrap() >= col_count {
-        return Err(SqlError::InvalidValue("column index out of bounds".into()));
-    }
 
     let mut ti = 0;
     for col in 0..col_count {
@@ -712,7 +718,7 @@ fn decode_value_raw(type_tag: u8, data: &[u8]) -> Result<RawColumn<'_>> {
 pub fn decode_column_raw(data: &[u8], target: usize) -> Result<RawColumn<'_>> {
     let (col_count, bitmap, mut pos) = parse_row_header(data)?;
     if target >= col_count {
-        return Err(SqlError::InvalidValue("column index out of bounds".into()));
+        return Ok(RawColumn::Null);
     }
 
     for col in 0..=target {
@@ -1178,10 +1184,13 @@ mod tests {
     }
 
     #[test]
-    fn raw_column_out_of_bounds() {
+    fn raw_column_out_of_bounds_returns_null() {
         let values = vec![Value::Integer(1)];
         let encoded = encode_row(&values);
-        assert!(decode_column_raw(&encoded, 1).is_err());
+        assert!(matches!(
+            decode_column_raw(&encoded, 1).unwrap(),
+            RawColumn::Null
+        ));
     }
 
     #[test]

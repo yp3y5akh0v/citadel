@@ -18,7 +18,7 @@ Every page is encrypted and authenticated before it hits disk. The database file
 ## Features
 
 - **Encrypted at rest** - AES-256-CTR + HMAC-SHA256 per page, verified before decryption
-- **SQL** - CREATE/DROP TABLE, SELECT with JOINs, subqueries, aggregates, indexes, prepared statements, DEFAULT, CHECK, FOREIGN KEY
+- **SQL** - CREATE/DROP TABLE, ALTER TABLE, SELECT with JOINs, subqueries, aggregates, indexes, prepared statements, DEFAULT, CHECK, FOREIGN KEY
 - **ACID** - Copy-on-Write B+ tree, shadow paging, no WAL. Snapshot isolation with concurrent readers
 - **P2P sync** - Merkle-based table diffing over Noise-encrypted channels with PSK auth
 - **CLI** - SQL shell with tab completion, syntax highlighting, dot-commands (.backup, .verify, .rekey, .sync, .dump, ...)
@@ -28,7 +28,7 @@ Every page is encrypted and authenticated before it hits disk. The database file
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. C FFI (37 functions), WebAssembly bindings
-- **2,200+ tests** - Unit, integration, torture tests across 10 crates
+- **2,300+ tests** - Unit, integration, torture tests across 10 crates
 
 ## Benchmarks
 
@@ -138,7 +138,7 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 ## SQL
 
-**Statements** - CREATE/DROP TABLE, CREATE/DROP INDEX, INSERT, SELECT, UPDATE, DELETE, BEGIN/COMMIT/ROLLBACK, EXPLAIN
+**Statements** - CREATE/DROP TABLE, ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE/DROP INDEX, INSERT, SELECT, UPDATE, DELETE, BEGIN/COMMIT/ROLLBACK, EXPLAIN
 
 **Constraints** - PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK (column + table level), FOREIGN KEY (RESTRICT/NO ACTION)
 

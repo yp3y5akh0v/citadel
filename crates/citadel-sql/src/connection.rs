@@ -342,6 +342,7 @@ impl<'a> Connection<'a> {
                 | Statement::DropTable(_)
                 | Statement::CreateIndex(_)
                 | Statement::DropIndex(_)
+                | Statement::AlterTable(_)
                 | Statement::Begin
                 | Statement::Commit
                 | Statement::Rollback

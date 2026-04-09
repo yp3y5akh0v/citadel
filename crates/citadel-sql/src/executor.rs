@@ -7,7 +7,7 @@ use citadel::Database;
 use crate::encoding::{
     decode_column_raw, decode_columns, decode_columns_into, decode_composite_key, decode_key_value,
     decode_pk_integer, decode_pk_into, decode_row_into, encode_composite_key,
-    encode_composite_key_into, encode_row, encode_row_into, RawColumn,
+    encode_composite_key_into, encode_row, encode_row_into, row_non_pk_count, RawColumn,
 };
 use crate::error::{Result, SqlError};
 use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap};
@@ -115,6 +115,7 @@ pub fn execute(
         Statement::DropTable(dt) => exec_drop_table(db, schema, dt),
         Statement::CreateIndex(ci) => exec_create_index(db, schema, ci),
         Statement::DropIndex(di) => exec_drop_index(db, schema, di),
+        Statement::AlterTable(at) => exec_alter_table(db, schema, at),
         Statement::Insert(ins) => exec_insert(db, schema, ins, params),
         Statement::Select(sel) => exec_select(db, schema, sel),
         Statement::Update(upd) => exec_update(db, schema, upd),
@@ -138,6 +139,7 @@ pub fn execute_in_txn(
         Statement::DropTable(dt) => exec_drop_table_in_txn(wtx, schema, dt),
         Statement::CreateIndex(ci) => exec_create_index_in_txn(wtx, schema, ci),
         Statement::DropIndex(di) => exec_drop_index_in_txn(wtx, schema, di),
+        Statement::AlterTable(at) => exec_alter_table_in_txn(wtx, schema, at),
         Statement::Insert(ins) => {
             let mut bufs = InsertBufs::new();
             exec_insert_in_txn(wtx, schema, ins, params, &mut bufs)
@@ -163,6 +165,28 @@ pub fn explain(schema: &SchemaManager, stmt: &Statement) -> Result<ExecutionResu
         Statement::Update(upd) => explain_dml(schema, &upd.table, &upd.where_clause, "UPDATE")?,
         Statement::Delete(del) => {
             explain_dml(schema, &del.table, &del.where_clause, "DELETE FROM")?
+        }
+        Statement::AlterTable(at) => {
+            let desc = match &at.op {
+                AlterTableOp::AddColumn { column, .. } => {
+                    format!("ALTER TABLE {} ADD COLUMN {}", at.table, column.name)
+                }
+                AlterTableOp::DropColumn { name, .. } => {
+                    format!("ALTER TABLE {} DROP COLUMN {}", at.table, name)
+                }
+                AlterTableOp::RenameColumn {
+                    old_name, new_name, ..
+                } => {
+                    format!(
+                        "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                        at.table, old_name, new_name
+                    )
+                }
+                AlterTableOp::RenameTable { new_name } => {
+                    format!("ALTER TABLE {} RENAME TO {}", at.table, new_name)
+                }
+            };
+            vec![desc]
         }
         Statement::Explain(_) => {
             return Err(SqlError::Unsupported("EXPLAIN EXPLAIN".into()));
@@ -1045,6 +1069,370 @@ fn exec_drop_index_in_txn(
     Ok(ExecutionResult::Ok)
 }
 
+// ── ALTER TABLE ──────────────────────────────────────────────────────
+
+fn exec_alter_table(
+    db: &Database,
+    schema: &mut SchemaManager,
+    stmt: &AlterTableStmt,
+) -> Result<ExecutionResult> {
+    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    SchemaManager::ensure_schema_table(&mut wtx)?;
+    alter_table_impl(&mut wtx, schema, stmt)?;
+    wtx.commit().map_err(SqlError::Storage)?;
+    Ok(ExecutionResult::Ok)
+}
+
+fn exec_alter_table_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    stmt: &AlterTableStmt,
+) -> Result<ExecutionResult> {
+    SchemaManager::ensure_schema_table(wtx)?;
+    alter_table_impl(wtx, schema, stmt)?;
+    Ok(ExecutionResult::Ok)
+}
+
+fn alter_table_impl(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    stmt: &AlterTableStmt,
+) -> Result<()> {
+    let lower_name = stmt.table.to_ascii_lowercase();
+    if lower_name == "_schema" {
+        return Err(SqlError::Unsupported("cannot alter internal table".into()));
+    }
+    match &stmt.op {
+        AlterTableOp::AddColumn {
+            column,
+            foreign_key,
+            if_not_exists,
+        } => alter_add_column(
+            wtx,
+            schema,
+            &lower_name,
+            column,
+            foreign_key.as_ref(),
+            *if_not_exists,
+        ),
+        AlterTableOp::DropColumn { name, if_exists } => {
+            alter_drop_column(wtx, schema, &lower_name, name, *if_exists)
+        }
+        AlterTableOp::RenameColumn { old_name, new_name } => {
+            alter_rename_column(wtx, schema, &lower_name, old_name, new_name)
+        }
+        AlterTableOp::RenameTable { new_name } => {
+            alter_rename_table(wtx, schema, &lower_name, new_name)
+        }
+    }
+}
+
+fn alter_add_column(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    table_name: &str,
+    col_spec: &ColumnSpec,
+    fk_def: Option<&ForeignKeyDef>,
+    if_not_exists: bool,
+) -> Result<()> {
+    let table_schema = schema
+        .get(table_name)
+        .ok_or_else(|| SqlError::TableNotFound(table_name.into()))?;
+
+    let col_lower = col_spec.name.to_ascii_lowercase();
+
+    if table_schema.column_index(&col_lower).is_some() {
+        if if_not_exists {
+            return Ok(());
+        }
+        return Err(SqlError::DuplicateColumn(col_spec.name.clone()));
+    }
+
+    if col_spec.is_primary_key {
+        return Err(SqlError::Unsupported(
+            "cannot add PRIMARY KEY column via ALTER TABLE".into(),
+        ));
+    }
+
+    if !col_spec.nullable && col_spec.default_expr.is_none() {
+        let count = wtx.table_entry_count(table_name.as_bytes()).unwrap_or(0);
+        if count > 0 {
+            return Err(SqlError::Unsupported(
+                "cannot add NOT NULL column without DEFAULT to non-empty table".into(),
+            ));
+        }
+    }
+
+    if let Some(ref check) = col_spec.check_expr {
+        if has_subquery(check) {
+            return Err(SqlError::Unsupported("subquery in CHECK constraint".into()));
+        }
+    }
+
+    let new_pos = table_schema.columns.len() as u16;
+    let new_col = ColumnDef {
+        name: col_lower.clone(),
+        data_type: col_spec.data_type,
+        nullable: col_spec.nullable,
+        position: new_pos,
+        default_expr: col_spec.default_expr.clone(),
+        default_sql: col_spec.default_sql.clone(),
+        check_expr: col_spec.check_expr.clone(),
+        check_sql: col_spec.check_sql.clone(),
+        check_name: col_spec.check_name.clone(),
+    };
+
+    let mut new_schema = table_schema.clone();
+    new_schema.columns.push(new_col);
+
+    if let Some(fk) = fk_def {
+        let col_idx = new_pos;
+        let fk_entry = ForeignKeySchemaEntry {
+            name: fk.name.clone(),
+            columns: vec![col_idx],
+            foreign_table: fk.foreign_table.to_ascii_lowercase(),
+            referred_columns: fk
+                .referred_columns
+                .iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect(),
+        };
+        new_schema.foreign_keys.push(fk_entry);
+    }
+
+    new_schema = new_schema.rebuild();
+
+    if fk_def.is_some() {
+        validate_foreign_keys(schema, &new_schema, &new_schema.foreign_keys)?;
+        new_schema = create_fk_auto_indices(wtx, new_schema)?;
+    }
+
+    SchemaManager::save_schema(wtx, &new_schema)?;
+    schema.register(new_schema);
+    Ok(())
+}
+
+fn alter_drop_column(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    table_name: &str,
+    col_name: &str,
+    if_exists: bool,
+) -> Result<()> {
+    let table_schema = schema
+        .get(table_name)
+        .ok_or_else(|| SqlError::TableNotFound(table_name.into()))?;
+
+    let col_lower = col_name.to_ascii_lowercase();
+    let drop_pos = match table_schema.column_index(&col_lower) {
+        Some(pos) => pos,
+        None => {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(SqlError::ColumnNotFound(col_name.into()));
+        }
+    };
+    let drop_pos_u16 = drop_pos as u16;
+
+    if table_schema.primary_key_columns.contains(&drop_pos_u16) {
+        return Err(SqlError::Unsupported(
+            "cannot drop primary key column".into(),
+        ));
+    }
+
+    for idx in &table_schema.indices {
+        if idx.columns.contains(&drop_pos_u16) {
+            return Err(SqlError::Unsupported(format!(
+                "column '{}' is indexed by '{}'; drop the index first",
+                col_lower, idx.name
+            )));
+        }
+    }
+
+    for fk in &table_schema.foreign_keys {
+        if fk.columns.contains(&drop_pos_u16) {
+            return Err(SqlError::Unsupported(format!(
+                "column '{}' is part of a foreign key",
+                col_lower
+            )));
+        }
+    }
+
+    for (child_table, fk) in schema.child_fks_for(table_name) {
+        if child_table == table_name {
+            continue; // self-ref already checked above
+        }
+        if fk.referred_columns.iter().any(|rc| rc == &col_lower) {
+            return Err(SqlError::Unsupported(format!(
+                "column '{}' is referenced by a foreign key in '{}'",
+                col_lower, child_table
+            )));
+        }
+    }
+
+    for tc in &table_schema.check_constraints {
+        if tc.sql.to_ascii_lowercase().contains(&col_lower) {
+            return Err(SqlError::Unsupported(format!(
+                "column '{}' is used in CHECK constraint '{}'",
+                col_lower,
+                tc.name.as_deref().unwrap_or("<unnamed>")
+            )));
+        }
+    }
+
+    // O(1): schema-only change. Old rows keep the dropped column's data
+    // in the encoding; decode paths skip it via decode_col_mapping().
+    // New rows encode NULL at the dead physical slot.
+    let new_schema = table_schema.without_column(drop_pos);
+
+    SchemaManager::save_schema(wtx, &new_schema)?;
+    schema.register(new_schema);
+    Ok(())
+}
+
+fn alter_rename_column(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    table_name: &str,
+    old_name: &str,
+    new_name: &str,
+) -> Result<()> {
+    let table_schema = schema
+        .get(table_name)
+        .ok_or_else(|| SqlError::TableNotFound(table_name.into()))?;
+
+    let old_lower = old_name.to_ascii_lowercase();
+    let new_lower = new_name.to_ascii_lowercase();
+
+    let col_pos = table_schema
+        .column_index(&old_lower)
+        .ok_or_else(|| SqlError::ColumnNotFound(old_name.into()))?;
+
+    if table_schema.column_index(&new_lower).is_some() {
+        return Err(SqlError::DuplicateColumn(new_name.into()));
+    }
+
+    let mut new_schema = table_schema.clone();
+    new_schema.columns[col_pos].name = new_lower.clone();
+
+    // Update CHECK constraint SQL text that references the old column name
+    for col in &mut new_schema.columns {
+        if let Some(ref sql) = col.check_sql {
+            if sql.to_ascii_lowercase().contains(&old_lower) {
+                let updated = sql.replace(&old_lower, &new_lower);
+                col.check_sql = Some(updated.clone());
+                // Re-parse the updated expression
+                if let Ok(parsed) = crate::parser::parse_sql_expr(&updated) {
+                    col.check_expr = Some(parsed);
+                }
+            }
+        }
+    }
+    for tc in &mut new_schema.check_constraints {
+        if tc.sql.to_ascii_lowercase().contains(&old_lower) {
+            tc.sql = tc.sql.replace(&old_lower, &new_lower);
+            if let Ok(parsed) = crate::parser::parse_sql_expr(&tc.sql) {
+                tc.expr = parsed;
+            }
+        }
+    }
+
+    // Update FK referred_columns if this table is referenced by child FKs
+    // (only for self-referencing FKs — cross-table FKs reference by name,
+    // so they'll be updated when child tables are loaded)
+    for fk in &mut new_schema.foreign_keys {
+        if fk.foreign_table == table_name {
+            for rc in &mut fk.referred_columns {
+                if *rc == old_lower {
+                    *rc = new_lower.clone();
+                }
+            }
+        }
+    }
+
+    SchemaManager::save_schema(wtx, &new_schema)?;
+    schema.register(new_schema);
+    Ok(())
+}
+
+fn alter_rename_table(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    old_name: &str,
+    new_name: &str,
+) -> Result<()> {
+    let new_lower = new_name.to_ascii_lowercase();
+
+    if new_lower == "_schema" {
+        return Err(SqlError::Unsupported(
+            "cannot rename to internal table name".into(),
+        ));
+    }
+
+    let table_schema = schema
+        .get(old_name)
+        .ok_or_else(|| SqlError::TableNotFound(old_name.into()))?
+        .clone();
+
+    if schema.contains(&new_lower) {
+        return Err(SqlError::TableAlreadyExists(new_name.into()));
+    }
+
+    wtx.rename_table(old_name.as_bytes(), new_lower.as_bytes())
+        .map_err(SqlError::Storage)?;
+
+    let idx_renames: Vec<(Vec<u8>, Vec<u8>)> = table_schema
+        .indices
+        .iter()
+        .map(|idx| {
+            let old_idx = TableSchema::index_table_name(old_name, &idx.name);
+            let new_idx = TableSchema::index_table_name(&new_lower, &idx.name);
+            (old_idx, new_idx)
+        })
+        .collect();
+    for (old_idx, new_idx) in &idx_renames {
+        wtx.rename_table(old_idx, new_idx)
+            .map_err(SqlError::Storage)?;
+    }
+
+    let child_tables: Vec<String> = schema
+        .child_fks_for(old_name)
+        .iter()
+        .filter(|(child, _)| *child != old_name)
+        .map(|(child, _)| child.to_string())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    for child_table in &child_tables {
+        let mut updated_child = schema.get(child_table).unwrap().clone();
+        for fk in &mut updated_child.foreign_keys {
+            if fk.foreign_table == old_name {
+                fk.foreign_table = new_lower.clone();
+            }
+        }
+        SchemaManager::save_schema(wtx, &updated_child)?;
+        schema.register(updated_child);
+    }
+
+    SchemaManager::delete_schema(wtx, old_name)?;
+    let mut new_schema = table_schema;
+    new_schema.name = new_lower.clone();
+
+    // Update self-referencing FKs
+    for fk in &mut new_schema.foreign_keys {
+        if fk.foreign_table == old_name {
+            fk.foreign_table = new_lower.clone();
+        }
+    }
+
+    SchemaManager::save_schema(wtx, &new_schema)?;
+    schema.remove(old_name);
+    schema.register(new_schema);
+    Ok(())
+}
+
 fn find_index_in_schemas(schema: &SchemaManager, index_name: &str) -> Option<(String, usize)> {
     for table_name in schema.table_names() {
         if let Some(ts) = schema.get(table_name) {
@@ -1787,9 +2175,11 @@ fn exec_insert(
 
     let pk_indices = table_schema.pk_indices();
     let non_pk = table_schema.non_pk_indices();
+    let enc_pos = table_schema.encoding_positions();
+    let phys_count = table_schema.physical_non_pk_count();
     let mut row = vec![Value::Null; table_schema.columns.len()];
     let mut pk_values: Vec<Value> = vec![Value::Null; pk_indices.len()];
-    let mut value_values: Vec<Value> = vec![Value::Null; non_pk.len()];
+    let mut value_values: Vec<Value> = vec![Value::Null; phys_count];
     let mut key_buf: Vec<u8> = Vec::with_capacity(64);
     let mut value_buf: Vec<u8> = Vec::with_capacity(256);
     let mut fk_key_buf: Vec<u8> = Vec::with_capacity(64);
@@ -1902,7 +2292,7 @@ fn exec_insert(
         encode_composite_key_into(&pk_values, &mut key_buf);
 
         for (j, &i) in non_pk.iter().enumerate() {
-            value_values[j] = std::mem::replace(&mut row[i], Value::Null);
+            value_values[enc_pos[j] as usize] = std::mem::replace(&mut row[i], Value::Null);
         }
         encode_row_into(&value_values, &mut value_buf);
 
@@ -1931,7 +2321,7 @@ fn exec_insert(
                 row[i] = pk_values[j].clone();
             }
             for (j, &i) in non_pk.iter().enumerate() {
-                row[i] = std::mem::replace(&mut value_values[j], Value::Null);
+                row[i] = std::mem::replace(&mut value_values[enc_pos[j] as usize], Value::Null);
             }
             insert_index_entries(&mut wtx, table_schema, &row, &pk_values)?;
         }
@@ -2702,6 +3092,7 @@ struct StreamAggPlan {
     partial_ctx: Option<PartialDecodeCtx>,
     raw_targets: Vec<RawAggTarget>,
     num_pk_cols: usize,
+    nonpk_agg_defaults: Vec<Option<Value>>,
 }
 
 impl StreamAggPlan {
@@ -2769,6 +3160,7 @@ impl StreamAggPlan {
         };
 
         let non_pk = table_schema.non_pk_indices();
+        let enc_pos = table_schema.encoding_positions();
         let raw_targets: Vec<RawAggTarget> = ops
             .iter()
             .map(|(op, _)| match op {
@@ -2785,8 +3177,8 @@ impl StreamAggPlan {
                     {
                         RawAggTarget::Pk(pk_pos)
                     } else {
-                        let nonpk_idx = non_pk.iter().position(|&i| i == *idx).unwrap();
-                        RawAggTarget::NonPk(nonpk_idx)
+                        let nonpk_order = non_pk.iter().position(|&i| i == *idx).unwrap();
+                        RawAggTarget::NonPk(enc_pos[nonpk_order] as usize)
                     }
                 }
             })
@@ -2794,11 +3186,30 @@ impl StreamAggPlan {
 
         let num_pk_cols = table_schema.primary_key_columns.len();
 
+        let mapping = table_schema.decode_col_mapping();
+        let nonpk_agg_defaults: Vec<Option<Value>> = raw_targets
+            .iter()
+            .map(|t| match t {
+                RawAggTarget::NonPk(phys_idx) => {
+                    let schema_col = mapping[*phys_idx];
+                    if schema_col == usize::MAX {
+                        return None;
+                    }
+                    table_schema.columns[schema_col]
+                        .default_expr
+                        .as_ref()
+                        .and_then(|expr| eval_const_expr(expr).ok())
+                }
+                _ => None,
+            })
+            .collect();
+
         Ok(Some(Self {
             ops,
             partial_ctx,
             raw_targets,
             num_pk_cols,
+            nonpk_agg_defaults,
         }))
     }
 
@@ -2900,13 +3311,28 @@ impl StreamAggPlan {
                         }
                     }
                 }
-                RawAggTarget::NonPk(idx) => match decode_column_raw(value, *idx) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        *scan_err = Some(e);
-                        return false;
+                RawAggTarget::NonPk(idx) => {
+                    let stored = row_non_pk_count(value);
+                    if *idx >= stored {
+                        if let Some(ref default) = self.nonpk_agg_defaults[i] {
+                            if let Err(e) = states[i].feed_val(default) {
+                                *scan_err = Some(e);
+                                return false;
+                            }
+                        } else if let Err(e) = states[i].feed_raw(&RawColumn::Null) {
+                            *scan_err = Some(e);
+                            return false;
+                        }
+                        continue;
                     }
-                },
+                    match decode_column_raw(value, *idx) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            *scan_err = Some(e);
+                            return false;
+                        }
+                    }
+                }
             };
             if let Err(e) = states[i].feed_raw(&raw) {
                 *scan_err = Some(e);
@@ -2975,6 +3401,7 @@ impl StreamGroupByPlan {
         }
 
         let non_pk = schema.non_pk_indices();
+        let enc_pos = schema.encoding_positions();
         let group_target = if let Some(pk_pos) = schema
             .primary_key_columns
             .iter()
@@ -2982,8 +3409,8 @@ impl StreamGroupByPlan {
         {
             RawAggTarget::Pk(pk_pos)
         } else {
-            let nonpk_idx = non_pk.iter().position(|&i| i == group_col_idx).unwrap();
-            RawAggTarget::NonPk(nonpk_idx)
+            let nonpk_order = non_pk.iter().position(|&i| i == group_col_idx).unwrap();
+            RawAggTarget::NonPk(enc_pos[nonpk_order] as usize)
         };
 
         let mut agg_ops = Vec::new();
@@ -3030,8 +3457,8 @@ impl StreamGroupByPlan {
                     {
                         RawAggTarget::Pk(pk_pos)
                     } else {
-                        let nonpk_idx = non_pk.iter().position(|&i| i == col_idx).unwrap();
-                        RawAggTarget::NonPk(nonpk_idx)
+                        let nonpk_order = non_pk.iter().position(|&i| i == col_idx).unwrap();
+                        RawAggTarget::NonPk(enc_pos[nonpk_order] as usize)
                     };
                     let agg_idx = agg_ops.len();
                     match func.as_str() {
@@ -3248,6 +3675,7 @@ impl TopKScanPlan {
         };
 
         let non_pk = schema.non_pk_indices();
+        let enc_pos_arr = schema.encoding_positions();
         let sort_target = if let Some(pk_pos) = schema
             .primary_key_columns
             .iter()
@@ -3255,8 +3683,8 @@ impl TopKScanPlan {
         {
             RawAggTarget::Pk(pk_pos)
         } else {
-            let nonpk_idx = non_pk.iter().position(|&i| i == col_idx).unwrap();
-            RawAggTarget::NonPk(nonpk_idx)
+            let nonpk_order = non_pk.iter().position(|&i| i == col_idx).unwrap();
+            RawAggTarget::NonPk(enc_pos_arr[nonpk_order] as usize)
         };
 
         let limit = eval_const_int(stmt.limit.as_ref().unwrap())?.max(0) as usize;
@@ -3470,6 +3898,8 @@ struct SimplePredicate {
     literal: Value,
     num_pk_cols: usize,
     precomputed_int: Option<i64>,
+    default_int: Option<i64>,
+    default_val: Option<Value>,
 }
 
 impl SimplePredicate {
@@ -3495,6 +3925,11 @@ impl SimplePredicate {
                     }
                 }
             }
+        } else if self.nonpk_idx >= row_non_pk_count(value) {
+            return Ok(match &self.default_val {
+                Some(d) => raw_matches_op_value(d, self.op, &self.literal),
+                None => false,
+            });
         } else {
             decode_column_raw(value, self.nonpk_idx)?
         };
@@ -3504,6 +3939,22 @@ impl SimplePredicate {
     #[inline(always)]
     fn match_nonpk_int_inline(&self, data: &[u8], target: i64) -> bool {
         let col_count = u16::from_le_bytes(data[0..2].try_into().unwrap()) as usize;
+
+        if self.nonpk_idx >= col_count {
+            return match self.default_int {
+                Some(v) => match self.op {
+                    BinOp::Eq => v == target,
+                    BinOp::NotEq => v != target,
+                    BinOp::Lt => v < target,
+                    BinOp::Gt => v > target,
+                    BinOp::LtEq => v <= target,
+                    BinOp::GtEq => v >= target,
+                    _ => false,
+                },
+                None => false,
+            };
+        }
+
         let bm_bytes = col_count.div_ceil(8);
 
         // NULL → false (SQL NULL semantics)
@@ -3569,13 +4020,24 @@ fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<SimplePredi
             literal: literal.clone(),
             num_pk_cols: schema.primary_key_columns.len(),
             precomputed_int: None,
+            default_int: None,
+            default_val: None,
         })
     } else {
-        let nonpk_idx = non_pk.iter().position(|&i| i == col_idx)?;
+        let nonpk_order = non_pk.iter().position(|&i| i == col_idx)?;
+        let nonpk_idx = schema.encoding_positions()[nonpk_order] as usize;
         let precomputed_int = match literal {
             Value::Integer(i) => Some(*i),
             _ => None,
         };
+        let default_val = schema.columns[col_idx]
+            .default_expr
+            .as_ref()
+            .and_then(|expr| eval_const_expr(expr).ok());
+        let default_int = default_val.as_ref().and_then(|v| match v {
+            Value::Integer(i) => Some(*i),
+            _ => None,
+        });
         Some(SimplePredicate {
             is_pk: false,
             pk_pos: 0,
@@ -3584,6 +4046,8 @@ fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<SimplePredi
             literal: literal.clone(),
             num_pk_cols: schema.primary_key_columns.len(),
             precomputed_int,
+            default_int,
+            default_val,
         })
     }
 }
@@ -4845,7 +5309,12 @@ fn exec_update(
         let new_key = encode_composite_key(&pk_values);
 
         let non_pk = table_schema.non_pk_indices();
-        let value_values: Vec<Value> = non_pk.iter().map(|&i| new_row[i].clone()).collect();
+        let enc_pos = table_schema.encoding_positions();
+        let phys_count = table_schema.physical_non_pk_count();
+        let mut value_values = vec![Value::Null; phys_count];
+        for (j, &i) in non_pk.iter().enumerate() {
+            value_values[enc_pos[j] as usize] = new_row[i].clone();
+        }
         let new_value = encode_row(&value_values);
 
         changes.push(UpdateChange {
@@ -5170,10 +5639,13 @@ pub fn exec_insert_in_txn(
 
     let pk_indices = table_schema.pk_indices();
     let non_pk = table_schema.non_pk_indices();
+    let enc_pos = table_schema.encoding_positions();
+    let phys_count = table_schema.physical_non_pk_count();
+    let dropped = table_schema.dropped_non_pk_slots();
 
     bufs.row.resize(table_schema.columns.len(), Value::Null);
     bufs.pk_values.resize(pk_indices.len(), Value::Null);
-    bufs.value_values.resize(non_pk.len(), Value::Null);
+    bufs.value_values.resize(phys_count, Value::Null);
 
     let mut count: u64 = 0;
 
@@ -5284,8 +5756,12 @@ pub fn exec_insert_in_txn(
         }
         encode_composite_key_into(&bufs.pk_values, &mut bufs.key_buf);
 
+        for &slot in dropped {
+            bufs.value_values[slot as usize] = Value::Null;
+        }
         for (j, &i) in non_pk.iter().enumerate() {
-            bufs.value_values[j] = std::mem::replace(&mut bufs.row[i], Value::Null);
+            bufs.value_values[enc_pos[j] as usize] =
+                std::mem::replace(&mut bufs.row[i], Value::Null);
         }
         encode_row_into(&bufs.value_values, &mut bufs.value_buf);
 
@@ -5314,7 +5790,8 @@ pub fn exec_insert_in_txn(
                 bufs.row[i] = bufs.pk_values[j].clone();
             }
             for (j, &i) in non_pk.iter().enumerate() {
-                bufs.row[i] = std::mem::replace(&mut bufs.value_values[j], Value::Null);
+                bufs.row[i] =
+                    std::mem::replace(&mut bufs.value_values[enc_pos[j] as usize], Value::Null);
             }
             insert_index_entries(wtx, table_schema, &bufs.row, &bufs.pk_values)?;
         }
@@ -5515,7 +5992,12 @@ fn exec_update_in_txn(
         let new_key = encode_composite_key(&pk_values);
 
         let non_pk = table_schema.non_pk_indices();
-        let value_values: Vec<Value> = non_pk.iter().map(|&i| new_row[i].clone()).collect();
+        let enc_pos = table_schema.encoding_positions();
+        let phys_count = table_schema.physical_non_pk_count();
+        let mut value_values = vec![Value::Null; phys_count];
+        for (j, &i) in non_pk.iter().enumerate() {
+            value_values[enc_pos[j] as usize] = new_row[i].clone();
+        }
         let new_value = encode_row(&value_values);
 
         changes.push(UpdateChange {
@@ -6209,11 +6691,14 @@ struct PartialDecodeCtx {
     remaining_pk: Vec<(usize, usize)>,
     remaining_nonpk_targets: Vec<usize>,
     remaining_nonpk_schema: Vec<usize>,
+    nonpk_defaults: Vec<(usize, usize, Value)>,
+    remaining_defaults: Vec<(usize, usize, Value)>,
 }
 
 impl PartialDecodeCtx {
     fn new(schema: &TableSchema, needed: &[usize]) -> Self {
         let non_pk = schema.non_pk_indices();
+        let enc_pos = schema.encoding_positions();
         let mut pk_positions = Vec::new();
         let mut nonpk_targets = Vec::new();
         let mut nonpk_schema = Vec::new();
@@ -6225,8 +6710,8 @@ impl PartialDecodeCtx {
                 .position(|&i| i as usize == col)
             {
                 pk_positions.push((pk_pos, col));
-            } else if let Some(nonpk_idx) = non_pk.iter().position(|&i| i == col) {
-                nonpk_targets.push(nonpk_idx);
+            } else if let Some(nonpk_order) = non_pk.iter().position(|&i| i == col) {
+                nonpk_targets.push(enc_pos[nonpk_order] as usize);
                 nonpk_schema.push(col);
             }
         }
@@ -6240,10 +6725,30 @@ impl PartialDecodeCtx {
         }
         let mut remaining_nonpk_targets = Vec::new();
         let mut remaining_nonpk_schema = Vec::new();
-        for (nonpk_idx, &col) in non_pk.iter().enumerate() {
+        for (nonpk_order, &col) in non_pk.iter().enumerate() {
             if !needed_set.contains(&col) {
-                remaining_nonpk_targets.push(nonpk_idx);
+                remaining_nonpk_targets.push(enc_pos[nonpk_order] as usize);
                 remaining_nonpk_schema.push(col);
+            }
+        }
+
+        let mut nonpk_defaults = Vec::new();
+        for (&phys_pos, &schema_col) in nonpk_targets.iter().zip(nonpk_schema.iter()) {
+            if let Some(ref expr) = schema.columns[schema_col].default_expr {
+                if let Ok(val) = eval_const_expr(expr) {
+                    nonpk_defaults.push((phys_pos, schema_col, val));
+                }
+            }
+        }
+        let mut remaining_defaults = Vec::new();
+        for (&phys_pos, &schema_col) in remaining_nonpk_targets
+            .iter()
+            .zip(remaining_nonpk_schema.iter())
+        {
+            if let Some(ref expr) = schema.columns[schema_col].default_expr {
+                if let Ok(val) = eval_const_expr(expr) {
+                    remaining_defaults.push((phys_pos, schema_col, val));
+                }
             }
         }
 
@@ -6256,6 +6761,8 @@ impl PartialDecodeCtx {
             remaining_pk,
             remaining_nonpk_targets,
             remaining_nonpk_schema,
+            nonpk_defaults,
+            remaining_defaults,
         }
     }
 
@@ -6277,6 +6784,15 @@ impl PartialDecodeCtx {
             decode_columns_into(value, &self.nonpk_targets, &self.nonpk_schema, &mut row)?;
         }
 
+        if !self.nonpk_defaults.is_empty() {
+            let stored = row_non_pk_count(value);
+            for (nonpk_idx, schema_col, default) in &self.nonpk_defaults {
+                if *nonpk_idx >= stored {
+                    row[*schema_col] = default.clone();
+                }
+            }
+        }
+
         Ok(row)
     }
 
@@ -6293,6 +6809,14 @@ impl PartialDecodeCtx {
                 row[schema_col] = std::mem::take(&mut values[i]);
             }
         }
+        if !self.remaining_defaults.is_empty() {
+            let stored = row_non_pk_count(value);
+            for (nonpk_idx, schema_col, default) in &self.remaining_defaults {
+                if *nonpk_idx >= stored {
+                    row[*schema_col] = default.clone();
+                }
+            }
+        }
         Ok(row)
     }
 }
@@ -6305,7 +6829,20 @@ fn decode_full_row(schema: &TableSchema, key: &[u8], value: &[u8]) -> Result<Vec
         &mut row,
         schema.pk_indices(),
     )?;
-    decode_row_into(value, &mut row, schema.non_pk_indices())?;
+    let mapping = schema.decode_col_mapping();
+    let stored_count = row_non_pk_count(value);
+    decode_row_into(value, &mut row, mapping)?;
+    // Fill defaults for physical positions beyond stored count
+    // (columns added after this row was written)
+    if stored_count < mapping.len() {
+        for &logical_idx in mapping.iter().skip(stored_count) {
+            if logical_idx != usize::MAX {
+                if let Some(ref expr) = schema.columns[logical_idx].default_expr {
+                    row[logical_idx] = eval_const_expr(expr)?;
+                }
+            }
+        }
+    }
     Ok(row)
 }
 

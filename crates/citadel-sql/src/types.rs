@@ -288,6 +288,16 @@ pub struct TableSchema {
     pub foreign_keys: Vec<ForeignKeySchemaEntry>,
     pk_idx_cache: Vec<usize>,
     non_pk_idx_cache: Vec<usize>,
+    /// Physical encoding slots that have been dropped (O(1) DROP COLUMN).
+    /// Sorted. Old rows still have data at these positions (skipped on decode);
+    /// new rows encode NULL there to maintain position consistency.
+    dropped_non_pk_slots: Vec<u16>,
+    /// Physical encoding position → logical column index.
+    /// `usize::MAX` for dropped slots.
+    decode_mapping_cache: Vec<usize>,
+    /// Logical non-PK order → physical encoding position.
+    /// `encoding_positions_cache[i]` is the physical slot for `non_pk_idx_cache[i]`.
+    encoding_positions_cache: Vec<u16>,
 }
 
 impl TableSchema {
@@ -299,10 +309,49 @@ impl TableSchema {
         check_constraints: Vec<TableCheckDef>,
         foreign_keys: Vec<ForeignKeySchemaEntry>,
     ) -> Self {
+        Self::with_drops(
+            name,
+            columns,
+            primary_key_columns,
+            indices,
+            check_constraints,
+            foreign_keys,
+            vec![],
+        )
+    }
+
+    pub fn with_drops(
+        name: String,
+        columns: Vec<ColumnDef>,
+        primary_key_columns: Vec<u16>,
+        indices: Vec<IndexDef>,
+        check_constraints: Vec<TableCheckDef>,
+        foreign_keys: Vec<ForeignKeySchemaEntry>,
+        dropped_non_pk_slots: Vec<u16>,
+    ) -> Self {
         let pk_idx_cache: Vec<usize> = primary_key_columns.iter().map(|&i| i as usize).collect();
         let non_pk_idx_cache: Vec<usize> = (0..columns.len())
             .filter(|i| !primary_key_columns.contains(&(*i as u16)))
             .collect();
+
+        let physical_count = non_pk_idx_cache.len() + dropped_non_pk_slots.len();
+        let mut decode_mapping_cache = vec![usize::MAX; physical_count];
+        let mut encoding_positions_cache = Vec::with_capacity(non_pk_idx_cache.len());
+
+        let mut drop_idx = 0;
+        let mut live_idx = 0;
+        for (phys_pos, slot) in decode_mapping_cache.iter_mut().enumerate() {
+            if drop_idx < dropped_non_pk_slots.len()
+                && dropped_non_pk_slots[drop_idx] as usize == phys_pos
+            {
+                drop_idx += 1;
+            } else {
+                *slot = non_pk_idx_cache[live_idx];
+                encoding_positions_cache.push(phys_pos as u16);
+                live_idx += 1;
+            }
+        }
+
         Self {
             name,
             columns,
@@ -312,16 +361,147 @@ impl TableSchema {
             foreign_keys,
             pk_idx_cache,
             non_pk_idx_cache,
+            dropped_non_pk_slots,
+            decode_mapping_cache,
+            encoding_positions_cache,
         }
+    }
+
+    /// Rebuild caches (preserving dropped slots). Use after mutating fields in place.
+    pub fn rebuild(self) -> Self {
+        let drops = self.dropped_non_pk_slots;
+        Self::with_drops(
+            self.name,
+            self.columns,
+            self.primary_key_columns,
+            self.indices,
+            self.check_constraints,
+            self.foreign_keys,
+            drops,
+        )
     }
 
     /// Returns true if any column-level or table-level CHECK constraints exist.
     pub fn has_checks(&self) -> bool {
         !self.check_constraints.is_empty() || self.columns.iter().any(|c| c.check_expr.is_some())
     }
+
+    /// Physical encoding position → logical column index mapping.
+    /// Length = physical_non_pk_count. `usize::MAX` for dropped slots.
+    pub fn decode_col_mapping(&self) -> &[usize] {
+        &self.decode_mapping_cache
+    }
+
+    /// Logical non-PK order → physical encoding position.
+    /// `encoding_positions()[i]` is the physical slot for `non_pk_indices()[i]`.
+    pub fn encoding_positions(&self) -> &[u16] {
+        &self.encoding_positions_cache
+    }
+
+    /// Total physical non-PK column count (live + dropped slots).
+    pub fn physical_non_pk_count(&self) -> usize {
+        self.non_pk_idx_cache.len() + self.dropped_non_pk_slots.len()
+    }
+
+    /// Physical encoding slots that have been dropped via O(1) DROP COLUMN.
+    pub fn dropped_non_pk_slots(&self) -> &[u16] {
+        &self.dropped_non_pk_slots
+    }
+
+    /// Create a new schema with the column at `drop_pos` removed.
+    /// O(1): marks the physical encoding slot as dropped instead of rewriting rows.
+    /// Decrements all logical position references > drop_pos. Filters out
+    /// table-level CHECK constraints referencing the dropped column.
+    pub fn without_column(&self, drop_pos: usize) -> Self {
+        // Find physical encoding slot for the dropped column
+        let non_pk_order = self
+            .non_pk_idx_cache
+            .iter()
+            .position(|&i| i == drop_pos)
+            .expect("cannot drop PK column via without_column");
+        let physical_slot = self.encoding_positions_cache[non_pk_order];
+
+        let mut new_dropped = self.dropped_non_pk_slots.clone();
+        new_dropped.push(physical_slot);
+        new_dropped.sort();
+
+        let dropped_name = &self.columns[drop_pos].name;
+        let drop_pos_u16 = drop_pos as u16;
+
+        let mut columns: Vec<ColumnDef> = self
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != drop_pos)
+            .map(|(_, c)| {
+                let mut col = c.clone();
+                if col.position > drop_pos_u16 {
+                    col.position -= 1;
+                }
+                col
+            })
+            .collect();
+        for (i, col) in columns.iter_mut().enumerate() {
+            col.position = i as u16;
+        }
+
+        let primary_key_columns: Vec<u16> = self
+            .primary_key_columns
+            .iter()
+            .map(|&p| if p > drop_pos_u16 { p - 1 } else { p })
+            .collect();
+
+        let indices: Vec<IndexDef> = self
+            .indices
+            .iter()
+            .map(|idx| IndexDef {
+                name: idx.name.clone(),
+                columns: idx
+                    .columns
+                    .iter()
+                    .map(|&c| if c > drop_pos_u16 { c - 1 } else { c })
+                    .collect(),
+                unique: idx.unique,
+            })
+            .collect();
+
+        let foreign_keys: Vec<ForeignKeySchemaEntry> = self
+            .foreign_keys
+            .iter()
+            .map(|fk| ForeignKeySchemaEntry {
+                name: fk.name.clone(),
+                columns: fk
+                    .columns
+                    .iter()
+                    .map(|&c| if c > drop_pos_u16 { c - 1 } else { c })
+                    .collect(),
+                foreign_table: fk.foreign_table.clone(),
+                referred_columns: fk.referred_columns.clone(),
+            })
+            .collect();
+
+        // Filter out table-level CHECKs that reference the dropped column
+        let dropped_lower = dropped_name.to_ascii_lowercase();
+        let check_constraints: Vec<TableCheckDef> = self
+            .check_constraints
+            .iter()
+            .filter(|c| !c.sql.to_ascii_lowercase().contains(&dropped_lower))
+            .cloned()
+            .collect();
+
+        Self::with_drops(
+            self.name.clone(),
+            columns,
+            primary_key_columns,
+            indices,
+            check_constraints,
+            foreign_keys,
+            new_dropped,
+        )
+    }
 }
 
-const SCHEMA_VERSION: u8 = 3;
+const SCHEMA_VERSION: u8 = 4;
 
 fn write_opt_string(buf: &mut Vec<u8>, s: &Option<String>) {
     match s {
@@ -447,13 +627,19 @@ impl TableSchema {
             }
         }
 
+        // v4: dropped non-PK encoding slots
+        buf.extend_from_slice(&(self.dropped_non_pk_slots.len() as u16).to_le_bytes());
+        for &slot in &self.dropped_non_pk_slots {
+            buf.extend_from_slice(&slot.to_le_bytes());
+        }
+
         buf
     }
 
     pub fn deserialize(data: &[u8]) -> crate::error::Result<Self> {
         let mut pos = 0;
 
-        if data.is_empty() || (data[0] != SCHEMA_VERSION && data[0] != 1 && data[0] != 2) {
+        if data.is_empty() || !matches!(data[0], 1 | 2 | 3 | SCHEMA_VERSION) {
             return Err(crate::error::SqlError::InvalidValue(
                 "invalid schema version".into(),
             ));
@@ -610,15 +796,27 @@ impl TableSchema {
                 });
             }
         }
+        // v4: dropped non-PK encoding slots
+        let mut dropped_non_pk_slots = Vec::new();
+        if version >= 4 && pos + 2 <= data.len() {
+            let slot_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            for _ in 0..slot_count {
+                let slot = u16::from_le_bytes([data[pos], data[pos + 1]]);
+                pos += 2;
+                dropped_non_pk_slots.push(slot);
+            }
+        }
         let _ = pos;
 
-        Ok(Self::new(
+        Ok(Self::with_drops(
             name,
             columns,
             primary_key_columns,
             indices,
             check_constraints,
             foreign_keys,
+            dropped_non_pk_slots,
         ))
     }
 

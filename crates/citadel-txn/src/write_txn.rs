@@ -198,6 +198,50 @@ impl<'a> WriteTxn<'a> {
         Ok(())
     }
 
+    /// Rename a table in the catalog. O(1) — no data copy.
+    pub fn rename_table(&mut self, old_name: &[u8], new_name: &[u8]) -> Result<()> {
+        self.ensure_table(old_name)?;
+
+        if self.named_trees.contains_key(new_name) {
+            return Err(Error::TableAlreadyExists(
+                String::from_utf8_lossy(new_name).into_owned(),
+            ));
+        }
+
+        self.ensure_catalog()?;
+        let catalog_root = self.catalog.as_ref().unwrap().root;
+        self.preload_path(catalog_root, new_name)?;
+        if let Some((vt, _)) = self
+            .catalog
+            .as_ref()
+            .unwrap()
+            .search(&self.pages, new_name)?
+        {
+            if vt != ValueType::Tombstone {
+                return Err(Error::TableAlreadyExists(
+                    String::from_utf8_lossy(new_name).into_owned(),
+                ));
+            }
+        }
+
+        let tree = self.named_trees.remove(old_name).unwrap();
+        self.named_trees.insert(new_name.to_vec(), tree);
+
+        // Remove old meta so finalize_catalog writes the new name
+        self.loaded_tree_meta.remove(old_name);
+
+        let catalog_root = self.catalog.as_ref().unwrap().root;
+        self.preload_path(catalog_root, old_name)?;
+        self.catalog.as_mut().unwrap().delete(
+            &mut self.pages,
+            &mut self.alloc,
+            self.txn_id,
+            old_name,
+        )?;
+        self.catalog_dirty = true;
+        Ok(())
+    }
+
     pub fn table_insert(&mut self, table: &[u8], key: &[u8], value: &[u8]) -> Result<bool> {
         Self::validate_key_value(key, value)?;
 
