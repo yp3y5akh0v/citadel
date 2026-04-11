@@ -192,7 +192,7 @@ fn crdt_equal_entries_detected() {
     }
 
     let result = sync_push(&source, &target, 42, true);
-    // key2 is new → applied. key1 is equal → entries_equal.
+    // key2 is new -> applied. key1 is equal -> entries_equal.
     assert!(result.entries_applied >= 1);
     assert_eq!(result.entries_skipped, 0);
     assert!(result.entries_equal >= 1);
@@ -303,7 +303,7 @@ fn bidirectional_crdt_conflict() {
     let db1 = fast_builder(&dir.path().join("db1.db")).create().unwrap();
     let db2 = fast_builder(&dir.path().join("db2.db")).create().unwrap();
 
-    let m1 = meta(2, 0, 1); // later → wins
+    let m1 = meta(2, 0, 1); // later -> wins
     let m2 = meta(1, 0, 2);
 
     {

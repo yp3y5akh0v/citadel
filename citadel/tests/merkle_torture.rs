@@ -204,7 +204,7 @@ fn batch_sizes_dont_affect_hash() {
 }
 
 // ============================================================
-// Split propagation — force tree structure changes
+// Split propagation - force tree structure changes
 // ============================================================
 
 #[test]
@@ -247,10 +247,10 @@ fn many_inserts_force_splits_hash_changes() {
 #[test]
 fn split_same_order_different_txn_granularity() {
     // Same insertion order with different transaction boundaries must produce
-    // identical tree structure and thus identical Merkle hash — even when
+    // identical tree structure and thus identical Merkle hash - even when
     // the dataset forces multiple leaf splits.
     // Note: different insertion ORDERS can produce different split points,
-    // which is correct — the Merkle hash reflects physical page structure.
+    // which is correct - the Merkle hash reflects physical page structure.
     let dir = tempfile::tempdir().unwrap();
 
     let db1 = fast_builder(&dir.path().join("a.db")).create().unwrap();

@@ -39,7 +39,7 @@ fn assert_plan(db: &citadel::Database, sql: &str, expected: &str) {
     let schema_mgr = SchemaManager::load(db).unwrap();
     let stmt = parse_sql(sql).unwrap();
     let (table_name, where_clause) = match &stmt {
-        citadel_sql::parser::Statement::Select(body) => match body.as_ref() {
+        citadel_sql::parser::Statement::Select(sq) => match &sq.body {
             citadel_sql::parser::QueryBody::Select(s) => {
                 (s.from.to_ascii_lowercase(), &s.where_clause)
             }
@@ -604,7 +604,7 @@ fn pk_lookup_with_additional_predicate_that_fails() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    // PK lookup finds id=1, but stock != 999 → residual WHERE eliminates it
+    // PK lookup finds id=1, but stock != 999 -> residual WHERE eliminates it
     let qr = query_result(
         conn.execute("SELECT * FROM products WHERE id = 1 AND stock = 999")
             .unwrap(),
@@ -1063,12 +1063,12 @@ fn index_range_scan_matches_full_scan() {
     );
 
     assert_eq!(full_scan.rows, index_scan.rows);
-    // grade 50..79 → ids: 10(50), 11(55), 12(60), 13(65), 14(70), 15(75)
+    // grade 50..79 -> ids: 10(50), 11(55), 12(60), 13(65), 14(70), 15(75)
     assert_eq!(index_scan.rows.len(), 6);
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  SCALE TEST: 1000 rows — prove index returns correct subset
+//  SCALE TEST: 1000 rows - prove index returns correct subset
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1105,7 +1105,7 @@ fn scale_1000_rows_index_equality() {
         conn.execute("SELECT id FROM big WHERE bucket = 7 ORDER BY id")
             .unwrap(),
     );
-    // bucket=7: ids 7, 27, 47, ... 987 → 50 rows
+    // bucket=7: ids 7, 27, 47, ... 987 -> 50 rows
     assert_eq!(qr.rows.len(), 50);
     assert_eq!(qr.rows[0][0], Value::Integer(7));
     assert_eq!(qr.rows[49][0], Value::Integer(987));
@@ -1376,7 +1376,7 @@ fn partial_composite_pk_is_not_pk_lookup() {
     conn.execute("INSERT INTO orders VALUES (2, 100, 30.0)")
         .unwrap();
 
-    // Only one PK column specified — can't do PK lookup
+    // Only one PK column specified - can't do PK lookup
     assert_plan(&db, "SELECT * FROM orders WHERE cust = 1", "SeqScan");
 
     let qr = query_result(
@@ -1612,7 +1612,7 @@ fn index_consistent_after_insert_update_delete_cycle() {
     let mut conn = Connection::open(&db).unwrap();
     setup_products(&mut conn);
 
-    // Insert — index should include new row
+    // Insert - index should include new row
     conn.execute("INSERT INTO products VALUES (9, 'Sprocket', 'Electronics', 5.99, 1000)")
         .unwrap();
     let qr = query_result(
@@ -1626,7 +1626,7 @@ fn index_consistent_after_insert_update_delete_cycle() {
     );
     assert_eq!(qr.rows[0][0], Value::Integer(9));
 
-    // Update category — old index entry removed, new one added
+    // Update category - old index entry removed, new one added
     conn.execute("UPDATE products SET category = 'Tools' WHERE name = 'Sprocket'")
         .unwrap();
     let qr = query_result(
@@ -1640,7 +1640,7 @@ fn index_consistent_after_insert_update_delete_cycle() {
     );
     assert_eq!(qr.rows[0][0], Value::Integer(3));
 
-    // Delete — index entry removed
+    // Delete - index entry removed
     conn.execute("DELETE FROM products WHERE name = 'Sprocket'")
         .unwrap();
     let qr = query_result(
@@ -1866,7 +1866,7 @@ fn prefers_more_equality_columns_composite() {
     setup_products(&mut conn);
 
     // WHERE category = 'X' AND price = Y
-    // idx_category has 1 eq col, idx_cat_price has 2 eq cols → pick idx_cat_price
+    // idx_category has 1 eq col, idx_cat_price has 2 eq cols -> pick idx_cat_price
     assert_plan(
         &db,
         "SELECT * FROM products WHERE category = 'Electronics' AND price = 29.99",
@@ -1976,7 +1976,7 @@ fn index_on_boolean_column() {
         conn.execute("SELECT id FROM flags WHERE active = TRUE ORDER BY id")
             .unwrap(),
     );
-    // ids 0, 3, 6, 9, 12, 15, 18 → 7 rows
+    // ids 0, 3, 6, 9, 12, 15, 18 -> 7 rows
     assert_eq!(qr.rows.len(), 7);
     assert_eq!(qr.rows[0][0], Value::Integer(0));
     assert_eq!(qr.rows[6][0], Value::Integer(18));

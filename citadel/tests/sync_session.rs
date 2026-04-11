@@ -172,7 +172,7 @@ fn push_empty_to_populated() {
 
     insert_range(&db2, 0, 50);
 
-    // Push from empty db1 → populated db2: no changes to push
+    // Push from empty db1 -> populated db2: no changes to push
     let (init_out, _) = sync_push(&db1, &db2);
     assert!(!init_out.already_in_sync);
 

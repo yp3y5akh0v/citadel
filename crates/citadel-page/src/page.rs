@@ -12,11 +12,11 @@ use citadel_core::{
 /// [14..16]   flags (u16)
 /// [16..24]   txn_id (u64)
 /// [24..26]   num_cells (u16)
-/// [26..28]   cell_area_start (u16) — where cell data begins (grows down from 8160)
+/// [26..28]   cell_area_start (u16) - where cell data begins (grows down from 8160)
 /// [28..30]   free_space (u16)
-/// [30..34]   right_child (u32) — rightmost child (branch) / 0 (leaf/overflow)
+/// [30..34]   right_child (u32) - rightmost child (branch) / 0 (leaf/overflow)
 /// [34..36]   _reserved (u16)
-/// [36..64]   merkle_hash (28B, BLAKE3 truncated) — Merkle tree hash for sync
+/// [36..64]   merkle_hash (28B, BLAKE3 truncated) - Merkle tree hash for sync
 /// [64..8160] cell data area (slotted page)
 #[derive(Clone)]
 pub struct Page {
@@ -32,25 +32,16 @@ impl Default for Page {
 }
 
 impl Page {
-    /// Create a new empty page.
     pub fn new(page_id: PageId, page_type: PageType, txn_id: TxnId) -> Self {
         let mut data = [0u8; BODY_SIZE];
 
-        // page_id
         data[8..12].copy_from_slice(&page_id.as_u32().to_le_bytes());
-        // page_type
         data[12..14].copy_from_slice(&(page_type as u16).to_le_bytes());
-        // flags
         data[14..16].copy_from_slice(&PageFlags::NONE.0.to_le_bytes());
-        // txn_id
         data[16..24].copy_from_slice(&txn_id.as_u64().to_le_bytes());
-        // num_cells = 0
         data[24..26].copy_from_slice(&0u16.to_le_bytes());
-        // cell_area_start = BODY_SIZE (no cells yet, start from end)
         data[26..28].copy_from_slice(&(BODY_SIZE as u16).to_le_bytes());
-        // free_space = USABLE_SIZE (entire cell area available)
         data[28..30].copy_from_slice(&(USABLE_SIZE as u16).to_le_bytes());
-        // right_child = 0
         data[30..34].copy_from_slice(&0u32.to_le_bytes());
 
         let mut page = Self { data };
@@ -58,7 +49,6 @@ impl Page {
         page
     }
 
-    /// Create a page from raw decrypted bytes.
     pub fn from_bytes(data: [u8; BODY_SIZE]) -> Self {
         Self { data }
     }
@@ -137,13 +127,11 @@ impl Page {
         self.data[30..34].copy_from_slice(&child.as_u32().to_le_bytes());
     }
 
-    /// Get the Merkle hash stored in this page's header.
     pub fn merkle_hash(&self) -> [u8; MERKLE_HASH_SIZE] {
         let end = MERKLE_HASH_OFFSET + MERKLE_HASH_SIZE;
         self.data[MERKLE_HASH_OFFSET..end].try_into().unwrap()
     }
 
-    /// Set the Merkle hash in this page's header.
     pub fn set_merkle_hash(&mut self, hash: &[u8; MERKLE_HASH_SIZE]) {
         let end = MERKLE_HASH_OFFSET + MERKLE_HASH_SIZE;
         self.data[MERKLE_HASH_OFFSET..end].copy_from_slice(hash);
@@ -151,40 +139,31 @@ impl Page {
 
     // --- Slotted page operations ---
 
-    /// Get the offset of cell pointer at index `i`.
-    /// Cell pointers start at offset 64, each is 2 bytes.
     #[inline]
     fn cell_ptr_offset(i: u16) -> usize {
         PAGE_HEADER_SIZE + (i as usize) * 2
     }
 
-    /// Get the cell data offset stored in cell pointer at index `i`.
     pub fn cell_offset(&self, i: u16) -> u16 {
         let off = Self::cell_ptr_offset(i);
         u16::from_le_bytes(self.data[off..off + 2].try_into().unwrap())
     }
 
-    /// Set the cell data offset at pointer index `i`.
     pub fn set_cell_offset(&mut self, i: u16, offset: u16) {
         let off = Self::cell_ptr_offset(i);
         self.data[off..off + 2].copy_from_slice(&offset.to_le_bytes());
     }
 
-    /// Get a slice of cell data at the given offset and length.
     pub fn cell_data(&self, offset: u16, len: usize) -> &[u8] {
         let start = offset as usize;
         &self.data[start..start + len]
     }
 
-    /// Get a mutable slice of cell data at the given offset and length.
     pub fn cell_data_mut(&mut self, offset: u16, len: usize) -> &mut [u8] {
         let start = offset as usize;
         &mut self.data[start..start + len]
     }
 
-    /// Calculate available space for a new cell (cell pointer + cell data).
-    /// Available = cell_area_start - (PAGE_HEADER_SIZE + num_cells * 2) - 2
-    /// The -2 accounts for the new cell pointer we need to add.
     pub fn available_space(&self) -> usize {
         let ptrs_end = PAGE_HEADER_SIZE + (self.num_cells() as usize) * 2;
         let cell_start = self.cell_area_start() as usize;
@@ -195,8 +174,6 @@ impl Page {
         }
     }
 
-    /// Write cell data at the bottom of the cell area, return the offset.
-    /// Updates cell_area_start and free_space.
     pub fn write_cell(&mut self, data: &[u8]) -> Option<u16> {
         let cell_len = data.len();
         if self.available_space() < cell_len {
@@ -217,31 +194,24 @@ impl Page {
         Some(new_start as u16)
     }
 
-    /// Insert cell data at position `idx` in the sorted cell pointer array.
-    /// Shifts existing pointers at idx..num_cells right by one slot.
-    /// Cell data is appended at the bottom of the cell area.
-    /// Returns the data offset, or None if not enough space.
+    /// Insert cell at `idx`, shifting pointers right. Returns data offset.
     pub fn insert_cell_at(&mut self, idx: u16, cell_data: &[u8]) -> Option<u16> {
         let cell_len = cell_data.len();
         if self.available_space() < cell_len {
             return None;
         }
 
-        // Write cell data at bottom of cell area
         let new_start = self.cell_area_start() as usize - cell_len;
         self.data[new_start..new_start + cell_len].copy_from_slice(cell_data);
         self.set_cell_area_start(new_start as u16);
 
         let n = self.num_cells();
-
-        // Shift cell pointers [idx..n] right by 2 bytes to make room
         if idx < n {
             let src_start = Self::cell_ptr_offset(idx);
             let src_end = Self::cell_ptr_offset(n);
             self.data.copy_within(src_start..src_end, src_start + 2);
         }
 
-        // Write new cell pointer at idx
         self.set_cell_offset(idx, new_start as u16);
         self.set_num_cells(n + 1);
 
@@ -279,14 +249,11 @@ impl Page {
         Some(new_start as u16)
     }
 
-    /// Delete cell at position `idx`. Shifts pointers left.
-    /// The cell data becomes a hole (not reclaimed until compact).
-    /// `cell_len` is the size of the cell data being removed.
+    /// Delete cell at `idx`. Data becomes a hole until compact.
     pub fn delete_cell_at(&mut self, idx: u16, cell_len: usize) {
         let n = self.num_cells();
         assert!(idx < n, "delete_cell_at: index out of bounds");
 
-        // Shift cell pointers [idx+1..n] left by 2 bytes
         if idx + 1 < n {
             let src_start = Self::cell_ptr_offset(idx + 1);
             let src_end = Self::cell_ptr_offset(n);
@@ -295,22 +262,16 @@ impl Page {
         }
 
         self.set_num_cells(n - 1);
-        // Free space increases by cell_len (data hole) + 2 (pointer slot)
-        // Note: cell data is not compacted, just the pointer is removed.
-        // free_space tracks total usable space including holes.
         let free = self.free_space() as usize + cell_len + 2;
         self.set_free_space(free as u16);
     }
 
-    /// Rebuild page from a list of cell data blobs. Clears all cells and re-inserts.
-    /// Used during CoW and split operations.
+    /// Clear all cells and re-insert from `cells`.
     pub fn rebuild_cells(&mut self, cells: &[&[u8]]) {
-        // Reset cell area
         self.set_num_cells(0);
         self.set_cell_area_start(BODY_SIZE as u16);
         self.set_free_space(USABLE_SIZE as u16);
 
-        // Re-insert all cells
         for cell_data in cells {
             self.write_cell(cell_data)
                 .expect("rebuild_cells: cell data should fit");
@@ -319,28 +280,23 @@ impl Page {
 
     // --- Checksum ---
 
-    /// Compute xxHash64 of bytes [8..8160] (everything after checksum field).
     pub fn compute_checksum(&self) -> u64 {
         xxhash_rust::xxh64::xxh64(&self.data[CHECKSUM_SIZE..], 0)
     }
 
-    /// Update the stored checksum to match current page contents.
     pub fn update_checksum(&mut self) {
         let cs = self.compute_checksum();
         self.data[0..CHECKSUM_SIZE].copy_from_slice(&cs.to_le_bytes());
     }
 
-    /// Verify the stored checksum matches the page contents.
     pub fn verify_checksum(&self) -> bool {
         self.checksum() == self.compute_checksum()
     }
 
-    /// Get the full page body as bytes (for encryption).
     pub fn as_bytes(&self) -> &[u8; BODY_SIZE] {
         &self.data
     }
 
-    /// Get the full page body as mutable bytes.
     pub fn as_bytes_mut(&mut self) -> &mut [u8; BODY_SIZE] {
         &mut self.data
     }

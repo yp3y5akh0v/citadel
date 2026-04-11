@@ -107,7 +107,7 @@ fn between_null_value() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    // NULL val BETWEEN 15 AND 35 → NULL → filtered out
+    // NULL val BETWEEN 15 AND 35 -> NULL -> filtered out
     let qr = query(
         &mut conn,
         "SELECT id FROM t WHERE val BETWEEN 15 AND 35 ORDER BY id",
@@ -124,7 +124,7 @@ fn between_reversed_range() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    // BETWEEN 30 AND 10 → always FALSE (no auto-swap)
+    // BETWEEN 30 AND 10 -> always FALSE (no auto-swap)
     let qr = query(&mut conn, "SELECT id FROM t WHERE val BETWEEN 30 AND 10");
     assert_eq!(qr.rows.len(), 0);
 }
@@ -205,7 +205,7 @@ fn like_null() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    // NULL LIKE '%' → NULL → not included
+    // NULL LIKE '%' -> NULL -> not included
     let qr = query(&mut conn, "SELECT id FROM t WHERE name LIKE '%'");
     assert_eq!(qr.rows.len(), 4); // all except id=5 which has NULL name
 }
@@ -303,7 +303,7 @@ fn case_null_operand() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    // NULL = NULL is not TRUE, so CASE NULL WHEN NULL → no match → ELSE
+    // NULL = NULL is not TRUE, so CASE NULL WHEN NULL -> no match -> ELSE
     let qr = query(
         &mut conn,
         "SELECT CASE val WHEN NULL THEN 'matched' ELSE 'no match' END FROM t WHERE id = 4",

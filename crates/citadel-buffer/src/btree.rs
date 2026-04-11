@@ -13,7 +13,7 @@ use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
 use std::collections::HashMap;
 
-/// B+ tree metadata. Lightweight struct — pages are stored externally.
+/// B+ tree metadata. Lightweight struct - pages are stored externally.
 #[derive(Clone)]
 pub struct BTree {
     pub root: PageId,
@@ -214,7 +214,6 @@ impl BTree {
         self.last_insert = None;
         let (path, leaf_id) = self.walk_to_leaf(pages, key)?;
 
-        // Check if key exists
         let found = {
             let page = pages.get(&leaf_id).unwrap();
             leaf_node::search(page, key).is_ok()
@@ -223,28 +222,23 @@ impl BTree {
             return Ok(false);
         }
 
-        // CoW the leaf and delete
         let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
         {
             let page = pages.get_mut(&new_leaf_id).unwrap();
             leaf_node::delete(page, key);
         }
 
-        // Check if leaf became empty
         let leaf_empty = pages.get(&new_leaf_id).unwrap().num_cells() == 0;
 
         if !leaf_empty || path.is_empty() {
-            // Leaf is non-empty, or it's the root (root can be empty)
             self.root = propagate_cow_up(pages, alloc, txn_id, &path, new_leaf_id);
             self.entry_count -= 1;
             return Ok(true);
         }
 
-        // Empty leaf — remove from tree
         alloc.free(new_leaf_id);
         pages.remove(&new_leaf_id);
 
-        // Walk up, handling the removal
         self.root = propagate_remove_up(pages, alloc, txn_id, &path, &mut self.depth);
         self.entry_count -= 1;
         Ok(true)
@@ -334,7 +328,6 @@ fn split_leaf_with_insert(
     val_type: ValueType,
     value: &[u8],
 ) -> (Vec<u8>, PageId) {
-    // Collect all existing cells + the new cell, sorted
     let mut cells: Vec<(Vec<u8>, Vec<u8>)> = {
         let page = pages.get(&leaf_id).unwrap();
         let n = page.num_cells() as usize;
@@ -347,7 +340,6 @@ fn split_leaf_with_insert(
             .collect()
     };
 
-    // Insert or update the new cell in sorted position
     let new_raw = leaf_node::build_cell(key, val_type, value);
     match cells.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
         Ok(idx) => cells[idx] = (key.to_vec(), new_raw),
@@ -356,8 +348,6 @@ fn split_leaf_with_insert(
 
     let total = cells.len();
 
-    // Size-aware split: ensure both halves fit within USABLE_SIZE.
-    // Simple midpoint-by-count fails when cell sizes vary significantly.
     let usable = citadel_core::constants::USABLE_SIZE;
     let mut cum: Vec<usize> = Vec::with_capacity(total + 1);
     cum.push(0);
@@ -382,7 +372,6 @@ fn split_leaf_with_insert(
 
     let sep_key = cells[split_point].0.clone();
 
-    // Rebuild left page with cells [0..split_point]
     {
         let left_refs: Vec<&[u8]> = cells[..split_point]
             .iter()
@@ -392,7 +381,6 @@ fn split_leaf_with_insert(
         page.rebuild_cells(&left_refs);
     }
 
-    // Create right page with cells [split_point..total]
     let right_id = alloc.allocate();
     {
         let mut right_page = Page::new(right_id, PageType::Leaf, txn_id);
@@ -407,8 +395,6 @@ fn split_leaf_with_insert(
     (sep_key, right_id)
 }
 
-/// Propagate a split upward through the ancestor chain.
-/// Returns the new root page ID.
 #[allow(clippy::too_many_arguments)]
 fn propagate_split_up(
     pages: &mut HashMap<PageId, Page>,
@@ -436,7 +422,6 @@ fn propagate_split_up(
                 pending_split = false;
                 left_child = new_ancestor;
             } else {
-                // Branch also full — split it
                 let (new_sep, new_right) = split_branch_with_insert(
                     pages,
                     alloc,
@@ -459,7 +444,6 @@ fn propagate_split_up(
     }
 
     if pending_split {
-        // Create a new root
         let new_root_id = alloc.allocate();
         let mut new_root = Page::new(new_root_id, PageType::Branch, txn_id);
         let cell = branch_node::build_cell(left_child, &sep_key);
@@ -473,9 +457,6 @@ fn propagate_split_up(
     }
 }
 
-/// Split a full branch and insert a separator.
-/// Returns (promoted_separator_key, right_branch_page_id).
-/// The left branch is `branch_id` (rebuilt in place).
 #[allow(clippy::too_many_arguments)]
 fn split_branch_with_insert(
     pages: &mut HashMap<PageId, Page>,
@@ -522,8 +503,6 @@ fn split_branch_with_insert(
         (result, final_rc)
     };
 
-    // Size-aware split — the middle key is promoted.
-    // Left = [0..split_point], promoted = [split_point], right = [split_point+1..total].
     let total = new_cells.len();
     let usable = citadel_core::constants::USABLE_SIZE;
     let raw_sizes: Vec<usize> = new_cells.iter().map(|(_, key)| 6 + key.len()).collect();
@@ -554,7 +533,6 @@ fn split_branch_with_insert(
     let promoted_sep = new_cells[split_point].1.clone();
     let promoted_child = new_cells[split_point].0;
 
-    // Rebuild left branch with cells [0..split_point], right_child = promoted_child
     {
         let left_raw: Vec<Vec<u8>> = new_cells[..split_point]
             .iter()
@@ -566,7 +544,6 @@ fn split_branch_with_insert(
         page.set_right_child(promoted_child);
     }
 
-    // Create right branch with cells [split_point+1..total], right_child = final_right_child
     let right_branch_id = alloc.allocate();
     {
         let mut right_page = Page::new(right_branch_id, PageType::Branch, txn_id);
@@ -583,14 +560,12 @@ fn split_branch_with_insert(
     (promoted_sep, right_branch_id)
 }
 
-/// Remove a child from a branch page at the given child index.
 fn remove_child_from_branch(page: &mut Page, child_idx: usize) {
     let n = page.num_cells() as usize;
     if child_idx < n {
         let cell_sz = branch_node::get_cell_size(page, child_idx as u16);
         page.delete_cell_at(child_idx as u16, cell_sz);
     } else {
-        // Removing right_child: promote last cell's child
         assert!(n > 0, "cannot remove right_child from branch with 0 cells");
         let last_child = branch_node::read_cell(page, (n - 1) as u16).child;
         let cell_sz = branch_node::get_cell_size(page, (n - 1) as u16);
@@ -599,8 +574,6 @@ fn remove_child_from_branch(page: &mut Page, child_idx: usize) {
     }
 }
 
-/// Propagate child removal upward through the ancestor chain.
-/// Handles cascading collapses when branches become empty.
 fn propagate_remove_up(
     pages: &mut HashMap<PageId, Page>,
     alloc: &mut PageAllocator,
@@ -632,7 +605,7 @@ fn propagate_remove_up(
 
         if num_cells > 0 || level == 0 {
             if num_cells == 0 && level == 0 {
-                // Root collapsed — replace with its only child
+                // Root collapsed - replace with its only child
                 let only_child = pages.get(&new_ancestor).unwrap().right_child();
                 alloc.free(new_ancestor);
                 pages.remove(&new_ancestor);
@@ -643,7 +616,7 @@ fn propagate_remove_up(
             new_child = new_ancestor;
             need_remove_at_level = false;
         } else {
-            // Branch became empty (0 cells) — collapse to its right_child
+            // Branch became empty (0 cells) - collapse to its right_child
             let only_child = pages.get(&new_ancestor).unwrap().right_child();
             alloc.free(new_ancestor);
             pages.remove(&new_ancestor);

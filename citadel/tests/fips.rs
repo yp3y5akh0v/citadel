@@ -216,7 +216,7 @@ fn pbkdf2_and_argon2_produce_different_databases() {
     drop(db_argon2);
     drop(db_pbkdf2);
 
-    // Read the raw files — encrypted content should differ
+    // Read the raw files - encrypted content should differ
     let raw_argon2 = std::fs::read(dir.path().join("argon2.citadel")).unwrap();
     let raw_pbkdf2 = std::fs::read(dir.path().join("pbkdf2.citadel")).unwrap();
 

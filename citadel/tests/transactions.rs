@@ -414,7 +414,7 @@ fn recovery_with_recovery_flag_set() {
         file_manager::write_god_byte(&io, crashed_god).unwrap();
     }
 
-    // Reopen — recovery should succeed, data should be intact
+    // Reopen - recovery should succeed, data should be intact
     {
         let mgr = open_shared_manager(&storage);
         let mut rtx = mgr.begin_read();
@@ -518,7 +518,7 @@ fn pending_free_pages_accumulate() {
     let storage = std::sync::Arc::new(SharedStorage::new(4 * 1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
-    // Insert then delete — should free pages
+    // Insert then delete - should free pages
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 0..100u32 {
@@ -530,7 +530,7 @@ fn pending_free_pages_accumulate() {
 
     let hwm_after_insert = mgr.current_slot().high_water_mark;
 
-    // Delete all — CoW creates new pages, frees old
+    // Delete all - CoW creates new pages, frees old
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 0..100u32 {
@@ -710,7 +710,7 @@ impl PageIO for FailingIO {
 
 #[test]
 fn failed_commit_releases_writer_lock() {
-    // FailingIO fails on second fsync — commit must still release writer lock.
+    // FailingIO fails on second fsync - commit must still release writer lock.
     let storage = std::sync::Arc::new(SharedStorage::new(4 * 1024 * 1024));
 
     // First, create a valid database with normal I/O
@@ -726,7 +726,7 @@ fn failed_commit_releases_writer_lock() {
     let failing_io = Box::new(FailingIO::new(storage.clone(), 2));
     let mgr = TxnManager::open(failing_io, dek, mac_key, 1, 256).unwrap();
 
-    // Attempt a write — commit should fail
+    // Attempt a write - commit should fail
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"new_key", b"new_val").unwrap();
@@ -735,7 +735,7 @@ fn failed_commit_releases_writer_lock() {
             result.is_err(),
             "commit should fail due to simulated fsync failure"
         );
-        // WriteTxn is dropped here — Drop should call abort_write() because committed=false
+        // WriteTxn is dropped here - Drop should call abort_write() because committed=false
     }
 
     // The critical test: can we begin a new write transaction?
@@ -854,7 +854,7 @@ fn reclaimed_pages_reused() {
         wtx.commit().unwrap();
     }
 
-    // Insert new data — should reuse reclaimed pages, not grow HWM much
+    // Insert new data - should reuse reclaimed pages, not grow HWM much
     let hwm_before_reuse = mgr.current_slot().high_water_mark;
     {
         let mut wtx = mgr.begin_write().unwrap();
@@ -935,7 +935,7 @@ fn for_each_filters_tombstones() {
         wtx.commit().unwrap();
     }
 
-    // Delete 5 keys — creates tombstones in the B+ tree
+    // Delete 5 keys - creates tombstones in the B+ tree
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 0..5u32 {
@@ -1292,7 +1292,7 @@ fn hwm_tracking_across_transactions() {
     let initial_hwm = mgr.current_slot().high_water_mark;
     assert!(initial_hwm >= 1, "initial HWM should include root page");
 
-    // Insert many keys — HWM should grow
+    // Insert many keys - HWM should grow
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 0..200u32 {
@@ -1335,7 +1335,7 @@ fn oldest_reader_blocks_reclamation() {
 
     let big_val = vec![0xABu8; 1800]; // Forces ~4 entries per leaf
 
-    // Insert 80 large-value keys → creates ~20+ leaf pages + branches
+    // Insert 80 large-value keys -> creates ~20+ leaf pages + branches
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 0..80u32 {
@@ -1358,7 +1358,7 @@ fn oldest_reader_blocks_reclamation() {
         "80 entries with 1800B values should need at least 20 pages, got HWM={hwm_after_insert}"
     );
 
-    // Start a reader AFTER insert — this pins the current snapshot.
+    // Start a reader AFTER insert - this pins the current snapshot.
     // Pages freed in future txns (freed_at_txn >= reader's txn) can't be reclaimed.
     let mut old_reader = mgr.begin_read();
     assert_eq!(old_reader.entry_count(), 80);
@@ -1374,7 +1374,7 @@ fn oldest_reader_blocks_reclamation() {
         wtx.commit().unwrap();
     }
 
-    // Trigger reclaim attempt — reader blocks it
+    // Trigger reclaim attempt - reader blocks it
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"trigger", b"x").unwrap();
@@ -1413,7 +1413,7 @@ fn oldest_reader_blocks_reclamation() {
         );
     }
 
-    // Drop the old reader — now pages become reclaimable
+    // Drop the old reader - now pages become reclaimable
     drop(old_reader);
 
     // Trigger reclaim: commit with no active readers
@@ -1633,7 +1633,7 @@ fn torn_commit_slot_falls_back_to_active() {
     let crashed_god = god | GOD_BIT_RECOVERY;
     file_manager::write_god_byte(&io, crashed_god).unwrap();
 
-    // Reopen — recovery should use the active slot (old commit)
+    // Reopen - recovery should use the active slot (old commit)
     let mgr = open_shared_manager(&storage);
     let mut rtx = mgr.begin_read();
     assert_eq!(
@@ -1675,7 +1675,7 @@ fn both_slots_corrupted_returns_error() {
         io.write_at(offset as u64, &garbage).unwrap();
     }
 
-    // Attempt to open — should get DatabaseCorrupted
+    // Attempt to open - should get DatabaseCorrupted
     let (dek, mac_key, _) = test_keys();
     let io = Box::new(SharedIO::new(storage.clone()));
     let result = TxnManager::open(io, dek, mac_key, 1, 256);
@@ -1695,7 +1695,7 @@ fn rapid_key_overwrite_file_stabilizes() {
     let storage = std::sync::Arc::new(SharedStorage::new(8 * 1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
-    // Warmup — 50 transactions overwriting the same key
+    // Warmup - 50 transactions overwriting the same key
     for i in 0..50u32 {
         let mut wtx = mgr.begin_write().unwrap();
         let val = format!("version-{i:05}");
@@ -1757,12 +1757,12 @@ fn transient_io_error_does_not_corrupt_database() {
         wtx.commit().unwrap();
     }
 
-    // FailingIO fails on second fsync — god byte flip lost, old slot stays active.
+    // FailingIO fails on second fsync - god byte flip lost, old slot stays active.
     let (dek, mac_key, _) = test_keys();
     let failing_io = Box::new(FailingIO::new(storage.clone(), 2));
     let mgr = TxnManager::open(failing_io, dek, mac_key, 1, 256).unwrap();
 
-    // Attempt a write that modifies existing data — commit fails
+    // Attempt a write that modifies existing data - commit fails
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 0..100u32 {
@@ -1776,7 +1776,7 @@ fn transient_io_error_does_not_corrupt_database() {
     // Drop the manager (clean close)
     drop(mgr);
 
-    // Reopen with normal I/O — database should be at the OLD consistent state
+    // Reopen with normal I/O - database should be at the OLD consistent state
     let mgr = open_shared_manager(&storage);
     let mut rtx = mgr.begin_read();
     assert_eq!(rtx.entry_count(), 100);
@@ -1813,7 +1813,7 @@ fn cow_produces_new_root_each_commit() {
     let root_v1 = mgr.current_slot().tree_root;
     let mut reader_v1 = mgr.begin_read();
 
-    // Commit 2: modify the tree — CoW should create a NEW root
+    // Commit 2: modify the tree - CoW should create a NEW root
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"cow-0000", b"modified").unwrap();
@@ -1840,7 +1840,7 @@ fn cow_produces_new_root_each_commit() {
         Some(b"modified".to_vec())
     );
 
-    // Commit 3: another modification — another new root
+    // Commit 3: another modification - another new root
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.delete(b"cow-0050").unwrap();
@@ -1898,7 +1898,7 @@ fn pages_freed_at_reader_txn_not_reclaimable() {
         wtx.commit().unwrap();
     }
 
-    // Start a reader RIGHT NOW — this reader's txn_id is the current committed txn_id
+    // Start a reader RIGHT NOW - this reader's txn_id is the current committed txn_id
     let mut reader = mgr.begin_read();
     assert_eq!(reader.entry_count(), 60);
 
@@ -1912,7 +1912,7 @@ fn pages_freed_at_reader_txn_not_reclaimable() {
         wtx.commit().unwrap();
     }
 
-    // Trigger reclaim attempt — reader should block reclamation
+    // Trigger reclaim attempt - reader should block reclamation
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"trigger", b"x").unwrap();
@@ -1925,7 +1925,7 @@ fn pages_freed_at_reader_txn_not_reclaimable() {
         assert_eq!(
             reader.get(key.as_bytes()).unwrap(),
             Some(big_val.clone()),
-            "reader must still see key {key} — freed pages must not be reclaimed \
+            "reader must still see key {key} - freed pages must not be reclaimed \
              while reader at that txn_id is active"
         );
     }

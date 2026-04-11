@@ -375,7 +375,7 @@ fn null_handling() {
         .unwrap();
     assert_eq!(qr.rows.len(), 2);
 
-    // COUNT(*) vs COUNT(col) — COUNT(col) skips NULLs
+    // COUNT(*) vs COUNT(col) - COUNT(col) skips NULLs
     let qr = conn.query("SELECT COUNT(*), COUNT(val) FROM data").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(3));
     assert_eq!(qr.rows[0][1], Value::Integer(2));
@@ -570,7 +570,7 @@ fn if_not_exists_and_if_exists() {
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
 
-    // IF NOT EXISTS — no error on duplicate
+    // IF NOT EXISTS - no error on duplicate
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
     assert_ok(
@@ -578,7 +578,7 @@ fn if_not_exists_and_if_exists() {
             .unwrap(),
     );
 
-    // IF EXISTS — no error on missing
+    // IF EXISTS - no error on missing
     assert_ok(conn.execute("DROP TABLE IF EXISTS nonexistent").unwrap());
 }
 

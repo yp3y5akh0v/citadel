@@ -5,16 +5,15 @@ title = "Citadel"
 ## Quick Start
 
 ```bash
-cargo add citadel citadel-sql
+cargo add citadeldb citadeldb-sql
 ```
 
 ```rust
-use citadel::{DatabaseBuilder, Argon2Profile};
+use citadel::DatabaseBuilder;
 use citadel_sql::Connection;
 
 let db = DatabaseBuilder::new("my.db")
     .passphrase(b"secret")
-    .argon2_profile(Argon2Profile::Interactive)
     .create()?;
 
 let mut conn = Connection::open(&db)?;

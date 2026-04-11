@@ -1133,7 +1133,7 @@ pub(crate) mod tests {
     #[test]
     fn oldest_active_reader_with_no_readers() {
         let mgr = create_test_manager();
-        // No readers — oldest should be current next_txn_id
+        // No readers - oldest should be current next_txn_id
         let oldest = mgr.oldest_active_reader();
         assert!(oldest.as_u64() >= 2); // At least 2 since create used txn 1
     }

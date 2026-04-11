@@ -39,34 +39,28 @@ impl<'a> ReadTxn<'a> {
         }
     }
 
-    /// Get the transaction ID.
     pub fn txn_id(&self) -> TxnId {
         self.txn_id
     }
 
-    /// Get the snapshot's tree root.
     pub fn root(&self) -> PageId {
         self.snapshot.tree_root
     }
 
-    /// Get the snapshot's entry count for the default table.
     pub fn entry_count(&self) -> u64 {
         self.snapshot.tree_entries
     }
 
     // ── Default table operations ──────────────────────────────────────
 
-    /// Look up a key in the default table.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.search_tree(self.snapshot.tree_root, key)
     }
 
-    /// Check if a key exists in the default table.
     pub fn contains_key(&mut self, key: &[u8]) -> Result<bool> {
         Ok(self.get(key)?.is_some())
     }
 
-    /// Iterate all key-value pairs in the default table in sorted order.
     pub fn for_each<F>(&mut self, mut f: F) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> Result<()>,
@@ -90,18 +84,15 @@ impl<'a> ReadTxn<'a> {
         Ok(self.lookup_table(table)?.entry_count)
     }
 
-    /// Look up a key in a named table.
     pub fn table_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
         let desc = self.lookup_table(table)?;
         self.search_tree(desc.root_page, key)
     }
 
-    /// Check if a key exists in a named table.
     pub fn table_contains_key(&mut self, table: &[u8], key: &[u8]) -> Result<bool> {
         Ok(self.table_get(table, key)?.is_some())
     }
 
-    /// Iterate all key-value pairs in a named table in sorted order.
     pub fn table_for_each<F>(&mut self, table: &[u8], mut f: F) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> Result<()>,

@@ -9,31 +9,26 @@
 pub struct NodeId(u64);
 
 impl NodeId {
-    /// Generate a random node ID using OS entropy.
     pub fn random() -> Self {
         use rand::Rng;
         Self(rand::thread_rng().gen())
     }
 
-    /// Create from a raw `u64` value.
     #[inline]
     pub fn from_u64(v: u64) -> Self {
         Self(v)
     }
 
-    /// Get the raw `u64` value.
     #[inline]
     pub fn as_u64(&self) -> u64 {
         self.0
     }
 
-    /// Big-endian byte serialization.
     #[inline]
     pub fn to_bytes(&self) -> [u8; 8] {
         self.0.to_be_bytes()
     }
 
-    /// Reconstruct from big-endian bytes.
     #[inline]
     pub fn from_bytes(b: [u8; 8]) -> Self {
         Self(u64::from_be_bytes(b))

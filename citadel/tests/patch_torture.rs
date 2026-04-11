@@ -254,12 +254,12 @@ fn three_node_ring_convergence() {
         wtx.commit().unwrap();
     }
 
-    // Ring sync: A→B, B→C, C→A (forward)
+    // Ring sync: A->B, B->C, C->A (forward)
     sync_push(&a, &b, 1, true);
     sync_push(&b, &c, 2, true);
     sync_push(&c, &a, 3, true);
 
-    // Reverse ring: A→C, C→B, B→A
+    // Reverse ring: A->C, C->B, B->A
     sync_push(&a, &c, 1, true);
     sync_push(&c, &b, 3, true);
     sync_push(&b, &a, 2, true);
@@ -420,7 +420,7 @@ fn node_id_tiebreaker() {
     let db1 = fast_builder(&dir.path().join("db1.db")).create().unwrap();
     let db2 = fast_builder(&dir.path().join("db2.db")).create().unwrap();
 
-    // Same timestamp, node 2 > node 1 → node 2 wins
+    // Same timestamp, node 2 > node 1 -> node 2 wins
     let m1 = CrdtMeta::new(HlcTimestamp::new(5 * NS, 0), NodeId::from_u64(1));
     let m2 = CrdtMeta::new(HlcTimestamp::new(5 * NS, 0), NodeId::from_u64(100));
 
@@ -437,13 +437,13 @@ fn node_id_tiebreaker() {
         wtx.commit().unwrap();
     }
 
-    // Sync db2 → db1: node 100 > node 1, remote wins
+    // Sync db2 -> db1: node 100 > node 1, remote wins
     sync_push(&db2, &db1, 100, true);
     let data1 = collect_all(&db1);
     let d1 = decode_lww_value(&data1[&b"tie".to_vec()]).unwrap();
     assert_eq!(d1.user_value, b"node100");
 
-    // Sync db1 → db2: db1 now has node100's value, equal → skip
+    // Sync db1 -> db2: db1 now has node100's value, equal -> skip
     sync_push(&db1, &db2, 1, true);
     assert_crdt_converged(&db1, &db2);
 }

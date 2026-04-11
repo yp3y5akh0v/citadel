@@ -73,7 +73,7 @@ pub const SLOT_MERKLE_ROOT: usize = 84; // CommitSlot offset [84..112]
 pub const AUDIT_LOG_MAGIC: u32 = 0x4155_4454; // "AUDT"
 pub const AUDIT_LOG_VERSION: u32 = 1;
 pub const AUDIT_HEADER_SIZE: usize = 64;
-pub const AUDIT_ENTRY_MAGIC: u32 = 0x454E_5452; // "ENTR" — per-entry sentinel for scanning past corruption
+pub const AUDIT_ENTRY_MAGIC: u32 = 0x454E_5452; // "ENTR" - per-entry sentinel for scanning past corruption
 pub const HKDF_INFO_AUDIT_KEY: &[u8] = b"citadel-audit-key-v1";
 
 // Buffer pool defaults

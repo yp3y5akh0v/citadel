@@ -4,8 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Hybrid Logical Clock timestamp.
 ///
 /// Layout (12 bytes):
-/// - `wall_time`: `i64` — nanoseconds since Unix epoch (true nanosecond precision)
-/// - `logical`: `i32` — counter for events within the same nanosecond
+/// - `wall_time`: `i64` - nanoseconds since Unix epoch (true nanosecond precision)
+/// - `logical`: `i32` - counter for events within the same nanosecond
 ///
 /// Comparison: wall_time first, then logical (total order).
 /// Big-endian byte serialization preserves comparison order for non-negative values.
@@ -19,7 +19,6 @@ pub struct HlcTimestamp {
     logical: i32,
 }
 
-/// Wire size of an HlcTimestamp in bytes.
 pub const HLC_TIMESTAMP_SIZE: usize = 12;
 
 impl HlcTimestamp {
@@ -28,7 +27,6 @@ impl HlcTimestamp {
         logical: 0,
     };
 
-    /// Create from wall-clock time in nanoseconds and logical counter.
     #[inline]
     pub fn new(wall_time_ns: i64, logical: i32) -> Self {
         Self {
@@ -37,19 +35,17 @@ impl HlcTimestamp {
         }
     }
 
-    /// Wall-clock time in nanoseconds since Unix epoch.
     #[inline]
     pub fn wall_time(&self) -> i64 {
         self.wall_time
     }
 
-    /// Logical counter.
     #[inline]
     pub fn logical(&self) -> i32 {
         self.logical
     }
 
-    /// Serialize to 12 bytes big-endian (preserves comparison order for non-negative values).
+    /// Big-endian serialization preserves comparison order for non-negative values.
     #[inline]
     pub fn to_bytes(&self) -> [u8; HLC_TIMESTAMP_SIZE] {
         let mut buf = [0u8; HLC_TIMESTAMP_SIZE];
@@ -58,7 +54,6 @@ impl HlcTimestamp {
         buf
     }
 
-    /// Reconstruct from 12 bytes big-endian.
     #[inline]
     pub fn from_bytes(b: &[u8; HLC_TIMESTAMP_SIZE]) -> Self {
         Self {
@@ -67,7 +62,6 @@ impl HlcTimestamp {
         }
     }
 
-    /// Returns `true` if this is the zero/uninitialized timestamp.
     #[inline]
     pub fn is_zero(&self) -> bool {
         self.wall_time == 0 && self.logical == 0
@@ -102,7 +96,6 @@ impl std::fmt::Display for HlcTimestamp {
     }
 }
 
-/// Errors from HLC clock operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ClockError {
     #[error(
@@ -143,25 +136,21 @@ impl PhysicalClock for SystemClock {
     }
 }
 
-/// Manually controlled clock for deterministic testing.
 pub struct ManualClock {
     time_ns: AtomicI64,
 }
 
 impl ManualClock {
-    /// Create a manual clock starting at `initial_ns` nanoseconds.
     pub fn new(initial_ns: i64) -> Self {
         Self {
             time_ns: AtomicI64::new(initial_ns),
         }
     }
 
-    /// Set the clock to an absolute time in nanoseconds.
     pub fn set(&self, time_ns: i64) {
         self.time_ns.store(time_ns, Ordering::SeqCst);
     }
 
-    /// Advance the clock by `delta_ns` nanoseconds.
     pub fn advance(&self, delta_ns: i64) {
         self.time_ns.fetch_add(delta_ns, Ordering::SeqCst);
     }
@@ -173,17 +162,14 @@ impl PhysicalClock for ManualClock {
     }
 }
 
-/// One second in nanoseconds.
 const SECOND_NS: i64 = 1_000_000_000;
-
-/// Default maximum clock drift: 5 seconds.
 const DEFAULT_MAX_DRIFT_NS: i64 = 5 * SECOND_NS;
 
 /// Hybrid Logical Clock state machine.
 ///
 /// Two core operations:
-/// - [`now()`](HlcClock::now) — generate a timestamp for a local event
-/// - [`update()`](HlcClock::update) — merge a remote timestamp into local state
+/// - [`now()`](HlcClock::now) - generate a timestamp for a local event
+/// - [`update()`](HlcClock::update) - merge a remote timestamp into local state
 ///
 /// `now()` always returns a strictly increasing timestamp.
 /// `update()` advances the internal clock state without generating a new timestamp.
@@ -202,7 +188,6 @@ impl Default for HlcClock<SystemClock> {
 }
 
 impl HlcClock<SystemClock> {
-    /// Create an HLC clock with the system clock and default max drift (5s).
     pub fn new() -> Self {
         Self {
             last: HlcTimestamp::ZERO,
@@ -213,7 +198,6 @@ impl HlcClock<SystemClock> {
 }
 
 impl<C: PhysicalClock> HlcClock<C> {
-    /// Create an HLC clock with a custom physical clock source.
     pub fn with_clock(clock: C) -> Self {
         Self {
             last: HlcTimestamp::ZERO,
@@ -222,27 +206,16 @@ impl<C: PhysicalClock> HlcClock<C> {
         }
     }
 
-    /// Set the maximum allowed drift in nanoseconds.
     pub fn set_max_drift_ns(&mut self, max_drift_ns: i64) {
         self.max_drift_ns = max_drift_ns;
     }
 
-    /// Seed the clock with a previously persisted timestamp.
-    ///
     /// Call on startup to restore monotonicity after a restart.
-    /// The next `now()` will return a timestamp strictly greater than `ts`.
     pub fn set_last(&mut self, ts: HlcTimestamp) {
         self.last = ts;
     }
 
-    /// Generate a timestamp for a local event.
-    ///
-    /// Guarantees:
-    /// - Monotonically increasing (never returns a value <= previous)
-    /// - Wall time tracks physical clock within `max_drift`
-    /// - Returns `ClockError::CounterOverflow` if counter saturates
-    /// - Returns `ClockError::ClockDriftExceeded` if wall time is too far
-    ///   ahead of physical time
+    /// Generate a monotonically increasing timestamp for a local event.
     pub fn now(&mut self) -> Result<HlcTimestamp, ClockError> {
         let pt = self.clock.now_ns();
 
@@ -260,7 +233,7 @@ impl<C: PhysicalClock> HlcClock<C> {
 
             HlcTimestamp::new(self.last.wall_time, new_logical)
         } else {
-            // Physical clock advanced — use it, reset logical to 0.
+            // Physical clock advanced - use it, reset logical to 0.
             HlcTimestamp::new(pt, 0)
         };
 
@@ -268,14 +241,7 @@ impl<C: PhysicalClock> HlcClock<C> {
         Ok(ts)
     }
 
-    /// Merge a remote timestamp into local clock state.
-    ///
-    /// Advances the internal state so that subsequent `now()` calls
-    /// will produce timestamps strictly greater than the remote.
-    /// Does NOT generate a new timestamp.
-    ///
-    /// Returns `ClockError::ClockDriftExceeded` if the remote wall time
-    /// is more than `max_drift` ahead of the local physical clock.
+    /// Merge a remote timestamp into local state (does not generate a new timestamp).
     pub fn update(&mut self, remote: HlcTimestamp) -> Result<(), ClockError> {
         let pt = self.clock.now_ns();
 
@@ -302,12 +268,10 @@ impl<C: PhysicalClock> HlcClock<C> {
         Ok(())
     }
 
-    /// Returns the last generated or merged timestamp.
     pub fn last_timestamp(&self) -> HlcTimestamp {
         self.last
     }
 
-    /// Returns a reference to the underlying physical clock.
     pub fn physical_clock(&self) -> &C {
         &self.clock
     }
@@ -576,7 +540,7 @@ mod tests {
         let err = clock.now().unwrap_err();
         assert!(matches!(err, ClockError::CounterOverflow));
 
-        // Advance physical time — should recover
+        // Advance physical time - should recover
         clock.physical_clock().advance(1);
         let t = clock.now().unwrap();
         assert_eq!(t.wall_time(), 1000 * SECOND + 1);
@@ -610,7 +574,7 @@ mod tests {
         let remote = HlcTimestamp::new(500 * SECOND, 99);
         clock.update(remote).unwrap();
 
-        // State unchanged — local was ahead
+        // State unchanged - local was ahead
         assert_eq!(clock.last_timestamp().wall_time(), 1000 * SECOND);
         assert_eq!(clock.last_timestamp().logical(), 0);
     }
@@ -671,7 +635,7 @@ mod tests {
         let remote = HlcTimestamp::new(1000 * SECOND, 2);
         clock.update(remote).unwrap();
 
-        // State unchanged — local logical was higher
+        // State unchanged - local logical was higher
         assert_eq!(clock.last_timestamp().logical(), 4);
     }
 
@@ -763,7 +727,7 @@ mod tests {
         assert_eq!(ta2.wall_time(), 1000 * SECOND + 50 * MS);
         assert_eq!(ta2.logical(), 1);
 
-        // B receives A's earlier timestamp — already behind, no effect
+        // B receives A's earlier timestamp - already behind, no effect
         clock_b.update(ta1).unwrap();
         let tb2 = clock_b.now().unwrap();
         assert_eq!(tb2.wall_time(), 1000 * SECOND + 50 * MS);
@@ -799,7 +763,7 @@ mod tests {
 
         // Both generate local events at same physical time
         let ta = clock_a.now().unwrap(); // (1000s, 0)
-        let tb = clock_b.now().unwrap(); // (1000s, 0) — same!
+        let tb = clock_b.now().unwrap(); // (1000s, 0) - same!
 
         // Advance physical time on both
         clock_a.physical_clock().advance(100 * MS);
@@ -833,19 +797,19 @@ mod tests {
         let tb = b.now().unwrap();
         let tc = c.now().unwrap();
 
-        // A → B: B receives A's timestamp and generates event
+        // A -> B: B receives A's timestamp and generates event
         b.update(ta).unwrap();
         let tb2 = b.now().unwrap();
         assert!(tb2 > tb);
         assert!(tb2 > ta);
 
-        // B → C: C receives B's latest and generates event
+        // B -> C: C receives B's latest and generates event
         c.update(tb2).unwrap();
         let tc2 = c.now().unwrap();
         assert!(tc2 > tc);
         assert!(tc2 > tb2);
 
-        // C → A: A receives C's latest and generates event
+        // C -> A: A receives C's latest and generates event
         a.update(tc2).unwrap();
         let ta2 = a.now().unwrap();
         assert!(ta2 > ta);
@@ -918,7 +882,7 @@ mod tests {
 
     #[test]
     fn i32_max_logical_counter() {
-        // i32::MAX = 2,147,483,647 — much more than u16's 65,535
+        // i32::MAX = 2,147,483,647 - much more than u16's 65,535
         let ts = HlcTimestamp::new(1000 * SECOND, i32::MAX);
         assert_eq!(ts.logical(), i32::MAX);
 

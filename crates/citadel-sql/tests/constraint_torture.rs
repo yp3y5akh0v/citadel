@@ -716,7 +716,7 @@ fn not_null_default_check_on_same_column() {
         "CREATE TABLE strict (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL DEFAULT 50 CHECK(val >= 0 AND val <= 100))"
     ).unwrap());
 
-    // Omit val → gets default 50, passes NOT NULL, passes CHECK
+    // Omit val -> gets default 50, passes NOT NULL, passes CHECK
     assert_rows_affected(
         conn.execute("INSERT INTO strict (id) VALUES (1)").unwrap(),
         1,
@@ -724,13 +724,13 @@ fn not_null_default_check_on_same_column() {
     let rows = get_rows(conn.execute("SELECT val FROM strict WHERE id = 1").unwrap());
     assert_eq!(rows[0][0], Value::Integer(50));
 
-    // Explicit 75 → passes
+    // Explicit 75 -> passes
     assert_rows_affected(
         conn.execute("INSERT INTO strict VALUES (2, 75)").unwrap(),
         1,
     );
 
-    // Explicit 150 → fails CHECK
+    // Explicit 150 -> fails CHECK
     let err = conn
         .execute("INSERT INTO strict VALUES (3, 150)")
         .unwrap_err();
@@ -924,7 +924,7 @@ fn default_does_not_override_explicit_null_stress() {
     );
     assert_eq!(rows[0][0], Value::Integer(100));
 
-    // 100 rows with omitted val → gets default
+    // 100 rows with omitted val -> gets default
     for i in 100..200 {
         assert_rows_affected(
             conn.execute(&format!("INSERT INTO t (id) VALUES ({i})"))
@@ -961,7 +961,7 @@ fn check_mixed_types_in_expression() {
         1,
     );
 
-    // inactive with zero count → fails
+    // inactive with zero count -> fails
     let err = conn
         .execute("INSERT INTO mixed VALUES (3, FALSE, 0)")
         .unwrap_err();
@@ -992,10 +992,10 @@ fn fk_delete_parent_after_child_update() {
         1,
     );
 
-    // Now parent 1 has no children → can delete
+    // Now parent 1 has no children -> can delete
     assert_rows_affected(conn.execute("DELETE FROM p WHERE id = 1").unwrap(), 1);
 
-    // Parent 2 has child → cannot delete
+    // Parent 2 has child -> cannot delete
     let err = conn.execute("DELETE FROM p WHERE id = 2").unwrap_err();
     assert!(matches!(err, SqlError::ForeignKeyViolation(..)));
 }
@@ -1048,7 +1048,7 @@ fn fk_update_child_to_null_allowed() {
     assert_rows_affected(conn.execute("INSERT INTO p VALUES (1)").unwrap(), 1);
     assert_rows_affected(conn.execute("INSERT INTO c VALUES (1, 1)").unwrap(), 1);
 
-    // Set FK to NULL → OK (MATCH SIMPLE)
+    // Set FK to NULL -> OK (MATCH SIMPLE)
     assert_rows_affected(
         conn.execute("UPDATE c SET pid = NULL WHERE id = 1")
             .unwrap(),

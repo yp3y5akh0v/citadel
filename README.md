@@ -13,12 +13,12 @@
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Beats unencrypted SQLite in all 9 benchmarks with equal cache budgets.
+Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Beats unencrypted SQLite in all 11 benchmarks with equal cache budgets.
 
 ## Features
 
 - **Encrypted at rest** - AES-256-CTR + HMAC-SHA256 per page, verified before decryption
-- **SQL** - CREATE/DROP TABLE, ALTER TABLE, SELECT with JOINs, subqueries, aggregates, indexes, prepared statements, DEFAULT, CHECK, FOREIGN KEY
+- **SQL** - JOINs, subqueries, CTEs (recursive), UNION/INTERSECT/EXCEPT, aggregates, indexes, constraints, ALTER TABLE, prepared statements
 - **ACID** - Copy-on-Write B+ tree, shadow paging, no WAL. Snapshot isolation with concurrent readers
 - **P2P sync** - Merkle-based table diffing over Noise-encrypted channels with PSK auth
 - **CLI** - SQL shell with tab completion, syntax highlighting, dot-commands (.backup, .verify, .rekey, .sync, .dump, ...)
@@ -28,7 +28,7 @@ Every page is encrypted and authenticated before it hits disk. The database file
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. C FFI (37 functions), WebAssembly bindings
-- **2,300+ tests** - Unit, integration, torture tests across 10 crates
+- **2,350+ tests** - Unit, integration, torture tests across 10 crates
 
 ## Benchmarks
 
@@ -40,12 +40,14 @@ Benchmark          Citadel        SQLite         Ratio
 count              186 ns         37.1 us        200x
 point              1.10 us        16.6 us        15.1x
 group_by           2.53 ms        12.1 ms        4.8x
+cte                1.61 ms        6.62 ms        4.1x
 filter             936 us         2.28 ms        2.4x
 sort               1.46 ms        3.09 ms        2.1x
 insert             94.8 us        164 us         1.7x
 scan               9.42 ms        15.1 ms        1.6x
 sum                1.68 ms        2.34 ms        1.4x
 join               107 us         133 us         1.2x
+recursive_cte      128 us         132 us         1.03x
 ```
 
 <details>
@@ -60,6 +62,8 @@ join               107 us         133 us         1.2x
 - **scan** - `SELECT * FROM t` (full 100K row decode)
 - **insert** - 100 rows in one transaction
 - **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id` (1K x 1K integer equi-join)
+- **cte** - `WITH filtered AS (SELECT ... WHERE age < 50) SELECT age, COUNT(*) FROM filtered GROUP BY age` (CTE + GROUP BY)
+- **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq` (1000-step recursion)
 
 SQLite config: `journal_mode=OFF, synchronous=OFF, cache_size=8000` (~32 MB).
 Citadel config: `SyncMode::Off, cache_size=4096` (~32 MB).
@@ -74,12 +78,11 @@ Reproduce with `cargo bench -p citadeldb-sql --bench h2h_bench`
 ### Library
 
 ```rust
-use citadel::{DatabaseBuilder, Argon2Profile};
+use citadel::DatabaseBuilder;
 use citadel_sql::Connection;
 
 let db = DatabaseBuilder::new("my.db")
     .passphrase(b"secret")
-    .argon2_profile(Argon2Profile::Interactive)
     .create()?;
 
 let mut conn = Connection::open(&db)?;
@@ -144,7 +147,7 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 **Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN
 
-**Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS), subqueries (scalar, IN, EXISTS), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, GROUP BY/HAVING, ORDER BY, LIMIT/OFFSET
+**Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS), subqueries (scalar, IN, EXISTS), CTEs (WITH / WITH RECURSIVE), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, GROUP BY/HAVING, ORDER BY, LIMIT/OFFSET
 
 **Functions** - COUNT, SUM, AVG, MIN, MAX, LENGTH, UPPER, LOWER, SUBSTR, ABS, ROUND, COALESCE, NULLIF, CAST, TYPEOF, HEX, TRIM, REPLACE, RANDOM, IIF, GLOB
 

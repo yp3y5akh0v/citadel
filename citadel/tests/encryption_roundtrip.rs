@@ -161,7 +161,7 @@ fn file_header_and_recovery() {
     write_file_header(&io, &header).unwrap();
     io.fsync().unwrap();
 
-    // Normal recovery — both slots valid (both empty/zero)
+    // Normal recovery - both slots valid (both empty/zero)
     let (slot_idx, slot) = recover(&io).unwrap();
     assert_eq!(slot_idx, 0);
     assert_eq!(slot.txn_id, TxnId(0));
@@ -298,10 +298,10 @@ fn sieve_eviction_dirty_never_evicted() {
     cache.insert(2, "two".into()).unwrap();
     cache.insert(3, "three".into()).unwrap();
 
-    // Mark entry 2 as dirty (pinned — must never be evicted)
+    // Mark entry 2 as dirty (pinned - must never be evicted)
     cache.set_dirty(2);
 
-    // Insert multiple entries — dirty entry 2 must survive all evictions
+    // Insert multiple entries - dirty entry 2 must survive all evictions
     for i in 10..15 {
         cache.insert(i, format!("val-{i}")).unwrap();
         assert!(cache.contains(2), "dirty entry 2 should never be evicted");
@@ -361,7 +361,7 @@ fn wrong_epoch_detected_on_fetch() {
     io.write_page(offset, &encrypted).unwrap();
     io.fsync().unwrap();
 
-    // Read with wrong epoch (epoch 2) — HMAC includes epoch, so it should fail
+    // Read with wrong epoch (epoch 2) - HMAC includes epoch, so it should fail
     let mut pool = BufferPool::new(64);
     let result = pool.fetch(&io, PageId(0), &keys.dek, &keys.mac_key, 2);
     assert!(
@@ -430,7 +430,7 @@ fn buffer_pool_eviction_under_pressure() {
     // Create pool with capacity 10 (much less than 50 pages)
     let mut pool = BufferPool::new(10);
 
-    // Fetch all 50 pages — forces eviction of older pages
+    // Fetch all 50 pages - forces eviction of older pages
     for i in 0..50u32 {
         let page = pool
             .fetch(&io, PageId(i), &keys.dek, &keys.mac_key, epoch)
@@ -720,12 +720,12 @@ fn cache_hit_returns_identical_data() {
 
     let mut pool = BufferPool::new(64);
 
-    // First fetch (cache miss — reads from disk)
+    // First fetch (cache miss - reads from disk)
     let p1 = pool
         .fetch(&io, PageId(0), &keys.dek, &keys.mac_key, 1)
         .unwrap()
         .clone();
-    // Second fetch (cache hit — returns cached)
+    // Second fetch (cache hit - returns cached)
     let p2 = pool
         .fetch(&io, PageId(0), &keys.dek, &keys.mac_key, 1)
         .unwrap();
@@ -871,7 +871,7 @@ fn page_swap_attack_detected() {
     io.write_page(offset1, &raw0).unwrap();
     io.fsync().unwrap();
 
-    // Try to read — HMAC verification should fail because:
+    // Try to read - HMAC verification should fail because:
     // Page at offset0 has MAC computed with page_id=1, but we pass page_id=0
     let mut pool = BufferPool::new(64);
     let result0 = pool.fetch(&io, PageId(0), &keys.dek, &keys.mac_key, epoch);
@@ -924,7 +924,7 @@ fn iv_uniqueness_across_many_writes() {
         let is_new = seen_ivs.insert(iv);
         assert!(
             is_new,
-            "IV must be unique across all encryptions — duplicate detected!"
+            "IV must be unique across all encryptions - duplicate detected!"
         );
     }
 
@@ -985,7 +985,7 @@ fn ctr_bit_flip_caught_before_decrypt() {
     io.fsync().unwrap();
 
     // Flip various bits in the ciphertext region (bytes 16..PAGE_SIZE-32)
-    // Each should be caught by HMAC — the MAC covers the ciphertext
+    // Each should be caught by HMAC - the MAC covers the ciphertext
     let ciphertext_offsets = [16, 100, 500, 4000, PAGE_SIZE - 33];
     for &flip_offset in &ciphertext_offsets {
         let mut tampered = [0u8; PAGE_SIZE];

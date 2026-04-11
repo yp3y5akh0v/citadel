@@ -17,7 +17,7 @@ pub enum Statement {
     DropIndex(DropIndexStmt),
     AlterTable(Box<AlterTableStmt>),
     Insert(InsertStmt),
-    Select(Box<QueryBody>),
+    Select(Box<SelectQuery>),
     Update(UpdateStmt),
     Delete(DeleteStmt),
     Begin,
@@ -114,7 +114,7 @@ pub struct DropIndexStmt {
 #[derive(Debug, Clone)]
 pub enum InsertSource {
     Values(Vec<Vec<Expr>>),
-    Select(Box<QueryBody>),
+    Select(Box<SelectQuery>),
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +182,20 @@ pub struct CompoundSelect {
 pub enum QueryBody {
     Select(Box<SelectStmt>),
     Compound(CompoundSelect),
+}
+
+#[derive(Debug, Clone)]
+pub struct CteDefinition {
+    pub name: String,
+    pub column_aliases: Vec<String>,
+    pub body: QueryBody,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectQuery {
+    pub ctes: Vec<CteDefinition>,
+    pub recursive: bool,
+    pub body: QueryBody,
 }
 
 #[derive(Debug, Clone)]
@@ -396,7 +410,7 @@ pub fn bind_params(
 
 fn bind_stmt(stmt: &Statement, params: &[crate::types::Value]) -> crate::error::Result<Statement> {
     match stmt {
-        Statement::Select(body) => Ok(Statement::Select(Box::new(bind_query_body(body, params)?))),
+        Statement::Select(sq) => Ok(Statement::Select(Box::new(bind_select_query(sq, params)?))),
         Statement::Insert(ins) => {
             let source = match &ins.source {
                 InsertSource::Values(rows) => {
@@ -410,8 +424,8 @@ fn bind_stmt(stmt: &Statement, params: &[crate::types::Value]) -> crate::error::
                         .collect::<crate::error::Result<Vec<_>>>()?;
                     InsertSource::Values(bound)
                 }
-                InsertSource::Select(body) => {
-                    InsertSource::Select(Box::new(bind_query_body(body, params)?))
+                InsertSource::Select(sq) => {
+                    InsertSource::Select(Box::new(bind_select_query(sq, params)?))
                 }
             };
             Ok(Statement::Insert(InsertStmt {
@@ -577,6 +591,29 @@ fn bind_query_body(
     }
 }
 
+fn bind_select_query(
+    sq: &SelectQuery,
+    params: &[crate::types::Value],
+) -> crate::error::Result<SelectQuery> {
+    let ctes = sq
+        .ctes
+        .iter()
+        .map(|cte| {
+            Ok(CteDefinition {
+                name: cte.name.clone(),
+                column_aliases: cte.column_aliases.clone(),
+                body: bind_query_body(&cte.body, params)?,
+            })
+        })
+        .collect::<crate::error::Result<Vec<_>>>()?;
+    let body = bind_query_body(&sq.body, params)?;
+    Ok(SelectQuery {
+        ctes,
+        recursive: sq.recursive,
+        body,
+    })
+}
+
 fn bind_expr(expr: &Expr, params: &[crate::types::Value]) -> crate::error::Result<Expr> {
     match expr {
         Expr::Parameter(n) => {
@@ -716,7 +753,12 @@ fn bind_expr(expr: &Expr, params: &[crate::types::Value]) -> crate::error::Resul
 
 fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
     match stmt {
-        Statement::Select(body) => visit_exprs_query_body(body, visitor),
+        Statement::Select(sq) => {
+            for cte in &sq.ctes {
+                visit_exprs_query_body(&cte.body, visitor);
+            }
+            visit_exprs_query_body(&sq.body, visitor);
+        }
         Statement::Insert(ins) => match &ins.source {
             InsertSource::Values(rows) => {
                 for row in rows {
@@ -725,7 +767,12 @@ fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
                     }
                 }
             }
-            InsertSource::Select(body) => visit_exprs_query_body(body, visitor),
+            InsertSource::Select(sq) => {
+                for cte in &sq.ctes {
+                    visit_exprs_query_body(&cte.body, visitor);
+                }
+                visit_exprs_query_body(&sq.body, visitor);
+            }
         },
         Statement::Update(upd) => {
             for (_, e) in &upd.assignments {
@@ -1221,7 +1268,19 @@ fn convert_insert(insert: sp::Insert) -> Result<Statement> {
             }
             InsertSource::Values(result)
         }
-        _ => InsertSource::Select(Box::new(convert_query_body(&query)?)),
+        _ => {
+            let (ctes, recursive) = if let Some(ref with) = query.with {
+                convert_with(with)?
+            } else {
+                (vec![], false)
+            };
+            let body = convert_query_body(&query)?;
+            InsertSource::Select(Box::new(SelectQuery {
+                ctes,
+                recursive,
+                body,
+            }))
+        }
     };
 
     Ok(Statement::Insert(InsertStmt {
@@ -1389,6 +1448,9 @@ fn convert_query_body(query: &sp::Query) -> Result<QueryBody> {
 }
 
 fn convert_subquery(query: &sp::Query) -> Result<SelectStmt> {
+    if query.with.is_some() {
+        return Err(SqlError::Unsupported("CTEs in subqueries".into()));
+    }
     match convert_query_body(query)? {
         QueryBody::Select(s) => Ok(*s),
         QueryBody::Compound(_) => Err(SqlError::Unsupported(
@@ -1397,8 +1459,42 @@ fn convert_subquery(query: &sp::Query) -> Result<SelectStmt> {
     }
 }
 
+fn convert_with(with: &sp::With) -> Result<(Vec<CteDefinition>, bool)> {
+    let mut names = std::collections::HashSet::new();
+    let mut ctes = Vec::new();
+    for cte in &with.cte_tables {
+        let name = cte.alias.name.value.to_ascii_lowercase();
+        if !names.insert(name.clone()) {
+            return Err(SqlError::DuplicateCteName(name));
+        }
+        let column_aliases: Vec<String> = cte
+            .alias
+            .columns
+            .iter()
+            .map(|c| c.name.value.to_ascii_lowercase())
+            .collect();
+        let body = convert_query_body(&cte.query)?;
+        ctes.push(CteDefinition {
+            name,
+            column_aliases,
+            body,
+        });
+    }
+    Ok((ctes, with.recursive))
+}
+
 fn convert_query(query: sp::Query) -> Result<Statement> {
-    Ok(Statement::Select(Box::new(convert_query_body(&query)?)))
+    let (ctes, recursive) = if let Some(ref with) = query.with {
+        convert_with(with)?
+    } else {
+        (vec![], false)
+    };
+    let body = convert_query_body(&query)?;
+    Ok(Statement::Select(Box::new(SelectQuery {
+        ctes,
+        recursive,
+        body,
+    })))
 }
 
 fn convert_join(join: &sp::Join) -> Result<JoinClause> {
@@ -2026,7 +2122,7 @@ mod tests {
     fn parse_select_all() {
         let stmt = parse_sql("SELECT * FROM users").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert_eq!(sel.from, "users");
                     assert!(matches!(sel.columns[0], SelectColumn::AllColumns));
@@ -2042,7 +2138,7 @@ mod tests {
     fn parse_select_where() {
         let stmt = parse_sql("SELECT id, name FROM users WHERE age > 18").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert_eq!(sel.columns.len(), 2);
                     assert!(sel.where_clause.is_some());
@@ -2057,7 +2153,7 @@ mod tests {
     fn parse_select_order_limit() {
         let stmt = parse_sql("SELECT * FROM users ORDER BY name ASC LIMIT 10 OFFSET 5").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert_eq!(sel.order_by.len(), 1);
                     assert!(!sel.order_by[0].descending);
@@ -2100,7 +2196,7 @@ mod tests {
     fn parse_aggregate() {
         let stmt = parse_sql("SELECT COUNT(*), SUM(age) FROM users").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert_eq!(sel.columns.len(), 2);
                     match &sel.columns[0] {
@@ -2124,7 +2220,7 @@ mod tests {
         )
         .unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert_eq!(sel.group_by.len(), 1);
                     assert!(sel.having.is_some());
@@ -2139,7 +2235,7 @@ mod tests {
     fn parse_expressions() {
         let stmt = parse_sql("SELECT id + 1, -price, NOT active FROM items").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert_eq!(sel.columns.len(), 3);
                     // id + 1
@@ -2183,7 +2279,7 @@ mod tests {
     fn parse_is_null() {
         let stmt = parse_sql("SELECT * FROM t WHERE x IS NULL").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert!(matches!(sel.where_clause, Some(Expr::IsNull(_))));
                 }
@@ -2197,7 +2293,7 @@ mod tests {
     fn parse_inner_join() {
         let stmt = parse_sql("SELECT * FROM a JOIN b ON a.id = b.id").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert_eq!(sel.from, "a");
                     assert_eq!(sel.joins.len(), 1);
@@ -2215,7 +2311,7 @@ mod tests {
     fn parse_inner_join_explicit() {
         let stmt = parse_sql("SELECT * FROM a INNER JOIN b ON a.id = b.a_id").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert_eq!(sel.joins.len(), 1);
                     assert_eq!(sel.joins[0].join_type, JoinType::Inner);
@@ -2230,7 +2326,7 @@ mod tests {
     fn parse_cross_join() {
         let stmt = parse_sql("SELECT * FROM a CROSS JOIN b").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert_eq!(sel.joins.len(), 1);
                     assert_eq!(sel.joins[0].join_type, JoinType::Cross);
@@ -2246,7 +2342,7 @@ mod tests {
     fn parse_left_join() {
         let stmt = parse_sql("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert_eq!(sel.joins.len(), 1);
                     assert_eq!(sel.joins[0].join_type, JoinType::Left);
@@ -2261,7 +2357,7 @@ mod tests {
     fn parse_table_alias() {
         let stmt = parse_sql("SELECT u.id FROM users u JOIN orders o ON u.id = o.user_id").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert_eq!(sel.from, "users");
                     assert_eq!(sel.from_alias.as_deref(), Some("u"));
@@ -2279,7 +2375,7 @@ mod tests {
         let stmt =
             parse_sql("SELECT * FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert_eq!(sel.joins.len(), 2);
                 }
@@ -2293,7 +2389,7 @@ mod tests {
     fn parse_qualified_column() {
         let stmt = parse_sql("SELECT u.id, u.name FROM users u").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => match &sel.columns[0] {
                     SelectColumn::Expr {
                         expr: Expr::QualifiedColumn { table, column },
@@ -2371,7 +2467,7 @@ mod tests {
     fn parse_alias() {
         let stmt = parse_sql("SELECT id AS user_id FROM users").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => match &sel.columns[0] {
                     SelectColumn::Expr { alias: Some(a), .. } => assert_eq!(a, "user_id"),
                     other => panic!("expected alias, got {other:?}"),
@@ -2410,7 +2506,7 @@ mod tests {
     fn parse_select_distinct() {
         let stmt = parse_sql("SELECT DISTINCT name FROM users").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert!(sel.distinct);
                     assert_eq!(sel.columns.len(), 1);
@@ -2425,7 +2521,7 @@ mod tests {
     fn parse_select_without_distinct() {
         let stmt = parse_sql("SELECT name FROM users").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert!(!sel.distinct);
                 }
@@ -2439,7 +2535,7 @@ mod tests {
     fn parse_select_distinct_all_columns() {
         let stmt = parse_sql("SELECT DISTINCT * FROM users").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => {
                     assert!(sel.distinct);
                     assert!(matches!(sel.columns[0], SelectColumn::AllColumns));
@@ -2551,7 +2647,7 @@ mod tests {
     fn parse_parameter_placeholder() {
         let stmt = parse_sql("SELECT * FROM t WHERE id = $1").unwrap();
         match stmt {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => match &sel.where_clause {
                     Some(Expr::BinaryOp { right, .. }) => {
                         assert!(matches!(right.as_ref(), Expr::Parameter(1)));
@@ -2589,7 +2685,7 @@ mod tests {
                 assert_eq!(ins.table, "t2");
                 assert_eq!(ins.columns, vec!["id", "name"]);
                 match &ins.source {
-                    InsertSource::Select(body) => match body.as_ref() {
+                    InsertSource::Select(sq) => match &sq.body {
                         QueryBody::Select(sel) => {
                             assert_eq!(sel.from, "t1");
                             assert_eq!(sel.columns.len(), 2);
@@ -2639,7 +2735,7 @@ mod tests {
         let stmt = parse_sql("SELECT * FROM t WHERE id = $1").unwrap();
         let bound = bind_params(&stmt, &[Value::Integer(42)]).unwrap();
         match bound {
-            Statement::Select(body) => match *body {
+            Statement::Select(sq) => match sq.body {
                 QueryBody::Select(sel) => match &sel.where_clause {
                     Some(Expr::BinaryOp { right, .. }) => {
                         assert!(matches!(right.as_ref(), Expr::Literal(Value::Integer(42))));

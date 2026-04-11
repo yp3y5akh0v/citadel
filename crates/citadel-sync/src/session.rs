@@ -101,7 +101,7 @@ impl SyncSession {
             already_in_sync: false,
         };
 
-        // Push phase: diff(local → remote), send patch to remote
+        // Push phase: diff(local -> remote), send patch to remote
         if self.config.direction == SyncDirection::Push
             || self.config.direction == SyncDirection::Bidirectional
         {
@@ -109,7 +109,7 @@ impl SyncSession {
             outcome.pushed = Some(result);
         }
 
-        // Pull phase: diff(remote → local), apply patch locally
+        // Pull phase: diff(remote -> local), apply patch locally
         if self.config.direction == SyncDirection::Pull
             || self.config.direction == SyncDirection::Bidirectional
         {
@@ -253,7 +253,7 @@ impl SyncSession {
         Ok(outcome)
     }
 
-    /// Push: diff(local → remote) via merkle_diff, send patch.
+    /// Push: diff(local -> remote) via merkle_diff, send patch.
     fn initiator_push(
         &self,
         manager: &TxnManager,
@@ -550,7 +550,7 @@ impl SyncSession {
         Ok(results)
     }
 
-    /// Pull: diff(remote → local) via merkle_diff, apply locally.
+    /// Pull: diff(remote -> local) via merkle_diff, apply locally.
     fn initiator_pull(
         &self,
         manager: &TxnManager,

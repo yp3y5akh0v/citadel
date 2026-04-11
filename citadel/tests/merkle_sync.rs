@@ -1,4 +1,4 @@
-//! Merkle sync tests — prove that two databases can detect differences
+//! Merkle sync tests - prove that two databases can detect differences
 //! at the page level using Merkle hashes and sync only the changed data.
 //!
 //! This is the actual purpose of the Merkle tree: replication.
@@ -20,7 +20,7 @@ fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
 }
 
 // ============================================================
-// Tree walker — reads all pages and their Merkle hashes
+// Tree walker - reads all pages and their Merkle hashes
 // ============================================================
 
 #[derive(Debug, Clone)]
@@ -111,7 +111,7 @@ fn recompute_branch_hash(child_hashes: &[[u8; MERKLE_HASH_SIZE]]) -> [u8; MERKLE
 }
 
 // ============================================================
-// Merkle diff algorithm — the core sync primitive
+// Merkle diff algorithm - the core sync primitive
 // ============================================================
 
 /// Diff two trees using Merkle hashes. Returns the set of key-value entries
@@ -136,22 +136,22 @@ fn merkle_diff(source: &Database, target: &Database) -> Vec<(Vec<u8>, Vec<u8>)> 
         let src_page = src_mgr.read_page_from_disk(src_pid).unwrap();
         let tgt_page = tgt_mgr.read_page_from_disk(tgt_pid).unwrap();
 
-        // If hashes match, entire subtree is identical — skip it
+        // If hashes match, entire subtree is identical - skip it
         if src_page.merkle_hash() == tgt_page.merkle_hash() {
             continue;
         }
 
-        // Hashes differ — descend or collect
+        // Hashes differ - descend or collect
         match (src_page.page_type().unwrap(), tgt_page.page_type().unwrap()) {
             (PageType::Leaf, PageType::Leaf) => {
-                // Both are leaves with different hashes — collect source entries
+                // Both are leaves with different hashes - collect source entries
                 for i in 0..src_page.num_cells() {
                     let cell = leaf_node::read_cell(&src_page, i);
                     changed_entries.push((cell.key.to_vec(), cell.value.to_vec()));
                 }
             }
             (PageType::Branch, PageType::Branch) => {
-                // Both branches — compare children pairwise
+                // Both branches - compare children pairwise
                 let src_n = src_page.num_cells() as usize;
                 let tgt_n = tgt_page.num_cells() as usize;
 
@@ -169,12 +169,12 @@ fn merkle_diff(source: &Database, target: &Database) -> Vec<(Vec<u8>, Vec<u8>)> 
                         queue.push_back((sr, tr));
                     }
                 } else {
-                    // Different structure — collect all source leaf entries from this subtree
+                    // Different structure - collect all source leaf entries from this subtree
                     collect_all_leaves(src_mgr, src_pid, &mut changed_entries);
                 }
             }
             _ => {
-                // Structure changed (leaf vs branch) — collect all source entries
+                // Structure changed (leaf vs branch) - collect all source entries
                 collect_all_leaves(src_mgr, src_pid, &mut changed_entries);
             }
         }
@@ -264,7 +264,7 @@ fn single_insert_detected_and_synced() {
     }
     assert_eq!(db1.stats().merkle_root, db2.stats().merkle_root);
 
-    // Modify db1 only — add one key
+    // Modify db1 only - add one key
     let mut wtx = db1.begin_write().unwrap();
     wtx.insert(b"new-key", b"new-value").unwrap();
     wtx.commit().unwrap();
@@ -382,7 +382,7 @@ fn sync_with_splits_large_dataset() {
     // With multi-level trees, entry-level sync makes the DATA converge,
     // but the tree STRUCTURE may differ (different CoW history = different
     // page layout). Merkle hashes reflect page structure, so roots may
-    // differ even when data is identical. This is correct — page-level
+    // differ even when data is identical. This is correct - page-level
     // sync will transfer actual pages for root convergence.
     let dir = tempfile::tempdir().unwrap();
     let db1 = fast_builder(&dir.path().join("a.db")).create().unwrap();
@@ -417,10 +417,10 @@ fn sync_with_splits_large_dataset() {
 
     let diff = merkle_diff(&db1, &db2);
 
-    // Diff must skip matching subtrees — fewer entries than total
+    // Diff must skip matching subtrees - fewer entries than total
     assert!(
         diff.len() < 500,
-        "merkle diff must skip matching subtrees — got {} entries out of 500",
+        "merkle diff must skip matching subtrees - got {} entries out of 500",
         diff.len()
     );
     assert!(!diff.is_empty());
@@ -436,7 +436,7 @@ fn sync_with_splits_large_dataset() {
         "diff must contain key 499"
     );
 
-    // Apply diff — data must converge
+    // Apply diff - data must converge
     apply_sync(&db2, &diff);
 
     let data1 = collect_all_data(&db1);
@@ -475,7 +475,7 @@ fn sync_efficiency_skips_matching_subtrees() {
     );
     assert!(leaf_count > 5, "need multiple leaves, got {leaf_count}");
 
-    // Change just 1 entry — should affect only 1 leaf page
+    // Change just 1 entry - should affect only 1 leaf page
     let mut wtx = db1.begin_write().unwrap();
     wtx.insert(&42u32.to_be_bytes(), b"CHANGED").unwrap();
     wtx.commit().unwrap();
@@ -613,7 +613,7 @@ fn hash_chain_is_complete_no_zero_hashes() {
     for page_info in &tree {
         assert_ne!(
             page_info.merkle_hash, zero_hash,
-            "page {:?} has zero hash — Merkle computation missed this page",
+            "page {:?} has zero hash - Merkle computation missed this page",
             page_info.page_id
         );
     }

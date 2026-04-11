@@ -7,7 +7,6 @@
 
 use citadel_core::types::PageId;
 
-/// In-memory page allocator state.
 pub struct PageAllocator {
     /// Next page ID to allocate from (high water mark).
     next_page_id: u32,
@@ -18,7 +17,6 @@ pub struct PageAllocator {
 }
 
 impl PageAllocator {
-    /// Create a new allocator starting from the given high water mark.
     pub fn new(high_water_mark: u32) -> Self {
         Self {
             next_page_id: high_water_mark,
@@ -27,8 +25,7 @@ impl PageAllocator {
         }
     }
 
-    /// Allocate a new page ID.
-    /// Prefers reusing reclaimed pages; falls back to incrementing the high water mark.
+    /// Prefers reusing reclaimed pages over incrementing the high water mark.
     pub fn allocate(&mut self) -> PageId {
         if let Some(id) = self.ready_to_use.pop() {
             id
@@ -39,44 +36,35 @@ impl PageAllocator {
         }
     }
 
-    /// Mark a page as freed in the current transaction.
-    /// The page is NOT immediately reusable — it goes into the pending-free list.
+    /// Not immediately reusable - goes into pending-free list.
     pub fn free(&mut self, page_id: PageId) {
         self.freed_this_txn.push(page_id);
     }
 
-    /// Current high water mark (next page ID that would be allocated from disk).
     pub fn high_water_mark(&self) -> u32 {
         self.next_page_id
     }
 
-    /// Pages freed in the current transaction.
     pub fn freed_this_txn(&self) -> &[PageId] {
         &self.freed_this_txn
     }
 
-    /// Add pages that are safe to reuse (reclaimed from pending-free chain).
     pub fn add_ready_to_use(&mut self, pages: Vec<PageId>) {
         self.ready_to_use.extend(pages);
     }
 
-    /// Commit: take ownership of freed pages (for writing to pending-free chain).
-    /// Returns the list of pages freed in this transaction.
     pub fn commit(&mut self) -> Vec<PageId> {
         std::mem::take(&mut self.freed_this_txn)
     }
 
-    /// Rollback: discard freed pages (transaction aborted).
     pub fn rollback(&mut self) {
         self.freed_this_txn.clear();
     }
 
-    /// Number of pages available for immediate reuse.
     pub fn ready_count(&self) -> usize {
         self.ready_to_use.len()
     }
 
-    /// Number of pages freed in the current transaction.
     pub fn freed_count(&self) -> usize {
         self.freed_this_txn.len()
     }

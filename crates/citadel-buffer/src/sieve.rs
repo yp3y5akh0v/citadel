@@ -53,7 +53,6 @@ impl<V: Default> SieveCache<V> {
         }
     }
 
-    /// Look up a key. If found, set visited=true and return reference.
     pub fn get(&mut self, key: u64) -> Option<&V> {
         if let Some(&idx) = self.index.get(&key) {
             self.entries[idx].visited = true;
@@ -63,7 +62,6 @@ impl<V: Default> SieveCache<V> {
         }
     }
 
-    /// Look up a key. If found, set visited=true and return mutable reference.
     pub fn get_mut(&mut self, key: u64) -> Option<&mut V> {
         if let Some(&idx) = self.index.get(&key) {
             self.entries[idx].visited = true;
@@ -73,26 +71,19 @@ impl<V: Default> SieveCache<V> {
         }
     }
 
-    /// Check if a key exists without marking visited.
     pub fn contains(&self, key: u64) -> bool {
         self.index.contains_key(&key)
     }
 
-    /// Insert a value. If cache is full, evict using SIEVE algorithm.
-    /// Returns None if inserted without eviction, or Some((evicted_key, evicted_value))
-    /// if an entry was evicted.
-    ///
-    /// Returns Err(()) if the cache is full and all entries are dirty (pinned).
+    /// Returns Err if all entries are dirty (pinned) and eviction is impossible.
     #[allow(clippy::result_unit_err)]
     pub fn insert(&mut self, key: u64, value: V) -> Result<Option<(u64, V)>, ()> {
-        // If already present, just update
         if let Some(&idx) = self.index.get(&key) {
             self.entries[idx].value = value;
             self.entries[idx].visited = true;
             return Ok(None);
         }
 
-        // If cache not full, use next empty slot
         if self.len < self.capacity {
             let idx = self.find_empty_slot();
             self.entries[idx].key = key;
@@ -105,10 +96,7 @@ impl<V: Default> SieveCache<V> {
             return Ok(None);
         }
 
-        // Cache is full — need to evict using SIEVE
         let evicted = self.evict()?;
-
-        // Find the slot that was just freed
         let idx = self.find_empty_slot();
         self.entries[idx].key = key;
         self.entries[idx].value = value;
@@ -121,15 +109,12 @@ impl<V: Default> SieveCache<V> {
         Ok(Some(evicted))
     }
 
-    /// Evict one entry using SIEVE algorithm.
-    /// Skips dirty (pinned) entries and visited entries (clears visited on pass).
-    /// Returns the evicted (key, value).
     fn evict(&mut self) -> Result<(u64, V), ()> {
         let mut scanned = 0;
 
         loop {
             if scanned >= self.capacity * 2 {
-                // All entries are dirty — can't evict
+                // All entries are dirty - can't evict
                 return Err(());
             }
 
@@ -142,17 +127,14 @@ impl<V: Default> SieveCache<V> {
             }
 
             if self.entries[idx].dirty {
-                // Pinned — skip
                 continue;
             }
 
             if self.entries[idx].visited {
-                // Give second chance
                 self.entries[idx].visited = false;
                 continue;
             }
 
-            // Found victim: not visited, not dirty
             let evicted_key = self.entries[idx].key;
             let evicted_value = std::mem::take(&mut self.entries[idx].value);
             self.entries[idx].occupied = false;
@@ -172,21 +154,18 @@ impl<V: Default> SieveCache<V> {
         unreachable!("find_empty_slot called when cache is full");
     }
 
-    /// Mark an entry as dirty (pinned, not evictable).
     pub fn set_dirty(&mut self, key: u64) {
         if let Some(&idx) = self.index.get(&key) {
             self.entries[idx].dirty = true;
         }
     }
 
-    /// Clear dirty flag on an entry (after flush).
     pub fn clear_dirty(&mut self, key: u64) {
         if let Some(&idx) = self.index.get(&key) {
             self.entries[idx].dirty = false;
         }
     }
 
-    /// Check if an entry is dirty.
     pub fn is_dirty(&self, key: u64) -> bool {
         self.index
             .get(&key)
@@ -194,7 +173,6 @@ impl<V: Default> SieveCache<V> {
             .unwrap_or(false)
     }
 
-    /// Iterate over all dirty entries. Returns (key, &value) pairs.
     pub fn dirty_entries(&self) -> impl Iterator<Item = (u64, &V)> {
         self.entries
             .iter()
@@ -202,7 +180,6 @@ impl<V: Default> SieveCache<V> {
             .map(|e| (e.key, &e.value))
     }
 
-    /// Iterate mutably over all dirty entries.
     pub fn dirty_entries_mut(&mut self) -> impl Iterator<Item = (u64, &mut V)> {
         self.entries
             .iter_mut()
@@ -210,7 +187,6 @@ impl<V: Default> SieveCache<V> {
             .map(|e| (e.key, &mut e.value))
     }
 
-    /// Clear all dirty flags (after commit).
     pub fn clear_all_dirty(&mut self) {
         for entry in &mut self.entries {
             if entry.occupied {
@@ -219,7 +195,6 @@ impl<V: Default> SieveCache<V> {
         }
     }
 
-    /// Remove an entry by key. Returns the value if present.
     pub fn remove(&mut self, key: u64) -> Option<V> {
         if let Some(idx) = self.index.remove(&key) {
             let value = std::mem::take(&mut self.entries[idx].value);
@@ -243,7 +218,6 @@ impl<V: Default> SieveCache<V> {
         self.capacity
     }
 
-    /// Count dirty entries.
     pub fn dirty_count(&self) -> usize {
         self.entries
             .iter()
@@ -251,7 +225,6 @@ impl<V: Default> SieveCache<V> {
             .count()
     }
 
-    /// Remove all entries from the cache.
     pub fn clear(&mut self) {
         for entry in &mut self.entries {
             entry.occupied = false;
@@ -287,7 +260,7 @@ mod tests {
         cache.insert(3, 300).unwrap();
         assert_eq!(cache.len(), 3);
 
-        // Don't access any — all are unvisited, one should be evicted
+        // Don't access any - all are unvisited, one should be evicted
         // Reset visited flags by clearing them
         for entry in &mut cache.entries {
             entry.visited = false;
@@ -313,7 +286,7 @@ mod tests {
         // Access entry 2 (marks visited)
         cache.get(2);
 
-        // Insert 4 — should evict 1 or 3 (not 2)
+        // Insert 4 - should evict 1 or 3 (not 2)
         let evicted = cache.insert(4, 400).unwrap().unwrap();
         assert_ne!(evicted.0, 2, "visited entry should not be evicted");
         assert!(cache.contains(2));
@@ -334,7 +307,7 @@ mod tests {
         // Mark entry 1 dirty
         cache.set_dirty(1);
 
-        // Insert 3 — must evict 2 (not dirty 1)
+        // Insert 3 - must evict 2 (not dirty 1)
         let evicted = cache.insert(3, 300).unwrap().unwrap();
         assert_eq!(evicted.0, 2);
         assert!(cache.contains(1));

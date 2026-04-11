@@ -333,7 +333,7 @@ impl AuditLog {
 
         self.file.sync_data()?;
 
-        // Shift rotated files: .N → delete, .N-1 → .N, ..., current → .1
+        // Shift rotated files: .N -> delete, .N-1 -> .N, ..., current -> .1
         for i in (1..=self.config.max_rotated_files).rev() {
             let src = if i == 1 {
                 self.path.clone()

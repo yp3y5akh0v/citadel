@@ -77,15 +77,11 @@ impl BufferPool {
     ) -> Result<&Page> {
         let offset = page_offset(page_id);
 
-        // Cache hit
         if self.cache.contains(offset) {
             return Ok(self.cache.get(offset).unwrap());
         }
 
-        // Cache miss: read from disk
         let page = read_and_decrypt(io, page_id, offset, dek, mac_key, encryption_epoch)?;
-
-        // Insert into cache (may evict)
         self.cache
             .insert(offset, Arc::new(page))
             .map_err(|()| Error::BufferPoolFull)?;
@@ -93,7 +89,6 @@ impl BufferPool {
         Ok(self.cache.get(offset).unwrap())
     }
 
-    /// Fetch a page mutably (for modification during write transaction).
     pub fn fetch_mut(
         &mut self,
         io: &dyn PageIO,
@@ -114,14 +109,11 @@ impl BufferPool {
         Ok(Arc::make_mut(self.cache.get_mut(offset).unwrap()))
     }
 
-    /// Insert a new page directly into the buffer pool (for newly allocated pages).
-    /// Marks it as dirty immediately.
+    /// Insert a newly allocated page. Marks it dirty immediately.
     pub fn insert_new(&mut self, page_id: PageId, page: Page) -> Result<()> {
         let offset = page_offset(page_id);
 
-        // Check if we'd exceed capacity with all dirty pages
         if self.cache.len() >= self.capacity && !self.cache.contains(offset) {
-            // Try to insert (may evict a clean page)
             self.cache
                 .insert(offset, Arc::new(page))
                 .map_err(|()| Error::TransactionTooLarge {
@@ -137,7 +129,6 @@ impl BufferPool {
         Ok(())
     }
 
-    /// Mark a page as dirty (modified in current write transaction).
     pub fn mark_dirty(&mut self, page_id: PageId) {
         let offset = page_offset(page_id);
         self.cache.set_dirty(offset);
@@ -152,7 +143,6 @@ impl BufferPool {
         mac_key: &[u8; MAC_KEY_SIZE],
         encryption_epoch: u32,
     ) -> Result<()> {
-        // Collect dirty page offsets and data
         let dirty: Vec<(u64, PageId, [u8; BODY_SIZE])> = self
             .cache
             .dirty_entries()
@@ -206,39 +196,32 @@ impl BufferPool {
         }
     }
 
-    /// Number of pages currently in the cache.
     pub fn len(&self) -> usize {
         self.cache.len()
     }
 
-    /// Whether the cache is empty.
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
     }
 
-    /// Number of dirty pages.
     pub fn dirty_count(&self) -> usize {
         self.cache.dirty_count()
     }
 
-    /// Cache capacity.
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
-    /// Check if a page is cached.
     pub fn is_cached(&self, page_id: PageId) -> bool {
         let offset = page_offset(page_id);
         self.cache.contains(offset)
     }
 
-    /// Remove a single page from the cache (e.g. after CoW overwrites it).
     pub fn invalidate(&mut self, page_id: PageId) {
         let offset = page_offset(page_id);
         self.cache.remove(offset);
     }
 
-    /// Clear all entries from the cache.
     pub fn clear(&mut self) {
         self.cache.clear();
     }
@@ -355,7 +338,7 @@ mod tests {
         let mut pool = BufferPool::new(16);
         pool.fetch(&io, PageId(0), &dek, &mac_key, epoch).unwrap();
 
-        // Remove from "disk" — should still be in cache
+        // Remove from "disk" - should still be in cache
         io.pages.lock().unwrap().clear();
         let fetched = pool.fetch(&io, PageId(0), &dek, &mac_key, epoch).unwrap();
         assert_eq!(fetched.page_id(), PageId(0));
@@ -401,7 +384,7 @@ mod tests {
         pool.cache.clear_dirty(page_offset(PageId(0)));
         pool.cache.clear_dirty(page_offset(PageId(2)));
 
-        // Insert page 3 — should evict page 0 or 2 (not dirty page 1)
+        // Insert page 3 - should evict page 0 or 2 (not dirty page 1)
         let mut page3 = Page::new(PageId(3), PageType::Leaf, TxnId(1));
         page3.update_checksum();
         pool.insert_new(PageId(3), page3).unwrap();

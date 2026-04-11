@@ -23,17 +23,14 @@ const DATA_LEN_OFFSET: usize = PAGE_HEADER_SIZE; // 64
 /// Offset where overflow data starts.
 const DATA_OFFSET: usize = DATA_LEN_OFFSET + 4; // 68
 
-/// Get the next_page_id from an overflow page (stored in right_child field).
 pub fn next_page(page: &Page) -> PageId {
     page.right_child()
 }
 
-/// Set the next_page_id on an overflow page.
 pub fn set_next_page(page: &mut Page, next: PageId) {
     page.set_right_child(next);
 }
 
-/// Get the data_len stored in this overflow page.
 pub fn data_len(page: &Page) -> u32 {
     u32::from_le_bytes(
         page.data[DATA_LEN_OFFSET..DATA_LEN_OFFSET + 4]
@@ -42,19 +39,16 @@ pub fn data_len(page: &Page) -> u32 {
     )
 }
 
-/// Set the data_len for this overflow page.
 pub fn set_data_len(page: &mut Page, len: u32) {
     page.data[DATA_LEN_OFFSET..DATA_LEN_OFFSET + 4].copy_from_slice(&len.to_le_bytes());
 }
 
-/// Get a slice of the overflow data in this page.
 pub fn read_data(page: &Page) -> &[u8] {
     let len = data_len(page) as usize;
     &page.data[DATA_OFFSET..DATA_OFFSET + len]
 }
 
-/// Write overflow data into this page. Returns the number of bytes written.
-/// Panics if data exceeds OVERFLOW_DATA_CAPACITY.
+/// Write data into page, returns bytes written.
 pub fn write_data(page: &mut Page, data: &[u8]) -> usize {
     let len = data.len().min(OVERFLOW_DATA_CAPACITY);
     page.data[DATA_OFFSET..DATA_OFFSET + len].copy_from_slice(&data[..len]);
@@ -62,7 +56,6 @@ pub fn write_data(page: &mut Page, data: &[u8]) -> usize {
     len
 }
 
-/// Calculate how many overflow pages are needed for a given total value length.
 pub fn pages_needed(total_len: usize) -> usize {
     if total_len == 0 {
         return 1; // at least one page even for empty data

@@ -338,7 +338,7 @@ fn union_different_column_names() {
     assert_eq!(qr.rows.len(), 2);
 }
 
-// ── 13. EXCEPT removes everything → 0 rows ────���────────────────────
+// ── 13. EXCEPT removes everything -> 0 rows ────���────────────────────
 
 #[test]
 fn except_empty_result() {

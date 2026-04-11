@@ -85,6 +85,22 @@ pub enum SqlError {
     #[error("compound column count mismatch: left has {left}, right has {right}")]
     CompoundColumnCountMismatch { left: usize, right: usize },
 
+    #[error("CTE '{name}' column alias count mismatch: expected {expected}, got {got}")]
+    CteColumnAliasMismatch {
+        name: String,
+        expected: usize,
+        got: usize,
+    },
+
+    #[error("duplicate CTE name: '{0}'")]
+    DuplicateCteName(String),
+
+    #[error("recursive CTE '{0}' requires UNION or UNION ALL")]
+    RecursiveCteNoUnion(String),
+
+    #[error("recursive CTE '{0}' exceeded maximum iterations ({1})")]
+    RecursiveCteMaxIterations(String, usize),
+
     #[error("storage error: {0}")]
     Storage(#[from] citadel_core::Error),
 }

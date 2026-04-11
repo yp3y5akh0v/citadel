@@ -1331,7 +1331,7 @@ fn torture_100_entries_healthy_scan_verify() {
 // ============================================================================
 
 /// Corrupt the entry_len field to exactly equal the file's remaining bytes.
-/// This makes the entry appear to extend to EOF — a subtle boundary case.
+/// This makes the entry appear to extend to EOF - a subtle boundary case.
 #[test]
 fn torture_entry_len_extends_to_eof() {
     let dir = tempfile::tempdir().unwrap();

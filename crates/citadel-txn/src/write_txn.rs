@@ -198,7 +198,7 @@ impl<'a> WriteTxn<'a> {
         Ok(())
     }
 
-    /// Rename a table in the catalog. O(1) — no data copy.
+    /// Rename a table in the catalog. O(1) - no data copy.
     pub fn rename_table(&mut self, old_name: &[u8], new_name: &[u8]) -> Result<()> {
         self.ensure_table(old_name)?;
 

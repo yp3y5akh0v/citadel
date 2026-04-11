@@ -43,7 +43,7 @@ fn sync_identical_tables() {
         let h = s.spawn(|| sess_a.sync_tables_as_initiator(mgr_a, &ta).unwrap());
         sess_b.handle_table_sync_as_responder(mgr_b, &tb).unwrap();
         let results = h.join().unwrap();
-        // No changes needed — tables are identical
+        // No changes needed - tables are identical
         assert!(results.is_empty());
     });
 }
@@ -154,7 +154,7 @@ fn sync_disjoint_tables() {
         let h = s.spawn(|| sess_a.sync_tables_as_initiator(mgr_a, &ta).unwrap());
         sess_b.handle_table_sync_as_responder(mgr_b, &tb).unwrap();
         let results = h.join().unwrap();
-        // A has "only_a" which B doesn't — should push it
+        // A has "only_a" which B doesn't - should push it
         assert!(results.iter().any(|(name, _)| name == b"only_a"));
     });
 

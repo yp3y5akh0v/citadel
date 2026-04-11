@@ -133,7 +133,7 @@ pub fn collect_chain_page_ids(pages: &HashMap<PageId, Page>, root: PageId) -> Re
 /// 1. Reads existing chain entries
 /// 2. Reclaims entries with freed_at_txn < oldest_active_reader
 /// 3. Adds freed_this_txn + deferred_free as new entries
-/// 4. Writes new chain (CoW — never reuses old chain pages)
+/// 4. Writes new chain (CoW - never reuses old chain pages)
 ///
 /// Returns: (new_chain_root, reclaimed_page_ids, old_chain_page_ids)
 ///

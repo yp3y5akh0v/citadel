@@ -253,7 +253,7 @@ fn decode_real(data: &[u8]) -> Result<(Value, usize)> {
 
 // ── Null-escaped byte encoding ──────────────────────────────────────
 
-/// Encode bytes with null-escape: 0x00 → 0x00 0xFF, terminated by bare 0x00.
+/// Encode bytes with null-escape: 0x00 -> 0x00 0xFF, terminated by bare 0x00.
 fn encode_bytes(tag: u8, data: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(data.len() + 2);
     buf.push(tag);
@@ -291,7 +291,7 @@ fn decode_null_escaped(data: &[u8]) -> Result<(Vec<u8>, usize)> {
     ))
 }
 
-// ── Row encoding (for B+ tree values — non-PK columns) ─────────────
+// ── Row encoding (for B+ tree values - non-PK columns) ─────────────
 
 /// Encode non-PK column values into a row.
 /// Format: [col_count: u16][null_bitmap][per-column: data_type(u8) + data_len(u32) + data]

@@ -209,7 +209,7 @@ fn insert_select_with_params() {
     assert_eq!(qr.rows[1][0], Value::Integer(3));
 }
 
-// ── 7. Type coercion: INTEGER → REAL ────────────────────────────────
+// ── 7. Type coercion: INTEGER -> REAL ────────────────────────────────
 
 #[test]
 fn insert_select_type_coercion() {

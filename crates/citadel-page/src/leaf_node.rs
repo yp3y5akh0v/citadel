@@ -159,7 +159,7 @@ pub fn insert_direct(page: &mut Page, key: &[u8], val_type: ValueType, value: &[
 pub fn insert(page: &mut Page, key: &[u8], val_type: ValueType, value: &[u8]) -> bool {
     let pos = match search(page, key) {
         Ok(idx) => {
-            // Key exists — update in place by deleting old and re-inserting
+            // Key exists - update in place by deleting old and re-inserting
             let old_size = get_cell_size(page, idx);
             page.delete_cell_at(idx, old_size);
             idx

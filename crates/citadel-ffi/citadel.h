@@ -314,7 +314,7 @@ citadel_error_t citadel_write_table_get(struct CitadelWriteTxn *txn,
 /**
  * Open a SQL connection on a database.
  *
- * The connection borrows the database — the database must outlive the
+ * The connection borrows the database - the database must outlive the
  * connection.
  */
 CITADEL_API citadel_error_t citadel_sql_open(struct CitadelDb *db, struct CitadelSqlConn **out);

@@ -292,10 +292,10 @@ pub struct TableSchema {
     /// Sorted. Old rows still have data at these positions (skipped on decode);
     /// new rows encode NULL there to maintain position consistency.
     dropped_non_pk_slots: Vec<u16>,
-    /// Physical encoding position → logical column index.
+    /// Physical encoding position -> logical column index.
     /// `usize::MAX` for dropped slots.
     decode_mapping_cache: Vec<usize>,
-    /// Logical non-PK order → physical encoding position.
+    /// Logical non-PK order -> physical encoding position.
     /// `encoding_positions_cache[i]` is the physical slot for `non_pk_idx_cache[i]`.
     encoding_positions_cache: Vec<u16>,
 }
@@ -386,13 +386,13 @@ impl TableSchema {
         !self.check_constraints.is_empty() || self.columns.iter().any(|c| c.check_expr.is_some())
     }
 
-    /// Physical encoding position → logical column index mapping.
+    /// Physical encoding position -> logical column index mapping.
     /// Length = physical_non_pk_count. `usize::MAX` for dropped slots.
     pub fn decode_col_mapping(&self) -> &[usize] {
         &self.decode_mapping_cache
     }
 
-    /// Logical non-PK order → physical encoding position.
+    /// Logical non-PK order -> physical encoding position.
     /// `encoding_positions()[i]` is the physical slot for `non_pk_indices()[i]`.
     pub fn encoding_positions(&self) -> &[u16] {
         &self.encoding_positions_cache
@@ -858,7 +858,7 @@ pub enum ExecutionResult {
 }
 
 /// Result of a SELECT query.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
@@ -1010,7 +1010,7 @@ mod tests {
         let mut data = old_schema.serialize();
         // Patch to v1 format: replace version byte and truncate everything after PK
         data[0] = 1;
-        // v1 has no indices or v3 data — truncate after PK columns
+        // v1 has no indices or v3 data - truncate after PK columns
         // Header(1) + name_len(2) + "test"(4) + col_count(2) + col("id": name_len(2)+"id"(2)+type(1)+nullable(1)+position(2)) + pk_count(2) + pk(2)
         let v1_len = 1 + 2 + 4 + 2 + (2 + 2 + 1 + 1 + 2) + 2 + 2;
         data.truncate(v1_len);

@@ -193,7 +193,7 @@ fn crdt_bidirectional_conflict_resolution() {
         wtx.commit().unwrap();
     }
 
-    // db2 has newer timestamp — should win
+    // db2 has newer timestamp - should win
     let m2 = meta(2000, 0, 2);
     let v2 = encode_lww_value(&m2, EntryKind::Put, b"from-db2");
     {
@@ -297,11 +297,11 @@ fn three_node_ring_convergence() {
     // C has keys 200..210
     insert_range(&db_c, 200, 210);
 
-    // A → B
+    // A -> B
     sync_session(&db_a, &db_b, SyncDirection::Bidirectional, false);
-    // B → C
+    // B -> C
     sync_session(&db_b, &db_c, SyncDirection::Bidirectional, false);
-    // C → A
+    // C -> A
     sync_session(&db_c, &db_a, SyncDirection::Bidirectional, false);
 
     let data_a = collect_all(&db_a);
@@ -487,11 +487,11 @@ fn stress_push_1000_entries() {
 fn crdt_commutativity_both_directions_same_result() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Test A→B then B→A
+    // Test A->B then B->A
     let db_a1 = fast_builder(&dir.path().join("a1.db")).create().unwrap();
     let db_b1 = fast_builder(&dir.path().join("b1.db")).create().unwrap();
 
-    // Test B→A then A→B
+    // Test B->A then A->B
     let db_a2 = fast_builder(&dir.path().join("a2.db")).create().unwrap();
     let db_b2 = fast_builder(&dir.path().join("b2.db")).create().unwrap();
 
@@ -512,11 +512,11 @@ fn crdt_commutativity_both_directions_same_result() {
         wtx.commit().unwrap();
     }
 
-    // Direction 1: A→B then B→A
+    // Direction 1: A->B then B->A
     sync_session(&db_a1, &db_b1, SyncDirection::Push, true);
     sync_session(&db_b1, &db_a1, SyncDirection::Push, true);
 
-    // Direction 2: B→A then A→B
+    // Direction 2: B->A then A->B
     sync_session(&db_b2, &db_a2, SyncDirection::Push, true);
     sync_session(&db_a2, &db_b2, SyncDirection::Push, true);
 

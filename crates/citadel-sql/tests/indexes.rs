@@ -60,7 +60,7 @@ fn insert_users(conn: &mut Connection) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  CREATE INDEX — basic
+//  CREATE INDEX - basic
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]
@@ -174,7 +174,7 @@ fn create_index_if_not_exists_new() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  CREATE INDEX — error cases
+//  CREATE INDEX - error cases
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]
@@ -423,7 +423,7 @@ fn drop_table_if_exists_with_indexes() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  INSERT — index maintenance
+//  INSERT - index maintenance
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]
@@ -603,21 +603,21 @@ fn insert_unique_violation_on_multicolumn_index() {
         1,
     );
 
-    // Different name, same age — OK
+    // Different name, same age - OK
     assert_rows_affected(
         conn.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'b@t.com', 30)")
             .unwrap(),
         1,
     );
 
-    // Same name, different age — OK
+    // Same name, different age - OK
     assert_rows_affected(
         conn.execute("INSERT INTO users (id, name, email, age) VALUES (3, 'Alice', 'c@t.com', 25)")
             .unwrap(),
         1,
     );
 
-    // Same name AND age — VIOLATION
+    // Same name AND age - VIOLATION
     let err = conn
         .execute("INSERT INTO users (id, name, email, age) VALUES (4, 'Alice', 'd@t.com', 30)")
         .unwrap_err();
@@ -649,7 +649,7 @@ fn insert_multicolumn_unique_allows_partial_null() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  DELETE — index maintenance
+//  DELETE - index maintenance
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]
@@ -779,7 +779,7 @@ fn delete_null_indexed_value() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  UPDATE — index maintenance
+//  UPDATE - index maintenance
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]
@@ -1041,7 +1041,7 @@ fn update_with_multiple_indexes() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Persistence — indexes survive reopen
+//  Persistence - indexes survive reopen
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]

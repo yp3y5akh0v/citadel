@@ -261,10 +261,10 @@ impl Cursor {
                     }
                 }
             }
-            // child_idx == num_cells (rightmost child) — keep going up
+            // child_idx == num_cells (rightmost child) - keep going up
         }
 
-        // No more siblings — we've exhausted the tree
+        // No more siblings - we've exhausted the tree
         self.valid = false;
         Ok(false)
     }
@@ -310,10 +310,10 @@ impl Cursor {
                     }
                 }
             }
-            // child_idx == 0 (leftmost child) — keep going up
+            // child_idx == 0 (leftmost child) - keep going up
         }
 
-        // No more siblings — we've exhausted the tree
+        // No more siblings - we've exhausted the tree
         self.valid = false;
         Ok(false)
     }
@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn cursor_seek() {
         let (pages, tree) = build_tree(&[b"b", b"d", b"f", b"h"]);
-        // Seek to "c" — should land on "d" (first key >= "c")
+        // Seek to "c" - should land on "d" (first key >= "c")
         let cursor = Cursor::seek(&pages, tree.root, b"c").unwrap();
         assert!(cursor.is_valid());
         let entry = cursor.current(&pages).unwrap();

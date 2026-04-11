@@ -70,7 +70,7 @@ fn between_null_low() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    // 5 >= NULL is NULL, 5 <= 10 is TRUE → NULL AND TRUE = NULL
+    // 5 >= NULL is NULL, 5 <= 10 is TRUE -> NULL AND TRUE = NULL
     assert_eq!(
         scalar(&mut conn, "SELECT 5 BETWEEN NULL AND 10"),
         Value::Null
@@ -93,7 +93,7 @@ fn between_null_val_definite_false() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    // 5 >= 10 is FALSE → FALSE AND anything = FALSE
+    // 5 >= 10 is FALSE -> FALSE AND anything = FALSE
     assert_eq!(
         scalar(&mut conn, "SELECT 5 BETWEEN 10 AND NULL"),
         Value::Boolean(false)
@@ -429,7 +429,7 @@ fn case_short_circuit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    // First branch TRUE → second (which would divide by zero) never evaluated
+    // First branch TRUE -> second (which would divide by zero) never evaluated
     let v = scalar(
         &mut conn,
         "SELECT CASE WHEN 1 = 1 THEN 'ok' WHEN 1/0 = 1 THEN 'boom' END",
@@ -528,7 +528,7 @@ fn nullif_both_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    // NULL = NULL is not TRUE in CASE → returns first arg (NULL)
+    // NULL = NULL is not TRUE in CASE -> returns first arg (NULL)
     let v = scalar(&mut conn, "SELECT NULLIF(NULL, NULL)");
     assert_eq!(v, Value::Null);
 }
@@ -554,7 +554,7 @@ fn nullif_with_column() {
         "SELECT NULLIF(val, 20) FROM t WHERE val IS NOT NULL ORDER BY id",
     );
     assert_eq!(qr.rows[0][0], Value::Integer(10));
-    assert_eq!(qr.rows[1][0], Value::Null); // val=20 → NULL
+    assert_eq!(qr.rows[1][0], Value::Null); // val=20 -> NULL
     assert_eq!(qr.rows[2][0], Value::Integer(30));
 }
 
@@ -563,7 +563,7 @@ fn iif_null_condition() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    // NULL is not truthy → returns else branch
+    // NULL is not truthy -> returns else branch
     let v = scalar(&mut conn, "SELECT IIF(NULL, 'yes', 'no')");
     assert_eq!(v, Value::Text("no".into()));
 }
@@ -611,7 +611,7 @@ fn cast_text_float_to_integer() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    // '3.7' → parse as float → truncate to 3
+    // '3.7' -> parse as float -> truncate to 3
     let v = scalar(&mut conn, "SELECT CAST('3.7' AS INTEGER)");
     assert_eq!(v, Value::Integer(3));
 }
@@ -667,7 +667,7 @@ fn cast_chained() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    // CAST(CAST('42' AS INTEGER) AS TEXT) → "42"
+    // CAST(CAST('42' AS INTEGER) AS TEXT) -> "42"
     let v = scalar(&mut conn, "SELECT CAST(CAST('42' AS INTEGER) AS TEXT)");
     assert_eq!(v, Value::Text("42".into()));
 }
@@ -894,7 +894,7 @@ fn round_integer_input() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    // Integer input → still returns Real (ROUND always returns float)
+    // Integer input -> still returns Real (ROUND always returns float)
     let v = scalar(&mut conn, "SELECT ROUND(5)");
     assert_eq!(v, Value::Real(5.0));
 }
@@ -1148,7 +1148,7 @@ fn aggregate_with_coalesce() {
         &mut conn,
         "SELECT COALESCE(SUM(val), 0) FROM t WHERE val > 1000",
     );
-    // No matching rows → SUM returns NULL → COALESCE → 0
+    // No matching rows -> SUM returns NULL -> COALESCE -> 0
     assert_eq!(v, Value::Integer(0));
 }
 
@@ -1219,7 +1219,7 @@ fn aggregate_in_case_detected() {
     let mut conn = Connection::open(&db).unwrap();
     setup(&mut conn);
 
-    // SUM inside CASE → should be recognized as aggregate
+    // SUM inside CASE -> should be recognized as aggregate
     let qr = query(
         &mut conn,
         "SELECT CASE WHEN SUM(val) > 50 THEN 'yes' ELSE 'no' END FROM t",
@@ -1284,7 +1284,7 @@ fn subquery_in_case() {
         "SELECT id, CASE WHEN val > (SELECT AVG(val) FROM t) THEN 'above' ELSE 'below' END \
          FROM t WHERE val IS NOT NULL ORDER BY id",
     );
-    // AVG = 27.5: 10→below, 20→below, 30→above, 50→above
+    // AVG = 27.5: 10->below, 20->below, 30->above, 50->above
     assert_eq!(qr.rows[0][1], Value::Text("below".into()));
     assert_eq!(qr.rows[1][1], Value::Text("below".into()));
     assert_eq!(qr.rows[2][1], Value::Text("above".into()));
@@ -1302,7 +1302,7 @@ fn subquery_in_coalesce() {
         &mut conn,
         "SELECT COALESCE((SELECT val FROM t WHERE id = 999), -1)",
     );
-    // No row with id=999 → scalar subquery returns NULL → COALESCE → -1
+    // No row with id=999 -> scalar subquery returns NULL -> COALESCE -> -1
     assert_eq!(v, Value::Integer(-1));
 }
 
@@ -1326,7 +1326,7 @@ fn replace_empty_from() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    // Empty search string → return unchanged
+    // Empty search string -> return unchanged
     let v = scalar(&mut conn, "SELECT REPLACE('hello', '', 'x')");
     assert_eq!(v, Value::Text("hello".into()));
 }
@@ -1623,7 +1623,7 @@ fn ilike_not() {
     setup(&mut conn);
 
     let qr = query(&mut conn, "SELECT name FROM t WHERE name NOT ILIKE 'ALICE'");
-    // bob, charlie, diana — (NULL name excluded by NULL LIKE → NULL)
+    // bob, charlie, diana - (NULL name excluded by NULL LIKE -> NULL)
     assert_eq!(qr.rows.len(), 3);
 }
 
@@ -1794,7 +1794,7 @@ fn coalesce_error_not_short_circuited() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
-    // First arg is NULL, so second arg IS evaluated → division by zero
+    // First arg is NULL, so second arg IS evaluated -> division by zero
     let err = conn.execute("SELECT COALESCE(NULL, 1/0)").unwrap_err();
     assert!(matches!(err, SqlError::DivisionByZero));
 }

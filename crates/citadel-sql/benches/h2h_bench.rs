@@ -348,6 +348,55 @@ fn h2h_insert(c: &mut Criterion) {
     g.finish();
 }
 
+fn h2h_cte(c: &mut Criterion) {
+    let mut g = c.benchmark_group("cte");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_100k(&mut cc);
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sqlite_100k(&sc);
+
+    let sql = "WITH filtered AS (SELECT id, name, age FROM t WHERE age < 50) \
+               SELECT age, COUNT(*) FROM filtered GROUP BY age";
+
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| cc.query(sql).unwrap());
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| sqlite_collect(&sc, sql));
+    });
+    g.finish();
+}
+
+fn h2h_recursive_cte(c: &mut Criterion) {
+    let mut g = c.benchmark_group("recursive_cte");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+
+    let sql = "WITH RECURSIVE seq(x) AS (\
+                   SELECT 1 \
+                   UNION ALL \
+                   SELECT x + 1 FROM seq WHERE x < 1000\
+               ) SELECT SUM(x) FROM seq";
+
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| cc.query(sql).unwrap());
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| sqlite_collect(&sc, sql));
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     h2h_count,
@@ -359,5 +408,7 @@ criterion_group!(
     h2h_sum,
     h2h_group_by,
     h2h_insert,
+    h2h_cte,
+    h2h_recursive_cte,
 );
 criterion_main!(benches);

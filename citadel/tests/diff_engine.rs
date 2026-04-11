@@ -155,7 +155,7 @@ fn multiple_changes_detected() {
 }
 
 // ============================================================
-// Efficiency — subtree skipping
+// Efficiency - subtree skipping
 // ============================================================
 
 #[test]
@@ -252,7 +252,7 @@ fn empty_source_vs_populated_target() {
 
     // Source has no data, diff finds nothing (one-directional)
     let result = diff(&db1, &db2);
-    // Source leaf is empty — diff collects source's entries which is just the empty leaf
+    // Source leaf is empty - diff collects source's entries which is just the empty leaf
     // The diff may or may not be empty depending on leaf structure
     // But applying it shouldn't break anything
     apply(&db2, &result);

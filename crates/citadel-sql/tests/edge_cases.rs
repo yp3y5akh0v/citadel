@@ -86,7 +86,7 @@ fn i64_min_literal_becomes_real() {
     // (a) fail with type mismatch (Real -> Integer coercion truncates), or
     // (b) succeed with truncated value
     let result = conn.execute("INSERT INTO t VALUES (1, -9223372036854775808)");
-    // Just verify it doesn't panic — the exact behavior is acceptable either way
+    // Just verify it doesn't panic - the exact behavior is acceptable either way
     let _ = result;
 }
 
@@ -340,7 +340,7 @@ fn update_pk_change_to_existing_key() {
 #[test]
 fn update_pk_shift_multiple_rows_data_integrity() {
     // Bug: UPDATE SET id = id + 1 on rows (1,2,3) processes sequentially.
-    // Row 1→2 overwrites existing row 2. Row 2→3 then operates on corrupted state.
+    // Row 1->2 overwrites existing row 2. Row 2->3 then operates on corrupted state.
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();
@@ -352,17 +352,17 @@ fn update_pk_shift_multiple_rows_data_integrity() {
     conn.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
 
     // This UPDATE shifts all PKs by +1:
-    // id=1 → id=2 (conflicts with existing id=2)
-    // id=2 → id=3 (conflicts with existing id=3)
-    // id=3 → id=4 (ok)
+    // id=1 -> id=2 (conflicts with existing id=2)
+    // id=2 -> id=3 (conflicts with existing id=3)
+    // id=3 -> id=4 (ok)
     let result = conn.execute("UPDATE t SET id = id + 1");
 
     // Correct behavior: should either error (DuplicateKey) or handle atomically.
-    // Bug: silently corrupts data — some rows get lost.
+    // Bug: silently corrupts data - some rows get lost.
     // Let's check what actually happened:
     match result {
         Err(_) => {
-            // This would be correct behavior — rejecting the conflicting update
+            // This would be correct behavior - rejecting the conflicting update
         }
         Ok(_) => {
             // If it "succeeds", verify data integrity
@@ -370,7 +370,7 @@ fn update_pk_shift_multiple_rows_data_integrity() {
             assert_eq!(
                 qr.rows[0][0],
                 Value::Integer(3),
-                "UPDATE SET id = id+1 lost rows — data corruption bug"
+                "UPDATE SET id = id+1 lost rows - data corruption bug"
             );
         }
     }
@@ -939,7 +939,7 @@ fn select_duplicate_columns() {
         .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 42)").unwrap();
 
-    // SELECT id, id, val — duplicate column reference is valid SQL
+    // SELECT id, id, val - duplicate column reference is valid SQL
     let qr = conn.query("SELECT id, id, val FROM t").unwrap();
     assert_eq!(qr.rows[0].len(), 3);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
@@ -1048,7 +1048,7 @@ fn real_to_integer_column_coercion() {
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
         .unwrap();
-    // Insert real literal into INTEGER column — should truncate or error
+    // Insert real literal into INTEGER column - should truncate or error
     let result = conn.execute("INSERT INTO t VALUES (1, 42.7)");
 
     match result {
@@ -1401,8 +1401,8 @@ fn deeply_nested_and_or() {
     let qr = conn
         .query("SELECT id FROM t WHERE (a > 7 AND b < 25) OR (c > 32 AND a < 8)")
         .unwrap();
-    // id=1: (10>7 AND 20<25)=true OR ... → true
-    // id=2: (5>7)=false, (35>32 AND 5<8)=true → true
+    // id=1: (10>7 AND 20<25)=true OR ... -> true
+    // id=2: (5>7)=false, (35>32 AND 5<8)=true -> true
     assert_eq!(qr.rows.len(), 2);
 }
 
@@ -1543,7 +1543,7 @@ fn order_by_multiple_columns() {
     let qr = conn
         .query("SELECT id FROM t ORDER BY grp ASC, val ASC")
         .unwrap();
-    // a,1 → a,3 → b,1 → b,2
+    // a,1 -> a,3 -> b,1 -> b,2
     assert_eq!(qr.rows[0][0], Value::Integer(3)); // a,1
     assert_eq!(qr.rows[1][0], Value::Integer(2)); // a,3
     assert_eq!(qr.rows[2][0], Value::Integer(4)); // b,1
@@ -1681,7 +1681,7 @@ fn all_comparison_operators_integer() {
         assert_eq!(
             qr.rows[0][0],
             Value::Integer(expected),
-            "failed: id {op} {threshold} — expected {expected} rows"
+            "failed: id {op} {threshold} - expected {expected} rows"
         );
     }
 }
@@ -1734,7 +1734,7 @@ fn null_propagation_all_operators() {
             .unwrap();
         assert!(
             qr.rows[0][0].is_null(),
-            "NULL propagation failed for: {expr} — got {:?}",
+            "NULL propagation failed for: {expr} - got {:?}",
             qr.rows[0][0]
         );
     }

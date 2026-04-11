@@ -330,7 +330,7 @@ pub extern "C" fn citadel_read_begin(
         }
 
         let db_ref = unsafe { &*db };
-        // Safety: transmute to 'static — caller must ensure db outlives txn.
+        // Safety: transmute to 'static - caller must ensure db outlives txn.
         let txn = db_ref.db.begin_read();
         let txn: citadel::txn::read_txn::ReadTxn<'static> = unsafe { std::mem::transmute(txn) };
 
@@ -505,7 +505,7 @@ pub extern "C" fn citadel_write_commit(txn: *mut CitadelWriteTxn) -> CitadelErro
                 CitadelError::Ok
             }
             Err(e) => {
-                // Commit failed — transaction was consumed by commit()
+                // Commit failed - transaction was consumed by commit()
                 // (it takes self), so we free the handle.
                 unsafe { drop(Box::from_raw(txn)) };
                 map_core_error(e)
@@ -873,7 +873,7 @@ pub extern "C" fn citadel_write_table_get(
 
 /// Open a SQL connection on a database.
 ///
-/// The connection borrows the database — the database must outlive the
+/// The connection borrows the database - the database must outlive the
 /// connection.
 #[no_mangle]
 pub extern "C" fn citadel_sql_open(

@@ -934,7 +934,7 @@ fn rename_table_fks_in_other_tables_updated() {
             .unwrap(),
     );
 
-    // FK should still be enforced — child references parent2 now
+    // FK should still be enforced - child references parent2 now
     let err = conn
         .execute("INSERT INTO child VALUES (2, 999)")
         .unwrap_err();

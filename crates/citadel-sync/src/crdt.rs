@@ -43,13 +43,11 @@ impl EntryKind {
 }
 
 impl CrdtMeta {
-    /// Create new CRDT metadata.
     #[inline]
     pub fn new(timestamp: HlcTimestamp, node_id: NodeId) -> Self {
         Self { timestamp, node_id }
     }
 
-    /// Serialize to 20 bytes: HLC (12B big-endian) + NodeId (8B big-endian).
     pub fn to_bytes(&self) -> [u8; CRDT_META_SIZE] {
         let mut buf = [0u8; CRDT_META_SIZE];
         let ts_bytes = self.timestamp.to_bytes();
@@ -59,7 +57,6 @@ impl CrdtMeta {
         buf
     }
 
-    /// Deserialize from 20 bytes.
     pub fn from_bytes(b: &[u8; CRDT_META_SIZE]) -> Self {
         let ts = HlcTimestamp::from_bytes(b[0..12].try_into().unwrap());
         let nid = NodeId::from_bytes(b[12..20].try_into().unwrap());
@@ -69,10 +66,7 @@ impl CrdtMeta {
         }
     }
 
-    /// LWW comparison: higher timestamp wins, NodeId tiebreaker.
-    ///
-    /// This total order is the foundation of LWW conflict resolution.
-    /// If `self > other`, self is the winner.
+    /// Higher timestamp wins, NodeId tiebreaker.
     #[inline]
     pub fn lww_cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.timestamp
@@ -80,7 +74,6 @@ impl CrdtMeta {
             .then(self.node_id.cmp(&other.node_id))
     }
 
-    /// Returns true if `self` wins over `other` in LWW resolution.
     #[inline]
     pub fn wins_over(&self, other: &Self) -> bool {
         self.lww_cmp(other) == std::cmp::Ordering::Greater
@@ -114,7 +107,6 @@ pub fn encode_lww_value(meta: &CrdtMeta, kind: EntryKind, user_value: &[u8]) -> 
     buf
 }
 
-/// Decoded CRDT value.
 #[derive(Debug)]
 pub struct DecodedValue<'a> {
     pub meta: CrdtMeta,
@@ -122,10 +114,6 @@ pub struct DecodedValue<'a> {
     pub user_value: &'a [u8],
 }
 
-/// Decode a CRDT-encoded value.
-///
-/// Returns the metadata, entry kind, and a slice to the user value.
-/// For tombstones, `user_value` is an empty slice.
 pub fn decode_lww_value(data: &[u8]) -> Result<DecodedValue<'_>, DecodeError> {
     if data.len() < CRDT_HEADER_SIZE {
         return Err(DecodeError::TooShort {
@@ -152,7 +140,6 @@ pub fn decode_lww_value(data: &[u8]) -> Result<DecodedValue<'_>, DecodeError> {
     })
 }
 
-/// Errors from CRDT value decoding.
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
     #[error("CRDT value too short: expected at least {expected} bytes, got {actual}")]
@@ -166,7 +153,7 @@ pub enum DecodeError {
 ///
 /// Returns which side wins using LWW resolution:
 /// higher timestamp wins, NodeId tiebreaker.
-/// The entry kind (Put vs Tombstone) does NOT affect the merge —
+/// The entry kind (Put vs Tombstone) does NOT affect the merge -
 /// a tombstone with a higher timestamp defeats a put with a lower one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeResult {
@@ -178,10 +165,6 @@ pub enum MergeResult {
     Equal,
 }
 
-/// Resolve a conflict between local and remote entries for the same key.
-///
-/// The merge function operates only on metadata — it doesn't need
-/// to know the actual values or entry kinds.
 pub fn lww_merge(local: &CrdtMeta, remote: &CrdtMeta) -> MergeResult {
     match local.lww_cmp(remote) {
         std::cmp::Ordering::Greater => MergeResult::Local,
@@ -492,7 +475,7 @@ mod tests {
         let put_decoded = decode_lww_value(&put_encoded).unwrap();
         let del_decoded = decode_lww_value(&del_encoded).unwrap();
 
-        // Tombstone has higher timestamp — it wins
+        // Tombstone has higher timestamp - it wins
         let result = lww_merge(&put_decoded.meta, &del_decoded.meta);
         assert_eq!(result, MergeResult::Remote);
         assert_eq!(del_decoded.kind, EntryKind::Tombstone);
@@ -509,7 +492,7 @@ mod tests {
         let del_decoded = decode_lww_value(&del_encoded).unwrap();
         let put_decoded = decode_lww_value(&put_encoded).unwrap();
 
-        // Put has higher timestamp — it wins over the tombstone
+        // Put has higher timestamp - it wins over the tombstone
         let result = lww_merge(&del_decoded.meta, &put_decoded.meta);
         assert_eq!(result, MergeResult::Remote);
         assert_eq!(put_decoded.kind, EntryKind::Put);

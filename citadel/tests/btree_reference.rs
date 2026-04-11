@@ -228,7 +228,7 @@ fn btree_cow_isolation() {
 
     let root_v1 = tree.root;
 
-    // Modify — should create new pages via CoW
+    // Modify - should create new pages via CoW
     tree.insert(
         &mut pages,
         &mut alloc,

@@ -65,13 +65,13 @@ pub fn apply_patch_to_txn(wtx: &mut WriteTxn<'_>, patch: &SyncPatch) -> Result<A
                                 continue;
                             }
                             MergeResult::Remote => {
-                                // Remote wins — fall through to write
+                                // Remote wins - fall through to write
                             }
                         }
                     }
-                    // Local value doesn't have valid CRDT header — remote wins
+                    // Local value doesn't have valid CRDT header - remote wins
                 }
-                // Key doesn't exist locally — remote wins
+                // Key doesn't exist locally - remote wins
             }
         }
 

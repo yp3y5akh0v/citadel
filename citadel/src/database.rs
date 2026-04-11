@@ -252,7 +252,7 @@ impl Database {
         Ok(())
     }
 
-    /// Restore a key file from an encrypted backup (static — no `Database` needed).
+    /// Restore a key file from an encrypted backup (static - no `Database` needed).
     ///
     /// Unwraps the REK using `backup_passphrase`, then creates a new key file
     /// protected by `new_db_passphrase`.

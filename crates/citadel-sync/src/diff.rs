@@ -6,7 +6,7 @@ use citadel_core::{Result, MERKLE_HASH_SIZE};
 /// 28-byte BLAKE3 Merkle hash.
 pub type MerkleHash = [u8; MERKLE_HASH_SIZE];
 
-/// Digest of a single page — hash, type, and children.
+/// Digest of a single page - hash, type, and children.
 #[derive(Debug, Clone)]
 pub struct PageDigest {
     pub page_id: PageId,
@@ -91,7 +91,7 @@ pub fn merkle_diff(source: &dyn TreeReader, target: &dyn TreeReader) -> Result<D
         subtrees_skipped: 0,
     };
 
-    // Roots match — databases are identical
+    // Roots match - databases are identical
     if src_root_hash == tgt_root_hash {
         return Ok(result);
     }

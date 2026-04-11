@@ -121,7 +121,7 @@ pub fn insert_separator(
         // Check if we have space for the size difference + new cell + pointer
         // We need: new_cell.len - old_cell_size + insert_cell.len + 2 (for new ptr)
         if page.available_space() + old_cell_size < new_cell.len() + insert_cell.len() + 2 {
-            // Not enough space — caller must split this branch
+            // Not enough space - caller must split this branch
             return false;
         }
 

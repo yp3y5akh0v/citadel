@@ -243,7 +243,7 @@ fn delete_and_reinsert_convergence() {
     }
 
     // db2 still has keys 20,21,28,29 with "original" (deletions not propagated)
-    // This is expected — delete propagation requires CRDT tombstones
+    // This is expected - delete propagation requires CRDT tombstones
     for i in [20u32, 21, 28, 29] {
         assert_eq!(db2_data[&i.to_be_bytes().to_vec()], b"original");
     }
@@ -338,7 +338,7 @@ fn alternating_insert_delete_stress() {
         wtx.commit().unwrap();
     }
 
-    // db2 is empty — diff should capture all of db1
+    // db2 is empty - diff should capture all of db1
     let result = diff(&db1, &db2);
     assert!(!result.is_empty());
 
@@ -381,12 +381,12 @@ fn diff_symmetry_both_directions() {
     assert!(!reverse.is_empty());
     assert!(reverse.entries.iter().any(|e| e.key == 20u32.to_be_bytes()));
 
-    // Apply forward (db1→db2): db2 gets db1's version of the changed page
+    // Apply forward (db1->db2): db2 gets db1's version of the changed page
     apply(&db2, &forward);
     let db2_data = collect_all(&db2);
     assert_eq!(db2_data[&10u32.to_be_bytes().to_vec()], b"from-db1");
 
-    // After forward apply, diff db1→db2 should be empty (db2 matches db1's source pages)
+    // After forward apply, diff db1->db2 should be empty (db2 matches db1's source pages)
     let post = diff(&db1, &db2);
     assert!(
         post.is_empty(),

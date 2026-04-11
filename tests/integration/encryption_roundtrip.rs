@@ -145,7 +145,7 @@ fn file_header_and_recovery() {
     write_file_header(&io, &header).unwrap();
     io.fsync().unwrap();
 
-    // Normal recovery — both slots valid (both empty/zero)
+    // Normal recovery - both slots valid (both empty/zero)
     let (slot_idx, slot) = recover(&io).unwrap();
     assert_eq!(slot_idx, 0);
     assert_eq!(slot.txn_id, TxnId(0));
@@ -195,13 +195,13 @@ fn sieve_eviction_under_pressure() {
 
     // Clear all visited first, then re-visit 0 and 4
     for i in 0..5 {
-        // This won't reset visited — get sets it true
+        // This won't reset visited - get sets it true
     }
 
     // Mark entry 2 as dirty (pinned)
     cache.set_dirty(2);
 
-    // Insert 5 more — should evict entries 1, 3 first (not visited, not dirty)
+    // Insert 5 more - should evict entries 1, 3 first (not visited, not dirty)
     let evicted1 = cache.insert(10, "ten".into()).unwrap();
     assert!(evicted1.is_some());
     let (ek, _) = evicted1.unwrap();

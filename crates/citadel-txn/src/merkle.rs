@@ -4,7 +4,7 @@
 //! - Leaf pages: hash of all cell contents (key-value entries in sorted order)
 //! - Branch pages: hash of all children's Merkle hashes concatenated
 //!
-//! The root page's hash serves as a database fingerprint — if two snapshots
+//! The root page's hash serves as a database fingerprint - if two snapshots
 //! have the same root hash, they contain identical data.
 
 use std::collections::HashMap;
@@ -29,18 +29,18 @@ fn compute_page_merkle(
     txn_id: TxnId,
     read_clean_hash: &dyn Fn(PageId) -> Result<[u8; MERKLE_HASH_SIZE]>,
 ) -> Result<[u8; MERKLE_HASH_SIZE]> {
-    // Page not in write set — it's clean, just read its hash
+    // Page not in write set - it's clean, just read its hash
     let page = match pages.get(&page_id) {
         Some(page) => page,
         None => return read_clean_hash(page_id),
     };
 
-    // Clean page in HashMap — hash already valid in header
+    // Clean page in HashMap - hash already valid in header
     if page.txn_id() != txn_id {
         return Ok(page.merkle_hash());
     }
 
-    // Dirty page — compute fresh hash
+    // Dirty page - compute fresh hash
     let page_type = page.page_type();
     let hash = match page_type {
         Some(PageType::Leaf) => compute_leaf_hash(page),
@@ -279,7 +279,7 @@ mod tests {
         let dirty_txn = TxnId(5);
         let clean_txn = TxnId(3);
 
-        // Clean leaf NOT in HashMap — hash fetched via callback
+        // Clean leaf NOT in HashMap - hash fetched via callback
         let mut clean_leaf = make_leaf(PageId(2), clean_txn, &[(b"x", b"y")]);
         let precomputed_hash = compute_leaf_hash(&clean_leaf);
         clean_leaf.set_merkle_hash(&precomputed_hash);
@@ -291,7 +291,7 @@ mod tests {
         let mut pages: HashMap<PageId, Page> = HashMap::new();
         pages.insert(PageId(0), branch);
         pages.insert(PageId(1), dirty_leaf);
-        // PageId(2) NOT in pages — read_clean_hash will be called
+        // PageId(2) NOT in pages - read_clean_hash will be called
 
         let root_hash = compute_tree_merkle(&mut pages, PageId(0), dirty_txn, &|page_id| {
             assert_eq!(page_id, PageId(2));
@@ -405,7 +405,7 @@ mod tests {
 
         let h1 = compute_leaf_hash(&page);
 
-        // Different tombstone — different hash
+        // Different tombstone - different hash
         let mut page2 = Page::new(PageId(0), PageType::Leaf, txn);
         let cell3 = leaf_node::build_cell(b"alive", ValueType::Inline, b"data");
         page2.insert_cell_at(0, &cell3);

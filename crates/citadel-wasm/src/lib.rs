@@ -5,7 +5,7 @@ use citadel_sql::Connection;
 /// An in-memory encrypted Citadel database.
 ///
 /// Wraps the full Citadel stack (encrypted B+ tree, MVCC, SQL engine)
-/// with an in-memory storage backend. Data is volatile — lost when
+/// with an in-memory storage backend. Data is volatile - lost when
 /// the struct is dropped.
 ///
 /// On WASM targets, this is exported via wasm-bindgen as `CitadelDb`.

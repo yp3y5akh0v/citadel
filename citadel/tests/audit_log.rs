@@ -614,7 +614,7 @@ fn scenario_truncation_detected_by_count() {
     assert!(result.chain_valid);
     assert_eq!(result.entries_verified, (original_count - 1) as u64);
 
-    // Header entry_count still reflects original total — mismatch reveals truncation
+    // Header entry_count still reflects original total - mismatch reveals truncation
     let header_data = std::fs::read(&ap).unwrap();
     let header_count = u64::from_le_bytes(header_data[24..32].try_into().unwrap());
     assert_ne!(header_count as usize, entries_after.len());
