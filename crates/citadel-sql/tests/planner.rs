@@ -39,7 +39,12 @@ fn assert_plan(db: &citadel::Database, sql: &str, expected: &str) {
     let schema_mgr = SchemaManager::load(db).unwrap();
     let stmt = parse_sql(sql).unwrap();
     let (table_name, where_clause) = match &stmt {
-        citadel_sql::parser::Statement::Select(s) => (s.from.to_ascii_lowercase(), &s.where_clause),
+        citadel_sql::parser::Statement::Select(body) => match body.as_ref() {
+            citadel_sql::parser::QueryBody::Select(s) => {
+                (s.from.to_ascii_lowercase(), &s.where_clause)
+            }
+            _ => panic!("assert_plan only works with simple SELECT"),
+        },
         citadel_sql::parser::Statement::Update(u) => {
             (u.table.to_ascii_lowercase(), &u.where_clause)
         }

@@ -117,7 +117,7 @@ pub fn execute(
         Statement::DropIndex(di) => exec_drop_index(db, schema, di),
         Statement::AlterTable(at) => exec_alter_table(db, schema, at),
         Statement::Insert(ins) => exec_insert(db, schema, ins, params),
-        Statement::Select(sel) => exec_select(db, schema, sel),
+        Statement::Select(body) => exec_query_body(db, schema, body),
         Statement::Update(upd) => exec_update(db, schema, upd),
         Statement::Delete(del) => exec_delete(db, schema, del),
         Statement::Explain(inner) => explain(schema, inner),
@@ -144,7 +144,7 @@ pub fn execute_in_txn(
             let mut bufs = InsertBufs::new();
             exec_insert_in_txn(wtx, schema, ins, params, &mut bufs)
         }
-        Statement::Select(sel) => exec_select_in_txn(wtx, schema, sel),
+        Statement::Select(body) => exec_query_body_in_txn(wtx, schema, body),
         Statement::Update(upd) => exec_update_in_txn(wtx, schema, upd),
         Statement::Delete(del) => exec_delete_in_txn(wtx, schema, del),
         Statement::Explain(inner) => explain(schema, inner),
@@ -158,7 +158,7 @@ pub fn execute_in_txn(
 
 pub fn explain(schema: &SchemaManager, stmt: &Statement) -> Result<ExecutionResult> {
     let lines = match stmt {
-        Statement::Select(sel) => explain_select(schema, sel)?,
+        Statement::Select(body) => explain_query_body(schema, body)?,
         Statement::Insert(ins) => match &ins.source {
             InsertSource::Values(rows) => {
                 vec![format!(
@@ -167,12 +167,12 @@ pub fn explain(schema: &SchemaManager, stmt: &Statement) -> Result<ExecutionResu
                     rows.len()
                 )]
             }
-            InsertSource::Select(sel) => {
+            InsertSource::Select(body) => {
                 let mut lines = vec![format!(
                     "INSERT INTO {} ... SELECT",
                     ins.table.to_ascii_lowercase()
                 )];
-                lines.extend(explain_select(schema, sel)?);
+                lines.extend(explain_query_body(schema, body)?);
                 lines
             }
         },
@@ -235,6 +235,32 @@ fn explain_dml(
     let plan = planner::plan_select(table_schema, where_clause);
     let scan_line = format_scan_line(&lower, &None, &plan, table_schema);
     Ok(vec![format!("{verb} {}", scan_line)])
+}
+
+fn explain_query_body(schema: &SchemaManager, body: &QueryBody) -> Result<Vec<String>> {
+    match body {
+        QueryBody::Select(sel) => explain_select(schema, sel),
+        QueryBody::Compound(comp) => {
+            let op_name = match (&comp.op, comp.all) {
+                (SetOp::Union, true) => "UNION ALL",
+                (SetOp::Union, false) => "UNION",
+                (SetOp::Intersect, true) => "INTERSECT ALL",
+                (SetOp::Intersect, false) => "INTERSECT",
+                (SetOp::Except, true) => "EXCEPT ALL",
+                (SetOp::Except, false) => "EXCEPT",
+            };
+            let mut lines = vec![op_name.to_string()];
+            let left_lines = explain_query_body(schema, &comp.left)?;
+            for l in left_lines {
+                lines.push(format!("  {l}"));
+            }
+            let right_lines = explain_query_body(schema, &comp.right)?;
+            for l in right_lines {
+                lines.push(format!("  {l}"));
+            }
+            Ok(lines)
+        }
+    }
 }
 
 fn explain_select(schema: &SchemaManager, stmt: &SelectStmt) -> Result<Vec<String>> {
@@ -2185,8 +2211,8 @@ fn exec_insert(
     };
 
     let select_rows = match &stmt.source {
-        InsertSource::Select(sel) => {
-            let qr = exec_subquery_read(db, schema, sel)?;
+        InsertSource::Select(body) => {
+            let qr = exec_query_body_read(db, schema, body)?;
             Some(qr.rows)
         }
         InsertSource::Values(_) => None,
@@ -2747,7 +2773,16 @@ fn materialize_delete(
 fn insert_has_subquery(stmt: &InsertStmt) -> bool {
     match &stmt.source {
         InsertSource::Values(rows) => rows.iter().any(|row| row.iter().any(has_subquery)),
-        InsertSource::Select(sel) => stmt_has_subquery(sel),
+        InsertSource::Select(body) => query_body_has_subquery(body),
+    }
+}
+
+fn query_body_has_subquery(body: &QueryBody) -> bool {
+    match body {
+        QueryBody::Select(sel) => stmt_has_subquery(sel),
+        QueryBody::Compound(comp) => {
+            query_body_has_subquery(&comp.left) || query_body_has_subquery(&comp.right)
+        }
     }
 }
 
@@ -2767,8 +2802,8 @@ fn materialize_insert(
                 .collect::<Result<Vec<_>>>()?;
             InsertSource::Values(mat)
         }
-        InsertSource::Select(sel) => {
-            InsertSource::Select(Box::new(materialize_stmt(sel, exec_sub)?))
+        InsertSource::Select(body) => {
+            InsertSource::Select(Box::new(materialize_query_body(body, exec_sub)?))
         }
     };
     Ok(InsertStmt {
@@ -2776,6 +2811,250 @@ fn materialize_insert(
         columns: stmt.columns.clone(),
         source,
     })
+}
+
+fn materialize_query_body(
+    body: &QueryBody,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
+) -> Result<QueryBody> {
+    match body {
+        QueryBody::Select(sel) => Ok(QueryBody::Select(Box::new(materialize_stmt(
+            sel, exec_sub,
+        )?))),
+        QueryBody::Compound(comp) => Ok(QueryBody::Compound(CompoundSelect {
+            op: comp.op.clone(),
+            all: comp.all,
+            left: Box::new(materialize_query_body(&comp.left, exec_sub)?),
+            right: Box::new(materialize_query_body(&comp.right, exec_sub)?),
+            order_by: comp.order_by.clone(),
+            limit: comp.limit.clone(),
+            offset: comp.offset.clone(),
+        })),
+    }
+}
+
+fn exec_query_body(
+    db: &Database,
+    schema: &SchemaManager,
+    body: &QueryBody,
+) -> Result<ExecutionResult> {
+    match body {
+        QueryBody::Select(sel) => exec_select(db, schema, sel),
+        QueryBody::Compound(comp) => exec_compound_select(db, schema, comp),
+    }
+}
+
+fn exec_query_body_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    body: &QueryBody,
+) -> Result<ExecutionResult> {
+    match body {
+        QueryBody::Select(sel) => exec_select_in_txn(wtx, schema, sel),
+        QueryBody::Compound(comp) => exec_compound_select_in_txn(wtx, schema, comp),
+    }
+}
+
+fn exec_query_body_read(
+    db: &Database,
+    schema: &SchemaManager,
+    body: &QueryBody,
+) -> Result<QueryResult> {
+    match exec_query_body(db, schema, body)? {
+        ExecutionResult::Query(qr) => Ok(qr),
+        _ => Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        }),
+    }
+}
+
+fn exec_query_body_write(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    body: &QueryBody,
+) -> Result<QueryResult> {
+    match exec_query_body_in_txn(wtx, schema, body)? {
+        ExecutionResult::Query(qr) => Ok(qr),
+        _ => Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        }),
+    }
+}
+
+fn exec_compound_select(
+    db: &Database,
+    schema: &SchemaManager,
+    comp: &CompoundSelect,
+) -> Result<ExecutionResult> {
+    let left_qr = match exec_query_body(db, schema, &comp.left)? {
+        ExecutionResult::Query(qr) => qr,
+        _ => QueryResult {
+            columns: vec![],
+            rows: vec![],
+        },
+    };
+    let right_qr = match exec_query_body(db, schema, &comp.right)? {
+        ExecutionResult::Query(qr) => qr,
+        _ => QueryResult {
+            columns: vec![],
+            rows: vec![],
+        },
+    };
+    apply_set_operation(comp, left_qr, right_qr)
+}
+
+fn exec_compound_select_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    comp: &CompoundSelect,
+) -> Result<ExecutionResult> {
+    let left_qr = match exec_query_body_in_txn(wtx, schema, &comp.left)? {
+        ExecutionResult::Query(qr) => qr,
+        _ => QueryResult {
+            columns: vec![],
+            rows: vec![],
+        },
+    };
+    let right_qr = match exec_query_body_in_txn(wtx, schema, &comp.right)? {
+        ExecutionResult::Query(qr) => qr,
+        _ => QueryResult {
+            columns: vec![],
+            rows: vec![],
+        },
+    };
+    apply_set_operation(comp, left_qr, right_qr)
+}
+
+fn apply_set_operation(
+    comp: &CompoundSelect,
+    left_qr: QueryResult,
+    right_qr: QueryResult,
+) -> Result<ExecutionResult> {
+    if !left_qr.columns.is_empty()
+        && !right_qr.columns.is_empty()
+        && left_qr.columns.len() != right_qr.columns.len()
+    {
+        return Err(SqlError::CompoundColumnCountMismatch {
+            left: left_qr.columns.len(),
+            right: right_qr.columns.len(),
+        });
+    }
+
+    let columns = left_qr.columns;
+
+    let mut rows = match (&comp.op, comp.all) {
+        (SetOp::Union, true) => {
+            let mut rows = left_qr.rows;
+            rows.extend(right_qr.rows);
+            rows
+        }
+        (SetOp::Union, false) => {
+            let mut seen = std::collections::HashSet::new();
+            let mut rows = Vec::new();
+            for row in left_qr.rows.into_iter().chain(right_qr.rows) {
+                if seen.insert(row.clone()) {
+                    rows.push(row);
+                }
+            }
+            rows
+        }
+        (SetOp::Intersect, true) => {
+            let mut right_counts: std::collections::HashMap<Vec<Value>, usize> =
+                std::collections::HashMap::new();
+            for row in &right_qr.rows {
+                *right_counts.entry(row.clone()).or_insert(0) += 1;
+            }
+            let mut rows = Vec::new();
+            for row in left_qr.rows {
+                if let Some(count) = right_counts.get_mut(&row) {
+                    if *count > 0 {
+                        *count -= 1;
+                        rows.push(row);
+                    }
+                }
+            }
+            rows
+        }
+        (SetOp::Intersect, false) => {
+            let right_set: std::collections::HashSet<Vec<Value>> =
+                right_qr.rows.into_iter().collect();
+            let mut seen = std::collections::HashSet::new();
+            let mut rows = Vec::new();
+            for row in left_qr.rows {
+                if right_set.contains(&row) && seen.insert(row.clone()) {
+                    rows.push(row);
+                }
+            }
+            rows
+        }
+        (SetOp::Except, true) => {
+            let mut right_counts: std::collections::HashMap<Vec<Value>, usize> =
+                std::collections::HashMap::new();
+            for row in &right_qr.rows {
+                *right_counts.entry(row.clone()).or_insert(0) += 1;
+            }
+            let mut rows = Vec::new();
+            for row in left_qr.rows {
+                if let Some(count) = right_counts.get_mut(&row) {
+                    if *count > 0 {
+                        *count -= 1;
+                        continue;
+                    }
+                }
+                rows.push(row);
+            }
+            rows
+        }
+        (SetOp::Except, false) => {
+            let right_set: std::collections::HashSet<Vec<Value>> =
+                right_qr.rows.into_iter().collect();
+            let mut seen = std::collections::HashSet::new();
+            let mut rows = Vec::new();
+            for row in left_qr.rows {
+                if !right_set.contains(&row) && seen.insert(row.clone()) {
+                    rows.push(row);
+                }
+            }
+            rows
+        }
+    };
+
+    if !comp.order_by.is_empty() {
+        let col_defs: Vec<crate::types::ColumnDef> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, name)| crate::types::ColumnDef {
+                name: name.clone(),
+                data_type: crate::types::DataType::Null,
+                nullable: true,
+                position: i as u16,
+                default_expr: None,
+                default_sql: None,
+                check_expr: None,
+                check_sql: None,
+                check_name: None,
+            })
+            .collect();
+        sort_rows(&mut rows, &comp.order_by, &col_defs)?;
+    }
+
+    if let Some(ref offset_expr) = comp.offset {
+        let offset = eval_const_int(offset_expr)?.max(0) as usize;
+        if offset < rows.len() {
+            rows = rows.split_off(offset);
+        } else {
+            rows.clear();
+        }
+    }
+
+    if let Some(ref limit_expr) = comp.limit {
+        let limit = eval_const_int(limit_expr)?.max(0) as usize;
+        rows.truncate(limit);
+    }
+
+    Ok(ExecutionResult::Query(QueryResult { columns, rows }))
 }
 
 fn exec_select(
@@ -5720,8 +5999,8 @@ pub fn exec_insert_in_txn(
     bufs.value_values.resize(phys_count, Value::Null);
 
     let select_rows = match &stmt.source {
-        InsertSource::Select(sel) => {
-            let qr = exec_subquery_write(wtx, schema, sel)?;
+        InsertSource::Select(body) => {
+            let qr = exec_query_body_write(wtx, schema, body)?;
             Some(qr.rows)
         }
         InsertSource::Values(_) => None,

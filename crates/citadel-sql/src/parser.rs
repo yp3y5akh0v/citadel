@@ -17,7 +17,7 @@ pub enum Statement {
     DropIndex(DropIndexStmt),
     AlterTable(Box<AlterTableStmt>),
     Insert(InsertStmt),
-    Select(Box<SelectStmt>),
+    Select(Box<QueryBody>),
     Update(UpdateStmt),
     Delete(DeleteStmt),
     Begin,
@@ -114,7 +114,7 @@ pub struct DropIndexStmt {
 #[derive(Debug, Clone)]
 pub enum InsertSource {
     Values(Vec<Vec<Expr>>),
-    Select(Box<SelectStmt>),
+    Select(Box<QueryBody>),
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +158,30 @@ pub struct SelectStmt {
     pub offset: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SetOp {
+    Union,
+    Intersect,
+    Except,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompoundSelect {
+    pub op: SetOp,
+    pub all: bool,
+    pub left: Box<QueryBody>,
+    pub right: Box<QueryBody>,
+    pub order_by: Vec<OrderByItem>,
+    pub limit: Option<Expr>,
+    pub offset: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub enum QueryBody {
+    Select(Box<SelectStmt>),
+    Compound(CompoundSelect),
 }
 
 #[derive(Debug, Clone)]
@@ -372,7 +396,7 @@ pub fn bind_params(
 
 fn bind_stmt(stmt: &Statement, params: &[crate::types::Value]) -> crate::error::Result<Statement> {
     match stmt {
-        Statement::Select(sel) => Ok(Statement::Select(Box::new(bind_select(sel, params)?))),
+        Statement::Select(body) => Ok(Statement::Select(Box::new(bind_query_body(body, params)?))),
         Statement::Insert(ins) => {
             let source = match &ins.source {
                 InsertSource::Values(rows) => {
@@ -386,8 +410,8 @@ fn bind_stmt(stmt: &Statement, params: &[crate::types::Value]) -> crate::error::
                         .collect::<crate::error::Result<Vec<_>>>()?;
                     InsertSource::Values(bound)
                 }
-                InsertSource::Select(sel) => {
-                    InsertSource::Select(Box::new(bind_select(sel, params)?))
+                InsertSource::Select(body) => {
+                    InsertSource::Select(Box::new(bind_query_body(body, params)?))
                 }
             };
             Ok(Statement::Insert(InsertStmt {
@@ -510,6 +534,47 @@ fn bind_select(
         group_by,
         having,
     })
+}
+
+fn bind_query_body(
+    body: &QueryBody,
+    params: &[crate::types::Value],
+) -> crate::error::Result<QueryBody> {
+    match body {
+        QueryBody::Select(sel) => Ok(QueryBody::Select(Box::new(bind_select(sel, params)?))),
+        QueryBody::Compound(comp) => {
+            let order_by = comp
+                .order_by
+                .iter()
+                .map(|o| {
+                    Ok(OrderByItem {
+                        expr: bind_expr(&o.expr, params)?,
+                        descending: o.descending,
+                        nulls_first: o.nulls_first,
+                    })
+                })
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            let limit = comp
+                .limit
+                .as_ref()
+                .map(|e| bind_expr(e, params))
+                .transpose()?;
+            let offset = comp
+                .offset
+                .as_ref()
+                .map(|e| bind_expr(e, params))
+                .transpose()?;
+            Ok(QueryBody::Compound(CompoundSelect {
+                op: comp.op.clone(),
+                all: comp.all,
+                left: Box::new(bind_query_body(&comp.left, params)?),
+                right: Box::new(bind_query_body(&comp.right, params)?),
+                order_by,
+                limit,
+                offset,
+            }))
+        }
+    }
 }
 
 fn bind_expr(expr: &Expr, params: &[crate::types::Value]) -> crate::error::Result<Expr> {
@@ -651,7 +716,7 @@ fn bind_expr(expr: &Expr, params: &[crate::types::Value]) -> crate::error::Resul
 
 fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
     match stmt {
-        Statement::Select(sel) => visit_exprs_select(sel, visitor),
+        Statement::Select(body) => visit_exprs_query_body(body, visitor),
         Statement::Insert(ins) => match &ins.source {
             InsertSource::Values(rows) => {
                 for row in rows {
@@ -660,7 +725,7 @@ fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
                     }
                 }
             }
-            InsertSource::Select(sel) => visit_exprs_select(sel, visitor),
+            InsertSource::Select(body) => visit_exprs_query_body(body, visitor),
         },
         Statement::Update(upd) => {
             for (_, e) in &upd.assignments {
@@ -677,6 +742,25 @@ fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
         }
         Statement::Explain(inner) => visit_exprs_stmt(inner, visitor),
         _ => {}
+    }
+}
+
+fn visit_exprs_query_body(body: &QueryBody, visitor: &mut impl FnMut(&Expr)) {
+    match body {
+        QueryBody::Select(sel) => visit_exprs_select(sel, visitor),
+        QueryBody::Compound(comp) => {
+            visit_exprs_query_body(&comp.left, visitor);
+            visit_exprs_query_body(&comp.right, visitor);
+            for o in &comp.order_by {
+                visit_expr(&o.expr, visitor);
+            }
+            if let Some(l) = &comp.limit {
+                visit_expr(l, visitor);
+            }
+            if let Some(o) = &comp.offset {
+                visit_expr(o, visitor);
+            }
+        }
     }
 }
 
@@ -1137,12 +1221,7 @@ fn convert_insert(insert: sp::Insert) -> Result<Statement> {
             }
             InsertSource::Values(result)
         }
-        sp::SetExpr::Select(_) => InsertSource::Select(Box::new(convert_subquery(&query)?)),
-        _ => {
-            return Err(SqlError::Unsupported(
-                "INSERT ... UNION/INTERSECT/EXCEPT".into(),
-            ))
-        }
+        _ => InsertSource::Select(Box::new(convert_query_body(&query)?)),
     };
 
     Ok(Statement::Insert(InsertStmt {
@@ -1152,19 +1231,7 @@ fn convert_insert(insert: sp::Insert) -> Result<Statement> {
     }))
 }
 
-fn convert_subquery(query: &sp::Query) -> Result<SelectStmt> {
-    match convert_query(query.clone())? {
-        Statement::Select(s) => Ok(*s),
-        _ => Err(SqlError::Unsupported("non-SELECT subquery".into())),
-    }
-}
-
-fn convert_query(query: sp::Query) -> Result<Statement> {
-    let select = match *query.body {
-        sp::SetExpr::Select(sel) => *sel,
-        _ => return Err(SqlError::Unsupported("UNION/INTERSECT/EXCEPT".into())),
-    };
-
+fn convert_select_body(select: &sp::Select) -> Result<SelectStmt> {
     let distinct = match &select.distinct {
         Some(sp::Distinct::Distinct) => true,
         Some(sp::Distinct::On(_)) => {
@@ -1206,6 +1273,72 @@ fn convert_query(query: sp::Query) -> Result<Statement> {
     // WHERE
     let where_clause = select.selection.as_ref().map(convert_expr).transpose()?;
 
+    // GROUP BY
+    let group_by = match &select.group_by {
+        sp::GroupByExpr::Expressions(exprs, _) => {
+            exprs.iter().map(convert_expr).collect::<Result<_>>()?
+        }
+        sp::GroupByExpr::All(_) => {
+            return Err(SqlError::Unsupported("GROUP BY ALL".into()));
+        }
+    };
+
+    // HAVING
+    let having = select.having.as_ref().map(convert_expr).transpose()?;
+
+    Ok(SelectStmt {
+        columns,
+        from,
+        from_alias,
+        joins,
+        distinct,
+        where_clause,
+        order_by: vec![],
+        limit: None,
+        offset: None,
+        group_by,
+        having,
+    })
+}
+
+fn convert_set_expr(set_expr: &sp::SetExpr) -> Result<QueryBody> {
+    match set_expr {
+        sp::SetExpr::Select(sel) => Ok(QueryBody::Select(Box::new(convert_select_body(sel)?))),
+        sp::SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            let set_op = match op {
+                sp::SetOperator::Union => SetOp::Union,
+                sp::SetOperator::Intersect => SetOp::Intersect,
+                sp::SetOperator::Except | sp::SetOperator::Minus => SetOp::Except,
+            };
+            let all = match set_quantifier {
+                sp::SetQuantifier::All => true,
+                sp::SetQuantifier::None | sp::SetQuantifier::Distinct => false,
+                _ => {
+                    return Err(SqlError::Unsupported("BY NAME set operations".into()));
+                }
+            };
+            Ok(QueryBody::Compound(CompoundSelect {
+                op: set_op,
+                all,
+                left: Box::new(convert_set_expr(left)?),
+                right: Box::new(convert_set_expr(right)?),
+                order_by: vec![],
+                limit: None,
+                offset: None,
+            }))
+        }
+        _ => Err(SqlError::Unsupported("unsupported set expression".into())),
+    }
+}
+
+fn convert_query_body(query: &sp::Query) -> Result<QueryBody> {
+    let mut body = convert_set_expr(&query.body)?;
+
     // ORDER BY
     let order_by = if let Some(ref ob) = query.order_by {
         match &ob.kind {
@@ -1239,32 +1372,33 @@ fn convert_query(query: sp::Query) -> Result<Statement> {
         None => (None, None),
     };
 
-    // GROUP BY
-    let group_by = match &select.group_by {
-        sp::GroupByExpr::Expressions(exprs, _) => {
-            exprs.iter().map(convert_expr).collect::<Result<_>>()?
+    match &mut body {
+        QueryBody::Select(sel) => {
+            sel.order_by = order_by;
+            sel.limit = limit;
+            sel.offset = offset;
         }
-        sp::GroupByExpr::All(_) => {
-            return Err(SqlError::Unsupported("GROUP BY ALL".into()));
+        QueryBody::Compound(comp) => {
+            comp.order_by = order_by;
+            comp.limit = limit;
+            comp.offset = offset;
         }
-    };
+    }
 
-    // HAVING
-    let having = select.having.as_ref().map(convert_expr).transpose()?;
+    Ok(body)
+}
 
-    Ok(Statement::Select(Box::new(SelectStmt {
-        columns,
-        from,
-        from_alias,
-        joins,
-        distinct,
-        where_clause,
-        order_by,
-        limit,
-        offset,
-        group_by,
-        having,
-    })))
+fn convert_subquery(query: &sp::Query) -> Result<SelectStmt> {
+    match convert_query_body(query)? {
+        QueryBody::Select(s) => Ok(*s),
+        QueryBody::Compound(_) => Err(SqlError::Unsupported(
+            "UNION/INTERSECT/EXCEPT in subqueries".into(),
+        )),
+    }
+}
+
+fn convert_query(query: sp::Query) -> Result<Statement> {
+    Ok(Statement::Select(Box::new(convert_query_body(&query)?)))
 }
 
 fn convert_join(join: &sp::Join) -> Result<JoinClause> {
@@ -1892,11 +2026,14 @@ mod tests {
     fn parse_select_all() {
         let stmt = parse_sql("SELECT * FROM users").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert_eq!(sel.from, "users");
-                assert!(matches!(sel.columns[0], SelectColumn::AllColumns));
-                assert!(sel.where_clause.is_none());
-            }
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert_eq!(sel.from, "users");
+                    assert!(matches!(sel.columns[0], SelectColumn::AllColumns));
+                    assert!(sel.where_clause.is_none());
+                }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -1905,10 +2042,13 @@ mod tests {
     fn parse_select_where() {
         let stmt = parse_sql("SELECT id, name FROM users WHERE age > 18").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert_eq!(sel.columns.len(), 2);
-                assert!(sel.where_clause.is_some());
-            }
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert_eq!(sel.columns.len(), 2);
+                    assert!(sel.where_clause.is_some());
+                }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -1917,12 +2057,15 @@ mod tests {
     fn parse_select_order_limit() {
         let stmt = parse_sql("SELECT * FROM users ORDER BY name ASC LIMIT 10 OFFSET 5").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert_eq!(sel.order_by.len(), 1);
-                assert!(!sel.order_by[0].descending);
-                assert!(sel.limit.is_some());
-                assert!(sel.offset.is_some());
-            }
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert_eq!(sel.order_by.len(), 1);
+                    assert!(!sel.order_by[0].descending);
+                    assert!(sel.limit.is_some());
+                    assert!(sel.offset.is_some());
+                }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -1957,16 +2100,19 @@ mod tests {
     fn parse_aggregate() {
         let stmt = parse_sql("SELECT COUNT(*), SUM(age) FROM users").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert_eq!(sel.columns.len(), 2);
-                match &sel.columns[0] {
-                    SelectColumn::Expr {
-                        expr: Expr::CountStar,
-                        ..
-                    } => {}
-                    other => panic!("expected CountStar, got {other:?}"),
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert_eq!(sel.columns.len(), 2);
+                    match &sel.columns[0] {
+                        SelectColumn::Expr {
+                            expr: Expr::CountStar,
+                            ..
+                        } => {}
+                        other => panic!("expected CountStar, got {other:?}"),
+                    }
                 }
-            }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -1978,10 +2124,13 @@ mod tests {
         )
         .unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert_eq!(sel.group_by.len(), 1);
-                assert!(sel.having.is_some());
-            }
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert_eq!(sel.group_by.len(), 1);
+                    assert!(sel.having.is_some());
+                }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -1990,39 +2139,42 @@ mod tests {
     fn parse_expressions() {
         let stmt = parse_sql("SELECT id + 1, -price, NOT active FROM items").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert_eq!(sel.columns.len(), 3);
-                // id + 1
-                match &sel.columns[0] {
-                    SelectColumn::Expr {
-                        expr: Expr::BinaryOp { op: BinOp::Add, .. },
-                        ..
-                    } => {}
-                    other => panic!("expected BinaryOp Add, got {other:?}"),
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert_eq!(sel.columns.len(), 3);
+                    // id + 1
+                    match &sel.columns[0] {
+                        SelectColumn::Expr {
+                            expr: Expr::BinaryOp { op: BinOp::Add, .. },
+                            ..
+                        } => {}
+                        other => panic!("expected BinaryOp Add, got {other:?}"),
+                    }
+                    // -price
+                    match &sel.columns[1] {
+                        SelectColumn::Expr {
+                            expr:
+                                Expr::UnaryOp {
+                                    op: UnaryOp::Neg, ..
+                                },
+                            ..
+                        } => {}
+                        other => panic!("expected UnaryOp Neg, got {other:?}"),
+                    }
+                    // NOT active
+                    match &sel.columns[2] {
+                        SelectColumn::Expr {
+                            expr:
+                                Expr::UnaryOp {
+                                    op: UnaryOp::Not, ..
+                                },
+                            ..
+                        } => {}
+                        other => panic!("expected UnaryOp Not, got {other:?}"),
+                    }
                 }
-                // -price
-                match &sel.columns[1] {
-                    SelectColumn::Expr {
-                        expr:
-                            Expr::UnaryOp {
-                                op: UnaryOp::Neg, ..
-                            },
-                        ..
-                    } => {}
-                    other => panic!("expected UnaryOp Neg, got {other:?}"),
-                }
-                // NOT active
-                match &sel.columns[2] {
-                    SelectColumn::Expr {
-                        expr:
-                            Expr::UnaryOp {
-                                op: UnaryOp::Not, ..
-                            },
-                        ..
-                    } => {}
-                    other => panic!("expected UnaryOp Not, got {other:?}"),
-                }
-            }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -2031,9 +2183,12 @@ mod tests {
     fn parse_is_null() {
         let stmt = parse_sql("SELECT * FROM t WHERE x IS NULL").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert!(matches!(sel.where_clause, Some(Expr::IsNull(_))));
-            }
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert!(matches!(sel.where_clause, Some(Expr::IsNull(_))));
+                }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -2042,13 +2197,16 @@ mod tests {
     fn parse_inner_join() {
         let stmt = parse_sql("SELECT * FROM a JOIN b ON a.id = b.id").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert_eq!(sel.from, "a");
-                assert_eq!(sel.joins.len(), 1);
-                assert_eq!(sel.joins[0].join_type, JoinType::Inner);
-                assert_eq!(sel.joins[0].table.name, "b");
-                assert!(sel.joins[0].on_clause.is_some());
-            }
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert_eq!(sel.from, "a");
+                    assert_eq!(sel.joins.len(), 1);
+                    assert_eq!(sel.joins[0].join_type, JoinType::Inner);
+                    assert_eq!(sel.joins[0].table.name, "b");
+                    assert!(sel.joins[0].on_clause.is_some());
+                }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -2057,10 +2215,13 @@ mod tests {
     fn parse_inner_join_explicit() {
         let stmt = parse_sql("SELECT * FROM a INNER JOIN b ON a.id = b.a_id").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert_eq!(sel.joins.len(), 1);
-                assert_eq!(sel.joins[0].join_type, JoinType::Inner);
-            }
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert_eq!(sel.joins.len(), 1);
+                    assert_eq!(sel.joins[0].join_type, JoinType::Inner);
+                }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -2069,11 +2230,14 @@ mod tests {
     fn parse_cross_join() {
         let stmt = parse_sql("SELECT * FROM a CROSS JOIN b").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert_eq!(sel.joins.len(), 1);
-                assert_eq!(sel.joins[0].join_type, JoinType::Cross);
-                assert!(sel.joins[0].on_clause.is_none());
-            }
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert_eq!(sel.joins.len(), 1);
+                    assert_eq!(sel.joins[0].join_type, JoinType::Cross);
+                    assert!(sel.joins[0].on_clause.is_none());
+                }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -2082,10 +2246,13 @@ mod tests {
     fn parse_left_join() {
         let stmt = parse_sql("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert_eq!(sel.joins.len(), 1);
-                assert_eq!(sel.joins[0].join_type, JoinType::Left);
-            }
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert_eq!(sel.joins.len(), 1);
+                    assert_eq!(sel.joins[0].join_type, JoinType::Left);
+                }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -2094,12 +2261,15 @@ mod tests {
     fn parse_table_alias() {
         let stmt = parse_sql("SELECT u.id FROM users u JOIN orders o ON u.id = o.user_id").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert_eq!(sel.from, "users");
-                assert_eq!(sel.from_alias.as_deref(), Some("u"));
-                assert_eq!(sel.joins[0].table.name, "orders");
-                assert_eq!(sel.joins[0].table.alias.as_deref(), Some("o"));
-            }
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert_eq!(sel.from, "users");
+                    assert_eq!(sel.from_alias.as_deref(), Some("u"));
+                    assert_eq!(sel.joins[0].table.name, "orders");
+                    assert_eq!(sel.joins[0].table.alias.as_deref(), Some("o"));
+                }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -2109,9 +2279,12 @@ mod tests {
         let stmt =
             parse_sql("SELECT * FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert_eq!(sel.joins.len(), 2);
-            }
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert_eq!(sel.joins.len(), 2);
+                }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -2120,15 +2293,18 @@ mod tests {
     fn parse_qualified_column() {
         let stmt = parse_sql("SELECT u.id, u.name FROM users u").unwrap();
         match stmt {
-            Statement::Select(sel) => match &sel.columns[0] {
-                SelectColumn::Expr {
-                    expr: Expr::QualifiedColumn { table, column },
-                    ..
-                } => {
-                    assert_eq!(table, "u");
-                    assert_eq!(column, "id");
-                }
-                other => panic!("expected QualifiedColumn, got {other:?}"),
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => match &sel.columns[0] {
+                    SelectColumn::Expr {
+                        expr: Expr::QualifiedColumn { table, column },
+                        ..
+                    } => {
+                        assert_eq!(table, "u");
+                        assert_eq!(column, "id");
+                    }
+                    other => panic!("expected QualifiedColumn, got {other:?}"),
+                },
+                _ => panic!("expected QueryBody::Select"),
             },
             _ => panic!("expected Select"),
         }
@@ -2195,9 +2371,12 @@ mod tests {
     fn parse_alias() {
         let stmt = parse_sql("SELECT id AS user_id FROM users").unwrap();
         match stmt {
-            Statement::Select(sel) => match &sel.columns[0] {
-                SelectColumn::Expr { alias: Some(a), .. } => assert_eq!(a, "user_id"),
-                other => panic!("expected alias, got {other:?}"),
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => match &sel.columns[0] {
+                    SelectColumn::Expr { alias: Some(a), .. } => assert_eq!(a, "user_id"),
+                    other => panic!("expected alias, got {other:?}"),
+                },
+                _ => panic!("expected QueryBody::Select"),
             },
             _ => panic!("expected Select"),
         }
@@ -2231,10 +2410,13 @@ mod tests {
     fn parse_select_distinct() {
         let stmt = parse_sql("SELECT DISTINCT name FROM users").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert!(sel.distinct);
-                assert_eq!(sel.columns.len(), 1);
-            }
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert!(sel.distinct);
+                    assert_eq!(sel.columns.len(), 1);
+                }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -2243,9 +2425,12 @@ mod tests {
     fn parse_select_without_distinct() {
         let stmt = parse_sql("SELECT name FROM users").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert!(!sel.distinct);
-            }
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert!(!sel.distinct);
+                }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -2254,10 +2439,13 @@ mod tests {
     fn parse_select_distinct_all_columns() {
         let stmt = parse_sql("SELECT DISTINCT * FROM users").unwrap();
         match stmt {
-            Statement::Select(sel) => {
-                assert!(sel.distinct);
-                assert!(matches!(sel.columns[0], SelectColumn::AllColumns));
-            }
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => {
+                    assert!(sel.distinct);
+                    assert!(matches!(sel.columns[0], SelectColumn::AllColumns));
+                }
+                _ => panic!("expected QueryBody::Select"),
+            },
             _ => panic!("expected Select"),
         }
     }
@@ -2363,11 +2551,14 @@ mod tests {
     fn parse_parameter_placeholder() {
         let stmt = parse_sql("SELECT * FROM t WHERE id = $1").unwrap();
         match stmt {
-            Statement::Select(sel) => match &sel.where_clause {
-                Some(Expr::BinaryOp { right, .. }) => {
-                    assert!(matches!(right.as_ref(), Expr::Parameter(1)));
-                }
-                other => panic!("expected BinaryOp with Parameter, got {other:?}"),
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => match &sel.where_clause {
+                    Some(Expr::BinaryOp { right, .. }) => {
+                        assert!(matches!(right.as_ref(), Expr::Parameter(1)));
+                    }
+                    other => panic!("expected BinaryOp with Parameter, got {other:?}"),
+                },
+                _ => panic!("expected QueryBody::Select"),
             },
             _ => panic!("expected Select"),
         }
@@ -2398,12 +2589,15 @@ mod tests {
                 assert_eq!(ins.table, "t2");
                 assert_eq!(ins.columns, vec!["id", "name"]);
                 match &ins.source {
-                    InsertSource::Select(sel) => {
-                        assert_eq!(sel.from, "t1");
-                        assert_eq!(sel.columns.len(), 2);
-                        assert!(sel.where_clause.is_some());
-                    }
-                    _ => panic!("expected Select"),
+                    InsertSource::Select(body) => match body.as_ref() {
+                        QueryBody::Select(sel) => {
+                            assert_eq!(sel.from, "t1");
+                            assert_eq!(sel.columns.len(), 2);
+                            assert!(sel.where_clause.is_some());
+                        }
+                        _ => panic!("expected QueryBody::Select"),
+                    },
+                    _ => panic!("expected InsertSource::Select"),
                 }
             }
             _ => panic!("expected Insert"),
@@ -2445,11 +2639,14 @@ mod tests {
         let stmt = parse_sql("SELECT * FROM t WHERE id = $1").unwrap();
         let bound = bind_params(&stmt, &[Value::Integer(42)]).unwrap();
         match bound {
-            Statement::Select(sel) => match &sel.where_clause {
-                Some(Expr::BinaryOp { right, .. }) => {
-                    assert!(matches!(right.as_ref(), Expr::Literal(Value::Integer(42))));
-                }
-                other => panic!("expected BinaryOp with Literal, got {other:?}"),
+            Statement::Select(body) => match *body {
+                QueryBody::Select(sel) => match &sel.where_clause {
+                    Some(Expr::BinaryOp { right, .. }) => {
+                        assert!(matches!(right.as_ref(), Expr::Literal(Value::Integer(42))));
+                    }
+                    other => panic!("expected BinaryOp with Literal, got {other:?}"),
+                },
+                _ => panic!("expected QueryBody::Select"),
             },
             _ => panic!("expected Select"),
         }

@@ -82,6 +82,9 @@ pub enum SqlError {
     #[error("parameter count mismatch: expected {expected}, got {got}")]
     ParameterCountMismatch { expected: usize, got: usize },
 
+    #[error("compound column count mismatch: left has {left}, right has {right}")]
+    CompoundColumnCountMismatch { left: usize, right: usize },
+
     #[error("storage error: {0}")]
     Storage(#[from] citadel_core::Error),
 }
