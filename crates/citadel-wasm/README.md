@@ -2,7 +2,7 @@
 
 WebAssembly bindings for [Citadel](https://github.com/yp3y5akh0v/citadel) - an encrypted-first embedded database engine that outperforms unencrypted SQLite.
 
-Every value is encrypted at rest with AES-256-CTR + HMAC-SHA256. Runs entirely in the browser or Node.js with no server required.
+Every page is encrypted at rest with AES-256-CTR + HMAC-SHA256. Runs entirely in the browser or Node.js with no server required.
 
 ## Install
 
@@ -59,9 +59,17 @@ db.free();
 
 ## SQL Support
 
-CREATE/DROP TABLE, CREATE/DROP INDEX, INSERT, SELECT, UPDATE, DELETE, JOINs (INNER, LEFT, RIGHT, CROSS), subqueries, aggregates, DISTINCT, GROUP BY, ORDER BY, LIMIT/OFFSET, BETWEEN, LIKE, CASE, prepared statements.
+**Statements** - CREATE/DROP TABLE, ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE/DROP INDEX, INSERT (VALUES, SELECT), SELECT, UPDATE, DELETE, BEGIN/COMMIT/ROLLBACK, EXPLAIN
 
-Types: INTEGER, REAL, TEXT, BLOB, BOOLEAN.
+**Constraints** - PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK (column + table level), FOREIGN KEY (RESTRICT/NO ACTION)
+
+**Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN
+
+**Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS), subqueries (scalar, IN, EXISTS), CTEs (WITH / WITH RECURSIVE), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, GROUP BY/HAVING, ORDER BY, LIMIT/OFFSET
+
+**Functions** - COUNT, SUM, AVG, MIN, MAX, LENGTH, UPPER, LOWER, SUBSTR, ABS, ROUND, COALESCE, NULLIF, CAST, TYPEOF, HEX, TRIM, REPLACE, RANDOM, IIF, GLOB
+
+**Prepared statements** - `$1, $2, ...` positional parameters
 
 ## License
 
