@@ -159,10 +159,7 @@ impl SchemaManager {
         self.views.keys().map(|s| s.as_str()).collect()
     }
 
-    pub fn save_view(
-        wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
-        view: &ViewDef,
-    ) -> Result<()> {
+    pub fn save_view(wtx: &mut citadel_txn::write_txn::WriteTxn<'_>, view: &ViewDef) -> Result<()> {
         let lower = view.name.to_ascii_lowercase();
         let data = view.serialize();
         wtx.table_insert(VIEWS_TABLE, lower.as_bytes(), &data)?;

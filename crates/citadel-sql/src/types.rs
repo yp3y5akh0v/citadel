@@ -306,8 +306,8 @@ impl ViewDef {
         let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
         pos += name_len;
 
-        let sql_len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-            as usize;
+        let sql_len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
         let sql = String::from_utf8_lossy(&data[pos..pos + sql_len]).into_owned();
         pos += sql_len;

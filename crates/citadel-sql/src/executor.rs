@@ -3902,11 +3902,7 @@ fn exec_view_read(
         let stmt = crate::parser::parse_sql(&view_def.sql)?;
         let sq = match stmt {
             Statement::Select(sq) => sq,
-            _ => {
-                return Err(SqlError::InvalidValue(
-                    "view body is not a SELECT".into(),
-                ))
-            }
+            _ => return Err(SqlError::InvalidValue("view body is not a SELECT".into())),
         };
         match exec_select_query(db, schema, &sq)? {
             ExecutionResult::Query(mut qr) => {
@@ -3942,11 +3938,7 @@ fn exec_view_write(
         let stmt = crate::parser::parse_sql(&view_def.sql)?;
         let sq = match stmt {
             Statement::Select(sq) => sq,
-            _ => {
-                return Err(SqlError::InvalidValue(
-                    "view body is not a SELECT".into(),
-                ))
-            }
+            _ => return Err(SqlError::InvalidValue("view body is not a SELECT".into())),
         };
         match exec_select_query_in_txn(wtx, schema, &sq)? {
             ExecutionResult::Query(mut qr) => {
@@ -4012,7 +4004,8 @@ fn try_fuse_view(
     }
 
     // Only fuse SELECT * views
-    let is_select_star = inner.columns.len() == 1 && matches!(inner.columns[0], SelectColumn::AllColumns);
+    let is_select_star =
+        inner.columns.len() == 1 && matches!(inner.columns[0], SelectColumn::AllColumns);
     if !is_select_star {
         return Ok(None);
     }
@@ -4125,10 +4118,11 @@ fn exec_select(
     }
 
     // View in JOINs
-    let any_join_view = stmt
-        .joins
-        .iter()
-        .any(|j| schema.get_view(&j.table.name.to_ascii_lowercase()).is_some());
+    let any_join_view = stmt.joins.iter().any(|j| {
+        schema
+            .get_view(&j.table.name.to_ascii_lowercase())
+            .is_some()
+    });
     if any_join_view {
         let mut view_ctes = ctes.clone();
         for j in &stmt.joins {
@@ -7382,10 +7376,11 @@ fn exec_select_in_txn(
         }
     }
 
-    let any_join_view = stmt
-        .joins
-        .iter()
-        .any(|j| schema.get_view(&j.table.name.to_ascii_lowercase()).is_some());
+    let any_join_view = stmt.joins.iter().any(|j| {
+        schema
+            .get_view(&j.table.name.to_ascii_lowercase())
+            .is_some()
+    });
     if any_join_view {
         let mut view_ctes = ctes.clone();
         for j in &stmt.joins {

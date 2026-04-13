@@ -13,7 +13,7 @@
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Beats unencrypted SQLite in all 13 benchmarks with equal cache budgets.
+Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Beats unencrypted SQLite in all 15 benchmarks with equal cache budgets.
 
 ## Features
 
@@ -38,11 +38,13 @@ Citadel vs SQLite on 100K rows (INTEGER, TEXT, INTEGER), single-threaded:
 Benchmark          Citadel        SQLite         Ratio
 -----------------------------------------------------
 count              186 ns         37.1 us        200x
+view_point         3.30 us        48.5 us        14.7x
 point              1.10 us        16.6 us        15.1x
 group_by           2.53 ms        12.1 ms        4.8x
 cte                1.61 ms        6.62 ms        4.1x
 window_agg         37.1 ms        87.4 ms        2.4x
 filter             936 us         2.28 ms        2.4x
+view_filter        2.18 ms        5.03 ms        2.3x
 sort               1.46 ms        3.09 ms        2.1x
 window_rank        75.0 ms        140 ms         1.9x
 insert             94.8 us        164 us         1.7x
@@ -68,6 +70,8 @@ recursive_cte      128 us         132 us         1.03x
 - **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq`
 - **window_rank** - `SELECT id, name, age, ROW_NUMBER() OVER (PARTITION BY age ORDER BY id), RANK() OVER (PARTITION BY age ORDER BY name) FROM t`
 - **window_agg** - `SELECT id, age, SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING), MIN(age) OVER (ORDER BY id ROWS 50 PRECEDING) FROM t`
+- **view_filter** - `CREATE VIEW v AS SELECT * FROM t` then `SELECT * FROM v WHERE age = 42`
+- **view_point** - `CREATE VIEW v AS SELECT * FROM t` then `SELECT * FROM v WHERE id = 50000`
 
 SQLite config: `journal_mode=OFF, synchronous=OFF, cache_size=8000` (~32 MB).
 Citadel config: `SyncMode::Off, cache_size=4096` (~32 MB).

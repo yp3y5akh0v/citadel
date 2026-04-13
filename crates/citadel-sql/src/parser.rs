@@ -1400,7 +1400,11 @@ fn convert_create_view(cv: sp::CreateView) -> Result<Statement> {
     }
     match &test[0] {
         sp::Statement::Query(_) => {}
-        _ => return Err(SqlError::Parse("view body must be a SELECT statement".into())),
+        _ => {
+            return Err(SqlError::Parse(
+                "view body must be a SELECT statement".into(),
+            ))
+        }
     }
 
     let column_aliases: Vec<String> = cv

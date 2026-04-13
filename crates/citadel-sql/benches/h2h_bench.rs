@@ -449,6 +449,56 @@ fn h2h_window_agg(c: &mut Criterion) {
     g.finish();
 }
 
+fn h2h_view_filter(c: &mut Criterion) {
+    let mut g = c.benchmark_group("view_filter");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_100k(&mut cc);
+    cc.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sqlite_100k(&sc);
+    sc.execute("CREATE VIEW v AS SELECT * FROM t", []).unwrap();
+
+    let sql = "SELECT * FROM v WHERE age = 42";
+
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| cc.query(sql).unwrap());
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| sqlite_collect(&sc, sql));
+    });
+    g.finish();
+}
+
+fn h2h_view_point(c: &mut Criterion) {
+    let mut g = c.benchmark_group("view_point");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_100k(&mut cc);
+    cc.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sqlite_100k(&sc);
+    sc.execute("CREATE VIEW v AS SELECT * FROM t", []).unwrap();
+
+    let sql = "SELECT * FROM v WHERE id = 50000";
+
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| cc.query(sql).unwrap());
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| sqlite_collect(&sc, sql));
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     h2h_count,
@@ -464,5 +514,7 @@ criterion_group!(
     h2h_recursive_cte,
     h2h_window_rank,
     h2h_window_agg,
+    h2h_view_filter,
+    h2h_view_point,
 );
 criterion_main!(benches);
