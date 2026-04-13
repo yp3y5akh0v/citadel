@@ -104,6 +104,18 @@ pub enum SqlError {
     #[error("window function '{0}' requires ORDER BY")]
     WindowFunctionRequiresOrderBy(String),
 
+    #[error("view '{0}' not found")]
+    ViewNotFound(String),
+
+    #[error("view '{0}' already exists")]
+    ViewAlreadyExists(String),
+
+    #[error("cannot modify view '{0}'")]
+    CannotModifyView(String),
+
+    #[error("circular or too deeply nested view reference: '{0}'")]
+    CircularViewReference(String),
+
     #[error("storage error: {0}")]
     Storage(#[from] citadel_core::Error),
 }

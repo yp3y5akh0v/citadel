@@ -115,6 +115,8 @@ pub fn execute(
         Statement::DropTable(dt) => exec_drop_table(db, schema, dt),
         Statement::CreateIndex(ci) => exec_create_index(db, schema, ci),
         Statement::DropIndex(di) => exec_drop_index(db, schema, di),
+        Statement::CreateView(cv) => exec_create_view(db, schema, cv),
+        Statement::DropView(dv) => exec_drop_view(db, schema, dv),
         Statement::AlterTable(at) => exec_alter_table(db, schema, at),
         Statement::Insert(ins) => exec_insert(db, schema, ins, params),
         Statement::Select(sq) => exec_select_query(db, schema, sq),
@@ -139,6 +141,8 @@ pub fn execute_in_txn(
         Statement::DropTable(dt) => exec_drop_table_in_txn(wtx, schema, dt),
         Statement::CreateIndex(ci) => exec_create_index_in_txn(wtx, schema, ci),
         Statement::DropIndex(di) => exec_drop_index_in_txn(wtx, schema, di),
+        Statement::CreateView(cv) => exec_create_view_in_txn(wtx, schema, cv),
+        Statement::DropView(dv) => exec_drop_view_in_txn(wtx, schema, dv),
         Statement::AlterTable(at) => exec_alter_table_in_txn(wtx, schema, at),
         Statement::Insert(ins) => {
             let mut bufs = InsertBufs::new();
@@ -223,6 +227,12 @@ pub fn explain(schema: &SchemaManager, stmt: &Statement) -> Result<ExecutionResu
                 }
             };
             vec![desc]
+        }
+        Statement::CreateView(cv) => {
+            vec![format!("CREATE VIEW {}", cv.name.to_ascii_lowercase())]
+        }
+        Statement::DropView(dv) => {
+            vec![format!("DROP VIEW {}", dv.name.to_ascii_lowercase())]
         }
         Statement::Explain(_) => {
             return Err(SqlError::Unsupported("EXPLAIN EXPLAIN".into()));
@@ -332,6 +342,22 @@ fn explain_select_cte(
         if stmt.distinct {
             lines.push("DISTINCT".into());
         }
+        if !stmt.order_by.is_empty() {
+            lines.push("SORT".into());
+        }
+        if stmt.limit.is_some() {
+            lines.push("LIMIT".into());
+        }
+        return Ok(lines);
+    }
+
+    // Check if FROM is a view
+    if let Some(view_def) = schema.get_view(&lower_from) {
+        if let Ok(Some(fused)) = try_fuse_view(stmt, schema, view_def) {
+            // Fused — explain against real table
+            return explain_select_cte(schema, &fused, cte_names);
+        }
+        lines.push(format!("SCAN VIEW {lower_from}"));
         if !stmt.order_by.is_empty() {
             lines.push("SORT".into());
         }
@@ -631,6 +657,10 @@ fn exec_create_table(
     stmt: &CreateTableStmt,
 ) -> Result<ExecutionResult> {
     let lower_name = stmt.name.to_ascii_lowercase();
+
+    if schema.get_view(&lower_name).is_some() {
+        return Err(SqlError::ViewAlreadyExists(stmt.name.clone()));
+    }
 
     if schema.contains(&lower_name) {
         if stmt.if_not_exists {
@@ -1186,6 +1216,146 @@ fn exec_drop_index_in_txn(
     SchemaManager::save_schema(wtx, &updated_schema)?;
 
     schema.register(updated_schema);
+    Ok(ExecutionResult::Ok)
+}
+
+// ── VIEW DDL ────────────────────────────────────────────────────────
+
+fn exec_create_view(
+    db: &Database,
+    schema: &mut SchemaManager,
+    stmt: &CreateViewStmt,
+) -> Result<ExecutionResult> {
+    let lower_name = stmt.name.to_ascii_lowercase();
+
+    // Check table name collision
+    if schema.contains(&lower_name) {
+        return Err(SqlError::TableAlreadyExists(stmt.name.clone()));
+    }
+
+    let replacing = if let Some(existing) = schema.get_view(&lower_name) {
+        if stmt.or_replace {
+            true
+        } else if stmt.if_not_exists {
+            return Ok(ExecutionResult::Ok);
+        } else {
+            return Err(SqlError::ViewAlreadyExists(existing.name.clone()));
+        }
+    } else {
+        false
+    };
+
+    // Validate the SQL is a SELECT
+    let parsed = crate::parser::parse_sql(&stmt.sql)?;
+    if !matches!(parsed, Statement::Select(_)) {
+        return Err(SqlError::Parse(
+            "view body must be a SELECT statement".into(),
+        ));
+    }
+
+    let view_def = ViewDef {
+        name: lower_name.clone(),
+        sql: stmt.sql.clone(),
+        column_aliases: stmt.column_aliases.clone(),
+    };
+
+    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    SchemaManager::ensure_views_table(&mut wtx)?;
+    if replacing {
+        SchemaManager::delete_view(&mut wtx, &lower_name)?;
+    }
+    SchemaManager::save_view(&mut wtx, &view_def)?;
+    wtx.commit().map_err(SqlError::Storage)?;
+
+    schema.register_view(view_def);
+    Ok(ExecutionResult::Ok)
+}
+
+fn exec_create_view_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    stmt: &CreateViewStmt,
+) -> Result<ExecutionResult> {
+    let lower_name = stmt.name.to_ascii_lowercase();
+
+    if schema.contains(&lower_name) {
+        return Err(SqlError::TableAlreadyExists(stmt.name.clone()));
+    }
+
+    let replacing = if let Some(existing) = schema.get_view(&lower_name) {
+        if stmt.or_replace {
+            true
+        } else if stmt.if_not_exists {
+            return Ok(ExecutionResult::Ok);
+        } else {
+            return Err(SqlError::ViewAlreadyExists(existing.name.clone()));
+        }
+    } else {
+        false
+    };
+
+    let parsed = crate::parser::parse_sql(&stmt.sql)?;
+    if !matches!(parsed, Statement::Select(_)) {
+        return Err(SqlError::Parse(
+            "view body must be a SELECT statement".into(),
+        ));
+    }
+
+    let view_def = ViewDef {
+        name: lower_name.clone(),
+        sql: stmt.sql.clone(),
+        column_aliases: stmt.column_aliases.clone(),
+    };
+
+    SchemaManager::ensure_views_table(wtx)?;
+    if replacing {
+        SchemaManager::delete_view(wtx, &lower_name)?;
+    }
+    SchemaManager::save_view(wtx, &view_def)?;
+
+    schema.register_view(view_def);
+    Ok(ExecutionResult::Ok)
+}
+
+fn exec_drop_view(
+    db: &Database,
+    schema: &mut SchemaManager,
+    stmt: &DropViewStmt,
+) -> Result<ExecutionResult> {
+    let lower_name = stmt.name.to_ascii_lowercase();
+
+    if schema.get_view(&lower_name).is_none() {
+        if stmt.if_exists {
+            return Ok(ExecutionResult::Ok);
+        }
+        return Err(SqlError::ViewNotFound(stmt.name.clone()));
+    }
+
+    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    SchemaManager::delete_view(&mut wtx, &lower_name)?;
+    wtx.commit().map_err(SqlError::Storage)?;
+
+    schema.remove_view(&lower_name);
+    Ok(ExecutionResult::Ok)
+}
+
+fn exec_drop_view_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    stmt: &DropViewStmt,
+) -> Result<ExecutionResult> {
+    let lower_name = stmt.name.to_ascii_lowercase();
+
+    if schema.get_view(&lower_name).is_none() {
+        if stmt.if_exists {
+            return Ok(ExecutionResult::Ok);
+        }
+        return Err(SqlError::ViewNotFound(stmt.name.clone()));
+    }
+
+    SchemaManager::delete_view(wtx, &lower_name)?;
+
+    schema.remove_view(&lower_name);
     Ok(ExecutionResult::Ok)
 }
 
@@ -2251,6 +2421,9 @@ fn exec_insert(
     };
 
     let lower_name = stmt.table.to_ascii_lowercase();
+    if schema.get_view(&lower_name).is_some() {
+        return Err(SqlError::CannotModifyView(stmt.table.clone()));
+    }
     let table_schema = schema
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
@@ -3524,6 +3697,23 @@ fn scan_table_read(
     Ok((table_schema.clone(), rows))
 }
 
+fn scan_table_read_or_view(
+    db: &Database,
+    schema: &SchemaManager,
+    name: &str,
+) -> Result<(TableSchema, Vec<Vec<Value>>)> {
+    if let Some(ts) = schema.get(name) {
+        let (rows, _) = collect_rows_read(db, ts, &None, None)?;
+        return Ok((ts.clone(), rows));
+    }
+    if let Some(vd) = schema.get_view(name) {
+        let qr = exec_view_read(db, schema, vd)?;
+        let vs = build_view_schema(name, &qr);
+        return Ok((vs, qr.rows));
+    }
+    Err(SqlError::TableNotFound(name.to_string()))
+}
+
 fn scan_table_write(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &SchemaManager,
@@ -3534,6 +3724,23 @@ fn scan_table_write(
         .ok_or_else(|| SqlError::TableNotFound(name.to_string()))?;
     let (rows, _) = collect_rows_write(wtx, table_schema, &None, None)?;
     Ok((table_schema.clone(), rows))
+}
+
+fn scan_table_write_or_view(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    name: &str,
+) -> Result<(TableSchema, Vec<Vec<Value>>)> {
+    if let Some(ts) = schema.get(name) {
+        let (rows, _) = collect_rows_write(wtx, ts, &None, None)?;
+        return Ok((ts.clone(), rows));
+    }
+    if let Some(vd) = schema.get_view(name) {
+        let qr = exec_view_write(wtx, schema, vd)?;
+        let vs = build_view_schema(name, &qr);
+        return Ok((vs, qr.rows));
+    }
+    Err(SqlError::TableNotFound(name.to_string()))
 }
 
 fn apply_set_operation(
@@ -3666,6 +3873,191 @@ fn apply_set_operation(
     Ok(ExecutionResult::Query(QueryResult { columns, rows }))
 }
 
+// ── View resolution helpers ─────────────────────────────────────────
+
+use std::cell::Cell;
+
+thread_local! {
+    static VIEW_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+const MAX_VIEW_DEPTH: u32 = 32;
+
+fn exec_view_read(
+    db: &Database,
+    schema: &SchemaManager,
+    view_def: &ViewDef,
+) -> Result<QueryResult> {
+    let depth = VIEW_DEPTH.with(|d| {
+        let v = d.get() + 1;
+        d.set(v);
+        v
+    });
+    if depth > MAX_VIEW_DEPTH {
+        VIEW_DEPTH.with(|d| d.set(d.get() - 1));
+        return Err(SqlError::CircularViewReference(view_def.name.clone()));
+    }
+
+    let result = (|| {
+        let stmt = crate::parser::parse_sql(&view_def.sql)?;
+        let sq = match stmt {
+            Statement::Select(sq) => sq,
+            _ => {
+                return Err(SqlError::InvalidValue(
+                    "view body is not a SELECT".into(),
+                ))
+            }
+        };
+        match exec_select_query(db, schema, &sq)? {
+            ExecutionResult::Query(mut qr) => {
+                apply_view_aliases(&mut qr, &view_def.column_aliases);
+                Ok(qr)
+            }
+            _ => Err(SqlError::InvalidValue(
+                "view query did not return results".into(),
+            )),
+        }
+    })();
+
+    VIEW_DEPTH.with(|d| d.set(d.get() - 1));
+    result
+}
+
+fn exec_view_write(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    view_def: &ViewDef,
+) -> Result<QueryResult> {
+    let depth = VIEW_DEPTH.with(|d| {
+        let v = d.get() + 1;
+        d.set(v);
+        v
+    });
+    if depth > MAX_VIEW_DEPTH {
+        VIEW_DEPTH.with(|d| d.set(d.get() - 1));
+        return Err(SqlError::CircularViewReference(view_def.name.clone()));
+    }
+
+    let result = (|| {
+        let stmt = crate::parser::parse_sql(&view_def.sql)?;
+        let sq = match stmt {
+            Statement::Select(sq) => sq,
+            _ => {
+                return Err(SqlError::InvalidValue(
+                    "view body is not a SELECT".into(),
+                ))
+            }
+        };
+        match exec_select_query_in_txn(wtx, schema, &sq)? {
+            ExecutionResult::Query(mut qr) => {
+                apply_view_aliases(&mut qr, &view_def.column_aliases);
+                Ok(qr)
+            }
+            _ => Err(SqlError::InvalidValue(
+                "view query did not return results".into(),
+            )),
+        }
+    })();
+
+    VIEW_DEPTH.with(|d| d.set(d.get() - 1));
+    result
+}
+
+fn apply_view_aliases(qr: &mut QueryResult, aliases: &[String]) {
+    for (i, alias) in aliases.iter().enumerate() {
+        if i < qr.columns.len() {
+            qr.columns[i] = alias.clone();
+        }
+    }
+}
+
+/// Merge a simple view into the outer query, replacing FROM with the real table.
+fn try_fuse_view(
+    outer: &SelectStmt,
+    schema: &SchemaManager,
+    view_def: &ViewDef,
+) -> Result<Option<SelectStmt>> {
+    let stmt = crate::parser::parse_sql(&view_def.sql)?;
+    let sq = match stmt {
+        Statement::Select(sq) => sq,
+        _ => return Ok(None),
+    };
+
+    // Column aliases require materialization
+    if !view_def.column_aliases.is_empty() {
+        return Ok(None);
+    }
+
+    // Must be a simple SELECT body (no CTEs, no compound)
+    if !sq.ctes.is_empty() || sq.recursive {
+        return Ok(None);
+    }
+    let inner = match &sq.body {
+        QueryBody::Select(s) => s.as_ref(),
+        _ => return Ok(None),
+    };
+
+    // Fusion conditions: simple view body
+    if !inner.joins.is_empty()
+        || !inner.group_by.is_empty()
+        || inner.distinct
+        || inner.having.is_some()
+        || inner.limit.is_some()
+        || inner.offset.is_some()
+        || !inner.order_by.is_empty()
+        || stmt_has_subquery(inner)
+        || has_any_window_function(inner)
+    {
+        return Ok(None);
+    }
+
+    // Only fuse SELECT * views
+    let is_select_star = inner.columns.len() == 1 && matches!(inner.columns[0], SelectColumn::AllColumns);
+    if !is_select_star {
+        return Ok(None);
+    }
+
+    // Outer query must not have JOINs on this view
+    if !outer.joins.is_empty() {
+        return Ok(None);
+    }
+
+    // The real table must exist
+    let real_table = inner.from.to_ascii_lowercase();
+    if schema.get(&real_table).is_none() {
+        return Ok(None);
+    }
+
+    // Merge WHERE clauses
+    let merged_where = match (&inner.where_clause, &outer.where_clause) {
+        (Some(iw), Some(ow)) => Some(Expr::BinaryOp {
+            left: Box::new(iw.clone()),
+            op: BinOp::And,
+            right: Box::new(ow.clone()),
+        }),
+        (Some(w), None) | (None, Some(w)) => Some(w.clone()),
+        (None, None) => None,
+    };
+
+    Ok(Some(SelectStmt {
+        columns: outer.columns.clone(),
+        from: inner.from.clone(),
+        from_alias: inner.from_alias.clone(),
+        joins: vec![],
+        distinct: outer.distinct,
+        where_clause: merged_where,
+        order_by: outer.order_by.clone(),
+        limit: outer.limit.clone(),
+        offset: outer.offset.clone(),
+        group_by: outer.group_by.clone(),
+        having: outer.having.clone(),
+    }))
+}
+
+fn build_view_schema(name: &str, qr: &QueryResult) -> TableSchema {
+    build_cte_schema(name, qr)
+}
+
 fn exec_select(
     db: &Database,
     schema: &SchemaManager,
@@ -3706,6 +4098,49 @@ fn exec_select(
             .any(|j| ctes.contains_key(&j.table.name.to_ascii_lowercase()))
     {
         return exec_select_join_with_ctes(stmt, ctes, &mut |name| {
+            scan_table_read_or_view(db, schema, name)
+        });
+    }
+
+    // ── View resolution ─────────────────────────────────────────────
+    if let Some(view_def) = schema.get_view(&lower_name) {
+        // Try fusion first
+        if let Some(fused) = try_fuse_view(stmt, schema, view_def)? {
+            return exec_select(db, schema, &fused, ctes);
+        }
+        // Fall back to materialization
+        let view_qr = exec_view_read(db, schema, view_def)?;
+        if stmt.joins.is_empty() {
+            return exec_select_from_cte(&view_qr, stmt, &mut |sub| {
+                exec_subquery_read(db, schema, sub, ctes)
+            });
+        } else {
+            // JOINs with view
+            let mut view_ctes = ctes.clone();
+            view_ctes.insert(lower_name.clone(), view_qr);
+            return exec_select_join_with_ctes(stmt, &view_ctes, &mut |name| {
+                scan_table_read_or_view(db, schema, name)
+            });
+        }
+    }
+
+    // View in JOINs
+    let any_join_view = stmt
+        .joins
+        .iter()
+        .any(|j| schema.get_view(&j.table.name.to_ascii_lowercase()).is_some());
+    if any_join_view {
+        let mut view_ctes = ctes.clone();
+        for j in &stmt.joins {
+            let jname = j.table.name.to_ascii_lowercase();
+            if let Some(vd) = schema.get_view(&jname) {
+                if let std::collections::hash_map::Entry::Vacant(e) = view_ctes.entry(jname) {
+                    let vqr = exec_view_read(db, schema, vd)?;
+                    e.insert(vqr);
+                }
+            }
+        }
+        return exec_select_join_with_ctes(stmt, &view_ctes, &mut |name| {
             scan_table_read(db, schema, name)
         });
     }
@@ -6235,6 +6670,9 @@ fn exec_update(
     };
 
     let lower_name = stmt.table.to_ascii_lowercase();
+    if schema.get_view(&lower_name).is_some() {
+        return Err(SqlError::CannotModifyView(stmt.table.clone()));
+    }
     let table_schema = schema
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
@@ -6510,6 +6948,9 @@ fn exec_delete(
     };
 
     let lower_name = stmt.table.to_ascii_lowercase();
+    if schema.get_view(&lower_name).is_some() {
+        return Err(SqlError::CannotModifyView(stmt.table.clone()));
+    }
     let table_schema = schema
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
@@ -6918,6 +7359,45 @@ fn exec_select_in_txn(
             .any(|j| ctes.contains_key(&j.table.name.to_ascii_lowercase()))
     {
         return exec_select_join_with_ctes(stmt, ctes, &mut |name| {
+            scan_table_write_or_view(wtx, schema, name)
+        });
+    }
+
+    // ── View resolution (in-txn) ────────────────────────────────────
+    if let Some(view_def) = schema.get_view(&lower_name) {
+        if let Some(fused) = try_fuse_view(stmt, schema, view_def)? {
+            return exec_select_in_txn(wtx, schema, &fused, ctes);
+        }
+        let view_qr = exec_view_write(wtx, schema, view_def)?;
+        if stmt.joins.is_empty() {
+            return exec_select_from_cte(&view_qr, stmt, &mut |sub| {
+                exec_subquery_write(wtx, schema, sub, ctes)
+            });
+        } else {
+            let mut view_ctes = ctes.clone();
+            view_ctes.insert(lower_name.clone(), view_qr);
+            return exec_select_join_with_ctes(stmt, &view_ctes, &mut |name| {
+                scan_table_write_or_view(wtx, schema, name)
+            });
+        }
+    }
+
+    let any_join_view = stmt
+        .joins
+        .iter()
+        .any(|j| schema.get_view(&j.table.name.to_ascii_lowercase()).is_some());
+    if any_join_view {
+        let mut view_ctes = ctes.clone();
+        for j in &stmt.joins {
+            let jname = j.table.name.to_ascii_lowercase();
+            if let Some(vd) = schema.get_view(&jname) {
+                if let std::collections::hash_map::Entry::Vacant(e) = view_ctes.entry(jname) {
+                    let vqr = exec_view_write(wtx, schema, vd)?;
+                    e.insert(vqr);
+                }
+            }
+        }
+        return exec_select_join_with_ctes(stmt, &view_ctes, &mut |name| {
             scan_table_write(wtx, schema, name)
         });
     }

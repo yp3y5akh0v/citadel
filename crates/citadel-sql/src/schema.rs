@@ -5,13 +5,15 @@ use std::collections::HashMap;
 use citadel::Database;
 
 use crate::error::{Result, SqlError};
-use crate::types::{ForeignKeySchemaEntry, TableSchema};
+use crate::types::{ForeignKeySchemaEntry, TableSchema, ViewDef};
 
 const SCHEMA_TABLE: &[u8] = b"_schema";
+const VIEWS_TABLE: &[u8] = b"_views";
 
 /// Manages table schemas in memory, backed by the `_schema` table.
 pub struct SchemaManager {
     tables: HashMap<String, TableSchema>,
+    views: HashMap<String, ViewDef>,
     generation: u64,
 }
 
@@ -43,8 +45,34 @@ impl SchemaManager {
             return Err(e);
         }
 
+        // Load views from _views table
+        let mut views = HashMap::new();
+        let mut rtx2 = db.begin_read();
+        let mut view_err: Option<crate::error::SqlError> = None;
+        let view_scan = rtx2.table_for_each(VIEWS_TABLE, |_key, value| {
+            match ViewDef::deserialize(value) {
+                Ok(vd) => {
+                    views.insert(vd.name.clone(), vd);
+                }
+                Err(e) => {
+                    view_err = Some(e);
+                }
+            }
+            Ok(())
+        });
+
+        match view_scan {
+            Ok(()) => {}
+            Err(citadel_core::Error::TableNotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        if let Some(e) = view_err {
+            return Err(e);
+        }
+
         Ok(Self {
             tables,
+            views,
             generation: 0,
         })
     }
@@ -97,6 +125,66 @@ impl SchemaManager {
     /// Returns all table schemas.
     pub fn all_schemas(&self) -> impl Iterator<Item = &TableSchema> {
         self.tables.values()
+    }
+
+    // ── View management ────────────────────────────────────────────
+
+    pub fn get_view(&self, name: &str) -> Option<&ViewDef> {
+        if let Some(v) = self.views.get(name) {
+            return Some(v);
+        }
+        if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.views.get(&name.to_ascii_lowercase())
+        } else {
+            None
+        }
+    }
+
+    pub fn register_view(&mut self, view: ViewDef) {
+        let lower = view.name.to_ascii_lowercase();
+        self.views.insert(lower, view);
+        self.generation += 1;
+    }
+
+    pub fn remove_view(&mut self, name: &str) -> Option<ViewDef> {
+        let lower = name.to_ascii_lowercase();
+        let result = self.views.remove(&lower);
+        if result.is_some() {
+            self.generation += 1;
+        }
+        result
+    }
+
+    pub fn view_names(&self) -> Vec<&str> {
+        self.views.keys().map(|s| s.as_str()).collect()
+    }
+
+    pub fn save_view(
+        wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+        view: &ViewDef,
+    ) -> Result<()> {
+        let lower = view.name.to_ascii_lowercase();
+        let data = view.serialize();
+        wtx.table_insert(VIEWS_TABLE, lower.as_bytes(), &data)?;
+        Ok(())
+    }
+
+    pub fn delete_view(wtx: &mut citadel_txn::write_txn::WriteTxn<'_>, name: &str) -> Result<()> {
+        let lower = name.to_ascii_lowercase();
+        wtx.table_delete(VIEWS_TABLE, lower.as_bytes())
+            .map_err(|e| match e {
+                citadel_core::Error::TableNotFound(_) => SqlError::ViewNotFound(name.into()),
+                other => SqlError::Storage(other),
+            })?;
+        Ok(())
+    }
+
+    pub fn ensure_views_table(wtx: &mut citadel_txn::write_txn::WriteTxn<'_>) -> Result<()> {
+        match wtx.create_table(VIEWS_TABLE) {
+            Ok(()) => Ok(()),
+            Err(citadel_core::Error::TableAlreadyExists(_)) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Find all FKs in other tables that reference `parent` table.

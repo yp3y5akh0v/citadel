@@ -260,6 +260,77 @@ pub struct IndexDef {
     pub unique: bool,
 }
 
+/// View definition stored in the _views metadata table.
+#[derive(Debug, Clone)]
+pub struct ViewDef {
+    pub name: String,
+    pub sql: String,
+    pub column_aliases: Vec<String>,
+}
+
+const VIEW_DEF_VERSION: u8 = 1;
+
+impl ViewDef {
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(VIEW_DEF_VERSION);
+
+        let name_bytes = self.name.as_bytes();
+        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name_bytes);
+
+        let sql_bytes = self.sql.as_bytes();
+        buf.extend_from_slice(&(sql_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(sql_bytes);
+
+        buf.extend_from_slice(&(self.column_aliases.len() as u16).to_le_bytes());
+        for alias in &self.column_aliases {
+            let alias_bytes = alias.as_bytes();
+            buf.extend_from_slice(&(alias_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(alias_bytes);
+        }
+
+        buf
+    }
+
+    pub fn deserialize(data: &[u8]) -> crate::error::Result<Self> {
+        if data.is_empty() || data[0] != VIEW_DEF_VERSION {
+            return Err(crate::error::SqlError::InvalidValue(
+                "invalid view definition version".into(),
+            ));
+        }
+        let mut pos = 1;
+
+        let name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
+        pos += name_len;
+
+        let sql_len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        pos += 4;
+        let sql = String::from_utf8_lossy(&data[pos..pos + sql_len]).into_owned();
+        pos += sql_len;
+
+        let alias_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        let mut column_aliases = Vec::with_capacity(alias_count);
+        for _ in 0..alias_count {
+            let alias_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            let alias = String::from_utf8_lossy(&data[pos..pos + alias_len]).into_owned();
+            pos += alias_len;
+            column_aliases.push(alias);
+        }
+
+        Ok(Self {
+            name,
+            sql,
+            column_aliases,
+        })
+    }
+}
+
 /// Table-level CHECK constraint stored in schema.
 #[derive(Debug, Clone)]
 pub struct TableCheckDef {

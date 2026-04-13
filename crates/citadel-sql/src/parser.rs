@@ -15,6 +15,8 @@ pub enum Statement {
     DropTable(DropTableStmt),
     CreateIndex(CreateIndexStmt),
     DropIndex(DropIndexStmt),
+    CreateView(CreateViewStmt),
+    DropView(DropViewStmt),
     AlterTable(Box<AlterTableStmt>),
     Insert(InsertStmt),
     Select(Box<SelectQuery>),
@@ -108,6 +110,21 @@ pub struct CreateIndexStmt {
 #[derive(Debug, Clone)]
 pub struct DropIndexStmt {
     pub index_name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateViewStmt {
+    pub name: String,
+    pub sql: String,
+    pub column_aliases: Vec<String>,
+    pub or_replace: bool,
+    pub if_not_exists: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DropViewStmt {
+    pub name: String,
     pub if_exists: bool,
 }
 
@@ -1061,6 +1078,21 @@ fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
                 if_exists,
             }))
         }
+        sp::Statement::CreateView(cv) => convert_create_view(cv),
+        sp::Statement::Drop {
+            object_type: sp::ObjectType::View,
+            if_exists,
+            names,
+            ..
+        } => {
+            if names.len() != 1 {
+                return Err(SqlError::Unsupported("multi-view DROP".into()));
+            }
+            Ok(Statement::DropView(DropViewStmt {
+                name: object_name_to_string(&names[0]),
+                if_exists,
+            }))
+        }
         sp::Statement::AlterTable(at) => convert_alter_table(at),
         sp::Statement::Insert(insert) => convert_insert(insert),
         sp::Statement::Query(query) => convert_query(*query),
@@ -1348,6 +1380,41 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
         columns,
         unique: ci.unique,
         if_not_exists: ci.if_not_exists,
+    }))
+}
+
+fn convert_create_view(cv: sp::CreateView) -> Result<Statement> {
+    let name = object_name_to_string(&cv.name);
+
+    if cv.materialized {
+        return Err(SqlError::Unsupported("MATERIALIZED VIEW".into()));
+    }
+
+    let sql = cv.query.to_string();
+
+    // Validate the SQL is parseable as a SELECT
+    let dialect = GenericDialect {};
+    let test = Parser::parse_sql(&dialect, &sql).map_err(|e| SqlError::Parse(e.to_string()))?;
+    if test.is_empty() {
+        return Err(SqlError::Parse("empty view definition".into()));
+    }
+    match &test[0] {
+        sp::Statement::Query(_) => {}
+        _ => return Err(SqlError::Parse("view body must be a SELECT statement".into())),
+    }
+
+    let column_aliases: Vec<String> = cv
+        .columns
+        .iter()
+        .map(|c| c.name.value.to_ascii_lowercase())
+        .collect();
+
+    Ok(Statement::CreateView(CreateViewStmt {
+        name,
+        sql,
+        column_aliases,
+        or_replace: cv.or_replace,
+        if_not_exists: cv.if_not_exists,
     }))
 }
 
