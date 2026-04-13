@@ -181,6 +181,10 @@ pub fn eval_expr(expr: &Expr, col_map: &ColumnMap, row: &[Value]) -> Result<Valu
         ),
 
         Expr::Parameter(n) => Err(SqlError::Parse(format!("unbound parameter ${n}"))),
+
+        Expr::WindowFunction { .. } => Err(SqlError::Unsupported(
+            "window functions are only allowed in SELECT columns".into(),
+        )),
     }
 }
 
@@ -1121,6 +1125,17 @@ fn collect_column_refs(expr: &Expr, columns: &[ColumnDef], out: &mut Vec<usize>)
         }
         Expr::Cast { expr, .. } => {
             collect_column_refs(expr, columns, out);
+        }
+        Expr::WindowFunction { args, spec, .. } => {
+            for arg in args {
+                collect_column_refs(arg, columns, out);
+            }
+            for pb in &spec.partition_by {
+                collect_column_refs(pb, columns, out);
+            }
+            for ob in &spec.order_by {
+                collect_column_refs(&ob.expr, columns, out);
+            }
         }
         Expr::Literal(_)
         | Expr::Parameter(_)

@@ -397,6 +397,58 @@ fn h2h_recursive_cte(c: &mut Criterion) {
     g.finish();
 }
 
+fn h2h_window_rank(c: &mut Criterion) {
+    let mut g = c.benchmark_group("window_rank");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_100k(&mut cc);
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sqlite_100k(&sc);
+
+    let sql = "SELECT id, name, age, \
+               ROW_NUMBER() OVER (PARTITION BY age ORDER BY id), \
+               RANK() OVER (PARTITION BY age ORDER BY name) \
+               FROM t";
+
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| cc.query(sql).unwrap());
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| sqlite_collect(&sc, sql));
+    });
+    g.finish();
+}
+
+fn h2h_window_agg(c: &mut Criterion) {
+    let mut g = c.benchmark_group("window_agg");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_100k(&mut cc);
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sqlite_100k(&sc);
+
+    let sql = "SELECT id, age, \
+               SUM(age) OVER (ORDER BY id ROWS BETWEEN 50 PRECEDING AND CURRENT ROW), \
+               MIN(age) OVER (ORDER BY id ROWS BETWEEN 50 PRECEDING AND CURRENT ROW) \
+               FROM t";
+
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| cc.query(sql).unwrap());
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| sqlite_collect(&sc, sql));
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     h2h_count,
@@ -410,5 +462,7 @@ criterion_group!(
     h2h_insert,
     h2h_cte,
     h2h_recursive_cte,
+    h2h_window_rank,
+    h2h_window_agg,
 );
 criterion_main!(benches);

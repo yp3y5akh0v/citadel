@@ -13,12 +13,12 @@
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Beats unencrypted SQLite in all 11 benchmarks with equal cache budgets.
+Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Beats unencrypted SQLite in all 13 benchmarks with equal cache budgets.
 
 ## Features
 
 - **Encrypted at rest** - AES-256-CTR + HMAC-SHA256 per page, verified before decryption
-- **SQL** - JOINs, subqueries, CTEs (recursive), UNION/INTERSECT/EXCEPT, aggregates, indexes, constraints, ALTER TABLE, prepared statements
+- **SQL** - JOINs, subqueries, CTEs (recursive), UNION/INTERSECT/EXCEPT, window functions, aggregates, indexes, constraints, ALTER TABLE, prepared statements
 - **ACID** - Copy-on-Write B+ tree, shadow paging, no WAL. Snapshot isolation with concurrent readers
 - **P2P sync** - Merkle-based table diffing over Noise-encrypted channels with PSK auth
 - **CLI** - SQL shell with tab completion, syntax highlighting, dot-commands (.backup, .verify, .rekey, .sync, .dump, ...)
@@ -41,8 +41,10 @@ count              186 ns         37.1 us        200x
 point              1.10 us        16.6 us        15.1x
 group_by           2.53 ms        12.1 ms        4.8x
 cte                1.61 ms        6.62 ms        4.1x
+window_agg         37.1 ms        87.4 ms        2.4x
 filter             936 us         2.28 ms        2.4x
 sort               1.46 ms        3.09 ms        2.1x
+window_rank        75.0 ms        140 ms         1.9x
 insert             94.8 us        164 us         1.7x
 scan               9.42 ms        15.1 ms        1.6x
 sum                1.68 ms        2.34 ms        1.4x
@@ -53,17 +55,19 @@ recursive_cte      128 us         132 us         1.03x
 <details>
 <summary>Methodology</summary>
 
-- **count** - `SELECT COUNT(*) FROM t` (O(1) catalog lookup vs full scan)
+- **count** - `SELECT COUNT(*) FROM t`
 - **group_by** - `SELECT age, COUNT(*) FROM t GROUP BY age`
-- **filter** - `SELECT * FROM t WHERE age = 42` (non-PK predicate, full scan with inline filter)
-- **sort** - `SELECT * FROM t ORDER BY age LIMIT 10` (partial sort, top-K)
-- **sum** - `SELECT SUM(age) FROM t` (streaming aggregation)
-- **point** - `SELECT * FROM t WHERE id = 50000` (B+ tree lookup)
-- **scan** - `SELECT * FROM t` (full 100K row decode)
+- **filter** - `SELECT * FROM t WHERE age = 42`
+- **sort** - `SELECT * FROM t ORDER BY age LIMIT 10`
+- **sum** - `SELECT SUM(age) FROM t`
+- **point** - `SELECT * FROM t WHERE id = 50000`
+- **scan** - `SELECT * FROM t` (full 100K rows)
 - **insert** - 100 rows in one transaction
-- **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id` (1K x 1K integer equi-join)
-- **cte** - `WITH filtered AS (SELECT ... WHERE age < 50) SELECT age, COUNT(*) FROM filtered GROUP BY age` (CTE + GROUP BY)
-- **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq` (1000-step recursion)
+- **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id` (1K x 1K)
+- **cte** - `WITH filtered AS (SELECT ... WHERE age < 50) SELECT age, COUNT(*) FROM filtered GROUP BY age`
+- **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq`
+- **window_rank** - `SELECT id, name, age, ROW_NUMBER() OVER (PARTITION BY age ORDER BY id), RANK() OVER (PARTITION BY age ORDER BY name) FROM t`
+- **window_agg** - `SELECT id, age, SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING), MIN(age) OVER (ORDER BY id ROWS 50 PRECEDING) FROM t`
 
 SQLite config: `journal_mode=OFF, synchronous=OFF, cache_size=8000` (~32 MB).
 Citadel config: `SyncMode::Off, cache_size=4096` (~32 MB).
@@ -148,6 +152,8 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 **Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN
 
 **Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS), subqueries (scalar, IN, EXISTS), CTEs (WITH / WITH RECURSIVE), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, GROUP BY/HAVING, ORDER BY, LIMIT/OFFSET
+
+**Window functions** - ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, SUM/COUNT/AVG/MIN/MAX OVER with PARTITION BY, ORDER BY, ROWS/RANGE frames
 
 **Functions** - COUNT, SUM, AVG, MIN, MAX, LENGTH, UPPER, LOWER, SUBSTR, ABS, ROUND, COALESCE, NULLIF, CAST, TYPEOF, HEX, TRIM, REPLACE, RANDOM, IIF, GLOB
 

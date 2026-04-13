@@ -101,6 +101,9 @@ pub enum SqlError {
     #[error("recursive CTE '{0}' exceeded maximum iterations ({1})")]
     RecursiveCteMaxIterations(String, usize),
 
+    #[error("window function '{0}' requires ORDER BY")]
+    WindowFunctionRequiresOrderBy(String),
+
     #[error("storage error: {0}")]
     Storage(#[from] citadel_core::Error),
 }

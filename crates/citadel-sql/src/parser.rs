@@ -181,7 +181,7 @@ pub struct CompoundSelect {
 #[derive(Debug, Clone)]
 pub enum QueryBody {
     Select(Box<SelectStmt>),
-    Compound(CompoundSelect),
+    Compound(Box<CompoundSelect>),
 }
 
 #[derive(Debug, Clone)]
@@ -292,6 +292,41 @@ pub enum Expr {
         data_type: DataType,
     },
     Parameter(usize),
+    WindowFunction {
+        name: String,
+        args: Vec<Expr>,
+        spec: WindowSpec,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowSpec {
+    pub partition_by: Vec<Expr>,
+    pub order_by: Vec<OrderByItem>,
+    pub frame: Option<WindowFrame>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowFrame {
+    pub units: WindowFrameUnits,
+    pub start: WindowFrameBound,
+    pub end: WindowFrameBound,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum WindowFrameUnits {
+    Rows,
+    Range,
+    Groups,
+}
+
+#[derive(Debug, Clone)]
+pub enum WindowFrameBound {
+    UnboundedPreceding,
+    Preceding(Box<Expr>),
+    CurrentRow,
+    Following(Box<Expr>),
+    UnboundedFollowing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -578,7 +613,7 @@ fn bind_query_body(
                 .as_ref()
                 .map(|e| bind_expr(e, params))
                 .transpose()?;
-            Ok(QueryBody::Compound(CompoundSelect {
+            Ok(QueryBody::Compound(Box::new(CompoundSelect {
                 op: comp.op.clone(),
                 all: comp.all,
                 left: Box::new(bind_query_body(&comp.left, params)?),
@@ -586,7 +621,7 @@ fn bind_query_body(
                 order_by,
                 limit,
                 offset,
-            }))
+            })))
         }
     }
 }
@@ -748,6 +783,60 @@ fn bind_expr(expr: &Expr, params: &[crate::types::Value]) -> crate::error::Resul
             expr: Box::new(bind_expr(e, params)?),
             data_type: *data_type,
         }),
+        Expr::WindowFunction { name, args, spec } => {
+            let args = args
+                .iter()
+                .map(|a| bind_expr(a, params))
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            let partition_by = spec
+                .partition_by
+                .iter()
+                .map(|e| bind_expr(e, params))
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            let order_by = spec
+                .order_by
+                .iter()
+                .map(|o| {
+                    Ok(OrderByItem {
+                        expr: bind_expr(&o.expr, params)?,
+                        descending: o.descending,
+                        nulls_first: o.nulls_first,
+                    })
+                })
+                .collect::<crate::error::Result<Vec<_>>>()?;
+            let frame = match &spec.frame {
+                Some(f) => Some(WindowFrame {
+                    units: f.units,
+                    start: bind_frame_bound(&f.start, params)?,
+                    end: bind_frame_bound(&f.end, params)?,
+                }),
+                None => None,
+            };
+            Ok(Expr::WindowFunction {
+                name: name.clone(),
+                args,
+                spec: WindowSpec {
+                    partition_by,
+                    order_by,
+                    frame,
+                },
+            })
+        }
+    }
+}
+
+fn bind_frame_bound(
+    bound: &WindowFrameBound,
+    params: &[crate::types::Value],
+) -> crate::error::Result<WindowFrameBound> {
+    match bound {
+        WindowFrameBound::Preceding(e) => {
+            Ok(WindowFrameBound::Preceding(Box::new(bind_expr(e, params)?)))
+        }
+        WindowFrameBound::Following(e) => {
+            Ok(WindowFrameBound::Following(Box::new(bind_expr(e, params)?)))
+        }
+        other => Ok(other.clone()),
     }
 }
 
@@ -908,6 +997,28 @@ fn visit_expr(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
             }
         }
         Expr::Cast { expr: e, .. } => visit_expr(e, visitor),
+        Expr::WindowFunction { args, spec, .. } => {
+            for a in args {
+                visit_expr(a, visitor);
+            }
+            for p in &spec.partition_by {
+                visit_expr(p, visitor);
+            }
+            for o in &spec.order_by {
+                visit_expr(&o.expr, visitor);
+            }
+            if let Some(ref frame) = spec.frame {
+                if let WindowFrameBound::Preceding(e) | WindowFrameBound::Following(e) =
+                    &frame.start
+                {
+                    visit_expr(e, visitor);
+                }
+                if let WindowFrameBound::Preceding(e) | WindowFrameBound::Following(e) = &frame.end
+                {
+                    visit_expr(e, visitor);
+                }
+            }
+        }
         Expr::Literal(_)
         | Expr::Column(_)
         | Expr::QualifiedColumn { .. }
@@ -1381,7 +1492,7 @@ fn convert_set_expr(set_expr: &sp::SetExpr) -> Result<QueryBody> {
                     return Err(SqlError::Unsupported("BY NAME set operations".into()));
                 }
             };
-            Ok(QueryBody::Compound(CompoundSelect {
+            Ok(QueryBody::Compound(Box::new(CompoundSelect {
                 op: set_op,
                 all,
                 left: Box::new(convert_set_expr(left)?),
@@ -1389,7 +1500,7 @@ fn convert_set_expr(set_expr: &sp::SetExpr) -> Result<QueryBody> {
                 order_by: vec![],
                 limit: None,
                 offset: None,
-            }))
+            })))
         }
         _ => Err(SqlError::Unsupported("unsupported set expression".into())),
     }
@@ -1873,87 +1984,159 @@ fn convert_bin_op(op: &sp::BinaryOperator) -> Result<BinOp> {
 fn convert_function(func: &sp::Function) -> Result<Expr> {
     let name = object_name_to_string(&func.name).to_ascii_uppercase();
 
-    // COUNT(*)
-    match &func.args {
+    let (args, is_count_star) = match &func.args {
         sp::FunctionArguments::List(list) => {
             if list.args.is_empty() && name == "COUNT" {
-                return Ok(Expr::CountStar);
-            }
-            let args = list
-                .args
-                .iter()
-                .map(|arg| match arg {
-                    sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => convert_expr(e),
-                    sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Wildcard) => {
-                        if name == "COUNT" {
-                            Ok(Expr::CountStar)
-                        } else {
-                            Err(SqlError::Unsupported(format!("{name}(*)")))
+                (vec![], true)
+            } else {
+                let mut count_star = false;
+                let args = list
+                    .args
+                    .iter()
+                    .map(|arg| match arg {
+                        sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => convert_expr(e),
+                        sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Wildcard) => {
+                            if name == "COUNT" {
+                                count_star = true;
+                                Ok(Expr::CountStar)
+                            } else {
+                                Err(SqlError::Unsupported(format!("{name}(*)")))
+                            }
                         }
-                    }
-                    _ => Err(SqlError::Unsupported(format!(
-                        "function arg type in {name}"
-                    ))),
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            if name == "COUNT" && args.len() == 1 && matches!(args[0], Expr::CountStar) {
-                return Ok(Expr::CountStar);
-            }
-
-            if name == "COALESCE" {
-                if args.is_empty() {
-                    return Err(SqlError::Parse(
-                        "COALESCE requires at least one argument".into(),
-                    ));
+                        _ => Err(SqlError::Unsupported(format!(
+                            "function arg type in {name}"
+                        ))),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if name == "COUNT" && args.len() == 1 && count_star {
+                    (vec![], true)
+                } else {
+                    (args, false)
                 }
-                return Ok(Expr::Coalesce(args));
             }
-
-            if name == "NULLIF" {
-                if args.len() != 2 {
-                    return Err(SqlError::Parse(
-                        "NULLIF requires exactly two arguments".into(),
-                    ));
-                }
-                return Ok(Expr::Case {
-                    operand: None,
-                    conditions: vec![(
-                        Expr::BinaryOp {
-                            left: Box::new(args[0].clone()),
-                            op: BinOp::Eq,
-                            right: Box::new(args[1].clone()),
-                        },
-                        Expr::Literal(Value::Null),
-                    )],
-                    else_result: Some(Box::new(args[0].clone())),
-                });
-            }
-
-            if name == "IIF" {
-                if args.len() != 3 {
-                    return Err(SqlError::Parse(
-                        "IIF requires exactly three arguments".into(),
-                    ));
-                }
-                return Ok(Expr::Case {
-                    operand: None,
-                    conditions: vec![(args[0].clone(), args[1].clone())],
-                    else_result: Some(Box::new(args[2].clone())),
-                });
-            }
-
-            Ok(Expr::Function { name, args })
         }
         sp::FunctionArguments::None => {
             if name == "COUNT" {
-                Ok(Expr::CountStar)
+                (vec![], true)
             } else {
-                Ok(Expr::Function { name, args: vec![] })
+                (vec![], false)
             }
         }
         sp::FunctionArguments::Subquery(_) => {
-            Err(SqlError::Unsupported("subquery in function".into()))
+            return Err(SqlError::Unsupported("subquery in function".into()));
+        }
+    };
+
+    // Window function: check OVER before any other special handling
+    if let Some(over) = &func.over {
+        let spec = match over {
+            sp::WindowType::WindowSpec(ws) => convert_window_spec(ws)?,
+            sp::WindowType::NamedWindow(_) => {
+                return Err(SqlError::Unsupported("named windows".into()));
+            }
+        };
+        return Ok(Expr::WindowFunction { name, args, spec });
+    }
+
+    // Non-window special forms
+    if is_count_star {
+        return Ok(Expr::CountStar);
+    }
+
+    if name == "COALESCE" {
+        if args.is_empty() {
+            return Err(SqlError::Parse(
+                "COALESCE requires at least one argument".into(),
+            ));
+        }
+        return Ok(Expr::Coalesce(args));
+    }
+
+    if name == "NULLIF" {
+        if args.len() != 2 {
+            return Err(SqlError::Parse(
+                "NULLIF requires exactly two arguments".into(),
+            ));
+        }
+        return Ok(Expr::Case {
+            operand: None,
+            conditions: vec![(
+                Expr::BinaryOp {
+                    left: Box::new(args[0].clone()),
+                    op: BinOp::Eq,
+                    right: Box::new(args[1].clone()),
+                },
+                Expr::Literal(Value::Null),
+            )],
+            else_result: Some(Box::new(args[0].clone())),
+        });
+    }
+
+    if name == "IIF" {
+        if args.len() != 3 {
+            return Err(SqlError::Parse(
+                "IIF requires exactly three arguments".into(),
+            ));
+        }
+        return Ok(Expr::Case {
+            operand: None,
+            conditions: vec![(args[0].clone(), args[1].clone())],
+            else_result: Some(Box::new(args[2].clone())),
+        });
+    }
+
+    Ok(Expr::Function { name, args })
+}
+
+fn convert_window_spec(ws: &sp::WindowSpec) -> Result<WindowSpec> {
+    let partition_by = ws
+        .partition_by
+        .iter()
+        .map(convert_expr)
+        .collect::<Result<Vec<_>>>()?;
+    let order_by = ws
+        .order_by
+        .iter()
+        .map(convert_order_by_expr)
+        .collect::<Result<Vec<_>>>()?;
+    let frame = ws
+        .window_frame
+        .as_ref()
+        .map(convert_window_frame)
+        .transpose()?;
+    Ok(WindowSpec {
+        partition_by,
+        order_by,
+        frame,
+    })
+}
+
+fn convert_window_frame(wf: &sp::WindowFrame) -> Result<WindowFrame> {
+    let units = match wf.units {
+        sp::WindowFrameUnits::Rows => WindowFrameUnits::Rows,
+        sp::WindowFrameUnits::Range => WindowFrameUnits::Range,
+        sp::WindowFrameUnits::Groups => {
+            return Err(SqlError::Unsupported("GROUPS window frame".into()));
+        }
+    };
+    let start = convert_window_frame_bound(&wf.start_bound)?;
+    let end = match &wf.end_bound {
+        Some(b) => convert_window_frame_bound(b)?,
+        None => WindowFrameBound::CurrentRow,
+    };
+    Ok(WindowFrame { units, start, end })
+}
+
+fn convert_window_frame_bound(b: &sp::WindowFrameBound) -> Result<WindowFrameBound> {
+    match b {
+        sp::WindowFrameBound::CurrentRow => Ok(WindowFrameBound::CurrentRow),
+        sp::WindowFrameBound::Preceding(None) => Ok(WindowFrameBound::UnboundedPreceding),
+        sp::WindowFrameBound::Preceding(Some(e)) => {
+            Ok(WindowFrameBound::Preceding(Box::new(convert_expr(e)?)))
+        }
+        sp::WindowFrameBound::Following(None) => Ok(WindowFrameBound::UnboundedFollowing),
+        sp::WindowFrameBound::Following(Some(e)) => {
+            Ok(WindowFrameBound::Following(Box::new(convert_expr(e)?)))
         }
     }
 }

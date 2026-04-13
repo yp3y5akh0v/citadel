@@ -32,15 +32,13 @@ Most databases use a write-ahead log for crash recovery. Citadel uses **shadow p
 
 ## Faster than unencrypted SQLite
 
-Citadel beats SQLite in all 11 head-to-head benchmarks, even though every page goes through AES-256-CTR + HMAC-SHA256 and SQLite runs without any encryption.
-
-The key: page-level caching means encryption cost is paid once per cold read, not on every access. Streaming aggregation, raw-byte predicate evaluation, and in-memory CTE materialization avoid the overhead of SQLite's temp B-trees and row decoding.
+Citadel beats SQLite in all 13 head-to-head benchmarks, even though every page goes through AES-256-CTR + HMAC-SHA256 and SQLite runs without any encryption.
 
 Full results are in the <a href="https://github.com/yp3y5akh0v/citadel#benchmarks" target="_blank" rel="noopener">README</a>.
 
 ## What it supports
 
-- **SQL** - JOINs, subqueries, CTEs (recursive too), UNION/INTERSECT/EXCEPT, aggregates, indexes, constraints (DEFAULT, CHECK, FOREIGN KEY), ALTER TABLE, prepared statements
+- **SQL** - JOINs, subqueries, CTEs (recursive too), UNION/INTERSECT/EXCEPT, window functions, aggregates, indexes, constraints (DEFAULT, CHECK, FOREIGN KEY), ALTER TABLE, prepared statements
 - **ACID transactions** - snapshot isolation, concurrent readers, no WAL
 - **P2P encrypted sync** - Merkle-based diffing over Noise protocol
 - **Cross-platform** - C FFI, WebAssembly, CLI with tab completion
