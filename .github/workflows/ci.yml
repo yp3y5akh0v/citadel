@@ -3,8 +3,18 @@ name: CI
 on:
   push:
     branches: [master]
+    paths-ignore:
+      - '**.md'
+      - 'site/**'
+      - 'LICENSE-*'
+      - '.github/FUNDING.yml'
   pull_request:
     branches: [master]
+    paths-ignore:
+      - '**.md'
+      - 'site/**'
+      - 'LICENSE-*'
+      - '.github/FUNDING.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}

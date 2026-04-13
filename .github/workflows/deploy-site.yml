@@ -3,6 +3,12 @@ name: Deploy Site
 on:
   push:
     branches: [master]
+    paths-ignore:
+      - 'LICENSE-*'
+      - 'SECURITY.md'
+      - '.github/FUNDING.yml'
+      - 'README.md'
+      - 'crates/*/README.md'
   workflow_dispatch:
 
 permissions:
