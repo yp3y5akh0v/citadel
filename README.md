@@ -13,7 +13,7 @@
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Beats unencrypted SQLite in all 15 benchmarks with equal cache budgets.
+Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Beats unencrypted SQLite in all 23 benchmarks with equal cache budgets.
 
 ## Features
 
@@ -28,7 +28,7 @@ Every page is encrypted and authenticated before it hits disk. The database file
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. C FFI (37 functions), WebAssembly bindings
-- **2,490+ tests** - Unit, integration, torture tests across 10 crates
+- **2,560+ tests** - Unit, integration, torture tests across 10 crates
 
 ## Benchmarks
 
@@ -37,41 +37,57 @@ Citadel vs SQLite on 100K rows (INTEGER, TEXT, INTEGER), single-threaded:
 ```
 Benchmark          Citadel        SQLite         Ratio
 -----------------------------------------------------
-count              186 ns         37.1 us        200x
-view_point         3.30 us        48.5 us        14.7x
-point              1.10 us        16.6 us        15.1x
-group_by           2.53 ms        12.1 ms        4.8x
-cte                1.61 ms        6.62 ms        4.1x
-window_agg         37.1 ms        87.4 ms        2.4x
-filter             936 us         2.28 ms        2.4x
-view_filter        2.18 ms        5.03 ms        2.3x
-sort               1.46 ms        3.09 ms        2.1x
-window_rank        75.0 ms        140 ms         1.9x
-insert             94.8 us        164 us         1.7x
-scan               9.42 ms        15.1 ms        1.6x
-sum                1.68 ms        2.34 ms        1.4x
-join               107 us         133 us         1.2x
-recursive_cte      128 us         132 us         1.03x
+correlated_in      5.49 ms        1.90 s         346x
+count              146 ns         31.0 us        213x
+correlated_scalar  264 us         18.1 ms        69x
+point              915 ns         12.7 us        13.9x
+group_by           1.94 ms        10.2 ms        5.3x
+cte                1.43 ms        6.16 ms        4.3x
+view_point         3.02 us        12.7 us        4.2x
+view_filter        734 us         1.77 ms        2.4x
+filter             721 us         1.76 ms        2.4x
+window_agg         36.5 ms        84.0 ms        2.3x
+sort               1.15 ms        2.52 ms        2.2x
+window_rank        65.5 ms        133 ms         2.0x
+insert             64.9 us        118 us         1.8x
+scan               9.15 ms        13.5 ms        1.5x
+insert_select      738 us         1.13 ms        1.5x
+sum                1.35 ms        1.84 ms        1.4x
+delete             102 us         137 us         1.3x
+join               87.0 us        113 us         1.3x
+distinct           3.14 ms        3.88 ms        1.2x
+correlated_exists  5.78 ms        6.59 ms        1.1x
+update             27.9 us        29.7 us        1.07x
+union              176 us         181 us         1.03x
+recursive_cte      111 us         115 us         1.03x
 ```
 
 <details>
 <summary>Methodology</summary>
 
 - **count** - `SELECT COUNT(*) FROM t`
-- **group_by** - `SELECT age, COUNT(*) FROM t GROUP BY age`
+- **point** - `SELECT * FROM t WHERE id = 50000`
+- **scan** - `SELECT * FROM t` (full 100K rows)
 - **filter** - `SELECT * FROM t WHERE age = 42`
 - **sort** - `SELECT * FROM t ORDER BY age LIMIT 10`
 - **sum** - `SELECT SUM(age) FROM t`
-- **point** - `SELECT * FROM t WHERE id = 50000`
-- **scan** - `SELECT * FROM t` (full 100K rows)
-- **insert** - 100 rows in one transaction
+- **group_by** - `SELECT age, COUNT(*) FROM t GROUP BY age`
+- **distinct** - `SELECT DISTINCT age FROM t`
 - **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id` (1K x 1K)
+- **union** - `SELECT id, val FROM a UNION ALL SELECT id, data FROM b`
 - **cte** - `WITH filtered AS (SELECT ... WHERE age < 50) SELECT age, COUNT(*) FROM filtered GROUP BY age`
 - **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq`
-- **window_rank** - `SELECT id, name, age, ROW_NUMBER() OVER (PARTITION BY age ORDER BY id), RANK() OVER (PARTITION BY age ORDER BY name) FROM t`
-- **window_agg** - `SELECT id, age, SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING), MIN(age) OVER (ORDER BY id ROWS 50 PRECEDING) FROM t`
-- **view_filter** - `CREATE VIEW v AS SELECT * FROM t` then `SELECT * FROM v WHERE age = 42`
-- **view_point** - `CREATE VIEW v AS SELECT * FROM t` then `SELECT * FROM v WHERE id = 50000`
+- **insert** - 100 rows in one transaction
+- **update** - `UPDATE t SET age = age + 1 WHERE id BETWEEN 10000 AND 10099`
+- **delete** - insert 100 rows then delete them
+- **insert_select** - `INSERT INTO sink SELECT id, val FROM a`
+- **window_rank** - `ROW_NUMBER() OVER (PARTITION BY age ORDER BY id), RANK() OVER (...)`
+- **window_agg** - `SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING), MIN(age) OVER (...)`
+- **view_filter** - `SELECT * FROM v WHERE age = 42` (v = view over t)
+- **view_point** - `SELECT * FROM v WHERE id = 50000`
+- **correlated_exists** - `SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM ref_table WHERE ref_table.id = t.id)`
+- **correlated_in** - `SELECT COUNT(*) FROM t WHERE id IN (SELECT id FROM ref_table WHERE ref_table.val = t.age)`
+- **correlated_scalar** - `SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.a_id = a.id) FROM a`
 
 SQLite config: `journal_mode=OFF, synchronous=OFF, cache_size=8000` (~32 MB).
 Citadel config: `SyncMode::Off, cache_size=4096` (~32 MB).
@@ -155,7 +171,7 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 **Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN
 
-**Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS), subqueries (scalar, IN, EXISTS), CTEs (WITH / WITH RECURSIVE), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, GROUP BY/HAVING, ORDER BY, LIMIT/OFFSET
+**Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS), subqueries (scalar, IN, EXISTS, correlated), CTEs (WITH / WITH RECURSIVE), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, GROUP BY/HAVING, ORDER BY, LIMIT/OFFSET
 
 **Window functions** - ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, SUM/COUNT/AVG/MIN/MAX OVER with PARTITION BY, ORDER BY, ROWS/RANGE frames
 

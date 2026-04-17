@@ -198,21 +198,17 @@ struct CacheEntry {
     stmt: Arc<Statement>,
     schema_gen: u64,
     param_count: usize,
+    compiled_update: Option<executor::CompiledUpdate>,
 }
 
-/// A SQL connection wrapping a Citadel database.
-///
-/// Supports explicit transactions via BEGIN / COMMIT / ROLLBACK.
-/// Without BEGIN, each statement runs in auto-commit mode.
-///
-/// Caches parsed SQL statements in an LRU cache keyed by SQL string.
-/// Cache entries are invalidated when the schema changes (DDL operations).
+/// SQL connection with LRU statement cache. Auto-commit; explicit txns via BEGIN/COMMIT/ROLLBACK.
 pub struct Connection<'a> {
     db: &'a Database,
     schema: SchemaManager,
     active_txn: Option<WriteTxn<'a>>,
     stmt_cache: LruCache<String, CacheEntry>,
     insert_bufs: executor::InsertBufs,
+    update_bufs: executor::UpdateBufs,
 }
 
 impl<'a> Connection<'a> {
@@ -226,23 +222,26 @@ impl<'a> Connection<'a> {
             active_txn: None,
             stmt_cache,
             insert_bufs: executor::InsertBufs::new(),
+            update_bufs: executor::UpdateBufs::new(),
         })
     }
 
     /// Execute a SQL statement. Returns the result.
     pub fn execute(&mut self, sql: &str) -> Result<ExecutionResult> {
-        if let Some((normalized_key, extracted)) = try_normalize_insert(sql) {
-            let gen = self.schema.generation();
-            let stmt = if let Some(entry) = self.stmt_cache.get(&normalized_key) {
-                if entry.schema_gen == gen {
-                    Arc::clone(&entry.stmt)
+        if matches!(sql.as_bytes().first(), Some(b'I' | b'i')) {
+            if let Some((normalized_key, extracted)) = try_normalize_insert(sql) {
+                let gen = self.schema.generation();
+                let stmt = if let Some(entry) = self.stmt_cache.get(&normalized_key) {
+                    if entry.schema_gen == gen {
+                        Arc::clone(&entry.stmt)
+                    } else {
+                        self.parse_and_cache(normalized_key, gen)?
+                    }
                 } else {
                     self.parse_and_cache(normalized_key, gen)?
-                }
-            } else {
-                self.parse_and_cache(normalized_key, gen)?
-            };
-            return self.dispatch(&stmt, &extracted);
+                };
+                return self.dispatch(&stmt, &extracted);
+            }
         }
 
         self.execute_params(sql, &[])
@@ -250,6 +249,37 @@ impl<'a> Connection<'a> {
 
     /// Execute a SQL statement with positional parameters ($1, $2, ...).
     pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<ExecutionResult> {
+        if params.is_empty() && self.active_txn.is_none() {
+            let gen = self.schema.generation();
+            if let Some(entry) = self.stmt_cache.get(sql) {
+                if entry.schema_gen == gen && entry.param_count == 0 {
+                    if let Statement::Update(ref upd) = *entry.stmt {
+                        if let Some(ref compiled) = entry.compiled_update {
+                            return executor::exec_update_compiled(
+                                self.db,
+                                &self.schema,
+                                upd,
+                                compiled,
+                                &mut self.update_bufs,
+                            );
+                        }
+                        let compiled = executor::compile_update(&self.schema, upd)?;
+                        let result = executor::exec_update_compiled(
+                            self.db,
+                            &self.schema,
+                            upd,
+                            &compiled,
+                            &mut self.update_bufs,
+                        )?;
+                        if let Some(e) = self.stmt_cache.get_mut(sql) {
+                            e.compiled_update = Some(compiled);
+                        }
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+
         let (stmt, param_count) = self.get_or_parse(sql)?;
 
         if param_count != params.len() {
@@ -257,6 +287,23 @@ impl<'a> Connection<'a> {
                 expected: param_count,
                 got: params.len(),
             });
+        }
+
+        if param_count == 0 && self.active_txn.is_none() {
+            if let Statement::Update(ref upd) = *stmt {
+                let compiled = executor::compile_update(&self.schema, upd)?;
+                let result = executor::exec_update_compiled(
+                    self.db,
+                    &self.schema,
+                    upd,
+                    &compiled,
+                    &mut self.update_bufs,
+                )?;
+                if let Some(e) = self.stmt_cache.get_mut(sql) {
+                    e.compiled_update = Some(compiled);
+                }
+                return Ok(result);
+            }
         }
 
         if param_count > 0
@@ -321,6 +368,7 @@ impl<'a> Connection<'a> {
                 stmt: Arc::clone(&stmt),
                 schema_gen: gen,
                 param_count,
+                compiled_update: None,
             },
         );
         Ok(stmt)
@@ -359,6 +407,7 @@ impl<'a> Connection<'a> {
                     stmt: Arc::clone(&stmt),
                     schema_gen: gen,
                     param_count,
+                    compiled_update: None,
                 },
             );
         }

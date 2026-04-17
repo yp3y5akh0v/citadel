@@ -499,6 +499,298 @@ fn h2h_view_point(c: &mut Criterion) {
     g.finish();
 }
 
+fn h2h_correlated_exists(c: &mut Criterion) {
+    let mut g = c.benchmark_group("correlated_exists");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_100k(&mut cc);
+    cc.execute("CREATE TABLE ref_table (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    cc.execute("BEGIN").unwrap();
+    for i in (0..100_000i64).step_by(100) {
+        cc.execute(&format!(
+            "INSERT INTO ref_table (id, val) VALUES ({i}, {i})"
+        ))
+        .unwrap();
+    }
+    cc.execute("COMMIT").unwrap();
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sqlite_100k(&sc);
+    sc.execute(
+        "CREATE TABLE ref_table (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)",
+        [],
+    )
+    .unwrap();
+    sc.execute_batch("BEGIN").unwrap();
+    for i in (0..100_000i64).step_by(100) {
+        sc.execute(
+            "INSERT INTO ref_table (id, val) VALUES (?1, ?1)",
+            rusqlite::params![i],
+        )
+        .unwrap();
+    }
+    sc.execute_batch("COMMIT").unwrap();
+
+    let sql =
+        "SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM ref_table WHERE ref_table.id = t.id)";
+
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| cc.query(sql).unwrap());
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| sqlite_collect(&sc, sql));
+    });
+    g.finish();
+}
+
+fn h2h_update(c: &mut Criterion) {
+    let mut g = c.benchmark_group("update");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_100k(&mut cc);
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sqlite_100k(&sc);
+
+    let sql = "UPDATE t SET age = age + 1 WHERE id BETWEEN 10000 AND 10099";
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| cc.execute(sql).unwrap());
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| sc.execute(sql, []).unwrap());
+    });
+    g.finish();
+}
+
+fn h2h_delete(c: &mut Criterion) {
+    let mut g = c.benchmark_group("delete");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    cc.execute("CREATE TABLE d (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sc.execute(
+        "CREATE TABLE d (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)",
+        [],
+    )
+    .unwrap();
+
+    let mut c_offset = 0i64;
+    let mut s_offset = 0i64;
+
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| {
+            cc.execute("BEGIN").unwrap();
+            for j in 0..100i64 {
+                cc.execute(&format!(
+                    "INSERT INTO d (id, val) VALUES ({}, {})",
+                    c_offset + j,
+                    j
+                ))
+                .unwrap();
+            }
+            cc.execute("COMMIT").unwrap();
+            cc.execute(&format!(
+                "DELETE FROM d WHERE id >= {} AND id < {}",
+                c_offset,
+                c_offset + 100
+            ))
+            .unwrap();
+            c_offset += 100;
+        });
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| {
+            sc.execute_batch("BEGIN").unwrap();
+            for j in 0..100i64 {
+                sc.execute(
+                    "INSERT INTO d (id, val) VALUES (?1, ?2)",
+                    rusqlite::params![s_offset + j, j],
+                )
+                .unwrap();
+            }
+            sc.execute_batch("COMMIT").unwrap();
+            sc.execute(
+                &format!(
+                    "DELETE FROM d WHERE id >= {} AND id < {}",
+                    s_offset,
+                    s_offset + 100
+                ),
+                [],
+            )
+            .unwrap();
+            s_offset += 100;
+        });
+    });
+    g.finish();
+}
+
+fn h2h_distinct(c: &mut Criterion) {
+    let mut g = c.benchmark_group("distinct");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_100k(&mut cc);
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sqlite_100k(&sc);
+
+    let sql = "SELECT DISTINCT age FROM t";
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| cc.query(sql).unwrap());
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| sqlite_collect(&sc, sql));
+    });
+    g.finish();
+}
+
+fn h2h_union(c: &mut Criterion) {
+    let mut g = c.benchmark_group("union");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_join_tables(&mut cc);
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sqlite_join_tables(&sc);
+
+    let sql = "SELECT id, val FROM a UNION ALL SELECT id, data FROM b";
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| cc.query(sql).unwrap());
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| sqlite_collect(&sc, sql));
+    });
+    g.finish();
+}
+
+fn h2h_correlated_in(c: &mut Criterion) {
+    let mut g = c.benchmark_group("correlated_in");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_100k(&mut cc);
+    cc.execute("CREATE TABLE ref_table (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    cc.execute("BEGIN").unwrap();
+    for i in (0..100_000i64).step_by(100) {
+        cc.execute(&format!(
+            "INSERT INTO ref_table (id, val) VALUES ({i}, {i})"
+        ))
+        .unwrap();
+    }
+    cc.execute("COMMIT").unwrap();
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sqlite_100k(&sc);
+    sc.execute(
+        "CREATE TABLE ref_table (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)",
+        [],
+    )
+    .unwrap();
+    sc.execute_batch("BEGIN").unwrap();
+    for i in (0..100_000i64).step_by(100) {
+        sc.execute(
+            "INSERT INTO ref_table (id, val) VALUES (?1, ?1)",
+            rusqlite::params![i],
+        )
+        .unwrap();
+    }
+    sc.execute_batch("COMMIT").unwrap();
+
+    let sql =
+        "SELECT COUNT(*) FROM t WHERE id IN (SELECT id FROM ref_table WHERE ref_table.val = t.age)";
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| cc.query(sql).unwrap());
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| sqlite_collect(&sc, sql));
+    });
+    g.finish();
+}
+
+fn h2h_correlated_scalar(c: &mut Criterion) {
+    let mut g = c.benchmark_group("correlated_scalar");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_join_tables(&mut cc);
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sqlite_join_tables(&sc);
+
+    let sql = "SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.a_id = a.id) AS cnt FROM a";
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| cc.query(sql).unwrap());
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| sqlite_collect(&sc, sql));
+    });
+    g.finish();
+}
+
+fn h2h_insert_select(c: &mut Criterion) {
+    let mut g = c.benchmark_group("insert_select");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_join_tables(&mut cc);
+    let mut c_run = 0i64;
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sqlite_join_tables(&sc);
+    let mut s_run = 0i64;
+
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| {
+            let tbl = format!("sink_{c_run}");
+            cc.execute(&format!(
+                "CREATE TABLE {tbl} (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"
+            ))
+            .unwrap();
+            cc.execute(&format!("INSERT INTO {tbl} SELECT id, val FROM a"))
+                .unwrap();
+            c_run += 1;
+        });
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| {
+            let tbl = format!("sink_{s_run}");
+            sc.execute(
+                &format!("CREATE TABLE {tbl} (id INTEGER NOT NULL PRIMARY KEY, val TEXT)"),
+                [],
+            )
+            .unwrap();
+            sc.execute(&format!("INSERT INTO {tbl} SELECT id, val FROM a"), [])
+                .unwrap();
+            s_run += 1;
+        });
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     h2h_count,
@@ -510,11 +802,19 @@ criterion_group!(
     h2h_sum,
     h2h_group_by,
     h2h_insert,
+    h2h_update,
+    h2h_delete,
+    h2h_distinct,
+    h2h_union,
     h2h_cte,
     h2h_recursive_cte,
     h2h_window_rank,
     h2h_window_agg,
     h2h_view_filter,
     h2h_view_point,
+    h2h_correlated_exists,
+    h2h_correlated_in,
+    h2h_correlated_scalar,
+    h2h_insert_select,
 );
 criterion_main!(benches);

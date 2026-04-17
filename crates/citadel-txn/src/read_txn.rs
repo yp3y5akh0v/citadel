@@ -1,8 +1,4 @@
-//! Read transaction: snapshot isolation via MVCC.
-//!
-//! Snapshots the active commit slot at creation time.
-//! Reads pages through the buffer pool (cached, decrypted).
-//! Auto-unregisters from the reader table on Drop (RAII).
+//! Read transaction: MVCC snapshot isolation. RAII reader registration.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,15 +9,33 @@ use citadel_io::file_manager::CommitSlot;
 use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
 
-use citadel_buffer::cursor::Cursor;
+use citadel_buffer::cursor::{Cursor, PageLoader, PageMap};
 
 use crate::catalog::TableDescriptor;
 use crate::manager::TxnManager;
 
-/// A read-only transaction with snapshot isolation.
-///
-/// Reads from the B+ tree root captured at transaction start.
-/// Multiple ReadTxns can coexist with each other and with a WriteTxn.
+struct ReadPages<'a> {
+    cache: &'a mut HashMap<PageId, Arc<Page>>,
+    manager: &'a TxnManager,
+}
+
+impl PageMap for ReadPages<'_> {
+    fn get_page(&self, id: &PageId) -> Option<&Page> {
+        self.cache.get(id).map(|a| a.as_ref())
+    }
+}
+
+impl PageLoader for ReadPages<'_> {
+    fn ensure_loaded(&mut self, id: PageId) -> Result<()> {
+        if !self.cache.contains_key(&id) {
+            let arc = self.manager.fetch_page(id)?;
+            self.cache.insert(id, arc);
+        }
+        Ok(())
+    }
+}
+
+/// Read-only transaction with snapshot isolation.
 pub struct ReadTxn<'a> {
     manager: &'a TxnManager,
     txn_id: TxnId,
@@ -111,26 +125,25 @@ impl<'a> ReadTxn<'a> {
         Ok(())
     }
 
-    /// Seek to `start_key` in a named table and iterate forward.
-    /// The callback returns `true` to continue or `false` to stop.
+    /// Lazy scan from `start_key`. Callback returns `false` to stop.
     pub fn table_scan_from<F>(&mut self, table: &[u8], start_key: &[u8], mut f: F) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> Result<bool>,
     {
         let desc = self.lookup_table(table)?;
-        self.preload_all_pages(desc.root_page)?;
-        let mut cursor = if start_key.is_empty() {
-            Cursor::first(&self.page_cache, desc.root_page)?
-        } else {
-            Cursor::seek(&self.page_cache, desc.root_page, start_key)?
+        let root = desc.root_page;
+        let mut view = ReadPages {
+            cache: &mut self.page_cache,
+            manager: self.manager,
         };
+        let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
         while cursor.is_valid() {
-            if let Some(entry) = cursor.current_ref(&self.page_cache) {
+            if let Some(entry) = cursor.current_ref_lazy(&mut view) {
                 if entry.val_type != ValueType::Tombstone && !f(entry.key, entry.value)? {
                     break;
                 }
             }
-            cursor.next(&self.page_cache)?;
+            cursor.next_lazy(&mut view)?;
         }
         Ok(())
     }
@@ -159,6 +172,17 @@ impl<'a> ReadTxn<'a> {
 
     /// Look up a table descriptor in the catalog.
     fn lookup_table(&mut self, name: &[u8]) -> Result<TableDescriptor> {
+        // Fast path: use cached root from commit slot
+        if let Some((root, depth)) = self.snapshot.named_entry_root(name) {
+            let entry_count = self.snapshot.named_entry_count(name).unwrap_or(0);
+            return Ok(TableDescriptor {
+                root_page: root,
+                entry_count,
+                depth,
+                flags: 0,
+            });
+        }
+
         let catalog_root = self.snapshot.catalog_root;
         if !catalog_root.is_valid() {
             return Err(Error::TableNotFound(
@@ -166,7 +190,7 @@ impl<'a> ReadTxn<'a> {
             ));
         }
 
-        // Search the catalog B+ tree for the table name
+        // Slow path: search the catalog B+ tree
         let mut current = catalog_root;
         loop {
             let page = self.load_page(current)?;

@@ -1,7 +1,4 @@
-//! Rule-based query planner with index selection.
-//!
-//! Analyzes WHERE clauses to choose between sequential scan, PK lookup,
-//! or index scan. Uses leftmost-prefix rule for composite indexes.
+//! Query planner: chooses between seq scan, PK lookup, or index scan.
 
 use crate::encoding::encode_composite_key;
 use crate::parser::{BinOp, Expr};
@@ -9,11 +6,16 @@ use crate::types::{IndexDef, TableSchema, Value};
 
 // ── Scan plan ────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ScanPlan {
     SeqScan,
     PkLookup {
         pk_values: Vec<Value>,
+    },
+    PkRangeScan {
+        start_key: Vec<u8>,
+        range_conds: Vec<(BinOp, Value)>,
+        num_pk_cols: usize,
     },
     IndexScan {
         index_name: String,
@@ -103,6 +105,44 @@ fn extract_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<SimpleP
     }
 }
 
+/// Decompose BETWEEN into two range predicates for planner use.
+fn flatten_between(expr: &Expr, schema: &TableSchema, out: &mut Vec<SimplePredicate>) {
+    match expr {
+        Expr::Between {
+            expr: col_expr,
+            low,
+            high,
+            negated: false,
+        } => {
+            if let (Some(name), Expr::Literal(lo), Expr::Literal(hi)) =
+                (resolve_column_name(col_expr), low.as_ref(), high.as_ref())
+            {
+                if let Some(col_idx) = schema.column_index(name) {
+                    out.push(SimplePredicate {
+                        col_idx,
+                        op: BinOp::GtEq,
+                        value: lo.clone(),
+                    });
+                    out.push(SimplePredicate {
+                        col_idx,
+                        op: BinOp::LtEq,
+                        value: hi.clone(),
+                    });
+                }
+            }
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            flatten_between(left, schema, out);
+            flatten_between(right, schema, out);
+        }
+        _ => {}
+    }
+}
+
 // ── Plan selection ───────────────────────────────────────────────────
 
 pub fn plan_select(schema: &TableSchema, where_clause: &Option<Expr>) -> ScanPlan {
@@ -121,11 +161,60 @@ pub fn plan_select(schema: &TableSchema, where_clause: &Option<Expr>) -> ScanPla
         return plan;
     }
 
+    // Collect range predicates from both comparisons and BETWEEN
+    let mut range_preds: Vec<SimplePredicate> = simple
+        .iter()
+        .filter_map(|p| {
+            let p = p.as_ref()?;
+            if is_range_op(p.op) {
+                Some(SimplePredicate {
+                    col_idx: p.col_idx,
+                    op: p.op,
+                    value: p.value.clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    flatten_between(where_expr, schema, &mut range_preds);
+
+    if let Some(plan) = try_pk_range_scan(schema, &range_preds) {
+        return plan;
+    }
+
     if let Some(plan) = try_best_index(schema, &simple) {
         return plan;
     }
 
     ScanPlan::SeqScan
+}
+
+fn try_pk_range_scan(schema: &TableSchema, range_preds: &[SimplePredicate]) -> Option<ScanPlan> {
+    if schema.primary_key_columns.len() != 1 {
+        return None; // Only single-column PK for now
+    }
+    let pk_col = schema.primary_key_columns[0] as usize;
+    let conds: Vec<(BinOp, Value)> = range_preds
+        .iter()
+        .filter(|p| p.col_idx == pk_col)
+        .map(|p| (p.op, p.value.clone()))
+        .collect();
+    if conds.is_empty() {
+        return None;
+    }
+    // Build start key from the tightest lower bound (GtEq or Gt)
+    let start_key = conds
+        .iter()
+        .filter(|(op, _)| matches!(op, BinOp::GtEq | BinOp::Gt))
+        .map(|(_, v)| encode_composite_key(std::slice::from_ref(v)))
+        .min_by(|a, b| a.cmp(b))
+        .unwrap_or_default();
+    Some(ScanPlan::PkRangeScan {
+        start_key,
+        range_conds: conds,
+        num_pk_cols: 1,
+    })
 }
 
 fn try_pk_lookup(schema: &TableSchema, predicates: &[Option<SimplePredicate>]) -> Option<ScanPlan> {
@@ -261,6 +350,15 @@ pub fn describe_plan(plan: &ScanPlan, table_schema: &TableSchema) -> String {
                 .map(|(col, val)| format!("{col} = {}", format_value(val)))
                 .collect();
             format!("USING PRIMARY KEY ({})", conditions.join(", "))
+        }
+
+        ScanPlan::PkRangeScan { range_conds, .. } => {
+            let pk_col = &table_schema.columns[table_schema.primary_key_columns[0] as usize].name;
+            let conditions: Vec<String> = range_conds
+                .iter()
+                .map(|(op, val)| format!("{pk_col} {} {}", op_symbol(*op), format_value(val)))
+                .collect();
+            format!("USING PRIMARY KEY RANGE ({})", conditions.join(", "))
         }
 
         ScanPlan::IndexScan {

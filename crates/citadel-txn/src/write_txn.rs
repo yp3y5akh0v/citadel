@@ -8,11 +8,32 @@ use citadel_page::page::Page;
 use std::collections::HashMap;
 
 use citadel_buffer::allocator::PageAllocator;
-use citadel_buffer::btree::BTree;
-use citadel_buffer::cursor::Cursor;
+use citadel_buffer::btree::{self, BTree};
+use citadel_buffer::cursor::{Cursor, PageLoader, PageMap};
 
 use crate::catalog::TableDescriptor;
 use crate::manager::TxnManager;
+
+struct WritePages<'a> {
+    pages: &'a mut HashMap<PageId, Page>,
+    manager: &'a TxnManager,
+}
+
+impl PageMap for WritePages<'_> {
+    fn get_page(&self, id: &PageId) -> Option<&Page> {
+        self.pages.get(id)
+    }
+}
+
+impl PageLoader for WritePages<'_> {
+    fn ensure_loaded(&mut self, id: PageId) -> Result<()> {
+        if !self.pages.contains_key(&id) {
+            let page = self.manager.fetch_page_owned(id)?;
+            self.pages.insert(id, page);
+        }
+        Ok(())
+    }
+}
 
 pub struct WriteTxn<'a> {
     manager: &'a TxnManager,
@@ -30,6 +51,7 @@ pub struct WriteTxn<'a> {
 }
 
 impl<'a> WriteTxn<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         manager: &'a TxnManager,
         txn_id: TxnId,
@@ -37,12 +59,23 @@ impl<'a> WriteTxn<'a> {
         tree: BTree,
         alloc: PageAllocator,
         deferred_free: Vec<PageId>,
+        recycled_pages: Option<HashMap<PageId, Page>>,
+        recycle_safe: bool,
     ) -> Self {
+        let pages = match recycled_pages {
+            Some(mut m) => {
+                if !(alloc.in_place() && recycle_safe) {
+                    m.clear();
+                }
+                m
+            }
+            None => HashMap::with_capacity(16),
+        };
         Self {
             manager,
             txn_id,
             old_slot: snapshot,
-            pages: HashMap::with_capacity(16),
+            pages,
             tree,
             alloc,
             committed: false,
@@ -133,19 +166,18 @@ impl<'a> WriteTxn<'a> {
     {
         self.ensure_table(table)?;
         let root = self.named_trees[table].root;
-        self.preload_all_pages(root)?;
-        let mut cursor = if start_key.is_empty() {
-            Cursor::first(&self.pages, root)?
-        } else {
-            Cursor::seek(&self.pages, root, start_key)?
+        let mut view = WritePages {
+            pages: &mut self.pages,
+            manager: self.manager,
         };
+        let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
         while cursor.is_valid() {
-            if let Some(entry) = cursor.current_ref(&self.pages) {
+            if let Some(entry) = cursor.current_ref_lazy(&mut view) {
                 if entry.val_type != ValueType::Tombstone && !f(entry.key, entry.value)? {
                     break;
                 }
             }
-            cursor.next(&self.pages)?;
+            cursor.next_lazy(&mut view)?;
         }
         Ok(())
     }
@@ -182,6 +214,7 @@ impl<'a> WriteTxn<'a> {
 
     pub fn drop_table(&mut self, name: &[u8]) -> Result<()> {
         self.ensure_table(name)?;
+        self.ensure_catalog()?;
 
         let tree = self.named_trees.remove(name).unwrap();
         self.free_tree_pages(tree.root)?;
@@ -268,6 +301,111 @@ impl<'a> WriteTxn<'a> {
         )
     }
 
+    /// Batch-update existing keys (sorted). Single traversal: O(depth + N).
+    pub fn table_update_sorted(&mut self, table: &[u8], pairs: &[(&[u8], &[u8])]) -> Result<u64> {
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_table(table)?;
+        // Preload path to first key only
+        let root = self.named_trees[table].root;
+        self.preload_path(root, pairs[0].0)?;
+
+        let tree = self.named_trees.get_mut(table).unwrap();
+        tree.update_sorted(&mut self.pages, &mut self.alloc, self.txn_id, pairs)
+    }
+
+    /// Fused scan + in-place patch from `start_key`. Callback: `Some(true)`=modified, `None`=stop.
+    pub fn table_update_range<F, E>(
+        &mut self,
+        table: &[u8],
+        start_key: &[u8],
+        mut f: F,
+    ) -> std::result::Result<u64, E>
+    where
+        F: FnMut(&[u8], &mut [u8]) -> std::result::Result<Option<bool>, E>,
+        E: From<Error>,
+    {
+        self.ensure_table(table)?;
+        let root = self.named_trees[table].root;
+
+        // Lazy-seek to start_key
+        let mut view = WritePages {
+            pages: &mut self.pages,
+            manager: self.manager,
+        };
+        let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
+
+        let mut count: u64 = 0;
+        let mut cow_leaf = PageId::INVALID;
+
+        while cursor.is_valid() {
+            // Ensure current leaf page is loaded
+            let leaf_id = cursor.leaf_page_id();
+            view.ensure_loaded(leaf_id)?;
+
+            {
+                let page = view.pages.get(&leaf_id).unwrap();
+                let cell = citadel_page::leaf_node::read_cell(page, cursor.cell_index());
+                if cell.val_type == ValueType::Tombstone {
+                    cursor.next_lazy(&mut view)?;
+                    continue;
+                }
+            }
+
+            // CoW leaf if not yet owned by this txn
+            if cow_leaf != leaf_id {
+                let new_id = btree::cow_page(view.pages, &mut self.alloc, leaf_id, self.txn_id);
+                if new_id != leaf_id {
+                    let tree = self.named_trees.get_mut(table).unwrap();
+                    let cell = citadel_page::leaf_node::read_cell(
+                        view.pages.get(&new_id).unwrap(),
+                        cursor.cell_index(),
+                    );
+                    let key_for_walk = cell.key.to_vec();
+                    let (path, _) = tree.walk_to_leaf(view.pages, &key_for_walk)?;
+                    tree.root = btree::propagate_cow_up(
+                        view.pages,
+                        &mut self.alloc,
+                        self.txn_id,
+                        &path,
+                        new_id,
+                    );
+                    // Update cursor to track the new page ID
+                    cursor.set_leaf_page_id(new_id);
+                }
+                cow_leaf = new_id;
+            }
+
+            // Direct mutable access to cell bytes in the CoW'd page
+            let page = view.pages.get_mut(&cow_leaf).unwrap();
+            let ci = cursor.cell_index();
+            let cell_off = page.cell_offset(ci) as usize;
+            let key_len =
+                u16::from_le_bytes(page.data[cell_off..cell_off + 2].try_into().unwrap()) as usize;
+            let val_len =
+                u32::from_le_bytes(page.data[cell_off + 2..cell_off + 6].try_into().unwrap())
+                    as usize;
+            let key_start = cell_off + 6;
+            let val_start = cell_off + 7 + key_len;
+
+            // Split borrow: key (immutable) and value (mutable) from non-overlapping regions
+            let (before_val, from_val) = page.data.split_at_mut(val_start);
+            let key = &before_val[key_start..key_start + key_len];
+            let value = &mut from_val[..val_len];
+
+            match f(key, value)? {
+                Some(true) => count += 1,
+                Some(false) => {}
+                None => break,
+            }
+
+            cursor.next_lazy(&mut view)?;
+        }
+
+        Ok(count)
+    }
+
     pub fn table_delete(&mut self, table: &[u8], key: &[u8]) -> Result<bool> {
         self.ensure_table(table)?;
 
@@ -297,6 +435,7 @@ impl<'a> WriteTxn<'a> {
             &self.deferred_free,
             catalog_root,
             &self.named_trees,
+            &self.loaded_tree_meta,
         )?;
         self.committed = true;
         Ok(())
@@ -389,6 +528,16 @@ impl<'a> WriteTxn<'a> {
             return Ok(());
         }
 
+        // Fast path: use cached root from commit slot (avoids catalog B+ tree lookup)
+        if let Some((root, depth)) = self.old_slot.named_entry_root(name) {
+            let entry_count = self.old_slot.named_entry_count(name).unwrap_or(0);
+            let tree = BTree::from_existing(root, depth, entry_count);
+            self.loaded_tree_meta.insert(name.to_vec(), (root, depth));
+            self.named_trees.insert(name.to_vec(), tree);
+            return Ok(());
+        }
+
+        // Slow path: fall back to catalog B+ tree
         self.ensure_catalog()?;
 
         let catalog_root = self.catalog.as_ref().unwrap().root;
@@ -420,28 +569,41 @@ impl<'a> WriteTxn<'a> {
             return Ok(self.old_slot.catalog_root);
         }
 
+        // SyncMode::Off: skip catalog update if only roots changed (cached in slot)
+        if !self.catalog_dirty && self.manager.sync_mode() == citadel_core::types::SyncMode::Off {
+            let needs_catalog = self.named_trees.iter().any(|(name, tree)| {
+                match self.loaded_tree_meta.get(name.as_slice()) {
+                    Some(&(_, old_depth)) => tree.depth != old_depth,
+                    None => true, // new table
+                }
+            });
+            if !needs_catalog {
+                return Ok(self.old_slot.catalog_root);
+            }
+        }
+
         if self.catalog.is_none() {
-            return Ok(self.old_slot.catalog_root);
+            self.ensure_catalog()?;
         }
 
         let structural_entries: Vec<(Vec<u8>, [u8; 20])> = self
             .named_trees
             .iter()
-            .filter(|(name, tree)| {
-                match self.loaded_tree_meta.get(name.as_slice()) {
+            .filter(
+                |(name, tree)| match self.loaded_tree_meta.get(name.as_slice()) {
                     Some(&(old_root, old_depth)) => {
                         tree.root != old_root || tree.depth != old_depth
                     }
-                    None => true, // new table, not loaded from catalog
-                }
-            })
+                    None => true,
+                },
+            )
             .map(|(name, tree)| {
                 let desc = TableDescriptor::from_tree(tree);
                 (name.clone(), desc.serialize())
             })
             .collect();
 
-        if structural_entries.is_empty() && !self.catalog_dirty {
+        if structural_entries.is_empty() {
             return Ok(self.catalog.as_ref().unwrap().root);
         }
 

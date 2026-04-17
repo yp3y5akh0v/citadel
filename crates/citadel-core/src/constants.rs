@@ -92,9 +92,9 @@ pub const SLOT_ENCRYPTION_EPOCH: usize = 40;
 pub const SLOT_DEK_ID: usize = 44;
 pub const SLOT_CHECKSUM: usize = 76;
 
-// Named table entry counts in CommitSlot [112..240]
+// Named table entries in CommitSlot [112..240], 18 bytes each
 pub const SLOT_NAMED_ENTRIES: usize = 112;
-pub const SLOT_NAMED_ENTRY_SIZE: usize = 12;
+pub const SLOT_NAMED_ENTRY_SIZE: usize = 18;
 pub const SLOT_NAMED_MAX_ENTRIES: usize =
     (COMMIT_SLOT_SIZE - SLOT_NAMED_ENTRIES - 2) / SLOT_NAMED_ENTRY_SIZE;
 
@@ -123,10 +123,7 @@ mod tests {
 
     #[test]
     fn two_cells_per_page_invariant() {
-        // Guarantees 2 cells fit per page for B+ tree splits
-        // branch cell: child(4) + key_len(2) + key(2048) = 2054
-        // leaf cell: key_len(2) + val_len(4) + key(2048) + val_type(1) + value(1920) = 3975
-        // 2 * max(2054, 3975) = 7950 <= 8096
+        // 2 * max_cell_size must fit in USABLE_SIZE for splits
         let max_branch_cell = 4 + 2 + MAX_KEY_SIZE;
         let max_leaf_cell = 2 + 4 + MAX_KEY_SIZE + 1 + MAX_INLINE_VALUE_SIZE;
         let max_cell = max_branch_cell.max(max_leaf_cell);

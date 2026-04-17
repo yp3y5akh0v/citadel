@@ -1,9 +1,4 @@
-//! Page allocator for the CoW B+ tree.
-//!
-//! Uses a two-phase pending-free model:
-//! - New pages are allocated from `ready_to_use` (reclaimed) or high water mark
-//! - Freed pages go into `freed_this_txn` (not reusable until committed + no older readers)
-//! - On-disk pending-free chain persistence happens during commit
+//! Page allocator with two-phase pending-free model for CoW B+ tree.
 
 use citadel_core::types::PageId;
 
@@ -14,6 +9,8 @@ pub struct PageAllocator {
     ready_to_use: Vec<PageId>,
     /// Pages freed in the current write transaction.
     freed_this_txn: Vec<PageId>,
+    /// In-place CoW mode (SyncMode::Off + no readers): reuse page IDs.
+    in_place: bool,
 }
 
 impl PageAllocator {
@@ -22,7 +19,16 @@ impl PageAllocator {
             next_page_id: high_water_mark,
             ready_to_use: Vec::new(),
             freed_this_txn: Vec::new(),
+            in_place: false,
         }
+    }
+
+    pub fn set_in_place(&mut self, enabled: bool) {
+        self.in_place = enabled;
+    }
+
+    pub fn in_place(&self) -> bool {
+        self.in_place
     }
 
     /// Prefers reusing reclaimed pages over incrementing the high water mark.

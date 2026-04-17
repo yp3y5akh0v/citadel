@@ -121,9 +121,10 @@ pub fn encrypt_page_with_hmac(
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut iv);
 
     out[..IV_SIZE].copy_from_slice(&iv);
-    out[IV_SIZE..IV_SIZE + BODY_SIZE].copy_from_slice(body);
     let mut cipher = Aes256Ctr::new(dek.into(), (&iv).into());
-    cipher.apply_keystream(&mut out[IV_SIZE..IV_SIZE + BODY_SIZE]);
+    cipher
+        .apply_keystream_b2b(body, &mut out[IV_SIZE..IV_SIZE + BODY_SIZE])
+        .expect("body/out size match");
 
     let mac = hmac_state.compute_mac(page_id, &iv, &out[IV_SIZE..IV_SIZE + BODY_SIZE]);
     out[IV_SIZE + BODY_SIZE..].copy_from_slice(&mac);

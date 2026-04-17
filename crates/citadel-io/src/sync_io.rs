@@ -5,10 +5,7 @@ use std::sync::Mutex;
 use crate::traits::PageIO;
 use citadel_core::{Result, PAGE_SIZE};
 
-/// Synchronous page I/O using standard file operations.
-///
-/// Uses a Mutex around the File handle to allow shared access
-/// (multiple readers can call read_page concurrently from different threads).
+/// Synchronous page I/O with Mutex-guarded file handle.
 pub struct SyncPageIO {
     file: Mutex<File>,
 }
@@ -54,11 +51,17 @@ impl PageIO for SyncPageIO {
         Ok(())
     }
 
+    fn write_pages(&self, pages: &[(u64, [u8; PAGE_SIZE])]) -> Result<()> {
+        let mut file = self.file.lock().unwrap();
+        for &(offset, ref buf) in pages {
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(buf)?;
+        }
+        Ok(())
+    }
+
     fn fsync(&self) -> Result<()> {
         let file = self.file.lock().unwrap();
-        // sync_data() maps to fdatasync() on Linux, F_FULLFSYNC on macOS,
-        // FlushFileBuffers on Windows. Skips unnecessary metadata (timestamps)
-        // while still flushing file size changes on Linux (POSIX requirement).
         file.sync_data()?;
         Ok(())
     }
@@ -71,6 +74,21 @@ impl PageIO for SyncPageIO {
     fn truncate(&self, size: u64) -> Result<()> {
         let file = self.file.lock().unwrap();
         file.set_len(size)?;
+        Ok(())
+    }
+
+    fn write_commit_meta(
+        &self,
+        god_offset: u64,
+        god_byte: u8,
+        slot_offset: u64,
+        slot_buf: &[u8],
+    ) -> Result<()> {
+        let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::Start(god_offset))?;
+        file.write_all(&[god_byte])?;
+        file.seek(SeekFrom::Start(slot_offset))?;
+        file.write_all(slot_buf)?;
         Ok(())
     }
 }

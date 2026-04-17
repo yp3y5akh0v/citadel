@@ -1,7 +1,4 @@
-//! Cursor for B+ tree range iteration.
-//!
-//! Uses a saved root-to-leaf path stack (no sibling pointers needed).
-//! Supports forward and backward iteration across leaf boundaries.
+//! B+ tree cursor for range iteration using a root-to-leaf path stack.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,6 +11,11 @@ use citadel_page::{branch_node, leaf_node};
 
 pub trait PageMap {
     fn get_page(&self, id: &PageId) -> Option<&Page>;
+}
+
+/// Extends `PageMap` with on-demand page loading for lazy cursor traversal.
+pub trait PageLoader: PageMap {
+    fn ensure_loaded(&mut self, id: PageId) -> Result<()>;
 }
 
 impl PageMap for HashMap<PageId, Page> {
@@ -34,8 +36,7 @@ pub struct CursorEntry {
     pub value: Vec<u8>,
 }
 
-/// Cursor position within the B+ tree.
-/// Stores the path from root to the current leaf.
+/// B+ tree cursor position with root-to-leaf path.
 pub struct Cursor {
     /// Stack of (page_id, child_index) from root to current leaf's parent.
     path: Vec<(PageId, usize)>,
@@ -48,8 +49,7 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    /// Position the cursor at the first key >= `key` (seek).
-    /// If `key` is empty, positions at the first entry in the tree.
+    /// Seek to first key >= `key`. Empty key = first entry.
     pub fn seek(pages: &impl PageMap, root: PageId, key: &[u8]) -> Result<Self> {
         let mut path = Vec::new();
         let mut current = root;
@@ -169,6 +169,21 @@ impl Cursor {
         self.valid
     }
 
+    /// Current leaf page ID.
+    pub fn leaf_page_id(&self) -> PageId {
+        self.leaf
+    }
+
+    /// Current cell index within the leaf.
+    pub fn cell_index(&self) -> u16 {
+        self.cell_idx
+    }
+
+    /// Update the current leaf page ID after a CoW operation.
+    pub fn set_leaf_page_id(&mut self, id: PageId) {
+        self.leaf = id;
+    }
+
     pub fn current(&self, pages: &impl PageMap) -> Option<CursorEntry> {
         if !self.valid {
             return None;
@@ -265,6 +280,124 @@ impl Cursor {
         }
 
         // No more siblings - we've exhausted the tree
+        self.valid = false;
+        Ok(false)
+    }
+
+    // ── Lazy variants (load pages on demand via PageLoader) ─────────
+
+    /// Seek with lazy page loading — only loads the root-to-leaf path.
+    pub fn seek_lazy(pages: &mut impl PageLoader, root: PageId, key: &[u8]) -> Result<Self> {
+        let mut path = Vec::new();
+        let mut current = root;
+
+        loop {
+            pages.ensure_loaded(current)?;
+            let page = pages
+                .get_page(&current)
+                .ok_or(Error::PageOutOfBounds(current))?;
+            match page.page_type() {
+                Some(PageType::Leaf) => break,
+                Some(PageType::Branch) => {
+                    let child_idx = branch_node::search_child_index(page, key);
+                    let child = branch_node::get_child(page, child_idx);
+                    path.push((current, child_idx));
+                    current = child;
+                }
+                _ => return Err(Error::InvalidPageType(page.page_type_raw(), current)),
+            }
+        }
+
+        let page = pages.get_page(&current).unwrap();
+        let cell_idx = match leaf_node::search(page, key) {
+            Ok(idx) => idx,
+            Err(idx) => idx,
+        };
+
+        let valid = cell_idx < page.num_cells();
+
+        let mut cursor = Self {
+            path,
+            leaf: current,
+            cell_idx,
+            valid,
+        };
+
+        if !valid && page.num_cells() > 0 {
+            cursor.advance_leaf_lazy(pages)?;
+        } else if page.num_cells() == 0 {
+            cursor.valid = false;
+        }
+
+        Ok(cursor)
+    }
+
+    /// Read the current entry, loading the leaf page if needed.
+    pub fn current_ref_lazy<'a, P: PageLoader>(&self, pages: &'a mut P) -> Option<LeafCell<'a>> {
+        if !self.valid {
+            return None;
+        }
+        pages.ensure_loaded(self.leaf).ok()?;
+        let page = pages.get_page(&self.leaf)?;
+        Some(leaf_node::read_cell(page, self.cell_idx))
+    }
+
+    /// Advance to the next entry, loading pages on demand.
+    pub fn next_lazy(&mut self, pages: &mut impl PageLoader) -> Result<bool> {
+        if !self.valid {
+            return Ok(false);
+        }
+
+        pages.ensure_loaded(self.leaf)?;
+        let page = pages
+            .get_page(&self.leaf)
+            .ok_or(Error::PageOutOfBounds(self.leaf))?;
+
+        if self.cell_idx + 1 < page.num_cells() {
+            self.cell_idx += 1;
+            return Ok(true);
+        }
+
+        self.advance_leaf_lazy(pages)
+    }
+
+    /// Advance to the next leaf, loading child pages on demand.
+    fn advance_leaf_lazy(&mut self, pages: &mut impl PageLoader) -> Result<bool> {
+        while let Some((parent_id, child_idx)) = self.path.pop() {
+            let parent = pages
+                .get_page(&parent_id)
+                .ok_or(Error::PageOutOfBounds(parent_id))?;
+            let n = parent.num_cells() as usize;
+
+            if child_idx < n {
+                let next_child_idx = child_idx + 1;
+                let next_child = branch_node::get_child(parent, next_child_idx);
+                self.path.push((parent_id, next_child_idx));
+
+                let mut current = next_child;
+                loop {
+                    pages.ensure_loaded(current)?;
+                    let page = pages
+                        .get_page(&current)
+                        .ok_or(Error::PageOutOfBounds(current))?;
+                    match page.page_type() {
+                        Some(PageType::Leaf) => {
+                            self.leaf = current;
+                            self.cell_idx = 0;
+                            self.valid = page.num_cells() > 0;
+                            return Ok(self.valid);
+                        }
+                        Some(PageType::Branch) => {
+                            let child = branch_node::get_child(page, 0);
+                            self.path.push((current, 0));
+                            current = child;
+                        }
+                        _ => return Err(Error::InvalidPageType(page.page_type_raw(), current)),
+                    }
+                }
+            }
+        }
+
         self.valid = false;
         Ok(false)
     }
@@ -401,6 +534,93 @@ mod tests {
 
         let cursor = Cursor::first(&pages, tree.root).unwrap();
         assert!(!cursor.is_valid());
+    }
+
+    /// PageLoader backed by a pre-built HashMap — tracks unique pages touched.
+    struct TrackingLoader {
+        pages: HashMap<PageId, Page>,
+        touched: std::collections::HashSet<PageId>,
+    }
+
+    impl TrackingLoader {
+        fn new(pages: HashMap<PageId, Page>) -> Self {
+            Self {
+                pages,
+                touched: std::collections::HashSet::new(),
+            }
+        }
+        fn unique_pages_touched(&self) -> usize {
+            self.touched.len()
+        }
+    }
+
+    impl PageMap for TrackingLoader {
+        fn get_page(&self, id: &PageId) -> Option<&Page> {
+            self.pages.get(id)
+        }
+    }
+
+    impl PageLoader for TrackingLoader {
+        fn ensure_loaded(&mut self, id: PageId) -> citadel_core::Result<()> {
+            if self.pages.contains_key(&id) {
+                self.touched.insert(id);
+                Ok(())
+            } else {
+                Err(citadel_core::Error::PageOutOfBounds(id))
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_cursor_forward() {
+        let keys: Vec<Vec<u8>> = (0..2000u32)
+            .map(|i| format!("{i:06}").into_bytes())
+            .collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let (pages, tree) = build_tree(&key_refs);
+
+        let mut loader = TrackingLoader::new(pages);
+        let mut cursor = Cursor::seek_lazy(&mut loader, tree.root, b"").unwrap();
+        let mut count = 0u32;
+        while cursor.is_valid() {
+            let entry = cursor.current_ref_lazy(&mut loader);
+            assert!(entry.is_some());
+            count += 1;
+            cursor.next_lazy(&mut loader).unwrap();
+        }
+        assert_eq!(count, 2000);
+    }
+
+    #[test]
+    fn lazy_cursor_range_loads_fewer_pages() {
+        let keys: Vec<Vec<u8>> = (0..2000u32)
+            .map(|i| format!("{i:06}").into_bytes())
+            .collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let (pages, tree) = build_tree(&key_refs);
+        let total_pages = pages.len();
+
+        let mut loader = TrackingLoader::new(pages);
+        let mut cursor = Cursor::seek_lazy(&mut loader, tree.root, b"001000").unwrap();
+        let mut count = 0u32;
+        while cursor.is_valid() {
+            if let Some(entry) = cursor.current_ref_lazy(&mut loader) {
+                if entry.key > b"001009".as_slice() {
+                    break;
+                }
+                count += 1;
+            }
+            cursor.next_lazy(&mut loader).unwrap();
+        }
+        assert_eq!(count, 10);
+        // Lazy loading should touch far fewer unique pages than the full tree
+        let touched = loader.unique_pages_touched();
+        assert!(
+            touched < total_pages,
+            "lazy touched {} unique pages but tree has {} total",
+            touched,
+            total_pages,
+        );
     }
 
     #[test]

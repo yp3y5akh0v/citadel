@@ -11,9 +11,19 @@ pub struct ColumnMap {
     short: HashMap<String, ShortMatch>,
 }
 
+#[derive(Clone)]
 enum ShortMatch {
     Unique(usize),
     Ambiguous,
+}
+
+impl Clone for ColumnMap {
+    fn clone(&self) -> Self {
+        Self {
+            exact: self.exact.clone(),
+            short: self.short.clone(),
+        }
+    }
 }
 
 impl ColumnMap {

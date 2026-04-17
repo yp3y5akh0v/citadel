@@ -1,7 +1,7 @@
 //! Transaction manager: single-writer MVCC with shadow-paging commit.
 
 use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use std::sync::Arc;
@@ -37,6 +37,7 @@ pub struct TxnManager {
     write_active: AtomicBool,
     state: Mutex<ManagerState>,
     sync_mode: citadel_core::types::SyncMode,
+    hmac_state: page_cipher::HmacState,
 }
 
 struct ManagerState {
@@ -47,6 +48,8 @@ struct ManagerState {
     reader_table: BTreeMap<TxnId, usize>,
     deferred_free: Vec<PageId>,
     reclaimed_pages: Vec<PageId>,
+    recycled_pages: Option<HashMap<PageId, Page>>,
+    recycle_safe: bool,
 }
 
 impl TxnManager {
@@ -89,8 +92,11 @@ impl TxnManager {
                 reader_table: BTreeMap::new(),
                 deferred_free: Vec::new(),
                 reclaimed_pages: Vec::new(),
+                recycled_pages: None,
+                recycle_safe: false,
             }),
             sync_mode,
+            hmac_state: page_cipher::HmacState::new(&mac_key, epoch),
         })
     }
 
@@ -189,9 +195,16 @@ impl TxnManager {
                 reader_table: BTreeMap::new(),
                 deferred_free: Vec::new(),
                 reclaimed_pages: Vec::new(),
+                recycled_pages: None,
+                recycle_safe: false,
             }),
             sync_mode,
+            hmac_state: page_cipher::HmacState::new(&mac_key, epoch),
         })
+    }
+
+    pub fn sync_mode(&self) -> citadel_core::types::SyncMode {
+        self.sync_mode
     }
 
     pub fn begin_read(&self) -> ReadTxn<'_> {
@@ -218,11 +231,18 @@ impl TxnManager {
         let snapshot = state.current_slot.clone();
         let deferred = state.deferred_free.clone();
         let reclaimed = std::mem::take(&mut state.reclaimed_pages);
+        let no_readers = state.reader_table.is_empty();
+        let recycled = state.recycled_pages.take();
+        let recycle_safe = state.recycle_safe;
         drop(state);
 
         let mut alloc = PageAllocator::new(snapshot.high_water_mark);
         if !reclaimed.is_empty() {
             alloc.add_ready_to_use(reclaimed);
+        }
+        // In-place CoW: reuse page IDs (SyncMode::Off + no readers only)
+        if no_readers && self.sync_mode == citadel_core::types::SyncMode::Off {
+            alloc.set_in_place(true);
         }
 
         let tree = BTree::from_existing(
@@ -231,7 +251,16 @@ impl TxnManager {
             snapshot.tree_entries,
         );
 
-        Ok(WriteTxn::new(self, txn_id, snapshot, tree, alloc, deferred))
+        Ok(WriteTxn::new(
+            self,
+            txn_id,
+            snapshot,
+            tree,
+            alloc,
+            deferred,
+            recycled,
+            recycle_safe,
+        ))
     }
 
     pub(crate) fn fetch_page(&self, page_id: PageId) -> Result<Arc<Page>> {
@@ -266,6 +295,7 @@ impl TxnManager {
         deferred_free: &[PageId],
         catalog_root: PageId,
         named_trees: &std::collections::HashMap<Vec<u8>, BTree>,
+        loaded_tree_meta: &std::collections::HashMap<Vec<u8>, (PageId, u16)>,
     ) -> Result<()> {
         let (active_slot, oldest_active, current_god_byte, cached_file_size) = {
             let state = self.state.lock();
@@ -284,6 +314,7 @@ impl TxnManager {
         }
 
         let freed_this_txn = alloc.commit();
+        let no_pages_freed = freed_this_txn.is_empty();
 
         let (new_pf_root, reclaimed, old_chain_pages) =
             if self.sync_mode == citadel_core::types::SyncMode::Off {
@@ -350,7 +381,7 @@ impl TxnManager {
             }
         }
 
-        let hmac_state = page_cipher::HmacState::new(&self.mac_key, self.epoch);
+        let hmac_state = &self.hmac_state;
         #[cfg(feature = "parallel")]
         {
             let encrypt_one = |&(offset, page_id): &(u64, PageId)| -> (u64, [u8; PAGE_SIZE]) {
@@ -358,7 +389,7 @@ impl TxnManager {
                 let mut encrypted = [0u8; PAGE_SIZE];
                 page_cipher::encrypt_page_with_hmac(
                     &self.dek,
-                    &hmac_state,
+                    hmac_state,
                     page_id,
                     page.as_bytes(),
                     &mut encrypted,
@@ -374,24 +405,62 @@ impl TxnManager {
         }
         #[cfg(not(feature = "parallel"))]
         {
-            let mut encrypted = [0u8; PAGE_SIZE];
-            for &(offset, page_id) in &dirty_page_info {
-                let page = &pages[&page_id];
-                page_cipher::encrypt_page_with_hmac(
-                    &self.dek,
-                    &hmac_state,
-                    page_id,
-                    page.as_bytes(),
-                    &mut encrypted,
-                );
-                self.io.write_page(offset, &encrypted)?;
+            if dirty_page_info.len() <= 1 {
+                let mut encrypted = [0u8; PAGE_SIZE];
+                for &(offset, page_id) in &dirty_page_info {
+                    let page = &pages[&page_id];
+                    page_cipher::encrypt_page_with_hmac(
+                        &self.dek,
+                        hmac_state,
+                        page_id,
+                        page.as_bytes(),
+                        &mut encrypted,
+                    );
+                    self.io.write_page(offset, &encrypted)?;
+                }
+            } else {
+                let encrypted_pages: Vec<(u64, [u8; PAGE_SIZE])> = dirty_page_info
+                    .iter()
+                    .map(|&(offset, page_id)| {
+                        let page = &pages[&page_id];
+                        let mut encrypted = [0u8; PAGE_SIZE];
+                        page_cipher::encrypt_page_with_hmac(
+                            &self.dek,
+                            hmac_state,
+                            page_id,
+                            page.as_bytes(),
+                            &mut encrypted,
+                        );
+                        (offset, encrypted)
+                    })
+                    .collect();
+                self.io.write_pages(&encrypted_pages)?;
             }
         }
 
-        let named_table_entries: Vec<(u32, u64)> = named_trees
+        // Merge current txn trees + carry forward old slot entries for untouched tables
+        let mut named_table_entries: Vec<(u32, u64, u32, u16)> = named_trees
             .iter()
-            .map(|(name, tree)| (file_manager::table_name_hash(name), tree.entry_count))
+            .map(|(name, tree)| {
+                (
+                    file_manager::table_name_hash(name),
+                    tree.entry_count,
+                    tree.root.as_u32(),
+                    tree.depth,
+                )
+            })
             .collect();
+        let loaded_hashes: Vec<u32> = loaded_tree_meta
+            .keys()
+            .map(|name| file_manager::table_name_hash(name))
+            .collect();
+        let current_hashes: std::collections::HashSet<u32> =
+            named_table_entries.iter().map(|e| e.0).collect();
+        for &(hash, count, root, depth) in &old_slot.named_table_entries {
+            if !loaded_hashes.contains(&hash) && !current_hashes.contains(&hash) {
+                named_table_entries.push((hash, count, root, depth));
+            }
+        }
 
         let new_slot = CommitSlot {
             txn_id,
@@ -408,14 +477,24 @@ impl TxnManager {
             merkle_root: merkle_root_hash,
             named_table_entries,
         };
-        write_commit_slot(&*self.io, inactive_slot_idx, &new_slot)?;
-
-        if self.sync_mode != citadel_core::types::SyncMode::Off {
-            self.io.fsync()?;
-        }
-
         let new_god_byte = inactive_slot_idx as u8 & GOD_BIT_ACTIVE_SLOT;
-        write_god_byte(&*self.io, new_god_byte)?;
+
+        if self.sync_mode == citadel_core::types::SyncMode::Off {
+            let slot_offset = citadel_core::COMMIT_SLOT_OFFSET
+                + inactive_slot_idx * citadel_core::COMMIT_SLOT_SIZE;
+            let god_offset = citadel_core::GOD_BYTE_OFFSET;
+            let slot_buf = new_slot.serialize();
+            self.io.write_commit_meta(
+                god_offset as u64,
+                new_god_byte,
+                slot_offset as u64,
+                &slot_buf,
+            )?;
+        } else {
+            write_commit_slot(&*self.io, inactive_slot_idx, &new_slot)?;
+            self.io.fsync()?;
+            write_god_byte(&*self.io, new_god_byte)?;
+        }
 
         if self.sync_mode == citadel_core::types::SyncMode::Full {
             if let Err(e) = self.io.fsync() {
@@ -443,6 +522,8 @@ impl TxnManager {
             state.cached_file_size = new_file_size;
             state.deferred_free = old_chain_pages;
             state.reclaimed_pages = reclaimed;
+            state.recycled_pages = Some(std::mem::take(pages));
+            state.recycle_safe = no_pages_freed;
         }
 
         self.write_active.store(false, Ordering::SeqCst);
@@ -736,7 +817,11 @@ impl TxnManager {
             dek_id: slot.dek_id,
             checksum: 0,
             merkle_root: root_merkle,
-            named_table_entries: slot.named_table_entries.clone(),
+            named_table_entries: slot
+                .named_table_entries
+                .iter()
+                .map(|&(hash, count, _, _)| (hash, count, 0, 0))
+                .collect(),
         };
 
         header.slots = [new_slot.clone(), new_slot];

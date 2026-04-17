@@ -37,4 +37,15 @@ pub trait PageIO: Send + Sync {
         self.write_pages(pages)?;
         self.fsync()
     }
+
+    fn write_commit_meta(
+        &self,
+        god_offset: u64,
+        god_byte: u8,
+        slot_offset: u64,
+        slot_buf: &[u8],
+    ) -> Result<()> {
+        self.write_at(god_offset, &[god_byte])?;
+        self.write_at(slot_offset, slot_buf)
+    }
 }

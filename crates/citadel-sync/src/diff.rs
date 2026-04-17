@@ -113,13 +113,11 @@ pub fn merkle_diff(source: &dyn TreeReader, target: &dyn TreeReader) -> Result<D
             (PageType::Leaf, PageType::Leaf) => {
                 result.entries.extend(source.leaf_entries(src_pid)?);
             }
-            (PageType::Branch, PageType::Branch) => {
-                if src_digest.children.len() == tgt_digest.children.len() {
-                    for (sc, tc) in src_digest.children.iter().zip(&tgt_digest.children) {
-                        queue.push_back((*sc, *tc));
-                    }
-                } else {
-                    result.entries.extend(source.subtree_entries(src_pid)?);
+            (PageType::Branch, PageType::Branch)
+                if src_digest.children.len() == tgt_digest.children.len() =>
+            {
+                for (sc, tc) in src_digest.children.iter().zip(&tgt_digest.children) {
+                    queue.push_back((*sc, *tc));
                 }
             }
             _ => {

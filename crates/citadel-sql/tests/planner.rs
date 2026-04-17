@@ -60,6 +60,7 @@ fn assert_plan(db: &citadel::Database, sql: &str, expected: &str) {
     let plan_name = match &plan {
         ScanPlan::SeqScan => "SeqScan",
         ScanPlan::PkLookup { .. } => "PkLookup",
+        ScanPlan::PkRangeScan { .. } => "PkRangeScan",
         ScanPlan::IndexScan { index_name, .. } => {
             // Return the index name as part of the match
             if let Some(expected_idx) = expected.strip_prefix("IndexScan:") {

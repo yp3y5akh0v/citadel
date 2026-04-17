@@ -26,7 +26,8 @@ pub struct CommitSlot {
     pub dek_id: [u8; MAC_SIZE],
     pub checksum: u64,
     pub merkle_root: [u8; MERKLE_HASH_SIZE],
-    pub named_table_entries: Vec<(u32, u64)>,
+    /// (hash, entry_count, root_page, depth) per table
+    pub named_table_entries: Vec<(u32, u64, u32, u16)>,
 }
 
 impl CommitSlot {
@@ -57,10 +58,13 @@ impl CommitSlot {
 
         let n = self.named_table_entries.len().min(SLOT_NAMED_MAX_ENTRIES);
         buf[SLOT_NAMED_ENTRIES..SLOT_NAMED_ENTRIES + 2].copy_from_slice(&(n as u16).to_le_bytes());
-        for (i, &(hash, count)) in self.named_table_entries.iter().take(n).enumerate() {
+        for (i, &(hash, count, root, depth)) in self.named_table_entries.iter().take(n).enumerate()
+        {
             let off = SLOT_NAMED_ENTRIES + 2 + i * SLOT_NAMED_ENTRY_SIZE;
             buf[off..off + 4].copy_from_slice(&hash.to_le_bytes());
             buf[off + 4..off + 12].copy_from_slice(&count.to_le_bytes());
+            buf[off + 12..off + 16].copy_from_slice(&root.to_le_bytes());
+            buf[off + 16..off + 18].copy_from_slice(&depth.to_le_bytes());
         }
 
         buf
@@ -127,7 +131,9 @@ impl CommitSlot {
                     let off = SLOT_NAMED_ENTRIES + 2 + i * SLOT_NAMED_ENTRY_SIZE;
                     let hash = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
                     let count = u64::from_le_bytes(buf[off + 4..off + 12].try_into().unwrap());
-                    entries.push((hash, count));
+                    let root = u32::from_le_bytes(buf[off + 12..off + 16].try_into().unwrap());
+                    let depth = u16::from_le_bytes(buf[off + 16..off + 18].try_into().unwrap());
+                    entries.push((hash, count, root, depth));
                 }
                 entries
             },
@@ -144,8 +150,23 @@ impl CommitSlot {
         let h = table_name_hash(name);
         self.named_table_entries
             .iter()
-            .find(|&&(hash, _)| hash == h)
-            .map(|&(_, count)| count)
+            .find(|&&(hash, ..)| hash == h)
+            .map(|&(_, count, ..)| count)
+    }
+
+    /// Cached root + depth for a named table. None if not in slot.
+    pub fn named_entry_root(&self, name: &[u8]) -> Option<(PageId, u16)> {
+        let h = table_name_hash(name);
+        self.named_table_entries
+            .iter()
+            .find(|&&(hash, ..)| hash == h)
+            .and_then(|&(_, _, root, depth)| {
+                if root != 0 {
+                    Some((PageId(root), depth))
+                } else {
+                    None
+                }
+            })
     }
 }
 
@@ -393,7 +414,7 @@ mod tests {
             dek_id: [0xAA; MAC_SIZE],
             checksum: 0,
             merkle_root: [0xBB; MERKLE_HASH_SIZE],
-            named_table_entries: vec![(0x12345678, 500)],
+            named_table_entries: vec![(0x12345678, 500, 77, 3)],
         };
 
         let buf = slot.serialize();
@@ -410,7 +431,7 @@ mod tests {
         assert_eq!(slot2.encryption_epoch, 1);
         assert_eq!(slot2.dek_id, [0xAA; MAC_SIZE]);
         assert_eq!(slot2.merkle_root, [0xBB; MERKLE_HASH_SIZE]);
-        assert_eq!(slot2.named_table_entries, vec![(0x12345678, 500)]);
+        assert_eq!(slot2.named_table_entries, vec![(0x12345678, 500, 77, 3)]);
     }
 
     #[test]

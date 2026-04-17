@@ -1,12 +1,4 @@
-//! Leaf node operations for the B+ tree.
-//!
-//! Leaf cell format: `[key_len: u16][val_len: u32][key_data: var][val_type: u8][value: var]`
-//! Total cell size: 7 + key_len + value_len (for inline)
-//!
-//! Value types:
-//! - Inline (0): value data follows immediately
-//! - Overflow (1): value is [first_overflow_page_id: u32][total_len: u32] = 8 bytes
-//! - Tombstone (2): no value data (val_len = 0)
+//! Leaf node ops. Cell: `[key_len:u16][val_len:u32][key][val_type:u8][value]`
 
 use crate::page::Page;
 use citadel_core::types::{PageId, ValueType};
@@ -93,8 +85,7 @@ pub fn read_cell_bytes(page: &Page, i: u16) -> Vec<u8> {
     page.data[offset..offset + size].to_vec()
 }
 
-/// Binary search for a key in a leaf page.
-/// Returns Ok(index) if found, Err(index) for insertion point.
+/// Binary search for key. Ok(index) if found, Err(index) for insertion point.
 pub fn search(page: &Page, search_key: &[u8]) -> Result<u16, u16> {
     let n = page.num_cells();
     let mut lo = 0u16;
@@ -118,6 +109,21 @@ fn write_cell_into(slot: &mut [u8], key: &[u8], val_type: ValueType, value: &[u8
     slot[6..6 + key.len()].copy_from_slice(key);
     slot[6 + key.len()] = val_type as u8;
     slot[7 + key.len()..7 + key.len() + value.len()].copy_from_slice(value);
+}
+
+/// In-place value overwrite if same length. Returns false if sizes differ.
+pub fn update_value_in_place(page: &mut Page, idx: u16, val_type: ValueType, value: &[u8]) -> bool {
+    let offset = page.cell_offset(idx) as usize;
+    let key_len = u16::from_le_bytes(page.data[offset..offset + 2].try_into().unwrap()) as usize;
+    let old_val_len =
+        u32::from_le_bytes(page.data[offset + 2..offset + 6].try_into().unwrap()) as usize;
+    if value.len() != old_val_len {
+        return false;
+    }
+    let val_start = offset + 6 + key_len;
+    page.data[val_start] = val_type as u8;
+    page.data[val_start + 1..val_start + 1 + value.len()].copy_from_slice(value);
+    true
 }
 
 pub fn insert_direct(page: &mut Page, key: &[u8], val_type: ValueType, value: &[u8]) -> bool {
@@ -154,8 +160,7 @@ pub fn insert_direct(page: &mut Page, key: &[u8], val_type: ValueType, value: &[
     false
 }
 
-/// Insert a key-value pair into the leaf page at the correct sorted position.
-/// Returns true if successful, false if not enough space.
+/// Insert key-value at sorted position. Returns false if not enough space.
 pub fn insert(page: &mut Page, key: &[u8], val_type: ValueType, value: &[u8]) -> bool {
     let pos = match search(page, key) {
         Ok(idx) => {
@@ -172,8 +177,7 @@ pub fn insert(page: &mut Page, key: &[u8], val_type: ValueType, value: &[u8]) ->
         return true;
     }
 
-    // Contiguous space exhausted but total free_space may suffice (holes from
-    // delete+reinsert cycles). Compact the page and retry.
+    // Compact fragmented space and retry
     let cell_len_with_ptr = cell.len() + 2;
     if (page.free_space() as usize) >= cell_len_with_ptr {
         compact_page(page);
@@ -197,8 +201,7 @@ fn compact_page(page: &mut Page) {
     page.rebuild_cells(&refs);
 }
 
-/// Delete a key from the leaf page.
-/// Returns true if the key was found and deleted, false if not found.
+/// Delete a key. Returns true if found and deleted.
 pub fn delete(page: &mut Page, key: &[u8]) -> bool {
     match search(page, key) {
         Ok(idx) => {
@@ -210,12 +213,7 @@ pub fn delete(page: &mut Page, key: &[u8]) -> bool {
     }
 }
 
-/// Split a leaf page. Returns (separator_key, right_cells).
-///
-/// Split point is num_cells / 2.
-/// - Left page keeps cells [0..split_point]
-/// - Right page gets cells [split_point..n]
-/// - Separator key = first key of right page (promoted to parent)
+/// Split at midpoint. Returns (separator_key, right_cells).
 pub fn split(page: &Page) -> (Vec<u8>, Vec<Vec<u8>>) {
     let n = page.num_cells() as usize;
     let split_point = n / 2;

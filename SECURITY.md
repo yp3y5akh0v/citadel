@@ -24,7 +24,8 @@ I will acknowledge your report within 5 business days and provide updates as the
 
 | Version | Supported |
 |---------|-----------|
-| 0.5.x   | Yes       |
+| 0.6.x   | Yes       |
+| 0.5.x   | No        |
 | 0.4.x   | No        |
 | 0.3.x   | No        |
 | 0.2.x   | No        |

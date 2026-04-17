@@ -1106,13 +1106,8 @@ pub extern "C" fn citadel_sql_value_int(
     let r = unsafe { &*result };
     match r.rows.get(row as usize).and_then(|r| r.get(col as usize)) {
         Some(Value::Integer(v)) => *v,
-        Some(Value::Boolean(b)) => {
-            if *b {
-                1
-            } else {
-                0
-            }
-        }
+        Some(Value::Boolean(true)) => 1,
+        Some(Value::Boolean(false)) => 0,
         _ => 0,
     }
 }

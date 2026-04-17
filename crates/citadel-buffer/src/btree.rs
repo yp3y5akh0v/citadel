@@ -1,10 +1,4 @@
-//! CoW B+ tree engine.
-//!
-//! All mutations use Copy-on-Write: the old page is cloned to a new page ID,
-//! modified, and ancestors are updated to point to the new page. Old pages
-//! are freed via the allocator's pending-free list.
-//!
-//! The tree uses `HashMap<PageId, Page>` as the in-memory page store.
+//! CoW B+ tree engine. Mutations clone pages; old pages go to pending-free list.
 
 use crate::allocator::PageAllocator;
 use citadel_core::types::{PageId, PageType, TxnId, ValueType};
@@ -90,8 +84,7 @@ impl BTree {
         false
     }
 
-    /// Insert a key-value pair. Returns `true` if a new entry was added,
-    /// `false` if an existing key was updated.
+    /// Insert key-value. Returns `true` if new, `false` if updated existing.
     pub fn insert(
         &mut self,
         pages: &mut HashMap<PageId, Page>,
@@ -203,6 +196,80 @@ impl BTree {
         Ok(!key_exists)
     }
 
+    /// Bulk-update existing keys (sorted). Single tree walk, in-place when sizes match.
+    pub fn update_sorted(
+        &mut self,
+        pages: &mut HashMap<PageId, Page>,
+        alloc: &mut PageAllocator,
+        txn_id: TxnId,
+        pairs: &[(&[u8], &[u8])],
+    ) -> Result<u64> {
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+        self.last_insert = None;
+
+        let (mut path, mut leaf_id) = self.walk_to_leaf(pages, pairs[0].0)?;
+        let mut cow_leaf = cow_page(pages, alloc, leaf_id, txn_id);
+        if cow_leaf != leaf_id {
+            self.root = propagate_cow_up(pages, alloc, txn_id, &path, cow_leaf);
+        }
+
+        let mut count: u64 = 0;
+        let mut hint: u16 = 0;
+
+        for &(key, value) in pairs {
+            // Check if key is past the current leaf's range
+            let past_leaf = {
+                let page = pages.get(&cow_leaf).unwrap();
+                let n = page.num_cells();
+                n == 0 || key > leaf_node::read_cell(page, n - 1).key
+            };
+
+            if past_leaf {
+                let (new_path, new_leaf) = self.walk_to_leaf(pages, key)?;
+                path = new_path;
+                leaf_id = new_leaf;
+                cow_leaf = cow_page(pages, alloc, leaf_id, txn_id);
+                if cow_leaf != leaf_id {
+                    self.root = propagate_cow_up(pages, alloc, txn_id, &path, cow_leaf);
+                }
+                hint = 0;
+            }
+
+            // Search from hint position (keys are sorted → position increases)
+            let page = pages.get(&cow_leaf).unwrap();
+            let n = page.num_cells();
+            let idx = {
+                let mut i = hint;
+                loop {
+                    if i >= n {
+                        break None;
+                    }
+                    let cell = leaf_node::read_cell(page, i);
+                    match key.cmp(cell.key) {
+                        std::cmp::Ordering::Equal => break Some(i),
+                        std::cmp::Ordering::Less => break None,
+                        std::cmp::Ordering::Greater => i += 1,
+                    }
+                }
+            };
+
+            if let Some(idx) = idx {
+                hint = idx + 1;
+                // Try in-place value overwrite (same size = no cell movement)
+                let page = pages.get_mut(&cow_leaf).unwrap();
+                if !leaf_node::update_value_in_place(page, idx, ValueType::Inline, value) {
+                    // Different size: fall back to delete + insert
+                    leaf_node::insert_direct(page, key, ValueType::Inline, value);
+                }
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
     /// Delete a key. Returns `true` if the key was found and deleted.
     pub fn delete(
         &mut self,
@@ -244,9 +311,8 @@ impl BTree {
         Ok(true)
     }
 
-    /// Walk from root to the leaf that should contain `key`.
-    /// Returns (path, leaf_page_id) where path is Vec<(ancestor_id, child_idx)>.
-    fn walk_to_leaf(
+    /// Walk root to leaf for `key`. Returns (path, leaf_page_id).
+    pub fn walk_to_leaf(
         &self,
         pages: &HashMap<PageId, Page>,
         key: &[u8],
@@ -269,15 +335,19 @@ impl BTree {
     }
 }
 
-/// Copy-on-Write: clone a page to a new page ID, free the old one.
-/// If the page already belongs to this transaction, return it as-is.
-fn cow_page(
+/// CoW a page. No-op if already owned by this txn. In-place mode reuses page ID.
+pub fn cow_page(
     pages: &mut HashMap<PageId, Page>,
     alloc: &mut PageAllocator,
     old_id: PageId,
     txn_id: TxnId,
 ) -> PageId {
     if pages.get(&old_id).unwrap().txn_id() == txn_id {
+        return old_id;
+    }
+    if alloc.in_place() {
+        let page = pages.get_mut(&old_id).unwrap();
+        page.set_txn_id(txn_id);
         return old_id;
     }
     let new_id = alloc.allocate();
@@ -301,7 +371,7 @@ fn update_branch_child(page: &mut Page, child_idx: usize, new_child: PageId) {
 }
 
 /// Propagate CoW up through ancestors (no split, just update child pointers).
-fn propagate_cow_up(
+pub fn propagate_cow_up(
     pages: &mut HashMap<PageId, Page>,
     alloc: &mut PageAllocator,
     txn_id: TxnId,
@@ -317,8 +387,7 @@ fn propagate_cow_up(
     new_child
 }
 
-/// Split a full leaf and insert the new key-value pair.
-/// Returns (separator_key, right_page_id). The left page is `leaf_id` (rebuilt in place).
+/// Split full leaf and insert. Returns (separator_key, right_page_id).
 fn split_leaf_with_insert(
     pages: &mut HashMap<PageId, Page>,
     alloc: &mut PageAllocator,
@@ -584,8 +653,7 @@ fn propagate_remove_up(
     // Process the bottom-most ancestor first (parent of the deleted leaf)
     let mut level = path.len();
 
-    // Track what needs to replace the removed child's slot in the parent above
-    // Initially: the child was removed entirely, so we need to remove it from parent
+    // Track whether parent needs child removal vs pointer update
     let mut need_remove_at_level = true;
 
     // Result: the page ID that should be propagated upward
@@ -622,8 +690,7 @@ fn propagate_remove_up(
             pages.remove(&new_ancestor);
             *depth -= 1;
 
-            // The only_child replaces this branch in the grandparent
-            // This is a pointer update (not a removal), so we stop cascading
+            // Replace this branch with only_child in grandparent (stop cascading)
             new_child = only_child;
             need_remove_at_level = false;
         }
@@ -728,11 +795,7 @@ mod tests {
     fn insert_triggers_leaf_split() {
         let (mut pages, mut alloc, mut tree) = new_tree();
 
-        // Insert enough keys to trigger at least one leaf split.
-        // Each leaf cell: 7 + key_len + value_len bytes + 2 bytes pointer.
-        // With 4-byte keys and 8-byte values: 7 + 4 + 8 = 19 bytes + 2 = 21 bytes per entry.
-        // Page usable space: 8096 bytes. Fits ~385 entries per leaf.
-        // We need > 385 entries to trigger a split.
+        // 500 entries > ~385 per leaf → triggers split
         let count = 500;
         for i in 0..count {
             let key = format!("key-{i:05}");
