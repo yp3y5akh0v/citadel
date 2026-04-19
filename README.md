@@ -44,11 +44,13 @@ point              915 ns         12.7 us        13.9x
 group_by           1.94 ms        10.2 ms        5.3x
 cte                1.43 ms        6.16 ms        4.3x
 view_point         3.02 us        12.7 us        4.2x
+savepoint_rollback 3.49 ms        10.1 ms        2.9x
 view_filter        734 us         1.77 ms        2.4x
 filter             721 us         1.76 ms        2.4x
 window_agg         36.5 ms        84.0 ms        2.3x
 sort               1.15 ms        2.52 ms        2.2x
 window_rank        65.5 ms        133 ms         2.0x
+savepoint_nested   518 us         1.05 ms        2.0x
 insert             64.9 us        118 us         1.8x
 scan               9.15 ms        13.5 ms        1.5x
 insert_select      738 us         1.13 ms        1.5x
@@ -60,38 +62,36 @@ correlated_exists  5.78 ms        6.59 ms        1.1x
 update             27.9 us        29.7 us        1.07x
 union              176 us         181 us         1.03x
 recursive_cte      111 us         115 us         1.03x
-savepoint_rollback 3.49 ms        10.1 ms        2.9x
-savepoint_nested   518 us         1.05 ms        2.0x
 ```
 
 <details>
 <summary>Methodology</summary>
 
-- **count** - `SELECT COUNT(*) FROM t`
-- **point** - `SELECT * FROM t WHERE id = 50000`
-- **scan** - `SELECT * FROM t` (full 100K rows)
-- **filter** - `SELECT * FROM t WHERE age = 42`
-- **sort** - `SELECT * FROM t ORDER BY age LIMIT 10`
-- **sum** - `SELECT SUM(age) FROM t`
-- **group_by** - `SELECT age, COUNT(*) FROM t GROUP BY age`
-- **distinct** - `SELECT DISTINCT age FROM t`
-- **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id` (1K x 1K)
-- **union** - `SELECT id, val FROM a UNION ALL SELECT id, data FROM b`
-- **cte** - `WITH filtered AS (SELECT ... WHERE age < 50) SELECT age, COUNT(*) FROM filtered GROUP BY age`
-- **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq`
-- **insert** - 100 rows in one transaction
-- **update** - `UPDATE t SET age = age + 1 WHERE id BETWEEN 10000 AND 10099`
-- **delete** - insert 100 rows then delete them
-- **insert_select** - `INSERT INTO sink SELECT id, val FROM a`
-- **window_rank** - `ROW_NUMBER() OVER (PARTITION BY age ORDER BY id), RANK() OVER (...)`
-- **window_agg** - `SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING), MIN(age) OVER (...)`
-- **view_filter** - `SELECT * FROM v WHERE age = 42` (v = view over t)
-- **view_point** - `SELECT * FROM v WHERE id = 50000`
-- **correlated_exists** - `SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM ref_table WHERE ref_table.id = t.id)`
 - **correlated_in** - `SELECT COUNT(*) FROM t WHERE id IN (SELECT id FROM ref_table WHERE ref_table.val = t.age)`
+- **count** - `SELECT COUNT(*) FROM t`
 - **correlated_scalar** - `SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.a_id = a.id) FROM a`
+- **point** - `SELECT * FROM t WHERE id = 50000`
+- **group_by** - `SELECT age, COUNT(*) FROM t GROUP BY age`
+- **cte** - `WITH filtered AS (SELECT ... WHERE age < 50) SELECT age, COUNT(*) FROM filtered GROUP BY age`
+- **view_point** - `SELECT * FROM v WHERE id = 50000`
 - **savepoint_rollback** - `BEGIN; INSERT 1K rows; SAVEPOINT sp; INSERT 10K rows; ROLLBACK TO sp; COMMIT`
+- **view_filter** - `SELECT * FROM v WHERE age = 42` (v = view over t)
+- **filter** - `SELECT * FROM t WHERE age = 42`
+- **window_agg** - `SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING), MIN(age) OVER (...)`
+- **sort** - `SELECT * FROM t ORDER BY age LIMIT 10`
+- **window_rank** - `ROW_NUMBER() OVER (PARTITION BY age ORDER BY id), RANK() OVER (...)`
 - **savepoint_nested** - 10 nested savepoints each with 100-row INSERT, alternating RELEASE/ROLLBACK TO
+- **insert** - 100 rows in one transaction
+- **scan** - `SELECT * FROM t` (full 100K rows)
+- **insert_select** - `INSERT INTO sink SELECT id, val FROM a`
+- **sum** - `SELECT SUM(age) FROM t`
+- **delete** - insert 100 rows then delete them
+- **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id` (1K x 1K)
+- **distinct** - `SELECT DISTINCT age FROM t`
+- **correlated_exists** - `SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM ref_table WHERE ref_table.id = t.id)`
+- **update** - `UPDATE t SET age = age + 1 WHERE id BETWEEN 10000 AND 10099`
+- **union** - `SELECT id, val FROM a UNION ALL SELECT id, data FROM b`
+- **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq`
 
 SQLite config: `journal_mode=OFF, synchronous=OFF, cache_size=8000` (~32 MB).
 Citadel config: `SyncMode::Off, cache_size=4096` (~32 MB).
