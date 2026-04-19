@@ -73,6 +73,9 @@ pub enum SqlError {
     #[error("no active transaction")]
     NoActiveTransaction,
 
+    #[error("savepoint '{0}' does not exist")]
+    SavepointNotFound(String),
+
     #[error("subquery must return exactly one column")]
     SubqueryMultipleColumns,
 

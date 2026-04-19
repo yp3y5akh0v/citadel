@@ -6,13 +6,13 @@ use std::sync::Arc;
 use lru::LruCache;
 
 use citadel::Database;
-use citadel_txn::write_txn::WriteTxn;
+use citadel_txn::write_txn::{WriteTxn, WriteTxnSnapshot};
 
 use crate::error::{Result, SqlError};
 use crate::executor;
 use crate::parser;
 use crate::parser::{InsertSource, Statement};
-use crate::schema::SchemaManager;
+use crate::schema::{SchemaManager, SchemaSnapshot};
 use crate::types::{ExecutionResult, QueryResult, TableSchema, Value};
 
 const DEFAULT_CACHE_CAPACITY: usize = 64;
@@ -201,11 +201,20 @@ struct CacheEntry {
     compiled_update: Option<executor::CompiledUpdate>,
 }
 
-/// SQL connection with LRU statement cache. Auto-commit; explicit txns via BEGIN/COMMIT/ROLLBACK.
+struct SavepointEntry {
+    name: String,
+    wtx_snap: WriteTxnSnapshot,
+    schema_snap: SchemaSnapshot,
+}
+
+/// SQL connection with LRU statement cache. Auto-commit; explicit txns via
+/// BEGIN/COMMIT/ROLLBACK with nested SAVEPOINT/RELEASE/ROLLBACK TO support.
 pub struct Connection<'a> {
     db: &'a Database,
     schema: SchemaManager,
     active_txn: Option<WriteTxn<'a>>,
+    savepoint_stack: Vec<SavepointEntry>,
+    in_place_saved: Option<bool>,
     stmt_cache: LruCache<String, CacheEntry>,
     insert_bufs: executor::InsertBufs,
     update_bufs: executor::UpdateBufs,
@@ -220,6 +229,8 @@ impl<'a> Connection<'a> {
             db,
             schema,
             active_txn: None,
+            savepoint_stack: Vec::new(),
+            in_place_saved: None,
             stmt_cache,
             insert_bufs: executor::InsertBufs::new(),
             update_bufs: executor::UpdateBufs::new(),
@@ -398,6 +409,9 @@ impl<'a> Connection<'a> {
                 | Statement::Begin
                 | Statement::Commit
                 | Statement::Rollback
+                | Statement::Savepoint(_)
+                | Statement::ReleaseSavepoint(_)
+                | Statement::RollbackTo(_)
         );
 
         if cacheable {
@@ -431,6 +445,7 @@ impl<'a> Connection<'a> {
                     .take()
                     .ok_or(SqlError::NoActiveTransaction)?;
                 wtx.commit().map_err(SqlError::Storage)?;
+                self.clear_savepoint_state();
                 Ok(ExecutionResult::Ok)
             }
             Statement::Rollback => {
@@ -439,9 +454,13 @@ impl<'a> Connection<'a> {
                     .take()
                     .ok_or(SqlError::NoActiveTransaction)?;
                 wtx.abort();
+                self.clear_savepoint_state();
                 self.schema = SchemaManager::load(self.db)?;
                 Ok(ExecutionResult::Ok)
             }
+            Statement::Savepoint(name) => self.do_savepoint(name),
+            Statement::ReleaseSavepoint(name) => self.do_release(name),
+            Statement::RollbackTo(name) => self.do_rollback_to(name),
             Statement::Insert(ins) if self.active_txn.is_some() => {
                 let wtx = self.active_txn.as_mut().unwrap();
                 executor::exec_insert_in_txn(wtx, &self.schema, ins, params, &mut self.insert_bufs)
@@ -454,5 +473,82 @@ impl<'a> Connection<'a> {
                 }
             }
         }
+    }
+
+    fn clear_savepoint_state(&mut self) {
+        self.savepoint_stack.clear();
+        self.in_place_saved = None;
+    }
+
+    fn do_savepoint(&mut self, name: &str) -> Result<ExecutionResult> {
+        let wtx = self
+            .active_txn
+            .as_mut()
+            .ok_or(SqlError::NoActiveTransaction)?;
+
+        if self.savepoint_stack.is_empty() {
+            self.in_place_saved = Some(wtx.in_place());
+            wtx.set_in_place(false);
+        }
+
+        let wtx_snap = wtx.begin_savepoint();
+        let schema_snap = self.schema.save_snapshot();
+
+        self.savepoint_stack.push(SavepointEntry {
+            name: name.to_string(),
+            wtx_snap,
+            schema_snap,
+        });
+
+        Ok(ExecutionResult::Ok)
+    }
+
+    fn do_release(&mut self, name: &str) -> Result<ExecutionResult> {
+        if self.active_txn.is_none() {
+            return Err(SqlError::NoActiveTransaction);
+        }
+
+        let idx = self
+            .savepoint_stack
+            .iter()
+            .rposition(|e| e.name == name)
+            .ok_or_else(|| SqlError::SavepointNotFound(name.to_string()))?;
+        self.savepoint_stack.truncate(idx);
+
+        if self.savepoint_stack.is_empty() {
+            if let (Some(wtx), Some(original)) =
+                (self.active_txn.as_mut(), self.in_place_saved.take())
+            {
+                wtx.set_in_place(original);
+            }
+        }
+
+        Ok(ExecutionResult::Ok)
+    }
+
+    fn do_rollback_to(&mut self, name: &str) -> Result<ExecutionResult> {
+        if self.active_txn.is_none() {
+            return Err(SqlError::NoActiveTransaction);
+        }
+
+        let idx = self
+            .savepoint_stack
+            .iter()
+            .rposition(|e| e.name == name)
+            .ok_or_else(|| SqlError::SavepointNotFound(name.to_string()))?;
+
+        self.savepoint_stack.truncate(idx + 1);
+        let entry = self.savepoint_stack.last().unwrap();
+        let wtx_snap = entry.wtx_snap.clone();
+        let schema_snap = entry.schema_snap.clone();
+
+        let wtx = self.active_txn.as_mut().unwrap();
+        wtx.restore_snapshot(wtx_snap);
+        self.schema.restore_snapshot(schema_snap);
+
+        // schema_gen went backward; evict cache entries keyed on it.
+        self.stmt_cache.clear();
+
+        Ok(ExecutionResult::Ok)
     }
 }

@@ -17,16 +17,16 @@ use citadel_page::{branch_node, leaf_node};
 pub fn compute_tree_merkle(
     pages: &mut HashMap<PageId, Page>,
     root: PageId,
-    txn_id: TxnId,
+    base_txn_id: TxnId,
     read_clean_hash: &dyn Fn(PageId) -> Result<[u8; MERKLE_HASH_SIZE]>,
 ) -> Result<[u8; MERKLE_HASH_SIZE]> {
-    compute_page_merkle(pages, root, txn_id, read_clean_hash)
+    compute_page_merkle(pages, root, base_txn_id, read_clean_hash)
 }
 
 fn compute_page_merkle(
     pages: &mut HashMap<PageId, Page>,
     page_id: PageId,
-    txn_id: TxnId,
+    base_txn_id: TxnId,
     read_clean_hash: &dyn Fn(PageId) -> Result<[u8; MERKLE_HASH_SIZE]>,
 ) -> Result<[u8; MERKLE_HASH_SIZE]> {
     // Page not in write set - it's clean, just read its hash
@@ -35,8 +35,9 @@ fn compute_page_merkle(
         None => return read_clean_hash(page_id),
     };
 
-    // Clean page in HashMap - hash already valid in header
-    if page.txn_id() != txn_id {
+    // Pages with txn_id < base are clean (any id >= base is this txn; savepoints
+    // bump txn_id mid-transaction so a single-value equality check won't work).
+    if page.txn_id() < base_txn_id {
         return Ok(page.merkle_hash());
     }
 
@@ -59,7 +60,8 @@ fn compute_page_merkle(
             // Recursively compute children's hashes
             let mut hasher = blake3::Hasher::new();
             for child_id in children {
-                let child_hash = compute_page_merkle(pages, child_id, txn_id, read_clean_hash)?;
+                let child_hash =
+                    compute_page_merkle(pages, child_id, base_txn_id, read_clean_hash)?;
                 hasher.update(&child_hash);
             }
             truncate_hash(&hasher.finalize())

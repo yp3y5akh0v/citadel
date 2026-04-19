@@ -37,6 +37,7 @@ impl PageLoader for WritePages<'_> {
 
 pub struct WriteTxn<'a> {
     manager: &'a TxnManager,
+    base_txn_id: TxnId,
     txn_id: TxnId,
     old_slot: CommitSlot,
     pages: HashMap<PageId, Page>,
@@ -48,6 +49,18 @@ pub struct WriteTxn<'a> {
     catalog: Option<BTree>,
     catalog_dirty: bool,
     loaded_tree_meta: HashMap<Vec<u8>, (PageId, u16)>,
+}
+
+#[derive(Clone)]
+pub struct WriteTxnSnapshot {
+    txn_id: TxnId,
+    tree: BTree,
+    alloc: PageAllocator,
+    named_trees: HashMap<Vec<u8>, BTree>,
+    catalog: Option<BTree>,
+    catalog_dirty: bool,
+    loaded_tree_meta: HashMap<Vec<u8>, (PageId, u16)>,
+    deferred_free: Vec<PageId>,
 }
 
 impl<'a> WriteTxn<'a> {
@@ -73,6 +86,7 @@ impl<'a> WriteTxn<'a> {
         };
         Self {
             manager,
+            base_txn_id: txn_id,
             txn_id,
             old_slot: snapshot,
             pages,
@@ -363,12 +377,12 @@ impl<'a> WriteTxn<'a> {
                         cursor.cell_index(),
                     );
                     let key_for_walk = cell.key.to_vec();
-                    let (path, _) = tree.walk_to_leaf(view.pages, &key_for_walk)?;
+                    let (mut path, _) = tree.walk_to_leaf(view.pages, &key_for_walk)?;
                     tree.root = btree::propagate_cow_up(
                         view.pages,
                         &mut self.alloc,
                         self.txn_id,
-                        &path,
+                        &mut path,
                         new_id,
                     );
                     // Update cursor to track the new page ID
@@ -427,6 +441,7 @@ impl<'a> WriteTxn<'a> {
     pub fn commit(mut self) -> Result<()> {
         let catalog_root = self.finalize_catalog()?;
         self.manager.commit_write(
+            self.base_txn_id,
             self.txn_id,
             &mut self.pages,
             &mut self.alloc,
@@ -444,6 +459,57 @@ impl<'a> WriteTxn<'a> {
     pub fn abort(mut self) {
         self.committed = true;
         self.manager.abort_write();
+    }
+
+    // ── Savepoint support ──────────────────────────────────────────
+
+    /// SAVEPOINT: snapshot state and advance txn_id so post-savepoint
+    /// mutations CoW into fresh PageIds.
+    pub fn begin_savepoint(&mut self) -> WriteTxnSnapshot {
+        let snap = self.capture_snapshot();
+        self.txn_id = self.manager.next_write_txn_id();
+        snap
+    }
+
+    /// ROLLBACK TO SAVEPOINT: restore state and drop post-savepoint pages.
+    /// Advances txn_id again so repeated rollback-to works.
+    pub fn restore_snapshot(&mut self, snap: WriteTxnSnapshot) {
+        let cutoff = snap.txn_id;
+        self.tree = snap.tree;
+        self.alloc = snap.alloc;
+        self.named_trees = snap.named_trees;
+        self.catalog = snap.catalog;
+        self.catalog_dirty = snap.catalog_dirty;
+        self.loaded_tree_meta = snap.loaded_tree_meta;
+        self.deferred_free = snap.deferred_free;
+        self.pages.retain(|_, page| page.txn_id() <= cutoff);
+        self.txn_id = self.manager.next_write_txn_id();
+    }
+
+    fn capture_snapshot(&self) -> WriteTxnSnapshot {
+        WriteTxnSnapshot {
+            txn_id: self.txn_id,
+            tree: self.tree.clone(),
+            alloc: self.alloc.clone(),
+            named_trees: self.named_trees.clone(),
+            catalog: self.catalog.clone(),
+            catalog_dirty: self.catalog_dirty,
+            loaded_tree_meta: self.loaded_tree_meta.clone(),
+            deferred_free: self.deferred_free.clone(),
+        }
+    }
+
+    /// Must be disabled while savepoints are live — in-place CoW defeats rollback.
+    pub fn set_in_place(&mut self, enabled: bool) {
+        self.alloc.set_in_place(enabled);
+    }
+
+    pub fn in_place(&self) -> bool {
+        self.alloc.in_place()
+    }
+
+    pub fn base_txn_id(&self) -> TxnId {
+        self.base_txn_id
     }
 
     fn validate_key_value(key: &[u8], value: &[u8]) -> Result<()> {
@@ -798,6 +864,142 @@ mod tests {
 
         let mut rtx = mgr.begin_read();
         assert_eq!(rtx.get(b"key").unwrap(), None);
+    }
+
+    #[test]
+    fn snapshot_and_restore_main_tree() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.set_in_place(false);
+
+        wtx.insert(b"a", b"1").unwrap();
+        wtx.insert(b"b", b"2").unwrap();
+        let snap = wtx.begin_savepoint();
+
+        wtx.insert(b"c", b"3").unwrap();
+        wtx.delete(b"a").unwrap();
+        assert_eq!(wtx.get(b"c").unwrap(), Some(b"3".to_vec()));
+        assert_eq!(wtx.get(b"a").unwrap(), None);
+
+        wtx.restore_snapshot(snap);
+
+        assert_eq!(wtx.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(wtx.get(b"b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(wtx.get(b"c").unwrap(), None);
+
+        wtx.commit().unwrap();
+        let mut rtx = mgr.begin_read();
+        assert_eq!(rtx.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(rtx.get(b"b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(rtx.get(b"c").unwrap(), None);
+    }
+
+    #[test]
+    fn snapshot_reusable_across_multiple_restores() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.set_in_place(false);
+
+        wtx.insert(b"base", b"v").unwrap();
+        let snap = wtx.begin_savepoint();
+
+        for i in 0..5 {
+            let k = format!("k{i}");
+            wtx.insert(k.as_bytes(), b"x").unwrap();
+            wtx.restore_snapshot(snap.clone());
+            assert_eq!(wtx.get(k.as_bytes()).unwrap(), None);
+        }
+        assert_eq!(wtx.get(b"base").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn snapshot_restores_named_tables() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.set_in_place(false);
+
+        wtx.create_table(b"t1").unwrap();
+        wtx.table_insert(b"t1", b"k1", b"v1").unwrap();
+        let snap = wtx.begin_savepoint();
+
+        wtx.create_table(b"t2").unwrap();
+        wtx.table_insert(b"t1", b"k2", b"v2").unwrap();
+        wtx.table_insert(b"t2", b"k", b"v").unwrap();
+
+        wtx.restore_snapshot(snap);
+
+        assert_eq!(wtx.table_get(b"t1", b"k1").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(wtx.table_get(b"t1", b"k2").unwrap(), None);
+        let err = wtx.table_get(b"t2", b"k").unwrap_err();
+        assert!(matches!(err, citadel_core::Error::TableNotFound(_)));
+    }
+
+    #[test]
+    fn snapshot_drops_post_snapshot_pages() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.set_in_place(false);
+
+        for i in 0..20u32 {
+            let k = format!("k{i:03}");
+            wtx.insert(k.as_bytes(), b"x").unwrap();
+        }
+        let snap = wtx.begin_savepoint();
+        let cutoff = snap.txn_id;
+
+        for i in 20..200u32 {
+            let k = format!("k{i:03}");
+            wtx.insert(k.as_bytes(), b"x").unwrap();
+        }
+
+        wtx.restore_snapshot(snap);
+        for page in wtx.pages.values() {
+            assert!(page.txn_id() <= cutoff);
+        }
+    }
+
+    #[test]
+    fn nested_savepoints_rollback_inner() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.set_in_place(false);
+
+        wtx.insert(b"a", b"1").unwrap();
+        let outer = wtx.begin_savepoint();
+        wtx.insert(b"b", b"2").unwrap();
+        let inner = wtx.begin_savepoint();
+        wtx.insert(b"c", b"3").unwrap();
+
+        wtx.restore_snapshot(inner);
+        assert_eq!(wtx.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(wtx.get(b"b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(wtx.get(b"c").unwrap(), None);
+
+        wtx.restore_snapshot(outer);
+        assert_eq!(wtx.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(wtx.get(b"b").unwrap(), None);
+    }
+
+    #[test]
+    fn in_place_toggle_helpers() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        let original = wtx.in_place();
+        wtx.set_in_place(!original);
+        assert_eq!(wtx.in_place(), !original);
+        wtx.set_in_place(original);
+        assert_eq!(wtx.in_place(), original);
+    }
+
+    #[test]
+    fn base_txn_id_stays_fixed_across_savepoints() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        let base = wtx.base_txn_id();
+        assert_eq!(wtx.txn_id, base);
+        let _snap = wtx.begin_savepoint();
+        assert!(wtx.txn_id.as_u64() > base.as_u64());
+        assert_eq!(wtx.base_txn_id(), base);
     }
 
     #[test]

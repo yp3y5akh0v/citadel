@@ -6,3 +6,4 @@
 .DS_Store
 site/public/
 site/static/wasm/*.wasm
+crates/citadel-wasm/pkg/

@@ -95,7 +95,7 @@ impl BTree {
         value: &[u8],
     ) -> Result<bool> {
         // LIL cache: skip walk_to_leaf for sequential appends to the rightmost leaf.
-        if let Some((cached_path, cached_leaf)) = self.last_insert.take() {
+        if let Some((mut cached_path, cached_leaf)) = self.last_insert.take() {
             let hit = {
                 let page = pages
                     .get(&cached_leaf)
@@ -111,7 +111,8 @@ impl BTree {
                 };
                 if ok {
                     if cow_id != cached_leaf {
-                        self.root = propagate_cow_up(pages, alloc, txn_id, &cached_path, cow_id);
+                        self.root =
+                            propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id);
                     }
                     self.entry_count += 1;
                     self.last_insert = Some((cached_path, cow_id));
@@ -212,7 +213,7 @@ impl BTree {
         let (mut path, mut leaf_id) = self.walk_to_leaf(pages, pairs[0].0)?;
         let mut cow_leaf = cow_page(pages, alloc, leaf_id, txn_id);
         if cow_leaf != leaf_id {
-            self.root = propagate_cow_up(pages, alloc, txn_id, &path, cow_leaf);
+            self.root = propagate_cow_up(pages, alloc, txn_id, &mut path, cow_leaf);
         }
 
         let mut count: u64 = 0;
@@ -232,7 +233,7 @@ impl BTree {
                 leaf_id = new_leaf;
                 cow_leaf = cow_page(pages, alloc, leaf_id, txn_id);
                 if cow_leaf != leaf_id {
-                    self.root = propagate_cow_up(pages, alloc, txn_id, &path, cow_leaf);
+                    self.root = propagate_cow_up(pages, alloc, txn_id, &mut path, cow_leaf);
                 }
                 hint = 0;
             }
@@ -279,7 +280,7 @@ impl BTree {
         key: &[u8],
     ) -> Result<bool> {
         self.last_insert = None;
-        let (path, leaf_id) = self.walk_to_leaf(pages, key)?;
+        let (mut path, leaf_id) = self.walk_to_leaf(pages, key)?;
 
         let found = {
             let page = pages.get(&leaf_id).unwrap();
@@ -298,7 +299,7 @@ impl BTree {
         let leaf_empty = pages.get(&new_leaf_id).unwrap().num_cells() == 0;
 
         if !leaf_empty || path.is_empty() {
-            self.root = propagate_cow_up(pages, alloc, txn_id, &path, new_leaf_id);
+            self.root = propagate_cow_up(pages, alloc, txn_id, &mut path, new_leaf_id);
             self.entry_count -= 1;
             return Ok(true);
         }
@@ -306,7 +307,7 @@ impl BTree {
         alloc.free(new_leaf_id);
         pages.remove(&new_leaf_id);
 
-        self.root = propagate_remove_up(pages, alloc, txn_id, &path, &mut self.depth);
+        self.root = propagate_remove_up(pages, alloc, txn_id, &mut path, &mut self.depth);
         self.entry_count -= 1;
         Ok(true)
     }
@@ -370,18 +371,22 @@ fn update_branch_child(page: &mut Page, child_idx: usize, new_child: PageId) {
     }
 }
 
-/// Propagate CoW up through ancestors (no split, just update child pointers).
+/// Propagate CoW up through ancestors. Updates `path` in place so callers
+/// caching the path (e.g. LIL) reuse current PageIds after CoW — critical
+/// across SAVEPOINT boundaries where txn_id changes invalidate the cache.
 pub fn propagate_cow_up(
     pages: &mut HashMap<PageId, Page>,
     alloc: &mut PageAllocator,
     txn_id: TxnId,
-    path: &[(PageId, usize)],
+    path: &mut [(PageId, usize)],
     mut new_child: PageId,
 ) -> PageId {
-    for &(ancestor_id, child_idx) in path.iter().rev() {
+    for i in (0..path.len()).rev() {
+        let (ancestor_id, child_idx) = path[i];
         let new_ancestor = cow_page(pages, alloc, ancestor_id, txn_id);
         let page = pages.get_mut(&new_ancestor).unwrap();
         update_branch_child(page, child_idx, new_child);
+        path[i] = (new_ancestor, child_idx);
         new_child = new_ancestor;
     }
     new_child
@@ -647,7 +652,7 @@ fn propagate_remove_up(
     pages: &mut HashMap<PageId, Page>,
     alloc: &mut PageAllocator,
     txn_id: TxnId,
-    path: &[(PageId, usize)],
+    path: &mut [(PageId, usize)],
     depth: &mut u16,
 ) -> PageId {
     // Process the bottom-most ancestor first (parent of the deleted leaf)
@@ -698,7 +703,7 @@ fn propagate_remove_up(
 
     // Propagate CoW for remaining path levels above
     if level > 0 {
-        let remaining_path = &path[..level];
+        let remaining_path = &mut path[..level];
         new_child = propagate_cow_up(pages, alloc, txn_id, remaining_path, new_child);
     }
 

@@ -25,6 +25,9 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    Savepoint(String),
+    ReleaseSavepoint(String),
+    RollbackTo(String),
     Explain(Box<Statement>),
 }
 
@@ -1099,8 +1102,24 @@ fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
         sp::Statement::Update(update) => convert_update(update),
         sp::Statement::Delete(delete) => convert_delete(delete),
         sp::Statement::StartTransaction { .. } => Ok(Statement::Begin),
+        sp::Statement::Commit { chain: true, .. } => {
+            Err(SqlError::Unsupported("COMMIT AND CHAIN".into()))
+        }
         sp::Statement::Commit { .. } => Ok(Statement::Commit),
+        sp::Statement::Rollback { chain: true, .. } => {
+            Err(SqlError::Unsupported("ROLLBACK AND CHAIN".into()))
+        }
+        sp::Statement::Rollback {
+            savepoint: Some(name),
+            ..
+        } => Ok(Statement::RollbackTo(name.value.to_ascii_lowercase())),
         sp::Statement::Rollback { .. } => Ok(Statement::Rollback),
+        sp::Statement::Savepoint { name } => {
+            Ok(Statement::Savepoint(name.value.to_ascii_lowercase()))
+        }
+        sp::Statement::ReleaseSavepoint { name } => {
+            Ok(Statement::ReleaseSavepoint(name.value.to_ascii_lowercase()))
+        }
         sp::Statement::Explain {
             statement, analyze, ..
         } => {
@@ -2754,6 +2773,81 @@ mod tests {
     fn parse_rollback() {
         let stmt = parse_sql("ROLLBACK").unwrap();
         assert!(matches!(stmt, Statement::Rollback));
+    }
+
+    #[test]
+    fn parse_savepoint() {
+        let stmt = parse_sql("SAVEPOINT sp1").unwrap();
+        match stmt {
+            Statement::Savepoint(name) => assert_eq!(name, "sp1"),
+            other => panic!("expected Savepoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_savepoint_case_insensitive() {
+        let stmt = parse_sql("SAVEPOINT My_SP").unwrap();
+        match stmt {
+            Statement::Savepoint(name) => assert_eq!(name, "my_sp"),
+            other => panic!("expected Savepoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_release_savepoint() {
+        let stmt = parse_sql("RELEASE SAVEPOINT sp1").unwrap();
+        match stmt {
+            Statement::ReleaseSavepoint(name) => assert_eq!(name, "sp1"),
+            other => panic!("expected ReleaseSavepoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_release_without_savepoint_keyword() {
+        let stmt = parse_sql("RELEASE sp1").unwrap();
+        match stmt {
+            Statement::ReleaseSavepoint(name) => assert_eq!(name, "sp1"),
+            other => panic!("expected ReleaseSavepoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rollback_to_savepoint() {
+        let stmt = parse_sql("ROLLBACK TO SAVEPOINT sp1").unwrap();
+        match stmt {
+            Statement::RollbackTo(name) => assert_eq!(name, "sp1"),
+            other => panic!("expected RollbackTo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rollback_to_without_savepoint_keyword() {
+        let stmt = parse_sql("ROLLBACK TO sp1").unwrap();
+        match stmt {
+            Statement::RollbackTo(name) => assert_eq!(name, "sp1"),
+            other => panic!("expected RollbackTo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rollback_to_case_insensitive() {
+        let stmt = parse_sql("ROLLBACK TO My_SP").unwrap();
+        match stmt {
+            Statement::RollbackTo(name) => assert_eq!(name, "my_sp"),
+            other => panic!("expected RollbackTo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_commit_and_chain_rejected() {
+        let err = parse_sql("COMMIT AND CHAIN").unwrap_err();
+        assert!(matches!(err, SqlError::Unsupported(_)));
+    }
+
+    #[test]
+    fn parse_rollback_and_chain_rejected() {
+        let err = parse_sql("ROLLBACK AND CHAIN").unwrap_err();
+        assert!(matches!(err, SqlError::Unsupported(_)));
     }
 
     #[test]

@@ -57,7 +57,12 @@ pub fn execute(
         Statement::Update(upd) => exec_update(db, schema, upd),
         Statement::Delete(del) => exec_delete(db, schema, del),
         Statement::Explain(inner) => explain(schema, inner),
-        Statement::Begin | Statement::Commit | Statement::Rollback => Err(SqlError::Unsupported(
+        Statement::Begin
+        | Statement::Commit
+        | Statement::Rollback
+        | Statement::Savepoint(_)
+        | Statement::ReleaseSavepoint(_)
+        | Statement::RollbackTo(_) => Err(SqlError::Unsupported(
             "transaction control in auto-commit mode".into(),
         )),
     }
@@ -86,7 +91,12 @@ pub fn execute_in_txn(
         Statement::Update(upd) => exec_update_in_txn(wtx, schema, upd),
         Statement::Delete(del) => exec_delete_in_txn(wtx, schema, del),
         Statement::Explain(inner) => explain(schema, inner),
-        Statement::Begin | Statement::Commit | Statement::Rollback => {
+        Statement::Begin
+        | Statement::Commit
+        | Statement::Rollback
+        | Statement::Savepoint(_)
+        | Statement::ReleaseSavepoint(_)
+        | Statement::RollbackTo(_) => {
             Err(SqlError::Unsupported("nested transaction control".into()))
         }
     }

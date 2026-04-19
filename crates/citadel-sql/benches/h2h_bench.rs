@@ -791,6 +791,189 @@ fn h2h_insert_select(c: &mut Criterion) {
     g.finish();
 }
 
+fn h2h_savepoint_create(c: &mut Criterion) {
+    let mut g = c.benchmark_group("savepoint_create");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    cc.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+        .unwrap();
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sc.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)",
+        [],
+    )
+    .unwrap();
+
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| {
+            cc.execute("BEGIN").unwrap();
+            cc.execute("SAVEPOINT sp").unwrap();
+            cc.execute("RELEASE SAVEPOINT sp").unwrap();
+            cc.execute("COMMIT").unwrap();
+        });
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| {
+            sc.execute_batch("BEGIN").unwrap();
+            sc.execute_batch("SAVEPOINT sp").unwrap();
+            sc.execute_batch("RELEASE SAVEPOINT sp").unwrap();
+            sc.execute_batch("COMMIT").unwrap();
+        });
+    });
+    g.finish();
+}
+
+fn h2h_savepoint_rollback(c: &mut Criterion) {
+    let mut g = c.benchmark_group("savepoint_rollback");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    cc.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+        .unwrap();
+    let mut c_off = 0i64;
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sc.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)",
+        [],
+    )
+    .unwrap();
+    let mut s_off = 0i64;
+
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| {
+            cc.execute("BEGIN").unwrap();
+            for _ in 0..1_000 {
+                cc.execute_params(
+                    "INSERT INTO t (id, val) VALUES ($1, 'pre')",
+                    &[Value::Integer(c_off)],
+                )
+                .unwrap();
+                c_off += 1;
+            }
+            cc.execute("SAVEPOINT sp").unwrap();
+            for _ in 0..10_000 {
+                cc.execute_params(
+                    "INSERT INTO t (id, val) VALUES ($1, 'post')",
+                    &[Value::Integer(c_off)],
+                )
+                .unwrap();
+                c_off += 1;
+            }
+            cc.execute("ROLLBACK TO SAVEPOINT sp").unwrap();
+            c_off -= 10_000;
+            cc.execute("COMMIT").unwrap();
+            cc.execute("DELETE FROM t").unwrap();
+            c_off = 0;
+        });
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| {
+            sc.execute_batch("BEGIN").unwrap();
+            for _ in 0..1_000 {
+                sc.execute(
+                    "INSERT INTO t (id, val) VALUES (?1, 'pre')",
+                    rusqlite::params![s_off],
+                )
+                .unwrap();
+                s_off += 1;
+            }
+            sc.execute_batch("SAVEPOINT sp").unwrap();
+            for _ in 0..10_000 {
+                sc.execute(
+                    "INSERT INTO t (id, val) VALUES (?1, 'post')",
+                    rusqlite::params![s_off],
+                )
+                .unwrap();
+                s_off += 1;
+            }
+            sc.execute_batch("ROLLBACK TO SAVEPOINT sp").unwrap();
+            s_off -= 10_000;
+            sc.execute_batch("COMMIT").unwrap();
+            sc.execute_batch("DELETE FROM t").unwrap();
+            s_off = 0;
+        });
+    });
+    g.finish();
+}
+
+fn h2h_savepoint_nested(c: &mut Criterion) {
+    let mut g = c.benchmark_group("savepoint_nested");
+
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    cc.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+        .unwrap();
+    let mut c_off = 0i64;
+
+    let sdir = tempfile::tempdir().unwrap();
+    let sc = sqlite_db(sdir.path());
+    sc.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)",
+        [],
+    )
+    .unwrap();
+    let mut s_off = 0i64;
+
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| {
+            cc.execute("BEGIN").unwrap();
+            for i in 0..10 {
+                cc.execute(&format!("SAVEPOINT sp{i}")).unwrap();
+                for _ in 0..100 {
+                    cc.execute_params(
+                        "INSERT INTO t (id, val) VALUES ($1, 'x')",
+                        &[Value::Integer(c_off)],
+                    )
+                    .unwrap();
+                    c_off += 1;
+                }
+                if i % 2 == 0 {
+                    cc.execute(&format!("RELEASE SAVEPOINT sp{i}")).unwrap();
+                } else {
+                    cc.execute(&format!("ROLLBACK TO SAVEPOINT sp{i}")).unwrap();
+                    cc.execute(&format!("RELEASE SAVEPOINT sp{i}")).unwrap();
+                }
+            }
+            cc.execute("COMMIT").unwrap();
+        });
+    });
+    g.bench_function(BenchmarkId::new("sqlite", ""), |b| {
+        b.iter(|| {
+            sc.execute_batch("BEGIN").unwrap();
+            for i in 0..10 {
+                sc.execute_batch(&format!("SAVEPOINT sp{i}")).unwrap();
+                for _ in 0..100 {
+                    sc.execute(
+                        "INSERT INTO t (id, val) VALUES (?1, 'x')",
+                        rusqlite::params![s_off],
+                    )
+                    .unwrap();
+                    s_off += 1;
+                }
+                if i % 2 == 0 {
+                    sc.execute_batch(&format!("RELEASE SAVEPOINT sp{i}"))
+                        .unwrap();
+                } else {
+                    sc.execute_batch(&format!("ROLLBACK TO SAVEPOINT sp{i}"))
+                        .unwrap();
+                    sc.execute_batch(&format!("RELEASE SAVEPOINT sp{i}"))
+                        .unwrap();
+                }
+            }
+            sc.execute_batch("COMMIT").unwrap();
+        });
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     h2h_count,
@@ -816,5 +999,8 @@ criterion_group!(
     h2h_correlated_in,
     h2h_correlated_scalar,
     h2h_insert_select,
+    h2h_savepoint_create,
+    h2h_savepoint_rollback,
+    h2h_savepoint_nested,
 );
 criterion_main!(benches);

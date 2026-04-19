@@ -17,6 +17,13 @@ pub struct SchemaManager {
     generation: u64,
 }
 
+#[derive(Clone)]
+pub struct SchemaSnapshot {
+    tables: HashMap<String, TableSchema>,
+    views: HashMap<String, ViewDef>,
+    generation: u64,
+}
+
 impl SchemaManager {
     /// Load all schemas from the database's `_schema` table.
     pub fn load(db: &Database) -> Result<Self> {
@@ -228,5 +235,19 @@ impl SchemaManager {
             Err(citadel_core::Error::TableAlreadyExists(_)) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    pub fn save_snapshot(&self) -> SchemaSnapshot {
+        SchemaSnapshot {
+            tables: self.tables.clone(),
+            views: self.views.clone(),
+            generation: self.generation,
+        }
+    }
+
+    pub fn restore_snapshot(&mut self, snap: SchemaSnapshot) {
+        self.tables = snap.tables;
+        self.views = snap.views;
+        self.generation = snap.generation;
     }
 }

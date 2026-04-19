@@ -284,9 +284,14 @@ impl TxnManager {
         Ok(arc)
     }
 
+    pub(crate) fn next_write_txn_id(&self) -> TxnId {
+        TxnId(self.next_txn_id.fetch_add(1, Ordering::SeqCst))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_write(
         &self,
+        base_txn_id: TxnId,
         txn_id: TxnId,
         pages: &mut std::collections::HashMap<PageId, Page>,
         alloc: &mut PageAllocator,
@@ -342,19 +347,25 @@ impl TxnManager {
             };
 
         let merkle_root_hash = if self.sync_mode != citadel_core::types::SyncMode::Off {
-            let hash = crate::merkle::compute_tree_merkle(pages, tree.root, txn_id, &|page_id| {
-                self.fetch_merkle_hash(page_id)
-            })?;
+            let hash =
+                crate::merkle::compute_tree_merkle(pages, tree.root, base_txn_id, &|page_id| {
+                    self.fetch_merkle_hash(page_id)
+                })?;
 
             let read_hash = &|page_id| self.fetch_merkle_hash(page_id);
             for named_tree in named_trees.values() {
                 if named_tree.root != PageId::INVALID {
-                    crate::merkle::compute_tree_merkle(pages, named_tree.root, txn_id, read_hash)?;
+                    crate::merkle::compute_tree_merkle(
+                        pages,
+                        named_tree.root,
+                        base_txn_id,
+                        read_hash,
+                    )?;
                 }
             }
 
             if catalog_root != PageId::INVALID && catalog_root != old_slot.catalog_root {
-                crate::merkle::compute_tree_merkle(pages, catalog_root, txn_id, read_hash)?;
+                crate::merkle::compute_tree_merkle(pages, catalog_root, base_txn_id, read_hash)?;
             }
             hash
         } else {
@@ -364,7 +375,7 @@ impl TxnManager {
         let mut dirty_page_info: Vec<(u64, PageId)> = Vec::with_capacity(pages.len());
         let mut max_offset = 0u64;
         for page in pages.values_mut() {
-            if page.txn_id() == txn_id {
+            if page.txn_id() >= base_txn_id {
                 page.update_checksum();
                 let page_id = page.page_id();
                 let offset = page_offset(page_id);

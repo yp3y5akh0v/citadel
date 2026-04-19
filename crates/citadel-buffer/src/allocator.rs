@@ -2,6 +2,7 @@
 
 use citadel_core::types::PageId;
 
+#[derive(Clone)]
 pub struct PageAllocator {
     /// Next page ID to allocate from (high water mark).
     next_page_id: u32,

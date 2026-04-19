@@ -28,7 +28,7 @@ Every page is encrypted and authenticated before it hits disk. The database file
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. C FFI (37 functions), WebAssembly bindings
-- **2,560+ tests** - Unit, integration, torture tests across 10 crates
+- **2,670+ tests** - Unit, integration, torture tests across 10 crates
 
 ## Benchmarks
 
@@ -60,6 +60,8 @@ correlated_exists  5.78 ms        6.59 ms        1.1x
 update             27.9 us        29.7 us        1.07x
 union              176 us         181 us         1.03x
 recursive_cte      111 us         115 us         1.03x
+savepoint_rollback 3.49 ms        10.1 ms        2.9x
+savepoint_nested   518 us         1.05 ms        2.0x
 ```
 
 <details>
@@ -88,6 +90,8 @@ recursive_cte      111 us         115 us         1.03x
 - **correlated_exists** - `SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM ref_table WHERE ref_table.id = t.id)`
 - **correlated_in** - `SELECT COUNT(*) FROM t WHERE id IN (SELECT id FROM ref_table WHERE ref_table.val = t.age)`
 - **correlated_scalar** - `SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.a_id = a.id) FROM a`
+- **savepoint_rollback** - `BEGIN; INSERT 1K rows; SAVEPOINT sp; INSERT 10K rows; ROLLBACK TO sp; COMMIT`
+- **savepoint_nested** - 10 nested savepoints each with 100-row INSERT, alternating RELEASE/ROLLBACK TO
 
 SQLite config: `journal_mode=OFF, synchronous=OFF, cache_size=8000` (~32 MB).
 Citadel config: `SyncMode::Off, cache_size=4096` (~32 MB).
@@ -165,7 +169,7 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 ## SQL
 
-**Statements** - CREATE/DROP TABLE, ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE/DROP INDEX, CREATE/DROP VIEW, INSERT (VALUES, SELECT), SELECT, UPDATE, DELETE, BEGIN/COMMIT/ROLLBACK, EXPLAIN
+**Statements** - CREATE/DROP TABLE, ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE/DROP INDEX, CREATE/DROP VIEW, INSERT (VALUES, SELECT), SELECT, UPDATE, DELETE, BEGIN/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, EXPLAIN
 
 **Constraints** - PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK (column + table level), FOREIGN KEY (RESTRICT/NO ACTION)
 
