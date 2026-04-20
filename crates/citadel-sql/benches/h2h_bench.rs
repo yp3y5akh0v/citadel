@@ -1,11 +1,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use mimalloc::MiMalloc;
 
 use citadel::{Argon2Profile, DatabaseBuilder, SyncMode};
 use citadel_sql::{Connection, Value};
-
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
 
 fn citadel_db(dir: &std::path::Path) -> citadel::Database {
     DatabaseBuilder::new(dir.join("bench.citadel"))
@@ -53,7 +49,8 @@ fn citadel_join_tables(conn: &mut Connection) {
 
 fn sqlite_db(dir: &std::path::Path) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open(dir.join("bench.db")).unwrap();
-    conn.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=8000;")
+    // SQLite default page = 4 KB × 8192 pages ≈ 32 MB, matching Citadel's 4096 × 8 KB.
+    conn.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=8192;")
         .unwrap();
     conn
 }
@@ -104,13 +101,16 @@ fn sqlite_join_tables(conn: &rusqlite::Connection) {
     conn.execute_batch("COMMIT").unwrap();
 }
 
-fn sqlite_collect(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
+fn sqlite_collect(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
     let mut stmt = conn.prepare_cached(sql).unwrap();
     let col_count = stmt.column_count();
     stmt.query_map([], |row| {
         let mut vals = Vec::with_capacity(col_count);
         for i in 0..col_count {
-            vals.push(row.get::<_, String>(i).unwrap_or_default());
+            vals.push(
+                row.get::<_, rusqlite::types::Value>(i)
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
         }
         Ok(vals)
     })
@@ -974,6 +974,107 @@ fn h2h_savepoint_nested(c: &mut Criterion) {
     g.finish();
 }
 
+// ── Native DATE / TIMESTAMP / INTERVAL benchmarks (Citadel only) ────
+
+const DATE_ROWS: i64 = 100_000;
+
+fn citadel_date_table(conn: &mut Connection) {
+    conn.execute("CREATE TABLE events (id INTEGER NOT NULL PRIMARY KEY, d DATE, ts TIMESTAMP)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for i in 0..DATE_ROWS {
+        let day_of_year = (i % 365) + 1;
+        let month = (day_of_year / 31) + 1;
+        let day = (day_of_year % 28) + 1;
+        let hour = i % 24;
+        let sql = format!(
+            "INSERT INTO events VALUES ({i}, DATE '2024-{:02}-{:02}', TIMESTAMP '2024-{:02}-{:02} {:02}:00:00')",
+            month, day, month, day, hour
+        );
+        conn.execute(&sql).unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+}
+
+fn citadel_date_range_scan(c: &mut Criterion) {
+    let mut g = c.benchmark_group("date_range_scan");
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_date_table(&mut cc);
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| {
+            cc.query(
+                "SELECT COUNT(*) FROM events WHERE d BETWEEN DATE '2024-02-01' AND DATE '2024-03-31'",
+            )
+            .unwrap()
+        });
+    });
+    g.finish();
+}
+
+fn citadel_date_groupby(c: &mut Criterion) {
+    let mut g = c.benchmark_group("date_groupby");
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_date_table(&mut cc);
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| {
+            cc.query("SELECT DATE_TRUNC('month', ts), COUNT(*) FROM events GROUP BY 1")
+                .unwrap()
+        });
+    });
+    g.finish();
+}
+
+fn citadel_date_extract(c: &mut Criterion) {
+    let mut g = c.benchmark_group("date_extract");
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_date_table(&mut cc);
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| {
+            cc.query("SELECT AVG(EXTRACT(HOUR FROM ts)) FROM events")
+                .unwrap()
+        });
+    });
+    g.finish();
+}
+
+fn citadel_date_sort(c: &mut Criterion) {
+    let mut g = c.benchmark_group("date_sort");
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_date_table(&mut cc);
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| {
+            cc.query("SELECT id FROM events ORDER BY ts LIMIT 100")
+                .unwrap()
+        });
+    });
+    g.finish();
+}
+
+fn citadel_date_arith(c: &mut Criterion) {
+    let mut g = c.benchmark_group("date_arith");
+    let cdir = tempfile::tempdir().unwrap();
+    let cdb = citadel_db(cdir.path());
+    let mut cc = Connection::open(&cdb).unwrap();
+    citadel_date_table(&mut cc);
+    g.bench_function(BenchmarkId::new("citadel", ""), |b| {
+        b.iter(|| {
+            cc.query(
+                "SELECT COUNT(*) FROM events WHERE ts + INTERVAL '1 day' > TIMESTAMP '2024-06-01 00:00:00'",
+            )
+            .unwrap()
+        });
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     h2h_count,
@@ -1002,5 +1103,10 @@ criterion_group!(
     h2h_savepoint_create,
     h2h_savepoint_rollback,
     h2h_savepoint_nested,
+    citadel_date_range_scan,
+    citadel_date_groupby,
+    citadel_date_extract,
+    citadel_date_sort,
+    citadel_date_arith,
 );
 criterion_main!(benches);

@@ -71,8 +71,15 @@ pub(super) fn exec_aggregate(
     }
 
     if stmt.distinct {
-        let mut seen = std::collections::HashSet::new();
-        result_rows.retain(|row| seen.insert(row.clone()));
+        let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
+        result_rows.retain(|row| {
+            if seen.contains(row) {
+                false
+            } else {
+                seen.insert(row.clone());
+                true
+            }
+        });
     }
 
     if !stmt.order_by.is_empty() {
@@ -117,7 +124,11 @@ pub(super) fn eval_aggregate_expr(
     match expr {
         Expr::CountStar => Ok(Value::Integer(group_rows.len() as i64)),
 
-        Expr::Function { name, args } if is_aggregate_function(name, args.len()) => {
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } if is_aggregate_function(name, args.len()) => {
             let func = name.to_ascii_uppercase();
             if args.len() != 1 {
                 return Err(SqlError::Unsupported(format!(
@@ -126,10 +137,21 @@ pub(super) fn eval_aggregate_expr(
                 )));
             }
             let arg = &args[0];
-            let values: Vec<Value> = group_rows
+            let mut values: Vec<Value> = group_rows
                 .iter()
                 .map(|row| eval_expr(arg, col_map, row))
                 .collect::<Result<_>>()?;
+            if *distinct {
+                let mut seen: std::collections::HashSet<Value> = std::collections::HashSet::new();
+                values.retain(|v| {
+                    if v.is_null() || seen.contains(v) {
+                        false
+                    } else {
+                        seen.insert(v.clone());
+                        true
+                    }
+                });
+            }
 
             match func.as_str() {
                 "COUNT" => {
@@ -137,6 +159,47 @@ pub(super) fn eval_aggregate_expr(
                     Ok(Value::Integer(count as i64))
                 }
                 "SUM" => {
+                    // INTERVAL sum: field-wise saturating add (PG semantic).
+                    let is_interval = values
+                        .iter()
+                        .find(|v| !v.is_null())
+                        .is_some_and(|v| matches!(v, Value::Interval { .. }));
+                    if is_interval {
+                        let mut months: i32 = 0;
+                        let mut days: i32 = 0;
+                        let mut micros: i64 = 0;
+                        let mut all_null = true;
+                        for v in &values {
+                            match v {
+                                Value::Null => {}
+                                Value::Interval {
+                                    months: m,
+                                    days: d,
+                                    micros: u,
+                                } => {
+                                    months = months.saturating_add(*m);
+                                    days = days.saturating_add(*d);
+                                    micros = micros.saturating_add(*u);
+                                    all_null = false;
+                                }
+                                _ => {
+                                    return Err(SqlError::TypeMismatch {
+                                        expected: "INTERVAL".into(),
+                                        got: v.data_type().to_string(),
+                                    })
+                                }
+                            }
+                        }
+                        return if all_null {
+                            Ok(Value::Null)
+                        } else {
+                            Ok(Value::Interval {
+                                months,
+                                days,
+                                micros,
+                            })
+                        };
+                    }
                     let mut int_sum: i64 = 0;
                     let mut real_sum: f64 = 0.0;
                     let mut has_real = false;
@@ -171,6 +234,48 @@ pub(super) fn eval_aggregate_expr(
                     }
                 }
                 "AVG" => {
+                    // INTERVAL avg: field-wise sum / count.
+                    let is_interval = values
+                        .iter()
+                        .find(|v| !v.is_null())
+                        .is_some_and(|v| matches!(v, Value::Interval { .. }));
+                    if is_interval {
+                        let mut months: i64 = 0;
+                        let mut days: i64 = 0;
+                        let mut micros: i128 = 0;
+                        let mut count: i64 = 0;
+                        for v in &values {
+                            match v {
+                                Value::Null => {}
+                                Value::Interval {
+                                    months: m,
+                                    days: d,
+                                    micros: u,
+                                } => {
+                                    months += *m as i64;
+                                    days += *d as i64;
+                                    micros += *u as i128;
+                                    count += 1;
+                                }
+                                _ => {
+                                    return Err(SqlError::TypeMismatch {
+                                        expected: "INTERVAL".into(),
+                                        got: v.data_type().to_string(),
+                                    })
+                                }
+                            }
+                        }
+                        return if count == 0 {
+                            Ok(Value::Null)
+                        } else {
+                            Ok(Value::Interval {
+                                months: (months / count).clamp(i32::MIN as i64, i32::MAX as i64)
+                                    as i32,
+                                days: (days / count).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                                micros: (micros / count as i128) as i64,
+                            })
+                        };
+                    }
                     let mut sum: f64 = 0.0;
                     let mut count: i64 = 0;
                     for v in &values {
@@ -384,7 +489,7 @@ pub(super) fn eval_aggregate_expr(
             )
         }
 
-        Expr::Function { name, args } => {
+        Expr::Function { name, args, .. } => {
             let evaluated: Vec<Value> = args
                 .iter()
                 .map(|a| eval_aggregate_expr(a, col_map, group_rows))
@@ -394,6 +499,7 @@ pub(super) fn eval_aggregate_expr(
                 &Expr::Function {
                     name: name.clone(),
                     args: literal_args,
+                    distinct: false,
                 },
                 col_map,
                 &[],
@@ -415,7 +521,7 @@ pub(super) fn is_aggregate_function(name: &str, arg_count: usize) -> bool {
 pub(super) fn is_aggregate_expr(expr: &Expr) -> bool {
     match expr {
         Expr::CountStar => true,
-        Expr::Function { name, args } => {
+        Expr::Function { name, args, .. } => {
             is_aggregate_function(name, args.len()) || args.iter().any(is_aggregate_expr)
         }
         Expr::BinaryOp { left, right, .. } => is_aggregate_expr(left) || is_aggregate_expr(right),

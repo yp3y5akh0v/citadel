@@ -28,6 +28,7 @@ pub enum Statement {
     Savepoint(String),
     ReleaseSavepoint(String),
     RollbackTo(String),
+    SetTimezone(String),
     Explain(Box<Statement>),
 }
 
@@ -266,6 +267,8 @@ pub enum Expr {
     Function {
         name: String,
         args: Vec<Expr>,
+        /// True for aggregate forms like `COUNT(DISTINCT x)`.
+        distinct: bool,
     },
     CountStar,
     InSubquery {
@@ -694,7 +697,11 @@ fn bind_expr(expr: &Expr, params: &[crate::types::Value]) -> crate::error::Resul
         }),
         Expr::IsNull(e) => Ok(Expr::IsNull(Box::new(bind_expr(e, params)?))),
         Expr::IsNotNull(e) => Ok(Expr::IsNotNull(Box::new(bind_expr(e, params)?))),
-        Expr::Function { name, args } => {
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => {
             let args = args
                 .iter()
                 .map(|a| bind_expr(a, params))
@@ -702,6 +709,7 @@ fn bind_expr(expr: &Expr, params: &[crate::types::Value]) -> crate::error::Resul
             Ok(Expr::Function {
                 name: name.clone(),
                 args,
+                distinct: *distinct,
             })
         }
         Expr::InSubquery {
@@ -1119,6 +1127,23 @@ fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
         }
         sp::Statement::ReleaseSavepoint { name } => {
             Ok(Statement::ReleaseSavepoint(name.value.to_ascii_lowercase()))
+        }
+        sp::Statement::Set(sp::Set::SetTimeZone { value, .. }) => {
+            // Accept a string literal or bare identifier (PG allows `SET TIME ZONE UTC`).
+            let zone = match value {
+                sp::Expr::Value(v) => match &v.value {
+                    sp::Value::SingleQuotedString(s) => s.clone(),
+                    sp::Value::DoubleQuotedString(s) => s.clone(),
+                    other => other.to_string(),
+                },
+                sp::Expr::Identifier(ident) => ident.value.clone(),
+                other => {
+                    return Err(SqlError::Parse(format!(
+                        "SET TIME ZONE expects a string literal or identifier, got: {other}"
+                    )))
+                }
+            };
+            Ok(Statement::SetTimezone(zone))
         }
         sp::Statement::Explain {
             statement, analyze, ..
@@ -1972,6 +1997,7 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
             Ok(Expr::Function {
                 name: "SUBSTR".into(),
                 args,
+                distinct: false,
             })
         }
         sp::Expr::Trim {
@@ -1996,19 +2022,81 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
             Ok(Expr::Function {
                 name: fn_name.into(),
                 args,
+                distinct: false,
             })
         }
         sp::Expr::Ceil { expr: e, .. } => Ok(Expr::Function {
             name: "CEIL".into(),
             args: vec![convert_expr(e)?],
+            distinct: false,
         }),
         sp::Expr::Floor { expr: e, .. } => Ok(Expr::Function {
             name: "FLOOR".into(),
             args: vec![convert_expr(e)?],
+            distinct: false,
         }),
         sp::Expr::Position { expr: e, r#in } => Ok(Expr::Function {
             name: "INSTR".into(),
             args: vec![convert_expr(r#in)?, convert_expr(e)?],
+            distinct: false,
+        }),
+        // Typed literal: `DATE '2024-01-15'`, `TIMESTAMP '...'`, etc.
+        sp::Expr::TypedString(ts) => {
+            let raw = match &ts.value.value {
+                sp::Value::SingleQuotedString(s) => s.clone(),
+                sp::Value::DoubleQuotedString(s) => s.clone(),
+                other => other.to_string(),
+            };
+            convert_typed_string(&ts.data_type, &raw)
+        }
+        // INTERVAL '...' — sqlparser emits Expr::Interval with a boxed Expr value + field qualifiers
+        sp::Expr::Interval(iv) => convert_interval_expr(iv),
+        // EXTRACT(field FROM src)
+        sp::Expr::Extract { field, expr: e, .. } => {
+            let field_name = match field {
+                sp::DateTimeField::Year => "year",
+                sp::DateTimeField::Month => "month",
+                sp::DateTimeField::Week(_) => "week",
+                sp::DateTimeField::Day => "day",
+                sp::DateTimeField::Date => "day",
+                sp::DateTimeField::Hour => "hour",
+                sp::DateTimeField::Minute => "minute",
+                sp::DateTimeField::Second => "second",
+                sp::DateTimeField::Millisecond => "milliseconds",
+                sp::DateTimeField::Microsecond => "microseconds",
+                sp::DateTimeField::Microseconds => "microseconds",
+                sp::DateTimeField::Milliseconds => "milliseconds",
+                sp::DateTimeField::Dow => "dow",
+                sp::DateTimeField::Isodow => "isodow",
+                sp::DateTimeField::Doy => "doy",
+                sp::DateTimeField::Epoch => "epoch",
+                sp::DateTimeField::Quarter => "quarter",
+                sp::DateTimeField::Decade => "decade",
+                sp::DateTimeField::Century => "century",
+                sp::DateTimeField::Millennium => "millennium",
+                sp::DateTimeField::Isoyear => "isoyear",
+                sp::DateTimeField::Julian => "julian",
+                other => {
+                    return Err(SqlError::InvalidExtractField(format!("{other:?}")));
+                }
+            };
+            Ok(Expr::Function {
+                name: "EXTRACT".into(),
+                args: vec![
+                    Expr::Literal(Value::Text(field_name.into())),
+                    convert_expr(e)?,
+                ],
+                distinct: false,
+            })
+        }
+        // `AT TIME ZONE 'zone'` operator — desugars to AT_TIMEZONE(ts, zone) scalar function.
+        sp::Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => Ok(Expr::Function {
+            name: "AT_TIMEZONE".into(),
+            args: vec![convert_expr(timestamp)?, convert_expr(time_zone)?],
+            distinct: false,
         }),
         _ => Err(SqlError::Unsupported(format!("expression: {expr}"))),
     }
@@ -2044,6 +2132,86 @@ fn convert_value(val: &sp::Value) -> Result<Expr> {
     }
 }
 
+fn convert_typed_string(dt: &sp::DataType, value: &str) -> Result<Expr> {
+    let s = value.trim_matches('\'');
+    match dt {
+        sp::DataType::Date => {
+            let d = crate::datetime::parse_date(s)?;
+            Ok(Expr::Literal(Value::Date(d)))
+        }
+        sp::DataType::Time(_, _) => {
+            let t = crate::datetime::parse_time(s)?;
+            Ok(Expr::Literal(Value::Time(t)))
+        }
+        sp::DataType::Timestamp(_, _) => {
+            let t = crate::datetime::parse_timestamp(s)?;
+            Ok(Expr::Literal(Value::Timestamp(t)))
+        }
+        sp::DataType::Interval { .. } => {
+            let (months, days, micros) = crate::datetime::parse_interval(s)?;
+            Ok(Expr::Literal(Value::Interval {
+                months,
+                days,
+                micros,
+            }))
+        }
+        _ => {
+            let target = convert_data_type(dt)?;
+            Ok(Expr::Cast {
+                expr: Box::new(Expr::Literal(Value::Text(s.into()))),
+                data_type: target,
+            })
+        }
+    }
+}
+
+fn convert_interval_expr(iv: &sp::Interval) -> Result<Expr> {
+    let raw = match iv.value.as_ref() {
+        sp::Expr::Value(v) => match &v.value {
+            sp::Value::SingleQuotedString(s) => s.clone(),
+            sp::Value::Number(n, _) => n.clone(),
+            other => {
+                return Err(SqlError::InvalidIntervalLiteral(format!(
+                    "unsupported inner value: {other}"
+                )))
+            }
+        },
+        other => {
+            return Err(SqlError::InvalidIntervalLiteral(format!(
+                "unsupported inner expr: {other}"
+            )))
+        }
+    };
+
+    // SQL-standard form `INTERVAL '5' DAY` — append the unit to the literal.
+    let with_unit = if let Some(field) = &iv.leading_field {
+        let unit_name = match field {
+            sp::DateTimeField::Year => "years",
+            sp::DateTimeField::Month => "months",
+            sp::DateTimeField::Week(_) => "weeks",
+            sp::DateTimeField::Day => "days",
+            sp::DateTimeField::Hour => "hours",
+            sp::DateTimeField::Minute => "minutes",
+            sp::DateTimeField::Second => "seconds",
+            _ => {
+                return Err(SqlError::InvalidIntervalLiteral(format!(
+                    "unsupported leading field: {field:?}"
+                )))
+            }
+        };
+        format!("{raw} {unit_name}")
+    } else {
+        raw
+    };
+
+    let (months, days, micros) = crate::datetime::parse_interval(&with_unit)?;
+    Ok(Expr::Literal(Value::Interval {
+        months,
+        days,
+        micros,
+    }))
+}
+
 fn convert_escape_value(val: &sp::Value) -> Result<Expr> {
     match val {
         sp::Value::SingleQuotedString(s) => Ok(Expr::Literal(Value::Text(s.as_str().into()))),
@@ -2074,10 +2242,14 @@ fn convert_bin_op(op: &sp::BinaryOperator) -> Result<BinOp> {
 fn convert_function(func: &sp::Function) -> Result<Expr> {
     let name = object_name_to_string(&func.name).to_ascii_uppercase();
 
-    let (args, is_count_star) = match &func.args {
+    let (args, is_count_star, distinct) = match &func.args {
         sp::FunctionArguments::List(list) => {
+            let distinct = matches!(
+                list.duplicate_treatment,
+                Some(sp::DuplicateTreatment::Distinct)
+            );
             if list.args.is_empty() && name == "COUNT" {
-                (vec![], true)
+                (vec![], true, distinct)
             } else {
                 let mut count_star = false;
                 let args = list
@@ -2099,17 +2271,17 @@ fn convert_function(func: &sp::Function) -> Result<Expr> {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 if name == "COUNT" && args.len() == 1 && count_star {
-                    (vec![], true)
+                    (vec![], true, distinct)
                 } else {
-                    (args, false)
+                    (args, false, distinct)
                 }
             }
         }
         sp::FunctionArguments::None => {
             if name == "COUNT" {
-                (vec![], true)
+                (vec![], true, false)
             } else {
-                (vec![], false)
+                (vec![], false, false)
             }
         }
         sp::FunctionArguments::Subquery(_) => {
@@ -2175,7 +2347,11 @@ fn convert_function(func: &sp::Function) -> Result<Expr> {
         });
     }
 
-    Ok(Expr::Function { name, args })
+    Ok(Expr::Function {
+        name,
+        args,
+        distinct,
+    })
 }
 
 fn convert_window_spec(ws: &sp::WindowSpec) -> Result<WindowSpec> {
@@ -2292,6 +2468,11 @@ fn convert_data_type(dt: &sp::DataType) -> Result<DataType> {
         sp::DataType::Blob(_) | sp::DataType::Bytea => Ok(DataType::Blob),
 
         sp::DataType::Boolean | sp::DataType::Bool => Ok(DataType::Boolean),
+
+        sp::DataType::Date => Ok(DataType::Date),
+        sp::DataType::Time(_, _) => Ok(DataType::Time),
+        sp::DataType::Timestamp(_, _) => Ok(DataType::Timestamp),
+        sp::DataType::Interval { .. } => Ok(DataType::Interval),
 
         _ => Err(SqlError::Unsupported(format!("data type: {dt}"))),
     }

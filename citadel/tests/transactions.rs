@@ -1,15 +1,4 @@
-//! Integration tests for transactions and commit protocol.
-//!
-//! Tests the full transaction lifecycle including:
-//! - CRUD through transactions
-//! - Snapshot isolation (MVCC)
-//! - Commit protocol correctness
-//! - Abort semantics
-//! - Reader registration and oldest_active_reader tracking
-//! - Pending-free chain lifecycle
-//! - Crash recovery simulation (god byte states)
-//! - Reopen-and-verify persistence
-//! - Multiple sequential transactions
+//! Transactions and commit protocol: CRUD, MVCC, abort, recovery, persistence.
 
 use citadel_core::{
     Error, Result, DEK_SIZE, GOD_BIT_ACTIVE_SLOT, GOD_BIT_RECOVERY, MAC_KEY_SIZE, PAGE_SIZE,
@@ -654,13 +643,10 @@ fn write_read_write_interleave() {
 }
 
 // ============================================================
-// Edge Case & Regression Tests
+// Edge cases and regressions
 // ============================================================
 
-// --- BUG #1 Regression: Failed commit must release writer lock ---
-
-/// FailingIO wraps SharedIO and fails on the Nth fsync call.
-/// This lets us simulate a commit failure mid-protocol.
+/// SharedIO that fails on the Nth fsync call, for simulating mid-commit failures.
 struct FailingIO {
     storage: std::sync::Arc<SharedStorage>,
     fsync_count: std::sync::atomic::AtomicU32,
@@ -735,11 +721,9 @@ fn failed_commit_releases_writer_lock() {
             result.is_err(),
             "commit should fail due to simulated fsync failure"
         );
-        // WriteTxn is dropped here - Drop should call abort_write() because committed=false
+        // WriteTxn dropped → Drop calls abort_write() because committed=false.
     }
 
-    // The critical test: can we begin a new write transaction?
-    // Before the fix, this would fail with WriteTransactionActive.
     let result = mgr.begin_write();
     assert!(
         result.is_ok(),
@@ -747,12 +731,9 @@ fn failed_commit_releases_writer_lock() {
     );
 }
 
-// --- BUG #2 Regression: for_each must work on multi-leaf trees ---
-
 #[test]
 fn for_each_multi_leaf_tree() {
-    // BUG #2 regression: for_each used to only preload the leftmost path,
-    // causing failures when cursor.next() tried to access unloaded pages.
+    // Regression: for_each must preload every leaf, not just the leftmost path.
     let storage = std::sync::Arc::new(SharedStorage::new(4 * 1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
@@ -866,8 +847,7 @@ fn reclaimed_pages_reused() {
     }
     let hwm_after_reuse = mgr.current_slot().high_water_mark;
 
-    // The HWM growth should be much less than 100 pages because reclaimed pages
-    // should be reused. Without the fix, HWM would grow by ~100+ pages.
+    // Reclaimed pages should be reused, keeping HWM growth small.
     let growth = hwm_after_reuse - hwm_before_reuse;
     assert!(
         growth < 50,
@@ -1327,13 +1307,11 @@ fn hwm_tracking_across_transactions() {
 
 #[test]
 fn oldest_reader_blocks_reclamation() {
-    // Uses large values (~1800 bytes each) to force multi-page trees.
-    // This creates enough pages to make reclamation effects measurable:
-    // Each leaf holds ~4 entries with 1800B values, so 80 entries ≈ 20+ leaves + branches.
+    // Large values force a multi-page tree so reclamation effects are measurable.
     let storage = std::sync::Arc::new(SharedStorage::new(16 * 1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
-    let big_val = vec![0xABu8; 1800]; // Forces ~4 entries per leaf
+    let big_val = vec![0xABu8; 1800];
 
     // Insert 80 large-value keys -> creates ~20+ leaf pages + branches
     {
@@ -1592,17 +1570,14 @@ fn fifty_sequential_transactions() {
 }
 
 // ============================================================
-// Additional Edge Case Tests
+// Commit-slot and recovery edge cases
 // ============================================================
 
 // --- Torn commit slot recovery ---
 
 #[test]
 fn torn_commit_slot_falls_back_to_active() {
-    // Simulates a crash during step 2 of the commit protocol:
-    // The inactive commit slot is only partially written (torn write).
-    // Recovery should detect the invalid checksum on the inactive slot
-    // and fall back to the active slot (old commit).
+    // Torn inactive-slot write: recovery should fall back to the active slot.
     let storage = std::sync::Arc::new(SharedStorage::new(4 * 1024 * 1024));
 
     // Create DB with some data
@@ -1655,8 +1630,7 @@ fn torn_commit_slot_falls_back_to_active() {
 
 #[test]
 fn both_slots_corrupted_returns_error() {
-    // Extremely rare scenario: both commit slots have invalid checksums.
-    // The only correct response is Error::DatabaseCorrupted.
+    // Both commit slots have invalid checksums → DatabaseCorrupted.
     let storage = std::sync::Arc::new(SharedStorage::new(1024 * 1024));
 
     // Create a valid DB first
@@ -1689,9 +1663,7 @@ fn both_slots_corrupted_returns_error() {
 
 #[test]
 fn rapid_key_overwrite_file_stabilizes() {
-    // Rapidly overwriting the same key should not cause unbounded file growth.
-    // With proper reclamation, freed pages are reused when no reader holds
-    // old snapshots.
+    // Reused pages should cap file growth when no reader pins an old snapshot.
     let storage = std::sync::Arc::new(SharedStorage::new(8 * 1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
@@ -1706,8 +1678,6 @@ fn rapid_key_overwrite_file_stabilizes() {
     let hwm_after_warmup = mgr.current_slot().high_water_mark;
 
     // 200 more transactions overwriting the same key
-    // With no active readers, freed pages should be reclaimed and reused.
-    // HWM growth should be bounded (not linear with transaction count).
     for i in 50..250u32 {
         let mut wtx = mgr.begin_write().unwrap();
         let val = format!("version-{i:05}");
@@ -1718,17 +1688,12 @@ fn rapid_key_overwrite_file_stabilizes() {
     let hwm_after_stress = mgr.current_slot().high_water_mark;
     let growth = hwm_after_stress - hwm_after_warmup;
 
-    // With proper page reclamation, growth should be minimal because:
-    // - Each overwrite only CoW's ~2-3 pages (leaf + ancestors)
-    // - Freed pages are reclaimed by subsequent transactions
-    // - 200 txns should NOT allocate 200+ new pages
     assert!(
         growth < 50,
         "HWM should stabilize with page reclamation: warmup_hwm={hwm_after_warmup} \
          stress_hwm={hwm_after_stress} growth={growth}"
     );
 
-    // Final value should be correct
     let mut rtx = mgr.begin_read();
     assert_eq!(
         rtx.get(b"hot-key").unwrap(),
@@ -1741,9 +1706,7 @@ fn rapid_key_overwrite_file_stabilizes() {
 
 #[test]
 fn transient_io_error_does_not_corrupt_database() {
-    // A transient I/O error during commit followed by clean close must not
-    // corrupt the database. After a failed commit, the DB must remain at
-    // the previous consistent state.
+    // A failed commit must leave the DB at the previous consistent state.
     let storage = std::sync::Arc::new(SharedStorage::new(4 * 1024 * 1024));
 
     // Create initial state with data
@@ -1794,9 +1757,7 @@ fn transient_io_error_does_not_corrupt_database() {
 
 #[test]
 fn cow_produces_new_root_each_commit() {
-    // Verifies that CoW correctly creates a new root on each commit.
-    // If the root were modified in-place, readers on old snapshots would
-    // see corrupted data (the old root points to new children).
+    // In-place root modification would corrupt readers holding old snapshots.
     let storage = std::sync::Arc::new(SharedStorage::new(4 * 1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
@@ -1880,9 +1841,7 @@ fn cow_produces_new_root_each_commit() {
 
 #[test]
 fn pages_freed_at_reader_txn_not_reclaimable() {
-    // Guards against an off-by-one in oldest_active_reader comparison:
-    // If pages freed at txn_id=X are reclaimed while a reader at txn_id=X
-    // is still active, the reader could access freed/reused pages.
+    // Off-by-one guard: a reader at txn_id=X must pin pages freed at txn_id=X.
     let storage = std::sync::Arc::new(SharedStorage::new(8 * 1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
@@ -1937,9 +1896,7 @@ fn pages_freed_at_reader_txn_not_reclaimable() {
 
 #[test]
 fn interleaved_insert_delete_stress() {
-    // Stochastic insert/delete across many transactions exercises the full
-    // commit/reload cycle under stress. Uses unique keys per insert to avoid
-    // cross-transaction tombstone interactions.
+    // Unique keys per insert to avoid cross-txn tombstone interactions.
     let storage = std::sync::Arc::new(SharedStorage::new(16 * 1024 * 1024));
     let mgr = create_shared_manager(&storage);
 

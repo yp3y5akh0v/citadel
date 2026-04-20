@@ -38,6 +38,7 @@ pub(super) fn build_joined_columns(tables: &[(String, &TableSchema)]) -> Vec<Col
                 check_expr: None,
                 check_sql: None,
                 check_name: None,
+                is_with_timezone: false,
             });
             pos += 1;
         }
@@ -200,6 +201,7 @@ pub(super) fn build_projected_columns(
                 check_expr: None,
                 check_sql: None,
                 check_name: None,
+                is_with_timezone: false,
             }
         })
         .collect()

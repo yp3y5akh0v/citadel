@@ -221,6 +221,7 @@ pub(super) fn materialize_recursive_cte(
                 check_expr: None,
                 check_sql: None,
                 check_name: None,
+                is_with_timezone: false,
             })
             .collect();
         let col_map = ColumnMap::new(&cte_cols);
@@ -261,7 +262,14 @@ pub(super) fn materialize_recursive_cte(
             }
 
             if let Some(ref mut seen_set) = seen {
-                step_rows.retain(|r| seen_set.insert(r.clone()));
+                step_rows.retain(|r| {
+                    if seen_set.contains(r) {
+                        false
+                    } else {
+                        seen_set.insert(r.clone());
+                        true
+                    }
+                });
             }
 
             if step_rows.is_empty() {
@@ -365,6 +373,7 @@ pub(super) fn build_cte_schema(name: &str, qr: &QueryResult) -> TableSchema {
             check_expr: None,
             check_sql: None,
             check_name: None,
+            is_with_timezone: false,
         })
         .collect();
     TableSchema::new(name.into(), columns, vec![], vec![], vec![], vec![])

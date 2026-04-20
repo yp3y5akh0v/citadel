@@ -148,6 +148,7 @@ pub(super) fn exec_create_table(
             check_expr: c.check_expr.clone(),
             check_sql: c.check_sql.clone(),
             check_name: c.check_name.clone(),
+            is_with_timezone: false,
         })
         .collect();
 
@@ -312,6 +313,7 @@ pub(super) fn exec_create_table_in_txn(
             check_expr: c.check_expr.clone(),
             check_sql: c.check_sql.clone(),
             check_name: c.check_name.clone(),
+            is_with_timezone: false,
         })
         .collect();
 
@@ -917,6 +919,7 @@ pub(super) fn alter_add_column(
         check_expr: col_spec.check_expr.clone(),
         check_sql: col_spec.check_sql.clone(),
         check_name: col_spec.check_name.clone(),
+        is_with_timezone: false,
     };
 
     let mut new_schema = table_schema.clone();

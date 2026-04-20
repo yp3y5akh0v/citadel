@@ -740,6 +740,26 @@ fn sql_literal(v: &citadel_sql::Value) -> String {
             hex.push('\'');
             hex
         }
+        citadel_sql::Value::Date(d) => {
+            format!("DATE '{}'", citadel_sql::datetime::format_date(*d))
+        }
+        citadel_sql::Value::Time(t) => {
+            format!("TIME '{}'", citadel_sql::datetime::format_time(*t))
+        }
+        citadel_sql::Value::Timestamp(t) => {
+            format!(
+                "TIMESTAMP '{}'",
+                citadel_sql::datetime::format_timestamp(*t)
+            )
+        }
+        citadel_sql::Value::Interval {
+            months,
+            days,
+            micros,
+        } => format!(
+            "INTERVAL '{}'",
+            citadel_sql::datetime::format_interval(*months, *days, *micros)
+        ),
     }
 }
 

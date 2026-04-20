@@ -5,24 +5,23 @@ use crate::types::{CompactString, DataType, Value};
 
 // ── Key encoding (order-preserving) ─────────────────────────────────
 
-/// Type tag bytes for key encoding. Ordering: NULL < BLOB < TEXT < BOOLEAN < INTEGER < REAL
+/// Type tags for order-preserving key encoding.
 const TAG_NULL: u8 = 0x00;
 const TAG_BLOB: u8 = 0x01;
 const TAG_TEXT: u8 = 0x02;
 const TAG_BOOLEAN: u8 = 0x03;
 const TAG_INTEGER: u8 = 0x04;
 const TAG_REAL: u8 = 0x05;
+const TAG_TIME: u8 = 0x06;
+const TAG_DATE: u8 = 0x07;
+const TAG_TIMESTAMP: u8 = 0x08;
+const TAG_INTERVAL: u8 = 0x09;
 
 /// Encode a single value into an order-preserving byte sequence.
 pub fn encode_key_value(value: &Value) -> Vec<u8> {
-    match value {
-        Value::Null => vec![TAG_NULL],
-        Value::Boolean(b) => vec![TAG_BOOLEAN, if *b { 0x01 } else { 0x00 }],
-        Value::Integer(i) => encode_integer(*i),
-        Value::Real(r) => encode_real(*r),
-        Value::Text(s) => encode_bytes(TAG_TEXT, s.as_bytes()),
-        Value::Blob(b) => encode_bytes(TAG_BLOB, b),
-    }
+    let mut buf = Vec::with_capacity(16);
+    encode_key_value_into(value, &mut buf);
+    buf
 }
 
 /// Encode a composite key (multiple values concatenated).
@@ -52,11 +51,40 @@ fn encode_key_value_into(value: &Value, buf: &mut Vec<u8>) {
         Value::Real(r) => encode_real_into(*r, buf),
         Value::Text(s) => encode_bytes_into(TAG_TEXT, s.as_bytes(), buf),
         Value::Blob(b) => encode_bytes_into(TAG_BLOB, b, buf),
+        Value::Time(t) => encode_signed_varint(TAG_TIME, *t, buf),
+        Value::Date(d) => encode_signed_varint(TAG_DATE, i64::from(*d), buf),
+        Value::Timestamp(t) => encode_signed_varint(TAG_TIMESTAMP, *t, buf),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            // 17 bytes: tag + (i32,i32,i64) BE with sign-flipped high byte per field.
+            buf.push(TAG_INTERVAL);
+            let mut mb = months.to_be_bytes();
+            mb[0] ^= 0x80;
+            buf.extend_from_slice(&mb);
+            let mut db = days.to_be_bytes();
+            db[0] ^= 0x80;
+            buf.extend_from_slice(&db);
+            let mut ub = micros.to_be_bytes();
+            ub[0] ^= 0x80;
+            buf.extend_from_slice(&ub);
+        }
     }
 }
 
 fn encode_integer_into(val: i64, buf: &mut Vec<u8>) {
-    buf.push(TAG_INTEGER);
+    encode_signed_varint(TAG_INTEGER, val, buf);
+}
+
+/// Order-preserving variable-width codec for signed i64 with a caller-supplied tag byte.
+/// Layout: [tag] [marker] [data bytes].
+/// marker = 0x80 for zero; 0x80+n for positive (n bytes follow);
+/// 0x80-n for negative (n one's-complemented bytes follow).
+/// Byte-wise lex compare matches signed integer order.
+pub(crate) fn encode_signed_varint(tag: u8, val: i64, buf: &mut Vec<u8>) {
+    buf.push(tag);
     if val == 0 {
         buf.push(0x80);
         return;
@@ -122,6 +150,33 @@ pub fn decode_key_value(data: &[u8]) -> Result<(Value, usize)> {
         }
         TAG_INTEGER => decode_integer(&data[1..]).map(|(v, n)| (v, n + 1)),
         TAG_REAL => decode_real(&data[1..]).map(|(v, n)| (v, n + 1)),
+        TAG_TIME => decode_signed_varint(&data[1..]).map(|(v, n)| (Value::Time(v), n + 1)),
+        TAG_DATE => decode_signed_varint(&data[1..]).map(|(v, n)| {
+            let d = v.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            (Value::Date(d), n + 1)
+        }),
+        TAG_TIMESTAMP => {
+            decode_signed_varint(&data[1..]).map(|(v, n)| (Value::Timestamp(v), n + 1))
+        }
+        TAG_INTERVAL => {
+            if data.len() < 1 + 16 {
+                return Err(SqlError::InvalidValue("truncated interval".into()));
+            }
+            let mut mb: [u8; 4] = data[1..5].try_into().unwrap();
+            mb[0] ^= 0x80;
+            let mut db: [u8; 4] = data[5..9].try_into().unwrap();
+            db[0] ^= 0x80;
+            let mut ub: [u8; 8] = data[9..17].try_into().unwrap();
+            ub[0] ^= 0x80;
+            Ok((
+                Value::Interval {
+                    months: i32::from_be_bytes(mb),
+                    days: i32::from_be_bytes(db),
+                    micros: i64::from_be_bytes(ub),
+                },
+                17,
+            ))
+        }
         TAG_TEXT => {
             let (bytes, n) = decode_null_escaped(&data[1..])?;
             let s = String::from_utf8(bytes)
@@ -150,49 +205,21 @@ pub fn decode_composite_key(data: &[u8], count: usize) -> Result<Vec<Value>> {
 
 // ── Integer encoding (variable-width) ───────────────────────────────
 
-fn encode_integer(val: i64) -> Vec<u8> {
-    let mut buf = vec![TAG_INTEGER];
-    if val == 0 {
-        buf.push(0x80);
-        return buf;
-    }
-    if val > 0 {
-        let bytes = val.to_be_bytes();
-        // Find first non-zero byte
-        let start = bytes.iter().position(|&b| b != 0).unwrap();
-        let byte_count = (8 - start) as u8;
-        buf.push(0x80 + byte_count);
-        buf.extend_from_slice(&bytes[start..]);
-    } else {
-        // Negative: one's complement of absolute value
-        let abs_val = if val == i64::MIN {
-            // Special case: |i64::MIN| doesn't fit in i64
-            u64::MAX / 2 + 1
-        } else {
-            (-val) as u64
-        };
-        let bytes = abs_val.to_be_bytes();
-        let start = bytes.iter().position(|&b| b != 0).unwrap();
-        let byte_count = (8 - start) as u8;
-        buf.push(0x80 - byte_count);
-        // One's complement: invert all bits
-        for &b in &bytes[start..] {
-            buf.push(!b);
-        }
-    }
-    buf
+fn decode_integer(data: &[u8]) -> Result<(Value, usize)> {
+    let (v, n) = decode_signed_varint(data)?;
+    Ok((Value::Integer(v), n))
 }
 
-fn decode_integer(data: &[u8]) -> Result<(Value, usize)> {
+/// Decode the variable-width codec emitted by `encode_signed_varint` (tag byte already consumed).
+pub(crate) fn decode_signed_varint(data: &[u8]) -> Result<(i64, usize)> {
     if data.is_empty() {
         return Err(SqlError::InvalidValue("truncated integer".into()));
     }
     let marker = data[0];
     if marker == 0x80 {
-        return Ok((Value::Integer(0), 1));
+        return Ok((0, 1));
     }
     if marker > 0x80 {
-        // Positive
         let byte_count = (marker - 0x80) as usize;
         if data.len() < 1 + byte_count {
             return Err(SqlError::InvalidValue("truncated positive integer".into()));
@@ -200,9 +227,8 @@ fn decode_integer(data: &[u8]) -> Result<(Value, usize)> {
         let mut bytes = [0u8; 8];
         bytes[8 - byte_count..].copy_from_slice(&data[1..1 + byte_count]);
         let val = i64::from_be_bytes(bytes);
-        Ok((Value::Integer(val), 1 + byte_count))
+        Ok((val, 1 + byte_count))
     } else {
-        // Negative
         let byte_count = (0x80 - marker) as usize;
         if data.len() < 1 + byte_count {
             return Err(SqlError::InvalidValue("truncated negative integer".into()));
@@ -212,27 +238,12 @@ fn decode_integer(data: &[u8]) -> Result<(Value, usize)> {
             bytes[8 - byte_count + i] = !data[1 + i];
         }
         let abs_val = u64::from_be_bytes(bytes);
-        // Use wrapping negation to handle i64::MIN correctly
         let val = (-(abs_val as i128)) as i64;
-        Ok((Value::Integer(val), 1 + byte_count))
+        Ok((val, 1 + byte_count))
     }
 }
 
 // ── Real encoding (IEEE 754 sign-bit manipulation) ──────────────────
-
-fn encode_real(val: f64) -> Vec<u8> {
-    let mut buf = vec![TAG_REAL];
-    let bits = val.to_bits();
-    let encoded = if val.is_sign_negative() {
-        // Negative (including -0.0): flip ALL bits
-        !bits
-    } else {
-        // Positive (including +0.0): flip sign bit only
-        bits ^ (1u64 << 63)
-    };
-    buf.extend_from_slice(&encoded.to_be_bytes());
-    buf
-}
 
 fn decode_real(data: &[u8]) -> Result<(Value, usize)> {
     if data.len() < 8 {
@@ -251,22 +262,6 @@ fn decode_real(data: &[u8]) -> Result<(Value, usize)> {
 }
 
 // ── Null-escaped byte encoding ──────────────────────────────────────
-
-/// Encode bytes with null-escape: 0x00 -> 0x00 0xFF, terminated by bare 0x00.
-fn encode_bytes(tag: u8, data: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(data.len() + 2);
-    buf.push(tag);
-    for &b in data {
-        if b == 0x00 {
-            buf.push(0x00);
-            buf.push(0xFF);
-        } else {
-            buf.push(b);
-        }
-    }
-    buf.push(0x00); // terminator
-    buf
-}
 
 /// Decode null-escaped bytes. Returns (decoded bytes, bytes consumed including terminator).
 fn decode_null_escaped(data: &[u8]) -> Result<(Vec<u8>, usize)> {
@@ -338,6 +333,32 @@ pub fn encode_row(values: &[Value]) -> Vec<u8> {
                 buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
                 buf.extend_from_slice(data);
             }
+            Value::Time(t) => {
+                buf.push(DataType::Time.type_tag());
+                buf.extend_from_slice(&8u32.to_le_bytes());
+                buf.extend_from_slice(&t.to_le_bytes());
+            }
+            Value::Date(d) => {
+                buf.push(DataType::Date.type_tag());
+                buf.extend_from_slice(&4u32.to_le_bytes());
+                buf.extend_from_slice(&d.to_le_bytes());
+            }
+            Value::Timestamp(t) => {
+                buf.push(DataType::Timestamp.type_tag());
+                buf.extend_from_slice(&8u32.to_le_bytes());
+                buf.extend_from_slice(&t.to_le_bytes());
+            }
+            Value::Interval {
+                months,
+                days,
+                micros,
+            } => {
+                buf.push(DataType::Interval.type_tag());
+                buf.extend_from_slice(&16u32.to_le_bytes());
+                buf.extend_from_slice(&months.to_le_bytes());
+                buf.extend_from_slice(&days.to_le_bytes());
+                buf.extend_from_slice(&micros.to_le_bytes());
+            }
             Value::Null => unreachable!(),
         }
     }
@@ -387,6 +408,32 @@ pub fn encode_row_into(values: &[Value], buf: &mut Vec<u8>) {
                 buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
                 buf.extend_from_slice(data);
             }
+            Value::Time(t) => {
+                buf.push(DataType::Time.type_tag());
+                buf.extend_from_slice(&8u32.to_le_bytes());
+                buf.extend_from_slice(&t.to_le_bytes());
+            }
+            Value::Date(d) => {
+                buf.push(DataType::Date.type_tag());
+                buf.extend_from_slice(&4u32.to_le_bytes());
+                buf.extend_from_slice(&d.to_le_bytes());
+            }
+            Value::Timestamp(t) => {
+                buf.push(DataType::Timestamp.type_tag());
+                buf.extend_from_slice(&8u32.to_le_bytes());
+                buf.extend_from_slice(&t.to_le_bytes());
+            }
+            Value::Interval {
+                months,
+                days,
+                micros,
+            } => {
+                buf.push(DataType::Interval.type_tag());
+                buf.extend_from_slice(&16u32.to_le_bytes());
+                buf.extend_from_slice(&months.to_le_bytes());
+                buf.extend_from_slice(&days.to_le_bytes());
+                buf.extend_from_slice(&micros.to_le_bytes());
+            }
             Value::Null => unreachable!(),
         }
     }
@@ -407,6 +454,28 @@ fn decode_value(type_tag: u8, data: &[u8]) -> Result<Value> {
             Ok(Value::Text(CompactString::from(s)))
         }
         Some(DataType::Blob) => Ok(Value::Blob(data.to_vec())),
+        Some(DataType::Time) => Ok(Value::Time(i64::from_le_bytes(
+            data[..8].try_into().unwrap(),
+        ))),
+        Some(DataType::Date) => Ok(Value::Date(i32::from_le_bytes(
+            data[..4].try_into().unwrap(),
+        ))),
+        Some(DataType::Timestamp) => Ok(Value::Timestamp(i64::from_le_bytes(
+            data[..8].try_into().unwrap(),
+        ))),
+        Some(DataType::Interval) => {
+            if data.len() < 16 {
+                return Err(SqlError::InvalidValue("truncated interval".into()));
+            }
+            let months = i32::from_le_bytes(data[0..4].try_into().unwrap());
+            let days = i32::from_le_bytes(data[4..8].try_into().unwrap());
+            let micros = i64::from_le_bytes(data[8..16].try_into().unwrap());
+            Ok(Value::Interval {
+                months,
+                days,
+                micros,
+            })
+        }
         _ => Err(SqlError::InvalidValue(format!(
             "unknown column type tag: {type_tag}"
         ))),
@@ -628,6 +697,10 @@ pub enum RawColumn<'a> {
     Boolean(bool),
     Text(&'a str),
     Blob(&'a [u8]),
+    Time(i64),
+    Date(i32),
+    Timestamp(i64),
+    Interval { months: i32, days: i32, micros: i64 },
 }
 
 impl<'a> RawColumn<'a> {
@@ -639,6 +712,18 @@ impl<'a> RawColumn<'a> {
             RawColumn::Boolean(b) => Value::Boolean(b),
             RawColumn::Text(s) => Value::Text(CompactString::from(s)),
             RawColumn::Blob(b) => Value::Blob(b.to_vec()),
+            RawColumn::Time(t) => Value::Time(t),
+            RawColumn::Date(d) => Value::Date(d),
+            RawColumn::Timestamp(t) => Value::Timestamp(t),
+            RawColumn::Interval {
+                months,
+                days,
+                micros,
+            } => Value::Interval {
+                months,
+                days,
+                micros,
+            },
         }
     }
 
@@ -654,6 +739,21 @@ impl<'a> RawColumn<'a> {
             (RawColumn::Text(a), Value::Text(b)) => Some((*a).cmp(b.as_str())),
             (RawColumn::Blob(a), Value::Blob(b)) => Some((*a).cmp(b.as_slice())),
             (RawColumn::Boolean(a), Value::Boolean(b)) => Some(a.cmp(b)),
+            (RawColumn::Time(a), Value::Time(b)) => Some(a.cmp(b)),
+            (RawColumn::Date(a), Value::Date(b)) => Some(a.cmp(b)),
+            (RawColumn::Timestamp(a), Value::Timestamp(b)) => Some(a.cmp(b)),
+            (
+                RawColumn::Interval {
+                    months: am,
+                    days: ad,
+                    micros: au,
+                },
+                Value::Interval {
+                    months: bm,
+                    days: bd,
+                    micros: bu,
+                },
+            ) => Some(am.cmp(bm).then(ad.cmp(bd)).then(au.cmp(bu))),
             _ => None,
         }
     }
@@ -668,6 +768,21 @@ impl<'a> RawColumn<'a> {
             (RawColumn::Text(a), Value::Text(b)) => *a == b.as_str(),
             (RawColumn::Blob(a), Value::Blob(b)) => *a == b.as_slice(),
             (RawColumn::Boolean(a), Value::Boolean(b)) => a == b,
+            (RawColumn::Time(a), Value::Time(b)) => a == b,
+            (RawColumn::Date(a), Value::Date(b)) => a == b,
+            (RawColumn::Timestamp(a), Value::Timestamp(b)) => a == b,
+            (
+                RawColumn::Interval {
+                    months: am,
+                    days: ad,
+                    micros: au,
+                },
+                Value::Interval {
+                    months: bm,
+                    days: bd,
+                    micros: bu,
+                },
+            ) => am == bm && ad == bd && au == bu,
             _ => false,
         }
     }
@@ -683,6 +798,9 @@ impl<'a> RawColumn<'a> {
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             RawColumn::Integer(i) => Some(*i),
+            RawColumn::Time(t) => Some(*t),
+            RawColumn::Date(d) => Some(*d as i64),
+            RawColumn::Timestamp(t) => Some(*t),
             _ => None,
         }
     }
@@ -703,6 +821,28 @@ fn decode_value_raw(type_tag: u8, data: &[u8]) -> Result<RawColumn<'_>> {
             Ok(RawColumn::Text(s))
         }
         Some(DataType::Blob) => Ok(RawColumn::Blob(data)),
+        Some(DataType::Time) => Ok(RawColumn::Time(i64::from_le_bytes(
+            data[..8].try_into().unwrap(),
+        ))),
+        Some(DataType::Date) => Ok(RawColumn::Date(i32::from_le_bytes(
+            data[..4].try_into().unwrap(),
+        ))),
+        Some(DataType::Timestamp) => Ok(RawColumn::Timestamp(i64::from_le_bytes(
+            data[..8].try_into().unwrap(),
+        ))),
+        Some(DataType::Interval) => {
+            if data.len() < 16 {
+                return Err(SqlError::InvalidValue("truncated interval".into()));
+            }
+            let months = i32::from_le_bytes(data[0..4].try_into().unwrap());
+            let days = i32::from_le_bytes(data[4..8].try_into().unwrap());
+            let micros = i64::from_le_bytes(data[8..16].try_into().unwrap());
+            Ok(RawColumn::Interval {
+                months,
+                days,
+                micros,
+            })
+        }
         _ => Err(SqlError::InvalidValue(format!(
             "unknown column type tag: {type_tag}"
         ))),
@@ -734,7 +874,9 @@ pub fn patch_column_in_place(data: &mut [u8], target: usize, new_val: &Value) ->
     }
     let old_data_len = u32::from_le_bytes(data[pos + 1..pos + 5].try_into().unwrap()) as usize;
     let new_data_len = match new_val {
-        Value::Integer(_) | Value::Real(_) => 8,
+        Value::Integer(_) | Value::Real(_) | Value::Time(_) | Value::Timestamp(_) => 8,
+        Value::Date(_) => 4,
+        Value::Interval { .. } => 16,
         Value::Boolean(_) => 1,
         Value::Text(s) => s.len(),
         Value::Blob(b) => b.len(),
@@ -751,6 +893,18 @@ pub fn patch_column_in_place(data: &mut [u8], target: usize, new_val: &Value) ->
         Value::Boolean(b) => data[val_start] = if *b { 1 } else { 0 },
         Value::Text(s) => data[val_start..val_start + s.len()].copy_from_slice(s.as_bytes()),
         Value::Blob(d) => data[val_start..val_start + d.len()].copy_from_slice(d),
+        Value::Time(t) => data[val_start..val_start + 8].copy_from_slice(&t.to_le_bytes()),
+        Value::Date(d) => data[val_start..val_start + 4].copy_from_slice(&d.to_le_bytes()),
+        Value::Timestamp(t) => data[val_start..val_start + 8].copy_from_slice(&t.to_le_bytes()),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            data[val_start..val_start + 4].copy_from_slice(&months.to_le_bytes());
+            data[val_start + 4..val_start + 8].copy_from_slice(&days.to_le_bytes());
+            data[val_start + 8..val_start + 16].copy_from_slice(&micros.to_le_bytes());
+        }
         Value::Null => unreachable!(),
     }
     Ok(true)
@@ -832,6 +986,32 @@ pub fn patch_row_column(
                         out.push(DataType::Blob.type_tag());
                         out.extend_from_slice(&(d.len() as u32).to_le_bytes());
                         out.extend_from_slice(d);
+                    }
+                    Value::Time(t) => {
+                        out.push(DataType::Time.type_tag());
+                        out.extend_from_slice(&8u32.to_le_bytes());
+                        out.extend_from_slice(&t.to_le_bytes());
+                    }
+                    Value::Date(d) => {
+                        out.push(DataType::Date.type_tag());
+                        out.extend_from_slice(&4u32.to_le_bytes());
+                        out.extend_from_slice(&d.to_le_bytes());
+                    }
+                    Value::Timestamp(t) => {
+                        out.push(DataType::Timestamp.type_tag());
+                        out.extend_from_slice(&8u32.to_le_bytes());
+                        out.extend_from_slice(&t.to_le_bytes());
+                    }
+                    Value::Interval {
+                        months,
+                        days,
+                        micros,
+                    } => {
+                        out.push(DataType::Interval.type_tag());
+                        out.extend_from_slice(&16u32.to_le_bytes());
+                        out.extend_from_slice(&months.to_le_bytes());
+                        out.extend_from_slice(&days.to_le_bytes());
+                        out.extend_from_slice(&micros.to_le_bytes());
                     }
                     Value::Null => unreachable!(),
                 }
@@ -949,7 +1129,9 @@ pub fn patch_at_offset(data: &mut [u8], offset: usize, new_val: &Value) -> Resul
     let old_data_len =
         u32::from_le_bytes(data[offset + 1..offset + 5].try_into().unwrap()) as usize;
     let new_data_len = match new_val {
-        Value::Integer(_) | Value::Real(_) => 8,
+        Value::Integer(_) | Value::Real(_) | Value::Time(_) | Value::Timestamp(_) => 8,
+        Value::Date(_) => 4,
+        Value::Interval { .. } => 16,
         Value::Boolean(_) => 1,
         Value::Text(s) => s.len(),
         Value::Blob(b) => b.len(),
@@ -966,6 +1148,18 @@ pub fn patch_at_offset(data: &mut [u8], offset: usize, new_val: &Value) -> Resul
         Value::Boolean(b) => data[val_start] = if *b { 1 } else { 0 },
         Value::Text(s) => data[val_start..val_start + s.len()].copy_from_slice(s.as_bytes()),
         Value::Blob(d) => data[val_start..val_start + d.len()].copy_from_slice(d),
+        Value::Time(t) => data[val_start..val_start + 8].copy_from_slice(&t.to_le_bytes()),
+        Value::Date(d) => data[val_start..val_start + 4].copy_from_slice(&d.to_le_bytes()),
+        Value::Timestamp(t) => data[val_start..val_start + 8].copy_from_slice(&t.to_le_bytes()),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            data[val_start..val_start + 4].copy_from_slice(&months.to_le_bytes());
+            data[val_start + 4..val_start + 8].copy_from_slice(&days.to_le_bytes());
+            data[val_start + 8..val_start + 16].copy_from_slice(&micros.to_le_bytes());
+        }
         Value::Null => unreachable!(),
     }
     Ok(true)

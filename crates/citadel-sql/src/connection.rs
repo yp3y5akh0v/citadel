@@ -17,6 +17,54 @@ use crate::types::{ExecutionResult, QueryResult, TableSchema, Value};
 
 const DEFAULT_CACHE_CAPACITY: usize = 64;
 
+fn parse_fixed_offset(s: &str) -> Option<()> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("z") || s.eq_ignore_ascii_case("utc") {
+        return Some(());
+    }
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let sign = match bytes[0] {
+        b'+' | b'-' => bytes[0] as char,
+        _ => return None,
+    };
+    let rest = &s[1..];
+    let (hh, mm) = if let Some((h, m)) = rest.split_once(':') {
+        (h, m)
+    } else if rest.len() == 4 {
+        (&rest[..2], &rest[2..])
+    } else if rest.len() == 2 {
+        (rest, "00")
+    } else {
+        return None;
+    };
+    let h: u32 = hh.parse().ok()?;
+    let m: u32 = mm.parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    let _ = sign;
+    Some(())
+}
+
+fn stmt_mutates(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+            | Statement::CreateTable(_)
+            | Statement::DropTable(_)
+            | Statement::AlterTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex(_)
+            | Statement::CreateView(_)
+            | Statement::DropView(_)
+    )
+}
+
 fn try_normalize_insert(sql: &str) -> Option<(String, Vec<Value>)> {
     let bytes = sql.as_bytes();
     let len = bytes.len();
@@ -203,12 +251,15 @@ struct CacheEntry {
 
 struct SavepointEntry {
     name: String,
+    snapshot: Option<SavepointSnapshot>,
+}
+
+struct SavepointSnapshot {
     wtx_snap: WriteTxnSnapshot,
     schema_snap: SchemaSnapshot,
 }
 
-/// SQL connection with LRU statement cache. Auto-commit; explicit txns via
-/// BEGIN/COMMIT/ROLLBACK with nested SAVEPOINT/RELEASE/ROLLBACK TO support.
+/// SQL connection with LRU statement cache.
 pub struct Connection<'a> {
     db: &'a Database,
     schema: SchemaManager,
@@ -218,6 +269,8 @@ pub struct Connection<'a> {
     stmt_cache: LruCache<String, CacheEntry>,
     insert_bufs: executor::InsertBufs,
     update_bufs: executor::UpdateBufs,
+    txn_start_ts: Option<i64>,
+    session_timezone: String,
 }
 
 impl<'a> Connection<'a> {
@@ -234,7 +287,36 @@ impl<'a> Connection<'a> {
             stmt_cache,
             insert_bufs: executor::InsertBufs::new(),
             update_bufs: executor::UpdateBufs::new(),
+            txn_start_ts: None,
+            session_timezone: "UTC".to_string(),
         })
+    }
+
+    /// Txn-start UTC µs inside BEGIN/COMMIT, else `None`.
+    pub fn txn_start_ts(&self) -> Option<i64> {
+        self.txn_start_ts
+    }
+
+    /// Returns the session time-zone (IANA name or fixed offset). Default `"UTC"`.
+    pub fn session_timezone(&self) -> &str {
+        &self.session_timezone
+    }
+
+    /// Set the session time-zone. Accepts IANA names, ISO-8601 offsets, `"UTC"`, `"Z"`.
+    pub fn set_session_timezone(&mut self, tz: &str) -> Result<()> {
+        let upper = tz.to_ascii_uppercase();
+        if (upper.starts_with("UTC+") || upper.starts_with("UTC-")) && tz.len() > 3 {
+            return Err(SqlError::InvalidTimezone(format!(
+                "'{tz}' is ambiguous; use ISO-8601 offset (e.g. '+05:00') or named zone (e.g. 'Etc/GMT-5')"
+            )));
+        }
+        if jiff::tz::TimeZone::get(tz).is_err() && parse_fixed_offset(tz).is_none() {
+            return Err(SqlError::InvalidTimezone(format!(
+                "{tz}: not a known IANA zone or ISO-8601 offset (e.g. '+05:00', 'UTC', 'America/New_York')"
+            )));
+        }
+        self.session_timezone = tz.to_string();
+        Ok(())
     }
 
     /// Execute a SQL statement. Returns the result.
@@ -264,7 +346,8 @@ impl<'a> Connection<'a> {
             let gen = self.schema.generation();
             if let Some(entry) = self.stmt_cache.get(sql) {
                 if entry.schema_gen == gen && entry.param_count == 0 {
-                    if let Statement::Update(ref upd) = *entry.stmt {
+                    let cached_stmt = Arc::clone(&entry.stmt);
+                    if let Statement::Update(ref upd) = *cached_stmt {
                         if let Some(ref compiled) = entry.compiled_update {
                             return executor::exec_update_compiled(
                                 self.db,
@@ -287,6 +370,7 @@ impl<'a> Connection<'a> {
                         }
                         return Ok(result);
                     }
+                    return self.dispatch(&cached_stmt, &[]);
                 }
             }
         }
@@ -430,6 +514,13 @@ impl<'a> Connection<'a> {
     }
 
     fn dispatch(&mut self, stmt: &Statement, params: &[Value]) -> Result<ExecutionResult> {
+        let cached_ts = self
+            .txn_start_ts
+            .or_else(|| Some(crate::datetime::now_micros()));
+        crate::datetime::with_txn_clock(cached_ts, || self.dispatch_inner(stmt, params))
+    }
+
+    fn dispatch_inner(&mut self, stmt: &Statement, params: &[Value]) -> Result<ExecutionResult> {
         match stmt {
             Statement::Begin => {
                 if self.active_txn.is_some() {
@@ -437,6 +528,7 @@ impl<'a> Connection<'a> {
                 }
                 let wtx = self.db.begin_write().map_err(SqlError::Storage)?;
                 self.active_txn = Some(wtx);
+                self.txn_start_ts = Some(crate::datetime::now_micros());
                 Ok(ExecutionResult::Ok)
             }
             Statement::Commit => {
@@ -446,6 +538,7 @@ impl<'a> Connection<'a> {
                     .ok_or(SqlError::NoActiveTransaction)?;
                 wtx.commit().map_err(SqlError::Storage)?;
                 self.clear_savepoint_state();
+                self.txn_start_ts = None;
                 Ok(ExecutionResult::Ok)
             }
             Statement::Rollback => {
@@ -456,16 +549,25 @@ impl<'a> Connection<'a> {
                 wtx.abort();
                 self.clear_savepoint_state();
                 self.schema = SchemaManager::load(self.db)?;
+                self.txn_start_ts = None;
                 Ok(ExecutionResult::Ok)
             }
             Statement::Savepoint(name) => self.do_savepoint(name),
             Statement::ReleaseSavepoint(name) => self.do_release(name),
             Statement::RollbackTo(name) => self.do_rollback_to(name),
+            Statement::SetTimezone(zone) => {
+                self.set_session_timezone(zone)?;
+                Ok(ExecutionResult::Ok)
+            }
             Statement::Insert(ins) if self.active_txn.is_some() => {
+                self.capture_pending_snapshots();
                 let wtx = self.active_txn.as_mut().unwrap();
                 executor::exec_insert_in_txn(wtx, &self.schema, ins, params, &mut self.insert_bufs)
             }
             _ => {
+                if self.active_txn.is_some() && stmt_mutates(stmt) {
+                    self.capture_pending_snapshots();
+                }
                 if let Some(ref mut wtx) = self.active_txn {
                     executor::execute_in_txn(wtx, &mut self.schema, stmt, params)
                 } else {
@@ -491,16 +593,40 @@ impl<'a> Connection<'a> {
             wtx.set_in_place(false);
         }
 
-        let wtx_snap = wtx.begin_savepoint();
-        let schema_snap = self.schema.save_snapshot();
-
         self.savepoint_stack.push(SavepointEntry {
             name: name.to_string(),
-            wtx_snap,
-            schema_snap,
+            snapshot: None,
         });
 
         Ok(ExecutionResult::Ok)
+    }
+
+    fn capture_pending_snapshots(&mut self) {
+        if !self.savepoint_stack.iter().any(|e| e.snapshot.is_none()) {
+            return;
+        }
+        let wtx = match self.active_txn.as_mut() {
+            Some(w) => w,
+            None => return,
+        };
+        let wtx_snap = wtx.begin_savepoint();
+        let schema_snap = self.schema.save_snapshot();
+        let mut pending = self
+            .savepoint_stack
+            .iter_mut()
+            .filter(|e| e.snapshot.is_none());
+        if let Some(first) = pending.next() {
+            first.snapshot = Some(SavepointSnapshot {
+                wtx_snap: wtx_snap.clone(),
+                schema_snap: schema_snap.clone(),
+            });
+        }
+        for entry in pending {
+            entry.snapshot = Some(SavepointSnapshot {
+                wtx_snap: wtx_snap.clone(),
+                schema_snap: schema_snap.clone(),
+            });
+        }
     }
 
     fn do_release(&mut self, name: &str) -> Result<ExecutionResult> {
@@ -538,15 +664,16 @@ impl<'a> Connection<'a> {
             .ok_or_else(|| SqlError::SavepointNotFound(name.to_string()))?;
 
         self.savepoint_stack.truncate(idx + 1);
-        let entry = self.savepoint_stack.last().unwrap();
-        let wtx_snap = entry.wtx_snap.clone();
-        let schema_snap = entry.schema_snap.clone();
+        let entry = self.savepoint_stack.last_mut().unwrap();
+        let snapshot = match entry.snapshot.take() {
+            Some(s) => s,
+            None => return Ok(ExecutionResult::Ok),
+        };
 
         let wtx = self.active_txn.as_mut().unwrap();
-        wtx.restore_snapshot(wtx_snap);
-        self.schema.restore_snapshot(schema_snap);
+        wtx.restore_snapshot(snapshot.wtx_snap);
+        self.schema.restore_snapshot(snapshot.schema_snap);
 
-        // schema_gen went backward; evict cache entries keyed on it.
         self.stmt_cache.clear();
 
         Ok(ExecutionResult::Ok)

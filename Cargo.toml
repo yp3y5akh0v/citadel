@@ -77,6 +77,10 @@ sqlparser = "0.61"
 lru = "0.12"
 compact_str = "0.8"
 
+# Date/Time — jiff with IANA tz support (tzdb-bundle-platform ships ~200 KB on Windows/WASM,
+# on Linux/macOS reads system /usr/share/zoneinfo at zero bundled cost)
+jiff = { version = "0.2", default-features = false, features = ["std", "alloc", "serde", "perf-inline", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
+
 # Benchmarks
 criterion = { version = "0.5", features = ["html_reports"] }
 rusqlite = { version = "0.39", features = ["bundled"] }

@@ -121,4 +121,28 @@ pub enum SqlError {
 
     #[error("storage error: {0}")]
     Storage(#[from] citadel_core::Error),
+
+    #[error("invalid DATE literal: {0}")]
+    InvalidDateLiteral(String),
+
+    #[error("invalid TIME literal: {0}")]
+    InvalidTimeLiteral(String),
+
+    #[error("invalid TIMESTAMP literal: {0}")]
+    InvalidTimestampLiteral(String),
+
+    #[error("invalid INTERVAL literal: {0}")]
+    InvalidIntervalLiteral(String),
+
+    #[error("invalid EXTRACT field: {0}")]
+    InvalidExtractField(String),
+
+    #[error("invalid DATE_TRUNC unit: {0}")]
+    InvalidDateTruncUnit(String),
+
+    #[error("time zone not supported: {0}")]
+    TimeZoneUnsupported(String),
+
+    #[error("invalid timezone: {0}")]
+    InvalidTimezone(String),
 }

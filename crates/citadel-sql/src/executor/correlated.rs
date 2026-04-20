@@ -63,6 +63,7 @@ pub(super) fn handle_correlated_select_read(
                                 check_expr: None,
                                 check_sql: None,
                                 check_name: None,
+                                is_with_timezone: false,
                             });
                             new_columns.push(SelectColumn::Expr {
                                 expr: Expr::Column(col_name),
@@ -1299,9 +1300,19 @@ pub(super) fn build_and_scan_correlated_read(
     let mut scan_err: Option<SqlError> = None;
     let mut rtx = db.begin_read();
 
+    let mut col_vals: Vec<(usize, Value)> = Vec::with_capacity(needed_raw.len());
+    let max_key_cols = exists_filters
+        .iter()
+        .map(|ef| ef.outer_col_indices.len())
+        .chain(in_filters.iter().map(|inf| inf.outer_col_indices.len()))
+        .max()
+        .unwrap_or(0);
+    let mut outer_key: Vec<Value> = Vec::with_capacity(max_key_cols);
+    let mut corr_key: Vec<Value> = Vec::with_capacity(max_key_cols);
+
     rtx.table_scan_raw(lower.as_bytes(), |key, value| {
         // Extract only the correlation columns from raw bytes (fast partial decode)
-        let mut col_vals: Vec<(usize, Value)> = Vec::with_capacity(needed_raw.len());
+        col_vals.clear();
         for &(col_idx, ref target) in &needed_raw {
             let val = match extract_raw_value(key, value, target, num_pk_cols) {
                 Ok(v) => v,
@@ -1315,18 +1326,16 @@ pub(super) fn build_and_scan_correlated_read(
 
         // Check EXISTS filters
         for ef in &exists_filters {
-            let outer_key: Vec<Value> = ef
-                .outer_col_indices
-                .iter()
-                .map(|&oci| {
-                    col_vals
-                        .iter()
-                        .find(|(idx, _)| *idx == oci)
-                        .unwrap()
-                        .1
-                        .clone()
-                })
-                .collect();
+            outer_key.clear();
+            for &oci in &ef.outer_col_indices {
+                let val = col_vals
+                    .iter()
+                    .find(|(idx, _)| *idx == oci)
+                    .unwrap()
+                    .1
+                    .clone();
+                outer_key.push(val);
+            }
             if outer_key.iter().any(|v| v.is_null()) {
                 if !ef.negated {
                     return true;
@@ -1375,18 +1384,16 @@ pub(super) fn build_and_scan_correlated_read(
 
         // Check IN filters
         for inf in &in_filters {
-            let corr_key: Vec<Value> = inf
-                .outer_col_indices
-                .iter()
-                .map(|&oci| {
-                    col_vals
-                        .iter()
-                        .find(|(idx, _)| *idx == oci)
-                        .unwrap()
-                        .1
-                        .clone()
-                })
-                .collect();
+            corr_key.clear();
+            for &oci in &inf.outer_col_indices {
+                let val = col_vals
+                    .iter()
+                    .find(|(idx, _)| *idx == oci)
+                    .unwrap()
+                    .1
+                    .clone();
+                corr_key.push(val);
+            }
             if corr_key.iter().any(|v| v.is_null()) {
                 if !inf.negated {
                     return true;

@@ -139,6 +139,24 @@ pub enum CellValue {
     Text(String),
     Blob(Vec<u8>),
     Boolean(bool),
+    Date {
+        days: i32,
+        iso: String,
+    },
+    Time {
+        micros: i64,
+        iso: String,
+    },
+    Timestamp {
+        micros: i64,
+        iso: String,
+    },
+    Interval {
+        months: i32,
+        days: i32,
+        micros: i64,
+        iso: String,
+    },
 }
 
 impl CellValue {
@@ -150,6 +168,28 @@ impl CellValue {
             Value::Text(s) => CellValue::Text(s.to_string()),
             Value::Blob(b) => CellValue::Blob(b.clone()),
             Value::Boolean(b) => CellValue::Boolean(*b),
+            Value::Date(d) => CellValue::Date {
+                days: *d,
+                iso: citadel_sql::datetime::format_date(*d),
+            },
+            Value::Time(t) => CellValue::Time {
+                micros: *t,
+                iso: citadel_sql::datetime::format_time(*t),
+            },
+            Value::Timestamp(t) => CellValue::Timestamp {
+                micros: *t,
+                iso: citadel_sql::datetime::format_timestamp(*t),
+            },
+            Value::Interval {
+                months,
+                days,
+                micros,
+            } => CellValue::Interval {
+                months: *months,
+                days: *days,
+                micros: *micros,
+                iso: citadel_sql::datetime::format_interval(*months, *days, *micros),
+            },
         }
     }
 }

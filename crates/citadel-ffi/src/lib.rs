@@ -1066,6 +1066,10 @@ pub enum CitadelValueType {
     Text = 3,
     Blob = 4,
     Boolean = 5,
+    Date = 6,
+    Time = 7,
+    Timestamp = 8,
+    Interval = 9,
 }
 
 /// Get the type of a value in a query result cell.
@@ -1088,6 +1092,10 @@ pub extern "C" fn citadel_sql_value_type(
         Some(Value::Text(_)) => CitadelValueType::Text,
         Some(Value::Blob(_)) => CitadelValueType::Blob,
         Some(Value::Boolean(_)) => CitadelValueType::Boolean,
+        Some(Value::Date(_)) => CitadelValueType::Date,
+        Some(Value::Time(_)) => CitadelValueType::Time,
+        Some(Value::Timestamp(_)) => CitadelValueType::Timestamp,
+        Some(Value::Interval { .. }) => CitadelValueType::Interval,
     }
 }
 

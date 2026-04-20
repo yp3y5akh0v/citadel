@@ -51,6 +51,10 @@ enum CitadelValueType
     Text = 3,
     Blob = 4,
     Boolean = 5,
+    Date = 6,
+    Time = 7,
+    Timestamp = 8,
+    Interval = 9,
 };
 #ifndef __cplusplus
 typedef int32_t CitadelValueType;

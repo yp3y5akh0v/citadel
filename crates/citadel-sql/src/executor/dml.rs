@@ -477,7 +477,11 @@ pub(super) fn materialize_expr(
             expr: Box::new(materialize_expr(e, exec_sub)?),
             data_type: *data_type,
         }),
-        Expr::Function { name, args } => {
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => {
             let materialized = args
                 .iter()
                 .map(|a| materialize_expr(a, exec_sub))
@@ -485,6 +489,7 @@ pub(super) fn materialize_expr(
             Ok(Expr::Function {
                 name: name.clone(),
                 args: materialized,
+                distinct: *distinct,
             })
         }
         other => Ok(other.clone()),
@@ -833,10 +838,11 @@ pub(super) fn apply_set_operation(
             rows
         }
         (SetOp::Union, false) => {
-            let mut seen = std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
             let mut rows = Vec::new();
             for row in left_qr.rows.into_iter().chain(right_qr.rows) {
-                if seen.insert(row.clone()) {
+                if !seen.contains(&row) {
+                    seen.insert(row.clone());
                     rows.push(row);
                 }
             }
@@ -862,10 +868,11 @@ pub(super) fn apply_set_operation(
         (SetOp::Intersect, false) => {
             let right_set: std::collections::HashSet<Vec<Value>> =
                 right_qr.rows.into_iter().collect();
-            let mut seen = std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
             let mut rows = Vec::new();
             for row in left_qr.rows {
-                if right_set.contains(&row) && seen.insert(row.clone()) {
+                if right_set.contains(&row) && !seen.contains(&row) {
+                    seen.insert(row.clone());
                     rows.push(row);
                 }
             }
@@ -892,10 +899,11 @@ pub(super) fn apply_set_operation(
         (SetOp::Except, false) => {
             let right_set: std::collections::HashSet<Vec<Value>> =
                 right_qr.rows.into_iter().collect();
-            let mut seen = std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
             let mut rows = Vec::new();
             for row in left_qr.rows {
-                if !right_set.contains(&row) && seen.insert(row.clone()) {
+                if !right_set.contains(&row) && !seen.contains(&row) {
+                    seen.insert(row.clone());
                     rows.push(row);
                 }
             }
@@ -917,6 +925,7 @@ pub(super) fn apply_set_operation(
                 check_expr: None,
                 check_sql: None,
                 check_name: None,
+                is_with_timezone: false,
             })
             .collect();
         sort_rows(&mut rows, &comp.order_by, &col_defs)?;

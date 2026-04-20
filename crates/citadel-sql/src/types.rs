@@ -15,6 +15,10 @@ pub enum DataType {
     Text,
     Blob,
     Boolean,
+    Time,
+    Date,
+    Timestamp,
+    Interval,
 }
 
 impl DataType {
@@ -26,6 +30,10 @@ impl DataType {
             DataType::Boolean => 3,
             DataType::Integer => 4,
             DataType::Real => 5,
+            DataType::Time => 6,
+            DataType::Date => 7,
+            DataType::Timestamp => 8,
+            DataType::Interval => 9,
         }
     }
 
@@ -37,6 +45,10 @@ impl DataType {
             3 => Some(DataType::Boolean),
             4 => Some(DataType::Integer),
             5 => Some(DataType::Real),
+            6 => Some(DataType::Time),
+            7 => Some(DataType::Date),
+            8 => Some(DataType::Timestamp),
+            9 => Some(DataType::Interval),
             _ => None,
         }
     }
@@ -51,11 +63,16 @@ impl fmt::Display for DataType {
             DataType::Text => write!(f, "TEXT"),
             DataType::Blob => write!(f, "BLOB"),
             DataType::Boolean => write!(f, "BOOLEAN"),
+            DataType::Time => write!(f, "TIME"),
+            DataType::Date => write!(f, "DATE"),
+            DataType::Timestamp => write!(f, "TIMESTAMP"),
+            DataType::Interval => write!(f, "INTERVAL"),
         }
     }
 }
 
-/// SQL value.
+/// SQL value. Temporal epochs: days/µs since 1970-01-01 UTC.
+/// `Date`/`Timestamp` reserve `i{32,64}::{MAX,MIN}` as `±infinity` sentinels.
 #[derive(Debug, Clone, Default)]
 pub enum Value {
     #[default]
@@ -65,6 +82,14 @@ pub enum Value {
     Text(CompactString),
     Blob(Vec<u8>),
     Boolean(bool),
+    Time(i64),
+    Date(i32),
+    Timestamp(i64),
+    Interval {
+        months: i32,
+        days: i32,
+        micros: i64,
+    },
 }
 
 impl Value {
@@ -76,11 +101,24 @@ impl Value {
             Value::Text(_) => DataType::Text,
             Value::Blob(_) => DataType::Blob,
             Value::Boolean(_) => DataType::Boolean,
+            Value::Time(_) => DataType::Time,
+            Value::Date(_) => DataType::Date,
+            Value::Timestamp(_) => DataType::Timestamp,
+            Value::Interval { .. } => DataType::Interval,
         }
     }
 
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
+    }
+
+    /// Returns true for `±infinity` sentinel values on DATE / TIMESTAMP; false otherwise.
+    pub fn is_finite_temporal(&self) -> bool {
+        match self {
+            Value::Date(d) => *d != i32::MAX && *d != i32::MIN,
+            Value::Timestamp(t) => *t != i64::MAX && *t != i64::MIN,
+            _ => true,
+        }
     }
 
     /// Attempt to coerce this value to the target type.
@@ -97,6 +135,21 @@ impl Value {
             (Value::Boolean(b), DataType::Boolean) => Some(Value::Boolean(*b)),
             (Value::Boolean(b), DataType::Integer) => Some(Value::Integer(if *b { 1 } else { 0 })),
             (Value::Integer(i), DataType::Boolean) => Some(Value::Boolean(*i != 0)),
+            (Value::Time(t), DataType::Time) => Some(Value::Time(*t)),
+            (Value::Date(d), DataType::Date) => Some(Value::Date(*d)),
+            (Value::Timestamp(t), DataType::Timestamp) => Some(Value::Timestamp(*t)),
+            (
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                },
+                DataType::Interval,
+            ) => Some(Value::Interval {
+                months: *months,
+                days: *days,
+                micros: *micros,
+            }),
             _ => None,
         }
     }
@@ -113,6 +166,76 @@ impl Value {
             (Value::Real(r), DataType::Integer) => Some(Value::Integer(r as i64)),
             (Value::Boolean(b), DataType::Integer) => Some(Value::Integer(if b { 1 } else { 0 })),
             (Value::Integer(i), DataType::Boolean) => Some(Value::Boolean(i != 0)),
+            (Value::Text(s), DataType::Date) => {
+                crate::datetime::parse_date(&s).ok().map(Value::Date)
+            }
+            (Value::Text(s), DataType::Time) => {
+                crate::datetime::parse_time(&s).ok().map(Value::Time)
+            }
+            (Value::Text(s), DataType::Timestamp) => crate::datetime::parse_timestamp(&s)
+                .ok()
+                .map(Value::Timestamp),
+            (Value::Text(s), DataType::Interval) => {
+                crate::datetime::parse_interval(&s)
+                    .ok()
+                    .map(|(m, d, u)| Value::Interval {
+                        months: m,
+                        days: d,
+                        micros: u,
+                    })
+            }
+            // INTEGER → TIMESTAMP: Unix epoch seconds.
+            (Value::Integer(n), DataType::Timestamp) => {
+                n.checked_mul(1_000_000).map(Value::Timestamp)
+            }
+            (Value::Integer(n), DataType::Date) => {
+                if n >= i32::MIN as i64 && n <= i32::MAX as i64 {
+                    Some(Value::Date(n as i32))
+                } else {
+                    None
+                }
+            }
+            (Value::Integer(n), DataType::Time) => {
+                if (0..=86_400_000_000).contains(&n) {
+                    Some(Value::Time(n))
+                } else {
+                    None
+                }
+            }
+            (Value::Integer(n), DataType::Interval) => {
+                if n >= i32::MIN as i64 && n <= i32::MAX as i64 {
+                    Some(Value::Interval {
+                        months: 0,
+                        days: n as i32,
+                        micros: 0,
+                    })
+                } else {
+                    None
+                }
+            }
+            (Value::Timestamp(t), DataType::Integer) => Some(Value::Integer(t / 1_000_000)),
+            (Value::Date(d), DataType::Integer) => Some(Value::Integer(d as i64)),
+            (Value::Time(t), DataType::Integer) => Some(Value::Integer(t)),
+            (Value::Date(d), DataType::Timestamp) => {
+                (d as i64).checked_mul(86_400_000_000).map(Value::Timestamp)
+            }
+            (Value::Timestamp(t), DataType::Date) => {
+                // div_euclid floors correctly for negative µs (pre-1970).
+                let days = t.div_euclid(86_400_000_000);
+                if days >= i32::MIN as i64 && days <= i32::MAX as i64 {
+                    Some(Value::Date(days as i32))
+                } else {
+                    None
+                }
+            }
+            (v, DataType::Text)
+                if matches!(
+                    v.data_type(),
+                    DataType::Date | DataType::Time | DataType::Timestamp | DataType::Interval
+                ) =>
+            {
+                Some(Value::Text(v.to_string().into()))
+            }
             _ => None,
         }
     }
@@ -130,6 +253,8 @@ impl Value {
 }
 
 impl PartialEq for Value {
+    // Field-wise for Eq/Hash/Ord transitivity. SQL-level `=` on INTERVAL
+    // normalizes separately (see eval.rs).
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Null, Value::Null) => true,
@@ -140,6 +265,21 @@ impl PartialEq for Value {
             (Value::Text(a), Value::Text(b)) => a == b,
             (Value::Blob(a), Value::Blob(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::Time(a), Value::Time(b)) => a == b,
+            (Value::Date(a), Value::Date(b)) => a == b,
+            (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
+            (
+                Value::Interval {
+                    months: am,
+                    days: ad,
+                    micros: au,
+                },
+                Value::Interval {
+                    months: bm,
+                    days: bd,
+                    micros: bu,
+                },
+            ) => am == bm && ad == bd && au == bu,
             _ => false,
         }
     }
@@ -173,6 +313,28 @@ impl Hash for Value {
                 4u8.hash(state);
                 b.hash(state);
             }
+            Value::Time(t) => {
+                5u8.hash(state);
+                t.hash(state);
+            }
+            Value::Date(d) => {
+                6u8.hash(state);
+                d.hash(state);
+            }
+            Value::Timestamp(t) => {
+                7u8.hash(state);
+                t.hash(state);
+            }
+            Value::Interval {
+                months,
+                days,
+                micros,
+            } => {
+                8u8.hash(state);
+                months.hash(state);
+                days.hash(state);
+                micros.hash(state);
+            }
         }
     }
 }
@@ -184,8 +346,9 @@ impl PartialOrd for Value {
 }
 
 impl Ord for Value {
+    // Order: NULL < BOOLEAN < numeric < TIME < DATE < TIMESTAMP < INTERVAL < TEXT < BLOB.
+    // INTERVAL compares field-wise for trait-invariant safety; SQL-level ops normalize.
     fn cmp(&self, other: &Self) -> Ordering {
-        // NULL < BOOLEAN < INTEGER/REAL (numeric) < TEXT < BLOB
         match (self, other) {
             (Value::Null, Value::Null) => Ordering::Equal,
             (Value::Null, _) => Ordering::Less,
@@ -195,12 +358,38 @@ impl Ord for Value {
             (Value::Boolean(_), _) => Ordering::Less,
             (_, Value::Boolean(_)) => Ordering::Greater,
 
-            // Numeric: Integer and Real are comparable
             (Value::Integer(_) | Value::Real(_), Value::Integer(_) | Value::Real(_)) => {
                 self.numeric_cmp(other).unwrap_or(Ordering::Equal)
             }
             (Value::Integer(_) | Value::Real(_), _) => Ordering::Less,
             (_, Value::Integer(_) | Value::Real(_)) => Ordering::Greater,
+
+            (Value::Time(a), Value::Time(b)) => a.cmp(b),
+            (Value::Time(_), _) => Ordering::Less,
+            (_, Value::Time(_)) => Ordering::Greater,
+
+            (Value::Date(a), Value::Date(b)) => a.cmp(b),
+            (Value::Date(_), _) => Ordering::Less,
+            (_, Value::Date(_)) => Ordering::Greater,
+
+            (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+            (Value::Timestamp(_), _) => Ordering::Less,
+            (_, Value::Timestamp(_)) => Ordering::Greater,
+
+            (
+                Value::Interval {
+                    months: am,
+                    days: ad,
+                    micros: au,
+                },
+                Value::Interval {
+                    months: bm,
+                    days: bd,
+                    micros: bu,
+                },
+            ) => am.cmp(bm).then(ad.cmp(bd)).then(au.cmp(bu)),
+            (Value::Interval { .. }, _) => Ordering::Less,
+            (_, Value::Interval { .. }) => Ordering::Greater,
 
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
             (Value::Text(_), _) => Ordering::Less,
@@ -226,6 +415,20 @@ impl fmt::Display for Value {
             Value::Text(s) => write!(f, "{s}"),
             Value::Blob(b) => write!(f, "X'{}'", hex_encode(b)),
             Value::Boolean(b) => write!(f, "{}", if *b { "TRUE" } else { "FALSE" }),
+            Value::Time(t) => write!(f, "{}", crate::datetime::format_time(*t)),
+            Value::Date(d) => write!(f, "{}", crate::datetime::format_date(*d)),
+            Value::Timestamp(t) => write!(f, "{}", crate::datetime::format_timestamp(*t)),
+            Value::Interval {
+                months,
+                days,
+                micros,
+            } => {
+                write!(
+                    f,
+                    "{}",
+                    crate::datetime::format_interval(*months, *days, *micros)
+                )
+            }
         }
     }
 }
@@ -250,6 +453,8 @@ pub struct ColumnDef {
     pub check_expr: Option<Expr>,
     pub check_sql: Option<String>,
     pub check_name: Option<String>,
+    /// Display-only flag for `TIMESTAMPTZ` / `TIMETZ`; storage is i64 µs UTC.
+    pub is_with_timezone: bool,
 }
 
 /// Index definition stored as part of the table schema.
@@ -752,6 +957,7 @@ impl TableSchema {
                 check_expr: None,
                 check_sql: None,
                 check_name: None,
+                is_with_timezone: false,
             });
         }
 
@@ -996,6 +1202,7 @@ mod tests {
             check_expr: None,
             check_sql: None,
             check_name: None,
+            is_with_timezone: false,
         }
     }
 

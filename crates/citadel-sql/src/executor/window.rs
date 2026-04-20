@@ -72,12 +72,17 @@ pub(super) fn extract_window_fns(
             expr: Box::new(extract_window_fns(e, slot_counter, extracted)),
             data_type: *data_type,
         },
-        Expr::Function { name, args } => Expr::Function {
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => Expr::Function {
             name: name.clone(),
             args: args
                 .iter()
                 .map(|a| extract_window_fns(a, slot_counter, extracted))
                 .collect(),
+            distinct: *distinct,
         },
         Expr::Coalesce(args) => Expr::Coalesce(
             args.iter()
@@ -792,6 +797,7 @@ pub(super) fn eval_window_select(
             check_expr: None,
             check_sql: None,
             check_name: None,
+            is_with_timezone: false,
         });
     }
 

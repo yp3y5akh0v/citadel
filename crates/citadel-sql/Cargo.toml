@@ -23,6 +23,7 @@ sqlparser = { workspace = true }
 thiserror = { workspace = true }
 lru = { workspace = true }
 compact_str = { workspace = true }
+jiff = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

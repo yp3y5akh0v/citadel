@@ -94,6 +94,52 @@ pub(super) enum RangeCheck {
     ExceedsUpper,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn scan_step(
+    schema: &TableSchema,
+    key: &[u8],
+    value: &[u8],
+    where_clause: Option<&Expr>,
+    simple_pred: Option<&SimplePredicate>,
+    between_pred: Option<&BetweenPredicate>,
+    col_map: Option<&ColumnMap>,
+    partial_ctx: Option<&PartialDecodeCtx>,
+) -> Result<Option<Vec<Value>>> {
+    if let Some(pred) = simple_pred {
+        return if pred.matches_raw(key, value)? {
+            Ok(Some(decode_full_row(schema, key, value)?))
+        } else {
+            Ok(None)
+        };
+    }
+    if let Some(pred) = between_pred {
+        return if pred.matches_raw(key, value)? {
+            Ok(Some(decode_full_row(schema, key, value)?))
+        } else {
+            Ok(None)
+        };
+    }
+    match (where_clause, col_map, partial_ctx) {
+        (Some(expr), Some(map), Some(ctx)) => {
+            let partial = ctx.decode(key, value)?;
+            if is_truthy(&eval_expr(expr, map, &partial)?) {
+                Ok(Some(ctx.complete(partial, key, value)?))
+            } else {
+                Ok(None)
+            }
+        }
+        (Some(expr), Some(map), None) => {
+            let row = decode_full_row(schema, key, value)?;
+            if is_truthy(&eval_expr(expr, map, &row)?) {
+                Ok(Some(row))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(Some(decode_full_row(schema, key, value)?)),
+    }
+}
+
 /// Collect rows via ReadTxn using the scan plan.
 pub(super) fn collect_rows_read(
     db: &Database,
@@ -110,36 +156,33 @@ pub(super) fn collect_rows_read(
             let simple_pred = where_clause
                 .as_ref()
                 .and_then(|expr| try_simple_predicate(expr, table_schema));
+            let between_pred = if simple_pred.is_none() {
+                where_clause
+                    .as_ref()
+                    .and_then(|expr| try_between_predicate(expr, table_schema))
+            } else {
+                None
+            };
+            let needs_generic_eval =
+                where_clause.is_some() && simple_pred.is_none() && between_pred.is_none();
 
-            if let Some(ref pred) = simple_pred {
-                let mut rtx = db.begin_read();
-                let entry_count =
-                    rtx.table_entry_count(lower_name.as_bytes()).unwrap_or(0) as usize;
-                let mut rows = Vec::with_capacity(entry_count / 4);
-                let mut scan_err: Option<SqlError> = None;
-                rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
-                    match pred.matches_raw(key, value) {
-                        Ok(true) => match decode_full_row(table_schema, key, value) {
-                            Ok(row) => rows.push(row),
-                            Err(e) => {
-                                scan_err = Some(e);
-                                return false;
-                            }
-                        },
-                        Ok(false) => {}
-                        Err(e) => {
-                            scan_err = Some(e);
-                            return false;
-                        }
+            let col_map = if needs_generic_eval {
+                Some(ColumnMap::new(columns))
+            } else {
+                None
+            };
+            let partial_ctx = if needs_generic_eval {
+                where_clause.as_ref().and_then(|expr| {
+                    let needed = referenced_columns(expr, columns);
+                    if needed.len() < columns.len() {
+                        Some(PartialDecodeCtx::new(table_schema, &needed))
+                    } else {
+                        None
                     }
-                    scan_err.is_none() && limit.map_or(true, |n| rows.len() < n)
                 })
-                .map_err(SqlError::Storage)?;
-                if let Some(e) = scan_err {
-                    return Err(e);
-                }
-                return Ok((rows, true));
-            }
+            } else {
+                None
+            };
 
             let mut rtx = db.begin_read();
             let entry_count = rtx.table_entry_count(lower_name.as_bytes()).unwrap_or(0) as usize;
@@ -151,44 +194,26 @@ pub(super) fn collect_rows_read(
             let mut rows = Vec::with_capacity(capacity);
             let mut scan_err: Option<SqlError> = None;
 
-            let col_map = ColumnMap::new(columns);
-            let partial_ctx = where_clause.as_ref().and_then(|expr| {
-                let needed = referenced_columns(expr, columns);
-                if needed.len() < columns.len() {
-                    Some(PartialDecodeCtx::new(table_schema, &needed))
-                } else {
-                    None
+            rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
+                let step = scan_step(
+                    table_schema,
+                    key,
+                    value,
+                    where_clause.as_ref(),
+                    simple_pred.as_ref(),
+                    between_pred.as_ref(),
+                    col_map.as_ref(),
+                    partial_ctx.as_ref(),
+                );
+                match step {
+                    Ok(Some(row)) => rows.push(row),
+                    Ok(None) => {}
+                    Err(e) => {
+                        scan_err = Some(e);
+                        return false;
+                    }
                 }
-            });
-
-            rtx.table_scan_from(lower_name.as_bytes(), b"", |key, value| {
-                match (&where_clause, &partial_ctx) {
-                    (Some(expr), Some(ctx)) => match ctx.decode(key, value) {
-                        Ok(partial) => match eval_expr(expr, &col_map, &partial) {
-                            Ok(val) if is_truthy(&val) => match ctx.complete(partial, key, value) {
-                                Ok(row) => rows.push(row),
-                                Err(e) => scan_err = Some(e),
-                            },
-                            Err(e) => scan_err = Some(e),
-                            _ => {}
-                        },
-                        Err(e) => scan_err = Some(e),
-                    },
-                    (Some(expr), None) => match decode_full_row(table_schema, key, value) {
-                        Ok(row) => match eval_expr(expr, &col_map, &row) {
-                            Ok(val) if is_truthy(&val) => rows.push(row),
-                            Err(e) => scan_err = Some(e),
-                            _ => {}
-                        },
-                        Err(e) => scan_err = Some(e),
-                    },
-                    _ => match decode_full_row(table_schema, key, value) {
-                        Ok(row) => rows.push(row),
-                        Err(e) => scan_err = Some(e),
-                    },
-                }
-                let keep_going = scan_err.is_none() && limit.map_or(true, |n| rows.len() < n);
-                Ok(keep_going)
+                limit.map_or(true, |n| rows.len() < n)
             })
             .map_err(SqlError::Storage)?;
             if let Some(e) = scan_err {
@@ -937,11 +962,127 @@ impl SimplePredicate {
     }
 }
 
+/// Single-column `BETWEEN` compiled into raw-bytes comparisons.
+pub(super) struct BetweenPredicate {
+    is_pk: bool,
+    pk_pos: usize,
+    nonpk_idx: usize,
+    low: Value,
+    high: Value,
+    negated: bool,
+    num_pk_cols: usize,
+    default_val: Option<Value>,
+}
+
+impl BetweenPredicate {
+    pub(super) fn matches_raw(&self, key: &[u8], value: &[u8]) -> Result<bool> {
+        let raw = if self.is_pk {
+            if self.num_pk_cols == 1 {
+                RawColumn::Integer(decode_pk_integer(key)?)
+            } else {
+                let pk = decode_composite_key(key, self.num_pk_cols)?;
+                match &pk[self.pk_pos] {
+                    Value::Integer(i) => RawColumn::Integer(*i),
+                    Value::Real(r) => RawColumn::Real(*r),
+                    Value::Boolean(b) => RawColumn::Boolean(*b),
+                    other => {
+                        let in_range = raw_matches_op_value(other, BinOp::GtEq, &self.low)
+                            && raw_matches_op_value(other, BinOp::LtEq, &self.high);
+                        return Ok(if self.negated { !in_range } else { in_range });
+                    }
+                }
+            }
+        } else if self.nonpk_idx >= row_non_pk_count(value) {
+            return Ok(match &self.default_val {
+                Some(d) => {
+                    let in_range = raw_matches_op_value(d, BinOp::GtEq, &self.low)
+                        && raw_matches_op_value(d, BinOp::LtEq, &self.high);
+                    if self.negated {
+                        !in_range
+                    } else {
+                        in_range
+                    }
+                }
+                None => false,
+            });
+        } else {
+            decode_column_raw(value, self.nonpk_idx)?
+        };
+        if matches!(raw, RawColumn::Null) {
+            return Ok(false);
+        }
+        let ge = raw_matches_op(&raw, BinOp::GtEq, &self.low);
+        let le = raw_matches_op(&raw, BinOp::LtEq, &self.high);
+        let in_range = ge && le;
+        Ok(if self.negated { !in_range } else { in_range })
+    }
+}
+
+pub(super) fn try_between_predicate(expr: &Expr, schema: &TableSchema) -> Option<BetweenPredicate> {
+    let (col_name, low, high, negated) = match expr {
+        Expr::Between {
+            expr: col_expr,
+            low,
+            high,
+            negated,
+        } => match (col_expr.as_ref(), low.as_ref(), high.as_ref()) {
+            (Expr::Column(name), Expr::Literal(lo), Expr::Literal(hi)) => {
+                (name.as_str(), lo.clone(), hi.clone(), *negated)
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    let col_idx = schema.column_index(col_name)?;
+    let non_pk = schema.non_pk_indices();
+
+    if let Some(pk_pos) = schema
+        .primary_key_columns
+        .iter()
+        .position(|&i| i as usize == col_idx)
+    {
+        Some(BetweenPredicate {
+            is_pk: true,
+            pk_pos,
+            nonpk_idx: 0,
+            low,
+            high,
+            negated,
+            num_pk_cols: schema.primary_key_columns.len(),
+            default_val: None,
+        })
+    } else {
+        let nonpk_order = non_pk.iter().position(|&i| i == col_idx)?;
+        let nonpk_idx = schema.encoding_positions()[nonpk_order] as usize;
+        let default_val = schema.columns[col_idx]
+            .default_expr
+            .as_ref()
+            .and_then(|expr| eval_const_expr(expr).ok());
+        Some(BetweenPredicate {
+            is_pk: false,
+            pk_pos: 0,
+            nonpk_idx,
+            low,
+            high,
+            negated,
+            num_pk_cols: schema.primary_key_columns.len(),
+            default_val,
+        })
+    }
+}
+
 pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<SimplePredicate> {
-    let (col_name, op, literal) = match expr {
+    // Fold `col ± lit <cmp> lit` into `col <cmp> (lit ∓ lit)` to avoid per-row arithmetic.
+    let folded = fold_temporal_offset(expr);
+    let expr_ref = folded.as_ref().unwrap_or(expr);
+
+    let (col_name, op, literal) = match expr_ref {
         Expr::BinaryOp { left, op, right } => match (left.as_ref(), right.as_ref()) {
-            (Expr::Column(name), Expr::Literal(lit)) => (name.as_str(), *op, lit),
-            (Expr::Literal(lit), Expr::Column(name)) => (name.as_str(), flip_cmp_op(*op)?, lit),
+            (Expr::Column(name), Expr::Literal(lit)) => (name.as_str(), *op, lit.clone()),
+            (Expr::Literal(lit), Expr::Column(name)) => {
+                (name.as_str(), flip_cmp_op(*op)?, lit.clone())
+            }
             _ => return None,
         },
         _ => return None,
@@ -953,6 +1094,7 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
     ) {
         return None;
     }
+    let literal = &literal;
 
     let col_idx = schema.column_index(col_name)?;
     let non_pk = schema.non_pk_indices();
@@ -1000,6 +1142,68 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
             default_val,
         })
     }
+}
+
+/// Fold `col ± lit <cmp> lit` → `col <cmp> (lit ∓ lit)` at plan time. Returns `None`
+/// if the pattern doesn't match.
+pub(super) fn fold_temporal_offset(expr: &Expr) -> Option<Expr> {
+    let (left, op, right) = match expr {
+        Expr::BinaryOp { left, op, right } => (left, *op, right),
+        _ => return None,
+    };
+    if !matches!(
+        op,
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq
+    ) {
+        return None;
+    }
+
+    // col +/- lit_offset <op> literal_rhs
+    let try_fold = |l: &Expr, r: &Expr, flip: bool| -> Option<Expr> {
+        let Expr::BinaryOp {
+            left: inner_l,
+            op: inner_op,
+            right: inner_r,
+        } = l
+        else {
+            return None;
+        };
+        if !matches!(inner_op, BinOp::Add | BinOp::Sub) {
+            return None;
+        }
+        let col = inner_l.as_ref();
+        let offset = inner_r.as_ref();
+        let (col_name, offset_lit, rhs_lit) = match (col, offset, r) {
+            (Expr::Column(name), Expr::Literal(off), Expr::Literal(rhs)) => (name, off, rhs),
+            _ => return None,
+        };
+        // Compute `rhs_lit <inverse> offset_lit` at plan time.
+        let new_literal = match inner_op {
+            BinOp::Add => {
+                crate::eval::eval_binary_op_public(rhs_lit, BinOp::Sub, offset_lit).ok()?
+            }
+            BinOp::Sub => {
+                crate::eval::eval_binary_op_public(rhs_lit, BinOp::Add, offset_lit).ok()?
+            }
+            _ => return None,
+        };
+        let final_op = if flip { flip_cmp_op(op)? } else { op };
+        Some(Expr::BinaryOp {
+            left: Box::new(Expr::Column(col_name.clone())),
+            op: final_op,
+            right: Box::new(Expr::Literal(new_literal)),
+        })
+    };
+
+    // Pattern: (col <op_inner> lit) <cmp> lit
+    if let Some(folded) = try_fold(left, right, false) {
+        return Some(folded);
+    }
+    // Pattern: lit <cmp> (col <op_inner> lit) — flip the comparison operator.
+    if let Some(folded) = try_fold(right, left, true) {
+        return Some(folded);
+    }
+    None
 }
 
 pub(super) fn flip_cmp_op(op: BinOp) -> Option<BinOp> {

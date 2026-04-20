@@ -1,5 +1,4 @@
-//! Edge case tests: boundary values, type edge cases, bug-finding tests.
-//! Tests that expose real bugs are clearly documented.
+//! Edge case tests: boundary values, type edge cases.
 
 use citadel::{Argon2Profile, DatabaseBuilder};
 use citadel_sql::{Connection, ExecutionResult, SqlError, Value};
@@ -72,9 +71,8 @@ fn i64_neg_max_as_negated_literal() {
 
 #[test]
 fn i64_min_literal_becomes_real() {
-    // i64::MIN = -9223372036854775808
-    // The parser sees -(9223372036854775808), but 9223372036854775808 > i64::MAX,
-    // so it parses as f64 Real. This is a known limitation.
+    // Parser sees `-(9223372036854775808)` but the inner literal exceeds i64::MAX
+    // and becomes f64, so the resulting value is Real, not Integer.
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let mut conn = Connection::open(&db).unwrap();

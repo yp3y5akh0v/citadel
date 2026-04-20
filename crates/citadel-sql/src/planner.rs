@@ -398,6 +398,17 @@ fn format_value(val: &Value) -> String {
         Value::Text(s) => format!("'{s}'"),
         Value::Blob(_) => "BLOB".into(),
         Value::Boolean(b) => b.to_string(),
+        Value::Date(d) => format!("DATE '{}'", crate::datetime::format_date(*d)),
+        Value::Time(t) => format!("TIME '{}'", crate::datetime::format_time(*t)),
+        Value::Timestamp(t) => format!("TIMESTAMP '{}'", crate::datetime::format_timestamp(*t)),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => format!(
+            "INTERVAL '{}'",
+            crate::datetime::format_interval(*months, *days, *micros)
+        ),
     }
 }
 
@@ -429,6 +440,7 @@ mod tests {
             check_expr: None,
             check_sql: None,
             check_name: None,
+            is_with_timezone: false,
         }
     }
 

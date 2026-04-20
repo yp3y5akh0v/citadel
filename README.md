@@ -32,36 +32,49 @@ Every page is encrypted and authenticated before it hits disk. The database file
 
 ## Benchmarks
 
-Citadel vs SQLite on 100K rows (INTEGER, TEXT, INTEGER), single-threaded:
+Single-threaded on 100K rows, schema `(id INTEGER PK, name TEXT, age INTEGER)`. Ratio = SQLite / Citadel time.
 
 ```
 Benchmark          Citadel        SQLite         Ratio
------------------------------------------------------
-correlated_in      5.49 ms        1.90 s         346x
-count              146 ns         31.0 us        213x
-correlated_scalar  264 us         18.1 ms        69x
-point              915 ns         12.7 us        13.9x
-group_by           1.94 ms        10.2 ms        5.3x
-cte                1.43 ms        6.16 ms        4.3x
-view_point         3.02 us        12.7 us        4.2x
-savepoint_rollback 3.49 ms        10.1 ms        2.9x
-view_filter        734 us         1.77 ms        2.4x
-filter             721 us         1.76 ms        2.4x
-window_agg         36.5 ms        84.0 ms        2.3x
-sort               1.15 ms        2.52 ms        2.2x
-window_rank        65.5 ms        133 ms         2.0x
-savepoint_nested   518 us         1.05 ms        2.0x
-insert             64.9 us        118 us         1.8x
-scan               9.15 ms        13.5 ms        1.5x
-insert_select      738 us         1.13 ms        1.5x
-sum                1.35 ms        1.84 ms        1.4x
-delete             102 us         137 us         1.3x
-join               87.0 us        113 us         1.3x
-distinct           3.14 ms        3.88 ms        1.2x
-correlated_exists  5.78 ms        6.59 ms        1.1x
-update             27.9 us        29.7 us        1.07x
-union              176 us         181 us         1.03x
-recursive_cte      111 us         115 us         1.03x
+------------------------------------------------------
+correlated_in      9.50 ms        1.84 s         194x
+count              550 ns         62.3 us        113x
+correlated_scalar  590 us         18.1 ms        31x
+cte                1.67 ms        14.6 ms        8.7x
+group_by           2.80 ms        21.0 ms        7.5x
+point              2.01 us        14.7 us        7.3x
+savepoint_nested   620 us         3.09 ms        5.0x
+sort               1.60 ms        6.37 ms        4.0x
+filter             1.05 ms        2.75 ms        2.6x
+view_point         4.99 us        12.4 us        2.5x
+view_filter        764 us         1.79 ms        2.3x
+savepoint_rollback 4.20 ms        9.30 ms        2.2x
+recursive_cte      156 us         264 us         1.7x
+correlated_exists  4.02 ms        6.55 ms        1.63x
+window_rank        149 ms         238 ms         1.6x
+distinct           2.43 ms        3.80 ms        1.56x
+insert             124 us         188 us         1.5x
+sum                1.44 ms        1.89 ms        1.31x
+insert_select      853 us         1.13 ms        1.3x
+scan               10.83 ms       13.59 ms       1.25x
+window_agg         67.7 ms        75.3 ms        1.11x
+update             26.9 us        29.5 us        1.10x
+delete             178 us         165 us         0.93x
+join               348 us         253 us         0.73x
+union              1.01 ms        252 us         0.25x
+savepoint_create   3.66 us        685 ns         0.19x
+```
+
+### Native DATE / TIMESTAMP (Citadel only, SQLite has no native type)
+
+```
+Benchmark          Citadel
+-------------------------------
+date_sort          1.23 ms
+date_arith         1.79 ms
+date_range_scan    1.86 ms
+date_groupby       16.8 ms
+date_extract       21.3 ms
 ```
 
 <details>
@@ -71,29 +84,34 @@ recursive_cte      111 us         115 us         1.03x
 - **count** - `SELECT COUNT(*) FROM t`
 - **correlated_scalar** - `SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.a_id = a.id) FROM a`
 - **point** - `SELECT * FROM t WHERE id = 50000`
+- **date_arith** - `SELECT COUNT(*) FROM events WHERE ts + INTERVAL '1 day' > TIMESTAMP '2024-06-01 00:00:00'`
 - **group_by** - `SELECT age, COUNT(*) FROM t GROUP BY age`
 - **cte** - `WITH filtered AS (SELECT ... WHERE age < 50) SELECT age, COUNT(*) FROM filtered GROUP BY age`
 - **view_point** - `SELECT * FROM v WHERE id = 50000`
 - **savepoint_rollback** - `BEGIN; INSERT 1K rows; SAVEPOINT sp; INSERT 10K rows; ROLLBACK TO sp; COMMIT`
-- **view_filter** - `SELECT * FROM v WHERE age = 42` (v = view over t)
+- **date_groupby** - `SELECT DATE_TRUNC('month', ts), COUNT(*) FROM events GROUP BY 1`
+- **date_sort** - `SELECT id FROM events ORDER BY ts LIMIT 100`
+- **view_filter** - `SELECT * FROM v WHERE age = 42`
 - **filter** - `SELECT * FROM t WHERE age = 42`
-- **window_agg** - `SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING), MIN(age) OVER (...)`
+- **window_agg** - `SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING), MIN(age) OVER ...`
 - **sort** - `SELECT * FROM t ORDER BY age LIMIT 10`
-- **window_rank** - `ROW_NUMBER() OVER (PARTITION BY age ORDER BY id), RANK() OVER (...)`
+- **window_rank** - `ROW_NUMBER() OVER (PARTITION BY age ORDER BY id), RANK() OVER ...`
 - **savepoint_nested** - 10 nested savepoints each with 100-row INSERT, alternating RELEASE/ROLLBACK TO
+- **date_range_scan** - `SELECT COUNT(*) FROM events WHERE d BETWEEN DATE '2024-02-01' AND DATE '2024-03-31'`
 - **insert** - 100 rows in one transaction
-- **scan** - `SELECT * FROM t` (full 100K rows)
+- **scan** - `SELECT * FROM t`
 - **insert_select** - `INSERT INTO sink SELECT id, val FROM a`
 - **sum** - `SELECT SUM(age) FROM t`
 - **delete** - insert 100 rows then delete them
-- **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id` (1K x 1K)
+- **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id`
 - **distinct** - `SELECT DISTINCT age FROM t`
 - **correlated_exists** - `SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM ref_table WHERE ref_table.id = t.id)`
 - **update** - `UPDATE t SET age = age + 1 WHERE id BETWEEN 10000 AND 10099`
+- **date_extract** - `SELECT AVG(EXTRACT(HOUR FROM ts)) FROM events`
 - **union** - `SELECT id, val FROM a UNION ALL SELECT id, data FROM b`
 - **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq`
 
-SQLite config: `journal_mode=OFF, synchronous=OFF, cache_size=8000` (~32 MB).
+SQLite config: `journal_mode=OFF, synchronous=OFF, cache_size=8192` (~32 MB).
 Citadel config: `SyncMode::Off, cache_size=4096` (~32 MB).
 Both run with durability disabled to measure pure engine overhead, not disk I/O.
 
@@ -173,7 +191,7 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 **Constraints** - PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK (column + table level), FOREIGN KEY (RESTRICT/NO ACTION)
 
-**Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN
+**Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN, DATE, TIME, TIMESTAMP (WITH TIME ZONE), INTERVAL
 
 **Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS), subqueries (scalar, IN, EXISTS, correlated), CTEs (WITH / WITH RECURSIVE), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, GROUP BY/HAVING, ORDER BY, LIMIT/OFFSET
 
@@ -182,6 +200,8 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 **Views** - CREATE/DROP VIEW, OR REPLACE, IF NOT EXISTS/IF EXISTS, column aliases, nested views
 
 **Functions** - COUNT, SUM, AVG, MIN, MAX, LENGTH, UPPER, LOWER, SUBSTR, ABS, ROUND, COALESCE, NULLIF, CAST, TYPEOF, HEX, TRIM, REPLACE, RANDOM, IIF, GLOB
+
+**Date/Time Functions** - NOW, CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME, LOCALTIMESTAMP, LOCALTIME, CLOCK_TIMESTAMP, EXTRACT, DATE_PART, DATE_TRUNC, DATE_BIN, AGE, MAKE_DATE, MAKE_TIME, MAKE_TIMESTAMP, MAKE_INTERVAL, JUSTIFY_DAYS, JUSTIFY_HOURS, JUSTIFY_INTERVAL, ISFINITE, DATE, TIME, DATETIME, STRFTIME, JULIANDAY, UNIXEPOCH, TIMEDIFF, AT TIME ZONE. Supports `INTERVAL '1 year 2 months'`, `DATE '2024-01-15'`, `TIMESTAMP '2024-01-15 12:30:00Z'`, `infinity`/`-infinity` sentinels, BC dates, full IANA zone parsing (jiff), PG-normalized INTERVAL comparison.
 
 **Prepared statements** - `$1, $2, ...` positional parameters with LRU statement cache
 

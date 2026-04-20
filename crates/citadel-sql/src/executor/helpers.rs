@@ -475,9 +475,17 @@ pub(super) fn expr_display_name(expr: &Expr) -> String {
         Expr::QualifiedColumn { table, column } => format!("{table}.{column}"),
         Expr::Literal(v) => format!("{v}"),
         Expr::CountStar => "COUNT(*)".into(),
-        Expr::Function { name, args } => {
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => {
             let arg_strs: Vec<String> = args.iter().map(expr_display_name).collect();
-            format!("{name}({})", arg_strs.join(", "))
+            if *distinct {
+                format!("{name}(DISTINCT {})", arg_strs.join(", "))
+            } else {
+                format!("{name}({})", arg_strs.join(", "))
+            }
         }
         Expr::BinaryOp { left, op, right } => {
             format!(
@@ -544,6 +552,7 @@ pub(super) fn build_output_columns(
             check_expr: None,
             check_sql: None,
             check_name: None,
+            is_with_timezone: false,
         });
     }
     out

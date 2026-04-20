@@ -107,7 +107,7 @@ pub fn eval_expr(expr: &Expr, col_map: &ColumnMap, row: &[Value]) -> Result<Valu
             Ok(Value::Boolean(!val.is_null()))
         }
 
-        Expr::Function { name, args } => eval_scalar_function(name, args, col_map, row),
+        Expr::Function { name, args, .. } => eval_scalar_function(name, args, col_map, row),
 
         Expr::CountStar => Err(SqlError::Unsupported(
             "COUNT(*) in non-aggregate context".into(),
@@ -198,17 +198,24 @@ pub fn eval_expr(expr: &Expr, col_map: &ColumnMap, row: &[Value]) -> Result<Valu
     }
 }
 
+/// Planner-level constant folding hook; shares semantics with row evaluation.
+pub fn eval_binary_op_public(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
+    eval_binary_op(left, op, right)
+}
+
 fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
-    // SQL three-valued logic for AND/OR
     match op {
         BinOp::And => return eval_and(left, right),
         BinOp::Or => return eval_or(left, right),
         _ => {}
     }
 
-    // NULL propagation for all other ops (including || per SQL standard)
     if left.is_null() || right.is_null() {
         return Ok(Value::Null);
+    }
+
+    if let Some(res) = eval_temporal_op(left, op, right) {
+        return res;
     }
 
     match op {
@@ -243,6 +250,291 @@ fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
             Ok(Value::Text(format!("{ls}{rs}").into()))
         }
         BinOp::And | BinOp::Or => unreachable!(),
+    }
+}
+
+/// Returns `Some` when `(left, op, right)` is a temporal operation; `None` to fall through.
+fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Value>> {
+    use crate::datetime as dt;
+    use std::cmp::Ordering;
+
+    let is_temporal = |v: &Value| {
+        matches!(
+            v,
+            Value::Date(_) | Value::Time(_) | Value::Timestamp(_) | Value::Interval { .. }
+        )
+    };
+    if matches!(op, BinOp::Add | BinOp::Sub)
+        && ((is_temporal(left) && matches!(right, Value::Real(_)))
+            || (matches!(left, Value::Real(_)) && is_temporal(right)))
+    {
+        return Some(Err(SqlError::TypeMismatch {
+            expected: "INTEGER or INTERVAL for date/time arithmetic (use CAST for REAL)".into(),
+            got: format!("{} and {}", left.data_type(), right.data_type()),
+        }));
+    }
+
+    match (left, op, right) {
+        (Value::Date(d), BinOp::Add, Value::Integer(n))
+        | (Value::Integer(n), BinOp::Add, Value::Date(d)) => {
+            Some(dt::add_days_to_date(*d, *n).map(Value::Date))
+        }
+        (Value::Date(d), BinOp::Sub, Value::Integer(n)) => {
+            Some(dt::add_days_to_date(*d, -*n).map(Value::Date))
+        }
+        (Value::Date(a), BinOp::Sub, Value::Date(b)) => {
+            Some(Ok(Value::Integer(*a as i64 - *b as i64)))
+        }
+        // DATE ± INTERVAL → TIMESTAMP (PG rule).
+        (
+            Value::Date(d),
+            BinOp::Add,
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        )
+        | (
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+            BinOp::Add,
+            Value::Date(d),
+        ) => Some(dt::add_interval_to_date(*d, *months, *days, *micros).map(Value::Timestamp)),
+        (
+            Value::Date(d),
+            BinOp::Sub,
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ) => Some(dt::add_interval_to_date(*d, -*months, -*days, -*micros).map(Value::Timestamp)),
+        (
+            Value::Timestamp(t),
+            BinOp::Add,
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        )
+        | (
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+            BinOp::Add,
+            Value::Timestamp(t),
+        ) => Some(dt::add_interval_to_timestamp(*t, *months, *days, *micros).map(Value::Timestamp)),
+        (
+            Value::Timestamp(t),
+            BinOp::Sub,
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ) => Some(
+            dt::add_interval_to_timestamp(*t, -*months, -*days, -*micros).map(Value::Timestamp),
+        ),
+        (Value::Timestamp(a), BinOp::Sub, Value::Timestamp(b)) => {
+            let (days, micros) = dt::subtract_timestamps(*a, *b);
+            Some(Ok(Value::Interval {
+                months: 0,
+                days,
+                micros,
+            }))
+        }
+        (
+            Value::Time(t),
+            BinOp::Add,
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ) => Some(dt::add_interval_to_time(*t, *months, *days, *micros).map(Value::Time)),
+        (
+            Value::Time(t),
+            BinOp::Sub,
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ) => Some(dt::add_interval_to_time(*t, -*months, -*days, -*micros).map(Value::Time)),
+        (Value::Time(a), BinOp::Sub, Value::Time(b)) => Some(Ok(Value::Interval {
+            months: 0,
+            days: 0,
+            micros: *a - *b,
+        })),
+        (
+            Value::Interval {
+                months: am,
+                days: ad,
+                micros: au,
+            },
+            BinOp::Add,
+            Value::Interval {
+                months: bm,
+                days: bd,
+                micros: bu,
+            },
+        ) => Some(Ok(Value::Interval {
+            months: am.saturating_add(*bm),
+            days: ad.saturating_add(*bd),
+            micros: au.saturating_add(*bu),
+        })),
+        (
+            Value::Interval {
+                months: am,
+                days: ad,
+                micros: au,
+            },
+            BinOp::Sub,
+            Value::Interval {
+                months: bm,
+                days: bd,
+                micros: bu,
+            },
+        ) => Some(Ok(Value::Interval {
+            months: am.saturating_sub(*bm),
+            days: ad.saturating_sub(*bd),
+            micros: au.saturating_sub(*bu),
+        })),
+        (
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+            BinOp::Mul,
+            Value::Integer(n),
+        )
+        | (
+            Value::Integer(n),
+            BinOp::Mul,
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ) => {
+            let n32 = (*n).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+            Some(Ok(Value::Interval {
+                months: months.saturating_mul(n32),
+                days: days.saturating_mul(n32),
+                micros: micros.saturating_mul(*n),
+            }))
+        }
+        // INTERVAL * REAL — fractional months → days, fractional days → micros (PG).
+        (
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+            BinOp::Mul,
+            Value::Real(r),
+        )
+        | (
+            Value::Real(r),
+            BinOp::Mul,
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ) => Some(Ok(scale_interval_by_real(*months, *days, *micros, *r))),
+        (
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+            BinOp::Div,
+            Value::Integer(n),
+        ) if *n != 0 => Some(Ok(Value::Interval {
+            months: (*months as i64 / *n) as i32,
+            days: (*days as i64 / *n) as i32,
+            micros: *micros / *n,
+        })),
+        (
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+            BinOp::Div,
+            Value::Real(r),
+        ) if *r != 0.0 => Some(Ok(scale_interval_by_real(*months, *days, *micros, 1.0 / r))),
+        // PG-normalized INTERVAL compare: 30-day month, 24-hour day.
+        (
+            Value::Interval {
+                months: am,
+                days: ad,
+                micros: au,
+            },
+            op,
+            Value::Interval {
+                months: bm,
+                days: bd,
+                micros: bu,
+            },
+        ) if matches!(
+            op,
+            BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq
+        ) =>
+        {
+            let ord = dt::pg_normalized_interval_cmp((*am, *ad, *au), (*bm, *bd, *bu));
+            let b = match op {
+                BinOp::Eq => ord == Ordering::Equal,
+                BinOp::NotEq => ord != Ordering::Equal,
+                BinOp::Lt => ord == Ordering::Less,
+                BinOp::Gt => ord == Ordering::Greater,
+                BinOp::LtEq => ord != Ordering::Greater,
+                BinOp::GtEq => ord != Ordering::Less,
+                _ => unreachable!(),
+            };
+            Some(Ok(Value::Boolean(b)))
+        }
+        // PG rejects TIMESTAMP ± INTEGER; require CAST to INTERVAL.
+        (Value::Timestamp(_), BinOp::Add | BinOp::Sub, Value::Integer(_))
+        | (Value::Integer(_), BinOp::Add, Value::Timestamp(_)) => {
+            Some(Err(SqlError::TypeMismatch {
+                expected: "INTERVAL (use CAST or explicit unit)".into(),
+                got: format!("{} and {}", left.data_type(), right.data_type()),
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// PG fractional-propagation: month frac → days (×30), day frac → micros (×86.4G).
+fn scale_interval_by_real(months: i32, days: i32, micros: i64, factor: f64) -> Value {
+    let raw_months = months as f64 * factor;
+    let whole_months = raw_months.trunc() as i64;
+    let frac_months = raw_months - whole_months as f64;
+    let months_frac_as_days = frac_months * 30.0;
+
+    let raw_days = days as f64 * factor + months_frac_as_days;
+    let whole_days = raw_days.trunc() as i64;
+    let frac_days = raw_days - whole_days as f64;
+    let days_frac_as_micros = (frac_days * crate::datetime::MICROS_PER_DAY as f64).round() as i64;
+
+    let raw_micros = (micros as f64 * factor).round() as i64;
+    let total_micros = raw_micros.saturating_add(days_frac_as_micros);
+
+    let clamp_i32 = |n: i64| n.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    Value::Interval {
+        months: clamp_i32(whole_months),
+        days: clamp_i32(whole_days),
+        micros: total_micros,
     }
 }
 
@@ -362,8 +654,22 @@ fn eval_unary_op(op: UnaryOp, val: &Value) -> Result<Value> {
                 .map(Value::Integer)
                 .ok_or(SqlError::IntegerOverflow),
             Value::Real(r) => Ok(Value::Real(-r)),
+            Value::Interval {
+                months,
+                days,
+                micros,
+            } => {
+                let m = months.checked_neg().ok_or(SqlError::IntegerOverflow)?;
+                let d = days.checked_neg().ok_or(SqlError::IntegerOverflow)?;
+                let u = micros.checked_neg().ok_or(SqlError::IntegerOverflow)?;
+                Ok(Value::Interval {
+                    months: m,
+                    days: d,
+                    micros: u,
+                })
+            }
             _ => Err(SqlError::TypeMismatch {
-                expected: "numeric".into(),
+                expected: "numeric or INTERVAL".into(),
                 got: format!("{}", val.data_type()),
             }),
         },
@@ -398,6 +704,14 @@ fn value_to_text(val: &Value) -> String {
             }
             s
         }
+        Value::Date(d) => crate::datetime::format_date(*d),
+        Value::Time(t) => crate::datetime::format_time(*t),
+        Value::Timestamp(t) => crate::datetime::format_timestamp(*t),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => crate::datetime::format_interval(*months, *days, *micros),
     }
 }
 
@@ -649,6 +963,18 @@ fn eval_cast(val: &Value, target: DataType) -> Result<Value> {
             ))),
         },
         DataType::Null => Ok(Value::Null),
+        DataType::Date => val.clone().coerce_into(DataType::Date).ok_or_else(|| {
+            SqlError::InvalidValue(format!("cannot cast {} to DATE", val.data_type()))
+        }),
+        DataType::Time => val.clone().coerce_into(DataType::Time).ok_or_else(|| {
+            SqlError::InvalidValue(format!("cannot cast {} to TIME", val.data_type()))
+        }),
+        DataType::Timestamp => val.clone().coerce_into(DataType::Timestamp).ok_or_else(|| {
+            SqlError::InvalidValue(format!("cannot cast {} to TIMESTAMP", val.data_type()))
+        }),
+        DataType::Interval => val.clone().coerce_into(DataType::Interval).ok_or_else(|| {
+            SqlError::InvalidValue(format!("cannot cast {} to INTERVAL", val.data_type()))
+        }),
     }
 }
 
@@ -965,6 +1291,10 @@ fn eval_scalar_function(
                 Value::Text(_) => "text",
                 Value::Blob(_) => "blob",
                 Value::Boolean(_) => "boolean",
+                Value::Date(_) => "date",
+                Value::Time(_) => "time",
+                Value::Timestamp(_) => "timestamp",
+                Value::Interval { .. } => "interval",
             };
             Ok(Value::Text(type_name.into()))
         }
@@ -1017,8 +1347,592 @@ fn eval_scalar_function(
                 _ => Ok(Value::Text(value_to_text(&evaluated[0]).into())),
             }
         }
+        "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" => {
+            check_args(name, &evaluated, 0)?;
+            Ok(Value::Timestamp(crate::datetime::txn_or_clock_micros()))
+        }
+        "CURRENT_DATE" => {
+            check_args(name, &evaluated, 0)?;
+            Ok(Value::Date(crate::datetime::ts_to_date_floor(
+                crate::datetime::txn_or_clock_micros(),
+            )))
+        }
+        "CURRENT_TIME" | "LOCALTIME" => {
+            check_args(name, &evaluated, 0)?;
+            Ok(Value::Time(
+                crate::datetime::ts_split(crate::datetime::txn_or_clock_micros()).1,
+            ))
+        }
+        "CLOCK_TIMESTAMP" | "STATEMENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP" => {
+            check_args(name, &evaluated, 0)?;
+            let ts = match name {
+                "CLOCK_TIMESTAMP" => crate::datetime::now_micros(),
+                _ => crate::datetime::txn_or_clock_micros(),
+            };
+            Ok(Value::Timestamp(ts))
+        }
+        "EXTRACT" | "DATE_PART" | "DATEPART" => {
+            check_args(name, &evaluated, 2)?;
+            // Borrow the field str without allocating; datetime::extract accepts &str.
+            let field: &str = match &evaluated[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.as_str(),
+                _ => {
+                    return Err(SqlError::TypeMismatch {
+                        expected: "TEXT field name".into(),
+                        got: evaluated[0].data_type().to_string(),
+                    })
+                }
+            };
+            if evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::datetime::extract(field, &evaluated[1])
+        }
+        "DATE_TRUNC" => {
+            if evaluated.len() < 2 || evaluated.len() > 3 {
+                return Err(SqlError::InvalidValue(
+                    "DATE_TRUNC requires 2 or 3 arguments".into(),
+                ));
+            }
+            let unit = match &evaluated[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(s) => s.to_string(),
+                _ => {
+                    return Err(SqlError::TypeMismatch {
+                        expected: "TEXT unit name".into(),
+                        got: evaluated[0].data_type().to_string(),
+                    })
+                }
+            };
+            if evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            // Optional tz arg: truncate in that zone, then convert back to UTC.
+            if evaluated.len() == 3 {
+                if let Value::Text(tz) = &evaluated[2] {
+                    if !tz.eq_ignore_ascii_case("UTC") {
+                        if let Value::Timestamp(ts) = &evaluated[1] {
+                            return date_trunc_in_zone(&unit, *ts, tz);
+                        }
+                    }
+                }
+            }
+            crate::datetime::date_trunc(&unit, &evaluated[1])
+        }
+        "DATE_BIN" => {
+            check_args(name, &evaluated, 3)?;
+            if evaluated.iter().any(|v| v.is_null()) {
+                return Ok(Value::Null);
+            }
+            let stride = match &evaluated[0] {
+                Value::Interval {
+                    months: _,
+                    days,
+                    micros,
+                } => *days as i64 * crate::datetime::MICROS_PER_DAY + *micros,
+                _ => {
+                    return Err(SqlError::TypeMismatch {
+                        expected: "INTERVAL stride".into(),
+                        got: evaluated[0].data_type().to_string(),
+                    })
+                }
+            };
+            if stride <= 0 {
+                return Err(SqlError::InvalidValue(
+                    "DATE_BIN stride must be positive".into(),
+                ));
+            }
+            let (src, origin) = match (&evaluated[1], &evaluated[2]) {
+                (Value::Timestamp(s), Value::Timestamp(o)) => (*s, *o),
+                _ => {
+                    return Err(SqlError::TypeMismatch {
+                        expected: "TIMESTAMP, TIMESTAMP".into(),
+                        got: format!("{}, {}", evaluated[1].data_type(), evaluated[2].data_type()),
+                    })
+                }
+            };
+            let diff = src - origin;
+            let binned = origin + (diff.div_euclid(stride)) * stride;
+            Ok(Value::Timestamp(binned))
+        }
+        "AGE" => {
+            if evaluated.len() == 1 {
+                if evaluated[0].is_null() {
+                    return Ok(Value::Null);
+                }
+                let ts = match &evaluated[0] {
+                    Value::Timestamp(t) => *t,
+                    Value::Date(d) => crate::datetime::date_to_ts(*d),
+                    _ => {
+                        return Err(SqlError::TypeMismatch {
+                            expected: "TIMESTAMP or DATE".into(),
+                            got: evaluated[0].data_type().to_string(),
+                        })
+                    }
+                };
+                // Implicit reference: today at midnight UTC.
+                let today = crate::datetime::today_days();
+                let midnight = crate::datetime::date_to_ts(today);
+                let (m, d, u) = crate::datetime::age(midnight, ts)?;
+                return Ok(Value::Interval {
+                    months: m,
+                    days: d,
+                    micros: u,
+                });
+            }
+            check_args(name, &evaluated, 2)?;
+            if evaluated.iter().any(|v| v.is_null()) {
+                return Ok(Value::Null);
+            }
+            let a = ts_of(&evaluated[0])?;
+            let b = ts_of(&evaluated[1])?;
+            let (m, d, u) = crate::datetime::age(a, b)?;
+            Ok(Value::Interval {
+                months: m,
+                days: d,
+                micros: u,
+            })
+        }
+        "MAKE_DATE" => {
+            check_args(name, &evaluated, 3)?;
+            if evaluated.iter().any(|v| v.is_null()) {
+                return Ok(Value::Null);
+            }
+            let y = int_arg(&evaluated[0], "MAKE_DATE year")? as i32;
+            let m = int_arg(&evaluated[1], "MAKE_DATE month")? as u8;
+            let d = int_arg(&evaluated[2], "MAKE_DATE day")? as u8;
+            crate::datetime::ymd_to_days(y, m, d)
+                .map(Value::Date)
+                .ok_or_else(|| SqlError::InvalidDateLiteral(format!("make_date({y}, {m}, {d})")))
+        }
+        "MAKE_TIME" => {
+            check_args(name, &evaluated, 3)?;
+            if evaluated.iter().any(|v| v.is_null()) {
+                return Ok(Value::Null);
+            }
+            let h = int_arg(&evaluated[0], "MAKE_TIME hour")? as u8;
+            let mi = int_arg(&evaluated[1], "MAKE_TIME minute")? as u8;
+            let (s, us) = real_sec_arg(&evaluated[2])?;
+            crate::datetime::hmsn_to_micros(h, mi, s, us)
+                .map(Value::Time)
+                .ok_or_else(|| SqlError::InvalidTimeLiteral(format!("make_time({h}, {mi}, ...)")))
+        }
+        "MAKE_TIMESTAMP" => {
+            check_args(name, &evaluated, 6)?;
+            if evaluated.iter().any(|v| v.is_null()) {
+                return Ok(Value::Null);
+            }
+            let y = int_arg(&evaluated[0], "MAKE_TIMESTAMP year")? as i32;
+            let mo = int_arg(&evaluated[1], "MAKE_TIMESTAMP month")? as u8;
+            let d = int_arg(&evaluated[2], "MAKE_TIMESTAMP day")? as u8;
+            let h = int_arg(&evaluated[3], "MAKE_TIMESTAMP hour")? as u8;
+            let mi = int_arg(&evaluated[4], "MAKE_TIMESTAMP min")? as u8;
+            let (s, us) = real_sec_arg(&evaluated[5])?;
+            let days = crate::datetime::ymd_to_days(y, mo, d).ok_or_else(|| {
+                SqlError::InvalidTimestampLiteral(format!("make_timestamp year={y}"))
+            })?;
+            let tmicros = crate::datetime::hmsn_to_micros(h, mi, s, us)
+                .ok_or_else(|| SqlError::InvalidTimestampLiteral("time out of range".into()))?;
+            Ok(Value::Timestamp(crate::datetime::ts_combine(days, tmicros)))
+        }
+        "MAKE_INTERVAL" => {
+            // Positional args: years, months, weeks, days, hours, mins, secs.
+            if evaluated.len() > 7 {
+                return Err(SqlError::InvalidValue(
+                    "MAKE_INTERVAL accepts at most 7 arguments".into(),
+                ));
+            }
+            let mut months: i64 = 0;
+            let mut days: i64 = 0;
+            let mut micros: i64 = 0;
+            for (i, v) in evaluated.iter().enumerate() {
+                if v.is_null() {
+                    continue;
+                }
+                let n = match v {
+                    Value::Integer(n) => *n,
+                    Value::Real(r) => *r as i64,
+                    _ => {
+                        return Err(SqlError::TypeMismatch {
+                            expected: "numeric".into(),
+                            got: v.data_type().to_string(),
+                        })
+                    }
+                };
+                match i {
+                    0 => months = months.saturating_add(n.saturating_mul(12)),
+                    1 => months = months.saturating_add(n),
+                    2 => days = days.saturating_add(n.saturating_mul(7)),
+                    3 => days = days.saturating_add(n),
+                    4 => {
+                        micros = micros
+                            .saturating_add(n.saturating_mul(crate::datetime::MICROS_PER_HOUR))
+                    }
+                    5 => {
+                        micros =
+                            micros.saturating_add(n.saturating_mul(crate::datetime::MICROS_PER_MIN))
+                    }
+                    6 => {
+                        // Seconds may be fractional — also check Real.
+                        if let Value::Real(r) = v {
+                            micros = micros.saturating_add(
+                                (*r * crate::datetime::MICROS_PER_SEC as f64) as i64,
+                            );
+                        } else {
+                            micros = micros
+                                .saturating_add(n.saturating_mul(crate::datetime::MICROS_PER_SEC));
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Ok(Value::Interval {
+                months: months.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                days: days.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                micros,
+            })
+        }
+        "JUSTIFY_DAYS" => {
+            check_args(name, &evaluated, 1)?;
+            match &evaluated[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                } => {
+                    let (m, d, u) = crate::datetime::justify_days(*months, *days, *micros);
+                    Ok(Value::Interval {
+                        months: m,
+                        days: d,
+                        micros: u,
+                    })
+                }
+                other => Err(SqlError::TypeMismatch {
+                    expected: "INTERVAL".into(),
+                    got: other.data_type().to_string(),
+                }),
+            }
+        }
+        "JUSTIFY_HOURS" => {
+            check_args(name, &evaluated, 1)?;
+            match &evaluated[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                } => {
+                    let (m, d, u) = crate::datetime::justify_hours(*months, *days, *micros);
+                    Ok(Value::Interval {
+                        months: m,
+                        days: d,
+                        micros: u,
+                    })
+                }
+                other => Err(SqlError::TypeMismatch {
+                    expected: "INTERVAL".into(),
+                    got: other.data_type().to_string(),
+                }),
+            }
+        }
+        "JUSTIFY_INTERVAL" => {
+            check_args(name, &evaluated, 1)?;
+            match &evaluated[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                } => {
+                    let (m, d, u) = crate::datetime::justify_interval(*months, *days, *micros);
+                    Ok(Value::Interval {
+                        months: m,
+                        days: d,
+                        micros: u,
+                    })
+                }
+                other => Err(SqlError::TypeMismatch {
+                    expected: "INTERVAL".into(),
+                    got: other.data_type().to_string(),
+                }),
+            }
+        }
+        "ISFINITE" => {
+            check_args(name, &evaluated, 1)?;
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Boolean(evaluated[0].is_finite_temporal()))
+        }
+        "DATE" => {
+            if evaluated.is_empty() {
+                return Err(SqlError::InvalidValue(
+                    "DATE requires at least 1 argument".into(),
+                ));
+            }
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let d = match &evaluated[0] {
+                Value::Date(d) => *d,
+                Value::Timestamp(t) => crate::datetime::ts_to_date_floor(*t),
+                Value::Text(s) if s.eq_ignore_ascii_case("now") => crate::datetime::today_days(),
+                Value::Text(s) => crate::datetime::parse_date(s)?,
+                Value::Integer(n) => {
+                    crate::datetime::ts_to_date_floor(*n * crate::datetime::MICROS_PER_SEC)
+                }
+                other => {
+                    return Err(SqlError::TypeMismatch {
+                        expected: "TIMESTAMP, DATE, TEXT, or INTEGER".into(),
+                        got: other.data_type().to_string(),
+                    })
+                }
+            };
+            Ok(Value::Date(d))
+        }
+        "TIME" => {
+            if evaluated.is_empty() {
+                return Err(SqlError::InvalidValue(
+                    "TIME requires at least 1 argument".into(),
+                ));
+            }
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let t = match &evaluated[0] {
+                Value::Time(t) => *t,
+                Value::Timestamp(t) => crate::datetime::ts_split(*t).1,
+                Value::Text(s) if s.eq_ignore_ascii_case("now") => {
+                    crate::datetime::current_time_micros()
+                }
+                Value::Text(s) => crate::datetime::parse_time(s)?,
+                other => {
+                    return Err(SqlError::TypeMismatch {
+                        expected: "TIMESTAMP, TIME, or TEXT".into(),
+                        got: other.data_type().to_string(),
+                    })
+                }
+            };
+            Ok(Value::Time(t))
+        }
+        "DATETIME" => {
+            if evaluated.is_empty() {
+                return Err(SqlError::InvalidValue(
+                    "DATETIME requires at least 1 argument".into(),
+                ));
+            }
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let t = match &evaluated[0] {
+                Value::Timestamp(t) => *t,
+                Value::Date(d) => crate::datetime::date_to_ts(*d),
+                Value::Text(s) if s.eq_ignore_ascii_case("now") => crate::datetime::now_micros(),
+                Value::Text(s) => crate::datetime::parse_timestamp(s)?,
+                Value::Integer(n) => n * crate::datetime::MICROS_PER_SEC,
+                other => {
+                    return Err(SqlError::TypeMismatch {
+                        expected: "TIMESTAMP, DATE, TEXT, or INTEGER".into(),
+                        got: other.data_type().to_string(),
+                    })
+                }
+            };
+            Ok(Value::Timestamp(t))
+        }
+        "STRFTIME" => {
+            if evaluated.len() < 2 {
+                return Err(SqlError::InvalidValue(
+                    "STRFTIME requires format + value".into(),
+                ));
+            }
+            if evaluated.iter().take(2).any(|v| v.is_null()) {
+                return Ok(Value::Null);
+            }
+            let fmt = match &evaluated[0] {
+                Value::Text(s) => s.to_string(),
+                _ => {
+                    return Err(SqlError::TypeMismatch {
+                        expected: "TEXT format".into(),
+                        got: evaluated[0].data_type().to_string(),
+                    })
+                }
+            };
+            let out = crate::datetime::strftime(&fmt, &evaluated[1])?;
+            Ok(Value::Text(out.into()))
+        }
+        "JULIANDAY" => {
+            if evaluated.is_empty() {
+                return Err(SqlError::InvalidValue(
+                    "JULIANDAY requires at least 1 argument".into(),
+                ));
+            }
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let micros = ts_of(&evaluated[0])?;
+            let (days, tmicros) = crate::datetime::ts_split(micros);
+            // Julian Day 2440587.5 = 1970-01-01 00:00:00 UTC (Julian days start at noon).
+            let julian =
+                days as f64 + 2_440_587.5 + tmicros as f64 / crate::datetime::MICROS_PER_DAY as f64;
+            Ok(Value::Real(julian))
+        }
+        "UNIXEPOCH" => {
+            if evaluated.is_empty() {
+                return Err(SqlError::InvalidValue(
+                    "UNIXEPOCH requires at least 1 argument".into(),
+                ));
+            }
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let micros = ts_of(&evaluated[0])?;
+            // Check for 'subsec' modifier (second arg).
+            let subsec = evaluated
+                .get(1)
+                .and_then(|v| {
+                    if let Value::Text(s) = v {
+                        Some(s.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .map(|s| s.eq_ignore_ascii_case("subsec") || s.eq_ignore_ascii_case("subsecond"))
+                .unwrap_or(false);
+            if subsec {
+                Ok(Value::Real(
+                    micros as f64 / crate::datetime::MICROS_PER_SEC as f64,
+                ))
+            } else {
+                Ok(Value::Integer(micros / crate::datetime::MICROS_PER_SEC))
+            }
+        }
+        "TIMEDIFF" => {
+            check_args(name, &evaluated, 2)?;
+            if evaluated.iter().any(|v| v.is_null()) {
+                return Ok(Value::Null);
+            }
+            let a = ts_of(&evaluated[0])?;
+            let b = ts_of(&evaluated[1])?;
+            let (days, micros) = crate::datetime::subtract_timestamps(a, b);
+            let sign = if days < 0 || (days == 0 && micros < 0) {
+                "-"
+            } else {
+                "+"
+            };
+            let abs_days = days.unsigned_abs() as i64;
+            let abs_us = micros.unsigned_abs() as i64;
+            // PG-compat format string: "(+|-)YYYY-MM-DD HH:MM:SS.SSS", days-only.
+            let (h, m, s, us) = crate::datetime::micros_to_hmsn(abs_us);
+            Ok(Value::Text(
+                format!("{sign}{abs_days:04}-00-00 {h:02}:{m:02}:{s:02}.{us:06}").into(),
+            ))
+        }
+        // ═══ AT TIME ZONE operator (desugared from parser) ════════════════
+        "AT_TIMEZONE" => {
+            check_args(name, &evaluated, 2)?;
+            if evaluated.iter().any(|v| v.is_null()) {
+                return Ok(Value::Null);
+            }
+            let ts = match &evaluated[0] {
+                Value::Timestamp(t) => *t,
+                Value::Date(d) => crate::datetime::date_to_ts(*d),
+                other => {
+                    return Err(SqlError::TypeMismatch {
+                        expected: "TIMESTAMP or DATE".into(),
+                        got: other.data_type().to_string(),
+                    })
+                }
+            };
+            let zone = match &evaluated[1] {
+                Value::Text(s) => s.to_string(),
+                _ => {
+                    return Err(SqlError::TypeMismatch {
+                        expected: "TEXT time zone".into(),
+                        got: evaluated[1].data_type().to_string(),
+                    })
+                }
+            };
+            // Reject POSIX-style 'UTC+5' (ambiguous sign convention).
+            let upper = zone.to_ascii_uppercase();
+            if (upper.starts_with("UTC+") || upper.starts_with("UTC-")) && zone.len() > 3 {
+                return Err(SqlError::InvalidTimezone(format!(
+                    "'{zone}' is ambiguous — use ISO-8601 offset like '+05:00' or named zone like 'Etc/GMT-5'"
+                )));
+            }
+            let formatted = crate::datetime::format_timestamp_in_zone(ts, &zone)?;
+            Ok(Value::Text(formatted.into()))
+        }
         _ => Err(SqlError::Unsupported(format!("scalar function: {name}"))),
     }
+}
+
+/// Extract a timestamp (µs UTC) from a Value, coercing DATE → midnight.
+fn ts_of(v: &Value) -> Result<i64> {
+    match v {
+        Value::Timestamp(t) => Ok(*t),
+        Value::Date(d) => Ok(crate::datetime::date_to_ts(*d)),
+        _ => Err(SqlError::TypeMismatch {
+            expected: "TIMESTAMP or DATE".into(),
+            got: v.data_type().to_string(),
+        }),
+    }
+}
+
+fn int_arg(v: &Value, label: &str) -> Result<i64> {
+    match v {
+        Value::Integer(n) => Ok(*n),
+        _ => Err(SqlError::TypeMismatch {
+            expected: format!("INTEGER ({label})"),
+            got: v.data_type().to_string(),
+        }),
+    }
+}
+
+/// Extract (whole_seconds: u8, frac_micros: u32) from a numeric argument for MAKE_TIME-style calls.
+fn real_sec_arg(v: &Value) -> Result<(u8, u32)> {
+    match v {
+        Value::Integer(n) => {
+            if !(0..=60).contains(n) {
+                return Err(SqlError::InvalidValue(format!("second out of range: {n}")));
+            }
+            Ok((*n as u8, 0))
+        }
+        Value::Real(r) => {
+            let whole = r.trunc() as i64;
+            if !(0..=60).contains(&whole) {
+                return Err(SqlError::InvalidValue(format!("second out of range: {r}")));
+            }
+            let frac = ((r - whole as f64) * 1_000_000.0).round() as i64;
+            Ok((whole as u8, frac.max(0) as u32))
+        }
+        _ => Err(SqlError::TypeMismatch {
+            expected: "numeric seconds".into(),
+            got: v.data_type().to_string(),
+        }),
+    }
+}
+
+/// DATE_TRUNC with a non-UTC IANA zone: convert → truncate in that zone → convert back to UTC.
+fn date_trunc_in_zone(unit: &str, ts_utc: i64, tz: &str) -> Result<Value> {
+    use jiff::{tz::TimeZone, Timestamp as JTimestamp};
+    let zone = TimeZone::get(tz).map_err(|e| SqlError::InvalidTimezone(format!("{tz}: {e}")))?;
+    let ts = JTimestamp::from_microsecond(ts_utc)
+        .map_err(|e| SqlError::InvalidValue(format!("ts: {e}")))?;
+    let zoned = ts.to_zoned(zone.clone());
+    let unit_lower = unit.to_ascii_lowercase();
+    let rounded = match unit_lower.as_str() {
+        "microseconds" => return Ok(Value::Timestamp(ts_utc)),
+        "second" => zoned
+            .start_of_day()
+            .map_err(|e| SqlError::InvalidValue(format!("{e}")))?,
+        _ => {
+            let naive_ts = zoned.timestamp().as_microsecond();
+            return crate::datetime::date_trunc(unit, &Value::Timestamp(naive_ts));
+        }
+    };
+    Ok(Value::Timestamp(rounded.timestamp().as_microsecond()))
 }
 
 fn check_args(name: &str, args: &[Value], expected: usize) -> Result<()> {
@@ -1181,6 +2095,7 @@ mod tests {
             check_expr: None,
             check_sql: None,
             check_name: None,
+            is_with_timezone: false,
         }
     }
 

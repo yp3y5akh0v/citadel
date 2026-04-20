@@ -62,8 +62,9 @@ pub fn execute(
         | Statement::Rollback
         | Statement::Savepoint(_)
         | Statement::ReleaseSavepoint(_)
-        | Statement::RollbackTo(_) => Err(SqlError::Unsupported(
-            "transaction control in auto-commit mode".into(),
+        | Statement::RollbackTo(_)
+        | Statement::SetTimezone(_) => Err(SqlError::Unsupported(
+            "transaction / session control handled by Connection".into(),
         )),
     }
 }
@@ -96,7 +97,8 @@ pub fn execute_in_txn(
         | Statement::Rollback
         | Statement::Savepoint(_)
         | Statement::ReleaseSavepoint(_)
-        | Statement::RollbackTo(_) => {
+        | Statement::RollbackTo(_)
+        | Statement::SetTimezone(_) => {
             Err(SqlError::Unsupported("nested transaction control".into()))
         }
     }

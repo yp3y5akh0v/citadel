@@ -90,6 +90,14 @@ fn value_to_string(v: &Value, settings: &Settings) -> String {
             s.push('\'');
             s
         }
+        Value::Date(d) => citadel_sql::datetime::format_date(*d),
+        Value::Time(t) => citadel_sql::datetime::format_time(*t),
+        Value::Timestamp(t) => citadel_sql::datetime::format_timestamp(*t),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => citadel_sql::datetime::format_interval(*months, *days, *micros),
     }
 }
 
@@ -217,6 +225,18 @@ fn value_to_json(v: &Value, _settings: &Settings) -> serde_json::Value {
             obj.insert("$blob".to_string(), serde_json::Value::String(hex));
             serde_json::Value::Object(obj)
         }
+        Value::Date(d) => serde_json::Value::String(citadel_sql::datetime::format_date(*d)),
+        Value::Time(t) => serde_json::Value::String(citadel_sql::datetime::format_time(*t)),
+        Value::Timestamp(t) => {
+            serde_json::Value::String(citadel_sql::datetime::format_timestamp(*t))
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => serde_json::Value::String(citadel_sql::datetime::format_interval(
+            *months, *days, *micros,
+        )),
     }
 }
 

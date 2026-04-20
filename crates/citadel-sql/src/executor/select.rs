@@ -22,6 +22,78 @@ use super::view::*;
 use super::window::*;
 use super::CteContext;
 
+// ── Table-valued functions ──────────────────────────────────────────
+
+fn try_tvf(name: &str) -> Option<QueryResult> {
+    match name {
+        "timezone_names" => Some(build_timezone_names()),
+        "timezone_abbrevs" => Some(build_timezone_abbrevs()),
+        _ => None,
+    }
+}
+
+fn build_timezone_names() -> QueryResult {
+    let columns = vec![
+        "name".to_string(),
+        "utc_offset".to_string(),
+        "is_dst".to_string(),
+    ];
+    let mut rows = Vec::new();
+    // Snapshot each zone's current offset + DST state.
+    let now = jiff::Timestamp::now();
+    let db = jiff::tz::db();
+    for name in db.available() {
+        if let Ok(tz) = db.get(name.as_str()) {
+            let info = tz.to_offset_info(now);
+            let (offset_seconds, is_dst) = (info.offset().seconds(), info.dst().is_dst());
+            let utc_offset = Value::Interval {
+                months: 0,
+                days: 0,
+                micros: i64::from(offset_seconds) * 1_000_000,
+            };
+            rows.push(vec![
+                Value::Text(name.to_string().into()),
+                utc_offset,
+                Value::Boolean(is_dst),
+            ]);
+        }
+    }
+    QueryResult { columns, rows }
+}
+
+fn build_timezone_abbrevs() -> QueryResult {
+    // Derived from each zone's current observed offset (approximate).
+    let columns = vec![
+        "abbrev".to_string(),
+        "utc_offset".to_string(),
+        "is_dst".to_string(),
+    ];
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut rows = Vec::new();
+    let now = jiff::Timestamp::now();
+    let db = jiff::tz::db();
+    for name in db.available() {
+        if let Ok(tz) = db.get(name.as_str()) {
+            let info = tz.to_offset_info(now);
+            let abbrev = info.abbreviation().to_string();
+            if !seen.insert(abbrev.clone()) {
+                continue;
+            }
+            let utc_offset = Value::Interval {
+                months: 0,
+                days: 0,
+                micros: i64::from(info.offset().seconds()) * 1_000_000,
+            };
+            rows.push(vec![
+                Value::Text(abbrev.into()),
+                utc_offset,
+                Value::Boolean(info.dst().is_dst()),
+            ]);
+        }
+    }
+    QueryResult { columns, rows }
+}
+
 // ── SELECT execution ────────────────────────────────────────────────
 
 pub(super) fn exec_select(
@@ -43,6 +115,20 @@ pub(super) fn exec_select(
     }
 
     let lower_name = stmt.from.to_ascii_lowercase();
+
+    // Built-in TVFs (reserved names — cannot collide with user tables).
+    if let Some(tvf_result) = try_tvf(&lower_name) {
+        if stmt.joins.is_empty() {
+            return exec_select_from_cte(&tvf_result, stmt, &mut |sub| {
+                exec_subquery_read(db, schema, sub, ctes)
+            });
+        }
+        let mut tvf_ctes = ctes.clone();
+        tvf_ctes.insert(lower_name.clone(), tvf_result);
+        return super::exec_select_join_with_ctes(stmt, &tvf_ctes, &mut |name| {
+            super::scan_table_read_or_view(db, schema, name)
+        });
+    }
 
     if let Some(cte_result) = ctes.get(&lower_name) {
         if stmt.joins.is_empty() {
@@ -353,10 +439,18 @@ pub(super) enum AggState {
         real_sum: f64,
         has_real: bool,
         all_null: bool,
+        interval_months: i32,
+        interval_days: i32,
+        interval_micros: i64,
+        is_interval: bool,
     },
     Avg {
         sum: f64,
         count: i64,
+        interval_months: i64,
+        interval_days: i64,
+        interval_micros: i128,
+        is_interval: bool,
     },
     Min(Option<Value>),
     Max(Option<Value>),
@@ -372,8 +466,19 @@ impl AggState {
                 real_sum: 0.0,
                 has_real: false,
                 all_null: true,
+                interval_months: 0,
+                interval_days: 0,
+                interval_micros: 0,
+                is_interval: false,
             },
-            StreamAgg::Avg(_) => AggState::Avg { sum: 0.0, count: 0 },
+            StreamAgg::Avg(_) => AggState::Avg {
+                sum: 0.0,
+                count: 0,
+                interval_months: 0,
+                interval_days: 0,
+                interval_micros: 0,
+                is_interval: false,
+            },
             StreamAgg::Min(_) => AggState::Min(None),
             StreamAgg::Max(_) => AggState::Max(None),
         }
@@ -394,6 +499,10 @@ impl AggState {
                 real_sum,
                 has_real,
                 all_null,
+                interval_months,
+                interval_days,
+                interval_micros,
+                is_interval,
             } => match val {
                 Value::Integer(i) => {
                     *int_sum += i;
@@ -404,15 +513,33 @@ impl AggState {
                     *has_real = true;
                     *all_null = false;
                 }
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                } => {
+                    *interval_months = interval_months.saturating_add(*months);
+                    *interval_days = interval_days.saturating_add(*days);
+                    *interval_micros = interval_micros.saturating_add(*micros);
+                    *all_null = false;
+                    *is_interval = true;
+                }
                 Value::Null => {}
                 _ => {
                     return Err(SqlError::TypeMismatch {
-                        expected: "numeric".into(),
+                        expected: "numeric or INTERVAL".into(),
                         got: val.data_type().to_string(),
                     })
                 }
             },
-            AggState::Avg { sum, count } => match val {
+            AggState::Avg {
+                sum,
+                count,
+                interval_months,
+                interval_days,
+                interval_micros,
+                is_interval,
+            } => match val {
                 Value::Integer(i) => {
                     *sum += *i as f64;
                     *count += 1;
@@ -421,10 +548,21 @@ impl AggState {
                     *sum += r;
                     *count += 1;
                 }
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                } => {
+                    *interval_months += *months as i64;
+                    *interval_days += *days as i64;
+                    *interval_micros += *micros as i128;
+                    *count += 1;
+                    *is_interval = true;
+                }
                 Value::Null => {}
                 _ => {
                     return Err(SqlError::TypeMismatch {
-                        expected: "numeric".into(),
+                        expected: "numeric or INTERVAL".into(),
                         got: val.data_type().to_string(),
                     })
                 }
@@ -476,6 +614,10 @@ impl AggState {
                 real_sum,
                 has_real,
                 all_null,
+                interval_months,
+                interval_days,
+                interval_micros,
+                is_interval,
             } => match raw {
                 RawColumn::Integer(i) => {
                     *int_sum += i;
@@ -486,15 +628,33 @@ impl AggState {
                     *has_real = true;
                     *all_null = false;
                 }
+                RawColumn::Interval {
+                    months,
+                    days,
+                    micros,
+                } => {
+                    *interval_months = interval_months.saturating_add(*months);
+                    *interval_days = interval_days.saturating_add(*days);
+                    *interval_micros = interval_micros.saturating_add(*micros);
+                    *all_null = false;
+                    *is_interval = true;
+                }
                 RawColumn::Null => {}
                 _ => {
                     return Err(SqlError::TypeMismatch {
-                        expected: "numeric".into(),
+                        expected: "numeric or INTERVAL".into(),
                         got: "non-numeric".into(),
                     })
                 }
             },
-            AggState::Avg { sum, count } => match raw {
+            AggState::Avg {
+                sum,
+                count,
+                interval_months,
+                interval_days,
+                interval_micros,
+                is_interval,
+            } => match raw {
                 RawColumn::Integer(i) => {
                     *sum += *i as f64;
                     *count += 1;
@@ -503,10 +663,21 @@ impl AggState {
                     *sum += r;
                     *count += 1;
                 }
+                RawColumn::Interval {
+                    months,
+                    days,
+                    micros,
+                } => {
+                    *interval_months += *months as i64;
+                    *interval_days += *days as i64;
+                    *interval_micros += *micros as i128;
+                    *count += 1;
+                    *is_interval = true;
+                }
                 RawColumn::Null => {}
                 _ => {
                     return Err(SqlError::TypeMismatch {
-                        expected: "numeric".into(),
+                        expected: "numeric or INTERVAL".into(),
                         got: "non-numeric".into(),
                     })
                 }
@@ -553,18 +724,43 @@ impl AggState {
                 real_sum,
                 has_real,
                 all_null,
+                interval_months,
+                interval_days,
+                interval_micros,
+                is_interval,
             } => {
                 if all_null {
                     Value::Null
+                } else if is_interval {
+                    Value::Interval {
+                        months: interval_months,
+                        days: interval_days,
+                        micros: interval_micros,
+                    }
                 } else if has_real {
                     Value::Real(real_sum + int_sum as f64)
                 } else {
                     Value::Integer(int_sum)
                 }
             }
-            AggState::Avg { sum, count } => {
+            AggState::Avg {
+                sum,
+                count,
+                interval_months,
+                interval_days,
+                interval_micros,
+                is_interval,
+            } => {
                 if count == 0 {
                     Value::Null
+                } else if is_interval {
+                    Value::Interval {
+                        months: (interval_months / count).clamp(i32::MIN as i64, i32::MAX as i64)
+                            as i32,
+                        days: (interval_days / count).clamp(i32::MIN as i64, i32::MAX as i64)
+                            as i32,
+                        micros: (interval_micros / count as i128) as i64,
+                    }
                 } else {
                     Value::Real(sum / count as f64)
                 }
@@ -580,6 +776,22 @@ pub(super) struct StreamAggPlan {
     raw_targets: Vec<RawAggTarget>,
     num_pk_cols: usize,
     nonpk_agg_defaults: Vec<Option<Value>>,
+    /// When `Some`, evaluates WHERE on raw column bytes without decoding the row.
+    fast_pred: Option<FastPredicate>,
+}
+
+pub(super) enum FastPredicate {
+    Simple(SimplePredicate),
+    Between(BetweenPredicate),
+}
+
+impl FastPredicate {
+    fn matches_raw(&self, key: &[u8], value: &[u8]) -> Result<bool> {
+        match self {
+            FastPredicate::Simple(p) => p.matches_raw(key, value),
+            FastPredicate::Between(p) => p.matches_raw(key, value),
+        }
+    }
 }
 
 impl StreamAggPlan {
@@ -604,7 +816,11 @@ impl StreamAggPlan {
                 Expr::Function {
                     name: func_name,
                     args,
+                    distinct,
                 } if args.len() == 1 => {
+                    if *distinct {
+                        return Ok(None);
+                    }
                     let func = func_name.to_ascii_uppercase();
                     let col_idx = match resolve_simple_col(&args[0], &col_map) {
                         Some(idx) => idx,
@@ -691,12 +907,27 @@ impl StreamAggPlan {
             })
             .collect();
 
+        // Raw-bytes predicate is only safe when every agg is CountStar.
+        let all_count_star = ops.iter().all(|(op, _)| matches!(op, StreamAgg::CountStar));
+        let fast_pred = if all_count_star {
+            stmt.where_clause.as_ref().and_then(|expr| {
+                try_simple_predicate(expr, table_schema)
+                    .map(FastPredicate::Simple)
+                    .or_else(|| {
+                        try_between_predicate(expr, table_schema).map(FastPredicate::Between)
+                    })
+            })
+        } else {
+            None
+        };
+
         Ok(Some(Self {
             ops,
             partial_ctx,
             raw_targets,
             num_pk_cols,
             nonpk_agg_defaults,
+            fast_pred,
         }))
     }
 
@@ -711,6 +942,24 @@ impl StreamAggPlan {
         states: &mut [AggState],
         scan_err: &mut Option<SqlError>,
     ) -> bool {
+        if let Some(ref pred) = self.fast_pred {
+            match pred.matches_raw(key, value) {
+                Ok(true) => {
+                    for state in states.iter_mut() {
+                        if let AggState::CountStar(ref mut c) = state {
+                            *c += 1;
+                        }
+                    }
+                    return true;
+                }
+                Ok(false) => return true,
+                Err(e) => {
+                    *scan_err = Some(e);
+                    return false;
+                }
+            }
+        }
+
         let row = match &self.partial_ctx {
             Some(ctx) => match ctx.decode(key, value) {
                 Ok(r) => r,
@@ -941,7 +1190,11 @@ impl StreamGroupByPlan {
                 Expr::Function {
                     name: func_name,
                     args,
+                    distinct,
                 } if args.len() == 1 => {
+                    if *distinct {
+                        return Ok(None);
+                    }
                     let func = func_name.to_ascii_uppercase();
                     let col_idx = match resolve_simple_col(&args[0], &col_map) {
                         Some(idx) => idx,
@@ -1487,42 +1740,44 @@ fn try_streaming_distinct(
                 },
             }
         }
-        if seen.insert(raw_key_buf.clone()) {
-            let mut row_val: Vec<Value> = Vec::with_capacity(targets.len());
-            for target in &targets {
-                let val = match target {
-                    RawAggTarget::CountStar => Value::Null,
-                    RawAggTarget::Pk(pk_pos) => {
-                        if num_pk_cols == 1 && *pk_pos == 0 {
-                            match decode_pk_integer(key) {
-                                Ok(v) => Value::Integer(v),
-                                Err(e) => {
-                                    scan_err = Some(e);
-                                    return false;
-                                }
+        if seen.contains(raw_key_buf.as_slice()) {
+            return true;
+        }
+        seen.insert(raw_key_buf.clone());
+        let mut row_val: Vec<Value> = Vec::with_capacity(targets.len());
+        for target in &targets {
+            let val = match target {
+                RawAggTarget::CountStar => Value::Null,
+                RawAggTarget::Pk(pk_pos) => {
+                    if num_pk_cols == 1 && *pk_pos == 0 {
+                        match decode_pk_integer(key) {
+                            Ok(v) => Value::Integer(v),
+                            Err(e) => {
+                                scan_err = Some(e);
+                                return false;
                             }
-                        } else {
-                            match decode_composite_key(key, num_pk_cols) {
-                                Ok(pk) => pk[*pk_pos].clone(),
-                                Err(e) => {
-                                    scan_err = Some(e);
-                                    return false;
-                                }
+                        }
+                    } else {
+                        match decode_composite_key(key, num_pk_cols) {
+                            Ok(pk) => pk[*pk_pos].clone(),
+                            Err(e) => {
+                                scan_err = Some(e);
+                                return false;
                             }
                         }
                     }
-                    RawAggTarget::NonPk(idx) => match decode_column_raw(value, *idx) {
-                        Ok(raw) => raw.to_value(),
-                        Err(e) => {
-                            scan_err = Some(e);
-                            return false;
-                        }
-                    },
-                };
-                row_val.push(val);
-            }
-            rows.push(row_val);
+                }
+                RawAggTarget::NonPk(idx) => match decode_column_raw(value, *idx) {
+                    Ok(raw) => raw.to_value(),
+                    Err(e) => {
+                        scan_err = Some(e);
+                        return false;
+                    }
+                },
+            };
+            row_val.push(val);
         }
+        rows.push(row_val);
         scan_err.is_none()
     })
     .map_err(SqlError::Storage)?;
@@ -1592,8 +1847,16 @@ pub(super) fn process_select(
     if stmt.distinct {
         let (col_names, mut projected) = project_rows(columns, &stmt.columns, rows)?;
 
-        let mut seen = std::collections::HashSet::new();
-        projected.retain(|row| seen.insert(row.clone()));
+        let mut seen: std::collections::HashSet<Vec<Value>> =
+            std::collections::HashSet::with_capacity(projected.len().min(1024));
+        projected.retain(|row| {
+            if seen.contains(row) {
+                false
+            } else {
+                seen.insert(row.clone());
+                true
+            }
+        });
 
         if !stmt.order_by.is_empty() {
             let output_cols = build_output_columns(&stmt.columns, columns);

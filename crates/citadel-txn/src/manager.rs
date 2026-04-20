@@ -302,6 +302,18 @@ impl TxnManager {
         named_trees: &std::collections::HashMap<Vec<u8>, BTree>,
         loaded_tree_meta: &std::collections::HashMap<Vec<u8>, (PageId, u16)>,
     ) -> Result<()> {
+        // No-op commit: skip I/O and slot flip when nothing changed.
+        let is_noop = pages.is_empty()
+            && alloc.freed_this_txn().is_empty()
+            && tree.root == old_slot.tree_root
+            && tree.depth == old_slot.tree_depth
+            && tree.entry_count == old_slot.tree_entries
+            && catalog_root == old_slot.catalog_root;
+        if is_noop {
+            self.write_active.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
+
         let (active_slot, oldest_active, current_god_byte, cached_file_size) = {
             let state = self.state.lock();
             (
