@@ -27,7 +27,7 @@ keywords = ["database", "embedded-database", "encryption", "sql", "encrypted-dat
 categories = ["database-implementations", "cryptography"]
 
 [workspace.dependencies]
-# Internal crates (package = crates.io name, key = Rust alias)
+# Package name on crates.io differs from Rust alias (e.g. citadeldb-core / citadel_core).
 citadel-core = { package = "citadeldb-core", path = "crates/citadel-core", version = "0.8.0" }
 citadel-crypto = { package = "citadeldb-crypto", path = "crates/citadel-crypto", version = "0.8.0" }
 citadel-io = { package = "citadeldb-io", path = "crates/citadel-io", version = "0.8.0" }
@@ -38,7 +38,6 @@ citadel-sync = { package = "citadeldb-sync", path = "crates/citadel-sync", versi
 citadel = { package = "citadeldb", path = "citadel", version = "0.8.0" }
 citadel-sql = { package = "citadeldb-sql", path = "crates/citadel-sql", version = "0.8.0" }
 
-# Crypto
 aes = "0.8"
 ctr = "0.9"
 chacha20 = "0.9"
@@ -54,41 +53,31 @@ rand = "0.8"
 snow = { version = "0.10", default-features = false, features = ["default-resolver", "default-resolver-crypto"] }
 base64 = "0.22"
 
-# Hashing
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 blake3 = "1"
 rustc-hash = "2.1"
 
-# Error handling
 thiserror = "2.0"
 
-# Sync
 parking_lot = "0.12"
 rayon = "1.10"
 
-# I/O
 libc = "0.2"
 io-uring = "0.7"
 memmap2 = "0.9"
 
-# Cipher traits
 cipher = "0.4"
 
-# SQL
 sqlparser = "0.61"
 lru = "0.12"
 compact_str = "0.8"
 
-# Date/Time — jiff with IANA tz support (tzdb-bundle-platform ships ~200 KB on Windows/WASM,
-# on Linux/macOS reads system /usr/share/zoneinfo at zero bundled cost)
 jiff = { version = "0.2", default-features = false, features = ["std", "alloc", "serde", "perf-inline", "tz-system", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
 
-# Benchmarks
 criterion = { version = "0.5", features = ["html_reports"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 mimalloc = "0.1"
 
-# CLI
 rustyline = "17"
 comfy-table = "7"
 clap = { version = "4", features = ["derive"] }

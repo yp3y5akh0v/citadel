@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use citadel_core::{Error, Result, KEY_FILE_SIZE, MERKLE_HASH_SIZE};
 use citadel_io::durable;
+#[cfg(not(target_arch = "wasm32"))]
 use citadel_io::mmap_io::MmapPageIO;
 use citadel_txn::integrity::IntegrityReport;
 use citadel_txn::manager::TxnManager;
@@ -178,6 +179,7 @@ impl Database {
     }
 
     /// Create a hot backup via MVCC snapshot. Also copies the key file.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn backup(&self, dest_path: &Path) -> Result<()> {
         let dest_file = OpenOptions::new()
             .read(true)
@@ -319,6 +321,7 @@ impl Database {
     }
 
     /// Compact the database into a new file. Also copies the key file.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn compact(&self, dest_path: &Path) -> Result<()> {
         let dest_file = OpenOptions::new()
             .read(true)

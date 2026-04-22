@@ -34,14 +34,12 @@ impl JsCitadelDb {
 
         let obj = Object::new();
 
-        // Build columns array
         let cols = Array::new();
         for name in &result.columns {
             cols.push(&JsValue::from_str(name));
         }
         Reflect::set(&obj, &JsValue::from_str("columns"), &cols)?;
 
-        // Build rows array
         let rows = Array::new();
         for row in &result.rows {
             let js_row = Array::new();
@@ -148,5 +146,9 @@ fn cell_to_js(cell: &CellValue) -> JsValue {
         CellValue::Text(s) => JsValue::from_str(s),
         CellValue::Blob(b) => js_sys::Uint8Array::from(b.as_slice()).into(),
         CellValue::Boolean(b) => JsValue::from_bool(*b),
+        CellValue::Date { iso, .. }
+        | CellValue::Time { iso, .. }
+        | CellValue::Timestamp { iso, .. }
+        | CellValue::Interval { iso, .. } => JsValue::from_str(iso),
     }
 }

@@ -61,6 +61,60 @@ pub(super) fn validate_foreign_keys(
     Ok(())
 }
 
+/// Create auto-indexes from inline `UNIQUE` constraints parsed from CREATE TABLE.
+pub(super) fn create_unique_auto_indices(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    mut table_schema: TableSchema,
+    stmt: &CreateTableStmt,
+) -> Result<TableSchema> {
+    for (i, uq) in stmt.unique_indices.iter().enumerate() {
+        let col_idxs: Vec<u16> = uq
+            .columns
+            .iter()
+            .map(|name| {
+                table_schema
+                    .column_index(name)
+                    .map(|idx| idx as u16)
+                    .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))
+            })
+            .collect::<Result<_>>()?;
+
+        if col_idxs == table_schema.primary_key_columns {
+            continue;
+        }
+
+        if table_schema
+            .indices
+            .iter()
+            .any(|idx| idx.unique && idx.columns == col_idxs)
+        {
+            continue;
+        }
+
+        let idx_name = uq
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("__uq_{}_{}", table_schema.name, i));
+
+        if uq.name.is_some()
+            && table_schema
+                .index_by_name(&idx_name.to_ascii_lowercase())
+                .is_some()
+        {
+            return Err(SqlError::IndexAlreadyExists(idx_name));
+        }
+
+        let idx_table = TableSchema::index_table_name(&table_schema.name, &idx_name);
+        wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
+        table_schema.indices.push(IndexDef {
+            name: idx_name,
+            columns: col_idxs,
+            unique: true,
+        });
+    }
+    Ok(table_schema)
+}
+
 /// Create auto-index on child FK columns. Returns updated schema with new indices.
 pub(super) fn create_fk_auto_indices(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
@@ -216,6 +270,7 @@ pub(super) fn exec_create_table(
     wtx.create_table(lower_name.as_bytes())
         .map_err(SqlError::Storage)?;
 
+    let table_schema = create_unique_auto_indices(&mut wtx, table_schema, stmt)?;
     let table_schema = create_fk_auto_indices(&mut wtx, table_schema)?;
 
     SchemaManager::save_schema(&mut wtx, &table_schema)?;
@@ -380,6 +435,7 @@ pub(super) fn exec_create_table_in_txn(
     wtx.create_table(lower_name.as_bytes())
         .map_err(SqlError::Storage)?;
 
+    let table_schema = create_unique_auto_indices(wtx, table_schema, stmt)?;
     let table_schema = create_fk_auto_indices(wtx, table_schema)?;
 
     SchemaManager::save_schema(wtx, &table_schema)?;

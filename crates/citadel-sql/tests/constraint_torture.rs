@@ -1049,3 +1049,325 @@ fn fk_update_child_to_null_allowed() {
     let rows = get_rows(conn.execute("SELECT pid FROM c WHERE id = 1").unwrap());
     assert_eq!(rows[0][0], Value::Null);
 }
+
+#[test]
+fn column_level_unique_rejects_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+            .unwrap(),
+    );
+    conn.execute("INSERT INTO t VALUES (1, 'a@x')").unwrap();
+    let err = conn.execute("INSERT INTO t VALUES (2, 'a@x')").unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+}
+
+#[test]
+fn column_level_unique_allows_multiple_nulls() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+            .unwrap(),
+    );
+    conn.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+    conn.execute("INSERT INTO t (id) VALUES (2)").unwrap();
+    conn.execute("INSERT INTO t (id) VALUES (3)").unwrap();
+    let rows = get_rows(conn.execute("SELECT COUNT(*) FROM t").unwrap());
+    assert_eq!(rows[0][0], Value::Integer(3));
+}
+
+#[test]
+fn table_level_unique_rejects_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    assert_ok(
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL CHECK(v > 0), UNIQUE(v))",
+        )
+        .unwrap(),
+    );
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    let err = conn.execute("INSERT INTO t VALUES (2, 10)").unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+}
+
+#[test]
+fn table_level_unique_multi_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    assert_ok(
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, UNIQUE(a, b))",
+        )
+        .unwrap(),
+    );
+    conn.execute("INSERT INTO t VALUES (1, 1, 2)").unwrap();
+    // Partial match is allowed: (1, 3) differs from (1, 2) in b.
+    conn.execute("INSERT INTO t VALUES (2, 1, 3)").unwrap();
+    // Same (a, b) combo → violation.
+    let err = conn.execute("INSERT INTO t VALUES (3, 1, 2)").unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+}
+
+#[test]
+fn table_level_unique_named_constraint() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    assert_ok(
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL, CONSTRAINT uk_v UNIQUE(v))",
+        )
+        .unwrap(),
+    );
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    let err = conn.execute("INSERT INTO t VALUES (2, 10)").unwrap_err();
+    match err {
+        SqlError::UniqueViolation(name) => assert_eq!(name, "uk_v"),
+        other => panic!("expected UniqueViolation(uk_v), got {other:?}"),
+    }
+}
+
+#[test]
+fn unique_on_pk_column_does_not_create_redundant_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    // UNIQUE on a PK column should be a no-op (no duplicate index).
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY UNIQUE, v INTEGER)")
+            .unwrap(),
+    );
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    // Duplicate PK still rejected via PK path.
+    let err = conn.execute("INSERT INTO t VALUES (1, 20)").unwrap_err();
+    assert!(matches!(
+        err,
+        SqlError::DuplicateKey | SqlError::UniqueViolation(_)
+    ));
+}
+
+#[test]
+fn unique_update_breaking_uniqueness_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL UNIQUE)")
+            .unwrap(),
+    );
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    let err = conn
+        .execute("UPDATE t SET v = 10 WHERE id = 2")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+    // Original values preserved.
+    let rows = get_rows(conn.execute("SELECT v FROM t WHERE id = 2").unwrap());
+    assert_eq!(rows[0][0], Value::Integer(20));
+}
+
+#[test]
+fn unique_update_to_same_value_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL UNIQUE)")
+            .unwrap(),
+    );
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    // UPDATE to same value must not raise UniqueViolation against itself.
+    assert_rows_affected(conn.execute("UPDATE t SET v = 10 WHERE id = 1").unwrap(), 1);
+}
+
+#[test]
+fn unique_delete_then_reinsert_same_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL UNIQUE)")
+            .unwrap(),
+    );
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    // After delete, the UNIQUE value is free again.
+    conn.execute("INSERT INTO t VALUES (2, 10)").unwrap();
+    let rows = get_rows(conn.execute("SELECT v FROM t").unwrap());
+    assert_eq!(rows[0][0], Value::Integer(10));
+}
+
+#[test]
+fn unique_null_column_allows_multiple_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+            .unwrap(),
+    );
+    // Explicit NULL + implicit NULL both allowed, multiple times.
+    conn.execute("INSERT INTO t (id, email) VALUES (1, NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, email) VALUES (2, NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id) VALUES (3)").unwrap();
+    conn.execute("INSERT INTO t VALUES (4, 'x')").unwrap();
+    // But non-null duplicates still rejected.
+    let err = conn.execute("INSERT INTO t VALUES (5, 'x')").unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+}
+
+#[test]
+fn unique_multi_column_null_in_one_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE(a, b))")
+            .unwrap(),
+    );
+    // SQL standard: tuples with any NULL component are treated as distinct.
+    conn.execute("INSERT INTO t VALUES (1, 1, NULL)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 1, NULL)").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, NULL, 1)").unwrap();
+    conn.execute("INSERT INTO t VALUES (4, NULL, NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (5, NULL, NULL)")
+        .unwrap();
+    let rows = get_rows(conn.execute("SELECT COUNT(*) FROM t").unwrap());
+    assert_eq!(rows[0][0], Value::Integer(5));
+}
+
+#[test]
+fn unique_multiple_constraints_same_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, phone TEXT UNIQUE, \
+             CONSTRAINT uk_ab UNIQUE(email, phone))",
+        )
+        .unwrap(),
+    );
+    conn.execute("INSERT INTO t VALUES (1, 'a@x', '111')")
+        .unwrap();
+    // Email dup.
+    let err = conn
+        .execute("INSERT INTO t VALUES (2, 'a@x', '222')")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+    // Phone dup.
+    let err = conn
+        .execute("INSERT INTO t VALUES (3, 'b@x', '111')")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+    // Both distinct → ok.
+    conn.execute("INSERT INTO t VALUES (4, 'b@x', '222')")
+        .unwrap();
+}
+
+#[test]
+fn unique_with_fk_on_same_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER UNIQUE REFERENCES parent(id))",
+        )
+        .unwrap(),
+    );
+    conn.execute("INSERT INTO parent VALUES (1), (2)").unwrap();
+    conn.execute("INSERT INTO child VALUES (1, 1)").unwrap();
+    // 1-to-1: another child pointing to same parent violates UNIQUE.
+    let err = conn.execute("INSERT INTO child VALUES (2, 1)").unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+    // Different parent → ok.
+    conn.execute("INSERT INTO child VALUES (3, 2)").unwrap();
+    // FK violation for non-existent parent.
+    let err = conn
+        .execute("INSERT INTO child VALUES (4, 999)")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::ForeignKeyViolation(_)));
+}
+
+#[test]
+fn unique_large_scale_1000_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL UNIQUE)")
+            .unwrap(),
+    );
+    for i in 0..1000 {
+        assert_rows_affected(
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .unwrap(),
+            1,
+        );
+    }
+    // Any duplicate in a large set is still rejected.
+    let err = conn
+        .execute("INSERT INTO t VALUES (5000, 500)")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+}
+
+#[test]
+fn unique_transaction_rollback_preserves_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL UNIQUE)")
+            .unwrap(),
+    );
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    let err = conn.execute("INSERT INTO t VALUES (3, 10)").unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+    conn.execute("ROLLBACK").unwrap();
+
+    // After rollback only the pre-transaction row survives.
+    let rows = get_rows(conn.execute("SELECT COUNT(*) FROM t").unwrap());
+    assert_eq!(rows[0][0], Value::Integer(1));
+}
+
+#[test]
+fn unique_composite_order_matters() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL, UNIQUE(a, b))")
+            .unwrap(),
+    );
+    conn.execute("INSERT INTO t VALUES (1, 1, 2)").unwrap();
+    // (2, 1) is a different tuple from (1, 2), should be allowed.
+    conn.execute("INSERT INTO t VALUES (2, 2, 1)").unwrap();
+    // Exact (1, 2) repeat rejected.
+    let err = conn.execute("INSERT INTO t VALUES (3, 1, 2)").unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+}

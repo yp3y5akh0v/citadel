@@ -11,6 +11,7 @@ use citadel_crypto::page_cipher::compute_dek_id;
 use citadel_io::durable;
 use citadel_io::file_lock;
 use citadel_io::file_manager::FileHeader;
+#[cfg(not(target_arch = "wasm32"))]
 use citadel_io::mmap_io::MmapPageIO;
 use citadel_io::traits::PageIO;
 use citadel_txn::manager::TxnManager;
@@ -127,6 +128,7 @@ impl DatabaseBuilder {
         })
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn create_page_io(file: std::fs::File) -> Box<dyn PageIO> {
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         {
@@ -214,6 +216,7 @@ impl DatabaseBuilder {
     }
 
     /// Create a new database. Fails if the data file already exists.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn create(self) -> Result<Database> {
         #[cfg(feature = "fips")]
         self.validate_fips()?;
@@ -318,6 +321,7 @@ impl DatabaseBuilder {
     }
 
     /// Open an existing database. Fails if the data file does not exist.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open(self) -> Result<Database> {
         let passphrase = self
             .passphrase

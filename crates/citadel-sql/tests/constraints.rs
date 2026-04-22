@@ -1054,3 +1054,57 @@ fn fk_persistence_after_reopen() {
         assert!(matches!(err, SqlError::ForeignKeyViolation(..)));
     }
 }
+
+#[test]
+fn unique_column_level_basic() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    assert_ok(
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL)")
+            .unwrap(),
+    );
+    conn.execute("INSERT INTO users VALUES (1, 'a@x')").unwrap();
+    let err = conn
+        .execute("INSERT INTO users VALUES (2, 'a@x')")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+
+    conn.execute("INSERT INTO users VALUES (2, 'b@x')").unwrap();
+    let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
+    assert_eq!(qr.rows[0][0], Value::Integer(2));
+}
+
+#[test]
+fn unique_table_level_single_col() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    assert_ok(
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL, UNIQUE(v))")
+            .unwrap(),
+    );
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    let err = conn.execute("INSERT INTO t VALUES (2, 10)").unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+}
+
+#[test]
+fn unique_persistence_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = create_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        assert_ok(
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+                .unwrap(),
+        );
+        conn.execute("INSERT INTO t VALUES (1, 'a@x')").unwrap();
+    }
+    let db = open_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    let err = conn.execute("INSERT INTO t VALUES (2, 'a@x')").unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+}

@@ -64,6 +64,13 @@ pub struct CreateTableStmt {
     pub if_not_exists: bool,
     pub check_constraints: Vec<TableCheckConstraint>,
     pub foreign_keys: Vec<ForeignKeyDef>,
+    pub unique_indices: Vec<UniqueIndexDef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UniqueIndexDef {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -738,15 +745,16 @@ fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
     }
 }
 
-/// Parse column options (NOT NULL, DEFAULT, CHECK, FK) from a sqlparser ColumnDef.
-/// Returns (ColumnSpec, Option<ForeignKeyDef>, was_inline_pk).
+/// Parse column options (NOT NULL, DEFAULT, CHECK, FK, UNIQUE) from a sqlparser ColumnDef.
+/// Returns (ColumnSpec, Option<ForeignKeyDef>, was_inline_pk, was_unique).
 fn convert_column_def(
     col_def: &sp::ColumnDef,
-) -> Result<(ColumnSpec, Option<ForeignKeyDef>, bool)> {
+) -> Result<(ColumnSpec, Option<ForeignKeyDef>, bool, bool)> {
     let col_name = col_def.name.value.clone();
     let data_type = convert_data_type(&col_def.data_type)?;
     let mut nullable = true;
     let mut is_primary_key = false;
+    let mut is_unique = false;
     let mut default_expr = None;
     let mut default_sql = None;
     let mut check_expr = None;
@@ -762,6 +770,7 @@ fn convert_column_def(
                 is_primary_key = true;
                 nullable = false;
             }
+            sp::ColumnOption::Unique(_) => is_unique = true,
             sp::ColumnOption::Default(expr) => {
                 default_sql = Some(expr.to_string());
                 default_expr = Some(convert_expr(expr)?);
@@ -805,7 +814,7 @@ fn convert_column_def(
         check_sql,
         check_name,
     };
-    Ok((spec, fk_def, is_primary_key))
+    Ok((spec, fk_def, is_primary_key, is_unique))
 }
 
 fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
@@ -815,14 +824,21 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
     let mut columns = Vec::new();
     let mut inline_pk: Vec<String> = Vec::new();
     let mut foreign_keys: Vec<ForeignKeyDef> = Vec::new();
+    let mut unique_indices: Vec<UniqueIndexDef> = Vec::new();
 
     for col_def in &ct.columns {
-        let (spec, fk_def, was_pk) = convert_column_def(col_def)?;
+        let (spec, fk_def, was_pk, was_unique) = convert_column_def(col_def)?;
         if was_pk {
             inline_pk.push(spec.name.clone());
         }
         if let Some(fk) = fk_def {
             foreign_keys.push(fk);
+        }
+        if was_unique && !was_pk {
+            unique_indices.push(UniqueIndexDef {
+                name: None,
+                columns: vec![spec.name.to_ascii_lowercase()],
+            });
         }
         columns.push(spec);
     }
@@ -878,6 +894,22 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
                     referred_columns: referred,
                 });
             }
+            sp::TableConstraint::Unique(u) => {
+                let cols: Vec<String> = u
+                    .columns
+                    .iter()
+                    .filter_map(|idx_col| match &idx_col.column.expr {
+                        sp::Expr::Identifier(ident) => Some(ident.value.to_ascii_lowercase()),
+                        _ => None,
+                    })
+                    .collect();
+                if !cols.is_empty() {
+                    unique_indices.push(UniqueIndexDef {
+                        name: u.name.as_ref().map(|n| n.value.clone()),
+                        columns: cols,
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -889,6 +921,7 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
         if_not_exists,
         check_constraints,
         foreign_keys,
+        unique_indices,
     }))
 }
 
@@ -905,7 +938,7 @@ fn convert_alter_table(at: sp::AlterTable) -> Result<Statement> {
             if_not_exists,
             ..
         } => {
-            let (spec, fk, _was_pk) = convert_column_def(&column_def)?;
+            let (spec, fk, _was_pk, _was_unique) = convert_column_def(&column_def)?;
             AlterTableOp::AddColumn {
                 column: Box::new(spec),
                 foreign_key: fk,
