@@ -20,7 +20,7 @@ citadel> INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob');
 citadel> SELECT * FROM users;
 ```
 
-Supports 27 dot-commands (`.backup`, `.verify`, `.stats`, `.sync`, `.keygen`, etc.), tab completion, syntax highlighting, and multiple output modes.
+Supports 26 dot-commands (`.backup`, `.verify`, `.stats`, `.sync`, `.keygen`, etc.), tab completion, syntax highlighting, and multiple output modes.
 
 ## License
 

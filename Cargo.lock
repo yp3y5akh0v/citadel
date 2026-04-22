@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "blake3",
  "citadeldb-buffer",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-buffer"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "citadeldb-core",
  "citadeldb-crypto",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-cli"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "citadeldb",
  "citadeldb-core",
@@ -389,14 +389,14 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "citadeldb-crypto"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "aes",
  "aes-kw",
@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-ffi"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "cbindgen",
  "citadeldb",
@@ -428,7 +428,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-io"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "citadeldb-core",
  "io-uring",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-page"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "citadeldb-core",
  "xxhash-rust",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-sql"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "citadeldb",
  "citadeldb-core",
@@ -471,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-sync"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "base64",
  "blake3",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-txn"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "blake3",
  "citadeldb-buffer",
@@ -503,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-wasm"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "citadeldb",
  "citadeldb-core",
