@@ -158,7 +158,7 @@ pub enum Action {
 pub fn execute_dot_command(
     input: &str,
     db: &Database,
-    conn: &mut Connection<'_>,
+    conn: &Connection<'_>,
     settings: &mut Settings,
     out: &mut dyn Write,
 ) -> Action {
@@ -640,7 +640,7 @@ fn cmd_dump(args: &[&str], conn: &Connection<'_>, out: &mut dyn Write) {
 }
 
 pub fn dump_data(
-    conn: &mut Connection<'_>,
+    conn: &Connection<'_>,
     table_name: Option<&str>,
     _settings: &Settings,
     out: &mut dyn Write,
@@ -766,7 +766,7 @@ fn sql_literal(v: &citadel_sql::Value) -> String {
 fn cmd_read(
     args: &[&str],
     db: &Database,
-    conn: &mut Connection<'_>,
+    conn: &Connection<'_>,
     settings: &mut Settings,
     out: &mut dyn Write,
 ) {
@@ -880,7 +880,7 @@ fn cmd_width(args: &[&str], settings: &mut Settings, out: &mut dyn Write) {
     settings.column_widths = widths;
 }
 
-fn cmd_sync(args: &[&str], db: &Database, conn: &mut Connection<'_>, out: &mut dyn Write) {
+fn cmd_sync(args: &[&str], db: &Database, conn: &Connection<'_>, out: &mut dyn Write) {
     if args.len() < 2 {
         let _ = writeln!(out, "Usage: .sync HOST:PORT KEY");
         return;
@@ -909,7 +909,7 @@ fn cmd_sync(args: &[&str], db: &Database, conn: &mut Connection<'_>, out: &mut d
     }
 }
 
-fn cmd_listen(args: &[&str], db: &Database, conn: &mut Connection<'_>, out: &mut dyn Write) {
+fn cmd_listen(args: &[&str], db: &Database, conn: &Connection<'_>, out: &mut dyn Write) {
     if args.is_empty() {
         let _ = writeln!(out, "Usage: .listen [PORT] KEY");
         return;
@@ -1008,7 +1008,7 @@ fn print_sync_outcome(outcome: &citadel::SyncOutcome, out: &mut dyn Write) {
 pub fn execute_dot_command_mut(
     input: &str,
     db: &Database,
-    conn: &mut Connection<'_>,
+    conn: &Connection<'_>,
     settings: &mut Settings,
     out: &mut dyn Write,
 ) -> Action {

@@ -3,11 +3,9 @@ use crate::encoding::{
     decode_row_into, encode_composite_key, row_non_pk_count,
 };
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, ColumnMap};
+use crate::eval::{eval_expr, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::types::*;
-
-// ── Helpers ─────────────────────────────────────────────────────────
 
 pub(super) struct PartialDecodeCtx {
     pk_positions: Vec<(usize, usize)>,
@@ -153,7 +151,7 @@ impl PartialDecodeCtx {
     }
 }
 
-pub(super) fn decode_full_row(
+pub(crate) fn decode_full_row(
     schema: &TableSchema,
     key: &[u8],
     value: &[u8],
@@ -168,7 +166,7 @@ pub(super) fn decode_full_row(
     let mapping = schema.decode_col_mapping();
     let stored_count = row_non_pk_count(value);
     decode_row_into(value, &mut row, mapping)?;
-    // Fill defaults for columns added after this row was written
+    // Columns added after this row was written need default values filled in.
     if stored_count < mapping.len() {
         for &logical_idx in mapping.iter().skip(stored_count) {
             if logical_idx != usize::MAX {
@@ -185,7 +183,7 @@ pub(super) fn decode_full_row(
 pub(super) fn eval_const_expr(expr: &Expr) -> Result<Value> {
     static EMPTY: std::sync::OnceLock<ColumnMap> = std::sync::OnceLock::new();
     let empty = EMPTY.get_or_init(|| ColumnMap::new(&[]));
-    eval_expr(expr, empty, &[])
+    eval_expr(expr, &EvalCtx::new(empty, &[]))
 }
 
 pub(super) fn eval_const_int(expr: &Expr) -> Result<i64> {
@@ -320,7 +318,9 @@ pub(super) fn extract_sort_keys(
         .map(|row| {
             order_by
                 .iter()
-                .map(|item| eval_expr(&item.expr, col_map, row).unwrap_or(Value::Null))
+                .map(|item| {
+                    eval_expr(&item.expr, &EvalCtx::new(col_map, row)).unwrap_or(Value::Null)
+                })
                 .collect()
         })
         .collect()
@@ -407,16 +407,13 @@ pub(super) fn project_rows(
     select_cols: &[SelectColumn],
     mut rows: Vec<Vec<Value>>,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
-    // Fast path: SELECT * - zero clones
     if select_cols.len() == 1 && matches!(select_cols[0], SelectColumn::AllColumns) {
         let col_names = columns.iter().map(|c| c.name.clone()).collect();
         return Ok((col_names, rows));
     }
 
-    // Fast path: all simple column refs - use mem::take, zero clones
     if let Some(map) = try_build_index_map(select_cols, columns) {
         let col_names: Vec<String> = map.iter().map(|(n, _)| n.clone()).collect();
-        // Identity: columns already in the right order - return as-is
         if map.len() == columns.len() && map.iter().enumerate().all(|(i, &(_, idx))| idx == i) {
             return Ok((col_names, rows));
         }
@@ -431,7 +428,6 @@ pub(super) fn project_rows(
         return Ok((col_names, projected));
     }
 
-    // Fallback: expression evaluation (requires cloning)
     let mut col_names = Vec::new();
     type Projector = Box<dyn Fn(&[Value]) -> Result<Value>>;
     let mut projectors: Vec<Projector> = Vec::new();
@@ -451,7 +447,9 @@ pub(super) fn project_rows(
                 col_names.push(name);
                 let expr = expr.clone();
                 let map = col_map.clone();
-                projectors.push(Box::new(move |row: &[Value]| eval_expr(&expr, &map, row)));
+                projectors.push(Box::new(move |row: &[Value]| {
+                    eval_expr(&expr, &EvalCtx::new(&map, row))
+                }));
             }
         }
     }
@@ -469,7 +467,7 @@ pub(super) fn project_rows(
     Ok((col_names, projected))
 }
 
-pub(super) fn expr_display_name(expr: &Expr) -> String {
+pub(crate) fn expr_display_name(expr: &Expr) -> String {
     match expr {
         Expr::Column(name) => name.clone(),
         Expr::QualifiedColumn { table, column } => format!("{table}.{column}"),
@@ -526,7 +524,7 @@ pub(super) fn op_symbol(op: &BinOp) -> &'static str {
     }
 }
 
-pub(super) fn build_output_columns(
+pub(crate) fn build_output_columns(
     select_cols: &[SelectColumn],
     columns: &[ColumnDef],
 ) -> Vec<ColumnDef> {
@@ -584,8 +582,6 @@ pub(super) fn infer_expr_type(expr: &Expr, columns: &[ColumnDef]) -> DataType {
         _ => DataType::Null,
     }
 }
-
-// ── Index helpers ────────────────────────────────────────────────────
 
 pub(super) fn encode_index_key(idx: &IndexDef, row: &[Value], pk_values: &[Value]) -> Vec<u8> {
     let indexed_values: Vec<Value> = idx

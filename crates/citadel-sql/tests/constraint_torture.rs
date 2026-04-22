@@ -35,7 +35,7 @@ fn get_rows(result: ExecutionResult) -> Vec<Vec<Value>> {
 fn bulk_insert_with_defaults_1000_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, name TEXT DEFAULT 'unnamed', score REAL DEFAULT 0.0, active BOOLEAN DEFAULT TRUE)"
@@ -72,7 +72,7 @@ fn bulk_insert_with_defaults_1000_rows() {
 fn bulk_insert_varying_column_subsets() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER DEFAULT 10, b TEXT DEFAULT 'x', c REAL DEFAULT 1.5, d BOOLEAN DEFAULT FALSE)"
@@ -125,7 +125,7 @@ fn bulk_insert_varying_column_subsets() {
 fn check_division_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE ratios (id INTEGER NOT NULL PRIMARY KEY, num INTEGER NOT NULL, denom INTEGER NOT NULL CHECK(denom != 0))"
@@ -147,7 +147,7 @@ fn check_division_boundary() {
 fn check_null_arithmetic_passes() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE vals (id INTEGER NOT NULL PRIMARY KEY, x INTEGER CHECK(x > 0), y INTEGER CHECK(y < 100))"
@@ -175,7 +175,7 @@ fn check_null_arithmetic_passes() {
 fn check_boundary_values() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE bounded (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL CHECK(val >= 0 AND val <= 100))"
@@ -209,7 +209,7 @@ fn check_boundary_values() {
 fn fk_stress_100_children_delete_parent() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY, name TEXT)")
@@ -243,7 +243,6 @@ fn fk_stress_100_children_delete_parent() {
         100,
     );
 
-    // Now parent can be deleted
     assert_rows_affected(conn.execute("DELETE FROM parent WHERE id = 1").unwrap(), 1);
 }
 
@@ -251,7 +250,7 @@ fn fk_stress_100_children_delete_parent() {
 fn fk_update_parent_pk_stress() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE dept (id INTEGER NOT NULL PRIMARY KEY, name TEXT)")
@@ -295,7 +294,7 @@ fn fk_update_parent_pk_stress() {
 fn mixed_default_check_fk_on_same_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -349,7 +348,7 @@ fn mixed_default_check_fk_on_same_table() {
 fn transaction_rollback_preserves_state_after_violations() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE accounts (id INTEGER NOT NULL PRIMARY KEY, balance INTEGER NOT NULL CHECK(balance >= 0))"
@@ -360,7 +359,6 @@ fn transaction_rollback_preserves_state_after_violations() {
         1,
     );
 
-    // Start transaction, do valid insert, then violate CHECK
     assert_ok(conn.execute("BEGIN").unwrap());
     assert_rows_affected(
         conn.execute("INSERT INTO accounts VALUES (2, 50)").unwrap(),
@@ -383,7 +381,7 @@ fn transaction_rollback_preserves_state_after_violations() {
 fn partial_insert_five_columns_with_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE records (id INTEGER NOT NULL PRIMARY KEY, a INTEGER DEFAULT 1, b TEXT DEFAULT 'hello', c REAL DEFAULT 3.14, d BOOLEAN DEFAULT TRUE, e INTEGER DEFAULT 42)"
@@ -415,7 +413,7 @@ fn partial_insert_five_columns_with_defaults() {
 fn update_hitting_check_and_fk_simultaneously() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE teams (id INTEGER NOT NULL PRIMARY KEY)")
@@ -457,7 +455,7 @@ fn update_hitting_check_and_fk_simultaneously() {
 fn multiple_fks_to_different_parents() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE countries (id INTEGER NOT NULL PRIMARY KEY, name TEXT)")
@@ -506,7 +504,7 @@ fn multiple_fks_to_different_parents() {
 fn self_referencing_fk() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE employees (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL, manager_id INTEGER REFERENCES employees(id))"
@@ -558,7 +556,7 @@ fn self_referencing_fk() {
 fn fk_composite_key() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE ledger (year INTEGER NOT NULL, month INTEGER NOT NULL, amount REAL, PRIMARY KEY (year, month))"
@@ -607,7 +605,7 @@ fn fk_composite_key() {
 fn check_with_coalesce() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, val INTEGER, CHECK(COALESCE(val, 0) >= 0))"
@@ -630,7 +628,7 @@ fn check_with_coalesce() {
 fn check_with_case_when() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, status TEXT NOT NULL, amount REAL NOT NULL, CHECK(CASE WHEN status = 'free' THEN amount = 0.0 ELSE amount > 0.0 END))"
@@ -664,7 +662,7 @@ fn check_with_case_when() {
 fn check_with_between() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE scores (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL CHECK(val BETWEEN 1 AND 10))"
@@ -692,7 +690,7 @@ fn check_with_between() {
 fn default_with_nested_arithmetic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -710,7 +708,7 @@ fn default_with_nested_arithmetic() {
 fn not_null_default_check_on_same_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE strict (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL DEFAULT 50 CHECK(val >= 0 AND val <= 100))"
@@ -741,7 +739,7 @@ fn not_null_default_check_on_same_column() {
 fn interleaved_insert_delete_with_fk() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE tags (id INTEGER NOT NULL PRIMARY KEY)")
@@ -776,7 +774,6 @@ fn interleaved_insert_delete_with_fk() {
             10,
         );
 
-        // Now can delete parent
         assert_rows_affected(
             conn.execute(&format!("DELETE FROM tags WHERE id = {tag_id}"))
                 .unwrap(),
@@ -794,7 +791,7 @@ fn interleaved_insert_delete_with_fk() {
 fn many_fk_violations_then_valid_inserts() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE colors (id INTEGER NOT NULL PRIMARY KEY)")
@@ -812,11 +809,9 @@ fn many_fk_violations_then_valid_inserts() {
         assert!(matches!(err, SqlError::ForeignKeyViolation(..)));
     }
 
-    // Verify table still empty
     let rows = get_rows(conn.execute("SELECT COUNT(*) FROM items").unwrap());
     assert_eq!(rows[0][0], Value::Integer(0));
 
-    // Now add parent and valid children
     assert_rows_affected(conn.execute("INSERT INTO colors VALUES (1)").unwrap(), 1);
     for i in 0..50 {
         assert_rows_affected(
@@ -834,7 +829,7 @@ fn many_fk_violations_then_valid_inserts() {
 fn check_on_update_multiple_set_clauses() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE ranges (id INTEGER NOT NULL PRIMARY KEY, lo INTEGER NOT NULL, hi INTEGER NOT NULL, CHECK(lo <= hi))"
@@ -859,7 +854,6 @@ fn check_on_update_multiple_set_clauses() {
         .unwrap_err();
     assert!(matches!(err, SqlError::CheckViolation(..)));
 
-    // Verify original values unchanged after failed update
     let rows = get_rows(
         conn.execute("SELECT lo, hi FROM ranges WHERE id = 1")
             .unwrap(),
@@ -872,7 +866,7 @@ fn check_on_update_multiple_set_clauses() {
 fn fk_in_transaction_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY)")
@@ -902,7 +896,7 @@ fn fk_in_transaction_rollback() {
 fn default_does_not_override_explicit_null_stress() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER DEFAULT 42)")
@@ -944,7 +938,7 @@ fn default_does_not_override_explicit_null_stress() {
 fn check_mixed_types_in_expression() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE mixed (id INTEGER NOT NULL PRIMARY KEY, active BOOLEAN NOT NULL, count INTEGER NOT NULL, CHECK(active = TRUE OR count > 0))"
@@ -972,7 +966,7 @@ fn check_mixed_types_in_expression() {
 fn fk_delete_parent_after_child_update() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE p (id INTEGER NOT NULL PRIMARY KEY)")
@@ -992,10 +986,8 @@ fn fk_delete_parent_after_child_update() {
         1,
     );
 
-    // Now parent 1 has no children -> can delete
     assert_rows_affected(conn.execute("DELETE FROM p WHERE id = 1").unwrap(), 1);
 
-    // Parent 2 has child -> cannot delete
     let err = conn.execute("DELETE FROM p WHERE id = 2").unwrap_err();
     assert!(matches!(err, SqlError::ForeignKeyViolation(..)));
 }
@@ -1004,7 +996,7 @@ fn fk_delete_parent_after_child_update() {
 fn fk_child_update_to_invalid_parent() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE p (id INTEGER NOT NULL PRIMARY KEY)")
@@ -1023,7 +1015,6 @@ fn fk_child_update_to_invalid_parent() {
         .unwrap_err();
     assert!(matches!(err, SqlError::ForeignKeyViolation(..)));
 
-    // Verify unchanged
     let rows = get_rows(conn.execute("SELECT pid FROM c WHERE id = 1").unwrap());
     assert_eq!(rows[0][0], Value::Integer(1));
 }
@@ -1032,7 +1023,7 @@ fn fk_child_update_to_invalid_parent() {
 fn fk_update_child_to_null_allowed() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE p (id INTEGER NOT NULL PRIMARY KEY)")

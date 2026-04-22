@@ -1,7 +1,8 @@
 //! Transaction manager: single-writer MVCC with shadow-paging commit.
 
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap};
+use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use std::sync::Arc;
@@ -48,7 +49,7 @@ struct ManagerState {
     reader_table: BTreeMap<TxnId, usize>,
     deferred_free: Vec<PageId>,
     reclaimed_pages: Vec<PageId>,
-    recycled_pages: Option<HashMap<PageId, Page>>,
+    recycled_pages: Option<FxHashMap<PageId, Page>>,
     recycle_safe: bool,
 }
 
@@ -138,7 +139,7 @@ impl TxnManager {
         let root_id = PageId(0);
         let root_page = Page::new(root_id, citadel_core::types::PageType::Leaf, TxnId(1));
 
-        let mut init_pages = std::collections::HashMap::new();
+        let mut init_pages = FxHashMap::default();
         init_pages.insert(root_id, root_page);
         let merkle_root_hash =
             crate::merkle::compute_tree_merkle(&mut init_pages, root_id, TxnId(1), &|_| {
@@ -293,16 +294,15 @@ impl TxnManager {
         &self,
         base_txn_id: TxnId,
         txn_id: TxnId,
-        pages: &mut std::collections::HashMap<PageId, Page>,
+        pages: &mut FxHashMap<PageId, Page>,
         alloc: &mut PageAllocator,
         tree: &BTree,
         old_slot: &CommitSlot,
         deferred_free: &[PageId],
         catalog_root: PageId,
-        named_trees: &std::collections::HashMap<Vec<u8>, BTree>,
-        loaded_tree_meta: &std::collections::HashMap<Vec<u8>, (PageId, u16)>,
+        named_trees: &FxHashMap<Vec<u8>, BTree>,
+        loaded_tree_meta: &FxHashMap<Vec<u8>, (PageId, u16)>,
     ) -> Result<()> {
-        // No-op commit: skip I/O and slot flip when nothing changed.
         let is_noop = pages.is_empty()
             && alloc.freed_this_txn().is_empty()
             && tree.root == old_slot.tree_root
@@ -332,6 +332,11 @@ impl TxnManager {
 
         let freed_this_txn = alloc.commit();
         let no_pages_freed = freed_this_txn.is_empty();
+
+        // Freed pages are unreachable via tree; don't encrypt+write them.
+        for &page_id in &freed_this_txn {
+            pages.remove(&page_id);
+        }
 
         let (new_pf_root, reclaimed, old_chain_pages) =
             if self.sync_mode == citadel_core::types::SyncMode::Off {
@@ -461,7 +466,6 @@ impl TxnManager {
             }
         }
 
-        // Merge current txn trees + carry forward old slot entries for untouched tables
         let mut named_table_entries: Vec<(u32, u64, u32, u16)> = named_trees
             .iter()
             .map(|(name, tree)| {
@@ -718,12 +722,11 @@ impl TxnManager {
     pub fn compact_to(&self, dest_io: &dyn PageIO) -> Result<()> {
         use citadel_core::types::ValueType;
         use citadel_page::{branch_node, leaf_node};
-        use std::collections::HashMap as StdMap;
         use std::collections::HashSet;
 
         let slot = self.current_slot();
         let mut next_id: u32 = 0;
-        let mut old_to_new: StdMap<PageId, PageId> = StdMap::new();
+        let mut old_to_new: FxHashMap<PageId, PageId> = FxHashMap::default();
         let mut catalog_leaves: HashSet<PageId> = HashSet::new();
 
         self.assign_new_ids(slot.tree_root, &mut old_to_new, &mut next_id)?;
@@ -972,7 +975,7 @@ impl TxnManager {
     fn assign_new_ids(
         &self,
         root: PageId,
-        mapping: &mut std::collections::HashMap<PageId, PageId>,
+        mapping: &mut FxHashMap<PageId, PageId>,
         next_id: &mut u32,
     ) -> Result<()> {
         use citadel_page::branch_node;
@@ -1001,7 +1004,7 @@ impl TxnManager {
 
     fn load_pending_free_chain(
         &self,
-        pages: &mut std::collections::HashMap<PageId, Page>,
+        pages: &mut FxHashMap<PageId, Page>,
         root: PageId,
     ) -> Result<()> {
         if !root.is_valid() {
@@ -1234,16 +1237,14 @@ pub(crate) mod tests {
         {
             let _wtx = mgr.begin_write().unwrap();
         }
-        // Should be able to begin another write after drop
         let _wtx2 = mgr.begin_write().unwrap();
     }
 
     #[test]
     fn oldest_active_reader_with_no_readers() {
         let mgr = create_test_manager();
-        // No readers - oldest should be current next_txn_id
         let oldest = mgr.oldest_active_reader();
-        assert!(oldest.as_u64() >= 2); // At least 2 since create used txn 1
+        assert!(oldest.as_u64() >= 2); // create used txn 1
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! B+ tree cursor for range iteration using a root-to-leaf path stack.
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::sync::Arc;
 
 use citadel_core::types::{PageId, PageType, ValueType};
@@ -18,13 +19,13 @@ pub trait PageLoader: PageMap {
     fn ensure_loaded(&mut self, id: PageId) -> Result<()>;
 }
 
-impl PageMap for HashMap<PageId, Page> {
+impl<S: BuildHasher> PageMap for HashMap<PageId, Page, S> {
     fn get_page(&self, id: &PageId) -> Option<&Page> {
         self.get(id)
     }
 }
 
-impl PageMap for HashMap<PageId, Arc<Page>> {
+impl<S: BuildHasher> PageMap for HashMap<PageId, Arc<Page>, S> {
     fn get_page(&self, id: &PageId) -> Option<&Page> {
         self.get(id).map(|a| a.as_ref())
     }
@@ -54,7 +55,6 @@ impl Cursor {
         let mut path = Vec::new();
         let mut current = root;
 
-        // Walk to the leaf
         loop {
             let page = pages
                 .get_page(&current)
@@ -71,7 +71,6 @@ impl Cursor {
             }
         }
 
-        // Find the cell index in the leaf
         let page = pages.get_page(&current).unwrap();
         let cell_idx = match leaf_node::search(page, key) {
             Ok(idx) => idx,
@@ -87,7 +86,7 @@ impl Cursor {
             valid,
         };
 
-        // If we landed past the end of this leaf, advance to next leaf
+        // Landed past the end of this leaf: advance to next.
         if !valid && page.num_cells() > 0 {
             cursor.advance_leaf(pages)?;
         } else if page.num_cells() == 0 {
@@ -102,7 +101,6 @@ impl Cursor {
         let mut path = Vec::new();
         let mut current = root;
 
-        // Walk to the leftmost leaf
         loop {
             let page = pages
                 .get_page(&current)
@@ -134,7 +132,6 @@ impl Cursor {
         let mut path = Vec::new();
         let mut current = root;
 
-        // Walk to the rightmost leaf
         loop {
             let page = pages
                 .get_page(&current)
@@ -220,7 +217,6 @@ impl Cursor {
             return Ok(true);
         }
 
-        // Need to move to the next leaf
         self.advance_leaf(pages)
     }
 
@@ -235,13 +231,11 @@ impl Cursor {
             return Ok(true);
         }
 
-        // Need to move to the previous leaf
         self.retreat_leaf(pages)
     }
 
     /// Advance to the first cell of the next leaf.
     fn advance_leaf(&mut self, pages: &impl PageMap) -> Result<bool> {
-        // Walk up the path to find a parent where we can go right
         while let Some((parent_id, child_idx)) = self.path.pop() {
             let parent = pages
                 .get_page(&parent_id)
@@ -249,12 +243,10 @@ impl Cursor {
             let n = parent.num_cells() as usize;
 
             if child_idx < n {
-                // There's a sibling to the right: child_idx + 1
                 let next_child_idx = child_idx + 1;
                 let next_child = branch_node::get_child(parent, next_child_idx);
                 self.path.push((parent_id, next_child_idx));
 
-                // Walk down to the leftmost leaf of this subtree
                 let mut current = next_child;
                 loop {
                     let page = pages
@@ -283,8 +275,6 @@ impl Cursor {
         self.valid = false;
         Ok(false)
     }
-
-    // ── Lazy variants (load pages on demand via PageLoader) ─────────
 
     /// Seek with lazy page loading — only loads the root-to-leaf path.
     pub fn seek_lazy(pages: &mut impl PageLoader, root: PageId, key: &[u8]) -> Result<Self> {
@@ -333,7 +323,10 @@ impl Cursor {
     }
 
     /// Read the current entry, loading the leaf page if needed.
-    pub fn current_ref_lazy<'a, P: PageLoader>(&self, pages: &'a mut P) -> Option<LeafCell<'a>> {
+    pub fn current_ref_lazy<'a, P: PageLoader + ?Sized>(
+        &self,
+        pages: &'a mut P,
+    ) -> Option<LeafCell<'a>> {
         if !self.valid {
             return None;
         }
@@ -343,7 +336,7 @@ impl Cursor {
     }
 
     /// Advance to the next entry, loading pages on demand.
-    pub fn next_lazy(&mut self, pages: &mut impl PageLoader) -> Result<bool> {
+    pub fn next_lazy<P: PageLoader + ?Sized>(&mut self, pages: &mut P) -> Result<bool> {
         if !self.valid {
             return Ok(false);
         }
@@ -362,7 +355,7 @@ impl Cursor {
     }
 
     /// Advance to the next leaf, loading child pages on demand.
-    fn advance_leaf_lazy(&mut self, pages: &mut impl PageLoader) -> Result<bool> {
+    fn advance_leaf_lazy<P: PageLoader + ?Sized>(&mut self, pages: &mut P) -> Result<bool> {
         while let Some((parent_id, child_idx)) = self.path.pop() {
             let parent = pages
                 .get_page(&parent_id)
@@ -404,10 +397,8 @@ impl Cursor {
 
     /// Retreat to the last cell of the previous leaf.
     fn retreat_leaf(&mut self, pages: &impl PageMap) -> Result<bool> {
-        // Walk up the path to find a parent where we can go left
         while let Some((parent_id, child_idx)) = self.path.pop() {
             if child_idx > 0 {
-                // There's a sibling to the left: child_idx - 1
                 let prev_child_idx = child_idx - 1;
                 let parent = pages
                     .get_page(&parent_id)
@@ -415,7 +406,6 @@ impl Cursor {
                 let prev_child = branch_node::get_child(parent, prev_child_idx);
                 self.path.push((parent_id, prev_child_idx));
 
-                // Walk down to the rightmost leaf of this subtree
                 let mut current = prev_child;
                 loop {
                     let page = pages
@@ -459,8 +449,8 @@ mod tests {
     use crate::btree::BTree;
     use citadel_core::types::TxnId;
 
-    fn build_tree(keys: &[&[u8]]) -> (HashMap<PageId, Page>, BTree) {
-        let mut pages = HashMap::new();
+    fn build_tree(keys: &[&[u8]]) -> (rustc_hash::FxHashMap<PageId, Page>, BTree) {
+        let mut pages = rustc_hash::FxHashMap::default();
         let mut alloc = PageAllocator::new(0);
         let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
         for k in keys {
@@ -528,7 +518,7 @@ mod tests {
 
     #[test]
     fn cursor_empty_tree() {
-        let mut pages = HashMap::new();
+        let mut pages = rustc_hash::FxHashMap::default();
         let mut alloc = PageAllocator::new(0);
         let tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -536,14 +526,14 @@ mod tests {
         assert!(!cursor.is_valid());
     }
 
-    /// PageLoader backed by a pre-built HashMap — tracks unique pages touched.
+    /// PageLoader backed by a pre-built FxHashMap — tracks unique pages touched.
     struct TrackingLoader {
-        pages: HashMap<PageId, Page>,
+        pages: rustc_hash::FxHashMap<PageId, Page>,
         touched: std::collections::HashSet<PageId>,
     }
 
     impl TrackingLoader {
-        fn new(pages: HashMap<PageId, Page>) -> Self {
+        fn new(pages: rustc_hash::FxHashMap<PageId, Page>) -> Self {
             Self {
                 pages,
                 touched: std::collections::HashSet::new(),

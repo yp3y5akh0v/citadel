@@ -10,10 +10,6 @@ use jiff::civil::{Date as JDate, DateTime as JDateTime, Time as JTime};
 use jiff::tz::TimeZone;
 use jiff::{Span, Timestamp as JTimestamp, ToSpan, Unit, Zoned};
 
-// ═══════════════════════════════════════════════════════════════════════
-// Constants & infinity sentinels
-// ═══════════════════════════════════════════════════════════════════════
-
 /// Microseconds per second.
 pub const MICROS_PER_SEC: i64 = 1_000_000;
 /// Microseconds per minute.
@@ -36,10 +32,6 @@ pub fn is_infinity_date(d: i32) -> bool {
 pub fn is_infinity_ts(t: i64) -> bool {
     t == TS_INFINITY_MICROS || t == TS_NEG_INFINITY_MICROS
 }
-
-// ═══════════════════════════════════════════════════════════════════════
-// Epoch conversion helpers
-// ═══════════════════════════════════════════════════════════════════════
 
 /// Unix epoch as a jiff civil Date (avoid `JDate::ZERO` which is year 1, not 1970).
 fn epoch_date() -> JDate {
@@ -116,10 +108,6 @@ pub fn ts_to_date_floor(micros: i64) -> i32 {
         micros.div_euclid(MICROS_PER_DAY) as i32
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════════
-// Parsers
-// ═══════════════════════════════════════════════════════════════════════
 
 /// Parse an ISO 8601 DATE literal (`YYYY-MM-DD`, optional `BC` suffix, `'infinity'` / `'-infinity'`).
 pub fn parse_date(s: &str) -> Result<i32> {
@@ -500,10 +488,6 @@ fn clamp_i32(n: i64) -> Result<i32> {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Formatters
-// ═══════════════════════════════════════════════════════════════════════
-
 pub fn format_date(days: i32) -> String {
     if days == DATE_INFINITY_DAYS {
         return "infinity".to_string();
@@ -675,10 +659,6 @@ trait Pipe: Sized {
 }
 impl<T> Pipe for T {}
 
-// ═══════════════════════════════════════════════════════════════════════
-// Clock readers
-// ═══════════════════════════════════════════════════════════════════════
-
 pub fn now_micros() -> i64 {
     JTimestamp::now().as_microsecond()
 }
@@ -712,10 +692,6 @@ pub fn today_days() -> i32 {
 pub fn current_time_micros() -> i64 {
     ts_split(now_micros()).1
 }
-
-// ═══════════════════════════════════════════════════════════════════════
-// Arithmetic
-// ═══════════════════════════════════════════════════════════════════════
 
 pub fn add_interval_to_timestamp(ts: i64, months: i32, days: i32, micros: i64) -> Result<i64> {
     if ts == TS_INFINITY_MICROS || ts == TS_NEG_INFINITY_MICROS {
@@ -810,10 +786,6 @@ fn span_to_triple(span: &Span) -> Result<(i32, i32, i64)> {
     Ok((clamp_i32(months)?, clamp_i32(days)?, micros))
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// JUSTIFY_*
-// ═══════════════════════════════════════════════════════════════════════
-
 pub fn justify_days(months: i32, days: i32, micros: i64) -> (i32, i32, i64) {
     // Convert every 30 days into 1 month.
     let extra_months = days / 30;
@@ -842,10 +814,6 @@ pub fn interval_to_total_micros(months: i32, days: i32, micros: i64) -> i128 {
         + (days as i128) * (MICROS_PER_DAY as i128)
         + micros as i128
 }
-
-// ═══════════════════════════════════════════════════════════════════════
-// EXTRACT / DATE_TRUNC / strftime
-// ═══════════════════════════════════════════════════════════════════════
 
 pub fn extract(field: &str, v: &Value) -> Result<Value> {
     let f = field.trim();

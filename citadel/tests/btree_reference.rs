@@ -10,7 +10,8 @@ use citadel_buffer::cursor::Cursor;
 use citadel_core::types::*;
 use citadel_page::branch_node;
 use citadel_page::page::Page;
-use std::collections::{BTreeMap, HashMap};
+use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
 
 /// Simple deterministic PRNG (xorshift32) for reproducible tests.
 struct Rng(u32);
@@ -31,7 +32,7 @@ impl Rng {
 
 #[test]
 fn btree_vs_btreemap_expected() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
     let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -96,7 +97,6 @@ fn btree_vs_btreemap_expected() {
             }
         }
 
-        // Verify entry count matches
         assert_eq!(
             tree.entry_count,
             expected.len() as u64,
@@ -104,7 +104,6 @@ fn btree_vs_btreemap_expected() {
         );
     }
 
-    // Final verification: iterate all entries and compare
     let mut cursor = Cursor::first(&pages, tree.root).unwrap();
     let mut tree_entries = Vec::new();
     while cursor.is_valid() {
@@ -130,11 +129,10 @@ fn btree_vs_btreemap_expected() {
 
 #[test]
 fn btree_cursor_range_scan() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
-    // Insert 1000 sequential keys
     for i in 0..1000u32 {
         let key = format!("{i:06}");
         let val = format!("v{i}");
@@ -167,7 +165,7 @@ fn btree_cursor_range_scan() {
 
 #[test]
 fn btree_cursor_reverse_range() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -184,7 +182,6 @@ fn btree_cursor_reverse_range() {
         .unwrap();
     }
 
-    // Iterate backward from end
     let mut cursor = Cursor::last(&pages, tree.root).unwrap();
     let mut prev_key: Option<Vec<u8>> = None;
     let mut count = 0;
@@ -202,11 +199,10 @@ fn btree_cursor_reverse_range() {
 
 #[test]
 fn btree_cow_isolation() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
-    // Insert some keys
     tree.insert(
         &mut pages,
         &mut alloc,
@@ -228,7 +224,6 @@ fn btree_cow_isolation() {
 
     let root_v1 = tree.root;
 
-    // Modify - should create new pages via CoW
     tree.insert(
         &mut pages,
         &mut alloc,
@@ -242,14 +237,13 @@ fn btree_cow_isolation() {
 
     assert_ne!(root_v1, root_v2, "CoW should produce new root");
 
-    // The new root should have all 3 keys
     let result = tree.search(&pages, b"c").unwrap();
     assert_eq!(result, Some((ValueType::Inline, b"3".to_vec())));
 }
 
 #[test]
 fn btree_large_values() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -271,7 +265,6 @@ fn btree_large_values() {
     assert_eq!(tree.entry_count, 20);
     assert!(tree.depth >= 2, "large values should cause more splits");
 
-    // Verify all keys present
     for i in 0..20u32 {
         let key = format!("bigkey-{i:04}");
         let result = tree.search(&pages, key.as_bytes()).unwrap();
@@ -283,11 +276,10 @@ fn btree_large_values() {
 
 #[test]
 fn btree_tombstone_values() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
-    // Insert a tombstone
     tree.insert(
         &mut pages,
         &mut alloc,
@@ -303,7 +295,7 @@ fn btree_tombstone_values() {
 
 #[test]
 fn btree_max_key_length() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -337,11 +329,10 @@ fn btree_max_key_length() {
 
 #[test]
 fn btree_insert_delete_reinsert() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
-    // Insert, delete, re-insert the same key
     tree.insert(
         &mut pages,
         &mut alloc,
@@ -372,7 +363,7 @@ fn btree_insert_delete_reinsert() {
 
 #[test]
 fn btree_allocator_frees_pages_on_cow() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -417,11 +408,9 @@ fn btree_allocator_frees_pages_on_cow() {
     assert_eq!(alloc.freed_count(), 0);
 }
 
-// === Edge Case Tests ===
-
 #[test]
 fn btree_single_entry() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -440,7 +429,6 @@ fn btree_single_entry() {
     let result = tree.search(&pages, b"only").unwrap();
     assert_eq!(result, Some((ValueType::Inline, b"one".to_vec())));
 
-    // Cursor on single-entry tree
     let mut cursor = Cursor::first(&pages, tree.root).unwrap();
     assert!(cursor.is_valid());
     let entry = cursor.current(&pages).unwrap();
@@ -448,7 +436,6 @@ fn btree_single_entry() {
     cursor.next(&pages).unwrap();
     assert!(!cursor.is_valid());
 
-    // Delete the single entry
     tree.delete(&mut pages, &mut alloc, TxnId(1), b"only")
         .unwrap();
     assert_eq!(tree.entry_count, 0);
@@ -457,14 +444,13 @@ fn btree_single_entry() {
 
 #[test]
 fn btree_delete_all_and_reinsert() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
     let count = 200;
     let keys: Vec<String> = (0..count).map(|i| format!("key-{i:04}")).collect();
 
-    // Insert all
     for k in &keys {
         tree.insert(
             &mut pages,
@@ -478,23 +464,19 @@ fn btree_delete_all_and_reinsert() {
     }
     assert_eq!(tree.entry_count, count as u64);
 
-    // Delete all
     for k in &keys {
         tree.delete(&mut pages, &mut alloc, TxnId(1), k.as_bytes())
             .unwrap();
     }
     assert_eq!(tree.entry_count, 0);
 
-    // Verify empty
     for k in &keys {
         assert_eq!(tree.search(&pages, k.as_bytes()).unwrap(), None);
     }
 
-    // Cursor on empty tree
     let cursor = Cursor::first(&pages, tree.root).unwrap();
     assert!(!cursor.is_valid());
 
-    // Re-insert all with new values
     for k in &keys {
         tree.insert(
             &mut pages,
@@ -508,7 +490,6 @@ fn btree_delete_all_and_reinsert() {
     }
     assert_eq!(tree.entry_count, count as u64);
 
-    // Verify all present with new values
     for k in &keys {
         let result = tree.search(&pages, k.as_bytes()).unwrap();
         assert_eq!(result, Some((ValueType::Inline, b"v2".to_vec())));
@@ -517,13 +498,12 @@ fn btree_delete_all_and_reinsert() {
 
 #[test]
 fn btree_depth_grows_with_entries() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
     assert_eq!(tree.depth, 1, "empty tree should have depth 1");
 
-    // Insert entries and track depth
     let mut prev_depth = tree.depth;
     for i in 0..3000u32 {
         let key = format!("{i:06}");
@@ -553,7 +533,7 @@ fn btree_depth_grows_with_entries() {
 #[test]
 fn btree_sequential_insert_stress() {
     // Sequential keys are a worst-case pattern (all inserts at the right edge)
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -573,7 +553,6 @@ fn btree_sequential_insert_stress() {
     }
     assert_eq!(tree.entry_count, count as u64);
 
-    // Verify all present
     for i in 0..count {
         let key = format!("{i:08}");
         let val = format!("v{i}");
@@ -584,7 +563,6 @@ fn btree_sequential_insert_stress() {
         );
     }
 
-    // Full forward cursor scan
     let mut cursor = Cursor::first(&pages, tree.root).unwrap();
     let mut scanned = 0u32;
     let mut prev_key: Option<Vec<u8>> = None;
@@ -602,7 +580,7 @@ fn btree_sequential_insert_stress() {
 
 #[test]
 fn btree_cursor_bidirectional() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -619,20 +597,17 @@ fn btree_cursor_bidirectional() {
         .unwrap();
     }
 
-    // Seek to middle
     let mut cursor = Cursor::seek(&pages, tree.root, b"0050").unwrap();
     assert!(cursor.is_valid());
     let entry = cursor.current(&pages).unwrap();
     assert_eq!(entry.key, b"0050");
 
-    // Go forward 5 entries
     for expected in 51..56u32 {
         cursor.next(&pages).unwrap();
         let entry = cursor.current(&pages).unwrap();
         assert_eq!(entry.key, format!("{expected:04}").as_bytes());
     }
 
-    // Now go backward 10 entries (back past starting point)
     for expected in (45..55u32).rev() {
         cursor.prev(&pages).unwrap();
         let entry = cursor.current(&pages).unwrap();
@@ -642,7 +617,7 @@ fn btree_cursor_bidirectional() {
 
 #[test]
 fn btree_delete_until_empty_one_by_one() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -662,7 +637,6 @@ fn btree_delete_until_empty_one_by_one() {
     }
     assert_eq!(tree.entry_count, count as u64);
 
-    // Delete one by one in random-ish order (reverse)
     for k in keys.iter().rev() {
         let existed = tree
             .delete(&mut pages, &mut alloc, TxnId(1), k.as_bytes())
@@ -671,15 +645,13 @@ fn btree_delete_until_empty_one_by_one() {
     }
     assert_eq!(tree.entry_count, 0);
 
-    // Verify empty
     let cursor = Cursor::first(&pages, tree.root).unwrap();
     assert!(!cursor.is_valid());
 }
 
 #[test]
 fn btree_heavy_random_expected() {
-    // Heavier variant: 10K operations
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
     let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -730,7 +702,6 @@ fn btree_heavy_random_expected() {
         );
     }
 
-    // Final full iteration comparison
     let mut cursor = Cursor::first(&pages, tree.root).unwrap();
     let mut tree_entries = Vec::new();
     while cursor.is_valid() {
@@ -748,11 +719,10 @@ fn btree_heavy_random_expected() {
 
 #[test]
 fn btree_duplicate_key_updates_value() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
-    // Insert same key 10 times with different values
     for i in 0..10u32 {
         let val = format!("version-{i}");
         let is_new = tree
@@ -772,21 +742,17 @@ fn btree_duplicate_key_updates_value() {
         }
     }
 
-    // Should only have 1 entry
     assert_eq!(tree.entry_count, 1);
 
-    // Should have the last value
     let result = tree.search(&pages, b"key").unwrap();
     assert_eq!(result, Some((ValueType::Inline, b"version-9".to_vec())));
 }
-
-// === Additional B+ Tree Edge Cases ===
 
 #[test]
 fn btree_variable_key_length_stress() {
     // Variable-length keys (1 to 512 bytes) with random insert/delete stress
     // split/merge paths and guard against page type confusion during rebalance.
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
     let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -803,7 +769,6 @@ fn btree_variable_key_length_stress() {
             .collect();
 
         if op < 6 {
-            // Insert with small value
             let val = format!("v{i}");
             let tree_new = tree
                 .insert(
@@ -821,7 +786,6 @@ fn btree_variable_key_length_stress() {
                 "insert mismatch at op {i} (key_len={key_len})"
             );
         } else {
-            // Delete
             let tree_found = tree.delete(&mut pages, &mut alloc, TxnId(1), &key).unwrap();
             let expected_found = expected.remove(&key).is_some();
             assert_eq!(
@@ -836,8 +800,8 @@ fn btree_variable_key_length_stress() {
         );
     }
 
-    // Verify all branch pages contain only branch cells and all leaf pages
-    // contain only leaf cells (guards against cross-merge corruption)
+    // Branch pages hold only branch cells, leaves hold only leaf cells —
+    // guards against cross-merge corruption.
     let mut stack = vec![tree.root];
     let mut branch_count = 0u32;
     let mut leaf_count = 0u32;
@@ -863,7 +827,6 @@ fn btree_variable_key_length_stress() {
         }
     }
     assert!(leaf_count >= 1, "should have at least one leaf page");
-    // If tree has depth > 1, should have branches
     if tree.depth > 1 {
         assert!(
             branch_count >= 1,
@@ -871,7 +834,6 @@ fn btree_variable_key_length_stress() {
         );
     }
 
-    // Full cursor scan must match expected
     let mut cursor = Cursor::first(&pages, tree.root).unwrap();
     let mut tree_entries = Vec::new();
     while cursor.is_valid() {
@@ -897,7 +859,7 @@ fn btree_variable_key_length_stress() {
 fn btree_insert_delete_same_key_repeatedly() {
     // Guards against double-free: inserting and deleting the same key
     // repeatedly should CoW the same leaf multiple times without corruption.
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -915,17 +877,14 @@ fn btree_insert_delete_same_key_repeatedly() {
         .unwrap();
     }
 
-    // Now repeatedly insert and delete the same key
     let target = b"0100";
     for round in 0..50u32 {
-        // Delete it
         let existed = tree
             .delete(&mut pages, &mut alloc, TxnId(1), target)
             .unwrap();
         assert!(existed, "key should exist before delete in round {round}");
         assert_eq!(tree.entry_count, 199);
 
-        // Re-insert it
         let is_new = tree
             .insert(
                 &mut pages,
@@ -940,11 +899,9 @@ fn btree_insert_delete_same_key_repeatedly() {
         assert_eq!(tree.entry_count, 200);
     }
 
-    // Verify the final value
     let result = tree.search(&pages, target).unwrap();
     assert_eq!(result, Some((ValueType::Inline, b"round-49".to_vec())));
 
-    // Verify the tree is still navigable
     let mut cursor = Cursor::first(&pages, tree.root).unwrap();
     let mut count = 0u32;
     while cursor.is_valid() {

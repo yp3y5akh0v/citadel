@@ -79,7 +79,6 @@ fn integrity_check_after_deletes() {
         wtx.commit().unwrap();
     }
 
-    // Delete half the keys
     {
         let mut wtx = db.begin_write().unwrap();
         for i in (0..500u32).step_by(2) {
@@ -129,7 +128,6 @@ fn integrity_check_detects_tampered_page() {
         root_page_id = u32::from_le_bytes(root_bytes);
     }
 
-    // Tamper with the root page's ciphertext area
     {
         use std::io::{Read, Seek, SeekFrom, Write};
         let mut file = std::fs::OpenOptions::new()
@@ -151,7 +149,6 @@ fn integrity_check_detects_tampered_page() {
         file.flush().unwrap();
     }
 
-    // Integrity check should detect the tampering
     let db = fast_builder(&db_path).open().unwrap();
     let report = db.integrity_check().unwrap();
     assert!(

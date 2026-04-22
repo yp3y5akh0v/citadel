@@ -56,10 +56,6 @@ fn assert_crdt_converged(db1: &Database, db2: &Database) {
     }
 }
 
-// ============================================================
-// Torture tests
-// ============================================================
-
 #[test]
 fn random_bidirectional_50_rounds_convergence() {
     let dir = tempfile::tempdir().unwrap();
@@ -207,13 +203,11 @@ fn idempotent_apply_twice() {
         wtx.commit().unwrap();
     }
 
-    // First apply
     let r1 = sync_push(&source, &target, 1, true);
     assert!(r1.entries_applied > 0);
 
     let snapshot = collect_all(&target);
 
-    // Second apply of the same diff: nothing should change
     let r2 = sync_push(&source, &target, 1, true);
     assert_eq!(r2.entries_applied, 0);
     assert!(r2.entries_equal > 0 || r2.entries_skipped == 0);
@@ -264,7 +258,6 @@ fn three_node_ring_convergence() {
     sync_push(&c, &b, 3, true);
     sync_push(&b, &a, 2, true);
 
-    // All three should have all 30 entries
     assert_crdt_converged(&a, &b);
     assert_crdt_converged(&b, &c);
     assert_eq!(collect_all(&a).len(), 30);

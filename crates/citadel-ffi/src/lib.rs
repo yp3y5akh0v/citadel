@@ -15,8 +15,6 @@ use std::slice;
 use citadel::{Database, DatabaseBuilder};
 use citadel_sql::{Connection, ExecutionResult, Value};
 
-// ── Error codes ────────────────────────────────────────────────────
-
 /// Error codes returned by all citadel_* functions.
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,8 +59,6 @@ impl Default for CitadelConfig {
     }
 }
 
-// ── Opaque handle types ────────────────────────────────────────────
-
 /// Opaque database handle.
 pub struct CitadelDb {
     db: Database,
@@ -90,8 +86,6 @@ pub struct CitadelSqlResult {
     rows_affected: u64,
     is_query: bool,
 }
-
-// ── Thread-local error message ─────────────────────────────────────
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -159,8 +153,6 @@ macro_rules! ffi_guard {
     }};
 }
 
-// ── Error message retrieval ────────────────────────────────────────
-
 /// Get the last error message for the current thread.
 ///
 /// Returns a pointer to a null-terminated UTF-8 string. The pointer is
@@ -181,8 +173,6 @@ pub extern "C" fn citadel_last_error_message() -> *const c_char {
 pub extern "C" fn citadel_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
 }
-
-// ── Database lifecycle ─────────────────────────────────────────────
 
 /// Create a new encrypted database.
 ///
@@ -312,8 +302,6 @@ pub extern "C" fn citadel_close(db: *mut CitadelDb) {
         }));
     }
 }
-
-// ── Read transactions ──────────────────────────────────────────────
 
 /// Begin a read-only transaction.
 ///
@@ -448,8 +436,6 @@ pub extern "C" fn citadel_read_table_get(
         }
     })
 }
-
-// ── Write transactions ─────────────────────────────────────────────
 
 /// Begin a read-write transaction.
 ///
@@ -664,8 +650,6 @@ pub extern "C" fn citadel_write_get(
     })
 }
 
-// ── Named table operations in write transactions ───────────────────
-
 /// Create a named table within a write transaction.
 #[no_mangle]
 pub extern "C" fn citadel_write_create_table(
@@ -868,8 +852,6 @@ pub extern "C" fn citadel_write_table_get(
         }
     })
 }
-
-// ── SQL connection ─────────────────────────────────────────────────
 
 /// Open a SQL connection on a database.
 ///
@@ -1211,8 +1193,6 @@ pub extern "C" fn citadel_sql_value_blob(
     }
 }
 
-// ── Memory management ──────────────────────────────────────────────
-
 /// Free bytes allocated by Citadel (e.g., from citadel_read_get).
 ///
 /// Accepts NULL (no-op). `len` must be the exact length returned by
@@ -1227,8 +1207,6 @@ pub extern "C" fn citadel_free_bytes(ptr: *mut u8, len: usize) {
         }));
     }
 }
-
-// ── Database utilities ─────────────────────────────────────────────
 
 /// Get database statistics.
 ///
@@ -1292,8 +1270,6 @@ pub extern "C" fn citadel_change_passphrase(
         }
     })
 }
-
-// ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1397,7 +1373,6 @@ mod tests {
             &mut db,
         );
 
-        // Write
         let mut wtxn: *mut CitadelWriteTxn = ptr::null_mut();
         assert_eq!(citadel_write_begin(db, &mut wtxn), CitadelError::Ok);
 
@@ -1419,7 +1394,6 @@ mod tests {
 
         assert_eq!(citadel_write_commit(wtxn), CitadelError::Ok);
 
-        // Read
         let mut rtxn: *mut CitadelReadTxn = ptr::null_mut();
         assert_eq!(citadel_read_begin(db, &mut rtxn), CitadelError::Ok);
 
@@ -1436,7 +1410,6 @@ mod tests {
         assert_eq!(result, b"world");
         citadel_free_bytes(out_val, out_len);
 
-        // Key not found
         let missing = b"missing";
         let mut out_val2: *mut u8 = ptr::null_mut();
         let mut out_len2: usize = 0;
@@ -1485,7 +1458,6 @@ mod tests {
         );
         citadel_write_abort(wtxn);
 
-        // Verify not visible
         let mut rtxn: *mut CitadelReadTxn = ptr::null_mut();
         citadel_read_begin(db, &mut rtxn);
 
@@ -1511,7 +1483,6 @@ mod tests {
             &mut db,
         );
 
-        // Create table and insert
         let mut wtxn: *mut CitadelWriteTxn = ptr::null_mut();
         citadel_write_begin(db, &mut wtxn);
 
@@ -1535,7 +1506,6 @@ mod tests {
         );
         citadel_write_commit(wtxn);
 
-        // Read from named table
         let mut rtxn: *mut CitadelReadTxn = ptr::null_mut();
         citadel_read_begin(db, &mut rtxn);
 
@@ -1577,7 +1547,6 @@ mod tests {
         let mut conn: *mut CitadelSqlConn = ptr::null_mut();
         assert_eq!(citadel_sql_open(db, &mut conn), CitadelError::Ok);
 
-        // CREATE TABLE
         let sql1 = CString::new("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
             .unwrap();
         let mut result: *mut CitadelSqlResult = ptr::null_mut();
@@ -1587,7 +1556,6 @@ mod tests {
         );
         citadel_sql_result_free(result);
 
-        // INSERT
         let sql2 = CString::new("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
         result = ptr::null_mut();
         assert_eq!(
@@ -1597,7 +1565,6 @@ mod tests {
         assert_eq!(citadel_sql_rows_affected(result), 1);
         citadel_sql_result_free(result);
 
-        // SELECT
         let sql3 = CString::new("SELECT id, name FROM users").unwrap();
         result = ptr::null_mut();
         assert_eq!(
@@ -1608,13 +1575,11 @@ mod tests {
         assert_eq!(citadel_sql_column_count(result), 2);
         assert_eq!(citadel_sql_row_count(result), 1);
 
-        // Check column names
         let col0 = citadel_sql_column_name(result, 0);
         assert!(!col0.is_null());
         let col0_str = unsafe { CStr::from_ptr(col0) }.to_str().unwrap();
         assert_eq!(col0_str, "id");
 
-        // Check values
         assert!(matches!(
             citadel_sql_value_type(result, 0, 0),
             CitadelValueType::Integer,
@@ -1673,7 +1638,6 @@ mod tests {
 
     #[test]
     fn error_message() {
-        // A failed call should set the error message
         let rc = citadel_create(ptr::null(), ptr::null(), 0, ptr::null(), ptr::null_mut());
         assert_eq!(rc, CitadelError::InvalidArgument);
         let msg = citadel_last_error_message();
@@ -1681,7 +1645,6 @@ mod tests {
         let s = unsafe { CStr::from_ptr(msg) }.to_str().unwrap();
         assert!(s.contains("null pointer"));
 
-        // After a successful call, error should be cleared
         let (_dir, cpath) = temp_path();
         let pass = b"test";
         let mut db: *mut CitadelDb = ptr::null_mut();
@@ -1711,7 +1674,6 @@ mod tests {
             &mut db,
         );
 
-        // Insert
         let mut wtxn: *mut CitadelWriteTxn = ptr::null_mut();
         citadel_write_begin(db, &mut wtxn);
         let key = b"delete_me";
@@ -1726,7 +1688,6 @@ mod tests {
         );
         citadel_write_commit(wtxn);
 
-        // Delete
         let mut wtxn2: *mut CitadelWriteTxn = ptr::null_mut();
         citadel_write_begin(db, &mut wtxn2);
         let mut existed: i32 = 0;
@@ -1737,7 +1698,6 @@ mod tests {
         assert_eq!(existed, 1);
         citadel_write_commit(wtxn2);
 
-        // Verify gone
         let mut rtxn: *mut CitadelReadTxn = ptr::null_mut();
         citadel_read_begin(db, &mut rtxn);
         let mut out_val: *mut u8 = ptr::null_mut();
@@ -1775,7 +1735,6 @@ mod tests {
             ptr::null_mut(),
         );
 
-        // Read within the same write txn
         let mut out_val: *mut u8 = ptr::null_mut();
         let mut out_len: usize = 0;
         assert_eq!(
@@ -1804,7 +1763,6 @@ mod tests {
             &mut db,
         );
 
-        // Insert data
         let mut wtxn: *mut CitadelWriteTxn = ptr::null_mut();
         citadel_write_begin(db, &mut wtxn);
         let key = b"key";
@@ -1819,7 +1777,6 @@ mod tests {
         );
         citadel_write_commit(wtxn);
 
-        // Change passphrase
         let new_pass = b"new_pass";
         assert_eq!(
             citadel_change_passphrase(
@@ -1833,7 +1790,6 @@ mod tests {
         );
         citadel_close(db);
 
-        // Reopen with new passphrase
         let mut db2: *mut CitadelDb = ptr::null_mut();
         assert_eq!(
             citadel_open(
@@ -1846,7 +1802,6 @@ mod tests {
             CitadelError::Ok,
         );
 
-        // Verify data
         let mut rtxn: *mut CitadelReadTxn = ptr::null_mut();
         citadel_read_begin(db2, &mut rtxn);
         let mut out_val: *mut u8 = ptr::null_mut();
@@ -1857,7 +1812,6 @@ mod tests {
         citadel_free_bytes(out_val, out_len);
         citadel_read_end(rtxn);
 
-        // Old passphrase should fail
         citadel_close(db2);
         let mut db3: *mut CitadelDb = ptr::null_mut();
         assert_eq!(
@@ -1870,8 +1824,6 @@ mod tests {
             ),
             CitadelError::BadPassphrase,
         );
-
-        // Clean up
     }
 
     #[test]
@@ -1908,7 +1860,6 @@ mod tests {
         citadel_stats(db, &mut entry_count, ptr::null_mut(), ptr::null_mut());
         assert_eq!(entry_count, 200);
 
-        // Verify first and last
         let mut rtxn: *mut CitadelReadTxn = ptr::null_mut();
         citadel_read_begin(db, &mut rtxn);
 
@@ -1940,7 +1891,6 @@ mod tests {
         let mut conn: *mut CitadelSqlConn = ptr::null_mut();
         citadel_sql_open(db, &mut conn);
 
-        // Parse error
         let bad_sql = CString::new("NOT VALID SQL AT ALL!!!").unwrap();
         let mut result: *mut CitadelSqlResult = ptr::null_mut();
         let rc = citadel_sql_execute(conn, bad_sql.as_ptr(), &mut result);

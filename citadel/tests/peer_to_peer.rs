@@ -21,10 +21,6 @@ fn test_sync_key() -> SyncKey {
     SyncKey::from_bytes([0x42u8; 32])
 }
 
-// ============================================================
-// NodeId persistence
-// ============================================================
-
 #[test]
 fn node_id_generated_and_persisted() {
     let dir = tempfile::tempdir().unwrap();
@@ -64,10 +60,6 @@ fn node_id_unique_per_database() {
     assert_ne!(id_a, id_b);
 }
 
-// ============================================================
-// Basic TCP sync
-// ============================================================
-
 #[test]
 fn sync_to_pushes_kv_data() {
     let dir = tempfile::tempdir().unwrap();
@@ -94,7 +86,6 @@ fn sync_to_pushes_kv_data() {
         db_a.sync_to(&addr, &key).unwrap();
     });
 
-    // Verify B has the data
     let mut rtx = db_b.begin_read();
     assert_eq!(rtx.table_get(b"data", b"k1").unwrap().unwrap(), b"v1");
     assert_eq!(rtx.table_get(b"data", b"k2").unwrap().unwrap(), b"v2");
@@ -137,7 +128,6 @@ fn sync_identical_databases_no_changes() {
     let db_a = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db_b = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
-    // Same data in both
     for db in [&db_a, &db_b] {
         let mut wtx = db.begin_write().unwrap();
         wtx.create_table(b"t").unwrap();
@@ -191,10 +181,6 @@ fn sync_multiple_tables_over_tcp() {
     assert_eq!(rtx.table_get(b"orders", b"o1").unwrap().unwrap(), b"item-A");
 }
 
-// ============================================================
-// Incremental sync
-// ============================================================
-
 #[test]
 fn sync_incremental_two_rounds() {
     let dir = tempfile::tempdir().unwrap();
@@ -202,7 +188,6 @@ fn sync_incremental_two_rounds() {
     let db_a = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db_b = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
-    // Round 1
     {
         let mut wtx = db_a.begin_write().unwrap();
         wtx.create_table(b"data").unwrap();
@@ -221,7 +206,6 @@ fn sync_incremental_two_rounds() {
         db_a.sync_to(&addr, &key).unwrap();
     });
 
-    // Round 2: add more data
     {
         let mut wtx = db_a.begin_write().unwrap();
         wtx.table_insert(b"data", b"k2", b"v2").unwrap();
@@ -243,10 +227,6 @@ fn sync_incremental_two_rounds() {
     assert_eq!(rtx.table_get(b"data", b"k1").unwrap().unwrap(), b"v1");
     assert_eq!(rtx.table_get(b"data", b"k2").unwrap().unwrap(), b"v2");
 }
-
-// ============================================================
-// Sync preserves existing data
-// ============================================================
 
 #[test]
 fn sync_preserves_responder_data() {
@@ -288,10 +268,6 @@ fn sync_preserves_responder_data() {
     assert_eq!(rtx.get(b"default-key").unwrap().unwrap(), b"default-val");
 }
 
-// ============================================================
-// Sync skips index tables
-// ============================================================
-
 #[test]
 fn sync_skips_index_tables_over_tcp() {
     let dir = tempfile::tempdir().unwrap();
@@ -326,10 +302,6 @@ fn sync_skips_index_tables_over_tcp() {
     });
 }
 
-// ============================================================
-// Persistence after sync
-// ============================================================
-
 #[test]
 fn sync_persists_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -358,15 +330,10 @@ fn sync_persists_across_reopen() {
         });
     }
 
-    // Reopen and verify
     let db_b = fast_builder(&path_b).open().unwrap();
     let mut rtx = db_b.begin_read();
     assert_eq!(rtx.table_get(b"t", b"k").unwrap().unwrap(), b"v");
 }
-
-// ============================================================
-// Connection error handling
-// ============================================================
 
 #[test]
 fn sync_to_connection_refused() {
@@ -378,10 +345,6 @@ fn sync_to_connection_refused() {
     let result = db.sync_to("127.0.0.1:1", &key);
     assert!(result.is_err());
 }
-
-// ============================================================
-// Empty databases
-// ============================================================
 
 #[test]
 fn sync_empty_databases_no_crash() {
@@ -402,10 +365,6 @@ fn sync_empty_databases_no_crash() {
         assert!(outcome.tables_synced.is_empty());
     });
 }
-
-// ============================================================
-// Node ID survives sync
-// ============================================================
 
 #[test]
 fn node_id_survives_sync() {
@@ -438,10 +397,6 @@ fn node_id_survives_sync() {
     assert_eq!(db_a.node_id().unwrap(), id_a_before);
     assert_eq!(db_b.node_id().unwrap(), id_b_before);
 }
-
-// ============================================================
-// Large table sync
-// ============================================================
 
 #[test]
 fn sync_large_table_100_entries() {
@@ -490,10 +445,6 @@ fn sync_large_table_100_entries() {
     );
 }
 
-// ============================================================
-// Multiple sync rounds over TCP
-// ============================================================
-
 #[test]
 fn three_sync_rounds_over_tcp() {
     let dir = tempfile::tempdir().unwrap();
@@ -529,10 +480,6 @@ fn three_sync_rounds_over_tcp() {
         );
     }
 }
-
-// ============================================================
-// Wrong key rejected
-// ============================================================
 
 #[test]
 fn sync_wrong_key_rejected() {

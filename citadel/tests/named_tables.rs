@@ -90,7 +90,6 @@ fn table_persist_across_reopen() {
         wtx.commit().unwrap();
     }
 
-    // Reopen and verify
     {
         let db = fast_builder(&db_path).open().unwrap();
         let mut rtx = db.begin_read();
@@ -113,7 +112,6 @@ fn table_update_and_delete() {
 
     let db = fast_builder(&db_path).create().unwrap();
 
-    // Create and populate
     {
         let mut wtx = db.begin_write().unwrap();
         wtx.create_table(b"items").unwrap();
@@ -123,7 +121,6 @@ fn table_update_and_delete() {
         wtx.commit().unwrap();
     }
 
-    // Update and delete
     {
         let mut wtx = db.begin_write().unwrap();
         wtx.table_insert(b"items", b"a", b"updated").unwrap();
@@ -154,7 +151,6 @@ fn drop_table() {
         wtx.commit().unwrap();
     }
 
-    // Drop the table
     {
         let mut wtx = db.begin_write().unwrap();
         wtx.drop_table(b"temp").unwrap();
@@ -211,7 +207,6 @@ fn read_table_snapshot_isolation() {
         wtx.commit().unwrap();
     }
 
-    // Start a reader
     let mut rtx = db.begin_read();
     assert_eq!(
         rtx.table_get(b"data", b"key1").unwrap(),
@@ -263,7 +258,6 @@ fn many_tables_stress() {
         wtx.commit().unwrap();
     }
 
-    // Verify all data
     let mut rtx = db.begin_read();
     for t in 0..20u32 {
         let table_name = format!("table_{t:02}");

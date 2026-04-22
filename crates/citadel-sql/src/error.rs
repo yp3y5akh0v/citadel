@@ -82,6 +82,9 @@ pub enum SqlError {
     #[error("scalar subquery returned more than one row")]
     SubqueryMultipleRows,
 
+    #[error("query returned no rows")]
+    QueryReturnedNoRows,
+
     #[error("parameter count mismatch: expected {expected}, got {got}")]
     ParameterCountMismatch { expected: usize, got: usize },
 

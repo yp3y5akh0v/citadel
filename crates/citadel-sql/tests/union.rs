@@ -17,7 +17,7 @@ fn assert_ok(result: ExecutionResult) {
     }
 }
 
-fn setup_two_tables(conn: &mut Connection) {
+fn setup_two_tables(conn: &Connection) {
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
             .unwrap(),
@@ -32,14 +32,12 @@ fn setup_two_tables(conn: &mut Connection) {
         .unwrap();
 }
 
-// ── 1. UNION removes duplicates ──────────���──────────────────────────
-
 #[test]
 fn union_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = conn
         .query("SELECT id, name FROM t1 UNION SELECT id, name FROM t2")
@@ -57,14 +55,12 @@ fn union_basic() {
     assert_eq!(ids, vec![1, 2, 3, 4]);
 }
 
-// ── 2. UNION ALL keeps duplicates ────────────────���──────────────────
-
 #[test]
 fn union_all_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = conn
         .query("SELECT id, name FROM t1 UNION ALL SELECT id, name FROM t2")
@@ -72,14 +68,12 @@ fn union_all_basic() {
     assert_eq!(qr.rows.len(), 6);
 }
 
-// ── 3. INTERSECT returns common rows ──────────���─────────────────────
-
 #[test]
 fn intersect_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = conn
         .query("SELECT id, name FROM t1 INTERSECT SELECT id, name FROM t2")
@@ -97,13 +91,11 @@ fn intersect_basic() {
     assert_eq!(ids, vec![2, 3]);
 }
 
-// ── 4. INTERSECT ALL (multiset intersection) ────────────────────────
-
 #[test]
 fn intersect_all_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (v INTEGER PRIMARY KEY)")
@@ -124,14 +116,12 @@ fn intersect_all_basic() {
     assert_eq!(qr.rows.len(), 2);
 }
 
-// ── 5. EXCEPT removes right from left ──────────��────────────────────
-
 #[test]
 fn except_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = conn
         .query("SELECT id, name FROM t1 EXCEPT SELECT id, name FROM t2")
@@ -141,13 +131,11 @@ fn except_basic() {
     assert_eq!(qr.rows[0][1], Value::Text("Alice".into()));
 }
 
-// ── 6. EXCEPT ALL (multiset difference) ─────────────────────────────
-
 #[test]
 fn except_all_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (v INTEGER PRIMARY KEY)")
@@ -177,14 +165,12 @@ fn except_all_basic() {
     assert_eq!(vals, vec![1, 3]);
 }
 
-// ── 7. UNION with ORDER BY + LIMIT ────────────────���─────────────────
-
 #[test]
 fn union_order_by_limit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = conn
         .query("SELECT id, name FROM t1 UNION SELECT id, name FROM t2 ORDER BY id LIMIT 3")
@@ -195,14 +181,12 @@ fn union_order_by_limit() {
     assert_eq!(qr.rows[2][0], Value::Integer(3));
 }
 
-// ── 8. Column count mismatch error ────────────────────��─────────────
-
 #[test]
 fn union_column_count_mismatch() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let err = conn
         .execute("SELECT id FROM t1 UNION SELECT id, name FROM t2")
@@ -216,13 +200,11 @@ fn union_column_count_mismatch() {
     );
 }
 
-// ── 9. Three-way UNION ──────────────���───────────────────────────────
-
 #[test]
 fn union_three_way() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (v INTEGER PRIMARY KEY)")
@@ -246,13 +228,11 @@ fn union_three_way() {
     assert_eq!(qr.rows.len(), 4);
 }
 
-// ── 10. INTERSECT has higher precedence than UNION ──────────────────
-
 #[test]
 fn intersect_precedence() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (v INTEGER PRIMARY KEY)")
@@ -287,14 +267,12 @@ fn intersect_precedence() {
     assert_eq!(vals, vec![1, 2, 3]);
 }
 
-// ── 11. UNION with WHERE on individual legs ─────────────────────────
-
 #[test]
 fn union_with_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = conn
         .query("SELECT id, name FROM t1 WHERE id = 1 UNION SELECT id, name FROM t2 WHERE id = 4")
@@ -312,13 +290,11 @@ fn union_with_where() {
     assert_eq!(ids, vec![1, 4]);
 }
 
-// ── 12. Column names come from the left-most SELECT ─────────────────
-
 #[test]
 fn union_different_column_names() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (a INTEGER PRIMARY KEY)")
@@ -338,13 +314,11 @@ fn union_different_column_names() {
     assert_eq!(qr.rows.len(), 2);
 }
 
-// ── 13. EXCEPT removes everything -> 0 rows ────���────────────────────
-
 #[test]
 fn except_empty_result() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (v INTEGER PRIMARY KEY)")
@@ -358,13 +332,11 @@ fn except_empty_result() {
     assert_eq!(qr.rows.len(), 0);
 }
 
-// ── 14. NULL handling in UNION dedup ────────────────────────────────
-
 #[test]
 fn union_with_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, v INTEGER)")
@@ -392,14 +364,12 @@ fn union_with_null() {
     assert_eq!(qr.rows[0][0], Value::Null);
 }
 
-// ── 15. INSERT ... SELECT ... UNION ──────────────��──────────────────
-
 #[test]
 fn insert_select_union() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     assert_ok(
         conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
@@ -418,14 +388,12 @@ fn insert_select_union() {
     assert_eq!(qr.rows[0][0], Value::Integer(4));
 }
 
-// ── 16. UNION with parameters ($1) ──────────────────────────────────
-
 #[test]
 fn union_with_params() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = conn
         .query_params(
@@ -446,14 +414,12 @@ fn union_with_params() {
     assert_eq!(ids, vec![3, 4]);
 }
 
-// ── 17. UNION DISTINCT explicit keyword ─────────────────────────────
-
 #[test]
 fn union_distinct_explicit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = conn
         .query("SELECT id, name FROM t1 UNION DISTINCT SELECT id, name FROM t2")
@@ -461,13 +427,11 @@ fn union_distinct_explicit() {
     assert_eq!(qr.rows.len(), 4);
 }
 
-// ── 18. Empty table on one side ─────────────────────────────────────
-
 #[test]
 fn union_with_empty_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (v INTEGER PRIMARY KEY)")
@@ -500,14 +464,12 @@ fn union_with_empty_table() {
     assert_eq!(qr.rows.len(), 3);
 }
 
-// ── 19. ORDER BY DESC on compound ───────────────────────────────────
-
 #[test]
 fn union_order_by_desc() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = conn
         .query("SELECT id, name FROM t1 UNION SELECT id, name FROM t2 ORDER BY id DESC")
@@ -519,14 +481,12 @@ fn union_order_by_desc() {
     assert_eq!(qr.rows[3][0], Value::Integer(1));
 }
 
-// ── 20. EXCEPT is not commutative ───────────────────────────────────
-
 #[test]
 fn except_not_commutative() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = conn
         .query("SELECT id, name FROM t1 EXCEPT SELECT id, name FROM t2")
@@ -541,14 +501,12 @@ fn except_not_commutative() {
     assert_eq!(qr.rows[0][0], Value::Integer(4));
 }
 
-// ── 21. Rollback discards UNION INSERT ──────────────────────────────
-
 #[test]
 fn union_insert_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     assert_ok(
         conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
@@ -564,13 +522,11 @@ fn union_insert_rollback() {
     assert_eq!(qr.rows[0][0], Value::Integer(0));
 }
 
-// ── 22. UNION in subquery is rejected ───────────────────────────────
-
 #[test]
 fn union_in_subquery_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (v INTEGER PRIMARY KEY)")

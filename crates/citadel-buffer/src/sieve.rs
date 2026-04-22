@@ -1,15 +1,11 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
-/// SIEVE eviction cache.
-///
-/// Single FIFO queue with a moving eviction hand and a visited bit.
-/// Dirty entries are pinned and never evictable.
-///
-/// O(1) amortized eviction.
+/// SIEVE eviction cache. FIFO queue with a moving eviction hand and a
+/// visited bit. Dirty entries are pinned.
 pub struct SieveCache<V> {
     entries: Vec<SieveEntry<V>>,
     /// Maps key -> index in entries vec.
-    index: HashMap<u64, usize>,
+    index: FxHashMap<u64, usize>,
     /// Moving eviction pointer.
     hand: usize,
     /// Number of occupied slots.
@@ -46,7 +42,7 @@ impl<V: Default> SieveCache<V> {
         }
         Self {
             entries,
-            index: HashMap::with_capacity(capacity),
+            index: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
             hand: 0,
             len: 0,
             capacity,
@@ -260,8 +256,6 @@ mod tests {
         cache.insert(3, 300).unwrap();
         assert_eq!(cache.len(), 3);
 
-        // Don't access any - all are unvisited, one should be evicted
-        // Reset visited flags by clearing them
         for entry in &mut cache.entries {
             entry.visited = false;
         }
@@ -278,15 +272,12 @@ mod tests {
         cache.insert(2, 200).unwrap();
         cache.insert(3, 300).unwrap();
 
-        // Reset all visited flags
         for entry in &mut cache.entries {
             entry.visited = false;
         }
 
-        // Access entry 2 (marks visited)
         cache.get(2);
 
-        // Insert 4 - should evict 1 or 3 (not 2)
         let evicted = cache.insert(4, 400).unwrap().unwrap();
         assert_ne!(evicted.0, 2, "visited entry should not be evicted");
         assert!(cache.contains(2));
@@ -299,15 +290,12 @@ mod tests {
         cache.insert(1, 100).unwrap();
         cache.insert(2, 200).unwrap();
 
-        // Reset visited
         for entry in &mut cache.entries {
             entry.visited = false;
         }
 
-        // Mark entry 1 dirty
         cache.set_dirty(1);
 
-        // Insert 3 - must evict 2 (not dirty 1)
         let evicted = cache.insert(3, 300).unwrap().unwrap();
         assert_eq!(evicted.0, 2);
         assert!(cache.contains(1));
@@ -323,7 +311,6 @@ mod tests {
         cache.set_dirty(1);
         cache.set_dirty(2);
 
-        // Reset visited
         for entry in &mut cache.entries {
             entry.visited = false;
         }

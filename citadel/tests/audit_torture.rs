@@ -72,10 +72,6 @@ fn generate_entries(dir: &Path, pass: &[u8], integrity_checks: usize) -> (usize,
     (entries.len(), key)
 }
 
-// ============================================================================
-// Corruption at every entry position
-// ============================================================================
-
 #[test]
 fn torture_corrupt_each_entry_individually() {
     let dir = tempfile::tempdir().unwrap();
@@ -180,10 +176,6 @@ fn torture_corrupt_entry_len_each_position() {
     }
 }
 
-// ============================================================================
-// Multiple simultaneous corruptions
-// ============================================================================
-
 #[test]
 fn torture_multiple_corrupted_entries() {
     let dir = tempfile::tempdir().unwrap();
@@ -268,10 +260,6 @@ fn torture_consecutive_corrupted_entries() {
     }
 }
 
-// ============================================================================
-// False positive sentinel rejection
-// ============================================================================
-
 #[test]
 fn torture_false_positive_magic_in_detail_data() {
     let dir = tempfile::tempdir().unwrap();
@@ -308,10 +296,6 @@ fn torture_false_positive_magic_in_detail_data() {
     let result = verify_audit_log(&ap, &key).unwrap();
     assert!(!result.chain_valid);
 }
-
-// ============================================================================
-// Boundary corruption patterns
-// ============================================================================
 
 #[test]
 fn torture_hmac_corruption_structural_recovery() {
@@ -410,10 +394,6 @@ fn torture_invalid_detail_len_skipped() {
     assert!(seq_nos.contains(&5));
 }
 
-// ============================================================================
-// Large-scale sentinel scanning
-// ============================================================================
-
 #[test]
 fn torture_large_scale_scattered_corruption() {
     let dir = tempfile::tempdir().unwrap();
@@ -478,10 +458,6 @@ fn torture_large_scale_scattered_corruption() {
     }
 }
 
-// ============================================================================
-// Zeroed regions
-// ============================================================================
-
 #[test]
 fn torture_zeroed_byte_block_spanning_entries() {
     let dir = tempfile::tempdir().unwrap();
@@ -541,10 +517,6 @@ fn torture_all_entries_zeroed() {
     assert!(!scan.corruption_offsets.is_empty());
 }
 
-// ============================================================================
-// Random byte corruption
-// ============================================================================
-
 #[test]
 fn torture_random_byte_overwrites_no_panic() {
     let dir = tempfile::tempdir().unwrap();
@@ -574,10 +546,6 @@ fn torture_random_byte_overwrites_no_panic() {
     let strict = read_audit_log(&ap).unwrap();
     assert!(strict.len() <= total);
 }
-
-// ============================================================================
-// Truncation patterns
-// ============================================================================
 
 #[test]
 fn torture_truncation_at_every_boundary() {
@@ -633,10 +601,6 @@ fn torture_truncation_at_every_boundary() {
     }
 }
 
-// ============================================================================
-// Scan correctness vs read_audit_log on healthy file
-// ============================================================================
-
 #[test]
 fn torture_scan_matches_read_on_healthy_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -659,10 +623,6 @@ fn torture_scan_matches_read_on_healthy_file() {
         assert_eq!(s.hmac, r.hmac);
     }
 }
-
-// ============================================================================
-// Chain integrity across corruption patterns
-// ============================================================================
 
 #[test]
 fn torture_chain_break_point_matches_corruption() {
@@ -687,10 +647,6 @@ fn torture_chain_break_point_matches_corruption() {
     assert_eq!(result.chain_break_at, Some(5));
     assert_eq!(result.entries_verified, 4);
 }
-
-// ============================================================================
-// Edge cases
-// ============================================================================
 
 #[test]
 fn torture_header_only_file() {
@@ -783,10 +739,6 @@ fn torture_single_entry_corrupted() {
     assert!(!scan.entries.is_empty());
 }
 
-// ============================================================================
-// Sequence number and ordering after recovery
-// ============================================================================
-
 #[test]
 fn torture_recovered_entries_monotonic_sequence() {
     let dir = tempfile::tempdir().unwrap();
@@ -825,10 +777,6 @@ fn torture_recovered_entries_monotonic_sequence() {
         );
     }
 }
-
-// ============================================================================
-// Rotation + corruption interaction
-// ============================================================================
 
 #[test]
 fn torture_rotation_then_corrupt_rotated() {
@@ -917,10 +865,6 @@ fn torture_scan_rotated_file() {
     }
 }
 
-// ============================================================================
-// Verify scan handles appended garbage after valid entries
-// ============================================================================
-
 #[test]
 fn torture_trailing_garbage_after_valid_entries() {
     let dir = tempfile::tempdir().unwrap();
@@ -956,10 +900,6 @@ fn torture_trailing_magic_without_full_entry() {
     let scan = scan_corrupted_audit_log(&ap).unwrap();
     assert_eq!(scan.entries.len(), total);
 }
-
-// ============================================================================
-// Small entry_len corruption values
-// ============================================================================
 
 #[test]
 fn torture_entry_len_below_minimum() {
@@ -1008,10 +948,6 @@ fn torture_entry_len_below_minimum() {
         }
     }
 }
-
-// ============================================================================
-// Off-by-one entry_len
-// ============================================================================
 
 #[test]
 fn torture_entry_len_off_by_one_too_large() {
@@ -1109,10 +1045,6 @@ fn torture_entry_len_off_by_entry_alignment() {
     }
 }
 
-// ============================================================================
-// Scan + Verify coherence after corruption
-// ============================================================================
-
 #[test]
 fn torture_scan_and_verify_coherent_after_gap() {
     let dir = tempfile::tempdir().unwrap();
@@ -1148,10 +1080,6 @@ fn torture_scan_and_verify_coherent_after_gap() {
     assert!(header_count > result.entries_verified);
     assert!(scan.entries.len() > result.entries_verified as usize);
 }
-
-// ============================================================================
-// Crafted false positive in corrupted data
-// ============================================================================
 
 #[test]
 fn torture_crafted_false_positive_in_corrupted_region() {
@@ -1194,10 +1122,6 @@ fn torture_crafted_false_positive_in_corrupted_region() {
     assert!(!result.chain_valid);
     assert!(result.entries_verified >= 2);
 }
-
-// ============================================================================
-// High-volume stress tests
-// ============================================================================
 
 #[test]
 fn torture_50_entries_scattered_corruption() {
@@ -1250,7 +1174,6 @@ fn torture_50_entries_scattered_corruption() {
     );
     assert_eq!(scan.corruption_offsets.len(), corrupt_indices.len());
 
-    // Verify exact set
     let recovered: std::collections::HashSet<u64> =
         scan.entries.iter().map(|e| e.sequence_no).collect();
     for seq in 1..=total as u64 {
@@ -1308,7 +1231,6 @@ fn torture_100_entries_healthy_scan_verify() {
     assert_eq!(scan.entries.len(), entries.len());
     assert!(scan.corruption_offsets.is_empty());
 
-    // Verify: full HMAC chain valid
     let key = get_audit_key(dir.path(), pass);
     let result = verify_audit_log(&ap, &key).unwrap();
     assert!(result.chain_valid);
@@ -1325,10 +1247,6 @@ fn torture_100_entries_healthy_scan_verify() {
         );
     }
 }
-
-// ============================================================================
-// Entry length boundary cases
-// ============================================================================
 
 /// Corrupt the entry_len field to exactly equal the file's remaining bytes.
 /// This makes the entry appear to extend to EOF - a subtle boundary case.
@@ -1396,7 +1314,6 @@ fn torture_repeated_magic_bytes_no_phantom() {
     // (magic bytes as entry_len = 0x454E5452 = ~1.16 billion, way too large)
     let seq_nos: Vec<u64> = scan.entries.iter().map(|e| e.sequence_no).collect();
 
-    // No phantom entries with sequence numbers that don't belong
     for e in &scan.entries {
         assert!(
             e.sequence_no >= 1 && e.sequence_no <= total as u64,

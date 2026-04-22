@@ -28,7 +28,7 @@ impl CitadelDb {
     ///
     /// Returns the number of rows affected, or 0 for DDL.
     pub fn execute(&self, sql: &str) -> Result<u64, String> {
-        let mut conn = Connection::open(&self.db).map_err(|e| format!("{e}"))?;
+        let conn = Connection::open(&self.db).map_err(|e| format!("{e}"))?;
         match conn.execute(sql).map_err(|e| format!("{e}"))? {
             ExecutionResult::RowsAffected(n) => Ok(n),
             ExecutionResult::Query(_) => Ok(0),
@@ -41,7 +41,7 @@ impl CitadelDb {
     /// Returns a tuple of (column_names, rows) where each row is a
     /// vector of string-formatted values.
     pub fn query(&self, sql: &str) -> Result<QueryResultData, String> {
-        let mut conn = Connection::open(&self.db).map_err(|e| format!("{e}"))?;
+        let conn = Connection::open(&self.db).map_err(|e| format!("{e}"))?;
         let qr = conn.query(sql).map_err(|e| format!("{e}"))?;
 
         let rows: Vec<Vec<CellValue>> = qr
@@ -58,7 +58,7 @@ impl CitadelDb {
 
     /// Execute multiple SQL statements separated by semicolons.
     pub fn execute_batch(&self, sql: &str) -> Result<(), String> {
-        let mut conn = Connection::open(&self.db).map_err(|e| format!("{e}"))?;
+        let conn = Connection::open(&self.db).map_err(|e| format!("{e}"))?;
         for stmt in sql.split(';') {
             let trimmed = stmt.trim();
             if trimmed.is_empty() {

@@ -24,14 +24,14 @@ fn assert_rows_affected(result: ExecutionResult, expected: u64) {
     }
 }
 
-fn query(conn: &mut Connection, sql: &str) -> QueryResult {
+fn query(conn: &Connection, sql: &str) -> QueryResult {
     match conn.execute(sql).unwrap() {
         ExecutionResult::Query(qr) => qr,
         other => panic!("expected Query, got {other:?}"),
     }
 }
 
-fn setup_users_orders(conn: &mut Connection) {
+fn setup_users_orders(conn: &Connection) {
     assert_ok(
         conn.execute("CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
             .unwrap(),
@@ -57,10 +57,10 @@ fn setup_users_orders(conn: &mut Connection) {
 fn basic_inner_join() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
-    let qr = query(&mut conn,
+    let qr = query(&conn,
         "SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id ORDER BY o.id"
     );
     assert_eq!(qr.rows.len(), 3);
@@ -82,11 +82,11 @@ fn basic_inner_join() {
 fn inner_join_excludes_non_matching() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id",
     );
     let names: Vec<&Value> = qr.rows.iter().map(|r| &r[0]).collect();
@@ -97,11 +97,11 @@ fn inner_join_excludes_non_matching() {
 fn join_bare_keyword_is_inner() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.id",
     );
     assert_eq!(qr.rows.len(), 3);
@@ -111,10 +111,10 @@ fn join_bare_keyword_is_inner() {
 fn one_to_many_join() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
-    let qr = query(&mut conn,
+    let qr = query(&conn,
         "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.name = 'Alice' ORDER BY o.amount"
     );
     assert_eq!(qr.rows.len(), 2);
@@ -126,7 +126,7 @@ fn one_to_many_join() {
 fn cross_join_cartesian_product() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE a (x INTEGER NOT NULL PRIMARY KEY)")
@@ -147,7 +147,7 @@ fn cross_join_cartesian_product() {
     );
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT a.x, b.y FROM a CROSS JOIN b ORDER BY a.x, b.y",
     );
     assert_eq!(qr.rows.len(), 6);
@@ -159,10 +159,10 @@ fn cross_join_cartesian_product() {
 fn left_join_includes_unmatched() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
-    let qr = query(&mut conn,
+    let qr = query(&conn,
         "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id ORDER BY u.id, o.id"
     );
     assert_eq!(qr.rows.len(), 4);
@@ -185,7 +185,7 @@ fn left_join_includes_unmatched() {
 fn self_join() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE employees (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL, manager_id INTEGER)"
@@ -194,7 +194,7 @@ fn self_join() {
         "INSERT INTO employees (id, name, manager_id) VALUES (1, 'Boss', NULL), (2, 'Alice', 1), (3, 'Bob', 1)"
     ).unwrap(), 3);
 
-    let qr = query(&mut conn,
+    let qr = query(&conn,
         "SELECT e.name, m.name FROM employees e JOIN employees m ON e.manager_id = m.id ORDER BY e.id"
     );
     assert_eq!(qr.rows.len(), 2);
@@ -212,7 +212,7 @@ fn self_join() {
 fn three_table_join() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -245,7 +245,7 @@ fn three_table_join() {
     ).unwrap(), 3);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT c.name, p.title FROM customers c \
          JOIN purchases pu ON c.id = pu.cust_id \
          JOIN products p ON pu.prod_id = p.id \
@@ -270,10 +270,10 @@ fn three_table_join() {
 fn join_with_where_filter() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
-    let qr = query(&mut conn,
+    let qr = query(&conn,
         "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 40.0 ORDER BY o.amount"
     );
     assert_eq!(qr.rows.len(), 2);
@@ -285,10 +285,10 @@ fn join_with_where_filter() {
 fn join_with_order_limit_offset() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
-    let qr = query(&mut conn,
+    let qr = query(&conn,
         "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.amount LIMIT 2 OFFSET 1"
     );
     assert_eq!(qr.rows.len(), 2);
@@ -300,10 +300,10 @@ fn join_with_order_limit_offset() {
 fn join_with_aggregation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
-    let qr = query(&mut conn,
+    let qr = query(&conn,
         "SELECT u.name, COUNT(*), SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name ORDER BY u.name"
     );
     assert_eq!(qr.rows.len(), 2);
@@ -319,11 +319,11 @@ fn join_with_aggregation() {
 fn join_with_distinct() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT DISTINCT u.name FROM users u JOIN orders o ON u.id = o.user_id ORDER BY u.name",
     );
     assert_eq!(qr.rows.len(), 2);
@@ -335,11 +335,11 @@ fn join_with_distinct() {
 fn qualified_column_resolution() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT u.id, o.id FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.id",
     );
     assert_eq!(qr.rows.len(), 3);
@@ -350,11 +350,11 @@ fn qualified_column_resolution() {
 fn unqualified_unique_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT name, amount FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.id",
     );
     assert_eq!(qr.rows.len(), 3);
@@ -366,8 +366,8 @@ fn unqualified_unique_column() {
 fn ambiguous_column_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let result = conn.execute("SELECT id FROM users u JOIN orders o ON u.id = o.user_id");
     assert!(matches!(result, Err(SqlError::AmbiguousColumn(_))));
@@ -377,11 +377,11 @@ fn ambiguous_column_error() {
 fn select_star_with_join() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT * FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.id",
     );
     assert_eq!(qr.rows.len(), 3);
@@ -397,7 +397,7 @@ fn select_star_with_join() {
 fn join_on_non_pk_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)")
@@ -419,7 +419,7 @@ fn join_on_non_pk_column() {
     );
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.val = t2.val",
     );
     assert_eq!(qr.rows.len(), 1);
@@ -430,7 +430,7 @@ fn join_on_non_pk_column() {
 fn join_null_equality_excludes_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, ref_id INTEGER)")
@@ -448,7 +448,7 @@ fn join_null_equality_excludes_rows() {
     assert_rows_affected(conn.execute("INSERT INTO t2 (id) VALUES (100)").unwrap(), 1);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.ref_id = t2.id",
     );
     assert_eq!(qr.rows.len(), 1);
@@ -459,7 +459,7 @@ fn join_null_equality_excludes_rows() {
 fn join_with_empty_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY)")
@@ -475,7 +475,7 @@ fn join_with_empty_table() {
     );
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.id = t2.id",
     );
     assert_eq!(qr.rows.len(), 0);
@@ -485,7 +485,7 @@ fn join_with_empty_table() {
 fn join_with_complex_on_clause() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, x INTEGER NOT NULL)")
@@ -507,7 +507,7 @@ fn join_with_complex_on_clause() {
     );
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.x = t2.y AND t1.x > 5 ORDER BY t1.id",
     );
     assert_eq!(qr.rows.len(), 2);
@@ -519,7 +519,7 @@ fn join_with_complex_on_clause() {
 fn join_same_table_twice() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
@@ -531,7 +531,7 @@ fn join_same_table_twice() {
         3,
     );
 
-    let qr = query(&mut conn,
+    let qr = query(&conn,
         "SELECT a.name, b.name FROM items a CROSS JOIN items b WHERE a.id < b.id ORDER BY a.id, b.id"
     );
     assert_eq!(qr.rows.len(), 3);
@@ -553,7 +553,7 @@ fn join_same_table_twice() {
 fn join_scale_100x1000() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
@@ -579,7 +579,7 @@ fn join_scale_100x1000() {
     }
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT COUNT(*) FROM users u JOIN orders o ON u.id = o.uid",
     );
     assert_eq!(qr.rows[0][0], Value::Integer(1000));
@@ -589,7 +589,7 @@ fn join_scale_100x1000() {
 fn join_within_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
 
@@ -614,7 +614,7 @@ fn join_within_transaction() {
     );
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT t1.val, t2.id FROM t1 JOIN t2 ON t1.id = t2.ref_id ORDER BY t2.id",
     );
     assert_eq!(qr.rows.len(), 2);
@@ -630,11 +630,11 @@ fn join_within_transaction() {
 fn right_join_includes_unmatched_right() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT u.name, o.id FROM users u RIGHT JOIN orders o ON u.id = o.user_id ORDER BY o.id",
     );
     assert_eq!(qr.rows.len(), 3);
@@ -656,7 +656,7 @@ fn right_join_includes_unmatched_right() {
 fn right_join_null_pads_left_side() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, val TEXT NOT NULL)")
@@ -678,7 +678,7 @@ fn right_join_null_pads_left_side() {
     );
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT t1.val, t2.id FROM t1 RIGHT JOIN t2 ON t1.id = t2.ref_id ORDER BY t2.id",
     );
     assert_eq!(qr.rows.len(), 2);
@@ -693,7 +693,7 @@ fn right_join_null_pads_left_side() {
 fn right_join_empty_left_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY)")
@@ -710,7 +710,7 @@ fn right_join_empty_left_table() {
     );
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT t1.id, t2.id FROM t1 RIGHT JOIN t2 ON t1.id = t2.id ORDER BY t2.id",
     );
     assert_eq!(qr.rows.len(), 3);
@@ -723,7 +723,7 @@ fn right_join_empty_left_table() {
 fn right_join_within_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
 
@@ -747,7 +747,7 @@ fn right_join_within_transaction() {
     );
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT t1.val, t2.id FROM t1 RIGHT JOIN t2 ON t1.id = t2.ref_id ORDER BY t2.id",
     );
     assert_eq!(qr.rows.len(), 2);
@@ -764,7 +764,7 @@ fn right_join_within_transaction() {
 fn join_table_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY)")

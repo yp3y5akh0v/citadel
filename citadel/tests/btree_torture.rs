@@ -9,7 +9,8 @@ use citadel_core::types::*;
 use citadel_page::branch_node;
 use citadel_page::leaf_node;
 use citadel_page::page::Page;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use rustc_hash::FxHashMap;
+use std::collections::{BTreeMap, HashSet};
 
 struct Rng(u32);
 impl Rng {
@@ -27,13 +28,9 @@ impl Rng {
     }
 }
 
-// =========================================================================
-// Empty key
-// =========================================================================
-
 #[test]
 fn empty_key() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -82,13 +79,9 @@ fn empty_key() {
     assert_eq!(tree.entry_count, 2);
 }
 
-// =========================================================================
-// Max key + max value simultaneously
-// =========================================================================
-
 #[test]
 fn max_key_max_value_together() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -129,13 +122,9 @@ fn max_key_max_value_together() {
     assert!(result.1.iter().all(|b| *b == 0xCC));
 }
 
-// =========================================================================
-// Multiple max-size entries force splits
-// =========================================================================
-
 #[test]
 fn many_max_size_entries() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -189,13 +178,9 @@ fn many_max_size_entries() {
     assert_eq!(count_scanned, count);
 }
 
-// =========================================================================
-// Delete from left edge repeatedly (stresses merge on left side)
-// =========================================================================
-
 #[test]
 fn delete_from_left_edge() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -236,13 +221,9 @@ fn delete_from_left_edge() {
     assert_eq!(tree.entry_count, 0);
 }
 
-// =========================================================================
-// Delete from right edge repeatedly (stresses merge on right side)
-// =========================================================================
-
 #[test]
 fn delete_from_right_edge() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -282,13 +263,9 @@ fn delete_from_right_edge() {
     assert_eq!(tree.entry_count, 0);
 }
 
-// =========================================================================
-// Alternating insert/delete pattern (delete every other)
-// =========================================================================
-
 #[test]
 fn delete_every_other_key() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
     let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -328,13 +305,9 @@ fn delete_every_other_key() {
     assert!(!cursor.is_valid());
 }
 
-// =========================================================================
-// Cursor: prev from first position, next from last position
-// =========================================================================
-
 #[test]
 fn cursor_boundary_movement() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -366,13 +339,9 @@ fn cursor_boundary_movement() {
     assert!(!cursor.is_valid());
 }
 
-// =========================================================================
-// Cursor: seek past all keys
-// =========================================================================
-
 #[test]
 fn cursor_seek_past_all() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -401,13 +370,9 @@ fn cursor_seek_past_all() {
     assert_eq!(entry.key, b"0000");
 }
 
-// =========================================================================
-// Cursor: full reverse iteration
-// =========================================================================
-
 #[test]
 fn cursor_full_reverse_matches_forward() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -442,13 +407,9 @@ fn cursor_full_reverse_matches_forward() {
     assert_eq!(forward_keys, reverse_keys);
 }
 
-// =========================================================================
-// Cursor: seek then reverse
-// =========================================================================
-
 #[test]
 fn cursor_seek_then_reverse() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -480,13 +441,9 @@ fn cursor_seek_then_reverse() {
     assert_eq!(count, 100);
 }
 
-// =========================================================================
-// Binary keys with all byte values
-// =========================================================================
-
 #[test]
 fn binary_keys_all_byte_values() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -525,13 +482,9 @@ fn binary_keys_all_byte_values() {
     assert_eq!(tree.entry_count, 0);
 }
 
-// =========================================================================
-// Keys that differ only in the last byte
-// =========================================================================
-
 #[test]
 fn keys_differ_only_in_last_byte() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -559,13 +512,9 @@ fn keys_differ_only_in_last_byte() {
     }
 }
 
-// =========================================================================
-// Keys that are prefixes of each other
-// =========================================================================
-
 #[test]
 fn prefix_key_chains() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -608,13 +557,9 @@ fn prefix_key_chains() {
     }
 }
 
-// =========================================================================
-// Allocator: heavy page churn with CoW across many transactions
-// =========================================================================
-
 #[test]
 fn allocator_heavy_page_churn() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -664,13 +609,9 @@ fn allocator_heavy_page_churn() {
     );
 }
 
-// =========================================================================
-// Allocator: rollback discards freed pages
-// =========================================================================
-
 #[test]
 fn allocator_rollback_discards_freed() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -710,13 +651,9 @@ fn allocator_rollback_discards_freed() {
     assert!(alloc.high_water_mark() >= hwm_after_commit);
 }
 
-// =========================================================================
-// Tree structure verification: all leaves at same depth
-// =========================================================================
-
 #[test]
 fn all_leaves_at_same_depth() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -771,13 +708,9 @@ fn all_leaves_at_same_depth() {
     assert_eq!(*leaf_depths.iter().next().unwrap(), (tree.depth - 1) as u32);
 }
 
-// =========================================================================
-// Tree structure: keys in branch pages are valid separators
-// =========================================================================
-
 #[test]
 fn branch_separators_valid() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -823,13 +756,9 @@ fn branch_separators_valid() {
     }
 }
 
-// =========================================================================
-// Leaf pages: keys in sorted order within each leaf
-// =========================================================================
-
 #[test]
 fn leaf_keys_sorted_within_page() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -879,13 +808,9 @@ fn leaf_keys_sorted_within_page() {
     }
 }
 
-// =========================================================================
-// No duplicate page references in live tree
-// =========================================================================
-
 #[test]
 fn no_duplicate_page_references() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -929,13 +854,9 @@ fn no_duplicate_page_references() {
     }
 }
 
-// =========================================================================
-// Reverse sequential insert (left-edge stress)
-// =========================================================================
-
 #[test]
 fn reverse_sequential_insert() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -964,13 +885,9 @@ fn reverse_sequential_insert() {
     assert!(!cursor.is_valid());
 }
 
-// =========================================================================
-// Interleaved insert pattern (even then odd)
-// =========================================================================
-
 #[test]
 fn interleaved_insert_pattern() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
     let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -1016,13 +933,9 @@ fn interleaved_insert_pattern() {
     assert!(!cursor.is_valid());
 }
 
-// =========================================================================
-// Empty value stress
-// =========================================================================
-
 #[test]
 fn empty_value_stress() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -1070,13 +983,9 @@ fn empty_value_stress() {
     }
 }
 
-// =========================================================================
-// Heavy randomized: 50K operations
-// =========================================================================
-
 #[test]
 fn heavy_expected_50k_ops() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
     let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -1143,13 +1052,9 @@ fn heavy_expected_50k_ops() {
     assert_eq!(count, expected.len() as u64);
 }
 
-// =========================================================================
-// CoW across multiple transaction IDs
-// =========================================================================
-
 #[test]
 fn cow_across_many_txn_ids() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -1200,13 +1105,9 @@ fn cow_across_many_txn_ids() {
     }
 }
 
-// =========================================================================
-// Delete all in random order, verify tree invariants at each step
-// =========================================================================
-
 #[test]
 fn delete_all_random_order_verify_invariants() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -1259,13 +1160,9 @@ fn delete_all_random_order_verify_invariants() {
     assert_eq!(tree.entry_count, 0);
 }
 
-// =========================================================================
-// Insert-heavy then delete-all then reinsert (exercises merge to empty)
-// =========================================================================
-
 #[test]
 fn insert_delete_all_reinsert_3_cycles() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -1297,13 +1194,9 @@ fn insert_delete_all_reinsert_3_cycles() {
     }
 }
 
-// =========================================================================
-// Verify entry_count is accurate through all operations
-// =========================================================================
-
 #[test]
 fn entry_count_always_accurate() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
     let mut expected: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
@@ -1338,13 +1231,9 @@ fn entry_count_always_accurate() {
     }
 }
 
-// =========================================================================
-// Cursor on tree with exactly 2 entries
-// =========================================================================
-
 #[test]
 fn cursor_two_entries() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -1386,13 +1275,9 @@ fn cursor_two_entries() {
     assert_eq!(cursor.current(&pages).unwrap().key, b"z");
 }
 
-// =========================================================================
-// Update value to different size (shrink/grow)
-// =========================================================================
-
 #[test]
 fn update_value_size_changes() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -1457,13 +1342,9 @@ fn update_value_size_changes() {
     assert_eq!(result.1.len(), MAX_INLINE_VALUE_SIZE);
 }
 
-// =========================================================================
-// Monotonically increasing keys with periodic bulk deletes
-// =========================================================================
-
 #[test]
 fn monotonic_insert_with_periodic_bulk_delete() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
     let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -1504,13 +1385,9 @@ fn monotonic_insert_with_periodic_bulk_delete() {
     assert!(!cursor.is_valid());
 }
 
-// =========================================================================
-// Stress: many keys with identical prefixes (exercises binary search)
-// =========================================================================
-
 #[test]
 fn identical_prefix_keys() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -1547,13 +1424,9 @@ fn identical_prefix_keys() {
     assert_eq!(tree.entry_count, 200);
 }
 
-// =========================================================================
-// Verify search returns None for keys between existing keys
-// =========================================================================
-
 #[test]
 fn search_nonexistent_keys_between_existing() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 
@@ -1579,13 +1452,9 @@ fn search_nonexistent_keys_between_existing() {
     }
 }
 
-// =========================================================================
-// Split then merge stress (grow tree deep, then shrink it back)
-// =========================================================================
-
 #[test]
 fn grow_deep_then_shrink() {
-    let mut pages: HashMap<PageId, Page> = HashMap::new();
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
     let mut alloc = PageAllocator::new(0);
     let mut tree = BTree::new(&mut pages, &mut alloc, TxnId(1));
 

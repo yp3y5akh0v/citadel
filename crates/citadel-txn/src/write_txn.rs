@@ -5,7 +5,7 @@ use citadel_core::{Error, Result, MAX_INLINE_VALUE_SIZE, MAX_KEY_SIZE};
 use citadel_io::file_manager::CommitSlot;
 use citadel_page::branch_node;
 use citadel_page::page::Page;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use citadel_buffer::allocator::PageAllocator;
 use citadel_buffer::btree::{self, BTree};
@@ -15,7 +15,7 @@ use crate::catalog::TableDescriptor;
 use crate::manager::TxnManager;
 
 struct WritePages<'a> {
-    pages: &'a mut HashMap<PageId, Page>,
+    pages: &'a mut FxHashMap<PageId, Page>,
     manager: &'a TxnManager,
 }
 
@@ -40,39 +40,38 @@ pub struct WriteTxn<'a> {
     base_txn_id: TxnId,
     txn_id: TxnId,
     old_slot: CommitSlot,
-    pages: HashMap<PageId, Page>,
+    pages: FxHashMap<PageId, Page>,
     tree: BTree,
     alloc: PageAllocator,
     committed: bool,
     deferred_free: Vec<PageId>,
-    named_trees: HashMap<Vec<u8>, BTree>,
+    named_trees: FxHashMap<Vec<u8>, BTree>,
     catalog: Option<BTree>,
     catalog_dirty: bool,
-    loaded_tree_meta: HashMap<Vec<u8>, (PageId, u16)>,
+    loaded_tree_meta: FxHashMap<Vec<u8>, (PageId, u16)>,
 }
 
 #[derive(Clone)]
 pub struct WriteTxnSnapshot {
-    txn_id: TxnId,
     tree: BTree,
     alloc: PageAllocator,
-    named_trees: HashMap<Vec<u8>, BTree>,
+    named_trees: FxHashMap<Vec<u8>, BTree>,
     catalog: Option<BTree>,
     catalog_dirty: bool,
-    loaded_tree_meta: HashMap<Vec<u8>, (PageId, u16)>,
+    loaded_tree_meta: FxHashMap<Vec<u8>, (PageId, u16)>,
     deferred_free: Vec<PageId>,
 }
 
-impl<'a> WriteTxn<'a> {
+impl<'db> WriteTxn<'db> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        manager: &'a TxnManager,
+        manager: &'db TxnManager,
         txn_id: TxnId,
         snapshot: CommitSlot,
         tree: BTree,
         alloc: PageAllocator,
         deferred_free: Vec<PageId>,
-        recycled_pages: Option<HashMap<PageId, Page>>,
+        recycled_pages: Option<FxHashMap<PageId, Page>>,
         recycle_safe: bool,
     ) -> Self {
         let pages = match recycled_pages {
@@ -82,7 +81,7 @@ impl<'a> WriteTxn<'a> {
                 }
                 m
             }
-            None => HashMap::with_capacity(16),
+            None => FxHashMap::with_capacity_and_hasher(16, Default::default()),
         };
         Self {
             manager,
@@ -94,10 +93,10 @@ impl<'a> WriteTxn<'a> {
             alloc,
             committed: false,
             deferred_free,
-            named_trees: HashMap::new(),
+            named_trees: FxHashMap::default(),
             catalog: None,
             catalog_dirty: false,
-            loaded_tree_meta: HashMap::new(),
+            loaded_tree_meta: FxHashMap::default(),
         }
     }
 
@@ -196,6 +195,25 @@ impl<'a> WriteTxn<'a> {
         Ok(())
     }
 
+    /// Pull-based scan from `start_key`. Returns a lending iterator.
+    pub fn table_scan_iter<'a>(
+        &'a mut self,
+        table: &[u8],
+        start_key: &[u8],
+    ) -> Result<crate::scan_iter::TableIter<WriteTxnScanAdapter<'a, 'db>>> {
+        self.ensure_table(table)?;
+        let root = self.named_trees[table].root;
+        let cursor = {
+            let mut view = WritePages {
+                pages: &mut self.pages,
+                manager: self.manager,
+            };
+            Cursor::seek_lazy(&mut view, root, start_key)?
+        };
+        let adapter = WriteTxnScanAdapter { txn: self };
+        Ok(crate::scan_iter::TableIter::new(adapter, cursor))
+    }
+
     pub fn create_table(&mut self, name: &[u8]) -> Result<()> {
         self.ensure_catalog()?;
 
@@ -245,7 +263,7 @@ impl<'a> WriteTxn<'a> {
         Ok(())
     }
 
-    /// Rename a table in the catalog. O(1) - no data copy.
+    /// Rename a table in the catalog.
     pub fn rename_table(&mut self, old_name: &[u8], new_name: &[u8]) -> Result<()> {
         self.ensure_table(old_name)?;
 
@@ -292,19 +310,25 @@ impl<'a> WriteTxn<'a> {
     pub fn table_insert(&mut self, table: &[u8], key: &[u8], value: &[u8]) -> Result<bool> {
         Self::validate_key_value(key, value)?;
 
-        let (root, lil_hit) = match self.named_trees.get(table) {
-            Some(tree) => (tree.root, tree.lil_would_hit(&self.pages, key)),
-            None => {
-                self.ensure_table(table)?;
-                let tree = &self.named_trees[table];
-                (tree.root, tree.lil_would_hit(&self.pages, key))
+        if let Some(tree) = self.named_trees.get_mut(table) {
+            let root = tree.root;
+            let lil_hit = tree.lil_would_hit(&self.pages, key);
+            if !lil_hit {
+                Self::preload_path_raw(&mut self.pages, self.manager, root, key)?;
             }
-        };
-        if !lil_hit {
-            self.preload_path(root, key)?;
+            return tree.insert(
+                &mut self.pages,
+                &mut self.alloc,
+                self.txn_id,
+                key,
+                ValueType::Inline,
+                value,
+            );
         }
-
+        self.ensure_table(table)?;
         let tree = self.named_trees.get_mut(table).unwrap();
+        let root = tree.root;
+        Self::preload_path_raw(&mut self.pages, self.manager, root, key)?;
         tree.insert(
             &mut self.pages,
             &mut self.alloc,
@@ -315,13 +339,12 @@ impl<'a> WriteTxn<'a> {
         )
     }
 
-    /// Batch-update existing keys (sorted). Single traversal: O(depth + N).
+    /// Batch-update existing keys. Keys must be sorted.
     pub fn table_update_sorted(&mut self, table: &[u8], pairs: &[(&[u8], &[u8])]) -> Result<u64> {
         if pairs.is_empty() {
             return Ok(0);
         }
         self.ensure_table(table)?;
-        // Preload path to first key only
         let root = self.named_trees[table].root;
         self.preload_path(root, pairs[0].0)?;
 
@@ -343,7 +366,6 @@ impl<'a> WriteTxn<'a> {
         self.ensure_table(table)?;
         let root = self.named_trees[table].root;
 
-        // Lazy-seek to start_key
         let mut view = WritePages {
             pages: &mut self.pages,
             manager: self.manager,
@@ -354,7 +376,6 @@ impl<'a> WriteTxn<'a> {
         let mut cow_leaf = PageId::INVALID;
 
         while cursor.is_valid() {
-            // Ensure current leaf page is loaded
             let leaf_id = cursor.leaf_page_id();
             view.ensure_loaded(leaf_id)?;
 
@@ -367,7 +388,6 @@ impl<'a> WriteTxn<'a> {
                 }
             }
 
-            // CoW leaf if not yet owned by this txn
             if cow_leaf != leaf_id {
                 let new_id = btree::cow_page(view.pages, &mut self.alloc, leaf_id, self.txn_id);
                 if new_id != leaf_id {
@@ -385,13 +405,11 @@ impl<'a> WriteTxn<'a> {
                         &mut path,
                         new_id,
                     );
-                    // Update cursor to track the new page ID
                     cursor.set_leaf_page_id(new_id);
                 }
                 cow_leaf = new_id;
             }
 
-            // Direct mutable access to cell bytes in the CoW'd page
             let page = view.pages.get_mut(&cow_leaf).unwrap();
             let ci = cursor.cell_index();
             let cell_off = page.cell_offset(ci) as usize;
@@ -430,6 +448,23 @@ impl<'a> WriteTxn<'a> {
         tree.delete(&mut self.pages, &mut self.alloc, self.txn_id, key)
     }
 
+    /// Drop all pages, reset to an empty leaf. Returns pre-truncation entry count.
+    pub fn table_truncate(&mut self, table: &[u8]) -> Result<u64> {
+        self.ensure_table(table)?;
+
+        let old_tree = self.named_trees[table].clone();
+        self.free_tree_pages(old_tree.root)?;
+
+        let new_root = self.alloc.allocate();
+        let mut leaf = Page::new(new_root, PageType::Leaf, self.txn_id);
+        leaf.update_checksum();
+        self.pages.insert(new_root, leaf);
+
+        self.named_trees
+            .insert(table.to_vec(), BTree::from_existing(new_root, 1, 0));
+        Ok(old_tree.entry_count)
+    }
+
     pub fn table_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.ensure_table(table)?;
 
@@ -461,8 +496,6 @@ impl<'a> WriteTxn<'a> {
         self.manager.abort_write();
     }
 
-    // ── Savepoint support ──────────────────────────────────────────
-
     /// SAVEPOINT: snapshot state and advance txn_id so post-savepoint
     /// mutations CoW into fresh PageIds.
     pub fn begin_savepoint(&mut self) -> WriteTxnSnapshot {
@@ -474,7 +507,10 @@ impl<'a> WriteTxn<'a> {
     /// ROLLBACK TO SAVEPOINT: restore state and drop post-savepoint pages.
     /// Advances txn_id again so repeated rollback-to works.
     pub fn restore_snapshot(&mut self, snap: WriteTxnSnapshot) {
-        let cutoff = snap.txn_id;
+        let pre_savepoint_alloc_len = snap.alloc.allocated_this_txn().len();
+        for &page_id in &self.alloc.allocated_this_txn()[pre_savepoint_alloc_len..] {
+            self.pages.remove(&page_id);
+        }
         self.tree = snap.tree;
         self.alloc = snap.alloc;
         self.named_trees = snap.named_trees;
@@ -482,13 +518,11 @@ impl<'a> WriteTxn<'a> {
         self.catalog_dirty = snap.catalog_dirty;
         self.loaded_tree_meta = snap.loaded_tree_meta;
         self.deferred_free = snap.deferred_free;
-        self.pages.retain(|_, page| page.txn_id() <= cutoff);
         self.txn_id = self.manager.next_write_txn_id();
     }
 
     fn capture_snapshot(&self) -> WriteTxnSnapshot {
         WriteTxnSnapshot {
-            txn_id: self.txn_id,
             tree: self.tree.clone(),
             alloc: self.alloc.clone(),
             named_trees: self.named_trees.clone(),
@@ -594,7 +628,6 @@ impl<'a> WriteTxn<'a> {
             return Ok(());
         }
 
-        // Fast path: use cached root from commit slot (avoids catalog B+ tree lookup)
         if let Some((root, depth)) = self.old_slot.named_entry_root(name) {
             let entry_count = self.old_slot.named_entry_count(name).unwrap_or(0);
             let tree = BTree::from_existing(root, depth, entry_count);
@@ -603,7 +636,6 @@ impl<'a> WriteTxn<'a> {
             return Ok(());
         }
 
-        // Slow path: fall back to catalog B+ tree
         self.ensure_catalog()?;
 
         let catalog_root = self.catalog.as_ref().unwrap().root;
@@ -746,13 +778,24 @@ impl<'a> WriteTxn<'a> {
     }
 
     fn preload_path(&mut self, root: PageId, key: &[u8]) -> Result<()> {
+        Self::preload_path_raw(&mut self.pages, self.manager, root, key)
+    }
+
+    fn preload_path_raw(
+        pages: &mut FxHashMap<PageId, Page>,
+        manager: &TxnManager,
+        root: PageId,
+        key: &[u8],
+    ) -> Result<()> {
         let mut current = root;
         loop {
-            if !self.pages.contains_key(&current) {
-                let page = self.manager.fetch_page_owned(current)?;
-                self.pages.insert(current, page);
-            }
-            let page = self.pages.get(&current).unwrap();
+            let page = match pages.entry(current) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let page = manager.fetch_page_owned(current)?;
+                    e.insert(page)
+                }
+            };
             match page.page_type() {
                 Some(PageType::Leaf) => return Ok(()),
                 Some(PageType::Branch) => {
@@ -791,7 +834,7 @@ impl<'a> WriteTxn<'a> {
     }
 }
 
-impl<'a> Drop for WriteTxn<'a> {
+impl<'db> Drop for WriteTxn<'db> {
     fn drop(&mut self) {
         if !self.committed {
             self.manager.abort_write();
@@ -799,9 +842,25 @@ impl<'a> Drop for WriteTxn<'a> {
     }
 }
 
+/// Scan adapter wrapping a `&mut WriteTxn` for use with [`crate::TableIter`].
+pub struct WriteTxnScanAdapter<'a, 'db: 'a> {
+    txn: &'a mut WriteTxn<'db>,
+}
+
+impl<'a, 'db: 'a> crate::scan_iter::TxnScanAdapter for WriteTxnScanAdapter<'a, 'db> {
+    fn with_loader<R>(&mut self, f: &mut dyn FnMut(&mut dyn PageLoader) -> Result<R>) -> Result<R> {
+        let mut view = WritePages {
+            pages: &mut self.txn.pages,
+            manager: self.txn.manager,
+        };
+        f(&mut view)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::manager::tests::create_test_manager;
+    use citadel_core::types::PageId;
 
     #[test]
     fn insert_and_get() {
@@ -824,7 +883,6 @@ mod tests {
         assert_eq!(wtx.get(b"key").unwrap(), Some(b"v2".to_vec()));
         wtx.commit().unwrap();
 
-        // Read back
         let mut rtx = mgr.begin_read();
         assert_eq!(rtx.get(b"key").unwrap(), Some(b"v2".to_vec()));
     }
@@ -944,8 +1002,8 @@ mod tests {
             let k = format!("k{i:03}");
             wtx.insert(k.as_bytes(), b"x").unwrap();
         }
+        let pre_pages: std::collections::HashSet<PageId> = wtx.pages.keys().copied().collect();
         let snap = wtx.begin_savepoint();
-        let cutoff = snap.txn_id;
 
         for i in 20..200u32 {
             let k = format!("k{i:03}");
@@ -953,8 +1011,11 @@ mod tests {
         }
 
         wtx.restore_snapshot(snap);
-        for page in wtx.pages.values() {
-            assert!(page.txn_id() <= cutoff);
+        for &page_id in wtx.pages.keys() {
+            assert!(
+                pre_pages.contains(&page_id),
+                "post-savepoint page {page_id:?} leaked"
+            );
         }
     }
 
@@ -1009,13 +1070,10 @@ mod tests {
         {
             let mut wtx = mgr.begin_write().unwrap();
             wtx.insert(b"key", b"value").unwrap();
-            // Dropped without commit
         }
 
-        // Writer should be released
         let _wtx2 = mgr.begin_write().unwrap();
 
-        // Data should not be visible
         let mut rtx = mgr.begin_read();
         assert_eq!(rtx.get(b"key").unwrap(), None);
     }
@@ -1035,7 +1093,6 @@ mod tests {
             wtx.commit().unwrap();
         }
 
-        // Read all back
         let mut rtx = mgr.begin_read();
         assert_eq!(rtx.entry_count(), 500);
         for i in 0..500u32 {
@@ -1049,7 +1106,6 @@ mod tests {
     fn multiple_transactions() {
         let mgr = create_test_manager();
 
-        // Txn 1: insert keys
         {
             let mut wtx = mgr.begin_write().unwrap();
             for i in 0..10u32 {
@@ -1059,7 +1115,6 @@ mod tests {
             wtx.commit().unwrap();
         }
 
-        // Txn 2: update some, delete some
         {
             let mut wtx = mgr.begin_write().unwrap();
             wtx.insert(b"k0", b"updated").unwrap();
@@ -1067,7 +1122,6 @@ mod tests {
             wtx.commit().unwrap();
         }
 
-        // Verify
         let mut rtx = mgr.begin_read();
         assert_eq!(rtx.get(b"k0").unwrap(), Some(b"updated".to_vec()));
         assert_eq!(rtx.get(b"k5").unwrap(), None);
@@ -1127,7 +1181,6 @@ mod tests {
             wtx.commit().unwrap();
         }
 
-        // Default table should be unaffected
         let rtx = mgr.begin_read();
         assert_eq!(rtx.entry_count(), 0);
     }

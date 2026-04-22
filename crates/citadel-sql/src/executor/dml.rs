@@ -1,17 +1,20 @@
+use std::cell::RefCell;
+
 use citadel::Database;
+use citadel_txn::write_txn::WriteTxn;
+use rustc_hash::FxHashMap;
 
 use crate::encoding::{encode_composite_key_into, encode_row_into};
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, ColumnMap};
+use crate::eval::{eval_expr, is_truthy, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::types::*;
 
 use crate::schema::SchemaManager;
 
+use super::compile::CompiledPlan;
 use super::helpers::*;
 use super::CteContext;
-
-// ── DML + materialization ───────────────────────────────────────────
 
 pub(super) fn exec_insert(
     db: &Database,
@@ -19,7 +22,7 @@ pub(super) fn exec_insert(
     stmt: &InsertStmt,
     params: &[Value],
 ) -> Result<ExecutionResult> {
-    let empty_ctes = CteContext::new();
+    let empty_ctes = CteContext::default();
     let materialized;
     let stmt = if insert_has_subquery(stmt) {
         materialized = materialize_insert(stmt, &mut |sub| {
@@ -203,7 +206,7 @@ pub(super) fn exec_insert(
         if let Some(ref col_map) = check_col_map {
             for col in &table_schema.columns {
                 if let Some(ref check) = col.check_expr {
-                    let result = eval_expr(check, col_map, &row)?;
+                    let result = eval_expr(check, &EvalCtx::new(col_map, &row))?;
                     if !is_truthy(&result) && !result.is_null() {
                         let name = col.check_name.as_deref().unwrap_or(&col.name);
                         return Err(SqlError::CheckViolation(name.to_string()));
@@ -211,7 +214,7 @@ pub(super) fn exec_insert(
                 }
             }
             for tc in &table_schema.check_constraints {
-                let result = eval_expr(&tc.expr, col_map, &row)?;
+                let result = eval_expr(&tc.expr, &EvalCtx::new(col_map, &row))?;
                 if !is_truthy(&result) && !result.is_null() {
                     let name = tc.name.as_deref().unwrap_or(&tc.sql);
                     return Err(SqlError::CheckViolation(name.to_string()));
@@ -849,8 +852,7 @@ pub(super) fn apply_set_operation(
             rows
         }
         (SetOp::Intersect, true) => {
-            let mut right_counts: std::collections::HashMap<Vec<Value>, usize> =
-                std::collections::HashMap::new();
+            let mut right_counts: FxHashMap<Vec<Value>, usize> = FxHashMap::default();
             for row in &right_qr.rows {
                 *right_counts.entry(row.clone()).or_insert(0) += 1;
             }
@@ -879,8 +881,7 @@ pub(super) fn apply_set_operation(
             rows
         }
         (SetOp::Except, true) => {
-            let mut right_counts: std::collections::HashMap<Vec<Value>, usize> =
-                std::collections::HashMap::new();
+            let mut right_counts: FxHashMap<Vec<Value>, usize> = FxHashMap::default();
             for row in &right_qr.rows {
                 *right_counts.entry(row.clone()).or_insert(0) += 1;
             }
@@ -948,8 +949,7 @@ pub(super) fn apply_set_operation(
     Ok(ExecutionResult::Query(QueryResult { columns, rows }))
 }
 
-#[derive(Default)]
-pub struct InsertBufs {
+struct InsertBufs {
     row: Vec<Value>,
     pk_values: Vec<Value>,
     value_values: Vec<Value>,
@@ -960,7 +960,7 @@ pub struct InsertBufs {
 }
 
 impl InsertBufs {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             row: Vec::new(),
             pk_values: Vec::new(),
@@ -973,16 +973,50 @@ impl InsertBufs {
     }
 }
 
+thread_local! {
+    static INSERT_SCRATCH: RefCell<InsertBufs> = RefCell::new(InsertBufs::new());
+}
+
+fn with_insert_scratch<R>(f: impl FnOnce(&mut InsertBufs) -> R) -> R {
+    INSERT_SCRATCH.with(|slot| f(&mut slot.borrow_mut()))
+}
+
 pub fn exec_insert_in_txn(
-    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    wtx: &mut WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &InsertStmt,
+    params: &[Value],
+) -> Result<ExecutionResult> {
+    with_insert_scratch(|bufs| exec_insert_in_txn_impl(wtx, schema, stmt, params, bufs, None))
+}
+
+fn exec_insert_in_txn_cached(
+    wtx: &mut WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &InsertStmt,
+    params: &[Value],
+    cache: &InsertCache,
+) -> Result<ExecutionResult> {
+    with_insert_scratch(|bufs| {
+        exec_insert_in_txn_impl(wtx, schema, stmt, params, bufs, Some(cache))
+    })
+}
+
+fn exec_insert_in_txn_impl(
+    wtx: &mut WriteTxn<'_>,
     schema: &SchemaManager,
     stmt: &InsertStmt,
     params: &[Value],
     bufs: &mut InsertBufs,
+    cache: Option<&InsertCache>,
 ) -> Result<ExecutionResult> {
-    let empty_ctes = CteContext::new();
+    let empty_ctes = CteContext::default();
     let materialized;
-    let stmt = if insert_has_subquery(stmt) {
+    let has_sub = match cache {
+        Some(c) => c.has_subquery,
+        None => insert_has_subquery(stmt),
+    };
+    let stmt = if has_sub {
         materialized = materialize_insert(stmt, &mut |sub| {
             exec_subquery_write(wtx, schema, sub, &empty_ctes)
         })?;
@@ -1008,22 +1042,42 @@ pub fn exec_insert_in_txn(
     };
 
     bufs.col_indices.clear();
-    for name in insert_columns {
-        bufs.col_indices.push(
-            table_schema
-                .column_index(name)
-                .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))?,
-        );
+    if let Some(c) = cache {
+        bufs.col_indices.extend_from_slice(&c.col_indices);
+    } else {
+        for name in insert_columns {
+            bufs.col_indices.push(
+                table_schema
+                    .column_index(name)
+                    .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))?,
+            );
+        }
     }
 
-    let defaults: Vec<(usize, &Expr)> = table_schema
-        .columns
-        .iter()
-        .filter(|c| c.default_expr.is_some() && !bufs.col_indices.contains(&(c.position as usize)))
-        .map(|c| (c.position as usize, c.default_expr.as_ref().unwrap()))
-        .collect();
+    let any_defaults = match cache {
+        Some(c) => c.any_defaults,
+        None => table_schema
+            .columns
+            .iter()
+            .any(|c| c.default_expr.is_some()),
+    };
+    let defaults: Vec<(usize, &Expr)> = if any_defaults {
+        table_schema
+            .columns
+            .iter()
+            .filter(|c| {
+                c.default_expr.is_some() && !bufs.col_indices.contains(&(c.position as usize))
+            })
+            .map(|c| (c.position as usize, c.default_expr.as_ref().unwrap()))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
-    let has_checks = table_schema.has_checks();
+    let has_checks = match cache {
+        Some(c) => c.has_checks,
+        None => table_schema.has_checks(),
+    };
     let check_col_map = if has_checks {
         Some(ColumnMap::new(&table_schema.columns))
     } else {
@@ -1039,6 +1093,11 @@ pub fn exec_insert_in_txn(
     bufs.row.resize(table_schema.columns.len(), Value::Null);
     bufs.pk_values.resize(pk_indices.len(), Value::Null);
     bufs.value_values.resize(phys_count, Value::Null);
+
+    let table_bytes = stmt.table.as_bytes();
+    let has_fks = !table_schema.foreign_keys.is_empty();
+    let has_indices = !table_schema.indices.is_empty();
+    let has_defaults = !defaults.is_empty();
 
     let select_rows = match &stmt.source {
         InsertSource::Select(sq) => {
@@ -1091,13 +1150,13 @@ pub fn exec_insert_in_txn(
                 )));
             }
             for (i, expr) in value_row.iter().enumerate() {
-                let val = if let Expr::Parameter(n) = expr {
-                    params
+                let val = match expr {
+                    Expr::Parameter(n) => params
                         .get(n - 1)
                         .cloned()
-                        .ok_or_else(|| SqlError::Parse(format!("unbound parameter ${n}")))?
-                } else {
-                    eval_const_expr(expr)?
+                        .ok_or_else(|| SqlError::Parse(format!("unbound parameter ${n}")))?,
+                    Expr::Literal(v) => v.clone(),
+                    _ => eval_const_expr(expr)?,
                 };
                 let col_idx = bufs.col_indices[i];
                 let col = &table_schema.columns[col_idx];
@@ -1131,19 +1190,19 @@ pub fn exec_insert_in_txn(
             }
         }
 
-        for &(pos, def_expr) in &defaults {
-            let val = eval_const_expr(def_expr)?;
-            let col = &table_schema.columns[pos];
-            if val.is_null() {
-                // bufs.row[pos] already Null from init
-            } else {
-                let got_type = val.data_type();
-                bufs.row[pos] =
-                    val.coerce_into(col.data_type)
-                        .ok_or_else(|| SqlError::TypeMismatch {
-                            expected: col.data_type.to_string(),
-                            got: got_type.to_string(),
-                        })?;
+        if has_defaults {
+            for &(pos, def_expr) in &defaults {
+                let val = eval_const_expr(def_expr)?;
+                let col = &table_schema.columns[pos];
+                if !val.is_null() {
+                    let got_type = val.data_type();
+                    bufs.row[pos] =
+                        val.coerce_into(col.data_type)
+                            .ok_or_else(|| SqlError::TypeMismatch {
+                                expected: col.data_type.to_string(),
+                                got: got_type.to_string(),
+                            })?;
+                }
             }
         }
 
@@ -1156,7 +1215,7 @@ pub fn exec_insert_in_txn(
         if let Some(ref col_map) = check_col_map {
             for col in &table_schema.columns {
                 if let Some(ref check) = col.check_expr {
-                    let result = eval_expr(check, col_map, &bufs.row)?;
+                    let result = eval_expr(check, &EvalCtx::new(col_map, &bufs.row))?;
                     if !is_truthy(&result) && !result.is_null() {
                         let name = col.check_name.as_deref().unwrap_or(&col.name);
                         return Err(SqlError::CheckViolation(name.to_string()));
@@ -1164,7 +1223,7 @@ pub fn exec_insert_in_txn(
                 }
             }
             for tc in &table_schema.check_constraints {
-                let result = eval_expr(&tc.expr, col_map, &bufs.row)?;
+                let result = eval_expr(&tc.expr, &EvalCtx::new(col_map, &bufs.row))?;
                 if !is_truthy(&result) && !result.is_null() {
                     let name = tc.name.as_deref().unwrap_or(&tc.sql);
                     return Err(SqlError::CheckViolation(name.to_string()));
@@ -1172,24 +1231,26 @@ pub fn exec_insert_in_txn(
             }
         }
 
-        for fk in &table_schema.foreign_keys {
-            let any_null = fk.columns.iter().any(|&ci| bufs.row[ci as usize].is_null());
-            if any_null {
-                continue;
-            }
-            let fk_vals: Vec<Value> = fk
-                .columns
-                .iter()
-                .map(|&ci| bufs.row[ci as usize].clone())
-                .collect();
-            bufs.fk_key_buf.clear();
-            encode_composite_key_into(&fk_vals, &mut bufs.fk_key_buf);
-            let found = wtx
-                .table_get(fk.foreign_table.as_bytes(), &bufs.fk_key_buf)
-                .map_err(SqlError::Storage)?;
-            if found.is_none() {
-                let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
-                return Err(SqlError::ForeignKeyViolation(name.to_string()));
+        if has_fks {
+            for fk in &table_schema.foreign_keys {
+                let any_null = fk.columns.iter().any(|&ci| bufs.row[ci as usize].is_null());
+                if any_null {
+                    continue;
+                }
+                let fk_vals: Vec<Value> = fk
+                    .columns
+                    .iter()
+                    .map(|&ci| bufs.row[ci as usize].clone())
+                    .collect();
+                bufs.fk_key_buf.clear();
+                encode_composite_key_into(&fk_vals, &mut bufs.fk_key_buf);
+                let found = wtx
+                    .table_get(fk.foreign_table.as_bytes(), &bufs.fk_key_buf)
+                    .map_err(SqlError::Storage)?;
+                if found.is_none() {
+                    let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
+                    return Err(SqlError::ForeignKeyViolation(name.to_string()));
+                }
             }
         }
 
@@ -1221,13 +1282,13 @@ pub fn exec_insert_in_txn(
         }
 
         let is_new = wtx
-            .table_insert(stmt.table.as_bytes(), &bufs.key_buf, &bufs.value_buf)
+            .table_insert(table_bytes, &bufs.key_buf, &bufs.value_buf)
             .map_err(SqlError::Storage)?;
         if !is_new {
             return Err(SqlError::DuplicateKey);
         }
 
-        if !table_schema.indices.is_empty() {
+        if has_indices {
             for (j, &i) in pk_indices.iter().enumerate() {
                 bufs.row[i] = bufs.pk_values[j].clone();
             }
@@ -1241,4 +1302,112 @@ pub fn exec_insert_in_txn(
     }
 
     Ok(ExecutionResult::RowsAffected(count))
+}
+
+pub struct CompiledInsert {
+    table_lower: String,
+    cached: Option<InsertCache>,
+}
+
+struct InsertCache {
+    col_indices: Vec<usize>,
+    has_subquery: bool,
+    any_defaults: bool,
+    has_checks: bool,
+}
+
+impl CompiledInsert {
+    pub fn try_compile(schema: &SchemaManager, stmt: &InsertStmt) -> Option<Self> {
+        let lower = stmt.table.to_ascii_lowercase();
+        let cached = if let Some(ts) = schema.get(&lower) {
+            let insert_columns: Vec<&str> = if stmt.columns.is_empty() {
+                ts.columns.iter().map(|c| c.name.as_str()).collect()
+            } else {
+                stmt.columns.iter().map(|s| s.as_str()).collect()
+            };
+            let mut col_indices = Vec::with_capacity(insert_columns.len());
+            for name in &insert_columns {
+                col_indices.push(ts.column_index(name)?);
+            }
+            Some(InsertCache {
+                col_indices,
+                has_subquery: insert_has_subquery(stmt),
+                any_defaults: ts.columns.iter().any(|c| c.default_expr.is_some()),
+                has_checks: ts.has_checks(),
+            })
+        } else if schema.get_view(&lower).is_some() {
+            None
+        } else {
+            return None;
+        };
+        Some(Self {
+            table_lower: lower,
+            cached,
+        })
+    }
+}
+
+impl CompiledPlan for CompiledInsert {
+    fn execute(
+        &self,
+        db: &Database,
+        schema: &SchemaManager,
+        stmt: &Statement,
+        params: &[Value],
+        wtx: Option<&mut WriteTxn<'_>>,
+    ) -> Result<ExecutionResult> {
+        let ins = match stmt {
+            Statement::Insert(i) => i,
+            _ => {
+                return Err(SqlError::Unsupported(
+                    "CompiledInsert received non-INSERT statement".into(),
+                ))
+            }
+        };
+        let _ = &self.table_lower;
+        match wtx {
+            None => exec_insert(db, schema, ins, params),
+            Some(outer) => match self.cached.as_ref() {
+                Some(c) => exec_insert_in_txn_cached(outer, schema, ins, params, c),
+                None => exec_insert_in_txn(outer, schema, ins, params),
+            },
+        }
+    }
+}
+
+pub struct CompiledDelete {
+    table_lower: String,
+}
+
+impl CompiledDelete {
+    pub fn try_compile(schema: &SchemaManager, stmt: &DeleteStmt) -> Option<Self> {
+        let lower = stmt.table.to_ascii_lowercase();
+        schema.get(&lower)?;
+        Some(Self { table_lower: lower })
+    }
+}
+
+impl CompiledPlan for CompiledDelete {
+    fn execute(
+        &self,
+        db: &Database,
+        schema: &SchemaManager,
+        stmt: &Statement,
+        _params: &[Value],
+        wtx: Option<&mut WriteTxn<'_>>,
+    ) -> Result<ExecutionResult> {
+        let del = match stmt {
+            Statement::Delete(d) => d,
+            _ => {
+                return Err(SqlError::Unsupported(
+                    "CompiledDelete received non-DELETE statement".into(),
+                ))
+            }
+        };
+        let _ = &self.table_lower;
+        match wtx {
+            None => super::write::exec_delete(db, schema, del),
+            Some(outer) => super::write::exec_delete_in_txn(outer, schema, del),
+        }
+    }
 }

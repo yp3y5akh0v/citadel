@@ -5,7 +5,7 @@ use citadel::{Argon2Profile, DatabaseBuilder, Error};
 fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
     DatabaseBuilder::new(path)
         .passphrase(b"test-passphrase")
-        .argon2_profile(Argon2Profile::Iot) // fast for tests
+        .argon2_profile(Argon2Profile::Iot)
 }
 
 #[test]
@@ -13,7 +13,6 @@ fn create_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
 
-    // Create
     {
         let db = fast_builder(&db_path).create().unwrap();
         let stats = db.stats();
@@ -21,7 +20,6 @@ fn create_and_reopen() {
         assert_eq!(stats.tree_depth, 1);
     }
 
-    // Reopen
     {
         let db = fast_builder(&db_path).open().unwrap();
         assert_eq!(db.stats().entry_count, 0);
@@ -46,7 +44,6 @@ fn insert_and_read_back() {
         assert_eq!(rtx.get(b"missing").unwrap(), None);
     }
 
-    // Reopen and verify persistence
     {
         let db = fast_builder(&db_path).open().unwrap();
         let mut rtx = db.begin_read();
@@ -108,7 +105,6 @@ fn multiple_transactions() {
 
     let db = fast_builder(&db_path).create().unwrap();
 
-    // Txn 1: insert
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..100u32 {
@@ -121,7 +117,6 @@ fn multiple_transactions() {
 
     assert_eq!(db.stats().entry_count, 100);
 
-    // Txn 2: update some, delete some
     {
         let mut wtx = db.begin_write().unwrap();
         wtx.insert(b"key-0000", b"updated").unwrap();
@@ -161,29 +156,25 @@ fn snapshot_isolation() {
 
     let db = fast_builder(&db_path).create().unwrap();
 
-    // Write initial data
     {
         let mut wtx = db.begin_write().unwrap();
         wtx.insert(b"key1", b"v1").unwrap();
         wtx.commit().unwrap();
     }
 
-    // Start a read
     let mut rtx = db.begin_read();
     assert_eq!(rtx.get(b"key1").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(db.reader_count(), 1);
 
-    // Write more data after the read started
     {
         let mut wtx = db.begin_write().unwrap();
         wtx.insert(b"key2", b"v2").unwrap();
         wtx.commit().unwrap();
     }
 
-    // Read should NOT see key2
+    // Old reader MUST NOT see key2 (snapshot isolation).
     assert_eq!(rtx.get(b"key2").unwrap(), None);
 
-    // New read should see both
     let mut rtx2 = db.begin_read();
     assert_eq!(rtx2.get(b"key1").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(rtx2.get(b"key2").unwrap(), Some(b"v2".to_vec()));
@@ -210,7 +201,6 @@ fn custom_key_path() {
         assert_eq!(db.key_path(), key_path);
     }
 
-    // Reopen with same custom key path
     {
         let db = DatabaseBuilder::new(&db_path)
             .passphrase(b"test")
@@ -269,7 +259,6 @@ fn large_dataset_persistence() {
         wtx.commit().unwrap();
     }
 
-    // Reopen and verify all data
     {
         let db = fast_builder(&db_path).open().unwrap();
         assert_eq!(db.stats().entry_count, count as u64);

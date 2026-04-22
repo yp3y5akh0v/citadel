@@ -7,8 +7,6 @@ use sqlparser::parser::Parser;
 use crate::error::{Result, SqlError};
 use crate::types::{DataType, Value};
 
-// ── Internal AST ────────────────────────────────────────────────────
-
 #[derive(Debug, Clone)]
 pub enum Statement {
     CreateTable(CreateTableStmt),
@@ -376,8 +374,6 @@ pub enum UnaryOp {
     Not,
 }
 
-// ── Expression utilities ────────────────────────────────────────────
-
 pub fn has_subquery(expr: &Expr) -> bool {
     match expr {
         Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => true,
@@ -429,8 +425,6 @@ pub fn parse_sql_expr(sql: &str) -> Result<Expr> {
     convert_expr(&sp_expr)
 }
 
-// ── Parser entry point ──────────────────────────────────────────────
-
 pub fn parse_sql(sql: &str) -> Result<Statement> {
     let dialect = GenericDialect {};
     let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| SqlError::Parse(e.to_string()))?;
@@ -445,8 +439,6 @@ pub fn parse_sql(sql: &str) -> Result<Statement> {
     convert_statement(stmts.into_iter().next().unwrap())
 }
 
-// ── Parameter utilities ─────────────────────────────────────────────
-
 /// Returns the number of distinct parameters in a statement (max $N found).
 pub fn count_params(stmt: &Statement) -> usize {
     let mut max_idx = 0usize;
@@ -456,416 +448,6 @@ pub fn count_params(stmt: &Statement) -> usize {
         }
     });
     max_idx
-}
-
-/// Replace all `Expr::Parameter(n)` with `Expr::Literal(params[n-1])`.
-pub fn bind_params(
-    stmt: &Statement,
-    params: &[crate::types::Value],
-) -> crate::error::Result<Statement> {
-    bind_stmt(stmt, params)
-}
-
-fn bind_stmt(stmt: &Statement, params: &[crate::types::Value]) -> crate::error::Result<Statement> {
-    match stmt {
-        Statement::Select(sq) => Ok(Statement::Select(Box::new(bind_select_query(sq, params)?))),
-        Statement::Insert(ins) => {
-            let source = match &ins.source {
-                InsertSource::Values(rows) => {
-                    let bound = rows
-                        .iter()
-                        .map(|row| {
-                            row.iter()
-                                .map(|e| bind_expr(e, params))
-                                .collect::<crate::error::Result<Vec<_>>>()
-                        })
-                        .collect::<crate::error::Result<Vec<_>>>()?;
-                    InsertSource::Values(bound)
-                }
-                InsertSource::Select(sq) => {
-                    InsertSource::Select(Box::new(bind_select_query(sq, params)?))
-                }
-            };
-            Ok(Statement::Insert(InsertStmt {
-                table: ins.table.clone(),
-                columns: ins.columns.clone(),
-                source,
-            }))
-        }
-        Statement::Update(upd) => {
-            let assignments = upd
-                .assignments
-                .iter()
-                .map(|(col, e)| Ok((col.clone(), bind_expr(e, params)?)))
-                .collect::<crate::error::Result<Vec<_>>>()?;
-            let where_clause = upd
-                .where_clause
-                .as_ref()
-                .map(|e| bind_expr(e, params))
-                .transpose()?;
-            Ok(Statement::Update(UpdateStmt {
-                table: upd.table.clone(),
-                assignments,
-                where_clause,
-            }))
-        }
-        Statement::Delete(del) => {
-            let where_clause = del
-                .where_clause
-                .as_ref()
-                .map(|e| bind_expr(e, params))
-                .transpose()?;
-            Ok(Statement::Delete(DeleteStmt {
-                table: del.table.clone(),
-                where_clause,
-            }))
-        }
-        Statement::Explain(inner) => Ok(Statement::Explain(Box::new(bind_stmt(inner, params)?))),
-        other => Ok(other.clone()),
-    }
-}
-
-fn bind_select(
-    sel: &SelectStmt,
-    params: &[crate::types::Value],
-) -> crate::error::Result<SelectStmt> {
-    let columns = sel
-        .columns
-        .iter()
-        .map(|c| match c {
-            SelectColumn::AllColumns => Ok(SelectColumn::AllColumns),
-            SelectColumn::Expr { expr, alias } => Ok(SelectColumn::Expr {
-                expr: bind_expr(expr, params)?,
-                alias: alias.clone(),
-            }),
-        })
-        .collect::<crate::error::Result<Vec<_>>>()?;
-    let joins = sel
-        .joins
-        .iter()
-        .map(|j| {
-            let on_clause = j
-                .on_clause
-                .as_ref()
-                .map(|e| bind_expr(e, params))
-                .transpose()?;
-            Ok(JoinClause {
-                join_type: j.join_type,
-                table: j.table.clone(),
-                on_clause,
-            })
-        })
-        .collect::<crate::error::Result<Vec<_>>>()?;
-    let where_clause = sel
-        .where_clause
-        .as_ref()
-        .map(|e| bind_expr(e, params))
-        .transpose()?;
-    let order_by = sel
-        .order_by
-        .iter()
-        .map(|o| {
-            Ok(OrderByItem {
-                expr: bind_expr(&o.expr, params)?,
-                descending: o.descending,
-                nulls_first: o.nulls_first,
-            })
-        })
-        .collect::<crate::error::Result<Vec<_>>>()?;
-    let limit = sel
-        .limit
-        .as_ref()
-        .map(|e| bind_expr(e, params))
-        .transpose()?;
-    let offset = sel
-        .offset
-        .as_ref()
-        .map(|e| bind_expr(e, params))
-        .transpose()?;
-    let group_by = sel
-        .group_by
-        .iter()
-        .map(|e| bind_expr(e, params))
-        .collect::<crate::error::Result<Vec<_>>>()?;
-    let having = sel
-        .having
-        .as_ref()
-        .map(|e| bind_expr(e, params))
-        .transpose()?;
-
-    Ok(SelectStmt {
-        columns,
-        from: sel.from.clone(),
-        from_alias: sel.from_alias.clone(),
-        joins,
-        distinct: sel.distinct,
-        where_clause,
-        order_by,
-        limit,
-        offset,
-        group_by,
-        having,
-    })
-}
-
-fn bind_query_body(
-    body: &QueryBody,
-    params: &[crate::types::Value],
-) -> crate::error::Result<QueryBody> {
-    match body {
-        QueryBody::Select(sel) => Ok(QueryBody::Select(Box::new(bind_select(sel, params)?))),
-        QueryBody::Compound(comp) => {
-            let order_by = comp
-                .order_by
-                .iter()
-                .map(|o| {
-                    Ok(OrderByItem {
-                        expr: bind_expr(&o.expr, params)?,
-                        descending: o.descending,
-                        nulls_first: o.nulls_first,
-                    })
-                })
-                .collect::<crate::error::Result<Vec<_>>>()?;
-            let limit = comp
-                .limit
-                .as_ref()
-                .map(|e| bind_expr(e, params))
-                .transpose()?;
-            let offset = comp
-                .offset
-                .as_ref()
-                .map(|e| bind_expr(e, params))
-                .transpose()?;
-            Ok(QueryBody::Compound(Box::new(CompoundSelect {
-                op: comp.op.clone(),
-                all: comp.all,
-                left: Box::new(bind_query_body(&comp.left, params)?),
-                right: Box::new(bind_query_body(&comp.right, params)?),
-                order_by,
-                limit,
-                offset,
-            })))
-        }
-    }
-}
-
-fn bind_select_query(
-    sq: &SelectQuery,
-    params: &[crate::types::Value],
-) -> crate::error::Result<SelectQuery> {
-    let ctes = sq
-        .ctes
-        .iter()
-        .map(|cte| {
-            Ok(CteDefinition {
-                name: cte.name.clone(),
-                column_aliases: cte.column_aliases.clone(),
-                body: bind_query_body(&cte.body, params)?,
-            })
-        })
-        .collect::<crate::error::Result<Vec<_>>>()?;
-    let body = bind_query_body(&sq.body, params)?;
-    Ok(SelectQuery {
-        ctes,
-        recursive: sq.recursive,
-        body,
-    })
-}
-
-fn bind_expr(expr: &Expr, params: &[crate::types::Value]) -> crate::error::Result<Expr> {
-    match expr {
-        Expr::Parameter(n) => {
-            if *n == 0 || *n > params.len() {
-                return Err(SqlError::ParameterCountMismatch {
-                    expected: *n,
-                    got: params.len(),
-                });
-            }
-            Ok(Expr::Literal(params[*n - 1].clone()))
-        }
-        Expr::Literal(_) | Expr::Column(_) | Expr::QualifiedColumn { .. } | Expr::CountStar => {
-            Ok(expr.clone())
-        }
-        Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
-            left: Box::new(bind_expr(left, params)?),
-            op: *op,
-            right: Box::new(bind_expr(right, params)?),
-        }),
-        Expr::UnaryOp { op, expr: e } => Ok(Expr::UnaryOp {
-            op: *op,
-            expr: Box::new(bind_expr(e, params)?),
-        }),
-        Expr::IsNull(e) => Ok(Expr::IsNull(Box::new(bind_expr(e, params)?))),
-        Expr::IsNotNull(e) => Ok(Expr::IsNotNull(Box::new(bind_expr(e, params)?))),
-        Expr::Function {
-            name,
-            args,
-            distinct,
-        } => {
-            let args = args
-                .iter()
-                .map(|a| bind_expr(a, params))
-                .collect::<crate::error::Result<Vec<_>>>()?;
-            Ok(Expr::Function {
-                name: name.clone(),
-                args,
-                distinct: *distinct,
-            })
-        }
-        Expr::InSubquery {
-            expr: e,
-            subquery,
-            negated,
-        } => Ok(Expr::InSubquery {
-            expr: Box::new(bind_expr(e, params)?),
-            subquery: Box::new(bind_select(subquery, params)?),
-            negated: *negated,
-        }),
-        Expr::InList {
-            expr: e,
-            list,
-            negated,
-        } => {
-            let list = list
-                .iter()
-                .map(|l| bind_expr(l, params))
-                .collect::<crate::error::Result<Vec<_>>>()?;
-            Ok(Expr::InList {
-                expr: Box::new(bind_expr(e, params)?),
-                list,
-                negated: *negated,
-            })
-        }
-        Expr::Exists { subquery, negated } => Ok(Expr::Exists {
-            subquery: Box::new(bind_select(subquery, params)?),
-            negated: *negated,
-        }),
-        Expr::ScalarSubquery(sq) => Ok(Expr::ScalarSubquery(Box::new(bind_select(sq, params)?))),
-        Expr::InSet {
-            expr: e,
-            values,
-            has_null,
-            negated,
-        } => Ok(Expr::InSet {
-            expr: Box::new(bind_expr(e, params)?),
-            values: values.clone(),
-            has_null: *has_null,
-            negated: *negated,
-        }),
-        Expr::Between {
-            expr: e,
-            low,
-            high,
-            negated,
-        } => Ok(Expr::Between {
-            expr: Box::new(bind_expr(e, params)?),
-            low: Box::new(bind_expr(low, params)?),
-            high: Box::new(bind_expr(high, params)?),
-            negated: *negated,
-        }),
-        Expr::Like {
-            expr: e,
-            pattern,
-            escape,
-            negated,
-        } => Ok(Expr::Like {
-            expr: Box::new(bind_expr(e, params)?),
-            pattern: Box::new(bind_expr(pattern, params)?),
-            escape: escape
-                .as_ref()
-                .map(|esc| bind_expr(esc, params).map(Box::new))
-                .transpose()?,
-            negated: *negated,
-        }),
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-        } => {
-            let operand = operand
-                .as_ref()
-                .map(|e| bind_expr(e, params).map(Box::new))
-                .transpose()?;
-            let conditions = conditions
-                .iter()
-                .map(|(cond, then)| Ok((bind_expr(cond, params)?, bind_expr(then, params)?)))
-                .collect::<crate::error::Result<Vec<_>>>()?;
-            let else_result = else_result
-                .as_ref()
-                .map(|e| bind_expr(e, params).map(Box::new))
-                .transpose()?;
-            Ok(Expr::Case {
-                operand,
-                conditions,
-                else_result,
-            })
-        }
-        Expr::Coalesce(args) => {
-            let args = args
-                .iter()
-                .map(|a| bind_expr(a, params))
-                .collect::<crate::error::Result<Vec<_>>>()?;
-            Ok(Expr::Coalesce(args))
-        }
-        Expr::Cast { expr: e, data_type } => Ok(Expr::Cast {
-            expr: Box::new(bind_expr(e, params)?),
-            data_type: *data_type,
-        }),
-        Expr::WindowFunction { name, args, spec } => {
-            let args = args
-                .iter()
-                .map(|a| bind_expr(a, params))
-                .collect::<crate::error::Result<Vec<_>>>()?;
-            let partition_by = spec
-                .partition_by
-                .iter()
-                .map(|e| bind_expr(e, params))
-                .collect::<crate::error::Result<Vec<_>>>()?;
-            let order_by = spec
-                .order_by
-                .iter()
-                .map(|o| {
-                    Ok(OrderByItem {
-                        expr: bind_expr(&o.expr, params)?,
-                        descending: o.descending,
-                        nulls_first: o.nulls_first,
-                    })
-                })
-                .collect::<crate::error::Result<Vec<_>>>()?;
-            let frame = match &spec.frame {
-                Some(f) => Some(WindowFrame {
-                    units: f.units,
-                    start: bind_frame_bound(&f.start, params)?,
-                    end: bind_frame_bound(&f.end, params)?,
-                }),
-                None => None,
-            };
-            Ok(Expr::WindowFunction {
-                name: name.clone(),
-                args,
-                spec: WindowSpec {
-                    partition_by,
-                    order_by,
-                    frame,
-                },
-            })
-        }
-    }
-}
-
-fn bind_frame_bound(
-    bound: &WindowFrameBound,
-    params: &[crate::types::Value],
-) -> crate::error::Result<WindowFrameBound> {
-    match bound {
-        WindowFrameBound::Preceding(e) => {
-            Ok(WindowFrameBound::Preceding(Box::new(bind_expr(e, params)?)))
-        }
-        WindowFrameBound::Following(e) => {
-            Ok(WindowFrameBound::Following(Box::new(bind_expr(e, params)?)))
-        }
-        other => Ok(other.clone()),
-    }
 }
 
 fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
@@ -1054,8 +636,6 @@ fn visit_expr(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
         | Expr::Parameter(_) => {}
     }
 }
-
-// ── Statement conversion ────────────────────────────────────────────
 
 fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
     match stmt {
@@ -1247,7 +827,6 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
         columns.push(spec);
     }
 
-    // Check table-level constraints
     let mut check_constraints: Vec<TableCheckConstraint> = Vec::new();
 
     for constraint in &ct.constraints {
@@ -1436,7 +1015,6 @@ fn convert_create_view(cv: sp::CreateView) -> Result<Statement> {
 
     let sql = cv.query.to_string();
 
-    // Validate the SQL is parseable as a SELECT
     let dialect = GenericDialect {};
     let test = Parser::parse_sql(&dialect, &sql).map_err(|e| SqlError::Parse(e.to_string()))?;
     if test.is_empty() {
@@ -1525,7 +1103,6 @@ fn convert_select_body(select: &sp::Select) -> Result<SelectStmt> {
         _ => false,
     };
 
-    // FROM clause
     let (from, from_alias, joins) = if select.from.is_empty() {
         (String::new(), None, vec![])
     } else if select.from.len() == 1 {
@@ -1548,17 +1125,14 @@ fn convert_select_body(select: &sp::Select) -> Result<SelectStmt> {
         return Err(SqlError::Unsupported("comma-separated FROM tables".into()));
     };
 
-    // Projection
     let columns: Vec<SelectColumn> = select
         .projection
         .iter()
         .map(convert_select_item)
         .collect::<Result<_>>()?;
 
-    // WHERE
     let where_clause = select.selection.as_ref().map(convert_expr).transpose()?;
 
-    // GROUP BY
     let group_by = match &select.group_by {
         sp::GroupByExpr::Expressions(exprs, _) => {
             exprs.iter().map(convert_expr).collect::<Result<_>>()?
@@ -1568,7 +1142,6 @@ fn convert_select_body(select: &sp::Select) -> Result<SelectStmt> {
         }
     };
 
-    // HAVING
     let having = select.having.as_ref().map(convert_expr).transpose()?;
 
     Ok(SelectStmt {
@@ -1624,7 +1197,6 @@ fn convert_set_expr(set_expr: &sp::SetExpr) -> Result<QueryBody> {
 fn convert_query_body(query: &sp::Query) -> Result<QueryBody> {
     let mut body = convert_set_expr(&query.body)?;
 
-    // ORDER BY
     let order_by = if let Some(ref ob) = query.order_by {
         match &ob.kind {
             sp::OrderByKind::Expressions(exprs) => exprs
@@ -1639,7 +1211,6 @@ fn convert_query_body(query: &sp::Query) -> Result<QueryBody> {
         vec![]
     };
 
-    // LIMIT / OFFSET
     let (limit, offset) = match &query.limit_clause {
         Some(sp::LimitClause::LimitOffset { limit, offset, .. }) => {
             let l = limit.as_ref().map(convert_expr).transpose()?;
@@ -1816,8 +1387,6 @@ fn convert_delete(delete: sp::Delete) -> Result<Statement> {
         where_clause,
     }))
 }
-
-// ── Expression conversion ───────────────────────────────────────────
 
 fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
     match expr {
@@ -2439,8 +2008,6 @@ fn convert_order_by_expr(expr: &sp::OrderByExpr) -> Result<OrderByItem> {
     })
 }
 
-// ── Data type conversion ────────────────────────────────────────────
-
 fn convert_data_type(dt: &sp::DataType) -> Result<DataType> {
     match dt {
         sp::DataType::Int(_)
@@ -2477,8 +2044,6 @@ fn convert_data_type(dt: &sp::DataType) -> Result<DataType> {
         _ => Err(SqlError::Unsupported(format!("data type: {dt}"))),
     }
 }
-
-// ── Helpers ─────────────────────────────────────────────────────────
 
 fn object_name_to_string(name: &sp::ObjectName) -> String {
     name.0
@@ -3257,31 +2822,6 @@ mod tests {
     fn count_params_none() {
         let stmt = parse_sql("SELECT * FROM t WHERE a = 1").unwrap();
         assert_eq!(count_params(&stmt), 0);
-    }
-
-    #[test]
-    fn bind_params_basic() {
-        let stmt = parse_sql("SELECT * FROM t WHERE id = $1").unwrap();
-        let bound = bind_params(&stmt, &[Value::Integer(42)]).unwrap();
-        match bound {
-            Statement::Select(sq) => match sq.body {
-                QueryBody::Select(sel) => match &sel.where_clause {
-                    Some(Expr::BinaryOp { right, .. }) => {
-                        assert!(matches!(right.as_ref(), Expr::Literal(Value::Integer(42))));
-                    }
-                    other => panic!("expected BinaryOp with Literal, got {other:?}"),
-                },
-                _ => panic!("expected QueryBody::Select"),
-            },
-            _ => panic!("expected Select"),
-        }
-    }
-
-    #[test]
-    fn bind_params_out_of_range() {
-        let stmt = parse_sql("SELECT * FROM t WHERE id = $2").unwrap();
-        let result = bind_params(&stmt, &[Value::Integer(1)]);
-        assert!(result.is_err());
     }
 
     #[test]

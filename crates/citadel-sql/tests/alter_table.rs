@@ -33,13 +33,11 @@ fn assert_rows_affected(result: ExecutionResult, expected: u64) {
     }
 }
 
-// ── ADD COLUMN ───────────────────────────────────────────────────────
-
 #[test]
 fn add_nullable_column_to_empty_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -58,7 +56,7 @@ fn add_nullable_column_to_empty_table() {
 fn add_nullable_column_to_nonempty_table_old_rows_get_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -79,7 +77,7 @@ fn add_nullable_column_to_nonempty_table_old_rows_get_null() {
 fn add_column_with_default_old_rows_get_default() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -102,7 +100,7 @@ fn add_column_with_default_old_rows_get_default() {
 fn add_not_null_with_default_to_nonempty() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -123,7 +121,7 @@ fn add_not_null_with_default_to_nonempty() {
 fn add_not_null_without_default_to_nonempty_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -144,7 +142,7 @@ fn add_not_null_without_default_to_nonempty_errors() {
 fn add_not_null_without_default_to_empty_ok() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -165,7 +163,7 @@ fn add_not_null_without_default_to_empty_ok() {
 fn add_duplicate_column_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -181,7 +179,7 @@ fn add_duplicate_column_errors() {
 fn add_column_if_not_exists_on_existing_is_noop() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -197,7 +195,7 @@ fn add_column_if_not_exists_on_existing_is_noop() {
 fn add_column_to_nonexistent_table_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let err = conn
         .execute("ALTER TABLE missing ADD COLUMN val TEXT")
@@ -209,7 +207,7 @@ fn add_column_to_nonexistent_table_errors() {
 fn add_column_select_star_returns_new_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -236,7 +234,7 @@ fn add_column_select_star_returns_new_column() {
 fn add_column_with_check_constraint() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -260,7 +258,7 @@ fn add_column_persistence_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         assert_ok(
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
                 .unwrap(),
@@ -273,7 +271,7 @@ fn add_column_persistence_after_reopen() {
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let qr = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
         assert_eq!(qr.rows[0][0], Value::Integer(99));
 
@@ -288,7 +286,7 @@ fn add_column_persistence_after_reopen() {
 fn add_column_in_txn_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -298,7 +296,6 @@ fn add_column_in_txn_rollback() {
     assert_ok(conn.execute("ALTER TABLE t ADD COLUMN val TEXT").unwrap());
     conn.execute("ROLLBACK").unwrap();
 
-    // Column should not exist
     let err = conn
         .execute("INSERT INTO t (id, val) VALUES (1, 'x')")
         .unwrap_err();
@@ -309,7 +306,7 @@ fn add_column_in_txn_rollback() {
 fn add_primary_key_column_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -324,13 +321,11 @@ fn add_primary_key_column_errors() {
     );
 }
 
-// ── DROP COLUMN ──────────────────────────────────────────────────────
-
 #[test]
 fn drop_non_pk_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER)")
@@ -355,7 +350,7 @@ fn drop_non_pk_column() {
 fn drop_column_positions_compacted() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c REAL)")
@@ -377,7 +372,7 @@ fn drop_column_positions_compacted() {
 fn drop_pk_column_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -394,7 +389,7 @@ fn drop_pk_column_errors() {
 fn drop_indexed_column_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -413,7 +408,7 @@ fn drop_indexed_column_errors() {
 fn drop_fk_column_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
@@ -440,7 +435,7 @@ fn drop_fk_column_errors() {
 fn drop_column_referenced_by_check_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -460,7 +455,7 @@ fn drop_column_referenced_by_check_errors() {
 fn drop_nonexistent_column_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -476,7 +471,7 @@ fn drop_nonexistent_column_errors() {
 fn drop_column_if_exists_nonexistent_is_noop() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -492,7 +487,7 @@ fn drop_column_if_exists_nonexistent_is_noop() {
 fn drop_column_from_empty_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -508,7 +503,7 @@ fn drop_column_from_empty_table() {
 fn drop_column_indexes_on_remaining_columns_still_work() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c REAL)")
@@ -534,7 +529,7 @@ fn drop_column_persistence_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         assert_ok(
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER)")
                 .unwrap(),
@@ -545,7 +540,7 @@ fn drop_column_persistence_after_reopen() {
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let qr = conn.query("SELECT * FROM t").unwrap();
         assert_eq!(qr.columns, vec!["id", "b"]);
         assert_eq!(qr.rows[0][1], Value::Integer(42));
@@ -556,7 +551,7 @@ fn drop_column_persistence_after_reopen() {
 fn drop_column_in_txn_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -576,7 +571,7 @@ fn drop_column_in_txn_rollback() {
 fn drop_column_with_check_and_default() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -589,12 +584,10 @@ fn drop_column_with_check_and_default() {
 
     assert_ok(conn.execute("ALTER TABLE t DROP COLUMN a").unwrap());
 
-    // Only id and b remain
     let qr = conn.query("SELECT * FROM t").unwrap();
     assert_eq!(qr.columns, vec!["id", "b"]);
     assert_eq!(qr.rows[0][1], Value::Text("x".into()));
 
-    // Insert should work without the dropped column's check
     conn.execute("INSERT INTO t (id, b) VALUES (2, 'y')")
         .unwrap();
 }
@@ -603,7 +596,7 @@ fn drop_column_with_check_and_default() {
 fn drop_column_then_insert_correct_count() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c REAL)")
@@ -618,13 +611,11 @@ fn drop_column_then_insert_correct_count() {
     assert_eq!(qr.rows[0][2], Value::Real(1.5));
 }
 
-// ── RENAME COLUMN ────────────────────────────────────────────────────
-
 #[test]
 fn rename_column_select_with_new_name() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, old_name TEXT)")
@@ -645,7 +636,7 @@ fn rename_column_select_with_new_name() {
 fn rename_column_old_name_no_longer_works() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, old_name TEXT)")
@@ -666,7 +657,7 @@ fn rename_column_old_name_no_longer_works() {
 fn rename_indexed_column_index_still_works() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
@@ -682,7 +673,6 @@ fn rename_indexed_column_index_still_works() {
             .unwrap(),
     );
 
-    // Index should still work under the new name
     let qr = conn.query("SELECT id FROM t WHERE amount = 200").unwrap();
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Integer(2));
@@ -692,7 +682,7 @@ fn rename_indexed_column_index_still_works() {
 fn rename_to_existing_name_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER)")
@@ -709,7 +699,7 @@ fn rename_to_existing_name_errors() {
 fn rename_nonexistent_column_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -726,7 +716,7 @@ fn rename_column_persistence_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         assert_ok(
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
                 .unwrap(),
@@ -739,7 +729,7 @@ fn rename_column_persistence_after_reopen() {
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let qr = conn.query("SELECT name FROM t WHERE id = 1").unwrap();
         assert_eq!(qr.rows[0][0], Value::Text("hello".into()));
     }
@@ -749,7 +739,7 @@ fn rename_column_persistence_after_reopen() {
 fn rename_fk_column_fk_still_enforced() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
@@ -764,13 +754,11 @@ fn rename_fk_column_fk_still_enforced() {
     conn.execute("INSERT INTO parent VALUES (1)").unwrap();
     conn.execute("INSERT INTO child VALUES (1, 1)").unwrap();
 
-    // Rename the FK column in child
     assert_ok(
         conn.execute("ALTER TABLE child RENAME COLUMN pid TO parent_id")
             .unwrap(),
     );
 
-    // FK still enforced
     let err = conn
         .execute("INSERT INTO child VALUES (2, 999)")
         .unwrap_err();
@@ -784,7 +772,7 @@ fn rename_fk_column_fk_still_enforced() {
 fn rename_column_in_txn_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -798,20 +786,17 @@ fn rename_column_in_txn_rollback() {
     );
     conn.execute("ROLLBACK").unwrap();
 
-    // Old name should work again
     conn.execute("INSERT INTO t (id, val) VALUES (1, 'hi')")
         .unwrap();
     let qr = conn.query("SELECT val FROM t").unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("hi".into()));
 }
 
-// ── RENAME TABLE ─────────────────────────────────────────────────────
-
 #[test]
 fn rename_table_old_errors_new_works() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE old_t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -834,7 +819,7 @@ fn rename_table_old_errors_new_works() {
 fn rename_table_data_preserved() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
@@ -858,7 +843,7 @@ fn rename_table_data_preserved() {
 fn rename_table_indexes_work() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
@@ -880,7 +865,7 @@ fn rename_table_indexes_work() {
 fn rename_to_existing_table_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY)")
@@ -902,7 +887,7 @@ fn rename_to_existing_table_errors() {
 fn rename_nonexistent_table_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let err = conn
         .execute("ALTER TABLE missing RENAME TO new_name")
@@ -914,7 +899,7 @@ fn rename_nonexistent_table_errors() {
 fn rename_table_fks_in_other_tables_updated() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
@@ -943,7 +928,6 @@ fn rename_table_fks_in_other_tables_updated() {
         "got: {err:?}"
     );
 
-    // Valid insert still works
     conn.execute("INSERT INTO parent2 VALUES (2)").unwrap();
     conn.execute("INSERT INTO child VALUES (2, 2)").unwrap();
 }
@@ -953,7 +937,7 @@ fn rename_table_persistence_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         assert_ok(
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
                 .unwrap(),
@@ -963,7 +947,7 @@ fn rename_table_persistence_after_reopen() {
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let qr = conn
             .query("SELECT val FROM t_renamed WHERE id = 1")
             .unwrap();
@@ -978,7 +962,7 @@ fn rename_table_persistence_after_reopen() {
 fn rename_table_in_txn_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -990,7 +974,6 @@ fn rename_table_in_txn_rollback() {
     assert_ok(conn.execute("ALTER TABLE t RENAME TO t_new").unwrap());
     conn.execute("ROLLBACK").unwrap();
 
-    // Old name should work again
     let qr = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("hi".into()));
 }
@@ -999,7 +982,7 @@ fn rename_table_in_txn_rollback() {
 fn rename_table_with_self_referencing_fk() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES t(id))")
@@ -1010,7 +993,6 @@ fn rename_table_with_self_referencing_fk() {
 
     assert_ok(conn.execute("ALTER TABLE t RENAME TO tree").unwrap());
 
-    // Self-referencing FK still enforced
     let err = conn
         .execute("INSERT INTO tree VALUES (3, 999)")
         .unwrap_err();
@@ -1019,7 +1001,6 @@ fn rename_table_with_self_referencing_fk() {
         "got: {err:?}"
     );
 
-    // Valid self-ref still works
     conn.execute("INSERT INTO tree VALUES (3, 2)").unwrap();
 }
 
@@ -1027,7 +1008,7 @@ fn rename_table_with_self_referencing_fk() {
 fn explain_alter_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -1051,13 +1032,11 @@ fn explain_alter_table() {
     assert!(line.contains("RENAME TO"), "got: {line}");
 }
 
-// ── Edge cases & decode-path coverage ────────────────────────────────
-
 #[test]
 fn add_then_drop_same_column_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -1081,7 +1060,7 @@ fn add_then_drop_same_column_roundtrip() {
 fn chained_in_txn_create_add_insert_drop() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -1107,7 +1086,7 @@ fn chained_in_txn_create_add_insert_drop() {
 fn multiple_sequential_add_columns_all_defaults_correct() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -1138,7 +1117,7 @@ fn multiple_sequential_add_columns_all_defaults_correct() {
 fn add_column_with_default_expression() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -1159,7 +1138,7 @@ fn add_column_with_default_expression() {
 fn large_table_drop_column_all_rows_rewritten() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)")
@@ -1183,7 +1162,7 @@ fn large_table_drop_column_all_rows_rewritten() {
 fn add_column_sum_avg_count_on_new_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -1210,7 +1189,7 @@ fn add_column_sum_avg_count_on_new_column() {
 fn add_column_where_on_new_column_integer_comparison() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -1226,7 +1205,6 @@ fn add_column_where_on_new_column_integer_comparison() {
             .unwrap(),
     );
 
-    // This exercises the SimplePredicate / match_nonpk_int_inline path
     let qr = conn.query("SELECT id FROM t WHERE val = 10").unwrap();
     assert_eq!(qr.rows.len(), 5);
 
@@ -1241,7 +1219,7 @@ fn add_column_where_on_new_column_integer_comparison() {
 fn add_column_select_projection_only_new_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
@@ -1255,7 +1233,6 @@ fn add_column_select_projection_only_new_column() {
             .unwrap(),
     );
 
-    // This exercises PartialDecodeCtx::decode() path
     let qr = conn.query("SELECT b FROM t ORDER BY id").unwrap();
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Integer(42));
@@ -1266,7 +1243,7 @@ fn add_column_select_projection_only_new_column() {
 fn add_column_join_using_new_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY)")
@@ -1295,7 +1272,7 @@ fn add_column_join_using_new_column() {
 fn add_column_with_default_then_update_old_row() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -1326,7 +1303,7 @@ fn add_column_with_default_then_update_old_row() {
 fn alter_internal_schema_table_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let err = conn
         .execute("ALTER TABLE _schema ADD COLUMN x TEXT")
@@ -1341,7 +1318,7 @@ fn alter_internal_schema_table_errors() {
 fn add_column_with_fk() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
@@ -1375,7 +1352,7 @@ fn add_column_with_fk() {
 fn drop_column_referenced_by_other_table_fk() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, val INTEGER)")
@@ -1406,7 +1383,7 @@ fn drop_column_referenced_by_other_table_fk() {
 fn add_column_nullable_with_where_null_check() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")

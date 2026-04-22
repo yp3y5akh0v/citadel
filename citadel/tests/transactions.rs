@@ -125,14 +125,11 @@ fn open_shared_manager(storage: &std::sync::Arc<SharedStorage>) -> TxnManager {
     TxnManager::open(io, dek, mac_key, 1, 256).unwrap()
 }
 
-// === Basic CRUD ===
-
 #[test]
 fn insert_read_delete_cycle() {
     let storage = std::sync::Arc::new(SharedStorage::new(1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
-    // Insert
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"name", b"Alice").unwrap();
@@ -140,21 +137,18 @@ fn insert_read_delete_cycle() {
         wtx.commit().unwrap();
     }
 
-    // Read
     {
         let mut rtx = mgr.begin_read();
         assert_eq!(rtx.get(b"name").unwrap(), Some(b"Alice".to_vec()));
         assert_eq!(rtx.get(b"age").unwrap(), Some(b"30".to_vec()));
     }
 
-    // Delete
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.delete(b"age").unwrap();
         wtx.commit().unwrap();
     }
 
-    // Verify
     {
         let mut rtx = mgr.begin_read();
         assert_eq!(rtx.get(b"name").unwrap(), Some(b"Alice".to_vec()));
@@ -162,13 +156,10 @@ fn insert_read_delete_cycle() {
     }
 }
 
-// === Persistence (reopen-and-verify) ===
-
 #[test]
 fn persist_across_reopen() {
     let storage = std::sync::Arc::new(SharedStorage::new(1024 * 1024));
 
-    // Session 1: create and insert
     {
         let mgr = create_shared_manager(&storage);
         let mut wtx = mgr.begin_write().unwrap();
@@ -180,7 +171,6 @@ fn persist_across_reopen() {
         wtx.commit().unwrap();
     }
 
-    // Session 2: reopen and verify all data
     {
         let mgr = open_shared_manager(&storage);
         let slot = mgr.current_slot();
@@ -203,7 +193,6 @@ fn persist_across_reopen() {
 fn multiple_sessions_accumulate() {
     let storage = std::sync::Arc::new(SharedStorage::new(1024 * 1024));
 
-    // Session 1: insert keys 0-49
     {
         let mgr = create_shared_manager(&storage);
         let mut wtx = mgr.begin_write().unwrap();
@@ -214,7 +203,6 @@ fn multiple_sessions_accumulate() {
         wtx.commit().unwrap();
     }
 
-    // Session 2: insert keys 50-99
     {
         let mgr = open_shared_manager(&storage);
         let mut wtx = mgr.begin_write().unwrap();
@@ -225,7 +213,6 @@ fn multiple_sessions_accumulate() {
         wtx.commit().unwrap();
     }
 
-    // Session 3: verify all 100
     {
         let mgr = open_shared_manager(&storage);
         let mut rtx = mgr.begin_read();
@@ -237,25 +224,20 @@ fn multiple_sessions_accumulate() {
     }
 }
 
-// === Snapshot Isolation ===
-
 #[test]
 fn snapshot_isolation_read_during_write() {
     let storage = std::sync::Arc::new(SharedStorage::new(1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
-    // Insert initial data
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"stable", b"yes").unwrap();
         wtx.commit().unwrap();
     }
 
-    // Start a read (snapshot before write)
     let mut rtx_before = mgr.begin_read();
     assert_eq!(rtx_before.get(b"stable").unwrap(), Some(b"yes".to_vec()));
 
-    // Write new data
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"new_key", b"new_val").unwrap();
@@ -263,11 +245,10 @@ fn snapshot_isolation_read_during_write() {
         wtx.commit().unwrap();
     }
 
-    // Old read should NOT see the new data (snapshot isolation via CoW)
+    // Old read MUST NOT see the new data (snapshot isolation via CoW).
     assert_eq!(rtx_before.get(b"stable").unwrap(), Some(b"yes".to_vec()));
     assert_eq!(rtx_before.get(b"new_key").unwrap(), None);
 
-    // New read should see everything
     let mut rtx_after = mgr.begin_read();
     assert_eq!(
         rtx_after.get(b"stable").unwrap(),
@@ -279,21 +260,17 @@ fn snapshot_isolation_read_during_write() {
     );
 }
 
-// === Abort Semantics ===
-
 #[test]
 fn abort_leaves_database_unchanged() {
     let storage = std::sync::Arc::new(SharedStorage::new(1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
-    // Initial state
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"original", b"data").unwrap();
         wtx.commit().unwrap();
     }
 
-    // Aborted write
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"aborted_key", b"should_not_exist").unwrap();
@@ -301,7 +278,6 @@ fn abort_leaves_database_unchanged() {
         wtx.abort();
     }
 
-    // Verify no changes from the abort
     {
         let mut rtx = mgr.begin_read();
         assert_eq!(rtx.get(b"original").unwrap(), Some(b"data".to_vec()));
@@ -320,23 +296,18 @@ fn drop_without_commit_is_abort() {
         // Dropped without commit
     }
 
-    // Writer should be released for a new write
     let _wtx2 = mgr.begin_write().unwrap();
 }
-
-// === Commit Slot Alternation ===
 
 #[test]
 fn commit_slot_alternates() {
     let storage = std::sync::Arc::new(SharedStorage::new(1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
-    // Read initial god byte
     let io = SharedIO::new(storage.clone());
     let initial_god = file_manager::read_god_byte(&io).unwrap();
     let initial_slot = (initial_god & GOD_BIT_ACTIVE_SLOT) as usize;
 
-    // Commit 1: should flip to opposite slot
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"k1", b"v1").unwrap();
@@ -347,7 +318,6 @@ fn commit_slot_alternates() {
     let slot_1 = (after_1 & GOD_BIT_ACTIVE_SLOT) as usize;
     assert_ne!(slot_1, initial_slot, "commit should flip active slot");
 
-    // Commit 2: should flip back
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"k2", b"v2").unwrap();
@@ -371,7 +341,6 @@ fn recovery_flag_cleared_after_commit() {
         wtx.commit().unwrap();
     }
 
-    // After commit, recovery flag (bit 1) should be 0
     let io = SharedIO::new(storage.clone());
     let god = file_manager::read_god_byte(&io).unwrap();
     assert_eq!(
@@ -381,13 +350,10 @@ fn recovery_flag_cleared_after_commit() {
     );
 }
 
-// === Recovery Simulation ===
-
 #[test]
 fn recovery_with_recovery_flag_set() {
     let storage = std::sync::Arc::new(SharedStorage::new(1024 * 1024));
 
-    // Create and commit some data
     {
         let mgr = create_shared_manager(&storage);
         let mut wtx = mgr.begin_write().unwrap();
@@ -395,7 +361,7 @@ fn recovery_with_recovery_flag_set() {
         wtx.commit().unwrap();
     }
 
-    // Simulate crash during a commit: set recovery flag manually
+    // Simulate mid-commit crash by setting the recovery flag manually.
     {
         let io = SharedIO::new(storage.clone());
         let god = file_manager::read_god_byte(&io).unwrap();
@@ -403,22 +369,18 @@ fn recovery_with_recovery_flag_set() {
         file_manager::write_god_byte(&io, crashed_god).unwrap();
     }
 
-    // Reopen - recovery should succeed, data should be intact
     {
         let mgr = open_shared_manager(&storage);
         let mut rtx = mgr.begin_read();
         assert_eq!(rtx.get(b"key").unwrap(), Some(b"value".to_vec()));
     }
 
-    // Recovery flag should be cleared
     {
         let io = SharedIO::new(storage.clone());
         let god = file_manager::read_god_byte(&io).unwrap();
         assert_eq!(god & GOD_BIT_RECOVERY, 0, "recovery should clear the flag");
     }
 }
-
-// === Reader Registration ===
 
 #[test]
 fn reader_count_lifecycle() {
@@ -440,13 +402,10 @@ fn reader_count_lifecycle() {
     assert_eq!(mgr.reader_count(), 0);
 }
 
-// === Large Data ===
-
 #[test]
 fn thousand_keys_persist() {
     let storage = std::sync::Arc::new(SharedStorage::new(4 * 1024 * 1024));
 
-    // Write 1000 keys
     {
         let mgr = create_shared_manager(&storage);
         let mut wtx = mgr.begin_write().unwrap();
@@ -458,7 +417,6 @@ fn thousand_keys_persist() {
         wtx.commit().unwrap();
     }
 
-    // Reopen and verify
     {
         let mgr = open_shared_manager(&storage);
         let slot = mgr.current_slot();
@@ -472,8 +430,6 @@ fn thousand_keys_persist() {
         }
     }
 }
-
-// === Multiple Transactions ===
 
 #[test]
 fn ten_sequential_transactions() {
@@ -500,8 +456,6 @@ fn ten_sequential_transactions() {
     }
 }
 
-// === Pending-Free Chain Lifecycle ===
-
 #[test]
 fn pending_free_pages_accumulate() {
     let storage = std::sync::Arc::new(SharedStorage::new(4 * 1024 * 1024));
@@ -519,7 +473,6 @@ fn pending_free_pages_accumulate() {
 
     let hwm_after_insert = mgr.current_slot().high_water_mark;
 
-    // Delete all - CoW creates new pages, frees old
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 0..100u32 {
@@ -529,26 +482,22 @@ fn pending_free_pages_accumulate() {
         wtx.commit().unwrap();
     }
 
-    // HWM should have grown (CoW allocated new pages for deletion path)
+    // HWM must not shrink: CoW allocates new pages for the deletion path.
     let hwm_after_delete = mgr.current_slot().high_water_mark;
     assert!(
         hwm_after_delete >= hwm_after_insert,
         "HWM should not shrink: before={hwm_after_insert} after={hwm_after_delete}"
     );
 
-    // Pending-free chain should exist
     let pf_root = mgr.current_slot().pending_free_root;
     assert!(pf_root.is_valid(), "pending-free chain should have entries");
 }
-
-// === Entry Count Correctness ===
 
 #[test]
 fn entry_count_tracks_across_transactions() {
     let storage = std::sync::Arc::new(SharedStorage::new(2 * 1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
-    // Txn 1: +5
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 0..5 {
@@ -558,7 +507,6 @@ fn entry_count_tracks_across_transactions() {
     }
     assert_eq!(mgr.current_slot().tree_entries, 5);
 
-    // Txn 2: +3 new, update 1 existing
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"k0", b"updated").unwrap(); // update
@@ -569,7 +517,6 @@ fn entry_count_tracks_across_transactions() {
     }
     assert_eq!(mgr.current_slot().tree_entries, 8);
 
-    // Txn 3: -2
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.delete(b"k1").unwrap();
@@ -579,37 +526,29 @@ fn entry_count_tracks_across_transactions() {
     assert_eq!(mgr.current_slot().tree_entries, 6);
 }
 
-// === Concurrent Read and Write ===
-
 #[test]
 fn reader_coexists_with_writer() {
     let storage = std::sync::Arc::new(SharedStorage::new(2 * 1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
-    // Insert initial data
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"pre", b"existing").unwrap();
         wtx.commit().unwrap();
     }
 
-    // Start a reader
     let mut rtx = mgr.begin_read();
     assert_eq!(rtx.get(b"pre").unwrap(), Some(b"existing".to_vec()));
 
-    // Start a writer while reader is active
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"during_write", b"new").unwrap();
         wtx.commit().unwrap();
     }
 
-    // Reader still sees old snapshot
     assert_eq!(rtx.get(b"during_write").unwrap(), None);
     assert_eq!(rtx.get(b"pre").unwrap(), Some(b"existing".to_vec()));
 }
-
-// === Write-Read-Write Interleaving ===
 
 #[test]
 fn write_read_write_interleave() {
@@ -632,7 +571,6 @@ fn write_read_write_interleave() {
         wtx.commit().unwrap();
     }
 
-    // rtx1 still sees old state
     assert_eq!(rtx1.get(b"a").unwrap(), Some(b"1".to_vec()));
     assert_eq!(rtx1.get(b"b").unwrap(), None);
 
@@ -641,10 +579,6 @@ fn write_read_write_interleave() {
     assert_eq!(rtx2.get(b"a").unwrap(), Some(b"2".to_vec()));
     assert_eq!(rtx2.get(b"b").unwrap(), Some(b"3".to_vec()));
 }
-
-// ============================================================
-// Edge cases and regressions
-// ============================================================
 
 /// SharedIO that fails on the Nth fsync call, for simulating mid-commit failures.
 struct FailingIO {
@@ -699,7 +633,6 @@ fn failed_commit_releases_writer_lock() {
     // FailingIO fails on second fsync - commit must still release writer lock.
     let storage = std::sync::Arc::new(SharedStorage::new(4 * 1024 * 1024));
 
-    // First, create a valid database with normal I/O
     {
         let mgr = create_shared_manager(&storage);
         let mut wtx = mgr.begin_write().unwrap();
@@ -707,7 +640,6 @@ fn failed_commit_releases_writer_lock() {
         wtx.commit().unwrap();
     }
 
-    // Now open with FailingIO that fails on 2nd fsync (during commit protocol)
     let (dek, mac_key, _) = test_keys();
     let failing_io = Box::new(FailingIO::new(storage.clone(), 2));
     let mgr = TxnManager::open(failing_io, dek, mac_key, 1, 256).unwrap();
@@ -750,7 +682,6 @@ fn for_each_multi_leaf_tree() {
         wtx.commit().unwrap();
     }
 
-    // Now use for_each in a NEW write transaction (reads from disk)
     {
         let mut wtx = mgr.begin_write().unwrap();
         let mut collected = Vec::new();
@@ -766,7 +697,6 @@ fn for_each_multi_leaf_tree() {
             "for_each should visit all {count} entries"
         );
 
-        // Verify sorted order
         for i in 1..collected.len() {
             assert!(
                 collected[i].0 > collected[i - 1].0,
@@ -774,7 +704,6 @@ fn for_each_multi_leaf_tree() {
             );
         }
 
-        // Verify first and last
         assert_eq!(collected[0].0, b"key-000000");
         assert_eq!(collected[0].1, b"val-000000");
         assert_eq!(
@@ -856,8 +785,6 @@ fn reclaimed_pages_reused() {
     );
 }
 
-// --- for_each edge cases ---
-
 #[test]
 fn for_each_empty_tree() {
     let storage = std::sync::Arc::new(SharedStorage::new(1024 * 1024));
@@ -931,7 +858,6 @@ fn for_each_filters_tombstones() {
         })
         .unwrap();
 
-        // Should only see the 5 remaining keys (tombstones filtered)
         assert_eq!(entries.len(), 5, "for_each should filter tombstones");
         for (i, (k, _)) in entries.iter().enumerate() {
             let expected = format!("fkey-{:02}", i + 5);
@@ -949,17 +875,14 @@ fn for_each_after_mixed_operations() {
 
     {
         let mut wtx = mgr.begin_write().unwrap();
-        // Insert 20 keys
         for i in 0..20u32 {
             let key = format!("m{i:03}");
             wtx.insert(key.as_bytes(), b"original").unwrap();
         }
-        // Delete even-numbered keys
         for i in (0..20u32).step_by(2) {
             let key = format!("m{i:03}");
             wtx.delete(key.as_bytes()).unwrap();
         }
-        // Update odd-numbered keys
         for i in (1..20u32).step_by(2) {
             let key = format!("m{i:03}");
             wtx.insert(key.as_bytes(), b"updated").unwrap();
@@ -984,8 +907,6 @@ fn for_each_after_mixed_operations() {
     }
 }
 
-// --- WriteTxn read-your-own-writes ---
-
 #[test]
 fn write_txn_sees_own_inserts() {
     let storage = std::sync::Arc::new(SharedStorage::new(1024 * 1024));
@@ -993,14 +914,12 @@ fn write_txn_sees_own_inserts() {
 
     let mut wtx = mgr.begin_write().unwrap();
 
-    // Insert and immediately read back (before commit)
     wtx.insert(b"key1", b"val1").unwrap();
     assert_eq!(wtx.get(b"key1").unwrap(), Some(b"val1".to_vec()));
 
     wtx.insert(b"key2", b"val2").unwrap();
     assert_eq!(wtx.get(b"key2").unwrap(), Some(b"val2".to_vec()));
 
-    // Both still visible
     assert_eq!(wtx.get(b"key1").unwrap(), Some(b"val1".to_vec()));
 
     wtx.commit().unwrap();
@@ -1021,7 +940,6 @@ fn write_txn_sees_own_deletes() {
 
     {
         let mut wtx = mgr.begin_write().unwrap();
-        // Delete and verify immediately
         wtx.delete(b"b").unwrap();
         assert_eq!(
             wtx.get(b"b").unwrap(),
@@ -1038,14 +956,11 @@ fn write_txn_sees_own_deletes() {
     }
 }
 
-// --- Empty commit ---
-
 #[test]
 fn empty_commit() {
     let storage = std::sync::Arc::new(SharedStorage::new(1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
-    // Insert data first
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.insert(b"key", b"val").unwrap();
@@ -1054,21 +969,17 @@ fn empty_commit() {
 
     let slot_before = mgr.current_slot();
 
-    // Empty commit (no operations)
     {
         let wtx = mgr.begin_write().unwrap();
         wtx.commit().unwrap();
     }
 
     let slot_after = mgr.current_slot();
-    // Data should still be there
     assert_eq!(slot_after.tree_entries, slot_before.tree_entries);
 
     let mut rtx = mgr.begin_read();
     assert_eq!(rtx.get(b"key").unwrap(), Some(b"val".to_vec()));
 }
-
-// --- Update same key many times ---
 
 #[test]
 fn update_same_key_many_times() {
@@ -1081,7 +992,6 @@ fn update_same_key_many_times() {
             let val = format!("version-{i:03}");
             wtx.insert(b"counter", val.as_bytes()).unwrap();
         }
-        // Entry count should still be 1 (updates, not new inserts)
         assert_eq!(wtx.entry_count(), 1);
         assert_eq!(wtx.get(b"counter").unwrap(), Some(b"version-099".to_vec()));
         wtx.commit().unwrap();
@@ -1092,13 +1002,10 @@ fn update_same_key_many_times() {
     assert_eq!(rtx.get(b"counter").unwrap(), Some(b"version-099".to_vec()));
 }
 
-// --- Three-session persistence ---
-
 #[test]
 fn three_session_persistence() {
     let storage = std::sync::Arc::new(SharedStorage::new(4 * 1024 * 1024));
 
-    // Session 1: create DB, insert keys
     {
         let mgr = create_shared_manager(&storage);
         let mut wtx = mgr.begin_write().unwrap();
@@ -1109,10 +1016,8 @@ fn three_session_persistence() {
         wtx.commit().unwrap();
     }
 
-    // Session 2: reopen, verify, add more
     {
         let mgr = open_shared_manager(&storage);
-        // Verify session 1 data
         let mut rtx = mgr.begin_read();
         assert_eq!(rtx.entry_count(), 50);
         assert_eq!(rtx.get(b"s1-000").unwrap(), Some(b"session1".to_vec()));
@@ -1126,13 +1031,11 @@ fn three_session_persistence() {
         wtx.commit().unwrap();
     }
 
-    // Session 3: reopen, verify all
     {
         let mgr = open_shared_manager(&storage);
         let mut rtx = mgr.begin_read();
         assert_eq!(rtx.entry_count(), 80);
 
-        // Session 1 data intact
         for i in 0..50u32 {
             let key = format!("s1-{i:03}");
             assert_eq!(
@@ -1141,7 +1044,6 @@ fn three_session_persistence() {
                 "session 1 key {key} should persist through 3 sessions"
             );
         }
-        // Session 2 data intact
         for i in 0..30u32 {
             let key = format!("s2-{i:03}");
             assert_eq!(rtx.get(key.as_bytes()).unwrap(), Some(b"session2".to_vec()));
@@ -1149,14 +1051,11 @@ fn three_session_persistence() {
     }
 }
 
-// --- Concurrent readers on different snapshots ---
-
 #[test]
 fn concurrent_readers_different_snapshots() {
     let storage = std::sync::Arc::new(SharedStorage::new(4 * 1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
-    // Version 1: 5 keys
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 0..5u32 {
@@ -1168,7 +1067,6 @@ fn concurrent_readers_different_snapshots() {
 
     let mut reader_v1 = mgr.begin_read();
 
-    // Version 2: add 5 more keys, update existing
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 5..10u32 {
@@ -1181,7 +1079,6 @@ fn concurrent_readers_different_snapshots() {
 
     let mut reader_v2 = mgr.begin_read();
 
-    // Version 3: delete some keys
     {
         let mut wtx = mgr.begin_write().unwrap();
         wtx.delete(b"snap-1").unwrap();
@@ -1191,7 +1088,6 @@ fn concurrent_readers_different_snapshots() {
 
     let mut reader_v3 = mgr.begin_read();
 
-    // Verify each reader sees its own snapshot
     assert_eq!(reader_v1.entry_count(), 5);
     assert_eq!(reader_v1.get(b"snap-0").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(reader_v1.get(b"snap-5").unwrap(), None); // Not yet in v1
@@ -1204,18 +1100,14 @@ fn concurrent_readers_different_snapshots() {
     assert_eq!(reader_v3.get(b"snap-1").unwrap(), None); // Deleted in v3
     assert_eq!(reader_v3.get(b"snap-3").unwrap(), Some(b"v1".to_vec()));
 
-    // 3 readers active simultaneously
     assert_eq!(mgr.reader_count(), 3);
 }
-
-// --- Large batch delete ---
 
 #[test]
 fn large_batch_delete_and_verify() {
     let storage = std::sync::Arc::new(SharedStorage::new(8 * 1024 * 1024));
     let mgr = create_shared_manager(&storage);
 
-    // Insert 1000 keys
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 0..1000u32 {
@@ -1226,7 +1118,6 @@ fn large_batch_delete_and_verify() {
         wtx.commit().unwrap();
     }
 
-    // Delete first 500
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 0..500u32 {
@@ -1237,7 +1128,6 @@ fn large_batch_delete_and_verify() {
         wtx.commit().unwrap();
     }
 
-    // Verify: first 500 gone, last 500 present
     {
         let mut rtx = mgr.begin_read();
         assert_eq!(rtx.entry_count(), 500);
@@ -1262,8 +1152,6 @@ fn large_batch_delete_and_verify() {
     }
 }
 
-// --- HWM tracking ---
-
 #[test]
 fn hwm_tracking_across_transactions() {
     let storage = std::sync::Arc::new(SharedStorage::new(4 * 1024 * 1024));
@@ -1272,7 +1160,6 @@ fn hwm_tracking_across_transactions() {
     let initial_hwm = mgr.current_slot().high_water_mark;
     assert!(initial_hwm >= 1, "initial HWM should include root page");
 
-    // Insert many keys - HWM should grow
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 0..200u32 {
@@ -1288,7 +1175,6 @@ fn hwm_tracking_across_transactions() {
         "HWM should grow after inserts: initial={initial_hwm} after={hwm_after_insert}"
     );
 
-    // HWM never decreases (even after deletes)
     {
         let mut wtx = mgr.begin_write().unwrap();
         for i in 0..100u32 {
@@ -1302,8 +1188,6 @@ fn hwm_tracking_across_transactions() {
     assert!(hwm_after_delete >= hwm_after_insert,
         "HWM should never decrease: after_insert={hwm_after_insert} after_delete={hwm_after_delete}");
 }
-
-// --- Oldest reader blocks page reclamation ---
 
 #[test]
 fn oldest_reader_blocks_reclamation() {
@@ -1425,8 +1309,6 @@ fn oldest_reader_blocks_reclamation() {
     );
 }
 
-// --- Write after abort ---
-
 #[test]
 fn write_after_abort_succeeds() {
     let storage = std::sync::Arc::new(SharedStorage::new(2 * 1024 * 1024));
@@ -1450,8 +1332,6 @@ fn write_after_abort_succeeds() {
     assert_eq!(rtx.get(b"aborted").unwrap(), None);
     assert_eq!(rtx.get(b"real").unwrap(), Some(b"data".to_vec()));
 }
-
-// --- Mixed insert/update/delete entry count ---
 
 #[test]
 fn entry_count_mixed_operations_single_txn() {
@@ -1492,8 +1372,6 @@ fn entry_count_mixed_operations_single_txn() {
 
     assert_eq!(mgr.current_slot().tree_entries, 9);
 }
-
-// --- Persistence after delete ---
 
 #[test]
 fn deleted_keys_stay_deleted_after_reopen() {
@@ -1544,8 +1422,6 @@ fn deleted_keys_stay_deleted_after_reopen() {
     }
 }
 
-// --- Stress: many small transactions ---
-
 #[test]
 fn fifty_sequential_transactions() {
     let storage = std::sync::Arc::new(SharedStorage::new(8 * 1024 * 1024));
@@ -1568,12 +1444,6 @@ fn fifty_sequential_transactions() {
     assert!(rtx.get(b"t025-05").unwrap().is_some());
     assert!(rtx.get(b"t049-09").unwrap().is_some());
 }
-
-// ============================================================
-// Commit-slot and recovery edge cases
-// ============================================================
-
-// --- Torn commit slot recovery ---
 
 #[test]
 fn torn_commit_slot_falls_back_to_active() {
@@ -1626,14 +1496,11 @@ fn torn_commit_slot_falls_back_to_active() {
     }
 }
 
-// --- Both commit slots corrupted = DatabaseCorrupted (double fault) ---
-
 #[test]
 fn both_slots_corrupted_returns_error() {
     // Both commit slots have invalid checksums → DatabaseCorrupted.
     let storage = std::sync::Arc::new(SharedStorage::new(1024 * 1024));
 
-    // Create a valid DB first
     {
         let mgr = create_shared_manager(&storage);
         let mut wtx = mgr.begin_write().unwrap();
@@ -1658,8 +1525,6 @@ fn both_slots_corrupted_returns_error() {
         "opening with both corrupted slots should fail"
     );
 }
-
-// --- Rapid key overwrite: file size stabilizes ---
 
 #[test]
 fn rapid_key_overwrite_file_stabilizes() {
@@ -1702,8 +1567,6 @@ fn rapid_key_overwrite_file_stabilizes() {
     assert_eq!(rtx.entry_count(), 1);
 }
 
-// --- Transient I/O error during commit + reopen consistency ---
-
 #[test]
 fn transient_io_error_does_not_corrupt_database() {
     // A failed commit must leave the DB at the previous consistent state.
@@ -1736,7 +1599,6 @@ fn transient_io_error_does_not_corrupt_database() {
         assert!(result.is_err(), "commit should fail due to I/O error");
     }
 
-    // Drop the manager (clean close)
     drop(mgr);
 
     // Reopen with normal I/O - database should be at the OLD consistent state
@@ -1752,8 +1614,6 @@ fn transient_io_error_does_not_corrupt_database() {
         );
     }
 }
-
-// --- CoW ancestor chain completeness ---
 
 #[test]
 fn cow_produces_new_root_each_commit() {
@@ -1837,8 +1697,6 @@ fn cow_produces_new_root_each_commit() {
     );
 }
 
-// --- Pages freed at reader's txn_id are NOT reclaimable (off-by-one guard) ---
-
 #[test]
 fn pages_freed_at_reader_txn_not_reclaimable() {
     // Off-by-one guard: a reader at txn_id=X must pin pages freed at txn_id=X.
@@ -1891,8 +1749,6 @@ fn pages_freed_at_reader_txn_not_reclaimable() {
 
     drop(reader);
 }
-
-// --- Interleaved insert-delete stress across many transactions ---
 
 #[test]
 fn interleaved_insert_delete_stress() {

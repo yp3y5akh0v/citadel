@@ -35,7 +35,7 @@ fn assert_rows(r: ExecutionResult, expected: u64) {
     }
 }
 
-fn count(conn: &mut Connection<'_>, sql: &str) -> i64 {
+fn count(conn: &Connection<'_>, sql: &str) -> i64 {
     let qr = conn.query(sql).unwrap();
     match &qr.rows[0][0] {
         Value::Integer(n) => *n,
@@ -43,20 +43,16 @@ fn count(conn: &mut Connection<'_>, sql: &str) -> i64 {
     }
 }
 
-fn setup(conn: &mut Connection<'_>) {
+fn setup(conn: &Connection<'_>) {
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// Mechanics & guards
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn savepoint_outside_txn_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let err = conn.execute("SAVEPOINT sp1").unwrap_err();
     assert!(matches!(err, SqlError::NoActiveTransaction));
 }
@@ -65,7 +61,7 @@ fn savepoint_outside_txn_errors() {
 fn release_outside_txn_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let err = conn.execute("RELEASE SAVEPOINT sp1").unwrap_err();
     assert!(matches!(err, SqlError::NoActiveTransaction));
 }
@@ -74,7 +70,7 @@ fn release_outside_txn_errors() {
 fn rollback_to_outside_txn_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let err = conn.execute("ROLLBACK TO sp1").unwrap_err();
     assert!(matches!(err, SqlError::NoActiveTransaction));
 }
@@ -83,8 +79,8 @@ fn rollback_to_outside_txn_errors() {
 fn commit_clears_savepoint_stack() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     assert_ok(conn.execute("BEGIN").unwrap());
     assert_ok(conn.execute("SAVEPOINT sp1").unwrap());
     assert_ok(conn.execute("COMMIT").unwrap());
@@ -98,8 +94,8 @@ fn commit_clears_savepoint_stack() {
 fn rollback_clears_savepoint_stack() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     assert_ok(conn.execute("BEGIN").unwrap());
     assert_ok(conn.execute("SAVEPOINT sp1").unwrap());
     assert_ok(conn.execute("ROLLBACK").unwrap());
@@ -113,8 +109,8 @@ fn rollback_clears_savepoint_stack() {
 fn release_nonexistent_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     assert_ok(conn.execute("BEGIN").unwrap());
     let err = conn.execute("RELEASE SAVEPOINT ghost").unwrap_err();
     assert!(matches!(err, SqlError::SavepointNotFound(_)));
@@ -124,23 +120,19 @@ fn release_nonexistent_errors() {
 fn rollback_to_nonexistent_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     assert_ok(conn.execute("BEGIN").unwrap());
     let err = conn.execute("ROLLBACK TO ghost").unwrap_err();
     assert!(matches!(err, SqlError::SavepointNotFound(_)));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Single-level semantics
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn release_keeps_work() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SAVEPOINT sp1").unwrap();
@@ -149,15 +141,15 @@ fn release_keeps_work() {
     conn.execute("RELEASE SAVEPOINT sp1").unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 1);
 }
 
 #[test]
 fn rollback_to_discards_post_savepoint() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, 'keep')")
@@ -180,8 +172,8 @@ fn rollback_to_discards_post_savepoint() {
 fn rollback_to_preserves_savepoint() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SAVEPOINT sp1").unwrap();
@@ -193,15 +185,15 @@ fn rollback_to_preserves_savepoint() {
     conn.execute("ROLLBACK TO sp1").unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 0);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 0);
 }
 
 #[test]
 fn pre_savepoint_work_persists() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, 'pre')")
@@ -217,16 +209,12 @@ fn pre_savepoint_work_persists() {
     assert_eq!(qr.rows[0][0], Value::Text("pre".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Nesting
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn release_inner_keeps_outer() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SAVEPOINT a").unwrap();
@@ -241,15 +229,15 @@ fn release_inner_keeps_outer() {
     conn.execute("ROLLBACK TO a").unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 0);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 0);
 }
 
 #[test]
 fn rollback_to_inner_keeps_work_up_to_inner() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, 'outer')")
@@ -273,8 +261,8 @@ fn rollback_to_inner_keeps_work_up_to_inner() {
 fn rollback_to_outer_discards_middle_and_inner() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SAVEPOINT a").unwrap();
@@ -289,7 +277,7 @@ fn rollback_to_outer_discards_middle_and_inner() {
     conn.execute("ROLLBACK TO a").unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 0);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 0);
 
     assert_ok(conn.execute("BEGIN").unwrap());
     let err = conn.execute("RELEASE b").unwrap_err();
@@ -300,8 +288,8 @@ fn rollback_to_outer_discards_middle_and_inner() {
 fn shadowed_duplicate_name() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SAVEPOINT sp").unwrap();
@@ -323,8 +311,8 @@ fn shadowed_duplicate_name() {
 fn shadowed_release_peels_inner() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SAVEPOINT sp").unwrap();
@@ -337,19 +325,15 @@ fn shadowed_release_peels_inner() {
     conn.execute("ROLLBACK TO sp").unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 0);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 0);
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// DDL across savepoints
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn create_table_rolled_back() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SAVEPOINT sp").unwrap();
@@ -367,8 +351,8 @@ fn create_table_rolled_back() {
 fn drop_table_rolled_back() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     conn.execute("INSERT INTO t (id, val) VALUES (1, 'a')")
         .unwrap();
 
@@ -378,15 +362,15 @@ fn drop_table_rolled_back() {
     conn.execute("ROLLBACK TO sp").unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 1);
 }
 
 #[test]
 fn create_index_rolled_back() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SAVEPOINT sp").unwrap();
@@ -401,8 +385,8 @@ fn create_index_rolled_back() {
 fn alter_table_rolled_back() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     conn.execute("INSERT INTO t (id, val) VALUES (1, 'a')")
         .unwrap();
 
@@ -421,8 +405,8 @@ fn alter_table_rolled_back() {
 fn ddl_and_dml_rolled_back_together() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SAVEPOINT sp").unwrap();
@@ -437,19 +421,15 @@ fn ddl_and_dml_rolled_back_together() {
 
     let err = conn.query("SELECT * FROM nested").unwrap_err();
     assert!(matches!(err, SqlError::TableNotFound(_)));
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 0);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 0);
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// Index maintenance
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn index_insert_rolled_back() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     conn.execute("CREATE INDEX idx_val ON t (val)").unwrap();
 
     conn.execute("BEGIN").unwrap();
@@ -461,18 +441,15 @@ fn index_insert_rolled_back() {
     conn.execute("ROLLBACK TO sp").unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(
-        count(&mut conn, "SELECT COUNT(*) FROM t WHERE val = 'x'"),
-        0
-    );
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t WHERE val = 'x'"), 0);
 }
 
 #[test]
 fn unique_index_respected_across_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     conn.execute("CREATE UNIQUE INDEX uq_val ON t (val)")
         .unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, 'existing')")
@@ -491,16 +468,12 @@ fn unique_index_respected_across_rollback() {
     conn.execute("COMMIT").unwrap();
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Error recovery
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn recover_from_unique_violation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     conn.execute("INSERT INTO t (id, val) VALUES (1, 'seed')")
         .unwrap();
 
@@ -515,14 +488,14 @@ fn recover_from_unique_violation() {
         .unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 2);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 2);
 }
 
 #[test]
 fn recover_from_check_violation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE tc (id INTEGER PRIMARY KEY, n INTEGER CHECK(n > 0))")
         .unwrap();
 
@@ -537,14 +510,14 @@ fn recover_from_check_violation() {
         .unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM tc"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM tc"), 1);
 }
 
 #[test]
 fn recover_from_fk_violation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
         .unwrap();
     conn.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))")
@@ -562,15 +535,15 @@ fn recover_from_fk_violation() {
         .unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM child"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM child"), 1);
 }
 
 #[test]
 fn partial_batch_insert_recovered() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     conn.execute("INSERT INTO t (id, val) VALUES (5, 'blocker')")
         .unwrap();
 
@@ -587,19 +560,15 @@ fn partial_batch_insert_recovered() {
         .unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 5);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 5);
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// Case handling, syntax variants
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn case_insensitive_savepoint_name() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SAVEPOINT My_SP").unwrap();
@@ -608,15 +577,15 @@ fn case_insensitive_savepoint_name() {
     conn.execute("ROLLBACK TO my_sp").unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 0);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 0);
 }
 
 #[test]
 fn release_without_savepoint_keyword() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SAVEPOINT sp1").unwrap();
@@ -628,8 +597,8 @@ fn release_without_savepoint_keyword() {
 fn rollback_to_without_savepoint_keyword() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SAVEPOINT sp1").unwrap();
@@ -637,16 +606,12 @@ fn rollback_to_without_savepoint_keyword() {
     conn.execute("COMMIT").unwrap();
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Cache / buffer correctness
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn stmt_cache_invalidated_after_rollback_to() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     conn.execute("INSERT INTO t (id, val) VALUES (1, 'pre')")
         .unwrap();
 
@@ -671,8 +636,8 @@ fn stmt_cache_invalidated_after_rollback_to() {
 fn batch_insert_after_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SAVEPOINT sp").unwrap();
@@ -689,20 +654,16 @@ fn batch_insert_after_rollback() {
     );
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 2);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 2);
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// Persistence
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn nested_savepoints_with_release_persist() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
-        setup(&mut conn);
+        let conn = Connection::open(&db).unwrap();
+        setup(&conn);
 
         conn.execute("BEGIN").unwrap();
         conn.execute("INSERT INTO t (id, val) VALUES (1, 'base')")
@@ -721,7 +682,7 @@ fn nested_savepoints_with_release_persist() {
     }
 
     let db = open_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let qr = conn.query("SELECT id, val FROM t ORDER BY id").unwrap();
     assert_eq!(qr.rows.len(), 3);
     assert_eq!(qr.rows[0][1], Value::Text("base".into()));
@@ -734,8 +695,8 @@ fn savepoint_then_outer_rollback_persists_nothing() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
-        setup(&mut conn);
+        let conn = Connection::open(&db).unwrap();
+        setup(&conn);
 
         conn.execute("BEGIN").unwrap();
         conn.execute("INSERT INTO t (id, val) VALUES (1, 'a')")
@@ -748,20 +709,16 @@ fn savepoint_then_outer_rollback_persists_nothing() {
     }
 
     let db = open_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 0);
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 0);
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// Smoke / end-to-end flows
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn smoke_simple_flow() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, 'a')")
@@ -772,15 +729,15 @@ fn smoke_simple_flow() {
     conn.execute("ROLLBACK TO sp1").unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 1);
 }
 
 #[test]
 fn smoke_update_delete_mix() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     for i in 1..=5 {
         conn.execute(&format!("INSERT INTO t (id, val) VALUES ({i}, 'v{i}')"))
             .unwrap();
@@ -807,8 +764,8 @@ fn smoke_update_delete_mix() {
 fn smoke_many_nested_savepoints() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     for i in 1..=10 {
@@ -826,16 +783,12 @@ fn smoke_many_nested_savepoints() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// AND CHAIN rejection (parser-level)
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn commit_and_chain_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     conn.execute("BEGIN").unwrap();
     let err = conn.execute("COMMIT AND CHAIN").unwrap_err();
     assert!(matches!(err, SqlError::Unsupported(_)));
@@ -846,23 +799,19 @@ fn commit_and_chain_rejected() {
 fn rollback_and_chain_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     conn.execute("BEGIN").unwrap();
     let err = conn.execute("ROLLBACK AND CHAIN").unwrap_err();
     assert!(matches!(err, SqlError::Unsupported(_)));
     conn.execute("ROLLBACK").unwrap();
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// Real-world scenarios
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn real_bank_transfer_with_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute(
         "CREATE TABLE accounts (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, balance INTEGER NOT NULL CHECK(balance >= 0), frozen INTEGER NOT NULL)",
     )
@@ -901,7 +850,7 @@ fn real_bank_transfer_with_fallback() {
     assert_eq!(qr.rows[0][1], Value::Integer(900));
     assert_eq!(qr.rows[1][1], Value::Integer(500));
     assert_eq!(qr.rows[2][1], Value::Integer(300));
-    let total = count(&mut conn, "SELECT SUM(balance) FROM accounts");
+    let total = count(&conn, "SELECT SUM(balance) FROM accounts");
     assert_eq!(total, 1700);
 }
 
@@ -909,7 +858,7 @@ fn real_bank_transfer_with_fallback() {
 fn real_bulk_import_with_batch_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, qty INTEGER CHECK(qty > 0))")
         .unwrap();
 
@@ -948,7 +897,7 @@ fn real_bulk_import_with_batch_recovery() {
 
     assert_eq!(skipped_batches, 1);
     assert_eq!(imported, 7);
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM items"), 7);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM items"), 7);
     let ids = conn.query("SELECT id FROM items ORDER BY id").unwrap();
     let got: Vec<i64> = ids
         .rows
@@ -965,7 +914,7 @@ fn real_bulk_import_with_batch_recovery() {
 fn real_fk_cascade_partial_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer TEXT NOT NULL)")
         .unwrap();
     conn.execute(
@@ -1007,7 +956,7 @@ fn real_fk_cascade_partial_rollback() {
 fn real_join_query_after_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
         .unwrap();
     conn.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, uid INTEGER, tag TEXT)")
@@ -1044,8 +993,8 @@ fn real_join_query_after_rollback() {
 fn real_view_rolled_back() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     conn.execute("INSERT INTO t (id, val) VALUES (1, 'a'), (2, 'b')")
         .unwrap();
 
@@ -1065,8 +1014,8 @@ fn real_view_rolled_back() {
 fn real_deep_nesting_30_levels() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     for i in 1..=30 {
@@ -1088,8 +1037,8 @@ fn real_deep_nesting_30_levels() {
 fn real_large_rollback_to() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     for i in 1..=50 {
         conn.execute(&format!("INSERT INTO t (id, val) VALUES ({i}, 'base{i}')"))
             .unwrap();
@@ -1106,7 +1055,7 @@ fn real_large_rollback_to() {
         .unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 51);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 51);
     let ids: Vec<i64> = conn
         .query("SELECT id FROM t WHERE id > 100 ORDER BY id")
         .unwrap()
@@ -1124,8 +1073,8 @@ fn real_large_rollback_to() {
 fn real_triple_shadow_peel() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SAVEPOINT sp").unwrap();
@@ -1139,15 +1088,15 @@ fn real_triple_shadow_peel() {
         .unwrap();
 
     conn.execute("RELEASE sp").unwrap();
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 3);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 3);
 
     conn.execute("ROLLBACK TO sp").unwrap();
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 1);
 
     conn.execute("RELEASE sp").unwrap();
 
     conn.execute("ROLLBACK TO sp").unwrap();
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 0);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 0);
 
     conn.execute("COMMIT").unwrap();
 }
@@ -1156,8 +1105,8 @@ fn real_triple_shadow_peel() {
 fn real_repeated_rollback_to_same() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, 'base')")
@@ -1173,13 +1122,13 @@ fn real_repeated_rollback_to_same() {
             "INSERT INTO t (id, val) VALUES ({attempt}1, 'more')"
         ))
         .unwrap();
-        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 3);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 3);
         conn.execute("ROLLBACK TO sp").unwrap();
-        assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 1);
     }
 
     conn.execute("COMMIT").unwrap();
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 1);
     let qr = conn.query("SELECT val FROM t").unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("base".into()));
 }
@@ -1188,13 +1137,13 @@ fn real_repeated_rollback_to_same() {
 fn real_reader_isolation_during_savepoint() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut writer = Connection::open(&db).unwrap();
-    setup(&mut writer);
+    let writer = Connection::open(&db).unwrap();
+    setup(&writer);
     writer
         .execute("INSERT INTO t (id, val) VALUES (1, 'committed')")
         .unwrap();
 
-    let mut reader = Connection::open(&db).unwrap();
+    let reader = Connection::open(&db).unwrap();
     let before = reader.query("SELECT val FROM t").unwrap();
     assert_eq!(before.rows[0][0], Value::Text("committed".into()));
 
@@ -1218,7 +1167,7 @@ fn real_reader_isolation_during_savepoint() {
 fn real_multicol_unique_index_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE m (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL)")
         .unwrap();
     conn.execute("CREATE UNIQUE INDEX uq_ab ON m (a, b)")
@@ -1245,14 +1194,14 @@ fn real_multicol_unique_index_rollback() {
         .unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM m"), 4);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM m"), 4);
 }
 
 #[test]
 fn real_aggregate_after_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, category TEXT, amount INTEGER)")
         .unwrap();
     for i in 1..=20 {
@@ -1288,8 +1237,8 @@ fn real_aggregate_after_rollback() {
 fn real_prepared_insert_across_savepoints() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     for i in 1..=5 {
@@ -1328,7 +1277,7 @@ fn real_prepared_insert_across_savepoints() {
 fn real_mixed_workload() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute(
         "CREATE TABLE events (id INTEGER PRIMARY KEY, type TEXT NOT NULL, amount INTEGER NOT NULL)",
     )
@@ -1375,7 +1324,7 @@ fn real_mixed_workload() {
 fn real_savepoint_name_matches_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .unwrap();
     conn.execute("INSERT INTO t (id) VALUES (1)").unwrap();
@@ -1386,7 +1335,7 @@ fn real_savepoint_name_matches_table() {
     conn.execute("ROLLBACK TO t").unwrap();
     conn.execute("COMMIT").unwrap();
 
-    assert_eq!(count(&mut conn, "SELECT COUNT(*) FROM t"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 1);
 }
 
 #[test]
@@ -1394,7 +1343,7 @@ fn real_complex_error_recovery_flow() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         conn.execute(
             "CREATE TABLE inv (sku TEXT PRIMARY KEY, qty INTEGER NOT NULL CHECK(qty >= 0))",
         )
@@ -1428,7 +1377,7 @@ fn real_complex_error_recovery_flow() {
     }
 
     let db = open_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let qr = conn.query("SELECT sku, qty FROM inv ORDER BY sku").unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("A".into()));
     assert_eq!(qr.rows[0][1], Value::Integer(0));

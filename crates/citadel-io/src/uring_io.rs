@@ -1,18 +1,15 @@
+use parking_lot::Mutex;
 use std::fs::File;
 use std::io;
 use std::os::unix::io::{IntoRawFd, RawFd};
-use std::sync::Mutex;
 
 use io_uring::{opcode, types, IoUring};
 
 use crate::traits::PageIO;
 use citadel_core::{Error, Result, PAGE_SIZE};
 
-/// io_uring-backed page I/O for Linux.
-///
-/// Individual operations use submit-one-wait-one (no faster than sync I/O).
-/// The performance win comes from `flush_pages()`, which batches all dirty
-/// page writes + fsync into a single io_uring submission during commit.
+/// io_uring-backed page I/O for Linux. `flush_pages()` batches all dirty-page
+/// writes + fsync into a single submission.
 pub struct UringPageIO {
     ring: Mutex<IoUring>,
     fd: RawFd,
@@ -22,7 +19,7 @@ impl UringPageIO {
     /// Try to create an io_uring-backed I/O instance.
     ///
     /// Returns `None` if io_uring is unavailable (old kernel, restricted container).
-    /// The caller should fall back to `SyncPageIO`.
+    /// The caller should fall back to `MmapPageIO`.
     pub fn try_new(file: File) -> Option<Self> {
         let fd = file.into_raw_fd();
 
@@ -65,7 +62,7 @@ impl UringPageIO {
     }
 
     fn submit_one(&self, sqe: io_uring::squeue::Entry) -> Result<i32> {
-        let mut ring = self.ring.lock().unwrap();
+        let mut ring = self.ring.lock();
 
         unsafe {
             ring.submission().push(&sqe).map_err(|_| sq_full_err())?;
@@ -188,7 +185,7 @@ impl PageIO for UringPageIO {
             self.truncate(max_end)?;
         }
 
-        let mut ring = self.ring.lock().unwrap();
+        let mut ring = self.ring.lock();
         let sq_cap = ring.submission().capacity();
         let batch_size = sq_cap.saturating_sub(1).max(1);
 

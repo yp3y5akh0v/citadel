@@ -21,10 +21,6 @@ fn fast_builder_cache(path: &std::path::Path, cache: usize) -> DatabaseBuilder {
         .cache_size(cache)
 }
 
-// ============================================================
-// Key / Value boundary tests
-// ============================================================
-
 #[test]
 fn empty_value() {
     let dir = tempfile::tempdir().unwrap();
@@ -156,10 +152,6 @@ fn prefix_keys_distinguished() {
     assert_eq!(rtx.get(b"abcde").unwrap(), Some(b"3".to_vec()));
 }
 
-// ============================================================
-// Insert / Delete / Reinsert cycles
-// ============================================================
-
 #[test]
 fn insert_delete_reinsert_same_key() {
     let dir = tempfile::tempdir().unwrap();
@@ -176,7 +168,6 @@ fn insert_delete_reinsert_same_key() {
         wtx.commit().unwrap();
     }
 
-    // Final insert
     {
         let mut wtx = db.begin_write().unwrap();
         wtx.insert(b"cycle-key", b"final").unwrap();
@@ -285,10 +276,6 @@ fn insert_delete_half_verify_remaining() {
     }
 }
 
-// ============================================================
-// Multiple reopen cycles
-// ============================================================
-
 #[test]
 fn five_reopen_cycles_accumulate() {
     let dir = tempfile::tempdir().unwrap();
@@ -326,7 +313,6 @@ fn reopen_with_delete_and_reinsert() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
 
-    // Session 1: insert
     {
         let db = fast_builder(&db_path).create().unwrap();
         let mut wtx = db.begin_write().unwrap();
@@ -337,7 +323,6 @@ fn reopen_with_delete_and_reinsert() {
         wtx.commit().unwrap();
     }
 
-    // Session 2: delete half, reinsert with different values
     {
         let db = fast_builder(&db_path).open().unwrap();
         let mut wtx = db.begin_write().unwrap();
@@ -351,7 +336,6 @@ fn reopen_with_delete_and_reinsert() {
         wtx.commit().unwrap();
     }
 
-    // Session 3: verify
     {
         let db = fast_builder(&db_path).open().unwrap();
         assert_eq!(db.stats().entry_count, 200);
@@ -374,10 +358,6 @@ fn reopen_with_delete_and_reinsert() {
         }
     }
 }
-
-// ============================================================
-// Named table edge cases
-// ============================================================
 
 #[test]
 fn table_and_default_same_keys() {
@@ -448,7 +428,6 @@ fn many_tables_create_drop_subset() {
     let dir = tempfile::tempdir().unwrap();
     let db = fast_builder(&dir.path().join("test.db")).create().unwrap();
 
-    // Create 30 tables
     {
         let mut wtx = db.begin_write().unwrap();
         for t in 0..30u32 {
@@ -460,7 +439,6 @@ fn many_tables_create_drop_subset() {
         wtx.commit().unwrap();
     }
 
-    // Drop even-numbered tables
     {
         let mut wtx = db.begin_write().unwrap();
         for t in (0..30u32).step_by(2) {
@@ -470,7 +448,6 @@ fn many_tables_create_drop_subset() {
         wtx.commit().unwrap();
     }
 
-    // Verify odd tables survive, even tables gone
     let mut rtx = db.begin_read();
     for t in (1..30u32).step_by(2) {
         let name = format!("t{t:03}");
@@ -518,7 +495,6 @@ fn table_for_each_correctness() {
     .unwrap();
 
     assert_eq!(entries.len(), 100);
-    // Verify sorted order
     for i in 1..entries.len() {
         assert!(entries[i].0 > entries[i - 1].0);
     }
@@ -557,10 +533,6 @@ fn named_table_persist_across_reopen() {
         }
     }
 }
-
-// ============================================================
-// Concurrent readers (thread safety)
-// ============================================================
 
 #[test]
 fn concurrent_readers_threaded() {
@@ -647,10 +619,6 @@ fn reader_while_writer_threaded() {
     reader.join().unwrap();
 }
 
-// ============================================================
-// Small cache (force eviction under real workload)
-// ============================================================
-
 #[test]
 fn small_cache_forces_eviction() {
     let dir = tempfile::tempdir().unwrap();
@@ -695,10 +663,6 @@ fn small_cache_multi_txn() {
     assert_eq!(rtx.get(b"b00-k00").unwrap(), Some(b"v".to_vec()));
     assert_eq!(rtx.get(b"b19-k49").unwrap(), Some(b"v".to_vec()));
 }
-
-// ============================================================
-// for_each edge cases through public API
-// ============================================================
 
 #[test]
 fn for_each_empty() {
@@ -774,10 +738,6 @@ fn for_each_after_delete() {
     assert_eq!(entries.len(), 50);
 }
 
-// ============================================================
-// Snapshot isolation edge cases
-// ============================================================
-
 #[test]
 fn snapshot_sees_consistent_state_during_heavy_writes() {
     let dir = tempfile::tempdir().unwrap();
@@ -791,11 +751,9 @@ fn snapshot_sees_consistent_state_during_heavy_writes() {
         wtx.commit().unwrap();
     }
 
-    // Take snapshot
     let mut rtx = db.begin_read();
     let snapshot_count = rtx.entry_count();
 
-    // Heavy modifications
     for round in 0..10u32 {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..200u32 {
@@ -806,7 +764,6 @@ fn snapshot_sees_consistent_state_during_heavy_writes() {
         wtx.commit().unwrap();
     }
 
-    // Old reader still sees original count
     assert_eq!(rtx.entry_count(), snapshot_count);
     for i in 0..200u32 {
         let key = format!("k{i:04}");
@@ -823,7 +780,6 @@ fn multiple_snapshots_at_different_versions() {
     let dir = tempfile::tempdir().unwrap();
     let db = fast_builder(&dir.path().join("test.db")).create().unwrap();
 
-    // Version 1: 10 keys
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..10u32 {
@@ -833,7 +789,6 @@ fn multiple_snapshots_at_different_versions() {
     }
     let mut r1 = db.begin_read();
 
-    // Version 2: add 10 more
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 10..20u32 {
@@ -843,7 +798,6 @@ fn multiple_snapshots_at_different_versions() {
     }
     let mut r2 = db.begin_read();
 
-    // Version 3: delete first 5
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..5u32 {
@@ -853,7 +807,6 @@ fn multiple_snapshots_at_different_versions() {
     }
     let mut r3 = db.begin_read();
 
-    // Version 4: update remaining
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 5..20u32 {
@@ -874,10 +827,6 @@ fn multiple_snapshots_at_different_versions() {
     assert_eq!(r4.get(b"k5").unwrap(), Some(b"v4".to_vec()));
     assert_eq!(db.reader_count(), 4);
 }
-
-// ============================================================
-// Backup / Compact after heavy churn
-// ============================================================
 
 #[test]
 fn backup_after_heavy_churn() {
@@ -971,10 +920,6 @@ fn compact_then_continue_writing() {
     assert!(report.is_ok(), "errors: {:?}", report.errors);
 }
 
-// ============================================================
-// Deterministic random ops vs BTreeMap
-// ============================================================
-
 struct SimpleRng(u32);
 impl SimpleRng {
     fn next(&mut self) -> u32 {
@@ -1047,10 +992,6 @@ fn kv_expected_500_transactions() {
     }
 }
 
-// ============================================================
-// Integrity after complex operations
-// ============================================================
-
 #[test]
 fn integrity_after_insert_delete_compact_more_writes() {
     let dir = tempfile::tempdir().unwrap();
@@ -1099,10 +1040,6 @@ fn integrity_after_insert_delete_compact_more_writes() {
     assert!(report.is_ok(), "post-compact errors: {:?}", report.errors);
     assert_eq!(cdb.stats().entry_count, 600 + 300);
 }
-
-// ============================================================
-// Rapid overwrite stress (buffer pool cache invalidation)
-// ============================================================
 
 #[test]
 fn rapid_overwrite_100_txns() {
@@ -1170,10 +1107,6 @@ fn rapid_overwrite_reopen_verify() {
     }
 }
 
-// ============================================================
-// Contains-key edge cases
-// ============================================================
-
 #[test]
 fn contains_key_after_delete() {
     let dir = tempfile::tempdir().unwrap();
@@ -1196,10 +1129,6 @@ fn contains_key_after_delete() {
     assert!(!rtx.contains_key(b"will-delete").unwrap());
     assert!(!rtx.contains_key(b"never-existed").unwrap());
 }
-
-// ============================================================
-// Abort stress
-// ============================================================
 
 #[test]
 fn many_aborts_then_commit() {
@@ -1257,10 +1186,6 @@ fn abort_with_named_table_modifications() {
     ));
 }
 
-// ============================================================
-// Drop WriteTxn without commit (implicit abort)
-// ============================================================
-
 #[test]
 fn drop_write_txn_releases_lock() {
     let dir = tempfile::tempdir().unwrap();
@@ -1272,7 +1197,6 @@ fn drop_write_txn_releases_lock() {
         // Dropped without commit
     }
 
-    // Should still be writable
     let mut wtx = db.begin_write().unwrap();
     wtx.insert(b"final", b"v").unwrap();
     wtx.commit().unwrap();
@@ -1281,10 +1205,6 @@ fn drop_write_txn_releases_lock() {
     assert_eq!(rtx.entry_count(), 1);
     assert_eq!(rtx.get(b"final").unwrap(), Some(b"v".to_vec()));
 }
-
-// ============================================================
-// Large value stress (near overflow threshold)
-// ============================================================
 
 #[test]
 fn many_large_values() {

@@ -1,6 +1,6 @@
 //! Schema manager: in-memory cache of table schemas.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use citadel::Database;
 
@@ -12,22 +12,22 @@ const VIEWS_TABLE: &[u8] = b"_views";
 
 /// Manages table schemas in memory, backed by the `_schema` table.
 pub struct SchemaManager {
-    tables: HashMap<String, TableSchema>,
-    views: HashMap<String, ViewDef>,
+    tables: FxHashMap<String, TableSchema>,
+    views: FxHashMap<String, ViewDef>,
     generation: u64,
 }
 
 #[derive(Clone)]
 pub struct SchemaSnapshot {
-    tables: HashMap<String, TableSchema>,
-    views: HashMap<String, ViewDef>,
+    tables: FxHashMap<String, TableSchema>,
+    views: FxHashMap<String, ViewDef>,
     generation: u64,
 }
 
 impl SchemaManager {
     /// Load all schemas from the database's `_schema` table.
     pub fn load(db: &Database) -> Result<Self> {
-        let mut tables = HashMap::new();
+        let mut tables = FxHashMap::default();
 
         let mut rtx = db.begin_read();
         let mut parse_err: Option<crate::error::SqlError> = None;
@@ -52,8 +52,7 @@ impl SchemaManager {
             return Err(e);
         }
 
-        // Load views from _views table
-        let mut views = HashMap::new();
+        let mut views = FxHashMap::default();
         let mut rtx2 = db.begin_read();
         let mut view_err: Option<crate::error::SqlError> = None;
         let view_scan = rtx2.table_for_each(VIEWS_TABLE, |_key, value| {
@@ -133,8 +132,6 @@ impl SchemaManager {
     pub fn all_schemas(&self) -> impl Iterator<Item = &TableSchema> {
         self.tables.values()
     }
-
-    // ── View management ────────────────────────────────────────────
 
     pub fn get_view(&self, name: &str) -> Option<&ViewDef> {
         if let Some(v) = self.views.get(name) {
@@ -229,7 +226,6 @@ impl SchemaManager {
 
     /// Ensure the _schema table exists (called once per write).
     pub fn ensure_schema_table(wtx: &mut citadel_txn::write_txn::WriteTxn<'_>) -> Result<()> {
-        // Try to create; ignore if already exists
         match wtx.create_table(SCHEMA_TABLE) {
             Ok(()) => Ok(()),
             Err(citadel_core::Error::TableAlreadyExists(_)) => Ok(()),

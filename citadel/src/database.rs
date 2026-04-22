@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use citadel_core::{Error, Result, KEY_FILE_SIZE, MERKLE_HASH_SIZE};
 use citadel_io::durable;
-use citadel_io::sync_io::SyncPageIO;
+use citadel_io::mmap_io::MmapPageIO;
 use citadel_txn::integrity::IntegrityReport;
 use citadel_txn::manager::TxnManager;
 use citadel_txn::read_txn::ReadTxn;
@@ -184,7 +184,7 @@ impl Database {
             .write(true)
             .create_new(true)
             .open(dest_path)?;
-        let dest_io = SyncPageIO::new(dest_file);
+        let dest_io = MmapPageIO::try_new(dest_file)?;
         self.manager.backup_to(&dest_io)?;
 
         let dest_key_path = resolve_key_path_for(dest_path);
@@ -325,7 +325,7 @@ impl Database {
             .write(true)
             .create_new(true)
             .open(dest_path)?;
-        let dest_io = SyncPageIO::new(dest_file);
+        let dest_io = MmapPageIO::try_new(dest_file)?;
         self.manager.compact_to(&dest_io)?;
 
         let dest_key_path = resolve_key_path_for(dest_path);
@@ -384,8 +384,6 @@ impl Database {
         self.log_audit(event_type, &detail);
     }
 }
-
-// --- Peer-to-peer sync ---
 
 use citadel_sync::transport::SyncTransport;
 

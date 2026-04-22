@@ -32,10 +32,6 @@ impl SimpleRng {
     }
 }
 
-// ============================================================
-// BTreeMap reference tests
-// ============================================================
-
 #[test]
 fn reference_500_txns_random_ops() {
     let db = create_db();
@@ -148,16 +144,10 @@ fn small_cache_multi_batch() {
 
     let mut rtx = db.begin_read();
     assert_eq!(rtx.entry_count(), 1000);
-    // Verify first and last batch survived eviction
     assert_eq!(rtx.get(b"b00-k00").unwrap(), Some(b"v".to_vec()));
     assert_eq!(rtx.get(b"b19-k49").unwrap(), Some(b"v".to_vec()));
-    // Spot check middle
     assert_eq!(rtx.get(b"b10-k25").unwrap(), Some(b"v".to_vec()));
 }
-
-// ============================================================
-// MVCC snapshot isolation
-// ============================================================
 
 #[test]
 fn snapshot_isolation_during_heavy_writes() {
@@ -185,7 +175,6 @@ fn snapshot_isolation_during_heavy_writes() {
         wtx.commit().unwrap();
     }
 
-    // Snapshot still sees original values
     assert_eq!(snap.entry_count(), 200);
     for i in 0..200u32 {
         let key = format!("k{i:04}");
@@ -201,7 +190,6 @@ fn snapshot_isolation_during_heavy_writes() {
 fn multiple_snapshots_different_versions() {
     let db = create_db();
 
-    // Version 1: 10 keys
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..10u32 {
@@ -211,7 +199,6 @@ fn multiple_snapshots_different_versions() {
     }
     let mut r1 = db.begin_read();
 
-    // Version 2: add 10 more
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 10..20u32 {
@@ -221,7 +208,6 @@ fn multiple_snapshots_different_versions() {
     }
     let mut r2 = db.begin_read();
 
-    // Version 3: delete first 5
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..5u32 {
@@ -240,10 +226,6 @@ fn multiple_snapshots_different_versions() {
     assert_eq!(r3.get(b"k0").unwrap(), None);
     assert_eq!(r3.get(b"k5").unwrap(), Some(b"v1".to_vec()));
 }
-
-// ============================================================
-// Abort correctness
-// ============================================================
 
 #[test]
 fn many_aborts_then_commit() {
@@ -284,10 +266,6 @@ fn drop_write_txn_releases_lock() {
     assert_eq!(rtx.entry_count(), 1);
     assert_eq!(rtx.get(b"final").unwrap(), Some(b"v".to_vec()));
 }
-
-// ============================================================
-// Insert/delete churn with verification
-// ============================================================
 
 #[test]
 fn insert_delete_half_verify_remaining() {
@@ -393,10 +371,6 @@ fn insert_delete_reinsert_50_cycles() {
     assert_eq!(rtx.entry_count(), 1);
 }
 
-// ============================================================
-// Named tables
-// ============================================================
-
 #[test]
 fn named_tables_reference() {
     let db = create_db();
@@ -418,7 +392,6 @@ fn named_tables_reference() {
     }
     wtx.commit().unwrap();
 
-    // Delete half from tables 0 and 2
     let mut wtx = db.begin_write().unwrap();
     for t in [0u8, 2] {
         let table = format!("t{t}");
@@ -468,7 +441,6 @@ fn create_drop_recreate_30_tables() {
         wtx.commit().unwrap();
     }
 
-    // Drop even
     {
         let mut wtx = db.begin_write().unwrap();
         for t in (0..30u32).step_by(2) {
@@ -494,10 +466,6 @@ fn create_drop_recreate_30_tables() {
         );
     }
 }
-
-// ============================================================
-// Concurrent readers (thread safety with in-memory)
-// ============================================================
 
 #[test]
 fn concurrent_readers_threaded() {
@@ -536,14 +504,10 @@ fn concurrent_readers_threaded() {
     }
 }
 
-// ============================================================
-// SQL with small cache (full stack through MemoryPageIO)
-// ============================================================
-
 #[test]
 fn sql_crud_small_cache() {
     let db = create_db_small_cache(16);
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE stress (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score INTEGER NOT NULL)",
@@ -583,7 +547,7 @@ fn sql_crud_small_cache() {
 #[test]
 fn sql_join_small_cache() {
     let db = create_db_small_cache(16);
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
         .unwrap();
@@ -620,7 +584,7 @@ fn sql_join_small_cache() {
 #[test]
 fn sql_index_small_cache() {
     let db = create_db_small_cache(16);
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE indexed (id INTEGER PRIMARY KEY, cat TEXT NOT NULL, val INTEGER NOT NULL)",
@@ -661,7 +625,7 @@ fn sql_index_small_cache() {
 #[test]
 fn sql_subquery_small_cache() {
     let db = create_db_small_cache(16);
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE scores (id INTEGER PRIMARY KEY, val INTEGER NOT NULL)")
         .unwrap();
@@ -692,7 +656,7 @@ fn sql_subquery_small_cache() {
 #[test]
 fn sql_prepared_params_small_cache() {
     let db = create_db_small_cache(16);
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE params (id INTEGER PRIMARY KEY, val TEXT NOT NULL)")
         .unwrap();
@@ -722,10 +686,6 @@ fn sql_prepared_params_small_cache() {
         );
     }
 }
-
-// ============================================================
-// Integrity check after heavy churn
-// ============================================================
 
 #[test]
 fn integrity_after_heavy_churn() {
@@ -789,10 +749,6 @@ fn integrity_small_cache_after_churn() {
     assert_eq!(db.stats().entry_count, 200);
 }
 
-// ============================================================
-// Large values through in-memory path
-// ============================================================
-
 #[test]
 fn large_values_near_overflow_threshold() {
     let db = create_db();
@@ -818,14 +774,10 @@ fn large_values_near_overflow_threshold() {
     }
 }
 
-// ============================================================
-// SQL multi-table isolation
-// ============================================================
-
 #[test]
 fn sql_multi_table_create_use_drop() {
     let db = create_db();
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     for t in 0..5 {
         conn.execute(&format!(
@@ -863,10 +815,6 @@ fn sql_multi_table_create_use_drop() {
     }
 }
 
-// ============================================================
-// Cursor scan ordering with small cache
-// ============================================================
-
 #[test]
 fn cursor_scan_sorted_order_small_cache() {
     let db = create_db_small_cache(8);
@@ -895,14 +843,10 @@ fn cursor_scan_sorted_order_small_cache() {
     assert_eq!(count, 200);
 }
 
-// ============================================================
-// Repeated create/drop table cycles (SQL)
-// ============================================================
-
 #[test]
 fn repeated_create_drop_table_sql() {
     let db = create_db();
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     for round in 0..20 {
         conn.execute("CREATE TABLE temp (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")

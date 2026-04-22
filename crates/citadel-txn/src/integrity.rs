@@ -47,7 +47,6 @@ pub(crate) fn run_integrity_check(mgr: &TxnManager) -> Result<IntegrityReport> {
     let mut errors = Vec::new();
     let mut pages_checked: u64 = 0;
 
-    // Walk the default tree
     let default_count = walk_tree(
         mgr,
         slot.tree_root,
@@ -56,7 +55,6 @@ pub(crate) fn run_integrity_check(mgr: &TxnManager) -> Result<IntegrityReport> {
         &mut pages_checked,
     );
 
-    // Check default table entry count
     if default_count != slot.tree_entries {
         errors.push(IntegrityError::EntryCountMismatch {
             expected: slot.tree_entries,
@@ -64,7 +62,6 @@ pub(crate) fn run_integrity_check(mgr: &TxnManager) -> Result<IntegrityReport> {
         });
     }
 
-    // Walk catalog tree and named tables
     if slot.catalog_root.is_valid() {
         walk_catalog(
             mgr,
@@ -75,7 +72,6 @@ pub(crate) fn run_integrity_check(mgr: &TxnManager) -> Result<IntegrityReport> {
         );
     }
 
-    // Walk pending-free chain
     if slot.pending_free_root.is_valid() {
         walk_chain(
             mgr,
@@ -168,10 +164,8 @@ fn walk_catalog(
     errors: &mut Vec<IntegrityError>,
     pages_checked: &mut u64,
 ) {
-    // First walk the catalog tree itself
     let table_roots = collect_named_table_roots(mgr, catalog_root, visited, errors, pages_checked);
 
-    // Then walk each named table tree
     for root in table_roots {
         walk_tree(mgr, root, visited, errors, pages_checked);
     }

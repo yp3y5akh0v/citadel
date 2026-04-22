@@ -24,6 +24,7 @@ thiserror = { workspace = true }
 lru = { workspace = true }
 compact_str = { workspace = true }
 jiff = { workspace = true }
+rustc-hash = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

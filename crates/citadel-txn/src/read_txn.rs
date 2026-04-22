@@ -1,6 +1,6 @@
 //! Read transaction: MVCC snapshot isolation. RAII reader registration.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 use citadel_core::types::{PageId, PageType, TxnId, ValueType};
@@ -15,7 +15,7 @@ use crate::catalog::TableDescriptor;
 use crate::manager::TxnManager;
 
 struct ReadPages<'a> {
-    cache: &'a mut HashMap<PageId, Arc<Page>>,
+    cache: &'a mut FxHashMap<PageId, Arc<Page>>,
     manager: &'a TxnManager,
 }
 
@@ -40,16 +40,16 @@ pub struct ReadTxn<'a> {
     manager: &'a TxnManager,
     txn_id: TxnId,
     snapshot: CommitSlot,
-    page_cache: HashMap<PageId, Arc<Page>>,
+    page_cache: FxHashMap<PageId, Arc<Page>>,
 }
 
-impl<'a> ReadTxn<'a> {
-    pub(crate) fn new(manager: &'a TxnManager, txn_id: TxnId, snapshot: CommitSlot) -> Self {
+impl<'db> ReadTxn<'db> {
+    pub(crate) fn new(manager: &'db TxnManager, txn_id: TxnId, snapshot: CommitSlot) -> Self {
         Self {
             manager,
             txn_id,
             snapshot,
-            page_cache: HashMap::new(),
+            page_cache: FxHashMap::default(),
         }
     }
 
@@ -64,8 +64,6 @@ impl<'a> ReadTxn<'a> {
     pub fn entry_count(&self) -> u64 {
         self.snapshot.tree_entries
     }
-
-    // ── Default table operations ──────────────────────────────────────
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.search_tree(self.snapshot.tree_root, key)
@@ -91,8 +89,6 @@ impl<'a> ReadTxn<'a> {
         }
         Ok(())
     }
-
-    // ── Named table operations ────────────────────────────────────────
 
     pub fn table_entry_count(&mut self, table: &[u8]) -> Result<u64> {
         Ok(self.lookup_table(table)?.entry_count)
@@ -148,6 +144,47 @@ impl<'a> ReadTxn<'a> {
         Ok(())
     }
 
+    /// Pull-based scan from `start_key`. Returns a lending iterator.
+    pub fn table_scan_iter<'a>(
+        &'a mut self,
+        table: &[u8],
+        start_key: &[u8],
+    ) -> Result<crate::scan_iter::TableIter<ReadTxnScanAdapter<'a, 'db>>> {
+        let desc = self.lookup_table(table)?;
+        let root = desc.root_page;
+        let cursor = {
+            let mut view = ReadPages {
+                cache: &mut self.page_cache,
+                manager: self.manager,
+            };
+            Cursor::seek_lazy(&mut view, root, start_key)?
+        };
+        let adapter = ReadTxnScanAdapter { txn: self };
+        Ok(crate::scan_iter::TableIter::new(adapter, cursor))
+    }
+
+    /// Consume self and return a lending iterator that owns the read txn.
+    ///
+    /// Useful when the caller needs the iterator to outlive a borrow scope —
+    /// the txn's snapshot is pinned for the iterator's lifetime.
+    pub fn into_table_scan_iter(
+        mut self,
+        table: &[u8],
+        start_key: &[u8],
+    ) -> Result<crate::scan_iter::TableIter<OwnedReadTxnAdapter<'db>>> {
+        let desc = self.lookup_table(table)?;
+        let root = desc.root_page;
+        let cursor = {
+            let mut view = ReadPages {
+                cache: &mut self.page_cache,
+                manager: self.manager,
+            };
+            Cursor::seek_lazy(&mut view, root, start_key)?
+        };
+        let adapter = OwnedReadTxnAdapter { txn: self };
+        Ok(crate::scan_iter::TableIter::new(adapter, cursor))
+    }
+
     /// Full table scan via direct leaf iteration. Callback returns `false` to stop.
     pub fn table_scan_raw<F>(&mut self, table: &[u8], mut f: F) -> Result<()>
     where
@@ -168,11 +205,7 @@ impl<'a> ReadTxn<'a> {
         Ok(())
     }
 
-    // ── Internal helpers ──────────────────────────────────────────────
-
-    /// Look up a table descriptor in the catalog.
     fn lookup_table(&mut self, name: &[u8]) -> Result<TableDescriptor> {
-        // Fast path: use cached root from commit slot
         if let Some((root, depth)) = self.snapshot.named_entry_root(name) {
             let entry_count = self.snapshot.named_entry_count(name).unwrap_or(0);
             return Ok(TableDescriptor {
@@ -190,7 +223,6 @@ impl<'a> ReadTxn<'a> {
             ));
         }
 
-        // Slow path: search the catalog B+ tree
         let mut current = catalog_root;
         loop {
             let page = self.load_page(current)?;
@@ -318,9 +350,39 @@ impl<'a> ReadTxn<'a> {
     }
 }
 
-impl<'a> Drop for ReadTxn<'a> {
+impl<'db> Drop for ReadTxn<'db> {
     fn drop(&mut self) {
         self.manager.unregister_reader(self.txn_id);
+    }
+}
+
+/// Scan adapter wrapping a `&mut ReadTxn` for use with [`crate::TableIter`].
+pub struct ReadTxnScanAdapter<'a, 'db: 'a> {
+    txn: &'a mut ReadTxn<'db>,
+}
+
+impl<'a, 'db: 'a> crate::scan_iter::TxnScanAdapter for ReadTxnScanAdapter<'a, 'db> {
+    fn with_loader<R>(&mut self, f: &mut dyn FnMut(&mut dyn PageLoader) -> Result<R>) -> Result<R> {
+        let mut view = ReadPages {
+            cache: &mut self.txn.page_cache,
+            manager: self.txn.manager,
+        };
+        f(&mut view)
+    }
+}
+
+/// Scan adapter owning a `ReadTxn` for iterators that outlive a borrow scope.
+pub struct OwnedReadTxnAdapter<'db> {
+    txn: ReadTxn<'db>,
+}
+
+impl<'db> crate::scan_iter::TxnScanAdapter for OwnedReadTxnAdapter<'db> {
+    fn with_loader<R>(&mut self, f: &mut dyn FnMut(&mut dyn PageLoader) -> Result<R>) -> Result<R> {
+        let mut view = ReadPages {
+            cache: &mut self.txn.page_cache,
+            manager: self.txn.manager,
+        };
+        f(&mut view)
     }
 }
 

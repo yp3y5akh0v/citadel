@@ -5,7 +5,7 @@ use crate::encoding::{
     encode_composite_key, row_non_pk_count, RawColumn,
 };
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap};
+use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::planner::{self, ScanPlan};
 use crate::types::*;
@@ -120,17 +120,17 @@ fn scan_step(
         };
     }
     match (where_clause, col_map, partial_ctx) {
-        (Some(expr), Some(map), Some(ctx)) => {
-            let partial = ctx.decode(key, value)?;
-            if is_truthy(&eval_expr(expr, map, &partial)?) {
-                Ok(Some(ctx.complete(partial, key, value)?))
+        (Some(expr), Some(map), Some(pctx)) => {
+            let partial = pctx.decode(key, value)?;
+            if is_truthy(&eval_expr(expr, &EvalCtx::new(map, &partial))?) {
+                Ok(Some(pctx.complete(partial, key, value)?))
             } else {
                 Ok(None)
             }
         }
         (Some(expr), Some(map), None) => {
             let row = decode_full_row(schema, key, value)?;
-            if is_truthy(&eval_expr(expr, map, &row)?) {
+            if is_truthy(&eval_expr(expr, &EvalCtx::new(map, &row))?) {
                 Ok(Some(row))
             } else {
                 Ok(None)
@@ -233,7 +233,7 @@ pub(super) fn collect_rows_read(
                     let row = decode_full_row(table_schema, &key, &value)?;
                     if let Some(ref expr) = where_clause {
                         let col_map = ColumnMap::new(columns);
-                        match eval_expr(expr, &col_map, &row) {
+                        match eval_expr(expr, &EvalCtx::new(&col_map, &row)) {
                             Ok(val) if is_truthy(&val) => Ok((vec![row], true)),
                             _ => Ok((vec![], true)),
                         }
@@ -270,9 +270,8 @@ pub(super) fn collect_rows_read(
                 match decode_full_row(table_schema, key, value) {
                     Ok(row) => {
                         let keep = match &where_clause {
-                            Some(expr) => {
-                                eval_expr(expr, &col_map, &row).is_ok_and(|v| is_truthy(&v))
-                            }
+                            Some(expr) => eval_expr(expr, &EvalCtx::new(&col_map, &row))
+                                .is_ok_and(|v| is_truthy(&v)),
                             None => true,
                         };
                         if keep {
@@ -348,7 +347,7 @@ pub(super) fn collect_rows_read(
                 {
                     let row = decode_full_row(table_schema, pk_key, &value)?;
                     if let Some(ref expr) = where_clause {
-                        match eval_expr(expr, &col_map, &row) {
+                        match eval_expr(expr, &EvalCtx::new(&col_map, &row)) {
                             Ok(val) if is_truthy(&val) => rows.push(row),
                             _ => {}
                         }
@@ -417,7 +416,7 @@ pub(super) fn collect_rows_write(
             wtx.table_scan_from(lower_name.as_bytes(), b"", |key, value| {
                 match (&where_clause, &partial_ctx) {
                     (Some(expr), Some(ctx)) => match ctx.decode(key, value) {
-                        Ok(partial) => match eval_expr(expr, &col_map, &partial) {
+                        Ok(partial) => match eval_expr(expr, &EvalCtx::new(&col_map, &partial)) {
                             Ok(val) if is_truthy(&val) => match ctx.complete(partial, key, value) {
                                 Ok(row) => rows.push(row),
                                 Err(e) => scan_err = Some(e),
@@ -428,7 +427,7 @@ pub(super) fn collect_rows_write(
                         Err(e) => scan_err = Some(e),
                     },
                     (Some(expr), None) => match decode_full_row(table_schema, key, value) {
-                        Ok(row) => match eval_expr(expr, &col_map, &row) {
+                        Ok(row) => match eval_expr(expr, &EvalCtx::new(&col_map, &row)) {
                             Ok(val) if is_truthy(&val) => rows.push(row),
                             Err(e) => scan_err = Some(e),
                             _ => {}
@@ -460,7 +459,7 @@ pub(super) fn collect_rows_write(
                     let row = decode_full_row(table_schema, &key, &value)?;
                     if let Some(ref expr) = where_clause {
                         let col_map = ColumnMap::new(columns);
-                        match eval_expr(expr, &col_map, &row) {
+                        match eval_expr(expr, &EvalCtx::new(&col_map, &row)) {
                             Ok(val) if is_truthy(&val) => Ok((vec![row], true)),
                             _ => Ok((vec![], true)),
                         }
@@ -496,9 +495,8 @@ pub(super) fn collect_rows_write(
                 match decode_full_row(table_schema, key, value) {
                     Ok(row) => {
                         let keep = match &where_clause {
-                            Some(expr) => {
-                                eval_expr(expr, &col_map, &row).is_ok_and(|v| is_truthy(&v))
-                            }
+                            Some(expr) => eval_expr(expr, &EvalCtx::new(&col_map, &row))
+                                .is_ok_and(|v| is_truthy(&v)),
                             None => true,
                         };
                         if keep {
@@ -572,7 +570,7 @@ pub(super) fn collect_rows_write(
                 {
                     let row = decode_full_row(table_schema, pk_key, &value)?;
                     if let Some(ref expr) = where_clause {
-                        match eval_expr(expr, &col_map, &row) {
+                        match eval_expr(expr, &EvalCtx::new(&col_map, &row)) {
                             Ok(val) if is_truthy(&val) => rows.push(row),
                             _ => {}
                         }

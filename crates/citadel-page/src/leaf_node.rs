@@ -222,7 +222,6 @@ pub fn split(page: &Page) -> (Vec<u8>, Vec<Vec<u8>>) {
     let sep_cell = read_cell(page, split_point as u16);
     let sep_key = sep_cell.key.to_vec();
 
-    // Collect right cells
     let mut right_cells = Vec::with_capacity(n - split_point);
     for i in split_point..n {
         right_cells.push(read_cell_bytes(page, i as u16));
@@ -260,7 +259,6 @@ mod tests {
 
         assert_eq!(page.num_cells(), 4);
 
-        // Verify sorted order
         assert_eq!(read_cell(&page, 0).key, b"ant");
         assert_eq!(read_cell(&page, 1).key, b"cat");
         assert_eq!(read_cell(&page, 2).key, b"dog");

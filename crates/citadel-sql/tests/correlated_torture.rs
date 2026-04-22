@@ -33,15 +33,11 @@ fn assert_ok(result: ExecutionResult) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Stress
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn stress_exists_500x500() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, cat INTEGER)")
@@ -79,7 +75,7 @@ fn stress_exists_500x500() {
 fn stress_not_exists_500x500() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, cat INTEGER)")
@@ -115,7 +111,7 @@ fn stress_not_exists_500x500() {
 fn stress_correlated_update() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
@@ -159,7 +155,7 @@ fn stress_correlated_update() {
 fn stress_correlated_delete() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
@@ -201,7 +197,7 @@ fn stress_correlated_delete() {
 fn stress_chained_exists_and_not_exists() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, dept TEXT)")
@@ -247,14 +243,7 @@ fn stress_chained_exists_and_not_exists() {
     let qr = conn.query(
         "SELECT COUNT(*) FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id) AND NOT EXISTS (SELECT 1 FROM reviews WHERE reviews.user_id = users.id)"
     ).unwrap();
-    // Even ids (0,2,4,...98) have orders = 50
-    // Multiples of 3 (0,3,6,...99) have reviews = 34
-    // Even AND NOT multiple-of-3: even ids not divisible by 6
-    // Even ids: 0,2,4,6,8,...98 = 50
-    // Even ids divisible by 6: 0,6,12,...96 = 17
-    // Even ids NOT divisible by 6 but divisible by 3: 0 is both... let me just check
-    // Even AND has review: even AND multiple-of-3 = multiple-of-6: 0,6,12,...96 = 17
-    // Answer: 50 - 17 = 33
+    // Even ids with orders = 50; even AND multiple-of-6 (reviewed) = 17; 50 - 17 = 33.
     assert_eq!(qr.rows[0][0], Value::Integer(33));
 }
 
@@ -262,7 +251,7 @@ fn stress_chained_exists_and_not_exists() {
 fn stress_scalar_select_500_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, cat INTEGER)")
@@ -296,15 +285,11 @@ fn stress_scalar_select_500_rows() {
     assert_eq!(qr.rows[0][1], Value::Integer(450));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  NULL edge cases
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn null_both_sides() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
@@ -334,7 +319,7 @@ fn null_both_sides() {
 fn null_scalar_returns_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, cat INTEGER)")
@@ -357,16 +342,12 @@ fn null_scalar_returns_null() {
     assert!(qr.rows[0][1].is_null());
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Persistence
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn correlated_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         assert_ok(
             conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, ref_id INTEGER)")
                 .unwrap(),
@@ -381,7 +362,7 @@ fn correlated_after_reopen() {
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let qr = conn.query(
             "SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.ref_id) ORDER BY id"
         ).unwrap();
@@ -390,15 +371,11 @@ fn correlated_after_reopen() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Complex interactions
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn correlated_with_window_function() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -445,7 +422,7 @@ fn correlated_with_window_function() {
 fn correlated_insert_select_dedup() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE src (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
@@ -478,7 +455,7 @@ fn correlated_insert_select_dedup() {
 fn correlated_with_view_outer_and_inner() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, name TEXT)")

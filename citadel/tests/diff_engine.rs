@@ -34,10 +34,6 @@ fn apply(db: &Database, result: &citadel_sync::DiffResult) {
     wtx.commit().unwrap();
 }
 
-// ============================================================
-// Basic diff detection
-// ============================================================
-
 #[test]
 fn identical_dbs_empty_diff() {
     let dir = tempfile::tempdir().unwrap();
@@ -154,10 +150,6 @@ fn multiple_changes_detected() {
     assert_eq!(collect_all(&db1), collect_all(&db2));
 }
 
-// ============================================================
-// Efficiency - subtree skipping
-// ============================================================
-
 #[test]
 fn large_dataset_skips_matching_subtrees() {
     let dir = tempfile::tempdir().unwrap();
@@ -214,10 +206,6 @@ fn diff_metrics_pages_compared_and_skipped() {
     assert!(result.subtrees_skipped > 0);
     assert!(result.pages_compared > result.subtrees_skipped);
 }
-
-// ============================================================
-// Edge cases
-// ============================================================
 
 #[test]
 fn populated_source_vs_empty_target() {

@@ -53,7 +53,7 @@ pub fn run_interactive(
     }
 
     'outer: loop {
-        let mut conn = match Connection::open(&db) {
+        let conn = match Connection::open(&db) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("Error opening connection: {e}");
@@ -66,12 +66,12 @@ pub fn run_interactive(
 
         if let Some(ref init_path) = init_file {
             if let Ok(content) = std::fs::read_to_string(init_path) {
-                execute_batch_sql(&mut conn, &db, &content, &mut settings);
+                execute_batch_sql(&conn, &db, &content, &mut settings);
             }
         }
 
         if let Some(ref cmd) = init_cmd {
-            execute_single(&mut conn, &db, cmd, &mut settings);
+            execute_single(&conn, &db, cmd, &mut settings);
         }
 
         let mut buf = String::new();
@@ -90,7 +90,7 @@ pub fn run_interactive(
                         match commands::execute_dot_command_mut(
                             trimmed,
                             &db,
-                            &mut conn,
+                            &conn,
                             &mut settings,
                             &mut std::io::stdout(),
                         ) {
@@ -149,7 +149,7 @@ pub fn run_interactive(
 
                     if has_complete_statement(&buf) {
                         let sql = buf.trim().to_string();
-                        execute_sql(&mut conn, &db, &sql, &mut settings);
+                        execute_sql(&conn, &db, &sql, &mut settings);
                         buf.clear();
                         update_helper_schema(&mut rl, &conn);
                     }
@@ -184,7 +184,7 @@ fn build_prompt(buf: &str, in_txn: bool) -> String {
     }
 }
 
-fn execute_sql(conn: &mut Connection<'_>, _db: &Database, sql: &str, settings: &mut Settings) {
+fn execute_sql(conn: &Connection<'_>, _db: &Database, sql: &str, settings: &mut Settings) {
     let start = Instant::now();
     match conn.execute(sql) {
         Ok(result) => {
@@ -208,7 +208,7 @@ fn execute_sql(conn: &mut Connection<'_>, _db: &Database, sql: &str, settings: &
     }
 }
 
-fn execute_single(conn: &mut Connection<'_>, db: &Database, input: &str, settings: &mut Settings) {
+fn execute_single(conn: &Connection<'_>, db: &Database, input: &str, settings: &mut Settings) {
     let trimmed = input.trim();
     if trimmed.starts_with('.') {
         commands::execute_dot_command_mut(trimmed, db, conn, settings, &mut std::io::stdout());
@@ -217,12 +217,7 @@ fn execute_single(conn: &mut Connection<'_>, db: &Database, input: &str, setting
     }
 }
 
-fn execute_batch_sql(
-    conn: &mut Connection<'_>,
-    db: &Database,
-    content: &str,
-    settings: &mut Settings,
-) {
+fn execute_batch_sql(conn: &Connection<'_>, db: &Database, content: &str, settings: &mut Settings) {
     let mut buf = String::new();
     for line in content.lines() {
         let trimmed = line.trim();

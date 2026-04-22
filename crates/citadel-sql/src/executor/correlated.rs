@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use citadel::Database;
+use rustc_hash::FxHashMap;
 
 use crate::encoding::{decode_column_raw, decode_composite_key, decode_pk_integer};
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, ColumnMap};
+use crate::eval::{eval_expr, is_truthy, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
@@ -12,7 +13,7 @@ use crate::types::*;
 use super::helpers::decode_full_row;
 use super::CteContext;
 
-pub(super) type InMap = (HashMap<Vec<Value>, std::collections::HashSet<Value>>, bool);
+pub(super) type InMap = (FxHashMap<Vec<Value>, HashSet<Value>>, bool);
 
 #[allow(clippy::type_complexity)]
 pub(super) fn handle_correlated_select_read(
@@ -24,7 +25,7 @@ pub(super) fn handle_correlated_select_read(
     columns: &mut Vec<ColumnDef>,
 ) -> Result<SelectStmt> {
     let mut new_columns = Vec::new();
-    let mut scalar_maps: Vec<(HashMap<Vec<Value>, Value>, Vec<usize>)> = Vec::new();
+    let mut scalar_maps: Vec<(FxHashMap<Vec<Value>, Value>, Vec<usize>)> = Vec::new();
     let mut corr_col_idx = columns.len();
 
     for col in &stmt.columns {
@@ -141,8 +142,6 @@ pub(super) fn resolve_inner_schema_write(
     }
     Err(SqlError::TableNotFound(name.to_string()))
 }
-
-// ── Correlated subquery support ─────────────────────────────────────
 
 /// Context for correlation detection — carries outer table info.
 pub(super) struct CorrelationCtx<'a> {
@@ -449,11 +448,11 @@ pub(super) fn strip_correlation_predicates(
         None => return (None, vec![]),
     };
     let conjuncts = flatten_and_exprs(w);
-    let corr_outer: std::collections::HashSet<&str> = corr_pairs
+    let corr_outer: HashSet<&str> = corr_pairs
         .iter()
         .map(|p| p.outer_col_name.as_str())
         .collect();
-    let corr_inner: std::collections::HashSet<&str> = corr_pairs
+    let corr_inner: HashSet<&str> = corr_pairs
         .iter()
         .map(|p| p.inner_col_name.as_str())
         .collect();
@@ -481,7 +480,6 @@ pub(super) fn strip_correlation_predicates(
                 continue;
             }
         }
-        // Check if this predicate references outer columns
         let mut refs = Vec::new();
         collect_column_names(c, &mut refs);
         let refs_outer = refs.iter().any(|name| {
@@ -571,12 +569,12 @@ pub(super) fn bind_outer_values_in_expr(
 }
 
 pub(super) enum ExistsResult {
-    Simple(std::collections::HashSet<Vec<Value>>),
+    Simple(HashSet<Vec<Value>>),
     WithFilter(Box<ExistsFilterData>),
 }
 
 pub(super) struct ExistsFilterData {
-    rows_by_key: HashMap<Vec<Value>, Vec<Vec<Value>>>,
+    rows_by_key: FxHashMap<Vec<Value>, Vec<Vec<Value>>>,
     non_eq_predicates: Vec<Expr>,
     inner_schema: TableSchema,
 }
@@ -604,7 +602,7 @@ pub(super) fn decorrelate_exists_read(
         let rows: Vec<Vec<Value>> = if let Some(ref w) = inner_where {
             vqr.rows
                 .into_iter()
-                .filter(|row| match eval_expr(w, &col_map, row) {
+                .filter(|row| match eval_expr(w, &EvalCtx::new(&col_map, row)) {
                     Ok(v) => is_truthy(&v),
                     _ => false,
                 })
@@ -627,7 +625,7 @@ pub(super) fn decorrelate_exists_read(
         .collect();
 
     if non_eq.is_empty() {
-        let mut key_set = std::collections::HashSet::new();
+        let mut key_set = HashSet::new();
         for row in &inner_rows {
             let key: Vec<Value> = inner_col_indices.iter().map(|&i| row[i].clone()).collect();
             if key.iter().any(|v| v.is_null()) {
@@ -637,7 +635,7 @@ pub(super) fn decorrelate_exists_read(
         }
         Ok(ExistsResult::Simple(key_set))
     } else {
-        let mut rows_by_key: HashMap<Vec<Value>, Vec<Vec<Value>>> = HashMap::new();
+        let mut rows_by_key: FxHashMap<Vec<Value>, Vec<Vec<Value>>> = FxHashMap::default();
         for row in inner_rows {
             let key: Vec<Value> = inner_col_indices.iter().map(|&i| row[i].clone()).collect();
             if key.iter().any(|v| v.is_null()) {
@@ -687,7 +685,7 @@ pub(super) fn decorrelate_in_read(
         .map(|p| inner_schema.column_index(&p.inner_col_name).unwrap_or(0))
         .collect();
 
-    let mut map: HashMap<Vec<Value>, std::collections::HashSet<Value>> = HashMap::new();
+    let mut map: FxHashMap<Vec<Value>, HashSet<Value>> = FxHashMap::default();
     let mut has_null_in_values = false;
 
     for row in &inner_rows {
@@ -713,7 +711,7 @@ pub(super) fn decorrelate_scalar_read(
     subquery: &SelectStmt,
     corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
-) -> Result<HashMap<Vec<Value>, Value>> {
+) -> Result<FxHashMap<Vec<Value>, Value>> {
     let inner_name = subquery.from.to_ascii_lowercase();
     let inner_schema = schema
         .get(&inner_name)
@@ -755,15 +753,15 @@ pub(super) fn decorrelate_scalar_read(
         having: None,
     };
 
-    let empty_ctes = CteContext::new();
+    let empty_ctes = CteContext::default();
     let qr = match super::exec_select(db, schema, &rewritten, &empty_ctes)? {
         ExecutionResult::Query(qr) => qr,
-        _ => return Ok(HashMap::new()),
+        _ => return Ok(FxHashMap::default()),
     };
 
-    // Build HashMap: first N columns are corr keys, last column is the scalar result
+    // Build FxHashMap: first N columns are corr keys, last column is the scalar result
     let num_corr = corr_pairs.len();
-    let mut map = HashMap::new();
+    let mut map = FxHashMap::default();
     for row in &qr.rows {
         let key: Vec<Value> = row[..num_corr].to_vec();
         if key.iter().any(|v| v.is_null()) {
@@ -780,7 +778,7 @@ pub(super) fn decorrelate_scalar_read(
     Ok(map)
 }
 
-// ── Write-transaction variants (same logic, use collect_rows_write) ──
+// Write-transaction variants below — same logic, use collect_rows_write.
 
 pub(super) fn decorrelate_exists_write(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
@@ -788,7 +786,7 @@ pub(super) fn decorrelate_exists_write(
     subquery: &SelectStmt,
     corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
-) -> Result<std::collections::HashSet<Vec<Value>>> {
+) -> Result<HashSet<Vec<Value>>> {
     let inner_name = subquery.from.to_ascii_lowercase();
     let inner_schema = schema
         .get(&inner_name)
@@ -800,7 +798,7 @@ pub(super) fn decorrelate_exists_write(
         .iter()
         .map(|p| inner_schema.column_index(&p.inner_col_name).unwrap_or(0))
         .collect();
-    let mut key_set = std::collections::HashSet::new();
+    let mut key_set = HashSet::new();
     for row in &inner_rows {
         let key: Vec<Value> = inner_col_indices.iter().map(|&i| row[i].clone()).collect();
         if key.iter().any(|v| v.is_null()) {
@@ -839,7 +837,7 @@ pub(super) fn decorrelate_in_write(
         .iter()
         .map(|p| inner_schema.column_index(&p.inner_col_name).unwrap_or(0))
         .collect();
-    let mut map: HashMap<Vec<Value>, std::collections::HashSet<Value>> = HashMap::new();
+    let mut map: FxHashMap<Vec<Value>, HashSet<Value>> = FxHashMap::default();
     let mut has_null_in_values = false;
     for row in &inner_rows {
         let key: Vec<Value> = inner_corr_indices.iter().map(|&i| row[i].clone()).collect();
@@ -862,7 +860,7 @@ pub(super) fn decorrelate_scalar_write(
     subquery: &SelectStmt,
     corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
-) -> Result<HashMap<Vec<Value>, Value>> {
+) -> Result<FxHashMap<Vec<Value>, Value>> {
     let inner_name = subquery.from.to_ascii_lowercase();
     let inner_schema = schema
         .get(&inner_name)
@@ -898,13 +896,13 @@ pub(super) fn decorrelate_scalar_write(
         group_by,
         having: None,
     };
-    let empty_ctes = CteContext::new();
+    let empty_ctes = CteContext::default();
     let qr = match super::exec_select_in_txn(wtx, schema, &rewritten, &empty_ctes)? {
         ExecutionResult::Query(qr) => qr,
-        _ => return Ok(HashMap::new()),
+        _ => return Ok(FxHashMap::default()),
     };
     let num_corr = corr_pairs.len();
-    let mut map = HashMap::new();
+    let mut map = FxHashMap::default();
     for row in &qr.rows {
         let key: Vec<Value> = row[..num_corr].to_vec();
         if key.iter().any(|v| v.is_null()) {
@@ -1012,7 +1010,7 @@ pub(super) fn handle_correlated_where_write(
                     rows.retain(|row| {
                         let key: Vec<Value> =
                             outer_col_indices.iter().map(|&i| row[i].clone()).collect();
-                        let in_val = match eval_expr(in_expr, &col_map, row) {
+                        let in_val = match eval_expr(in_expr, &EvalCtx::new(&col_map, row)) {
                             Ok(v) => v,
                             Err(_) => return false,
                         };
@@ -1068,16 +1066,17 @@ pub(super) fn handle_correlated_where_write(
                                         outer_col_indices.iter().map(|&i| row[i].clone()).collect();
                                     let scalar_val =
                                         scalar_map.get(&key).cloned().unwrap_or(Value::Null);
-                                    let left_val = match eval_expr(&left_expr, &col_map, row) {
-                                        Ok(v) => v,
-                                        Err(_) => return false,
-                                    };
+                                    let left_val =
+                                        match eval_expr(&left_expr, &EvalCtx::new(&col_map, row)) {
+                                            Ok(v) => v,
+                                            Err(_) => return false,
+                                        };
                                     let cmp = Expr::BinaryOp {
                                         left: Box::new(Expr::Literal(left_val)),
                                         op: cmp_op,
                                         right: Box::new(Expr::Literal(scalar_val)),
                                     };
-                                    match eval_expr(&cmp, &col_map, row) {
+                                    match eval_expr(&cmp, &EvalCtx::new(&col_map, row)) {
                                         Ok(val) => is_truthy(&val),
                                         Err(_) => false,
                                     }
@@ -1324,7 +1323,6 @@ pub(super) fn build_and_scan_correlated_read(
             col_vals.push((col_idx, val));
         }
 
-        // Check EXISTS filters
         for ef in &exists_filters {
             outer_key.clear();
             for &oci in &ef.outer_col_indices {
@@ -1361,7 +1359,7 @@ pub(super) fn build_and_scan_correlated_read(
                             filter_data.non_eq_predicates.iter().all(|pred| {
                                 let bound =
                                     bind_outer_values_in_expr(pred, &row, &outer_col_map, ctx);
-                                match eval_expr(&bound, &inner_col_map, inner_row) {
+                                match eval_expr(&bound, &EvalCtx::new(&inner_col_map, inner_row)) {
                                     Ok(v) => is_truthy(&v),
                                     Err(_) => false,
                                 }
@@ -1382,7 +1380,6 @@ pub(super) fn build_and_scan_correlated_read(
             }
         }
 
-        // Check IN filters
         for inf in &in_filters {
             corr_key.clear();
             for &oci in &inf.outer_col_indices {
@@ -1410,7 +1407,7 @@ pub(super) fn build_and_scan_correlated_read(
                         return false;
                     }
                 };
-                let in_val = match eval_expr(&inf.in_expr, &outer_col_map, &row) {
+                let in_val = match eval_expr(&inf.in_expr, &EvalCtx::new(&outer_col_map, &row)) {
                     Ok(v) => v,
                     Err(e) => {
                         scan_err = Some(e);
@@ -1519,7 +1516,7 @@ struct ExistsFilter {
 }
 
 struct InFilter {
-    map: HashMap<Vec<Value>, std::collections::HashSet<Value>>,
+    map: FxHashMap<Vec<Value>, HashSet<Value>>,
     has_null: bool,
     outer_col_indices: Vec<usize>,
     in_expr: Expr,
@@ -1603,7 +1600,10 @@ pub(super) fn handle_correlated_where_read(
                                                     &outer_col_map,
                                                     ctx,
                                                 );
-                                                match eval_expr(&bound, &inner_col_map, inner_row) {
+                                                match eval_expr(
+                                                    &bound,
+                                                    &EvalCtx::new(&inner_col_map, inner_row),
+                                                ) {
                                                     Ok(val) => is_truthy(&val),
                                                     Err(_) => false,
                                                 }
@@ -1654,7 +1654,7 @@ pub(super) fn handle_correlated_where_read(
                     rows.retain(|row| {
                         let key: Vec<Value> =
                             outer_col_indices.iter().map(|&i| row[i].clone()).collect();
-                        let in_val = match eval_expr(in_expr, &col_map, row) {
+                        let in_val = match eval_expr(in_expr, &EvalCtx::new(&col_map, row)) {
                             Ok(v) => v,
                             Err(_) => return false,
                         };
@@ -1708,16 +1708,17 @@ pub(super) fn handle_correlated_where_read(
                                         outer_col_indices.iter().map(|&i| row[i].clone()).collect();
                                     let scalar_val =
                                         scalar_map.get(&key).cloned().unwrap_or(Value::Null);
-                                    let left_val = match eval_expr(&left_expr, &col_map, row) {
-                                        Ok(v) => v,
-                                        Err(_) => return false,
-                                    };
+                                    let left_val =
+                                        match eval_expr(&left_expr, &EvalCtx::new(&col_map, row)) {
+                                            Ok(v) => v,
+                                            Err(_) => return false,
+                                        };
                                     let cmp_expr = Expr::BinaryOp {
                                         left: Box::new(Expr::Literal(left_val)),
                                         op: cmp_op,
                                         right: Box::new(Expr::Literal(scalar_val)),
                                     };
-                                    match eval_expr(&cmp_expr, &col_map, row) {
+                                    match eval_expr(&cmp_expr, &EvalCtx::new(&col_map, row)) {
                                         Ok(val) => is_truthy(&val),
                                         Err(_) => false,
                                     }

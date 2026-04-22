@@ -564,9 +564,9 @@ pub struct TableSchema {
     pub foreign_keys: Vec<ForeignKeySchemaEntry>,
     pk_idx_cache: Vec<usize>,
     non_pk_idx_cache: Vec<usize>,
-    /// Physical encoding slots that have been dropped (O(1) DROP COLUMN).
-    /// Sorted. Old rows still have data at these positions (skipped on decode);
-    /// new rows encode NULL there to maintain position consistency.
+    /// Physical encoding slots dropped via DROP COLUMN. Sorted.
+    /// Old rows have data at these positions (skipped on decode);
+    /// new rows encode NULL to maintain position consistency.
     dropped_non_pk_slots: Vec<u16>,
     /// Physical encoding position -> logical column index.
     /// `usize::MAX` for dropped slots.
@@ -679,17 +679,16 @@ impl TableSchema {
         self.non_pk_idx_cache.len() + self.dropped_non_pk_slots.len()
     }
 
-    /// Physical encoding slots that have been dropped via O(1) DROP COLUMN.
+    /// Physical encoding slots that have been dropped via DROP COLUMN.
     pub fn dropped_non_pk_slots(&self) -> &[u16] {
         &self.dropped_non_pk_slots
     }
 
-    /// Create a new schema with the column at `drop_pos` removed.
-    /// O(1): marks the physical encoding slot as dropped instead of rewriting rows.
-    /// Decrements all logical position references > drop_pos. Filters out
-    /// table-level CHECK constraints referencing the dropped column.
+    /// Return a new schema with the column at `drop_pos` marked as dropped.
+    /// Row data is not rewritten; decode skips the slot. Logical positions
+    /// above `drop_pos` shift down; table-level CHECKs referencing it are
+    /// filtered out.
     pub fn without_column(&self, drop_pos: usize) -> Self {
-        // Find physical encoding slot for the dropped column
         let non_pk_order = self
             .non_pk_idx_cache
             .iter()
@@ -815,15 +814,12 @@ impl TableSchema {
         let mut buf = Vec::new();
         buf.push(SCHEMA_VERSION);
 
-        // Table name
         let name_bytes = self.name.as_bytes();
         buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(name_bytes);
 
-        // Column count
         buf.extend_from_slice(&(self.columns.len() as u16).to_le_bytes());
 
-        // Columns (v1/v2 core fields)
         for col in &self.columns {
             let col_name = col.name.as_bytes();
             buf.extend_from_slice(&(col_name.len() as u16).to_le_bytes());
@@ -833,13 +829,11 @@ impl TableSchema {
             buf.extend_from_slice(&col.position.to_le_bytes());
         }
 
-        // Primary key columns
         buf.extend_from_slice(&(self.primary_key_columns.len() as u16).to_le_bytes());
         for &pk_idx in &self.primary_key_columns {
             buf.extend_from_slice(&pk_idx.to_le_bytes());
         }
 
-        // Indices (v2+)
         buf.extend_from_slice(&(self.indices.len() as u16).to_le_bytes());
         for idx in &self.indices {
             let idx_name = idx.name.as_bytes();
@@ -852,7 +846,6 @@ impl TableSchema {
             buf.push(if idx.unique { 1 } else { 0 });
         }
 
-        // ── v3: per-column defaults and checks ──
         for col in &self.columns {
             let mut flags: u8 = 0;
             if col.default_sql.is_some() {
@@ -875,7 +868,6 @@ impl TableSchema {
             }
         }
 
-        // ── v3: table-level check constraints ──
         buf.extend_from_slice(&(self.check_constraints.len() as u16).to_le_bytes());
         for chk in &self.check_constraints {
             write_opt_string(&mut buf, &chk.name);
@@ -884,7 +876,6 @@ impl TableSchema {
             buf.extend_from_slice(sql_bytes);
         }
 
-        // ── v3: foreign keys ──
         buf.extend_from_slice(&(self.foreign_keys.len() as u16).to_le_bytes());
         for fk in &self.foreign_keys {
             write_opt_string(&mut buf, &fk.name);
@@ -903,7 +894,6 @@ impl TableSchema {
             }
         }
 
-        // v4: dropped non-PK encoding slots
         buf.extend_from_slice(&(self.dropped_non_pk_slots.len() as u16).to_le_bytes());
         for &slot in &self.dropped_non_pk_slots {
             buf.extend_from_slice(&slot.to_le_bytes());
@@ -923,13 +913,11 @@ impl TableSchema {
         let version = data[0];
         pos += 1;
 
-        // Table name
         let name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
         let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
         pos += name_len;
 
-        // Column count
         let col_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
 
@@ -961,7 +949,6 @@ impl TableSchema {
             });
         }
 
-        // Primary key columns
         let pk_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
         let mut primary_key_columns = Vec::with_capacity(pk_count);
@@ -971,7 +958,6 @@ impl TableSchema {
             primary_key_columns.push(pk_idx);
         }
 
-        // Indices (v2+)
         let indices = if version >= 2 && pos + 2 <= data.len() {
             let idx_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
@@ -1002,7 +988,6 @@ impl TableSchema {
             vec![]
         };
 
-        // v3: per-column defaults and checks
         let mut check_constraints = Vec::new();
         let mut foreign_keys = Vec::new();
 
@@ -1031,7 +1016,6 @@ impl TableSchema {
                 }
             }
 
-            // Table-level check constraints
             let chk_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
             for _ in 0..chk_count {
@@ -1045,7 +1029,6 @@ impl TableSchema {
                 check_constraints.push(TableCheckDef { name, expr, sql });
             }
 
-            // Foreign keys
             let fk_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
             for _ in 0..fk_count {
@@ -1073,7 +1056,6 @@ impl TableSchema {
                 });
             }
         }
-        // v4: dropped non-PK encoding slots
         let mut dropped_non_pk_slots = Vec::new();
         if version >= 4 && pos + 2 <= data.len() {
             let slot_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;

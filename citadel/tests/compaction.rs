@@ -70,7 +70,6 @@ fn compact_reduces_file_size() {
 
     let db = fast_builder(&db_path).create().unwrap();
 
-    // Insert many keys
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..500u32 {
@@ -80,7 +79,7 @@ fn compact_reduces_file_size() {
         wtx.commit().unwrap();
     }
 
-    // Delete most of them (creating free pages)
+    // Delete most to create free pages.
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..400u32 {
@@ -94,7 +93,6 @@ fn compact_reduces_file_size() {
     db.compact(&compact_path).unwrap();
     let compact_size = std::fs::metadata(&compact_path).unwrap().len();
 
-    // Compacted file should be smaller (fewer live pages)
     assert!(
         compact_size < original_size,
         "compact ({compact_size}) should be smaller than original ({original_size})"
@@ -197,9 +195,8 @@ fn compact_no_pending_free() {
         .open()
         .unwrap();
 
-    // Compacted DB should have no pending-free pages
     let stats = compacted.stats();
-    // HWM should equal total pages (no gaps)
+    // HWM must equal total pages: compaction leaves no gaps.
     assert_eq!(stats.total_pages, stats.high_water_mark);
 }
 
@@ -235,7 +232,6 @@ fn compact_then_writable() {
 
     db.compact(&compact_path).unwrap();
 
-    // Open the compacted DB and continue writing
     let compacted = DatabaseBuilder::new(&compact_path)
         .passphrase(b"test-passphrase")
         .argon2_profile(Argon2Profile::Iot)

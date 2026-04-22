@@ -81,7 +81,6 @@ fn sync_one_table_push() {
         assert_eq!(results[0].1.entries_applied, 2);
     });
 
-    // Verify B now has the data
     let mut rtx = db_b.begin_read();
     assert_eq!(rtx.table_get(b"data", b"k1").unwrap().unwrap(), b"v1");
     assert_eq!(rtx.table_get(b"data", b"k2").unwrap().unwrap(), b"v2");
@@ -192,7 +191,6 @@ fn sync_skips_index_tables() {
     let db_a = fast_builder(&dir_a.path().join("a.db")).create().unwrap();
     let db_b = fast_builder(&dir_b.path().join("b.db")).create().unwrap();
 
-    // Create a table and an index-like table
     let mut wtx = db_a.begin_write().unwrap();
     wtx.create_table(b"data").unwrap();
     wtx.create_table(b"__idx_data_name").unwrap();
@@ -238,7 +236,6 @@ fn sync_preserves_unshared_data() {
     wtx.table_insert(b"shared", b"from_b", b"val_b").unwrap();
     wtx.commit().unwrap();
 
-    // Also put something in B's default tree
     let mut wtx = db_b.begin_write().unwrap();
     wtx.insert(b"default_key", b"default_val").unwrap();
     wtx.commit().unwrap();

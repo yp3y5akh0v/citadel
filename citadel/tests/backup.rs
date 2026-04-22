@@ -15,7 +15,6 @@ fn backup_empty_db() {
     let db = fast_builder(&db_path).create().unwrap();
     db.backup(&backup_path).unwrap();
 
-    // Open the backup independently
     let backup = DatabaseBuilder::new(&backup_path)
         .passphrase(b"test-passphrase")
         .argon2_profile(Argon2Profile::Iot)
@@ -44,7 +43,6 @@ fn backup_with_data() {
 
     db.backup(&backup_path).unwrap();
 
-    // Verify backup has all data
     let backup = DatabaseBuilder::new(&backup_path)
         .passphrase(b"test-passphrase")
         .argon2_profile(Argon2Profile::Iot)
@@ -109,7 +107,6 @@ fn backup_snapshot_consistency() {
 
     let db = fast_builder(&db_path).create().unwrap();
 
-    // Write initial data
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..100u32 {
@@ -119,10 +116,9 @@ fn backup_snapshot_consistency() {
         wtx.commit().unwrap();
     }
 
-    // Take backup
     db.backup(&backup_path).unwrap();
 
-    // Write more data AFTER backup
+    // Snapshot isolation: writes after backup must not leak into it.
     {
         let mut wtx = db.begin_write().unwrap();
         for i in 100..200u32 {
@@ -132,7 +128,6 @@ fn backup_snapshot_consistency() {
         wtx.commit().unwrap();
     }
 
-    // Backup should only have the first 100 keys
     let backup = DatabaseBuilder::new(&backup_path)
         .passphrase(b"test-passphrase")
         .argon2_profile(Argon2Profile::Iot)
@@ -140,7 +135,6 @@ fn backup_snapshot_consistency() {
         .unwrap();
     assert_eq!(backup.stats().entry_count, 100);
 
-    // Source should have all 200
     assert_eq!(db.stats().entry_count, 200);
 }
 
@@ -184,7 +178,6 @@ fn backup_fails_if_dest_exists() {
 
     let db = fast_builder(&db_path).create().unwrap();
 
-    // Create the destination file first
     std::fs::write(&backup_path, b"existing").unwrap();
 
     let result = db.backup(&backup_path);

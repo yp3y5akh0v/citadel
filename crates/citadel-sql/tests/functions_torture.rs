@@ -17,21 +17,21 @@ fn assert_ok(result: ExecutionResult) {
     }
 }
 
-fn query(conn: &mut Connection, sql: &str) -> QueryResult {
+fn query(conn: &Connection, sql: &str) -> QueryResult {
     match conn.execute(sql).unwrap() {
         ExecutionResult::Query(qr) => qr,
         other => panic!("expected Query, got {other:?}"),
     }
 }
 
-fn scalar(conn: &mut Connection, sql: &str) -> Value {
+fn scalar(conn: &Connection, sql: &str) -> Value {
     let qr = query(conn, sql);
     assert_eq!(qr.rows.len(), 1, "expected 1 row for: {sql}");
     assert_eq!(qr.rows[0].len(), 1, "expected 1 col for: {sql}");
     qr.rows[0][0].clone()
 }
 
-fn setup(conn: &mut Connection) {
+fn setup(conn: &Connection) {
     assert_ok(
         conn.execute(
             "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, name TEXT, val INTEGER, score REAL)",
@@ -50,17 +50,13 @@ fn setup(conn: &mut Connection) {
         .unwrap();
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// BETWEEN torture
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn between_all_three_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_eq!(
-        scalar(&mut conn, "SELECT NULL BETWEEN NULL AND NULL"),
+        scalar(&conn, "SELECT NULL BETWEEN NULL AND NULL"),
         Value::Null
     );
 }
@@ -69,33 +65,27 @@ fn between_all_three_null() {
 fn between_null_low() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // 5 >= NULL is NULL, 5 <= 10 is TRUE -> NULL AND TRUE = NULL
-    assert_eq!(
-        scalar(&mut conn, "SELECT 5 BETWEEN NULL AND 10"),
-        Value::Null
-    );
+    assert_eq!(scalar(&conn, "SELECT 5 BETWEEN NULL AND 10"), Value::Null);
 }
 
 #[test]
 fn between_null_high() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(
-        scalar(&mut conn, "SELECT 5 BETWEEN 1 AND NULL"),
-        Value::Null
-    );
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT 5 BETWEEN 1 AND NULL"), Value::Null);
 }
 
 #[test]
 fn between_null_val_definite_false() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // 5 >= 10 is FALSE -> FALSE AND anything = FALSE
     assert_eq!(
-        scalar(&mut conn, "SELECT 5 BETWEEN 10 AND NULL"),
+        scalar(&conn, "SELECT 5 BETWEEN 10 AND NULL"),
         Value::Boolean(false)
     );
 }
@@ -104,10 +94,10 @@ fn between_null_val_definite_false() {
 fn between_mixed_types() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id FROM t WHERE val BETWEEN 9.5 AND 20.5 ORDER BY id",
     );
     assert_eq!(qr.rows.len(), 2);
@@ -119,10 +109,10 @@ fn between_mixed_types() {
 fn between_with_expressions() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id FROM t WHERE val BETWEEN 5 + 5 AND 15 * 2 ORDER BY id",
     );
     assert_eq!(qr.rows.len(), 3); // 10, 20, 30
@@ -132,7 +122,7 @@ fn between_with_expressions() {
 fn between_in_having() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_ok(conn.execute(
         "CREATE TABLE sales (id INTEGER NOT NULL PRIMARY KEY, region TEXT NOT NULL, amount INTEGER NOT NULL)"
     ).unwrap());
@@ -143,7 +133,7 @@ fn between_in_having() {
     conn.execute("INSERT INTO sales VALUES (3, 'south', 50)")
         .unwrap();
 
-    let qr = query(&mut conn,
+    let qr = query(&conn,
         "SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(amount) BETWEEN 100 AND 400"
     );
     assert_eq!(qr.rows.len(), 1);
@@ -155,103 +145,75 @@ fn between_in_having() {
 fn not_between_null_three_valued() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // NOT BETWEEN: NOT(NULL) = NULL
     assert_eq!(
-        scalar(&mut conn, "SELECT 5 NOT BETWEEN NULL AND 10"),
+        scalar(&conn, "SELECT 5 NOT BETWEEN NULL AND 10"),
         Value::Null
     );
     // NOT BETWEEN: NOT(FALSE) = TRUE
     assert_eq!(
-        scalar(&mut conn, "SELECT 5 NOT BETWEEN 10 AND NULL"),
+        scalar(&conn, "SELECT 5 NOT BETWEEN 10 AND NULL"),
         Value::Boolean(true)
     );
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// LIKE torture
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn like_empty_pattern_empty_string() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT '' LIKE ''"), Value::Boolean(true));
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT '' LIKE ''"), Value::Boolean(true));
 }
 
 #[test]
 fn like_empty_pattern_nonempty_string() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(
-        scalar(&mut conn, "SELECT 'abc' LIKE ''"),
-        Value::Boolean(false)
-    );
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT 'abc' LIKE ''"), Value::Boolean(false));
 }
 
 #[test]
 fn like_percent_matches_empty() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(
-        scalar(&mut conn, "SELECT '' LIKE '%'"),
-        Value::Boolean(true)
-    );
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT '' LIKE '%'"), Value::Boolean(true));
 }
 
 #[test]
 fn like_underscore_needs_one_char() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(
-        scalar(&mut conn, "SELECT '' LIKE '_'"),
-        Value::Boolean(false)
-    );
-    assert_eq!(
-        scalar(&mut conn, "SELECT 'a' LIKE '_'"),
-        Value::Boolean(true)
-    );
-    assert_eq!(
-        scalar(&mut conn, "SELECT 'ab' LIKE '_'"),
-        Value::Boolean(false)
-    );
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT '' LIKE '_'"), Value::Boolean(false));
+    assert_eq!(scalar(&conn, "SELECT 'a' LIKE '_'"), Value::Boolean(true));
+    assert_eq!(scalar(&conn, "SELECT 'ab' LIKE '_'"), Value::Boolean(false));
 }
 
 #[test]
 fn like_consecutive_percent() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_eq!(
-        scalar(&mut conn, "SELECT 'abc' LIKE '%%'"),
+        scalar(&conn, "SELECT 'abc' LIKE '%%'"),
         Value::Boolean(true)
     );
-    assert_eq!(
-        scalar(&mut conn, "SELECT '' LIKE '%%'"),
-        Value::Boolean(true)
-    );
+    assert_eq!(scalar(&conn, "SELECT '' LIKE '%%'"), Value::Boolean(true));
 }
 
 #[test]
 fn like_percent_underscore_percent() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // %_% matches one or more characters
+    assert_eq!(scalar(&conn, "SELECT 'a' LIKE '%_%'"), Value::Boolean(true));
+    assert_eq!(scalar(&conn, "SELECT '' LIKE '%_%'"), Value::Boolean(false));
     assert_eq!(
-        scalar(&mut conn, "SELECT 'a' LIKE '%_%'"),
-        Value::Boolean(true)
-    );
-    assert_eq!(
-        scalar(&mut conn, "SELECT '' LIKE '%_%'"),
-        Value::Boolean(false)
-    );
-    assert_eq!(
-        scalar(&mut conn, "SELECT 'ab' LIKE '%_%'"),
+        scalar(&conn, "SELECT 'ab' LIKE '%_%'"),
         Value::Boolean(true)
     );
 }
@@ -260,10 +222,10 @@ fn like_percent_underscore_percent() {
 fn like_backtracking_stress() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // This pattern requires backtracking: 'aaaaaaaaa' does NOT contain 'b'
     assert_eq!(
-        scalar(&mut conn, "SELECT 'aaaaaaaaa' LIKE '%a%a%a%a%b'"),
+        scalar(&conn, "SELECT 'aaaaaaaaa' LIKE '%a%a%a%a%b'"),
         Value::Boolean(false)
     );
 }
@@ -272,9 +234,9 @@ fn like_backtracking_stress() {
 fn like_backtracking_success() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_eq!(
-        scalar(&mut conn, "SELECT 'aaxaayaazb' LIKE '%a%a%a%b'"),
+        scalar(&conn, "SELECT 'aaxaayaazb' LIKE '%a%a%a%b'"),
         Value::Boolean(true)
     );
 }
@@ -283,10 +245,10 @@ fn like_backtracking_success() {
 fn like_unicode_underscore() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // _ matches one Unicode code point
     assert_eq!(
-        scalar(&mut conn, "SELECT '\u{00e9}' LIKE '_'"),
+        scalar(&conn, "SELECT '\u{00e9}' LIKE '_'"),
         Value::Boolean(true)
     );
 }
@@ -295,17 +257,17 @@ fn like_unicode_underscore() {
 fn like_escape_percent_and_underscore() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_eq!(
-        scalar(&mut conn, "SELECT '50%' LIKE '%!%' ESCAPE '!'"),
+        scalar(&conn, "SELECT '50%' LIKE '%!%' ESCAPE '!'"),
         Value::Boolean(true)
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT 'a_b' LIKE 'a!_b' ESCAPE '!'"),
+        scalar(&conn, "SELECT 'a_b' LIKE 'a!_b' ESCAPE '!'"),
         Value::Boolean(true)
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT 'axb' LIKE 'a!_b' ESCAPE '!'"),
+        scalar(&conn, "SELECT 'axb' LIKE 'a!_b' ESCAPE '!'"),
         Value::Boolean(false)
     );
 }
@@ -314,13 +276,10 @@ fn like_escape_percent_and_underscore() {
 fn like_pattern_only_percent() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     // % matches everything including NULL name (but NULL LIKE '%' is NULL, filtered out)
-    let qr = query(
-        &mut conn,
-        "SELECT id FROM t WHERE name LIKE '%' ORDER BY id",
-    );
+    let qr = query(&conn, "SELECT id FROM t WHERE name LIKE '%' ORDER BY id");
     assert_eq!(qr.rows.len(), 4); // alice, bob, charlie, diana (not NULL id=5)
 }
 
@@ -328,7 +287,7 @@ fn like_pattern_only_percent() {
 fn like_in_join_on_clause() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE patterns (id INTEGER NOT NULL PRIMARY KEY, pat TEXT NOT NULL)")
@@ -345,24 +304,20 @@ fn like_in_join_on_clause() {
     conn.execute("INSERT INTO data VALUES (2, 'bob')").unwrap();
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT d.val FROM data d JOIN patterns p ON d.val LIKE p.pat",
     );
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Text("alice".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// CASE WHEN torture
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn case_nested() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let v = scalar(
-        &mut conn,
+        &conn,
         "SELECT CASE WHEN 1 > 0 THEN \
             CASE WHEN 2 > 1 THEN 'deep' ELSE 'shallow' END \
          ELSE 'none' END",
@@ -374,11 +329,11 @@ fn case_nested() {
 fn case_in_order_by() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT name FROM t WHERE name IS NOT NULL \
          ORDER BY CASE name WHEN 'charlie' THEN 1 WHEN 'alice' THEN 2 ELSE 3 END",
     );
@@ -390,11 +345,11 @@ fn case_in_order_by() {
 fn case_many_branches() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT CASE val \
             WHEN 10 THEN 'ten' \
             WHEN 20 THEN 'twenty' \
@@ -414,11 +369,11 @@ fn case_many_branches() {
 fn case_with_aggregate_in_result() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     let v = scalar(
-        &mut conn,
+        &conn,
         "SELECT CASE WHEN MAX(val) > 40 THEN 'big' ELSE 'small' END FROM t",
     );
     assert_eq!(v, Value::Text("big".into()));
@@ -428,10 +383,10 @@ fn case_with_aggregate_in_result() {
 fn case_short_circuit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // First branch TRUE -> second (which would divide by zero) never evaluated
     let v = scalar(
-        &mut conn,
+        &conn,
         "SELECT CASE WHEN 1 = 1 THEN 'ok' WHEN 1/0 = 1 THEN 'boom' END",
     );
     assert_eq!(v, Value::Text("ok".into()));
@@ -441,11 +396,11 @@ fn case_short_circuit() {
 fn case_in_group_by() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT CASE WHEN val <= 20 THEN 'low' ELSE 'high' END AS bucket, COUNT(*) \
          FROM t WHERE val IS NOT NULL \
          GROUP BY CASE WHEN val <= 20 THEN 'low' ELSE 'high' END \
@@ -458,16 +413,12 @@ fn case_in_group_by() {
     assert_eq!(qr.rows[1][1], Value::Integer(2)); // 10, 20
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// COALESCE torture
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn coalesce_nested() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT COALESCE(NULL, COALESCE(NULL, 42))");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT COALESCE(NULL, COALESCE(NULL, 42))");
     assert_eq!(v, Value::Integer(42));
 }
 
@@ -475,11 +426,8 @@ fn coalesce_nested() {
 fn coalesce_many_nulls() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(
-        &mut conn,
-        "SELECT COALESCE(NULL, NULL, NULL, NULL, NULL, 99)",
-    );
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT COALESCE(NULL, NULL, NULL, NULL, NULL, 99)");
     assert_eq!(v, Value::Integer(99));
 }
 
@@ -487,9 +435,9 @@ fn coalesce_many_nulls() {
 fn coalesce_short_circuit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // First non-null found, division by zero never evaluated
-    let v = scalar(&mut conn, "SELECT COALESCE(1, 1/0)");
+    let v = scalar(&conn, "SELECT COALESCE(1, 1/0)");
     assert_eq!(v, Value::Integer(1));
 }
 
@@ -497,13 +445,10 @@ fn coalesce_short_circuit() {
 fn coalesce_with_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
-    let qr = query(
-        &mut conn,
-        "SELECT COALESCE(name, 'unknown') FROM t ORDER BY id",
-    );
+    let qr = query(&conn, "SELECT COALESCE(name, 'unknown') FROM t ORDER BY id");
     assert_eq!(qr.rows[0][0], Value::Text("alice".into()));
     assert_eq!(qr.rows[4][0], Value::Text("unknown".into())); // id=5 has NULL name
 }
@@ -512,24 +457,20 @@ fn coalesce_with_column() {
 fn coalesce_in_aggregate_context() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
-    let v = scalar(&mut conn, "SELECT SUM(COALESCE(val, 0)) FROM t");
+    let v = scalar(&conn, "SELECT SUM(COALESCE(val, 0)) FROM t");
     assert_eq!(v, Value::Integer(110)); // 10+20+30+0+50
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// NULLIF/IIF torture
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn nullif_both_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // NULL = NULL is not TRUE in CASE -> returns first arg (NULL)
-    let v = scalar(&mut conn, "SELECT NULLIF(NULL, NULL)");
+    let v = scalar(&conn, "SELECT NULLIF(NULL, NULL)");
     assert_eq!(v, Value::Null);
 }
 
@@ -537,8 +478,8 @@ fn nullif_both_null() {
 fn nullif_first_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT NULLIF(NULL, 5)");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT NULLIF(NULL, 5)");
     assert_eq!(v, Value::Null);
 }
 
@@ -546,11 +487,11 @@ fn nullif_first_null() {
 fn nullif_with_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT NULLIF(val, 20) FROM t WHERE val IS NOT NULL ORDER BY id",
     );
     assert_eq!(qr.rows[0][0], Value::Integer(10));
@@ -562,27 +503,23 @@ fn nullif_with_column() {
 fn iif_null_condition() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // NULL is not truthy -> returns else branch
-    let v = scalar(&mut conn, "SELECT IIF(NULL, 'yes', 'no')");
+    let v = scalar(&conn, "SELECT IIF(NULL, 'yes', 'no')");
     assert_eq!(v, Value::Text("no".into()));
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// CAST torture
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn cast_bool_to_integer() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_eq!(
-        scalar(&mut conn, "SELECT CAST(TRUE AS INTEGER)"),
+        scalar(&conn, "SELECT CAST(TRUE AS INTEGER)"),
         Value::Integer(1)
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT CAST(FALSE AS INTEGER)"),
+        scalar(&conn, "SELECT CAST(FALSE AS INTEGER)"),
         Value::Integer(0)
     );
 }
@@ -591,17 +528,17 @@ fn cast_bool_to_integer() {
 fn cast_integer_to_bool() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_eq!(
-        scalar(&mut conn, "SELECT CAST(1 AS BOOLEAN)"),
+        scalar(&conn, "SELECT CAST(1 AS BOOLEAN)"),
         Value::Boolean(true)
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT CAST(0 AS BOOLEAN)"),
+        scalar(&conn, "SELECT CAST(0 AS BOOLEAN)"),
         Value::Boolean(false)
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT CAST(42 AS BOOLEAN)"),
+        scalar(&conn, "SELECT CAST(42 AS BOOLEAN)"),
         Value::Boolean(true)
     );
 }
@@ -610,9 +547,9 @@ fn cast_integer_to_bool() {
 fn cast_text_float_to_integer() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // '3.7' -> parse as float -> truncate to 3
-    let v = scalar(&mut conn, "SELECT CAST('3.7' AS INTEGER)");
+    let v = scalar(&conn, "SELECT CAST('3.7' AS INTEGER)");
     assert_eq!(v, Value::Integer(3));
 }
 
@@ -620,8 +557,8 @@ fn cast_text_float_to_integer() {
 fn cast_empty_string_to_integer_fails() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
     let err = conn
         .execute("SELECT CAST('' AS INTEGER) FROM t WHERE id = 1")
         .unwrap_err();
@@ -632,13 +569,10 @@ fn cast_empty_string_to_integer_fails() {
 fn cast_bool_to_real() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT CAST(TRUE AS REAL)"), Value::Real(1.0));
     assert_eq!(
-        scalar(&mut conn, "SELECT CAST(TRUE AS REAL)"),
-        Value::Real(1.0)
-    );
-    assert_eq!(
-        scalar(&mut conn, "SELECT CAST(FALSE AS REAL)"),
+        scalar(&conn, "SELECT CAST(FALSE AS REAL)"),
         Value::Real(0.0)
     );
 }
@@ -647,8 +581,8 @@ fn cast_bool_to_real() {
 fn cast_real_to_text() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT CAST(3.14 AS TEXT)");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT CAST(3.14 AS TEXT)");
     assert_eq!(v, Value::Text("3.14".into()));
 }
 
@@ -656,9 +590,9 @@ fn cast_real_to_text() {
 fn cast_integer_whole_real_to_text() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // Whole-number reals display with .0
-    let v = scalar(&mut conn, "SELECT CAST(5.0 AS TEXT)");
+    let v = scalar(&conn, "SELECT CAST(5.0 AS TEXT)");
     assert_eq!(v, Value::Text("5.0".into()));
 }
 
@@ -666,9 +600,9 @@ fn cast_integer_whole_real_to_text() {
 fn cast_chained() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // CAST(CAST('42' AS INTEGER) AS TEXT) -> "42"
-    let v = scalar(&mut conn, "SELECT CAST(CAST('42' AS INTEGER) AS TEXT)");
+    let v = scalar(&conn, "SELECT CAST(CAST('42' AS INTEGER) AS TEXT)");
     assert_eq!(v, Value::Text("42".into()));
 }
 
@@ -676,31 +610,27 @@ fn cast_chained() {
 fn cast_text_to_blob() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT TYPEOF(CAST('hello' AS BLOB))");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT TYPEOF(CAST('hello' AS BLOB))");
     assert_eq!(v, Value::Text("blob".into()));
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// String concat (||) torture
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn concat_op_null_propagation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // Standard SQL: || propagates NULL
-    assert_eq!(scalar(&mut conn, "SELECT NULL || 'b'"), Value::Null);
-    assert_eq!(scalar(&mut conn, "SELECT 'a' || NULL"), Value::Null);
+    assert_eq!(scalar(&conn, "SELECT NULL || 'b'"), Value::Null);
+    assert_eq!(scalar(&conn, "SELECT 'a' || NULL"), Value::Null);
 }
 
 #[test]
 fn concat_op_integer_text() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT 42 || ' items'");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT 42 || ' items'");
     assert_eq!(v, Value::Text("42 items".into()));
 }
 
@@ -708,8 +638,8 @@ fn concat_op_integer_text() {
 fn concat_op_boolean_text() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT TRUE || ' story'");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT TRUE || ' story'");
     assert_eq!(v, Value::Text("TRUE story".into()));
 }
 
@@ -717,9 +647,9 @@ fn concat_op_boolean_text() {
 fn concat_op_chain_ten() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let v = scalar(
-        &mut conn,
+        &conn,
         "SELECT 'a' || 'b' || 'c' || 'd' || 'e' || 'f' || 'g' || 'h' || 'i' || 'j'",
     );
     assert_eq!(v, Value::Text("abcdefghij".into()));
@@ -729,26 +659,22 @@ fn concat_op_chain_ten() {
 fn concat_fn_vs_operator_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // CONCAT() treats NULL as empty; || propagates NULL
     assert_eq!(
-        scalar(&mut conn, "SELECT CONCAT('a', NULL, 'b')"),
+        scalar(&conn, "SELECT CONCAT('a', NULL, 'b')"),
         Value::Text("ab".into())
     );
-    assert_eq!(scalar(&mut conn, "SELECT 'a' || NULL || 'b'"), Value::Null);
+    assert_eq!(scalar(&conn, "SELECT 'a' || NULL || 'b'"), Value::Null);
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// SUBSTR torture
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn substr_start_zero() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // Start=0 with length: treated like start=1 but length reduced by 1
-    let v = scalar(&mut conn, "SELECT SUBSTR('hello', 0, 3)");
+    let v = scalar(&conn, "SELECT SUBSTR('hello', 0, 3)");
     // 0-based: absorb 1 char of length, take 2 from start
     assert_eq!(v, Value::Text("he".into()));
 }
@@ -757,8 +683,8 @@ fn substr_start_zero() {
 fn substr_start_beyond_length() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT SUBSTR('abc', 10, 5)");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT SUBSTR('abc', 10, 5)");
     assert_eq!(v, Value::Text("".into()));
 }
 
@@ -766,8 +692,8 @@ fn substr_start_beyond_length() {
 fn substr_length_zero() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT SUBSTR('abc', 1, 0)");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT SUBSTR('abc', 1, 0)");
     assert_eq!(v, Value::Text("".into()));
 }
 
@@ -775,8 +701,8 @@ fn substr_length_zero() {
 fn substr_very_large_length() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT SUBSTR('abc', 1, 99999)");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT SUBSTR('abc', 1, 99999)");
     assert_eq!(v, Value::Text("abc".into()));
 }
 
@@ -784,12 +710,12 @@ fn substr_very_large_length() {
 fn substr_negative_start_with_length() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // Start=-1 counts from right: last 1 char
-    let v = scalar(&mut conn, "SELECT SUBSTR('hello', -1)");
+    let v = scalar(&conn, "SELECT SUBSTR('hello', -1)");
     assert_eq!(v, Value::Text("o".into()));
 
-    let v2 = scalar(&mut conn, "SELECT SUBSTR('hello', -3)");
+    let v2 = scalar(&conn, "SELECT SUBSTR('hello', -3)");
     assert_eq!(v2, Value::Text("llo".into()));
 }
 
@@ -797,29 +723,19 @@ fn substr_negative_start_with_length() {
 fn substr_null_args() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT SUBSTR(NULL, 1, 2)"), Value::Null);
-    assert_eq!(
-        scalar(&mut conn, "SELECT SUBSTR('abc', NULL, 2)"),
-        Value::Null
-    );
-    assert_eq!(
-        scalar(&mut conn, "SELECT SUBSTR('abc', 1, NULL)"),
-        Value::Null
-    );
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT SUBSTR(NULL, 1, 2)"), Value::Null);
+    assert_eq!(scalar(&conn, "SELECT SUBSTR('abc', NULL, 2)"), Value::Null);
+    assert_eq!(scalar(&conn, "SELECT SUBSTR('abc', 1, NULL)"), Value::Null);
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// TRIM torture
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn trim_multi_char_set() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // Trim chars 'a' and 'b' from both ends
-    let v = scalar(&mut conn, "SELECT TRIM('abcba', 'ab')");
+    let v = scalar(&conn, "SELECT TRIM('abcba', 'ab')");
     assert_eq!(v, Value::Text("c".into()));
 }
 
@@ -827,8 +743,8 @@ fn trim_multi_char_set() {
 fn trim_nothing_to_trim() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT TRIM('hello')");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT TRIM('hello')");
     assert_eq!(v, Value::Text("hello".into()));
 }
 
@@ -836,8 +752,8 @@ fn trim_nothing_to_trim() {
 fn trim_all_chars() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT TRIM('aaa', 'a')");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT TRIM('aaa', 'a')");
     assert_eq!(v, Value::Text("".into()));
 }
 
@@ -845,13 +761,13 @@ fn trim_all_chars() {
 fn ltrim_rtrim_specific() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_eq!(
-        scalar(&mut conn, "SELECT LTRIM('xxhello', 'x')"),
+        scalar(&conn, "SELECT LTRIM('xxhello', 'x')"),
         Value::Text("hello".into())
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT RTRIM('helloxx', 'x')"),
+        scalar(&conn, "SELECT RTRIM('helloxx', 'x')"),
         Value::Text("hello".into())
     );
 }
@@ -860,21 +776,17 @@ fn ltrim_rtrim_specific() {
 fn trim_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT TRIM(NULL)"), Value::Null);
-    assert_eq!(scalar(&mut conn, "SELECT TRIM('abc', NULL)"), Value::Null);
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT TRIM(NULL)"), Value::Null);
+    assert_eq!(scalar(&conn, "SELECT TRIM('abc', NULL)"), Value::Null);
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// ROUND torture
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn round_negative_places() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT ROUND(1234.0, -2)");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT ROUND(1234.0, -2)");
     assert_eq!(v, Value::Real(1200.0));
 }
 
@@ -882,20 +794,20 @@ fn round_negative_places() {
 fn round_half_away_from_zero() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT ROUND(0.5)"), Value::Real(1.0));
-    assert_eq!(scalar(&mut conn, "SELECT ROUND(-0.5)"), Value::Real(-1.0));
-    assert_eq!(scalar(&mut conn, "SELECT ROUND(2.5)"), Value::Real(3.0));
-    assert_eq!(scalar(&mut conn, "SELECT ROUND(-2.5)"), Value::Real(-3.0));
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT ROUND(0.5)"), Value::Real(1.0));
+    assert_eq!(scalar(&conn, "SELECT ROUND(-0.5)"), Value::Real(-1.0));
+    assert_eq!(scalar(&conn, "SELECT ROUND(2.5)"), Value::Real(3.0));
+    assert_eq!(scalar(&conn, "SELECT ROUND(-2.5)"), Value::Real(-3.0));
 }
 
 #[test]
 fn round_integer_input() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // Integer input -> still returns Real (ROUND always returns float)
-    let v = scalar(&mut conn, "SELECT ROUND(5)");
+    let v = scalar(&conn, "SELECT ROUND(5)");
     assert_eq!(v, Value::Real(5.0));
 }
 
@@ -903,111 +815,99 @@ fn round_integer_input() {
 fn round_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT ROUND(NULL)"), Value::Null);
-    assert_eq!(scalar(&mut conn, "SELECT ROUND(3.14, NULL)"), Value::Null);
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT ROUND(NULL)"), Value::Null);
+    assert_eq!(scalar(&conn, "SELECT ROUND(3.14, NULL)"), Value::Null);
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// CEIL / FLOOR torture
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn ceil_negative() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // CEIL rounds toward positive infinity
-    assert_eq!(scalar(&mut conn, "SELECT CEIL(-2.1)"), Value::Integer(-2));
-    assert_eq!(scalar(&mut conn, "SELECT CEIL(-2.9)"), Value::Integer(-2));
+    assert_eq!(scalar(&conn, "SELECT CEIL(-2.1)"), Value::Integer(-2));
+    assert_eq!(scalar(&conn, "SELECT CEIL(-2.9)"), Value::Integer(-2));
 }
 
 #[test]
 fn floor_negative() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // FLOOR rounds toward negative infinity
-    assert_eq!(scalar(&mut conn, "SELECT FLOOR(-2.1)"), Value::Integer(-3));
-    assert_eq!(scalar(&mut conn, "SELECT FLOOR(-2.9)"), Value::Integer(-3));
+    assert_eq!(scalar(&conn, "SELECT FLOOR(-2.1)"), Value::Integer(-3));
+    assert_eq!(scalar(&conn, "SELECT FLOOR(-2.9)"), Value::Integer(-3));
 }
 
 #[test]
 fn ceil_floor_zero() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT CEIL(0.0)"), Value::Integer(0));
-    assert_eq!(scalar(&mut conn, "SELECT FLOOR(0.0)"), Value::Integer(0));
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT CEIL(0.0)"), Value::Integer(0));
+    assert_eq!(scalar(&conn, "SELECT FLOOR(0.0)"), Value::Integer(0));
 }
 
 #[test]
 fn ceil_floor_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT CEIL(NULL)"), Value::Null);
-    assert_eq!(scalar(&mut conn, "SELECT FLOOR(NULL)"), Value::Null);
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT CEIL(NULL)"), Value::Null);
+    assert_eq!(scalar(&conn, "SELECT FLOOR(NULL)"), Value::Null);
 }
 
 #[test]
 fn ceil_floor_very_small() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT FLOOR(0.0001)"), Value::Integer(0));
-    assert_eq!(scalar(&mut conn, "SELECT CEIL(0.0001)"), Value::Integer(1));
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT FLOOR(0.0001)"), Value::Integer(0));
+    assert_eq!(scalar(&conn, "SELECT CEIL(0.0001)"), Value::Integer(1));
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// ABS / SIGN edge cases
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn abs_zero() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT ABS(0)"), Value::Integer(0));
-    assert_eq!(scalar(&mut conn, "SELECT ABS(0.0)"), Value::Real(0.0));
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT ABS(0)"), Value::Integer(0));
+    assert_eq!(scalar(&conn, "SELECT ABS(0.0)"), Value::Real(0.0));
 }
 
 #[test]
 fn abs_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT ABS(NULL)"), Value::Null);
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT ABS(NULL)"), Value::Null);
 }
 
 #[test]
 fn sign_real() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT SIGN(-3.14)"), Value::Integer(-1));
-    assert_eq!(scalar(&mut conn, "SELECT SIGN(0.0)"), Value::Integer(0));
-    assert_eq!(scalar(&mut conn, "SELECT SIGN(3.14)"), Value::Integer(1));
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT SIGN(-3.14)"), Value::Integer(-1));
+    assert_eq!(scalar(&conn, "SELECT SIGN(0.0)"), Value::Integer(0));
+    assert_eq!(scalar(&conn, "SELECT SIGN(3.14)"), Value::Integer(1));
 }
 
 #[test]
 fn sign_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT SIGN(NULL)"), Value::Null);
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT SIGN(NULL)"), Value::Null);
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// FROM-less SELECT torture
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn select_no_from_multiple_columns() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let qr = query(&mut conn, "SELECT 1, 'hello', TRUE, NULL");
+    let conn = Connection::open(&db).unwrap();
+    let qr = query(&conn, "SELECT 1, 'hello', TRUE, NULL");
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
     assert_eq!(qr.rows[0][1], Value::Text("hello".into()));
@@ -1019,16 +919,16 @@ fn select_no_from_multiple_columns() {
 fn select_no_from_arithmetic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT 2 + 3 * 4"), Value::Integer(14));
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT 2 + 3 * 4"), Value::Integer(14));
 }
 
 #[test]
 fn select_no_from_nested_functions() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT ROUND(SQRT(144), 0)");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT ROUND(SQRT(144), 0)");
     assert_eq!(v, Value::Real(12.0));
 }
 
@@ -1036,9 +936,9 @@ fn select_no_from_nested_functions() {
 fn select_no_from_case() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let v = scalar(
-        &mut conn,
+        &conn,
         "SELECT CASE WHEN 1 + 1 = 2 THEN 'math works' ELSE 'broken' END",
     );
     assert_eq!(v, Value::Text("math works".into()));
@@ -1048,20 +948,16 @@ fn select_no_from_case() {
 fn select_no_from_coalesce_cast() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT COALESCE(NULL, CAST(42 AS TEXT))");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT COALESCE(NULL, CAST(42 AS TEXT))");
     assert_eq!(v, Value::Text("42".into()));
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// eval_const_expr improvements
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn insert_with_arithmetic_values() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE calc (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)")
@@ -1069,7 +965,7 @@ fn insert_with_arithmetic_values() {
     );
     conn.execute("INSERT INTO calc VALUES (1, 2 + 3 * 4)")
         .unwrap();
-    let v = scalar(&mut conn, "SELECT val FROM calc WHERE id = 1");
+    let v = scalar(&conn, "SELECT val FROM calc WHERE id = 1");
     assert_eq!(v, Value::Integer(14));
 }
 
@@ -1077,7 +973,7 @@ fn insert_with_arithmetic_values() {
 fn insert_with_function_values() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE calc (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
@@ -1085,7 +981,7 @@ fn insert_with_function_values() {
     );
     conn.execute("INSERT INTO calc VALUES (1, UPPER('hello'))")
         .unwrap();
-    let v = scalar(&mut conn, "SELECT name FROM calc WHERE id = 1");
+    let v = scalar(&conn, "SELECT name FROM calc WHERE id = 1");
     assert_eq!(v, Value::Text("HELLO".into()));
 }
 
@@ -1093,7 +989,7 @@ fn insert_with_function_values() {
 fn insert_with_cast_value() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE calc (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)")
@@ -1101,7 +997,7 @@ fn insert_with_cast_value() {
     );
     conn.execute("INSERT INTO calc VALUES (1, CAST('42' AS INTEGER))")
         .unwrap();
-    let v = scalar(&mut conn, "SELECT val FROM calc WHERE id = 1");
+    let v = scalar(&conn, "SELECT val FROM calc WHERE id = 1");
     assert_eq!(v, Value::Integer(42));
 }
 
@@ -1109,10 +1005,10 @@ fn insert_with_cast_value() {
 fn limit_with_expression() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
-    let qr = query(&mut conn, "SELECT id FROM t ORDER BY id LIMIT 1 + 1");
+    let qr = query(&conn, "SELECT id FROM t ORDER BY id LIMIT 1 + 1");
     assert_eq!(qr.rows.len(), 2);
 }
 
@@ -1120,32 +1016,25 @@ fn limit_with_expression() {
 fn offset_with_expression() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
-    let qr = query(
-        &mut conn,
-        "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1 + 1",
-    );
+    let qr = query(&conn, "SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1 + 1");
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Integer(3));
     assert_eq!(qr.rows[1][0], Value::Integer(4));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// eval_aggregate_expr with new variants
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn aggregate_with_coalesce() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     // COALESCE in aggregate projection
     let v = scalar(
-        &mut conn,
+        &conn,
         "SELECT COALESCE(SUM(val), 0) FROM t WHERE val > 1000",
     );
     // No matching rows -> SUM returns NULL -> COALESCE -> 0
@@ -1156,10 +1045,10 @@ fn aggregate_with_coalesce() {
 fn aggregate_with_cast() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
-    let v = scalar(&mut conn, "SELECT CAST(COUNT(*) AS TEXT) FROM t");
+    let v = scalar(&conn, "SELECT CAST(COUNT(*) AS TEXT) FROM t");
     assert_eq!(v, Value::Text("5".into()));
 }
 
@@ -1167,12 +1056,12 @@ fn aggregate_with_cast() {
 fn aggregate_with_between() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     // Is the average between 20 and 30?
     let v = scalar(
-        &mut conn,
+        &conn,
         "SELECT CASE WHEN AVG(val) BETWEEN 20.0 AND 30.0 THEN 'yes' ELSE 'no' END FROM t",
     );
     // AVG(10,20,30,50) = 27.5, which is between 20 and 30
@@ -1183,10 +1072,10 @@ fn aggregate_with_between() {
 fn aggregate_with_scalar_function() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
-    let v = scalar(&mut conn, "SELECT ABS(MIN(val) - MAX(val)) FROM t");
+    let v = scalar(&conn, "SELECT ABS(MIN(val) - MAX(val)) FROM t");
     // |10 - 50| = 40
     assert_eq!(v, Value::Integer(40));
 }
@@ -1195,33 +1084,29 @@ fn aggregate_with_scalar_function() {
 fn aggregate_with_unary_and_isnull() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
-    let v = scalar(&mut conn, "SELECT -SUM(val) FROM t");
+    let v = scalar(&conn, "SELECT -SUM(val) FROM t");
     assert_eq!(v, Value::Integer(-110));
 
     let v2 = scalar(
-        &mut conn,
+        &conn,
         "SELECT CASE WHEN SUM(val) IS NOT NULL THEN 'has data' ELSE 'empty' END FROM t",
     );
     assert_eq!(v2, Value::Text("has data".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// is_aggregate_expr with new variants
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn aggregate_in_case_detected() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     // SUM inside CASE -> should be recognized as aggregate
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT CASE WHEN SUM(val) > 50 THEN 'yes' ELSE 'no' END FROM t",
     );
     assert_eq!(qr.rows[0][0], Value::Text("yes".into()));
@@ -1231,10 +1116,10 @@ fn aggregate_in_case_detected() {
 fn aggregate_in_coalesce_detected() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
-    let v = scalar(&mut conn, "SELECT COALESCE(AVG(score), 0.0) FROM t");
+    let v = scalar(&conn, "SELECT COALESCE(AVG(score), 0.0) FROM t");
     // AVG(1.5, 2.5, 3.5, 5.5) = 13.0/4 = 3.25
     match v {
         Value::Real(r) => assert!((r - 3.25).abs() < 0.001),
@@ -1246,26 +1131,22 @@ fn aggregate_in_coalesce_detected() {
 fn aggregate_in_cast_detected() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
-    let v = scalar(&mut conn, "SELECT CAST(SUM(val) AS REAL) FROM t");
+    let v = scalar(&conn, "SELECT CAST(SUM(val) AS REAL) FROM t");
     assert_eq!(v, Value::Real(110.0));
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// materialize_expr / has_subquery with new variants
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn subquery_in_between() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id FROM t WHERE val BETWEEN \
             (SELECT MIN(val) FROM t) AND (SELECT MAX(val) FROM t) ORDER BY id",
     );
@@ -1276,11 +1157,11 @@ fn subquery_in_between() {
 fn subquery_in_case() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id, CASE WHEN val > (SELECT AVG(val) FROM t) THEN 'above' ELSE 'below' END \
          FROM t WHERE val IS NOT NULL ORDER BY id",
     );
@@ -1295,11 +1176,11 @@ fn subquery_in_case() {
 fn subquery_in_coalesce() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     let v = scalar(
-        &mut conn,
+        &conn,
         "SELECT COALESCE((SELECT val FROM t WHERE id = 999), -1)",
     );
     // No row with id=999 -> scalar subquery returns NULL -> COALESCE -> -1
@@ -1310,24 +1191,20 @@ fn subquery_in_coalesce() {
 fn subquery_in_cast() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
-    let v = scalar(&mut conn, "SELECT CAST((SELECT COUNT(*) FROM t) AS TEXT)");
+    let v = scalar(&conn, "SELECT CAST((SELECT COUNT(*) FROM t) AS TEXT)");
     assert_eq!(v, Value::Text("5".into()));
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// REPLACE / INSTR edge cases
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn replace_empty_from() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // Empty search string -> return unchanged
-    let v = scalar(&mut conn, "SELECT REPLACE('hello', '', 'x')");
+    let v = scalar(&conn, "SELECT REPLACE('hello', '', 'x')");
     assert_eq!(v, Value::Text("hello".into()));
 }
 
@@ -1335,17 +1212,14 @@ fn replace_empty_from() {
 fn replace_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT REPLACE(NULL, 'a', 'b')"), Value::Null);
     assert_eq!(
-        scalar(&mut conn, "SELECT REPLACE(NULL, 'a', 'b')"),
+        scalar(&conn, "SELECT REPLACE('abc', NULL, 'b')"),
         Value::Null
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT REPLACE('abc', NULL, 'b')"),
-        Value::Null
-    );
-    assert_eq!(
-        scalar(&mut conn, "SELECT REPLACE('abc', 'a', NULL)"),
+        scalar(&conn, "SELECT REPLACE('abc', 'a', NULL)"),
         Value::Null
     );
 }
@@ -1354,51 +1228,43 @@ fn replace_null() {
 fn instr_1_indexed() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_eq!(
-        scalar(&mut conn, "SELECT INSTR('abcdef', 'a')"),
+        scalar(&conn, "SELECT INSTR('abcdef', 'a')"),
         Value::Integer(1)
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT INSTR('abcdef', 'f')"),
+        scalar(&conn, "SELECT INSTR('abcdef', 'f')"),
         Value::Integer(6)
     );
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// SQRT edge cases
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn sqrt_zero() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT SQRT(0)"), Value::Real(0.0));
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT SQRT(0)"), Value::Real(0.0));
 }
 
 #[test]
 fn sqrt_perfect_square() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT SQRT(144)"), Value::Real(12.0));
-    assert_eq!(scalar(&mut conn, "SELECT SQRT(1)"), Value::Real(1.0));
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT SQRT(144)"), Value::Real(12.0));
+    assert_eq!(scalar(&conn, "SELECT SQRT(1)"), Value::Real(1.0));
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// Complex combinations
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn complex_case_between_like_combo() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT name, \
             CASE \
                 WHEN val BETWEEN 1 AND 15 AND name LIKE 'a%' THEN 'low-a' \
@@ -1417,10 +1283,10 @@ fn complex_case_between_like_combo() {
 fn complex_nested_everything() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // Combine: COALESCE + CAST + CASE + UPPER + || + BETWEEN
     let v = scalar(
-        &mut conn,
+        &conn,
         "SELECT UPPER(COALESCE(CAST(\
             CASE WHEN 5 BETWEEN 1 AND 10 THEN 42 ELSE 0 END \
          AS TEXT), 'none')) || '!'",
@@ -1432,12 +1298,12 @@ fn complex_nested_everything() {
 fn complex_function_chain_in_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     // WHERE with nested functions
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT name FROM t WHERE INSTR(LOWER(COALESCE(name, '')), 'li') > 0 ORDER BY name",
     );
     assert_eq!(qr.rows.len(), 2); // alice, charlie
@@ -1449,15 +1315,15 @@ fn complex_function_chain_in_where() {
 fn complex_all_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     conn.execute("BEGIN").unwrap();
     conn.execute("INSERT INTO t VALUES (6, 'eve', 60, 6.5)")
         .unwrap();
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT UPPER(name), ABS(val - 35), \
             CASE WHEN val > 35 THEN 'high' ELSE 'low' END \
          FROM t WHERE val BETWEEN 10 AND 60 AND name LIKE '%e%' ORDER BY id",
@@ -1475,8 +1341,7 @@ fn complex_all_in_transaction() {
 
     conn.execute("ROLLBACK").unwrap();
 
-    // After rollback, eve is gone
-    let qr2 = query(&mut conn, "SELECT COUNT(*) FROM t");
+    let qr2 = query(&conn, "SELECT COUNT(*) FROM t");
     assert_eq!(qr2.rows[0][0], Value::Integer(5));
 }
 
@@ -1484,14 +1349,14 @@ fn complex_all_in_transaction() {
 fn length_unicode() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // LENGTH counts Unicode code points, not bytes
     assert_eq!(
-        scalar(&mut conn, "SELECT LENGTH('\u{00e9}')"),
+        scalar(&conn, "SELECT LENGTH('\u{00e9}')"),
         Value::Integer(1)
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT LENGTH('\u{1f600}')"),
+        scalar(&conn, "SELECT LENGTH('\u{1f600}')"),
         Value::Integer(1)
     );
 }
@@ -1500,29 +1365,29 @@ fn length_unicode() {
 fn typeof_all_types() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_eq!(
-        scalar(&mut conn, "SELECT TYPEOF(1)"),
+        scalar(&conn, "SELECT TYPEOF(1)"),
         Value::Text("integer".into())
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT TYPEOF(1.5)"),
+        scalar(&conn, "SELECT TYPEOF(1.5)"),
         Value::Text("real".into())
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT TYPEOF('hi')"),
+        scalar(&conn, "SELECT TYPEOF('hi')"),
         Value::Text("text".into())
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT TYPEOF(TRUE)"),
+        scalar(&conn, "SELECT TYPEOF(TRUE)"),
         Value::Text("boolean".into())
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT TYPEOF(NULL)"),
+        scalar(&conn, "SELECT TYPEOF(NULL)"),
         Value::Text("null".into())
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT TYPEOF(CAST('abc' AS BLOB))"),
+        scalar(&conn, "SELECT TYPEOF(CAST('abc' AS BLOB))"),
         Value::Text("blob".into())
     );
 }
@@ -1531,8 +1396,8 @@ fn typeof_all_types() {
 fn wrong_arg_count_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     assert!(conn.execute("SELECT ABS() FROM t WHERE id = 1").is_err());
     assert!(conn
@@ -1549,8 +1414,8 @@ fn wrong_arg_count_errors() {
 fn unknown_function_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
     let err = conn
         .execute("SELECT FOOBAR(1) FROM t WHERE id = 1")
@@ -1562,7 +1427,7 @@ fn unknown_function_error() {
 fn hex_blob_input() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE blobtest (id INTEGER NOT NULL PRIMARY KEY, data BLOB)")
@@ -1571,7 +1436,7 @@ fn hex_blob_input() {
     conn.execute("INSERT INTO blobtest VALUES (1, CAST('hello' AS BLOB))")
         .unwrap();
 
-    let v = scalar(&mut conn, "SELECT HEX(data) FROM blobtest WHERE id = 1");
+    let v = scalar(&conn, "SELECT HEX(data) FROM blobtest WHERE id = 1");
     assert_eq!(v, Value::Text("68656C6C6F".into()));
 }
 
@@ -1579,8 +1444,8 @@ fn hex_blob_input() {
 fn concat_fn_zero_args() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT CONCAT()");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT CONCAT()");
     assert_eq!(v, Value::Text("".into()));
 }
 
@@ -1588,30 +1453,26 @@ fn concat_fn_zero_args() {
 fn concat_fn_single_arg() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v = scalar(&mut conn, "SELECT CONCAT('only')");
+    let conn = Connection::open(&db).unwrap();
+    let v = scalar(&conn, "SELECT CONCAT('only')");
     assert_eq!(v, Value::Text("only".into()));
 }
-
-// ═══════════════════════════════════════════════════════════════════
-// Coverage gap tests
-// ═══════════════════════════════════════════════════════════════════
 
 #[test]
 fn ilike_keyword() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
-    let qr = query(&mut conn, "SELECT name FROM t WHERE name ILIKE 'ALICE'");
+    let qr = query(&conn, "SELECT name FROM t WHERE name ILIKE 'ALICE'");
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Text("alice".into()));
 
-    let qr2 = query(&mut conn, "SELECT name FROM t WHERE name ILIKE 'al%'");
+    let qr2 = query(&conn, "SELECT name FROM t WHERE name ILIKE 'al%'");
     assert_eq!(qr2.rows.len(), 1);
 
-    let qr3 = query(&mut conn, "SELECT name FROM t WHERE name ILIKE '%LIE'");
+    let qr3 = query(&conn, "SELECT name FROM t WHERE name ILIKE '%LIE'");
     assert_eq!(qr3.rows.len(), 1);
 }
 
@@ -1619,10 +1480,10 @@ fn ilike_keyword() {
 fn ilike_not() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup(&conn);
 
-    let qr = query(&mut conn, "SELECT name FROM t WHERE name NOT ILIKE 'ALICE'");
+    let qr = query(&conn, "SELECT name FROM t WHERE name NOT ILIKE 'ALICE'");
     // bob, charlie, diana - (NULL name excluded by NULL LIKE -> NULL)
     assert_eq!(qr.rows.len(), 3);
 }
@@ -1631,12 +1492,12 @@ fn ilike_not() {
 fn concat_op_real() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // Real with fractional part
-    let v = scalar(&mut conn, "SELECT 3.14 || ' units'");
+    let v = scalar(&conn, "SELECT 3.14 || ' units'");
     assert_eq!(v, Value::Text("3.14 units".into()));
     // Real with whole value displays as X.0
-    let v2 = scalar(&mut conn, "SELECT 5.0 || ' items'");
+    let v2 = scalar(&conn, "SELECT 5.0 || ' items'");
     assert_eq!(v2, Value::Text("5.0 items".into()));
 }
 
@@ -1644,9 +1505,9 @@ fn concat_op_real() {
 fn concat_op_blob() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // Blob in value_to_text produces hex
-    let v = scalar(&mut conn, "SELECT CAST('AB' AS BLOB) || ' data'");
+    let v = scalar(&conn, "SELECT CAST('AB' AS BLOB) || ' data'");
     assert_eq!(v, Value::Text("4142 data".into()));
 }
 
@@ -1654,7 +1515,7 @@ fn concat_op_blob() {
 fn cast_integer_to_blob_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let err = conn.execute("SELECT CAST(42 AS BLOB)").unwrap_err();
     assert!(matches!(err, SqlError::InvalidValue(_)));
 }
@@ -1663,7 +1524,7 @@ fn cast_integer_to_blob_error() {
 fn cast_bool_to_blob_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let err = conn.execute("SELECT CAST(TRUE AS BLOB)").unwrap_err();
     assert!(matches!(err, SqlError::InvalidValue(_)));
 }
@@ -1672,7 +1533,7 @@ fn cast_bool_to_blob_error() {
 fn cast_real_to_blob_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let err = conn.execute("SELECT CAST(3.14 AS BLOB)").unwrap_err();
     assert!(matches!(err, SqlError::InvalidValue(_)));
 }
@@ -1681,11 +1542,11 @@ fn cast_real_to_blob_error() {
 fn cast_negative_real_to_integer() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // Truncates toward zero
-    let v = scalar(&mut conn, "SELECT CAST(-3.7 AS INTEGER)");
+    let v = scalar(&conn, "SELECT CAST(-3.7 AS INTEGER)");
     assert_eq!(v, Value::Integer(-3));
-    let v2 = scalar(&mut conn, "SELECT CAST(-0.9 AS INTEGER)");
+    let v2 = scalar(&conn, "SELECT CAST(-0.9 AS INTEGER)");
     assert_eq!(v2, Value::Integer(0));
 }
 
@@ -1693,9 +1554,9 @@ fn cast_negative_real_to_integer() {
 fn cast_blob_to_text() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // CAST blob to text uses value_to_text (hex encoding)
-    let v = scalar(&mut conn, "SELECT CAST(CAST('hi' AS BLOB) AS TEXT)");
+    let v = scalar(&conn, "SELECT CAST(CAST('hi' AS BLOB) AS TEXT)");
     assert_eq!(v, Value::Text("6869".into()));
 }
 
@@ -1703,7 +1564,7 @@ fn cast_blob_to_text() {
 fn cast_real_to_boolean_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let err = conn.execute("SELECT CAST(3.14 AS BOOLEAN)").unwrap_err();
     assert!(matches!(err, SqlError::InvalidValue(_)));
 }
@@ -1712,7 +1573,7 @@ fn cast_real_to_boolean_error() {
 fn cast_blob_to_integer_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let err = conn
         .execute("SELECT CAST(CAST('x' AS BLOB) AS INTEGER)")
         .unwrap_err();
@@ -1723,15 +1584,14 @@ fn cast_blob_to_integer_error() {
 fn between_real_range() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // Real value between integer bounds
-    let v = scalar(&mut conn, "SELECT 3.5 BETWEEN 2 AND 4");
+    let v = scalar(&conn, "SELECT 3.5 BETWEEN 2 AND 4");
     assert_eq!(v, Value::Boolean(true));
     // Integer value between real bounds
-    let v2 = scalar(&mut conn, "SELECT 3 BETWEEN 2.5 AND 4.5");
+    let v2 = scalar(&conn, "SELECT 3 BETWEEN 2.5 AND 4.5");
     assert_eq!(v2, Value::Boolean(true));
-    // Just outside range
-    let v3 = scalar(&mut conn, "SELECT 4.5 BETWEEN 2 AND 4");
+    let v3 = scalar(&conn, "SELECT 4.5 BETWEEN 2 AND 4");
     assert_eq!(v3, Value::Boolean(false));
 }
 
@@ -1739,9 +1599,9 @@ fn between_real_range() {
 fn case_all_null_conditions_no_else() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let v = scalar(
-        &mut conn,
+        &conn,
         "SELECT CASE WHEN NULL THEN 'x' WHEN NULL THEN 'y' END",
     );
     assert_eq!(v, Value::Null);
@@ -1751,10 +1611,10 @@ fn case_all_null_conditions_no_else() {
 fn case_simple_null_operand() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // NULL doesn't match NULL in simple CASE
     let v = scalar(
-        &mut conn,
+        &conn,
         "SELECT CASE NULL WHEN NULL THEN 'match' ELSE 'no match' END",
     );
     assert_eq!(v, Value::Text("no match".into()));
@@ -1764,7 +1624,7 @@ fn case_simple_null_operand() {
 fn select_no_from_count_star_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // COUNT(*) without FROM is unsupported (non-aggregate context)
     let err = conn.execute("SELECT COUNT(*)").unwrap_err();
     assert!(matches!(err, SqlError::Unsupported(_)));
@@ -1774,9 +1634,9 @@ fn select_no_from_count_star_error() {
 fn concat_fn_mixed_types() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // CONCAT with 3+ mixed-type args, NULL treated as empty
-    let v = scalar(&mut conn, "SELECT CONCAT('x', 42, NULL, TRUE, 3.14)");
+    let v = scalar(&conn, "SELECT CONCAT('x', 42, NULL, TRUE, 3.14)");
     assert_eq!(v, Value::Text("x42TRUE3.14".into()));
 }
 
@@ -1784,16 +1644,16 @@ fn concat_fn_mixed_types() {
 fn sqrt_negative_returns_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    assert_eq!(scalar(&mut conn, "SELECT SQRT(-1.0)"), Value::Null);
-    assert_eq!(scalar(&mut conn, "SELECT SQRT(-100)"), Value::Null);
+    let conn = Connection::open(&db).unwrap();
+    assert_eq!(scalar(&conn, "SELECT SQRT(-1.0)"), Value::Null);
+    assert_eq!(scalar(&conn, "SELECT SQRT(-100)"), Value::Null);
 }
 
 #[test]
 fn coalesce_error_not_short_circuited() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // First arg is NULL, so second arg IS evaluated -> division by zero
     let err = conn.execute("SELECT COALESCE(NULL, 1/0)").unwrap_err();
     assert!(matches!(err, SqlError::DivisionByZero));
@@ -1803,7 +1663,7 @@ fn coalesce_error_not_short_circuited() {
 fn like_empty_escape_string() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     let err = conn
         .execute("SELECT 'test' LIKE 'test' ESCAPE ''")
         .unwrap_err();
@@ -1814,10 +1674,10 @@ fn like_empty_escape_string() {
 fn random_returns_integer() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    let v1 = scalar(&mut conn, "SELECT RANDOM()");
+    let conn = Connection::open(&db).unwrap();
+    let v1 = scalar(&conn, "SELECT RANDOM()");
     assert!(matches!(v1, Value::Integer(_)));
-    let v2 = scalar(&mut conn, "SELECT RANDOM()");
+    let v2 = scalar(&conn, "SELECT RANDOM()");
     assert!(matches!(v2, Value::Integer(_)));
     // Extremely unlikely to be equal
     if let (Value::Integer(a), Value::Integer(b)) = (&v1, &v2) {
@@ -1829,12 +1689,12 @@ fn random_returns_integer() {
 fn concat_op_all_types() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     // Boolean
-    let v = scalar(&mut conn, "SELECT TRUE || FALSE");
+    let v = scalar(&conn, "SELECT TRUE || FALSE");
     assert_eq!(v, Value::Text("TRUEFALSE".into()));
     // NULL propagation
-    let v2 = scalar(&mut conn, "SELECT 'a' || NULL || 'b'");
+    let v2 = scalar(&conn, "SELECT 'a' || NULL || 'b'");
     assert_eq!(v2, Value::Null);
 }
 
@@ -1842,22 +1702,22 @@ fn concat_op_all_types() {
 fn value_to_text_via_cast_all_types() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_eq!(
-        scalar(&mut conn, "SELECT CAST(42 AS TEXT)"),
+        scalar(&conn, "SELECT CAST(42 AS TEXT)"),
         Value::Text("42".into())
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT CAST(3.14 AS TEXT)"),
+        scalar(&conn, "SELECT CAST(3.14 AS TEXT)"),
         Value::Text("3.14".into())
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT CAST(TRUE AS TEXT)"),
+        scalar(&conn, "SELECT CAST(TRUE AS TEXT)"),
         Value::Text("TRUE".into())
     );
     assert_eq!(
-        scalar(&mut conn, "SELECT CAST(FALSE AS TEXT)"),
+        scalar(&conn, "SELECT CAST(FALSE AS TEXT)"),
         Value::Text("FALSE".into())
     );
-    assert_eq!(scalar(&mut conn, "SELECT CAST(NULL AS TEXT)"), Value::Null);
+    assert_eq!(scalar(&conn, "SELECT CAST(NULL AS TEXT)"), Value::Null);
 }

@@ -9,7 +9,7 @@ use citadel_crypto::hkdf_utils::derive_keys_from_rek;
 use citadel_crypto::key_manager::{create_key_file, open_key_file};
 use citadel_crypto::page_cipher;
 use citadel_io::file_manager::*;
-use citadel_io::sync_io::SyncPageIO;
+use citadel_io::mmap_io::MmapPageIO;
 use citadel_io::traits::PageIO;
 use citadel_buffer::pool::BufferPool;
 use citadel_page::page::Page;
@@ -40,7 +40,7 @@ fn full_encryption_roundtrip() {
     let file = File::options()
         .read(true).write(true).create(true)
         .open(&db_path).unwrap();
-    let io = SyncPageIO::new(file);
+    let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = page_cipher::compute_dek_id(&keys.mac_key, &keys.dek);
     let header = FileHeader::new(file_id, dek_id);
@@ -138,7 +138,7 @@ fn file_header_and_recovery() {
     let file = File::options()
         .read(true).write(true).create(true)
         .open(&db_path).unwrap();
-    let io = SyncPageIO::new(file);
+    let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = [0xAAu8; MAC_SIZE];
     let header = FileHeader::new(0x42, dek_id);

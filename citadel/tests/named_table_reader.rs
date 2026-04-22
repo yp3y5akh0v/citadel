@@ -47,7 +47,6 @@ fn named_table_reader() {
     assert_eq!(root, table_root);
     assert_ne!(hash, ZERO_HASH);
 
-    // Should be different from default tree
     let default_reader = LocalTreeReader::new(db.manager());
     let (def_root, def_hash) = default_reader.root_info().unwrap();
     assert_ne!(root, def_root);

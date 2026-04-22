@@ -7,7 +7,7 @@
 //! The root page's hash serves as a database fingerprint - if two snapshots
 //! have the same root hash, they contain identical data.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use citadel_core::types::{PageId, PageType, TxnId};
 use citadel_core::{Result, MERKLE_HASH_SIZE};
@@ -15,7 +15,7 @@ use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
 
 pub fn compute_tree_merkle(
-    pages: &mut HashMap<PageId, Page>,
+    pages: &mut FxHashMap<PageId, Page>,
     root: PageId,
     base_txn_id: TxnId,
     read_clean_hash: &dyn Fn(PageId) -> Result<[u8; MERKLE_HASH_SIZE]>,
@@ -24,29 +24,26 @@ pub fn compute_tree_merkle(
 }
 
 fn compute_page_merkle(
-    pages: &mut HashMap<PageId, Page>,
+    pages: &mut FxHashMap<PageId, Page>,
     page_id: PageId,
     base_txn_id: TxnId,
     read_clean_hash: &dyn Fn(PageId) -> Result<[u8; MERKLE_HASH_SIZE]>,
 ) -> Result<[u8; MERKLE_HASH_SIZE]> {
-    // Page not in write set - it's clean, just read its hash
     let page = match pages.get(&page_id) {
         Some(page) => page,
         None => return read_clean_hash(page_id),
     };
 
-    // Pages with txn_id < base are clean (any id >= base is this txn; savepoints
-    // bump txn_id mid-transaction so a single-value equality check won't work).
+    // Savepoints bump txn_id mid-txn, so single-value equality won't work here.
     if page.txn_id() < base_txn_id {
         return Ok(page.merkle_hash());
     }
 
-    // Dirty page - compute fresh hash
     let page_type = page.page_type();
     let hash = match page_type {
         Some(PageType::Leaf) => compute_leaf_hash(page),
         Some(PageType::Branch) => {
-            // Collect child page IDs first (avoid borrow conflict)
+            // Collect IDs before recursing — pages map borrow would conflict.
             let num_cells = page.num_cells();
             let mut children: Vec<PageId> = Vec::with_capacity(num_cells as usize + 1);
             for i in 0..num_cells as usize {
@@ -57,7 +54,6 @@ fn compute_page_merkle(
                 children.push(right);
             }
 
-            // Recursively compute children's hashes
             let mut hasher = blake3::Hasher::new();
             for child_id in children {
                 let child_hash =
@@ -69,7 +65,6 @@ fn compute_page_merkle(
         _ => [0u8; MERKLE_HASH_SIZE],
     };
 
-    // Store hash in page header
     let page = pages.get_mut(&page_id).unwrap();
     page.set_merkle_hash(&hash);
 
@@ -174,7 +169,7 @@ mod tests {
         let txn = TxnId(1);
         let leaf = make_leaf(PageId(0), txn, &[(b"a", b"1")]);
 
-        let mut pages: HashMap<PageId, Page> = HashMap::new();
+        let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
         pages.insert(PageId(0), leaf);
 
         let root_hash = compute_tree_merkle(&mut pages, PageId(0), txn, &|_| {
@@ -183,8 +178,6 @@ mod tests {
         .unwrap();
 
         assert_ne!(root_hash, [0u8; MERKLE_HASH_SIZE]);
-
-        // Hash should be stored in page header
         assert_eq!(pages[&PageId(0)].merkle_hash(), root_hash);
     }
 
@@ -195,7 +188,7 @@ mod tests {
         let right = make_leaf(PageId(2), txn, &[(b"c", b"3")]);
         let branch = make_branch(PageId(0), txn, &[(PageId(1), b"b")], PageId(2));
 
-        let mut pages: HashMap<PageId, Page> = HashMap::new();
+        let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
         pages.insert(PageId(0), branch);
         pages.insert(PageId(1), left);
         pages.insert(PageId(2), right);
@@ -206,8 +199,6 @@ mod tests {
         .unwrap();
 
         assert_ne!(root_hash, [0u8; MERKLE_HASH_SIZE]);
-
-        // Verify all pages got their hashes set
         assert_ne!(pages[&PageId(0)].merkle_hash(), [0u8; MERKLE_HASH_SIZE]);
         assert_ne!(pages[&PageId(1)].merkle_hash(), [0u8; MERKLE_HASH_SIZE]);
         assert_ne!(pages[&PageId(2)].merkle_hash(), [0u8; MERKLE_HASH_SIZE]);
@@ -217,24 +208,22 @@ mod tests {
     fn branch_hash_changes_when_child_changes() {
         let txn = TxnId(1);
 
-        // Tree 1: left has "a"="1"
         let left1 = make_leaf(PageId(1), txn, &[(b"a", b"1")]);
         let right1 = make_leaf(PageId(2), txn, &[(b"c", b"3")]);
         let branch1 = make_branch(PageId(0), txn, &[(PageId(1), b"b")], PageId(2));
 
-        let mut pages1: HashMap<PageId, Page> = HashMap::new();
+        let mut pages1: FxHashMap<PageId, Page> = FxHashMap::default();
         pages1.insert(PageId(0), branch1);
         pages1.insert(PageId(1), left1);
         pages1.insert(PageId(2), right1);
 
         let h1 = compute_tree_merkle(&mut pages1, PageId(0), txn, &|_| panic!("no disk")).unwrap();
 
-        // Tree 2: left has "a"="2" (different value)
         let left2 = make_leaf(PageId(1), txn, &[(b"a", b"2")]);
         let right2 = make_leaf(PageId(2), txn, &[(b"c", b"3")]);
         let branch2 = make_branch(PageId(0), txn, &[(PageId(1), b"b")], PageId(2));
 
-        let mut pages2: HashMap<PageId, Page> = HashMap::new();
+        let mut pages2: FxHashMap<PageId, Page> = FxHashMap::default();
         pages2.insert(PageId(0), branch2);
         pages2.insert(PageId(1), left2);
         pages2.insert(PageId(2), right2);
@@ -247,20 +236,17 @@ mod tests {
     #[test]
     fn clean_page_uses_existing_hash() {
         let dirty_txn = TxnId(5);
-        let clean_txn = TxnId(3); // older txn = clean
+        let clean_txn = TxnId(3);
 
-        // Create a clean leaf with a pre-set hash
         let mut clean_leaf = make_leaf(PageId(2), clean_txn, &[(b"x", b"y")]);
         let expected_hash = [0xAB; MERKLE_HASH_SIZE];
         clean_leaf.set_merkle_hash(&expected_hash);
 
-        // Create dirty left leaf
         let dirty_leaf = make_leaf(PageId(1), dirty_txn, &[(b"a", b"1")]);
 
-        // Branch references both
         let branch = make_branch(PageId(0), dirty_txn, &[(PageId(1), b"m")], PageId(2));
 
-        let mut pages: HashMap<PageId, Page> = HashMap::new();
+        let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
         pages.insert(PageId(0), branch);
         pages.insert(PageId(1), dirty_leaf);
         pages.insert(PageId(2), clean_leaf);
@@ -272,7 +258,6 @@ mod tests {
 
         assert_ne!(root_hash, [0u8; MERKLE_HASH_SIZE]);
 
-        // Clean leaf should still have its original hash (not recomputed)
         assert_eq!(pages[&PageId(2)].merkle_hash(), expected_hash);
     }
 
@@ -281,16 +266,15 @@ mod tests {
         let dirty_txn = TxnId(5);
         let clean_txn = TxnId(3);
 
-        // Clean leaf NOT in HashMap - hash fetched via callback
+        // Clean leaf NOT in page map - hash fetched via callback
         let mut clean_leaf = make_leaf(PageId(2), clean_txn, &[(b"x", b"y")]);
         let precomputed_hash = compute_leaf_hash(&clean_leaf);
         clean_leaf.set_merkle_hash(&precomputed_hash);
 
-        // Dirty leaf
         let dirty_leaf = make_leaf(PageId(1), dirty_txn, &[(b"a", b"1")]);
         let branch = make_branch(PageId(0), dirty_txn, &[(PageId(1), b"m")], PageId(2));
 
-        let mut pages: HashMap<PageId, Page> = HashMap::new();
+        let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
         pages.insert(PageId(0), branch);
         pages.insert(PageId(1), dirty_leaf);
         // PageId(2) NOT in pages - read_clean_hash will be called
@@ -303,7 +287,7 @@ mod tests {
 
         assert_ne!(root_hash, [0u8; MERKLE_HASH_SIZE]);
 
-        // Clean page should NOT be loaded into the HashMap (hash-only fetch)
+        // Clean page should NOT be loaded into the page map (hash-only fetch)
         assert!(!pages.contains_key(&PageId(2)));
     }
 
@@ -325,7 +309,6 @@ mod tests {
         page.update_checksum();
         assert!(page.verify_checksum());
 
-        // Tamper with the hash
         let mut bad_hash = hash;
         bad_hash[0] ^= 0xFF;
         page.set_merkle_hash(&bad_hash);
@@ -336,20 +319,17 @@ mod tests {
     fn three_level_tree() {
         let txn = TxnId(1);
 
-        // Level 0 (leaves)
         let l0 = make_leaf(PageId(3), txn, &[(b"a", b"1")]);
         let l1 = make_leaf(PageId(4), txn, &[(b"c", b"3")]);
         let l2 = make_leaf(PageId(5), txn, &[(b"e", b"5")]);
         let l3 = make_leaf(PageId(6), txn, &[(b"g", b"7")]);
 
-        // Level 1 (branches)
         let b0 = make_branch(PageId(1), txn, &[(PageId(3), b"b")], PageId(4));
         let b1 = make_branch(PageId(2), txn, &[(PageId(5), b"f")], PageId(6));
 
-        // Level 2 (root)
         let root = make_branch(PageId(0), txn, &[(PageId(1), b"d")], PageId(2));
 
-        let mut pages: HashMap<PageId, Page> = HashMap::new();
+        let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
         pages.insert(PageId(0), root);
         pages.insert(PageId(1), b0);
         pages.insert(PageId(2), b1);
@@ -365,7 +345,6 @@ mod tests {
 
         assert_ne!(root_hash, [0u8; MERKLE_HASH_SIZE]);
 
-        // All 7 pages should have non-zero hashes
         for i in 0..7 {
             assert_ne!(
                 pages[&PageId(i)].merkle_hash(),
@@ -382,12 +361,12 @@ mod tests {
             &[(b"alpha", b"one"), (b"beta", b"two"), (b"gamma", b"three")];
 
         let leaf1 = make_leaf(PageId(0), txn, entries);
-        let mut pages1: HashMap<PageId, Page> = HashMap::new();
+        let mut pages1: FxHashMap<PageId, Page> = FxHashMap::default();
         pages1.insert(PageId(0), leaf1);
         let h1 = compute_tree_merkle(&mut pages1, PageId(0), txn, &|_| panic!()).unwrap();
 
         let leaf2 = make_leaf(PageId(0), txn, entries);
-        let mut pages2: HashMap<PageId, Page> = HashMap::new();
+        let mut pages2: FxHashMap<PageId, Page> = FxHashMap::default();
         pages2.insert(PageId(0), leaf2);
         let h2 = compute_tree_merkle(&mut pages2, PageId(0), txn, &|_| panic!()).unwrap();
 
@@ -407,7 +386,6 @@ mod tests {
 
         let h1 = compute_leaf_hash(&page);
 
-        // Different tombstone - different hash
         let mut page2 = Page::new(PageId(0), PageType::Leaf, txn);
         let cell3 = leaf_node::build_cell(b"alive", ValueType::Inline, b"data");
         page2.insert_cell_at(0, &cell3);
@@ -450,17 +428,16 @@ mod tests {
     fn recomputing_gives_same_hash() {
         let txn = TxnId(1);
         let leaf = make_leaf(PageId(0), txn, &[(b"k", b"v")]);
-        let mut pages: HashMap<PageId, Page> = HashMap::new();
+        let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
         pages.insert(PageId(0), leaf);
 
         let h1 = compute_tree_merkle(&mut pages, PageId(0), txn, &|_| panic!()).unwrap();
 
-        // Reset hash and recompute
         pages
             .get_mut(&PageId(0))
             .unwrap()
             .set_merkle_hash(&[0u8; MERKLE_HASH_SIZE]);
-        // Page is still "dirty" (txn_id matches), so it will be recomputed
+        // txn_id matches → still dirty → recompute
         let h2 = compute_tree_merkle(&mut pages, PageId(0), txn, &|_| panic!()).unwrap();
 
         assert_eq!(h1, h2);

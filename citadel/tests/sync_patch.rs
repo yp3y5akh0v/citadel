@@ -40,10 +40,6 @@ fn sync_push(source: &Database, target: &Database, source_node: u64, crdt: bool)
     apply_patch(target.manager(), &patch).unwrap()
 }
 
-// ============================================================
-// Tests
-// ============================================================
-
 #[test]
 fn empty_databases_noop() {
     let dir = tempfile::tempdir().unwrap();

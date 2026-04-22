@@ -57,6 +57,7 @@ base64 = "0.22"
 # Hashing
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 blake3 = "1"
+rustc-hash = "2.1"
 
 # Error handling
 thiserror = "2.0"
@@ -68,6 +69,7 @@ rayon = "1.10"
 # I/O
 libc = "0.2"
 io-uring = "0.7"
+memmap2 = "0.9"
 
 # Cipher traits
 cipher = "0.4"

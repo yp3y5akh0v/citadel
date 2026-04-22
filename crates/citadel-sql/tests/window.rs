@@ -17,7 +17,7 @@ fn assert_ok(result: ExecutionResult) {
     }
 }
 
-fn setup_employees(conn: &mut Connection) {
+fn setup_employees(conn: &Connection) {
     assert_ok(
         conn.execute(
             "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT NOT NULL, dept TEXT NOT NULL, salary INTEGER NOT NULL)",
@@ -28,14 +28,12 @@ fn setup_employees(conn: &mut Connection) {
         .unwrap();
 }
 
-// ── 1. ROW_NUMBER basic ─────────────────────────────────────────────
-
 #[test]
 fn row_number_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query("SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM employees ORDER BY id")
@@ -46,14 +44,12 @@ fn row_number_basic() {
     }
 }
 
-// ── 2. ROW_NUMBER with PARTITION BY ─────────────────────────────────
-
 #[test]
 fn row_number_partition() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -71,14 +67,12 @@ fn row_number_partition() {
     assert_eq!(qr.rows[4][2], Value::Integer(2));
 }
 
-// ── 3. RANK with ties ───────────────────────────────────────────────
-
 #[test]
 fn rank_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -95,14 +89,12 @@ fn rank_basic() {
     assert_eq!(qr.rows[4][2], Value::Integer(5));
 }
 
-// ── 4. DENSE_RANK ───────────────────────────────────────────────────
-
 #[test]
 fn dense_rank_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -119,14 +111,12 @@ fn dense_rank_basic() {
     assert_eq!(qr.rows[4][2], Value::Integer(4));
 }
 
-// ── 5. NTILE ────────────────────────────────────────────────────────
-
 #[test]
 fn ntile_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query("SELECT id, NTILE(3) OVER (ORDER BY id) AS tile FROM employees ORDER BY id")
@@ -139,14 +129,12 @@ fn ntile_basic() {
     assert_eq!(qr.rows[4][1], Value::Integer(3));
 }
 
-// ── 6. LAG basic ────────────────────────────────────────────────────
-
 #[test]
 fn lag_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -159,14 +147,12 @@ fn lag_basic() {
     assert_eq!(qr.rows[2][2], Value::Integer(90)); // Bob's salary
 }
 
-// ── 7. LAG with default ─────────────────────────────────────────────
-
 #[test]
 fn lag_default() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -178,14 +164,12 @@ fn lag_default() {
     assert_eq!(qr.rows[1][1], Value::Integer(100));
 }
 
-// ── 8. LEAD basic ───────────────────────────────────────────────────
-
 #[test]
 fn lead_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -197,14 +181,12 @@ fn lead_basic() {
     assert_eq!(qr.rows[4][2], Value::Null); // no next
 }
 
-// ── 9. FIRST_VALUE ──────────────────────────────────────────────────
-
 #[test]
 fn first_value() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -221,14 +203,12 @@ fn first_value() {
     assert_eq!(qr.rows[4][2], Value::Text("Carol".into()));
 }
 
-// ── 10. LAST_VALUE ──────────────────────────────────────────────────
-
 #[test]
 fn last_value() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -246,14 +226,12 @@ fn last_value() {
     assert_eq!(qr.rows[4][2], Value::Text("Dave".into()));
 }
 
-// ── 11. SUM running total ───────────────────────────────────────────
-
 #[test]
 fn sum_running() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -269,14 +247,12 @@ fn sum_running() {
     assert_eq!(qr.rows[4][2], Value::Integer(440));
 }
 
-// ── 12. COUNT(*) OVER partition ─────────────────────────────────────
-
 #[test]
 fn count_partition() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -293,14 +269,12 @@ fn count_partition() {
     assert_eq!(qr.rows[4][2], Value::Integer(2));
 }
 
-// ── 13. AVG sliding window ──────────────────────────────────────────
-
 #[test]
 fn avg_sliding() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -316,14 +290,12 @@ fn avg_sliding() {
     assert_eq!(qr.rows[2][2], Value::Real(85.0));
 }
 
-// ── 14. MIN sliding ─────────────────────────────────────────────────
-
 #[test]
 fn min_sliding() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -338,14 +310,12 @@ fn min_sliding() {
     assert_eq!(qr.rows[4][2], Value::Integer(70)); // min(70,100)
 }
 
-// ── 15. MAX sliding ─────────────────────────────────────────────────
-
 #[test]
 fn max_sliding() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -360,14 +330,12 @@ fn max_sliding() {
     assert_eq!(qr.rows[4][2], Value::Integer(100)); // max(70,100)
 }
 
-// ── 16. Multiple different windows ──────────────────────────────────
-
 #[test]
 fn multiple_windows() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -383,14 +351,12 @@ fn multiple_windows() {
     assert_eq!(qr.rows[4][2], Value::Integer(440));
 }
 
-// ── 17. Window with WHERE ───────────────────────────────────────────
-
 #[test]
 fn window_with_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -404,14 +370,12 @@ fn window_with_where() {
     assert_eq!(qr.rows[2][1], Value::Integer(3));
 }
 
-// ── 18. Outer ORDER BY differs from window ──────────────────────────
-
 #[test]
 fn window_with_order_by() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -430,14 +394,12 @@ fn window_with_order_by() {
     assert!(matches!(rn5, Value::Integer(1) | Value::Integer(2)));
 }
 
-// ── 19. Window with LIMIT ───────────────────────────────────────────
-
 #[test]
 fn window_with_limit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -450,14 +412,12 @@ fn window_with_limit() {
     assert_eq!(qr.rows[2][1], Value::Integer(3));
 }
 
-// ── 20. Window over CTE ─────────────────────────────────────────────
-
 #[test]
 fn window_over_cte() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(

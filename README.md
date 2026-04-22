@@ -13,7 +13,7 @@
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Beats unencrypted SQLite in all 23 benchmarks with equal cache budgets.
+Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Beats unencrypted SQLite in all 26 head-to-head benchmarks with equal cache budgets.
 
 ## Features
 
@@ -28,7 +28,7 @@ Every page is encrypted and authenticated before it hits disk. The database file
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. C FFI (37 functions), WebAssembly bindings
-- **2,670+ tests** - Unit, integration, torture tests across 10 crates
+- **2,700+ tests** - Unit, integration, torture tests across 10 crates
 
 ## Benchmarks
 
@@ -37,32 +37,32 @@ Single-threaded on 100K rows, schema `(id INTEGER PK, name TEXT, age INTEGER)`. 
 ```
 Benchmark          Citadel        SQLite         Ratio
 ------------------------------------------------------
-correlated_in      9.50 ms        1.84 s         194x
-count              550 ns         62.3 us        113x
-correlated_scalar  590 us         18.1 ms        31x
-cte                1.67 ms        14.6 ms        8.7x
-group_by           2.80 ms        21.0 ms        7.5x
-point              2.01 us        14.7 us        7.3x
-savepoint_nested   620 us         3.09 ms        5.0x
-sort               1.60 ms        6.37 ms        4.0x
-filter             1.05 ms        2.75 ms        2.6x
-view_point         4.99 us        12.4 us        2.5x
-view_filter        764 us         1.79 ms        2.3x
-savepoint_rollback 4.20 ms        9.30 ms        2.2x
-recursive_cte      156 us         264 us         1.7x
-correlated_exists  4.02 ms        6.55 ms        1.63x
-window_rank        149 ms         238 ms         1.6x
-distinct           2.43 ms        3.80 ms        1.56x
-insert             124 us         188 us         1.5x
-sum                1.44 ms        1.89 ms        1.31x
-insert_select      853 us         1.13 ms        1.3x
-scan               10.83 ms       13.59 ms       1.25x
-window_agg         67.7 ms        75.3 ms        1.11x
-update             26.9 us        29.5 us        1.10x
-delete             178 us         165 us         0.93x
-join               348 us         253 us         0.73x
-union              1.01 ms        252 us         0.25x
-savepoint_create   3.66 us        685 ns         0.19x
+correlated_in      6.20 ms        1.94 s         312x
+count              146 ns         21.4 us        147x
+correlated_scalar  298 us         18.5 ms        62x
+point              808 ns         12.4 us        15.3x
+group_by           1.20 ms        10.5 ms        8.75x
+cte                1.09 ms        6.23 ms        5.74x
+view_point         3.01 us        12.9 us        4.28x
+filter             726 us         1.73 ms        2.38x
+sort               1.09 ms        2.59 ms        2.37x
+view_filter        737 us         1.74 ms        2.36x
+window_agg         32.1 ms        74.0 ms        2.31x
+savepoint_create   343 ns         716 ns         2.09x
+window_rank        60.8 ms        124 ms         2.04x
+insert_select      627 us         1.15 ms        1.83x
+correlated_exists  3.94 ms        6.74 ms        1.71x
+distinct           2.39 ms        3.97 ms        1.66x
+update             17.9 us        27.95 us       1.56x
+delete             55.8 us        78.5 us        1.41x
+scan               6.13 ms        7.90 ms        1.29x
+recursive_cte      104 us         130 us         1.26x
+sum                1.48 ms        1.85 ms        1.25x
+union              117 us         147 us         1.25x
+savepoint_nested   304 us         367 us         1.21x
+insert             44.0 us        52.6 us        1.19x
+join               87.0 us        100 us         1.15x
+savepoint_rollback 2.12 ms        2.23 ms        1.05x
 ```
 
 ### Native DATE / TIMESTAMP (Citadel only, SQLite has no native type)
@@ -70,46 +70,52 @@ savepoint_create   3.66 us        685 ns         0.19x
 ```
 Benchmark          Citadel
 -------------------------------
-date_sort          1.23 ms
-date_arith         1.79 ms
-date_range_scan    1.86 ms
-date_groupby       16.8 ms
-date_extract       21.3 ms
+date_arith         1.64 ms
+date_range_scan    1.66 ms
+date_sort          3.63 ms
+date_groupby       9.11 ms
+date_extract       12.88 ms
 ```
 
 <details>
 <summary>Methodology</summary>
 
+H2H benchmarks (sorted by ratio, highest first):
+
 - **correlated_in** - `SELECT COUNT(*) FROM t WHERE id IN (SELECT id FROM ref_table WHERE ref_table.val = t.age)`
 - **count** - `SELECT COUNT(*) FROM t`
 - **correlated_scalar** - `SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.a_id = a.id) FROM a`
 - **point** - `SELECT * FROM t WHERE id = 50000`
-- **date_arith** - `SELECT COUNT(*) FROM events WHERE ts + INTERVAL '1 day' > TIMESTAMP '2024-06-01 00:00:00'`
 - **group_by** - `SELECT age, COUNT(*) FROM t GROUP BY age`
 - **cte** - `WITH filtered AS (SELECT ... WHERE age < 50) SELECT age, COUNT(*) FROM filtered GROUP BY age`
 - **view_point** - `SELECT * FROM v WHERE id = 50000`
-- **savepoint_rollback** - `BEGIN; INSERT 1K rows; SAVEPOINT sp; INSERT 10K rows; ROLLBACK TO sp; COMMIT`
-- **date_groupby** - `SELECT DATE_TRUNC('month', ts), COUNT(*) FROM events GROUP BY 1`
-- **date_sort** - `SELECT id FROM events ORDER BY ts LIMIT 100`
-- **view_filter** - `SELECT * FROM v WHERE age = 42`
 - **filter** - `SELECT * FROM t WHERE age = 42`
-- **window_agg** - `SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING), MIN(age) OVER ...`
 - **sort** - `SELECT * FROM t ORDER BY age LIMIT 10`
+- **view_filter** - `SELECT * FROM v WHERE age = 42`
+- **window_agg** - `SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING), MIN(age) OVER ...`
+- **savepoint_create** - `BEGIN; SAVEPOINT sp; RELEASE sp; COMMIT`
 - **window_rank** - `ROW_NUMBER() OVER (PARTITION BY age ORDER BY id), RANK() OVER ...`
-- **savepoint_nested** - 10 nested savepoints each with 100-row INSERT, alternating RELEASE/ROLLBACK TO
-- **date_range_scan** - `SELECT COUNT(*) FROM events WHERE d BETWEEN DATE '2024-02-01' AND DATE '2024-03-31'`
-- **insert** - 100 rows in one transaction
-- **scan** - `SELECT * FROM t`
 - **insert_select** - `INSERT INTO sink SELECT id, val FROM a`
-- **sum** - `SELECT SUM(age) FROM t`
-- **delete** - insert 100 rows then delete them
-- **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id`
-- **distinct** - `SELECT DISTINCT age FROM t`
 - **correlated_exists** - `SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM ref_table WHERE ref_table.id = t.id)`
+- **distinct** - `SELECT DISTINCT age FROM t`
 - **update** - `UPDATE t SET age = age + 1 WHERE id BETWEEN 10000 AND 10099`
-- **date_extract** - `SELECT AVG(EXTRACT(HOUR FROM ts)) FROM events`
-- **union** - `SELECT id, val FROM a UNION ALL SELECT id, data FROM b`
+- **delete** - insert 100 rows then delete them
+- **scan** - `SELECT * FROM t`
 - **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq`
+- **sum** - `SELECT SUM(age) FROM t`
+- **union** - `SELECT id, val FROM a UNION ALL SELECT id, data FROM b`
+- **savepoint_nested** - 10 nested savepoints each with 100-row INSERT, alternating RELEASE/ROLLBACK TO
+- **insert** - 100 rows in one transaction
+- **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id`
+- **savepoint_rollback** - `BEGIN; INSERT 1K rows; SAVEPOINT sp; INSERT 10K rows; ROLLBACK TO sp; COMMIT`
+
+Date benchmarks (Citadel-only, sorted by duration):
+
+- **date_arith** - `SELECT COUNT(*) FROM events WHERE ts + INTERVAL '1 day' > TIMESTAMP '2024-06-01 00:00:00'`
+- **date_range_scan** - `SELECT COUNT(*) FROM events WHERE d BETWEEN DATE '2024-02-01' AND DATE '2024-03-31'`
+- **date_sort** - `SELECT id FROM events ORDER BY ts LIMIT 100`
+- **date_groupby** - `SELECT DATE_TRUNC('month', ts), COUNT(*) FROM events GROUP BY 1`
+- **date_extract** - `SELECT AVG(EXTRACT(HOUR FROM ts)) FROM events`
 
 SQLite config: `journal_mode=OFF, synchronous=OFF, cache_size=8192` (~32 MB).
 Citadel config: `SyncMode::Off, cache_size=4096` (~32 MB).

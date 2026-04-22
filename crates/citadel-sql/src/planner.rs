@@ -4,8 +4,6 @@ use crate::encoding::encode_composite_key;
 use crate::parser::{BinOp, Expr};
 use crate::types::{IndexDef, TableSchema, Value};
 
-// ── Scan plan ────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone)]
 pub enum ScanPlan {
     SeqScan,
@@ -27,8 +25,6 @@ pub enum ScanPlan {
         index_columns: Vec<u16>,
     },
 }
-
-// ── Simple predicate extraction ──────────────────────────────────────
 
 struct SimplePredicate {
     col_idx: usize,
@@ -80,23 +76,31 @@ fn resolve_column_name(expr: &Expr) -> Option<&str> {
     }
 }
 
+fn resolve_literal(expr: &Expr) -> Option<Value> {
+    match expr {
+        Expr::Literal(v) => Some(v.clone()),
+        Expr::Parameter(n) => crate::eval::resolve_scoped_param(*n).ok(),
+        _ => None,
+    }
+}
+
 fn extract_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<SimplePredicate> {
     match expr {
         Expr::BinaryOp { left, op, right } if is_comparison(*op) => {
-            if let (Some(name), Expr::Literal(val)) = (resolve_column_name(left), right.as_ref()) {
+            if let (Some(name), Some(val)) = (resolve_column_name(left), resolve_literal(right)) {
                 let col_idx = schema.column_index(name)?;
                 return Some(SimplePredicate {
                     col_idx,
                     op: *op,
-                    value: val.clone(),
+                    value: val,
                 });
             }
-            if let (Expr::Literal(val), Some(name)) = (left.as_ref(), resolve_column_name(right)) {
+            if let (Some(val), Some(name)) = (resolve_literal(left), resolve_column_name(right)) {
                 let col_idx = schema.column_index(name)?;
                 return Some(SimplePredicate {
                     col_idx,
                     op: flip_op(*op),
-                    value: val.clone(),
+                    value: val,
                 });
             }
             None
@@ -114,19 +118,21 @@ fn flatten_between(expr: &Expr, schema: &TableSchema, out: &mut Vec<SimplePredic
             high,
             negated: false,
         } => {
-            if let (Some(name), Expr::Literal(lo), Expr::Literal(hi)) =
-                (resolve_column_name(col_expr), low.as_ref(), high.as_ref())
-            {
+            if let (Some(name), Some(lo), Some(hi)) = (
+                resolve_column_name(col_expr),
+                resolve_literal(low),
+                resolve_literal(high),
+            ) {
                 if let Some(col_idx) = schema.column_index(name) {
                     out.push(SimplePredicate {
                         col_idx,
                         op: BinOp::GtEq,
-                        value: lo.clone(),
+                        value: lo,
                     });
                     out.push(SimplePredicate {
                         col_idx,
                         op: BinOp::LtEq,
-                        value: hi.clone(),
+                        value: hi,
                     });
                 }
             }
@@ -142,8 +148,6 @@ fn flatten_between(expr: &Expr, schema: &TableSchema, out: &mut Vec<SimplePredic
         _ => {}
     }
 }
-
-// ── Plan selection ───────────────────────────────────────────────────
 
 pub fn plan_select(schema: &TableSchema, where_clause: &Option<Expr>) -> ScanPlan {
     let where_expr = match where_clause {
@@ -161,7 +165,6 @@ pub fn plan_select(schema: &TableSchema, where_clause: &Option<Expr>) -> ScanPla
         return plan;
     }
 
-    // Collect range predicates from both comparisons and BETWEEN
     let mut range_preds: Vec<SimplePredicate> = simple
         .iter()
         .filter_map(|p| {
@@ -203,7 +206,6 @@ fn try_pk_range_scan(schema: &TableSchema, range_preds: &[SimplePredicate]) -> O
     if conds.is_empty() {
         return None;
     }
-    // Build start key from the tightest lower bound (GtEq or Gt)
     let start_key = conds
         .iter()
         .filter(|(op, _)| matches!(op, BinOp::GtEq | BinOp::Gt))
@@ -236,8 +238,6 @@ fn try_pk_lookup(schema: &TableSchema, predicates: &[Option<SimplePredicate>]) -
         None
     }
 }
-
-// ── Index scoring and selection ──────────────────────────────────────
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct IndexScore {
@@ -331,8 +331,6 @@ fn try_index_scan(
         },
     ))
 }
-
-// ── Plan description for EXPLAIN ────────────────────────────────────
 
 pub fn describe_plan(plan: &ScanPlan, table_schema: &TableSchema) -> String {
     match plan {

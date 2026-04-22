@@ -11,26 +11,22 @@ fn change_passphrase_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
 
-    // Create and populate
     {
         let db = fast_builder(&db_path).create().unwrap();
         let mut wtx = db.begin_write().unwrap();
         wtx.insert(b"key", b"value").unwrap();
         wtx.commit().unwrap();
 
-        // Change passphrase while DB is open
         db.change_passphrase(b"original-passphrase", b"new-passphrase")
             .unwrap();
     }
 
-    // Old passphrase should fail
     let result = DatabaseBuilder::new(&db_path)
         .passphrase(b"original-passphrase")
         .argon2_profile(Argon2Profile::Iot)
         .open();
     assert!(result.is_err());
 
-    // New passphrase should work and data is intact
     let db = DatabaseBuilder::new(&db_path)
         .passphrase(b"new-passphrase")
         .argon2_profile(Argon2Profile::Iot)
@@ -67,7 +63,6 @@ fn change_passphrase_preserves_named_tables() {
             .unwrap();
     }
 
-    // Open with new passphrase, verify all data
     let db = DatabaseBuilder::new(&db_path)
         .passphrase(b"rotated")
         .argon2_profile(Argon2Profile::Iot)
@@ -95,14 +90,12 @@ fn change_passphrase_multiple_rotations() {
         wtx.insert(b"persistent", b"data").unwrap();
         wtx.commit().unwrap();
 
-        // Rotate multiple times
         db.change_passphrase(b"original-passphrase", b"pass2")
             .unwrap();
         db.change_passphrase(b"pass2", b"pass3").unwrap();
         db.change_passphrase(b"pass3", b"final-pass").unwrap();
     }
 
-    // Only the final passphrase should work
     assert!(DatabaseBuilder::new(&db_path)
         .passphrase(b"original-passphrase")
         .argon2_profile(Argon2Profile::Iot)

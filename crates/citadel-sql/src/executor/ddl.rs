@@ -7,8 +7,6 @@ use crate::types::*;
 
 use super::helpers::*;
 
-// ── FK validation helper ────────────────────────────────────────────
-
 /// Validate FK references: parent must exist, referred columns must be PK or UNIQUE.
 pub(super) fn validate_foreign_keys(
     schema: &SchemaManager,
@@ -101,8 +99,6 @@ pub(super) fn create_fk_auto_indices(
     }
     Ok(table_schema)
 }
-
-// ── DDL ─────────────────────────────────────────────────────────────
 
 pub(super) fn exec_create_table(
     db: &Database,
@@ -670,8 +666,6 @@ pub(super) fn exec_drop_index_in_txn(
     Ok(ExecutionResult::Ok)
 }
 
-// ── VIEW DDL ────────────────────────────────────────────────────────
-
 pub(super) fn exec_create_view(
     db: &Database,
     schema: &mut SchemaManager,
@@ -807,8 +801,6 @@ pub(super) fn exec_drop_view_in_txn(
     schema.remove_view(&lower_name);
     Ok(ExecutionResult::Ok)
 }
-
-// ── ALTER TABLE ──────────────────────────────────────────────────────
 
 pub(super) fn exec_alter_table(
     db: &Database,
@@ -1021,7 +1013,7 @@ pub(super) fn alter_drop_column(
         }
     }
 
-    // O(1) schema-only; old rows keep dead slot, decode skips via col_mapping
+    // Schema-only: rows keep the dead slot; decode skips via col_mapping.
     let new_schema = table_schema.without_column(drop_pos);
 
     SchemaManager::save_schema(wtx, &new_schema)?;

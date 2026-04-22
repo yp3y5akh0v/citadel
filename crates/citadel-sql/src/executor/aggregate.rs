@@ -1,13 +1,11 @@
 use std::collections::BTreeMap;
 
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, ColumnMap};
+use crate::eval::{eval_expr, is_truthy, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::types::*;
 
 use super::helpers::*;
-
-// ── Aggregation ─────────────────────────────────────────────────────
 
 pub(super) fn exec_aggregate(
     columns: &[ColumnDef],
@@ -22,10 +20,11 @@ pub(super) fn exec_aggregate(
     } else {
         let mut m: BTreeMap<Vec<Value>, Vec<&Vec<Value>>> = BTreeMap::new();
         for row in rows {
+            let ctx = EvalCtx::new(&col_map, row);
             let group_key: Vec<Value> = stmt
                 .group_by
                 .iter()
-                .map(|expr| eval_expr(expr, &col_map, row))
+                .map(|expr| eval_expr(expr, &ctx))
                 .collect::<Result<_>>()?;
             m.entry(group_key).or_default().push(row);
         }
@@ -55,7 +54,7 @@ pub(super) fn exec_aggregate(
                 Ok(val) => is_truthy(&val),
                 Err(SqlError::ColumnNotFound(_)) => {
                     let output_map = ColumnMap::new(&output_cols);
-                    match eval_expr(having, &output_map, &result_row) {
+                    match eval_expr(having, &EvalCtx::new(&output_map, &result_row)) {
                         Ok(val) => is_truthy(&val),
                         Err(_) => false,
                     }
@@ -139,7 +138,7 @@ pub(super) fn eval_aggregate_expr(
             let arg = &args[0];
             let mut values: Vec<Value> = group_rows
                 .iter()
-                .map(|row| eval_expr(arg, col_map, row))
+                .map(|row| eval_expr(arg, &EvalCtx::new(col_map, row)))
                 .collect::<Result<_>>()?;
             if *distinct {
                 let mut seen: std::collections::HashSet<Value> = std::collections::HashSet::new();
@@ -347,7 +346,7 @@ pub(super) fn eval_aggregate_expr(
 
         Expr::Column(_) | Expr::QualifiedColumn { .. } => {
             if let Some(first) = group_rows.first() {
-                eval_expr(expr, col_map, first)
+                eval_expr(expr, &EvalCtx::new(col_map, first))
             } else {
                 Ok(Value::Null)
             }
@@ -364,8 +363,7 @@ pub(super) fn eval_aggregate_expr(
                     op: *op,
                     right: Box::new(Expr::Literal(r)),
                 },
-                col_map,
-                &[],
+                &EvalCtx::new(col_map, &[]),
             )
         }
 
@@ -376,8 +374,7 @@ pub(super) fn eval_aggregate_expr(
                     op: *op,
                     expr: Box::new(Expr::Literal(v)),
                 },
-                col_map,
-                &[],
+                &EvalCtx::new(col_map, &[]),
             )
         }
 
@@ -398,8 +395,7 @@ pub(super) fn eval_aggregate_expr(
                     expr: Box::new(Expr::Literal(v)),
                     data_type: *data_type,
                 },
-                col_map,
-                &[],
+                &EvalCtx::new(col_map, &[]),
             )
         }
 
@@ -459,8 +455,7 @@ pub(super) fn eval_aggregate_expr(
                     high: Box::new(Expr::Literal(hi)),
                     negated: *negated,
                 },
-                col_map,
-                &[],
+                &EvalCtx::new(col_map, &[]),
             )
         }
 
@@ -484,8 +479,7 @@ pub(super) fn eval_aggregate_expr(
                     escape: esc_box,
                     negated: *negated,
                 },
-                col_map,
-                &[],
+                &EvalCtx::new(col_map, &[]),
             )
         }
 
@@ -501,10 +495,11 @@ pub(super) fn eval_aggregate_expr(
                     args: literal_args,
                     distinct: false,
                 },
-                col_map,
-                &[],
+                &EvalCtx::new(col_map, &[]),
             )
         }
+
+        Expr::Parameter(_) => eval_expr(expr, &EvalCtx::new(col_map, &[])),
 
         _ => Err(SqlError::Unsupported(format!(
             "expression in aggregate: {expr:?}"

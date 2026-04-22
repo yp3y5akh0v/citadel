@@ -71,10 +71,6 @@ fn sync_session(
     })
 }
 
-// ============================================================
-// Threaded sync
-// ============================================================
-
 #[test]
 fn threaded_push_basic() {
     let dir = tempfile::tempdir().unwrap();
@@ -102,10 +98,6 @@ fn threaded_pull_basic() {
     assert_eq!(collect_all(&db1), collect_all(&db2));
 }
 
-// ============================================================
-// Multi-round convergence
-// ============================================================
-
 #[test]
 fn random_50_rounds_bidirectional_convergence() {
     let dir = tempfile::tempdir().unwrap();
@@ -121,13 +113,11 @@ fn random_50_rounds_bidirectional_convergence() {
         wtx.insert(&key, &val).unwrap();
         wtx.commit().unwrap();
 
-        // Sync every 5 rounds
         if round % 5 == 4 {
             sync_session(&db1, &db2, SyncDirection::Bidirectional, false);
         }
     }
 
-    // Final sync
     sync_session(&db1, &db2, SyncDirection::Bidirectional, false);
 
     let data1 = collect_all(&db1);
@@ -152,17 +142,12 @@ fn incremental_push_10_rounds() {
     assert_eq!(collect_all(&db2).len(), 100);
 }
 
-// ============================================================
-// CRDT-aware sync
-// ============================================================
-
 #[test]
 fn crdt_push_sync() {
     let dir = tempfile::tempdir().unwrap();
     let db1 = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db2 = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
-    // Insert CRDT values on db1
     let m = meta(1000, 0, 1);
     let val = encode_lww_value(&m, EntryKind::Put, b"hello");
     {
@@ -248,10 +233,6 @@ fn crdt_tombstone_wins_over_older_put() {
     assert_eq!(decoded.kind, EntryKind::Tombstone);
 }
 
-// ============================================================
-// Concurrent reader during sync
-// ============================================================
-
 #[test]
 fn snapshot_isolation_during_sync() {
     let dir = tempfile::tempdir().unwrap();
@@ -260,7 +241,6 @@ fn snapshot_isolation_during_sync() {
 
     insert_range(&db1, 0, 50);
 
-    // Take a read snapshot of db2 before sync
     let rtx = db2.begin_read();
     let before_count = {
         let mut count = 0u64;
@@ -274,14 +254,9 @@ fn snapshot_isolation_during_sync() {
     };
     assert_eq!(before_count, 0);
 
-    // Sync should still work
     sync_session(&db1, &db2, SyncDirection::Push, false);
     assert_eq!(collect_all(&db2).len(), 50);
 }
-
-// ============================================================
-// 3-node ring sync
-// ============================================================
 
 #[test]
 fn three_node_ring_convergence() {
@@ -313,10 +288,6 @@ fn three_node_ring_convergence() {
     assert_eq!(data_b, data_c);
 }
 
-// ============================================================
-// Many small syncs
-// ============================================================
-
 #[test]
 fn many_small_syncs_rapid_fire() {
     let dir = tempfile::tempdir().unwrap();
@@ -330,15 +301,10 @@ fn many_small_syncs_rapid_fire() {
         wtx.insert(&key, &val).unwrap();
         wtx.commit().unwrap();
 
-        // Sync after each insert
         sync_session(&db1, &db2, SyncDirection::Push, false);
         assert_eq!(collect_all(&db1), collect_all(&db2));
     }
 }
-
-// ============================================================
-// Large values
-// ============================================================
 
 #[test]
 fn sync_with_large_values() {
@@ -360,10 +326,6 @@ fn sync_with_large_values() {
     assert_eq!(collect_all(&db1), collect_all(&db2));
 }
 
-// ============================================================
-// Mixed operations
-// ============================================================
-
 #[test]
 fn sync_after_deletes() {
     let dir = tempfile::tempdir().unwrap();
@@ -374,7 +336,6 @@ fn sync_after_deletes() {
     sync_session(&db1, &db2, SyncDirection::Push, false);
     assert_eq!(collect_all(&db1), collect_all(&db2));
 
-    // Delete some keys from db1
     {
         let mut wtx = db1.begin_write().unwrap();
         for i in 0..10u32 {
@@ -383,7 +344,6 @@ fn sync_after_deletes() {
         wtx.commit().unwrap();
     }
 
-    // After push sync, db2 gets the remaining entries from db1
     sync_session(&db1, &db2, SyncDirection::Push, false);
 
     // db1 has 10 entries, db2 has 20 (push only sends source entries, doesn't delete)
@@ -397,7 +357,6 @@ fn sync_value_update_across_rounds() {
     let db1 = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db2 = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
-    // Round 1: insert key=0 with value "v1"
     {
         let mut wtx = db1.begin_write().unwrap();
         wtx.insert(b"key", b"v1").unwrap();
@@ -406,7 +365,6 @@ fn sync_value_update_across_rounds() {
     sync_session(&db1, &db2, SyncDirection::Push, false);
     assert_eq!(collect_all(&db2)[b"key".as_slice()], b"v1");
 
-    // Round 2: update key=0 to "v2"
     {
         let mut wtx = db1.begin_write().unwrap();
         wtx.insert(b"key", b"v2").unwrap();
@@ -415,7 +373,6 @@ fn sync_value_update_across_rounds() {
     sync_session(&db1, &db2, SyncDirection::Push, false);
     assert_eq!(collect_all(&db2)[b"key".as_slice()], b"v2");
 
-    // Round 3: update key=0 to "v3"
     {
         let mut wtx = db1.begin_write().unwrap();
         wtx.insert(b"key", b"v3").unwrap();
@@ -424,10 +381,6 @@ fn sync_value_update_across_rounds() {
     sync_session(&db1, &db2, SyncDirection::Push, false);
     assert_eq!(collect_all(&db2)[b"key".as_slice()], b"v3");
 }
-
-// ============================================================
-// Stress tests
-// ============================================================
 
 #[test]
 fn stress_bidirectional_alternating_writers() {
@@ -454,7 +407,6 @@ fn stress_bidirectional_alternating_writers() {
         }
     }
 
-    // Final sync
     sync_session(&db1, &db2, SyncDirection::Bidirectional, false);
 
     let data1 = collect_all(&db1);
@@ -479,19 +431,13 @@ fn stress_push_1000_entries() {
     assert_eq!(data1, data2);
 }
 
-// ============================================================
-// CRDT convergence
-// ============================================================
-
 #[test]
 fn crdt_commutativity_both_directions_same_result() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Test A->B then B->A
     let db_a1 = fast_builder(&dir.path().join("a1.db")).create().unwrap();
     let db_b1 = fast_builder(&dir.path().join("b1.db")).create().unwrap();
 
-    // Test B->A then A->B
     let db_a2 = fast_builder(&dir.path().join("a2.db")).create().unwrap();
     let db_b2 = fast_builder(&dir.path().join("b2.db")).create().unwrap();
 
@@ -559,7 +505,6 @@ fn crdt_many_conflicts_all_resolved() {
     let data2 = collect_all(&db2);
     assert_eq!(data1, data2);
 
-    // All keys should have db2's values
     for i in 0..20u32 {
         let key = format!("conflict-{}", i);
         let decoded = decode_lww_value(&data1[key.as_bytes()]).unwrap();
@@ -571,10 +516,6 @@ fn crdt_many_conflicts_all_resolved() {
         );
     }
 }
-
-// ============================================================
-// Edge cases
-// ============================================================
 
 #[test]
 fn sync_both_empty() {

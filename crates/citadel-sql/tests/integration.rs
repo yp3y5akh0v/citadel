@@ -33,15 +33,12 @@ fn assert_ok(result: ExecutionResult) {
     }
 }
 
-// ── Basic CRUD workflow ────────────────────────────────────────────
-
 #[test]
 fn full_crud_workflow() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
-    // CREATE TABLE
     assert_ok(
         conn.execute(
             "CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, name TEXT, age INTEGER)",
@@ -49,7 +46,6 @@ fn full_crud_workflow() {
         .unwrap(),
     );
 
-    // INSERT
     assert_rows_affected(
         conn.execute("INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)")
             .unwrap(),
@@ -66,7 +62,6 @@ fn full_crud_workflow() {
         1,
     );
 
-    // SELECT all
     let qr = conn.query("SELECT * FROM users").unwrap();
     assert_eq!(qr.rows.len(), 3);
     assert_eq!(qr.columns.len(), 3);
@@ -74,11 +69,9 @@ fn full_crud_workflow() {
     assert_eq!(qr.columns[1], "name");
     assert_eq!(qr.columns[2], "age");
 
-    // SELECT WHERE
     let qr = conn.query("SELECT name FROM users WHERE age > 28").unwrap();
     assert_eq!(qr.rows.len(), 2);
 
-    // UPDATE
     assert_rows_affected(
         conn.execute("UPDATE users SET age = 31 WHERE id = 1")
             .unwrap(),
@@ -88,27 +81,22 @@ fn full_crud_workflow() {
     let qr = conn.query("SELECT age FROM users WHERE id = 1").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(31));
 
-    // DELETE
     assert_rows_affected(conn.execute("DELETE FROM users WHERE id = 2").unwrap(), 1);
 
     let qr = conn.query("SELECT * FROM users").unwrap();
     assert_eq!(qr.rows.len(), 2);
 
-    // DROP TABLE
     assert_ok(conn.execute("DROP TABLE users").unwrap());
     assert!(conn.tables().is_empty());
 }
-
-// ── Persistence across reopen ──────────────────────────────────────
 
 #[test]
 fn persistence_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Create and populate
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         conn.execute("CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, label TEXT NOT NULL)")
             .unwrap();
         conn.execute("INSERT INTO items (id, label) VALUES (1, 'alpha')")
@@ -119,10 +107,9 @@ fn persistence_across_reopen() {
             .unwrap();
     }
 
-    // Reopen and verify
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         let tables = conn.tables();
         assert_eq!(tables.len(), 1);
@@ -136,13 +123,11 @@ fn persistence_across_reopen() {
     }
 }
 
-// ── Multi-table isolation ──────────────────────────────────────────
-
 #[test]
 fn multi_table_isolation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE products (id INTEGER NOT NULL PRIMARY KEY, name TEXT)")
         .unwrap();
@@ -169,13 +154,11 @@ fn multi_table_isolation() {
     assert_eq!(conn.tables().len(), 1);
 }
 
-// ── ORDER BY ───────────────────────────────────────────────────────
-
 #[test]
 fn order_by_ascending_descending() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE scores (id INTEGER NOT NULL PRIMARY KEY, score INTEGER)")
         .unwrap();
@@ -184,14 +167,12 @@ fn order_by_ascending_descending() {
     conn.execute("INSERT INTO scores VALUES (3, 70)").unwrap();
     conn.execute("INSERT INTO scores VALUES (4, 90)").unwrap();
 
-    // ASC
     let qr = conn
         .query("SELECT id, score FROM scores ORDER BY score ASC")
         .unwrap();
     assert_eq!(qr.rows[0][1], Value::Integer(70));
     assert_eq!(qr.rows[3][1], Value::Integer(95));
 
-    // DESC
     let qr = conn
         .query("SELECT id, score FROM scores ORDER BY score DESC")
         .unwrap();
@@ -199,13 +180,11 @@ fn order_by_ascending_descending() {
     assert_eq!(qr.rows[3][1], Value::Integer(70));
 }
 
-// ── LIMIT / OFFSET ─────────────────────────────────────────────────
-
 #[test]
 fn limit_and_offset() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE nums (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -248,13 +227,11 @@ fn limit_and_offset() {
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 }
 
-// ── Aggregation ────────────────────────────────────────────────────
-
 #[test]
 fn aggregate_functions() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE sales (id INTEGER NOT NULL PRIMARY KEY, amount REAL, region TEXT NOT NULL)",
@@ -271,19 +248,15 @@ fn aggregate_functions() {
     conn.execute("INSERT INTO sales VALUES (5, 50.0, 'east')")
         .unwrap();
 
-    // COUNT(*)
     let qr = conn.query("SELECT COUNT(*) FROM sales").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(5));
 
-    // SUM
     let qr = conn.query("SELECT SUM(amount) FROM sales").unwrap();
     assert_eq!(qr.rows[0][0], Value::Real(800.0));
 
-    // AVG
     let qr = conn.query("SELECT AVG(amount) FROM sales").unwrap();
     assert_eq!(qr.rows[0][0], Value::Real(160.0));
 
-    // MIN / MAX
     let qr = conn
         .query("SELECT MIN(amount), MAX(amount) FROM sales")
         .unwrap();
@@ -295,7 +268,7 @@ fn aggregate_functions() {
 fn group_by() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE sales (id INTEGER NOT NULL PRIMARY KEY, amount REAL, region TEXT NOT NULL)",
@@ -326,7 +299,7 @@ fn group_by() {
 fn group_by_having() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE sales (id INTEGER NOT NULL PRIMARY KEY, amount INTEGER, region TEXT NOT NULL)"
@@ -348,13 +321,11 @@ fn group_by_having() {
     assert_eq!(qr.rows[0][1], Value::Integer(500));
 }
 
-// ── NULL handling ──────────────────────────────────────────────────
-
 #[test]
 fn null_handling() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE data (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
         .unwrap();
@@ -381,13 +352,11 @@ fn null_handling() {
     assert_eq!(qr.rows[0][1], Value::Integer(2));
 }
 
-// ── Boolean type ───────────────────────────────────────────────────
-
 #[test]
 fn boolean_type() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE flags (id INTEGER NOT NULL PRIMARY KEY, active BOOLEAN NOT NULL)")
         .unwrap();
@@ -406,13 +375,11 @@ fn boolean_type() {
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 }
 
-// ── Complex WHERE expressions ──────────────────────────────────────
-
 #[test]
 fn complex_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, price REAL, category TEXT NOT NULL)",
@@ -429,14 +396,12 @@ fn complex_where() {
     conn.execute("INSERT INTO items VALUES (5, 25.0, 'clothing')")
         .unwrap();
 
-    // AND
     let qr = conn
         .query("SELECT id FROM items WHERE category = 'food' AND price > 7.0")
         .unwrap();
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 
-    // OR
     let qr = conn
         .query("SELECT id FROM items WHERE category = 'food' OR category = 'clothing' ORDER BY id")
         .unwrap();
@@ -451,13 +416,11 @@ fn complex_where() {
     assert_eq!(qr.rows[1][0], Value::Integer(4));
 }
 
-// ── UPDATE multiple columns ────────────────────────────────────────
-
 #[test]
 fn update_multiple_columns() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, name TEXT, score INTEGER)")
         .unwrap();
@@ -477,13 +440,11 @@ fn update_multiple_columns() {
     assert_eq!(qr.rows[0][1], Value::Integer(200));
 }
 
-// ── UPDATE evaluates SET against original row (SQL standard) ──────
-
 #[test]
 fn update_set_evaluates_against_original_row() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, b INTEGER)")
         .unwrap();
@@ -501,13 +462,11 @@ fn update_set_evaluates_against_original_row() {
     assert_eq!(qr.rows[0][1], Value::Integer(10)); // b was 20, now has a's original value
 }
 
-// ── UPDATE with no matches ─────────────────────────────────────────
-
 #[test]
 fn update_no_matches() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, v INTEGER)")
         .unwrap();
@@ -519,13 +478,11 @@ fn update_no_matches() {
     );
 }
 
-// ── DELETE all rows ────────────────────────────────────────────────
-
 #[test]
 fn delete_all_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -540,13 +497,11 @@ fn delete_all_rows() {
     assert_eq!(qr.rows[0][0], Value::Integer(0));
 }
 
-// ── Error cases ────────────────────────────────────────────────────
-
 #[test]
 fn error_table_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let result = conn.execute("SELECT * FROM nonexistent");
     assert!(matches!(result, Err(SqlError::TableNotFound(_))));
@@ -556,7 +511,7 @@ fn error_table_not_found() {
 fn error_table_already_exists() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -568,7 +523,7 @@ fn error_table_already_exists() {
 fn if_not_exists_and_if_exists() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     // IF NOT EXISTS - no error on duplicate
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
@@ -586,7 +541,7 @@ fn if_not_exists_and_if_exists() {
 fn error_duplicate_key() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -599,7 +554,7 @@ fn error_duplicate_key() {
 fn error_not_null_violation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
         .unwrap();
@@ -611,7 +566,7 @@ fn error_not_null_violation() {
 fn error_column_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -623,7 +578,7 @@ fn error_column_not_found() {
 fn error_primary_key_required() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let result = conn.execute("CREATE TABLE t (id INTEGER NOT NULL)");
     assert!(matches!(result, Err(SqlError::PrimaryKeyRequired)));
@@ -633,19 +588,17 @@ fn error_primary_key_required() {
 fn error_drop_nonexistent() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let result = conn.execute("DROP TABLE nonexistent");
     assert!(matches!(result, Err(SqlError::TableNotFound(_))));
 }
 
-// ── Edge cases ─────────────────────────────────────────────────────
-
 #[test]
 fn empty_string_values() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
         .unwrap();
@@ -659,7 +612,7 @@ fn empty_string_values() {
 fn negative_integers() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
         .unwrap();
@@ -678,7 +631,7 @@ fn negative_integers() {
 fn real_precision() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)")
         .unwrap();
@@ -696,7 +649,7 @@ fn real_precision() {
 fn case_insensitive_identifiers() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE MyTable (ID INTEGER NOT NULL PRIMARY KEY, Name TEXT)")
         .unwrap();
@@ -711,7 +664,7 @@ fn case_insensitive_identifiers() {
 fn insert_many_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
         .unwrap();
@@ -724,7 +677,6 @@ fn insert_many_rows() {
     let qr = conn.query("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(100));
 
-    // Verify ordering
     let qr = conn.query("SELECT id FROM t ORDER BY id LIMIT 1").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(0));
 
@@ -738,7 +690,7 @@ fn insert_many_rows() {
 fn select_with_expression_in_projection() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, price REAL, qty INTEGER)")
         .unwrap();
@@ -757,7 +709,7 @@ fn select_with_expression_in_projection() {
 fn composite_primary_key() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE t (a INTEGER NOT NULL, b INTEGER NOT NULL, val TEXT, PRIMARY KEY (a, b))",
@@ -786,7 +738,7 @@ fn composite_primary_key() {
 fn update_with_expression() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, score INTEGER)")
         .unwrap();
@@ -803,7 +755,7 @@ fn update_with_expression() {
 fn select_empty_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -820,7 +772,7 @@ fn select_empty_table() {
 fn multi_row_insert() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
         .unwrap();
@@ -838,7 +790,7 @@ fn multi_row_insert() {
 fn comparison_operators() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -864,7 +816,7 @@ fn comparison_operators() {
 fn not_operator() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, active BOOLEAN NOT NULL)")
         .unwrap();
@@ -880,7 +832,7 @@ fn not_operator() {
 fn modulo_and_division() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
         .unwrap();
@@ -897,7 +849,7 @@ fn modulo_and_division() {
 fn tables_listing() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert!(conn.tables().is_empty());
 
@@ -918,13 +870,11 @@ fn tables_listing() {
     assert_eq!(tables, vec!["alpha", "gamma"]);
 }
 
-// ── HAVING with alias and aggregate expressions ─────────────────────
-
 #[test]
 fn having_with_count_alias() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, customer TEXT NOT NULL, amount INTEGER)"
@@ -950,7 +900,7 @@ fn having_with_count_alias() {
 fn having_with_avg_alias() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE scores (id INTEGER NOT NULL PRIMARY KEY, team TEXT NOT NULL, score REAL NOT NULL)"
@@ -977,7 +927,7 @@ fn having_with_avg_alias() {
 fn having_with_min_max_alias() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE temps (id INTEGER NOT NULL PRIMARY KEY, city TEXT NOT NULL, temp INTEGER NOT NULL)"
@@ -1010,7 +960,7 @@ fn having_with_min_max_alias() {
 fn having_aggregate_expr_and_alias_combined() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, cat TEXT NOT NULL, price INTEGER NOT NULL)"
@@ -1039,13 +989,11 @@ fn having_aggregate_expr_and_alias_combined() {
     assert_eq!(qr.rows[0][1], Value::Integer(150));
 }
 
-// ── DISTINCT ──────────────────────────────────────────────────────
-
 #[test]
 fn distinct_basic_dedup() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, color TEXT NOT NULL)")
         .unwrap();
@@ -1068,7 +1016,7 @@ fn distinct_basic_dedup() {
 fn distinct_no_duplicates() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -1084,7 +1032,7 @@ fn distinct_no_duplicates() {
 fn distinct_all_same() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)")
         .unwrap();
@@ -1101,7 +1049,7 @@ fn distinct_all_same() {
 fn distinct_with_nulls() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
         .unwrap();
@@ -1124,7 +1072,7 @@ fn distinct_with_nulls() {
 fn distinct_star() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a TEXT, b INTEGER)")
         .unwrap();
@@ -1140,7 +1088,7 @@ fn distinct_star() {
 fn distinct_multi_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a TEXT NOT NULL, b INTEGER NOT NULL)",
@@ -1165,7 +1113,7 @@ fn distinct_multi_column() {
 fn distinct_with_order_by() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)")
         .unwrap();
@@ -1187,7 +1135,7 @@ fn distinct_with_order_by() {
 fn distinct_with_limit_offset() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)")
         .unwrap();
@@ -1221,7 +1169,7 @@ fn distinct_with_limit_offset() {
 fn distinct_empty_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
         .unwrap();
@@ -1234,7 +1182,7 @@ fn distinct_empty_table() {
 fn distinct_with_expression() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)")
         .unwrap();
@@ -1256,7 +1204,7 @@ fn distinct_with_expression() {
 fn distinct_with_group_by() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, grp TEXT NOT NULL, val INTEGER NOT NULL)",
@@ -1278,7 +1226,7 @@ fn distinct_with_group_by() {
 fn distinct_boolean_dedup() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, flag BOOLEAN NOT NULL)")
         .unwrap();

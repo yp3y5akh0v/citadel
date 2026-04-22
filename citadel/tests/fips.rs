@@ -11,7 +11,6 @@ fn pbkdf2_create_open_reopen() {
     let db_path = dir.path().join("pbkdf2.citadel");
     let passphrase = b"pbkdf2-test-passphrase";
 
-    // Create with PBKDF2
     {
         let db = DatabaseBuilder::new(&db_path)
             .passphrase(passphrase)
@@ -29,7 +28,6 @@ fn pbkdf2_create_open_reopen() {
         assert_eq!(stats.entry_count, 1);
     }
 
-    // Reopen with PBKDF2
     {
         let db = DatabaseBuilder::new(&db_path)
             .passphrase(passphrase)
@@ -41,7 +39,6 @@ fn pbkdf2_create_open_reopen() {
         assert_eq!(val, Some(b"value1".to_vec()));
     }
 
-    // Wrong passphrase should fail
     {
         let result = DatabaseBuilder::new(&db_path).passphrase(b"wrong").open();
         assert!(result.is_err());
@@ -130,13 +127,11 @@ fn pbkdf2_change_passphrase() {
         db.change_passphrase(old_pass, new_pass).unwrap();
     }
 
-    // Old passphrase should fail
     {
         let result = DatabaseBuilder::new(&db_path).passphrase(old_pass).open();
         assert!(result.is_err());
     }
 
-    // New passphrase should work and data should be intact
     {
         let db = DatabaseBuilder::new(&db_path)
             .passphrase(new_pass)
@@ -167,7 +162,6 @@ fn default_kdf_is_argon2id() {
     wtx.commit().unwrap();
     drop(db);
 
-    // Reopen without specifying KDF (defaults to Argon2id)
     let db = DatabaseBuilder::new(&db_path)
         .passphrase(b"test")
         .open()
@@ -200,7 +194,6 @@ fn pbkdf2_and_argon2_produce_different_databases() {
         .create()
         .unwrap();
 
-    // Write same data to both
     {
         let mut wtx = db_argon2.begin_write().unwrap();
         wtx.insert(b"key", b"value").unwrap();
@@ -212,11 +205,9 @@ fn pbkdf2_and_argon2_produce_different_databases() {
         wtx.commit().unwrap();
     }
 
-    // Drop databases to release file locks before reading raw files
     drop(db_argon2);
     drop(db_pbkdf2);
 
-    // Read the raw files - encrypted content should differ
     let raw_argon2 = std::fs::read(dir.path().join("argon2.citadel")).unwrap();
     let raw_pbkdf2 = std::fs::read(dir.path().join("pbkdf2.citadel")).unwrap();
 
@@ -252,14 +243,11 @@ fn pbkdf2_backup_and_integrity() {
     }
     wtx.commit().unwrap();
 
-    // Integrity check
     let report = db.integrity_check().unwrap();
     assert!(report.errors.is_empty());
 
-    // Backup
     db.backup(&backup_path).unwrap();
 
-    // Open backup
     let backup_db = DatabaseBuilder::new(&backup_path)
         .passphrase(b"test")
         .open()
@@ -271,8 +259,6 @@ fn pbkdf2_backup_and_integrity() {
         assert_eq!(val, format!("val-{i}").into_bytes());
     }
 }
-
-// === FIPS mode tests (only compiled when fips feature is enabled) ===
 
 #[cfg(feature = "fips")]
 mod fips_tests {

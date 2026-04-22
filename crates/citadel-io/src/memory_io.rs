@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use crate::traits::PageIO;
 use citadel_core::{Error, Result, PAGE_SIZE};
@@ -30,7 +30,7 @@ impl Default for MemoryPageIO {
 
 impl PageIO for MemoryPageIO {
     fn read_page(&self, offset: u64, buf: &mut [u8; PAGE_SIZE]) -> Result<()> {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock();
         let start = offset as usize;
         let end = start + PAGE_SIZE;
         if end > data.len() {
@@ -44,7 +44,7 @@ impl PageIO for MemoryPageIO {
     }
 
     fn write_page(&self, offset: u64, buf: &[u8; PAGE_SIZE]) -> Result<()> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock();
         let start = offset as usize;
         let end = start + PAGE_SIZE;
         if end > data.len() {
@@ -55,7 +55,7 @@ impl PageIO for MemoryPageIO {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock();
         let start = offset as usize;
         let end = start + buf.len();
         if end > data.len() {
@@ -69,7 +69,7 @@ impl PageIO for MemoryPageIO {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock();
         let start = offset as usize;
         let end = start + buf.len();
         if end > data.len() {
@@ -84,12 +84,12 @@ impl PageIO for MemoryPageIO {
     }
 
     fn file_size(&self) -> Result<u64> {
-        let data = self.data.lock().unwrap();
+        let data = self.data.lock();
         Ok(data.len() as u64)
     }
 
     fn truncate(&self, size: u64) -> Result<()> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.lock();
         data.resize(size as usize, 0);
         Ok(())
     }

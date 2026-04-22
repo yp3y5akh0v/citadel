@@ -38,6 +38,8 @@ parking_lot = { workspace = true, optional = true }
 tempfile = "3"
 blake3 = { workspace = true }
 criterion = { workspace = true }
+rustc-hash = { workspace = true }
+mimalloc = { workspace = true }
 
 [[bench]]
 name = "kv_bench"

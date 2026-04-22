@@ -7,8 +7,6 @@ use crate::types::*;
 use super::helpers::*;
 use super::window::has_any_window_function;
 
-// ── EXPLAIN ──────────────────────────────────────────────────────────
-
 pub(super) fn explain(schema: &SchemaManager, stmt: &Statement) -> Result<ExecutionResult> {
     let lines = match stmt {
         Statement::Select(sq) => {

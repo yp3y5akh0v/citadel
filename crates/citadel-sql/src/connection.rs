@@ -1,5 +1,6 @@
 //! Public SQL connection API.
 
+use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -11,7 +12,8 @@ use citadel_txn::write_txn::{WriteTxn, WriteTxnSnapshot};
 use crate::error::{Result, SqlError};
 use crate::executor;
 use crate::parser;
-use crate::parser::{InsertSource, Statement};
+use crate::parser::Statement;
+use crate::prepared::PreparedStatement;
 use crate::schema::{SchemaManager, SchemaSnapshot};
 use crate::types::{ExecutionResult, QueryResult, TableSchema, Value};
 
@@ -242,11 +244,11 @@ fn try_normalize_insert(sql: &str) -> Option<(String, Vec<Value>)> {
     Some((normalized, values))
 }
 
-struct CacheEntry {
-    stmt: Arc<Statement>,
-    schema_gen: u64,
-    param_count: usize,
-    compiled_update: Option<executor::CompiledUpdate>,
+pub(crate) struct CacheEntry {
+    pub(crate) stmt: Arc<Statement>,
+    pub(crate) schema_gen: u64,
+    pub(crate) param_count: usize,
+    pub(crate) compiled: Option<Arc<dyn executor::CompiledPlan>>,
 }
 
 struct SavepointEntry {
@@ -259,18 +261,20 @@ struct SavepointSnapshot {
     schema_snap: SchemaSnapshot,
 }
 
-/// SQL connection with LRU statement cache.
-pub struct Connection<'a> {
-    db: &'a Database,
-    schema: SchemaManager,
+pub(crate) struct ConnectionInner<'a> {
+    pub(crate) schema: SchemaManager,
     active_txn: Option<WriteTxn<'a>>,
     savepoint_stack: Vec<SavepointEntry>,
     in_place_saved: Option<bool>,
-    stmt_cache: LruCache<String, CacheEntry>,
-    insert_bufs: executor::InsertBufs,
-    update_bufs: executor::UpdateBufs,
+    pub(crate) stmt_cache: LruCache<String, CacheEntry>,
     txn_start_ts: Option<i64>,
     session_timezone: String,
+}
+
+/// SQL connection with LRU statement cache.
+pub struct Connection<'a> {
+    pub(crate) db: &'a Database,
+    pub(crate) inner: RefCell<ConnectionInner<'a>>,
 }
 
 impl<'a> Connection<'a> {
@@ -280,30 +284,105 @@ impl<'a> Connection<'a> {
         let stmt_cache = LruCache::new(NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).unwrap());
         Ok(Self {
             db,
-            schema,
-            active_txn: None,
-            savepoint_stack: Vec::new(),
-            in_place_saved: None,
-            stmt_cache,
-            insert_bufs: executor::InsertBufs::new(),
-            update_bufs: executor::UpdateBufs::new(),
-            txn_start_ts: None,
-            session_timezone: "UTC".to_string(),
+            inner: RefCell::new(ConnectionInner {
+                schema,
+                active_txn: None,
+                savepoint_stack: Vec::new(),
+                in_place_saved: None,
+                stmt_cache,
+                txn_start_ts: None,
+                session_timezone: "UTC".to_string(),
+            }),
         })
     }
 
     /// Txn-start UTC µs inside BEGIN/COMMIT, else `None`.
     pub fn txn_start_ts(&self) -> Option<i64> {
-        self.txn_start_ts
+        self.inner.borrow().txn_start_ts
     }
 
     /// Returns the session time-zone (IANA name or fixed offset). Default `"UTC"`.
-    pub fn session_timezone(&self) -> &str {
-        &self.session_timezone
+    pub fn session_timezone(&self) -> String {
+        self.inner.borrow().session_timezone.clone()
     }
 
     /// Set the session time-zone. Accepts IANA names, ISO-8601 offsets, `"UTC"`, `"Z"`.
-    pub fn set_session_timezone(&mut self, tz: &str) -> Result<()> {
+    pub fn set_session_timezone(&self, tz: &str) -> Result<()> {
+        self.inner.borrow_mut().set_session_timezone_impl(tz)
+    }
+
+    /// Execute a SQL statement. Returns the result.
+    pub fn execute(&self, sql: &str) -> Result<ExecutionResult> {
+        self.inner.borrow_mut().execute_impl(self.db, sql)
+    }
+
+    /// Execute a SQL statement with positional parameters ($1, $2, ...).
+    pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<ExecutionResult> {
+        self.inner
+            .borrow_mut()
+            .execute_params_impl(self.db, sql, params)
+    }
+
+    /// Execute a SQL query and return the result set.
+    pub fn query(&self, sql: &str) -> Result<QueryResult> {
+        self.query_params(sql, &[])
+    }
+
+    /// Execute a SQL query with positional parameters ($1, $2, ...).
+    pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+        match self.execute_params(sql, params)? {
+            ExecutionResult::Query(qr) => Ok(qr),
+            ExecutionResult::RowsAffected(n) => Ok(QueryResult {
+                columns: vec!["rows_affected".into()],
+                rows: vec![vec![Value::Integer(n as i64)]],
+            }),
+            ExecutionResult::Ok => Ok(QueryResult {
+                columns: vec![],
+                rows: vec![],
+            }),
+        }
+    }
+
+    /// Prepare a SQL statement for repeated execution with parameters.
+    pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_, 'a>> {
+        PreparedStatement::new(self, sql)
+    }
+
+    /// List all table names.
+    pub fn tables(&self) -> Vec<String> {
+        self.inner
+            .borrow()
+            .schema
+            .table_names()
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    /// Returns true if an explicit transaction is active (BEGIN was issued).
+    pub fn in_transaction(&self) -> bool {
+        self.inner.borrow().active_txn.is_some()
+    }
+
+    /// Get the schema for a named table.
+    pub fn table_schema(&self, name: &str) -> Option<TableSchema> {
+        self.inner.borrow().schema.get(name).cloned()
+    }
+
+    /// Reload schemas from the database.
+    pub fn refresh_schema(&self) -> Result<()> {
+        let new_schema = SchemaManager::load(self.db)?;
+        self.inner.borrow_mut().schema = new_schema;
+        Ok(())
+    }
+}
+
+impl<'a> ConnectionInner<'a> {
+    pub(crate) fn active_txn_is_some(&self) -> bool {
+        self.active_txn.is_some()
+    }
+
+    fn set_session_timezone_impl(&mut self, tz: &str) -> Result<()> {
         let upper = tz.to_ascii_uppercase();
         if (upper.starts_with("UTC+") || upper.starts_with("UTC-")) && tz.len() > 3 {
             return Err(SqlError::InvalidTimezone(format!(
@@ -319,8 +398,7 @@ impl<'a> Connection<'a> {
         Ok(())
     }
 
-    /// Execute a SQL statement. Returns the result.
-    pub fn execute(&mut self, sql: &str) -> Result<ExecutionResult> {
+    fn execute_impl(&mut self, db: &'a Database, sql: &str) -> Result<ExecutionResult> {
         if matches!(sql.as_bytes().first(), Some(b'I' | b'i')) {
             if let Some((normalized_key, extracted)) = try_normalize_insert(sql) {
                 let gen = self.schema.generation();
@@ -333,44 +411,26 @@ impl<'a> Connection<'a> {
                 } else {
                     self.parse_and_cache(normalized_key, gen)?
                 };
-                return self.dispatch(&stmt, &extracted);
+                return self.dispatch(db, &stmt, &extracted);
             }
         }
-
-        self.execute_params(sql, &[])
+        self.execute_params_impl(db, sql, &[])
     }
 
-    /// Execute a SQL statement with positional parameters ($1, $2, ...).
-    pub fn execute_params(&mut self, sql: &str, params: &[Value]) -> Result<ExecutionResult> {
-        if params.is_empty() && self.active_txn.is_none() {
-            let gen = self.schema.generation();
+    fn execute_params_impl(
+        &mut self,
+        db: &'a Database,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecutionResult> {
+        let gen = self.schema.generation();
+        if self.active_txn.is_none() {
             if let Some(entry) = self.stmt_cache.get(sql) {
-                if entry.schema_gen == gen && entry.param_count == 0 {
-                    let cached_stmt = Arc::clone(&entry.stmt);
-                    if let Statement::Update(ref upd) = *cached_stmt {
-                        if let Some(ref compiled) = entry.compiled_update {
-                            return executor::exec_update_compiled(
-                                self.db,
-                                &self.schema,
-                                upd,
-                                compiled,
-                                &mut self.update_bufs,
-                            );
-                        }
-                        let compiled = executor::compile_update(&self.schema, upd)?;
-                        let result = executor::exec_update_compiled(
-                            self.db,
-                            &self.schema,
-                            upd,
-                            &compiled,
-                            &mut self.update_bufs,
-                        )?;
-                        if let Some(e) = self.stmt_cache.get_mut(sql) {
-                            e.compiled_update = Some(compiled);
-                        }
-                        return Ok(result);
+                if entry.schema_gen == gen && entry.param_count == params.len() {
+                    if let Some(plan) = entry.compiled.as_ref().map(Arc::clone) {
+                        let stmt = Arc::clone(&entry.stmt);
+                        return self.run_compiled(db, &plan, &stmt, params);
                     }
-                    return self.dispatch(&cached_stmt, &[]);
                 }
             }
         }
@@ -384,77 +444,46 @@ impl<'a> Connection<'a> {
             });
         }
 
-        if param_count == 0 && self.active_txn.is_none() {
-            if let Statement::Update(ref upd) = *stmt {
-                let compiled = executor::compile_update(&self.schema, upd)?;
-                let result = executor::exec_update_compiled(
-                    self.db,
-                    &self.schema,
-                    upd,
-                    &compiled,
-                    &mut self.update_bufs,
-                )?;
+        if self.active_txn.is_none() {
+            if let Some(plan) = executor::compile(&self.schema, &stmt) {
                 if let Some(e) = self.stmt_cache.get_mut(sql) {
-                    e.compiled_update = Some(compiled);
+                    e.compiled = Some(Arc::clone(&plan));
                 }
-                return Ok(result);
+                let stmt_owned = Arc::clone(&stmt);
+                return self.run_compiled(db, &plan, &stmt_owned, params);
             }
         }
 
-        if param_count > 0
-            && matches!(*stmt, Statement::Insert(ref ins) if matches!(ins.source, InsertSource::Values(_)))
-        {
-            self.dispatch(&stmt, params)
-        } else if param_count > 0 {
-            let bound = parser::bind_params(&stmt, params)?;
-            self.dispatch(&bound, &[])
-        } else {
-            self.dispatch(&stmt, &[])
-        }
+        self.dispatch(db, &stmt, params)
     }
 
-    /// Execute a SQL query and return the result set.
-    pub fn query(&mut self, sql: &str) -> Result<QueryResult> {
-        self.query_params(sql, &[])
+    fn run_compiled(
+        &mut self,
+        db: &'a Database,
+        plan: &Arc<dyn executor::CompiledPlan>,
+        stmt: &Statement,
+        params: &[Value],
+    ) -> Result<ExecutionResult> {
+        let cached_ts = self
+            .txn_start_ts
+            .or_else(|| Some(crate::datetime::now_micros()));
+        let schema = &self.schema;
+        crate::datetime::with_txn_clock(cached_ts, || {
+            if params.is_empty() {
+                plan.execute(db, schema, stmt, params, None)
+            } else {
+                crate::eval::with_scoped_params(params, || {
+                    plan.execute(db, schema, stmt, params, None)
+                })
+            }
+        })
     }
 
-    /// Execute a SQL query with positional parameters ($1, $2, ...).
-    pub fn query_params(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult> {
-        match self.execute_params(sql, params)? {
-            ExecutionResult::Query(qr) => Ok(qr),
-            ExecutionResult::RowsAffected(n) => Ok(QueryResult {
-                columns: vec!["rows_affected".into()],
-                rows: vec![vec![Value::Integer(n as i64)]],
-            }),
-            ExecutionResult::Ok => Ok(QueryResult {
-                columns: vec![],
-                rows: vec![],
-            }),
-        }
-    }
-
-    /// List all table names.
-    pub fn tables(&self) -> Vec<&str> {
-        self.schema.table_names()
-    }
-
-    /// Returns true if an explicit transaction is active (BEGIN was issued).
-    pub fn in_transaction(&self) -> bool {
-        self.active_txn.is_some()
-    }
-
-    /// Get the schema for a named table.
-    pub fn table_schema(&self, name: &str) -> Option<&TableSchema> {
-        self.schema.get(name)
-    }
-
-    /// Reload schemas from the database.
-    pub fn refresh_schema(&mut self) -> Result<()> {
-        self.schema = SchemaManager::load(self.db)?;
-        Ok(())
-    }
-
-    fn parse_and_cache(&mut self, normalized_key: String, gen: u64) -> Result<Arc<Statement>> {
+    pub(crate) fn parse_and_cache(
+        &mut self,
+        normalized_key: String,
+        gen: u64,
+    ) -> Result<Arc<Statement>> {
         let stmt = Arc::new(parser::parse_sql(&normalized_key)?);
         let param_count = parser::count_params(&stmt);
         self.stmt_cache.put(
@@ -463,13 +492,13 @@ impl<'a> Connection<'a> {
                 stmt: Arc::clone(&stmt),
                 schema_gen: gen,
                 param_count,
-                compiled_update: None,
+                compiled: None,
             },
         );
         Ok(stmt)
     }
 
-    fn get_or_parse(&mut self, sql: &str) -> Result<(Arc<Statement>, usize)> {
+    pub(crate) fn get_or_parse(&mut self, sql: &str) -> Result<(Arc<Statement>, usize)> {
         let gen = self.schema.generation();
 
         if let Some(entry) = self.stmt_cache.get(sql) {
@@ -490,12 +519,6 @@ impl<'a> Connection<'a> {
                 | Statement::CreateView(_)
                 | Statement::DropView(_)
                 | Statement::AlterTable(_)
-                | Statement::Begin
-                | Statement::Commit
-                | Statement::Rollback
-                | Statement::Savepoint(_)
-                | Statement::ReleaseSavepoint(_)
-                | Statement::RollbackTo(_)
         );
 
         if cacheable {
@@ -505,7 +528,7 @@ impl<'a> Connection<'a> {
                     stmt: Arc::clone(&stmt),
                     schema_gen: gen,
                     param_count,
-                    compiled_update: None,
+                    compiled: None,
                 },
             );
         }
@@ -513,22 +536,80 @@ impl<'a> Connection<'a> {
         Ok((stmt, param_count))
     }
 
-    fn dispatch(&mut self, stmt: &Statement, params: &[Value]) -> Result<ExecutionResult> {
+    pub(crate) fn execute_prepared(
+        &mut self,
+        db: &'a Database,
+        stmt: &Statement,
+        compiled: Option<&Arc<dyn executor::CompiledPlan>>,
+        params: &[Value],
+    ) -> Result<ExecutionResult> {
+        if let Some(plan) = compiled {
+            if self.active_txn.is_none() {
+                return self.run_compiled(db, plan, stmt, params);
+            }
+            if stmt_mutates(stmt) {
+                self.capture_pending_snapshots();
+            }
+            return self.run_compiled_in_txn(db, plan, stmt, params);
+        }
+        self.dispatch(db, stmt, params)
+    }
+
+    fn run_compiled_in_txn(
+        &mut self,
+        db: &'a Database,
+        plan: &Arc<dyn executor::CompiledPlan>,
+        stmt: &Statement,
+        params: &[Value],
+    ) -> Result<ExecutionResult> {
         let cached_ts = self
             .txn_start_ts
             .or_else(|| Some(crate::datetime::now_micros()));
-        crate::datetime::with_txn_clock(cached_ts, || self.dispatch_inner(stmt, params))
+        let schema = &self.schema;
+        let wtx = self.active_txn.as_mut();
+        crate::datetime::with_txn_clock(cached_ts, || {
+            if params.is_empty() {
+                plan.execute(db, schema, stmt, params, wtx)
+            } else {
+                crate::eval::with_scoped_params(params, || {
+                    plan.execute(db, schema, stmt, params, wtx)
+                })
+            }
+        })
     }
 
-    fn dispatch_inner(&mut self, stmt: &Statement, params: &[Value]) -> Result<ExecutionResult> {
+    pub(crate) fn dispatch(
+        &mut self,
+        db: &'a Database,
+        stmt: &Statement,
+        params: &[Value],
+    ) -> Result<ExecutionResult> {
+        let cached_ts = self
+            .txn_start_ts
+            .or_else(|| Some(crate::datetime::now_micros()));
+        crate::datetime::with_txn_clock(cached_ts, || {
+            if params.is_empty() {
+                self.dispatch_inner(db, stmt, params)
+            } else {
+                crate::eval::with_scoped_params(params, || self.dispatch_inner(db, stmt, params))
+            }
+        })
+    }
+
+    fn dispatch_inner(
+        &mut self,
+        db: &'a Database,
+        stmt: &Statement,
+        params: &[Value],
+    ) -> Result<ExecutionResult> {
         match stmt {
             Statement::Begin => {
                 if self.active_txn.is_some() {
                     return Err(SqlError::TransactionAlreadyActive);
                 }
-                let wtx = self.db.begin_write().map_err(SqlError::Storage)?;
+                let wtx = db.begin_write().map_err(SqlError::Storage)?;
                 self.active_txn = Some(wtx);
-                self.txn_start_ts = Some(crate::datetime::now_micros());
+                self.txn_start_ts = Some(crate::datetime::txn_or_clock_micros());
                 Ok(ExecutionResult::Ok)
             }
             Statement::Commit => {
@@ -548,7 +629,7 @@ impl<'a> Connection<'a> {
                     .ok_or(SqlError::NoActiveTransaction)?;
                 wtx.abort();
                 self.clear_savepoint_state();
-                self.schema = SchemaManager::load(self.db)?;
+                self.schema = SchemaManager::load(db)?;
                 self.txn_start_ts = None;
                 Ok(ExecutionResult::Ok)
             }
@@ -556,13 +637,13 @@ impl<'a> Connection<'a> {
             Statement::ReleaseSavepoint(name) => self.do_release(name),
             Statement::RollbackTo(name) => self.do_rollback_to(name),
             Statement::SetTimezone(zone) => {
-                self.set_session_timezone(zone)?;
+                self.set_session_timezone_impl(zone)?;
                 Ok(ExecutionResult::Ok)
             }
             Statement::Insert(ins) if self.active_txn.is_some() => {
                 self.capture_pending_snapshots();
                 let wtx = self.active_txn.as_mut().unwrap();
-                executor::exec_insert_in_txn(wtx, &self.schema, ins, params, &mut self.insert_bufs)
+                executor::exec_insert_in_txn(wtx, &self.schema, ins, params)
             }
             _ => {
                 if self.active_txn.is_some() && stmt_mutates(stmt) {
@@ -571,7 +652,7 @@ impl<'a> Connection<'a> {
                 if let Some(ref mut wtx) = self.active_txn {
                     executor::execute_in_txn(wtx, &mut self.schema, stmt, params)
                 } else {
-                    executor::execute(self.db, &mut self.schema, stmt, params)
+                    executor::execute(db, &mut self.schema, stmt, params)
                 }
             }
         }

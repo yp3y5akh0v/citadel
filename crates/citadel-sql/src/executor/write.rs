@@ -1,17 +1,19 @@
-use std::collections::HashMap;
+use std::cell::RefCell;
 
 use citadel::Database;
+use citadel_txn::write_txn::WriteTxn;
 
 use crate::encoding::{
     decode_column_raw, decode_column_with_offset, decode_composite_key, decode_pk_integer,
     encode_composite_key, encode_row, patch_at_offset, patch_column_in_place, patch_row_column,
 };
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, ColumnMap};
+use crate::eval::{eval_expr, is_truthy, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
 
+use super::compile::CompiledPlan;
 use super::correlated::*;
 use super::dml::*;
 use super::helpers::*;
@@ -20,16 +22,14 @@ use super::select::*;
 use super::view::*;
 use super::CteContext;
 
-// ── Compiled UPDATE plan cache ──────────────────────────────────────
-
-pub struct UpdateBufs {
+struct UpdateBufs {
     partial_row: Vec<Value>,
     patch_buf: Vec<u8>,
     offsets: Vec<usize>,
 }
 
-impl Default for UpdateBufs {
-    fn default() -> Self {
+impl UpdateBufs {
+    fn new() -> Self {
         Self {
             partial_row: Vec::new(),
             patch_buf: Vec::with_capacity(256),
@@ -38,10 +38,12 @@ impl Default for UpdateBufs {
     }
 }
 
-impl UpdateBufs {
-    pub fn new() -> Self {
-        Self::default()
-    }
+thread_local! {
+    static UPDATE_SCRATCH: RefCell<UpdateBufs> = RefCell::new(UpdateBufs::new());
+}
+
+fn with_update_scratch<R>(f: impl FnOnce(&mut UpdateBufs) -> R) -> R {
+    UPDATE_SCRATCH.with(|slot| f(&mut slot.borrow_mut()))
 }
 
 pub struct CompiledUpdate {
@@ -70,6 +72,10 @@ enum FastEval {
     IntSub(i64),
     IntMul(i64),
     IntSet(i64),
+    IntAddParam(usize),
+    IntSubParam(usize),
+    IntMulParam(usize),
+    IntSetParam(usize),
 }
 
 struct CompiledTarget {
@@ -84,11 +90,16 @@ fn detect_fast_eval(expr: &Expr, col_name: &str) -> FastEval {
     let lower = col_name.to_ascii_lowercase();
     match expr {
         Expr::Literal(Value::Integer(n)) => FastEval::IntSet(*n),
+        Expr::Parameter(n) => FastEval::IntSetParam(*n),
         Expr::BinaryOp { left, op, right } => {
             let col_match =
                 |e: &Expr| matches!(e, Expr::Column(c) if c.to_ascii_lowercase() == lower);
             let int_lit = |e: &Expr| match e {
                 Expr::Literal(Value::Integer(n)) => Some(*n),
+                _ => None,
+            };
+            let param_ref = |e: &Expr| match e {
+                Expr::Parameter(n) => Some(*n),
                 _ => None,
             };
             if col_match(left) {
@@ -97,6 +108,14 @@ fn detect_fast_eval(expr: &Expr, col_name: &str) -> FastEval {
                         BinOp::Add => FastEval::IntAdd(n),
                         BinOp::Sub => FastEval::IntSub(n),
                         BinOp::Mul => FastEval::IntMul(n),
+                        _ => FastEval::None,
+                    };
+                }
+                if let Some(n) = param_ref(right) {
+                    return match op {
+                        BinOp::Add => FastEval::IntAddParam(n),
+                        BinOp::Sub => FastEval::IntSubParam(n),
+                        BinOp::Mul => FastEval::IntMulParam(n),
                         _ => FastEval::None,
                     };
                 }
@@ -109,6 +128,13 @@ fn detect_fast_eval(expr: &Expr, col_name: &str) -> FastEval {
                         _ => FastEval::None,
                     };
                 }
+                if let Some(n) = param_ref(left) {
+                    return match op {
+                        BinOp::Add => FastEval::IntAddParam(n),
+                        BinOp::Mul => FastEval::IntMulParam(n),
+                        _ => FastEval::None,
+                    };
+                }
             }
             FastEval::None
         }
@@ -116,7 +142,44 @@ fn detect_fast_eval(expr: &Expr, col_name: &str) -> FastEval {
     }
 }
 
-pub fn compile_update(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<CompiledUpdate> {
+fn resolve_int_param(n: usize) -> Option<i64> {
+    match crate::eval::resolve_scoped_param(n).ok()? {
+        Value::Integer(v) => Some(v),
+        _ => None,
+    }
+}
+
+impl CompiledUpdate {
+    pub fn try_compile(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Option<Self>> {
+        compile_update_impl(schema, stmt).map(Some)
+    }
+}
+
+impl CompiledPlan for CompiledUpdate {
+    fn execute(
+        &self,
+        db: &Database,
+        schema: &SchemaManager,
+        stmt: &Statement,
+        _params: &[Value],
+        wtx: Option<&mut WriteTxn<'_>>,
+    ) -> Result<ExecutionResult> {
+        let upd = match stmt {
+            Statement::Update(u) => u,
+            _ => {
+                return Err(SqlError::Unsupported(
+                    "CompiledUpdate received non-UPDATE statement".into(),
+                ))
+            }
+        };
+        match wtx {
+            None => with_update_scratch(|bufs| exec_update_compiled(db, schema, upd, self, bufs)),
+            Some(outer) => exec_update_in_txn(outer, schema, upd),
+        }
+    }
+}
+
+fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<CompiledUpdate> {
     let table_name_lower = stmt.table.to_ascii_lowercase();
     let is_view = schema.get_view(&table_name_lower).is_some();
     if is_view {
@@ -245,7 +308,7 @@ pub fn compile_update(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Compi
     })
 }
 
-pub fn exec_update_compiled(
+fn exec_update_compiled(
     db: &Database,
     schema: &SchemaManager,
     stmt: &UpdateStmt,
@@ -323,32 +386,58 @@ pub fn exec_update_compiled(
                     bufs.offsets[i] = off;
                 }
                 for (i, target) in fast.targets.iter().enumerate() {
+                    let generic_eval = || {
+                        eval_expr(
+                            &target.expr,
+                            &EvalCtx::new(&fast.col_map, &bufs.partial_row),
+                        )
+                    };
                     let new_val = match target.fast_eval {
                         FastEval::IntAdd(n) => {
                             if let Value::Integer(v) = bufs.partial_row[target.schema_idx] {
                                 Value::Integer(v.wrapping_add(n))
                             } else {
-                                eval_expr(&target.expr, &fast.col_map, &bufs.partial_row)?
+                                generic_eval()?
                             }
                         }
                         FastEval::IntSub(n) => {
                             if let Value::Integer(v) = bufs.partial_row[target.schema_idx] {
                                 Value::Integer(v.wrapping_sub(n))
                             } else {
-                                eval_expr(&target.expr, &fast.col_map, &bufs.partial_row)?
+                                generic_eval()?
                             }
                         }
                         FastEval::IntMul(n) => {
                             if let Value::Integer(v) = bufs.partial_row[target.schema_idx] {
                                 Value::Integer(v.wrapping_mul(n))
                             } else {
-                                eval_expr(&target.expr, &fast.col_map, &bufs.partial_row)?
+                                generic_eval()?
                             }
                         }
                         FastEval::IntSet(n) => Value::Integer(n),
-                        FastEval::None => {
-                            eval_expr(&target.expr, &fast.col_map, &bufs.partial_row)?
+                        FastEval::IntAddParam(p) => {
+                            match (resolve_int_param(p), &bufs.partial_row[target.schema_idx]) {
+                                (Some(n), Value::Integer(v)) => Value::Integer(v.wrapping_add(n)),
+                                _ => generic_eval()?,
+                            }
                         }
+                        FastEval::IntSubParam(p) => {
+                            match (resolve_int_param(p), &bufs.partial_row[target.schema_idx]) {
+                                (Some(n), Value::Integer(v)) => Value::Integer(v.wrapping_sub(n)),
+                                _ => generic_eval()?,
+                            }
+                        }
+                        FastEval::IntMulParam(p) => {
+                            match (resolve_int_param(p), &bufs.partial_row[target.schema_idx]) {
+                                (Some(n), Value::Integer(v)) => Value::Integer(v.wrapping_mul(n)),
+                                _ => generic_eval()?,
+                            }
+                        }
+                        FastEval::IntSetParam(p) => match resolve_int_param(p) {
+                            Some(n) => Value::Integer(n),
+                            None => generic_eval()?,
+                        },
+                        FastEval::None => generic_eval()?,
                     };
                     let coerced = if new_val.is_null() {
                         if !target.col.nullable {
@@ -386,8 +475,6 @@ pub fn exec_update_compiled(
     drop(wtx);
     exec_update(db, schema, stmt)
 }
-
-// ── UPDATE / DELETE execution ───────────────────────────────────────
 
 pub(super) fn exec_update(
     db: &Database,
@@ -427,7 +514,7 @@ pub(super) fn exec_update(
 
         if let Some(ref w) = remaining {
             let col_map = ColumnMap::new(&table_schema.columns);
-            rows.retain(|row| match eval_expr(w, &col_map, row) {
+            rows.retain(|row| match eval_expr(w, &EvalCtx::new(&col_map, row)) {
                 Ok(val) => is_truthy(&val),
                 Err(_) => false,
             });
@@ -459,7 +546,7 @@ pub(super) fn exec_update(
     let materialized;
     let stmt = if update_has_subquery(stmt) {
         materialized = materialize_update(stmt, &mut |sub| {
-            exec_subquery_read(db, schema, sub, &HashMap::new())
+            exec_subquery_read(db, schema, sub, &CteContext::default())
         })?;
         &materialized
     } else {
@@ -475,7 +562,6 @@ pub(super) fn exec_update(
             .is_some_and(|idx| table_schema.primary_key_columns.contains(&(idx as u16)))
     });
 
-    // Fast path: no FK, no indices, no PK change → raw-byte scan + patch
     let has_fk = !table_schema.foreign_keys.is_empty();
     let has_indices = !table_schema.indices.is_empty();
     let has_child_fk = !schema.child_fks_for(&lower_name).is_empty();
@@ -569,7 +655,8 @@ pub(super) fn exec_update(
                     }
                     // Eval + patch directly in the leaf cell's value bytes
                     for target in &targets {
-                        let new_val = eval_expr(&target.expr, &col_map, &partial_row)?;
+                        let new_val =
+                            eval_expr(&target.expr, &EvalCtx::new(&col_map, &partial_row))?;
                         let coerced = if new_val.is_null() {
                             if !target.col.nullable {
                                 return Err(SqlError::NotNullViolation(target.col.name.clone()));
@@ -628,7 +715,7 @@ pub(super) fn exec_update(
             if matches!(plan, crate::planner::ScanPlan::SeqScan) {
                 if let Some(ref w) = stmt.where_clause {
                     let row = decode_full_row(table_schema, key, raw_value)?;
-                    if !eval_expr(w, &col_map, &row).is_ok_and(|v| is_truthy(&v)) {
+                    if !eval_expr(w, &EvalCtx::new(&col_map, &row)).is_ok_and(|v| is_truthy(&v)) {
                         continue;
                     }
                 }
@@ -646,7 +733,7 @@ pub(super) fn exec_update(
                     decode_column_raw(raw_value, target.phys_idx)?.to_value();
             }
             for target in &targets {
-                let new_val = eval_expr(&target.expr, &col_map, &partial_row)?;
+                let new_val = eval_expr(&target.expr, &EvalCtx::new(&col_map, &partial_row))?;
                 let coerced = if new_val.is_null() {
                     if !target.col.nullable {
                         return Err(SqlError::NotNullViolation(target.col.name.clone()));
@@ -682,12 +769,13 @@ pub(super) fn exec_update(
         return Ok(ExecutionResult::RowsAffected(count));
     }
 
-    // Slow path: has FK/indices/PK changes — materialize all changes for validation
     let all_candidates = collect_keyed_rows_read(db, table_schema, &stmt.where_clause)?;
     let matching_rows: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
         .into_iter()
         .filter(|(_, row)| match &stmt.where_clause {
-            Some(where_expr) => eval_expr(where_expr, &col_map, row).is_ok_and(|v| is_truthy(&v)),
+            Some(where_expr) => {
+                eval_expr(where_expr, &EvalCtx::new(&col_map, row)).is_ok_and(|v| is_truthy(&v))
+            }
             None => true,
         })
         .collect();
@@ -715,7 +803,7 @@ pub(super) fn exec_update(
             let col_idx = table_schema
                 .column_index(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-            let new_val = eval_expr(expr, &col_map, row)?;
+            let new_val = eval_expr(expr, &EvalCtx::new(&col_map, row))?;
             let col = &table_schema.columns[col_idx];
 
             let got_type = new_val.data_type();
@@ -743,7 +831,7 @@ pub(super) fn exec_update(
         if table_schema.has_checks() {
             for col in &table_schema.columns {
                 if let Some(ref check) = col.check_expr {
-                    let result = eval_expr(check, &col_map, &new_row)?;
+                    let result = eval_expr(check, &EvalCtx::new(&col_map, &new_row))?;
                     if !is_truthy(&result) && !result.is_null() {
                         let name = col.check_name.as_deref().unwrap_or(&col.name);
                         return Err(SqlError::CheckViolation(name.to_string()));
@@ -751,7 +839,7 @@ pub(super) fn exec_update(
                 }
             }
             for tc in &table_schema.check_constraints {
-                let result = eval_expr(&tc.expr, &col_map, &new_row)?;
+                let result = eval_expr(&tc.expr, &EvalCtx::new(&col_map, &new_row))?;
                 if !is_truthy(&result) && !result.is_null() {
                     let name = tc.name.as_deref().unwrap_or(&tc.sql);
                     return Err(SqlError::CheckViolation(name.to_string()));
@@ -964,7 +1052,7 @@ pub(super) fn exec_delete(
 
         if let Some(ref w) = remaining {
             let col_map = ColumnMap::new(&table_schema.columns);
-            rows.retain(|row| match eval_expr(w, &col_map, row) {
+            rows.retain(|row| match eval_expr(w, &EvalCtx::new(&col_map, row)) {
                 Ok(val) => is_truthy(&val),
                 Err(_) => false,
             });
@@ -995,7 +1083,7 @@ pub(super) fn exec_delete(
     let materialized;
     let stmt = if delete_has_subquery(stmt) {
         materialized = materialize_delete(stmt, &mut |sub| {
-            exec_subquery_read(db, schema, sub, &HashMap::new())
+            exec_subquery_read(db, schema, sub, &CteContext::default())
         })?;
         &materialized
     } else {
@@ -1004,11 +1092,24 @@ pub(super) fn exec_delete(
 
     let col_map = ColumnMap::new(&table_schema.columns);
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+
+    if stmt.where_clause.is_none() && schema.child_fks_for(&lower_name).is_empty() {
+        let count = wtx
+            .table_truncate(lower_name.as_bytes())
+            .map_err(SqlError::Storage)?;
+        for idx in &table_schema.indices {
+            let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
+            wtx.table_truncate(&idx_table).map_err(SqlError::Storage)?;
+        }
+        wtx.commit().map_err(SqlError::Storage)?;
+        return Ok(ExecutionResult::RowsAffected(count));
+    }
+
     let all_candidates = collect_keyed_rows_write(&mut wtx, table_schema, &stmt.where_clause)?;
     let rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
         .into_iter()
         .filter(|(_, row)| match &stmt.where_clause {
-            Some(where_expr) => match eval_expr(where_expr, &col_map, row) {
+            Some(where_expr) => match eval_expr(where_expr, &EvalCtx::new(&col_map, row)) {
                 Ok(val) => is_truthy(&val),
                 Err(_) => false,
             },
@@ -1112,7 +1213,6 @@ pub(super) fn exec_select_in_txn(
         });
     }
 
-    // ── View resolution (in-txn) ────────────────────────────────────
     if let Some(view_def) = schema.get_view(&lower_name) {
         if let Some(fused) = try_fuse_view(stmt, schema, view_def)? {
             return super::exec_select_in_txn(wtx, schema, &fused, ctes);
@@ -1268,7 +1368,7 @@ pub(super) fn exec_update_in_txn(
     let materialized;
     let stmt = if update_has_subquery(stmt) {
         materialized = materialize_update(stmt, &mut |sub| {
-            exec_subquery_write(wtx, schema, sub, &HashMap::new())
+            exec_subquery_write(wtx, schema, sub, &CteContext::default())
         })?;
         &materialized
     } else {
@@ -1285,7 +1385,7 @@ pub(super) fn exec_update_in_txn(
     let matching_rows: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
         .into_iter()
         .filter(|(_, row)| match &stmt.where_clause {
-            Some(where_expr) => match eval_expr(where_expr, &col_map, row) {
+            Some(where_expr) => match eval_expr(where_expr, &EvalCtx::new(&col_map, row)) {
                 Ok(val) => is_truthy(&val),
                 Err(_) => false,
             },
@@ -1319,7 +1419,7 @@ pub(super) fn exec_update_in_txn(
             let col_idx = table_schema
                 .column_index(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-            let new_val = eval_expr(expr, &col_map, row)?;
+            let new_val = eval_expr(expr, &EvalCtx::new(&col_map, row))?;
             let col = &table_schema.columns[col_idx];
 
             let got_type = new_val.data_type();
@@ -1350,7 +1450,7 @@ pub(super) fn exec_update_in_txn(
         if table_schema.has_checks() {
             for col in &table_schema.columns {
                 if let Some(ref check) = col.check_expr {
-                    let result = eval_expr(check, &col_map, &new_row)?;
+                    let result = eval_expr(check, &EvalCtx::new(&col_map, &new_row))?;
                     if !is_truthy(&result) && !result.is_null() {
                         let name = col.check_name.as_deref().unwrap_or(&col.name);
                         return Err(SqlError::CheckViolation(name.to_string()));
@@ -1358,7 +1458,7 @@ pub(super) fn exec_update_in_txn(
                 }
             }
             for tc in &table_schema.check_constraints {
-                let result = eval_expr(&tc.expr, &col_map, &new_row)?;
+                let result = eval_expr(&tc.expr, &EvalCtx::new(&col_map, &new_row))?;
                 if !is_truthy(&result) && !result.is_null() {
                     let name = tc.name.as_deref().unwrap_or(&tc.sql);
                     return Err(SqlError::CheckViolation(name.to_string()));
@@ -1539,7 +1639,7 @@ pub(super) fn exec_delete_in_txn(
     let materialized;
     let stmt = if delete_has_subquery(stmt) {
         materialized = materialize_delete(stmt, &mut |sub| {
-            exec_subquery_write(wtx, schema, sub, &HashMap::new())
+            exec_subquery_write(wtx, schema, sub, &CteContext::default())
         })?;
         &materialized
     } else {
@@ -1551,12 +1651,23 @@ pub(super) fn exec_delete_in_txn(
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
+    if stmt.where_clause.is_none() && schema.child_fks_for(&lower_name).is_empty() {
+        let count = wtx
+            .table_truncate(lower_name.as_bytes())
+            .map_err(SqlError::Storage)?;
+        for idx in &table_schema.indices {
+            let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
+            wtx.table_truncate(&idx_table).map_err(SqlError::Storage)?;
+        }
+        return Ok(ExecutionResult::RowsAffected(count));
+    }
+
     let col_map = ColumnMap::new(&table_schema.columns);
     let all_candidates = collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?;
     let rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
         .into_iter()
         .filter(|(_, row)| match &stmt.where_clause {
-            Some(where_expr) => match eval_expr(where_expr, &col_map, row) {
+            Some(where_expr) => match eval_expr(where_expr, &EvalCtx::new(&col_map, row)) {
                 Ok(val) => is_truthy(&val),
                 Err(_) => false,
             },

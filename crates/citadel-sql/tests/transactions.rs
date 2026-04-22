@@ -33,13 +33,11 @@ fn assert_rows_affected(result: ExecutionResult, expected: u64) {
     }
 }
 
-// ── Basic transaction control ────────────────────────────────────────
-
 #[test]
 fn begin_commit_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
@@ -72,7 +70,7 @@ fn begin_commit_basic() {
 fn begin_rollback_discards_changes() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
@@ -104,7 +102,7 @@ fn begin_rollback_discards_changes() {
 fn begin_transaction_keyword() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     // "BEGIN TRANSACTION" should work the same as "BEGIN"
     assert_ok(conn.execute("BEGIN TRANSACTION").unwrap());
@@ -113,13 +111,11 @@ fn begin_transaction_keyword() {
     assert!(!conn.in_transaction());
 }
 
-// ── Read-your-writes ────────────────────────────────────────────────
-
 #[test]
 fn read_your_writes_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
@@ -152,7 +148,7 @@ fn read_your_writes_in_transaction() {
 fn read_after_update_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
@@ -180,7 +176,7 @@ fn read_after_update_in_transaction() {
 fn read_after_delete_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
@@ -205,13 +201,11 @@ fn read_after_delete_in_transaction() {
     conn.execute("COMMIT").unwrap();
 }
 
-// ── DDL in transactions ─────────────────────────────────────────────
-
 #[test]
 fn create_table_in_transaction_committed() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -231,7 +225,7 @@ fn create_table_in_transaction_committed() {
 fn create_table_in_transaction_rolled_back() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -252,7 +246,7 @@ fn create_table_in_transaction_rolled_back() {
 fn drop_table_in_transaction_rolled_back() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
@@ -276,7 +270,7 @@ fn drop_table_in_transaction_rolled_back() {
 fn create_and_drop_same_table_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
@@ -290,13 +284,11 @@ fn create_and_drop_same_table_in_transaction() {
     assert!(matches!(err, SqlError::TableNotFound(_)));
 }
 
-// ── Error handling in transactions ──────────────────────────────────
-
 #[test]
 fn error_begin_while_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
     let err = conn.execute("BEGIN").unwrap_err();
@@ -310,7 +302,7 @@ fn error_begin_while_in_transaction() {
 fn error_commit_without_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let err = conn.execute("COMMIT").unwrap_err();
     assert!(matches!(err, SqlError::NoActiveTransaction));
@@ -320,7 +312,7 @@ fn error_commit_without_transaction() {
 fn error_rollback_without_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let err = conn.execute("ROLLBACK").unwrap_err();
     assert!(matches!(err, SqlError::NoActiveTransaction));
@@ -330,7 +322,7 @@ fn error_rollback_without_transaction() {
 fn statement_error_keeps_transaction_active() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT NOT NULL)")
         .unwrap();
@@ -364,7 +356,7 @@ fn statement_error_keeps_transaction_active() {
 fn duplicate_key_error_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .unwrap();
@@ -381,13 +373,11 @@ fn duplicate_key_error_in_transaction() {
     conn.execute("ROLLBACK").unwrap();
 }
 
-// ── Multi-table transactions ────────────────────────────────────────
-
 #[test]
 fn multi_table_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)")
         .unwrap();
@@ -422,7 +412,7 @@ fn multi_table_transaction() {
 fn multi_table_transaction_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)")
         .unwrap();
@@ -456,14 +446,12 @@ fn multi_table_transaction_rollback() {
     assert_eq!(qr.rows.len(), 0);
 }
 
-// ── Persistence ─────────────────────────────────────────────────────
-
 #[test]
 fn committed_transaction_persists_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
             .unwrap();
@@ -483,7 +471,7 @@ fn committed_transaction_persists_across_reopen() {
 
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let qr = conn.query("SELECT * FROM t ORDER BY id").unwrap();
         assert_eq!(qr.rows.len(), 2);
         assert_eq!(qr.rows[0][1], Value::Text("persisted".into()));
@@ -495,7 +483,7 @@ fn rolled_back_transaction_not_persisted() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
             .unwrap();
@@ -516,14 +504,12 @@ fn rolled_back_transaction_not_persisted() {
 
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let qr = conn.query("SELECT * FROM t").unwrap();
         assert_eq!(qr.rows.len(), 1);
         assert_eq!(qr.rows[0][1], Value::Text("keep".into()));
     }
 }
-
-// ── Drop without commit (auto-rollback) ─────────────────────────────
 
 #[test]
 fn drop_connection_with_active_transaction_rolls_back() {
@@ -531,7 +517,7 @@ fn drop_connection_with_active_transaction_rolls_back() {
     let db = create_db(dir.path());
 
     {
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
             .unwrap();
         assert_rows_affected(
@@ -542,7 +528,7 @@ fn drop_connection_with_active_transaction_rolls_back() {
     }
 
     {
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         conn.execute("BEGIN").unwrap();
         assert_rows_affected(
@@ -554,20 +540,18 @@ fn drop_connection_with_active_transaction_rolls_back() {
     }
 
     {
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let qr = conn.query("SELECT * FROM t").unwrap();
         assert_eq!(qr.rows.len(), 1);
         assert_eq!(qr.rows[0][1], Value::Text("keep".into()));
     }
 }
 
-// ── Aggregation in transactions ─────────────────────────────────────
-
 #[test]
 fn aggregation_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
         .unwrap();
@@ -596,18 +580,15 @@ fn aggregation_in_transaction() {
     conn.execute("COMMIT").unwrap();
 }
 
-// ── Multiple transactions in sequence ───────────────────────────────
-
 #[test]
 fn sequential_transactions() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
 
-    // Transaction 1: insert and commit
     conn.execute("BEGIN").unwrap();
     assert_rows_affected(
         conn.execute("INSERT INTO t (id, val) VALUES (1, 'first')")
@@ -616,7 +597,6 @@ fn sequential_transactions() {
     );
     conn.execute("COMMIT").unwrap();
 
-    // Transaction 2: insert and rollback
     conn.execute("BEGIN").unwrap();
     assert_rows_affected(
         conn.execute("INSERT INTO t (id, val) VALUES (2, 'second')")
@@ -625,7 +605,6 @@ fn sequential_transactions() {
     );
     conn.execute("ROLLBACK").unwrap();
 
-    // Transaction 3: insert and commit
     conn.execute("BEGIN").unwrap();
     assert_rows_affected(
         conn.execute("INSERT INTO t (id, val) VALUES (3, 'third')")
@@ -640,13 +619,11 @@ fn sequential_transactions() {
     assert_eq!(qr.rows[1][0], Value::Integer(3));
 }
 
-// ── Complex scenarios ───────────────────────────────────────────────
-
 #[test]
 fn insert_update_delete_in_single_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
@@ -694,7 +671,7 @@ fn insert_update_delete_in_single_transaction() {
 fn order_by_limit_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
         .unwrap();
@@ -720,7 +697,7 @@ fn order_by_limit_in_transaction() {
 fn where_filter_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, status TEXT)")
         .unwrap();
@@ -747,7 +724,7 @@ fn where_filter_in_transaction() {
 fn auto_commit_still_works() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     // Without BEGIN, each statement is auto-committed
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -767,7 +744,7 @@ fn auto_commit_still_works() {
 fn group_by_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE sales (id INTEGER PRIMARY KEY, category TEXT NOT NULL, amount INTEGER NOT NULL)"
@@ -797,13 +774,11 @@ fn group_by_in_transaction() {
     conn.execute("COMMIT").unwrap();
 }
 
-// ── DISTINCT within transactions ─────────────────────────────────────
-
 #[test]
 fn distinct_within_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER NOT NULL)")
         .unwrap();
@@ -836,7 +811,7 @@ fn distinct_within_transaction() {
 fn distinct_sees_uncommitted_within_txn() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, color TEXT NOT NULL)")
         .unwrap();

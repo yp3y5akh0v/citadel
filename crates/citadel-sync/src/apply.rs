@@ -51,7 +51,6 @@ pub fn apply_patch_to_txn(wtx: &mut WriteTxn<'_>, patch: &SyncPatch) -> Result<A
     for entry in &patch.entries {
         if patch.crdt_aware {
             if let Some(ref remote_meta) = entry.crdt_meta {
-                // Check if key exists locally with CRDT metadata
                 let existing = wtx.get(&entry.key)?;
                 if let Some(local_data) = existing {
                     if let Ok(local_decoded) = decode_lww_value(&local_data) {
@@ -163,7 +162,7 @@ mod tests {
     use crate::patch::PatchEntry;
 
     use citadel_core::constants::{DEK_SIZE, MAC_KEY_SIZE, MAC_SIZE};
-    use citadel_io::sync_io::SyncPageIO;
+    use citadel_io::mmap_io::MmapPageIO;
 
     const SECOND: i64 = 1_000_000_000;
 
@@ -179,7 +178,7 @@ mod tests {
             .truncate(true)
             .open(path)
             .unwrap();
-        let io = Box::new(SyncPageIO::new(file));
+        let io = Box::new(MmapPageIO::try_new(file).unwrap());
         let dek = [0x42u8; DEK_SIZE];
         let mac_key = [0x43u8; MAC_KEY_SIZE];
         let dek_id = [0x44u8; MAC_SIZE];

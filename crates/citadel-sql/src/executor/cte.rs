@@ -1,7 +1,7 @@
 use citadel::Database;
 
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, ColumnMap};
+use crate::eval::{eval_expr, is_truthy, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
@@ -9,15 +9,13 @@ use crate::types::*;
 use super::aggregate::*;
 use super::CteContext;
 
-// ── CTE support ──────────────────────────────────────────────────────
-
 pub(super) fn exec_select_query(
     db: &Database,
     schema: &SchemaManager,
     sq: &SelectQuery,
 ) -> Result<ExecutionResult> {
     if let Some(fused) = try_fuse_cte(sq) {
-        let empty = CteContext::new();
+        let empty = CteContext::default();
         return super::exec_query_body(db, schema, &fused, &empty);
     }
     let ctes = materialize_all_ctes(&sq.ctes, sq.recursive, &mut |body, ctx| {
@@ -32,7 +30,7 @@ pub(super) fn exec_select_query_in_txn(
     sq: &SelectQuery,
 ) -> Result<ExecutionResult> {
     if let Some(fused) = try_fuse_cte(sq) {
-        let empty = CteContext::new();
+        let empty = CteContext::default();
         return super::exec_query_body_in_txn(wtx, schema, &fused, &empty);
     }
     let ctes = materialize_all_ctes(&sq.ctes, sq.recursive, &mut |body, ctx| {
@@ -116,7 +114,7 @@ pub(super) fn materialize_all_ctes(
     recursive: bool,
     exec_body: &mut dyn FnMut(&QueryBody, &CteContext) -> Result<QueryResult>,
 ) -> Result<CteContext> {
-    let mut ctx = CteContext::new();
+    let mut ctx = CteContext::default();
     for cte in defs {
         let qr = if recursive && cte_body_references_self(&cte.body, &cte.name) {
             materialize_recursive_cte(cte, &ctx, exec_body)?
@@ -236,8 +234,9 @@ pub(super) fn materialize_recursive_cte(
 
             step_rows.clear();
             for row in &accumulated[work_start..work_end] {
+                let ctx = EvalCtx::new(&col_map, row);
                 if let Some(ref w) = sel.where_clause {
-                    match eval_expr(w, &col_map, row) {
+                    match eval_expr(w, &ctx) {
                         Ok(val) if is_truthy(&val) => {}
                         Ok(_) => continue,
                         Err(e) => return Err(e),
@@ -247,7 +246,7 @@ pub(super) fn materialize_recursive_cte(
                 for col in &sel.columns {
                     match col {
                         SelectColumn::Expr { expr, .. } => {
-                            row_buf.push(eval_expr(expr, &col_map, row)?);
+                            row_buf.push(eval_expr(expr, &ctx)?);
                         }
                         SelectColumn::AllColumns => {
                             row_buf.extend_from_slice(row);
@@ -404,10 +403,12 @@ pub(super) fn exec_select_from_cte(
             let filtered: Vec<Vec<Value>> = cte_result
                 .rows
                 .iter()
-                .filter(|row| match eval_expr(where_expr, &col_map, row) {
-                    Ok(val) => is_truthy(&val),
-                    _ => false,
-                })
+                .filter(
+                    |row| match eval_expr(where_expr, &EvalCtx::new(&col_map, row)) {
+                        Ok(val) => is_truthy(&val),
+                        _ => false,
+                    },
+                )
                 .cloned()
                 .collect();
             return exec_aggregate(&cte_schema.columns, &filtered, s);

@@ -33,13 +33,11 @@ fn assert_ok(result: ExecutionResult) {
     }
 }
 
-// ── DEFAULT: literal defaults (INT, TEXT, REAL, BOOL) ────────────────
-
 #[test]
 fn default_literal_int() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER DEFAULT 42)")
@@ -55,7 +53,7 @@ fn default_literal_int() {
 fn default_literal_text() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -73,7 +71,7 @@ fn default_literal_text() {
 fn default_literal_real() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, score REAL DEFAULT 2.72)")
@@ -92,7 +90,7 @@ fn default_literal_real() {
 fn default_literal_bool() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -106,13 +104,11 @@ fn default_literal_bool() {
     assert_eq!(qr.rows[0][0], Value::Boolean(true));
 }
 
-// ── DEFAULT NULL on nullable column ──────────────────────────────────
-
 #[test]
 fn default_null_on_nullable_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER DEFAULT NULL)")
@@ -124,13 +120,11 @@ fn default_null_on_nullable_column() {
     assert!(qr.rows[0][0].is_null());
 }
 
-// ── Explicit value overrides default ─────────────────────────────────
-
 #[test]
 fn default_explicit_value_overrides() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER DEFAULT 42)")
@@ -146,13 +140,11 @@ fn default_explicit_value_overrides() {
     assert_eq!(qr.rows[0][0], Value::Integer(99));
 }
 
-// ── Explicit NULL does NOT trigger default ───────────────────────────
-
 #[test]
 fn default_explicit_null_stores_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER DEFAULT 42)")
@@ -168,13 +160,11 @@ fn default_explicit_null_stores_null() {
     assert!(qr.rows[0][0].is_null());
 }
 
-// ── DEFAULT with expression ──────────────────────────────────────────
-
 #[test]
 fn default_expression_addition() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -192,7 +182,7 @@ fn default_expression_addition() {
 fn default_expression_abs() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -206,13 +196,11 @@ fn default_expression_abs() {
     assert_eq!(qr.rows[0][0], Value::Integer(5));
 }
 
-// ── Multiple defaults on different columns ───────────────────────────
-
 #[test]
 fn default_multiple_columns() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -238,13 +226,11 @@ fn default_multiple_columns() {
     }
 }
 
-// ── NOT NULL + DEFAULT combo ─────────────────────────────────────────
-
 #[test]
 fn default_not_null_combo() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -261,15 +247,13 @@ fn default_not_null_combo() {
     assert_eq!(qr.rows[0][0], Value::Text("active".into()));
 }
 
-// ── DEFAULT persistence after close/reopen ───────────────────────────
-
 #[test]
 fn default_persistence_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
 
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER DEFAULT 77)")
             .unwrap();
         conn.execute("INSERT INTO t (id) VALUES (1)").unwrap();
@@ -277,7 +261,7 @@ fn default_persistence_after_reopen() {
 
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         let qr = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
         assert_eq!(qr.rows[0][0], Value::Integer(77));
@@ -288,13 +272,11 @@ fn default_persistence_after_reopen() {
     }
 }
 
-// ── Partial INSERT with prepared statements ──────────────────────────
-
 #[test]
 fn default_partial_insert_prepared() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -320,13 +302,11 @@ fn default_partial_insert_prepared() {
     assert_eq!(qr.rows[0][1], Value::Integer(100));
 }
 
-// ── DEFAULT on all non-PK columns ───────────────────────────────────
-
 #[test]
 fn default_on_all_non_pk_columns() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -347,13 +327,11 @@ fn default_on_all_non_pk_columns() {
     assert_eq!(qr.rows[0][2], Value::Boolean(false));
 }
 
-// ── CHECK: column-level pass ─────────────────────────────────────────
-
 #[test]
 fn check_column_level_pass() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -371,13 +349,11 @@ fn check_column_level_pass() {
     assert_eq!(qr.rows[0][0], Value::Integer(25));
 }
 
-// ── CHECK: column-level fail ─────────────────────────────────────────
-
 #[test]
 fn check_column_level_fail() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, age INTEGER CHECK(age >= 0))")
         .unwrap();
@@ -388,13 +364,11 @@ fn check_column_level_fail() {
     assert!(matches!(err, SqlError::CheckViolation(..)));
 }
 
-// ── CHECK: table-level pass/fail (multi-column) ──────────────────────
-
 #[test]
 fn check_table_level_pass() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -418,7 +392,7 @@ fn check_table_level_pass() {
 fn check_table_level_fail() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE t (\
@@ -436,13 +410,11 @@ fn check_table_level_fail() {
     assert!(matches!(err, SqlError::CheckViolation(..)));
 }
 
-// ── CHECK: NULL passes (UNKNOWN semantics) ───────────────────────────
-
 #[test]
 fn check_null_passes_unknown() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, x INTEGER CHECK(x > 0))")
@@ -458,13 +430,11 @@ fn check_null_passes_unknown() {
     assert!(qr.rows[0][0].is_null());
 }
 
-// ── CHECK: on UPDATE pass/fail ───────────────────────────────────────
-
 #[test]
 fn check_update_pass() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, age INTEGER CHECK(age >= 0))")
         .unwrap();
@@ -484,7 +454,7 @@ fn check_update_pass() {
 fn check_update_fail() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, age INTEGER CHECK(age >= 0))")
         .unwrap();
@@ -497,13 +467,11 @@ fn check_update_fail() {
     assert!(matches!(err, SqlError::CheckViolation(..)));
 }
 
-// ── CHECK: named constraint ──────────────────────────────────────────
-
 #[test]
 fn check_named_constraint() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE t (\
@@ -528,13 +496,11 @@ fn check_named_constraint() {
     }
 }
 
-// ── CHECK: multiple CHECKs all enforced ──────────────────────────────
-
 #[test]
 fn check_multiple_all_enforced() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE t (\
@@ -562,13 +528,11 @@ fn check_multiple_all_enforced() {
     assert!(matches!(err, SqlError::CheckViolation(..)));
 }
 
-// ── CHECK: with function (LENGTH) ────────────────────────────────────
-
 #[test]
 fn check_with_length_function() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE t (\
@@ -590,13 +554,11 @@ fn check_with_length_function() {
     assert!(matches!(err, SqlError::CheckViolation(..)));
 }
 
-// ── CHECK: with boolean logic ────────────────────────────────────────
-
 #[test]
 fn check_with_boolean_logic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE t (\
@@ -625,15 +587,13 @@ fn check_with_boolean_logic() {
     assert!(matches!(err, SqlError::CheckViolation(..)));
 }
 
-// ── CHECK: persistence after reopen ──────────────────────────────────
-
 #[test]
 fn check_persistence_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
 
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         conn.execute(
             "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER CHECK(val > 0))",
         )
@@ -644,7 +604,7 @@ fn check_persistence_after_reopen() {
 
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         let qr = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
         assert_eq!(qr.rows[0][0], Value::Integer(10));
@@ -656,13 +616,11 @@ fn check_persistence_after_reopen() {
     }
 }
 
-// ── CHECK: transaction rollback after violation ──────────────────────
-
 #[test]
 fn check_transaction_rollback_after_violation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER CHECK(val > 0))")
         .unwrap();
@@ -680,13 +638,11 @@ fn check_transaction_rollback_after_violation() {
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 }
 
-// ── CHECK: subquery rejected at CREATE TABLE time ────────────────────
-
 #[test]
 fn check_subquery_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE other (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -705,13 +661,11 @@ fn check_subquery_rejected() {
     );
 }
 
-// ── CHECK: referencing multiple columns in single expression ─────────
-
 #[test]
 fn check_multi_column_expression() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE t (\
@@ -741,13 +695,11 @@ fn check_multi_column_expression() {
     assert!(matches!(err, SqlError::CheckViolation(..)));
 }
 
-// ── FOREIGN KEY: insert valid reference ──────────────────────────────
-
 #[test]
 fn fk_insert_valid_reference() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -768,13 +720,11 @@ fn fk_insert_valid_reference() {
     );
 }
 
-// ── FOREIGN KEY: insert invalid reference ────────────────────────────
-
 #[test]
 fn fk_insert_invalid_reference() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -793,13 +743,11 @@ fn fk_insert_invalid_reference() {
     assert!(matches!(err, SqlError::ForeignKeyViolation(..)));
 }
 
-// ── FOREIGN KEY: NULL FK value allowed ───────────────────────────────
-
 #[test]
 fn fk_null_value_allowed() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -824,13 +772,11 @@ fn fk_null_value_allowed() {
     assert!(qr.rows[0][0].is_null());
 }
 
-// ── FOREIGN KEY: delete parent with no children ──────────────────────
-
 #[test]
 fn fk_delete_parent_no_children() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -849,13 +795,11 @@ fn fk_delete_parent_no_children() {
     assert_rows_affected(conn.execute("DELETE FROM parent WHERE id = 2").unwrap(), 1);
 }
 
-// ── FOREIGN KEY: delete parent with children ─────────────────────────
-
 #[test]
 fn fk_delete_parent_with_children() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -876,13 +820,11 @@ fn fk_delete_parent_with_children() {
     assert!(matches!(err, SqlError::ForeignKeyViolation(..)));
 }
 
-// ── FOREIGN KEY: update parent PK with no children ───────────────────
-
 #[test]
 fn fk_update_parent_pk_no_children() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -904,13 +846,11 @@ fn fk_update_parent_pk_no_children() {
     );
 }
 
-// ── FOREIGN KEY: update parent PK with children ──────────────────────
-
 #[test]
 fn fk_update_parent_pk_with_children() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -933,13 +873,11 @@ fn fk_update_parent_pk_with_children() {
     assert!(matches!(err, SqlError::ForeignKeyViolation(..)));
 }
 
-// ── FOREIGN KEY: create FK to nonexistent table ──────────────────────
-
 #[test]
 fn fk_nonexistent_parent_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let err = conn
         .execute(
@@ -961,13 +899,11 @@ fn fk_nonexistent_parent_table() {
     );
 }
 
-// ── FOREIGN KEY: FK referencing non-PK/non-UNIQUE column ─────────────
-
 #[test]
 fn fk_reference_non_pk_non_unique() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY, name TEXT)")
         .unwrap();
@@ -992,13 +928,11 @@ fn fk_reference_non_pk_non_unique() {
     );
 }
 
-// ── FOREIGN KEY: drop table referenced by FK ─────────────────────────
-
 #[test]
 fn fk_drop_referenced_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -1021,13 +955,11 @@ fn fk_drop_referenced_table() {
     );
 }
 
-// ── FOREIGN KEY: column-level syntax ─────────────────────────────────
-
 #[test]
 fn fk_column_level_syntax() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -1052,13 +984,11 @@ fn fk_column_level_syntax() {
     assert!(matches!(err, SqlError::ForeignKeyViolation(..)));
 }
 
-// ── FOREIGN KEY: table-level syntax ──────────────────────────────────
-
 #[test]
 fn fk_table_level_syntax() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -1084,15 +1014,13 @@ fn fk_table_level_syntax() {
     assert!(matches!(err, SqlError::ForeignKeyViolation(..)));
 }
 
-// ── FOREIGN KEY: persistence after reopen ────────────────────────────
-
 #[test]
 fn fk_persistence_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
 
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY)")
             .unwrap();
         conn.execute(
@@ -1110,7 +1038,7 @@ fn fk_persistence_after_reopen() {
 
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         let qr = conn
             .query("SELECT parent_id FROM child WHERE id = 1")

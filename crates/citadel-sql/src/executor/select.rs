@@ -1,18 +1,22 @@
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use citadel::Database;
+use rustc_hash::FxHashMap;
 
 use crate::encoding::{
     decode_column_raw, decode_column_with_offset, decode_composite_key, decode_pk_integer,
     row_non_pk_count, RawColumn,
 };
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap};
+use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
 
+use citadel_txn::write_txn::WriteTxn;
+
 use super::aggregate::*;
+use super::compile::CompiledPlan;
 use super::correlated::*;
 use super::cte::*;
 use super::dml::*;
@@ -21,8 +25,6 @@ use super::scan::*;
 use super::view::*;
 use super::window::*;
 use super::CteContext;
-
-// ── Table-valued functions ──────────────────────────────────────────
 
 fn try_tvf(name: &str) -> Option<QueryResult> {
     match name {
@@ -94,8 +96,6 @@ fn build_timezone_abbrevs() -> QueryResult {
     QueryResult { columns, rows }
 }
 
-// ── SELECT execution ────────────────────────────────────────────────
-
 pub(super) fn exec_select(
     db: &Database,
     schema: &SchemaManager,
@@ -153,14 +153,12 @@ pub(super) fn exec_select(
         });
     }
 
-    // ── View resolution ─────────────────────────────────────────────
     if let Some(view_def) = schema.get_view(&lower_name) {
         if let Some(fused) = try_fuse_view(stmt, schema, view_def)? {
             return exec_select(db, schema, &fused, ctes);
         }
         let view_qr = exec_view_read(db, schema, view_def)?;
         if stmt.joins.is_empty() {
-            // Check for correlated subqueries on view result
             let view_schema = build_view_schema(&lower_name, &view_qr);
             let view_ctx = CorrelationCtx {
                 outer_schema: &view_schema,
@@ -267,7 +265,6 @@ pub(super) fn exec_select(
         return process_select(&ext_cols, rows, s, false);
     }
 
-    // Check for correlated scalar in SELECT (no correlated WHERE)
     if has_correlated_select(&stmt.columns, &corr_ctx, schema) {
         let (mut rows, _) = collect_rows_read(db, table_schema, &stmt.where_clause, None)?;
         let mut ext_cols = table_schema.columns.clone();
@@ -978,7 +975,7 @@ impl StreamAggPlan {
         };
 
         if let Some(expr) = where_clause {
-            match eval_expr(expr, col_map, &row) {
+            match eval_expr(expr, &EvalCtx::new(col_map, &row)) {
                 Ok(val) if !is_truthy(&val) => return true,
                 Err(e) => {
                     *scan_err = Some(e);
@@ -1242,7 +1239,7 @@ impl StreamGroupByPlan {
             &mut dyn FnMut(&[u8], &[u8]) -> bool,
         ) -> std::result::Result<(), citadel::Error>,
     ) -> Result<ExecutionResult> {
-        let mut groups: HashMap<i64, Vec<AggState>> = HashMap::new();
+        let mut groups: FxHashMap<i64, Vec<AggState>> = FxHashMap::default();
         let mut null_group: Option<Vec<AggState>> = None;
         let mut scan_err: Option<SqlError> = None;
 
@@ -1824,10 +1821,12 @@ pub(super) fn process_select(
     if !predicate_applied {
         if let Some(ref where_expr) = stmt.where_clause {
             let col_map = ColumnMap::new(columns);
-            rows.retain(|row| match eval_expr(where_expr, &col_map, row) {
-                Ok(val) => is_truthy(&val),
-                Err(_) => false,
-            });
+            rows.retain(
+                |row| match eval_expr(where_expr, &EvalCtx::new(&col_map, row)) {
+                    Ok(val) => is_truthy(&val),
+                    Err(_) => false,
+                },
+            );
         }
     }
 
@@ -1924,4 +1923,207 @@ pub(super) fn process_select(
         columns: col_names,
         rows: projected,
     }))
+}
+
+pub struct CompiledSelect;
+
+impl CompiledSelect {
+    pub fn try_compile(_schema: &SchemaManager, sq: &SelectQuery) -> Option<Self> {
+        if sq.recursive || !sq.ctes.is_empty() {
+            return None;
+        }
+        let sel = match &sq.body {
+            QueryBody::Select(s) => s,
+            QueryBody::Compound(_) => return None,
+        };
+        if !sel.joins.is_empty()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+            || has_any_window_function(sel)
+            || sel.columns.iter().any(|c| match c {
+                SelectColumn::Expr { expr, .. } => {
+                    is_aggregate_expr(expr) || expr_has_subquery(expr)
+                }
+                SelectColumn::AllColumns => false,
+            })
+            || sel.where_clause.as_ref().is_some_and(expr_has_subquery)
+        {
+            return None;
+        }
+        Some(Self)
+    }
+}
+
+impl CompiledPlan for CompiledSelect {
+    fn execute(
+        &self,
+        db: &Database,
+        schema: &SchemaManager,
+        stmt: &Statement,
+        _params: &[Value],
+        wtx: Option<&mut WriteTxn<'_>>,
+    ) -> Result<ExecutionResult> {
+        let sq = match stmt {
+            Statement::Select(s) => s,
+            _ => {
+                return Err(SqlError::Unsupported(
+                    "CompiledSelect received non-SELECT statement".into(),
+                ))
+            }
+        };
+        match wtx {
+            None => exec_select_query(db, schema, sq),
+            Some(outer) => exec_select_query_in_txn(outer, schema, sq),
+        }
+    }
+
+    fn try_stream<'db>(
+        &self,
+        db: &'db Database,
+        schema: &SchemaManager,
+        stmt: &Statement,
+        _params: &[Value],
+    ) -> Option<Box<dyn super::compile::RowSourceIter + 'db>> {
+        let sq = match stmt {
+            Statement::Select(s) => s,
+            _ => return None,
+        };
+        let sel = match &sq.body {
+            QueryBody::Select(s) => s,
+            QueryBody::Compound(_) => return None,
+        };
+        if sel.where_clause.is_some()
+            || !sel.order_by.is_empty()
+            || sel.limit.is_some()
+            || sel.offset.is_some()
+            || !sel.joins.is_empty()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.distinct
+        {
+            return None;
+        }
+        let lower = sel.from.to_ascii_lowercase();
+        let table_schema = schema.get(&lower)?.clone();
+        let projection = build_projection(&sel.columns, &table_schema.columns)?;
+        let columns = projection_column_names(&sel.columns, &table_schema.columns);
+        let rtx = db.begin_read();
+        let iter = rtx.into_table_scan_iter(lower.as_bytes(), b"").ok()?;
+        Some(Box::new(StreamingSelect {
+            iter,
+            table_schema: Arc::new(table_schema),
+            projection,
+            columns,
+        }))
+    }
+}
+
+struct StreamingSelect<'db> {
+    iter: citadel_txn::TableIter<citadel_txn::read_txn::OwnedReadTxnAdapter<'db>>,
+    table_schema: Arc<TableSchema>,
+    projection: Vec<usize>,
+    columns: Vec<String>,
+}
+
+impl<'db> super::compile::RowSourceIter for StreamingSelect<'db> {
+    fn next_row(&mut self) -> Result<Option<Vec<Value>>> {
+        match self.iter.next().map_err(SqlError::Storage)? {
+            Some((key, value)) => {
+                let full = decode_full_row(&self.table_schema, key, value)?;
+                let out: Vec<Value> = self.projection.iter().map(|&i| full[i].clone()).collect();
+                Ok(Some(out))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn columns(&self) -> &[String] {
+        &self.columns
+    }
+}
+
+fn build_projection(select_cols: &[SelectColumn], columns: &[ColumnDef]) -> Option<Vec<usize>> {
+    let mut out = Vec::new();
+    for col in select_cols {
+        match col {
+            SelectColumn::AllColumns => {
+                for (i, _) in columns.iter().enumerate() {
+                    out.push(i);
+                }
+            }
+            SelectColumn::Expr { expr, .. } => match expr {
+                Expr::Column(name) => {
+                    let idx = columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(name))?;
+                    out.push(idx);
+                }
+                Expr::QualifiedColumn { column, .. } => {
+                    let idx = columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(column))?;
+                    out.push(idx);
+                }
+                _ => return None,
+            },
+        }
+    }
+    Some(out)
+}
+
+fn projection_column_names(select_cols: &[SelectColumn], columns: &[ColumnDef]) -> Vec<String> {
+    let mut out = Vec::new();
+    for col in select_cols {
+        match col {
+            SelectColumn::AllColumns => {
+                for c in columns {
+                    out.push(c.name.clone());
+                }
+            }
+            SelectColumn::Expr { alias: Some(a), .. } => out.push(a.clone()),
+            SelectColumn::Expr { expr, alias: None } => out.push(expr_display_name(expr)),
+        }
+    }
+    out
+}
+
+fn expr_has_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => true,
+        Expr::BinaryOp { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. } => expr_has_subquery(expr),
+        Expr::Function { args, .. } | Expr::Coalesce(args) => args.iter().any(expr_has_subquery),
+        Expr::InList { expr, list, .. } => {
+            expr_has_subquery(expr) || list.iter().any(expr_has_subquery)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_subquery(expr) || expr_has_subquery(low) || expr_has_subquery(high),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_has_subquery(expr)
+                || expr_has_subquery(pattern)
+                || escape.as_deref().is_some_and(expr_has_subquery)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(expr_has_subquery)
+                || conditions
+                    .iter()
+                    .any(|(c, r)| expr_has_subquery(c) || expr_has_subquery(r))
+                || else_result.as_deref().is_some_and(expr_has_subquery)
+        }
+        _ => false,
+    }
 }

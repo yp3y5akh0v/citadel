@@ -24,14 +24,14 @@ fn assert_rows_affected(result: ExecutionResult, expected: u64) {
     }
 }
 
-fn query(conn: &mut Connection, sql: &str) -> QueryResult {
+fn query(conn: &Connection, sql: &str) -> QueryResult {
     match conn.execute(sql).unwrap() {
         ExecutionResult::Query(qr) => qr,
         other => panic!("expected Query, got {other:?}"),
     }
 }
 
-fn setup_two_tables(conn: &mut Connection) {
+fn setup_two_tables(conn: &Connection) {
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
             .unwrap(),
@@ -52,19 +52,14 @@ fn setup_two_tables(conn: &mut Connection) {
     );
 }
 
-// ── IN subquery basics ────────────────────────────────────────────
-
 #[test]
 fn in_subquery_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
-    let qr = query(
-        &mut conn,
-        "SELECT id FROM t1 WHERE id IN (SELECT id FROM t2)",
-    );
+    let qr = query(&conn, "SELECT id FROM t1 WHERE id IN (SELECT id FROM t2)");
     let mut ids: Vec<i64> = qr
         .rows
         .iter()
@@ -81,11 +76,11 @@ fn in_subquery_basic() {
 fn not_in_subquery_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id FROM t1 WHERE id NOT IN (SELECT id FROM t2)",
     );
     let mut ids: Vec<i64> = qr
@@ -104,11 +99,11 @@ fn not_in_subquery_basic() {
 fn in_subquery_empty_result() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id FROM t1 WHERE id IN (SELECT id FROM t2 WHERE val > 9999)",
     );
     assert_eq!(qr.rows.len(), 0);
@@ -118,11 +113,11 @@ fn in_subquery_empty_result() {
 fn not_in_subquery_empty_result() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id FROM t1 WHERE id NOT IN (SELECT id FROM t2 WHERE val > 9999)",
     );
     assert_eq!(qr.rows.len(), 5);
@@ -132,11 +127,11 @@ fn not_in_subquery_empty_result() {
 fn in_subquery_with_where_filter() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id FROM t1 WHERE id IN (SELECT id FROM t2 WHERE val >= 400)",
     );
     let mut ids: Vec<i64> = qr
@@ -151,13 +146,11 @@ fn in_subquery_with_where_filter() {
     assert_eq!(ids, vec![4]);
 }
 
-// ── NULL handling (three-valued logic) ────────────────────────────
-
 #[test]
 fn in_subquery_with_null_in_subquery_result() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, cat INTEGER)")
@@ -179,7 +172,7 @@ fn in_subquery_with_null_in_subquery_result() {
     );
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id FROM items WHERE cat IN (SELECT cat_id FROM cats)",
     );
     let mut ids: Vec<i64> = qr
@@ -198,7 +191,7 @@ fn in_subquery_with_null_in_subquery_result() {
 fn not_in_subquery_with_null_returns_zero_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE a (id INTEGER NOT NULL PRIMARY KEY)")
@@ -220,7 +213,7 @@ fn not_in_subquery_with_null_returns_zero_rows() {
     );
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id FROM a WHERE id NOT IN (SELECT val FROM b)",
     );
     assert_eq!(qr.rows.len(), 0);
@@ -230,7 +223,7 @@ fn not_in_subquery_with_null_returns_zero_rows() {
 fn null_lhs_in_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
@@ -251,10 +244,7 @@ fn null_lhs_in_subquery() {
         2,
     );
 
-    let qr = query(
-        &mut conn,
-        "SELECT id FROM t WHERE val IN (SELECT id FROM s)",
-    );
+    let qr = query(&conn, "SELECT id FROM t WHERE val IN (SELECT id FROM s)");
     let ids: Vec<i64> = qr
         .rows
         .iter()
@@ -270,7 +260,7 @@ fn null_lhs_in_subquery() {
 fn not_in_all_null_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
@@ -291,7 +281,7 @@ fn not_in_all_null_subquery() {
     );
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id FROM t WHERE id NOT IN (SELECT val FROM s)",
     );
     assert_eq!(qr.rows.len(), 0);
@@ -301,7 +291,7 @@ fn not_in_all_null_subquery() {
 fn in_empty_subquery_with_null_lhs() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
@@ -317,24 +307,19 @@ fn in_empty_subquery_with_null_lhs() {
         1,
     );
 
-    let qr = query(
-        &mut conn,
-        "SELECT id FROM t WHERE val IN (SELECT id FROM s)",
-    );
+    let qr = query(&conn, "SELECT id FROM t WHERE val IN (SELECT id FROM s)");
     assert_eq!(qr.rows.len(), 0);
 }
-
-// ── Scalar subquery ──────────────────────────────────────────────
 
 #[test]
 fn scalar_subquery_in_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id FROM t1 WHERE val > (SELECT MIN(val) FROM t1 WHERE id <= 2)",
     );
     let mut ids: Vec<i64> = qr
@@ -353,11 +338,11 @@ fn scalar_subquery_in_where() {
 fn scalar_subquery_in_projection() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id, (SELECT COUNT(*) FROM t2) FROM t1 WHERE id = 1",
     );
     assert_eq!(qr.rows.len(), 1);
@@ -369,11 +354,11 @@ fn scalar_subquery_in_projection() {
 fn scalar_subquery_empty_returns_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id FROM t1 WHERE val = (SELECT val FROM t2 WHERE id = 999)",
     );
     assert_eq!(qr.rows.len(), 0);
@@ -383,24 +368,22 @@ fn scalar_subquery_empty_returns_null() {
 fn scalar_subquery_multiple_rows_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let result = conn.execute("SELECT id FROM t1 WHERE val = (SELECT val FROM t2)");
     assert!(matches!(result, Err(SqlError::SubqueryMultipleRows)));
 }
 
-// ── EXISTS / NOT EXISTS ──────────────────────────────────────────
-
 #[test]
 fn exists_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = 2)",
     );
     assert_eq!(qr.rows.len(), 5);
@@ -410,11 +393,11 @@ fn exists_basic() {
 fn not_exists_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.id = 999)",
     );
     assert_eq!(qr.rows.len(), 5);
@@ -424,7 +407,7 @@ fn not_exists_basic() {
 fn exists_empty_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY)")
@@ -440,10 +423,7 @@ fn exists_empty_table() {
         3,
     );
 
-    let qr = query(
-        &mut conn,
-        "SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2)",
-    );
+    let qr = query(&conn, "SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2)");
     assert_eq!(qr.rows.len(), 0);
 }
 
@@ -451,7 +431,7 @@ fn exists_empty_table() {
 fn exists_never_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY)")
@@ -468,23 +448,18 @@ fn exists_never_null() {
         1,
     );
 
-    let qr = query(
-        &mut conn,
-        "SELECT id FROM t1 WHERE EXISTS (SELECT val FROM t2)",
-    );
+    let qr = query(&conn, "SELECT id FROM t1 WHERE EXISTS (SELECT val FROM t2)");
     assert_eq!(qr.rows.len(), 1);
 }
-
-// ── IN list (no subquery) ────────────────────────────────────────
 
 #[test]
 fn in_list_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
-    let qr = query(&mut conn, "SELECT id FROM t1 WHERE id IN (1, 3, 5)");
+    let qr = query(&conn, "SELECT id FROM t1 WHERE id IN (1, 3, 5)");
     let mut ids: Vec<i64> = qr
         .rows
         .iter()
@@ -501,10 +476,10 @@ fn in_list_basic() {
 fn not_in_list_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
-    let qr = query(&mut conn, "SELECT id FROM t1 WHERE id NOT IN (1, 3, 5)");
+    let qr = query(&conn, "SELECT id FROM t1 WHERE id NOT IN (1, 3, 5)");
     let mut ids: Vec<i64> = qr
         .rows
         .iter()
@@ -521,10 +496,10 @@ fn not_in_list_basic() {
 fn in_list_with_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
-    let qr = query(&mut conn, "SELECT id FROM t1 WHERE id IN (1, NULL, 3)");
+    let qr = query(&conn, "SELECT id FROM t1 WHERE id IN (1, NULL, 3)");
     let mut ids: Vec<i64> = qr
         .rows
         .iter()
@@ -537,14 +512,12 @@ fn in_list_with_null() {
     assert_eq!(ids, vec![1, 3]);
 }
 
-// ── Validation ───────────────────────────────────────────────────
-
 #[test]
 fn in_subquery_multiple_columns_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let result = conn.execute("SELECT id FROM t1 WHERE id IN (SELECT id, val FROM t2)");
     assert!(matches!(result, Err(SqlError::SubqueryMultipleColumns)));
@@ -554,24 +527,22 @@ fn in_subquery_multiple_columns_error() {
 fn subquery_table_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let result = conn.execute("SELECT id FROM t1 WHERE id IN (SELECT id FROM nonexistent)");
     assert!(matches!(result, Err(SqlError::TableNotFound(_))));
 }
 
-// ── Integration with other features ──────────────────────────────
-
 #[test]
 fn in_subquery_with_order_by_limit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     let qr = query(
-        &mut conn,
+        &conn,
         "SELECT id FROM t1 WHERE id IN (SELECT id FROM t2) ORDER BY id DESC LIMIT 1",
     );
     assert_eq!(qr.rows.len(), 1);
@@ -582,7 +553,7 @@ fn in_subquery_with_order_by_limit() {
 fn in_subquery_with_group_by_having() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, product INTEGER NOT NULL, qty INTEGER NOT NULL)"
@@ -600,7 +571,7 @@ fn in_subquery_with_group_by_having() {
         2,
     );
 
-    let qr = query(&mut conn,
+    let qr = query(&conn,
         "SELECT product, SUM(qty) FROM orders WHERE product IN (SELECT id FROM vip_products) GROUP BY product HAVING SUM(qty) > 5"
     );
     assert_eq!(qr.rows.len(), 1);
@@ -612,7 +583,7 @@ fn in_subquery_with_group_by_having() {
 fn in_subquery_with_join() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
@@ -640,7 +611,7 @@ fn in_subquery_with_join() {
     );
     assert_rows_affected(conn.execute("INSERT INTO vip (id) VALUES (1)").unwrap(), 1);
 
-    let qr = query(&mut conn,
+    let qr = query(&conn,
         "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id IN (SELECT id FROM vip)"
     );
     assert_eq!(qr.rows.len(), 1);
@@ -651,14 +622,11 @@ fn in_subquery_with_join() {
 fn subquery_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     conn.execute("BEGIN").unwrap();
-    let qr = query(
-        &mut conn,
-        "SELECT id FROM t1 WHERE id IN (SELECT id FROM t2)",
-    );
+    let qr = query(&conn, "SELECT id FROM t1 WHERE id IN (SELECT id FROM t2)");
     let mut ids: Vec<i64> = qr
         .rows
         .iter()
@@ -676,8 +644,8 @@ fn subquery_in_transaction() {
 fn delete_with_in_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     assert_rows_affected(
         conn.execute("DELETE FROM t1 WHERE id IN (SELECT id FROM t2)")
@@ -685,7 +653,7 @@ fn delete_with_in_subquery() {
         2,
     );
 
-    let qr = query(&mut conn, "SELECT id FROM t1 ORDER BY id");
+    let qr = query(&conn, "SELECT id FROM t1 ORDER BY id");
     let ids: Vec<i64> = qr
         .rows
         .iter()
@@ -701,8 +669,8 @@ fn delete_with_in_subquery() {
 fn update_with_scalar_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     assert_rows_affected(
         conn.execute("UPDATE t1 SET val = (SELECT MAX(val) FROM t2) WHERE id = 1")
@@ -710,7 +678,7 @@ fn update_with_scalar_subquery() {
         1,
     );
 
-    let qr = query(&mut conn, "SELECT val FROM t1 WHERE id = 1");
+    let qr = query(&conn, "SELECT val FROM t1 WHERE id = 1");
     assert_eq!(qr.rows[0][0], Value::Integer(600));
 }
 
@@ -718,8 +686,8 @@ fn update_with_scalar_subquery() {
 fn update_where_in_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_two_tables(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_two_tables(&conn);
 
     assert_rows_affected(
         conn.execute("UPDATE t1 SET val = 999 WHERE id IN (SELECT id FROM t2)")
@@ -727,10 +695,7 @@ fn update_where_in_subquery() {
         2,
     );
 
-    let qr = query(
-        &mut conn,
-        "SELECT id, val FROM t1 WHERE val = 999 ORDER BY id",
-    );
+    let qr = query(&conn, "SELECT id, val FROM t1 WHERE val = 999 ORDER BY id");
     assert_eq!(qr.rows.len(), 2);
     assert_eq!(qr.rows[0][0], Value::Integer(2));
     assert_eq!(qr.rows[1][0], Value::Integer(4));
@@ -741,8 +706,8 @@ fn persistence_after_subquery_operations() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     {
-        let mut conn = Connection::open(&db).unwrap();
-        setup_two_tables(&mut conn);
+        let conn = Connection::open(&db).unwrap();
+        setup_two_tables(&conn);
         assert_rows_affected(
             conn.execute("DELETE FROM t1 WHERE id NOT IN (SELECT id FROM t2)")
                 .unwrap(),
@@ -757,8 +722,8 @@ fn persistence_after_subquery_operations() {
         .argon2_profile(Argon2Profile::Iot)
         .open()
         .unwrap();
-    let mut conn = Connection::open(&db).unwrap();
-    let qr = query(&mut conn, "SELECT id FROM t1 ORDER BY id");
+    let conn = Connection::open(&db).unwrap();
+    let qr = query(&conn, "SELECT id FROM t1 ORDER BY id");
     let ids: Vec<i64> = qr
         .rows
         .iter()

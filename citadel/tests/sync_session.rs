@@ -102,10 +102,6 @@ fn sync_bidi(initiator_db: &Database, responder_db: &Database) -> (SyncOutcome, 
     })
 }
 
-// ============================================================
-// Push tests
-// ============================================================
-
 #[test]
 fn push_identical_dbs_already_in_sync() {
     let dir = tempfile::tempdir().unwrap();
@@ -176,7 +172,6 @@ fn push_empty_to_populated() {
     let (init_out, _) = sync_push(&db1, &db2);
     assert!(!init_out.already_in_sync);
 
-    // db2 still has its data
     assert_eq!(collect_all(&db2).len(), 50);
 }
 
@@ -193,10 +188,6 @@ fn push_populated_to_empty() {
 
     assert_eq!(collect_all(&db1), collect_all(&db2));
 }
-
-// ============================================================
-// Pull tests
-// ============================================================
 
 #[test]
 fn pull_sync() {
@@ -225,10 +216,6 @@ fn pull_identical_is_noop() {
     assert!(init_out.already_in_sync);
 }
 
-// ============================================================
-// Bidirectional tests
-// ============================================================
-
 #[test]
 fn bidirectional_disjoint_changes() {
     let dir = tempfile::tempdir().unwrap();
@@ -241,7 +228,6 @@ fn bidirectional_disjoint_changes() {
     let (init_out, _) = sync_bidi(&db1, &db2);
     assert!(!init_out.already_in_sync);
 
-    // After bidirectional sync, both databases should have all entries
     let data1 = collect_all(&db1);
     let data2 = collect_all(&db2);
     assert_eq!(data1.len(), 50);
@@ -263,27 +249,20 @@ fn bidirectional_one_side_empty() {
     assert_eq!(collect_all(&db1), collect_all(&db2));
 }
 
-// ============================================================
-// Incremental sync tests
-// ============================================================
-
 #[test]
 fn incremental_sync_3_rounds() {
     let dir = tempfile::tempdir().unwrap();
     let db1 = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db2 = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
-    // Round 1: push 10 entries
     insert_range(&db1, 0, 10);
     sync_push(&db1, &db2);
     assert_eq!(collect_all(&db1), collect_all(&db2));
 
-    // Round 2: push 10 more
     insert_range(&db1, 10, 20);
     sync_push(&db1, &db2);
     assert_eq!(collect_all(&db1), collect_all(&db2));
 
-    // Round 3: push 10 more
     insert_range(&db1, 20, 30);
     let (init_out, _) = sync_push(&db1, &db2);
     assert!(!init_out.already_in_sync);
@@ -300,14 +279,9 @@ fn sync_after_sync_is_noop() {
     insert_range(&db1, 0, 20);
     sync_push(&db1, &db2);
 
-    // Second sync should detect in-sync
     let (init_out, _) = sync_push(&db1, &db2);
     assert!(init_out.already_in_sync);
 }
-
-// ============================================================
-// Value update tests
-// ============================================================
 
 #[test]
 fn push_value_update() {
@@ -315,11 +289,9 @@ fn push_value_update() {
     let db1 = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db2 = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
-    // Insert same key in both
     insert_range(&db1, 0, 5);
     insert_range(&db2, 0, 5);
 
-    // Update a value on db1
     {
         let mut wtx = db1.begin_write().unwrap();
         wtx.insert(&0u32.to_be_bytes(), b"updated-value").unwrap();
@@ -329,10 +301,6 @@ fn push_value_update() {
     sync_push(&db1, &db2);
     assert_eq!(collect_all(&db1), collect_all(&db2));
 }
-
-// ============================================================
-// Large dataset test
-// ============================================================
 
 #[test]
 fn push_large_dataset_500_entries() {
@@ -349,10 +317,6 @@ fn push_large_dataset_500_entries() {
     assert_eq!(data1, data2);
 }
 
-// ============================================================
-// Persistence test
-// ============================================================
-
 #[test]
 fn sync_persists_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -367,7 +331,6 @@ fn sync_persists_across_reopen() {
         sync_push(&db1, &db2);
     }
 
-    // Reopen both databases
     let db1 = fast_builder(&path1).open().unwrap();
     let db2 = fast_builder(&path2).open().unwrap();
 

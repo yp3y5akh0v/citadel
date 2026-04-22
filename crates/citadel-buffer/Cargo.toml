@@ -21,3 +21,4 @@ citadel-crypto = { workspace = true }
 citadel-io = { workspace = true }
 citadel-page = { workspace = true }
 parking_lot = { workspace = true }
+rustc-hash = { workspace = true }

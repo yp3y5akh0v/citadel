@@ -17,7 +17,7 @@ fn query_result(result: ExecutionResult) -> QueryResult {
     }
 }
 
-fn explain_lines(conn: &mut Connection<'_>, sql: &str) -> Vec<String> {
+fn explain_lines(conn: &Connection<'_>, sql: &str) -> Vec<String> {
     let qr = query_result(conn.execute(sql).unwrap());
     assert_eq!(qr.columns, vec!["plan"]);
     qr.rows
@@ -29,7 +29,7 @@ fn explain_lines(conn: &mut Connection<'_>, sql: &str) -> Vec<String> {
         .collect()
 }
 
-fn setup_full_schema(conn: &mut Connection<'_>) {
+fn setup_full_schema(conn: &Connection<'_>) {
     conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER, email TEXT, dept TEXT)").unwrap();
     conn.execute("CREATE INDEX idx_name ON users (name)")
         .unwrap();
@@ -53,16 +53,14 @@ fn setup_full_schema(conn: &mut Connection<'_>) {
         .unwrap();
 }
 
-// ── Scan plan accuracy ──────────────────────────────────────────────
-
 #[test]
 fn pk_lookup_shows_actual_value() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
-    let lines = explain_lines(&mut conn, "EXPLAIN SELECT * FROM users WHERE id = 42");
+    let lines = explain_lines(&conn, "EXPLAIN SELECT * FROM users WHERE id = 42");
     assert!(lines[0].contains("id = 42"));
 }
 
@@ -70,11 +68,11 @@ fn pk_lookup_shows_actual_value() {
 fn pk_lookup_text_value() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)")
         .unwrap();
 
-    let lines = explain_lines(&mut conn, "EXPLAIN SELECT * FROM kv WHERE k = 'hello'");
+    let lines = explain_lines(&conn, "EXPLAIN SELECT * FROM kv WHERE k = 'hello'");
     assert!(lines[0].contains("SEARCH TABLE kv"));
     assert!(lines[0].contains("USING PRIMARY KEY"));
     assert!(lines[0].contains("k = 'hello'"));
@@ -84,14 +82,11 @@ fn pk_lookup_text_value() {
 fn composite_pk_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE assoc (a INTEGER, b INTEGER, val TEXT, PRIMARY KEY (a, b))")
         .unwrap();
 
-    let lines = explain_lines(
-        &mut conn,
-        "EXPLAIN SELECT * FROM assoc WHERE a = 1 AND b = 2",
-    );
+    let lines = explain_lines(&conn, "EXPLAIN SELECT * FROM assoc WHERE a = 1 AND b = 2");
     assert!(lines[0].contains("SEARCH TABLE assoc"));
     assert!(lines[0].contains("USING PRIMARY KEY"));
     assert!(lines[0].contains("a = 1"));
@@ -102,11 +97,11 @@ fn composite_pk_lookup() {
 fn partial_composite_pk_is_seq_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE assoc (a INTEGER, b INTEGER, val TEXT, PRIMARY KEY (a, b))")
         .unwrap();
 
-    let lines = explain_lines(&mut conn, "EXPLAIN SELECT * FROM assoc WHERE a = 1");
+    let lines = explain_lines(&conn, "EXPLAIN SELECT * FROM assoc WHERE a = 1");
     assert!(lines[0].contains("SCAN TABLE assoc"));
 }
 
@@ -114,11 +109,11 @@ fn partial_composite_pk_is_seq_scan() {
 fn index_equality_plus_range() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
     let lines = explain_lines(
-        &mut conn,
+        &conn,
         "EXPLAIN SELECT * FROM users WHERE name = 'Alice' AND age > 20",
     );
     assert!(lines[0].contains("USING INDEX idx_name_age"));
@@ -130,10 +125,10 @@ fn index_equality_plus_range() {
 fn unindexed_column_forces_seq_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
-    let lines = explain_lines(&mut conn, "EXPLAIN SELECT * FROM users WHERE age = 30");
+    let lines = explain_lines(&conn, "EXPLAIN SELECT * FROM users WHERE age = 30");
     assert!(lines[0].contains("SCAN TABLE users"));
     assert!(lines.contains(&"FILTER".to_string()));
 }
@@ -142,26 +137,24 @@ fn unindexed_column_forces_seq_scan() {
 fn or_forces_seq_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
     let lines = explain_lines(
-        &mut conn,
+        &conn,
         "EXPLAIN SELECT * FROM users WHERE name = 'A' OR name = 'B'",
     );
     assert!(lines[0].contains("SCAN TABLE users"));
 }
 
-// ── Join plans ───────────────────────────────────────────────────────
-
 #[test]
 fn join_shows_all_tables() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
-    let lines = explain_lines(&mut conn,
+    let lines = explain_lines(&conn,
         "EXPLAIN SELECT * FROM users u JOIN orders o ON u.id = o.user_id JOIN order_items oi ON o.id = oi.order_id");
     assert!(lines.iter().any(|l| l.contains("users")));
     assert!(lines.iter().any(|l| l.contains("orders")));
@@ -172,11 +165,11 @@ fn join_shows_all_tables() {
 fn self_join_different_aliases() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
     let lines = explain_lines(
-        &mut conn,
+        &conn,
         "EXPLAIN SELECT * FROM users a JOIN users b ON a.id = b.id",
     );
     assert!(lines.iter().any(|l| l.contains("users AS a")));
@@ -187,26 +180,24 @@ fn self_join_different_aliases() {
 fn join_with_where_and_order() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
-    let lines = explain_lines(&mut conn,
+    let lines = explain_lines(&conn,
         "EXPLAIN SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.amount LIMIT 5");
     assert!(lines.contains(&"SORT".to_string()));
     assert!(lines.contains(&"LIMIT 5".to_string()));
 }
 
-// ── Complex query features ──────────────────────────────────────────
-
 #[test]
 fn distinct_sort_limit_offset_all_present() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
     let lines = explain_lines(
-        &mut conn,
+        &conn,
         "EXPLAIN SELECT DISTINCT name FROM users ORDER BY name LIMIT 5 OFFSET 2",
     );
     let scan_pos = lines.iter().position(|l| l.contains("SCAN TABLE")).unwrap();
@@ -225,11 +216,11 @@ fn distinct_sort_limit_offset_all_present() {
 fn group_by_with_having() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
     let lines = explain_lines(
-        &mut conn,
+        &conn,
         "EXPLAIN SELECT dept, COUNT(*) FROM users GROUP BY dept HAVING COUNT(*) > 3",
     );
     assert!(lines.contains(&"GROUP BY".to_string()));
@@ -239,11 +230,11 @@ fn group_by_with_having() {
 fn group_by_with_order_and_limit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
     let lines = explain_lines(
-        &mut conn,
+        &conn,
         "EXPLAIN SELECT dept, COUNT(*) FROM users GROUP BY dept ORDER BY dept LIMIT 3",
     );
     assert!(lines.contains(&"GROUP BY".to_string()));
@@ -251,17 +242,15 @@ fn group_by_with_order_and_limit() {
     assert!(lines.contains(&"LIMIT 3".to_string()));
 }
 
-// ── Subqueries ───────────────────────────────────────────────────────
-
 #[test]
 fn in_subquery_shows_subquery_line() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
     let lines = explain_lines(
-        &mut conn,
+        &conn,
         "EXPLAIN SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > 100)",
     );
     assert!(lines.contains(&"SUBQUERY".to_string()));
@@ -271,11 +260,11 @@ fn in_subquery_shows_subquery_line() {
 fn exists_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
     let lines = explain_lines(
-        &mut conn,
+        &conn,
         "EXPLAIN SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = 1)",
     );
     assert!(lines.contains(&"SUBQUERY".to_string()));
@@ -285,11 +274,11 @@ fn exists_subquery() {
 fn scalar_subquery_in_select() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
     let lines = explain_lines(
-        &mut conn,
+        &conn,
         "EXPLAIN SELECT name, (SELECT COUNT(*) FROM orders) FROM users",
     );
     assert!(lines.contains(&"SUBQUERY".to_string()));
@@ -299,26 +288,24 @@ fn scalar_subquery_in_select() {
 fn multiple_subqueries() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
-    let lines = explain_lines(&mut conn,
+    let lines = explain_lines(&conn,
         "EXPLAIN SELECT * FROM users WHERE id IN (SELECT user_id FROM orders) AND name IN (SELECT name FROM products)");
     let subquery_count = lines.iter().filter(|l| l.as_str() == "SUBQUERY").count();
     assert_eq!(subquery_count, 2);
 }
 
-// ── DML plans ────────────────────────────────────────────────────────
-
 #[test]
 fn update_with_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
     let lines = explain_lines(
-        &mut conn,
+        &conn,
         "EXPLAIN UPDATE users SET age = 30 WHERE email = 'a@b.com'",
     );
     assert!(lines[0].contains("UPDATE"));
@@ -330,10 +317,10 @@ fn update_with_index() {
 fn delete_full_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
-    let lines = explain_lines(&mut conn, "EXPLAIN DELETE FROM users");
+    let lines = explain_lines(&conn, "EXPLAIN DELETE FROM users");
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("DELETE FROM"));
     assert!(lines[0].contains("SCAN TABLE users"));
@@ -343,22 +330,20 @@ fn delete_full_table() {
 fn delete_pk_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
-    let lines = explain_lines(&mut conn, "EXPLAIN DELETE FROM users WHERE id = 99");
+    let lines = explain_lines(&conn, "EXPLAIN DELETE FROM users WHERE id = 99");
     assert!(lines[0].contains("DELETE FROM"));
     assert!(lines[0].contains("SEARCH TABLE users"));
     assert!(lines[0].contains("USING PRIMARY KEY"));
 }
 
-// ── Error handling ───────────────────────────────────────────────────
-
 #[test]
 fn explain_nonexistent_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let result = conn.execute("EXPLAIN SELECT * FROM nonexistent");
     assert!(result.is_err());
@@ -370,7 +355,7 @@ fn explain_nonexistent_table() {
 fn explain_drop_table_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let result = conn.execute("EXPLAIN DROP TABLE users");
     assert!(result.is_err());
@@ -380,7 +365,7 @@ fn explain_drop_table_error() {
 fn explain_create_index_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let result = conn.execute("EXPLAIN CREATE INDEX idx ON t (a)");
     assert!(result.is_err());
@@ -390,20 +375,18 @@ fn explain_create_index_error() {
 fn explain_begin_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let result = conn.execute("EXPLAIN BEGIN");
     assert!(result.is_err());
 }
 
-// ── Transaction interaction ──────────────────────────────────────────
-
 #[test]
 fn explain_in_txn_does_not_modify() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
     conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')")
         .unwrap();
 
@@ -424,40 +407,36 @@ fn explain_in_txn_does_not_modify() {
 fn explain_sees_uncommitted_schema() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
     conn.execute("CREATE TABLE temp (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
-    let lines = explain_lines(&mut conn, "EXPLAIN SELECT * FROM temp WHERE id = 1");
+    let lines = explain_lines(&conn, "EXPLAIN SELECT * FROM temp WHERE id = 1");
     assert!(lines[0].contains("SEARCH TABLE temp"));
     conn.execute("ROLLBACK").unwrap();
 }
-
-// ── No alias when same as table name ─────────────────────────────────
 
 #[test]
 fn no_alias_shown_when_same_as_name() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
-    let lines = explain_lines(&mut conn, "EXPLAIN SELECT * FROM users users");
+    let lines = explain_lines(&conn, "EXPLAIN SELECT * FROM users users");
     assert!(lines[0].contains("SCAN TABLE users"));
     assert!(!lines[0].contains("AS"));
 }
-
-// ── Plan stability ──────────────────────────────────────────────────
 
 #[test]
 fn plan_same_before_and_after_data() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
-    let before = explain_lines(&mut conn, "EXPLAIN SELECT * FROM users WHERE id = 1");
+    let before = explain_lines(&conn, "EXPLAIN SELECT * FROM users WHERE id = 1");
 
     for i in 1..=100 {
         conn.execute(&format!(
@@ -466,21 +445,19 @@ fn plan_same_before_and_after_data() {
         )).unwrap();
     }
 
-    let after = explain_lines(&mut conn, "EXPLAIN SELECT * FROM users WHERE id = 1");
+    let after = explain_lines(&conn, "EXPLAIN SELECT * FROM users WHERE id = 1");
     assert_eq!(before, after);
 }
-
-// ── BETWEEN / LIKE in WHERE ──────────────────────────────────────────
 
 #[test]
 fn explain_with_between() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
     let lines = explain_lines(
-        &mut conn,
+        &conn,
         "EXPLAIN SELECT * FROM users WHERE age BETWEEN 20 AND 30",
     );
     assert!(lines[0].contains("SCAN TABLE users"));
@@ -491,25 +468,20 @@ fn explain_with_between() {
 fn explain_with_like() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
-    let lines = explain_lines(
-        &mut conn,
-        "EXPLAIN SELECT * FROM users WHERE name LIKE 'A%'",
-    );
+    let lines = explain_lines(&conn, "EXPLAIN SELECT * FROM users WHERE name LIKE 'A%'");
     assert!(lines[0].contains("SCAN TABLE users"));
     assert!(lines.contains(&"FILTER".to_string()));
 }
-
-// ── via query() method ──────────────────────────────────────────────
 
 #[test]
 fn explain_via_query_method() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_full_schema(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_full_schema(&conn);
 
     let qr = conn
         .query("EXPLAIN SELECT * FROM users WHERE id = 1")

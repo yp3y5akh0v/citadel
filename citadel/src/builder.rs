@@ -11,7 +11,7 @@ use citadel_crypto::page_cipher::compute_dek_id;
 use citadel_io::durable;
 use citadel_io::file_lock;
 use citadel_io::file_manager::FileHeader;
-use citadel_io::sync_io::SyncPageIO;
+use citadel_io::mmap_io::MmapPageIO;
 use citadel_io::traits::PageIO;
 use citadel_txn::manager::TxnManager;
 
@@ -136,7 +136,7 @@ impl DatabaseBuilder {
                 return Box::new(uring);
             }
         }
-        Box::new(SyncPageIO::new(file))
+        Box::new(MmapPageIO::try_new(file).expect("mmap init failed"))
     }
 
     /// Resolve KDF parameters: (m_cost, t_cost, p_cost) for Argon2id,
@@ -237,10 +237,8 @@ impl DatabaseBuilder {
             p_cost,
         )?;
 
-        // Write key file to disk with fsync + directory sync
         durable::write_and_sync(&key_path, &kf.serialize())?;
 
-        // Create data file (fail if exists)
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -328,18 +326,15 @@ impl DatabaseBuilder {
 
         let key_path = self.resolve_key_path();
 
-        // Open data file
         let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
 
         file_lock::try_lock_exclusive(&file)?;
 
-        // Read file header to get file_id
         let mut header_buf = [0u8; FILE_HEADER_SIZE];
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut header_buf)?;
         let header = FileHeader::deserialize(&header_buf)?;
 
-        // Read and validate key file
         let key_data = fs::read(&key_path)?;
         if key_data.len() != KEY_FILE_SIZE {
             return Err(Error::Io(std::io::Error::new(
@@ -363,7 +358,6 @@ impl DatabaseBuilder {
             self.sync_mode,
         )?;
 
-        // Verify dek_id against the recovered commit slot
         let slot = manager.current_slot();
         if slot.dek_id != dek_id {
             return Err(Error::BadPassphrase);

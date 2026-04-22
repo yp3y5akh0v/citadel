@@ -18,13 +18,11 @@ fn assert_ok(result: ExecutionResult) {
     }
 }
 
-// ── 1. Large UNION dedup ─────────────────────────────────────────────
-
 #[test]
 fn union_large_dedup() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (v INTEGER PRIMARY KEY)")
@@ -53,13 +51,11 @@ fn union_large_dedup() {
     assert_eq!(qr.rows.len(), 1500);
 }
 
-// ── 2. UNION ALL preserves all ───────────────────────────────────────
-
 #[test]
 fn union_all_preserves_all() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (v INTEGER PRIMARY KEY)")
@@ -87,13 +83,11 @@ fn union_all_preserves_all() {
     assert_eq!(qr.rows.len(), 1000);
 }
 
-// ── 3. INTERSECT ALL multiset ────────────────────────────────────────
-
 #[test]
 fn intersect_all_multiset() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, v INTEGER)")
@@ -130,13 +124,11 @@ fn intersect_all_multiset() {
     assert_eq!(twenties, 2);
 }
 
-// ── 4. EXCEPT ALL multiset ──────────────────────────────────────────
-
 #[test]
 fn except_all_multiset() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, v INTEGER)")
@@ -173,13 +165,11 @@ fn except_all_multiset() {
     assert_eq!(twenties, 2);
 }
 
-// ── 5. Five-way chain with precedence ────────────────────────────────
-
 #[test]
 fn five_way_chain() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     for t in ["t1", "t2", "t3", "t4", "t5"] {
         assert_ok(
@@ -218,13 +208,11 @@ fn five_way_chain() {
     assert_eq!(vals, vec![1, 2, 3, 5, 6, 7]);
 }
 
-// ── 6. UNION with mixed types (INTEGER vs REAL) ─────────────────────
-
 #[test]
 fn union_mixed_types() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, v INTEGER)")
@@ -246,13 +234,11 @@ fn union_mixed_types() {
     assert_eq!(qr.rows.len(), 1);
 }
 
-// ── 7. UNION with BLOB, TEXT, BOOLEAN, NULL ─────────────────────────
-
 #[test]
 fn union_all_types_blob_text() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -282,13 +268,11 @@ fn union_all_types_blob_text() {
     assert_eq!(qr.rows[1][1], Value::Boolean(false));
 }
 
-// ── 8. UNION ORDER BY + OFFSET + LIMIT ──────────────────────────────
-
 #[test]
 fn union_order_by_offset() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (v INTEGER PRIMARY KEY)")
@@ -312,13 +296,11 @@ fn union_order_by_offset() {
     assert_eq!(qr.rows[2][0], Value::Integer(5));
 }
 
-// ── 9. UNION in transaction ─────────────────────────────────────────
-
 #[test]
 fn union_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (v INTEGER PRIMARY KEY)")
@@ -349,13 +331,11 @@ fn union_in_transaction() {
     assert_eq!(qr.rows[0][0], Value::Integer(3));
 }
 
-// ── 10. Self-referential UNION INSERT ────────────────────────────────
-
 #[test]
 fn union_self_referential() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (v INTEGER PRIMARY KEY)")
@@ -377,13 +357,11 @@ fn union_self_referential() {
     assert_eq!(qr.rows[0][0], Value::Integer(9)); // 3 original + 6 new
 }
 
-// ── 11. EXCEPT ALL with no overlap ──────────────────────────────────
-
 #[test]
 fn except_all_no_overlap() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (v INTEGER PRIMARY KEY)")
@@ -404,13 +382,11 @@ fn except_all_no_overlap() {
     assert_eq!(qr.rows.len(), 3);
 }
 
-// ── 12. INTERSECT with zero overlap ─────────────────────────────────
-
 #[test]
 fn intersect_disjoint() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (v INTEGER PRIMARY KEY)")
@@ -431,13 +407,11 @@ fn intersect_disjoint() {
     assert_eq!(qr.rows.len(), 0);
 }
 
-// ── 13. UNION with aggregates ────────────────────────────────────────
-
 #[test]
 fn union_with_aggregates() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, v INTEGER)")
@@ -470,13 +444,11 @@ fn union_with_aggregates() {
     assert!(vals.contains(&2)); // COUNT(*)
 }
 
-// ── 14. UNION with JOIN ─────────────────────────────────────────────
-
 #[test]
 fn union_with_join() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)")
@@ -504,13 +476,11 @@ fn union_with_join() {
     assert_eq!(qr.rows.len(), 3); // 10, 20, 30
 }
 
-// ── 15. EXPLAIN shows compound operations ───────────────────────────
-
 #[test]
 fn explain_compound() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (v INTEGER PRIMARY KEY)")

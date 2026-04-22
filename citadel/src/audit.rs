@@ -24,7 +24,7 @@ impl Default for AuditConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_file_size: 10 * 1024 * 1024, // 10 MB
+            max_file_size: 10 * 1024 * 1024,
             max_rotated_files: 3,
         }
     }

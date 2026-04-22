@@ -33,13 +33,13 @@ fn assert_ok(result: ExecutionResult) {
     }
 }
 
-fn setup_users_table(conn: &mut Connection) {
+fn setup_users_table(conn: &Connection) {
     assert_ok(conn.execute(
         "CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, name TEXT, email TEXT, age INTEGER)"
     ).unwrap());
 }
 
-fn insert_users(conn: &mut Connection) {
+fn insert_users(conn: &Connection) {
     assert_rows_affected(
         conn.execute(
             "INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@test.com', 30)",
@@ -59,17 +59,13 @@ fn insert_users(conn: &mut Connection) {
     ).unwrap(), 1);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  CREATE INDEX - basic
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn create_non_unique_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
-    insert_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
+    insert_users(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -81,9 +77,9 @@ fn create_non_unique_index() {
 fn create_unique_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
-    insert_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
+    insert_users(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -95,8 +91,8 @@ fn create_unique_index() {
 fn create_index_on_empty_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -119,9 +115,9 @@ fn create_index_on_empty_table() {
 fn create_multi_column_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
-    insert_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
+    insert_users(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name_age ON users (name, age)")
@@ -133,9 +129,9 @@ fn create_multi_column_index() {
 fn create_unique_multi_column_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
-    insert_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
+    insert_users(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_name_email ON users (name, email)")
@@ -147,8 +143,8 @@ fn create_unique_multi_column_index() {
 fn create_index_if_not_exists_on_existing() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -164,8 +160,8 @@ fn create_index_if_not_exists_on_existing() {
 fn create_index_if_not_exists_new() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX IF NOT EXISTS idx_name ON users (name)")
@@ -173,15 +169,11 @@ fn create_index_if_not_exists_new() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  CREATE INDEX - error cases
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn create_index_on_nonexistent_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let err = conn
         .execute("CREATE INDEX idx_name ON ghost (name)")
@@ -193,8 +185,8 @@ fn create_index_on_nonexistent_table() {
 fn create_index_on_nonexistent_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     let err = conn
         .execute("CREATE INDEX idx_bad ON users (nonexistent)")
@@ -206,8 +198,8 @@ fn create_index_on_nonexistent_column() {
 fn create_duplicate_index_name() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -223,8 +215,8 @@ fn create_duplicate_index_name() {
 fn create_unique_index_violates_existing_data() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_rows_affected(
         conn.execute(
@@ -251,8 +243,8 @@ fn create_unique_index_violates_existing_data() {
 fn create_unique_index_allows_null_duplicates_in_existing_data() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_rows_affected(
         conn.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', NULL, 30)")
@@ -275,8 +267,8 @@ fn create_unique_index_allows_null_duplicates_in_existing_data() {
 fn create_index_case_insensitive_name() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX IDX_NAME ON users (name)")
@@ -288,16 +280,12 @@ fn create_index_case_insensitive_name() {
     assert!(matches!(err, SqlError::IndexAlreadyExists(_)));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  DROP INDEX
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn drop_index_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -310,8 +298,8 @@ fn drop_index_basic() {
 fn drop_nonexistent_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     let err = conn.execute("DROP INDEX ghost_idx").unwrap_err();
     assert!(matches!(err, SqlError::IndexNotFound(_)));
@@ -321,8 +309,8 @@ fn drop_nonexistent_index() {
 fn drop_index_if_exists_nonexistent() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(conn.execute("DROP INDEX IF EXISTS ghost_idx").unwrap());
 }
@@ -331,8 +319,8 @@ fn drop_index_if_exists_nonexistent() {
 fn drop_index_if_exists_existing() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -345,9 +333,9 @@ fn drop_index_if_exists_existing() {
 fn drop_and_recreate_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
-    insert_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
+    insert_users(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -364,8 +352,8 @@ fn drop_and_recreate_index() {
 fn drop_index_case_insensitive() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -374,17 +362,13 @@ fn drop_index_case_insensitive() {
     assert_ok(conn.execute("DROP INDEX IDX_NAME").unwrap());
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  DROP TABLE cascades index drops
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn drop_table_cascades_indexes() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
-    insert_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
+    insert_users(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -396,7 +380,7 @@ fn drop_table_cascades_indexes() {
     );
     assert_ok(conn.execute("DROP TABLE users").unwrap());
 
-    setup_users_table(&mut conn);
+    setup_users_table(&conn);
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
             .unwrap(),
@@ -411,8 +395,8 @@ fn drop_table_cascades_indexes() {
 fn drop_table_if_exists_with_indexes() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -422,16 +406,12 @@ fn drop_table_if_exists_with_indexes() {
     assert_ok(conn.execute("DROP TABLE IF EXISTS users").unwrap());
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  INSERT - index maintenance
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn insert_populates_non_unique_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -459,8 +439,8 @@ fn insert_populates_non_unique_index() {
 fn insert_populates_unique_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -485,8 +465,8 @@ fn insert_populates_unique_index() {
 fn insert_violates_unique_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -511,8 +491,8 @@ fn insert_violates_unique_index() {
 fn insert_null_in_unique_index_allowed() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -540,8 +520,8 @@ fn insert_null_in_unique_index_allowed() {
 fn insert_multiple_nulls_unique_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -566,8 +546,8 @@ fn insert_multiple_nulls_unique_index() {
 fn insert_with_multiple_indexes_on_same_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -579,7 +559,7 @@ fn insert_with_multiple_indexes_on_same_table() {
     );
     assert_ok(conn.execute("CREATE INDEX idx_age ON users (age)").unwrap());
 
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     let qr = conn.query("SELECT * FROM users").unwrap();
     assert_eq!(qr.rows.len(), 3);
@@ -589,8 +569,8 @@ fn insert_with_multiple_indexes_on_same_table() {
 fn insert_unique_violation_on_multicolumn_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_name_age ON users (name, age)")
@@ -628,8 +608,8 @@ fn insert_unique_violation_on_multicolumn_index() {
 fn insert_multicolumn_unique_allows_partial_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_name_email ON users (name, email)")
@@ -648,22 +628,18 @@ fn insert_multicolumn_unique_allows_partial_null() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  DELETE - index maintenance
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn delete_removes_index_entries() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     assert_rows_affected(conn.execute("DELETE FROM users WHERE id = 1").unwrap(), 1);
 
@@ -680,18 +656,18 @@ fn delete_removes_index_entries() {
 fn delete_all_rows_cleans_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     assert_rows_affected(conn.execute("DELETE FROM users").unwrap(), 3);
 
-    insert_users(&mut conn);
+    insert_users(&conn);
     let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(3));
 }
@@ -700,14 +676,14 @@ fn delete_all_rows_cleans_index() {
 fn delete_with_where_cleans_correct_entries() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     assert_rows_affected(conn.execute("DELETE FROM users WHERE age < 30").unwrap(), 1);
 
@@ -729,8 +705,8 @@ fn delete_with_where_cleans_correct_entries() {
 fn delete_with_multiple_indexes() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -742,7 +718,7 @@ fn delete_with_multiple_indexes() {
     );
     assert_ok(conn.execute("CREATE INDEX idx_age ON users (age)").unwrap());
 
-    insert_users(&mut conn);
+    insert_users(&conn);
     assert_rows_affected(conn.execute("DELETE FROM users WHERE id = 2").unwrap(), 1);
 
     assert_rows_affected(
@@ -758,8 +734,8 @@ fn delete_with_multiple_indexes() {
 fn delete_null_indexed_value() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -778,22 +754,18 @@ fn delete_null_indexed_value() {
     assert_eq!(qr.rows[0][0], Value::Integer(0));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  UPDATE - index maintenance
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn update_non_indexed_column_no_index_change() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     assert_rows_affected(
         conn.execute("UPDATE users SET age = 99 WHERE id = 1")
@@ -813,14 +785,14 @@ fn update_non_indexed_column_no_index_change() {
 fn update_indexed_column_updates_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     assert_rows_affected(
         conn.execute("UPDATE users SET email = 'newalice@test.com' WHERE id = 1")
@@ -848,14 +820,14 @@ fn update_indexed_column_updates_index() {
 fn update_causes_unique_violation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     let err = conn
         .execute("UPDATE users SET email = 'bob@test.com' WHERE id = 1")
@@ -867,14 +839,14 @@ fn update_causes_unique_violation() {
 fn update_pk_column_updates_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     assert_rows_affected(
         conn.execute("UPDATE users SET id = 100 WHERE id = 1")
@@ -900,14 +872,14 @@ fn update_pk_column_updates_index() {
 fn update_sets_indexed_column_to_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     assert_rows_affected(
         conn.execute("UPDATE users SET email = NULL WHERE id = 1")
@@ -928,8 +900,8 @@ fn update_sets_indexed_column_to_null() {
 fn update_from_null_to_value_unique_check() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -965,14 +937,14 @@ fn update_from_null_to_value_unique_check() {
 fn update_multiple_rows_indexed_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     assert_rows_affected(
         conn.execute("UPDATE users SET name = 'Everyone'").unwrap(),
@@ -989,14 +961,14 @@ fn update_multiple_rows_indexed_column() {
 fn update_multiple_rows_unique_violation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     let err = conn
         .execute("UPDATE users SET email = 'same@test.com'")
@@ -1008,8 +980,8 @@ fn update_multiple_rows_unique_violation() {
 fn update_with_multiple_indexes() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -1021,7 +993,7 @@ fn update_with_multiple_indexes() {
     );
     assert_ok(conn.execute("CREATE INDEX idx_age ON users (age)").unwrap());
 
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     assert_rows_affected(
         conn.execute(
@@ -1040,18 +1012,14 @@ fn update_with_multiple_indexes() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Persistence - indexes survive reopen
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn index_persists_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
-        setup_users_table(&mut conn);
-        insert_users(&mut conn);
+        let conn = Connection::open(&db).unwrap();
+        setup_users_table(&conn);
+        insert_users(&conn);
         assert_ok(
             conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
                 .unwrap(),
@@ -1059,7 +1027,7 @@ fn index_persists_across_reopen() {
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         let err = conn
             .execute(
@@ -1083,17 +1051,17 @@ fn index_data_persists_after_insert_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
-        setup_users_table(&mut conn);
+        let conn = Connection::open(&db).unwrap();
+        setup_users_table(&conn);
         assert_ok(
             conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
                 .unwrap(),
         );
-        insert_users(&mut conn);
+        insert_users(&conn);
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
         assert_eq!(qr.rows[0][0], Value::Integer(3));
@@ -1112,8 +1080,8 @@ fn create_index_reopen_then_insert() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
-        setup_users_table(&mut conn);
+        let conn = Connection::open(&db).unwrap();
+        setup_users_table(&conn);
         assert_ok(
             conn.execute("CREATE INDEX idx_name ON users (name)")
                 .unwrap(),
@@ -1125,9 +1093,9 @@ fn create_index_reopen_then_insert() {
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
-        insert_users(&mut conn);
+        insert_users(&conn);
 
         let err = conn
             .execute(
@@ -1143,9 +1111,9 @@ fn create_index_reopen_then_drop_index() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
-        setup_users_table(&mut conn);
-        insert_users(&mut conn);
+        let conn = Connection::open(&db).unwrap();
+        setup_users_table(&conn);
+        insert_users(&conn);
         assert_ok(
             conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
                 .unwrap(),
@@ -1153,7 +1121,7 @@ fn create_index_reopen_then_drop_index() {
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         assert_ok(conn.execute("DROP INDEX idx_email").unwrap());
 
@@ -1172,13 +1140,13 @@ fn multiple_reopens_with_index_operations() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
-        setup_users_table(&mut conn);
-        insert_users(&mut conn);
+        let conn = Connection::open(&db).unwrap();
+        setup_users_table(&conn);
+        insert_users(&conn);
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         assert_ok(
             conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
                 .unwrap(),
@@ -1186,7 +1154,7 @@ fn multiple_reopens_with_index_operations() {
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         assert_rows_affected(
             conn.execute(
                 "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'dave@test.com', 40)",
@@ -1197,7 +1165,7 @@ fn multiple_reopens_with_index_operations() {
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
         assert_eq!(qr.rows[0][0], Value::Integer(4));
 
@@ -1210,17 +1178,13 @@ fn multiple_reopens_with_index_operations() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Transaction interaction (BEGIN/COMMIT/ROLLBACK)
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn create_index_in_transaction_commit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
-    insert_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
+    insert_users(&conn);
 
     conn.execute("BEGIN").unwrap();
     assert_ok(
@@ -1241,9 +1205,9 @@ fn create_index_in_transaction_commit() {
 fn create_index_in_transaction_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
-    insert_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
+    insert_users(&conn);
 
     conn.execute("BEGIN").unwrap();
     assert_ok(
@@ -1262,9 +1226,9 @@ fn create_index_in_transaction_rollback() {
 fn drop_index_in_transaction_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
-    insert_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
+    insert_users(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -1287,8 +1251,8 @@ fn drop_index_in_transaction_rollback() {
 fn insert_with_index_in_transaction_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -1318,14 +1282,14 @@ fn insert_with_index_in_transaction_rollback() {
 fn update_with_index_in_transaction_commit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     conn.execute("BEGIN").unwrap();
     assert_rows_affected(
@@ -1348,14 +1312,14 @@ fn update_with_index_in_transaction_commit() {
 fn delete_with_index_in_transaction_commit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     conn.execute("BEGIN").unwrap();
     assert_rows_affected(conn.execute("DELETE FROM users WHERE id = 1").unwrap(), 1);
@@ -1374,8 +1338,8 @@ fn delete_with_index_in_transaction_commit() {
 fn mixed_ddl_dml_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     conn.execute("BEGIN").unwrap();
     assert_rows_affected(
@@ -1404,8 +1368,8 @@ fn mixed_ddl_dml_in_transaction() {
 fn create_index_then_unique_violation_in_txn() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     conn.execute("BEGIN").unwrap();
     assert_rows_affected(
@@ -1424,17 +1388,13 @@ fn create_index_then_unique_violation_in_txn() {
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  DROP TABLE in transaction cascades indexes
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn drop_table_cascade_in_transaction_commit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
-    insert_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
+    insert_users(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -1449,7 +1409,7 @@ fn drop_table_cascade_in_transaction_commit() {
     assert_ok(conn.execute("DROP TABLE users").unwrap());
     conn.execute("COMMIT").unwrap();
 
-    setup_users_table(&mut conn);
+    setup_users_table(&conn);
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
             .unwrap(),
@@ -1464,9 +1424,9 @@ fn drop_table_cascade_in_transaction_commit() {
 fn drop_table_cascade_in_transaction_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
-    insert_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
+    insert_users(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -1488,22 +1448,18 @@ fn drop_table_cascade_in_transaction_rollback() {
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Index on different column types
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn index_on_integer_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_age ON users (age)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     let err = conn
         .execute("INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'd@t.com', 30)")
@@ -1515,7 +1471,7 @@ fn index_on_integer_column() {
 fn index_on_boolean_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -1555,7 +1511,7 @@ fn index_on_boolean_column() {
 fn index_on_real_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE measurements (id INTEGER NOT NULL PRIMARY KEY, value REAL)")
@@ -1588,8 +1544,8 @@ fn index_on_real_column() {
 fn index_on_text_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_name ON users (name)")
@@ -1612,8 +1568,8 @@ fn index_on_text_column() {
 fn index_on_nullable_text_with_mixed_values() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -1660,8 +1616,8 @@ fn index_on_nullable_text_with_mixed_values() {
 fn index_on_empty_string() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_name ON users (name)")
@@ -1680,16 +1636,12 @@ fn index_on_empty_string() {
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Edge cases
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn multiple_indexes_on_same_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name1 ON users (name)")
@@ -1700,7 +1652,7 @@ fn multiple_indexes_on_same_column() {
             .unwrap(),
     );
 
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     assert_ok(conn.execute("DROP INDEX idx_name1").unwrap());
 
@@ -1714,8 +1666,8 @@ fn multiple_indexes_on_same_column() {
 fn index_across_multiple_tables() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute(
@@ -1733,7 +1685,7 @@ fn index_across_multiple_tables() {
             .unwrap(),
     );
 
-    insert_users(&mut conn);
+    insert_users(&conn);
     assert_rows_affected(
         conn.execute("INSERT INTO orders (id, user_id, total) VALUES (1, 1, 99.99)")
             .unwrap(),
@@ -1752,8 +1704,8 @@ fn index_across_multiple_tables() {
 fn create_drop_create_same_name_cycle() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     for _ in 0..5 {
         assert_ok(
@@ -1773,8 +1725,8 @@ fn create_drop_create_same_name_cycle() {
 fn insert_delete_cycle_with_unique_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -1812,8 +1764,8 @@ fn insert_delete_cycle_with_unique_index() {
 fn update_swap_indexed_values() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -1858,7 +1810,7 @@ fn update_swap_indexed_values() {
 fn index_on_single_column_pk_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE simple (id INTEGER NOT NULL PRIMARY KEY)")
@@ -1885,14 +1837,14 @@ fn index_on_single_column_pk_table() {
 fn unique_index_on_pk_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_pk ON users (id)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     let err = conn
         .execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Dup', 'dup@t.com', 99)")
@@ -1907,8 +1859,8 @@ fn unique_index_on_pk_column() {
 fn index_with_all_null_values() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -1938,16 +1890,12 @@ fn index_with_all_null_values() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Stress tests
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn stress_many_rows_with_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -1974,8 +1922,8 @@ fn stress_many_rows_with_index() {
 fn stress_many_indexes_on_one_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -1995,7 +1943,7 @@ fn stress_many_indexes_on_one_table() {
             .unwrap(),
     );
 
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     assert_rows_affected(
         conn.execute(
@@ -2015,8 +1963,8 @@ fn stress_many_indexes_on_one_table() {
 fn stress_interleaved_crud_with_indexes() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -2066,8 +2014,8 @@ fn stress_interleaved_crud_with_indexes() {
 fn stress_create_populate_drop_cycle() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     for i in 0..50 {
         assert_rows_affected(conn.execute(
@@ -2094,8 +2042,8 @@ fn stress_create_populate_drop_cycle() {
 fn stress_index_with_transactions() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -2123,8 +2071,8 @@ fn stress_index_persistence_cycle() {
 
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
-        setup_users_table(&mut conn);
+        let conn = Connection::open(&db).unwrap();
+        setup_users_table(&conn);
         assert_ok(
             conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
                 .unwrap(),
@@ -2139,7 +2087,7 @@ fn stress_index_persistence_cycle() {
 
     for batch in 1..=5 {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         for i in 0..10 {
             let id = 20 + (batch - 1) * 10 + i;
@@ -2151,21 +2099,17 @@ fn stress_index_persistence_cycle() {
 
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
         assert_eq!(qr.rows[0][0], Value::Integer(70));
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Composite key edge cases
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn composite_unique_index_enforces_full_combination() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -2205,7 +2149,7 @@ fn composite_unique_index_enforces_full_combination() {
 fn composite_non_unique_index_allows_duplicates() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -2233,16 +2177,12 @@ fn composite_non_unique_index_allows_duplicates() {
     assert_eq!(qr.rows[0][0], Value::Integer(10));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Data integrity: full CRUD cycle correctness
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn full_lifecycle_correctness() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
@@ -2253,7 +2193,7 @@ fn full_lifecycle_correctness() {
             .unwrap(),
     );
 
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     let qr = conn.query("SELECT * FROM users ORDER BY id").unwrap();
     assert_eq!(qr.rows.len(), 3);
@@ -2311,18 +2251,18 @@ fn full_lifecycle_with_persistence() {
 
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
-        setup_users_table(&mut conn);
+        let conn = Connection::open(&db).unwrap();
+        setup_users_table(&conn);
         assert_ok(
             conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
                 .unwrap(),
         );
-        insert_users(&mut conn);
+        insert_users(&conn);
     }
 
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         assert_rows_affected(
             conn.execute("UPDATE users SET email = 'newalice@test.com' WHERE id = 1")
@@ -2335,7 +2275,7 @@ fn full_lifecycle_with_persistence() {
 
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         let qr = conn.query("SELECT COUNT(*) FROM users").unwrap();
         assert_eq!(qr.rows[0][0], Value::Integer(2));
@@ -2368,16 +2308,12 @@ fn full_lifecycle_with_persistence() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Multi-column index with NULL combinations
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn composite_unique_null_in_first_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_name_email ON users (name, email)")
@@ -2400,8 +2336,8 @@ fn composite_unique_null_in_first_column() {
 fn composite_unique_null_in_second_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_name_email ON users (name, email)")
@@ -2424,8 +2360,8 @@ fn composite_unique_null_in_second_column() {
 fn composite_unique_both_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_name_email ON users (name, email)")
@@ -2444,16 +2380,12 @@ fn composite_unique_both_null() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  SELECT still works correctly with indexes present
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn select_with_index_returns_correct_data() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(conn.execute("CREATE INDEX idx_age ON users (age)").unwrap());
     assert_ok(
@@ -2461,7 +2393,7 @@ fn select_with_index_returns_correct_data() {
             .unwrap(),
     );
 
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     let qr = conn.query("SELECT * FROM users ORDER BY id").unwrap();
     assert_eq!(qr.rows.len(), 3);
@@ -2475,11 +2407,11 @@ fn select_with_index_returns_correct_data() {
 fn aggregation_with_index_present() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(conn.execute("CREATE INDEX idx_age ON users (age)").unwrap());
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     let qr = conn
         .query("SELECT COUNT(*), SUM(age), AVG(age) FROM users")
@@ -2493,8 +2425,8 @@ fn aggregation_with_index_present() {
 fn distinct_with_index_present() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(conn.execute("CREATE INDEX idx_age ON users (age)").unwrap());
 
@@ -2528,14 +2460,14 @@ fn distinct_with_index_present() {
 fn order_by_with_index_present() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE INDEX idx_name ON users (name)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     let qr = conn.query("SELECT name FROM users ORDER BY name").unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("Alice".into()));
@@ -2543,16 +2475,12 @@ fn order_by_with_index_present() {
     assert_eq!(qr.rows[2][0], Value::Text("Charlie".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Error recovery: state consistency after failures
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn state_consistent_after_unique_violation_on_insert() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -2593,14 +2521,14 @@ fn state_consistent_after_unique_violation_on_insert() {
 fn state_consistent_after_unique_violation_on_update() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     let err = conn
         .execute("UPDATE users SET email = 'bob@test.com' WHERE id = 1")
@@ -2624,8 +2552,8 @@ fn state_consistent_after_unique_violation_on_update() {
 fn state_consistent_after_create_unique_index_failure() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_rows_affected(
         conn.execute(
@@ -2668,8 +2596,8 @@ fn state_consistent_after_create_unique_index_failure() {
 fn multiple_violations_dont_corrupt_state() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -2701,16 +2629,12 @@ fn multiple_violations_dont_corrupt_state() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Complex multi-step scenarios
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn update_pk_and_indexed_column_simultaneously() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -2720,7 +2644,7 @@ fn update_pk_and_indexed_column_simultaneously() {
         conn.execute("CREATE INDEX idx_name ON users (name)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     assert_rows_affected(
         conn.execute(
@@ -2760,8 +2684,8 @@ fn update_pk_and_indexed_column_simultaneously() {
 fn multi_row_insert_with_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -2785,8 +2709,8 @@ fn multi_row_insert_with_index() {
 fn multi_row_insert_duplicate_within_batch() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -2803,14 +2727,14 @@ fn multi_row_insert_duplicate_within_batch() {
 fn delete_no_matching_rows_with_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     assert_rows_affected(conn.execute("DELETE FROM users WHERE id = 999").unwrap(), 0);
 
@@ -2822,14 +2746,14 @@ fn delete_no_matching_rows_with_index() {
 fn update_no_matching_rows_with_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     assert_rows_affected(
         conn.execute("UPDATE users SET email = 'new@t.com' WHERE id = 999")
@@ -2845,14 +2769,14 @@ fn update_no_matching_rows_with_index() {
 fn update_to_same_value_no_change() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
             .unwrap(),
     );
-    insert_users(&mut conn);
+    insert_users(&conn);
 
     assert_rows_affected(
         conn.execute("UPDATE users SET email = 'alice@test.com' WHERE id = 1")
@@ -2868,7 +2792,7 @@ fn update_to_same_value_no_change() {
 fn complex_transaction_with_mixed_operations() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
 
@@ -2941,8 +2865,8 @@ fn complex_transaction_with_mixed_operations() {
 fn complex_transaction_rollback_undoes_everything() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -3001,7 +2925,7 @@ fn complex_transaction_rollback_undoes_everything() {
 fn multiple_tables_independent_index_operations() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, email TEXT)")
@@ -3076,8 +3000,8 @@ fn multiple_tables_independent_index_operations() {
 fn index_correctness_after_bulk_update() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -3124,8 +3048,8 @@ fn index_correctness_after_bulk_update() {
 fn index_correctness_after_selective_delete() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -3172,8 +3096,8 @@ fn index_correctness_after_selective_delete() {
 fn transition_null_to_non_null_and_back() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -3224,8 +3148,8 @@ fn transition_null_to_non_null_and_back() {
 fn index_with_negative_and_zero_integers() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_age ON users (age)")
@@ -3268,7 +3192,7 @@ fn index_with_negative_and_zero_integers() {
 fn index_with_float_edge_values() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE data (id INTEGER NOT NULL PRIMARY KEY, val REAL)")
@@ -3311,7 +3235,7 @@ fn index_with_float_edge_values() {
 fn index_with_very_long_text() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE data (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
@@ -3349,16 +3273,12 @@ fn index_with_very_long_text() {
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Hardcore stress: large scale correctness verification
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn stress_500_rows_full_crud_cycle_with_indexes() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -3437,8 +3357,8 @@ fn stress_500_rows_full_crud_cycle_with_indexes() {
 fn stress_transaction_batches_with_index_verification() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -3497,7 +3417,7 @@ fn stress_multiple_tables_multiple_indexes_persistence() {
 
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         assert_ok(
             conn.execute(
@@ -3558,7 +3478,7 @@ fn stress_multiple_tables_multiple_indexes_persistence() {
 
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         assert_eq!(
             conn.query("SELECT COUNT(*) FROM users").unwrap().rows[0][0],
@@ -3589,7 +3509,7 @@ fn stress_multiple_tables_multiple_indexes_persistence() {
 
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         assert_eq!(
             conn.query("SELECT COUNT(*) FROM users").unwrap().rows[0][0],
@@ -3621,8 +3541,8 @@ fn stress_multiple_tables_multiple_indexes_persistence() {
 fn index_population_from_existing_large_dataset() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     for i in 0..300 {
         assert_rows_affected(
@@ -3658,8 +3578,8 @@ fn index_population_from_existing_large_dataset() {
 fn update_all_rows_shifts_indexes() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_table(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_table(&conn);
 
     assert_ok(
         conn.execute("CREATE UNIQUE INDEX idx_email ON users (email)")
@@ -3706,15 +3626,11 @@ fn update_all_rows_shifts_indexes() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Composite PK table with indexes
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn index_on_composite_pk_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE enrollments (student_id INTEGER NOT NULL, course_id INTEGER NOT NULL, grade TEXT, PRIMARY KEY (student_id, course_id))"
@@ -3762,7 +3678,7 @@ fn index_on_composite_pk_table() {
 fn unique_index_on_composite_pk_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE enrollments (student_id INTEGER NOT NULL, course_id INTEGER NOT NULL, grade TEXT, PRIMARY KEY (student_id, course_id))"
@@ -3804,7 +3720,7 @@ fn unique_index_on_composite_pk_table() {
 fn update_composite_pk_with_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE enrollments (student_id INTEGER NOT NULL, course_id INTEGER NOT NULL, grade TEXT, PRIMARY KEY (student_id, course_id))"

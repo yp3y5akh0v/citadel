@@ -17,7 +17,7 @@ fn query_result(result: ExecutionResult) -> QueryResult {
     }
 }
 
-fn setup_and_populate(conn: &mut Connection<'_>) {
+fn setup_and_populate(conn: &Connection<'_>) {
     conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, price REAL, active BOOLEAN)").unwrap();
     let sql = "INSERT INTO items (id, name, price, active) VALUES ($1, $2, $3, $4)";
     for i in 1..=100 {
@@ -34,14 +34,12 @@ fn setup_and_populate(conn: &mut Connection<'_>) {
     }
 }
 
-// ── Scale ───────────────────────────────────────────────────────────
-
 #[test]
 fn repeated_parameterized_select_1000() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_and_populate(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_and_populate(&conn);
 
     let sql = "SELECT name FROM items WHERE id = $1";
     for i in 1..=100 {
@@ -55,7 +53,7 @@ fn repeated_parameterized_select_1000() {
 fn repeated_parameterized_insert() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
 
@@ -72,14 +70,12 @@ fn repeated_parameterized_insert() {
     assert_eq!(qr.rows[0][0], Value::Integer(200));
 }
 
-// ── Type variation ──────────────────────────────────────────────────
-
 #[test]
 fn same_param_slot_different_types() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_and_populate(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_and_populate(&conn);
 
     let qr = query_result(
         conn.execute_params("SELECT id FROM items WHERE id = $1", &[Value::Integer(5)])
@@ -97,13 +93,11 @@ fn same_param_slot_different_types() {
     assert_eq!(qr.rows.len(), 1);
 }
 
-// ── Interleaved DML ─────────────────────────────────────────────────
-
 #[test]
 fn interleave_insert_select_with_cache() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
         .unwrap();
 
@@ -128,7 +122,7 @@ fn interleave_insert_select_with_cache() {
 fn all_dml_with_params() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
 
@@ -155,13 +149,11 @@ fn all_dml_with_params() {
     assert_eq!(qr.rows[0][0], Value::Integer(0));
 }
 
-// ── Large param count ───────────────────────────────────────────────
-
 #[test]
 fn twenty_params_in_insert() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE wide (id INTEGER PRIMARY KEY, c1 TEXT, c2 TEXT, c3 TEXT, c4 TEXT, c5 TEXT, c6 TEXT, c7 TEXT, c8 TEXT, c9 TEXT, c10 TEXT)").unwrap();
 
     let sql = "INSERT INTO wide (id, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)";
@@ -176,13 +168,11 @@ fn twenty_params_in_insert() {
     assert_eq!(qr.rows[0][5], Value::Text("val5".into()));
 }
 
-// ── Cache capacity ──────────────────────────────────────────────────
-
 #[test]
 fn cache_eviction_under_pressure() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
         .unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, 100)")
@@ -197,13 +187,11 @@ fn cache_eviction_under_pressure() {
     assert_eq!(qr.rows[0][0], Value::Integer(100));
 }
 
-// ── Transaction + params ────────────────────────────────────────────
-
 #[test]
 fn params_in_transaction_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, 'original')")
@@ -225,7 +213,7 @@ fn params_in_transaction_rollback() {
 fn params_in_multi_statement_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
 
@@ -243,13 +231,11 @@ fn params_in_multi_statement_transaction() {
     assert_eq!(qr.rows[0][0], Value::Integer(5));
 }
 
-// ── Subquery with params ────────────────────────────────────────────
-
 #[test]
 fn param_with_in_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
         .unwrap();
     conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL)")
@@ -272,14 +258,12 @@ fn param_with_in_subquery() {
     assert_eq!(qr.rows[0][0], Value::Text("Alice".into()));
 }
 
-// ── CASE/COALESCE with params ───────────────────────────────────────
-
 #[test]
 fn param_in_case_expression() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_and_populate(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_and_populate(&conn);
 
     let qr = query_result(
         conn.execute_params(
@@ -295,7 +279,7 @@ fn param_in_case_expression() {
 fn param_in_coalesce() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, NULL)")
@@ -311,13 +295,11 @@ fn param_in_coalesce() {
     assert_eq!(qr.rows[0][0], Value::Text("default".into()));
 }
 
-// ── CAST with params ────────────────────────────────────────────────
-
 #[test]
 fn param_in_cast() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL)")
         .unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, 3.14)")
@@ -333,14 +315,12 @@ fn param_in_cast() {
     assert_eq!(qr.rows[0][0], Value::Real(42.0));
 }
 
-// ── Group by / having with params ───────────────────────────────────
-
 #[test]
 fn param_in_having() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_and_populate(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_and_populate(&conn);
 
     let qr = query_result(
         conn.execute_params(
@@ -352,14 +332,12 @@ fn param_in_having() {
     assert!(!qr.rows.is_empty());
 }
 
-// ── Persistence ─────────────────────────────────────────────────────
-
 #[test]
 fn params_persist_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     {
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
         conn.execute_params(
@@ -369,7 +347,7 @@ fn params_persist_across_reopen() {
         .unwrap();
     }
     {
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let qr = query_result(
             conn.execute_params("SELECT name FROM t WHERE id = $1", &[Value::Integer(1)])
                 .unwrap(),
@@ -378,14 +356,12 @@ fn params_persist_across_reopen() {
     }
 }
 
-// ── Mixed params and literals ───────────────────────────────────────
-
 #[test]
 fn mixed_params_and_literals() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_and_populate(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_and_populate(&conn);
 
     let qr = query_result(
         conn.execute_params(
@@ -397,13 +373,11 @@ fn mixed_params_and_literals() {
     assert!(!qr.rows.is_empty());
 }
 
-// ── Duplicate key with params ───────────────────────────────────────
-
 #[test]
 fn duplicate_key_with_params() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .unwrap();
     conn.execute_params("INSERT INTO t (id) VALUES ($1)", &[Value::Integer(1)])
@@ -412,13 +386,11 @@ fn duplicate_key_with_params() {
     assert!(result.is_err());
 }
 
-// ── SELECT $1 (no table) ────────────────────────────────────────────
-
 #[test]
 fn select_param_no_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = query_result(
         conn.execute_params("SELECT $1 + $2", &[Value::Integer(3), Value::Integer(4)])
@@ -427,14 +399,12 @@ fn select_param_no_table() {
     assert_eq!(qr.rows[0][0], Value::Integer(7));
 }
 
-// ── Boolean params ──────────────────────────────────────────────────
-
 #[test]
 fn boolean_param() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_and_populate(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_and_populate(&conn);
 
     let qr = query_result(
         conn.execute_params(
@@ -446,13 +416,11 @@ fn boolean_param() {
     assert!(matches!(qr.rows[0][0], Value::Integer(n) if n > 0));
 }
 
-// ── NOT NULL violation with params ──────────────────────────────────
-
 #[test]
 fn not_null_violation_with_params() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
         .unwrap();
 
@@ -463,13 +431,11 @@ fn not_null_violation_with_params() {
     assert!(result.is_err());
 }
 
-// ── Schema generation / cache invalidation ─────────────────────────
-
 #[test]
 fn cache_invalidated_by_create_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
     conn.execute("INSERT INTO t1 (id, val) VALUES (1, 'hello')")
@@ -490,7 +456,7 @@ fn cache_invalidated_by_create_table() {
 fn cache_invalidated_by_drop_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
         .unwrap();
     conn.execute("CREATE INDEX idx_name ON t (name)").unwrap();
@@ -517,7 +483,7 @@ fn cache_invalidated_by_drop_index() {
 fn multiple_ddl_operations_all_invalidate_cache() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, score INTEGER)")
         .unwrap();
     conn.execute("INSERT INTO t (id, val, score) VALUES (1, 'x', 42)")
@@ -548,7 +514,7 @@ fn multiple_ddl_operations_all_invalidate_cache() {
 fn cache_survives_drop_of_unrelated_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
     conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY)")
@@ -565,13 +531,11 @@ fn cache_survives_drop_of_unrelated_table() {
     assert_eq!(qr.rows[0][0], Value::Text("kept".into()));
 }
 
-// ── Rollback + cache ───────────────────────────────────────────────
-
 #[test]
 fn rollback_ddl_invalidates_cache() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, 'original')")
@@ -590,13 +554,11 @@ fn rollback_ddl_invalidates_cache() {
     assert_eq!(qr.rows[0][0], Value::Text("original".into()));
 }
 
-// ── Parameter reuse and gaps ───────────────────────────────────────
-
 #[test]
 fn same_param_used_twice() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, lo INTEGER, hi INTEGER)")
         .unwrap();
     conn.execute("INSERT INTO t (id, lo, hi) VALUES (1, 5, 15)")
@@ -619,7 +581,7 @@ fn same_param_used_twice() {
 fn param_gap_in_indices() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)")
         .unwrap();
     conn.execute("INSERT INTO t (id, a, b) VALUES (1, 10, 20)")
@@ -636,13 +598,11 @@ fn param_gap_in_indices() {
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 }
 
-// ── Param in EXISTS / NOT EXISTS / NOT IN / scalar subquery ────────
-
 #[test]
 fn param_in_exists_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
         .unwrap();
     conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL)")
@@ -668,7 +628,7 @@ fn param_in_exists_subquery() {
 fn param_in_not_exists_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
         .unwrap();
     conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER)")
@@ -694,7 +654,7 @@ fn param_in_not_exists_subquery() {
 fn param_in_not_in_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER)")
         .unwrap();
     conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, ref_val INTEGER)")
@@ -725,7 +685,7 @@ fn param_in_not_in_subquery() {
 fn param_in_scalar_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
         .unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, 100)")
@@ -745,13 +705,11 @@ fn param_in_scalar_subquery() {
     assert_eq!(qr.rows.len(), 2);
 }
 
-// ── Param in IN list (no subquery) ─────────────────────────────────
-
 #[test]
 fn param_in_in_list_values() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
         .unwrap();
     conn.execute("INSERT INTO t (id, name) VALUES (1, 'a')")
@@ -773,13 +731,11 @@ fn param_in_in_list_values() {
     assert_eq!(qr.rows[1][0], Value::Text("c".into()));
 }
 
-// ── Param in IS NULL / IS NOT NULL / unary ─────────────────────────
-
 #[test]
 fn param_in_arithmetic_negation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
         .unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, 42)")
@@ -796,8 +752,8 @@ fn param_in_arithmetic_negation() {
 fn param_in_not_expression() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_and_populate(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_and_populate(&conn);
 
     let qr = query_result(
         conn.execute_params(
@@ -813,14 +769,12 @@ fn param_in_not_expression() {
     assert!(count > 0);
 }
 
-// ── Param with DISTINCT ────────────────────────────────────────────
-
 #[test]
 fn param_in_distinct_query() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_and_populate(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_and_populate(&conn);
 
     let qr = query_result(
         conn.execute_params(
@@ -832,13 +786,11 @@ fn param_in_distinct_query() {
     assert_eq!(qr.rows.len(), 2);
 }
 
-// ── Param in join ON + WHERE combined ──────────────────────────────
-
 #[test]
 fn param_in_join_on_and_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
         .unwrap();
     conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL)")
@@ -863,13 +815,11 @@ fn param_in_join_on_and_where() {
     assert_eq!(qr.rows[0][1], Value::Real(150.0));
 }
 
-// ── Edge case values ───────────────────────────────────────────────
-
 #[test]
 fn empty_string_param() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
     conn.execute_params(
@@ -889,7 +839,7 @@ fn empty_string_param() {
 fn large_integer_param() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, big INTEGER)")
         .unwrap();
 
@@ -911,7 +861,7 @@ fn large_integer_param() {
 fn negative_real_param() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = query_result(
         conn.execute_params("SELECT $1 + $2", &[Value::Real(-3.15), Value::Real(3.15)])
@@ -920,14 +870,12 @@ fn negative_real_param() {
     assert_eq!(qr.rows[0][0], Value::Real(0.0));
 }
 
-// ── Multiple connections (independent caches) ──────────────────────
-
 #[test]
 fn independent_caches_per_connection() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
 
-    let mut conn1 = Connection::open(&db).unwrap();
+    let conn1 = Connection::open(&db).unwrap();
     conn1
         .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
@@ -939,18 +887,16 @@ fn independent_caches_per_connection() {
     let qr = query_result(conn1.execute_params(sql, &[Value::Integer(1)]).unwrap());
     assert_eq!(qr.rows[0][0], Value::Text("hello".into()));
 
-    let mut conn2 = Connection::open(&db).unwrap();
+    let conn2 = Connection::open(&db).unwrap();
     let qr = query_result(conn2.execute_params(sql, &[Value::Integer(1)]).unwrap());
     assert_eq!(qr.rows[0][0], Value::Text("hello".into()));
 }
-
-// ── DDL inside transaction + cache ─────────────────────────────────
 
 #[test]
 fn ddl_in_transaction_invalidates_cache() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, 'x')")
@@ -968,13 +914,11 @@ fn ddl_in_transaction_invalidates_cache() {
     assert_eq!(qr.rows[0][0], Value::Text("x".into()));
 }
 
-// ── Cache hit then evict then re-execute ───────────────────────────
-
 #[test]
 fn evicted_query_re_parsed_correctly() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
         .unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, 42)")
@@ -999,14 +943,12 @@ fn evicted_query_re_parsed_correctly() {
     assert_eq!(qr.rows[0][0], Value::Integer(42));
 }
 
-// ── Param in BETWEEN (negated) ─────────────────────────────────────
-
 #[test]
 fn param_in_not_between() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_and_populate(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_and_populate(&conn);
 
     let qr = query_result(
         conn.execute_params(
@@ -1022,13 +964,11 @@ fn param_in_not_between() {
     assert_eq!(count, 19);
 }
 
-// ── Param in NOT LIKE ──────────────────────────────────────────────
-
 #[test]
 fn param_in_not_like() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
         .unwrap();
     conn.execute("INSERT INTO t (id, name) VALUES (1, 'Alice')")
@@ -1050,14 +990,12 @@ fn param_in_not_like() {
     assert_eq!(qr.rows[1][0], Value::Text("Carol".into()));
 }
 
-// ── Param in LIMIT and OFFSET ──────────────────────────────────────
-
 #[test]
 fn param_in_limit_and_offset() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_and_populate(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_and_populate(&conn);
 
     let qr = query_result(
         conn.execute_params(
@@ -1072,13 +1010,11 @@ fn param_in_limit_and_offset() {
     assert_eq!(qr.rows[2][0], Value::Integer(8));
 }
 
-// ── Param in EXPLAIN ───────────────────────────────────────────────
-
 #[test]
 fn explain_with_multiple_params() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
         .unwrap();
 
@@ -1100,13 +1036,11 @@ fn explain_with_multiple_params() {
     assert!(plan[0].contains("SEARCH TABLE t"));
 }
 
-// ── Rapid alternation between cached queries ───────────────────────
-
 #[test]
 fn rapid_cache_alternation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)")
         .unwrap();
     conn.execute("INSERT INTO t (id, a, b) VALUES (1, 10, 'hello')")
@@ -1124,13 +1058,11 @@ fn rapid_cache_alternation() {
     }
 }
 
-// ── Param in nested binary operations ──────────────────────────────
-
 #[test]
 fn deeply_nested_param_expressions() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = query_result(
         conn.execute_params(
@@ -1147,13 +1079,11 @@ fn deeply_nested_param_expressions() {
     assert_eq!(qr.rows[0][0], Value::Integer(30));
 }
 
-// ── Param in UPDATE SET + WHERE combined ───────────────────────────
-
 #[test]
 fn param_in_update_set_and_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, score INTEGER, label TEXT)")
         .unwrap();
     conn.execute("INSERT INTO t (id, score, label) VALUES (1, 10, 'old')")
@@ -1186,14 +1116,12 @@ fn param_in_update_set_and_where() {
     assert_eq!(qr.rows[0][1], Value::Text("old".into()));
 }
 
-// ── Param in DELETE with complex WHERE ──────────────────────────────
-
 #[test]
 fn param_in_delete_complex_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_and_populate(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_and_populate(&conn);
 
     conn.execute_params(
         "DELETE FROM items WHERE price > $1 AND active = $2 AND id < $3",
@@ -1209,13 +1137,11 @@ fn param_in_delete_complex_where() {
     assert!(remaining < 100);
 }
 
-// ── Null param in various positions ────────────────────────────────
-
 #[test]
 fn null_param_in_coalesce_chain() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .unwrap();
     conn.execute("INSERT INTO t (id) VALUES (1)").unwrap();
@@ -1234,7 +1160,7 @@ fn null_param_in_coalesce_chain() {
 fn null_param_in_is_null_check() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
     conn.execute("INSERT INTO t (id, val) VALUES (1, NULL)")
@@ -1253,14 +1179,12 @@ fn null_param_in_is_null_check() {
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 }
 
-// ── Param in aggregate function argument ───────────────────────────
-
 #[test]
 fn param_in_case_inside_aggregate() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_and_populate(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_and_populate(&conn);
 
     let qr = query_result(
         conn.execute_params(

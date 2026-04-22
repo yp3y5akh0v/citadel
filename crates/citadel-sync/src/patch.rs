@@ -51,7 +51,6 @@ impl SyncPatch {
             .iter()
             .map(|e| {
                 if crdt_aware && e.value.len() >= CRDT_HEADER_SIZE {
-                    // Try to decode CRDT header from the value
                     if let Ok(decoded) = crate::crdt::decode_lww_value(&e.value) {
                         return PatchEntry {
                             key: e.key.clone(),
@@ -107,7 +106,6 @@ impl SyncPatch {
     pub fn serialize(&self) -> Vec<u8> {
         let flags = if self.crdt_aware { FLAG_HAS_CRDT } else { 0 };
 
-        // Estimate capacity
         let header_size = 4 + 1 + 1 + 8 + 4; // 18
         let per_entry_overhead = 2 + 4 + 1 + if self.crdt_aware { CRDT_META_SIZE } else { 0 };
         let data_size: usize = self
@@ -118,14 +116,12 @@ impl SyncPatch {
 
         let mut buf = Vec::with_capacity(header_size + data_size);
 
-        // Header
         buf.extend_from_slice(&PATCH_MAGIC.to_le_bytes());
         buf.push(PATCH_VERSION);
         buf.push(flags);
         buf.extend_from_slice(&self.source_node.to_bytes());
         buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
 
-        // Entries
         for entry in &self.entries {
             buf.extend_from_slice(&(entry.key.len() as u16).to_le_bytes());
             buf.extend_from_slice(&(entry.value.len() as u32).to_le_bytes());

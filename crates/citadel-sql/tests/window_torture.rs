@@ -17,7 +17,7 @@ fn assert_ok(result: ExecutionResult) {
     }
 }
 
-fn setup_employees(conn: &mut Connection) {
+fn setup_employees(conn: &Connection) {
     assert_ok(
         conn.execute(
             "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT NOT NULL, \
@@ -34,14 +34,12 @@ fn setup_employees(conn: &mut Connection) {
     .unwrap();
 }
 
-// ── 1. RANK without ORDER BY → error ────────────────────────────────
-
 #[test]
 fn error_rank_no_order_by() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let err = conn
         .query("SELECT RANK() OVER () FROM employees")
@@ -50,14 +48,12 @@ fn error_rank_no_order_by() {
     assert!(msg.contains("requires ORDER BY"), "unexpected error: {msg}");
 }
 
-// ── 2. NTILE(0) → error ────────────────────────────────────────────
-
 #[test]
 fn error_ntile_zero() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let err = conn
         .query("SELECT NTILE(0) OVER (ORDER BY id) FROM employees")
@@ -69,13 +65,11 @@ fn error_ntile_zero() {
     );
 }
 
-// ── 3. Window over empty table ──────────────────────────────────────
-
 #[test]
 fn window_empty_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_ok(
         conn.execute("CREATE TABLE empty (id INTEGER PRIMARY KEY, val INTEGER)")
             .unwrap(),
@@ -87,13 +81,11 @@ fn window_empty_table() {
     assert_eq!(qr.rows.len(), 0);
 }
 
-// ── 4. Window over single row ───��──────────────────────────────────��
-
 #[test]
 fn window_single_row() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_ok(
         conn.execute("CREATE TABLE one (id INTEGER PRIMARY KEY, val INTEGER)")
             .unwrap(),
@@ -114,14 +106,12 @@ fn window_single_row() {
     assert_eq!(qr.rows[0][2], Value::Integer(-1)); // lag default
 }
 
-// ── 5. All same partition (single partition) ────────────────────────
-
 #[test]
 fn window_all_same_partition() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     // All 5 rows in one partition — ROW_NUMBER should be 1..5
     let qr = conn
@@ -133,14 +123,12 @@ fn window_all_same_partition() {
     }
 }
 
-// ── 6. Each row its own partition ───────────────────────────────────
-
 #[test]
 fn window_each_own_partition() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     // PARTITION BY id → each row is its own partition
     let qr = conn
@@ -155,14 +143,12 @@ fn window_each_own_partition() {
     }
 }
 
-// ── 7. LAG beyond partition boundary ────────────────────────────────
-
 #[test]
 fn lag_beyond_partition() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     // LAG(salary, 10) — offset larger than any partition
     let qr = conn
@@ -176,14 +162,12 @@ fn lag_beyond_partition() {
     }
 }
 
-// ── 8. LEAD beyond partition boundary ───────────────────────────────
-
 #[test]
 fn lead_beyond_partition() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -196,13 +180,11 @@ fn lead_beyond_partition() {
     }
 }
 
-// ── 9. NULL partition keys ────────────────────────────��─────────────
-
 #[test]
 fn window_nulls_in_partition() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_ok(
         conn.execute("CREATE TABLE np (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)")
             .unwrap(),
@@ -223,13 +205,11 @@ fn window_nulls_in_partition() {
     assert_eq!(qr.rows[3][1], Value::Integer(2)); // id=4 second in 'a' partition
 }
 
-// ── 10. NULL values in aggregated column ────────────��───────────────
-
 #[test]
 fn window_nulls_in_values() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_ok(
         conn.execute("CREATE TABLE nv (id INTEGER PRIMARY KEY, val INTEGER)")
             .unwrap(),
@@ -258,18 +238,15 @@ fn window_nulls_in_values() {
     assert_eq!(qr.rows[4][2], Value::Integer(3));
 }
 
-// ── 11. Sliding MIN/MAX over large dataset ──────────────────────────
-
 #[test]
 fn sliding_min_max_large() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_ok(
         conn.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, val INTEGER)")
             .unwrap(),
     );
-    // Insert 1000 rows
     for batch in 0..10 {
         let mut sql = String::from("INSERT INTO big VALUES ");
         for i in 0..100 {
@@ -294,12 +271,9 @@ fn sliding_min_max_large() {
         .unwrap();
     assert_eq!(qr.rows.len(), 1000);
 
-    // Verify first few and last few results manually
-    // Row 1 (id=1): window = [row 1], val=(1*7+13)%997=20
-    assert_eq!(qr.rows[0][2], qr.rows[0][1]); // min=val for first row
-    assert_eq!(qr.rows[0][3], qr.rows[0][1]); // max=val for first row
+    assert_eq!(qr.rows[0][2], qr.rows[0][1]);
+    assert_eq!(qr.rows[0][3], qr.rows[0][1]);
 
-    // Verify all MIN/MAX are correct against brute force
     let vals: Vec<i64> = qr
         .rows
         .iter()
@@ -325,13 +299,11 @@ fn sliding_min_max_large() {
     }
 }
 
-// ── 12. Running SUM verified against manual computation ─────────────
-
 #[test]
 fn running_sum_vs_explicit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_ok(
         conn.execute("CREATE TABLE rs (id INTEGER PRIMARY KEY, val INTEGER)")
             .unwrap(),
@@ -355,14 +327,12 @@ fn running_sum_vs_explicit() {
     }
 }
 
-// ── 13. Sort sharing (same OVER spec) ───────────────────────────────
-
 #[test]
 fn sort_sharing() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     // Two window functions with the same OVER spec
     let qr = conn
@@ -382,20 +352,18 @@ fn sort_sharing() {
     }
 }
 
-// ── 14. Window with JOIN ────────────────────────────────────────────
-
 #[test]
 fn window_with_join() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
     assert_ok(
         conn.execute("CREATE TABLE depts (name TEXT PRIMARY KEY, budget INTEGER NOT NULL)")
             .unwrap(),
     );
     conn.execute("INSERT INTO depts VALUES ('eng', 1000), ('sales', 500)")
         .unwrap();
-    setup_employees(&mut conn);
+    setup_employees(&conn);
 
     let qr = conn
         .query(
@@ -415,14 +383,12 @@ fn window_with_join() {
     assert_eq!(qr.rows[4][2], Value::Integer(3));
 }
 
-// ── 15. UNBOUNDED frame ───────────────────────────────────���─────────
-
 #[test]
 fn unbounded_frame() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_employees(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_employees(&conn);
 
     // ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING = whole partition
     let qr = conn

@@ -1,13 +1,11 @@
 use std::collections::VecDeque;
 
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, ColumnMap};
+use crate::eval::{eval_expr, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::types::*;
 
 use super::helpers::*;
-
-// ── Window functions ────────────────────────────────────────────────
 
 pub(super) fn has_window_function(expr: &Expr) -> bool {
     match expr {
@@ -178,13 +176,15 @@ pub(super) fn find_peer_range(
 ) -> (usize, usize) {
     let key: Vec<Value> = order_by
         .iter()
-        .map(|o| eval_expr(&o.expr, col_map, &rows[i]).unwrap_or(Value::Null))
+        .map(|o| eval_expr(&o.expr, &EvalCtx::new(col_map, &rows[i])).unwrap_or(Value::Null))
         .collect();
     let mut start = i;
     while start > 0 {
         let prev_key: Vec<Value> = order_by
             .iter()
-            .map(|o| eval_expr(&o.expr, col_map, &rows[start - 1]).unwrap_or(Value::Null))
+            .map(|o| {
+                eval_expr(&o.expr, &EvalCtx::new(col_map, &rows[start - 1])).unwrap_or(Value::Null)
+            })
             .collect();
         if prev_key != key {
             break;
@@ -195,7 +195,9 @@ pub(super) fn find_peer_range(
     while end + 1 < rows.len() {
         let next_key: Vec<Value> = order_by
             .iter()
-            .map(|o| eval_expr(&o.expr, col_map, &rows[end + 1]).unwrap_or(Value::Null))
+            .map(|o| {
+                eval_expr(&o.expr, &EvalCtx::new(col_map, &rows[end + 1])).unwrap_or(Value::Null)
+            })
             .collect();
         if next_key != key {
             break;
@@ -234,7 +236,7 @@ pub(super) fn frame_indices(
     }
 }
 
-// Monotonic deque for O(1) amortized sliding MIN/MAX
+/// Monotonic deque for sliding MIN/MAX.
 pub(super) struct MonoDeque {
     deque: VecDeque<(usize, Value)>,
     is_min: bool,
@@ -285,7 +287,7 @@ impl MonoDeque {
     }
 }
 
-// Removable accumulator for O(1) sliding SUM/COUNT/AVG
+/// Removable accumulator for sliding SUM/COUNT/AVG.
 pub(super) struct SlidingSum {
     int_sum: i64,
     real_sum: f64,
@@ -412,7 +414,7 @@ pub(super) fn eval_window_select(
         for row in &rows {
             let vals: Vec<Value> = args
                 .iter()
-                .map(|a| eval_expr(a, &col_map, row).unwrap_or(Value::Null))
+                .map(|a| eval_expr(a, &EvalCtx::new(&col_map, row)).unwrap_or(Value::Null))
                 .collect();
             per_row.push(vals);
         }
@@ -424,7 +426,6 @@ pub(super) fn eval_window_select(
     let mut row_results: Vec<Vec<Value>> = (0..n).map(|_| vec![Value::Null; num_win]).collect();
 
     for (win_idx, (_, fn_name, _, spec)) in all_extracted.iter().enumerate() {
-        // Sort rows by (partition_by, order_by) for this window spec
         let mut sort_keys: Vec<OrderByItem> = Vec::new();
         for pb in &spec.partition_by {
             sort_keys.push(OrderByItem {
@@ -435,7 +436,6 @@ pub(super) fn eval_window_select(
         }
         sort_keys.extend(spec.order_by.clone());
 
-        // Build index array for this sort
         let mut indices: Vec<usize> = (0..n).collect();
         if !sort_keys.is_empty() {
             let keys: Vec<Vec<Value>> = indices
@@ -443,14 +443,16 @@ pub(super) fn eval_window_select(
                 .map(|&i| {
                     sort_keys
                         .iter()
-                        .map(|o| eval_expr(&o.expr, &col_map, &rows[i]).unwrap_or(Value::Null))
+                        .map(|o| {
+                            eval_expr(&o.expr, &EvalCtx::new(&col_map, &rows[i]))
+                                .unwrap_or(Value::Null)
+                        })
                         .collect()
                 })
                 .collect();
             indices.sort_by(|&a, &b| compare_sort_keys(&keys[a], &keys[b], &sort_keys));
         }
 
-        // Identify partition boundaries
         let part_count = spec.partition_by.len();
         let mut partitions: Vec<(usize, usize)> = Vec::new();
         let mut part_start = 0;
@@ -458,10 +460,16 @@ pub(super) fn eval_window_select(
             let mut same = true;
             if part_count > 0 {
                 for p in 0..part_count {
-                    let prev = eval_expr(&spec.partition_by[p], &col_map, &rows[indices[pos - 1]])
-                        .unwrap_or(Value::Null);
-                    let cur = eval_expr(&spec.partition_by[p], &col_map, &rows[indices[pos]])
-                        .unwrap_or(Value::Null);
+                    let prev = eval_expr(
+                        &spec.partition_by[p],
+                        &EvalCtx::new(&col_map, &rows[indices[pos - 1]]),
+                    )
+                    .unwrap_or(Value::Null);
+                    let cur = eval_expr(
+                        &spec.partition_by[p],
+                        &EvalCtx::new(&col_map, &rows[indices[pos]]),
+                    )
+                    .unwrap_or(Value::Null);
                     if prev != cur {
                         same = false;
                         break;
@@ -478,7 +486,6 @@ pub(super) fn eval_window_select(
         let frame = resolve_frame(spec);
         let upper_name = fn_name.to_ascii_uppercase();
 
-        // Evaluate per partition
         for &(ps, pe) in &partitions {
             let part_len = pe - ps;
             let part_indices = &indices[ps..pe];
@@ -500,7 +507,8 @@ pub(super) fn eval_window_select(
                             .order_by
                             .iter()
                             .map(|o| {
-                                eval_expr(&o.expr, &col_map, &rows[orig_idx]).unwrap_or(Value::Null)
+                                eval_expr(&o.expr, &EvalCtx::new(&col_map, &rows[orig_idx]))
+                                    .unwrap_or(Value::Null)
                             })
                             .collect();
                         if let Some(ref pk) = prev_key {
@@ -523,7 +531,8 @@ pub(super) fn eval_window_select(
                             .order_by
                             .iter()
                             .map(|o| {
-                                eval_expr(&o.expr, &col_map, &rows[orig_idx]).unwrap_or(Value::Null)
+                                eval_expr(&o.expr, &EvalCtx::new(&col_map, &rows[orig_idx]))
+                                    .unwrap_or(Value::Null)
                             })
                             .collect();
                         if let Some(ref pk) = prev_key {
@@ -638,7 +647,6 @@ pub(super) fn eval_window_select(
                 }
                 "SUM" | "COUNT" | "AVG" => {
                     let is_count_star = upper_name == "COUNT" && arg_values[win_idx][0].is_empty();
-                    // Check if we can use sliding window optimization (ROWS frame)
                     if matches!(frame.units, WindowFrameUnits::Rows)
                         && matches!(
                             frame.start,
@@ -726,12 +734,10 @@ pub(super) fn eval_window_select(
                             WindowFrameBound::CurrentRow | WindowFrameBound::Following(_)
                         )
                     {
-                        // Monotonic deque O(N)
                         let mut deque = MonoDeque::new(is_min);
                         let mut prev_end: Option<usize> = None;
                         for (pos, &orig_idx) in part_indices.iter().enumerate() {
                             let (fs, fe) = rows_frame_indices(&frame, pos, part_len)?;
-                            // Add new elements
                             let add_from = prev_end.map(|pe| pe + 1).unwrap_or(fs);
                             for add_pos in add_from..=fe {
                                 deque.push(

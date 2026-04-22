@@ -24,7 +24,7 @@ fn assert_ok(result: ExecutionResult) {
     }
 }
 
-fn setup_users_orders(conn: &mut Connection) {
+fn setup_users_orders(conn: &Connection) {
     assert_ok(
         conn.execute("CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, name TEXT, dept TEXT)")
             .unwrap(),
@@ -59,7 +59,7 @@ fn setup_users_orders(conn: &mut Connection) {
     }
 }
 
-fn setup_emp(conn: &mut Connection) {
+fn setup_emp(conn: &Connection) {
     assert_ok(conn.execute(
         "CREATE TABLE emp (id INTEGER NOT NULL PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER)"
     ).unwrap());
@@ -81,16 +81,12 @@ fn setup_emp(conn: &mut Connection) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Correlated EXISTS
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn exists_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id) ORDER BY name"
@@ -102,8 +98,8 @@ fn exists_basic() {
 fn exists_with_inner_filter() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id AND orders.total > 150.0) ORDER BY name"
@@ -115,8 +111,8 @@ fn exists_with_inner_filter() {
 fn exists_with_outer_filter() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE dept = 'eng' AND EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id) ORDER BY name"
@@ -128,8 +124,8 @@ fn exists_with_outer_filter() {
 fn exists_empty_inner() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id AND orders.total > 9999.0)"
@@ -141,8 +137,8 @@ fn exists_empty_inner() {
 fn exists_all_match() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     // Give everyone an order
     assert_rows_affected(
@@ -166,8 +162,8 @@ fn exists_all_match() {
 fn exists_no_duplicate_outer_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     // Alice has 2 orders — should appear once
     let qr = conn.query(
@@ -187,8 +183,8 @@ fn exists_no_duplicate_outer_rows() {
 fn exists_with_order_by() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id) ORDER BY name DESC"
@@ -200,8 +196,8 @@ fn exists_with_order_by() {
 fn exists_with_limit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id) ORDER BY id LIMIT 2"
@@ -209,16 +205,12 @@ fn exists_with_limit() {
     assert_eq!(qr.rows.len(), 2);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Correlated NOT EXISTS
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn not_exists_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id) ORDER BY name"
@@ -232,8 +224,8 @@ fn not_exists_basic() {
 fn not_exists_all_have_orders() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
     assert_rows_affected(
         conn.execute("INSERT INTO orders VALUES (10, 2, 10.0)")
             .unwrap(),
@@ -255,8 +247,8 @@ fn not_exists_all_have_orders() {
 fn not_exists_empty_inner() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id AND orders.total > 9999.0)"
@@ -268,8 +260,8 @@ fn not_exists_empty_inner() {
 fn not_exists_with_filter() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE dept = 'sales' AND NOT EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id) ORDER BY name"
@@ -278,16 +270,12 @@ fn not_exists_with_filter() {
     assert_eq!(qr.rows.len(), 2);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Correlated IN
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn in_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE orders.user_id = users.id) ORDER BY name"
@@ -299,8 +287,8 @@ fn in_basic() {
 fn in_no_match() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE orders.user_id = users.id AND orders.total > 9999.0)"
@@ -308,16 +296,12 @@ fn in_no_match() {
     assert_eq!(qr.rows.len(), 0);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Correlated NOT IN
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn not_in_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders WHERE orders.user_id = users.id) ORDER BY name"
@@ -325,15 +309,11 @@ fn not_in_basic() {
     assert_eq!(qr.rows.len(), 2); // Bob, Dave
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Correlated scalar subqueries in WHERE
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn scalar_where_above_dept_avg() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     // Use separate tables to avoid self-join alias complexity
     assert_ok(conn.execute(
@@ -389,7 +369,7 @@ fn scalar_where_above_dept_avg() {
 fn scalar_where_max_in_dept() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE staff2 (id INTEGER NOT NULL PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER)"
@@ -438,16 +418,12 @@ fn scalar_where_max_in_dept() {
     assert_eq!(qr.rows.len(), 3); // Eve(120), Charlie(90), Frank(85)
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Real-world SQL patterns
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn pattern_customers_with_orders() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id) ORDER BY name"
@@ -459,8 +435,8 @@ fn pattern_customers_with_orders() {
 fn pattern_customers_without_orders() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id) ORDER BY name"
@@ -472,7 +448,7 @@ fn pattern_customers_without_orders() {
 fn pattern_find_with_lookup_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     // Use separate tables: items + email_counts (pre-computed)
     assert_ok(
@@ -534,8 +510,8 @@ fn pattern_find_with_lookup_table() {
 fn pattern_above_dept_average() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_emp(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_emp(&conn);
 
     // Use separate table for averages to avoid self-join alias issue
     assert_ok(
@@ -567,16 +543,12 @@ fn pattern_above_dept_average() {
     assert_eq!(qr.rows[0][0], Value::Text("Eve".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Mixed: correlated + non-correlated
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn mixed_correlated_exists_and_regular_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE dept = 'eng' AND EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id AND orders.total > 50.0) ORDER BY name"
@@ -589,8 +561,8 @@ fn mixed_correlated_exists_and_regular_where() {
 fn two_correlated_exists_in_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
     assert_ok(
         conn.execute("CREATE TABLE reviews (id INTEGER NOT NULL PRIMARY KEY, user_id INTEGER)")
             .unwrap(),
@@ -611,16 +583,12 @@ fn two_correlated_exists_in_where() {
     assert_eq!(qr.rows.len(), 2);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  DML with correlated subqueries
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn update_with_correlated_exists() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     assert_rows_affected(conn.execute(
         "UPDATE users SET name = 'BUYER' WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)"
@@ -636,8 +604,8 @@ fn update_with_correlated_exists() {
 fn delete_with_correlated_not_exists() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     assert_rows_affected(conn.execute(
         "DELETE FROM users WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)"
@@ -651,8 +619,8 @@ fn delete_with_correlated_not_exists() {
 fn insert_select_with_correlated_not_exists() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
     assert_ok(
         conn.execute(
             "CREATE TABLE archive (id INTEGER NOT NULL PRIMARY KEY, name TEXT, dept TEXT)",
@@ -672,16 +640,12 @@ fn insert_select_with_correlated_not_exists() {
     assert_eq!(qr.rows[1][0], Value::Text("Dave".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Data integrity: compare with JOIN equivalents
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn exists_matches_inner_join() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr_exists = conn.query(
         "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id) ORDER BY id"
@@ -696,8 +660,8 @@ fn exists_matches_inner_join() {
 fn not_exists_matches_left_join_null() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr_ne = conn.query(
         "SELECT id FROM users WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id) ORDER BY id"
@@ -708,16 +672,12 @@ fn not_exists_matches_left_join_null() {
     assert_eq!(qr_ne.rows, qr_lj.rows);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Interaction with views
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn correlated_exists_with_distinct() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT DISTINCT dept FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id) ORDER BY dept"
@@ -727,16 +687,12 @@ fn correlated_exists_with_distinct() {
     assert_eq!(qr.rows[0][0], Value::Text("eng".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Transactions
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn correlated_exists_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     conn.execute("BEGIN").unwrap();
     let qr = conn.query(
@@ -746,15 +702,11 @@ fn correlated_exists_in_transaction() {
     conn.execute("COMMIT").unwrap();
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Large data correctness
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn exists_large_tables() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
@@ -800,8 +752,8 @@ fn exists_large_tables() {
 fn self_join_above_dept_avg() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_emp(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_emp(&conn);
 
     // Self-join with aliases: employees above their department average
     let qr = conn.query(
@@ -819,8 +771,8 @@ fn self_join_above_dept_avg() {
 fn scalar_in_select_max() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name, (SELECT MAX(total) FROM orders WHERE orders.user_id = users.id) AS max_order FROM users ORDER BY id"
@@ -838,8 +790,8 @@ fn scalar_in_select_max() {
 fn scalar_in_select_count() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name, (SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id) AS order_count FROM users ORDER BY id"
@@ -855,8 +807,8 @@ fn scalar_in_select_count() {
 fn self_join_scalar_select() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_emp(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_emp(&conn);
 
     let qr = conn.query(
         "SELECT name, salary, (SELECT AVG(salary) FROM emp e2 WHERE e2.dept = e1.dept) AS dept_avg FROM emp e1 ORDER BY id"
@@ -870,16 +822,12 @@ fn self_join_scalar_select() {
     assert_eq!(qr.rows[2][2], Value::Real(80.0));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Error cases
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn error_inner_table_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let err = conn.query(
         "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM ghost WHERE ghost.id = users.id)",
@@ -887,16 +835,12 @@ fn error_inner_table_not_found() {
     assert!(err.is_err());
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Prepared params with correlated
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn correlated_with_prepared_params() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query_params(
         "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id AND orders.total > $1) ORDER BY name",
@@ -907,16 +851,12 @@ fn correlated_with_prepared_params() {
     assert_eq!(qr.rows[1][0], Value::Text("Eve".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Correlated + DISTINCT / GROUP BY / ORDER BY
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn correlated_with_group_by_having() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT dept, COUNT(*) AS cnt FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id) GROUP BY dept ORDER BY dept"
@@ -930,8 +870,8 @@ fn correlated_with_group_by_having() {
 fn correlated_with_order_by_limit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id) ORDER BY name LIMIT 2"
@@ -941,15 +881,11 @@ fn correlated_with_order_by_limit() {
     assert_eq!(qr.rows[1][0], Value::Text("Charlie".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Multiple correlation columns
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn multi_column_correlation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, b INTEGER)")
@@ -991,7 +927,7 @@ fn multi_column_correlation() {
 fn non_eq_find_duplicates() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE items (id INTEGER NOT NULL PRIMARY KEY, email TEXT)")
@@ -1031,8 +967,8 @@ fn non_eq_find_duplicates() {
 fn non_eq_greater_than_correlation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_emp(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_emp(&conn);
 
     // Employees who have someone in their dept earning more than them
     let qr = conn.query(
@@ -1051,8 +987,8 @@ fn non_eq_greater_than_correlation() {
 fn correlated_exists_on_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     // View with WHERE (non-fusable)
     assert_ok(
@@ -1072,8 +1008,8 @@ fn correlated_exists_on_view() {
 fn correlated_not_exists_on_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW all_users AS SELECT * FROM users")
@@ -1089,16 +1025,12 @@ fn correlated_not_exists_on_view() {
     assert_eq!(qr.rows[1][0], Value::Text("Dave".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Self-join alias — additional
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn self_join_not_exists_highest_paid() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_emp(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_emp(&conn);
 
     let qr = conn.query(
         "SELECT name FROM emp e1 WHERE NOT EXISTS (SELECT 1 FROM emp e2 WHERE e2.dept = e1.dept AND e2.salary > e1.salary) ORDER BY name"
@@ -1113,8 +1045,8 @@ fn self_join_not_exists_highest_paid() {
 fn self_join_max_salary() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_emp(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_emp(&conn);
 
     let qr = conn.query(
         "SELECT name FROM emp e1 WHERE salary = (SELECT MAX(salary) FROM emp e2 WHERE e2.dept = e1.dept) ORDER BY name"
@@ -1122,16 +1054,12 @@ fn self_join_max_salary() {
     assert_eq!(qr.rows.len(), 3);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Scalar SELECT — additional
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn scalar_select_sum_with_alias() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name, (SELECT SUM(total) FROM orders WHERE orders.user_id = users.id) AS total_spent FROM users ORDER BY id"
@@ -1144,8 +1072,8 @@ fn scalar_select_sum_with_alias() {
 fn multiple_scalar_in_select() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT name, (SELECT MIN(total) FROM orders WHERE orders.user_id = users.id) AS mn, (SELECT MAX(total) FROM orders WHERE orders.user_id = users.id) AS mx FROM users WHERE id = 1"
@@ -1155,16 +1083,12 @@ fn multiple_scalar_in_select() {
     assert_eq!(qr.rows[0][2], Value::Real(200.0));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Non-equality — additional
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn non_eq_not_exists_lowest_paid() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_emp(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_emp(&conn);
 
     let qr = conn.query(
         "SELECT name FROM emp e1 WHERE NOT EXISTS (SELECT 1 FROM emp e2 WHERE e2.dept = e1.dept AND e2.salary < e1.salary) ORDER BY name"
@@ -1175,15 +1099,11 @@ fn non_eq_not_exists_lowest_paid() {
     assert_eq!(qr.rows[2][0], Value::Text("Frank".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  NULL edge cases
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn null_outer_exists_excluded() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t1 (id INTEGER NOT NULL PRIMARY KEY, ref_id INTEGER)")
@@ -1211,7 +1131,7 @@ fn null_outer_exists_excluded() {
 fn null_not_exists_passes() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE p1 (id INTEGER NOT NULL PRIMARY KEY, ref_id INTEGER)")
@@ -1232,16 +1152,12 @@ fn null_not_exists_passes() {
     assert_eq!(qr.rows[0][0], Value::Integer(2));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Data freshness
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn correlated_reflects_inserts() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     let qr = conn.query(
         "SELECT COUNT(*) FROM users WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)"
@@ -1265,16 +1181,12 @@ fn correlated_reflects_inserts() {
     assert_eq!(qr.rows[0][0], Value::Integer(0));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  View as inner table
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn view_as_inner_correlated() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users_orders(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW big_orders AS SELECT * FROM orders WHERE total > 100.0")

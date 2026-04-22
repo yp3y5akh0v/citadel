@@ -19,10 +19,6 @@ fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
         .argon2_profile(Argon2Profile::Iot)
 }
 
-// ============================================================
-// Tree walker - reads all pages and their Merkle hashes
-// ============================================================
-
 #[derive(Debug, Clone)]
 struct PageInfo {
     page_id: PageId,
@@ -109,10 +105,6 @@ fn recompute_branch_hash(child_hashes: &[[u8; MERKLE_HASH_SIZE]]) -> [u8; MERKLE
     out.copy_from_slice(&hash.as_bytes()[..MERKLE_HASH_SIZE]);
     out
 }
-
-// ============================================================
-// Merkle diff algorithm - the core sync primitive
-// ============================================================
 
 /// Diff two trees using Merkle hashes. Returns the set of key-value entries
 /// that exist in `source` but differ from (or are missing in) `target`.
@@ -219,10 +211,6 @@ fn apply_sync(db: &Database, entries: &[(Vec<u8>, Vec<u8>)]) {
     wtx.commit().unwrap();
 }
 
-// ============================================================
-// Tests: prove the full sync round-trip
-// ============================================================
-
 #[test]
 fn identical_dbs_merkle_diff_returns_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -254,7 +242,6 @@ fn single_insert_detected_and_synced() {
     let db1 = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db2 = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
-    // Same initial data
     for db in [&db1, &db2] {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..20u32 {
@@ -264,34 +251,28 @@ fn single_insert_detected_and_synced() {
     }
     assert_eq!(db1.stats().merkle_root, db2.stats().merkle_root);
 
-    // Modify db1 only - add one key
     let mut wtx = db1.begin_write().unwrap();
     wtx.insert(b"new-key", b"new-value").unwrap();
     wtx.commit().unwrap();
 
     assert_ne!(db1.stats().merkle_root, db2.stats().merkle_root);
 
-    // Diff detects the change
     let diff = merkle_diff(&db1, &db2);
     assert!(!diff.is_empty(), "diff must find changed entries");
 
-    // The diff must contain our new key
     let has_new_key = diff
         .iter()
         .any(|(k, v)| k == b"new-key" && v == b"new-value");
     assert!(has_new_key, "diff must contain the newly inserted key");
 
-    // Apply the diff to db2
     apply_sync(&db2, &diff);
 
-    // After sync, both DBs must have identical data
     assert_eq!(
         db1.stats().merkle_root,
         db2.stats().merkle_root,
         "after sync, merkle roots must match"
     );
 
-    // Verify data actually matches
     let data1 = collect_all_data(&db1);
     let data2 = collect_all_data(&db2);
     assert_eq!(data1, data2, "after sync, all data must match");
@@ -312,7 +293,6 @@ fn value_update_detected_and_synced() {
     }
     assert_eq!(db1.stats().merkle_root, db2.stats().merkle_root);
 
-    // Update one value in db1
     let mut wtx = db1.begin_write().unwrap();
     wtx.insert(&15u32.to_be_bytes(), b"modified").unwrap();
     wtx.commit().unwrap();
@@ -322,7 +302,6 @@ fn value_update_detected_and_synced() {
     let diff = merkle_diff(&db1, &db2);
     assert!(!diff.is_empty());
 
-    // Apply and verify convergence
     apply_sync(&db2, &diff);
     assert_eq!(db1.stats().merkle_root, db2.stats().merkle_root);
 
@@ -337,7 +316,6 @@ fn multiple_changes_detected_and_synced() {
     let db1 = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db2 = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
-    // Start with same 100 entries
     for db in [&db1, &db2] {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..100u32 {
@@ -347,13 +325,10 @@ fn multiple_changes_detected_and_synced() {
     }
     assert_eq!(db1.stats().merkle_root, db2.stats().merkle_root);
 
-    // Make several changes to db1
     let mut wtx = db1.begin_write().unwrap();
-    // Update some
     for i in (0..100u32).step_by(10) {
         wtx.insert(&i.to_be_bytes(), b"UPDATED").unwrap();
     }
-    // Insert new
     for i in 100..110u32 {
         wtx.insert(&i.to_be_bytes(), b"new-entry").unwrap();
     }
@@ -364,7 +339,6 @@ fn multiple_changes_detected_and_synced() {
     let diff = merkle_diff(&db1, &db2);
     assert!(!diff.is_empty());
 
-    // Apply and verify
     apply_sync(&db2, &diff);
     assert_eq!(
         db1.stats().merkle_root,
@@ -496,7 +470,6 @@ fn sync_efficiency_skips_matching_subtrees() {
     let has_key_42 = diff.iter().any(|(k, _)| k == &42u32.to_be_bytes());
     assert!(has_key_42, "diff must contain the changed key");
 
-    // Apply and verify convergence
     apply_sync(&db2, &diff);
     assert_eq!(db1.stats().merkle_root, db2.stats().merkle_root);
 
@@ -504,10 +477,6 @@ fn sync_efficiency_skips_matching_subtrees() {
     let data2 = collect_all_data(&db2);
     assert_eq!(data1, data2);
 }
-
-// ============================================================
-// Deep page-level hash verification
-// ============================================================
 
 #[test]
 fn every_leaf_hash_matches_independent_recomputation() {
@@ -549,7 +518,6 @@ fn every_branch_hash_matches_independent_recomputation() {
 
     let tree = walk_tree(&db);
 
-    // Build a map of page_id -> merkle_hash for lookup
     let hash_map: BTreeMap<PageId, [u8; MERKLE_HASH_SIZE]> =
         tree.iter().map(|p| (p.page_id, p.merkle_hash)).collect();
 
@@ -619,10 +587,6 @@ fn hash_chain_is_complete_no_zero_hashes() {
     }
 }
 
-// ============================================================
-// Full sync scenario: diverge, diff, sync, verify
-// ============================================================
-
 #[test]
 fn full_sync_scenario_diverge_and_converge() {
     let dir = tempfile::tempdir().unwrap();
@@ -674,7 +638,6 @@ fn full_sync_scenario_diverge_and_converge() {
     assert!(!diff.is_empty());
     apply_sync(&db_replica, &diff);
 
-    // After sync: roots match, data matches
     assert_eq!(
         db_source.stats().merkle_root,
         db_replica.stats().merkle_root,
@@ -770,10 +733,6 @@ fn no_diff_after_sync_is_complete() {
         "after successful sync, second diff must be empty"
     );
 }
-
-// ============================================================
-// Helper
-// ============================================================
 
 fn collect_all_data(db: &Database) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut data = BTreeMap::new();

@@ -33,7 +33,7 @@ fn assert_ok(result: ExecutionResult) {
     }
 }
 
-fn setup_users(conn: &mut Connection) {
+fn setup_users(conn: &Connection) {
     assert_ok(conn.execute(
         "CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, name TEXT, email TEXT, age INTEGER)"
     ).unwrap());
@@ -56,16 +56,12 @@ fn setup_users(conn: &mut Connection) {
     ).unwrap(), 1);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  CREATE VIEW — basic
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn create_simple_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW all_users AS SELECT * FROM users")
@@ -80,8 +76,8 @@ fn create_simple_view() {
 fn create_view_with_column_aliases() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW user_info (user_id, user_name) AS SELECT id, name FROM users")
@@ -98,8 +94,8 @@ fn create_view_with_column_aliases() {
 fn create_view_if_not_exists_new() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW IF NOT EXISTS v AS SELECT * FROM users")
@@ -114,8 +110,8 @@ fn create_view_if_not_exists_new() {
 fn create_view_if_not_exists_existing() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -135,8 +131,8 @@ fn create_view_if_not_exists_existing() {
 fn create_view_or_replace_new() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE OR REPLACE VIEW v AS SELECT * FROM users")
@@ -151,8 +147,8 @@ fn create_view_or_replace_new() {
 fn create_view_or_replace_existing() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -171,8 +167,8 @@ fn create_view_or_replace_existing() {
 fn create_view_case_insensitive() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW MyView AS SELECT * FROM users")
@@ -187,8 +183,8 @@ fn create_view_case_insensitive() {
 fn create_view_with_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW adults AS SELECT * FROM users WHERE age >= 30")
@@ -203,8 +199,8 @@ fn create_view_with_where() {
 fn create_view_with_join() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
     assert_ok(
         conn.execute(
             "CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, user_id INTEGER, total REAL)",
@@ -230,8 +226,8 @@ fn create_view_with_join() {
 fn create_view_with_aggregates() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute(
@@ -250,8 +246,8 @@ fn create_view_with_aggregates() {
 fn create_view_with_distinct() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
     assert_rows_affected(
         conn.execute(
             "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'dave@test.com', 30)",
@@ -275,8 +271,8 @@ fn create_view_with_distinct() {
 fn create_view_with_expressions() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(conn.execute(
         "CREATE VIEW user_labels AS SELECT id, name || ' (age ' || age || ')' AS label FROM users"
@@ -292,8 +288,8 @@ fn create_view_with_expressions() {
 fn create_view_with_union() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(conn.execute(
         "CREATE VIEW young_or_old AS SELECT * FROM users WHERE age < 28 UNION ALL SELECT * FROM users WHERE age > 32"
@@ -307,8 +303,8 @@ fn create_view_with_union() {
 fn create_view_with_cte_in_body() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(conn.execute(
         "CREATE VIEW top_users AS WITH ranked AS (SELECT * FROM users WHERE age >= 30) SELECT * FROM ranked"
@@ -318,15 +314,11 @@ fn create_view_with_cte_in_body() {
     assert_eq!(qr.rows.len(), 2);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  CREATE VIEW — errors
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn create_view_on_nonexistent_table_lazy() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     // CREATE succeeds (lazy validation)
     assert_ok(
@@ -343,8 +335,8 @@ fn create_view_on_nonexistent_table_lazy() {
 fn create_view_same_name_as_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     let err = conn
         .execute("CREATE VIEW users AS SELECT * FROM users")
@@ -356,8 +348,8 @@ fn create_view_same_name_as_table() {
 fn create_table_same_name_as_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -374,8 +366,8 @@ fn create_table_same_name_as_view() {
 fn create_duplicate_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -387,16 +379,12 @@ fn create_duplicate_view() {
     assert!(matches!(err, SqlError::ViewAlreadyExists(_)));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  DROP VIEW
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn drop_view_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -412,7 +400,7 @@ fn drop_view_basic() {
 fn drop_nonexistent_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let err = conn.execute("DROP VIEW ghost").unwrap_err();
     assert!(matches!(err, SqlError::ViewNotFound(_)));
@@ -422,8 +410,8 @@ fn drop_nonexistent_view() {
 fn drop_view_if_exists_existing() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -436,7 +424,7 @@ fn drop_view_if_exists_existing() {
 fn drop_view_if_exists_nonexistent() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute("DROP VIEW IF EXISTS ghost").unwrap());
 }
@@ -445,8 +433,8 @@ fn drop_view_if_exists_nonexistent() {
 fn drop_and_recreate_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -466,8 +454,8 @@ fn drop_and_recreate_view() {
 fn drop_view_case_insensitive() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW MyView AS SELECT * FROM users")
@@ -480,8 +468,8 @@ fn drop_view_case_insensitive() {
 fn drop_view_table_intact() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -493,16 +481,12 @@ fn drop_view_table_intact() {
     assert_eq!(qr.rows[0][0], Value::Integer(3));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  SELECT from view
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn select_star_from_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -518,8 +502,8 @@ fn select_star_from_view() {
 fn select_columns_from_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT id, name FROM users")
@@ -535,8 +519,8 @@ fn select_columns_from_view() {
 fn select_with_where_on_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -551,8 +535,8 @@ fn select_with_where_on_view() {
 fn select_with_order_by_on_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -568,8 +552,8 @@ fn select_with_order_by_on_view() {
 fn select_with_limit_offset_on_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -590,8 +574,8 @@ fn select_with_limit_offset_on_view() {
 fn select_with_group_by_on_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
     assert_rows_affected(
         conn.execute(
             "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'dave@test.com', 30)",
@@ -615,8 +599,8 @@ fn select_with_group_by_on_view() {
 fn select_aggregate_on_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -632,8 +616,8 @@ fn select_aggregate_on_view() {
 fn select_distinct_on_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
     assert_rows_affected(
         conn.execute(
             "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'dave@test.com', 30)",
@@ -657,8 +641,8 @@ fn select_distinct_on_view() {
 fn count_star_on_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users WHERE age >= 30")
@@ -669,16 +653,12 @@ fn count_star_on_view() {
     assert_eq!(qr.rows[0][0], Value::Integer(2));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  JOINs with views
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn view_inner_join_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
     assert_ok(
         conn.execute(
             "CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, user_id INTEGER, total REAL)",
@@ -707,8 +687,8 @@ fn view_inner_join_table() {
 fn table_left_join_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
     assert_ok(
         conn.execute(
             "CREATE TABLE scores (id INTEGER NOT NULL PRIMARY KEY, user_id INTEGER, score INTEGER)",
@@ -738,8 +718,8 @@ fn table_left_join_view() {
 fn view_join_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
     assert_ok(
         conn.execute(
             "CREATE TABLE orders (id INTEGER NOT NULL PRIMARY KEY, user_id INTEGER, total REAL)",
@@ -767,16 +747,12 @@ fn view_join_view() {
     assert_eq!(qr.rows.len(), 1);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Subqueries with views
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn view_in_in_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW adults AS SELECT * FROM users WHERE age >= 30")
@@ -793,8 +769,8 @@ fn view_in_in_subquery() {
 fn view_in_exists_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW adults AS SELECT * FROM users WHERE age >= 30")
@@ -822,8 +798,8 @@ fn view_in_exists_subquery() {
 fn view_in_scalar_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute(
@@ -842,8 +818,8 @@ fn view_in_scalar_subquery() {
 fn view_in_insert_select() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
     assert_ok(conn.execute(
         "CREATE TABLE archive (id INTEGER NOT NULL PRIMARY KEY, name TEXT, email TEXT, age INTEGER)"
     ).unwrap());
@@ -863,16 +839,12 @@ fn view_in_insert_select() {
     assert_eq!(qr.rows[0][0], Value::Integer(2));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Nested views
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn nested_view_two_levels() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v1 AS SELECT * FROM users WHERE age >= 25")
@@ -891,8 +863,8 @@ fn nested_view_two_levels() {
 fn nested_view_three_levels() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v1 AS SELECT * FROM users")
@@ -915,8 +887,8 @@ fn nested_view_three_levels() {
 fn circular_view_detection() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW va AS SELECT * FROM users")
@@ -937,7 +909,7 @@ fn circular_view_detection() {
 fn self_referencing_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute("CREATE VIEW v AS SELECT 1").unwrap());
     assert_ok(
@@ -949,16 +921,12 @@ fn self_referencing_view() {
     assert!(matches!(err, SqlError::CircularViewReference(_)));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  DML on views — errors
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn insert_into_view_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -975,8 +943,8 @@ fn insert_into_view_error() {
 fn update_view_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -993,8 +961,8 @@ fn update_view_error() {
 fn delete_from_view_error() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -1005,17 +973,13 @@ fn delete_from_view_error() {
     assert!(matches!(err, SqlError::CannotModifyView(_)));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Persistence
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn view_persists_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
-        setup_users(&mut conn);
+        let conn = Connection::open(&db).unwrap();
+        setup_users(&conn);
         assert_ok(
             conn.execute("CREATE VIEW v AS SELECT * FROM users WHERE age >= 30")
                 .unwrap(),
@@ -1023,7 +987,7 @@ fn view_persists_across_reopen() {
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let qr = conn.query("SELECT * FROM v").unwrap();
         assert_eq!(qr.rows.len(), 2);
     }
@@ -1034,8 +998,8 @@ fn view_drop_persists_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
-        setup_users(&mut conn);
+        let conn = Connection::open(&db).unwrap();
+        setup_users(&conn);
         assert_ok(
             conn.execute("CREATE VIEW v AS SELECT * FROM users")
                 .unwrap(),
@@ -1043,12 +1007,12 @@ fn view_drop_persists_across_reopen() {
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         assert_ok(conn.execute("DROP VIEW v").unwrap());
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let err = conn.query("SELECT * FROM v").unwrap_err();
         assert!(matches!(err, SqlError::TableNotFound(_)));
     }
@@ -1059,8 +1023,8 @@ fn view_reflects_new_data_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
-        setup_users(&mut conn);
+        let conn = Connection::open(&db).unwrap();
+        setup_users(&conn);
         assert_ok(
             conn.execute("CREATE VIEW v AS SELECT * FROM users")
                 .unwrap(),
@@ -1068,7 +1032,7 @@ fn view_reflects_new_data_after_reopen() {
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         assert_rows_affected(
             conn.execute(
                 "INSERT INTO users (id, name, email, age) VALUES (4, 'Dave', 'd@t.com', 40)",
@@ -1087,8 +1051,8 @@ fn multiple_views_persist() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
-        setup_users(&mut conn);
+        let conn = Connection::open(&db).unwrap();
+        setup_users(&conn);
         assert_ok(
             conn.execute("CREATE VIEW v1 AS SELECT * FROM users WHERE age < 30")
                 .unwrap(),
@@ -1100,7 +1064,7 @@ fn multiple_views_persist() {
     }
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let qr1 = conn.query("SELECT COUNT(*) FROM v1").unwrap();
         assert_eq!(qr1.rows[0][0], Value::Integer(1));
         let qr2 = conn.query("SELECT COUNT(*) FROM v2").unwrap();
@@ -1108,16 +1072,12 @@ fn multiple_views_persist() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Transactions
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn create_view_in_commit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     conn.execute("BEGIN").unwrap();
     assert_ok(
@@ -1134,8 +1094,8 @@ fn create_view_in_commit() {
 fn create_view_in_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     conn.execute("BEGIN").unwrap();
     assert_ok(
@@ -1152,8 +1112,8 @@ fn create_view_in_rollback() {
 fn drop_view_in_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -1172,8 +1132,8 @@ fn drop_view_in_rollback() {
 fn select_view_inside_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
             .unwrap(),
@@ -1189,7 +1149,7 @@ fn select_view_inside_transaction() {
 fn create_table_and_view_in_txn() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
     assert_ok(
@@ -1209,16 +1169,12 @@ fn create_table_and_view_in_txn() {
     assert_eq!(qr.rows[0][1], Value::Integer(42));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  DROP TABLE cascade
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn drop_table_view_breaks() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -1234,8 +1190,8 @@ fn drop_table_view_breaks() {
 fn drop_table_recreate_view_works() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -1244,7 +1200,7 @@ fn drop_table_recreate_view_works() {
     assert_ok(conn.execute("DROP TABLE users").unwrap());
 
     // Recreate with same schema
-    setup_users(&mut conn);
+    setup_users(&conn);
 
     let qr = conn.query("SELECT * FROM v").unwrap();
     assert_eq!(qr.rows.len(), 3);
@@ -1254,8 +1210,8 @@ fn drop_table_recreate_view_works() {
 fn drop_table_recreate_different_schema() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -1279,16 +1235,12 @@ fn drop_table_recreate_different_schema() {
     assert_eq!(qr.rows.len(), 1);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  CTE + View interaction
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn cte_body_references_view() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users WHERE age >= 30")
@@ -1306,8 +1258,8 @@ fn cte_body_references_view() {
 fn cte_same_name_as_view_takes_precedence() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")
@@ -1326,8 +1278,8 @@ fn cte_same_name_as_view_takes_precedence() {
 fn view_body_contains_cte() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(conn.execute(
         "CREATE VIEW v AS WITH adults AS (SELECT * FROM users WHERE age >= 30) SELECT * FROM adults"
@@ -1337,16 +1289,12 @@ fn view_body_contains_cte() {
     assert_eq!(qr.rows.len(), 2);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  View fusion verification
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn simple_view_fuses_with_outer_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users WHERE age >= 25")
@@ -1362,8 +1310,8 @@ fn simple_view_fuses_with_outer_where() {
 fn view_new_data_visible() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_users(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
 
     assert_ok(
         conn.execute("CREATE VIEW v AS SELECT * FROM users")

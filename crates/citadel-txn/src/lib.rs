@@ -4,4 +4,7 @@ pub mod manager;
 pub mod merkle;
 pub mod pending_free;
 pub mod read_txn;
+pub mod scan_iter;
 pub mod write_txn;
+
+pub use scan_iter::{TableIter, TxnScanAdapter};

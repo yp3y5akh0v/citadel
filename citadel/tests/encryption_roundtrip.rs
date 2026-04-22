@@ -9,7 +9,7 @@ use citadel_core::*;
 use citadel_crypto::key_manager::{create_key_file, open_key_file};
 use citadel_crypto::page_cipher;
 use citadel_io::file_manager::*;
-use citadel_io::sync_io::SyncPageIO;
+use citadel_io::mmap_io::MmapPageIO;
 use citadel_io::traits::PageIO;
 use citadel_page::page::Page;
 
@@ -24,7 +24,6 @@ fn full_encryption_roundtrip() {
     let passphrase = b"integration-test-passphrase";
     let file_id: u64 = 0xDEAD_CAFE_1234;
 
-    // 1. Create key file
     let (key_file, keys) = create_key_file(
         passphrase,
         file_id,
@@ -38,7 +37,6 @@ fn full_encryption_roundtrip() {
     let key_buf = key_file.serialize();
     std::fs::write(&key_path, key_buf).unwrap();
 
-    // 2. Create data file with header
     let file = File::options()
         .read(true)
         .write(true)
@@ -46,18 +44,16 @@ fn full_encryption_roundtrip() {
         .truncate(false)
         .open(&db_path)
         .unwrap();
-    let io = SyncPageIO::new(file);
+    let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = page_cipher::compute_dek_id(&keys.mac_key, &keys.dek);
     let header = FileHeader::new(file_id, dek_id);
     write_file_header(&io, &header).unwrap();
     io.fsync().unwrap();
 
-    // 3. Create and encrypt pages via buffer pool
     let mut pool = BufferPool::new(64);
     let epoch = 1u32;
 
-    // Create 10 leaf pages with test data
     for i in 0..10u32 {
         let mut page = Page::new(PageId(i), PageType::Leaf, TxnId(1));
         let cell = format!("key-{i}:value-{i}");
@@ -71,13 +67,11 @@ fn full_encryption_roundtrip() {
 
     assert_eq!(pool.dirty_count(), 10);
 
-    // 4. Flush dirty pages (encrypts and writes to disk)
     pool.flush_dirty(&io, &keys.dek, &keys.mac_key, epoch)
         .unwrap();
     io.fsync().unwrap();
     assert_eq!(pool.dirty_count(), 0);
 
-    // 5. Verify no plaintext on disk
     let raw_bytes = std::fs::read(&db_path).unwrap();
     for i in 0..10u32 {
         let needle = format!("key-{i}:value-{i}");
@@ -87,7 +81,6 @@ fn full_encryption_roundtrip() {
         assert!(!found, "Plaintext found on disk for page {i}!");
     }
 
-    // 6. Create a new buffer pool (simulating reopen) and read back
     let mut pool2 = BufferPool::new(64);
 
     for i in 0..10u32 {
@@ -100,14 +93,12 @@ fn full_encryption_roundtrip() {
         assert_eq!(page.num_cells(), 1);
         assert!(page.verify_checksum());
 
-        // Read cell data back
         let offset = page.cell_offset(0);
         let expected = format!("key-{i}:value-{i}");
         let data = page.cell_data(offset, expected.len());
         assert_eq!(data, expected.as_bytes());
     }
 
-    // 7. Verify tamper detection: flip a bit in encrypted page on disk
     {
         let tamper_offset = page_offset(PageId(5));
         let mut encrypted = [0u8; PAGE_SIZE];
@@ -116,28 +107,23 @@ fn full_encryption_roundtrip() {
         io.write_page(tamper_offset, &encrypted).unwrap();
     }
 
-    // New pool, should detect tamper on page 5
     let mut pool3 = BufferPool::new(64);
     let result = pool3.fetch(&io, PageId(5), &keys.dek, &keys.mac_key, epoch);
     assert!(matches!(result, Err(Error::PageTampered(PageId(5)))));
 
-    // Other pages should still be readable
     let page0 = pool3
         .fetch(&io, PageId(0), &keys.dek, &keys.mac_key, epoch)
         .unwrap();
     assert_eq!(page0.page_id(), PageId(0));
 
-    // 8. Verify key file re-open with correct password
     let key_bytes: [u8; KEY_FILE_SIZE] = key_buf;
     let (_kf2, keys2) = open_key_file(&key_bytes, passphrase, file_id).unwrap();
     assert_eq!(keys2.dek, keys.dek);
     assert_eq!(keys2.mac_key, keys.mac_key);
 
-    // 9. Wrong password should fail
     let result = open_key_file(&key_bytes, b"wrong-password", file_id);
     assert!(result.is_err());
 
-    // 10. Wrong file_id should fail
     let result = open_key_file(&key_bytes, passphrase, 0xBAAD);
     assert!(matches!(result, Err(Error::KeyFileMismatch)));
 }
@@ -154,19 +140,17 @@ fn file_header_and_recovery() {
         .truncate(false)
         .open(&db_path)
         .unwrap();
-    let io = SyncPageIO::new(file);
+    let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = [0xAAu8; MAC_SIZE];
     let header = FileHeader::new(0x42, dek_id);
     write_file_header(&io, &header).unwrap();
     io.fsync().unwrap();
 
-    // Normal recovery - both slots valid (both empty/zero)
     let (slot_idx, slot) = recover(&io).unwrap();
     assert_eq!(slot_idx, 0);
     assert_eq!(slot.txn_id, TxnId(0));
 
-    // Write to inactive slot and flip god byte
     let new_slot = CommitSlot {
         txn_id: TxnId(1),
         tree_root: PageId(0),
@@ -188,7 +172,6 @@ fn file_header_and_recovery() {
     write_god_byte(&io, GOD_BIT_ACTIVE_SLOT).unwrap(); // flip to slot 1
     io.fsync().unwrap();
 
-    // Recovery should find slot 1
     let (slot_idx, slot) = recover(&io).unwrap();
     assert_eq!(slot_idx, 1);
     assert_eq!(slot.txn_id, TxnId(1));
@@ -207,7 +190,7 @@ fn recovery_rejects_tree_root_at_high_water_mark() {
         .truncate(false)
         .open(&db_path)
         .unwrap();
-    let io = SyncPageIO::new(file);
+    let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = [0xBBu8; MAC_SIZE];
     let header = FileHeader::new(0x99, dek_id);
@@ -253,7 +236,7 @@ fn recovery_rejects_pending_free_at_high_water_mark() {
         .truncate(false)
         .open(&db_path)
         .unwrap();
-    let io = SyncPageIO::new(file);
+    let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = [0xCCu8; MAC_SIZE];
     let header = FileHeader::new(0xAA, dek_id);
@@ -293,7 +276,6 @@ fn sieve_eviction_dirty_never_evicted() {
 
     let mut cache = SieveCache::<String>::new(3);
 
-    // Fill cache
     cache.insert(1, "one".into()).unwrap();
     cache.insert(2, "two".into()).unwrap();
     cache.insert(3, "three".into()).unwrap();
@@ -311,8 +293,6 @@ fn sieve_eviction_dirty_never_evicted() {
     assert_eq!(cache.dirty_count(), 1);
     assert!(cache.is_dirty(2));
 }
-
-// === Edge Case Tests ===
 
 #[test]
 fn wrong_epoch_detected_on_fetch() {
@@ -338,13 +318,12 @@ fn wrong_epoch_detected_on_fetch() {
         .truncate(false)
         .open(&db_path)
         .unwrap();
-    let io = SyncPageIO::new(file);
+    let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = page_cipher::compute_dek_id(&keys.mac_key, &keys.dek);
     let header = FileHeader::new(0x1111, dek_id);
     write_file_header(&io, &header).unwrap();
 
-    // Write page with epoch 1
     let mut page = Page::new(PageId(0), PageType::Leaf, TxnId(1));
     page.update_checksum();
     let mut encrypted = [0u8; PAGE_SIZE];
@@ -369,7 +348,6 @@ fn wrong_epoch_detected_on_fetch() {
         "wrong epoch should be detected as tampered"
     );
 
-    // Read with correct epoch should succeed
     let page_back = pool
         .fetch(&io, PageId(0), &keys.dek, &keys.mac_key, 1)
         .unwrap();
@@ -399,13 +377,12 @@ fn buffer_pool_eviction_under_pressure() {
         .truncate(false)
         .open(&db_path)
         .unwrap();
-    let io = SyncPageIO::new(file);
+    let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = page_cipher::compute_dek_id(&keys.mac_key, &keys.dek);
     let header = FileHeader::new(0x2222, dek_id);
     write_file_header(&io, &header).unwrap();
 
-    // Write 50 pages to disk
     let epoch = 1u32;
     for i in 0..50u32 {
         let mut page = Page::new(PageId(i), PageType::Leaf, TxnId(1));
@@ -469,7 +446,7 @@ fn tamper_iv_region_detected() {
         .truncate(false)
         .open(&db_path)
         .unwrap();
-    let io = SyncPageIO::new(file);
+    let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = page_cipher::compute_dek_id(&keys.mac_key, &keys.dek);
     let header = FileHeader::new(0x3333, dek_id);
@@ -528,7 +505,7 @@ fn tamper_mac_region_detected() {
         .truncate(false)
         .open(&db_path)
         .unwrap();
-    let io = SyncPageIO::new(file);
+    let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = page_cipher::compute_dek_id(&keys.mac_key, &keys.dek);
     let header = FileHeader::new(0x4444, dek_id);
@@ -609,13 +586,11 @@ fn different_keys_produce_different_ciphertext() {
         &mut enc2,
     );
 
-    // Ciphertext should differ (different keys)
     assert_ne!(
         &enc1[16..PAGE_SIZE - 32],
         &enc2[16..PAGE_SIZE - 32],
         "different DEKs must produce different ciphertext"
     );
-    // MACs should also differ
     assert_ne!(
         &enc1[PAGE_SIZE - 32..],
         &enc2[PAGE_SIZE - 32..],
@@ -694,7 +669,7 @@ fn cache_hit_returns_identical_data() {
         .truncate(false)
         .open(&db_path)
         .unwrap();
-    let io = SyncPageIO::new(file);
+    let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = page_cipher::compute_dek_id(&keys.mac_key, &keys.dek);
     let header = FileHeader::new(0x7777, dek_id);
@@ -720,12 +695,10 @@ fn cache_hit_returns_identical_data() {
 
     let mut pool = BufferPool::new(64);
 
-    // First fetch (cache miss - reads from disk)
     let p1 = pool
         .fetch(&io, PageId(0), &keys.dek, &keys.mac_key, 1)
         .unwrap()
         .clone();
-    // Second fetch (cache hit - returns cached)
     let p2 = pool
         .fetch(&io, PageId(0), &keys.dek, &keys.mac_key, 1)
         .unwrap();
@@ -758,7 +731,7 @@ fn multiple_page_types_all_encrypted() {
         .truncate(false)
         .open(&db_path)
         .unwrap();
-    let io = SyncPageIO::new(file);
+    let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = page_cipher::compute_dek_id(&keys.mac_key, &keys.dek);
     let header = FileHeader::new(0x8888, dek_id);
@@ -767,7 +740,6 @@ fn multiple_page_types_all_encrypted() {
     let epoch = 1u32;
     let page_types = [(PageId(0), PageType::Leaf), (PageId(1), PageType::Branch)];
 
-    // Write different page types
     for &(page_id, page_type) in &page_types {
         let mut page = Page::new(page_id, page_type, TxnId(1));
         page.update_checksum();
@@ -786,7 +758,6 @@ fn multiple_page_types_all_encrypted() {
     }
     io.fsync().unwrap();
 
-    // Read back and verify types preserved
     let mut pool = BufferPool::new(64);
     for &(page_id, page_type) in &page_types {
         let page = pool
@@ -800,8 +771,6 @@ fn multiple_page_types_all_encrypted() {
         );
     }
 }
-
-// === Additional Encryption Edge Cases ===
 
 #[test]
 fn page_swap_attack_detected() {
@@ -829,7 +798,7 @@ fn page_swap_attack_detected() {
         .truncate(false)
         .open(&db_path)
         .unwrap();
-    let io = SyncPageIO::new(file);
+    let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = page_cipher::compute_dek_id(&keys.mac_key, &keys.dek);
     let header = FileHeader::new(0xAAAA, dek_id);
@@ -837,7 +806,6 @@ fn page_swap_attack_detected() {
 
     let epoch = 1u32;
 
-    // Write page 0 and page 1 with different data
     for i in 0..2u32 {
         let mut page = Page::new(PageId(i), PageType::Leaf, TxnId(1));
         let cell = format!("page-{i}-data");
@@ -858,7 +826,6 @@ fn page_swap_attack_detected() {
     }
     io.fsync().unwrap();
 
-    // Read both pages' raw bytes
     let offset0 = page_offset(PageId(0));
     let offset1 = page_offset(PageId(1));
     let mut raw0 = [0u8; PAGE_SIZE];
@@ -866,7 +833,6 @@ fn page_swap_attack_detected() {
     io.read_page(offset0, &mut raw0).unwrap();
     io.read_page(offset1, &mut raw1).unwrap();
 
-    // Swap them on disk
     io.write_page(offset0, &raw1).unwrap();
     io.write_page(offset1, &raw0).unwrap();
     io.fsync().unwrap();
@@ -961,7 +927,7 @@ fn ctr_bit_flip_caught_before_decrypt() {
         .truncate(false)
         .open(&db_path)
         .unwrap();
-    let io = SyncPageIO::new(file);
+    let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = page_cipher::compute_dek_id(&keys.mac_key, &keys.dek);
     let header = FileHeader::new(0xCCCC, dek_id);
@@ -1000,7 +966,6 @@ fn ctr_bit_flip_caught_before_decrypt() {
             "bit flip at offset {flip_offset} should be detected by HMAC"
         );
 
-        // Restore original for next iteration
         io.write_page(offset, &encrypted).unwrap();
     }
 }

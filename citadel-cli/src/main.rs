@@ -3,6 +3,10 @@ mod formatter;
 mod helper;
 mod repl;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process;
@@ -152,7 +156,7 @@ fn main() {
 fn run_batch(db: &citadel::Database, sql: &str, settings: &mut repl::Settings) {
     use std::time::Instant;
 
-    let mut conn = match citadel_sql::Connection::open(db) {
+    let conn = match citadel_sql::Connection::open(db) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -181,7 +185,7 @@ fn run_batch(db: &citadel::Database, sql: &str, settings: &mut repl::Settings) {
 fn run_piped(db: &citadel::Database, settings: &mut repl::Settings) {
     use std::io::{self, BufRead};
 
-    let mut conn = match citadel_sql::Connection::open(db) {
+    let conn = match citadel_sql::Connection::open(db) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -207,7 +211,7 @@ fn run_piped(db: &citadel::Database, settings: &mut repl::Settings) {
         }
 
         if trimmed.starts_with('.') {
-            commands::execute_dot_command_mut(trimmed, db, &mut conn, settings, &mut io::stdout());
+            commands::execute_dot_command_mut(trimmed, db, &conn, settings, &mut io::stdout());
             continue;
         }
 
@@ -217,19 +221,19 @@ fn run_piped(db: &citadel::Database, settings: &mut repl::Settings) {
         if has_complete_statement(&buf) {
             let sql = buf.trim();
             if !sql.is_empty() {
-                execute_and_display(&mut conn, sql, &mut *settings);
+                execute_and_display(&conn, sql, &mut *settings);
             }
             buf.clear();
         }
     }
 
     if !buf.trim().is_empty() {
-        execute_and_display(&mut conn, buf.trim(), settings);
+        execute_and_display(&conn, buf.trim(), settings);
     }
 }
 
 fn execute_and_display(
-    conn: &mut citadel_sql::Connection<'_>,
+    conn: &citadel_sql::Connection<'_>,
     sql: &str,
     settings: &mut repl::Settings,
 ) {

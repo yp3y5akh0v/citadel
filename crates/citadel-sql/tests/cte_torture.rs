@@ -17,13 +17,11 @@ fn assert_ok(result: ExecutionResult) {
     }
 }
 
-// -- 1. Column alias count mismatch --------------------------------------
-
 #[test]
 fn error_column_alias_mismatch() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let err = conn
         .query("WITH t(a, b, c) AS (SELECT 1, 2) SELECT * FROM t")
@@ -34,13 +32,11 @@ fn error_column_alias_mismatch() {
     );
 }
 
-// -- 2. Duplicate CTE name -----------------------------------------------
-
 #[test]
 fn error_duplicate_name() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let err = conn
         .query("WITH t AS (SELECT 1), t AS (SELECT 2) SELECT * FROM t")
@@ -51,13 +47,11 @@ fn error_duplicate_name() {
     );
 }
 
-// -- 3. RECURSIVE without UNION ------------------------------------------
-
 #[test]
 fn error_recursive_no_union() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let err = conn
         .query("WITH RECURSIVE t(x) AS (SELECT x + 1 FROM t WHERE x < 10) SELECT * FROM t")
@@ -68,13 +62,11 @@ fn error_recursive_no_union() {
     );
 }
 
-// -- 4. Recursive CTE exceeds max iterations -----------------------------
-
 #[test]
 fn error_recursive_max_iterations() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let err = conn
         .query("WITH RECURSIVE t(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM t) SELECT * FROM t")
@@ -85,13 +77,11 @@ fn error_recursive_max_iterations() {
     );
 }
 
-// -- 5. CTE inside subquery not supported --------------------------------
-
 #[test]
 fn error_cte_in_subquery() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let err = conn
         .query("SELECT * FROM (WITH t AS (SELECT 1) SELECT * FROM t)")
@@ -104,13 +94,11 @@ fn error_cte_in_subquery() {
     );
 }
 
-// -- 6. CTE returning empty result set -----------------------------------
-
 #[test]
 fn cte_empty_result() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE tbl (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
         .unwrap();
@@ -120,13 +108,11 @@ fn cte_empty_result() {
     assert_eq!(qr.rows.len(), 0);
 }
 
-// -- 7. CTE over large table --------------------------------------------
-
 #[test]
 fn cte_large_result() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE big (val INTEGER PRIMARY KEY)")
@@ -146,13 +132,11 @@ fn cte_large_result() {
     assert_eq!(qr.rows[0][0], Value::Integer(5000));
 }
 
-// -- 8. CTE self-join ----------------------------------------------------
-
 #[test]
 fn cte_self_join() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query(
@@ -182,13 +166,11 @@ fn cte_self_join() {
     assert_eq!(pairs, vec![(1, 1), (1, 2), (1, 3), (2, 2), (2, 3), (3, 3)]);
 }
 
-// -- 9. Three chained CTEs ----------------------------------------------
-
 #[test]
 fn cte_three_chained() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query(
@@ -203,13 +185,11 @@ fn cte_three_chained() {
     assert_eq!(qr.rows[0][0], Value::Integer(111));
 }
 
-// -- 10. Unused CTE does not error ---------------------------------------
-
 #[test]
 fn cte_unused() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query("WITH t AS (SELECT 1 AS x) SELECT 42 AS val")
@@ -219,13 +199,11 @@ fn cte_unused() {
     assert_eq!(qr.rows[0][0], Value::Integer(42));
 }
 
-// -- 11. Recursive fibonacci ---------------------------------------------
-
 #[test]
 fn recursive_fibonacci() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query(
@@ -258,13 +236,11 @@ fn recursive_fibonacci() {
     }
 }
 
-// -- 12. CTE with NULLs -------------------------------------------------
-
 #[test]
 fn cte_with_nulls() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query(
@@ -279,13 +255,11 @@ fn cte_with_nulls() {
     assert_eq!(qr.rows[2][0], Value::Integer(1));
 }
 
-// -- 13. CTE with mixed types -------------------------------------------
-
 #[test]
 fn cte_mixed_types() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query("WITH t AS (SELECT 1 AS x UNION ALL SELECT 'hello') SELECT x FROM t")
@@ -296,13 +270,11 @@ fn cte_mixed_types() {
     assert_eq!(qr.rows[1][0], Value::Text("hello".into()));
 }
 
-// -- 14. INSERT from joined CTEs ----------------------------------------
-
 #[test]
 fn cte_insert_multiple() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT)")
@@ -327,13 +299,11 @@ fn cte_insert_multiple() {
     assert_eq!(qr.rows[0][1], Value::Text("test".into()));
 }
 
-// -- 15. Recursive CTE inside a transaction ------------------------------
-
 #[test]
 fn recursive_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
 
@@ -382,7 +352,6 @@ fn recursive_in_transaction() {
         assert_eq!(row[2], Value::Integer(*exp_depth));
     }
 
-    // Verify results persist after COMMIT
     let qr2 = conn.query("SELECT COUNT(*) FROM tree").unwrap();
     assert_eq!(qr2.rows[0][0], Value::Integer(5));
 }

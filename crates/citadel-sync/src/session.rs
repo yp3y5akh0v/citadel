@@ -63,7 +63,6 @@ impl SyncSession {
         let local_reader = LocalTreeReader::new(manager);
         let (local_root, local_hash) = local_reader.root_info().map_err(SyncError::Database)?;
 
-        // Hello exchange
         transport.send(&SyncMessage::Hello {
             node_id: self.config.node_id,
             root_page: local_root,
@@ -150,7 +149,6 @@ impl SyncSession {
         let local_reader = LocalTreeReader::new(manager);
         let (local_root, local_hash) = local_reader.root_info().map_err(SyncError::Database)?;
 
-        // Receive Hello
         let remote_hash = match transport.recv()? {
             SyncMessage::Hello { root_hash, .. } => root_hash,
             SyncMessage::Error { message } => return Err(SyncError::Remote(message)),
@@ -186,7 +184,6 @@ impl SyncSession {
             already_in_sync: false,
         };
 
-        // Serve requests until Done
         loop {
             let msg = transport.recv()?;
             match msg {

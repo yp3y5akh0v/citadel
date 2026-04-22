@@ -1,17 +1,14 @@
-use std::collections::HashMap;
-
 use citadel::Database;
+use rustc_hash::FxHashMap;
 
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap};
+use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
 
 use super::helpers::*;
 use super::scan::*;
-
-// ── JOIN execution ──────────────────────────────────────────────────
 
 pub(super) fn resolve_table_name<'a>(
     schema: &'a SchemaManager,
@@ -286,7 +283,8 @@ pub(super) fn try_integer_join(
         return Ok(result);
     }
 
-    let mut inner_map: HashMap<i64, Vec<usize>> = HashMap::with_capacity(inner_rows.len());
+    let mut inner_map: FxHashMap<i64, Vec<usize>> =
+        FxHashMap::with_capacity_and_hasher(inner_rows.len(), Default::default());
     for (idx, inner) in inner_rows.iter().enumerate() {
         match &inner[inner_key_col] {
             Value::Integer(k) => inner_map.entry(*k).or_default().push(idx),
@@ -433,7 +431,7 @@ pub(super) fn exec_join_step(
     let outer_key_cols: Vec<usize> = equi_pairs.iter().map(|&(o, _)| o).collect();
     let inner_key_cols: Vec<usize> = equi_pairs.iter().map(|&(_, i)| i).collect();
 
-    let mut inner_map: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
+    let mut inner_map: FxHashMap<Vec<Value>, Vec<usize>> = FxHashMap::default();
     for (idx, inner) in inner_rows.iter().enumerate() {
         inner_map
             .entry(hash_key(inner, &inner_key_cols))
@@ -531,7 +529,7 @@ pub(super) fn exec_join_step(
         let combined_map = ColumnMap::new(combined_cols);
         let on_matches = |combined: &[Value]| -> bool {
             match join.on_clause {
-                Some(ref on_expr) => eval_expr(on_expr, &combined_map, combined)
+                Some(ref on_expr) => eval_expr(on_expr, &EvalCtx::new(&combined_map, combined))
                     .map(|v| is_truthy(&v))
                     .unwrap_or(false),
                 None => true,

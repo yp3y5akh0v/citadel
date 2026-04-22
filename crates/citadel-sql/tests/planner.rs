@@ -62,7 +62,6 @@ fn assert_plan(db: &citadel::Database, sql: &str, expected: &str) {
         ScanPlan::PkLookup { .. } => "PkLookup",
         ScanPlan::PkRangeScan { .. } => "PkRangeScan",
         ScanPlan::IndexScan { index_name, .. } => {
-            // Return the index name as part of the match
             if let Some(expected_idx) = expected.strip_prefix("IndexScan:") {
                 assert_eq!(
                     index_name, expected_idx,
@@ -79,7 +78,7 @@ fn assert_plan(db: &citadel::Database, sql: &str, expected: &str) {
     );
 }
 
-fn setup_products(conn: &mut Connection) {
+fn setup_products(conn: &Connection) {
     assert_ok(conn.execute(
         "CREATE TABLE products (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL, category TEXT, price REAL, stock INTEGER)"
     ).unwrap());
@@ -111,16 +110,12 @@ fn setup_products(conn: &mut Connection) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  PLAN VERIFICATION: prove the planner picks the right scan type
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn plan_pk_lookup_chosen_for_pk_equality() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(&db, "SELECT * FROM products WHERE id = 3", "PkLookup");
 }
@@ -129,8 +124,8 @@ fn plan_pk_lookup_chosen_for_pk_equality() {
 fn plan_pk_lookup_reversed_operands() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(&db, "SELECT * FROM products WHERE 5 = id", "PkLookup");
 }
@@ -139,8 +134,8 @@ fn plan_pk_lookup_reversed_operands() {
 fn plan_unique_index_chosen_for_name_equality() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(
         &db,
@@ -153,8 +148,8 @@ fn plan_unique_index_chosen_for_name_equality() {
 fn plan_non_unique_index_chosen_for_category_equality() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     // Should pick idx_cat_price (2 cols) or idx_category (1 col); both have
     // 1 equality column, but idx_cat_price has more columns so could score higher
@@ -170,8 +165,8 @@ fn plan_non_unique_index_chosen_for_category_equality() {
 fn plan_composite_index_chosen_for_two_column_equality() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(
         &db,
@@ -184,8 +179,8 @@ fn plan_composite_index_chosen_for_two_column_equality() {
 fn plan_composite_index_chosen_for_equality_plus_range() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(
         &db,
@@ -198,8 +193,8 @@ fn plan_composite_index_chosen_for_equality_plus_range() {
 fn plan_seq_scan_for_no_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(&db, "SELECT * FROM products", "SeqScan");
 }
@@ -208,8 +203,8 @@ fn plan_seq_scan_for_no_where() {
 fn plan_seq_scan_for_or_condition() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(
         &db,
@@ -222,8 +217,8 @@ fn plan_seq_scan_for_or_condition() {
 fn plan_seq_scan_for_non_indexed_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(&db, "SELECT * FROM products WHERE stock = 100", "SeqScan");
 }
@@ -232,8 +227,8 @@ fn plan_seq_scan_for_non_indexed_column() {
 fn plan_seq_scan_for_non_leading_composite_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     // price alone is not the leading column of idx_cat_price
     assert_plan(&db, "SELECT * FROM products WHERE price = 29.99", "SeqScan");
@@ -243,8 +238,8 @@ fn plan_seq_scan_for_non_leading_composite_column() {
 fn plan_index_scan_for_range_on_leading_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(
         &db,
@@ -257,8 +252,8 @@ fn plan_index_scan_for_range_on_leading_column() {
 fn plan_pk_lookup_for_update() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(
         &db,
@@ -271,8 +266,8 @@ fn plan_pk_lookup_for_update() {
 fn plan_index_scan_for_delete() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(
         &db,
@@ -285,8 +280,8 @@ fn plan_index_scan_for_delete() {
 fn plan_pk_lookup_for_delete_by_pk() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(&db, "DELETE FROM products WHERE id = 7", "PkLookup");
 }
@@ -295,8 +290,8 @@ fn plan_pk_lookup_for_delete_by_pk() {
 fn plan_index_scan_for_update_by_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(
         &db,
@@ -305,16 +300,12 @@ fn plan_index_scan_for_update_by_index() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  PK LOOKUP CORRECTNESS
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn pk_lookup_returns_correct_row() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(conn.execute("SELECT * FROM products WHERE id = 3").unwrap());
     assert_eq!(qr.rows.len(), 1);
@@ -329,8 +320,8 @@ fn pk_lookup_returns_correct_row() {
 fn pk_lookup_nonexistent_returns_empty() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute("SELECT * FROM products WHERE id = 999")
@@ -343,8 +334,8 @@ fn pk_lookup_nonexistent_returns_empty() {
 fn pk_lookup_reversed_operands_returns_correct() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute("SELECT name FROM products WHERE 5 = id")
@@ -354,16 +345,12 @@ fn pk_lookup_reversed_operands_returns_correct() {
     assert_eq!(qr.rows[0][0], Value::Text("Gizmo".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  UNIQUE INDEX SCAN CORRECTNESS
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn unique_index_returns_correct_row() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute("SELECT id, price FROM products WHERE name = 'Gadget'")
@@ -378,8 +365,8 @@ fn unique_index_returns_correct_row() {
 fn unique_index_no_match_returns_empty() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute("SELECT * FROM products WHERE name = 'NoSuchProduct'")
@@ -388,16 +375,12 @@ fn unique_index_no_match_returns_empty() {
     assert_eq!(qr.rows.len(), 0);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  NON-UNIQUE INDEX SCAN CORRECTNESS
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn non_unique_index_returns_all_matches() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute("SELECT id FROM products WHERE category = 'Electronics' ORDER BY id")
@@ -414,8 +397,8 @@ fn non_unique_index_returns_all_matches() {
 fn non_unique_index_no_match_returns_empty() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute("SELECT * FROM products WHERE category = 'Food'")
@@ -424,16 +407,12 @@ fn non_unique_index_no_match_returns_empty() {
     assert_eq!(qr.rows.len(), 0);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  COMPOSITE INDEX CORRECTNESS
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn composite_full_equality_returns_correct() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute("SELECT name FROM products WHERE category = 'Electronics' AND price = 49.99")
@@ -447,8 +426,8 @@ fn composite_full_equality_returns_correct() {
 fn composite_equality_plus_range_gt() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(conn.execute(
         "SELECT name FROM products WHERE category = 'Electronics' AND price > 30.0 ORDER BY name"
@@ -462,8 +441,8 @@ fn composite_equality_plus_range_gt() {
 fn composite_equality_plus_range_lt() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(conn.execute(
         "SELECT name FROM products WHERE category = 'Electronics' AND price < 30.0 ORDER BY name"
@@ -477,8 +456,8 @@ fn composite_equality_plus_range_lt() {
 fn composite_equality_plus_range_between() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(conn.execute(
         "SELECT name FROM products WHERE category = 'Electronics' AND price >= 20.0 AND price <= 50.0 ORDER BY name"
@@ -492,8 +471,8 @@ fn composite_equality_plus_range_between() {
 fn composite_leading_eq_no_range_returns_all_in_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     // category = 'Toys' via idx_cat_price returns all Toys regardless of price
     let qr = query_result(
@@ -505,16 +484,12 @@ fn composite_leading_eq_no_range_returns_all_in_prefix() {
     assert_eq!(qr.rows[1][0], Value::Text("Thingamajig".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  RANGE SCAN ON LEADING COLUMN
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn range_gt_on_leading_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute(
@@ -531,8 +506,8 @@ fn range_gt_on_leading_column() {
 fn range_lt_on_leading_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute(
@@ -548,8 +523,8 @@ fn range_lt_on_leading_column() {
 fn range_gte_on_leading_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute(
@@ -566,8 +541,8 @@ fn range_gte_on_leading_column() {
 fn range_lte_on_leading_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(conn.execute(
         "SELECT DISTINCT category FROM products WHERE category <= 'Electronics' ORDER BY category"
@@ -576,16 +551,12 @@ fn range_lte_on_leading_column() {
     assert_eq!(qr.rows[0][0], Value::Text("Electronics".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  RESIDUAL WHERE: index narrows, full WHERE still applied
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn index_scan_with_residual_and_predicate() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute(
@@ -602,8 +573,8 @@ fn index_scan_with_residual_and_predicate() {
 fn pk_lookup_with_additional_predicate_that_fails() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     // PK lookup finds id=1, but stock != 999 -> residual WHERE eliminates it
     let qr = query_result(
@@ -617,8 +588,8 @@ fn pk_lookup_with_additional_predicate_that_fails() {
 fn pk_lookup_with_additional_predicate_that_passes() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute("SELECT name FROM products WHERE id = 1 AND stock = 100")
@@ -628,16 +599,12 @@ fn pk_lookup_with_additional_predicate_that_passes() {
     assert_eq!(qr.rows[0][0], Value::Text("Widget".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  UPDATE VIA INDEX
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn update_via_pk_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(
         &db,
@@ -661,8 +628,8 @@ fn update_via_pk_lookup() {
 fn update_via_unique_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(
         &db,
@@ -686,8 +653,8 @@ fn update_via_unique_index() {
 fn update_via_non_unique_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_rows_affected(
         conn.execute("UPDATE products SET stock = 0 WHERE category = 'Toys'")
@@ -708,8 +675,8 @@ fn update_via_non_unique_index() {
 fn update_indexed_column_maintains_index_consistency() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     // Move a product to a different category
     assert_rows_affected(
@@ -739,8 +706,8 @@ fn update_indexed_column_maintains_index_consistency() {
 fn update_nonexistent_via_pk_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_rows_affected(
         conn.execute("UPDATE products SET stock = 0 WHERE id = 999")
@@ -749,16 +716,12 @@ fn update_nonexistent_via_pk_lookup() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  DELETE VIA INDEX
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn delete_via_pk_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(&db, "DELETE FROM products WHERE id = 4", "PkLookup");
     assert_rows_affected(
@@ -773,8 +736,8 @@ fn delete_via_pk_lookup() {
 fn delete_via_unique_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(
         &db,
@@ -798,8 +761,8 @@ fn delete_via_unique_index() {
 fn delete_via_non_unique_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_rows_affected(
         conn.execute("DELETE FROM products WHERE category = 'Electronics'")
@@ -823,8 +786,8 @@ fn delete_via_non_unique_index() {
 fn delete_nonexistent_via_pk_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_rows_affected(
         conn.execute("DELETE FROM products WHERE id = 999").unwrap(),
@@ -836,8 +799,8 @@ fn delete_nonexistent_via_pk_lookup() {
 fn delete_nonexistent_via_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_rows_affected(
         conn.execute("DELETE FROM products WHERE name = 'NoSuchProduct'")
@@ -846,16 +809,12 @@ fn delete_nonexistent_via_index() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  TRANSACTION MODE: index scans within BEGIN/COMMIT/ROLLBACK
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn select_via_index_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     conn.execute("BEGIN").unwrap();
     let qr = query_result(
@@ -880,8 +839,8 @@ fn select_via_index_in_transaction() {
 fn update_via_index_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     conn.execute("BEGIN").unwrap();
     assert_rows_affected(
@@ -907,8 +866,8 @@ fn update_via_index_in_transaction() {
 fn delete_via_index_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     conn.execute("BEGIN").unwrap();
     assert_rows_affected(
@@ -928,8 +887,8 @@ fn delete_via_index_in_transaction() {
 fn rollback_undoes_index_assisted_delete() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     conn.execute("BEGIN").unwrap();
     assert_rows_affected(
@@ -954,8 +913,8 @@ fn rollback_undoes_index_assisted_delete() {
 fn rollback_undoes_index_assisted_update() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     conn.execute("BEGIN").unwrap();
     assert_rows_affected(
@@ -973,15 +932,11 @@ fn rollback_undoes_index_assisted_update() {
     assert_eq!(qr.rows[0][0], Value::Real(29.99));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  INDEX SCAN vs FULL SCAN: prove same results
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn index_scan_matches_full_scan_equality() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -1028,7 +983,7 @@ fn index_scan_matches_full_scan_equality() {
 fn index_range_scan_matches_full_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -1068,15 +1023,11 @@ fn index_range_scan_matches_full_scan() {
     assert_eq!(index_scan.rows.len(), 6);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  SCALE TEST: 1000 rows - prove index returns correct subset
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn scale_1000_rows_index_equality() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE big (id INTEGER NOT NULL PRIMARY KEY, bucket INTEGER NOT NULL, data TEXT)"
@@ -1111,7 +1062,6 @@ fn scale_1000_rows_index_equality() {
     assert_eq!(qr.rows[0][0], Value::Integer(7));
     assert_eq!(qr.rows[49][0], Value::Integer(987));
 
-    // Verify every returned id mod 20 == 7
     for row in &qr.rows {
         if let Value::Integer(id) = row[0] {
             assert_eq!(id % 20, 7, "id {id} should have bucket 7");
@@ -1123,7 +1073,7 @@ fn scale_1000_rows_index_equality() {
 fn scale_1000_rows_index_range() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE big (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)")
@@ -1158,7 +1108,7 @@ fn scale_1000_rows_index_range() {
 fn scale_1000_rows_pk_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE big (id INTEGER NOT NULL PRIMARY KEY, data TEXT NOT NULL)")
@@ -1183,7 +1133,7 @@ fn scale_1000_rows_pk_lookup() {
 fn scale_1000_rows_delete_via_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE big (id INTEGER NOT NULL PRIMARY KEY, bucket INTEGER NOT NULL)")
@@ -1210,7 +1160,6 @@ fn scale_1000_rows_delete_via_index() {
     let qr = query_result(conn.execute("SELECT COUNT(*) FROM big").unwrap());
     assert_eq!(qr.rows[0][0], Value::Integer(900));
 
-    // Verify no rows with bucket=3 remain
     let qr = query_result(
         conn.execute("SELECT COUNT(*) FROM big WHERE bucket = 3")
             .unwrap(),
@@ -1222,7 +1171,7 @@ fn scale_1000_rows_delete_via_index() {
 fn scale_1000_rows_update_via_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE big (id INTEGER NOT NULL PRIMARY KEY, bucket INTEGER NOT NULL, val INTEGER)"
@@ -1253,15 +1202,11 @@ fn scale_1000_rows_update_via_index() {
     assert_eq!(qr.rows[0][0], Value::Integer(100));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  EDGE CASES
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn empty_table_with_index() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE empty (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
@@ -1280,7 +1225,7 @@ fn empty_table_with_index() {
 fn index_on_column_with_nulls() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE data (id INTEGER NOT NULL PRIMARY KEY, tag TEXT)")
@@ -1307,7 +1252,7 @@ fn index_on_column_with_nulls() {
 fn unique_index_with_null_values() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE data (id INTEGER NOT NULL PRIMARY KEY, code TEXT)")
@@ -1335,7 +1280,7 @@ fn unique_index_with_null_values() {
 fn composite_pk_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE orders (cust INTEGER NOT NULL, ord INTEGER NOT NULL, amount REAL, PRIMARY KEY (cust, ord))"
@@ -1365,7 +1310,7 @@ fn composite_pk_lookup() {
 fn partial_composite_pk_is_not_pk_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(conn.execute(
         "CREATE TABLE orders (cust INTEGER NOT NULL, ord INTEGER NOT NULL, amount REAL, PRIMARY KEY (cust, ord))"
@@ -1393,8 +1338,8 @@ fn partial_composite_pk_is_not_pk_lookup() {
 fn or_condition_correct_with_indexes_present() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     // OR falls back to SeqScan but results must still be correct
     assert_plan(
@@ -1420,7 +1365,7 @@ fn or_condition_correct_with_indexes_present() {
 fn single_row_table_pk_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE single (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
@@ -1441,7 +1386,7 @@ fn single_row_table_pk_lookup() {
 fn single_row_table_index_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE single (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
@@ -1472,7 +1417,7 @@ fn single_row_table_index_scan() {
 fn delete_all_via_index_then_reinsert() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, cat TEXT)")
@@ -1496,16 +1441,12 @@ fn delete_all_via_index_then_reinsert() {
     assert_eq!(qr.rows[0][0], Value::Integer(10));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  AGGREGATION + DISTINCT + ORDER BY + LIMIT with index pre-filter
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn aggregate_sum_with_index_prefilter() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute("SELECT SUM(price) FROM products WHERE category = 'Electronics'")
@@ -1524,8 +1465,8 @@ fn aggregate_sum_with_index_prefilter() {
 fn aggregate_count_with_index_prefilter() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute("SELECT COUNT(*) FROM products WHERE category = 'Toys'")
@@ -1538,8 +1479,8 @@ fn aggregate_count_with_index_prefilter() {
 fn aggregate_min_max_with_index_prefilter() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute("SELECT MIN(price), MAX(price) FROM products WHERE category = 'Electronics'")
@@ -1553,8 +1494,8 @@ fn aggregate_min_max_with_index_prefilter() {
 fn distinct_with_index_prefilter() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute(
@@ -1573,8 +1514,8 @@ fn distinct_with_index_prefilter() {
 fn order_by_limit_with_index_prefilter() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(
         conn.execute(
@@ -1591,8 +1532,8 @@ fn order_by_limit_with_index_prefilter() {
 fn order_by_limit_offset_with_index_prefilter() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     let qr = query_result(conn.execute(
         "SELECT name FROM products WHERE category = 'Electronics' ORDER BY price LIMIT 2 OFFSET 1"
@@ -1602,16 +1543,12 @@ fn order_by_limit_offset_with_index_prefilter() {
     assert_eq!(qr.rows[1][0], Value::Text("Gadget".into()));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  INDEX CONSISTENCY AFTER MUTATIONS
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn index_consistent_after_insert_update_delete_cycle() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     // Insert - index should include new row
     conn.execute("INSERT INTO products VALUES (9, 'Sprocket', 'Electronics', 5.99, 1000)")
@@ -1661,8 +1598,8 @@ fn index_scan_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
-        setup_products(&mut conn);
+        let conn = Connection::open(&db).unwrap();
+        setup_products(&conn);
     }
 
     // Reopen
@@ -1672,7 +1609,7 @@ fn index_scan_after_reopen() {
         .argon2_profile(Argon2Profile::Iot)
         .open()
         .unwrap();
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     // Plan should still use index
     assert_plan(
@@ -1695,15 +1632,11 @@ fn index_scan_after_reopen() {
     assert_eq!(qr.rows.len(), 4);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  BOUNDARY VALUES
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn index_scan_with_empty_string() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
@@ -1728,7 +1661,7 @@ fn index_scan_with_empty_string() {
 fn index_scan_with_negative_integers() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
@@ -1762,7 +1695,7 @@ fn index_scan_with_negative_integers() {
 fn index_scan_with_zero() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
@@ -1785,7 +1718,7 @@ fn index_scan_with_zero() {
 fn pk_lookup_with_large_integer() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
@@ -1806,7 +1739,7 @@ fn pk_lookup_with_large_integer() {
 fn index_scan_with_real_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val REAL)")
@@ -1826,15 +1759,11 @@ fn index_scan_with_real_boundary() {
     assert!(!qr.rows.is_empty());
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  MULTIPLE INDEXES: planner picks best one
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn prefers_unique_over_non_unique() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, code TEXT NOT NULL)")
@@ -1863,8 +1792,8 @@ fn prefers_unique_over_non_unique() {
 fn prefers_more_equality_columns_composite() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     // WHERE category = 'X' AND price = Y
     // idx_category has 1 eq col, idx_cat_price has 2 eq cols -> pick idx_cat_price
@@ -1875,16 +1804,12 @@ fn prefers_more_equality_columns_composite() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  DELETE ALL WITHOUT WHERE (always SeqScan)
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn delete_all_is_seq_scan_with_indexes() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(&db, "DELETE FROM products", "SeqScan");
     assert_rows_affected(conn.execute("DELETE FROM products").unwrap(), 8);
@@ -1892,16 +1817,12 @@ fn delete_all_is_seq_scan_with_indexes() {
     assert_eq!(qr.rows[0][0], Value::Integer(0));
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  INDEX NOT USED: IS NULL, IS NOT NULL, expression comparisons
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn is_null_falls_back_to_seq_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(
         &db,
@@ -1914,8 +1835,8 @@ fn is_null_falls_back_to_seq_scan() {
 fn is_not_null_falls_back_to_seq_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(
         &db,
@@ -1928,8 +1849,8 @@ fn is_not_null_falls_back_to_seq_scan() {
 fn not_equal_falls_back_to_seq_scan() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_products(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_products(&conn);
 
     assert_plan(
         &db,
@@ -1938,15 +1859,11 @@ fn not_equal_falls_back_to_seq_scan() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  BOOLEAN INDEX
-// ═══════════════════════════════════════════════════════════════════
-
 #[test]
 fn index_on_boolean_column() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(

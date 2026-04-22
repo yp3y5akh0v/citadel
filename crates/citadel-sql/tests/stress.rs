@@ -19,13 +19,11 @@ fn open_db(dir: &std::path::Path) -> citadel::Database {
         .unwrap()
 }
 
-// ── Bulk insert/select ─────────────────────────────────────────────
-
 #[test]
 fn insert_1000_rows_verify_all() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)")
         .unwrap();
@@ -38,7 +36,6 @@ fn insert_1000_rows_verify_all() {
     let qr = conn.query("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(1000));
 
-    // Verify each row
     for i in 0..1000i64 {
         let qr = conn
             .query(&format!("SELECT val FROM t WHERE id = {i}"))
@@ -56,7 +53,7 @@ fn insert_1000_rows_verify_all() {
 fn insert_then_delete_half_verify_remaining() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -66,7 +63,6 @@ fn insert_then_delete_half_verify_remaining() {
             .unwrap();
     }
 
-    // Delete even-numbered rows
     for i in (0..500).step_by(2) {
         conn.execute(&format!("DELETE FROM t WHERE id = {i}"))
             .unwrap();
@@ -75,7 +71,6 @@ fn insert_then_delete_half_verify_remaining() {
     let qr = conn.query("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(250));
 
-    // Verify only odd rows remain
     for i in 0..500 {
         let qr = conn
             .query(&format!("SELECT id FROM t WHERE id = {i}"))
@@ -92,7 +87,7 @@ fn insert_then_delete_half_verify_remaining() {
 fn update_all_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
         .unwrap();
@@ -102,7 +97,6 @@ fn update_all_rows() {
             .unwrap();
     }
 
-    // Update all rows
     conn.execute("UPDATE t SET val = id * 3").unwrap();
 
     let qr = conn.query("SELECT id, val FROM t ORDER BY id").unwrap();
@@ -113,13 +107,11 @@ fn update_all_rows() {
     }
 }
 
-// ── Many sequential transactions ───────────────────────────────────
-
 #[test]
 fn many_sequential_inserts() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, batch INTEGER)")
         .unwrap();
@@ -137,7 +129,6 @@ fn many_sequential_inserts() {
     let qr = conn.query("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(500));
 
-    // Verify batch assignments
     for batch in 0..50 {
         let qr = conn
             .query(&format!("SELECT COUNT(*) FROM t WHERE batch = {batch}"))
@@ -150,13 +141,11 @@ fn many_sequential_inserts() {
     }
 }
 
-// ── Create/drop table cycles ───────────────────────────────────────
-
 #[test]
 fn create_drop_cycle_50_times() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     for i in 0..50 {
         let name = format!("table_{i}");
@@ -182,14 +171,12 @@ fn create_drop_cycle_50_times() {
 fn recreate_same_table_with_different_schema() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
-    // Create with 2 columns
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, name TEXT)")
         .unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
 
-    // Drop and recreate with different schema (3 columns, different types)
     conn.execute("DROP TABLE t").unwrap();
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, score REAL, active BOOLEAN)")
         .unwrap();
@@ -203,13 +190,11 @@ fn recreate_same_table_with_different_schema() {
     assert_eq!(qr.rows[0][1], Value::Boolean(true));
 }
 
-// ── Many tables simultaneously ─────────────────────────────────────
-
 #[test]
 fn create_50_tables_all_active() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     for i in 0..50 {
         conn.execute(&format!(
@@ -222,7 +207,6 @@ fn create_50_tables_all_active() {
 
     assert_eq!(conn.tables().len(), 50);
 
-    // Verify each table independently
     for i in 0..50 {
         let qr = conn
             .query(&format!("SELECT val FROM t_{i} WHERE id = {i}"))
@@ -231,25 +215,21 @@ fn create_50_tables_all_active() {
     }
 }
 
-// ── Persistence stress ─────────────────────────────────────────────
-
 #[test]
 fn repeated_open_close_cycles() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Create initial data
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
             .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 100)").unwrap();
     }
 
-    // Open/close 20 times, adding data each time
     for cycle in 2..=21 {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         let qr = conn.query("SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(
@@ -262,10 +242,9 @@ fn repeated_open_close_cycles() {
             .unwrap();
     }
 
-    // Final verification
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let qr = conn.query("SELECT COUNT(*) FROM t").unwrap();
         assert_eq!(qr.rows[0][0], Value::Integer(21));
     }
@@ -277,16 +256,15 @@ fn write_close_reopen_verify_10_cycles() {
 
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, data TEXT)")
             .unwrap();
     }
 
     for cycle in 0..10 {
-        // Open and write
         {
             let db = open_db(dir.path());
-            let mut conn = Connection::open(&db).unwrap();
+            let conn = Connection::open(&db).unwrap();
             for j in 0..10 {
                 let id = cycle * 10 + j;
                 conn.execute(&format!(
@@ -296,10 +274,9 @@ fn write_close_reopen_verify_10_cycles() {
             }
         }
 
-        // Reopen and verify
         {
             let db = open_db(dir.path());
-            let mut conn = Connection::open(&db).unwrap();
+            let conn = Connection::open(&db).unwrap();
             let expected_count = (cycle + 1) * 10;
             let qr = conn.query("SELECT COUNT(*) FROM t").unwrap();
             assert_eq!(
@@ -311,21 +288,19 @@ fn write_close_reopen_verify_10_cycles() {
     }
 }
 
-// ── Multiple connections to same database ──────────────────────────
-
 #[test]
 fn multiple_connections_same_db() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
 
-    let mut conn1 = Connection::open(&db).unwrap();
+    let conn1 = Connection::open(&db).unwrap();
     conn1
         .execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
         .unwrap();
     conn1.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
 
     // Second connection should see the table
-    let mut conn2 = Connection::open(&db).unwrap();
+    let conn2 = Connection::open(&db).unwrap();
     let qr = conn2.query("SELECT val FROM t WHERE id = 1").unwrap();
     assert_eq!(qr.rows[0][0], Value::Text("hello".into()));
 }
@@ -335,39 +310,33 @@ fn connection_sees_writes_from_other_connection() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
 
-    let mut conn1 = Connection::open(&db).unwrap();
+    let conn1 = Connection::open(&db).unwrap();
     conn1
         .execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
         .unwrap();
     conn1.execute("INSERT INTO t VALUES (1, 100)").unwrap();
 
-    let mut conn2 = Connection::open(&db).unwrap();
+    let conn2 = Connection::open(&db).unwrap();
 
-    // conn2 should see conn1's data
     let qr = conn2.query("SELECT val FROM t WHERE id = 1").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(100));
 
-    // conn1 writes more
     conn1.execute("INSERT INTO t VALUES (2, 200)").unwrap();
 
-    // conn2 should see the new data
     let qr = conn2.query("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(2));
 }
-
-// ── Delete then re-insert ──────────────────────────────────────────
 
 #[test]
 fn delete_all_reinsert_cycle() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, gen INTEGER)")
         .unwrap();
 
     for gen in 0..10 {
-        // Insert 50 rows
         for i in 0..50 {
             conn.execute(&format!("INSERT INTO t VALUES ({i}, {gen})"))
                 .unwrap();
@@ -380,7 +349,6 @@ fn delete_all_reinsert_cycle() {
             "wrong count in generation {gen}"
         );
 
-        // Delete all
         conn.execute("DELETE FROM t").unwrap();
 
         let qr = conn.query("SELECT COUNT(*) FROM t").unwrap();
@@ -392,13 +360,11 @@ fn delete_all_reinsert_cycle() {
     }
 }
 
-// ── Large text values ──────────────────────────────────────────────
-
 #[test]
 fn large_text_values() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, data TEXT)")
         .unwrap();
@@ -411,7 +377,6 @@ fn large_text_values() {
             .unwrap();
     }
 
-    // Verify each
     for i in 1..=20 {
         let size = i * 25;
         let qr = conn
@@ -428,7 +393,7 @@ fn large_text_values() {
 fn value_near_max_inline_size() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, data TEXT)")
         .unwrap();
@@ -451,7 +416,7 @@ fn value_near_max_inline_size() {
 fn value_exceeding_max_inline_size_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, data TEXT)")
         .unwrap();
@@ -467,15 +432,12 @@ fn value_exceeding_max_inline_size_is_rejected() {
     );
 }
 
-// ── Many columns ───────────────────────────────────────────────────
-
 #[test]
 fn table_with_20_columns() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
-    // Build CREATE TABLE with 20 columns
     let mut cols: Vec<String> = vec!["id INTEGER NOT NULL PRIMARY KEY".into()];
     for i in 1..20 {
         cols.push(format!("col_{i} INTEGER"));
@@ -483,7 +445,6 @@ fn table_with_20_columns() {
     let create = format!("CREATE TABLE wide ({})", cols.join(", "));
     conn.execute(&create).unwrap();
 
-    // Insert a row with all columns
     let mut vals: Vec<String> = vec!["1".into()];
     for i in 1..20 {
         vals.push(format!("{}", i * 10));
@@ -491,7 +452,6 @@ fn table_with_20_columns() {
     let insert = format!("INSERT INTO wide VALUES ({})", vals.join(", "));
     conn.execute(&insert).unwrap();
 
-    // Verify SELECT *
     let qr = conn.query("SELECT * FROM wide WHERE id = 1").unwrap();
     assert_eq!(qr.rows[0].len(), 20);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
@@ -504,7 +464,7 @@ fn table_with_20_columns() {
 fn table_with_many_nullable_columns() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     // 15 nullable columns
     let mut cols: Vec<String> = vec!["id INTEGER NOT NULL PRIMARY KEY".into()];
@@ -514,10 +474,8 @@ fn table_with_many_nullable_columns() {
     let create = format!("CREATE TABLE sparse ({})", cols.join(", "));
     conn.execute(&create).unwrap();
 
-    // Insert with only PK
     conn.execute("INSERT INTO sparse (id) VALUES (1)").unwrap();
 
-    // Verify all nullable columns are NULL
     let qr = conn.query("SELECT * FROM sparse WHERE id = 1").unwrap();
     assert_eq!(qr.rows[0].len(), 16);
     assert_eq!(qr.rows[0][0], Value::Integer(1));
@@ -525,7 +483,6 @@ fn table_with_many_nullable_columns() {
         assert!(qr.rows[0][i].is_null(), "col {i} should be NULL");
     }
 
-    // Insert with some columns set
     conn.execute("INSERT INTO sparse (id, nullable_5, nullable_10) VALUES (2, 50, 100)")
         .unwrap();
 
@@ -536,13 +493,11 @@ fn table_with_many_nullable_columns() {
     assert_eq!(qr.rows[0][1], Value::Integer(100));
 }
 
-// ── ORDER BY on many rows ──────────────────────────────────────────
-
 #[test]
 fn order_by_500_rows_ascending() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
         .unwrap();
@@ -564,7 +519,7 @@ fn order_by_500_rows_ascending() {
 fn order_by_text_500_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
         .unwrap();
@@ -584,13 +539,11 @@ fn order_by_text_500_rows() {
     }
 }
 
-// ── Group by with many groups ──────────────────────────────────────
-
 #[test]
 fn group_by_100_groups() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, grp INTEGER NOT NULL, val INTEGER)",
@@ -618,13 +571,11 @@ fn group_by_100_groups() {
     }
 }
 
-// ── Parameterized integer range ────────────────────────────────────
-
 #[test]
 fn integer_range_minus_500_to_499_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY)")
         .unwrap();
@@ -637,7 +588,6 @@ fn integer_range_minus_500_to_499_roundtrip() {
     let qr = conn.query("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(1000));
 
-    // Verify ordering
     let qr = conn.query("SELECT id FROM t ORDER BY id").unwrap();
     assert_eq!(qr.rows.len(), 1000);
     for (idx, row) in qr.rows.iter().enumerate() {
@@ -645,13 +595,11 @@ fn integer_range_minus_500_to_499_roundtrip() {
     }
 }
 
-// ── Interleaved operations ─────────────────────────────────────────
-
 #[test]
 fn interleaved_insert_update_delete() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
         .unwrap();
@@ -659,21 +607,18 @@ fn interleaved_insert_update_delete() {
     for round in 0..20 {
         let base = round * 10;
 
-        // Insert 10 rows
         for j in 0..10 {
             let id = base + j;
             conn.execute(&format!("INSERT INTO t VALUES ({id}, 0)"))
                 .unwrap();
         }
 
-        // Update the first 5
         for j in 0..5 {
             let id = base + j;
             conn.execute(&format!("UPDATE t SET val = 1 WHERE id = {id}"))
                 .unwrap();
         }
 
-        // Delete the last 3
         for j in 7..10 {
             let id = base + j;
             conn.execute(&format!("DELETE FROM t WHERE id = {id}"))
@@ -685,7 +630,7 @@ fn interleaved_insert_update_delete() {
     // 20 rounds * (10 inserted - 3 deleted) = 140
     assert_eq!(qr.rows[0][0], Value::Integer(140));
 
-    // Verify updates: first 5 of each round have val=1, next 2 have val=0
+    // First 5 of each round have val=1, next 2 have val=0.
     let qr = conn.query("SELECT COUNT(*) FROM t WHERE val = 1").unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(100)); // 20 * 5
 
@@ -693,15 +638,13 @@ fn interleaved_insert_update_delete() {
     assert_eq!(qr.rows[0][0], Value::Integer(40)); // 20 * 2
 }
 
-// ── Schema persistence across many cycles ──────────────────────────
-
 #[test]
 fn schema_persists_with_multiple_tables_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
 
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         conn.execute("CREATE TABLE users (id INTEGER NOT NULL PRIMARY KEY, name TEXT)")
             .unwrap();
         conn.execute(
@@ -719,7 +662,7 @@ fn schema_persists_with_multiple_tables_across_reopen() {
 
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         let mut tables = conn.tables();
         tables.sort();
@@ -734,7 +677,6 @@ fn schema_persists_with_multiple_tables_across_reopen() {
         let qr = conn.query("SELECT label FROM tags WHERE id = 1").unwrap();
         assert_eq!(qr.rows[0][0], Value::Text("rust".into()));
 
-        // Drop one table, add another
         conn.execute("DROP TABLE posts").unwrap();
         conn.execute("CREATE TABLE comments (id INTEGER NOT NULL PRIMARY KEY, text TEXT)")
             .unwrap();
@@ -744,13 +686,12 @@ fn schema_persists_with_multiple_tables_across_reopen() {
 
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
 
         let mut tables = conn.tables();
         tables.sort();
         assert_eq!(tables, vec!["comments", "tags", "users"]);
 
-        // posts table should be gone
         let result = conn.query("SELECT * FROM posts");
         assert!(result.is_err());
 
@@ -761,18 +702,15 @@ fn schema_persists_with_multiple_tables_across_reopen() {
     }
 }
 
-// ── Bulk multi-row insert ──────────────────────────────────────────
-
 #[test]
 fn multi_row_insert_100_at_a_time() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
         .unwrap();
 
-    // Build a single INSERT with 100 value tuples
     for batch in 0..5 {
         let mut values = Vec::new();
         for j in 0..100 {
@@ -790,13 +728,11 @@ fn multi_row_insert_100_at_a_time() {
     assert_eq!(qr.rows[0][0], Value::Integer(500));
 }
 
-// ── Mixed type columns stress ──────────────────────────────────────
-
 #[test]
 fn all_types_in_one_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE mixed (
@@ -820,7 +756,6 @@ fn all_types_in_one_table() {
         .unwrap();
     }
 
-    // Query each type with WHERE
     let qr = conn
         .query("SELECT COUNT(*) FROM mixed WHERE int_col >= 5000")
         .unwrap();
@@ -836,7 +771,6 @@ fn all_types_in_one_table() {
         .unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(50));
 
-    // Aggregation over mixed
     let qr = conn.query("SELECT SUM(int_col) FROM mixed").unwrap();
     // Sum of 0, 100, 200, ..., 9900 = 100 * (0+1+...+99) = 100 * 4950 = 495000
     assert_eq!(qr.rows[0][0], Value::Integer(495000));
@@ -849,15 +783,13 @@ fn all_types_in_one_table() {
     assert_eq!(qr.rows[0][1], Value::Text("item_99".into()));
 }
 
-// ── Update all rows then verify persistence ────────────────────────
-
 #[test]
 fn update_all_then_reopen() {
     let dir = tempfile::tempdir().unwrap();
 
     {
         let db = create_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
             .unwrap();
         for i in 0..100 {
@@ -869,7 +801,7 @@ fn update_all_then_reopen() {
 
     {
         let db = open_db(dir.path());
-        let mut conn = Connection::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
         let qr = conn.query("SELECT id, val FROM t ORDER BY id").unwrap();
         assert_eq!(qr.rows.len(), 100);
         for (i, row) in qr.rows.iter().enumerate() {
@@ -879,13 +811,11 @@ fn update_all_then_reopen() {
     }
 }
 
-// ── Rapid successive queries ───────────────────────────────────────
-
 #[test]
 fn rapid_queries_500() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
         .unwrap();
@@ -894,7 +824,6 @@ fn rapid_queries_500() {
             .unwrap();
     }
 
-    // Execute 500 queries rapidly
     for _ in 0..10 {
         for i in 0..50 {
             let qr = conn
@@ -905,13 +834,11 @@ fn rapid_queries_500() {
     }
 }
 
-// ── DISTINCT stress ─────────────────────────────────────────────────
-
 #[test]
 fn distinct_many_duplicates() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)")
         .unwrap();
@@ -934,7 +861,7 @@ fn distinct_many_duplicates() {
 fn distinct_multi_column_many_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute(
         "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL)",
@@ -956,7 +883,7 @@ fn distinct_multi_column_many_rows() {
 fn distinct_with_limit_on_large_dataset() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER NOT NULL)")
         .unwrap();

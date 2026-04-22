@@ -185,8 +185,6 @@ mod tests {
         CrdtMeta::new(HlcTimestamp::new(wall_ns, logical), NodeId::from_u64(node))
     }
 
-    // ── CrdtMeta basics ──────────────────────────────────────────────
-
     #[test]
     fn meta_new_and_accessors() {
         let ts = HlcTimestamp::new(1000 * SECOND, 5);
@@ -230,8 +228,6 @@ mod tests {
         assert!(s.contains("NodeId"));
     }
 
-    // ── LWW comparison ───────────────────────────────────────────────
-
     #[test]
     fn lww_higher_timestamp_wins() {
         let a = meta(1000 * SECOND, 0, 1);
@@ -273,8 +269,6 @@ mod tests {
         assert!(a.wins_over(&b));
     }
 
-    // ── LWW merge function ───────────────────────────────────────────
-
     #[test]
     fn merge_local_wins() {
         let local = meta(1001 * SECOND, 0, 1);
@@ -295,8 +289,6 @@ mod tests {
         let remote = meta(1000 * SECOND, 5, 100);
         assert_eq!(lww_merge(&local, &remote), MergeResult::Equal);
     }
-
-    // ── CRDT properties ──────────────────────────────────────────────
 
     #[test]
     fn merge_commutativity() {
@@ -354,8 +346,6 @@ mod tests {
         assert_eq!(lww_merge(&a, &a), MergeResult::Equal);
     }
 
-    // ── EntryKind ────────────────────────────────────────────────────
-
     #[test]
     fn entry_kind_roundtrip() {
         assert_eq!(EntryKind::from_u8(0), Some(EntryKind::Put));
@@ -363,8 +353,6 @@ mod tests {
         assert_eq!(EntryKind::from_u8(2), None);
         assert_eq!(EntryKind::from_u8(255), None);
     }
-
-    // ── Value encoding ───────────────────────────────────────────────
 
     #[test]
     fn encode_decode_put_roundtrip() {
@@ -447,8 +435,6 @@ mod tests {
         assert_eq!(1 + 3 + 12 + 8, CRDT_HEADER_SIZE);
     }
 
-    // ── Encoding preserves metadata across merge ─────────────────────
-
     #[test]
     fn merge_encoded_values() {
         let local_meta = meta(1000 * SECOND, 0, 1);
@@ -498,8 +484,6 @@ mod tests {
         assert_eq!(put_decoded.kind, EntryKind::Put);
     }
 
-    // ── Binary format verification ───────────────────────────────────
-
     #[test]
     fn encoded_format_put() {
         let m = CrdtMeta::new(
@@ -535,8 +519,6 @@ mod tests {
         assert_eq!(encoded.len(), CRDT_HEADER_SIZE);
     }
 
-    // ── Stress: many merges ──────────────────────────────────────────
-
     #[test]
     fn merge_many_entries_finds_latest() {
         let entries: Vec<CrdtMeta> = (0..100)
@@ -561,7 +543,6 @@ mod tests {
             .map(|i| meta(1000 * SECOND + i as i64, 0, i as u64))
             .collect();
 
-        // Forward merge
         let mut fwd_winner = entries[0];
         for e in &entries[1..] {
             if lww_merge(&fwd_winner, e) == MergeResult::Remote {
@@ -569,7 +550,6 @@ mod tests {
             }
         }
 
-        // Reverse merge
         let mut rev_winner = entries[99];
         for e in entries[..99].iter().rev() {
             if lww_merge(&rev_winner, e) == MergeResult::Remote {
@@ -584,15 +564,12 @@ mod tests {
     fn merge_shuffled_order_same_result() {
         use std::collections::BTreeSet;
 
-        // Create entries with different timestamps
         let entries: Vec<CrdtMeta> = (0..50)
             .map(|i| meta(1000 * SECOND + (i * 7 % 50) as i64, 0, i as u64))
             .collect();
 
-        // Find absolute winner (max by lww_cmp)
         let expected = entries.iter().max_by(|a, b| a.lww_cmp(b)).unwrap();
 
-        // Merge in original order
         let mut winner = entries[0];
         for e in &entries[1..] {
             if lww_merge(&winner, e) == MergeResult::Remote {

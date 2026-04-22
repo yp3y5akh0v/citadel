@@ -3,8 +3,6 @@
 use crate::error::{Result, SqlError};
 use crate::types::{CompactString, DataType, Value};
 
-// ── Key encoding (order-preserving) ─────────────────────────────────
-
 /// Type tags for order-preserving key encoding.
 const TAG_NULL: u8 = 0x00;
 const TAG_BLOB: u8 = 0x01;
@@ -203,8 +201,6 @@ pub fn decode_composite_key(data: &[u8], count: usize) -> Result<Vec<Value>> {
     Ok(values)
 }
 
-// ── Integer encoding (variable-width) ───────────────────────────────
-
 fn decode_integer(data: &[u8]) -> Result<(Value, usize)> {
     let (v, n) = decode_signed_varint(data)?;
     Ok((Value::Integer(v), n))
@@ -243,8 +239,6 @@ pub(crate) fn decode_signed_varint(data: &[u8]) -> Result<(i64, usize)> {
     }
 }
 
-// ── Real encoding (IEEE 754 sign-bit manipulation) ──────────────────
-
 fn decode_real(data: &[u8]) -> Result<(Value, usize)> {
     if data.len() < 8 {
         return Err(SqlError::InvalidValue("truncated real".into()));
@@ -260,8 +254,6 @@ fn decode_real(data: &[u8]) -> Result<(Value, usize)> {
     let val = f64::from_bits(bits);
     Ok((Value::Real(val), 8))
 }
-
-// ── Null-escaped byte encoding ──────────────────────────────────────
 
 /// Decode null-escaped bytes. Returns (decoded bytes, bytes consumed including terminator).
 fn decode_null_escaped(data: &[u8]) -> Result<(Vec<u8>, usize)> {
@@ -284,8 +276,6 @@ fn decode_null_escaped(data: &[u8]) -> Result<(Vec<u8>, usize)> {
         "unterminated null-escaped string".into(),
     ))
 }
-
-// ── Row encoding (for B+ tree values - non-PK columns) ─────────────
 
 /// Encode non-PK columns. Format: [col_count:u16][null_bitmap][type(u8)+len(u32)+data per col]
 pub fn encode_row(values: &[Value]) -> Vec<u8> {
@@ -1180,8 +1170,6 @@ pub fn decode_pk_integer(key: &[u8]) -> Result<i64> {
 mod tests {
     use super::*;
 
-    // ── Key encoding tests ──────────────────────────────────────────
-
     #[test]
     fn key_null() {
         let encoded = encode_key_value(&Value::Null);
@@ -1382,8 +1370,6 @@ mod tests {
         assert!(text < bool_val);
         assert!(bool_val < int);
     }
-
-    // ── Row encoding tests ──────────────────────────────────────────
 
     #[test]
     fn row_roundtrip_simple() {

@@ -14,10 +14,6 @@ fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
 
 const ZERO_HASH: [u8; 28] = [0u8; 28];
 
-// ============================================================
-// Basic properties
-// ============================================================
-
 #[test]
 fn empty_db_has_nonzero_merkle_root() {
     let dir = tempfile::tempdir().unwrap();
@@ -94,10 +90,6 @@ fn abort_does_not_change_merkle_root() {
     let after = db.stats().merkle_root;
     assert_eq!(before, after, "abort must not change merkle root");
 }
-
-// ============================================================
-// Determinism
-// ============================================================
 
 #[test]
 fn same_data_produces_same_merkle_root() {
@@ -189,10 +181,6 @@ fn insert_order_does_not_affect_merkle_root() {
     );
 }
 
-// ============================================================
-// Persistence
-// ============================================================
-
 #[test]
 fn merkle_root_persists_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -223,7 +211,6 @@ fn merkle_root_persists_across_multiple_sessions() {
 
     let mut hashes = Vec::new();
 
-    // Session 1: create + insert
     {
         let db = fast_builder(&db_path).create().unwrap();
         let mut wtx = db.begin_write().unwrap();
@@ -232,7 +219,6 @@ fn merkle_root_persists_across_multiple_sessions() {
         hashes.push(db.stats().merkle_root);
     }
 
-    // Session 2: more inserts
     {
         let db = fast_builder(&db_path).open().unwrap();
         assert_eq!(db.stats().merkle_root, hashes[0]);
@@ -242,17 +228,12 @@ fn merkle_root_persists_across_multiple_sessions() {
         hashes.push(db.stats().merkle_root);
     }
 
-    // Session 3: verify accumulated
     {
         let db = fast_builder(&db_path).open().unwrap();
         assert_eq!(db.stats().merkle_root, hashes[1]);
         assert_ne!(hashes[0], hashes[1]);
     }
 }
-
-// ============================================================
-// Backup & Compact
-// ============================================================
 
 #[test]
 fn backup_preserves_merkle_root() {
@@ -284,7 +265,6 @@ fn compact_preserves_merkle_root() {
     let dir = tempfile::tempdir().unwrap();
     let db = fast_builder(&dir.path().join("test.db")).create().unwrap();
 
-    // Insert, then delete some to create free pages
     let mut wtx = db.begin_write().unwrap();
     for i in 0..100u32 {
         wtx.insert(&i.to_be_bytes(), b"data").unwrap();
@@ -310,10 +290,6 @@ fn compact_preserves_merkle_root() {
         "compact must preserve merkle root"
     );
 }
-
-// ============================================================
-// Multi-transaction tracking
-// ============================================================
 
 #[test]
 fn each_commit_produces_unique_merkle_root() {
@@ -361,10 +337,6 @@ fn delete_then_reinsert_restores_merkle_root() {
     );
 }
 
-// ============================================================
-// Named tables
-// ============================================================
-
 #[test]
 fn named_table_operations_do_not_affect_default_merkle_root() {
     let dir = tempfile::tempdir().unwrap();
@@ -388,10 +360,6 @@ fn named_table_operations_do_not_affect_default_merkle_root() {
         "named table changes must not affect default tree merkle root"
     );
 }
-
-// ============================================================
-// Edge cases
-// ============================================================
 
 #[test]
 fn empty_value_has_distinct_hash() {
@@ -423,7 +391,6 @@ fn single_byte_keys_and_values() {
         roots.push(db.stats().merkle_root);
     }
 
-    // Each insert changes the root
     for i in 1..roots.len() {
         assert_ne!(roots[i - 1], roots[i], "insert {i} must change root");
     }

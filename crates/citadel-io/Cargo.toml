@@ -22,6 +22,10 @@ io-uring = ["dep:io-uring"]
 [dependencies]
 citadel-core = { workspace = true }
 xxhash-rust = { workspace = true }
+parking_lot = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

@@ -20,10 +20,6 @@ fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
         .argon2_profile(Argon2Profile::Iot)
 }
 
-// ============================================================
-// Independently compute expected Merkle root
-// ============================================================
-
 /// Compute the expected Merkle leaf hash from a sorted set of key-value pairs.
 /// This mirrors the algorithm in merkle.rs but uses only public data.
 fn expected_leaf_hash(entries: &BTreeMap<Vec<u8>, Vec<u8>>) -> [u8; MERKLE_HASH_SIZE] {
@@ -41,10 +37,6 @@ fn expected_leaf_hash(entries: &BTreeMap<Vec<u8>, Vec<u8>>) -> [u8; MERKLE_HASH_
     out.copy_from_slice(&hash.as_bytes()[..MERKLE_HASH_SIZE]);
     out
 }
-
-// ============================================================
-// Single-leaf tree verification
-// ============================================================
 
 #[test]
 fn single_leaf_hash_matches() {
@@ -135,10 +127,6 @@ fn update_value_hash_matches() {
     assert_ne!(h1, h2);
 }
 
-// ============================================================
-// Transaction boundary independence
-// ============================================================
-
 #[test]
 fn single_txn_vs_many_txns_same_hash() {
     let dir = tempfile::tempdir().unwrap();
@@ -203,10 +191,6 @@ fn batch_sizes_dont_affect_hash() {
     );
 }
 
-// ============================================================
-// Split propagation - force tree structure changes
-// ============================================================
-
 #[test]
 fn many_inserts_force_splits_hash_changes() {
     let dir = tempfile::tempdir().unwrap();
@@ -228,7 +212,6 @@ fn many_inserts_force_splits_hash_changes() {
         prev_hash = h;
     }
 
-    // Verify depth increased (splits happened)
     assert!(
         db.stats().tree_depth >= 2,
         "500 inserts should create a multi-level tree, got depth {}",
@@ -281,7 +264,6 @@ fn split_same_order_different_txn_granularity() {
         "same order, different txn boundaries must produce same hash after splits"
     );
 
-    // Verify both have multi-level trees (splits happened)
     assert!(db1.stats().tree_depth >= 2, "db1 depth must be >= 2");
     assert!(db2.stats().tree_depth >= 2, "db2 depth must be >= 2");
 }
@@ -291,7 +273,6 @@ fn delete_half_then_reinsert_restores_hash() {
     let dir = tempfile::tempdir().unwrap();
     let db = fast_builder(&dir.path().join("test.db")).create().unwrap();
 
-    // Insert 200 entries
     let mut wtx = db.begin_write().unwrap();
     for i in 0..200u32 {
         wtx.insert(&i.to_be_bytes(), &i.to_le_bytes()).unwrap();
@@ -299,7 +280,6 @@ fn delete_half_then_reinsert_restores_hash() {
     wtx.commit().unwrap();
     let full_hash = db.stats().merkle_root;
 
-    // Delete even entries
     let mut wtx = db.begin_write().unwrap();
     for i in (0..200u32).step_by(2) {
         wtx.delete(&i.to_be_bytes()).unwrap();
@@ -308,7 +288,6 @@ fn delete_half_then_reinsert_restores_hash() {
     let half_hash = db.stats().merkle_root;
     assert_ne!(full_hash, half_hash);
 
-    // Reinsert even entries
     let mut wtx = db.begin_write().unwrap();
     for i in (0..200u32).step_by(2) {
         wtx.insert(&i.to_be_bytes(), &i.to_le_bytes()).unwrap();
@@ -321,10 +300,6 @@ fn delete_half_then_reinsert_restores_hash() {
         "reinserting deleted entries must restore hash"
     );
 }
-
-// ============================================================
-// Random operation stress with seeded RNG
-// ============================================================
 
 /// Simple deterministic PRNG (xorshift32)
 struct Rng(u32);
@@ -362,7 +337,6 @@ fn random_ops_maintain_consistency() {
             let key = rng.next_range(100).to_be_bytes().to_vec();
             match rng.next_range(3) {
                 0 | 1 => {
-                    // Insert/update
                     let val = rng.next().to_le_bytes().to_vec();
                     let old = expected.insert(key.clone(), val.clone());
                     if old.as_ref() != Some(&val) {
@@ -371,7 +345,6 @@ fn random_ops_maintain_consistency() {
                     wtx.insert(&key, &val).unwrap();
                 }
                 _ => {
-                    // Delete
                     if expected.remove(&key).is_some() {
                         changed = true;
                     }
@@ -388,7 +361,6 @@ fn random_ops_maintain_consistency() {
         prev_hash = h;
     }
 
-    // Final consistency: verify all data matches expected
     let mut rtx = db.begin_read();
     let mut db_entries = BTreeMap::new();
     rtx.for_each(|k, v| {
@@ -417,7 +389,6 @@ fn random_ops_two_dbs_converge() {
         }
         wtx.commit().unwrap();
     }
-    // Update some values
     {
         let mut wtx = db1.begin_write().unwrap();
         for i in (0..50u32).step_by(3) {
@@ -452,10 +423,6 @@ fn random_ops_two_dbs_converge() {
     );
 }
 
-// ============================================================
-// Cross-passphrase determinism
-// ============================================================
-
 #[test]
 fn different_passphrase_same_merkle_root() {
     let dir = tempfile::tempdir().unwrap();
@@ -488,10 +455,6 @@ fn different_passphrase_same_merkle_root() {
     );
 }
 
-// ============================================================
-// Persistence and reopen consistency
-// ============================================================
-
 #[test]
 fn merkle_root_survives_many_reopen_cycles() {
     let dir = tempfile::tempdir().unwrap();
@@ -507,7 +470,6 @@ fn merkle_root_survives_many_reopen_cycles() {
                 fast_builder(&db_path).open().unwrap()
             };
 
-            // Verify previous hash persisted
             if !hashes.is_empty() {
                 assert_eq!(db.stats().merkle_root, *hashes.last().unwrap());
             }
@@ -522,7 +484,6 @@ fn merkle_root_survives_many_reopen_cycles() {
         }
     }
 
-    // All hashes should be unique
     let unique: std::collections::HashSet<_> = hashes.iter().collect();
     assert_eq!(
         unique.len(),
@@ -530,10 +491,6 @@ fn merkle_root_survives_many_reopen_cycles() {
         "each round must produce unique hash"
     );
 }
-
-// ============================================================
-// Backup and compact under stress
-// ============================================================
 
 #[test]
 fn backup_preserves_hash_after_heavy_writes() {
@@ -613,12 +570,10 @@ fn compact_then_more_writes_still_consistent() {
     }
     wtx.commit().unwrap();
 
-    // Compact
     let compact_path = dir.path().join("compact.db");
     db.compact(&compact_path).unwrap();
     drop(db);
 
-    // Open compacted DB, add more data
     let db = fast_builder(&compact_path).open().unwrap();
     let mut wtx = db.begin_write().unwrap();
     for i in 100..150u32 {
@@ -641,10 +596,6 @@ fn compact_then_more_writes_still_consistent() {
         "compacted + extended DB must match fresh DB with same data"
     );
 }
-
-// ============================================================
-// Edge cases
-// ============================================================
 
 #[test]
 fn many_single_byte_keys_unique_hashes() {
@@ -752,10 +703,6 @@ fn empty_key_and_value() {
     );
 }
 
-// ============================================================
-// Interleaved insert/delete cycles
-// ============================================================
-
 #[test]
 fn insert_delete_interleave_convergence() {
     let dir = tempfile::tempdir().unwrap();
@@ -833,10 +780,6 @@ fn overwrite_all_values_then_compare() {
     );
 }
 
-// ============================================================
-// Scale: large dataset consistency
-// ============================================================
-
 #[test]
 fn large_dataset_integrity_and_determinism() {
     let dir = tempfile::tempdir().unwrap();
@@ -893,10 +836,6 @@ fn large_dataset_integrity_and_determinism() {
     );
 }
 
-// ============================================================
-// Multiple aborts followed by commit
-// ============================================================
-
 #[test]
 fn multiple_aborts_then_commit() {
     let dir = tempfile::tempdir().unwrap();
@@ -917,7 +856,6 @@ fn multiple_aborts_then_commit() {
         "aborts must not change hash"
     );
 
-    // Now a real commit
     let mut wtx = db.begin_write().unwrap();
     wtx.insert(b"committed", b"data").unwrap();
     wtx.commit().unwrap();
@@ -928,10 +866,6 @@ fn multiple_aborts_then_commit() {
         "commit after aborts must change hash"
     );
 }
-
-// ============================================================
-// Concurrent readers see consistent hash
-// ============================================================
 
 #[test]
 fn reader_sees_consistent_hash_during_writes() {
@@ -973,10 +907,6 @@ fn reader_sees_consistent_hash_during_writes() {
     );
     drop(rtx);
 }
-
-// ============================================================
-// Named tables isolation
-// ============================================================
 
 #[test]
 fn named_table_churn_does_not_affect_default_hash() {
@@ -1021,10 +951,6 @@ fn named_table_churn_does_not_affect_default_hash() {
     );
 }
 
-// ============================================================
-// Stress: rapid insert-delete cycles
-// ============================================================
-
 #[test]
 fn rapid_insert_delete_cycles() {
     let dir = tempfile::tempdir().unwrap();
@@ -1061,10 +987,6 @@ fn rapid_insert_delete_cycles() {
         "after all insert-delete cycles, must return to empty hash"
     );
 }
-
-// ============================================================
-// Integrity check across all operations
-// ============================================================
 
 #[test]
 fn integrity_check_after_complex_workload() {
@@ -1104,10 +1026,6 @@ fn integrity_check_after_complex_workload() {
     let r = db.integrity_check().unwrap();
     assert!(r.is_ok(), "after reinsert: {:?}", r.errors);
 }
-
-// ============================================================
-// Hash sensitivity: single bit changes
-// ============================================================
 
 #[test]
 fn single_bit_value_difference() {

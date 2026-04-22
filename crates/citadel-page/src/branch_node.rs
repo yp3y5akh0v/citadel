@@ -165,12 +165,10 @@ pub fn split(page: &Page) -> (Vec<u8>, Vec<Vec<u8>>, PageId, PageId) {
     let n = page.num_cells() as usize;
     let split_point = n / 2;
 
-    // Read the promoted cell
     let promoted = read_cell(page, split_point as u16);
     let sep_key = promoted.key.to_vec();
     let promoted_child = promoted.child; // becomes left page's right_child
 
-    // Collect right page cells
     let mut right_cells = Vec::with_capacity(n - split_point - 1);
     for i in (split_point + 1)..n {
         let c = read_cell(page, i as u16);
@@ -259,7 +257,6 @@ mod tests {
         assert!(ok);
 
         assert_eq!(page.num_cells(), 3);
-        // Verify: [(1, "b"), (20, "d"), (21, "f")], rc=3
         let c0 = read_cell(&page, 0);
         assert_eq!(c0.child, PageId(1));
         assert_eq!(c0.key, b"b");

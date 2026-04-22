@@ -24,7 +24,7 @@ fn assert_rows_affected(result: ExecutionResult, expected: u64) {
     }
 }
 
-fn setup_src(conn: &mut Connection) {
+fn setup_src(conn: &Connection) {
     assert_ok(
         conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")
             .unwrap(),
@@ -39,14 +39,12 @@ fn setup_src(conn: &mut Connection) {
     );
 }
 
-// ── 1. Basic INSERT ... SELECT ──────────────────────────────────────
-
 #[test]
 fn basic_insert_select() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_src(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_src(&conn);
 
     assert_ok(
         conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")
@@ -72,14 +70,12 @@ fn basic_insert_select() {
     assert_eq!(qr.rows[2][2], Value::Integer(35));
 }
 
-// ── 2. INSERT ... SELECT with explicit columns + WHERE ──────────────
-
 #[test]
 fn insert_select_with_columns() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_src(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_src(&conn);
 
     assert_ok(
         conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")
@@ -105,14 +101,12 @@ fn insert_select_with_columns() {
     assert_eq!(qr.rows[1][2], Value::Integer(35));
 }
 
-// ── 3. INSERT ... SELECT with column reorder ────────────────────────
-
 #[test]
 fn insert_select_column_reorder() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_src(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_src(&conn);
 
     assert_ok(
         conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")
@@ -133,14 +127,12 @@ fn insert_select_column_reorder() {
     assert_eq!(qr.rows[0][2], Value::Integer(30));
 }
 
-// ── 4. Column count mismatch ────────────────────────────────────────
-
 #[test]
 fn insert_select_column_count_mismatch() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_src(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_src(&conn);
 
     assert_ok(
         conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")
@@ -156,14 +148,12 @@ fn insert_select_column_count_mismatch() {
     );
 }
 
-// ── 5. Self-referential INSERT ... SELECT (snapshot semantics) ──────
-
 #[test]
 fn insert_select_self_referential() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_src(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_src(&conn);
 
     assert_rows_affected(
         conn.execute("INSERT INTO src SELECT id + 10, name, age FROM src")
@@ -181,14 +171,12 @@ fn insert_select_self_referential() {
     assert_eq!(qr.rows[5][0], Value::Integer(13));
 }
 
-// ── 6. INSERT ... SELECT with parameters ────────────────────────────
-
 #[test]
 fn insert_select_with_params() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_src(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_src(&conn);
 
     assert_ok(
         conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")
@@ -209,13 +197,11 @@ fn insert_select_with_params() {
     assert_eq!(qr.rows[1][0], Value::Integer(3));
 }
 
-// ── 7. Type coercion: INTEGER -> REAL ────────────────────────────────
-
 #[test]
 fn insert_select_type_coercion() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, val INTEGER)")
@@ -243,14 +229,12 @@ fn insert_select_type_coercion() {
     }
 }
 
-// ── 8. Empty result set ─────────────────────────────────────────────
-
 #[test]
 fn insert_select_empty_result() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_src(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_src(&conn);
 
     assert_ok(
         conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")
@@ -266,14 +250,12 @@ fn insert_select_empty_result() {
     assert_eq!(qr.rows[0][0], Value::Integer(0));
 }
 
-// ── 9. Default fills omitted column ─────────────────────────────────
-
 #[test]
 fn insert_select_with_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_src(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_src(&conn);
 
     assert_ok(
         conn.execute(
@@ -300,14 +282,12 @@ fn insert_select_with_defaults() {
     }
 }
 
-// ── 10. INSERT ... SELECT inside transaction ────────────────────────
-
 #[test]
 fn insert_select_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_src(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_src(&conn);
 
     assert_ok(
         conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")
@@ -325,14 +305,12 @@ fn insert_select_in_transaction() {
     assert_eq!(qr.rows[0][0], Value::Integer(3));
 }
 
-// ── 11. Duplicate primary key ───────────────────────────────────────
-
 #[test]
 fn insert_select_duplicate_key() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
-    setup_src(&mut conn);
+    let conn = Connection::open(&db).unwrap();
+    setup_src(&conn);
 
     assert_ok(
         conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")
@@ -347,13 +325,11 @@ fn insert_select_duplicate_key() {
     assert!(matches!(err, SqlError::DuplicateKey));
 }
 
-// ── 12. NOT NULL violation ──────────────────────────────────────────
-
 #[test]
 fn insert_select_not_null_violation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, val INTEGER)")
@@ -379,13 +355,11 @@ fn insert_select_not_null_violation() {
     );
 }
 
-// ── 13. Foreign key violation ───────────────────────────────────────
-
 #[test]
 fn insert_select_fk_violation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE parent (id INTEGER NOT NULL PRIMARY KEY)")
@@ -423,13 +397,11 @@ fn insert_select_fk_violation() {
     );
 }
 
-// ── 14. CHECK constraint violation ──────────────────────────────────
-
 #[test]
 fn insert_select_check_violation() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, age INTEGER)")
@@ -455,13 +427,11 @@ fn insert_select_check_violation() {
     );
 }
 
-// ── 15. INSERT ... SELECT with JOIN ─────────────────────────────────
-
 #[test]
 fn insert_select_with_join() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, age INTEGER)")

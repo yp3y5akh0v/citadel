@@ -350,8 +350,10 @@ dependencies = [
  "citadeldb-txn",
  "criterion",
  "hmac",
+ "mimalloc",
  "parking_lot",
  "rand",
+ "rustc-hash",
  "sha2",
  "tempfile",
 ]
@@ -365,6 +367,7 @@ dependencies = [
  "citadeldb-io",
  "citadeldb-page",
  "parking_lot",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -377,6 +380,7 @@ dependencies = [
  "clap",
  "comfy-table",
  "dirs",
+ "mimalloc",
  "owo-colors",
  "rpassword",
  "rustyline",
@@ -429,6 +433,8 @@ dependencies = [
  "citadeldb-core",
  "io-uring",
  "libc",
+ "memmap2",
+ "parking_lot",
  "tempfile",
  "windows-sys 0.59.0",
  "xxhash-rust",
@@ -457,6 +463,7 @@ dependencies = [
  "mimalloc",
  "rand",
  "rusqlite",
+ "rustc-hash",
  "sqlparser",
  "tempfile",
  "thiserror",
@@ -491,6 +498,7 @@ dependencies = [
  "citadeldb-page",
  "parking_lot",
  "rayon",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -1223,6 +1231,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memmap2"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "mimalloc"
 version = "0.1.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1655,6 +1672,12 @@ dependencies = [
  "smallvec",
  "sqlite-wasm-rs",
 ]
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
 
 [[package]]
 name = "rustc_version"

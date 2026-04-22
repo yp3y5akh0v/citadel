@@ -32,7 +32,7 @@ Most databases use a write-ahead log for crash recovery. Citadel uses **shadow p
 
 ## Faster than unencrypted SQLite
 
-Citadel beats SQLite in all 13 head-to-head benchmarks, even though every page goes through AES-256-CTR + HMAC-SHA256 and SQLite runs without any encryption.
+Citadel beats SQLite in all 26 head-to-head benchmarks, even though every page goes through AES-256-CTR + HMAC-SHA256 and SQLite runs without any encryption.
 
 Full results are in the <a href="https://github.com/yp3y5akh0v/citadel#benchmarks" target="_blank" rel="noopener">README</a>.
 

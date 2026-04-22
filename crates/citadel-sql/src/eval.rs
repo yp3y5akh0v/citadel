@@ -1,14 +1,14 @@
 //! Expression evaluator with SQL three-valued logic.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::error::{Result, SqlError};
 use crate::parser::{BinOp, Expr, UnaryOp};
 use crate::types::{ColumnDef, CompactString, DataType, Value};
 
 pub struct ColumnMap {
-    exact: HashMap<String, usize>,
-    short: HashMap<String, ShortMatch>,
+    exact: FxHashMap<String, usize>,
+    short: FxHashMap<String, ShortMatch>,
 }
 
 #[derive(Clone)]
@@ -28,8 +28,9 @@ impl Clone for ColumnMap {
 
 impl ColumnMap {
     pub fn new(columns: &[ColumnDef]) -> Self {
-        let mut exact = HashMap::with_capacity(columns.len() * 2);
-        let mut short: HashMap<String, ShortMatch> = HashMap::with_capacity(columns.len());
+        let mut exact = FxHashMap::with_capacity_and_hasher(columns.len() * 2, Default::default());
+        let mut short: FxHashMap<String, ShortMatch> =
+            FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
 
         for (i, col) in columns.iter().enumerate() {
             let lower = col.name.to_ascii_lowercase();
@@ -72,42 +73,115 @@ impl ColumnMap {
     }
 }
 
-pub fn eval_expr(expr: &Expr, col_map: &ColumnMap, row: &[Value]) -> Result<Value> {
+pub struct EvalCtx<'a> {
+    pub col_map: &'a ColumnMap,
+    pub row: &'a [Value],
+    pub params: &'a [Value],
+}
+
+impl<'a> EvalCtx<'a> {
+    pub fn new(col_map: &'a ColumnMap, row: &'a [Value]) -> Self {
+        Self {
+            col_map,
+            row,
+            params: &[],
+        }
+    }
+
+    pub fn with_params(col_map: &'a ColumnMap, row: &'a [Value], params: &'a [Value]) -> Self {
+        Self {
+            col_map,
+            row,
+            params,
+        }
+    }
+}
+
+thread_local! {
+    static SCOPED_PARAMS: std::cell::Cell<(*const Value, usize)> =
+        const { std::cell::Cell::new((std::ptr::null(), 0)) };
+}
+
+/// Install positional parameters for `Expr::Parameter` resolution during `f`.
+pub fn with_scoped_params<R>(params: &[Value], f: impl FnOnce() -> R) -> R {
+    struct Guard((*const Value, usize));
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SCOPED_PARAMS.with(|slot| slot.set(self.0));
+        }
+    }
+    SCOPED_PARAMS.with(|slot| {
+        let prev = slot.get();
+        slot.set((params.as_ptr(), params.len()));
+        let _guard = Guard(prev);
+        f()
+    })
+}
+
+fn resolve_parameter(n: usize, ctx_params: &[Value]) -> Result<Value> {
+    if !ctx_params.is_empty() {
+        if n == 0 || n > ctx_params.len() {
+            return Err(SqlError::ParameterCountMismatch {
+                expected: n,
+                got: ctx_params.len(),
+            });
+        }
+        return Ok(ctx_params[n - 1].clone());
+    }
+    resolve_scoped_param(n)
+}
+
+pub fn resolve_scoped_param(n: usize) -> Result<Value> {
+    SCOPED_PARAMS.with(|slot| {
+        let (ptr, len) = slot.get();
+        if n == 0 || n > len {
+            return Err(SqlError::ParameterCountMismatch {
+                expected: n,
+                got: len,
+            });
+        }
+        // SAFETY: `with_scoped_params` keeps the slice alive for the duration of `f()`
+        // and restores the previous pointer on return. Reads only happen inside `f()`.
+        unsafe { Ok((*ptr.add(n - 1)).clone()) }
+    })
+}
+
+pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
     match expr {
         Expr::Literal(v) => Ok(v.clone()),
 
         Expr::Column(name) => {
-            let idx = col_map.resolve(name)?;
-            Ok(row[idx].clone())
+            let idx = ctx.col_map.resolve(name)?;
+            Ok(ctx.row[idx].clone())
         }
 
         Expr::QualifiedColumn { table, column } => {
-            let idx = col_map.resolve_qualified(table, column)?;
-            Ok(row[idx].clone())
+            let idx = ctx.col_map.resolve_qualified(table, column)?;
+            Ok(ctx.row[idx].clone())
         }
 
         Expr::BinaryOp { left, op, right } => {
-            let lval = eval_expr(left, col_map, row)?;
-            let rval = eval_expr(right, col_map, row)?;
+            let lval = eval_expr(left, ctx)?;
+            let rval = eval_expr(right, ctx)?;
             eval_binary_op(&lval, *op, &rval)
         }
 
         Expr::UnaryOp { op, expr } => {
-            let val = eval_expr(expr, col_map, row)?;
+            let val = eval_expr(expr, ctx)?;
             eval_unary_op(*op, &val)
         }
 
         Expr::IsNull(e) => {
-            let val = eval_expr(e, col_map, row)?;
+            let val = eval_expr(e, ctx)?;
             Ok(Value::Boolean(val.is_null()))
         }
 
         Expr::IsNotNull(e) => {
-            let val = eval_expr(e, col_map, row)?;
+            let val = eval_expr(e, ctx)?;
             Ok(Value::Boolean(!val.is_null()))
         }
 
-        Expr::Function { name, args, .. } => eval_scalar_function(name, args, col_map, row),
+        Expr::Function { name, args, .. } => eval_scalar_function(name, args, ctx),
 
         Expr::CountStar => Err(SqlError::Unsupported(
             "COUNT(*) in non-aggregate context".into(),
@@ -118,8 +192,8 @@ pub fn eval_expr(expr: &Expr, col_map: &ColumnMap, row: &[Value]) -> Result<Valu
             list,
             negated,
         } => {
-            let lhs = eval_expr(e, col_map, row)?;
-            eval_in_values(&lhs, list, col_map, row, *negated)
+            let lhs = eval_expr(e, ctx)?;
+            eval_in_values(&lhs, list, ctx, *negated)
         }
 
         Expr::InSet {
@@ -128,7 +202,7 @@ pub fn eval_expr(expr: &Expr, col_map: &ColumnMap, row: &[Value]) -> Result<Valu
             has_null,
             negated,
         } => {
-            let lhs = eval_expr(e, col_map, row)?;
+            let lhs = eval_expr(e, ctx)?;
             eval_in_set(&lhs, values, *has_null, *negated)
         }
 
@@ -138,9 +212,9 @@ pub fn eval_expr(expr: &Expr, col_map: &ColumnMap, row: &[Value]) -> Result<Valu
             high,
             negated,
         } => {
-            let val = eval_expr(e, col_map, row)?;
-            let lo = eval_expr(low, col_map, row)?;
-            let hi = eval_expr(high, col_map, row)?;
+            let val = eval_expr(e, ctx)?;
+            let lo = eval_expr(low, ctx)?;
+            let hi = eval_expr(high, ctx)?;
             eval_between(&val, &lo, &hi, *negated)
         }
 
@@ -150,12 +224,9 @@ pub fn eval_expr(expr: &Expr, col_map: &ColumnMap, row: &[Value]) -> Result<Valu
             escape,
             negated,
         } => {
-            let val = eval_expr(e, col_map, row)?;
-            let pat = eval_expr(pattern, col_map, row)?;
-            let esc = escape
-                .as_ref()
-                .map(|e| eval_expr(e, col_map, row))
-                .transpose()?;
+            let val = eval_expr(e, ctx)?;
+            let pat = eval_expr(pattern, ctx)?;
+            let esc = escape.as_ref().map(|e| eval_expr(e, ctx)).transpose()?;
             eval_like(&val, &pat, esc.as_ref(), *negated)
         }
 
@@ -163,17 +234,11 @@ pub fn eval_expr(expr: &Expr, col_map: &ColumnMap, row: &[Value]) -> Result<Valu
             operand,
             conditions,
             else_result,
-        } => eval_case(
-            operand.as_deref(),
-            conditions,
-            else_result.as_deref(),
-            col_map,
-            row,
-        ),
+        } => eval_case(operand.as_deref(), conditions, else_result.as_deref(), ctx),
 
         Expr::Coalesce(args) => {
             for arg in args {
-                let val = eval_expr(arg, col_map, row)?;
+                let val = eval_expr(arg, ctx)?;
                 if !val.is_null() {
                     return Ok(val);
                 }
@@ -182,7 +247,7 @@ pub fn eval_expr(expr: &Expr, col_map: &ColumnMap, row: &[Value]) -> Result<Valu
         }
 
         Expr::Cast { expr: e, data_type } => {
-            let val = eval_expr(e, col_map, row)?;
+            let val = eval_expr(e, ctx)?;
             eval_cast(&val, *data_type)
         }
 
@@ -190,7 +255,7 @@ pub fn eval_expr(expr: &Expr, col_map: &ColumnMap, row: &[Value]) -> Result<Valu
             SqlError::Unsupported("subquery not materialized (internal error)".into()),
         ),
 
-        Expr::Parameter(n) => Err(SqlError::Parse(format!("unbound parameter ${n}"))),
+        Expr::Parameter(n) => resolve_parameter(*n, ctx.params),
 
         Expr::WindowFunction { .. } => Err(SqlError::Unsupported(
             "window functions are only allowed in SELECT columns".into(),
@@ -592,13 +657,7 @@ fn eval_arithmetic(
     }
 }
 
-fn eval_in_values(
-    lhs: &Value,
-    list: &[Expr],
-    col_map: &ColumnMap,
-    row: &[Value],
-    negated: bool,
-) -> Result<Value> {
+fn eval_in_values(lhs: &Value, list: &[Expr], ctx: &EvalCtx, negated: bool) -> Result<Value> {
     if list.is_empty() {
         return Ok(Value::Boolean(negated));
     }
@@ -607,7 +666,7 @@ fn eval_in_values(
     }
     let mut has_null = false;
     for item in list {
-        let rhs = eval_expr(item, col_map, row)?;
+        let rhs = eval_expr(item, ctx)?;
         if rhs.is_null() {
             has_null = true;
         } else if lhs == &rhs {
@@ -876,27 +935,26 @@ fn eval_case(
     operand: Option<&Expr>,
     conditions: &[(Expr, Expr)],
     else_result: Option<&Expr>,
-    col_map: &ColumnMap,
-    row: &[Value],
+    ctx: &EvalCtx,
 ) -> Result<Value> {
     if let Some(op_expr) = operand {
-        let op_val = eval_expr(op_expr, col_map, row)?;
+        let op_val = eval_expr(op_expr, ctx)?;
         for (cond, result) in conditions {
-            let cond_val = eval_expr(cond, col_map, row)?;
+            let cond_val = eval_expr(cond, ctx)?;
             if !op_val.is_null() && !cond_val.is_null() && op_val == cond_val {
-                return eval_expr(result, col_map, row);
+                return eval_expr(result, ctx);
             }
         }
     } else {
         for (cond, result) in conditions {
-            let cond_val = eval_expr(cond, col_map, row)?;
+            let cond_val = eval_expr(cond, ctx)?;
             if is_truthy(&cond_val) {
-                return eval_expr(result, col_map, row);
+                return eval_expr(result, ctx);
             }
         }
     }
     match else_result {
-        Some(e) => eval_expr(e, col_map, row),
+        Some(e) => eval_expr(e, ctx),
         None => Ok(Value::Null),
     }
 }
@@ -978,15 +1036,10 @@ fn eval_cast(val: &Value, target: DataType) -> Result<Value> {
     }
 }
 
-fn eval_scalar_function(
-    name: &str,
-    args: &[Expr],
-    col_map: &ColumnMap,
-    row: &[Value],
-) -> Result<Value> {
+fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Value> {
     let evaluated: Vec<Value> = args
         .iter()
-        .map(|a| eval_expr(a, col_map, row))
+        .map(|a| eval_expr(a, ctx))
         .collect::<Result<Vec<_>>>()?;
 
     match name {
@@ -1788,7 +1841,6 @@ fn eval_scalar_function(
                 return Ok(Value::Null);
             }
             let micros = ts_of(&evaluated[0])?;
-            // Check for 'subsec' modifier (second arg).
             let subsec = evaluated
                 .get(1)
                 .and_then(|v| {
@@ -1829,7 +1881,6 @@ fn eval_scalar_function(
                 format!("{sign}{abs_days:04}-00-00 {h:02}:{m:02}:{s:02}.{us:06}").into(),
             ))
         }
-        // ═══ AT TIME ZONE operator (desugared from parser) ════════════════
         "AT_TIMEZONE" => {
             check_args(name, &evaluated, 2)?;
             if evaluated.iter().any(|v| v.is_null()) {
@@ -2123,7 +2174,10 @@ mod tests {
         let cm = ColumnMap::new(&cols);
         let row = test_row();
         let expr = Expr::Literal(Value::Integer(42));
-        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Integer(42));
+        assert_eq!(
+            eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+            Value::Integer(42)
+        );
     }
 
     #[test]
@@ -2133,7 +2187,7 @@ mod tests {
         let row = test_row();
         let expr = Expr::Column("name".into());
         assert_eq!(
-            eval_expr(&expr, &cm, &row).unwrap(),
+            eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
             Value::Text("Alice".into())
         );
     }
@@ -2145,7 +2199,7 @@ mod tests {
         let row = test_row();
         let expr = Expr::Column("name".into());
         assert_eq!(
-            eval_expr(&expr, &cm, &row).unwrap(),
+            eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
             Value::Text("Alice".into())
         );
     }
@@ -2160,7 +2214,10 @@ mod tests {
             op: BinOp::Add,
             right: Box::new(Expr::Literal(Value::Integer(10))),
         };
-        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Integer(11));
+        assert_eq!(
+            eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+            Value::Integer(11)
+        );
     }
 
     #[test]
@@ -2173,7 +2230,10 @@ mod tests {
             op: BinOp::Gt,
             right: Box::new(Expr::Literal(Value::Real(90.0))),
         };
-        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Boolean(true));
+        assert_eq!(
+            eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+            Value::Boolean(true)
+        );
     }
 
     #[test]
@@ -2191,7 +2251,9 @@ mod tests {
             op: BinOp::Eq,
             right: Box::new(Expr::Literal(Value::Text("test".into()))),
         };
-        assert!(eval_expr(&expr, &cm, &row).unwrap().is_null());
+        assert!(eval_expr(&expr, &EvalCtx::new(&cm, &row))
+            .unwrap()
+            .is_null());
     }
 
     #[test]
@@ -2211,7 +2273,10 @@ mod tests {
             op: BinOp::And,
             right: Box::new(Expr::Literal(Value::Boolean(false))),
         };
-        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Boolean(false));
+        assert_eq!(
+            eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+            Value::Boolean(false)
+        );
 
         // NULL AND true = NULL
         let expr = Expr::BinaryOp {
@@ -2219,7 +2284,9 @@ mod tests {
             op: BinOp::And,
             right: Box::new(Expr::Literal(Value::Boolean(true))),
         };
-        assert!(eval_expr(&expr, &cm, &row).unwrap().is_null());
+        assert!(eval_expr(&expr, &EvalCtx::new(&cm, &row))
+            .unwrap()
+            .is_null());
     }
 
     #[test]
@@ -2239,7 +2306,10 @@ mod tests {
             op: BinOp::Or,
             right: Box::new(Expr::Literal(Value::Boolean(true))),
         };
-        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Boolean(true));
+        assert_eq!(
+            eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+            Value::Boolean(true)
+        );
 
         // NULL OR false = NULL
         let expr = Expr::BinaryOp {
@@ -2247,7 +2317,9 @@ mod tests {
             op: BinOp::Or,
             right: Box::new(Expr::Literal(Value::Boolean(false))),
         };
-        assert!(eval_expr(&expr, &cm, &row).unwrap().is_null());
+        assert!(eval_expr(&expr, &EvalCtx::new(&cm, &row))
+            .unwrap()
+            .is_null());
     }
 
     #[test]
@@ -2261,10 +2333,16 @@ mod tests {
             Value::Boolean(true),
         ];
         let expr = Expr::IsNull(Box::new(Expr::Column("name".into())));
-        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Boolean(true));
+        assert_eq!(
+            eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+            Value::Boolean(true)
+        );
 
         let expr = Expr::IsNotNull(Box::new(Expr::Column("id".into())));
-        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Boolean(true));
+        assert_eq!(
+            eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+            Value::Boolean(true)
+        );
     }
 
     #[test]
@@ -2276,7 +2354,10 @@ mod tests {
             op: UnaryOp::Not,
             expr: Box::new(Expr::Column("active".into())),
         };
-        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Boolean(false));
+        assert_eq!(
+            eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+            Value::Boolean(false)
+        );
     }
 
     #[test]
@@ -2288,7 +2369,10 @@ mod tests {
             op: UnaryOp::Neg,
             expr: Box::new(Expr::Column("id".into())),
         };
-        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Integer(-1));
+        assert_eq!(
+            eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+            Value::Integer(-1)
+        );
     }
 
     #[test]
@@ -2302,7 +2386,7 @@ mod tests {
             right: Box::new(Expr::Literal(Value::Integer(0))),
         };
         assert!(matches!(
-            eval_expr(&expr, &cm, &row),
+            eval_expr(&expr, &EvalCtx::new(&cm, &row)),
             Err(SqlError::DivisionByZero)
         ));
     }
@@ -2318,7 +2402,10 @@ mod tests {
             op: BinOp::Add,
             right: Box::new(Expr::Column("score".into())),
         };
-        assert_eq!(eval_expr(&expr, &cm, &row).unwrap(), Value::Real(96.5));
+        assert_eq!(
+            eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+            Value::Real(96.5)
+        );
     }
 
     #[test]

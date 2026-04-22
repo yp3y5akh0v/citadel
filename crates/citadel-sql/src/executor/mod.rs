@@ -1,22 +1,24 @@
 //! SQL executor: DDL and DML operations.
 
 mod aggregate;
+pub(crate) mod compile;
 mod correlated;
 mod cte;
 mod ddl;
 mod dml;
 mod explain;
-mod helpers;
+pub(crate) mod helpers;
 mod join;
 mod scan;
 mod select;
 mod view;
 mod window;
-mod write;
+pub(crate) mod write;
+pub use compile::{compile, CompiledPlan};
 use cte::*;
 use ddl::*;
+pub use dml::exec_insert_in_txn;
 use dml::*;
-pub use dml::{exec_insert_in_txn, InsertBufs};
 use explain::*;
 use join::*;
 use scan::*;
@@ -24,18 +26,16 @@ use select::*;
 use view::*;
 use window::*;
 use write::*;
-pub use write::{compile_update, exec_update_compiled, CompiledUpdate, UpdateBufs};
-
-use std::collections::HashMap;
 
 use citadel::Database;
+use rustc_hash::FxHashMap;
 
 use crate::error::{Result, SqlError};
 use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
 
-type CteContext = HashMap<String, QueryResult>;
+type CteContext = FxHashMap<String, QueryResult>;
 type ScanTableFn<'a> = &'a mut dyn FnMut(&str) -> Result<(TableSchema, Vec<Vec<Value>>)>;
 
 pub fn execute(
@@ -84,10 +84,7 @@ pub fn execute_in_txn(
         Statement::CreateView(cv) => exec_create_view_in_txn(wtx, schema, cv),
         Statement::DropView(dv) => exec_drop_view_in_txn(wtx, schema, dv),
         Statement::AlterTable(at) => exec_alter_table_in_txn(wtx, schema, at),
-        Statement::Insert(ins) => {
-            let mut bufs = InsertBufs::new();
-            exec_insert_in_txn(wtx, schema, ins, params, &mut bufs)
-        }
+        Statement::Insert(ins) => exec_insert_in_txn(wtx, schema, ins, params),
         Statement::Select(sq) => exec_select_query_in_txn(wtx, schema, sq),
         Statement::Update(upd) => exec_update_in_txn(wtx, schema, upd),
         Statement::Delete(del) => exec_delete_in_txn(wtx, schema, del),
@@ -103,8 +100,6 @@ pub fn execute_in_txn(
         }
     }
 }
-
-// ── Table scanning ──────────────────────────────────────────────────
 
 pub(super) fn scan_table_read(
     db: &Database,
@@ -232,5 +227,3 @@ pub(super) fn exec_select_join_with_ctes(
     let joined_cols = build_joined_columns(&cur_tables);
     process_select(&joined_cols, outer_rows, stmt, false)
 }
-
-// ── SELECT execution ────────────────────────────────────────────────

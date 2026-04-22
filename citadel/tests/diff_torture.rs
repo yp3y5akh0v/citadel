@@ -34,10 +34,6 @@ fn apply(db: &Database, result: &citadel_sync::DiffResult) {
     wtx.commit().unwrap();
 }
 
-// ============================================================
-// Correctness
-// ============================================================
-
 #[test]
 fn random_500_entries_diff_correctness() {
     let dir = tempfile::tempdir().unwrap();
@@ -54,7 +50,6 @@ fn random_500_entries_diff_correctness() {
     wtx1.commit().unwrap();
     wtx2.commit().unwrap();
 
-    // Mutate 50 random entries in db1
     let changed: Vec<u32> = (0..50).map(|i| i * 10).collect();
     let mut wtx = db1.begin_write().unwrap();
     for &k in &changed {
@@ -65,7 +60,6 @@ fn random_500_entries_diff_correctness() {
     let result = diff(&db1, &db2);
     assert!(!result.is_empty());
 
-    // Every changed key must appear in diff
     for &k in &changed {
         let found = result.entries.iter().any(|e| e.key == k.to_be_bytes());
         assert!(found, "changed key {k} missing from diff");
@@ -81,7 +75,6 @@ fn random_mutations_100_rounds_incremental() {
     let db1 = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db2 = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
-    // Seed both with same data
     for db in [&db1, &db2] {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..200u32 {
@@ -90,7 +83,6 @@ fn random_mutations_100_rounds_incremental() {
         wtx.commit().unwrap();
     }
 
-    // 100 rounds of single-key mutation + sync
     for round in 0..100u32 {
         let key = (round % 200).to_be_bytes();
         let val = format!("round-{round}");
@@ -101,13 +93,11 @@ fn random_mutations_100_rounds_incremental() {
         let result = diff(&db1, &db2);
         assert!(!result.is_empty(), "round {round}: must find change");
 
-        // The changed key must be in the diff
         let found = result.entries.iter().any(|e| e.key == key);
         assert!(found, "round {round}: changed key must appear in diff");
 
         apply(&db2, &result);
 
-        // After apply, trees must be fully in sync
         let post_diff = diff(&db1, &db2);
         assert!(
             post_diff.is_empty(),
@@ -117,10 +107,6 @@ fn random_mutations_100_rounds_incremental() {
 
     assert_eq!(collect_all(&db1), collect_all(&db2));
 }
-
-// ============================================================
-// Efficiency tests
-// ============================================================
 
 #[test]
 fn many_small_changes_efficiency() {
@@ -137,7 +123,6 @@ fn many_small_changes_efficiency() {
         wtx.commit().unwrap();
     }
 
-    // Change only 3 entries out of 1000
     let mut wtx = db1.begin_write().unwrap();
     wtx.insert(&100u32.to_be_bytes(), b"changed-a").unwrap();
     wtx.insert(&500u32.to_be_bytes(), b"changed-b").unwrap();
@@ -146,7 +131,6 @@ fn many_small_changes_efficiency() {
 
     let result = diff(&db1, &db2);
     assert!(result.subtrees_skipped > 0, "must skip matching subtrees");
-    // Diff should return far fewer entries than the full dataset
     assert!(
         result.len() < 500,
         "expected efficient diff, got {} entries out of 1000",
@@ -172,7 +156,6 @@ fn single_bit_value_change_detected() {
         wtx.commit().unwrap();
     }
 
-    // Change a single bit in one value
     let mut modified_val = val;
     modified_val[128] = 0x01;
     let mut wtx = db1.begin_write().unwrap();
@@ -190,17 +173,12 @@ fn single_bit_value_change_detected() {
     assert_eq!(collect_all(&db1), collect_all(&db2));
 }
 
-// ============================================================
-// Convergence and stress
-// ============================================================
-
 #[test]
 fn delete_and_reinsert_convergence() {
     let dir = tempfile::tempdir().unwrap();
     let db1 = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db2 = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
-    // Seed both
     for db in [&db1, &db2] {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..50u32 {
@@ -209,7 +187,6 @@ fn delete_and_reinsert_convergence() {
         wtx.commit().unwrap();
     }
 
-    // Delete entries 20..30 from db1, then reinsert 22..28 with new values
     let mut wtx = db1.begin_write().unwrap();
     for i in 20..30u32 {
         wtx.delete(&i.to_be_bytes()).unwrap();
@@ -228,7 +205,6 @@ fn delete_and_reinsert_convergence() {
     let result = diff(&db1, &db2);
     assert!(!result.is_empty());
 
-    // The reinserted keys with new values must appear in the diff
     for i in 22..28u32 {
         let found = result.entries.iter().any(|e| e.key == i.to_be_bytes());
         assert!(found, "reinserted key {i} must be in diff");
@@ -236,7 +212,6 @@ fn delete_and_reinsert_convergence() {
 
     apply(&db2, &result);
 
-    // Verify reinserted keys have correct values in db2
     let db2_data = collect_all(&db2);
     for i in 22..28u32 {
         assert_eq!(db2_data[&i.to_be_bytes().to_vec()], b"reinserted");
@@ -267,12 +242,10 @@ fn concurrent_reader_during_diff() {
     wtx.insert(b"extra-key", b"extra-value").unwrap();
     wtx.commit().unwrap();
 
-    // Hold a reader on db2 while diffing
     let mut rtx = db2.begin_read();
     let result = diff(&db1, &db2);
     assert!(!result.is_empty());
 
-    // Reader still works
     assert!(rtx.get(&0u32.to_be_bytes()).unwrap().is_some());
     drop(rtx);
 
@@ -294,7 +267,6 @@ fn all_entries_changed_full_diff() {
         wtx.commit().unwrap();
     }
 
-    // Change every entry
     let mut wtx = db1.begin_write().unwrap();
     for i in 0..100u32 {
         wtx.insert(&i.to_be_bytes(), b"ALL-CHANGED").unwrap();
@@ -303,7 +275,6 @@ fn all_entries_changed_full_diff() {
 
     let result = diff(&db1, &db2);
     assert!(!result.is_empty());
-    // All entries should be captured (every leaf has changed)
     assert!(result.len() >= 100, "all entries must be in diff");
 
     apply(&db2, &result);
@@ -316,18 +287,15 @@ fn alternating_insert_delete_stress() {
     let db1 = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db2 = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
-    // Build up data with alternating inserts and deletes
     let mut expected = BTreeMap::new();
     for round in 0..20u32 {
         let mut wtx = db1.begin_write().unwrap();
-        // Insert 10 new keys
         for j in 0..10u32 {
             let key = (round * 100 + j).to_be_bytes();
             let val = format!("r{round}j{j}");
             wtx.insert(&key, val.as_bytes()).unwrap();
             expected.insert(key.to_vec(), val.into_bytes());
         }
-        // Delete 3 from previous rounds if they exist
         if round > 0 {
             for j in 0..3u32 {
                 let key = ((round - 1) * 100 + j).to_be_bytes();
@@ -353,7 +321,6 @@ fn diff_symmetry_both_directions() {
     let db1 = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db2 = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
-    // Seed both the same
     for db in [&db1, &db2] {
         let mut wtx = db.begin_write().unwrap();
         for i in 0..100u32 {
@@ -362,7 +329,6 @@ fn diff_symmetry_both_directions() {
         wtx.commit().unwrap();
     }
 
-    // Modify different keys in each
     let mut wtx1 = db1.begin_write().unwrap();
     wtx1.insert(&10u32.to_be_bytes(), b"from-db1").unwrap();
     wtx1.commit().unwrap();
@@ -386,7 +352,6 @@ fn diff_symmetry_both_directions() {
     let db2_data = collect_all(&db2);
     assert_eq!(db2_data[&10u32.to_be_bytes().to_vec()], b"from-db1");
 
-    // After forward apply, diff db1->db2 should be empty (db2 matches db1's source pages)
     let post = diff(&db1, &db2);
     assert!(
         post.is_empty(),
@@ -409,7 +374,6 @@ fn large_values_multi_page_diff() {
         wtx.commit().unwrap();
     }
 
-    // Change a few large values
     let mut wtx = db1.begin_write().unwrap();
     wtx.insert(&5u32.to_be_bytes(), &vec![0xBB_u8; 1024])
         .unwrap();
@@ -472,14 +436,11 @@ fn disjoint_keys_no_overlap() {
     }
     wtx2.commit().unwrap();
 
-    // Diff db1 -> db2: should find all even keys
     let result = diff(&db1, &db2);
     assert!(!result.is_empty());
 
-    // Apply db1's entries to db2
     apply(&db2, &result);
 
-    // Now db2 has all 100 keys (evens from db1 + odds from db2)
     let all = collect_all(&db2);
     assert_eq!(all.len(), 100);
     for i in (0..100u32).step_by(2) {
@@ -496,7 +457,6 @@ fn diff_empty_after_full_overwrite() {
     let db1 = fast_builder(&dir.path().join("a.db")).create().unwrap();
     let db2 = fast_builder(&dir.path().join("b.db")).create().unwrap();
 
-    // Different initial data
     let mut wtx1 = db1.begin_write().unwrap();
     for i in 0..100u32 {
         wtx1.insert(&i.to_be_bytes(), b"db1-original").unwrap();
@@ -509,14 +469,11 @@ fn diff_empty_after_full_overwrite() {
     }
     wtx2.commit().unwrap();
 
-    // Overwrite db2 with db1's data
     let result = diff(&db1, &db2);
     apply(&db2, &result);
 
-    // Now they should match
     assert_eq!(collect_all(&db1), collect_all(&db2));
 
-    // Second diff should be empty
     let result2 = diff(&db1, &db2);
     assert!(
         result2.is_empty(),
@@ -543,7 +500,6 @@ fn mixed_key_sizes() {
         wtx.commit().unwrap();
     }
 
-    // Change one of each size in db1
     let mut wtx = db1.begin_write().unwrap();
     wtx.insert(b"a", b"SHORT-CHANGED").unwrap();
     wtx.insert(b"medium-length-key", b"MEDIUM-CHANGED").unwrap();

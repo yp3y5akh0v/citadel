@@ -10,6 +10,9 @@ pub struct PageAllocator {
     ready_to_use: Vec<PageId>,
     /// Pages freed in the current write transaction.
     freed_this_txn: Vec<PageId>,
+    /// All page IDs allocated this txn (in allocation order). Used to bound
+    /// O(allocated) page-cache cleanup on ROLLBACK TO SAVEPOINT.
+    allocated_this_txn: Vec<PageId>,
     /// In-place CoW mode (SyncMode::Off + no readers): reuse page IDs.
     in_place: bool,
 }
@@ -20,6 +23,7 @@ impl PageAllocator {
             next_page_id: high_water_mark,
             ready_to_use: Vec::new(),
             freed_this_txn: Vec::new(),
+            allocated_this_txn: Vec::new(),
             in_place: false,
         }
     }
@@ -34,13 +38,15 @@ impl PageAllocator {
 
     /// Prefers reusing reclaimed pages over incrementing the high water mark.
     pub fn allocate(&mut self) -> PageId {
-        if let Some(id) = self.ready_to_use.pop() {
+        let id = if let Some(id) = self.ready_to_use.pop() {
             id
         } else {
             let id = PageId(self.next_page_id);
             self.next_page_id += 1;
             id
-        }
+        };
+        self.allocated_this_txn.push(id);
+        id
     }
 
     /// Not immediately reusable - goes into pending-free list.
@@ -56,16 +62,22 @@ impl PageAllocator {
         &self.freed_this_txn
     }
 
+    pub fn allocated_this_txn(&self) -> &[PageId] {
+        &self.allocated_this_txn
+    }
+
     pub fn add_ready_to_use(&mut self, pages: Vec<PageId>) {
         self.ready_to_use.extend(pages);
     }
 
     pub fn commit(&mut self) -> Vec<PageId> {
+        self.allocated_this_txn.clear();
         std::mem::take(&mut self.freed_this_txn)
     }
 
     pub fn rollback(&mut self) {
         self.freed_this_txn.clear();
+        self.allocated_this_txn.clear();
     }
 
     pub fn ready_count(&self) -> usize {
@@ -94,10 +106,8 @@ mod tests {
     fn allocate_from_ready_to_use() {
         let mut alloc = PageAllocator::new(10);
         alloc.add_ready_to_use(vec![PageId(3), PageId(7)]);
-        // Should use ready_to_use first (LIFO)
         assert_eq!(alloc.allocate(), PageId(7));
         assert_eq!(alloc.allocate(), PageId(3));
-        // Now falls back to HWM
         assert_eq!(alloc.allocate(), PageId(10));
     }
 

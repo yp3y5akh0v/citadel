@@ -17,13 +17,11 @@ fn assert_ok(result: ExecutionResult) {
     }
 }
 
-// ── 1. Basic CTE ────────────────────────────────────────────────────
-
 #[test]
 fn cte_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query("WITH t AS (SELECT 1 AS x) SELECT x FROM t")
@@ -33,13 +31,11 @@ fn cte_basic() {
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 }
 
-// ── 2. CTE over real table ──────────────────────────────────────────
-
 #[test]
 fn cte_from_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
@@ -66,13 +62,11 @@ fn cte_from_table() {
     );
 }
 
-// ── 3. WHERE on outer query filters CTE ─────────────────────────────
-
 #[test]
 fn cte_with_where() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query("WITH t AS (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) SELECT x FROM t WHERE x > 1 ORDER BY x")
@@ -82,13 +76,11 @@ fn cte_with_where() {
     assert_eq!(qr.rows[1][0], Value::Integer(3));
 }
 
-// ── 4. Column aliases ───────────────────────────────────────────────
-
 #[test]
 fn cte_column_aliases() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query("WITH t(a, b) AS (SELECT 1, 2) SELECT a, b FROM t")
@@ -98,13 +90,11 @@ fn cte_column_aliases() {
     assert_eq!(qr.rows[0], vec![Value::Integer(1), Value::Integer(2)]);
 }
 
-// ── 5. Multiple independent CTEs ────────────────────────────────────
-
 #[test]
 fn cte_multiple() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query("WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT * FROM a JOIN b ON 1=1")
@@ -113,13 +103,11 @@ fn cte_multiple() {
     assert_eq!(qr.rows[0], vec![Value::Integer(1), Value::Integer(2)]);
 }
 
-// ── 6. Chained CTE (later references earlier) ──────────────────────
-
 #[test]
 fn cte_chained() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query("WITH a AS (SELECT 1 AS x), b AS (SELECT x + 1 AS y FROM a) SELECT y FROM b")
@@ -129,13 +117,11 @@ fn cte_chained() {
     assert_eq!(qr.rows[0][0], Value::Integer(2));
 }
 
-// ── 7. CTE shadows real table ───────────────────────────────────────
-
 #[test]
 fn cte_shadows_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER NOT NULL)")
@@ -151,13 +137,11 @@ fn cte_shadows_table() {
     assert_eq!(qr.rows[0][0], Value::Integer(99));
 }
 
-// ── 8. CTE as left side of JOIN ─────────────────────────────────────
-
 #[test]
 fn cte_with_join() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
@@ -176,13 +160,11 @@ fn cte_with_join() {
     );
 }
 
-// ── 9. CTE as right side of JOIN ────────────────────────────────────
-
 #[test]
 fn cte_as_join_rhs() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
@@ -201,13 +183,11 @@ fn cte_as_join_rhs() {
     );
 }
 
-// ── 10. CTE body is a UNION ────────────────────────────────────────
-
 #[test]
 fn cte_union_body() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query("WITH t AS (SELECT 1 AS x UNION SELECT 2) SELECT x FROM t ORDER BY x")
@@ -217,13 +197,11 @@ fn cte_union_body() {
     assert_eq!(qr.rows[1][0], Value::Integer(2));
 }
 
-// ── 11. ORDER BY + LIMIT on outer query over CTE ───────────────────
-
 #[test]
 fn cte_order_by_limit() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query(
@@ -237,13 +215,11 @@ fn cte_order_by_limit() {
     assert_eq!(qr.rows[2][0], Value::Integer(3));
 }
 
-// ── 12. INSERT...SELECT with CTE ───────────────────────────────────
-
 #[test]
 fn cte_insert_select() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
@@ -268,13 +244,11 @@ fn cte_insert_select() {
     );
 }
 
-// ── 13. Parameters in CTE body ─────────────────────────────────────
-
 #[test]
 fn cte_with_params() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query_params(
@@ -286,13 +260,11 @@ fn cte_with_params() {
     assert_eq!(qr.rows[0][0], Value::Integer(42));
 }
 
-// ── 14. Aggregates on CTE ──────────────────────────────────────────
-
 #[test]
 fn cte_aggregate() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, val INTEGER NOT NULL)")
@@ -309,13 +281,11 @@ fn cte_aggregate() {
     assert_eq!(qr.rows[0][1], Value::Integer(60));
 }
 
-// ── 15. GROUP BY on CTE ────────────────────────────────────────────
-
 #[test]
 fn cte_group_by() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute("CREATE TABLE sales (id INTEGER PRIMARY KEY, category TEXT NOT NULL, amount INTEGER NOT NULL)")
@@ -340,13 +310,11 @@ fn cte_group_by() {
     );
 }
 
-// ── 16. DISTINCT on CTE ────────────────────────────────────────────
-
 #[test]
 fn cte_distinct() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query(
@@ -360,13 +328,11 @@ fn cte_distinct() {
     assert_eq!(qr.rows[2][0], Value::Integer(3));
 }
 
-// ── 17. Basic recursive CTE ────────────────────────────────────────
-
 #[test]
 fn recursive_basic() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query(
@@ -380,13 +346,11 @@ fn recursive_basic() {
     }
 }
 
-// ── 18. Recursive tree traversal ───────────────────────────────────
-
 #[test]
 fn recursive_tree() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     assert_ok(
         conn.execute(
@@ -456,13 +420,11 @@ fn recursive_tree() {
     );
 }
 
-// ── 19. EXPLAIN shows CTE in plan ──────────────────────────────────
-
 #[test]
 fn cte_explain() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     let qr = conn
         .query("EXPLAIN WITH t AS (SELECT 1 AS x) SELECT x FROM t")
@@ -485,13 +447,11 @@ fn cte_explain() {
     );
 }
 
-// ── 20. CTE within transaction ─────────────────────────────────────
-
 #[test]
 fn cte_in_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
-    let mut conn = Connection::open(&db).unwrap();
+    let conn = Connection::open(&db).unwrap();
 
     conn.execute("BEGIN").unwrap();
 

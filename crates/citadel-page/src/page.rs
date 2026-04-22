@@ -53,8 +53,6 @@ impl Page {
         Self { data }
     }
 
-    // --- Header field accessors ---
-
     pub fn checksum(&self) -> u64 {
         u64::from_le_bytes(self.data[0..8].try_into().unwrap())
     }
@@ -136,8 +134,6 @@ impl Page {
         let end = MERKLE_HASH_OFFSET + MERKLE_HASH_SIZE;
         self.data[MERKLE_HASH_OFFSET..end].copy_from_slice(hash);
     }
-
-    // --- Slotted page operations ---
 
     #[inline]
     fn cell_ptr_offset(i: u16) -> usize {
@@ -278,8 +274,6 @@ impl Page {
         }
     }
 
-    // --- Checksum ---
-
     pub fn compute_checksum(&self) -> u64 {
         xxhash_rust::xxh64::xxh64(&self.data[CHECKSUM_SIZE..], 0)
     }
@@ -344,7 +338,6 @@ mod tests {
         page.update_checksum();
         assert!(page.verify_checksum());
 
-        // Corrupt a data byte
         page.data[100] ^= 0xFF;
         assert!(!page.verify_checksum());
     }
