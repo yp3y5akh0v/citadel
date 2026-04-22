@@ -1,15 +1,22 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::{self, OpenOptions};
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 use citadel_core::types::{Argon2Profile, CipherId, KdfAlgorithm, SyncMode};
-use citadel_core::{
-    Error, Result, DEFAULT_BUFFER_POOL_SIZE, FILE_HEADER_SIZE, KEY_FILE_SIZE, PBKDF2_MIN_ITERATIONS,
-};
-use citadel_crypto::key_manager::{create_key_file, open_key_file};
+use citadel_core::{Error, Result, DEFAULT_BUFFER_POOL_SIZE, PBKDF2_MIN_ITERATIONS};
+#[cfg(not(target_arch = "wasm32"))]
+use citadel_core::{FILE_HEADER_SIZE, KEY_FILE_SIZE};
+use citadel_crypto::key_manager::create_key_file;
+#[cfg(not(target_arch = "wasm32"))]
+use citadel_crypto::key_manager::open_key_file;
 use citadel_crypto::page_cipher::compute_dek_id;
+#[cfg(not(target_arch = "wasm32"))]
 use citadel_io::durable;
+#[cfg(not(target_arch = "wasm32"))]
 use citadel_io::file_lock;
+#[cfg(not(target_arch = "wasm32"))]
 use citadel_io::file_manager::FileHeader;
 #[cfg(not(target_arch = "wasm32"))]
 use citadel_io::mmap_io::MmapPageIO;
@@ -120,6 +127,7 @@ impl DatabaseBuilder {
     }
 
     /// Default key file path: `{data_path}.citadel-keys`
+    #[cfg(not(target_arch = "wasm32"))]
     fn resolve_key_path(&self) -> PathBuf {
         self.key_path.clone().unwrap_or_else(|| {
             let mut name = self.path.as_os_str().to_os_string();

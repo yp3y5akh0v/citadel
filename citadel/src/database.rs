@@ -1,4 +1,5 @@
 use std::fs;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
