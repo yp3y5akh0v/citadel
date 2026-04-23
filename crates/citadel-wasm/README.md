@@ -19,11 +19,23 @@ await init();
 
 const db = new CitadelDb("my-passphrase");
 
-// SQL
+// Single statement
 db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);");
 db.execute("INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob');");
 const result = db.query("SELECT * FROM users;");
 // { columns: ["id", "name"], rows: [[1, "Alice"], [2, "Bob"]] }
+
+// Multi-statement script — returns one outcome per statement
+const outcomes = db.run(`
+    CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+    INSERT INTO posts VALUES (1, 'Hello'), (2, 'World');
+    SELECT * FROM posts;
+`);
+// [
+//   { type: "ok" },
+//   { type: "rowsAffected", value: 2 },
+//   { type: "query", columns: ["id", "title"], rows: [[1, "Hello"], [2, "World"]] }
+// ]
 
 // Key-value
 db.put(new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6]));
@@ -45,9 +57,10 @@ db.free();
 | Method | Description |
 |--------|-------------|
 | `new CitadelDb(passphrase)` | Create an in-memory encrypted database |
-| `execute(sql)` | Execute DDL/DML, returns rows affected |
-| `executeBatch(sql)` | Execute multiple statements |
-| `query(sql)` | Execute SELECT, returns `{ columns, rows }` |
+| `execute(sql)` | Execute single DDL/DML statement, returns rows affected |
+| `query(sql)` | Execute single SELECT, returns `{ columns, rows }` |
+| `run(sql)` | Execute `;`-separated statements, returns `[{type, ...}, ...]` |
+| `executeBatch(sql)` | Execute `;`-separated statements, discards results |
 | `put(key, value)` | Insert into default table |
 | `get(key)` | Get from default table |
 | `delete(key)` | Delete from default table |

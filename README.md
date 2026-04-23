@@ -211,6 +211,8 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 **Prepared statements** - `$1, $2, ...` positional parameters with LRU statement cache
 
+**Multi-statement scripts** - `Connection::execute_script(sql)` runs `;`-separated statements in one call, returning per-statement outcomes with partial-success preserved. WASM: `db.run(sql)` returns `[{type, ...}, ...]`.
+
 ## Security
 
 **No plaintext on disk.** Every page is encrypted before writing and authenticated before reading.
