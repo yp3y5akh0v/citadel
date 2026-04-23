@@ -81,6 +81,33 @@ impl CitadelDb {
         })
     }
 
+    /// Execute `;`-separated SQL statements. Stops at the first failure.
+    pub fn execute_script(&self, sql: &str) -> Vec<ScriptOutcome> {
+        self.cell.with_dependent(|_, conn| {
+            let exec = conn.execute_script(sql);
+            let mut outcomes: Vec<ScriptOutcome> = exec
+                .completed
+                .into_iter()
+                .map(|r| match r {
+                    ExecutionResult::RowsAffected(n) => ScriptOutcome::Rows(n),
+                    ExecutionResult::Query(qr) => ScriptOutcome::Query(QueryResultData {
+                        columns: qr.columns,
+                        rows: qr
+                            .rows
+                            .iter()
+                            .map(|row| row.iter().map(CellValue::from_value).collect())
+                            .collect(),
+                    }),
+                    ExecutionResult::Ok => ScriptOutcome::Ok,
+                })
+                .collect();
+            if let Some(e) = exec.error {
+                outcomes.push(ScriptOutcome::Error(format!("{e}")));
+            }
+            outcomes
+        })
+    }
+
     /// Put a key-value pair into the default table.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<(), String> {
         let mut wtx = self.db().begin_write().map_err(|e| format!("{e}"))?;
@@ -209,6 +236,14 @@ impl CellValue {
 pub struct QueryResultData {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<CellValue>>,
+}
+
+#[derive(Debug)]
+pub enum ScriptOutcome {
+    Rows(u64),
+    Query(QueryResultData),
+    Ok,
+    Error(String),
 }
 
 /// Database statistics.
@@ -559,5 +594,70 @@ mod tests {
         drop(rtx);
 
         assert!(db.get(b"k2").unwrap().is_some());
+    }
+
+    #[test]
+    fn script_mixed_outcomes() {
+        let db = CitadelDb::create("secret").unwrap();
+
+        let outcomes = db.execute_script(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);
+             INSERT INTO t VALUES (1, 10);
+             SELECT * FROM t",
+        );
+        assert_eq!(outcomes.len(), 3);
+        assert!(matches!(outcomes[0], ScriptOutcome::Ok));
+        assert!(matches!(outcomes[1], ScriptOutcome::Rows(1)));
+        match &outcomes[2] {
+            ScriptOutcome::Query(qr) => assert_eq!(qr.rows.len(), 1),
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_runtime_error_mid_script() {
+        let db = CitadelDb::create("secret").unwrap();
+
+        db.execute_script("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+        let outcomes =
+            db.execute_script("INSERT INTO t VALUES (1); INSERT INTO t VALUES (1); SELECT 1");
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(matches!(outcomes[0], ScriptOutcome::Rows(1)));
+        assert!(matches!(outcomes[1], ScriptOutcome::Error(_)));
+    }
+
+    #[test]
+    fn script_parse_error() {
+        let db = CitadelDb::create("secret").unwrap();
+
+        let outcomes = db.execute_script("GARBAGE NOT SQL");
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], ScriptOutcome::Error(_)));
+    }
+
+    #[test]
+    fn script_transaction_persists_across_calls() {
+        let db = CitadelDb::create("secret").unwrap();
+
+        db.execute_script("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+        let open = db.execute_script("BEGIN; INSERT INTO t VALUES (1)");
+        assert_eq!(open.len(), 2);
+        assert!(matches!(open[0], ScriptOutcome::Ok));
+        assert!(matches!(open[1], ScriptOutcome::Rows(1)));
+
+        let more = db.execute_script("INSERT INTO t VALUES (2)");
+        assert_eq!(more.len(), 1);
+        assert!(matches!(more[0], ScriptOutcome::Rows(1)));
+
+        let close = db.execute_script("COMMIT");
+        assert_eq!(close.len(), 1);
+        assert!(matches!(close[0], ScriptOutcome::Ok));
+
+        let verify = db.execute_script("SELECT id FROM t ORDER BY id");
+        match &verify[0] {
+            ScriptOutcome::Query(qr) => assert_eq!(qr.rows.len(), 2),
+            other => panic!("expected Query, got {other:?}"),
+        }
     }
 }

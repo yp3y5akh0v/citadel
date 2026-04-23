@@ -1,7 +1,7 @@
 use js_sys::{Array, Object, Reflect};
 use wasm_bindgen::prelude::*;
 
-use crate::{CellValue, CitadelDb as InnerDb};
+use crate::{CellValue, CitadelDb as InnerDb, ScriptOutcome};
 
 #[wasm_bindgen(js_name = "CitadelDb")]
 pub struct JsCitadelDb {
@@ -59,6 +59,17 @@ impl JsCitadelDb {
         self.inner
             .execute_batch(sql)
             .map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// Execute `;`-separated SQL statements. Returns an array of
+    /// tagged outcome objects, one per statement.
+    pub fn run(&self, sql: &str) -> Result<Array, JsValue> {
+        let outcomes = self.inner.execute_script(sql);
+        let arr = Array::new();
+        for outcome in &outcomes {
+            arr.push(&outcome_to_js(outcome)?);
+        }
+        Ok(arr)
     }
 
     /// Put a key-value pair into the default table.
@@ -136,6 +147,57 @@ impl JsCitadelDb {
         )?;
         Ok(obj.into())
     }
+}
+
+fn outcome_to_js(o: &ScriptOutcome) -> Result<JsValue, JsValue> {
+    let obj = Object::new();
+    match o {
+        ScriptOutcome::Ok => {
+            Reflect::set(&obj, &JsValue::from_str("type"), &JsValue::from_str("ok"))?;
+        }
+        ScriptOutcome::Rows(n) => {
+            Reflect::set(
+                &obj,
+                &JsValue::from_str("type"),
+                &JsValue::from_str("rowsAffected"),
+            )?;
+            Reflect::set(
+                &obj,
+                &JsValue::from_str("value"),
+                &JsValue::from_f64(*n as f64),
+            )?;
+        }
+        ScriptOutcome::Query(qr) => {
+            Reflect::set(
+                &obj,
+                &JsValue::from_str("type"),
+                &JsValue::from_str("query"),
+            )?;
+            let cols = Array::new();
+            for name in &qr.columns {
+                cols.push(&JsValue::from_str(name));
+            }
+            Reflect::set(&obj, &JsValue::from_str("columns"), &cols)?;
+            let rows = Array::new();
+            for row in &qr.rows {
+                let js_row = Array::new();
+                for cell in row {
+                    js_row.push(&cell_to_js(cell));
+                }
+                rows.push(&js_row);
+            }
+            Reflect::set(&obj, &JsValue::from_str("rows"), &rows)?;
+        }
+        ScriptOutcome::Error(msg) => {
+            Reflect::set(
+                &obj,
+                &JsValue::from_str("type"),
+                &JsValue::from_str("error"),
+            )?;
+            Reflect::set(&obj, &JsValue::from_str("message"), &JsValue::from_str(msg))?;
+        }
+    }
+    Ok(obj.into())
 }
 
 fn cell_to_js(cell: &CellValue) -> JsValue {

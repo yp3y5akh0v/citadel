@@ -10,7 +10,7 @@ pub mod prepared;
 pub mod schema;
 pub mod types;
 
-pub use connection::Connection;
+pub use connection::{Connection, ScriptExecution};
 pub use error::{Result, SqlError};
 pub use prepared::{PreparedStatement, Row, Rows};
 pub use types::{ColumnDef, DataType, ExecutionResult, IndexDef, QueryResult, TableSchema, Value};

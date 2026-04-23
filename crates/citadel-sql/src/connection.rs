@@ -19,6 +19,12 @@ use crate::types::{ExecutionResult, QueryResult, TableSchema, Value};
 
 const DEFAULT_CACHE_CAPACITY: usize = 64;
 
+#[derive(Debug)]
+pub struct ScriptExecution {
+    pub completed: Vec<ExecutionResult>,
+    pub error: Option<SqlError>,
+}
+
 fn parse_fixed_offset(s: &str) -> Option<()> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("z") || s.eq_ignore_ascii_case("utc") {
@@ -321,6 +327,35 @@ impl<'a> Connection<'a> {
         self.inner
             .borrow_mut()
             .execute_params_impl(self.db, sql, params)
+    }
+
+    /// Execute `;`-separated SQL statements. Stops at the first failure.
+    pub fn execute_script(&self, sql: &str) -> ScriptExecution {
+        let stmts = match parser::parse_sql_multi(sql) {
+            Ok(s) => s,
+            Err(e) => {
+                return ScriptExecution {
+                    completed: vec![],
+                    error: Some(e),
+                }
+            }
+        };
+        let mut completed = Vec::with_capacity(stmts.len());
+        for stmt in stmts {
+            match self.inner.borrow_mut().dispatch(self.db, &stmt, &[]) {
+                Ok(r) => completed.push(r),
+                Err(e) => {
+                    return ScriptExecution {
+                        completed,
+                        error: Some(e),
+                    }
+                }
+            }
+        }
+        ScriptExecution {
+            completed,
+            error: None,
+        }
     }
 
     /// Execute a SQL query and return the result set.

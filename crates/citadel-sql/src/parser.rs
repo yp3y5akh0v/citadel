@@ -446,6 +446,18 @@ pub fn parse_sql(sql: &str) -> Result<Statement> {
     convert_statement(stmts.into_iter().next().unwrap())
 }
 
+/// Parse one or more `;`-separated SQL statements.
+pub fn parse_sql_multi(sql: &str) -> Result<Vec<Statement>> {
+    let dialect = GenericDialect {};
+    let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| SqlError::Parse(e.to_string()))?;
+
+    if stmts.is_empty() {
+        return Err(SqlError::Parse("empty SQL".into()));
+    }
+
+    stmts.into_iter().map(convert_statement).collect()
+}
+
 /// Returns the number of distinct parameters in a statement (max $N found).
 pub fn count_params(stmt: &Statement) -> usize {
     let mut max_idx = 0usize;
