@@ -1,6 +1,8 @@
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use citadel::Database;
+use citadel_buffer::btree::{UpsertAction, UpsertOutcome};
 use citadel_txn::write_txn::WriteTxn;
 use rustc_hash::FxHashMap;
 
@@ -89,6 +91,16 @@ pub(super) fn exec_insert(
         }
         InsertSource::Values(_) => None,
     };
+
+    let compiled_conflict: Option<Arc<CompiledOnConflict>> = stmt
+        .on_conflict
+        .as_ref()
+        .map(|oc| compile_on_conflict(oc, table_schema).map(Arc::new))
+        .transpose()?;
+
+    let row_col_map = compiled_conflict
+        .as_ref()
+        .map(|_| ColumnMap::new(&table_schema.columns));
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     let mut count: u64 = 0;
@@ -266,23 +278,53 @@ pub(super) fn exec_insert(
             });
         }
 
-        let is_new = wtx
-            .table_insert(stmt.table.as_bytes(), &key_buf, &value_buf)
-            .map_err(SqlError::Storage)?;
-        if !is_new {
-            return Err(SqlError::DuplicateKey);
-        }
-
-        if !table_schema.indices.is_empty() {
-            for (j, &i) in pk_indices.iter().enumerate() {
-                row[i] = pk_values[j].clone();
+        match compiled_conflict.as_ref() {
+            None => {
+                let is_new = wtx
+                    .table_insert(stmt.table.as_bytes(), &key_buf, &value_buf)
+                    .map_err(SqlError::Storage)?;
+                if !is_new {
+                    return Err(SqlError::DuplicateKey);
+                }
+                if !table_schema.indices.is_empty() {
+                    for (j, &i) in pk_indices.iter().enumerate() {
+                        row[i] = pk_values[j].clone();
+                    }
+                    for (j, &i) in non_pk.iter().enumerate() {
+                        row[i] =
+                            std::mem::replace(&mut value_values[enc_pos[j] as usize], Value::Null);
+                    }
+                    insert_index_entries(&mut wtx, table_schema, &row, &pk_values)?;
+                }
+                count += 1;
             }
-            for (j, &i) in non_pk.iter().enumerate() {
-                row[i] = std::mem::replace(&mut value_values[enc_pos[j] as usize], Value::Null);
+            Some(oc) => {
+                let oc_ref: &CompiledOnConflict = oc;
+                let needs_row = upsert_needs_row(oc_ref, table_schema);
+                if needs_row {
+                    for (j, &i) in pk_indices.iter().enumerate() {
+                        row[i] = pk_values[j].clone();
+                    }
+                    for (j, &i) in non_pk.iter().enumerate() {
+                        row[i] =
+                            std::mem::replace(&mut value_values[enc_pos[j] as usize], Value::Null);
+                    }
+                }
+                match apply_insert_with_conflict(
+                    &mut wtx,
+                    table_schema,
+                    &key_buf,
+                    &value_buf,
+                    &row,
+                    &pk_values,
+                    oc_ref,
+                    row_col_map.as_ref().unwrap(),
+                )? {
+                    InsertRowOutcome::Inserted => count += 1,
+                    InsertRowOutcome::Skipped => {}
+                }
             }
-            insert_index_entries(&mut wtx, table_schema, &row, &pk_values)?;
         }
-        count += 1;
     }
 
     wtx.commit().map_err(SqlError::Storage)?;
@@ -694,6 +736,7 @@ pub(super) fn materialize_insert(
         table: stmt.table.clone(),
         columns: stmt.columns.clone(),
         source,
+        on_conflict: stmt.on_conflict.clone(),
     })
 }
 
@@ -975,10 +1018,29 @@ impl InsertBufs {
 
 thread_local! {
     static INSERT_SCRATCH: RefCell<InsertBufs> = RefCell::new(InsertBufs::new());
+    static UPSERT_SCRATCH: RefCell<UpsertBufs> = RefCell::new(UpsertBufs::new());
 }
 
 fn with_insert_scratch<R>(f: impl FnOnce(&mut InsertBufs) -> R) -> R {
     INSERT_SCRATCH.with(|slot| f(&mut slot.borrow_mut()))
+}
+
+pub(super) struct UpsertBufs {
+    old_row: Vec<Value>,
+    new_row: Vec<Value>,
+    value_values: Vec<Value>,
+    new_value_buf: Vec<u8>,
+}
+
+impl UpsertBufs {
+    pub(super) fn new() -> Self {
+        Self {
+            old_row: Vec::new(),
+            new_row: Vec::new(),
+            value_values: Vec::new(),
+            new_value_buf: Vec::with_capacity(256),
+        }
+    }
 }
 
 pub fn exec_insert_in_txn(
@@ -1098,6 +1160,22 @@ fn exec_insert_in_txn_impl(
     let has_fks = !table_schema.foreign_keys.is_empty();
     let has_indices = !table_schema.indices.is_empty();
     let has_defaults = !defaults.is_empty();
+
+    let compiled_conflict: Option<Arc<CompiledOnConflict>> = match (cache, &stmt.on_conflict) {
+        (Some(c), Some(_)) if c.on_conflict.is_some() => c.on_conflict.clone(),
+        (_, Some(oc)) => Some(Arc::new(compile_on_conflict(oc, table_schema)?)),
+        (_, None) => None,
+    };
+
+    let row_col_map_owned: Option<ColumnMap> =
+        if compiled_conflict.is_some() && cache.and_then(|c| c.row_col_map.as_ref()).is_none() {
+            Some(ColumnMap::new(&table_schema.columns))
+        } else {
+            None
+        };
+    let row_col_map: Option<&ColumnMap> = cache
+        .and_then(|c| c.row_col_map.as_ref())
+        .or(row_col_map_owned.as_ref());
 
     let select_rows = match &stmt.source {
         InsertSource::Select(sq) => {
@@ -1281,24 +1359,57 @@ fn exec_insert_in_txn_impl(
             });
         }
 
-        let is_new = wtx
-            .table_insert(table_bytes, &bufs.key_buf, &bufs.value_buf)
-            .map_err(SqlError::Storage)?;
-        if !is_new {
-            return Err(SqlError::DuplicateKey);
-        }
-
-        if has_indices {
-            for (j, &i) in pk_indices.iter().enumerate() {
-                bufs.row[i] = bufs.pk_values[j].clone();
+        match compiled_conflict.as_ref() {
+            None => {
+                let is_new = wtx
+                    .table_insert(table_bytes, &bufs.key_buf, &bufs.value_buf)
+                    .map_err(SqlError::Storage)?;
+                if !is_new {
+                    return Err(SqlError::DuplicateKey);
+                }
+                if has_indices {
+                    for (j, &i) in pk_indices.iter().enumerate() {
+                        bufs.row[i] = bufs.pk_values[j].clone();
+                    }
+                    for (j, &i) in non_pk.iter().enumerate() {
+                        bufs.row[i] = std::mem::replace(
+                            &mut bufs.value_values[enc_pos[j] as usize],
+                            Value::Null,
+                        );
+                    }
+                    insert_index_entries(wtx, table_schema, &bufs.row, &bufs.pk_values)?;
+                }
+                count += 1;
             }
-            for (j, &i) in non_pk.iter().enumerate() {
-                bufs.row[i] =
-                    std::mem::replace(&mut bufs.value_values[enc_pos[j] as usize], Value::Null);
+            Some(oc) => {
+                let oc_ref: &CompiledOnConflict = oc;
+                let needs_row = upsert_needs_row(oc_ref, table_schema);
+                if needs_row {
+                    for (j, &i) in pk_indices.iter().enumerate() {
+                        bufs.row[i] = bufs.pk_values[j].clone();
+                    }
+                    for (j, &i) in non_pk.iter().enumerate() {
+                        bufs.row[i] = std::mem::replace(
+                            &mut bufs.value_values[enc_pos[j] as usize],
+                            Value::Null,
+                        );
+                    }
+                }
+                match apply_insert_with_conflict(
+                    wtx,
+                    table_schema,
+                    &bufs.key_buf,
+                    &bufs.value_buf,
+                    &bufs.row,
+                    &bufs.pk_values,
+                    oc_ref,
+                    row_col_map.unwrap(),
+                )? {
+                    InsertRowOutcome::Inserted => count += 1,
+                    InsertRowOutcome::Skipped => {}
+                }
             }
-            insert_index_entries(wtx, table_schema, &bufs.row, &bufs.pk_values)?;
         }
-        count += 1;
     }
 
     Ok(ExecutionResult::RowsAffected(count))
@@ -1314,6 +1425,750 @@ struct InsertCache {
     has_subquery: bool,
     any_defaults: bool,
     has_checks: bool,
+    on_conflict: Option<Arc<CompiledOnConflict>>,
+    row_col_map: Option<ColumnMap>,
+}
+
+#[derive(Clone)]
+pub(super) enum CompiledOnConflict {
+    DoNothing {
+        target: Option<ConflictKind>,
+    },
+    DoUpdate {
+        target: ConflictKind,
+        assignments: Vec<(usize, Expr)>,
+        where_clause: Option<Expr>,
+        fast_paths: Option<Vec<DoUpdateFastPath>>,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DoUpdateFastPath {
+    IntAddConst { phys_idx: usize, delta: i64 },
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum ConflictKind {
+    PrimaryKey,
+    UniqueIndex { index_idx: usize },
+}
+
+fn resolve_conflict_target(target: &ConflictTarget, ts: &TableSchema) -> Result<ConflictKind> {
+    match target {
+        ConflictTarget::Columns(cols) => {
+            let col_idx_set: Vec<u16> = cols
+                .iter()
+                .map(|name| {
+                    ts.column_index(name)
+                        .map(|i| i as u16)
+                        .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))
+                })
+                .collect::<Result<_>>()?;
+            let pk_set = ts.primary_key_columns.clone();
+            if set_equal(&col_idx_set, &pk_set) {
+                return Ok(ConflictKind::PrimaryKey);
+            }
+            for (index_idx, idx) in ts.indices.iter().enumerate() {
+                if idx.unique && set_equal(&col_idx_set, &idx.columns) {
+                    return Ok(ConflictKind::UniqueIndex { index_idx });
+                }
+            }
+            Err(SqlError::Plan(
+                "ON CONFLICT target does not match any unique constraint".into(),
+            ))
+        }
+        ConflictTarget::Constraint(name) => {
+            let lower = name.to_ascii_lowercase();
+            for (index_idx, idx) in ts.indices.iter().enumerate() {
+                if idx.name.eq_ignore_ascii_case(&lower) {
+                    if idx.unique {
+                        return Ok(ConflictKind::UniqueIndex { index_idx });
+                    }
+                    return Err(SqlError::Plan(format!(
+                        "ON CONFLICT ON CONSTRAINT '{name}' requires a unique index"
+                    )));
+                }
+            }
+            Err(SqlError::Plan(format!(
+                "unknown constraint '{name}'; primary keys cannot be referenced by name, use ON CONFLICT (col_list)"
+            )))
+        }
+    }
+}
+
+fn set_equal(a: &[u16], b: &[u16]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a_sorted = a.to_vec();
+    let mut b_sorted = b.to_vec();
+    a_sorted.sort_unstable();
+    b_sorted.sort_unstable();
+    a_sorted == b_sorted
+}
+
+pub(super) enum InsertRowOutcome {
+    Inserted,
+    Skipped,
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn apply_insert_with_conflict(
+    wtx: &mut WriteTxn<'_>,
+    table_schema: &TableSchema,
+    key_buf: &[u8],
+    value_buf: &[u8],
+    row: &[Value],
+    pk_values: &[Value],
+    on_conflict: &CompiledOnConflict,
+    col_map: &ColumnMap,
+) -> Result<InsertRowOutcome> {
+    let table_bytes = table_schema.name.as_bytes();
+
+    if let CompiledOnConflict::DoNothing { target } = on_conflict {
+        let pk_target = matches!(target, None | Some(ConflictKind::PrimaryKey));
+        if pk_target && table_schema.indices.is_empty() && table_schema.foreign_keys.is_empty() {
+            let inserted = wtx
+                .table_insert_if_absent(table_bytes, key_buf, value_buf)
+                .map_err(SqlError::Storage)?;
+            return Ok(if inserted {
+                InsertRowOutcome::Inserted
+            } else {
+                InsertRowOutcome::Skipped
+            });
+        }
+    }
+
+    if let CompiledOnConflict::DoUpdate {
+        target: ConflictKind::PrimaryKey,
+        assignments,
+        where_clause,
+        fast_paths,
+    } = on_conflict
+    {
+        if can_fuse_do_update(table_schema, assignments) {
+            return apply_do_update_fused(
+                wtx,
+                table_schema,
+                table_bytes,
+                key_buf,
+                value_buf,
+                row,
+                assignments,
+                where_clause.as_ref(),
+                col_map,
+                fast_paths.as_deref(),
+            );
+        }
+    }
+
+    let primary_outcome = wtx
+        .table_insert_or_fetch(table_bytes, key_buf, value_buf)
+        .map_err(SqlError::Storage)?;
+
+    match primary_outcome {
+        citadel_txn::write_txn::InsertOutcome::Inserted => {
+            if table_schema.indices.is_empty() {
+                return Ok(InsertRowOutcome::Inserted);
+            }
+            let mut inserted_keys: Vec<(usize, Vec<u8>)> = Vec::new();
+            match insert_index_entries_or_fetch(
+                wtx,
+                table_schema,
+                row,
+                pk_values,
+                &mut inserted_keys,
+            )? {
+                None => Ok(InsertRowOutcome::Inserted),
+                Some(conflicting_idx) => {
+                    let matches_target =
+                        matches!(on_conflict, CompiledOnConflict::DoNothing { target: None })
+                            || matches!(
+                                on_conflict,
+                                CompiledOnConflict::DoNothing {
+                                    target: Some(ConflictKind::UniqueIndex { index_idx }),
+                                } | CompiledOnConflict::DoUpdate {
+                                    target: ConflictKind::UniqueIndex { index_idx },
+                                    ..
+                                } if *index_idx == conflicting_idx
+                            );
+                    undo_partial_insert(wtx, table_schema, key_buf, &inserted_keys)?;
+                    if !matches_target {
+                        return Err(SqlError::UniqueViolation(
+                            table_schema.indices[conflicting_idx].name.clone(),
+                        ));
+                    }
+                    match on_conflict {
+                        CompiledOnConflict::DoNothing { .. } => Ok(InsertRowOutcome::Skipped),
+                        CompiledOnConflict::DoUpdate {
+                            assignments,
+                            where_clause,
+                            ..
+                        } => {
+                            let existing_pk =
+                                fetch_unique_index_pk(wtx, table_schema, conflicting_idx, row)?;
+                            apply_do_update(
+                                wtx,
+                                table_schema,
+                                &existing_pk,
+                                row,
+                                assignments,
+                                where_clause.as_ref(),
+                                col_map,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        citadel_txn::write_txn::InsertOutcome::Existed(old_bytes) => {
+            let matches_target = matches!(
+                on_conflict,
+                CompiledOnConflict::DoNothing { target: None }
+                    | CompiledOnConflict::DoNothing {
+                        target: Some(ConflictKind::PrimaryKey),
+                    }
+                    | CompiledOnConflict::DoUpdate {
+                        target: ConflictKind::PrimaryKey,
+                        ..
+                    }
+            );
+            if !matches_target {
+                return Err(SqlError::DuplicateKey);
+            }
+            match on_conflict {
+                CompiledOnConflict::DoNothing { .. } => Ok(InsertRowOutcome::Skipped),
+                CompiledOnConflict::DoUpdate {
+                    assignments,
+                    where_clause,
+                    ..
+                } => {
+                    let old_row = decode_full_row(table_schema, key_buf, &old_bytes)?;
+                    apply_do_update_with_old_row(
+                        wtx,
+                        table_schema,
+                        key_buf,
+                        &old_row,
+                        row,
+                        assignments,
+                        where_clause.as_ref(),
+                        col_map,
+                    )
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn apply_fast_path_patch(
+    old_bytes: &[u8],
+    fast_paths: &[DoUpdateFastPath],
+) -> Result<UpsertAction> {
+    UPSERT_SCRATCH.with(|slot| {
+        let mut bufs = slot.borrow_mut();
+        bufs.new_value_buf.clear();
+        bufs.new_value_buf.extend_from_slice(old_bytes);
+
+        let mut patch_scratch: Vec<u8> = Vec::new();
+
+        for fp in fast_paths {
+            match fp {
+                DoUpdateFastPath::IntAddConst { phys_idx, delta } => {
+                    let decoded =
+                        crate::encoding::decode_columns(&bufs.new_value_buf, &[*phys_idx])?;
+                    let old_val = &decoded[0];
+                    let new_val = match old_val {
+                        Value::Integer(i) => Value::Integer(i.wrapping_add(*delta)),
+                        Value::Null => Value::Null,
+                        _ => {
+                            return Err(SqlError::TypeMismatch {
+                                expected: "INTEGER".into(),
+                                got: old_val.data_type().to_string(),
+                            });
+                        }
+                    };
+                    if !crate::encoding::patch_column_in_place(
+                        &mut bufs.new_value_buf,
+                        *phys_idx,
+                        &new_val,
+                    )? {
+                        patch_scratch.clear();
+                        crate::encoding::patch_row_column(
+                            &bufs.new_value_buf,
+                            *phys_idx,
+                            &new_val,
+                            &mut patch_scratch,
+                        )?;
+                        std::mem::swap(&mut bufs.new_value_buf, &mut patch_scratch);
+                    }
+                }
+            }
+        }
+
+        if bufs.new_value_buf.len() > citadel_core::MAX_INLINE_VALUE_SIZE {
+            return Err(SqlError::RowTooLarge {
+                size: bufs.new_value_buf.len(),
+                max: citadel_core::MAX_INLINE_VALUE_SIZE,
+            });
+        }
+
+        Ok(UpsertAction::Replace(bufs.new_value_buf.clone()))
+    })
+}
+
+fn upsert_needs_row(oc: &CompiledOnConflict, ts: &TableSchema) -> bool {
+    if !ts.indices.is_empty() {
+        return true;
+    }
+    match oc {
+        CompiledOnConflict::DoNothing { .. } => false,
+        CompiledOnConflict::DoUpdate { fast_paths, .. } => fast_paths.is_none() || ts.has_checks(),
+    }
+}
+
+fn can_fuse_do_update(ts: &TableSchema, assignments: &[(usize, Expr)]) -> bool {
+    if !ts.indices.is_empty() {
+        return false;
+    }
+    if !ts.foreign_keys.is_empty() {
+        return false;
+    }
+    let pk = ts.pk_indices();
+    !assignments.iter().any(|(ci, _)| pk.contains(ci))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn apply_do_update_fused(
+    wtx: &mut WriteTxn<'_>,
+    table_schema: &TableSchema,
+    table_bytes: &[u8],
+    key_buf: &[u8],
+    value_buf: &[u8],
+    proposed_row: &[Value],
+    assignments: &[(usize, Expr)],
+    where_clause: Option<&Expr>,
+    col_map: &ColumnMap,
+    fast_paths: Option<&[DoUpdateFastPath]>,
+) -> Result<InsertRowOutcome> {
+    let non_pk = table_schema.non_pk_indices();
+    let enc_pos = table_schema.encoding_positions();
+    let phys_count = table_schema.physical_non_pk_count();
+    let dropped = table_schema.dropped_non_pk_slots();
+    let has_checks = table_schema.has_checks();
+    let has_fks = !table_schema.foreign_keys.is_empty();
+
+    let outcome =
+        wtx.table_upsert_with::<_, SqlError>(table_bytes, key_buf, value_buf, |old_bytes| {
+            if let Some(fps) = fast_paths {
+                if !has_checks {
+                    return apply_fast_path_patch(old_bytes, fps);
+                }
+            }
+            UPSERT_SCRATCH.with(|slot| {
+                let mut bufs = slot.borrow_mut();
+                let UpsertBufs {
+                    old_row,
+                    new_row,
+                    value_values,
+                    new_value_buf,
+                } = &mut *bufs;
+
+                old_row.clear();
+                old_row.resize(table_schema.columns.len(), Value::Null);
+                decode_full_row_into(table_schema, key_buf, old_bytes, old_row)?;
+
+                if let Some(w) = where_clause {
+                    let ctx = EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row);
+                    let result = eval_expr(w, &ctx)?;
+                    if result.is_null() || !is_truthy(&result) {
+                        return Ok(UpsertAction::Skip);
+                    }
+                }
+
+                new_row.clear();
+                new_row.extend_from_slice(old_row);
+                for (col_idx, expr) in assignments {
+                    let ctx = EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row);
+                    let val = eval_expr(expr, &ctx)?;
+                    let col = &table_schema.columns[*col_idx];
+                    new_row[*col_idx] = if val.is_null() {
+                        Value::Null
+                    } else {
+                        let got = val.data_type();
+                        val.coerce_into(col.data_type)
+                            .ok_or_else(|| SqlError::TypeMismatch {
+                                expected: col.data_type.to_string(),
+                                got: got.to_string(),
+                            })?
+                    };
+                }
+
+                for (assigned_idx, _) in assignments {
+                    let col = &table_schema.columns[*assigned_idx];
+                    if !col.nullable && new_row[col.position as usize].is_null() {
+                        return Err(SqlError::NotNullViolation(col.name.clone()));
+                    }
+                }
+                if has_checks {
+                    for col in &table_schema.columns {
+                        if let Some(ref check) = col.check_expr {
+                            let ctx = EvalCtx::new(col_map, new_row);
+                            let result = eval_expr(check, &ctx)?;
+                            if !is_truthy(&result) && !result.is_null() {
+                                let name = col.check_name.as_deref().unwrap_or(&col.name);
+                                return Err(SqlError::CheckViolation(name.to_string()));
+                            }
+                        }
+                    }
+                    for tc in &table_schema.check_constraints {
+                        let ctx = EvalCtx::new(col_map, new_row);
+                        let result = eval_expr(&tc.expr, &ctx)?;
+                        if !is_truthy(&result) && !result.is_null() {
+                            let name = tc.name.as_deref().unwrap_or(&tc.sql);
+                            return Err(SqlError::CheckViolation(name.to_string()));
+                        }
+                    }
+                }
+                let _ = has_fks;
+
+                value_values.clear();
+                value_values.resize(phys_count, Value::Null);
+                for &slot in dropped {
+                    value_values[slot as usize] = Value::Null;
+                }
+                for (j, &i) in non_pk.iter().enumerate() {
+                    value_values[enc_pos[j] as usize] = new_row[i].clone();
+                }
+                new_value_buf.clear();
+                crate::encoding::encode_row_into(value_values, new_value_buf);
+
+                if new_value_buf.len() > citadel_core::MAX_INLINE_VALUE_SIZE {
+                    return Err(SqlError::RowTooLarge {
+                        size: new_value_buf.len(),
+                        max: citadel_core::MAX_INLINE_VALUE_SIZE,
+                    });
+                }
+
+                Ok(UpsertAction::Replace(new_value_buf.clone()))
+            })
+        })?;
+
+    match outcome {
+        UpsertOutcome::Inserted | UpsertOutcome::Updated => Ok(InsertRowOutcome::Inserted),
+        UpsertOutcome::Skipped => Ok(InsertRowOutcome::Skipped),
+    }
+}
+
+fn fetch_unique_index_pk(
+    wtx: &mut WriteTxn<'_>,
+    table_schema: &TableSchema,
+    index_idx: usize,
+    row: &[Value],
+) -> Result<Vec<u8>> {
+    let idx = &table_schema.indices[index_idx];
+    let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
+    let indexed: Vec<Value> = idx
+        .columns
+        .iter()
+        .map(|&col_idx| row[col_idx as usize].clone())
+        .collect();
+    let key = crate::encoding::encode_composite_key(&indexed);
+    let value = wtx
+        .table_get(&idx_table, &key)
+        .map_err(SqlError::Storage)?
+        .ok_or_else(|| {
+            SqlError::InvalidValue("unique index missing expected collision entry".into())
+        })?;
+    Ok(value)
+}
+
+fn apply_do_update(
+    wtx: &mut WriteTxn<'_>,
+    table_schema: &TableSchema,
+    pk_key: &[u8],
+    proposed_row: &[Value],
+    assignments: &[(usize, Expr)],
+    where_clause: Option<&Expr>,
+    col_map: &ColumnMap,
+) -> Result<InsertRowOutcome> {
+    let old_value = wtx
+        .table_get(table_schema.name.as_bytes(), pk_key)
+        .map_err(SqlError::Storage)?
+        .ok_or_else(|| SqlError::InvalidValue("primary row missing for DO UPDATE target".into()))?;
+    let old_row = decode_full_row(table_schema, pk_key, &old_value)?;
+    apply_do_update_with_old_row(
+        wtx,
+        table_schema,
+        pk_key,
+        &old_row,
+        proposed_row,
+        assignments,
+        where_clause,
+        col_map,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_do_update_with_old_row(
+    wtx: &mut WriteTxn<'_>,
+    table_schema: &TableSchema,
+    old_pk_key: &[u8],
+    old_row: &[Value],
+    proposed_row: &[Value],
+    assignments: &[(usize, Expr)],
+    where_clause: Option<&Expr>,
+    col_map: &ColumnMap,
+) -> Result<InsertRowOutcome> {
+    if let Some(w) = where_clause {
+        let ctx = EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row);
+        let result = eval_expr(w, &ctx)?;
+        if result.is_null() || !is_truthy(&result) {
+            return Ok(InsertRowOutcome::Skipped);
+        }
+    }
+
+    let mut new_row = old_row.to_vec();
+    for (col_idx, expr) in assignments {
+        let ctx = EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row);
+        let val = eval_expr(expr, &ctx)?;
+        let col = &table_schema.columns[*col_idx];
+        new_row[*col_idx] = if val.is_null() {
+            Value::Null
+        } else {
+            let got = val.data_type();
+            val.coerce_into(col.data_type)
+                .ok_or_else(|| SqlError::TypeMismatch {
+                    expected: col.data_type.to_string(),
+                    got: got.to_string(),
+                })?
+        };
+    }
+
+    let pk_indices = table_schema.pk_indices();
+    let assigned_pk = assignments.iter().any(|(ci, _)| pk_indices.contains(ci));
+    let pk_changed = assigned_pk && pk_indices.iter().any(|&i| old_row[i] != new_row[i]);
+
+    for (assigned_idx, _) in assignments {
+        let col = &table_schema.columns[*assigned_idx];
+        if !col.nullable && new_row[col.position as usize].is_null() {
+            return Err(SqlError::NotNullViolation(col.name.clone()));
+        }
+    }
+    if table_schema.has_checks() {
+        for col in &table_schema.columns {
+            if let Some(ref check) = col.check_expr {
+                let ctx = EvalCtx::new(col_map, &new_row);
+                let result = eval_expr(check, &ctx)?;
+                if !is_truthy(&result) && !result.is_null() {
+                    let name = col.check_name.as_deref().unwrap_or(&col.name);
+                    return Err(SqlError::CheckViolation(name.to_string()));
+                }
+            }
+        }
+        for tc in &table_schema.check_constraints {
+            let ctx = EvalCtx::new(col_map, &new_row);
+            let result = eval_expr(&tc.expr, &ctx)?;
+            if !is_truthy(&result) && !result.is_null() {
+                let name = tc.name.as_deref().unwrap_or(&tc.sql);
+                return Err(SqlError::CheckViolation(name.to_string()));
+            }
+        }
+    }
+    for fk in &table_schema.foreign_keys {
+        let changed = fk
+            .columns
+            .iter()
+            .any(|&ci| old_row[ci as usize] != new_row[ci as usize]);
+        if !changed {
+            continue;
+        }
+        let any_null = fk.columns.iter().any(|&ci| new_row[ci as usize].is_null());
+        if any_null {
+            continue;
+        }
+        let fk_vals: Vec<Value> = fk
+            .columns
+            .iter()
+            .map(|&ci| new_row[ci as usize].clone())
+            .collect();
+        let fk_key = crate::encoding::encode_composite_key(&fk_vals);
+        let found = wtx
+            .table_get(fk.foreign_table.as_bytes(), &fk_key)
+            .map_err(SqlError::Storage)?;
+        if found.is_none() {
+            let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
+            return Err(SqlError::ForeignKeyViolation(name.to_string()));
+        }
+    }
+
+    let has_indices = !table_schema.indices.is_empty();
+    let old_pk_values: Vec<Value> = if has_indices || pk_changed {
+        pk_indices.iter().map(|&i| old_row[i].clone()).collect()
+    } else {
+        Vec::new()
+    };
+    let new_pk_values: Vec<Value> = if has_indices || pk_changed {
+        pk_indices.iter().map(|&i| new_row[i].clone()).collect()
+    } else {
+        Vec::new()
+    };
+
+    let non_pk = table_schema.non_pk_indices();
+    let enc_pos = table_schema.encoding_positions();
+    let phys_count = table_schema.physical_non_pk_count();
+    let dropped = table_schema.dropped_non_pk_slots();
+    let mut value_values: Vec<Value> = vec![Value::Null; phys_count];
+    for &slot in dropped {
+        value_values[slot as usize] = Value::Null;
+    }
+    for (j, &i) in non_pk.iter().enumerate() {
+        value_values[enc_pos[j] as usize] = new_row[i].clone();
+    }
+    let mut new_value_buf = Vec::with_capacity(256);
+    crate::encoding::encode_row_into(&value_values, &mut new_value_buf);
+
+    if new_value_buf.len() > citadel_core::MAX_INLINE_VALUE_SIZE {
+        return Err(SqlError::RowTooLarge {
+            size: new_value_buf.len(),
+            max: citadel_core::MAX_INLINE_VALUE_SIZE,
+        });
+    }
+
+    if pk_changed {
+        let new_pk_key = crate::encoding::encode_composite_key(&new_pk_values);
+        let inserted = wtx
+            .table_insert(table_schema.name.as_bytes(), &new_pk_key, &new_value_buf)
+            .map_err(SqlError::Storage)?;
+        if !inserted {
+            return Err(SqlError::DuplicateKey);
+        }
+        wtx.table_delete(table_schema.name.as_bytes(), old_pk_key)
+            .map_err(SqlError::Storage)?;
+        for idx in &table_schema.indices {
+            let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
+            let old_idx_key = encode_index_key(idx, old_row, &old_pk_values);
+            wtx.table_delete(&idx_table, &old_idx_key)
+                .map_err(SqlError::Storage)?;
+            let new_idx_key = encode_index_key(idx, &new_row, &new_pk_values);
+            let new_idx_val = encode_index_value(idx, &new_row, &new_pk_values);
+            let is_new = wtx
+                .table_insert(&idx_table, &new_idx_key, &new_idx_val)
+                .map_err(SqlError::Storage)?;
+            if idx.unique && !is_new {
+                let any_null = idx.columns.iter().any(|&c| new_row[c as usize].is_null());
+                if !any_null {
+                    return Err(SqlError::UniqueViolation(idx.name.clone()));
+                }
+            }
+        }
+    } else {
+        wtx.table_update_sorted(
+            table_schema.name.as_bytes(),
+            &[(old_pk_key, new_value_buf.as_slice())],
+        )
+        .map_err(SqlError::Storage)?;
+        for idx in &table_schema.indices {
+            if !index_columns_changed(idx, old_row, &new_row) {
+                continue;
+            }
+            let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
+            let old_idx_key = encode_index_key(idx, old_row, &old_pk_values);
+            wtx.table_delete(&idx_table, &old_idx_key)
+                .map_err(SqlError::Storage)?;
+            let new_idx_key = encode_index_key(idx, &new_row, &new_pk_values);
+            let new_idx_val = encode_index_value(idx, &new_row, &new_pk_values);
+            let is_new = wtx
+                .table_insert(&idx_table, &new_idx_key, &new_idx_val)
+                .map_err(SqlError::Storage)?;
+            if idx.unique && !is_new {
+                let any_null = idx.columns.iter().any(|&c| new_row[c as usize].is_null());
+                if !any_null {
+                    return Err(SqlError::UniqueViolation(idx.name.clone()));
+                }
+            }
+        }
+    }
+
+    Ok(InsertRowOutcome::Inserted)
+}
+
+fn detect_fast_paths(
+    ts: &TableSchema,
+    assignments: &[(usize, Expr)],
+) -> Option<Vec<DoUpdateFastPath>> {
+    let non_pk = ts.non_pk_indices();
+    let enc_pos = ts.encoding_positions();
+    let mut out = Vec::with_capacity(assignments.len());
+    for (col_idx, expr) in assignments {
+        let col = &ts.columns[*col_idx];
+        if col.data_type != DataType::Integer {
+            return None;
+        }
+        let nonpk_order = non_pk.iter().position(|&i| i == *col_idx)?;
+        let phys_idx = enc_pos[nonpk_order] as usize;
+
+        if let Expr::BinaryOp { left, op, right } = expr {
+            if !matches!(op, BinOp::Add | BinOp::Sub) {
+                return None;
+            }
+            let reads_target =
+                matches!(left.as_ref(), Expr::Column(n) if n.eq_ignore_ascii_case(&col.name));
+            if !reads_target {
+                return None;
+            }
+            if let Expr::Literal(Value::Integer(n)) = right.as_ref() {
+                let delta = if matches!(op, BinOp::Sub) { -n } else { *n };
+                let _ = col_idx;
+                out.push(DoUpdateFastPath::IntAddConst { phys_idx, delta });
+                continue;
+            }
+            return None;
+        }
+        return None;
+    }
+    Some(out)
+}
+
+fn compile_on_conflict(oc: &OnConflictClause, ts: &TableSchema) -> Result<CompiledOnConflict> {
+    let target = oc
+        .target
+        .as_ref()
+        .map(|t| resolve_conflict_target(t, ts))
+        .transpose()?;
+    match &oc.action {
+        OnConflictAction::DoNothing => Ok(CompiledOnConflict::DoNothing { target }),
+        OnConflictAction::DoUpdate {
+            assignments,
+            where_clause,
+        } => {
+            let target = target.ok_or_else(|| {
+                SqlError::Plan("ON CONFLICT without target requires DO NOTHING".into())
+            })?;
+            let compiled_assignments: Vec<(usize, Expr)> = assignments
+                .iter()
+                .map(|(name, expr)| {
+                    let col_idx = ts
+                        .column_index(name)
+                        .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))?;
+                    Ok((col_idx, expr.clone()))
+                })
+                .collect::<Result<_>>()?;
+            let fast_paths = if where_clause.is_none() {
+                detect_fast_paths(ts, &compiled_assignments)
+            } else {
+                None
+            };
+            Ok(CompiledOnConflict::DoUpdate {
+                target,
+                assignments: compiled_assignments,
+                where_clause: where_clause.clone(),
+                fast_paths,
+            })
+        }
+    }
 }
 
 impl CompiledInsert {
@@ -1329,11 +2184,22 @@ impl CompiledInsert {
             for name in &insert_columns {
                 col_indices.push(ts.column_index(name)?);
             }
+            let on_conflict = stmt
+                .on_conflict
+                .as_ref()
+                .map(|oc| compile_on_conflict(oc, ts))
+                .transpose()
+                .ok()
+                .flatten()
+                .map(Arc::new);
+            let row_col_map = on_conflict.as_ref().map(|_| ColumnMap::new(&ts.columns));
             Some(InsertCache {
                 col_indices,
                 has_subquery: insert_has_subquery(stmt),
                 any_defaults: ts.columns.iter().any(|c| c.default_expr.is_some()),
                 has_checks: ts.has_checks(),
+                on_conflict,
+                row_col_map,
             })
         } else if schema.get_view(&lower).is_some() {
             None

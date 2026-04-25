@@ -38,5 +38,9 @@ criterion_group!(
     h2h::date_extract::bench,
     h2h::date_sort::bench,
     h2h::date_arith::bench,
+    h2h::upsert_all_new::bench,
+    h2h::upsert_counter::bench,
+    h2h::upsert_mixed::bench,
+    h2h::upsert_dedup::bench,
 );
 criterion_main!(benches);

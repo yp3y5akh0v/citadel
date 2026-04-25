@@ -156,17 +156,35 @@ pub(crate) fn decode_full_row(
     key: &[u8],
     value: &[u8],
 ) -> Result<Vec<Value>> {
-    let mut row = vec![Value::Null; schema.columns.len()];
+    let mut row = Vec::with_capacity(schema.columns.len());
+    decode_full_row_into(schema, key, value, &mut row)?;
+    Ok(row)
+}
+
+#[inline]
+pub(crate) fn decode_full_row_into(
+    schema: &TableSchema,
+    key: &[u8],
+    value: &[u8],
+    row: &mut Vec<Value>,
+) -> Result<()> {
+    if row.len() != schema.columns.len() {
+        row.clear();
+        row.resize(schema.columns.len(), Value::Null);
+    } else {
+        for v in row.iter_mut() {
+            *v = Value::Null;
+        }
+    }
     decode_pk_into(
         key,
         schema.primary_key_columns.len(),
-        &mut row,
+        row,
         schema.pk_indices(),
     )?;
     let mapping = schema.decode_col_mapping();
     let stored_count = row_non_pk_count(value);
-    decode_row_into(value, &mut row, mapping)?;
-    // Columns added after this row was written need default values filled in.
+    decode_row_into(value, row, mapping)?;
     if stored_count < mapping.len() {
         for &logical_idx in mapping.iter().skip(stored_count) {
             if logical_idx != usize::MAX {
@@ -176,7 +194,7 @@ pub(crate) fn decode_full_row(
             }
         }
     }
-    Ok(row)
+    Ok(())
 }
 
 /// Evaluate a constant expression (no column references).
@@ -633,17 +651,77 @@ pub(super) fn insert_index_entries(
             .map_err(SqlError::Storage)?;
 
         if idx.unique && !is_new {
+            let any_null = idx.columns.iter().any(|&c| row[c as usize].is_null());
+            if !any_null {
+                return Err(SqlError::UniqueViolation(idx.name.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn insert_index_entries_or_fetch(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    table_schema: &TableSchema,
+    row: &[Value],
+    pk_values: &[Value],
+    inserted_keys: &mut Vec<(usize, Vec<u8>)>,
+) -> Result<Option<usize>> {
+    for (i, idx) in table_schema.indices.iter().enumerate() {
+        let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
+        let key = encode_index_key(idx, row, pk_values);
+        let value = encode_index_value(idx, row, pk_values);
+
+        if idx.unique {
             let indexed_values: Vec<Value> = idx
                 .columns
                 .iter()
                 .map(|&col_idx| row[col_idx as usize].clone())
                 .collect();
             let any_null = indexed_values.iter().any(|v| v.is_null());
-            if !any_null {
-                return Err(SqlError::UniqueViolation(idx.name.clone()));
+            if any_null {
+                let is_new = wtx
+                    .table_insert(&idx_table, &key, &value)
+                    .map_err(SqlError::Storage)?;
+                if is_new {
+                    inserted_keys.push((i, key));
+                }
+                continue;
             }
+            match wtx
+                .table_insert_or_fetch(&idx_table, &key, &value)
+                .map_err(SqlError::Storage)?
+            {
+                citadel_txn::write_txn::InsertOutcome::Inserted => {
+                    inserted_keys.push((i, key));
+                }
+                citadel_txn::write_txn::InsertOutcome::Existed(_) => {
+                    return Ok(Some(i));
+                }
+            }
+        } else {
+            wtx.table_insert(&idx_table, &key, &value)
+                .map_err(SqlError::Storage)?;
+            inserted_keys.push((i, key));
         }
     }
+    Ok(None)
+}
+
+pub(super) fn undo_partial_insert(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    table_schema: &TableSchema,
+    primary_key: &[u8],
+    inserted_keys: &[(usize, Vec<u8>)],
+) -> Result<()> {
+    for (i, key) in inserted_keys.iter().rev() {
+        let idx = &table_schema.indices[*i];
+        let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
+        wtx.table_delete(&idx_table, key)
+            .map_err(SqlError::Storage)?;
+    }
+    wtx.table_delete(table_schema.name.as_bytes(), primary_key)
+        .map_err(SqlError::Storage)?;
     Ok(())
 }
 

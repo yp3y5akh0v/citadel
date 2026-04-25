@@ -17,6 +17,7 @@ name = "citadel_sql"
 
 [dependencies]
 citadel-core = { workspace = true }
+citadel-buffer = { workspace = true }
 citadel-txn = { workspace = true }
 citadel = { workspace = true }
 sqlparser = { workspace = true }

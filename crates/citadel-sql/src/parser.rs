@@ -148,6 +148,28 @@ pub struct InsertStmt {
     pub table: String,
     pub columns: Vec<String>,
     pub source: InsertSource,
+    pub on_conflict: Option<OnConflictClause>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OnConflictClause {
+    pub target: Option<ConflictTarget>,
+    pub action: OnConflictAction,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConflictTarget {
+    Columns(Vec<String>),
+    Constraint(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum OnConflictAction {
+    DoNothing,
+    DoUpdate {
+        assignments: Vec<(String, Expr)>,
+        where_clause: Option<Expr>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1132,11 +1154,81 @@ fn convert_insert(insert: sp::Insert) -> Result<Statement> {
         }
     };
 
+    let on_conflict = insert.on.as_ref().map(convert_on_insert).transpose()?;
+
     Ok(Statement::Insert(InsertStmt {
         table,
         columns,
         source,
+        on_conflict,
     }))
+}
+
+fn convert_on_insert(on: &sp::OnInsert) -> Result<OnConflictClause> {
+    match on {
+        sp::OnInsert::OnConflict(oc) => {
+            let target = oc
+                .conflict_target
+                .as_ref()
+                .map(convert_conflict_target)
+                .transpose()?;
+            let action = convert_on_conflict_action(&oc.action)?;
+            Ok(OnConflictClause { target, action })
+        }
+        sp::OnInsert::DuplicateKeyUpdate(_) => Err(SqlError::Parse(
+            "ON DUPLICATE KEY UPDATE is MySQL-specific; use ON CONFLICT".into(),
+        )),
+        _ => Err(SqlError::Parse("unsupported ON INSERT clause".into())),
+    }
+}
+
+fn convert_conflict_target(target: &sp::ConflictTarget) -> Result<ConflictTarget> {
+    match target {
+        sp::ConflictTarget::Columns(cols) => Ok(ConflictTarget::Columns(
+            cols.iter().map(|c| c.value.to_ascii_lowercase()).collect(),
+        )),
+        sp::ConflictTarget::OnConstraint(name) => {
+            if name.0.len() > 1 {
+                return Err(SqlError::Parse(
+                    "qualified constraint names not supported".into(),
+                ));
+            }
+            Ok(ConflictTarget::Constraint(
+                object_name_to_string(name).to_ascii_lowercase(),
+            ))
+        }
+    }
+}
+
+fn convert_on_conflict_action(action: &sp::OnConflictAction) -> Result<OnConflictAction> {
+    match action {
+        sp::OnConflictAction::DoNothing => Ok(OnConflictAction::DoNothing),
+        sp::OnConflictAction::DoUpdate(du) => {
+            let assignments = du
+                .assignments
+                .iter()
+                .map(|a| {
+                    let col = match &a.target {
+                        sp::AssignmentTarget::ColumnName(name) => {
+                            object_name_to_string(name).to_ascii_lowercase()
+                        }
+                        _ => {
+                            return Err(SqlError::Unsupported(
+                                "tuple assignment in ON CONFLICT".into(),
+                            ))
+                        }
+                    };
+                    let expr = convert_expr(&a.value)?;
+                    Ok((col, expr))
+                })
+                .collect::<Result<_>>()?;
+            let where_clause = du.selection.as_ref().map(convert_expr).transpose()?;
+            Ok(OnConflictAction::DoUpdate {
+                assignments,
+                where_clause,
+            })
+        }
+    }
 }
 
 fn convert_select_body(select: &sp::Select) -> Result<SelectStmt> {
@@ -2177,6 +2269,151 @@ mod tests {
                 assert_eq!(values.len(), 2);
                 assert!(matches!(values[0][0], Expr::Literal(Value::Integer(1))));
                 assert!(matches!(&values[0][1], Expr::Literal(Value::Text(s)) if s == "Alice"));
+                assert!(ins.on_conflict.is_none());
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_upsert_do_nothing() {
+        let stmt =
+            parse_sql("INSERT INTO t (id, v) VALUES (1, 'a') ON CONFLICT (id) DO NOTHING").unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                let oc = ins.on_conflict.expect("expected on_conflict");
+                match oc.target.expect("target") {
+                    ConflictTarget::Columns(cols) => assert_eq!(cols, vec!["id"]),
+                    _ => panic!("expected Columns target"),
+                }
+                assert!(matches!(oc.action, OnConflictAction::DoNothing));
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_upsert_do_nothing_no_target() {
+        let stmt = parse_sql("INSERT INTO t VALUES (1, 'a') ON CONFLICT DO NOTHING").unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                let oc = ins.on_conflict.expect("expected on_conflict");
+                assert!(oc.target.is_none());
+                assert!(matches!(oc.action, OnConflictAction::DoNothing));
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_upsert_do_update_simple() {
+        let stmt = parse_sql(
+            "INSERT INTO t (id, v) VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET v = 'b'",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                let oc = ins.on_conflict.expect("expected on_conflict");
+                match oc.action {
+                    OnConflictAction::DoUpdate {
+                        assignments,
+                        where_clause,
+                    } => {
+                        assert_eq!(assignments.len(), 1);
+                        assert_eq!(assignments[0].0, "v");
+                        assert!(where_clause.is_none());
+                    }
+                    _ => panic!("expected DoUpdate"),
+                }
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_upsert_do_update_excluded() {
+        let stmt = parse_sql(
+            "INSERT INTO t (id, v) VALUES (1, 'a') \
+             ON CONFLICT (id) DO UPDATE SET v = excluded.v",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                let oc = ins.on_conflict.expect("expected on_conflict");
+                let assignments = match oc.action {
+                    OnConflictAction::DoUpdate { assignments, .. } => assignments,
+                    _ => panic!("expected DoUpdate"),
+                };
+                match &assignments[0].1 {
+                    Expr::QualifiedColumn { table, column } => {
+                        assert_eq!(table, "excluded");
+                        assert_eq!(column, "v");
+                    }
+                    _ => panic!("expected QualifiedColumn"),
+                }
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_upsert_do_update_where() {
+        let stmt = parse_sql(
+            "INSERT INTO t (id, v) VALUES (1, 'a') \
+             ON CONFLICT (id) DO UPDATE SET v = excluded.v WHERE t.v < 'z'",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                let oc = ins.on_conflict.expect("expected on_conflict");
+                match oc.action {
+                    OnConflictAction::DoUpdate { where_clause, .. } => {
+                        assert!(where_clause.is_some());
+                    }
+                    _ => panic!("expected DoUpdate"),
+                }
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_upsert_on_constraint_named() {
+        let stmt = parse_sql(
+            "INSERT INTO t (id, v) VALUES (1, 'a') \
+             ON CONFLICT ON CONSTRAINT t_v_idx DO NOTHING",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                let oc = ins.on_conflict.expect("expected on_conflict");
+                match oc.target.expect("target") {
+                    ConflictTarget::Constraint(name) => assert_eq!(name, "t_v_idx"),
+                    _ => panic!("expected Constraint target"),
+                }
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parse_upsert_rejects_duplicate_key_update() {
+        let err = parse_sql("INSERT INTO t (id) VALUES (1) ON DUPLICATE KEY UPDATE id = 2")
+            .expect_err("should reject MySQL syntax");
+        let msg = format!("{err}");
+        assert!(msg.contains("ON DUPLICATE KEY UPDATE") || msg.contains("MySQL"));
+    }
+
+    #[test]
+    fn parse_upsert_lowercases_conflict_target() {
+        let stmt = parse_sql("INSERT INTO t (id) VALUES (1) ON CONFLICT (ID) DO NOTHING").unwrap();
+        match stmt {
+            Statement::Insert(ins) => {
+                let oc = ins.on_conflict.expect("expected on_conflict");
+                match oc.target.expect("target") {
+                    ConflictTarget::Columns(cols) => assert_eq!(cols, vec!["id"]),
+                    _ => panic!("expected Columns"),
+                }
             }
             _ => panic!("expected Insert"),
         }

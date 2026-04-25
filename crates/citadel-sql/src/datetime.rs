@@ -679,6 +679,10 @@ pub fn with_txn_clock<R>(ts: Option<i64>, f: impl FnOnce() -> R) -> R {
     })
 }
 
+pub fn set_txn_clock(ts: Option<i64>) {
+    TXN_CLOCK.with(|slot| slot.set(ts));
+}
+
 /// Read the cached txn-start clock if one is installed, else a fresh `now_micros()`.
 /// Used by `NOW` / `CURRENT_TIMESTAMP` / `CURRENT_DATE` / `LOCALTIMESTAMP`.
 pub fn txn_or_clock_micros() -> i64 {

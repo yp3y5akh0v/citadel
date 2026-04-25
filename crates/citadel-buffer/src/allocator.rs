@@ -87,6 +87,43 @@ impl PageAllocator {
     pub fn freed_count(&self) -> usize {
         self.freed_this_txn.len()
     }
+
+    pub fn checkpoint(&self) -> AllocCheckpoint {
+        AllocCheckpoint {
+            next_page_id: self.next_page_id,
+            ready_to_use: self.ready_to_use.clone(),
+            freed_this_txn_len: self.freed_this_txn.len(),
+            allocated_this_txn_len: self.allocated_this_txn.len(),
+            in_place: self.in_place,
+        }
+    }
+
+    pub fn restore(&mut self, cp: AllocCheckpoint) {
+        self.next_page_id = cp.next_page_id;
+        self.ready_to_use = cp.ready_to_use;
+        self.freed_this_txn.truncate(cp.freed_this_txn_len);
+        self.allocated_this_txn.truncate(cp.allocated_this_txn_len);
+        self.in_place = cp.in_place;
+    }
+
+    pub fn allocated_since(&self, checkpoint_len: usize) -> &[PageId] {
+        &self.allocated_this_txn[checkpoint_len..]
+    }
+}
+
+#[derive(Clone)]
+pub struct AllocCheckpoint {
+    next_page_id: u32,
+    ready_to_use: Vec<PageId>,
+    freed_this_txn_len: usize,
+    allocated_this_txn_len: usize,
+    in_place: bool,
+}
+
+impl AllocCheckpoint {
+    pub fn allocated_this_txn_len(&self) -> usize {
+        self.allocated_this_txn_len
+    }
 }
 
 #[cfg(test)]

@@ -597,20 +597,13 @@ impl<'a> ConnectionInner<'a> {
         stmt: &Statement,
         params: &[Value],
     ) -> Result<ExecutionResult> {
-        let cached_ts = self
-            .txn_start_ts
-            .or_else(|| Some(crate::datetime::now_micros()));
         let schema = &self.schema;
         let wtx = self.active_txn.as_mut();
-        crate::datetime::with_txn_clock(cached_ts, || {
-            if params.is_empty() {
-                plan.execute(db, schema, stmt, params, wtx)
-            } else {
-                crate::eval::with_scoped_params(params, || {
-                    plan.execute(db, schema, stmt, params, wtx)
-                })
-            }
-        })
+        if params.is_empty() {
+            plan.execute(db, schema, stmt, params, wtx)
+        } else {
+            crate::eval::with_scoped_params(params, || plan.execute(db, schema, stmt, params, wtx))
+        }
     }
 
     pub(crate) fn dispatch(
@@ -644,7 +637,9 @@ impl<'a> ConnectionInner<'a> {
                 }
                 let wtx = db.begin_write().map_err(SqlError::Storage)?;
                 self.active_txn = Some(wtx);
-                self.txn_start_ts = Some(crate::datetime::txn_or_clock_micros());
+                let ts = crate::datetime::txn_or_clock_micros();
+                self.txn_start_ts = Some(ts);
+                crate::datetime::set_txn_clock(Some(ts));
                 Ok(ExecutionResult::Ok)
             }
             Statement::Commit => {
@@ -655,6 +650,7 @@ impl<'a> ConnectionInner<'a> {
                 wtx.commit().map_err(SqlError::Storage)?;
                 self.clear_savepoint_state();
                 self.txn_start_ts = None;
+                crate::datetime::set_txn_clock(None);
                 Ok(ExecutionResult::Ok)
             }
             Statement::Rollback => {
@@ -666,6 +662,7 @@ impl<'a> ConnectionInner<'a> {
                 self.clear_savepoint_state();
                 self.schema = SchemaManager::load(db)?;
                 self.txn_start_ts = None;
+                crate::datetime::set_txn_clock(None);
                 Ok(ExecutionResult::Ok)
             }
             Statement::Savepoint(name) => self.do_savepoint(name),
@@ -718,31 +715,33 @@ impl<'a> ConnectionInner<'a> {
     }
 
     fn capture_pending_snapshots(&mut self) {
-        if !self.savepoint_stack.iter().any(|e| e.snapshot.is_none()) {
-            return;
-        }
+        let last_pending = match self
+            .savepoint_stack
+            .iter()
+            .rposition(|e| e.snapshot.is_none())
+        {
+            Some(i) => i,
+            None => return,
+        };
         let wtx = match self.active_txn.as_mut() {
             Some(w) => w,
             None => return,
         };
         let wtx_snap = wtx.begin_savepoint();
         let schema_snap = self.schema.save_snapshot();
-        let mut pending = self
-            .savepoint_stack
-            .iter_mut()
-            .filter(|e| e.snapshot.is_none());
-        if let Some(first) = pending.next() {
-            first.snapshot = Some(SavepointSnapshot {
-                wtx_snap: wtx_snap.clone(),
-                schema_snap: schema_snap.clone(),
-            });
+
+        for i in 0..last_pending {
+            if self.savepoint_stack[i].snapshot.is_none() {
+                self.savepoint_stack[i].snapshot = Some(SavepointSnapshot {
+                    wtx_snap: wtx_snap.clone(),
+                    schema_snap: schema_snap.clone(),
+                });
+            }
         }
-        for entry in pending {
-            entry.snapshot = Some(SavepointSnapshot {
-                wtx_snap: wtx_snap.clone(),
-                schema_snap: schema_snap.clone(),
-            });
-        }
+        self.savepoint_stack[last_pending].snapshot = Some(SavepointSnapshot {
+            wtx_snap,
+            schema_snap,
+        });
     }
 
     fn do_release(&mut self, name: &str) -> Result<ExecutionResult> {
@@ -789,8 +788,6 @@ impl<'a> ConnectionInner<'a> {
         let wtx = self.active_txn.as_mut().unwrap();
         wtx.restore_snapshot(snapshot.wtx_snap);
         self.schema.restore_snapshot(snapshot.schema_snap);
-
-        self.stmt_cache.clear();
 
         Ok(ExecutionResult::Ok)
     }

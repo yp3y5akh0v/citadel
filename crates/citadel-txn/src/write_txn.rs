@@ -7,12 +7,27 @@ use citadel_page::branch_node;
 use citadel_page::page::Page;
 use rustc_hash::FxHashMap;
 
-use citadel_buffer::allocator::PageAllocator;
-use citadel_buffer::btree::{self, BTree};
+use citadel_buffer::allocator::{AllocCheckpoint, PageAllocator};
+use citadel_buffer::btree::{self, BTree, UpsertAction, UpsertOutcome};
 use citadel_buffer::cursor::{Cursor, PageLoader, PageMap};
 
 use crate::catalog::TableDescriptor;
 use crate::manager::TxnManager;
+
+#[derive(Debug, Clone)]
+pub enum InsertOutcome {
+    Inserted,
+    Existed(Vec<u8>),
+}
+
+impl From<Option<Vec<u8>>> for InsertOutcome {
+    fn from(v: Option<Vec<u8>>) -> Self {
+        match v {
+            None => InsertOutcome::Inserted,
+            Some(existing) => InsertOutcome::Existed(existing),
+        }
+    }
+}
 
 struct WritePages<'a> {
     pages: &'a mut FxHashMap<PageId, Page>,
@@ -54,7 +69,7 @@ pub struct WriteTxn<'a> {
 #[derive(Clone)]
 pub struct WriteTxnSnapshot {
     tree: BTree,
-    alloc: PageAllocator,
+    alloc_checkpoint: AllocCheckpoint,
     named_trees: FxHashMap<Vec<u8>, BTree>,
     catalog: Option<BTree>,
     catalog_dirty: bool,
@@ -312,24 +327,180 @@ impl<'db> WriteTxn<'db> {
 
         if let Some(tree) = self.named_trees.get_mut(table) {
             let root = tree.root;
-            let lil_hit = tree.lil_would_hit(&self.pages, key);
-            if !lil_hit {
-                Self::preload_path_raw(&mut self.pages, self.manager, root, key)?;
+            if tree.lil_would_hit(&self.pages, key) {
+                return tree.insert(
+                    &mut self.pages,
+                    &mut self.alloc,
+                    self.txn_id,
+                    key,
+                    ValueType::Inline,
+                    value,
+                );
             }
-            return tree.insert(
+            let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
+            return tree.insert_at_leaf(
                 &mut self.pages,
                 &mut self.alloc,
                 self.txn_id,
                 key,
                 ValueType::Inline,
                 value,
+                path,
+                leaf_id,
             );
         }
         self.ensure_table(table)?;
         let tree = self.named_trees.get_mut(table).unwrap();
         let root = tree.root;
+        let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
+        tree.insert_at_leaf(
+            &mut self.pages,
+            &mut self.alloc,
+            self.txn_id,
+            key,
+            ValueType::Inline,
+            value,
+            path,
+            leaf_id,
+        )
+    }
+
+    #[inline]
+    pub fn table_insert_if_absent(
+        &mut self,
+        table: &[u8],
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<bool> {
+        Self::validate_key_value(key, value)?;
+
+        if let Some(tree) = self.named_trees.get_mut(table) {
+            let root = tree.root;
+            if tree.lil_would_hit(&self.pages, key) {
+                return tree.insert_if_absent(
+                    &mut self.pages,
+                    &mut self.alloc,
+                    self.txn_id,
+                    key,
+                    ValueType::Inline,
+                    value,
+                );
+            }
+            let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
+            return tree.insert_if_absent_at_leaf(
+                &mut self.pages,
+                &mut self.alloc,
+                self.txn_id,
+                key,
+                ValueType::Inline,
+                value,
+                path,
+                leaf_id,
+            );
+        }
+        self.ensure_table(table)?;
+        let tree = self.named_trees.get_mut(table).unwrap();
+        let root = tree.root;
+        let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
+        tree.insert_if_absent_at_leaf(
+            &mut self.pages,
+            &mut self.alloc,
+            self.txn_id,
+            key,
+            ValueType::Inline,
+            value,
+            path,
+            leaf_id,
+        )
+    }
+
+    #[inline]
+    pub fn table_upsert_with<F, E>(
+        &mut self,
+        table: &[u8],
+        key: &[u8],
+        default_value: &[u8],
+        f: F,
+    ) -> std::result::Result<UpsertOutcome, E>
+    where
+        F: FnMut(&[u8]) -> std::result::Result<UpsertAction, E>,
+        E: From<Error>,
+    {
+        Self::validate_key_value(key, default_value)?;
+
+        if let Some(tree) = self.named_trees.get_mut(table) {
+            let root = tree.root;
+            if tree.lil_would_hit(&self.pages, key) {
+                return tree.upsert_with(
+                    &mut self.pages,
+                    &mut self.alloc,
+                    self.txn_id,
+                    key,
+                    ValueType::Inline,
+                    default_value,
+                    f,
+                );
+            }
+            let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
+            return tree.upsert_with_at_leaf(
+                &mut self.pages,
+                &mut self.alloc,
+                self.txn_id,
+                key,
+                ValueType::Inline,
+                default_value,
+                path,
+                leaf_id,
+                f,
+            );
+        }
+        self.ensure_table(table)?;
+        let tree = self.named_trees.get_mut(table).unwrap();
+        let root = tree.root;
+        let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
+        tree.upsert_with_at_leaf(
+            &mut self.pages,
+            &mut self.alloc,
+            self.txn_id,
+            key,
+            ValueType::Inline,
+            default_value,
+            path,
+            leaf_id,
+            f,
+        )
+    }
+
+    pub fn table_insert_or_fetch(
+        &mut self,
+        table: &[u8],
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<InsertOutcome> {
+        Self::validate_key_value(key, value)?;
+
+        if let Some(tree) = self.named_trees.get_mut(table) {
+            let root = tree.root;
+            let lil_hit = tree.lil_would_hit(&self.pages, key);
+            if !lil_hit {
+                Self::preload_path_raw(&mut self.pages, self.manager, root, key)?;
+            }
+            return tree
+                .insert_or_fetch(
+                    &mut self.pages,
+                    &mut self.alloc,
+                    self.txn_id,
+                    key,
+                    ValueType::Inline,
+                    value,
+                )
+                .map(InsertOutcome::from);
+        }
+        self.ensure_table(table)?;
+        let tree = self.named_trees.get_mut(table).unwrap();
+        let root = tree.root;
         Self::preload_path_raw(&mut self.pages, self.manager, root, key)?;
-        tree.insert(
+        tree.insert_or_fetch(
             &mut self.pages,
             &mut self.alloc,
             self.txn_id,
@@ -337,6 +508,7 @@ impl<'db> WriteTxn<'db> {
             ValueType::Inline,
             value,
         )
+        .map(InsertOutcome::from)
     }
 
     /// Batch-update existing keys. Keys must be sorted.
@@ -507,12 +679,12 @@ impl<'db> WriteTxn<'db> {
     /// ROLLBACK TO SAVEPOINT: restore state and drop post-savepoint pages.
     /// Advances txn_id again so repeated rollback-to works.
     pub fn restore_snapshot(&mut self, snap: WriteTxnSnapshot) {
-        let pre_savepoint_alloc_len = snap.alloc.allocated_this_txn().len();
-        for &page_id in &self.alloc.allocated_this_txn()[pre_savepoint_alloc_len..] {
+        let pre_savepoint_alloc_len = snap.alloc_checkpoint.allocated_this_txn_len();
+        for &page_id in self.alloc.allocated_since(pre_savepoint_alloc_len) {
             self.pages.remove(&page_id);
         }
         self.tree = snap.tree;
-        self.alloc = snap.alloc;
+        self.alloc.restore(snap.alloc_checkpoint);
         self.named_trees = snap.named_trees;
         self.catalog = snap.catalog;
         self.catalog_dirty = snap.catalog_dirty;
@@ -524,7 +696,7 @@ impl<'db> WriteTxn<'db> {
     fn capture_snapshot(&self) -> WriteTxnSnapshot {
         WriteTxnSnapshot {
             tree: self.tree.clone(),
-            alloc: self.alloc.clone(),
+            alloc_checkpoint: self.alloc.checkpoint(),
             named_trees: self.named_trees.clone(),
             catalog: self.catalog.clone(),
             catalog_dirty: self.catalog_dirty,
@@ -801,6 +973,35 @@ impl<'db> WriteTxn<'db> {
                 Some(PageType::Branch) => {
                     let idx = branch_node::search_child_index(page, key);
                     current = branch_node::get_child(page, idx);
+                }
+                _ => return Err(Error::InvalidPageType(page.page_type_raw(), current)),
+            }
+        }
+    }
+
+    fn walk_loading(
+        pages: &mut FxHashMap<PageId, Page>,
+        manager: &TxnManager,
+        root: PageId,
+        key: &[u8],
+    ) -> Result<(Vec<(PageId, usize)>, PageId)> {
+        let mut path = Vec::new();
+        let mut current = root;
+        loop {
+            let page = match pages.entry(current) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let page = manager.fetch_page_owned(current)?;
+                    e.insert(page)
+                }
+            };
+            match page.page_type() {
+                Some(PageType::Leaf) => return Ok((path, current)),
+                Some(PageType::Branch) => {
+                    let idx = branch_node::search_child_index(page, key);
+                    let child = branch_node::get_child(page, idx);
+                    path.push((current, idx));
+                    current = child;
                 }
                 _ => return Err(Error::InvalidPageType(page.page_type_raw(), current)),
             }
@@ -1232,4 +1433,239 @@ mod tests {
 
     use citadel_core::MAX_INLINE_VALUE_SIZE;
     use citadel_core::MAX_KEY_SIZE;
+
+    use super::InsertOutcome;
+
+    #[test]
+    fn insert_or_fetch_new_key_returns_inserted() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.create_table(b"t").unwrap();
+        let out = wtx.table_insert_or_fetch(b"t", b"k", b"v").unwrap();
+        assert!(matches!(out, InsertOutcome::Inserted));
+        assert_eq!(wtx.table_get(b"t", b"k").unwrap(), Some(b"v".to_vec()));
+        wtx.commit().unwrap();
+    }
+
+    #[test]
+    fn insert_or_fetch_existing_key_returns_existed_with_value() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.create_table(b"t").unwrap();
+        wtx.table_insert(b"t", b"k", b"old").unwrap();
+
+        let out = wtx.table_insert_or_fetch(b"t", b"k", b"new").unwrap();
+        match out {
+            InsertOutcome::Existed(bytes) => assert_eq!(bytes, b"old"),
+            _ => panic!("expected Existed"),
+        }
+        assert_eq!(wtx.table_get(b"t", b"k").unwrap(), Some(b"old".to_vec()));
+        wtx.commit().unwrap();
+    }
+
+    #[test]
+    fn insert_or_fetch_does_not_overwrite_on_conflict() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.create_table(b"t").unwrap();
+        wtx.table_insert(b"t", b"k", b"first").unwrap();
+        let _ = wtx.table_insert_or_fetch(b"t", b"k", b"second").unwrap();
+        let _ = wtx.table_insert_or_fetch(b"t", b"k", b"third").unwrap();
+        assert_eq!(wtx.table_get(b"t", b"k").unwrap(), Some(b"first".to_vec()));
+        wtx.commit().unwrap();
+    }
+
+    #[test]
+    fn insert_or_fetch_large_value_boundary() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.create_table(b"t").unwrap();
+        let big = vec![b'x'; MAX_INLINE_VALUE_SIZE - 16];
+        assert!(matches!(
+            wtx.table_insert_or_fetch(b"t", b"k", &big).unwrap(),
+            InsertOutcome::Inserted
+        ));
+        match wtx.table_insert_or_fetch(b"t", b"k", &big).unwrap() {
+            InsertOutcome::Existed(bytes) => assert_eq!(bytes.len(), big.len()),
+            _ => panic!("expected Existed"),
+        }
+        wtx.commit().unwrap();
+    }
+
+    #[test]
+    fn insert_or_fetch_empty_value() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.create_table(b"t").unwrap();
+        assert!(matches!(
+            wtx.table_insert_or_fetch(b"t", b"k", b"").unwrap(),
+            InsertOutcome::Inserted
+        ));
+        match wtx.table_insert_or_fetch(b"t", b"k", b"x").unwrap() {
+            InsertOutcome::Existed(bytes) => assert!(bytes.is_empty()),
+            _ => panic!("expected Existed"),
+        }
+        wtx.commit().unwrap();
+    }
+
+    #[test]
+    fn insert_or_fetch_multi_row_sequential() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.create_table(b"t").unwrap();
+        for i in 0u8..32 {
+            let out = wtx.table_insert_or_fetch(b"t", &[i], b"initial").unwrap();
+            assert!(matches!(out, InsertOutcome::Inserted));
+        }
+        for i in 0u8..32 {
+            match wtx.table_insert_or_fetch(b"t", &[i], b"other").unwrap() {
+                InsertOutcome::Existed(bytes) => assert_eq!(bytes, b"initial"),
+                _ => panic!("expected Existed for key {i}"),
+            }
+        }
+        wtx.commit().unwrap();
+    }
+
+    #[test]
+    fn insert_or_fetch_persists_across_read_txn() {
+        let mgr = create_test_manager();
+        {
+            let mut wtx = mgr.begin_write().unwrap();
+            wtx.create_table(b"t").unwrap();
+            wtx.table_insert_or_fetch(b"t", b"k", b"v").unwrap();
+            wtx.commit().unwrap();
+        }
+        let mut rtx = mgr.begin_read();
+        assert_eq!(rtx.table_get(b"t", b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn insert_or_fetch_abort_rolls_back_insert() {
+        let mgr = create_test_manager();
+        {
+            let mut wtx = mgr.begin_write().unwrap();
+            wtx.create_table(b"t").unwrap();
+            wtx.commit().unwrap();
+        }
+        {
+            let mut wtx = mgr.begin_write().unwrap();
+            let _ = wtx.table_insert_or_fetch(b"t", b"k", b"v").unwrap();
+            wtx.abort();
+        }
+        let mut rtx = mgr.begin_read();
+        assert_eq!(rtx.table_get(b"t", b"k").unwrap(), None);
+    }
+
+    use super::{UpsertAction, UpsertOutcome};
+
+    #[test]
+    fn upsert_with_new_key_inserts_default() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.create_table(b"t").unwrap();
+        let out = wtx
+            .table_upsert_with::<_, citadel_core::Error>(b"t", b"k", b"default", |_| {
+                Ok(UpsertAction::Replace(b"unused".to_vec()))
+            })
+            .unwrap();
+        assert!(matches!(out, UpsertOutcome::Inserted));
+        assert_eq!(
+            wtx.table_get(b"t", b"k").unwrap(),
+            Some(b"default".to_vec())
+        );
+        wtx.commit().unwrap();
+    }
+
+    #[test]
+    fn upsert_with_existing_key_replace() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.create_table(b"t").unwrap();
+        wtx.table_insert(b"t", b"k", b"old").unwrap();
+        let out = wtx
+            .table_upsert_with::<_, citadel_core::Error>(b"t", b"k", b"default", |old| {
+                assert_eq!(old, b"old");
+                Ok(UpsertAction::Replace(b"new".to_vec()))
+            })
+            .unwrap();
+        assert!(matches!(out, UpsertOutcome::Updated));
+        assert_eq!(wtx.table_get(b"t", b"k").unwrap(), Some(b"new".to_vec()));
+        wtx.commit().unwrap();
+    }
+
+    #[test]
+    fn upsert_with_skip_leaves_cell_unchanged() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.create_table(b"t").unwrap();
+        wtx.table_insert(b"t", b"k", b"keep").unwrap();
+        let out = wtx
+            .table_upsert_with::<_, citadel_core::Error>(b"t", b"k", b"default", |_| {
+                Ok(UpsertAction::Skip)
+            })
+            .unwrap();
+        assert!(matches!(out, UpsertOutcome::Skipped));
+        assert_eq!(wtx.table_get(b"t", b"k").unwrap(), Some(b"keep".to_vec()));
+        wtx.commit().unwrap();
+    }
+
+    #[test]
+    fn upsert_with_closure_error_propagates() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.create_table(b"t").unwrap();
+        wtx.table_insert(b"t", b"k", b"v").unwrap();
+        let err = wtx
+            .table_upsert_with::<_, citadel_core::Error>(b"t", b"k", b"default", |_| {
+                Err(citadel_core::Error::ValueTooLarge { size: 1, max: 1 })
+            })
+            .unwrap_err();
+        assert!(matches!(err, citadel_core::Error::ValueTooLarge { .. }));
+    }
+
+    #[test]
+    fn upsert_with_sequential_inserts_via_lil() {
+        let mgr = create_test_manager();
+        let mut wtx = mgr.begin_write().unwrap();
+        wtx.create_table(b"t").unwrap();
+        for i in 0u8..50 {
+            let out = wtx
+                .table_upsert_with::<_, citadel_core::Error>(b"t", &[i], b"v", |_| {
+                    Ok(UpsertAction::Replace(b"unused".to_vec()))
+                })
+                .unwrap();
+            assert!(matches!(out, UpsertOutcome::Inserted));
+        }
+        for i in 0u8..50 {
+            assert_eq!(wtx.table_get(b"t", &[i]).unwrap(), Some(b"v".to_vec()));
+        }
+        wtx.commit().unwrap();
+    }
+
+    #[test]
+    fn upsert_with_update_then_persist() {
+        let mgr = create_test_manager();
+        {
+            let mut wtx = mgr.begin_write().unwrap();
+            wtx.create_table(b"ct").unwrap();
+            wtx.table_insert(b"ct", b"hot", b"\x00\x00\x00\x00\x00\x00\x00\x00")
+                .unwrap();
+            wtx.commit().unwrap();
+        }
+        {
+            let mut wtx = mgr.begin_write().unwrap();
+            for _ in 0..5 {
+                wtx.table_upsert_with::<_, citadel_core::Error>(b"ct", b"hot", b"ignored", |old| {
+                    let cur = i64::from_le_bytes(old.try_into().unwrap());
+                    let next = cur + 1;
+                    Ok(UpsertAction::Replace(next.to_le_bytes().to_vec()))
+                })
+                .unwrap();
+            }
+            wtx.commit().unwrap();
+        }
+        let mut rtx = mgr.begin_read();
+        let got = rtx.table_get(b"ct", b"hot").unwrap().unwrap();
+        assert_eq!(i64::from_le_bytes(got.try_into().unwrap()), 5);
+    }
 }

@@ -77,6 +77,12 @@ pub struct EvalCtx<'a> {
     pub col_map: &'a ColumnMap,
     pub row: &'a [Value],
     pub params: &'a [Value],
+    pub excluded: Option<ExcludedRow<'a>>,
+}
+
+pub struct ExcludedRow<'a> {
+    pub col_map: &'a ColumnMap,
+    pub row: &'a [Value],
 }
 
 impl<'a> EvalCtx<'a> {
@@ -85,6 +91,7 @@ impl<'a> EvalCtx<'a> {
             col_map,
             row,
             params: &[],
+            excluded: None,
         }
     }
 
@@ -93,6 +100,24 @@ impl<'a> EvalCtx<'a> {
             col_map,
             row,
             params,
+            excluded: None,
+        }
+    }
+
+    pub fn with_excluded(
+        col_map: &'a ColumnMap,
+        row: &'a [Value],
+        excluded_col_map: &'a ColumnMap,
+        excluded_row: &'a [Value],
+    ) -> Self {
+        Self {
+            col_map,
+            row,
+            params: &[],
+            excluded: Some(ExcludedRow {
+                col_map: excluded_col_map,
+                row: excluded_row,
+            }),
         }
     }
 }
@@ -156,6 +181,13 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         }
 
         Expr::QualifiedColumn { table, column } => {
+            if let Some(excluded) = ctx.excluded.as_ref() {
+                if table.eq_ignore_ascii_case("excluded") {
+                    let lowered = column.to_ascii_lowercase();
+                    let idx = excluded.col_map.resolve(&lowered)?;
+                    return Ok(excluded.row[idx].clone());
+                }
+            }
             let idx = ctx.col_map.resolve_qualified(table, column)?;
             Ok(ctx.row[idx].clone())
         }

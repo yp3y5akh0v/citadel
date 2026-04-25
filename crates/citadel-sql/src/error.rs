@@ -7,6 +7,9 @@ pub enum SqlError {
     #[error("parse error: {0}")]
     Parse(String),
 
+    #[error("plan error: {0}")]
+    Plan(String),
+
     #[error("table '{0}' not found")]
     TableNotFound(String),
 

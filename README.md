@@ -13,12 +13,12 @@
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Beats unencrypted SQLite in all 26 head-to-head benchmarks with equal cache budgets.
+Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Beats unencrypted SQLite in all 30 head-to-head benchmarks with equal cache budgets.
 
 ## Features
 
 - **Encrypted at rest** - AES-256-CTR + HMAC-SHA256 per page, verified before decryption
-- **SQL** - JOINs, subqueries, CTEs (recursive), UNION/INTERSECT/EXCEPT, window functions, views, aggregates, indexes, constraints, ALTER TABLE, prepared statements
+- **SQL** - JOINs, subqueries, CTEs (recursive), UNION/INTERSECT/EXCEPT, window functions, views, aggregates, indexes, constraints, ALTER TABLE, UPSERT (`ON CONFLICT`), prepared statements
 - **ACID** - Copy-on-Write B+ tree, shadow paging, no WAL. Snapshot isolation with concurrent readers
 - **P2P sync** - Merkle-based table diffing over Noise-encrypted channels with PSK auth
 - **CLI** - SQL shell with tab completion, syntax highlighting, dot-commands (.backup, .verify, .rekey, .sync, .dump, ...)
@@ -28,7 +28,7 @@ Every page is encrypted and authenticated before it hits disk. The database file
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. C FFI (37 functions), WebAssembly bindings
-- **2,700+ tests** - Unit, integration, torture tests across 10 crates
+- **2,800+ tests** - Unit, integration, torture tests across 10 crates
 
 ## Benchmarks
 
@@ -37,32 +37,36 @@ Single-threaded on 100K rows, schema `(id INTEGER PK, name TEXT, age INTEGER)`. 
 ```
 Benchmark          Citadel        SQLite         Ratio
 ------------------------------------------------------
-correlated_in      6.20 ms        1.94 s         312x
-count              146 ns         21.4 us        147x
-correlated_scalar  298 us         18.5 ms        62x
-point              808 ns         12.4 us        15.3x
-group_by           1.20 ms        10.5 ms        8.75x
-cte                1.09 ms        6.23 ms        5.74x
-view_point         3.01 us        12.9 us        4.28x
-filter             726 us         1.73 ms        2.38x
-sort               1.09 ms        2.59 ms        2.37x
-view_filter        737 us         1.74 ms        2.36x
-window_agg         32.1 ms        74.0 ms        2.31x
-savepoint_create   343 ns         716 ns         2.09x
-window_rank        60.8 ms        124 ms         2.04x
-insert_select      627 us         1.15 ms        1.83x
-correlated_exists  3.94 ms        6.74 ms        1.71x
-distinct           2.39 ms        3.97 ms        1.66x
-update             17.9 us        27.95 us       1.56x
-delete             55.8 us        78.5 us        1.41x
-scan               6.13 ms        7.90 ms        1.29x
-recursive_cte      104 us         130 us         1.26x
-sum                1.48 ms        1.85 ms        1.25x
-union              117 us         147 us         1.25x
-savepoint_nested   304 us         367 us         1.21x
-insert             44.0 us        52.6 us        1.19x
-join               87.0 us        100 us         1.15x
-savepoint_rollback 2.12 ms        2.23 ms        1.05x
+correlated_in      5.78 ms        1.90 s         329x
+count              144 ns         21.2 us        147x
+correlated_scalar  290 us         18.9 ms        65.2x
+point              738 ns         12.2 us        16.5x
+group_by           1.23 ms        10.4 ms        8.47x
+cte                1.03 ms        6.14 ms        5.94x
+view_point         2.75 us        12.4 us        4.49x
+filter             698 us         1.72 ms        2.46x
+view_filter        704 us         1.71 ms        2.43x
+sort               1.06 ms        2.54 ms        2.39x
+window_rank        56.0 ms        128 ms         2.28x
+window_agg         31.7 ms        71.7 ms        2.26x
+savepoint_create   323 ns         705 ns         2.18x
+upsert_counter     24.4 us        51.5 us        2.11x
+insert_select      615 us         1.08 ms        1.76x
+upsert_dedup       19.0 us        32.1 us        1.69x
+correlated_exists  3.96 ms        6.69 ms        1.69x
+distinct           2.40 ms        3.84 ms        1.60x
+update             17.6 us        27.6 us        1.57x
+sum                1.42 ms        1.82 ms        1.29x
+delete             55.8 us        70.5 us        1.26x
+scan               6.01 ms        7.60 ms        1.26x
+savepoint_nested   282 us         343 us         1.21x
+recursive_cte      102 us         117 us         1.15x
+insert             43.2 us        49.8 us        1.15x
+union              118 us         133 us         1.13x
+upsert_all_new     44.8 us        50.1 us        1.12x
+upsert_mixed       54.1 us        56.6 us        1.05x
+join               84.7 us        88.1 us        1.04x
+savepoint_rollback 2.11 ms        2.16 ms        1.02x
 ```
 
 ### Native DATE / TIMESTAMP (Citadel only, SQLite has no native type)
@@ -70,11 +74,11 @@ savepoint_rollback 2.12 ms        2.23 ms        1.05x
 ```
 Benchmark          Citadel
 -------------------------------
-date_arith         1.64 ms
-date_range_scan    1.66 ms
-date_sort          3.63 ms
-date_groupby       9.11 ms
-date_extract       12.88 ms
+date_sort          1.17 ms
+date_range_scan    1.59 ms
+date_arith         1.59 ms
+date_groupby       8.54 ms
+date_extract       11.85 ms
 ```
 
 <details>
@@ -90,22 +94,26 @@ H2H benchmarks (sorted by ratio, highest first):
 - **cte** - `WITH filtered AS (SELECT ... WHERE age < 50) SELECT age, COUNT(*) FROM filtered GROUP BY age`
 - **view_point** - `SELECT * FROM v WHERE id = 50000`
 - **filter** - `SELECT * FROM t WHERE age = 42`
-- **sort** - `SELECT * FROM t ORDER BY age LIMIT 10`
 - **view_filter** - `SELECT * FROM v WHERE age = 42`
+- **sort** - `SELECT * FROM t ORDER BY age LIMIT 10`
+- **window_rank** - `ROW_NUMBER() OVER (PARTITION BY age ORDER BY id), RANK() OVER ...`
 - **window_agg** - `SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING), MIN(age) OVER ...`
 - **savepoint_create** - `BEGIN; SAVEPOINT sp; RELEASE sp; COMMIT`
-- **window_rank** - `ROW_NUMBER() OVER (PARTITION BY age ORDER BY id), RANK() OVER ...`
+- **upsert_counter** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1` on existing keys
 - **insert_select** - `INSERT INTO sink SELECT id, val FROM a`
+- **upsert_dedup** - `INSERT ... ON CONFLICT (id) DO NOTHING` on existing keys
 - **correlated_exists** - `SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM ref_table WHERE ref_table.id = t.id)`
 - **distinct** - `SELECT DISTINCT age FROM t`
 - **update** - `UPDATE t SET age = age + 1 WHERE id BETWEEN 10000 AND 10099`
+- **sum** - `SELECT SUM(age) FROM t`
 - **delete** - insert 100 rows then delete them
 - **scan** - `SELECT * FROM t`
-- **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq`
-- **sum** - `SELECT SUM(age) FROM t`
-- **union** - `SELECT id, val FROM a UNION ALL SELECT id, data FROM b`
 - **savepoint_nested** - 10 nested savepoints each with 100-row INSERT, alternating RELEASE/ROLLBACK TO
+- **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq`
 - **insert** - 100 rows in one transaction
+- **union** - `SELECT id, val FROM a UNION ALL SELECT id, data FROM b`
+- **upsert_all_new** - `INSERT ... ON CONFLICT (id) DO NOTHING` with all-new keys
+- **upsert_mixed** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1` mixing existing and new keys
 - **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id`
 - **savepoint_rollback** - `BEGIN; INSERT 1K rows; SAVEPOINT sp; INSERT 10K rows; ROLLBACK TO sp; COMMIT`
 
@@ -193,7 +201,7 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 ## SQL
 
-**Statements** - CREATE/DROP TABLE, ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE/DROP INDEX, CREATE/DROP VIEW, INSERT (VALUES, SELECT), SELECT, UPDATE, DELETE, BEGIN/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, SET TIME ZONE, EXPLAIN
+**Statements** - CREATE/DROP TABLE, ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE/DROP INDEX, CREATE/DROP VIEW, INSERT (VALUES, SELECT, ON CONFLICT DO NOTHING/DO UPDATE, ON CONSTRAINT), SELECT, UPDATE, DELETE, BEGIN/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, SET TIME ZONE, EXPLAIN
 
 **Constraints** - PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK (column + table level), FOREIGN KEY (RESTRICT/NO ACTION)
 
@@ -212,6 +220,8 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 **Prepared statements** - `$1, $2, ...` positional parameters with LRU statement cache
 
 **Multi-statement scripts** - `Connection::execute_script(sql)` runs `;`-separated statements in one call, returning per-statement outcomes with partial-success preserved. WASM: `db.run(sql)` returns `[{type, ...}, ...]`.
+
+**UPSERT** - `INSERT ... ON CONFLICT (cols) DO NOTHING` / `DO UPDATE SET col = excluded.col ... WHERE ...` and `ON CONFLICT ON CONSTRAINT idx_name`. `excluded.*` refers to the proposed row; bare `col` refers to the existing row. Single-descent storage primitive: on the canonical `DO UPDATE SET counter = counter + 1` pattern, Citadel is ~2× faster than SQLite.
 
 ## Security
 
