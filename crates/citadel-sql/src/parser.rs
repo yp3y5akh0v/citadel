@@ -149,6 +149,7 @@ pub struct InsertStmt {
     pub columns: Vec<String>,
     pub source: InsertSource,
     pub on_conflict: Option<OnConflictClause>,
+    pub returning: Option<Vec<SelectColumn>>,
 }
 
 #[derive(Debug, Clone)]
@@ -251,17 +252,21 @@ pub struct UpdateStmt {
     pub table: String,
     pub assignments: Vec<(String, Expr)>,
     pub where_clause: Option<Expr>,
+    pub returning: Option<Vec<SelectColumn>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct DeleteStmt {
     pub table: String,
     pub where_clause: Option<Expr>,
+    pub returning: Option<Vec<SelectColumn>>,
 }
 
 #[derive(Debug, Clone)]
 pub enum SelectColumn {
     AllColumns,
+    AllFromOld,
+    AllFromNew,
     Expr { expr: Expr, alias: Option<String> },
 }
 
@@ -1155,12 +1160,14 @@ fn convert_insert(insert: sp::Insert) -> Result<Statement> {
     };
 
     let on_conflict = insert.on.as_ref().map(convert_on_insert).transpose()?;
+    let returning = convert_returning(insert.returning.as_deref())?;
 
     Ok(Statement::Insert(InsertStmt {
         table,
         columns,
         source,
         on_conflict,
+        returning,
     }))
 }
 
@@ -1487,11 +1494,13 @@ fn convert_update(update: sp::Update) -> Result<Statement> {
         .collect::<Result<_>>()?;
 
     let where_clause = update.selection.as_ref().map(convert_expr).transpose()?;
+    let returning = convert_returning(update.returning.as_deref())?;
 
     Ok(Statement::Update(UpdateStmt {
         table,
         assignments,
         where_clause,
+        returning,
     }))
 }
 
@@ -1518,10 +1527,12 @@ fn convert_delete(delete: sp::Delete) -> Result<Statement> {
     };
 
     let where_clause = delete.selection.as_ref().map(convert_expr).transpose()?;
+    let returning = convert_returning(delete.returning.as_deref())?;
 
     Ok(Statement::Delete(DeleteStmt {
         table: table_name,
         where_clause,
+        returning,
     }))
 }
 
@@ -2111,6 +2122,143 @@ fn convert_window_frame_bound(b: &sp::WindowFrameBound) -> Result<WindowFrameBou
             Ok(WindowFrameBound::Following(Box::new(convert_expr(e)?)))
         }
     }
+}
+
+fn convert_returning(items: Option<&[sp::SelectItem]>) -> Result<Option<Vec<SelectColumn>>> {
+    match items {
+        None => Ok(None),
+        Some(items) => {
+            let cols = items
+                .iter()
+                .map(convert_returning_item)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some(cols))
+        }
+    }
+}
+
+fn convert_returning_item(item: &sp::SelectItem) -> Result<SelectColumn> {
+    match item {
+        sp::SelectItem::Wildcard(_) => Ok(SelectColumn::AllColumns),
+        sp::SelectItem::UnnamedExpr(e) => {
+            reject_aggregate_or_window(e, "RETURNING")?;
+            Ok(SelectColumn::Expr {
+                expr: convert_expr(e)?,
+                alias: None,
+            })
+        }
+        sp::SelectItem::ExprWithAlias { expr, alias } => {
+            reject_aggregate_or_window(expr, "RETURNING")?;
+            Ok(SelectColumn::Expr {
+                expr: convert_expr(expr)?,
+                alias: Some(alias.value.clone()),
+            })
+        }
+        sp::SelectItem::QualifiedWildcard(kind, _) => match kind {
+            sp::SelectItemQualifiedWildcardKind::ObjectName(name) => {
+                let s = object_name_to_string(name);
+                if s.eq_ignore_ascii_case("old") {
+                    Ok(SelectColumn::AllFromOld)
+                } else if s.eq_ignore_ascii_case("new") {
+                    Ok(SelectColumn::AllFromNew)
+                } else {
+                    Err(SqlError::Unsupported(format!(
+                        "RETURNING {s}.* — only old.* and new.* qualified wildcards allowed"
+                    )))
+                }
+            }
+            sp::SelectItemQualifiedWildcardKind::Expr(_) => Err(SqlError::Unsupported(
+                "expression.* in RETURNING".into(),
+            )),
+        },
+    }
+}
+
+fn reject_aggregate_or_window(expr: &sp::Expr, ctx: &str) -> Result<()> {
+    use sp::Expr as E;
+    match expr {
+        E::Function(f) => {
+            if f.over.is_some() {
+                return Err(SqlError::Unsupported(format!(
+                    "window functions are not allowed in {ctx}"
+                )));
+            }
+            let name = f
+                .name
+                .0
+                .last()
+                .map(|p| match p {
+                    sp::ObjectNamePart::Identifier(id) => id.value.to_ascii_uppercase(),
+                    _ => String::new(),
+                })
+                .unwrap_or_default();
+            if matches!(
+                name.as_str(),
+                "COUNT"
+                    | "SUM"
+                    | "AVG"
+                    | "MIN"
+                    | "MAX"
+                    | "GROUP_CONCAT"
+                    | "STRING_AGG"
+                    | "ARRAY_AGG"
+                    | "BIT_AND"
+                    | "BIT_OR"
+                    | "BOOL_AND"
+                    | "BOOL_OR"
+                    | "EVERY"
+                    | "STDDEV"
+                    | "STDDEV_POP"
+                    | "STDDEV_SAMP"
+                    | "VARIANCE"
+                    | "VAR_POP"
+                    | "VAR_SAMP"
+            ) {
+                return Err(SqlError::Unsupported(format!(
+                    "aggregate functions are not allowed in {ctx}"
+                )));
+            }
+            for arg in walk_function_args(f) {
+                reject_aggregate_or_window(arg, ctx)?;
+            }
+            Ok(())
+        }
+        E::BinaryOp { left, right, .. } => {
+            reject_aggregate_or_window(left, ctx)?;
+            reject_aggregate_or_window(right, ctx)
+        }
+        E::UnaryOp { expr, .. } => reject_aggregate_or_window(expr, ctx),
+        E::Cast { expr, .. } => reject_aggregate_or_window(expr, ctx),
+        E::Nested(e) => reject_aggregate_or_window(e, ctx),
+        E::Case {
+            conditions,
+            else_result,
+            ..
+        } => {
+            for cwt in conditions {
+                reject_aggregate_or_window(&cwt.condition, ctx)?;
+                reject_aggregate_or_window(&cwt.result, ctx)?;
+            }
+            if let Some(e) = else_result {
+                reject_aggregate_or_window(e, ctx)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn walk_function_args(f: &sp::Function) -> Vec<&sp::Expr> {
+    use sp::FunctionArguments as FA;
+    let mut out = Vec::new();
+    if let FA::List(args) = &f.args {
+        for a in &args.args {
+            if let sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) = a {
+                out.push(e);
+            }
+        }
+    }
+    out
 }
 
 fn convert_select_item(item: &sp::SelectItem) -> Result<SelectColumn> {

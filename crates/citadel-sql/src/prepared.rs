@@ -407,7 +407,9 @@ fn derive_from_select_stmt(sel: &SelectStmt, schema: &SchemaManager) -> Vec<Stri
     let mut out = Vec::new();
     for col in &sel.columns {
         match col {
-            SelectColumn::AllColumns => {
+            SelectColumn::AllColumns
+            | SelectColumn::AllFromOld
+            | SelectColumn::AllFromNew => {
                 if let Some(cols) = table_columns {
                     for c in cols {
                         out.push(c.name.clone());

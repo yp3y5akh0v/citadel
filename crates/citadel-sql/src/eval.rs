@@ -78,11 +78,18 @@ pub struct EvalCtx<'a> {
     pub row: &'a [Value],
     pub params: &'a [Value],
     pub excluded: Option<ExcludedRow<'a>>,
+    pub old_new: Option<OldNewRows<'a>>,
 }
 
 pub struct ExcludedRow<'a> {
     pub col_map: &'a ColumnMap,
     pub row: &'a [Value],
+}
+
+pub struct OldNewRows<'a> {
+    pub col_map: &'a ColumnMap,
+    pub old_row: Option<&'a [Value]>,
+    pub new_row: Option<&'a [Value]>,
 }
 
 impl<'a> EvalCtx<'a> {
@@ -92,6 +99,7 @@ impl<'a> EvalCtx<'a> {
             row,
             params: &[],
             excluded: None,
+            old_new: None,
         }
     }
 
@@ -101,6 +109,7 @@ impl<'a> EvalCtx<'a> {
             row,
             params,
             excluded: None,
+            old_new: None,
         }
     }
 
@@ -117,6 +126,26 @@ impl<'a> EvalCtx<'a> {
             excluded: Some(ExcludedRow {
                 col_map: excluded_col_map,
                 row: excluded_row,
+            }),
+            old_new: None,
+        }
+    }
+
+    pub fn with_old_new(
+        col_map: &'a ColumnMap,
+        row: &'a [Value],
+        old_row: Option<&'a [Value]>,
+        new_row: Option<&'a [Value]>,
+    ) -> Self {
+        Self {
+            col_map,
+            row,
+            params: &[],
+            excluded: None,
+            old_new: Some(OldNewRows {
+                col_map,
+                old_row,
+                new_row,
             }),
         }
     }
@@ -186,6 +215,18 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     let lowered = column.to_ascii_lowercase();
                     let idx = excluded.col_map.resolve(&lowered)?;
                     return Ok(excluded.row[idx].clone());
+                }
+            }
+            if let Some(on) = ctx.old_new.as_ref() {
+                if table.eq_ignore_ascii_case("old") {
+                    let lowered = column.to_ascii_lowercase();
+                    let idx = on.col_map.resolve(&lowered)?;
+                    return Ok(on.old_row.map(|r| r[idx].clone()).unwrap_or(Value::Null));
+                }
+                if table.eq_ignore_ascii_case("new") {
+                    let lowered = column.to_ascii_lowercase();
+                    let idx = on.col_map.resolve(&lowered)?;
+                    return Ok(on.new_row.map(|r| r[idx].clone()).unwrap_or(Value::Null));
                 }
             }
             let idx = ctx.col_map.resolve_qualified(table, column)?;

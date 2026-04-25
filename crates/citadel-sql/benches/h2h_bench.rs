@@ -42,5 +42,9 @@ criterion_group!(
     h2h::upsert_counter::bench,
     h2h::upsert_mixed::bench,
     h2h::upsert_dedup::bench,
+    h2h::insert_returning::bench,
+    h2h::update_returning::bench,
+    h2h::delete_returning::bench,
+    h2h::upsert_returning::bench,
 );
 criterion_main!(benches);

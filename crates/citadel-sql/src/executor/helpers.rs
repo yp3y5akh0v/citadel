@@ -401,6 +401,7 @@ pub(super) fn try_build_index_map(
                     map.push((col.name.clone(), idx));
                 }
             }
+            SelectColumn::AllFromOld | SelectColumn::AllFromNew => return None,
             SelectColumn::Expr { expr, alias } => {
                 let idx = match expr {
                     Expr::Column(name) => col_map.resolve(name).ok()?,
@@ -453,7 +454,7 @@ pub(super) fn project_rows(
 
     for sel_col in select_cols {
         match sel_col {
-            SelectColumn::AllColumns => {
+            SelectColumn::AllColumns | SelectColumn::AllFromOld | SelectColumn::AllFromNew => {
                 for col in columns {
                     let idx = col.position as usize;
                     col_names.push(col.name.clone());
@@ -483,6 +484,83 @@ pub(super) fn project_rows(
         .collect::<Result<Vec<_>>>()?;
 
     Ok((col_names, projected))
+}
+
+pub(super) fn project_returning(
+    table_schema: &TableSchema,
+    returning: &[SelectColumn],
+    rows: &[(Option<Vec<Value>>, Option<Vec<Value>>)],
+) -> Result<QueryResult> {
+    let columns = &table_schema.columns;
+    let col_map = ColumnMap::new(columns);
+
+    let mut col_names = Vec::new();
+    for sel_col in returning {
+        match sel_col {
+            SelectColumn::AllColumns
+            | SelectColumn::AllFromOld
+            | SelectColumn::AllFromNew => {
+                for c in columns {
+                    col_names.push(c.name.clone());
+                }
+            }
+            SelectColumn::Expr { alias: Some(a), .. } => col_names.push(a.clone()),
+            SelectColumn::Expr { expr, alias: None } => col_names.push(expr_display_name(expr)),
+        }
+    }
+
+    let mut out_rows = Vec::with_capacity(rows.len());
+    for (old, new) in rows {
+        let default_row: &[Value] = new
+            .as_deref()
+            .or(old.as_deref())
+            .unwrap_or(&[]);
+        let ctx = EvalCtx::with_old_new(&col_map, default_row, old.as_deref(), new.as_deref());
+
+        let mut out = Vec::with_capacity(col_names.len());
+        for sel_col in returning {
+            match sel_col {
+                SelectColumn::AllColumns => {
+                    for c in columns {
+                        out.push(default_row[c.position as usize].clone());
+                    }
+                }
+                SelectColumn::AllFromOld => match old {
+                    Some(r) => {
+                        for c in columns {
+                            out.push(r[c.position as usize].clone());
+                        }
+                    }
+                    None => {
+                        for _ in columns {
+                            out.push(Value::Null);
+                        }
+                    }
+                },
+                SelectColumn::AllFromNew => match new {
+                    Some(r) => {
+                        for c in columns {
+                            out.push(r[c.position as usize].clone());
+                        }
+                    }
+                    None => {
+                        for _ in columns {
+                            out.push(Value::Null);
+                        }
+                    }
+                },
+                SelectColumn::Expr { expr, .. } => {
+                    out.push(eval_expr(expr, &ctx)?);
+                }
+            }
+        }
+        out_rows.push(out);
+    }
+
+    Ok(QueryResult {
+        columns: col_names,
+        rows: out_rows,
+    })
 }
 
 pub(crate) fn expr_display_name(expr: &Expr) -> String {
@@ -549,7 +627,9 @@ pub(crate) fn build_output_columns(
     let mut out = Vec::new();
     for (i, col) in select_cols.iter().enumerate() {
         let (name, data_type) = match col {
-            SelectColumn::AllColumns => (format!("col{i}"), DataType::Null),
+            SelectColumn::AllColumns
+            | SelectColumn::AllFromOld
+            | SelectColumn::AllFromNew => (format!("col{i}"), DataType::Null),
             SelectColumn::Expr {
                 alias: Some(a),
                 expr,

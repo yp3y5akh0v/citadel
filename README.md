@@ -13,12 +13,12 @@
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Beats unencrypted SQLite in all 30 head-to-head benchmarks with equal cache budgets.
+Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Beats unencrypted SQLite in all 34 head-to-head benchmarks with equal cache budgets.
 
 ## Features
 
 - **Encrypted at rest** - AES-256-CTR + HMAC-SHA256 per page, verified before decryption
-- **SQL** - JOINs, subqueries, CTEs (recursive), UNION/INTERSECT/EXCEPT, window functions, views, aggregates, indexes, constraints, ALTER TABLE, UPSERT (`ON CONFLICT`), prepared statements
+- **SQL** - JOINs, subqueries, CTEs (recursive), UNION/INTERSECT/EXCEPT, window functions, views, aggregates, indexes, constraints, ALTER TABLE, UPSERT (`ON CONFLICT`), RETURNING (with `OLD/NEW`), prepared statements
 - **ACID** - Copy-on-Write B+ tree, shadow paging, no WAL. Snapshot isolation with concurrent readers
 - **P2P sync** - Merkle-based table diffing over Noise-encrypted channels with PSK auth
 - **CLI** - SQL shell with tab completion, syntax highlighting, dot-commands (.backup, .verify, .rekey, .sync, .dump, ...)
@@ -37,36 +37,40 @@ Single-threaded on 100K rows, schema `(id INTEGER PK, name TEXT, age INTEGER)`. 
 ```
 Benchmark          Citadel        SQLite         Ratio
 ------------------------------------------------------
-correlated_in      5.78 ms        1.90 s         329x
-count              144 ns         21.2 us        147x
-correlated_scalar  290 us         18.9 ms        65.2x
-point              738 ns         12.2 us        16.5x
-group_by           1.23 ms        10.4 ms        8.47x
-cte                1.03 ms        6.14 ms        5.94x
-view_point         2.75 us        12.4 us        4.49x
-filter             698 us         1.72 ms        2.46x
-view_filter        704 us         1.71 ms        2.43x
-sort               1.06 ms        2.54 ms        2.39x
-window_rank        56.0 ms        128 ms         2.28x
-window_agg         31.7 ms        71.7 ms        2.26x
-savepoint_create   323 ns         705 ns         2.18x
-upsert_counter     24.4 us        51.5 us        2.11x
-insert_select      615 us         1.08 ms        1.76x
-upsert_dedup       19.0 us        32.1 us        1.69x
-correlated_exists  3.96 ms        6.69 ms        1.69x
-distinct           2.40 ms        3.84 ms        1.60x
-update             17.6 us        27.6 us        1.57x
-sum                1.42 ms        1.82 ms        1.29x
-delete             55.8 us        70.5 us        1.26x
-scan               6.01 ms        7.60 ms        1.26x
-savepoint_nested   282 us         343 us         1.21x
-recursive_cte      102 us         117 us         1.15x
-insert             43.2 us        49.8 us        1.15x
-union              118 us         133 us         1.13x
-upsert_all_new     44.8 us        50.1 us        1.12x
-upsert_mixed       54.1 us        56.6 us        1.05x
-join               84.7 us        88.1 us        1.04x
-savepoint_rollback 2.11 ms        2.16 ms        1.02x
+correlated_in      5.77 ms        1.89 s         328x
+count              147 ns         20.9 us        142x
+correlated_scalar  298 us         18.2 ms        61.1x
+point              783 ns         12.1 us        15.5x
+group_by           1.15 ms        10.4 ms        9.04x
+cte                1.03 ms        6.21 ms        6.03x
+view_point         2.76 us        12.1 us        4.38x
+upsert_returning   59.6 us        161.5 us       2.71x
+insert_returning   65.1 us        163.6 us       2.51x
+view_filter        700 us         1.73 ms        2.47x
+filter             703 us         1.69 ms        2.41x
+sort               1.06 ms        2.47 ms        2.33x
+savepoint_create   318 ns         692 ns         2.18x
+window_rank        57.9 ms        124 ms         2.13x
+window_agg         33.9 ms        72.1 ms        2.13x
+upsert_counter     25.1 us        51.9 us        2.07x
+insert_select      624 us         1.12 ms        1.79x
+delete_returning   92.4 us        159.8 us       1.73x
+correlated_exists  3.89 ms        6.57 ms        1.69x
+distinct           2.34 ms        3.74 ms        1.60x
+upsert_dedup       19.8 us        31.6 us        1.60x
+update             17.5 us        27.3 us        1.57x
+update_returning   104.8 us       141.5 us       1.35x
+savepoint_nested   276 us         359 us         1.30x
+scan               5.97 ms        7.75 ms        1.30x
+delete             54.8 us        69.2 us        1.26x
+sum                1.46 ms        1.80 ms        1.23x
+union              115 us         137 us         1.20x
+insert             42.6 us        48.9 us        1.15x
+recursive_cte      102 us         116 us         1.14x
+upsert_all_new     44.7 us        48.8 us        1.09x
+upsert_mixed       53.6 us        56.7 us        1.06x
+join               86.7 us        89.5 us        1.03x
+savepoint_rollback 2.07 ms        2.14 ms        1.03x
 ```
 
 ### Native DATE / TIMESTAMP (Citadel only, SQLite has no native type)
@@ -99,12 +103,16 @@ H2H benchmarks (sorted by ratio, highest first):
 - **window_rank** - `ROW_NUMBER() OVER (PARTITION BY age ORDER BY id), RANK() OVER ...`
 - **window_agg** - `SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING), MIN(age) OVER ...`
 - **savepoint_create** - `BEGIN; SAVEPOINT sp; RELEASE sp; COMMIT`
+- **upsert_returning** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1 RETURNING c` on existing keys
+- **insert_returning** - `INSERT INTO t (id, val) VALUES (...) RETURNING id, val`
 - **upsert_counter** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1` on existing keys
 - **insert_select** - `INSERT INTO sink SELECT id, val FROM a`
+- **delete_returning** - insert 100 rows then `DELETE ... WHERE id = ? RETURNING id, val` per row
 - **upsert_dedup** - `INSERT ... ON CONFLICT (id) DO NOTHING` on existing keys
 - **correlated_exists** - `SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM ref_table WHERE ref_table.id = t.id)`
 - **distinct** - `SELECT DISTINCT age FROM t`
 - **update** - `UPDATE t SET age = age + 1 WHERE id BETWEEN 10000 AND 10099`
+- **update_returning** - `UPDATE t SET c = c + ? WHERE id = ? RETURNING c` per row
 - **sum** - `SELECT SUM(age) FROM t`
 - **delete** - insert 100 rows then delete them
 - **scan** - `SELECT * FROM t`

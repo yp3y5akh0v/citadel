@@ -373,6 +373,8 @@ pub(super) fn eval_window_select(
             .iter()
             .map(|c| match c {
                 SelectColumn::AllColumns => "*".into(),
+                SelectColumn::AllFromOld => "old.*".into(),
+                SelectColumn::AllFromNew => "new.*".into(),
                 SelectColumn::Expr { alias: Some(a), .. } => a.clone(),
                 SelectColumn::Expr { expr, .. } => expr_display_name(expr),
             })
@@ -391,6 +393,8 @@ pub(super) fn eval_window_select(
     for col in &stmt.columns {
         match col {
             SelectColumn::AllColumns => rewritten_columns.push(SelectColumn::AllColumns),
+            SelectColumn::AllFromOld => rewritten_columns.push(SelectColumn::AllFromOld),
+            SelectColumn::AllFromNew => rewritten_columns.push(SelectColumn::AllFromNew),
             SelectColumn::Expr { expr, alias } => {
                 let new_expr = extract_window_fns(expr, &mut slot_counter, &mut all_extracted);
                 rewritten_columns.push(SelectColumn::Expr {

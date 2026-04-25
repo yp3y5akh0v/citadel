@@ -318,7 +318,11 @@ fn exec_update_compiled(
     if compiled.is_view {
         return Err(SqlError::CannotModifyView(stmt.table.clone()));
     }
-    if compiled.has_correlated_where || compiled.has_subquery || !compiled.can_fast_path {
+    if compiled.has_correlated_where
+        || compiled.has_subquery
+        || !compiled.can_fast_path
+        || stmt.returning.is_some()
+    {
         return exec_update(db, schema, stmt);
     }
 
@@ -539,6 +543,7 @@ pub(super) fn exec_update(
             table: stmt.table.clone(),
             assignments: stmt.assignments.clone(),
             where_clause: new_where,
+            returning: stmt.returning.clone(),
         };
         return exec_update(db, schema, &rewritten);
     }
@@ -565,7 +570,12 @@ pub(super) fn exec_update(
     let has_fk = !table_schema.foreign_keys.is_empty();
     let has_indices = !table_schema.indices.is_empty();
     let has_child_fk = !schema.child_fks_for(&lower_name).is_empty();
-    if !pk_changed_by_set && !has_fk && !has_indices && !has_child_fk && !table_schema.has_checks()
+    if !pk_changed_by_set
+        && !has_fk
+        && !has_indices
+        && !has_child_fk
+        && !table_schema.has_checks()
+        && stmt.returning.is_none()
     {
         let non_pk = table_schema.non_pk_indices();
         let enc_pos = table_schema.encoding_positions();
@@ -781,6 +791,10 @@ pub(super) fn exec_update(
         .collect();
 
     if matching_rows.is_empty() {
+        if let Some(returning_cols) = stmt.returning.as_ref() {
+            let qr = super::helpers::project_returning(table_schema, returning_cols, &[])?;
+            return Ok(ExecutionResult::Query(qr));
+        }
         return Ok(ExecutionResult::RowsAffected(0));
     }
 
@@ -1010,6 +1024,16 @@ pub(super) fn exec_update(
         }
     }
 
+    if let Some(returning_cols) = stmt.returning.as_ref() {
+        let rows: Vec<(Option<Vec<Value>>, Option<Vec<Value>>)> = changes
+            .iter()
+            .map(|c| (Some(c.old_row.clone()), Some(c.new_row.clone())))
+            .collect();
+        let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
+        wtx.commit().map_err(SqlError::Storage)?;
+        return Ok(ExecutionResult::Query(qr));
+    }
+
     let count = changes.len() as u64;
     wtx.commit().map_err(SqlError::Storage)?;
     Ok(ExecutionResult::RowsAffected(count))
@@ -1076,6 +1100,7 @@ pub(super) fn exec_delete(
         let rewritten = DeleteStmt {
             table: stmt.table.clone(),
             where_clause: new_where,
+            returning: stmt.returning.clone(),
         };
         return exec_delete(db, schema, &rewritten);
     }
@@ -1093,7 +1118,10 @@ pub(super) fn exec_delete(
     let col_map = ColumnMap::new(&table_schema.columns);
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
 
-    if stmt.where_clause.is_none() && schema.child_fks_for(&lower_name).is_empty() {
+    if stmt.where_clause.is_none()
+        && schema.child_fks_for(&lower_name).is_empty()
+        && stmt.returning.is_none()
+    {
         let count = wtx
             .table_truncate(lower_name.as_bytes())
             .map_err(SqlError::Storage)?;
@@ -1118,6 +1146,11 @@ pub(super) fn exec_delete(
         .collect();
 
     if rows_to_delete.is_empty() {
+        if let Some(returning_cols) = stmt.returning.as_ref() {
+            let qr = super::helpers::project_returning(table_schema, returning_cols, &[])?;
+            wtx.commit().map_err(SqlError::Storage)?;
+            return Ok(ExecutionResult::Query(qr));
+        }
         wtx.commit().map_err(SqlError::Storage)?;
         return Ok(ExecutionResult::RowsAffected(0));
     }
@@ -1165,6 +1198,17 @@ pub(super) fn exec_delete(
         wtx.table_delete(lower_name.as_bytes(), key)
             .map_err(SqlError::Storage)?;
     }
+
+    if let Some(returning_cols) = stmt.returning.as_ref() {
+        let rows: Vec<(Option<Vec<Value>>, Option<Vec<Value>>)> = rows_to_delete
+            .iter()
+            .map(|(_, row)| (Some(row.clone()), None))
+            .collect();
+        let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
+        wtx.commit().map_err(SqlError::Storage)?;
+        return Ok(ExecutionResult::Query(qr));
+    }
+
     let count = rows_to_delete.len() as u64;
     wtx.commit().map_err(SqlError::Storage)?;
     Ok(ExecutionResult::RowsAffected(count))
@@ -1394,6 +1438,10 @@ pub(super) fn exec_update_in_txn(
         .collect();
 
     if matching_rows.is_empty() {
+        if let Some(returning_cols) = stmt.returning.as_ref() {
+            let qr = super::helpers::project_returning(table_schema, returning_cols, &[])?;
+            return Ok(ExecutionResult::Query(qr));
+        }
         return Ok(ExecutionResult::RowsAffected(0));
     }
 
@@ -1627,6 +1675,15 @@ pub(super) fn exec_update_in_txn(
         }
     }
 
+    if let Some(returning_cols) = stmt.returning.as_ref() {
+        let rows: Vec<(Option<Vec<Value>>, Option<Vec<Value>>)> = changes
+            .iter()
+            .map(|c| (Some(c.old_row.clone()), Some(c.new_row.clone())))
+            .collect();
+        let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
+        return Ok(ExecutionResult::Query(qr));
+    }
+
     let count = changes.len() as u64;
     Ok(ExecutionResult::RowsAffected(count))
 }
@@ -1651,7 +1708,10 @@ pub(super) fn exec_delete_in_txn(
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
-    if stmt.where_clause.is_none() && schema.child_fks_for(&lower_name).is_empty() {
+    if stmt.where_clause.is_none()
+        && schema.child_fks_for(&lower_name).is_empty()
+        && stmt.returning.is_none()
+    {
         let count = wtx
             .table_truncate(lower_name.as_bytes())
             .map_err(SqlError::Storage)?;
@@ -1722,6 +1782,16 @@ pub(super) fn exec_delete_in_txn(
         wtx.table_delete(lower_name.as_bytes(), key)
             .map_err(SqlError::Storage)?;
     }
+
+    if let Some(returning_cols) = stmt.returning.as_ref() {
+        let rows: Vec<(Option<Vec<Value>>, Option<Vec<Value>>)> = rows_to_delete
+            .iter()
+            .map(|(_, row)| (Some(row.clone()), None))
+            .collect();
+        let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
+        return Ok(ExecutionResult::Query(qr));
+    }
+
     let count = rows_to_delete.len() as u64;
     Ok(ExecutionResult::RowsAffected(count))
 }

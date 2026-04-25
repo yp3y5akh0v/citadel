@@ -68,6 +68,7 @@ pub(super) fn try_fuse_cte(sq: &SelectQuery) -> Option<QueryBody> {
 
     let all_simple_refs = inner.columns.iter().all(|c| match c {
         SelectColumn::AllColumns => true,
+        SelectColumn::AllFromOld | SelectColumn::AllFromNew => false,
         SelectColumn::Expr { expr, alias } => alias.is_none() && matches!(expr, Expr::Column(_)),
     });
     if !all_simple_refs {
@@ -248,7 +249,9 @@ pub(super) fn materialize_recursive_cte(
                         SelectColumn::Expr { expr, .. } => {
                             row_buf.push(eval_expr(expr, &ctx)?);
                         }
-                        SelectColumn::AllColumns => {
+                        SelectColumn::AllColumns
+                        | SelectColumn::AllFromOld
+                        | SelectColumn::AllFromNew => {
                             row_buf.extend_from_slice(row);
                         }
                     }

@@ -104,6 +104,8 @@ pub(super) fn exec_insert(
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     let mut count: u64 = 0;
+    let mut returning_rows: Option<Vec<(Option<Vec<Value>>, Option<Vec<Value>>)>> =
+        stmt.returning.as_ref().map(|_| Vec::new());
 
     let pk_indices = table_schema.pk_indices();
     let non_pk = table_schema.non_pk_indices();
@@ -255,6 +257,9 @@ pub(super) fn exec_insert(
             }
         }
 
+        let proposed_row_for_returning: Option<Vec<Value>> =
+            returning_rows.as_ref().map(|_| row.clone());
+
         for (j, &i) in pk_indices.iter().enumerate() {
             pk_values[j] = std::mem::replace(&mut row[i], Value::Null);
         }
@@ -297,6 +302,9 @@ pub(super) fn exec_insert(
                     insert_index_entries(&mut wtx, table_schema, &row, &pk_values)?;
                 }
                 count += 1;
+                if let Some(buf) = returning_rows.as_mut() {
+                    buf.push((None, proposed_row_for_returning));
+                }
             }
             Some(oc) => {
                 let oc_ref: &CompiledOnConflict = oc;
@@ -310,7 +318,7 @@ pub(super) fn exec_insert(
                             std::mem::replace(&mut value_values[enc_pos[j] as usize], Value::Null);
                     }
                 }
-                match apply_insert_with_conflict(
+                let outcome = apply_insert_with_conflict(
                     &mut wtx,
                     table_schema,
                     &key_buf,
@@ -319,12 +327,31 @@ pub(super) fn exec_insert(
                     &pk_values,
                     oc_ref,
                     row_col_map.as_ref().unwrap(),
-                )? {
-                    InsertRowOutcome::Inserted => count += 1,
+                    stmt.returning.is_some(),
+                )?;
+                match outcome {
+                    InsertRowOutcome::Inserted => {
+                        count += 1;
+                        if let Some(buf) = returning_rows.as_mut() {
+                            buf.push((None, proposed_row_for_returning));
+                        }
+                    }
+                    InsertRowOutcome::Updated { old, new } => {
+                        count += 1;
+                        if let Some(buf) = returning_rows.as_mut() {
+                            buf.push((Some(old), Some(new)));
+                        }
+                    }
                     InsertRowOutcome::Skipped => {}
                 }
             }
         }
+    }
+
+    if let (Some(returning_cols), Some(rows)) = (stmt.returning.as_ref(), returning_rows) {
+        let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
+        wtx.commit().map_err(SqlError::Storage)?;
+        return Ok(ExecutionResult::Query(qr));
     }
 
     wtx.commit().map_err(SqlError::Storage)?;
@@ -560,6 +587,8 @@ pub(super) fn materialize_stmt(
         .iter()
         .map(|c| match c {
             SelectColumn::AllColumns => Ok(SelectColumn::AllColumns),
+            SelectColumn::AllFromOld => Ok(SelectColumn::AllFromOld),
+            SelectColumn::AllFromNew => Ok(SelectColumn::AllFromNew),
             SelectColumn::Expr { expr, alias } => Ok(SelectColumn::Expr {
                 expr: materialize_expr(expr, exec_sub)?,
                 alias: alias.clone(),
@@ -666,6 +695,7 @@ pub(super) fn materialize_update(
         table: stmt.table.clone(),
         assignments,
         where_clause,
+        returning: stmt.returning.clone(),
     })
 }
 
@@ -685,6 +715,7 @@ pub(super) fn materialize_delete(
     Ok(DeleteStmt {
         table: stmt.table.clone(),
         where_clause,
+        returning: stmt.returning.clone(),
     })
 }
 
@@ -737,6 +768,7 @@ pub(super) fn materialize_insert(
         columns: stmt.columns.clone(),
         source,
         on_conflict: stmt.on_conflict.clone(),
+        returning: stmt.returning.clone(),
     })
 }
 
@@ -1190,6 +1222,8 @@ fn exec_insert_in_txn_impl(
     };
 
     let mut count: u64 = 0;
+    let mut returning_rows: Option<Vec<(Option<Vec<Value>>, Option<Vec<Value>>)>> =
+        stmt.returning.as_ref().map(|_| Vec::new());
 
     let values = match &stmt.source {
         InsertSource::Values(rows) => Some(rows.as_slice()),
@@ -1332,6 +1366,10 @@ fn exec_insert_in_txn_impl(
             }
         }
 
+        let proposed_row_for_returning: Option<Vec<Value>> = returning_rows
+            .as_ref()
+            .map(|_| bufs.row.clone());
+
         for (j, &i) in pk_indices.iter().enumerate() {
             bufs.pk_values[j] = std::mem::replace(&mut bufs.row[i], Value::Null);
         }
@@ -1380,6 +1418,9 @@ fn exec_insert_in_txn_impl(
                     insert_index_entries(wtx, table_schema, &bufs.row, &bufs.pk_values)?;
                 }
                 count += 1;
+                if let Some(buf) = returning_rows.as_mut() {
+                    buf.push((None, proposed_row_for_returning));
+                }
             }
             Some(oc) => {
                 let oc_ref: &CompiledOnConflict = oc;
@@ -1395,7 +1436,7 @@ fn exec_insert_in_txn_impl(
                         );
                     }
                 }
-                match apply_insert_with_conflict(
+                let outcome = apply_insert_with_conflict(
                     wtx,
                     table_schema,
                     &bufs.key_buf,
@@ -1404,12 +1445,33 @@ fn exec_insert_in_txn_impl(
                     &bufs.pk_values,
                     oc_ref,
                     row_col_map.unwrap(),
-                )? {
-                    InsertRowOutcome::Inserted => count += 1,
+                    stmt.returning.is_some(),
+                )?;
+                match outcome {
+                    InsertRowOutcome::Inserted => {
+                        count += 1;
+                        if let Some(buf) = returning_rows.as_mut() {
+                            buf.push((None, proposed_row_for_returning));
+                        }
+                    }
+                    InsertRowOutcome::Updated { old, new } => {
+                        count += 1;
+                        if let Some(buf) = returning_rows.as_mut() {
+                            buf.push((Some(old), Some(new)));
+                        }
+                    }
                     InsertRowOutcome::Skipped => {}
                 }
             }
         }
+    }
+
+    if let (Some(returning_cols), Some(rows)) = (stmt.returning.as_ref(), returning_rows) {
+        return Ok(ExecutionResult::Query(super::helpers::project_returning(
+            table_schema,
+            returning_cols,
+            &rows,
+        )?));
     }
 
     Ok(ExecutionResult::RowsAffected(count))
@@ -1509,6 +1571,10 @@ fn set_equal(a: &[u16], b: &[u16]) -> bool {
 
 pub(super) enum InsertRowOutcome {
     Inserted,
+    Updated {
+        old: Vec<Value>,
+        new: Vec<Value>,
+    },
     Skipped,
 }
 
@@ -1523,6 +1589,7 @@ pub(super) fn apply_insert_with_conflict(
     pk_values: &[Value],
     on_conflict: &CompiledOnConflict,
     col_map: &ColumnMap,
+    capture_returning: bool,
 ) -> Result<InsertRowOutcome> {
     let table_bytes = table_schema.name.as_bytes();
 
@@ -1559,6 +1626,7 @@ pub(super) fn apply_insert_with_conflict(
                 where_clause.as_ref(),
                 col_map,
                 fast_paths.as_deref(),
+                capture_returning,
             );
         }
     }
@@ -1616,6 +1684,7 @@ pub(super) fn apply_insert_with_conflict(
                                 assignments,
                                 where_clause.as_ref(),
                                 col_map,
+                                capture_returning,
                             )
                         }
                     }
@@ -1654,6 +1723,7 @@ pub(super) fn apply_insert_with_conflict(
                         assignments,
                         where_clause.as_ref(),
                         col_map,
+                        capture_returning,
                     )
                 }
             }
@@ -1752,6 +1822,7 @@ fn apply_do_update_fused(
     where_clause: Option<&Expr>,
     col_map: &ColumnMap,
     fast_paths: Option<&[DoUpdateFastPath]>,
+    capture_returning: bool,
 ) -> Result<InsertRowOutcome> {
     let non_pk = table_schema.non_pk_indices();
     let enc_pos = table_schema.encoding_positions();
@@ -1760,11 +1831,22 @@ fn apply_do_update_fused(
     let has_checks = table_schema.has_checks();
     let has_fks = !table_schema.foreign_keys.is_empty();
 
+    let captured: std::cell::RefCell<Option<(Vec<Value>, Vec<Value>)>> =
+        std::cell::RefCell::new(None);
+
     let outcome =
         wtx.table_upsert_with::<_, SqlError>(table_bytes, key_buf, value_buf, |old_bytes| {
             if let Some(fps) = fast_paths {
                 if !has_checks {
-                    return apply_fast_path_patch(old_bytes, fps);
+                    let action = apply_fast_path_patch(old_bytes, fps)?;
+                    if capture_returning {
+                        if let UpsertAction::Replace(ref new_bytes) = action {
+                            let old_row = decode_full_row(table_schema, key_buf, old_bytes)?;
+                            let new_row = decode_full_row(table_schema, key_buf, new_bytes)?;
+                            *captured.borrow_mut() = Some((old_row, new_row));
+                        }
+                    }
+                    return Ok(action);
                 }
             }
             UPSERT_SCRATCH.with(|slot| {
@@ -1852,12 +1934,25 @@ fn apply_do_update_fused(
                     });
                 }
 
+                if capture_returning {
+                    *captured.borrow_mut() = Some((old_row.clone(), new_row.clone()));
+                }
                 Ok(UpsertAction::Replace(new_value_buf.clone()))
             })
         })?;
 
     match outcome {
-        UpsertOutcome::Inserted | UpsertOutcome::Updated => Ok(InsertRowOutcome::Inserted),
+        UpsertOutcome::Inserted => Ok(InsertRowOutcome::Inserted),
+        UpsertOutcome::Updated => {
+            if capture_returning {
+                let (old, new) = captured.into_inner().ok_or_else(|| {
+                    SqlError::InvalidValue("DO UPDATE produced no captured rows".into())
+                })?;
+                Ok(InsertRowOutcome::Updated { old, new })
+            } else {
+                Ok(InsertRowOutcome::Inserted)
+            }
+        }
         UpsertOutcome::Skipped => Ok(InsertRowOutcome::Skipped),
     }
 }
@@ -1893,6 +1988,7 @@ fn apply_do_update(
     assignments: &[(usize, Expr)],
     where_clause: Option<&Expr>,
     col_map: &ColumnMap,
+    capture_returning: bool,
 ) -> Result<InsertRowOutcome> {
     let old_value = wtx
         .table_get(table_schema.name.as_bytes(), pk_key)
@@ -1908,6 +2004,7 @@ fn apply_do_update(
         assignments,
         where_clause,
         col_map,
+        capture_returning,
     )
 }
 
@@ -1921,6 +2018,7 @@ fn apply_do_update_with_old_row(
     assignments: &[(usize, Expr)],
     where_clause: Option<&Expr>,
     col_map: &ColumnMap,
+    capture_returning: bool,
 ) -> Result<InsertRowOutcome> {
     if let Some(w) = where_clause {
         let ctx = EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row);
@@ -2092,7 +2190,14 @@ fn apply_do_update_with_old_row(
         }
     }
 
-    Ok(InsertRowOutcome::Inserted)
+    if capture_returning {
+        Ok(InsertRowOutcome::Updated {
+            old: old_row.to_vec(),
+            new: new_row,
+        })
+    } else {
+        Ok(InsertRowOutcome::Inserted)
+    }
 }
 
 fn detect_fast_paths(
