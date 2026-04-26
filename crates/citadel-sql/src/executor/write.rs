@@ -1025,7 +1025,7 @@ pub(super) fn exec_update(
     }
 
     if let Some(returning_cols) = stmt.returning.as_ref() {
-        let rows: Vec<(Option<Vec<Value>>, Option<Vec<Value>>)> = changes
+        let rows: Vec<super::helpers::ReturningRow> = changes
             .iter()
             .map(|c| (Some(c.old_row.clone()), Some(c.new_row.clone())))
             .collect();
@@ -1200,7 +1200,7 @@ pub(super) fn exec_delete(
     }
 
     if let Some(returning_cols) = stmt.returning.as_ref() {
-        let rows: Vec<(Option<Vec<Value>>, Option<Vec<Value>>)> = rows_to_delete
+        let rows: Vec<super::helpers::ReturningRow> = rows_to_delete
             .iter()
             .map(|(_, row)| (Some(row.clone()), None))
             .collect();
@@ -1676,7 +1676,7 @@ pub(super) fn exec_update_in_txn(
     }
 
     if let Some(returning_cols) = stmt.returning.as_ref() {
-        let rows: Vec<(Option<Vec<Value>>, Option<Vec<Value>>)> = changes
+        let rows: Vec<super::helpers::ReturningRow> = changes
             .iter()
             .map(|c| (Some(c.old_row.clone()), Some(c.new_row.clone())))
             .collect();
@@ -1784,7 +1784,7 @@ pub(super) fn exec_delete_in_txn(
     }
 
     if let Some(returning_cols) = stmt.returning.as_ref() {
-        let rows: Vec<(Option<Vec<Value>>, Option<Vec<Value>>)> = rows_to_delete
+        let rows: Vec<super::helpers::ReturningRow> = rows_to_delete
             .iter()
             .map(|(_, row)| (Some(row.clone()), None))
             .collect();

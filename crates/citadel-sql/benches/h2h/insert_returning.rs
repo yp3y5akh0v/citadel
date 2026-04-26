@@ -33,9 +33,7 @@ pub fn bench(c: &mut Criterion) {
         b.iter(|| {
             cc.execute("BEGIN").unwrap();
             for j in 0..100i64 {
-                let _ = cs
-                    .query_collect(&[Value::Integer(c_offset + j)])
-                    .unwrap();
+                let _ = cs.query_collect(&[Value::Integer(c_offset + j)]).unwrap();
             }
             cc.execute("COMMIT").unwrap();
             c_offset += 100;

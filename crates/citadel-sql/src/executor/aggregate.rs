@@ -39,9 +39,7 @@ pub(super) fn exec_aggregate(
 
         for sel_col in &stmt.columns {
             match sel_col {
-                SelectColumn::AllColumns
-                | SelectColumn::AllFromOld
-                | SelectColumn::AllFromNew => {
+                SelectColumn::AllColumns | SelectColumn::AllFromOld | SelectColumn::AllFromNew => {
                     return Err(SqlError::Unsupported("SELECT * with GROUP BY".into()));
                 }
                 SelectColumn::Expr { expr, .. } => {

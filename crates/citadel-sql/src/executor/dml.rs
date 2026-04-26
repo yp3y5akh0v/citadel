@@ -104,7 +104,7 @@ pub(super) fn exec_insert(
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     let mut count: u64 = 0;
-    let mut returning_rows: Option<Vec<(Option<Vec<Value>>, Option<Vec<Value>>)>> =
+    let mut returning_rows: Option<Vec<super::helpers::ReturningRow>> =
         stmt.returning.as_ref().map(|_| Vec::new());
 
     let pk_indices = table_schema.pk_indices();
@@ -1222,7 +1222,7 @@ fn exec_insert_in_txn_impl(
     };
 
     let mut count: u64 = 0;
-    let mut returning_rows: Option<Vec<(Option<Vec<Value>>, Option<Vec<Value>>)>> =
+    let mut returning_rows: Option<Vec<super::helpers::ReturningRow>> =
         stmt.returning.as_ref().map(|_| Vec::new());
 
     let values = match &stmt.source {
@@ -1366,9 +1366,8 @@ fn exec_insert_in_txn_impl(
             }
         }
 
-        let proposed_row_for_returning: Option<Vec<Value>> = returning_rows
-            .as_ref()
-            .map(|_| bufs.row.clone());
+        let proposed_row_for_returning: Option<Vec<Value>> =
+            returning_rows.as_ref().map(|_| bufs.row.clone());
 
         for (j, &i) in pk_indices.iter().enumerate() {
             bufs.pk_values[j] = std::mem::replace(&mut bufs.row[i], Value::Null);
@@ -1571,10 +1570,7 @@ fn set_equal(a: &[u16], b: &[u16]) -> bool {
 
 pub(super) enum InsertRowOutcome {
     Inserted,
-    Updated {
-        old: Vec<Value>,
-        new: Vec<Value>,
-    },
+    Updated { old: Vec<Value>, new: Vec<Value> },
     Skipped,
 }
 
@@ -1980,6 +1976,7 @@ fn fetch_unique_index_pk(
     Ok(value)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_do_update(
     wtx: &mut WriteTxn<'_>,
     table_schema: &TableSchema,

@@ -7,6 +7,8 @@ use crate::eval::{eval_expr, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::types::*;
 
+pub(super) type ReturningRow = (Option<Vec<Value>>, Option<Vec<Value>>);
+
 pub(super) struct PartialDecodeCtx {
     pk_positions: Vec<(usize, usize)>,
     nonpk_targets: Vec<usize>,
@@ -489,7 +491,7 @@ pub(super) fn project_rows(
 pub(super) fn project_returning(
     table_schema: &TableSchema,
     returning: &[SelectColumn],
-    rows: &[(Option<Vec<Value>>, Option<Vec<Value>>)],
+    rows: &[ReturningRow],
 ) -> Result<QueryResult> {
     let columns = &table_schema.columns;
     let col_map = ColumnMap::new(columns);
@@ -497,9 +499,7 @@ pub(super) fn project_returning(
     let mut col_names = Vec::new();
     for sel_col in returning {
         match sel_col {
-            SelectColumn::AllColumns
-            | SelectColumn::AllFromOld
-            | SelectColumn::AllFromNew => {
+            SelectColumn::AllColumns | SelectColumn::AllFromOld | SelectColumn::AllFromNew => {
                 for c in columns {
                     col_names.push(c.name.clone());
                 }
@@ -511,10 +511,7 @@ pub(super) fn project_returning(
 
     let mut out_rows = Vec::with_capacity(rows.len());
     for (old, new) in rows {
-        let default_row: &[Value] = new
-            .as_deref()
-            .or(old.as_deref())
-            .unwrap_or(&[]);
+        let default_row: &[Value] = new.as_deref().or(old.as_deref()).unwrap_or(&[]);
         let ctx = EvalCtx::with_old_new(&col_map, default_row, old.as_deref(), new.as_deref());
 
         let mut out = Vec::with_capacity(col_names.len());
@@ -627,9 +624,9 @@ pub(crate) fn build_output_columns(
     let mut out = Vec::new();
     for (i, col) in select_cols.iter().enumerate() {
         let (name, data_type) = match col {
-            SelectColumn::AllColumns
-            | SelectColumn::AllFromOld
-            | SelectColumn::AllFromNew => (format!("col{i}"), DataType::Null),
+            SelectColumn::AllColumns | SelectColumn::AllFromOld | SelectColumn::AllFromNew => {
+                (format!("col{i}"), DataType::Null)
+            }
             SelectColumn::Expr {
                 alias: Some(a),
                 expr,

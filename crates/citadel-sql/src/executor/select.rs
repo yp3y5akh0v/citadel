@@ -1945,9 +1945,9 @@ impl CompiledSelect {
                 SelectColumn::Expr { expr, .. } => {
                     is_aggregate_expr(expr) || expr_has_subquery(expr)
                 }
-                SelectColumn::AllColumns
-                | SelectColumn::AllFromOld
-                | SelectColumn::AllFromNew => false,
+                SelectColumn::AllColumns | SelectColumn::AllFromOld | SelectColumn::AllFromNew => {
+                    false
+                }
             })
             || sel.where_clause.as_ref().is_some_and(expr_has_subquery)
         {
@@ -2079,9 +2079,7 @@ fn projection_column_names(select_cols: &[SelectColumn], columns: &[ColumnDef]) 
     let mut out = Vec::new();
     for col in select_cols {
         match col {
-            SelectColumn::AllColumns
-            | SelectColumn::AllFromOld
-            | SelectColumn::AllFromNew => {
+            SelectColumn::AllColumns | SelectColumn::AllFromOld | SelectColumn::AllFromNew => {
                 for c in columns {
                     out.push(c.name.clone());
                 }

@@ -352,7 +352,11 @@ fn prepared_insert_returning() {
         .prepare("INSERT INTO users VALUES ($1, $2, $3) RETURNING id, name")
         .unwrap();
     let result = stmt
-        .query_collect(&[Value::Integer(7), Value::Text("Eve".into()), Value::Integer(0)])
+        .query_collect(&[
+            Value::Integer(7),
+            Value::Text("Eve".into()),
+            Value::Integer(0),
+        ])
         .unwrap();
     assert_eq!(result.rows[0][0], Value::Integer(7));
     assert_eq!(result.rows[0][1], Value::Text("Eve".into()));

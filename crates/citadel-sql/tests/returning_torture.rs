@@ -269,10 +269,8 @@ fn returning_multi_column_pk() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let conn = Connection::open(&db).unwrap();
-    conn.execute(
-        "CREATE TABLE t (a INTEGER, b INTEGER, val TEXT, PRIMARY KEY (a, b))",
-    )
-    .unwrap();
+    conn.execute("CREATE TABLE t (a INTEGER, b INTEGER, val TEXT, PRIMARY KEY (a, b))")
+        .unwrap();
 
     let qr = query(
         &conn,
@@ -452,7 +450,10 @@ fn returning_inside_savepoint_then_rollback() {
     conn.execute("BEGIN").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 100)").unwrap();
     conn.execute("SAVEPOINT sp").unwrap();
-    let qr = query(&conn, "UPDATE t SET v = 999 WHERE id = 1 RETURNING old.v, new.v");
+    let qr = query(
+        &conn,
+        "UPDATE t SET v = 999 WHERE id = 1 RETURNING old.v, new.v",
+    );
     assert_eq!(qr.rows[0][0], Value::Integer(100));
     assert_eq!(qr.rows[0][1], Value::Integer(999));
     conn.execute("ROLLBACK TO SAVEPOINT sp").unwrap();
@@ -549,7 +550,8 @@ fn returning_after_on_constraint_upsert() {
         .unwrap();
     conn.execute("CREATE UNIQUE INDEX idx_email ON t(email)")
         .unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'x@y.com', 0)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'x@y.com', 0)")
+        .unwrap();
 
     let qr = query(
         &conn,
@@ -655,10 +657,8 @@ fn update_returning_with_complex_where() {
     let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, s TEXT)")
         .unwrap();
-    conn.execute(
-        "INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd')",
-    )
-    .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd')")
+        .unwrap();
 
     let qr = query(
         &conn,
