@@ -1,7 +1,5 @@
-use std::collections::HashSet;
-
 use citadel::Database;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::encoding::{decode_column_raw, decode_composite_key, decode_pk_integer};
 use crate::error::{Result, SqlError};
@@ -13,7 +11,7 @@ use crate::types::*;
 use super::helpers::decode_full_row;
 use super::CteContext;
 
-pub(super) type InMap = (FxHashMap<Vec<Value>, HashSet<Value>>, bool);
+pub(super) type InMap = (FxHashMap<Vec<Value>, FxHashSet<Value>>, bool);
 
 #[allow(clippy::type_complexity)]
 pub(super) fn handle_correlated_select_read(
@@ -65,6 +63,9 @@ pub(super) fn handle_correlated_select_read(
                                 check_sql: None,
                                 check_name: None,
                                 is_with_timezone: false,
+                                generated_expr: None,
+                                generated_sql: None,
+                                generated_kind: None,
                             });
                             new_columns.push(SelectColumn::Expr {
                                 expr: Expr::Column(col_name),
@@ -258,7 +259,6 @@ pub(super) fn is_correlated_subquery(
 ) -> bool {
     let inner_name = subquery.from.to_ascii_lowercase();
     let inner_schema = schema.get(&inner_name);
-    // Inner must be a known table or view
     if inner_schema.is_none() && schema.get_view(&inner_name).is_none() {
         return false;
     }
@@ -281,21 +281,17 @@ pub(super) fn is_correlated_subquery(
         if let Some(dot) = name.find('.') {
             let table_part = &name[..dot];
             let col_part = &name[dot + 1..];
-            // Skip if matches inner table/view name or inner alias
             if table_part == inner_name || inner_alias.as_deref() == Some(table_part) {
                 continue;
             }
-            // Matches outer → correlated
             if ctx.matches_outer(table_part) && resolves_in(col_part, ctx.outer_schema) {
                 return true;
             }
         } else if let Some(is) = inner_schema {
-            // Unqualified: check against inner schema (only when inner is a real table)
             if !resolves_in(name, is) && resolves_in(name, ctx.outer_schema) {
                 return true;
             }
         }
-        // Views as inner: qualified refs detect correlation for common patterns
     }
     false
 }
@@ -448,11 +444,11 @@ pub(super) fn strip_correlation_predicates(
         None => return (None, vec![]),
     };
     let conjuncts = flatten_and_exprs(w);
-    let corr_outer: HashSet<&str> = corr_pairs
+    let corr_outer: FxHashSet<&str> = corr_pairs
         .iter()
         .map(|p| p.outer_col_name.as_str())
         .collect();
-    let corr_inner: HashSet<&str> = corr_pairs
+    let corr_inner: FxHashSet<&str> = corr_pairs
         .iter()
         .map(|p| p.inner_col_name.as_str())
         .collect();
@@ -569,7 +565,7 @@ pub(super) fn bind_outer_values_in_expr(
 }
 
 pub(super) enum ExistsResult {
-    Simple(HashSet<Vec<Value>>),
+    Simple(FxHashSet<Vec<Value>>),
     WithFilter(Box<ExistsFilterData>),
 }
 
@@ -625,7 +621,7 @@ pub(super) fn decorrelate_exists_read(
         .collect();
 
     if non_eq.is_empty() {
-        let mut key_set = HashSet::new();
+        let mut key_set = FxHashSet::default();
         for row in &inner_rows {
             let key: Vec<Value> = inner_col_indices.iter().map(|&i| row[i].clone()).collect();
             if key.iter().any(|v| v.is_null()) {
@@ -664,7 +660,6 @@ pub(super) fn decorrelate_in_read(
         .get(&inner_name)
         .ok_or_else(|| SqlError::TableNotFound(subquery.from.clone()))?;
 
-    // The IN column is the first (and should be only) SELECT column
     let in_col_name = match &subquery.columns[0] {
         SelectColumn::Expr {
             expr: Expr::Column(name),
@@ -685,7 +680,7 @@ pub(super) fn decorrelate_in_read(
         .map(|p| inner_schema.column_index(&p.inner_col_name).unwrap_or(0))
         .collect();
 
-    let mut map: FxHashMap<Vec<Value>, HashSet<Value>> = FxHashMap::default();
+    let mut map: FxHashMap<Vec<Value>, FxHashSet<Value>> = FxHashMap::default();
     let mut has_null_in_values = false;
 
     for row in &inner_rows {
@@ -759,7 +754,6 @@ pub(super) fn decorrelate_scalar_read(
         _ => return Ok(FxHashMap::default()),
     };
 
-    // Build FxHashMap: first N columns are corr keys, last column is the scalar result
     let num_corr = corr_pairs.len();
     let mut map = FxHashMap::default();
     for row in &qr.rows {
@@ -786,7 +780,7 @@ pub(super) fn decorrelate_exists_write(
     subquery: &SelectStmt,
     corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
-) -> Result<HashSet<Vec<Value>>> {
+) -> Result<FxHashSet<Vec<Value>>> {
     let inner_name = subquery.from.to_ascii_lowercase();
     let inner_schema = schema
         .get(&inner_name)
@@ -798,7 +792,7 @@ pub(super) fn decorrelate_exists_write(
         .iter()
         .map(|p| inner_schema.column_index(&p.inner_col_name).unwrap_or(0))
         .collect();
-    let mut key_set = HashSet::new();
+    let mut key_set = FxHashSet::default();
     for row in &inner_rows {
         let key: Vec<Value> = inner_col_indices.iter().map(|&i| row[i].clone()).collect();
         if key.iter().any(|v| v.is_null()) {
@@ -837,7 +831,7 @@ pub(super) fn decorrelate_in_write(
         .iter()
         .map(|p| inner_schema.column_index(&p.inner_col_name).unwrap_or(0))
         .collect();
-    let mut map: FxHashMap<Vec<Value>, HashSet<Value>> = FxHashMap::default();
+    let mut map: FxHashMap<Vec<Value>, FxHashSet<Value>> = FxHashMap::default();
     let mut has_null_in_values = false;
     for row in &inner_rows {
         let key: Vec<Value> = inner_corr_indices.iter().map(|&i| row[i].clone()).collect();
@@ -1516,7 +1510,7 @@ struct ExistsFilter {
 }
 
 struct InFilter {
-    map: FxHashMap<Vec<Value>, HashSet<Value>>,
+    map: FxHashMap<Vec<Value>, FxHashSet<Value>>,
     has_null: bool,
     outer_col_indices: Vec<usize>,
     in_expr: Expr,
@@ -1593,7 +1587,6 @@ pub(super) fn handle_correlated_where_read(
                                     if let Some(inner_rows) = filter_data.rows_by_key.get(&key) {
                                         inner_rows.iter().any(|inner_row| {
                                             filter_data.non_eq_predicates.iter().all(|pred| {
-                                                // Bind outer column refs to outer_row values
                                                 let bound = bind_outer_values_in_expr(
                                                     pred,
                                                     outer_row,
@@ -1735,7 +1728,6 @@ pub(super) fn handle_correlated_where_read(
         }
     }
 
-    // Rebuild remaining WHERE
     if remaining_conjuncts.is_empty() {
         Ok(None)
     } else {

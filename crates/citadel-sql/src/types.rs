@@ -455,6 +455,9 @@ pub struct ColumnDef {
     pub check_name: Option<String>,
     /// Display-only flag for `TIMESTAMPTZ` / `TIMETZ`; storage is i64 µs UTC.
     pub is_with_timezone: bool,
+    pub generated_expr: Option<Expr>,
+    pub generated_sql: Option<String>,
+    pub generated_kind: Option<crate::parser::GeneratedKind>,
 }
 
 /// Index definition stored as part of the table schema.
@@ -574,6 +577,7 @@ pub struct TableSchema {
     /// Logical non-PK order -> physical encoding position.
     /// `encoding_positions_cache[i]` is the physical slot for `non_pk_idx_cache[i]`.
     encoding_positions_cache: Vec<u16>,
+    has_virtual_columns_cache: bool,
 }
 
 impl TableSchema {
@@ -628,6 +632,13 @@ impl TableSchema {
             }
         }
 
+        let has_virtual_columns_cache = columns.iter().any(|c| {
+            matches!(
+                c.generated_kind,
+                Some(crate::parser::GeneratedKind::Virtual)
+            )
+        });
+
         Self {
             name,
             columns,
@@ -640,7 +651,12 @@ impl TableSchema {
             dropped_non_pk_slots,
             decode_mapping_cache,
             encoding_positions_cache,
+            has_virtual_columns_cache,
         }
+    }
+
+    pub fn has_virtual_columns(&self) -> bool {
+        self.has_virtual_columns_cache
     }
 
     /// Rebuild caches (preserving dropped slots). Use after mutating fields in place.
@@ -776,7 +792,7 @@ impl TableSchema {
     }
 }
 
-const SCHEMA_VERSION: u8 = 4;
+const SCHEMA_VERSION: u8 = 5;
 
 fn write_opt_string(buf: &mut Vec<u8>, s: &Option<String>) {
     match s {
@@ -899,13 +915,28 @@ impl TableSchema {
             buf.extend_from_slice(&slot.to_le_bytes());
         }
 
+        for col in &self.columns {
+            let kind_tag: u8 = match col.generated_kind {
+                None => 0,
+                Some(crate::parser::GeneratedKind::Stored) => 1,
+                Some(crate::parser::GeneratedKind::Virtual) => 2,
+            };
+            buf.push(kind_tag);
+            if kind_tag != 0 {
+                let sql = col.generated_sql.as_deref().unwrap_or("");
+                let bytes = sql.as_bytes();
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(bytes);
+            }
+        }
+
         buf
     }
 
     pub fn deserialize(data: &[u8]) -> crate::error::Result<Self> {
         let mut pos = 0;
 
-        if data.is_empty() || !matches!(data[0], 1 | 2 | 3 | SCHEMA_VERSION) {
+        if data.is_empty() || !matches!(data[0], 1 | 2 | 3 | 4 | SCHEMA_VERSION) {
             return Err(crate::error::SqlError::InvalidValue(
                 "invalid schema version".into(),
             ));
@@ -946,6 +977,9 @@ impl TableSchema {
                 check_sql: None,
                 check_name: None,
                 is_with_timezone: false,
+                generated_expr: None,
+                generated_sql: None,
+                generated_kind: None,
             });
         }
 
@@ -1064,6 +1098,39 @@ impl TableSchema {
                 let slot = u16::from_le_bytes([data[pos], data[pos + 1]]);
                 pos += 2;
                 dropped_non_pk_slots.push(slot);
+            }
+        }
+        if version >= 5 && pos < data.len() {
+            for col in &mut columns {
+                let kind_tag = data[pos];
+                pos += 1;
+                if kind_tag != 0 {
+                    let len = u32::from_le_bytes([
+                        data[pos],
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                    ]) as usize;
+                    pos += 4;
+                    let sql = String::from_utf8_lossy(&data[pos..pos + len]).into_owned();
+                    pos += len;
+                    let expr = crate::parser::parse_sql_expr(&sql).map_err(|_| {
+                        crate::error::SqlError::InvalidValue(format!(
+                            "cannot parse GENERATED expression: {sql}"
+                        ))
+                    })?;
+                    col.generated_sql = Some(sql);
+                    col.generated_expr = Some(expr);
+                    col.generated_kind = Some(match kind_tag {
+                        1 => crate::parser::GeneratedKind::Stored,
+                        2 => crate::parser::GeneratedKind::Virtual,
+                        _ => {
+                            return Err(crate::error::SqlError::InvalidValue(
+                                "unknown GENERATED kind tag".into(),
+                            ));
+                        }
+                    });
+                }
             }
         }
         let _ = pos;

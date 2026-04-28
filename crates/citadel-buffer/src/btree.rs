@@ -7,7 +7,7 @@ use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
 use rustc_hash::FxHashMap;
 
-/// B+ tree metadata. Lightweight struct - pages are stored externally.
+/// B+ tree metadata. Pages stored externally.
 #[derive(Clone)]
 pub struct BTree {
     pub root: PageId,
@@ -95,6 +95,67 @@ impl BTree {
             }
         }
         false
+    }
+
+    /// Combined LIL check + insert. Returns `Some(was_new)` on hit, `None` on miss.
+    pub fn try_lil_insert(
+        &mut self,
+        pages: &mut FxHashMap<PageId, Page>,
+        alloc: &mut PageAllocator,
+        txn_id: TxnId,
+        key: &[u8],
+        val_type: ValueType,
+        value: &[u8],
+    ) -> Result<Option<bool>> {
+        let cached_leaf = match self.last_insert.as_ref() {
+            Some((_, leaf)) => *leaf,
+            None => return Ok(None),
+        };
+        let (hit, needs_cow) = {
+            let page = pages
+                .get(&cached_leaf)
+                .ok_or(Error::PageOutOfBounds(cached_leaf))?;
+            let n = page.num_cells();
+            let h = n > 0 && key > leaf_node::read_cell(page, n - 1).key;
+            let nc = page.txn_id() != txn_id;
+            (h, nc)
+        };
+        if !hit {
+            return Ok(None);
+        }
+        let mut cached_path = self.last_insert.take().unwrap().0;
+        let cow_id = if needs_cow {
+            cow_page(pages, alloc, cached_leaf, txn_id)
+        } else {
+            cached_leaf
+        };
+        let ok = {
+            let page = pages.get_mut(&cow_id).unwrap();
+            leaf_node::insert_append_direct(page, key, val_type, value)
+        };
+        if ok {
+            if cow_id != cached_leaf {
+                self.root = propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id);
+            }
+            self.entry_count += 1;
+            self.last_insert = Some((cached_path, cow_id));
+            return Ok(Some(true));
+        }
+        let (sep_key, right_id) =
+            split_leaf_with_insert(pages, alloc, txn_id, cow_id, key, val_type, value);
+        self.root = propagate_split_up(
+            pages,
+            alloc,
+            txn_id,
+            &cached_path,
+            cow_id,
+            &sep_key,
+            right_id,
+            &mut self.depth,
+        );
+        self.last_insert = None;
+        self.entry_count += 1;
+        Ok(Some(true))
     }
 
     /// Insert key-value. Returns `true` if new, `false` if updated existing.

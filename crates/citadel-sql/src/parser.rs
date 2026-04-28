@@ -1,4 +1,4 @@
-//! SQL parser: converts SQL strings into our internal AST.
+//! SQL parser: converts SQL strings into the internal AST.
 
 use sqlparser::ast as sp;
 use sqlparser::dialect::GenericDialect;
@@ -88,6 +88,12 @@ pub struct ForeignKeyDef {
     pub referred_columns: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratedKind {
+    Stored,
+    Virtual,
+}
+
 #[derive(Debug, Clone)]
 pub struct ColumnSpec {
     pub name: String,
@@ -99,6 +105,9 @@ pub struct ColumnSpec {
     pub check_expr: Option<Expr>,
     pub check_sql: Option<String>,
     pub check_name: Option<String>,
+    pub generated_expr: Option<Expr>,
+    pub generated_sql: Option<String>,
+    pub generated_kind: Option<GeneratedKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -320,7 +329,7 @@ pub enum Expr {
     ScalarSubquery(Box<SelectStmt>),
     InSet {
         expr: Box<Expr>,
-        values: std::collections::HashSet<Value>,
+        values: rustc_hash::FxHashSet<Value>,
         has_null: bool,
         negated: bool,
     },
@@ -799,6 +808,9 @@ fn convert_column_def(
     let mut check_expr = None;
     let mut check_sql = None;
     let mut check_name = None;
+    let mut generated_expr = None;
+    let mut generated_sql = None;
+    let mut generated_kind = None;
     let mut fk_def = None;
 
     for opt in &col_def.options {
@@ -838,7 +850,47 @@ fn convert_column_def(
                     referred_columns: referred,
                 });
             }
+            sp::ColumnOption::Generated {
+                generation_expr,
+                generation_expr_mode,
+                sequence_options: _,
+                ..
+            } => {
+                let Some(expr) = generation_expr else {
+                    return Err(SqlError::Unsupported(
+                        "identity columns not yet supported; use INTEGER PRIMARY KEY for autoincrement".into(),
+                    ));
+                };
+                let mode = generation_expr_mode.unwrap_or(sp::GeneratedExpressionMode::Virtual);
+                let converted = convert_expr(expr)?;
+                reject_aggregate_or_window(expr, "GENERATED")?;
+                if has_subquery(&converted) {
+                    return Err(SqlError::Unsupported(
+                        "subquery in GENERATED expression".into(),
+                    ));
+                }
+                reject_volatile_in_generated(&converted)?;
+                generated_sql = Some(expr.to_string());
+                generated_expr = Some(converted);
+                generated_kind = Some(match mode {
+                    sp::GeneratedExpressionMode::Stored => GeneratedKind::Stored,
+                    sp::GeneratedExpressionMode::Virtual => GeneratedKind::Virtual,
+                });
+            }
             _ => {}
+        }
+    }
+
+    if generated_kind.is_some() {
+        if default_expr.is_some() {
+            return Err(SqlError::Unsupported(
+                "DEFAULT and GENERATED cannot be combined".into(),
+            ));
+        }
+        if is_primary_key {
+            return Err(SqlError::Unsupported(
+                "GENERATED column cannot be PRIMARY KEY".into(),
+            ));
         }
     }
 
@@ -852,8 +904,68 @@ fn convert_column_def(
         check_expr,
         check_sql,
         check_name,
+        generated_expr,
+        generated_sql,
+        generated_kind,
     };
     Ok((spec, fk_def, is_primary_key, is_unique))
+}
+
+fn reject_volatile_in_generated(expr: &Expr) -> Result<()> {
+    fn walk(e: &Expr) -> Result<()> {
+        match e {
+            Expr::Function { name, args, .. } => {
+                let upper = name.to_ascii_uppercase();
+                if matches!(
+                    upper.as_str(),
+                    "RANDOM"
+                        | "NOW"
+                        | "CURRENT_TIMESTAMP"
+                        | "CURRENT_DATE"
+                        | "CURRENT_TIME"
+                        | "CLOCK_TIMESTAMP"
+                        | "STATEMENT_TIMESTAMP"
+                        | "TRANSACTION_TIMESTAMP"
+                        | "LOCALTIMESTAMP"
+                        | "LOCALTIME"
+                ) {
+                    return Err(SqlError::Unsupported(format!(
+                        "volatile function {name}() not allowed in GENERATED expression"
+                    )));
+                }
+                for a in args {
+                    walk(a)?;
+                }
+                Ok(())
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                walk(left)?;
+                walk(right)
+            }
+            Expr::UnaryOp { expr, .. } => walk(expr),
+            Expr::Cast { expr, .. } => walk(expr),
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+            } => {
+                if let Some(o) = operand {
+                    walk(o)?;
+                }
+                for (cond, res) in conditions {
+                    walk(cond)?;
+                    walk(res)?;
+                }
+                if let Some(e) = else_result {
+                    walk(e)?;
+                }
+                Ok(())
+            }
+            Expr::Coalesce(items) => items.iter().try_for_each(walk),
+            _ => Ok(()),
+        }
+    }
+    walk(expr)
 }
 
 fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
@@ -1401,7 +1513,7 @@ fn convert_subquery(query: &sp::Query) -> Result<SelectStmt> {
 }
 
 fn convert_with(with: &sp::With) -> Result<(Vec<CteDefinition>, bool)> {
-    let mut names = std::collections::HashSet::new();
+    let mut names = rustc_hash::FxHashSet::default();
     let mut ctes = Vec::new();
     for cte in &with.cte_tables {
         let name = cte.alias.name.value.to_ascii_lowercase();

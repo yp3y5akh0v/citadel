@@ -755,7 +755,7 @@ fn eval_in_values(lhs: &Value, list: &[Expr], ctx: &EvalCtx, negated: bool) -> R
 
 fn eval_in_set(
     lhs: &Value,
-    values: &std::collections::HashSet<Value>,
+    values: &rustc_hash::FxHashSet<Value>,
     has_null: bool,
     negated: bool,
 ) -> Result<Value> {

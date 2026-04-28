@@ -38,6 +38,12 @@ pub fn encode_composite_key_into(values: &[Value], buf: &mut Vec<u8>) {
     }
 }
 
+#[inline]
+pub fn encode_int_key_into(val: i64, buf: &mut Vec<u8>) {
+    buf.clear();
+    encode_signed_varint(TAG_INTEGER, val, buf);
+}
+
 fn encode_key_value_into(value: &Value, buf: &mut Vec<u8>) {
     match value {
         Value::Null => buf.push(TAG_NULL),
@@ -277,82 +283,60 @@ fn decode_null_escaped(data: &[u8]) -> Result<(Vec<u8>, usize)> {
     ))
 }
 
-/// Encode non-PK columns. Format: [col_count:u16][null_bitmap][type(u8)+len(u32)+data per col]
+fn encode_cell_v2(v: &Value, buf: &mut Vec<u8>) {
+    match v {
+        Value::Integer(val) => {
+            buf.push(DataType::Integer.type_tag());
+            buf.extend_from_slice(&val.to_le_bytes());
+        }
+        Value::Real(r) => {
+            buf.push(DataType::Real.type_tag());
+            buf.extend_from_slice(&r.to_le_bytes());
+        }
+        Value::Boolean(b) => {
+            buf.push(DataType::Boolean.type_tag());
+            buf.push(if *b { 1 } else { 0 });
+        }
+        Value::Text(s) => {
+            let bytes = s.as_bytes();
+            buf.push(DataType::Text.type_tag());
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        Value::Blob(data) => {
+            buf.push(DataType::Blob.type_tag());
+            buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            buf.extend_from_slice(data);
+        }
+        Value::Time(t) => {
+            buf.push(DataType::Time.type_tag());
+            buf.extend_from_slice(&t.to_le_bytes());
+        }
+        Value::Date(d) => {
+            buf.push(DataType::Date.type_tag());
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        Value::Timestamp(t) => {
+            buf.push(DataType::Timestamp.type_tag());
+            buf.extend_from_slice(&t.to_le_bytes());
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            buf.push(DataType::Interval.type_tag());
+            buf.extend_from_slice(&months.to_le_bytes());
+            buf.extend_from_slice(&days.to_le_bytes());
+            buf.extend_from_slice(&micros.to_le_bytes());
+        }
+        Value::Null => unreachable!(),
+    }
+}
+
 pub fn encode_row(values: &[Value]) -> Vec<u8> {
-    let col_count = values.len();
-    let bitmap_bytes = col_count.div_ceil(8);
     let mut buf = Vec::new();
-
-    buf.extend_from_slice(&(col_count as u16).to_le_bytes());
-    let mut bitmap = vec![0u8; bitmap_bytes];
-    for (i, v) in values.iter().enumerate() {
-        if v.is_null() {
-            bitmap[i / 8] |= 1 << (i % 8);
-        }
-    }
-    buf.extend_from_slice(&bitmap);
-
-    for v in values {
-        if v.is_null() {
-            continue;
-        }
-        match v {
-            Value::Integer(i) => {
-                buf.push(DataType::Integer.type_tag());
-                buf.extend_from_slice(&8u32.to_le_bytes());
-                buf.extend_from_slice(&i.to_le_bytes());
-            }
-            Value::Real(r) => {
-                buf.push(DataType::Real.type_tag());
-                buf.extend_from_slice(&8u32.to_le_bytes());
-                buf.extend_from_slice(&r.to_le_bytes());
-            }
-            Value::Boolean(b) => {
-                buf.push(DataType::Boolean.type_tag());
-                buf.extend_from_slice(&1u32.to_le_bytes());
-                buf.push(if *b { 1 } else { 0 });
-            }
-            Value::Text(s) => {
-                let bytes = s.as_bytes();
-                buf.push(DataType::Text.type_tag());
-                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                buf.extend_from_slice(bytes);
-            }
-            Value::Blob(data) => {
-                buf.push(DataType::Blob.type_tag());
-                buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                buf.extend_from_slice(data);
-            }
-            Value::Time(t) => {
-                buf.push(DataType::Time.type_tag());
-                buf.extend_from_slice(&8u32.to_le_bytes());
-                buf.extend_from_slice(&t.to_le_bytes());
-            }
-            Value::Date(d) => {
-                buf.push(DataType::Date.type_tag());
-                buf.extend_from_slice(&4u32.to_le_bytes());
-                buf.extend_from_slice(&d.to_le_bytes());
-            }
-            Value::Timestamp(t) => {
-                buf.push(DataType::Timestamp.type_tag());
-                buf.extend_from_slice(&8u32.to_le_bytes());
-                buf.extend_from_slice(&t.to_le_bytes());
-            }
-            Value::Interval {
-                months,
-                days,
-                micros,
-            } => {
-                buf.push(DataType::Interval.type_tag());
-                buf.extend_from_slice(&16u32.to_le_bytes());
-                buf.extend_from_slice(&months.to_le_bytes());
-                buf.extend_from_slice(&days.to_le_bytes());
-                buf.extend_from_slice(&micros.to_le_bytes());
-            }
-            Value::Null => unreachable!(),
-        }
-    }
-
+    encode_row_into(values, &mut buf);
     buf
 }
 
@@ -361,7 +345,8 @@ pub fn encode_row_into(values: &[Value], buf: &mut Vec<u8>) {
     let col_count = values.len();
     let bitmap_bytes = col_count.div_ceil(8);
 
-    buf.extend_from_slice(&(col_count as u16).to_le_bytes());
+    let header = (col_count as u16) | V2_FLAG;
+    buf.extend_from_slice(&header.to_le_bytes());
 
     let bitmap_start = buf.len();
     buf.resize(buf.len() + bitmap_bytes, 0);
@@ -371,62 +356,62 @@ pub fn encode_row_into(values: &[Value], buf: &mut Vec<u8>) {
             buf[bitmap_start + i / 8] |= 1 << (i % 8);
             continue;
         }
-        match v {
-            Value::Integer(val) => {
-                buf.push(DataType::Integer.type_tag());
-                buf.extend_from_slice(&8u32.to_le_bytes());
-                buf.extend_from_slice(&val.to_le_bytes());
+        encode_cell_v2(v, buf);
+    }
+}
+
+pub struct IntRowTemplate {
+    pub template: Vec<u8>,
+    pub slot_offsets: Vec<(usize, usize)>,
+}
+
+pub fn build_int_row_template(phys_count: usize, null_slots: &[usize]) -> IntRowTemplate {
+    let bitmap_bytes = phys_count.div_ceil(8);
+    let mut template = Vec::with_capacity(2 + bitmap_bytes + phys_count * 9);
+    let header = (phys_count as u16) | V2_FLAG;
+    template.extend_from_slice(&header.to_le_bytes());
+    let bitmap_start = template.len();
+    template.resize(bitmap_start + bitmap_bytes, 0);
+    for &i in null_slots {
+        template[bitmap_start + i / 8] |= 1 << (i % 8);
+    }
+    let mut slot_offsets = Vec::with_capacity(phys_count.saturating_sub(null_slots.len()));
+    for slot in 0..phys_count {
+        if null_slots.contains(&slot) {
+            continue;
+        }
+        template.push(DataType::Integer.type_tag());
+        let value_offset = template.len();
+        template.extend_from_slice(&[0u8; 8]);
+        slot_offsets.push((slot, value_offset));
+    }
+    IntRowTemplate {
+        template,
+        slot_offsets,
+    }
+}
+
+/// Caller must guarantee every non-NULL `values[slot]` is `Value::Integer`.
+#[inline]
+pub fn encode_int_row_with_template(
+    tmpl: &IntRowTemplate,
+    values: &[Value],
+    buf: &mut Vec<u8>,
+) -> Result<()> {
+    buf.clear();
+    buf.extend_from_slice(&tmpl.template);
+    for &(slot, off) in &tmpl.slot_offsets {
+        match &values[slot] {
+            Value::Integer(v) => buf[off..off + 8].copy_from_slice(&v.to_le_bytes()),
+            other => {
+                return Err(SqlError::TypeMismatch {
+                    expected: "Integer".into(),
+                    got: other.data_type().to_string(),
+                });
             }
-            Value::Real(r) => {
-                buf.push(DataType::Real.type_tag());
-                buf.extend_from_slice(&8u32.to_le_bytes());
-                buf.extend_from_slice(&r.to_le_bytes());
-            }
-            Value::Boolean(b) => {
-                buf.push(DataType::Boolean.type_tag());
-                buf.extend_from_slice(&1u32.to_le_bytes());
-                buf.push(if *b { 1 } else { 0 });
-            }
-            Value::Text(s) => {
-                let bytes = s.as_bytes();
-                buf.push(DataType::Text.type_tag());
-                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                buf.extend_from_slice(bytes);
-            }
-            Value::Blob(data) => {
-                buf.push(DataType::Blob.type_tag());
-                buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                buf.extend_from_slice(data);
-            }
-            Value::Time(t) => {
-                buf.push(DataType::Time.type_tag());
-                buf.extend_from_slice(&8u32.to_le_bytes());
-                buf.extend_from_slice(&t.to_le_bytes());
-            }
-            Value::Date(d) => {
-                buf.push(DataType::Date.type_tag());
-                buf.extend_from_slice(&4u32.to_le_bytes());
-                buf.extend_from_slice(&d.to_le_bytes());
-            }
-            Value::Timestamp(t) => {
-                buf.push(DataType::Timestamp.type_tag());
-                buf.extend_from_slice(&8u32.to_le_bytes());
-                buf.extend_from_slice(&t.to_le_bytes());
-            }
-            Value::Interval {
-                months,
-                days,
-                micros,
-            } => {
-                buf.push(DataType::Interval.type_tag());
-                buf.extend_from_slice(&16u32.to_le_bytes());
-                buf.extend_from_slice(&months.to_le_bytes());
-                buf.extend_from_slice(&days.to_le_bytes());
-                buf.extend_from_slice(&micros.to_le_bytes());
-            }
-            Value::Null => unreachable!(),
         }
     }
+    Ok(())
 }
 
 fn decode_value(type_tag: u8, data: &[u8]) -> Result<Value> {
@@ -472,17 +457,113 @@ fn decode_value(type_tag: u8, data: &[u8]) -> Result<Value> {
     }
 }
 
-fn parse_row_header(data: &[u8]) -> Result<(usize, &[u8], usize)> {
+/// V1 cells: `[tag:u8][len:u32][data]`. V2 cells drop `len` for fixed-width types.
+/// High bit of `col_count:u16` flags V2.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RowVersion {
+    V1,
+    V2,
+}
+
+pub(crate) const V2_FLAG: u16 = 0x8000;
+pub(crate) const COL_COUNT_MASK: u16 = 0x7FFF;
+
+#[inline]
+pub(crate) fn fixed_width_size(type_tag: u8) -> Option<usize> {
+    match DataType::from_tag(type_tag)? {
+        DataType::Integer | DataType::Real | DataType::Time | DataType::Timestamp => Some(8),
+        DataType::Date => Some(4),
+        DataType::Boolean => Some(1),
+        DataType::Interval => Some(16),
+        DataType::Text | DataType::Blob | DataType::Null => None,
+    }
+}
+
+#[inline]
+fn read_cell(data: &[u8], pos: usize, version: RowVersion) -> Result<(u8, &[u8], usize)> {
+    if pos >= data.len() {
+        return Err(SqlError::InvalidValue("truncated column data".into()));
+    }
+    let type_tag = data[pos];
+    let after_tag = pos + 1;
+    let (data_len, body_pos) = match version {
+        RowVersion::V2 => match fixed_width_size(type_tag) {
+            Some(n) => (n, after_tag),
+            None => {
+                if after_tag + 4 > data.len() {
+                    return Err(SqlError::InvalidValue("truncated column data".into()));
+                }
+                let len = u32::from_le_bytes([
+                    data[after_tag],
+                    data[after_tag + 1],
+                    data[after_tag + 2],
+                    data[after_tag + 3],
+                ]) as usize;
+                (len, after_tag + 4)
+            }
+        },
+        RowVersion::V1 => {
+            if after_tag + 4 > data.len() {
+                return Err(SqlError::InvalidValue("truncated column data".into()));
+            }
+            let len = u32::from_le_bytes([
+                data[after_tag],
+                data[after_tag + 1],
+                data[after_tag + 2],
+                data[after_tag + 3],
+            ]) as usize;
+            (len, after_tag + 4)
+        }
+    };
+    if body_pos + data_len > data.len() {
+        return Err(SqlError::InvalidValue("truncated column value".into()));
+    }
+    Ok((
+        type_tag,
+        &data[body_pos..body_pos + data_len],
+        body_pos + data_len,
+    ))
+}
+
+#[inline]
+fn skip_cell(data: &[u8], pos: usize, version: RowVersion) -> Result<usize> {
+    let (_, _, next) = read_cell(data, pos, version)?;
+    Ok(next)
+}
+
+fn copy_cell_to_v2(
+    data: &[u8],
+    pos: usize,
+    version: RowVersion,
+    out: &mut Vec<u8>,
+) -> Result<usize> {
+    let (tag, body, next) = read_cell(data, pos, version)?;
+    out.push(tag);
+    if fixed_width_size(tag).is_none() {
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    }
+    out.extend_from_slice(body);
+    Ok(next)
+}
+
+fn parse_row_header(data: &[u8]) -> Result<(RowVersion, usize, &[u8], usize)> {
     if data.len() < 2 {
         return Err(SqlError::InvalidValue("row data too short".into()));
     }
-    let col_count = u16::from_le_bytes([data[0], data[1]]) as usize;
+    let raw = u16::from_le_bytes([data[0], data[1]]);
+    let version = if raw & V2_FLAG != 0 {
+        RowVersion::V2
+    } else {
+        RowVersion::V1
+    };
+    let col_count = (raw & COL_COUNT_MASK) as usize;
     let bitmap_bytes = col_count.div_ceil(8);
     let pos = 2;
     if data.len() < pos + bitmap_bytes {
         return Err(SqlError::InvalidValue("truncated null bitmap".into()));
     }
     Ok((
+        version,
         col_count,
         &data[pos..pos + bitmap_bytes],
         pos + bitmap_bytes,
@@ -490,7 +571,7 @@ fn parse_row_header(data: &[u8]) -> Result<(usize, &[u8], usize)> {
 }
 
 pub fn decode_row(data: &[u8]) -> Result<Vec<Value>> {
-    let (col_count, bitmap, mut pos) = parse_row_header(data)?;
+    let (version, col_count, bitmap, mut pos) = parse_row_header(data)?;
 
     let mut values = Vec::with_capacity(col_count);
     for i in 0..col_count {
@@ -498,22 +579,9 @@ pub fn decode_row(data: &[u8]) -> Result<Vec<Value>> {
             values.push(Value::Null);
             continue;
         }
-
-        if pos + 5 > data.len() {
-            return Err(SqlError::InvalidValue("truncated column data".into()));
-        }
-        let type_tag = data[pos];
-        pos += 1;
-        let data_len =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
-
-        if pos + data_len > data.len() {
-            return Err(SqlError::InvalidValue("truncated column value".into()));
-        }
-
-        values.push(decode_value(type_tag, &data[pos..pos + data_len])?);
-        pos += data_len;
+        let (type_tag, body, next) = read_cell(data, pos, version)?;
+        values.push(decode_value(type_tag, body)?);
+        pos = next;
     }
 
     Ok(values)
@@ -522,34 +590,21 @@ pub fn decode_row(data: &[u8]) -> Result<Vec<Value>> {
 /// Returns the number of non-PK columns stored in a row value blob.
 #[inline]
 pub fn row_non_pk_count(data: &[u8]) -> usize {
-    u16::from_le_bytes([data[0], data[1]]) as usize
+    (u16::from_le_bytes([data[0], data[1]]) & COL_COUNT_MASK) as usize
 }
 
 pub fn decode_row_into(data: &[u8], out: &mut [Value], col_mapping: &[usize]) -> Result<()> {
-    let (col_count, bitmap, mut pos) = parse_row_header(data)?;
+    let (version, col_count, bitmap, mut pos) = parse_row_header(data)?;
 
     for i in 0..col_count {
         if bitmap[i / 8] & (1 << (i % 8)) != 0 {
             continue;
         }
-
-        if pos + 5 > data.len() {
-            return Err(SqlError::InvalidValue("truncated column data".into()));
-        }
-        let type_tag = data[pos];
-        pos += 1;
-        let data_len =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
-
-        if pos + data_len > data.len() {
-            return Err(SqlError::InvalidValue("truncated column value".into()));
-        }
-
+        let (type_tag, body, next) = read_cell(data, pos, version)?;
         if i < col_mapping.len() && col_mapping[i] != usize::MAX {
-            out[col_mapping[i]] = decode_value(type_tag, &data[pos..pos + data_len])?;
+            out[col_mapping[i]] = decode_value(type_tag, body)?;
         }
-        pos += data_len;
+        pos = next;
     }
 
     Ok(())
@@ -576,7 +631,7 @@ pub fn decode_columns(data: &[u8], targets: &[usize]) -> Result<Vec<Value>> {
     if targets.is_empty() {
         return Ok(Vec::new());
     }
-    let (col_count, bitmap, mut pos) = parse_row_header(data)?;
+    let (version, col_count, bitmap, mut pos) = parse_row_header(data)?;
 
     let mut results = Vec::with_capacity(targets.len());
     let mut ti = 0;
@@ -591,34 +646,16 @@ pub fn decode_columns(data: &[u8], targets: &[usize]) -> Result<Vec<Value>> {
             if is_null {
                 results.push(Value::Null);
             } else {
-                if pos + 5 > data.len() {
-                    return Err(SqlError::InvalidValue("truncated column data".into()));
-                }
-                let type_tag = data[pos];
-                pos += 1;
-                let data_len =
-                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                        as usize;
-                pos += 4;
-                if pos + data_len > data.len() {
-                    return Err(SqlError::InvalidValue("truncated column value".into()));
-                }
-                results.push(decode_value(type_tag, &data[pos..pos + data_len])?);
-                pos += data_len;
+                let (type_tag, body, next) = read_cell(data, pos, version)?;
+                results.push(decode_value(type_tag, body)?);
+                pos = next;
             }
             ti += 1;
         } else if !is_null {
-            if pos + 5 > data.len() {
-                return Err(SqlError::InvalidValue("truncated column data".into()));
-            }
-            let data_len =
-                u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
-                    as usize;
-            pos += 5 + data_len;
+            pos = skip_cell(data, pos, version)?;
         }
     }
 
-    // Targets beyond stored column count get Null
     while ti < targets.len() {
         results.push(Value::Null);
         ti += 1;
@@ -636,7 +673,7 @@ pub fn decode_columns_into(
     if targets.is_empty() {
         return Ok(());
     }
-    let (col_count, bitmap, mut pos) = parse_row_header(data)?;
+    let (version, col_count, bitmap, mut pos) = parse_row_header(data)?;
 
     let mut ti = 0;
     for col in 0..col_count {
@@ -649,30 +686,13 @@ pub fn decode_columns_into(
             if is_null {
                 row[schema_cols[ti]] = Value::Null;
             } else {
-                if pos + 5 > data.len() {
-                    return Err(SqlError::InvalidValue("truncated column data".into()));
-                }
-                let type_tag = data[pos];
-                pos += 1;
-                let data_len =
-                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                        as usize;
-                pos += 4;
-                if pos + data_len > data.len() {
-                    return Err(SqlError::InvalidValue("truncated column value".into()));
-                }
-                row[schema_cols[ti]] = decode_value(type_tag, &data[pos..pos + data_len])?;
-                pos += data_len;
+                let (type_tag, body, next) = read_cell(data, pos, version)?;
+                row[schema_cols[ti]] = decode_value(type_tag, body)?;
+                pos = next;
             }
             ti += 1;
         } else if !is_null {
-            if pos + 5 > data.len() {
-                return Err(SqlError::InvalidValue("truncated column data".into()));
-            }
-            let data_len =
-                u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
-                    as usize;
-            pos += 5 + data_len;
+            pos = skip_cell(data, pos, version)?;
         }
     }
 
@@ -841,7 +861,7 @@ fn decode_value_raw(type_tag: u8, data: &[u8]) -> Result<RawColumn<'_>> {
 
 /// Patch column in-place if value size unchanged. Ok(false) = size mismatch, use `patch_row_column`.
 pub fn patch_column_in_place(data: &mut [u8], target: usize, new_val: &Value) -> Result<bool> {
-    let (col_count, bitmap, mut pos) = parse_row_header(data)?;
+    let (version, col_count, bitmap, mut pos) = parse_row_header(data)?;
     if target >= col_count || new_val.is_null() {
         return Ok(false);
     }
@@ -852,17 +872,29 @@ pub fn patch_column_in_place(data: &mut [u8], target: usize, new_val: &Value) ->
     for col in 0..target {
         let is_null = bitmap[col / 8] & (1 << (col % 8)) != 0;
         if !is_null {
+            pos = skip_cell(data, pos, version)?;
+        }
+    }
+    let type_tag = data[pos];
+    let (old_data_len, val_start) = match version {
+        RowVersion::V2 => match fixed_width_size(type_tag) {
+            Some(n) => (n, pos + 1),
+            None => {
+                if pos + 5 > data.len() {
+                    return Err(SqlError::InvalidValue("truncated column data".into()));
+                }
+                let len = u32::from_le_bytes(data[pos + 1..pos + 5].try_into().unwrap()) as usize;
+                (len, pos + 5)
+            }
+        },
+        RowVersion::V1 => {
             if pos + 5 > data.len() {
                 return Err(SqlError::InvalidValue("truncated column data".into()));
             }
-            let data_len = u32::from_le_bytes(data[pos + 1..pos + 5].try_into().unwrap()) as usize;
-            pos += 5 + data_len;
+            let len = u32::from_le_bytes(data[pos + 1..pos + 5].try_into().unwrap()) as usize;
+            (len, pos + 5)
         }
-    }
-    if pos + 5 > data.len() {
-        return Err(SqlError::InvalidValue("truncated column data".into()));
-    }
-    let old_data_len = u32::from_le_bytes(data[pos + 1..pos + 5].try_into().unwrap()) as usize;
+    };
     let new_data_len = match new_val {
         Value::Integer(_) | Value::Real(_) | Value::Time(_) | Value::Timestamp(_) => 8,
         Value::Date(_) => 4,
@@ -876,7 +908,6 @@ pub fn patch_column_in_place(data: &mut [u8], target: usize, new_val: &Value) ->
         return Ok(false);
     }
     data[pos] = new_val.data_type().type_tag();
-    let val_start = pos + 5;
     match new_val {
         Value::Integer(v) => data[val_start..val_start + 8].copy_from_slice(&v.to_le_bytes()),
         Value::Real(r) => data[val_start..val_start + 8].copy_from_slice(&r.to_le_bytes()),
@@ -907,9 +938,8 @@ pub fn patch_row_column(
     new_val: &Value,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let (col_count, bitmap, header_end) = parse_row_header(data)?;
+    let (version, col_count, bitmap, header_end) = parse_row_header(data)?;
 
-    // Expand row if target is beyond stored col count (ALTER TABLE ADD COLUMN)
     let new_col_count = if target >= col_count {
         target + 1
     } else {
@@ -919,11 +949,12 @@ pub fn patch_row_column(
     let bitmap_bytes = col_count.div_ceil(8);
     out.clear();
 
-    out.extend_from_slice(&(new_col_count as u16).to_le_bytes());
+    let header = (new_col_count as u16) | V2_FLAG;
+    out.extend_from_slice(&header.to_le_bytes());
     let bitmap_start = out.len();
     out.extend_from_slice(&data[2..2 + bitmap_bytes]);
     for _ in bitmap_bytes..new_bitmap_bytes {
-        out.push(0xFF); // new columns default to NULL
+        out.push(0xFF);
     }
     if new_val.is_null() {
         out[bitmap_start + target / 8] |= 1 << (target % 8);
@@ -936,97 +967,25 @@ pub fn patch_row_column(
         let was_null = if col < col_count {
             bitmap[col / 8] & (1 << (col % 8)) != 0
         } else {
-            true // columns beyond old col_count are NULL on disk
+            true
         };
 
         if col == target {
-            if !was_null && pos + 5 <= data.len() {
-                let data_len = u32::from_le_bytes([
-                    data[pos + 1],
-                    data[pos + 2],
-                    data[pos + 3],
-                    data[pos + 4],
-                ]) as usize;
-                pos += 5 + data_len;
+            if !was_null {
+                pos = skip_cell(data, pos, version)?;
             }
             if !new_val.is_null() {
-                match new_val {
-                    Value::Integer(v) => {
-                        out.push(DataType::Integer.type_tag());
-                        out.extend_from_slice(&8u32.to_le_bytes());
-                        out.extend_from_slice(&v.to_le_bytes());
-                    }
-                    Value::Real(r) => {
-                        out.push(DataType::Real.type_tag());
-                        out.extend_from_slice(&8u32.to_le_bytes());
-                        out.extend_from_slice(&r.to_le_bytes());
-                    }
-                    Value::Boolean(b) => {
-                        out.push(DataType::Boolean.type_tag());
-                        out.extend_from_slice(&1u32.to_le_bytes());
-                        out.push(if *b { 1 } else { 0 });
-                    }
-                    Value::Text(s) => {
-                        let bytes = s.as_bytes();
-                        out.push(DataType::Text.type_tag());
-                        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                        out.extend_from_slice(bytes);
-                    }
-                    Value::Blob(d) => {
-                        out.push(DataType::Blob.type_tag());
-                        out.extend_from_slice(&(d.len() as u32).to_le_bytes());
-                        out.extend_from_slice(d);
-                    }
-                    Value::Time(t) => {
-                        out.push(DataType::Time.type_tag());
-                        out.extend_from_slice(&8u32.to_le_bytes());
-                        out.extend_from_slice(&t.to_le_bytes());
-                    }
-                    Value::Date(d) => {
-                        out.push(DataType::Date.type_tag());
-                        out.extend_from_slice(&4u32.to_le_bytes());
-                        out.extend_from_slice(&d.to_le_bytes());
-                    }
-                    Value::Timestamp(t) => {
-                        out.push(DataType::Timestamp.type_tag());
-                        out.extend_from_slice(&8u32.to_le_bytes());
-                        out.extend_from_slice(&t.to_le_bytes());
-                    }
-                    Value::Interval {
-                        months,
-                        days,
-                        micros,
-                    } => {
-                        out.push(DataType::Interval.type_tag());
-                        out.extend_from_slice(&16u32.to_le_bytes());
-                        out.extend_from_slice(&months.to_le_bytes());
-                        out.extend_from_slice(&days.to_le_bytes());
-                        out.extend_from_slice(&micros.to_le_bytes());
-                    }
-                    Value::Null => unreachable!(),
-                }
+                encode_cell_v2(new_val, out);
             }
-        } else if was_null {
-        } else {
-            if pos + 5 > data.len() {
-                return Err(SqlError::InvalidValue("truncated column data".into()));
-            }
-            let data_len =
-                u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
-                    as usize;
-            let end = pos + 5 + data_len;
-            if end > data.len() {
-                return Err(SqlError::InvalidValue("truncated column value".into()));
-            }
-            out.extend_from_slice(&data[pos..end]);
-            pos = end;
+        } else if !was_null {
+            pos = copy_cell_to_v2(data, pos, version, out)?;
         }
     }
     Ok(())
 }
 
 pub fn decode_column_raw(data: &[u8], target: usize) -> Result<RawColumn<'_>> {
-    let (col_count, bitmap, mut pos) = parse_row_header(data)?;
+    let (version, col_count, bitmap, mut pos) = parse_row_header(data)?;
     if target >= col_count {
         return Ok(RawColumn::Null);
     }
@@ -1038,27 +997,10 @@ pub fn decode_column_raw(data: &[u8], target: usize) -> Result<RawColumn<'_>> {
             if is_null {
                 return Ok(RawColumn::Null);
             }
-            if pos + 5 > data.len() {
-                return Err(SqlError::InvalidValue("truncated column data".into()));
-            }
-            let type_tag = data[pos];
-            pos += 1;
-            let data_len =
-                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                    as usize;
-            pos += 4;
-            if pos + data_len > data.len() {
-                return Err(SqlError::InvalidValue("truncated column value".into()));
-            }
-            return decode_value_raw(type_tag, &data[pos..pos + data_len]);
+            let (type_tag, body, _) = read_cell(data, pos, version)?;
+            return decode_value_raw(type_tag, body);
         } else if !is_null {
-            if pos + 5 > data.len() {
-                return Err(SqlError::InvalidValue("truncated column data".into()));
-            }
-            let data_len =
-                u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
-                    as usize;
-            pos += 5 + data_len;
+            pos = skip_cell(data, pos, version)?;
         }
     }
 
@@ -1067,7 +1009,7 @@ pub fn decode_column_raw(data: &[u8], target: usize) -> Result<RawColumn<'_>> {
 
 /// Like `decode_column_raw` but also returns the byte offset (usize::MAX if NULL).
 pub fn decode_column_with_offset(data: &[u8], target: usize) -> Result<(RawColumn<'_>, usize)> {
-    let (col_count, bitmap, mut pos) = parse_row_header(data)?;
+    let (version, col_count, bitmap, mut pos) = parse_row_header(data)?;
     if target >= col_count {
         return Ok((RawColumn::Null, usize::MAX));
     }
@@ -1079,29 +1021,12 @@ pub fn decode_column_with_offset(data: &[u8], target: usize) -> Result<(RawColum
             if is_null {
                 return Ok((RawColumn::Null, usize::MAX));
             }
-            if pos + 5 > data.len() {
-                return Err(SqlError::InvalidValue("truncated column data".into()));
-            }
             let tag_offset = pos;
-            let type_tag = data[pos];
-            pos += 1;
-            let data_len =
-                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-                    as usize;
-            pos += 4;
-            if pos + data_len > data.len() {
-                return Err(SqlError::InvalidValue("truncated column value".into()));
-            }
-            let raw = decode_value_raw(type_tag, &data[pos..pos + data_len])?;
+            let (type_tag, body, _) = read_cell(data, pos, version)?;
+            let raw = decode_value_raw(type_tag, body)?;
             return Ok((raw, tag_offset));
         } else if !is_null {
-            if pos + 5 > data.len() {
-                return Err(SqlError::InvalidValue("truncated column data".into()));
-            }
-            let data_len =
-                u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
-                    as usize;
-            pos += 5 + data_len;
+            pos = skip_cell(data, pos, version)?;
         }
     }
 
@@ -1113,11 +1038,35 @@ pub fn patch_at_offset(data: &mut [u8], offset: usize, new_val: &Value) -> Resul
     if offset == usize::MAX || new_val.is_null() {
         return Ok(false);
     }
-    if offset + 5 > data.len() {
+    if data.len() < 2 || offset >= data.len() {
         return Err(SqlError::InvalidValue("truncated column data".into()));
     }
-    let old_data_len =
-        u32::from_le_bytes(data[offset + 1..offset + 5].try_into().unwrap()) as usize;
+    let version = if u16::from_le_bytes([data[0], data[1]]) & V2_FLAG != 0 {
+        RowVersion::V2
+    } else {
+        RowVersion::V1
+    };
+    let type_tag = data[offset];
+    let (old_data_len, val_start) = match version {
+        RowVersion::V2 => match fixed_width_size(type_tag) {
+            Some(n) => (n, offset + 1),
+            None => {
+                if offset + 5 > data.len() {
+                    return Err(SqlError::InvalidValue("truncated column data".into()));
+                }
+                let len =
+                    u32::from_le_bytes(data[offset + 1..offset + 5].try_into().unwrap()) as usize;
+                (len, offset + 5)
+            }
+        },
+        RowVersion::V1 => {
+            if offset + 5 > data.len() {
+                return Err(SqlError::InvalidValue("truncated column data".into()));
+            }
+            let len = u32::from_le_bytes(data[offset + 1..offset + 5].try_into().unwrap()) as usize;
+            (len, offset + 5)
+        }
+    };
     let new_data_len = match new_val {
         Value::Integer(_) | Value::Real(_) | Value::Time(_) | Value::Timestamp(_) => 8,
         Value::Date(_) => 4,
@@ -1131,7 +1080,6 @@ pub fn patch_at_offset(data: &mut [u8], offset: usize, new_val: &Value) -> Resul
         return Ok(false);
     }
     data[offset] = new_val.data_type().type_tag();
-    let val_start = offset + 5;
     match new_val {
         Value::Integer(v) => data[val_start..val_start + 8].copy_from_slice(&v.to_le_bytes()),
         Value::Real(r) => data[val_start..val_start + 8].copy_from_slice(&r.to_le_bytes()),

@@ -493,3 +493,43 @@ fn raw_column_matches_full_decode() {
         assert_eq!(raw.to_value(), *expected, "mismatch at column {i}");
     }
 }
+
+#[test]
+fn int_row_template_matches_generic_encoder() {
+    let mut state: u64 = 0x00C1_ADE7_BABE_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state as i64
+    };
+
+    for trial in 0..2_000 {
+        let phys_count = (trial % 6) + 1;
+        let virtual_mask = trial % (1 << phys_count);
+
+        let mut null_slots: Vec<usize> = Vec::new();
+        let mut values: Vec<Value> = Vec::with_capacity(phys_count);
+        for slot in 0..phys_count {
+            if (virtual_mask >> slot) & 1 == 1 {
+                null_slots.push(slot);
+                values.push(Value::Null);
+            } else {
+                values.push(Value::Integer(next()));
+            }
+        }
+
+        let mut generic = Vec::new();
+        encode_row_into(&values, &mut generic);
+
+        let tmpl = build_int_row_template(phys_count, &null_slots);
+        let mut specialized = Vec::new();
+        encode_int_row_with_template(&tmpl, &values, &mut specialized).unwrap();
+
+        assert_eq!(
+            specialized, generic,
+            "trial {trial}: phys_count={phys_count} null_slots={null_slots:?} \
+             values={values:?}",
+        );
+    }
+}

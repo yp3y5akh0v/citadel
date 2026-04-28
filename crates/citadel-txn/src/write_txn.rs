@@ -326,17 +326,17 @@ impl<'db> WriteTxn<'db> {
         Self::validate_key_value(key, value)?;
 
         if let Some(tree) = self.named_trees.get_mut(table) {
-            let root = tree.root;
-            if tree.lil_would_hit(&self.pages, key) {
-                return tree.insert(
-                    &mut self.pages,
-                    &mut self.alloc,
-                    self.txn_id,
-                    key,
-                    ValueType::Inline,
-                    value,
-                );
+            if let Some(was_new) = tree.try_lil_insert(
+                &mut self.pages,
+                &mut self.alloc,
+                self.txn_id,
+                key,
+                ValueType::Inline,
+                value,
+            )? {
+                return Ok(was_new);
             }
+            let root = tree.root;
             let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
             return tree.insert_at_leaf(
                 &mut self.pages,

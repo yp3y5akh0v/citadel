@@ -911,7 +911,9 @@ impl SimplePredicate {
 
     #[inline(always)]
     fn match_nonpk_int_inline(&self, data: &[u8], target: i64) -> bool {
-        let col_count = u16::from_le_bytes(data[0..2].try_into().unwrap()) as usize;
+        let raw = u16::from_le_bytes(data[0..2].try_into().unwrap());
+        let is_v2 = raw & crate::encoding::V2_FLAG != 0;
+        let col_count = (raw & crate::encoding::COL_COUNT_MASK) as usize;
 
         if self.nonpk_idx >= col_count {
             return match self.default_int {
@@ -930,23 +932,38 @@ impl SimplePredicate {
 
         let bm_bytes = col_count.div_ceil(8);
 
-        // NULL -> false (SQL NULL semantics)
         if data[2 + self.nonpk_idx / 8] & (1 << (self.nonpk_idx % 8)) != 0 {
             return false;
         }
 
         let mut pos = 2 + bm_bytes;
 
-        // Skip preceding non-null columns by reading their length
         for col in 0..self.nonpk_idx {
             if data[2 + col / 8] & (1 << (col % 8)) == 0 {
-                let len = u32::from_le_bytes(data[pos + 1..pos + 5].try_into().unwrap()) as usize;
-                pos += 5 + len;
+                let tag = data[pos];
+                let cell_len = if is_v2 {
+                    match crate::encoding::fixed_width_size(tag) {
+                        Some(n) => 1 + n,
+                        None => {
+                            let len = u32::from_le_bytes(data[pos + 1..pos + 5].try_into().unwrap())
+                                as usize;
+                            5 + len
+                        }
+                    }
+                } else {
+                    let len =
+                        u32::from_le_bytes(data[pos + 1..pos + 5].try_into().unwrap()) as usize;
+                    5 + len
+                };
+                pos += cell_len;
             }
         }
 
-        // Read i64 directly: skip type_tag(1) + len(4), read 8 bytes
-        let v = i64::from_le_bytes(data[pos + 5..pos + 13].try_into().unwrap());
+        let v = if is_v2 {
+            i64::from_le_bytes(data[pos + 1..pos + 9].try_into().unwrap())
+        } else {
+            i64::from_le_bytes(data[pos + 5..pos + 13].try_into().unwrap())
+        };
 
         match self.op {
             BinOp::Eq => v == target,
@@ -1033,6 +1050,12 @@ pub(super) fn try_between_predicate(expr: &Expr, schema: &TableSchema) -> Option
     };
 
     let col_idx = schema.column_index(col_name)?;
+    if matches!(
+        schema.columns[col_idx].generated_kind,
+        Some(crate::parser::GeneratedKind::Virtual)
+    ) {
+        return None;
+    }
     let non_pk = schema.non_pk_indices();
 
     if let Some(pk_pos) = schema
@@ -1095,6 +1118,12 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
     let literal = &literal;
 
     let col_idx = schema.column_index(col_name)?;
+    if matches!(
+        schema.columns[col_idx].generated_kind,
+        Some(crate::parser::GeneratedKind::Virtual)
+    ) {
+        return None;
+    }
     let non_pk = schema.non_pk_indices();
 
     if let Some(pk_pos) = schema

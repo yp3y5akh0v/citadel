@@ -9,6 +9,118 @@ use crate::types::*;
 
 pub(super) type ReturningRow = (Option<Vec<Value>>, Option<Vec<Value>>);
 
+#[derive(Clone)]
+pub(super) enum FastGenEval {
+    None,
+    /// `(col * mul) + add` over a single Integer column.
+    IntColMulAdd {
+        col_schema_idx: usize,
+        mul: i64,
+        add: i64,
+    },
+    /// `col1 + col2` over two Integer columns.
+    IntColAddCol {
+        left_idx: usize,
+        right_idx: usize,
+    },
+}
+
+pub(super) fn detect_fast_gen_eval(expr: &Expr, table_schema: &TableSchema) -> FastGenEval {
+    let resolve_col_idx = |e: &Expr| -> Option<usize> {
+        match e {
+            Expr::Column(name) => table_schema.column_index(name),
+            Expr::QualifiedColumn { column, .. } => table_schema.column_index(column),
+            _ => None,
+        }
+    };
+    let int_lit = |e: &Expr| match e {
+        Expr::Literal(Value::Integer(n)) => Some(*n),
+        _ => None,
+    };
+
+    if let Expr::BinaryOp { left, op, right } = expr {
+        match op {
+            BinOp::Add => {
+                if let (Some(a), Some(b)) = (resolve_col_idx(left), resolve_col_idx(right)) {
+                    return FastGenEval::IntColAddCol {
+                        left_idx: a,
+                        right_idx: b,
+                    };
+                }
+                if let Expr::BinaryOp {
+                    left: ml,
+                    op: BinOp::Mul,
+                    right: mr,
+                } = left.as_ref()
+                {
+                    if let (Some(c), Some(m), Some(a)) =
+                        (resolve_col_idx(ml), int_lit(mr), int_lit(right))
+                    {
+                        return FastGenEval::IntColMulAdd {
+                            col_schema_idx: c,
+                            mul: m,
+                            add: a,
+                        };
+                    }
+                    if let (Some(m), Some(c), Some(a)) =
+                        (int_lit(ml), resolve_col_idx(mr), int_lit(right))
+                    {
+                        return FastGenEval::IntColMulAdd {
+                            col_schema_idx: c,
+                            mul: m,
+                            add: a,
+                        };
+                    }
+                }
+            }
+            BinOp::Mul => {
+                if let (Some(c), Some(m)) = (resolve_col_idx(left), int_lit(right)) {
+                    return FastGenEval::IntColMulAdd {
+                        col_schema_idx: c,
+                        mul: m,
+                        add: 0,
+                    };
+                }
+                if let (Some(m), Some(c)) = (int_lit(left), resolve_col_idx(right)) {
+                    return FastGenEval::IntColMulAdd {
+                        col_schema_idx: c,
+                        mul: m,
+                        add: 0,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    FastGenEval::None
+}
+
+pub(super) fn eval_fast_gen(
+    fast: &FastGenEval,
+    expr: &Expr,
+    partial_row: &[Value],
+    col_map: &ColumnMap,
+) -> Result<Value> {
+    match fast {
+        FastGenEval::IntColMulAdd {
+            col_schema_idx,
+            mul,
+            add,
+        } => match partial_row[*col_schema_idx] {
+            Value::Integer(v) => Ok(Value::Integer(v.wrapping_mul(*mul).wrapping_add(*add))),
+            _ => eval_expr(expr, &EvalCtx::new(col_map, partial_row)),
+        },
+        FastGenEval::IntColAddCol {
+            left_idx,
+            right_idx,
+        } => match (&partial_row[*left_idx], &partial_row[*right_idx]) {
+            (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a.wrapping_add(*b))),
+            _ => eval_expr(expr, &EvalCtx::new(col_map, partial_row)),
+        },
+        FastGenEval::None => eval_expr(expr, &EvalCtx::new(col_map, partial_row)),
+    }
+}
+
 pub(super) struct PartialDecodeCtx {
     pk_positions: Vec<(usize, usize)>,
     nonpk_targets: Vec<usize>,
@@ -20,6 +132,8 @@ pub(super) struct PartialDecodeCtx {
     remaining_nonpk_schema: Vec<usize>,
     nonpk_defaults: Vec<(usize, usize, Value)>,
     remaining_defaults: Vec<(usize, usize, Value)>,
+    virtuals_to_eval: Vec<(usize, Expr, DataType, bool)>,
+    col_map: ColumnMap,
 }
 
 impl PartialDecodeCtx {
@@ -29,6 +143,32 @@ impl PartialDecodeCtx {
         let mut pk_positions = Vec::new();
         let mut nonpk_targets = Vec::new();
         let mut nonpk_schema = Vec::new();
+
+        let mut expanded_needed: Vec<usize> = needed.to_vec();
+        if schema.has_virtual_columns() {
+            let mut to_add: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
+            for &col in needed {
+                let c = &schema.columns[col];
+                if matches!(
+                    c.generated_kind,
+                    Some(crate::parser::GeneratedKind::Virtual)
+                ) {
+                    let mut refs = Vec::new();
+                    super::ddl::collect_column_refs(c.generated_expr.as_ref().unwrap(), &mut refs);
+                    for r in refs {
+                        if let Some(idx) = schema.column_index(&r) {
+                            if !needed.contains(&idx) {
+                                to_add.insert(idx);
+                            }
+                        }
+                    }
+                }
+            }
+            for idx in to_add {
+                expanded_needed.push(idx);
+            }
+        }
+        let needed: &[usize] = &expanded_needed;
 
         for &col in needed {
             if let Some(pk_pos) = schema
@@ -43,7 +183,16 @@ impl PartialDecodeCtx {
             }
         }
 
-        let needed_set: std::collections::HashSet<usize> = needed.iter().copied().collect();
+        let mut paired: Vec<(usize, usize)> = nonpk_targets
+            .iter()
+            .copied()
+            .zip(nonpk_schema.iter().copied())
+            .collect();
+        paired.sort_by_key(|&(t, _)| t);
+        nonpk_targets = paired.iter().map(|&(t, _)| t).collect();
+        nonpk_schema = paired.iter().map(|&(_, s)| s).collect();
+
+        let needed_set: rustc_hash::FxHashSet<usize> = needed.iter().copied().collect();
         let mut remaining_pk = Vec::new();
         for (pk_pos, &pk_col) in schema.primary_key_columns.iter().enumerate() {
             if !needed_set.contains(&(pk_col as usize)) {
@@ -79,6 +228,24 @@ impl PartialDecodeCtx {
             }
         }
 
+        let mut virtuals_to_eval = Vec::new();
+        if schema.has_virtual_columns() {
+            for &col in needed {
+                let c = &schema.columns[col];
+                if matches!(
+                    c.generated_kind,
+                    Some(crate::parser::GeneratedKind::Virtual)
+                ) {
+                    virtuals_to_eval.push((
+                        col,
+                        c.generated_expr.as_ref().unwrap().clone(),
+                        c.data_type,
+                        c.nullable,
+                    ));
+                }
+            }
+        }
+
         Self {
             pk_positions,
             nonpk_targets,
@@ -90,7 +257,30 @@ impl PartialDecodeCtx {
             remaining_nonpk_schema,
             nonpk_defaults,
             remaining_defaults,
+            virtuals_to_eval,
+            col_map: ColumnMap::new(&schema.columns),
         }
+    }
+
+    fn materialize_virtuals(&self, row: &mut [Value]) -> Result<()> {
+        for (pos, expr, dt, nullable) in &self.virtuals_to_eval {
+            let val = eval_expr(expr, &EvalCtx::new(&self.col_map, row))?;
+            row[*pos] = if val.is_null() {
+                if !*nullable {
+                    return Err(SqlError::InvalidValue(format!(
+                        "VIRTUAL generated column at position {pos} produced NULL but is NOT NULL"
+                    )));
+                }
+                Value::Null
+            } else {
+                let got = val.data_type();
+                val.coerce_into(*dt).ok_or_else(|| SqlError::TypeMismatch {
+                    expected: dt.to_string(),
+                    got: got.to_string(),
+                })?
+            };
+        }
+        Ok(())
     }
 
     pub(super) fn decode(&self, key: &[u8], value: &[u8]) -> Result<Vec<Value>> {
@@ -118,6 +308,10 @@ impl PartialDecodeCtx {
                     row[*schema_col] = default.clone();
                 }
             }
+        }
+
+        if !self.virtuals_to_eval.is_empty() {
+            self.materialize_virtuals(&mut row)?;
         }
 
         Ok(row)
@@ -194,6 +388,38 @@ pub(crate) fn decode_full_row_into(
                     row[logical_idx] = eval_const_expr(expr)?;
                 }
             }
+        }
+    }
+    if schema.has_virtual_columns() {
+        materialize_virtual(schema, row)?;
+    }
+    Ok(())
+}
+
+/// Caller must ensure all non-virtual columns in `row` are already populated.
+#[inline]
+pub(crate) fn materialize_virtual(schema: &TableSchema, row: &mut [Value]) -> Result<()> {
+    let col_map = ColumnMap::new(&schema.columns);
+    for col in &schema.columns {
+        if matches!(
+            col.generated_kind,
+            Some(crate::parser::GeneratedKind::Virtual)
+        ) {
+            let val = eval_expr(
+                col.generated_expr.as_ref().unwrap(),
+                &EvalCtx::new(&col_map, row),
+            )?;
+            let pos = col.position as usize;
+            row[pos] = if val.is_null() {
+                Value::Null
+            } else {
+                let got_type = val.data_type();
+                val.coerce_into(col.data_type)
+                    .ok_or_else(|| SqlError::TypeMismatch {
+                        expected: col.data_type.to_string(),
+                        got: got_type.to_string(),
+                    })?
+            };
         }
     }
     Ok(())
@@ -391,7 +617,7 @@ pub(super) fn try_build_index_map(
 ) -> Option<Vec<(String, usize)>> {
     let col_map = ColumnMap::new(columns);
     let mut map = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = rustc_hash::FxHashSet::default();
     for sel in select_cols {
         match sel {
             SelectColumn::AllColumns => {
@@ -646,6 +872,9 @@ pub(crate) fn build_output_columns(
             check_sql: None,
             check_name: None,
             is_with_timezone: false,
+            generated_expr: None,
+            generated_sql: None,
+            generated_kind: None,
         });
     }
     out

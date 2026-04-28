@@ -70,7 +70,7 @@ fn build_timezone_abbrevs() -> QueryResult {
         "utc_offset".to_string(),
         "is_dst".to_string(),
     ];
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
     let mut rows = Vec::new();
     let now = jiff::Timestamp::now();
     let db = jiff::tz::db();
@@ -1706,7 +1706,7 @@ fn try_streaming_distinct(
     }
 
     let lower_name = &table_schema.name;
-    let mut seen = std::collections::HashSet::<Vec<u8>>::new();
+    let mut seen: rustc_hash::FxHashSet<Vec<u8>> = rustc_hash::FxHashSet::default();
     let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut scan_err: Option<SqlError> = None;
     let mut raw_key_buf: Vec<u8> = Vec::with_capacity(64);
@@ -1846,8 +1846,11 @@ pub(super) fn process_select(
     if stmt.distinct {
         let (col_names, mut projected) = project_rows(columns, &stmt.columns, rows)?;
 
-        let mut seen: std::collections::HashSet<Vec<Value>> =
-            std::collections::HashSet::with_capacity(projected.len().min(1024));
+        let mut seen: rustc_hash::FxHashSet<Vec<Value>> =
+            rustc_hash::FxHashSet::with_capacity_and_hasher(
+                projected.len().min(1024),
+                Default::default(),
+            );
         projected.retain(|row| {
             if seen.contains(row) {
                 false

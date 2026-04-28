@@ -582,7 +582,7 @@ impl<'a> ConnectionInner<'a> {
             if self.active_txn.is_none() {
                 return self.run_compiled(db, plan, stmt, params);
             }
-            if stmt_mutates(stmt) {
+            if !self.savepoint_stack.is_empty() && stmt_mutates(stmt) {
                 self.capture_pending_snapshots();
             }
             return self.run_compiled_in_txn(db, plan, stmt, params);
@@ -599,7 +599,7 @@ impl<'a> ConnectionInner<'a> {
     ) -> Result<ExecutionResult> {
         let schema = &self.schema;
         let wtx = self.active_txn.as_mut();
-        if params.is_empty() {
+        if params.is_empty() || !plan.uses_scoped_params() {
             plan.execute(db, schema, stmt, params, wtx)
         } else {
             crate::eval::with_scoped_params(params, || plan.execute(db, schema, stmt, params, wtx))

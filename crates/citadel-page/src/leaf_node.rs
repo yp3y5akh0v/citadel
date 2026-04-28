@@ -126,6 +126,39 @@ pub fn update_value_in_place(page: &mut Page, idx: u16, val_type: ValueType, val
     true
 }
 
+/// Caller must guarantee `key > last_cell.key` (strictly greater than current
+/// max). Skips the binary search since the insert position is always the end.
+pub fn insert_append_direct(
+    page: &mut Page,
+    key: &[u8],
+    val_type: ValueType,
+    value: &[u8],
+) -> bool {
+    let pos = page.num_cells();
+    let total = LEAF_CELL_FIXED + key.len() + value.len();
+
+    if page
+        .insert_cell_direct(pos, total, |slot| {
+            write_cell_into(slot, key, val_type, value);
+        })
+        .is_some()
+    {
+        return true;
+    }
+
+    let cell_len_with_ptr = total + 2;
+    if (page.free_space() as usize) >= cell_len_with_ptr {
+        compact_page(page);
+        return page
+            .insert_cell_direct(pos, total, |slot| {
+                write_cell_into(slot, key, val_type, value);
+            })
+            .is_some();
+    }
+
+    false
+}
+
 pub fn insert_direct(page: &mut Page, key: &[u8], val_type: ValueType, value: &[u8]) -> bool {
     let pos = match search(page, key) {
         Ok(idx) => {

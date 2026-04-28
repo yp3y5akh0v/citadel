@@ -13,12 +13,12 @@
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Beats unencrypted SQLite in all 34 head-to-head benchmarks with equal cache budgets.
+Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Wins all 38 head-to-head benchmarks against unencrypted SQLite at equal cache budgets.
 
 ## Features
 
 - **Encrypted at rest** - AES-256-CTR + HMAC-SHA256 per page, verified before decryption
-- **SQL** - JOINs, subqueries, CTEs (recursive), UNION/INTERSECT/EXCEPT, window functions, views, aggregates, indexes, constraints, ALTER TABLE, UPSERT (`ON CONFLICT`), RETURNING (with `OLD/NEW`), prepared statements
+- **SQL** - JOINs, subqueries, CTEs (recursive), UNION/INTERSECT/EXCEPT, window functions, views, aggregates, indexes, constraints, generated columns (STORED + VIRTUAL), ALTER TABLE, UPSERT (`ON CONFLICT`), RETURNING (with `OLD/NEW`), prepared statements
 - **ACID** - Copy-on-Write B+ tree, shadow paging, no WAL. Snapshot isolation with concurrent readers
 - **P2P sync** - Merkle-based table diffing over Noise-encrypted channels with PSK auth
 - **CLI** - SQL shell with tab completion, syntax highlighting, dot-commands (.backup, .verify, .rekey, .sync, .dump, ...)
@@ -28,49 +28,53 @@ Every page is encrypted and authenticated before it hits disk. The database file
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. C FFI (37 functions), WebAssembly bindings
-- **2,800+ tests** - Unit, integration, torture tests across 10 crates
+- **3,100+ tests** - Unit, integration, torture tests across 10 crates
 
 ## Benchmarks
 
 Single-threaded on 100K rows, schema `(id INTEGER PK, name TEXT, age INTEGER)`. Ratio = SQLite / Citadel time.
 
 ```
-Benchmark          Citadel        SQLite         Ratio
-------------------------------------------------------
-correlated_in      5.77 ms        1.89 s         328x
-count              147 ns         20.9 us        142x
-correlated_scalar  298 us         18.2 ms        61.1x
-point              783 ns         12.1 us        15.5x
-group_by           1.15 ms        10.4 ms        9.04x
-cte                1.03 ms        6.21 ms        6.03x
-view_point         2.76 us        12.1 us        4.38x
-upsert_returning   59.6 us        161.5 us       2.71x
-insert_returning   65.1 us        163.6 us       2.51x
-view_filter        700 us         1.73 ms        2.47x
-filter             703 us         1.69 ms        2.41x
-sort               1.06 ms        2.47 ms        2.33x
-savepoint_create   318 ns         692 ns         2.18x
-window_rank        57.9 ms        124 ms         2.13x
-window_agg         33.9 ms        72.1 ms        2.13x
-upsert_counter     25.1 us        51.9 us        2.07x
-insert_select      624 us         1.12 ms        1.79x
-delete_returning   92.4 us        159.8 us       1.73x
-correlated_exists  3.89 ms        6.57 ms        1.69x
-distinct           2.34 ms        3.74 ms        1.60x
-upsert_dedup       19.8 us        31.6 us        1.60x
-update             17.5 us        27.3 us        1.57x
-update_returning   104.8 us       141.5 us       1.35x
-savepoint_nested   276 us         359 us         1.30x
-scan               5.97 ms        7.75 ms        1.30x
-delete             54.8 us        69.2 us        1.26x
-sum                1.46 ms        1.80 ms        1.23x
-union              115 us         137 us         1.20x
-insert             42.6 us        48.9 us        1.15x
-recursive_cte      102 us         116 us         1.14x
-upsert_all_new     44.7 us        48.8 us        1.09x
-upsert_mixed       53.6 us        56.7 us        1.06x
-join               86.7 us        89.5 us        1.03x
-savepoint_rollback 2.07 ms        2.14 ms        1.03x
+Benchmark              Citadel        SQLite         Ratio
+----------------------------------------------------------
+correlated_in          5.92 ms        1.87 s         315.5x
+count                  146 ns         21.4 us        146.6x
+correlated_scalar      292 us         17.96 ms       61.5x
+point                  772 ns         12.4 us        16.0x
+group_by               1.27 ms        9.89 ms        7.81x
+cte                    1.16 ms        5.85 ms        5.03x
+view_point             2.78 us        12.4 us        4.44x
+upsert_returning       55.5 us        166 us         2.99x
+insert_returning       57.6 us        165 us         2.86x
+window_agg             31.7 ms        74.0 ms        2.34x
+filter                 769 us         1.76 ms        2.29x
+view_filter            768 us         1.74 ms        2.26x
+savepoint_create       316 ns         687 ns         2.17x
+sort                   1.22 ms        2.58 ms        2.11x
+upsert_counter         25.0 us        52.8 us        2.11x
+window_rank            60.2 ms        121 ms         2.01x
+delete_returning       86.5 us        161 us         1.86x
+upsert_dedup           18.7 us        31.7 us        1.70x
+update                 18.2 us        28.4 us        1.56x
+insert_select          720 us         1.12 ms        1.55x
+delete                 43.5 us        66.5 us        1.53x
+correlated_exists      4.32 ms        6.50 ms        1.50x
+savepoint_nested       216 us         303 us         1.41x
+savepoint_rollback     1.52 ms        2.10 ms        1.39x
+distinct               2.67 ms        3.63 ms        1.36x
+insert                 36.9 us        49.9 us        1.35x
+update_returning       110 us         144 us         1.31x
+scan                   6.35 ms        7.70 ms        1.21x
+union                  119 us         140 us         1.18x
+insert_gen_stored      47.6 us        55.7 us        1.17x
+insert_gen_virtual     44.9 us        52.4 us        1.17x
+sum                    1.60 ms        1.85 ms        1.16x
+update_gen_propagate   38.2 us        44.3 us        1.16x
+upsert_all_new         44.1 us        49.3 us        1.12x
+select_gen_virtual     15.5 us        17.5 us        1.12x
+recursive_cte          104 us         117 us         1.12x
+upsert_mixed           51.5 us        56.2 us        1.09x
+join                   91.4 us        93.8 us        1.025x
 ```
 
 ### Native DATE / TIMESTAMP (Citadel only, SQLite has no native type)
@@ -78,11 +82,11 @@ savepoint_rollback 2.07 ms        2.14 ms        1.03x
 ```
 Benchmark          Citadel
 -------------------------------
-date_sort          1.17 ms
-date_range_scan    1.59 ms
-date_arith         1.59 ms
-date_groupby       8.54 ms
-date_extract       11.85 ms
+date_sort          1.32 ms
+date_range_scan    1.75 ms
+date_arith         1.76 ms
+date_groupby       9.12 ms
+date_extract       12.68 ms
 ```
 
 <details>
@@ -97,39 +101,43 @@ H2H benchmarks (sorted by ratio, highest first):
 - **group_by** - `SELECT age, COUNT(*) FROM t GROUP BY age`
 - **cte** - `WITH filtered AS (SELECT ... WHERE age < 50) SELECT age, COUNT(*) FROM filtered GROUP BY age`
 - **view_point** - `SELECT * FROM v WHERE id = 50000`
+- **upsert_returning** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1 RETURNING c`
+- **insert_returning** - `INSERT INTO t (id, val) VALUES (...) RETURNING id, val`
+- **window_agg** - `SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING)`
 - **filter** - `SELECT * FROM t WHERE age = 42`
 - **view_filter** - `SELECT * FROM v WHERE age = 42`
-- **sort** - `SELECT * FROM t ORDER BY age LIMIT 10`
-- **window_rank** - `ROW_NUMBER() OVER (PARTITION BY age ORDER BY id), RANK() OVER ...`
-- **window_agg** - `SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING), MIN(age) OVER ...`
 - **savepoint_create** - `BEGIN; SAVEPOINT sp; RELEASE sp; COMMIT`
-- **upsert_returning** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1 RETURNING c` on existing keys
-- **insert_returning** - `INSERT INTO t (id, val) VALUES (...) RETURNING id, val`
-- **upsert_counter** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1` on existing keys
-- **insert_select** - `INSERT INTO sink SELECT id, val FROM a`
-- **delete_returning** - insert 100 rows then `DELETE ... WHERE id = ? RETURNING id, val` per row
-- **upsert_dedup** - `INSERT ... ON CONFLICT (id) DO NOTHING` on existing keys
-- **correlated_exists** - `SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM ref_table WHERE ref_table.id = t.id)`
-- **distinct** - `SELECT DISTINCT age FROM t`
+- **sort** - `SELECT * FROM t ORDER BY age LIMIT 10`
+- **upsert_counter** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1`
+- **window_rank** - `ROW_NUMBER() OVER (PARTITION BY age ORDER BY id)`
+- **delete_returning** - `DELETE ... WHERE id = ? RETURNING id, val`
+- **upsert_dedup** - `INSERT ... ON CONFLICT (id) DO NOTHING`
 - **update** - `UPDATE t SET age = age + 1 WHERE id BETWEEN 10000 AND 10099`
-- **update_returning** - `UPDATE t SET c = c + ? WHERE id = ? RETURNING c` per row
-- **sum** - `SELECT SUM(age) FROM t`
-- **delete** - insert 100 rows then delete them
-- **scan** - `SELECT * FROM t`
-- **savepoint_nested** - 10 nested savepoints each with 100-row INSERT, alternating RELEASE/ROLLBACK TO
-- **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq`
-- **insert** - 100 rows in one transaction
-- **union** - `SELECT id, val FROM a UNION ALL SELECT id, data FROM b`
-- **upsert_all_new** - `INSERT ... ON CONFLICT (id) DO NOTHING` with all-new keys
-- **upsert_mixed** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1` mixing existing and new keys
-- **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id`
+- **insert_select** - `INSERT INTO sink SELECT id, val FROM a`
+- **delete** - `DELETE FROM t WHERE id = ?`
+- **correlated_exists** - `SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM ref_table WHERE ref_table.id = t.id)`
+- **savepoint_nested** - `BEGIN; SAVEPOINT sp1; ... ; RELEASE/ROLLBACK TO sp1; COMMIT`
 - **savepoint_rollback** - `BEGIN; INSERT 1K rows; SAVEPOINT sp; INSERT 10K rows; ROLLBACK TO sp; COMMIT`
+- **distinct** - `SELECT DISTINCT age FROM t`
+- **insert** - `INSERT INTO t (id, val) VALUES (?, ?)`
+- **update_returning** - `UPDATE t SET c = c + ? WHERE id = ? RETURNING c`
+- **scan** - `SELECT * FROM t`
+- **union** - `SELECT id, val FROM a UNION ALL SELECT id, data FROM b`
+- **insert_gen_stored** - `INSERT INTO t (id, a, b) VALUES (?, ?, ?)`
+- **insert_gen_virtual** - `INSERT INTO t (id, a, b) VALUES (?, ?, ?)`
+- **sum** - `SELECT SUM(age) FROM t`
+- **update_gen_propagate** - `UPDATE t SET a = a + ? WHERE id = ?`
+- **upsert_all_new** - `INSERT ... ON CONFLICT (id) DO NOTHING`
+- **select_gen_virtual** - `SELECT id, s FROM t WHERE s > ?`
+- **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq`
+- **upsert_mixed** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1`
+- **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id`
 
 Date benchmarks (Citadel-only, sorted by duration):
 
-- **date_arith** - `SELECT COUNT(*) FROM events WHERE ts + INTERVAL '1 day' > TIMESTAMP '2024-06-01 00:00:00'`
-- **date_range_scan** - `SELECT COUNT(*) FROM events WHERE d BETWEEN DATE '2024-02-01' AND DATE '2024-03-31'`
 - **date_sort** - `SELECT id FROM events ORDER BY ts LIMIT 100`
+- **date_range_scan** - `SELECT COUNT(*) FROM events WHERE d BETWEEN DATE '2024-02-01' AND DATE '2024-03-31'`
+- **date_arith** - `SELECT COUNT(*) FROM events WHERE ts + INTERVAL '1 day' > TIMESTAMP '2024-06-01 00:00:00'`
 - **date_groupby** - `SELECT DATE_TRUNC('month', ts), COUNT(*) FROM events GROUP BY 1`
 - **date_extract** - `SELECT AVG(EXTRACT(HOUR FROM ts)) FROM events`
 
@@ -209,9 +217,9 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 ## SQL
 
-**Statements** - CREATE/DROP TABLE, ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE/DROP INDEX, CREATE/DROP VIEW, INSERT (VALUES, SELECT, ON CONFLICT DO NOTHING/DO UPDATE, ON CONSTRAINT), SELECT, UPDATE, DELETE, BEGIN/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, SET TIME ZONE, EXPLAIN
+**Statements** - CREATE/DROP TABLE, ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE/DROP INDEX, CREATE/DROP VIEW, INSERT (VALUES, SELECT, ON CONFLICT DO NOTHING/DO UPDATE, ON CONSTRAINT), SELECT, UPDATE, DELETE, RETURNING (with `OLD`/`NEW`), BEGIN/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, SET TIME ZONE, EXPLAIN
 
-**Constraints** - PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK (column + table level), FOREIGN KEY (RESTRICT/NO ACTION)
+**Constraints** - PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK (column + table level), FOREIGN KEY (RESTRICT/NO ACTION), GENERATED ALWAYS AS (...) STORED|VIRTUAL
 
 **Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN, DATE, TIME, TIMESTAMP (WITH TIME ZONE), INTERVAL
 

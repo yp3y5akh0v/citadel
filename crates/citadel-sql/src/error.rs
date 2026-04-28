@@ -151,4 +151,13 @@ pub enum SqlError {
 
     #[error("invalid timezone: {0}")]
     InvalidTimezone(String),
+
+    #[error("cannot insert into generated column '{0}'")]
+    CannotInsertIntoGeneratedColumn(String),
+
+    #[error("cannot update generated column '{0}'")]
+    CannotUpdateGeneratedColumn(String),
+
+    #[error("GENERATED column '{0}' cannot reference another generated column")]
+    GeneratedColumnReference(String),
 }

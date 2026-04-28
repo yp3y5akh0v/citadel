@@ -58,6 +58,9 @@ fn col(name: &str, dt: DataType, nullable: bool, pos: u16) -> ColumnDef {
         check_sql: None,
         check_name: None,
         is_with_timezone: false,
+        generated_expr: None,
+        generated_sql: None,
+        generated_kind: None,
     }
 }
 

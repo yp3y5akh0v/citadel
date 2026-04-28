@@ -70,7 +70,7 @@ pub(super) fn exec_aggregate(
     }
 
     if stmt.distinct {
-        let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
+        let mut seen: rustc_hash::FxHashSet<Vec<Value>> = rustc_hash::FxHashSet::default();
         result_rows.retain(|row| {
             if seen.contains(row) {
                 false
@@ -143,7 +143,7 @@ pub(super) fn eval_aggregate_expr(
                 .map(|row| eval_expr(arg, &EvalCtx::new(col_map, row)))
                 .collect::<Result<_>>()?;
             if *distinct {
-                let mut seen: std::collections::HashSet<Value> = std::collections::HashSet::new();
+                let mut seen: rustc_hash::FxHashSet<Value> = rustc_hash::FxHashSet::default();
                 values.retain(|v| {
                     if v.is_null() || seen.contains(v) {
                         false

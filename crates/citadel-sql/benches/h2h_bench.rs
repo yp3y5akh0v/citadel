@@ -46,5 +46,9 @@ criterion_group!(
     h2h::update_returning::bench,
     h2h::delete_returning::bench,
     h2h::upsert_returning::bench,
+    h2h::insert_gen_stored::bench,
+    h2h::insert_gen_virtual::bench,
+    h2h::update_gen_propagate::bench,
+    h2h::select_gen_virtual::bench,
 );
 criterion_main!(benches);

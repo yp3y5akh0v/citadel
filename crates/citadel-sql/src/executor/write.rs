@@ -26,6 +26,8 @@ struct UpdateBufs {
     partial_row: Vec<Value>,
     patch_buf: Vec<u8>,
     offsets: Vec<usize>,
+    kv_pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    patched: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl UpdateBufs {
@@ -34,6 +36,8 @@ impl UpdateBufs {
             partial_row: Vec::new(),
             patch_buf: Vec::with_capacity(256),
             offsets: Vec::new(),
+            kv_pairs: Vec::new(),
+            patched: Vec::new(),
         }
     }
 }
@@ -64,6 +68,29 @@ struct CompiledFastPath {
     pk_idx_cache: Vec<usize>,
     col_map: ColumnMap,
     range_bounds_i64: Option<Vec<(BinOp, i64)>>,
+    gen_targets: Vec<GenColPatch>,
+    gen_extra_cols: Vec<(usize, usize)>,
+    pk_lookup_fast: Option<PkLookupFast>,
+}
+
+#[derive(Clone)]
+enum PkLookupSource {
+    Literal(Value),
+    Parameter(usize),
+}
+
+#[derive(Clone)]
+struct PkLookupFast {
+    source: PkLookupSource,
+}
+
+#[derive(Clone)]
+struct GenColPatch {
+    schema_idx: usize,
+    phys_idx: usize,
+    expr: Expr,
+    col: ColumnDef,
+    fast_eval: FastGenEval,
 }
 
 enum FastEval {
@@ -142,11 +169,241 @@ fn detect_fast_eval(expr: &Expr, col_name: &str) -> FastEval {
     }
 }
 
+fn detect_pk_lookup_fast(
+    where_clause: &Option<Expr>,
+    table_schema: &TableSchema,
+) -> Option<PkLookupFast> {
+    let pk = &table_schema.primary_key_columns;
+    if pk.len() != 1 {
+        return None;
+    }
+    let pk_idx = pk[0] as usize;
+    let pk_name = table_schema.columns[pk_idx].name.to_ascii_lowercase();
+    let where_expr = where_clause.as_ref()?;
+    let (left, right) = match where_expr {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => (left.as_ref(), right.as_ref()),
+        _ => return None,
+    };
+    let col_matches = |e: &Expr| match e {
+        Expr::Column(name) => name.to_ascii_lowercase() == pk_name,
+        Expr::QualifiedColumn { column, .. } => column.to_ascii_lowercase() == pk_name,
+        _ => false,
+    };
+    let extract_source = |e: &Expr| match e {
+        Expr::Literal(v) => Some(PkLookupSource::Literal(v.clone())),
+        Expr::Parameter(n) => Some(PkLookupSource::Parameter(*n)),
+        _ => None,
+    };
+    let source = if col_matches(left) {
+        extract_source(right)?
+    } else if col_matches(right) {
+        extract_source(left)?
+    } else {
+        return None;
+    };
+    Some(PkLookupFast { source })
+}
+
 fn resolve_int_param(n: usize) -> Option<i64> {
     match crate::eval::resolve_scoped_param(n).ok()? {
         Value::Integer(v) => Some(v),
         _ => None,
     }
+}
+
+fn compute_gen_col_targets(
+    table_schema: &TableSchema,
+    _set_target_schema_indices: &[usize],
+    pk_indices: &[usize],
+) -> (Vec<GenColPatch>, Vec<(usize, usize)>) {
+    let stored_gen_cols: Vec<&ColumnDef> = table_schema
+        .columns
+        .iter()
+        .filter(|c| matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored)))
+        .collect();
+    if stored_gen_cols.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let non_pk = table_schema.non_pk_indices();
+    let enc_pos = table_schema.encoding_positions();
+    let mut gen_targets = Vec::with_capacity(stored_gen_cols.len());
+    for c in &stored_gen_cols {
+        let schema_idx = c.position as usize;
+        let nonpk_order = non_pk.iter().position(|&i| i == schema_idx).unwrap();
+        let phys_idx = enc_pos[nonpk_order] as usize;
+        let expr = c.generated_expr.clone().unwrap();
+        let fast_eval = detect_fast_gen_eval(&expr, table_schema);
+        gen_targets.push(GenColPatch {
+            schema_idx,
+            phys_idx,
+            expr,
+            col: (*c).clone(),
+            fast_eval,
+        });
+    }
+
+    let mut needed_names: Vec<String> = Vec::new();
+    for gp in &gen_targets {
+        super::ddl::collect_column_refs(&gp.expr, &mut needed_names);
+    }
+
+    let mut needed_indices: Vec<usize> = Vec::new();
+    for name in &needed_names {
+        if let Some(idx) = table_schema.column_index(name) {
+            if !needed_indices.contains(&idx) {
+                needed_indices.push(idx);
+            }
+        }
+    }
+
+    let mut gen_eval_decode_cols: Vec<(usize, usize)> = Vec::new();
+    for &schema_idx in &needed_indices {
+        if pk_indices.contains(&schema_idx) {
+            continue;
+        }
+        if let Some(nonpk_order) = non_pk.iter().position(|&i| i == schema_idx) {
+            let phys_idx = enc_pos[nonpk_order] as usize;
+            gen_eval_decode_cols.push((schema_idx, phys_idx));
+        }
+    }
+
+    (gen_targets, gen_eval_decode_cols)
+}
+
+enum RangeStatus {
+    Hit,
+    Skip,
+    Stop,
+    Err,
+}
+
+fn range_in_bounds(
+    key: &[u8],
+    single_int_pk: bool,
+    num_pk_cols: usize,
+    range_conds: &[(BinOp, Value)],
+    out_err: &mut Option<SqlError>,
+) -> RangeStatus {
+    let pk_val = if single_int_pk {
+        match decode_pk_integer(key) {
+            Ok(v) => Value::Integer(v),
+            Err(e) => {
+                *out_err = Some(e);
+                return RangeStatus::Err;
+            }
+        }
+    } else {
+        match decode_composite_key(key, num_pk_cols) {
+            Ok(mut vs) => vs.remove(0),
+            Err(e) => {
+                *out_err = Some(e);
+                return RangeStatus::Err;
+            }
+        }
+    };
+    for (op, bound) in range_conds {
+        match op {
+            BinOp::Lt if &pk_val >= bound => return RangeStatus::Stop,
+            BinOp::LtEq if &pk_val > bound => return RangeStatus::Stop,
+            BinOp::Gt if &pk_val <= bound => return RangeStatus::Skip,
+            BinOp::GtEq if &pk_val < bound => return RangeStatus::Skip,
+            _ => {}
+        }
+    }
+    RangeStatus::Hit
+}
+
+fn is_fixed_width_type(dt: DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Integer
+            | DataType::Real
+            | DataType::Boolean
+            | DataType::Date
+            | DataType::Time
+            | DataType::Timestamp
+            | DataType::Interval
+    )
+}
+
+fn pk_range_patch_safe(set_cols: &[ColumnDef], gen_cols: &[ColumnDef]) -> bool {
+    set_cols
+        .iter()
+        .chain(gen_cols.iter())
+        .all(|c| !c.nullable && is_fixed_width_type(c.data_type))
+}
+
+fn coerce_gen_value(val: Value, col: &ColumnDef) -> Result<Value> {
+    if val.is_null() {
+        if !col.nullable {
+            return Err(SqlError::NotNullViolation(col.name.clone()));
+        }
+        Ok(Value::Null)
+    } else {
+        let got_type = val.data_type();
+        val.coerce_into(col.data_type)
+            .ok_or_else(|| SqlError::TypeMismatch {
+                expected: col.data_type.to_string(),
+                got: got_type.to_string(),
+            })
+    }
+}
+
+fn apply_gen_col_patches_slice(
+    value: &mut [u8],
+    partial_row: &mut [Value],
+    gen_targets: &[GenColPatch],
+    gen_extra_cols: &[(usize, usize)],
+    col_map: &ColumnMap,
+    patch_buf: &mut Vec<u8>,
+) -> Result<()> {
+    if gen_targets.is_empty() {
+        return Ok(());
+    }
+    for &(schema_idx, phys_idx) in gen_extra_cols {
+        partial_row[schema_idx] = decode_column_raw(value, phys_idx)?.to_value();
+    }
+    for gp in gen_targets {
+        let raw = eval_fast_gen(&gp.fast_eval, &gp.expr, partial_row, col_map)?;
+        let coerced = coerce_gen_value(raw, &gp.col)?;
+        partial_row[gp.schema_idx] = coerced.clone();
+        if !patch_column_in_place(value, gp.phys_idx, &coerced)? {
+            patch_row_column(value, gp.phys_idx, &coerced, patch_buf)?;
+            value[..patch_buf.len()].copy_from_slice(patch_buf);
+        }
+    }
+    Ok(())
+}
+
+fn apply_gen_col_patches_vec(
+    value: &mut Vec<u8>,
+    partial_row: &mut [Value],
+    gen_targets: &[GenColPatch],
+    gen_extra_cols: &[(usize, usize)],
+    col_map: &ColumnMap,
+    patch_buf: &mut Vec<u8>,
+) -> Result<()> {
+    if gen_targets.is_empty() {
+        return Ok(());
+    }
+    for &(schema_idx, phys_idx) in gen_extra_cols {
+        partial_row[schema_idx] = decode_column_raw(value, phys_idx)?.to_value();
+    }
+    for gp in gen_targets {
+        let raw = eval_fast_gen(&gp.fast_eval, &gp.expr, partial_row, col_map)?;
+        let coerced = coerce_gen_value(raw, &gp.col)?;
+        partial_row[gp.schema_idx] = coerced.clone();
+        if !patch_column_in_place(value, gp.phys_idx, &coerced)? {
+            patch_row_column(value, gp.phys_idx, &coerced, patch_buf)?;
+            std::mem::swap(value, patch_buf);
+        }
+    }
+    Ok(())
 }
 
 impl CompiledUpdate {
@@ -174,7 +431,9 @@ impl CompiledPlan for CompiledUpdate {
         };
         match wtx {
             None => with_update_scratch(|bufs| exec_update_compiled(db, schema, upd, self, bufs)),
-            Some(outer) => exec_update_in_txn(outer, schema, upd),
+            Some(outer) => with_update_scratch(|bufs| {
+                exec_update_in_txn_compiled(outer, schema, upd, self, bufs)
+            }),
         }
     }
 }
@@ -240,6 +499,10 @@ fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Comp
             let schema_idx = table_schema
                 .column_index(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
+            let col = &table_schema.columns[schema_idx];
+            if col.generated_kind.is_some() {
+                return Err(SqlError::CannotUpdateGeneratedColumn(col.name.clone()));
+            }
             let nonpk_order = non_pk
                 .iter()
                 .position(|&i| i == schema_idx)
@@ -250,7 +513,7 @@ fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Comp
                 schema_idx,
                 phys_idx,
                 expr: expr.clone(),
-                col: table_schema.columns[schema_idx].clone(),
+                col: col.clone(),
                 fast_eval,
             });
         }
@@ -284,6 +547,11 @@ fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Comp
             None
         };
 
+        let set_target_indices: Vec<usize> = targets.iter().map(|t| t.schema_idx).collect();
+        let (gen_targets, gen_extra_cols) =
+            compute_gen_col_targets(table_schema, &set_target_indices, pk_indices);
+        let pk_lookup_fast = detect_pk_lookup_fast(&stmt.where_clause, table_schema);
+
         Some(CompiledFastPath {
             num_pk_cols,
             num_columns: table_schema.columns.len(),
@@ -293,6 +561,9 @@ fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Comp
             pk_idx_cache: pk_indices.to_vec(),
             col_map: ColumnMap::new(&table_schema.columns),
             range_bounds_i64,
+            gen_targets,
+            gen_extra_cols,
+            pk_lookup_fast,
         })
     } else {
         None
@@ -467,6 +738,14 @@ fn exec_update_compiled(
                         }
                     }
                 }
+                apply_gen_col_patches_slice(
+                    value,
+                    &mut bufs.partial_row,
+                    &fast.gen_targets,
+                    &fast.gen_extra_cols,
+                    &fast.col_map,
+                    &mut bufs.patch_buf,
+                )?;
                 Ok(Some(true))
             },
         )?;
@@ -475,7 +754,6 @@ fn exec_update_compiled(
         return Ok(ExecutionResult::RowsAffected(count));
     }
 
-    // PkLookup / SeqScan — fall back to full exec_update for now
     drop(wtx);
     exec_update(db, schema, stmt)
 }
@@ -527,7 +805,7 @@ pub(super) fn exec_update(
         let pk_indices = table_schema.pk_indices();
         let pk_values: Vec<Value> = rows.iter().map(|row| row[pk_indices[0]].clone()).collect();
         let pk_col = &table_schema.columns[pk_indices[0]].name;
-        let in_set: std::collections::HashSet<Value> = pk_values.into_iter().collect();
+        let in_set: rustc_hash::FxHashSet<Value> = pk_values.into_iter().collect();
         let new_where = if in_set.is_empty() {
             Some(Expr::Literal(Value::Boolean(false)))
         } else {
@@ -570,6 +848,10 @@ pub(super) fn exec_update(
     let has_fk = !table_schema.foreign_keys.is_empty();
     let has_indices = !table_schema.indices.is_empty();
     let has_child_fk = !schema.child_fks_for(&lower_name).is_empty();
+    let has_stored_generated = table_schema
+        .columns
+        .iter()
+        .any(|c| matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored)));
     if !pk_changed_by_set
         && !has_fk
         && !has_indices
@@ -592,6 +874,10 @@ pub(super) fn exec_update(
             let schema_idx = table_schema
                 .column_index(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
+            let col = &table_schema.columns[schema_idx];
+            if col.generated_kind.is_some() {
+                return Err(SqlError::CannotUpdateGeneratedColumn(col.name.clone()));
+            }
             let nonpk_order = non_pk
                 .iter()
                 .position(|&i| i == schema_idx)
@@ -601,7 +887,7 @@ pub(super) fn exec_update(
                 schema_idx,
                 phys_idx,
                 expr: expr.clone(),
-                col: table_schema.columns[schema_idx].clone(),
+                col: col.clone(),
             });
         }
 
@@ -610,14 +896,26 @@ pub(super) fn exec_update(
             && table_schema.columns[table_schema.primary_key_columns[0] as usize].data_type
                 == DataType::Integer;
 
+        let pk_indices_vec = table_schema.pk_indices().to_vec();
+        let set_target_indices: Vec<usize> = targets.iter().map(|t| t.schema_idx).collect();
+        let (gen_targets, gen_extra_cols) =
+            compute_gen_col_targets(table_schema, &set_target_indices, &pk_indices_vec);
+
+        let set_cols: Vec<ColumnDef> = targets.iter().map(|t| t.col.clone()).collect();
+        let gen_cols: Vec<ColumnDef> = gen_targets.iter().map(|g| g.col.clone()).collect();
+        let patch_safe = pk_range_patch_safe(&set_cols, &gen_cols);
+
         let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
 
-        // Fused PkRangeScan: scan + patch in a single leaf pass, zero allocs
-        if let crate::planner::ScanPlan::PkRangeScan {
-            ref start_key,
-            ref range_conds,
-            ..
-        } = plan
+        // `value: &mut [u8]` can't grow; nullable/variable-width fall through.
+        if let (
+            true,
+            crate::planner::ScanPlan::PkRangeScan {
+                start_key,
+                range_conds,
+                ..
+            },
+        ) = (patch_safe, &plan)
         {
             let range_conds = range_conds.clone();
             let mut partial_row = vec![Value::Null; table_schema.columns.len()];
@@ -626,7 +924,6 @@ pub(super) fn exec_update(
 
             let count =
                 wtx.table_update_range(lower_name.as_bytes(), start_key, |key, value| {
-                    // Range check: None = stop, Some(false) = skip, fall through = in range
                     if single_int_pk {
                         let pk_int = Value::Integer(decode_pk_integer(key)?);
                         for (op, bound) in &range_conds {
@@ -663,7 +960,6 @@ pub(super) fn exec_update(
                         partial_row[target.schema_idx] =
                             decode_column_raw(value, target.phys_idx)?.to_value();
                     }
-                    // Eval + patch directly in the leaf cell's value bytes
                     for target in &targets {
                         let new_val =
                             eval_expr(&target.expr, &EvalCtx::new(&col_map, &partial_row))?;
@@ -686,6 +982,14 @@ pub(super) fn exec_update(
                             value[..patch_buf.len()].copy_from_slice(&patch_buf);
                         }
                     }
+                    apply_gen_col_patches_slice(
+                        value,
+                        &mut partial_row,
+                        &gen_targets,
+                        &gen_extra_cols,
+                        &col_map,
+                        &mut patch_buf,
+                    )?;
                     Ok(Some(true))
                 })?;
 
@@ -693,7 +997,6 @@ pub(super) fn exec_update(
             return Ok(ExecutionResult::RowsAffected(count));
         }
 
-        // Collect-then-write path for PkLookup and SeqScan
         let mut kv_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         {
             match &plan {
@@ -704,6 +1007,36 @@ pub(super) fn exec_update(
                         .map_err(SqlError::Storage)?
                     {
                         kv_pairs.push((key, value));
+                    }
+                }
+                crate::planner::ScanPlan::PkRangeScan {
+                    start_key,
+                    range_conds,
+                    ..
+                } => {
+                    let range_conds = range_conds.clone();
+                    let mut scan_err: Option<SqlError> = None;
+                    wtx.table_scan_from(lower_name.as_bytes(), start_key, |key, value| {
+                        let in_range = range_in_bounds(
+                            key,
+                            single_int_pk,
+                            num_pk_cols,
+                            &range_conds,
+                            &mut scan_err,
+                        );
+                        match in_range {
+                            RangeStatus::Stop => Ok(false),
+                            RangeStatus::Skip => Ok(true),
+                            RangeStatus::Hit => {
+                                kv_pairs.push((key.to_vec(), value.to_vec()));
+                                Ok(true)
+                            }
+                            RangeStatus::Err => Ok(false),
+                        }
+                    })
+                    .map_err(SqlError::Storage)?;
+                    if let Some(e) = scan_err {
+                        return Err(e);
                     }
                 }
                 _ => {
@@ -763,6 +1096,14 @@ pub(super) fn exec_update(
                     std::mem::swap(raw_value, &mut patch_buf);
                 }
             }
+            apply_gen_col_patches_vec(
+                raw_value,
+                &mut partial_row,
+                &gen_targets,
+                &gen_extra_cols,
+                &col_map,
+                &mut patch_buf,
+            )?;
             patched.push((std::mem::take(key), std::mem::take(raw_value)));
         }
 
@@ -809,6 +1150,20 @@ pub(super) fn exec_update(
 
     let mut changes: Vec<UpdateChange> = Vec::new();
 
+    let stored_gen_cols: Vec<&ColumnDef> = if has_stored_generated {
+        table_schema
+            .columns
+            .iter()
+            .filter(|c| matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let non_pk = table_schema.non_pk_indices();
+    let enc_pos = table_schema.encoding_positions();
+    let phys_count = table_schema.physical_non_pk_count();
+    let mut value_values = vec![Value::Null; phys_count];
+
     for (old_key, row) in &matching_rows {
         let mut new_row = row.clone();
 
@@ -817,8 +1172,11 @@ pub(super) fn exec_update(
             let col_idx = table_schema
                 .column_index(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-            let new_val = eval_expr(expr, &EvalCtx::new(&col_map, row))?;
             let col = &table_schema.columns[col_idx];
+            if col.generated_kind.is_some() {
+                return Err(SqlError::CannotUpdateGeneratedColumn(col.name.clone()));
+            }
+            let new_val = eval_expr(expr, &EvalCtx::new(&col_map, row))?;
 
             let got_type = new_val.data_type();
             let coerced = if new_val.is_null() {
@@ -840,6 +1198,27 @@ pub(super) fn exec_update(
 
         for (col_idx, coerced) in evaluated {
             new_row[col_idx] = coerced;
+        }
+
+        for col in &stored_gen_cols {
+            let val = eval_expr(
+                col.generated_expr.as_ref().unwrap(),
+                &EvalCtx::new(&col_map, &new_row),
+            )?;
+            let pos = col.position as usize;
+            new_row[pos] = if val.is_null() {
+                if !col.nullable {
+                    return Err(SqlError::NotNullViolation(col.name.clone()));
+                }
+                Value::Null
+            } else {
+                let got_type = val.data_type();
+                val.coerce_into(col.data_type)
+                    .ok_or_else(|| SqlError::TypeMismatch {
+                        expected: col.data_type.to_string(),
+                        got: got_type.to_string(),
+                    })?
+            };
         }
 
         if table_schema.has_checks() {
@@ -864,12 +1243,19 @@ pub(super) fn exec_update(
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| new_row[i].clone()).collect();
         let new_key = encode_composite_key(&pk_values);
 
-        let non_pk = table_schema.non_pk_indices();
-        let enc_pos = table_schema.encoding_positions();
-        let phys_count = table_schema.physical_non_pk_count();
-        let mut value_values = vec![Value::Null; phys_count];
+        for v in value_values.iter_mut() {
+            *v = Value::Null;
+        }
         for (j, &i) in non_pk.iter().enumerate() {
-            value_values[enc_pos[j] as usize] = new_row[i].clone();
+            let col = &table_schema.columns[i];
+            value_values[enc_pos[j] as usize] = if matches!(
+                col.generated_kind,
+                Some(crate::parser::GeneratedKind::Virtual)
+            ) {
+                Value::Null
+            } else {
+                new_row[i].clone()
+            };
         }
         let new_value = encode_row(&value_values);
 
@@ -884,8 +1270,7 @@ pub(super) fn exec_update(
     }
 
     {
-        use std::collections::HashSet;
-        let mut new_keys: HashSet<Vec<u8>> = HashSet::new();
+        let mut new_keys: rustc_hash::FxHashSet<Vec<u8>> = rustc_hash::FxHashSet::default();
         for c in &changes {
             if c.pk_changed && c.new_key != c.old_key && !new_keys.insert(c.new_key.clone()) {
                 return Err(SqlError::DuplicateKey);
@@ -1085,7 +1470,7 @@ pub(super) fn exec_delete(
         let pk_indices = table_schema.pk_indices();
         let pk_values: Vec<Value> = rows.iter().map(|row| row[pk_indices[0]].clone()).collect();
         let pk_col = &table_schema.columns[pk_indices[0]].name;
-        let in_set: std::collections::HashSet<Value> = pk_values.into_iter().collect();
+        let in_set: rustc_hash::FxHashSet<Value> = pk_values.into_iter().collect();
         let new_where = if in_set.is_empty() {
             Some(Expr::Literal(Value::Boolean(false)))
         } else {
@@ -1305,7 +1690,6 @@ pub(super) fn exec_select_in_txn(
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
 
-    // Correlated subquery handling (in-txn)
     let corr_ctx = CorrelationCtx {
         outer_schema: table_schema,
         outer_alias: stmt.from_alias.as_deref(),
@@ -1404,6 +1788,628 @@ pub(super) fn exec_select_in_txn(
     super::process_select(&table_schema.columns, rows, stmt, predicate_applied)
 }
 
+fn exec_update_in_txn_compiled(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &UpdateStmt,
+    compiled: &CompiledUpdate,
+    bufs: &mut UpdateBufs,
+) -> Result<ExecutionResult> {
+    if compiled.is_view {
+        return Err(SqlError::CannotModifyView(stmt.table.clone()));
+    }
+    if compiled.has_correlated_where || compiled.has_subquery || !compiled.can_fast_path {
+        return exec_update_in_txn(wtx, schema, stmt);
+    }
+    let fast = match &compiled.fast {
+        Some(f) => f,
+        None => return exec_update_in_txn(wtx, schema, stmt),
+    };
+
+    let table_schema = schema
+        .get(&compiled.table_name_lower)
+        .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+
+    if stmt.returning.is_some() {
+        return exec_update_in_txn(wtx, schema, stmt);
+    }
+
+    let single_int_pk = fast.single_int_pk;
+    let num_pk_cols = fast.num_pk_cols;
+    let pk_idx_cache = &fast.pk_idx_cache;
+    let col_map = &fast.col_map;
+    let targets = &fast.targets;
+    let gen_targets = &fast.gen_targets;
+    let gen_extra_cols = &fast.gen_extra_cols;
+
+    bufs.partial_row.clear();
+    bufs.partial_row.resize(fast.num_columns, Value::Null);
+
+    if let Some(ref pkl) = fast.pk_lookup_fast {
+        let pk_value = match &pkl.source {
+            PkLookupSource::Literal(v) => v.clone(),
+            PkLookupSource::Parameter(n) => crate::eval::resolve_scoped_param(*n)?,
+        };
+        return exec_pk_lookup_update(
+            wtx,
+            &compiled.table_name_lower,
+            &pk_value,
+            pk_idx_cache,
+            col_map,
+            targets,
+            gen_targets,
+            gen_extra_cols,
+            bufs,
+        );
+    }
+
+    let plan = crate::planner::plan_select(table_schema, &stmt.where_clause);
+
+    let set_cols_safe = targets
+        .iter()
+        .all(|t| !t.col.nullable && is_fixed_width_type(t.col.data_type));
+    let gen_cols_safe = gen_targets
+        .iter()
+        .all(|g| !g.col.nullable && is_fixed_width_type(g.col.data_type));
+    let patch_safe = set_cols_safe && gen_cols_safe;
+
+    if let (
+        true,
+        crate::planner::ScanPlan::PkRangeScan {
+            start_key,
+            range_conds,
+            ..
+        },
+    ) = (patch_safe, &plan)
+    {
+        let range_conds = range_conds.clone();
+        let partial_row = &mut bufs.partial_row;
+        let patch_buf = &mut bufs.patch_buf;
+
+        let count = wtx.table_update_range::<_, SqlError>(
+            compiled.table_name_lower.as_bytes(),
+            start_key,
+            |key, value| {
+                if single_int_pk {
+                    let pk_int = Value::Integer(decode_pk_integer(key)?);
+                    for (op, bound) in &range_conds {
+                        match op {
+                            BinOp::Lt if &pk_int >= bound => return Ok(None),
+                            BinOp::LtEq if &pk_int > bound => return Ok(None),
+                            BinOp::Gt if &pk_int <= bound => return Ok(Some(false)),
+                            BinOp::GtEq if &pk_int < bound => return Ok(Some(false)),
+                            _ => {}
+                        }
+                    }
+                    partial_row[pk_idx_cache[0]] = pk_int;
+                } else {
+                    let pk_vals = decode_composite_key(key, num_pk_cols)?;
+                    for (op, bound) in &range_conds {
+                        match op {
+                            BinOp::Lt if &pk_vals[0] >= bound => return Ok(None),
+                            BinOp::LtEq if &pk_vals[0] > bound => return Ok(None),
+                            BinOp::Gt if &pk_vals[0] <= bound => return Ok(Some(false)),
+                            BinOp::GtEq if &pk_vals[0] < bound => return Ok(Some(false)),
+                            _ => {}
+                        }
+                    }
+                    for (i, &pi) in pk_idx_cache.iter().enumerate() {
+                        partial_row[pi] = pk_vals[i].clone();
+                    }
+                }
+                for target in targets {
+                    partial_row[target.schema_idx] =
+                        decode_column_raw(value, target.phys_idx)?.to_value();
+                }
+                for target in targets {
+                    let new_val = compiled_target_eval(target, partial_row, col_map)?;
+                    let coerced = coerce_gen_value(new_val, &target.col)?;
+                    if !patch_column_in_place(value, target.phys_idx, &coerced)? {
+                        patch_row_column(value, target.phys_idx, &coerced, patch_buf)?;
+                        value[..patch_buf.len()].copy_from_slice(patch_buf);
+                    }
+                }
+                apply_gen_col_patches_slice(
+                    value,
+                    partial_row,
+                    gen_targets,
+                    gen_extra_cols,
+                    col_map,
+                    patch_buf,
+                )?;
+                Ok(Some(true))
+            },
+        )?;
+        return Ok(ExecutionResult::RowsAffected(count));
+    }
+
+    if let crate::planner::ScanPlan::PkLookup { pk_values } = &plan {
+        let key = encode_composite_key(pk_values);
+        let mut raw_value = match wtx
+            .table_get(compiled.table_name_lower.as_bytes(), &key)
+            .map_err(SqlError::Storage)?
+        {
+            Some(v) => v,
+            None => return Ok(ExecutionResult::RowsAffected(0)),
+        };
+        let partial_row = &mut bufs.partial_row;
+        let patch_buf = &mut bufs.patch_buf;
+        if single_int_pk {
+            partial_row[pk_idx_cache[0]] = Value::Integer(decode_pk_integer(&key)?);
+        } else {
+            let pk_vals = decode_composite_key(&key, num_pk_cols)?;
+            for (i, &pi) in pk_idx_cache.iter().enumerate() {
+                partial_row[pi] = pk_vals[i].clone();
+            }
+        }
+        for target in targets {
+            partial_row[target.schema_idx] =
+                decode_column_raw(&raw_value, target.phys_idx)?.to_value();
+        }
+        for target in targets {
+            let new_val = compiled_target_eval(target, partial_row, col_map)?;
+            let coerced = coerce_gen_value(new_val, &target.col)?;
+            if !patch_column_in_place(&mut raw_value, target.phys_idx, &coerced)? {
+                patch_row_column(&raw_value, target.phys_idx, &coerced, patch_buf)?;
+                std::mem::swap(&mut raw_value, patch_buf);
+            }
+        }
+        apply_gen_col_patches_vec(
+            &mut raw_value,
+            partial_row,
+            gen_targets,
+            gen_extra_cols,
+            col_map,
+            patch_buf,
+        )?;
+        wtx.table_insert(compiled.table_name_lower.as_bytes(), &key, &raw_value)
+            .map_err(SqlError::Storage)?;
+        return Ok(ExecutionResult::RowsAffected(1));
+    }
+
+    bufs.kv_pairs.clear();
+    bufs.patched.clear();
+    match &plan {
+        crate::planner::ScanPlan::PkRangeScan {
+            start_key,
+            range_conds,
+            ..
+        } => {
+            let range_conds = range_conds.clone();
+            let mut scan_err: Option<SqlError> = None;
+            let kv_pairs = &mut bufs.kv_pairs;
+            wtx.table_scan_from(
+                compiled.table_name_lower.as_bytes(),
+                start_key,
+                |key, value| {
+                    let in_range = range_in_bounds(
+                        key,
+                        single_int_pk,
+                        num_pk_cols,
+                        &range_conds,
+                        &mut scan_err,
+                    );
+                    match in_range {
+                        RangeStatus::Stop => Ok(false),
+                        RangeStatus::Skip => Ok(true),
+                        RangeStatus::Hit => {
+                            kv_pairs.push((key.to_vec(), value.to_vec()));
+                            Ok(true)
+                        }
+                        RangeStatus::Err => Ok(false),
+                    }
+                },
+            )
+            .map_err(SqlError::Storage)?;
+            if let Some(e) = scan_err {
+                return Err(e);
+            }
+        }
+        crate::planner::ScanPlan::SeqScan => {
+            let kv_pairs = &mut bufs.kv_pairs;
+            wtx.table_for_each(compiled.table_name_lower.as_bytes(), |key, value| {
+                kv_pairs.push((key.to_vec(), value.to_vec()));
+                Ok(())
+            })
+            .map_err(SqlError::Storage)?;
+        }
+        _ => return exec_update_in_txn(wtx, schema, stmt),
+    }
+
+    let partial_row = &mut bufs.partial_row;
+    let patch_buf = &mut bufs.patch_buf;
+
+    for (key, raw_value) in bufs.kv_pairs.iter_mut() {
+        if matches!(plan, crate::planner::ScanPlan::SeqScan) {
+            if let Some(ref w) = stmt.where_clause {
+                let row = decode_full_row(table_schema, key, raw_value)?;
+                if !eval_expr(w, &EvalCtx::new(col_map, &row)).is_ok_and(|v| is_truthy(&v)) {
+                    continue;
+                }
+            }
+        }
+        if single_int_pk {
+            partial_row[pk_idx_cache[0]] = Value::Integer(decode_pk_integer(key)?);
+        } else {
+            let pk_vals = decode_composite_key(key, num_pk_cols)?;
+            for (i, &pi) in pk_idx_cache.iter().enumerate() {
+                partial_row[pi] = pk_vals[i].clone();
+            }
+        }
+        for target in targets {
+            partial_row[target.schema_idx] =
+                decode_column_raw(raw_value, target.phys_idx)?.to_value();
+        }
+        for target in targets {
+            let new_val = compiled_target_eval(target, partial_row, col_map)?;
+            let coerced = coerce_gen_value(new_val, &target.col)?;
+            if !patch_column_in_place(raw_value, target.phys_idx, &coerced)? {
+                patch_row_column(raw_value, target.phys_idx, &coerced, patch_buf)?;
+                std::mem::swap(raw_value, patch_buf);
+            }
+        }
+        apply_gen_col_patches_vec(
+            raw_value,
+            partial_row,
+            gen_targets,
+            gen_extra_cols,
+            col_map,
+            patch_buf,
+        )?;
+        bufs.patched
+            .push((std::mem::take(key), std::mem::take(raw_value)));
+    }
+
+    if !bufs.patched.is_empty() {
+        let refs: Vec<(&[u8], &[u8])> = bufs
+            .patched
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        wtx.table_update_sorted(compiled.table_name_lower.as_bytes(), &refs)
+            .map_err(SqlError::Storage)?;
+    }
+    Ok(ExecutionResult::RowsAffected(bufs.patched.len() as u64))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exec_pk_lookup_update(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    table_name_lower: &str,
+    pk_value: &Value,
+    pk_idx_cache: &[usize],
+    col_map: &ColumnMap,
+    targets: &[CompiledTarget],
+    gen_targets: &[GenColPatch],
+    gen_extra_cols: &[(usize, usize)],
+    bufs: &mut UpdateBufs,
+) -> Result<ExecutionResult> {
+    let key = encode_composite_key(std::slice::from_ref(pk_value));
+    let mut raw_value = match wtx
+        .table_get(table_name_lower.as_bytes(), &key)
+        .map_err(SqlError::Storage)?
+    {
+        Some(v) => v,
+        None => return Ok(ExecutionResult::RowsAffected(0)),
+    };
+    let partial_row = &mut bufs.partial_row;
+    let patch_buf = &mut bufs.patch_buf;
+    partial_row[pk_idx_cache[0]] = pk_value.clone();
+    for target in targets {
+        partial_row[target.schema_idx] = decode_column_raw(&raw_value, target.phys_idx)?.to_value();
+    }
+    for target in targets {
+        let new_val = compiled_target_eval(target, partial_row, col_map)?;
+        let coerced = coerce_gen_value(new_val, &target.col)?;
+        if !patch_column_in_place(&mut raw_value, target.phys_idx, &coerced)? {
+            patch_row_column(&raw_value, target.phys_idx, &coerced, patch_buf)?;
+            std::mem::swap(&mut raw_value, patch_buf);
+        }
+    }
+    apply_gen_col_patches_vec(
+        &mut raw_value,
+        partial_row,
+        gen_targets,
+        gen_extra_cols,
+        col_map,
+        patch_buf,
+    )?;
+    wtx.table_insert(table_name_lower.as_bytes(), &key, &raw_value)
+        .map_err(SqlError::Storage)?;
+    Ok(ExecutionResult::RowsAffected(1))
+}
+
+fn compiled_target_eval(
+    target: &CompiledTarget,
+    partial_row: &[Value],
+    col_map: &ColumnMap,
+) -> Result<Value> {
+    let generic = || eval_expr(&target.expr, &EvalCtx::new(col_map, partial_row));
+    match target.fast_eval {
+        FastEval::IntAdd(n) => match partial_row[target.schema_idx] {
+            Value::Integer(v) => Ok(Value::Integer(v.wrapping_add(n))),
+            _ => generic(),
+        },
+        FastEval::IntSub(n) => match partial_row[target.schema_idx] {
+            Value::Integer(v) => Ok(Value::Integer(v.wrapping_sub(n))),
+            _ => generic(),
+        },
+        FastEval::IntMul(n) => match partial_row[target.schema_idx] {
+            Value::Integer(v) => Ok(Value::Integer(v.wrapping_mul(n))),
+            _ => generic(),
+        },
+        FastEval::IntSet(n) => Ok(Value::Integer(n)),
+        FastEval::IntAddParam(p) => match (resolve_int_param(p), &partial_row[target.schema_idx]) {
+            (Some(n), Value::Integer(v)) => Ok(Value::Integer(v.wrapping_add(n))),
+            _ => generic(),
+        },
+        FastEval::IntSubParam(p) => match (resolve_int_param(p), &partial_row[target.schema_idx]) {
+            (Some(n), Value::Integer(v)) => Ok(Value::Integer(v.wrapping_sub(n))),
+            _ => generic(),
+        },
+        FastEval::IntMulParam(p) => match (resolve_int_param(p), &partial_row[target.schema_idx]) {
+            (Some(n), Value::Integer(v)) => Ok(Value::Integer(v.wrapping_mul(n))),
+            _ => generic(),
+        },
+        FastEval::IntSetParam(p) => match resolve_int_param(p) {
+            Some(n) => Ok(Value::Integer(n)),
+            None => generic(),
+        },
+        FastEval::None => generic(),
+    }
+}
+
+fn try_fast_update_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &UpdateStmt,
+    table_schema: &TableSchema,
+    col_map: &ColumnMap,
+) -> Result<Option<ExecutionResult>> {
+    let lower_name = stmt.table.to_ascii_lowercase();
+    let pk_changed_by_set = stmt.assignments.iter().any(|(col_name, _)| {
+        table_schema
+            .column_index(col_name)
+            .is_some_and(|idx| table_schema.primary_key_columns.contains(&(idx as u16)))
+    });
+    let has_fk = !table_schema.foreign_keys.is_empty();
+    let has_indices = !table_schema.indices.is_empty();
+    let has_child_fk = !schema.child_fks_for(&lower_name).is_empty();
+    if pk_changed_by_set
+        || has_fk
+        || has_indices
+        || has_child_fk
+        || table_schema.has_checks()
+        || stmt.returning.is_some()
+    {
+        return Ok(None);
+    }
+
+    let non_pk = table_schema.non_pk_indices();
+    let enc_pos = table_schema.encoding_positions();
+    let num_pk_cols = table_schema.primary_key_columns.len();
+
+    struct AssignTarget {
+        schema_idx: usize,
+        phys_idx: usize,
+        expr: Expr,
+        col: ColumnDef,
+    }
+    let mut targets: Vec<AssignTarget> = Vec::with_capacity(stmt.assignments.len());
+    for (col_name, expr) in &stmt.assignments {
+        let schema_idx = table_schema
+            .column_index(col_name)
+            .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
+        let col = &table_schema.columns[schema_idx];
+        if col.generated_kind.is_some() {
+            return Err(SqlError::CannotUpdateGeneratedColumn(col.name.clone()));
+        }
+        let nonpk_order = non_pk
+            .iter()
+            .position(|&i| i == schema_idx)
+            .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
+        let phys_idx = enc_pos[nonpk_order] as usize;
+        targets.push(AssignTarget {
+            schema_idx,
+            phys_idx,
+            expr: expr.clone(),
+            col: col.clone(),
+        });
+    }
+
+    let plan = crate::planner::plan_select(table_schema, &stmt.where_clause);
+    let single_int_pk = num_pk_cols == 1
+        && table_schema.columns[table_schema.primary_key_columns[0] as usize].data_type
+            == DataType::Integer;
+
+    let pk_idx_cache = table_schema.pk_indices().to_vec();
+    let set_target_indices: Vec<usize> = targets.iter().map(|t| t.schema_idx).collect();
+    let (gen_targets, gen_extra_cols) =
+        compute_gen_col_targets(table_schema, &set_target_indices, &pk_idx_cache);
+
+    let set_cols: Vec<ColumnDef> = targets.iter().map(|t| t.col.clone()).collect();
+    let gen_cols: Vec<ColumnDef> = gen_targets.iter().map(|g| g.col.clone()).collect();
+    let patch_safe = pk_range_patch_safe(&set_cols, &gen_cols);
+
+    if let (
+        true,
+        crate::planner::ScanPlan::PkRangeScan {
+            start_key,
+            range_conds,
+            ..
+        },
+    ) = (patch_safe, &plan)
+    {
+        let range_conds = range_conds.clone();
+        let mut partial_row = vec![Value::Null; table_schema.columns.len()];
+        let mut patch_buf: Vec<u8> = Vec::with_capacity(256);
+
+        let count = wtx.table_update_range::<_, SqlError>(
+            lower_name.as_bytes(),
+            start_key,
+            |key, value| {
+                if single_int_pk {
+                    let pk_int = Value::Integer(decode_pk_integer(key)?);
+                    for (op, bound) in &range_conds {
+                        match op {
+                            BinOp::Lt if &pk_int >= bound => return Ok(None),
+                            BinOp::LtEq if &pk_int > bound => return Ok(None),
+                            BinOp::Gt if &pk_int <= bound => return Ok(Some(false)),
+                            BinOp::GtEq if &pk_int < bound => return Ok(Some(false)),
+                            _ => {}
+                        }
+                    }
+                } else {
+                    let pk_vals = decode_composite_key(key, num_pk_cols)?;
+                    for (op, bound) in &range_conds {
+                        match op {
+                            BinOp::Lt if &pk_vals[0] >= bound => return Ok(None),
+                            BinOp::LtEq if &pk_vals[0] > bound => return Ok(None),
+                            BinOp::Gt if &pk_vals[0] <= bound => return Ok(Some(false)),
+                            BinOp::GtEq if &pk_vals[0] < bound => return Ok(Some(false)),
+                            _ => {}
+                        }
+                    }
+                }
+
+                if single_int_pk {
+                    partial_row[pk_idx_cache[0]] = Value::Integer(decode_pk_integer(key)?);
+                } else {
+                    let pk_vals = decode_composite_key(key, num_pk_cols)?;
+                    for (i, &pi) in pk_idx_cache.iter().enumerate() {
+                        partial_row[pi] = pk_vals[i].clone();
+                    }
+                }
+                for target in &targets {
+                    partial_row[target.schema_idx] =
+                        decode_column_raw(value, target.phys_idx)?.to_value();
+                }
+                for target in &targets {
+                    let new_val = eval_expr(&target.expr, &EvalCtx::new(col_map, &partial_row))?;
+                    let coerced = coerce_gen_value(new_val, &target.col)?;
+                    partial_row[target.schema_idx] = coerced.clone();
+                    if !patch_column_in_place(value, target.phys_idx, &coerced)? {
+                        patch_row_column(value, target.phys_idx, &coerced, &mut patch_buf)?;
+                        value[..patch_buf.len()].copy_from_slice(&patch_buf);
+                    }
+                }
+                apply_gen_col_patches_slice(
+                    value,
+                    &mut partial_row,
+                    &gen_targets,
+                    &gen_extra_cols,
+                    col_map,
+                    &mut patch_buf,
+                )?;
+                Ok(Some(true))
+            },
+        )?;
+        return Ok(Some(ExecutionResult::RowsAffected(count)));
+    }
+
+    let mut kv_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    match &plan {
+        crate::planner::ScanPlan::PkLookup { pk_values } => {
+            let key = encode_composite_key(pk_values);
+            if let Some(value) = wtx
+                .table_get(lower_name.as_bytes(), &key)
+                .map_err(SqlError::Storage)?
+            {
+                kv_pairs.push((key, value));
+            }
+        }
+        crate::planner::ScanPlan::PkRangeScan {
+            start_key,
+            range_conds,
+            ..
+        } => {
+            let range_conds = range_conds.clone();
+            let mut scan_err: Option<SqlError> = None;
+            wtx.table_scan_from(lower_name.as_bytes(), start_key, |key, value| {
+                let in_range =
+                    range_in_bounds(key, single_int_pk, num_pk_cols, &range_conds, &mut scan_err);
+                match in_range {
+                    RangeStatus::Stop => Ok(false),
+                    RangeStatus::Skip => Ok(true),
+                    RangeStatus::Hit => {
+                        kv_pairs.push((key.to_vec(), value.to_vec()));
+                        Ok(true)
+                    }
+                    RangeStatus::Err => Ok(false),
+                }
+            })
+            .map_err(SqlError::Storage)?;
+            if let Some(e) = scan_err {
+                return Err(e);
+            }
+        }
+        crate::planner::ScanPlan::SeqScan => {
+            wtx.table_for_each(lower_name.as_bytes(), |key, value| {
+                kv_pairs.push((key.to_vec(), value.to_vec()));
+                Ok(())
+            })
+            .map_err(SqlError::Storage)?;
+        }
+        _ => return Ok(None),
+    }
+
+    let mut patch_buf: Vec<u8> = Vec::with_capacity(256);
+    let mut partial_row = vec![Value::Null; table_schema.columns.len()];
+    let mut patched: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(kv_pairs.len());
+
+    for (key, raw_value) in &mut kv_pairs {
+        if matches!(plan, crate::planner::ScanPlan::SeqScan) {
+            if let Some(ref w) = stmt.where_clause {
+                let row = decode_full_row(table_schema, key, raw_value)?;
+                if !eval_expr(w, &EvalCtx::new(col_map, &row)).is_ok_and(|v| is_truthy(&v)) {
+                    continue;
+                }
+            }
+        }
+        if single_int_pk {
+            partial_row[pk_idx_cache[0]] = Value::Integer(decode_pk_integer(key)?);
+        } else {
+            let pk_vals = decode_composite_key(key, num_pk_cols)?;
+            for (i, &pi) in pk_idx_cache.iter().enumerate() {
+                partial_row[pi] = pk_vals[i].clone();
+            }
+        }
+        for target in &targets {
+            partial_row[target.schema_idx] =
+                decode_column_raw(raw_value, target.phys_idx)?.to_value();
+        }
+        for target in &targets {
+            let new_val = eval_expr(&target.expr, &EvalCtx::new(col_map, &partial_row))?;
+            let coerced = coerce_gen_value(new_val, &target.col)?;
+            partial_row[target.schema_idx] = coerced.clone();
+            if !patch_column_in_place(raw_value, target.phys_idx, &coerced)? {
+                patch_row_column(raw_value, target.phys_idx, &coerced, &mut patch_buf)?;
+                std::mem::swap(raw_value, &mut patch_buf);
+            }
+        }
+        apply_gen_col_patches_vec(
+            raw_value,
+            &mut partial_row,
+            &gen_targets,
+            &gen_extra_cols,
+            col_map,
+            &mut patch_buf,
+        )?;
+        patched.push((std::mem::take(key), std::mem::take(raw_value)));
+    }
+
+    if !patched.is_empty() {
+        let refs: Vec<(&[u8], &[u8])> = patched
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        wtx.table_update_sorted(lower_name.as_bytes(), &refs)
+            .map_err(SqlError::Storage)?;
+    }
+    let count = patched.len() as u64;
+    Ok(Some(ExecutionResult::RowsAffected(count)))
+}
+
 pub(super) fn exec_update_in_txn(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &SchemaManager,
@@ -1425,6 +2431,11 @@ pub(super) fn exec_update_in_txn(
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
     let col_map = ColumnMap::new(&table_schema.columns);
+
+    if let Some(result) = try_fast_update_in_txn(wtx, schema, stmt, table_schema, &col_map)? {
+        return Ok(result);
+    }
+
     let all_candidates = collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?;
     let matching_rows: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
         .into_iter()
@@ -1457,6 +2468,16 @@ pub(super) fn exec_update_in_txn(
     let pk_indices = table_schema.pk_indices();
     let mut changes: Vec<UpdateChange> = Vec::new();
 
+    let stored_gen_cols: Vec<&ColumnDef> = table_schema
+        .columns
+        .iter()
+        .filter(|c| matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored)))
+        .collect();
+    let non_pk = table_schema.non_pk_indices();
+    let enc_pos = table_schema.encoding_positions();
+    let phys_count = table_schema.physical_non_pk_count();
+    let mut value_values = vec![Value::Null; phys_count];
+
     for (old_key, row) in &matching_rows {
         let mut new_row = row.clone();
         let mut pk_changed = false;
@@ -1467,8 +2488,11 @@ pub(super) fn exec_update_in_txn(
             let col_idx = table_schema
                 .column_index(col_name)
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))?;
-            let new_val = eval_expr(expr, &EvalCtx::new(&col_map, row))?;
             let col = &table_schema.columns[col_idx];
+            if col.generated_kind.is_some() {
+                return Err(SqlError::CannotUpdateGeneratedColumn(col.name.clone()));
+            }
+            let new_val = eval_expr(expr, &EvalCtx::new(&col_map, row))?;
 
             let got_type = new_val.data_type();
             let coerced = if new_val.is_null() {
@@ -1495,6 +2519,27 @@ pub(super) fn exec_update_in_txn(
             new_row[col_idx] = coerced;
         }
 
+        for col in &stored_gen_cols {
+            let val = eval_expr(
+                col.generated_expr.as_ref().unwrap(),
+                &EvalCtx::new(&col_map, &new_row),
+            )?;
+            let pos = col.position as usize;
+            new_row[pos] = if val.is_null() {
+                if !col.nullable {
+                    return Err(SqlError::NotNullViolation(col.name.clone()));
+                }
+                Value::Null
+            } else {
+                let got_type = val.data_type();
+                val.coerce_into(col.data_type)
+                    .ok_or_else(|| SqlError::TypeMismatch {
+                        expected: col.data_type.to_string(),
+                        got: got_type.to_string(),
+                    })?
+            };
+        }
+
         if table_schema.has_checks() {
             for col in &table_schema.columns {
                 if let Some(ref check) = col.check_expr {
@@ -1517,12 +2562,19 @@ pub(super) fn exec_update_in_txn(
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| new_row[i].clone()).collect();
         let new_key = encode_composite_key(&pk_values);
 
-        let non_pk = table_schema.non_pk_indices();
-        let enc_pos = table_schema.encoding_positions();
-        let phys_count = table_schema.physical_non_pk_count();
-        let mut value_values = vec![Value::Null; phys_count];
+        for v in value_values.iter_mut() {
+            *v = Value::Null;
+        }
         for (j, &i) in non_pk.iter().enumerate() {
-            value_values[enc_pos[j] as usize] = new_row[i].clone();
+            let col = &table_schema.columns[i];
+            value_values[enc_pos[j] as usize] = if matches!(
+                col.generated_kind,
+                Some(crate::parser::GeneratedKind::Virtual)
+            ) {
+                Value::Null
+            } else {
+                new_row[i].clone()
+            };
         }
         let new_value = encode_row(&value_values);
 
@@ -1537,8 +2589,7 @@ pub(super) fn exec_update_in_txn(
     }
 
     {
-        use std::collections::HashSet;
-        let mut new_keys: HashSet<Vec<u8>> = HashSet::new();
+        let mut new_keys: rustc_hash::FxHashSet<Vec<u8>> = rustc_hash::FxHashSet::default();
         for c in &changes {
             if c.pk_changed && c.new_key != c.old_key && !new_keys.insert(c.new_key.clone()) {
                 return Err(SqlError::DuplicateKey);

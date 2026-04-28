@@ -65,6 +65,14 @@ pub(super) fn exec_insert(
         })
         .collect::<Result<_>>()?;
 
+    for &ci in &col_indices {
+        if table_schema.columns[ci].generated_kind.is_some() {
+            return Err(SqlError::CannotInsertIntoGeneratedColumn(
+                table_schema.columns[ci].name.clone(),
+            ));
+        }
+    }
+
     let defaults: Vec<(usize, &Expr)> = table_schema
         .columns
         .iter()
@@ -72,8 +80,19 @@ pub(super) fn exec_insert(
         .map(|c| (c.position as usize, c.default_expr.as_ref().unwrap()))
         .collect();
 
-    // ColumnMap for CHECK evaluation
+    let generated_cols: Vec<(usize, &Expr)> = table_schema
+        .columns
+        .iter()
+        .filter(|c| matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored)))
+        .map(|c| (c.position as usize, c.generated_expr.as_ref().unwrap()))
+        .collect();
+
     let has_checks = table_schema.has_checks();
+    let row_col_map_for_gen = if !generated_cols.is_empty() {
+        Some(ColumnMap::new(&table_schema.columns))
+    } else {
+        None
+    };
     let check_col_map = if has_checks {
         Some(ColumnMap::new(&table_schema.columns))
     } else {
@@ -198,9 +217,7 @@ pub(super) fn exec_insert(
         for &(pos, def_expr) in &defaults {
             let val = eval_const_expr(def_expr)?;
             let col = &table_schema.columns[pos];
-            if val.is_null() {
-                // row[pos] already Null from init
-            } else {
+            if !val.is_null() {
                 let got_type = val.data_type();
                 row[pos] =
                     val.coerce_into(col.data_type)
@@ -208,6 +225,23 @@ pub(super) fn exec_insert(
                             expected: col.data_type.to_string(),
                             got: got_type.to_string(),
                         })?;
+            }
+        }
+
+        if let Some(ref gen_map) = row_col_map_for_gen {
+            for &(pos, gen_expr) in &generated_cols {
+                let val = eval_expr(gen_expr, &EvalCtx::new(gen_map, &row))?;
+                let col = &table_schema.columns[pos];
+                row[pos] = if val.is_null() {
+                    Value::Null
+                } else {
+                    let got_type = val.data_type();
+                    val.coerce_into(col.data_type)
+                        .ok_or_else(|| SqlError::TypeMismatch {
+                            expected: col.data_type.to_string(),
+                            got: got_type.to_string(),
+                        })?
+                };
             }
         }
 
@@ -266,7 +300,16 @@ pub(super) fn exec_insert(
         encode_composite_key_into(&pk_values, &mut key_buf);
 
         for (j, &i) in non_pk.iter().enumerate() {
-            value_values[enc_pos[j] as usize] = std::mem::replace(&mut row[i], Value::Null);
+            let col = &table_schema.columns[i];
+            if matches!(
+                col.generated_kind,
+                Some(crate::parser::GeneratedKind::Virtual)
+            ) {
+                value_values[enc_pos[j] as usize] = Value::Null;
+                row[i] = Value::Null;
+            } else {
+                value_values[enc_pos[j] as usize] = std::mem::replace(&mut row[i], Value::Null);
+            }
         }
         encode_row_into(&value_values, &mut value_buf);
 
@@ -410,7 +453,7 @@ pub(super) fn materialize_expr(
             if !qr.columns.is_empty() && qr.columns.len() != 1 {
                 return Err(SqlError::SubqueryMultipleColumns);
             }
-            let mut values = std::collections::HashSet::new();
+            let mut values = rustc_hash::FxHashSet::default();
             let mut has_null = false;
             for row in &qr.rows {
                 if row[0].is_null() {
@@ -916,7 +959,7 @@ pub(super) fn apply_set_operation(
             rows
         }
         (SetOp::Union, false) => {
-            let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
+            let mut seen: rustc_hash::FxHashSet<Vec<Value>> = rustc_hash::FxHashSet::default();
             let mut rows = Vec::new();
             for row in left_qr.rows.into_iter().chain(right_qr.rows) {
                 if !seen.contains(&row) {
@@ -943,9 +986,8 @@ pub(super) fn apply_set_operation(
             rows
         }
         (SetOp::Intersect, false) => {
-            let right_set: std::collections::HashSet<Vec<Value>> =
-                right_qr.rows.into_iter().collect();
-            let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
+            let right_set: rustc_hash::FxHashSet<Vec<Value>> = right_qr.rows.into_iter().collect();
+            let mut seen: rustc_hash::FxHashSet<Vec<Value>> = rustc_hash::FxHashSet::default();
             let mut rows = Vec::new();
             for row in left_qr.rows {
                 if right_set.contains(&row) && !seen.contains(&row) {
@@ -973,9 +1015,8 @@ pub(super) fn apply_set_operation(
             rows
         }
         (SetOp::Except, false) => {
-            let right_set: std::collections::HashSet<Vec<Value>> =
-                right_qr.rows.into_iter().collect();
-            let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
+            let right_set: rustc_hash::FxHashSet<Vec<Value>> = right_qr.rows.into_iter().collect();
+            let mut seen: rustc_hash::FxHashSet<Vec<Value>> = rustc_hash::FxHashSet::default();
             let mut rows = Vec::new();
             for row in left_qr.rows {
                 if !right_set.contains(&row) && !seen.contains(&row) {
@@ -1002,6 +1043,9 @@ pub(super) fn apply_set_operation(
                 check_sql: None,
                 check_name: None,
                 is_with_timezone: false,
+                generated_expr: None,
+                generated_sql: None,
+                generated_kind: None,
             })
             .collect();
         sort_rows(&mut rows, &comp.order_by, &col_defs)?;
@@ -1148,6 +1192,51 @@ fn exec_insert_in_txn_impl(
         }
     }
 
+    if cache.is_none() {
+        for &ci in &bufs.col_indices {
+            if table_schema.columns[ci].generated_kind.is_some() {
+                return Err(SqlError::CannotInsertIntoGeneratedColumn(
+                    table_schema.columns[ci].name.clone(),
+                ));
+            }
+        }
+    }
+
+    let generated_cols_uncached: Vec<(usize, &Expr, FastGenEval)>;
+    let cached_gen_positions: &[usize];
+    let cached_gen_fast_evals: &[FastGenEval];
+    if let Some(c) = cache {
+        cached_gen_positions = &c.generated_col_positions;
+        cached_gen_fast_evals = &c.generated_fast_evals;
+        generated_cols_uncached = Vec::new();
+    } else {
+        cached_gen_positions = &[];
+        cached_gen_fast_evals = &[];
+        generated_cols_uncached = table_schema
+            .columns
+            .iter()
+            .filter(|c| matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored)))
+            .map(|c| {
+                let expr = c.generated_expr.as_ref().unwrap();
+                let fe = detect_fast_gen_eval(expr, table_schema);
+                (c.position as usize, expr, fe)
+            })
+            .collect();
+    }
+    let has_gen_cols = !cached_gen_positions.is_empty() || !generated_cols_uncached.is_empty();
+    let row_col_map_for_gen_owned: Option<ColumnMap> = if !has_gen_cols || cache.is_some() {
+        None
+    } else {
+        Some(ColumnMap::new(&table_schema.columns))
+    };
+    let row_col_map_for_gen: Option<&ColumnMap> = if !has_gen_cols {
+        None
+    } else if let Some(c) = cache {
+        c.row_col_map.as_ref()
+    } else {
+        row_col_map_for_gen_owned.as_ref()
+    };
+
     let any_defaults = match cache {
         Some(c) => c.any_defaults,
         None => table_schema
@@ -1178,11 +1267,29 @@ fn exec_insert_in_txn_impl(
         None
     };
 
-    let pk_indices = table_schema.pk_indices();
-    let non_pk = table_schema.non_pk_indices();
-    let enc_pos = table_schema.encoding_positions();
-    let phys_count = table_schema.physical_non_pk_count();
-    let dropped = table_schema.dropped_non_pk_slots();
+    let (pk_indices, non_pk, enc_pos, phys_count, dropped): (
+        &[usize],
+        &[usize],
+        &[u16],
+        usize,
+        &[u16],
+    ) = if let Some(c) = cache {
+        (
+            &c.pk_indices,
+            &c.non_pk_indices,
+            &c.encoding_positions,
+            c.phys_count,
+            &c.dropped_non_pk_slots,
+        )
+    } else {
+        (
+            table_schema.pk_indices(),
+            table_schema.non_pk_indices(),
+            table_schema.encoding_positions(),
+            table_schema.physical_non_pk_count(),
+            table_schema.dropped_non_pk_slots(),
+        )
+    };
 
     bufs.row.resize(table_schema.columns.len(), Value::Null);
     bufs.pk_values.resize(pk_indices.len(), Value::Null);
@@ -1247,41 +1354,74 @@ fn exec_insert_in_txn_impl(
         }
     }
 
+    let skip_row_clear = cache.is_some_and(|c| c.row_fully_overwritten);
     for idx in 0..total {
-        for v in bufs.row.iter_mut() {
-            *v = Value::Null;
+        if !skip_row_clear {
+            for v in bufs.row.iter_mut() {
+                *v = Value::Null;
+            }
         }
 
         if let Some(value_rows) = values {
-            let value_row = &value_rows[idx];
-            if value_row.len() != insert_columns.len() {
-                return Err(SqlError::InvalidValue(format!(
-                    "expected {} values, got {}",
-                    insert_columns.len(),
-                    value_row.len()
-                )));
-            }
-            for (i, expr) in value_row.iter().enumerate() {
-                let val = match expr {
-                    Expr::Parameter(n) => params
-                        .get(n - 1)
-                        .cloned()
-                        .ok_or_else(|| SqlError::Parse(format!("unbound parameter ${n}")))?,
-                    Expr::Literal(v) => v.clone(),
-                    _ => eval_const_expr(expr)?,
-                };
-                let col_idx = bufs.col_indices[i];
-                let col = &table_schema.columns[col_idx];
-                let got_type = val.data_type();
-                bufs.row[col_idx] = if val.is_null() {
-                    Value::Null
-                } else {
-                    val.coerce_into(col.data_type)
-                        .ok_or_else(|| SqlError::TypeMismatch {
-                            expected: col.data_type.to_string(),
-                            got: got_type.to_string(),
-                        })?
-                };
+            if let Some(plan) = cache.and_then(|c| c.bind_plan.as_ref()) {
+                for action in plan {
+                    match action {
+                        BindAction::Param {
+                            param_idx,
+                            col_idx,
+                            target,
+                        } => {
+                            let v = &params[*param_idx];
+                            bufs.row[*col_idx] = if v.is_null() {
+                                Value::Null
+                            } else if v.data_type() == *target {
+                                v.clone()
+                            } else {
+                                let got = v.data_type();
+                                v.clone().coerce_into(*target).ok_or_else(|| {
+                                    SqlError::TypeMismatch {
+                                        expected: target.to_string(),
+                                        got: got.to_string(),
+                                    }
+                                })?
+                            };
+                        }
+                        BindAction::Literal { value, col_idx } => {
+                            bufs.row[*col_idx] = value.clone();
+                        }
+                    }
+                }
+            } else {
+                let value_row = &value_rows[idx];
+                if value_row.len() != insert_columns.len() {
+                    return Err(SqlError::InvalidValue(format!(
+                        "expected {} values, got {}",
+                        insert_columns.len(),
+                        value_row.len()
+                    )));
+                }
+                for (i, expr) in value_row.iter().enumerate() {
+                    let val = match expr {
+                        Expr::Parameter(n) => params
+                            .get(n - 1)
+                            .cloned()
+                            .ok_or_else(|| SqlError::Parse(format!("unbound parameter ${n}")))?,
+                        Expr::Literal(v) => v.clone(),
+                        _ => eval_const_expr(expr)?,
+                    };
+                    let col_idx = bufs.col_indices[i];
+                    let col = &table_schema.columns[col_idx];
+                    let got_type = val.data_type();
+                    bufs.row[col_idx] = if val.is_null() {
+                        Value::Null
+                    } else {
+                        val.coerce_into(col.data_type)
+                            .ok_or_else(|| SqlError::TypeMismatch {
+                                expected: col.data_type.to_string(),
+                                got: got_type.to_string(),
+                            })?
+                    };
+                }
             }
         } else if let Some(sel) = sel_rows {
             let sel_row = &sel[idx];
@@ -1318,9 +1458,58 @@ fn exec_insert_in_txn_impl(
             }
         }
 
-        for col in &table_schema.columns {
-            if !col.nullable && bufs.row[col.position as usize].is_null() {
-                return Err(SqlError::NotNullViolation(col.name.clone()));
+        if let Some(gen_map) = row_col_map_for_gen {
+            if cache.is_some() {
+                for (pos, fast) in cached_gen_positions
+                    .iter()
+                    .copied()
+                    .zip(cached_gen_fast_evals.iter())
+                {
+                    let gen_expr = table_schema.columns[pos].generated_expr.as_ref().unwrap();
+                    let val = eval_fast_gen(fast, gen_expr, &bufs.row, gen_map)?;
+                    let col = &table_schema.columns[pos];
+                    bufs.row[pos] = if val.is_null() {
+                        Value::Null
+                    } else {
+                        let got_type = val.data_type();
+                        val.coerce_into(col.data_type)
+                            .ok_or_else(|| SqlError::TypeMismatch {
+                                expected: col.data_type.to_string(),
+                                got: got_type.to_string(),
+                            })?
+                    };
+                }
+            } else {
+                for (pos, gen_expr, fast) in &generated_cols_uncached {
+                    let val = eval_fast_gen(fast, gen_expr, &bufs.row, gen_map)?;
+                    let col = &table_schema.columns[*pos];
+                    bufs.row[*pos] = if val.is_null() {
+                        Value::Null
+                    } else {
+                        let got_type = val.data_type();
+                        val.coerce_into(col.data_type)
+                            .ok_or_else(|| SqlError::TypeMismatch {
+                                expected: col.data_type.to_string(),
+                                got: got_type.to_string(),
+                            })?
+                    };
+                }
+            }
+        }
+
+        if let Some(c) = cache {
+            for &pos in &c.not_null_indices {
+                if bufs.row[pos as usize].is_null() {
+                    return Err(SqlError::NotNullViolation(
+                        table_schema.columns[pos as usize].name.clone(),
+                    ));
+                }
+            }
+        } else {
+            for col in &table_schema.columns {
+                if !col.nullable && bufs.row[col.position as usize].is_null() {
+                    return Err(SqlError::NotNullViolation(col.name.clone()));
+                }
             }
         }
 
@@ -1372,16 +1561,38 @@ fn exec_insert_in_txn_impl(
         for (j, &i) in pk_indices.iter().enumerate() {
             bufs.pk_values[j] = std::mem::replace(&mut bufs.row[i], Value::Null);
         }
-        encode_composite_key_into(&bufs.pk_values, &mut bufs.key_buf);
+        match cache.map(|c| c.single_int_pk).unwrap_or(false) {
+            true => match bufs.pk_values[0] {
+                Value::Integer(v) => crate::encoding::encode_int_key_into(v, &mut bufs.key_buf),
+                _ => encode_composite_key_into(&bufs.pk_values, &mut bufs.key_buf),
+            },
+            false => encode_composite_key_into(&bufs.pk_values, &mut bufs.key_buf),
+        }
 
         for &slot in dropped {
             bufs.value_values[slot as usize] = Value::Null;
         }
         for (j, &i) in non_pk.iter().enumerate() {
-            bufs.value_values[enc_pos[j] as usize] =
-                std::mem::replace(&mut bufs.row[i], Value::Null);
+            let col = &table_schema.columns[i];
+            if matches!(
+                col.generated_kind,
+                Some(crate::parser::GeneratedKind::Virtual)
+            ) {
+                bufs.value_values[enc_pos[j] as usize] = Value::Null;
+                bufs.row[i] = Value::Null;
+            } else {
+                bufs.value_values[enc_pos[j] as usize] =
+                    std::mem::replace(&mut bufs.row[i], Value::Null);
+            }
         }
-        encode_row_into(&bufs.value_values, &mut bufs.value_buf);
+        match cache.and_then(|c| c.row_encoder.as_ref()) {
+            Some(tmpl) => crate::encoding::encode_int_row_with_template(
+                tmpl,
+                &bufs.value_values,
+                &mut bufs.value_buf,
+            )?,
+            None => encode_row_into(&bufs.value_values, &mut bufs.value_buf),
+        }
 
         if bufs.key_buf.len() > citadel_core::MAX_KEY_SIZE {
             return Err(SqlError::KeyTooLarge {
@@ -1488,6 +1699,235 @@ struct InsertCache {
     has_checks: bool,
     on_conflict: Option<Arc<CompiledOnConflict>>,
     row_col_map: Option<ColumnMap>,
+    generated_col_positions: Vec<usize>,
+    generated_fast_evals: Vec<FastGenEval>,
+    pk_indices: Vec<usize>,
+    non_pk_indices: Vec<usize>,
+    encoding_positions: Vec<u16>,
+    dropped_non_pk_slots: Vec<u16>,
+    phys_count: usize,
+    single_int_pk: bool,
+    not_null_indices: Vec<u16>,
+    bind_plan: Option<Vec<BindAction>>,
+    row_fully_overwritten: bool,
+    row_encoder: Option<crate::encoding::IntRowTemplate>,
+    is_trivial_fast: bool,
+    trivial_fast_program: Option<TrivialFastProgram>,
+}
+
+#[derive(Clone)]
+enum BindAction {
+    Param {
+        param_idx: usize,
+        col_idx: usize,
+        target: DataType,
+    },
+    Literal {
+        value: Value,
+        col_idx: usize,
+    },
+}
+
+#[derive(Clone)]
+struct TrivialFastProgram {
+    template: Vec<u8>,
+    ops: Vec<WriteOp>,
+    pk_param: u8,
+    not_null_param_indices: Vec<u8>,
+}
+
+#[derive(Clone)]
+enum WriteOp {
+    ParamI64 {
+        param_idx: u8,
+        off: u32,
+    },
+    LiteralI64 {
+        value: i64,
+        off: u32,
+    },
+    GenAddParamsI64 {
+        a_param: u8,
+        b_param: u8,
+        off: u32,
+        bitmap_byte_off: u32,
+        bitmap_bit_mask: u8,
+    },
+    GenMulAddParamI64 {
+        param_idx: u8,
+        mul: i64,
+        add: i64,
+        off: u32,
+        bitmap_byte_off: u32,
+        bitmap_bit_mask: u8,
+    },
+}
+
+fn build_trivial_fast_program(
+    bind_plan: &[BindAction],
+    row_encoder: &crate::encoding::IntRowTemplate,
+    non_virtual_pairs: &[(usize, usize)],
+    generated_col_positions: &[usize],
+    generated_fast_evals: &[FastGenEval],
+    pk_indices: &[usize],
+    columns: &[crate::types::ColumnDef],
+) -> Option<TrivialFastProgram> {
+    let pk_col = pk_indices[0];
+    let col_to_slot: rustc_hash::FxHashMap<usize, usize> =
+        non_virtual_pairs.iter().copied().collect();
+    let slot_to_off: rustc_hash::FxHashMap<usize, usize> =
+        row_encoder.slot_offsets.iter().copied().collect();
+
+    let mut col_to_param: rustc_hash::FxHashMap<usize, u8> = Default::default();
+    let mut col_to_lit_int: rustc_hash::FxHashMap<usize, i64> = Default::default();
+    let mut pk_param: Option<u8> = None;
+    let mut ops: Vec<WriteOp> = Vec::with_capacity(bind_plan.len() + generated_col_positions.len());
+    let mut not_null_param_indices: Vec<u8> = Vec::new();
+
+    for action in bind_plan {
+        match action {
+            BindAction::Param {
+                param_idx,
+                col_idx,
+                target,
+            } => {
+                if *target != DataType::Integer {
+                    return None;
+                }
+                let pi: u8 = u8::try_from(*param_idx).ok()?;
+                col_to_param.insert(*col_idx, pi);
+                if *col_idx == pk_col {
+                    pk_param = Some(pi);
+                } else {
+                    let slot = *col_to_slot.get(col_idx)?;
+                    let off = u32::try_from(*slot_to_off.get(&slot)?).ok()?;
+                    ops.push(WriteOp::ParamI64 { param_idx: pi, off });
+                    if !columns[*col_idx].nullable {
+                        not_null_param_indices.push(pi);
+                    }
+                }
+            }
+            BindAction::Literal { value, col_idx } => match value {
+                Value::Integer(v) => {
+                    col_to_lit_int.insert(*col_idx, *v);
+                    if *col_idx == pk_col {
+                        return None;
+                    }
+                    let slot = *col_to_slot.get(col_idx)?;
+                    let off = u32::try_from(*slot_to_off.get(&slot)?).ok()?;
+                    ops.push(WriteOp::LiteralI64 { value: *v, off });
+                }
+                _ => return None,
+            },
+        }
+    }
+
+    let pk_param = pk_param?;
+
+    for (i, &gen_pos) in generated_col_positions.iter().enumerate() {
+        let gen_slot = *col_to_slot.get(&gen_pos)?;
+        let gen_off = u32::try_from(*slot_to_off.get(&gen_slot)?).ok()?;
+        let bitmap_byte_off = u32::try_from(2 + gen_slot / 8).ok()?;
+        let bitmap_bit_mask: u8 = 1u8 << (gen_slot % 8);
+        let gen_col_nullable = columns[gen_pos].nullable;
+
+        match &generated_fast_evals[i] {
+            FastGenEval::IntColAddCol {
+                left_idx,
+                right_idx,
+            } => {
+                let a_param = col_to_param.get(left_idx).copied();
+                let b_param = col_to_param.get(right_idx).copied();
+                match (a_param, b_param) {
+                    (Some(ap), Some(bp)) => {
+                        let deps_safe = gen_col_nullable
+                            || (not_null_param_indices.contains(&ap)
+                                && not_null_param_indices.contains(&bp));
+                        if !deps_safe {
+                            return None;
+                        }
+                        ops.push(WriteOp::GenAddParamsI64 {
+                            a_param: ap,
+                            b_param: bp,
+                            off: gen_off,
+                            bitmap_byte_off,
+                            bitmap_bit_mask,
+                        });
+                    }
+                    (Some(p), None) => {
+                        let lit = col_to_lit_int.get(right_idx).copied()?;
+                        if !gen_col_nullable && !not_null_param_indices.contains(&p) {
+                            return None;
+                        }
+                        ops.push(WriteOp::GenMulAddParamI64 {
+                            param_idx: p,
+                            mul: 1,
+                            add: lit,
+                            off: gen_off,
+                            bitmap_byte_off,
+                            bitmap_bit_mask,
+                        });
+                    }
+                    (None, Some(p)) => {
+                        let lit = col_to_lit_int.get(left_idx).copied()?;
+                        if !gen_col_nullable && !not_null_param_indices.contains(&p) {
+                            return None;
+                        }
+                        ops.push(WriteOp::GenMulAddParamI64 {
+                            param_idx: p,
+                            mul: 1,
+                            add: lit,
+                            off: gen_off,
+                            bitmap_byte_off,
+                            bitmap_bit_mask,
+                        });
+                    }
+                    (None, None) => {
+                        let la = col_to_lit_int.get(left_idx).copied()?;
+                        let lb = col_to_lit_int.get(right_idx).copied()?;
+                        ops.push(WriteOp::LiteralI64 {
+                            value: la.wrapping_add(lb),
+                            off: gen_off,
+                        });
+                    }
+                }
+            }
+            FastGenEval::IntColMulAdd {
+                col_schema_idx,
+                mul,
+                add,
+            } => {
+                if let Some(p) = col_to_param.get(col_schema_idx).copied() {
+                    if !gen_col_nullable && !not_null_param_indices.contains(&p) {
+                        return None;
+                    }
+                    ops.push(WriteOp::GenMulAddParamI64 {
+                        param_idx: p,
+                        mul: *mul,
+                        add: *add,
+                        off: gen_off,
+                        bitmap_byte_off,
+                        bitmap_bit_mask,
+                    });
+                } else if let Some(lit) = col_to_lit_int.get(col_schema_idx).copied() {
+                    ops.push(WriteOp::LiteralI64 {
+                        value: lit.wrapping_mul(*mul).wrapping_add(*add),
+                        off: gen_off,
+                    });
+                } else {
+                    return None;
+                }
+            }
+            FastGenEval::None => return None,
+        }
+    }
+
+    Some(TrivialFastProgram {
+        template: row_encoder.template.clone(),
+        ops,
+        pk_param,
+        not_null_param_indices,
+    })
 }
 
 #[derive(Clone)]
@@ -1801,6 +2241,9 @@ fn can_fuse_do_update(ts: &TableSchema, assignments: &[(usize, Expr)]) -> bool {
     if !ts.foreign_keys.is_empty() {
         return false;
     }
+    if ts.columns.iter().any(|c| c.generated_kind.is_some()) {
+        return false;
+    }
     let pk = ts.pk_indices();
     !assignments.iter().any(|(ci, _)| pk.contains(ci))
 }
@@ -2042,6 +2485,32 @@ fn apply_do_update_with_old_row(
         };
     }
 
+    for col in &table_schema.columns {
+        if matches!(
+            col.generated_kind,
+            Some(crate::parser::GeneratedKind::Stored)
+        ) {
+            let val = eval_expr(
+                col.generated_expr.as_ref().unwrap(),
+                &EvalCtx::new(col_map, &new_row),
+            )?;
+            let pos = col.position as usize;
+            new_row[pos] = if val.is_null() {
+                if !col.nullable {
+                    return Err(SqlError::NotNullViolation(col.name.clone()));
+                }
+                Value::Null
+            } else {
+                let got = val.data_type();
+                val.coerce_into(col.data_type)
+                    .ok_or_else(|| SqlError::TypeMismatch {
+                        expected: col.data_type.to_string(),
+                        got: got.to_string(),
+                    })?
+            };
+        }
+    }
+
     let pk_indices = table_schema.pk_indices();
     let assigned_pk = assignments.iter().any(|(ci, _)| pk_indices.contains(ci));
     let pk_changed = assigned_pk && pk_indices.iter().any(|&i| old_row[i] != new_row[i]);
@@ -2120,7 +2589,15 @@ fn apply_do_update_with_old_row(
         value_values[slot as usize] = Value::Null;
     }
     for (j, &i) in non_pk.iter().enumerate() {
-        value_values[enc_pos[j] as usize] = new_row[i].clone();
+        let col = &table_schema.columns[i];
+        value_values[enc_pos[j] as usize] = if matches!(
+            col.generated_kind,
+            Some(crate::parser::GeneratedKind::Virtual)
+        ) {
+            Value::Null
+        } else {
+            new_row[i].clone()
+        };
     }
     let mut new_value_buf = Vec::with_capacity(256);
     crate::encoding::encode_row_into(&value_values, &mut new_value_buf);
@@ -2273,6 +2750,136 @@ fn compile_on_conflict(oc: &OnConflictClause, ts: &TableSchema) -> Result<Compil
     }
 }
 
+/// Caller MUST check `cache.is_trivial_fast` first.
+fn exec_insert_trivial_fast(
+    wtx: &mut WriteTxn<'_>,
+    table_lower: &str,
+    cache: &InsertCache,
+    bufs: &mut InsertBufs,
+    params: &[Value],
+) -> Result<ExecutionResult> {
+    let prog = cache
+        .trivial_fast_program
+        .as_ref()
+        .expect("trivial fast: program");
+
+    for &p in &prog.not_null_param_indices {
+        if params[p as usize].is_null() {
+            return Err(SqlError::NotNullViolation(format!("param@{p}")));
+        }
+    }
+
+    match &params[prog.pk_param as usize] {
+        Value::Integer(v) => crate::encoding::encode_int_key_into(*v, &mut bufs.key_buf),
+        _ => return Err(SqlError::InvalidValue("non-integer PK in fast path".into())),
+    }
+
+    bufs.value_buf.clear();
+    bufs.value_buf.extend_from_slice(&prog.template);
+
+    for op in &prog.ops {
+        match op {
+            WriteOp::ParamI64 { param_idx, off } => match &params[*param_idx as usize] {
+                Value::Integer(v) => {
+                    let off = *off as usize;
+                    bufs.value_buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+                }
+                other => {
+                    return Err(SqlError::TypeMismatch {
+                        expected: "Integer".into(),
+                        got: other.data_type().to_string(),
+                    });
+                }
+            },
+            WriteOp::LiteralI64 { value, off } => {
+                let off = *off as usize;
+                bufs.value_buf[off..off + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            WriteOp::GenAddParamsI64 {
+                a_param,
+                b_param,
+                off,
+                bitmap_byte_off,
+                bitmap_bit_mask,
+            } => match (&params[*a_param as usize], &params[*b_param as usize]) {
+                (Value::Integer(a), Value::Integer(b)) => {
+                    let off = *off as usize;
+                    bufs.value_buf[off..off + 8].copy_from_slice(&a.wrapping_add(*b).to_le_bytes());
+                }
+                _ => {
+                    bufs.value_buf[*bitmap_byte_off as usize] |= *bitmap_bit_mask;
+                }
+            },
+            WriteOp::GenMulAddParamI64 {
+                param_idx,
+                mul,
+                add,
+                off,
+                bitmap_byte_off,
+                bitmap_bit_mask,
+            } => match &params[*param_idx as usize] {
+                Value::Integer(v) => {
+                    let r = v.wrapping_mul(*mul).wrapping_add(*add);
+                    let off = *off as usize;
+                    bufs.value_buf[off..off + 8].copy_from_slice(&r.to_le_bytes());
+                }
+                _ => {
+                    bufs.value_buf[*bitmap_byte_off as usize] |= *bitmap_bit_mask;
+                }
+            },
+        }
+    }
+
+    let is_new = wtx
+        .table_insert(table_lower.as_bytes(), &bufs.key_buf, &bufs.value_buf)
+        .map_err(SqlError::Storage)?;
+    if !is_new {
+        return Err(SqlError::DuplicateKey);
+    }
+    Ok(ExecutionResult::RowsAffected(1))
+}
+
+fn build_bind_plan(
+    stmt: &InsertStmt,
+    col_indices: &[usize],
+    col_data_types: &[DataType],
+) -> Option<Vec<BindAction>> {
+    let rows = match &stmt.source {
+        InsertSource::Values(rows) => rows,
+        _ => return None,
+    };
+    if rows.len() != 1 {
+        return None;
+    }
+    let value_row = &rows[0];
+    if value_row.len() != col_indices.len() {
+        return None;
+    }
+    let mut plan = Vec::with_capacity(value_row.len());
+    for (i, expr) in value_row.iter().enumerate() {
+        let col_idx = col_indices[i];
+        let target = col_data_types[col_idx];
+        match expr {
+            Expr::Parameter(n) => {
+                if *n == 0 {
+                    return None;
+                }
+                plan.push(BindAction::Param {
+                    param_idx: n - 1,
+                    col_idx,
+                    target,
+                });
+            }
+            Expr::Literal(v) => plan.push(BindAction::Literal {
+                value: v.clone(),
+                col_idx,
+            }),
+            _ => return None,
+        }
+    }
+    Some(plan)
+}
+
 impl CompiledInsert {
     pub fn try_compile(schema: &SchemaManager, stmt: &InsertStmt) -> Option<Self> {
         let lower = stmt.table.to_ascii_lowercase();
@@ -2286,6 +2893,12 @@ impl CompiledInsert {
             for name in &insert_columns {
                 col_indices.push(ts.column_index(name)?);
             }
+            if col_indices
+                .iter()
+                .any(|&ci| ts.columns[ci].generated_kind.is_some())
+            {
+                return None;
+            }
             let on_conflict = stmt
                 .on_conflict
                 .as_ref()
@@ -2294,7 +2907,134 @@ impl CompiledInsert {
                 .ok()
                 .flatten()
                 .map(Arc::new);
-            let row_col_map = on_conflict.as_ref().map(|_| ColumnMap::new(&ts.columns));
+            let generated_col_positions: Vec<usize> = ts
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| {
+                    matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored))
+                        .then_some(i)
+                })
+                .collect();
+            let generated_fast_evals: Vec<FastGenEval> = generated_col_positions
+                .iter()
+                .map(|&pos| {
+                    detect_fast_gen_eval(ts.columns[pos].generated_expr.as_ref().unwrap(), ts)
+                })
+                .collect();
+            let row_col_map = if on_conflict.is_some() || !generated_col_positions.is_empty() {
+                Some(ColumnMap::new(&ts.columns))
+            } else {
+                None
+            };
+            let pk_indices: Vec<usize> = ts.pk_indices().to_vec();
+            let non_pk_indices: Vec<usize> = ts.non_pk_indices().to_vec();
+            let encoding_positions: Vec<u16> = ts.encoding_positions().to_vec();
+            let dropped_non_pk_slots: Vec<u16> = ts.dropped_non_pk_slots().to_vec();
+            let phys_count = ts.physical_non_pk_count();
+            let col_data_types: Vec<DataType> = ts.columns.iter().map(|c| c.data_type).collect();
+            let single_int_pk =
+                pk_indices.len() == 1 && ts.columns[pk_indices[0]].data_type == DataType::Integer;
+            let not_null_indices: Vec<u16> = ts
+                .columns
+                .iter()
+                .filter(|c| !c.nullable)
+                .map(|c| c.position)
+                .collect();
+            let bind_plan = build_bind_plan(stmt, &col_indices, &col_data_types);
+            let any_defaults_flag = ts.columns.iter().any(|c| c.default_expr.is_some());
+            let row_fully_overwritten = if any_defaults_flag {
+                false
+            } else {
+                let mut covered: rustc_hash::FxHashSet<usize> =
+                    col_indices.iter().copied().collect();
+                covered.extend(generated_col_positions.iter().copied());
+                for (j, &i) in non_pk_indices.iter().enumerate() {
+                    let _ = j;
+                    if matches!(
+                        ts.columns[i].generated_kind,
+                        Some(crate::parser::GeneratedKind::Virtual)
+                    ) {
+                        covered.insert(i);
+                    }
+                }
+                bind_plan.is_some() && covered.len() == ts.columns.len()
+            };
+            let has_fks = !ts.foreign_keys.is_empty();
+            let has_indices = !ts.indices.is_empty();
+            let mut non_virtual_pairs: Vec<(usize, usize)> = Vec::new();
+            let mut null_value_slots: Vec<usize> =
+                dropped_non_pk_slots.iter().map(|&s| s as usize).collect();
+            for (j, &i) in non_pk_indices.iter().enumerate() {
+                let slot = encoding_positions[j] as usize;
+                if matches!(
+                    ts.columns[i].generated_kind,
+                    Some(crate::parser::GeneratedKind::Virtual)
+                ) {
+                    null_value_slots.push(slot);
+                } else {
+                    non_virtual_pairs.push((i, slot));
+                }
+            }
+            let row_encoder = {
+                let all_int_or_null = non_pk_indices.iter().enumerate().all(|(j, &i)| {
+                    let col = &ts.columns[i];
+                    if matches!(
+                        col.generated_kind,
+                        Some(crate::parser::GeneratedKind::Virtual)
+                    ) {
+                        true
+                    } else {
+                        col.data_type == DataType::Integer && encoding_positions[j] != u16::MAX
+                    }
+                });
+                if all_int_or_null {
+                    let mut null_slots: Vec<usize> =
+                        dropped_non_pk_slots.iter().map(|&s| s as usize).collect();
+                    for (j, &i) in non_pk_indices.iter().enumerate() {
+                        if matches!(
+                            ts.columns[i].generated_kind,
+                            Some(crate::parser::GeneratedKind::Virtual)
+                        ) {
+                            null_slots.push(encoding_positions[j] as usize);
+                        }
+                    }
+                    Some(crate::encoding::build_int_row_template(
+                        phys_count,
+                        &null_slots,
+                    ))
+                } else {
+                    None
+                }
+            };
+            let is_trivial_fast_eligible = !insert_has_subquery(stmt)
+                && !ts.columns.iter().any(|c| c.default_expr.is_some())
+                && !ts.has_checks()
+                && !has_fks
+                && !has_indices
+                && stmt.on_conflict.is_none()
+                && stmt.returning.is_none()
+                && bind_plan.is_some()
+                && row_encoder.is_some()
+                && row_fully_overwritten
+                && single_int_pk
+                && generated_fast_evals
+                    .iter()
+                    .all(|fe| !matches!(fe, FastGenEval::None));
+            let trivial_fast_program = if is_trivial_fast_eligible {
+                build_trivial_fast_program(
+                    bind_plan.as_ref().unwrap(),
+                    row_encoder.as_ref().unwrap(),
+                    &non_virtual_pairs,
+                    &generated_col_positions,
+                    &generated_fast_evals,
+                    &pk_indices,
+                    &ts.columns,
+                )
+            } else {
+                None
+            };
+            let is_trivial_fast = trivial_fast_program.is_some();
             Some(InsertCache {
                 col_indices,
                 has_subquery: insert_has_subquery(stmt),
@@ -2302,6 +3042,20 @@ impl CompiledInsert {
                 has_checks: ts.has_checks(),
                 on_conflict,
                 row_col_map,
+                generated_col_positions,
+                generated_fast_evals,
+                pk_indices,
+                non_pk_indices,
+                encoding_positions,
+                dropped_non_pk_slots,
+                phys_count,
+                single_int_pk,
+                not_null_indices,
+                bind_plan,
+                row_fully_overwritten,
+                row_encoder,
+                is_trivial_fast,
+                trivial_fast_program,
             })
         } else if schema.get_view(&lower).is_some() {
             None
@@ -2332,13 +3086,22 @@ impl CompiledPlan for CompiledInsert {
                 ))
             }
         };
-        let _ = &self.table_lower;
         match wtx {
             None => exec_insert(db, schema, ins, params),
             Some(outer) => match self.cached.as_ref() {
+                Some(c) if c.is_trivial_fast => with_insert_scratch(|bufs| {
+                    exec_insert_trivial_fast(outer, &self.table_lower, c, bufs, params)
+                }),
                 Some(c) => exec_insert_in_txn_cached(outer, schema, ins, params, c),
                 None => exec_insert_in_txn(outer, schema, ins, params),
             },
+        }
+    }
+
+    fn uses_scoped_params(&self) -> bool {
+        match self.cached.as_ref() {
+            Some(c) => !c.is_trivial_fast,
+            None => true,
         }
     }
 }

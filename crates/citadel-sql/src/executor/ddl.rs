@@ -7,6 +7,68 @@ use crate::types::*;
 
 use super::helpers::*;
 
+pub(super) fn collect_column_refs(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Column(name) => out.push(name.to_ascii_lowercase()),
+        Expr::QualifiedColumn { column, .. } => out.push(column.to_ascii_lowercase()),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_column_refs(left, out);
+            collect_column_refs(right, out);
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } => collect_column_refs(expr, out),
+        Expr::Function { args, .. } => {
+            for a in args {
+                collect_column_refs(a, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                collect_column_refs(o, out);
+            }
+            for (c, r) in conditions {
+                collect_column_refs(c, out);
+                collect_column_refs(r, out);
+            }
+            if let Some(e) = else_result {
+                collect_column_refs(e, out);
+            }
+        }
+        Expr::Coalesce(items) => {
+            for i in items {
+                collect_column_refs(i, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn validate_no_chained_generated(columns: &[ColumnDef]) -> Result<()> {
+    let generated_names: rustc_hash::FxHashSet<String> = columns
+        .iter()
+        .filter(|c| c.generated_kind.is_some())
+        .map(|c| c.name.to_ascii_lowercase())
+        .collect();
+    if generated_names.is_empty() {
+        return Ok(());
+    }
+    for col in columns {
+        if let Some(expr) = &col.generated_expr {
+            let mut refs = Vec::new();
+            collect_column_refs(expr, &mut refs);
+            for r in refs {
+                if generated_names.contains(&r) && r != col.name.to_ascii_lowercase() {
+                    return Err(SqlError::GeneratedColumnReference(col.name.clone()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate FK references: parent must exist, referred columns must be PK or UNIQUE.
 pub(super) fn validate_foreign_keys(
     schema: &SchemaManager,
@@ -176,7 +238,7 @@ pub(super) fn exec_create_table(
         return Err(SqlError::PrimaryKeyRequired);
     }
 
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = rustc_hash::FxHashSet::default();
     for col in &stmt.columns {
         let lower = col.name.to_ascii_lowercase();
         if !seen.insert(lower.clone()) {
@@ -199,8 +261,13 @@ pub(super) fn exec_create_table(
             check_sql: c.check_sql.clone(),
             check_name: c.check_name.clone(),
             is_with_timezone: false,
+            generated_expr: c.generated_expr.clone(),
+            generated_sql: c.generated_sql.clone(),
+            generated_kind: c.generated_kind,
         })
         .collect();
+
+    validate_no_chained_generated(&columns)?;
 
     let primary_key_columns: Vec<u16> = stmt
         .primary_key
@@ -342,7 +409,7 @@ pub(super) fn exec_create_table_in_txn(
         return Err(SqlError::PrimaryKeyRequired);
     }
 
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = rustc_hash::FxHashSet::default();
     for col in &stmt.columns {
         let lower = col.name.to_ascii_lowercase();
         if !seen.insert(lower.clone()) {
@@ -365,8 +432,13 @@ pub(super) fn exec_create_table_in_txn(
             check_sql: c.check_sql.clone(),
             check_name: c.check_name.clone(),
             is_with_timezone: false,
+            generated_expr: c.generated_expr.clone(),
+            generated_sql: c.generated_sql.clone(),
+            generated_kind: c.generated_kind,
         })
         .collect();
+
+    validate_no_chained_generated(&columns)?;
 
     let primary_key_columns: Vec<u16> = stmt
         .primary_key
@@ -516,6 +588,18 @@ pub(super) fn exec_create_index(
         })
         .collect::<Result<_>>()?;
 
+    for &ci in &col_indices {
+        if matches!(
+            table_schema.columns[ci as usize].generated_kind,
+            Some(crate::parser::GeneratedKind::Virtual)
+        ) {
+            return Err(SqlError::Unsupported(format!(
+                "cannot CREATE INDEX on VIRTUAL generated column '{}'",
+                table_schema.columns[ci as usize].name
+            )));
+        }
+    }
+
     let idx_def = IndexDef {
         name: lower_idx.clone(),
         columns: col_indices,
@@ -636,6 +720,18 @@ pub(super) fn exec_create_index_in_txn(
                 .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))
         })
         .collect::<Result<_>>()?;
+
+    for &ci in &col_indices {
+        if matches!(
+            table_schema.columns[ci as usize].generated_kind,
+            Some(crate::parser::GeneratedKind::Virtual)
+        ) {
+            return Err(SqlError::Unsupported(format!(
+                "cannot CREATE INDEX on VIRTUAL generated column '{}'",
+                table_schema.columns[ci as usize].name
+            )));
+        }
+    }
 
     let idx_def = IndexDef {
         name: lower_idx.clone(),
@@ -941,11 +1037,23 @@ pub(super) fn alter_add_column(
         ));
     }
 
-    if !col_spec.nullable && col_spec.default_expr.is_none() {
+    if !col_spec.nullable && col_spec.default_expr.is_none() && col_spec.generated_kind.is_none() {
         let count = wtx.table_entry_count(table_name.as_bytes()).unwrap_or(0);
         if count > 0 {
             return Err(SqlError::Unsupported(
                 "cannot add NOT NULL column without DEFAULT to non-empty table".into(),
+            ));
+        }
+    }
+
+    if matches!(
+        col_spec.generated_kind,
+        Some(crate::parser::GeneratedKind::Stored)
+    ) {
+        let count = wtx.table_entry_count(table_name.as_bytes()).unwrap_or(0);
+        if count > 0 {
+            return Err(SqlError::Unsupported(
+                "cannot add STORED generated column to non-empty table; use VIRTUAL or recreate the table".into(),
             ));
         }
     }
@@ -968,10 +1076,15 @@ pub(super) fn alter_add_column(
         check_sql: col_spec.check_sql.clone(),
         check_name: col_spec.check_name.clone(),
         is_with_timezone: false,
+        generated_expr: col_spec.generated_expr.clone(),
+        generated_sql: col_spec.generated_sql.clone(),
+        generated_kind: col_spec.generated_kind,
     };
 
     let mut new_schema = table_schema.clone();
     new_schema.columns.push(new_col);
+
+    validate_no_chained_generated(&new_schema.columns)?;
 
     if let Some(fk) = fk_def {
         let col_idx = new_pos;
@@ -1069,6 +1182,22 @@ pub(super) fn alter_drop_column(
         }
     }
 
+    for col in &table_schema.columns {
+        if col.position == drop_pos_u16 {
+            continue;
+        }
+        if let Some(expr) = &col.generated_expr {
+            let mut refs = Vec::new();
+            collect_column_refs(expr, &mut refs);
+            if refs.iter().any(|r| r == &col_lower) {
+                return Err(SqlError::Unsupported(format!(
+                    "column '{}' is referenced by generated column '{}'",
+                    col_lower, col.name
+                )));
+            }
+        }
+    }
+
     // Schema-only: rows keep the dead slot; decode skips via col_mapping.
     let new_schema = table_schema.without_column(drop_pos);
 
@@ -1134,6 +1263,18 @@ pub(super) fn alter_rename_column(
         }
     }
 
+    for col in &mut new_schema.columns {
+        if let Some(ref sql) = col.generated_sql {
+            if sql.to_ascii_lowercase().contains(&old_lower) {
+                let updated = sql.replace(&old_lower, &new_lower);
+                col.generated_sql = Some(updated.clone());
+                if let Ok(parsed) = crate::parser::parse_sql_expr(&updated) {
+                    col.generated_expr = Some(parsed);
+                }
+            }
+        }
+    }
+
     SchemaManager::save_schema(wtx, &new_schema)?;
     schema.register(new_schema);
     Ok(())
@@ -1184,7 +1325,7 @@ pub(super) fn alter_rename_table(
         .iter()
         .filter(|(child, _)| *child != old_name)
         .map(|(child, _)| child.to_string())
-        .collect::<std::collections::HashSet<_>>()
+        .collect::<rustc_hash::FxHashSet<_>>()
         .into_iter()
         .collect();
 

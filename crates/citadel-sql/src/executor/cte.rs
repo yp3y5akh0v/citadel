@@ -178,7 +178,7 @@ pub(super) fn materialize_recursive_cte(
     let mut work_start = 0;
     let mut work_end = accumulated.len();
     let mut seen = if !union_all {
-        let mut s = std::collections::HashSet::new();
+        let mut s = rustc_hash::FxHashSet::default();
         for row in &accumulated {
             s.insert(row.clone());
         }
@@ -221,6 +221,9 @@ pub(super) fn materialize_recursive_cte(
                 check_sql: None,
                 check_name: None,
                 is_with_timezone: false,
+                generated_expr: None,
+                generated_sql: None,
+                generated_kind: None,
             })
             .collect();
         let col_map = ColumnMap::new(&cte_cols);
@@ -376,6 +379,9 @@ pub(super) fn build_cte_schema(name: &str, qr: &QueryResult) -> TableSchema {
             check_sql: None,
             check_name: None,
             is_with_timezone: false,
+            generated_expr: None,
+            generated_sql: None,
+            generated_kind: None,
         })
         .collect();
     TableSchema::new(name.into(), columns, vec![], vec![], vec![], vec![])

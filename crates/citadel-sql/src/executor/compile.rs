@@ -29,6 +29,12 @@ pub trait CompiledPlan: Send + Sync {
     ) -> Option<Box<dyn RowSourceIter + 'db>> {
         None
     }
+
+    /// `false` when `execute` reads `params` directly without `resolve_scoped_param`,
+    /// letting the caller skip `with_scoped_params`.
+    fn uses_scoped_params(&self) -> bool {
+        true
+    }
 }
 
 /// Internal trait: object-safe streaming source over decoded rows.
