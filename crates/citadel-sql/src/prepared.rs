@@ -113,13 +113,6 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
     }
 
     /// Execute and return a stepping `Rows<'_>` iterator.
-    ///
-    /// Streams rows directly from the B+ tree for simple `SELECT [cols] FROM t`
-    /// shapes (no WHERE/ORDER BY/aggregate/join). Materializes internally for
-    /// everything else — same user-visible API either way.
-    ///
-    /// DML statements execute the mutation and yield an immediately-exhausted `Rows`
-    /// (matching rusqlite semantics).
     pub fn query(&self, params: &[Value]) -> Result<Rows<'_>> {
         if params.len() != self.param_count {
             return Err(SqlError::ParameterCountMismatch {
@@ -144,8 +137,6 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
     }
 
     /// Execute and return the fully-materialized `QueryResult`.
-    ///
-    /// Equivalent to `self.query(params)?.collect()` but slightly more direct.
     pub fn query_collect(&self, params: &[Value]) -> Result<QueryResult> {
         match self.run(params)? {
             ExecutionResult::Query(qr) => Ok(qr),
@@ -161,9 +152,6 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
     }
 
     /// Run the query and pass the first row to `f`.
-    ///
-    /// Returns `SqlError::QueryReturnedNoRows` if the query produced zero rows.
-    /// Extra rows after the first are ignored (matches rusqlite's `query_row`).
     pub fn query_row<T, F>(&self, params: &[Value], f: F) -> Result<T>
     where
         F: FnOnce(&Row<'_>) -> Result<T>,
@@ -176,9 +164,6 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
     }
 
     /// True if the query returns at least one row (DML returns `n > 0`).
-    ///
-    /// For streamable SELECTs this short-circuits on the first matching row
-    /// without materializing the rest.
     pub fn exists(&self, params: &[Value]) -> Result<bool> {
         if params.len() != self.param_count {
             return Err(SqlError::ParameterCountMismatch {
@@ -223,11 +208,6 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
 }
 
 /// Stepping iterator over query rows. Obtained from [`PreparedStatement::query`].
-///
-/// Uses a lending-iterator pattern: `next()` returns `Result<Option<Row<'_>>>`
-/// where the `Row` borrows from `&mut self`. Incompatible with `std::iter::Iterator`
-/// because the row's lifetime is tied to the stepper — same design as rusqlite's
-/// [`Rows`](https://docs.rs/rusqlite/latest/rusqlite/struct.Rows.html).
 pub struct Rows<'a> {
     source: RowSource<'a>,
     columns: Vec<String>,
@@ -300,9 +280,6 @@ impl<'a> Rows<'a> {
 }
 
 /// A single row produced by [`Rows::next`].
-///
-/// Borrows column metadata and values from the parent `Rows`. Drop before calling
-/// `Rows::next` again.
 pub struct Row<'a> {
     columns: &'a [String],
     values: &'a [Value],
@@ -386,6 +363,7 @@ fn derive_body_columns(body: &QueryBody, schema: &SchemaManager) -> Vec<String> 
     match body {
         QueryBody::Select(sel) => derive_from_select_stmt(sel, schema),
         QueryBody::Compound(cs) => derive_body_columns(&cs.left, schema),
+        QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_) => Vec::new(),
     }
 }
 

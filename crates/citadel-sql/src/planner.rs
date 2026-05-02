@@ -186,7 +186,7 @@ pub fn plan_select(schema: &TableSchema, where_clause: &Option<Expr>) -> ScanPla
         return plan;
     }
 
-    if let Some(plan) = try_best_index(schema, &simple) {
+    if let Some(plan) = try_best_index(schema, where_expr, &simple) {
         return plan;
     }
 
@@ -248,12 +248,17 @@ struct IndexScore {
 
 fn try_best_index(
     schema: &TableSchema,
+    where_expr: &Expr,
     predicates: &[Option<SimplePredicate>],
 ) -> Option<ScanPlan> {
     let mut best_score: Option<IndexScore> = None;
     let mut best_plan: Option<ScanPlan> = None;
 
+    let conjuncts = flatten_and(where_expr);
     for idx in &schema.indices {
+        if !partial_predicate_implied(idx, where_expr, &conjuncts) {
+            continue;
+        }
         if let Some((score, plan)) = try_index_scan(schema, idx, predicates) {
             if best_score.is_none() || score > *best_score.as_ref().unwrap() {
                 best_score = Some(score);
@@ -263,6 +268,41 @@ fn try_best_index(
     }
 
     best_plan
+}
+
+fn partial_predicate_implied(idx: &IndexDef, where_expr: &Expr, conjuncts: &[&Expr]) -> bool {
+    let Some(pred) = idx.predicate_expr.as_ref() else {
+        return true;
+    };
+    if expr_structurally_eq(pred, where_expr) {
+        return true;
+    }
+    if conjuncts.iter().any(|c| expr_structurally_eq(pred, c)) {
+        return true;
+    }
+    if let Expr::IsNotNull(target) = pred {
+        if let Expr::Column(col) = target.as_ref() {
+            return conjuncts.iter().any(|c| conjunct_proves_not_null(c, col));
+        }
+    }
+    false
+}
+
+fn expr_structurally_eq(a: &Expr, b: &Expr) -> bool {
+    format!("{a:?}") == format!("{b:?}")
+}
+
+fn conjunct_proves_not_null(expr: &Expr, col: &str) -> bool {
+    let mentions = |e: &Expr| matches!(e, Expr::Column(n) if n.eq_ignore_ascii_case(col));
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq,
+            right,
+        } => mentions(left) || mentions(right),
+        Expr::IsNotNull(inner) => mentions(inner),
+        _ => false,
+    }
 }
 
 fn try_index_scan(

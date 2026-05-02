@@ -143,6 +143,9 @@ pub(super) fn explain_query_body_cte(
             }
             Ok(lines)
         }
+        QueryBody::Insert(ins) => Ok(vec![format!("INSERT INTO {}", ins.table)]),
+        QueryBody::Update(upd) => Ok(vec![format!("UPDATE {}", upd.table)]),
+        QueryBody::Delete(del) => Ok(vec![format!("DELETE FROM {}", del.table)]),
     }
 }
 

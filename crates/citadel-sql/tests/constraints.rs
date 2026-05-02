@@ -1108,3 +1108,269 @@ fn unique_persistence_after_reopen() {
     let err = conn.execute("INSERT INTO t VALUES (2, 'a@x')").unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
 }
+
+fn count(conn: &Connection<'_>, sql: &str) -> i64 {
+    let qr = conn.query(sql).unwrap();
+    match &qr.rows[0][0] {
+        Value::Integer(n) => *n,
+        v => panic!("expected integer count, got {v:?}"),
+    }
+}
+
+#[test]
+fn fk_cascade_delete_single_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER, \
+         FOREIGN KEY (p) REFERENCES parent(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    assert_rows_affected(conn.execute("INSERT INTO parent VALUES (1)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO child VALUES (10, 1)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO child VALUES (11, 1)").unwrap(), 1);
+
+    assert_rows_affected(conn.execute("DELETE FROM parent WHERE id = 1").unwrap(), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM child"), 0);
+}
+
+#[test]
+fn fk_cascade_delete_multi_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, \
+         FOREIGN KEY (a_id) REFERENCES a(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, b_id INTEGER, \
+         FOREIGN KEY (b_id) REFERENCES b(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    assert_rows_affected(conn.execute("INSERT INTO a VALUES (1)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO b VALUES (10, 1)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO c VALUES (100, 10)").unwrap(), 1);
+
+    assert_rows_affected(conn.execute("DELETE FROM a WHERE id = 1").unwrap(), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM b"), 0);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM c"), 0);
+}
+
+#[test]
+fn fk_set_null_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER, \
+         FOREIGN KEY (p) REFERENCES parent(id) ON DELETE SET NULL)",
+    )
+    .unwrap();
+    assert_rows_affected(conn.execute("INSERT INTO parent VALUES (1)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO child VALUES (10, 1)").unwrap(), 1);
+
+    assert_rows_affected(conn.execute("DELETE FROM parent WHERE id = 1").unwrap(), 1);
+    let qr = conn.query("SELECT p FROM child WHERE id = 10").unwrap();
+    assert_eq!(qr.rows[0][0], Value::Null);
+}
+
+#[test]
+fn fk_set_null_on_not_null_column_runtime_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER NOT NULL, \
+         FOREIGN KEY (p) REFERENCES parent(id) ON DELETE SET NULL)",
+    )
+    .unwrap();
+    assert_rows_affected(conn.execute("INSERT INTO parent VALUES (1)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO child VALUES (10, 1)").unwrap(), 1);
+
+    let err = conn.execute("DELETE FROM parent WHERE id = 1").unwrap_err();
+    assert!(matches!(err, SqlError::NotNullViolation(_)));
+}
+
+#[test]
+fn fk_set_default_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER DEFAULT 99, \
+         FOREIGN KEY (p) REFERENCES parent(id) ON DELETE SET DEFAULT)",
+    )
+    .unwrap();
+    assert_rows_affected(conn.execute("INSERT INTO parent VALUES (1)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO parent VALUES (99)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO child VALUES (10, 1)").unwrap(), 1);
+
+    assert_rows_affected(conn.execute("DELETE FROM parent WHERE id = 1").unwrap(), 1);
+    let qr = conn.query("SELECT p FROM child WHERE id = 10").unwrap();
+    assert_eq!(qr.rows[0][0], Value::Integer(99));
+}
+
+#[test]
+fn fk_set_default_falls_back_to_null_when_no_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER, \
+         FOREIGN KEY (p) REFERENCES parent(id) ON DELETE SET DEFAULT)",
+    )
+    .unwrap();
+    assert_rows_affected(conn.execute("INSERT INTO parent VALUES (1)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO child VALUES (10, 1)").unwrap(), 1);
+
+    assert_rows_affected(conn.execute("DELETE FROM parent WHERE id = 1").unwrap(), 1);
+    let qr = conn.query("SELECT p FROM child WHERE id = 10").unwrap();
+    assert_eq!(qr.rows[0][0], Value::Null);
+}
+
+#[test]
+fn fk_on_update_cascade_propagates_pk_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER, \
+         FOREIGN KEY (p) REFERENCES parent(id) ON UPDATE CASCADE)",
+    )
+    .unwrap();
+    assert_rows_affected(conn.execute("INSERT INTO parent VALUES (1)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO child VALUES (10, 1)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO child VALUES (11, 1)").unwrap(), 1);
+
+    assert_rows_affected(
+        conn.execute("UPDATE parent SET id = 99 WHERE id = 1")
+            .unwrap(),
+        1,
+    );
+    let qr = conn.query("SELECT p FROM child WHERE id = 10").unwrap();
+    assert_eq!(qr.rows[0][0], Value::Integer(99));
+}
+
+#[test]
+fn fk_mixed_delete_cascade_update_restrict() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER, \
+         FOREIGN KEY (p) REFERENCES parent(id) ON DELETE CASCADE ON UPDATE RESTRICT)",
+    )
+    .unwrap();
+    assert_rows_affected(conn.execute("INSERT INTO parent VALUES (1)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO child VALUES (10, 1)").unwrap(), 1);
+
+    let err = conn
+        .execute("UPDATE parent SET id = 2 WHERE id = 1")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::ForeignKeyViolation(_)));
+
+    assert_rows_affected(conn.execute("DELETE FROM parent WHERE id = 1").unwrap(), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM child"), 0);
+}
+
+#[test]
+fn fk_self_referential_cascade() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE node (id INTEGER PRIMARY KEY, manager INTEGER, \
+         FOREIGN KEY (manager) REFERENCES node(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    assert_rows_affected(
+        conn.execute("INSERT INTO node VALUES (1, NULL)").unwrap(),
+        1,
+    );
+    assert_rows_affected(conn.execute("INSERT INTO node VALUES (2, 1)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO node VALUES (3, 2)").unwrap(), 1);
+
+    assert_rows_affected(conn.execute("DELETE FROM node WHERE id = 1").unwrap(), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM node"), 0);
+}
+
+#[test]
+fn fk_self_referential_set_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE node (id INTEGER PRIMARY KEY, manager INTEGER, \
+         FOREIGN KEY (manager) REFERENCES node(id) ON DELETE SET NULL)",
+    )
+    .unwrap();
+    assert_rows_affected(
+        conn.execute("INSERT INTO node VALUES (1, NULL)").unwrap(),
+        1,
+    );
+    assert_rows_affected(conn.execute("INSERT INTO node VALUES (2, 1)").unwrap(), 1);
+
+    assert_rows_affected(conn.execute("DELETE FROM node WHERE id = 1").unwrap(), 1);
+    let qr = conn.query("SELECT manager FROM node WHERE id = 2").unwrap();
+    assert_eq!(qr.rows[0][0], Value::Null);
+}
+
+#[test]
+fn fk_no_action_default_rejects() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER, \
+         FOREIGN KEY (p) REFERENCES parent(id))",
+    )
+    .unwrap();
+    assert_rows_affected(conn.execute("INSERT INTO parent VALUES (1)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO child VALUES (10, 1)").unwrap(), 1);
+
+    let err = conn.execute("DELETE FROM parent WHERE id = 1").unwrap_err();
+    assert!(matches!(err, SqlError::ForeignKeyViolation(_)));
+}
+
+#[test]
+fn fk_actions_persist_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = create_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER, \
+             FOREIGN KEY (p) REFERENCES parent(id) ON DELETE CASCADE)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+        conn.execute("INSERT INTO child VALUES (10, 1)").unwrap();
+    }
+    let db = open_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_rows_affected(conn.execute("DELETE FROM parent WHERE id = 1").unwrap(), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM child"), 0);
+}

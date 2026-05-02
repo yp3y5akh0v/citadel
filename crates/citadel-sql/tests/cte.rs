@@ -1,5 +1,5 @@
 use citadel::{Argon2Profile, DatabaseBuilder};
-use citadel_sql::{Connection, ExecutionResult, Value};
+use citadel_sql::{Connection, ExecutionResult, SqlError, Value};
 
 fn create_db(dir: &std::path::Path) -> citadel::Database {
     let db_path = dir.join("test.db");
@@ -489,4 +489,235 @@ fn cte_in_transaction() {
         qr.rows[1],
         vec![Value::Integer(2), Value::Text("world".into())]
     );
+}
+
+fn assert_rows(r: ExecutionResult, expected: u64) {
+    match r {
+        ExecutionResult::RowsAffected(n) => assert_eq!(n, expected),
+        other => panic!("expected RowsAffected({expected}), got {other:?}"),
+    }
+}
+
+fn count(conn: &Connection<'_>, sql: &str) -> i64 {
+    let qr = conn.query(sql).unwrap();
+    match &qr.rows[0][0] {
+        Value::Integer(n) => *n,
+        v => panic!("expected integer count, got {v:?}"),
+    }
+}
+
+#[test]
+fn with_dml_insert_returning_basic() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+
+    let qr = conn
+        .query("WITH x AS (INSERT INTO t VALUES (1, 100) RETURNING *) SELECT COUNT(*) FROM x")
+        .unwrap();
+    assert_eq!(qr.rows[0][0], Value::Integer(1));
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 1);
+}
+
+#[test]
+fn with_dml_move_with_log_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE archive (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    for i in 1..=5 {
+        assert_rows(
+            conn.execute(&format!("INSERT INTO src VALUES ({i}, {})", i * 10))
+                .unwrap(),
+            1,
+        );
+    }
+
+    assert_rows(
+        conn.execute(
+            "WITH d AS (DELETE FROM src WHERE id <= 3 RETURNING *) \
+             INSERT INTO archive SELECT * FROM d",
+        )
+        .unwrap(),
+        3,
+    );
+
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM src"), 2);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM archive"), 3);
+}
+
+#[test]
+fn with_dml_no_returning_runs_for_side_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    for i in 1..=5 {
+        assert_rows(
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 10))
+                .unwrap(),
+            1,
+        );
+    }
+
+    let qr = conn
+        .query("WITH _d AS (DELETE FROM t WHERE id <= 3) SELECT 1 AS marker")
+        .unwrap();
+    assert_eq!(qr.rows[0][0], Value::Integer(1));
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 2);
+}
+
+#[test]
+fn with_dml_update_returning() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    assert_rows(conn.execute("INSERT INTO t VALUES (1, 100)").unwrap(), 1);
+    assert_rows(conn.execute("INSERT INTO t VALUES (2, 200)").unwrap(), 1);
+
+    let qr = conn
+        .query(
+            "WITH u AS (UPDATE t SET val = val * 2 RETURNING id, val) SELECT * FROM u ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(qr.rows.len(), 2);
+    assert_eq!(qr.rows[0][1], Value::Integer(200));
+    assert_eq!(qr.rows[1][1], Value::Integer(400));
+}
+
+#[test]
+fn with_dml_delete_returning_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    for i in 1..=10 {
+        assert_rows(
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 10))
+                .unwrap(),
+            1,
+        );
+    }
+
+    let qr = conn
+        .query("WITH d AS (DELETE FROM t WHERE val > 50 RETURNING *) SELECT COUNT(*) FROM d")
+        .unwrap();
+    assert_eq!(qr.rows[0][0], Value::Integer(5));
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 5);
+}
+
+#[test]
+fn with_dml_recursive_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let err = conn
+        .execute("WITH RECURSIVE x AS (DELETE FROM t WHERE id = 1 RETURNING *) SELECT * FROM x")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("Recursive")));
+}
+
+#[test]
+fn with_dml_in_subquery_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let err = conn
+        .execute("SELECT * FROM (WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d) sub")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(_)));
+}
+
+#[test]
+fn with_dml_chain_insert_then_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+
+    assert_rows(
+        conn.execute(
+            "WITH ins AS (INSERT INTO users VALUES (1, 'alice') RETURNING id, name) \
+             INSERT INTO log SELECT * FROM ins",
+        )
+        .unwrap(),
+        1,
+    );
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM users"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM log"), 1);
+}
+
+#[test]
+fn with_dml_inside_explicit_txn() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE archive (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    assert_rows(conn.execute("INSERT INTO src VALUES (1, 100)").unwrap(), 1);
+
+    assert_ok(conn.execute("BEGIN").unwrap());
+    assert_rows(
+        conn.execute(
+            "WITH d AS (DELETE FROM src WHERE id = 1 RETURNING *) \
+             INSERT INTO archive SELECT * FROM d",
+        )
+        .unwrap(),
+        1,
+    );
+    assert_ok(conn.execute("COMMIT").unwrap());
+
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM src"), 0);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM archive"), 1);
+}
+
+#[test]
+fn with_dml_savepoint_rollback_restores() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    assert_rows(conn.execute("INSERT INTO t VALUES (1, 100)").unwrap(), 1);
+    assert_rows(conn.execute("INSERT INTO t VALUES (2, 200)").unwrap(), 1);
+
+    assert_ok(conn.execute("BEGIN").unwrap());
+    assert_ok(conn.execute("SAVEPOINT sp").unwrap());
+    let qr = conn
+        .query("WITH d AS (DELETE FROM t RETURNING *) SELECT COUNT(*) FROM d")
+        .unwrap();
+    assert_eq!(qr.rows[0][0], Value::Integer(2));
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 0);
+    assert_ok(conn.execute("ROLLBACK TO sp").unwrap());
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 2);
+    assert_ok(conn.execute("COMMIT").unwrap());
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 2);
 }

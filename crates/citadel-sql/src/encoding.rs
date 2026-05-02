@@ -38,13 +38,20 @@ pub fn encode_composite_key_into(values: &[Value], buf: &mut Vec<u8>) {
     }
 }
 
+pub fn encode_composite_key_from_indices(indices: &[u16], row: &[Value], buf: &mut Vec<u8>) {
+    buf.clear();
+    for &i in indices {
+        encode_key_value_into(&row[i as usize], buf);
+    }
+}
+
 #[inline]
 pub fn encode_int_key_into(val: i64, buf: &mut Vec<u8>) {
     buf.clear();
     encode_signed_varint(TAG_INTEGER, val, buf);
 }
 
-fn encode_key_value_into(value: &Value, buf: &mut Vec<u8>) {
+pub(crate) fn encode_key_value_into(value: &Value, buf: &mut Vec<u8>) {
     match value {
         Value::Null => buf.push(TAG_NULL),
         Value::Boolean(b) => {

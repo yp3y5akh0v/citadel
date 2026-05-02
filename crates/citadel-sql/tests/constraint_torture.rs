@@ -78,7 +78,6 @@ fn bulk_insert_varying_column_subsets() {
         "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER DEFAULT 10, b TEXT DEFAULT 'x', c REAL DEFAULT 1.5, d BOOLEAN DEFAULT FALSE)"
     ).unwrap());
 
-    // Only id
     for i in 0..100 {
         assert_rows_affected(
             conn.execute(&format!("INSERT INTO t (id) VALUES ({i})"))
@@ -86,7 +85,6 @@ fn bulk_insert_varying_column_subsets() {
             1,
         );
     }
-    // id + a
     for i in 100..200 {
         assert_rows_affected(
             conn.execute(&format!("INSERT INTO t (id, a) VALUES ({i}, 99)"))
@@ -94,7 +92,6 @@ fn bulk_insert_varying_column_subsets() {
             1,
         );
     }
-    // id + b + d
     for i in 200..300 {
         assert_rows_affected(
             conn.execute(&format!(
@@ -1370,4 +1367,218 @@ fn unique_composite_order_matters() {
     // Exact (1, 2) repeat rejected.
     let err = conn.execute("INSERT INTO t VALUES (3, 1, 2)").unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
+}
+
+fn count(conn: &Connection<'_>, sql: &str) -> i64 {
+    let qr = conn.query(sql).unwrap();
+    match &qr.rows[0][0] {
+        Value::Integer(n) => *n,
+        v => panic!("expected integer count, got {v:?}"),
+    }
+}
+
+#[test]
+fn fk_cascade_5_level_chain_1000_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, \
+         FOREIGN KEY (a_id) REFERENCES a(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, b_id INTEGER, \
+         FOREIGN KEY (b_id) REFERENCES b(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE d (id INTEGER PRIMARY KEY, c_id INTEGER, \
+         FOREIGN KEY (c_id) REFERENCES c(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE TABLE e (id INTEGER PRIMARY KEY, d_id INTEGER, \
+         FOREIGN KEY (d_id) REFERENCES d(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+
+    assert_ok(conn.execute("BEGIN").unwrap());
+    assert_rows_affected(conn.execute("INSERT INTO a VALUES (1)").unwrap(), 1);
+    for i in 0..1000 {
+        assert_rows_affected(
+            conn.execute(&format!("INSERT INTO b VALUES ({i}, 1)"))
+                .unwrap(),
+            1,
+        );
+        assert_rows_affected(
+            conn.execute(&format!("INSERT INTO c VALUES ({}, {i})", 1000 + i))
+                .unwrap(),
+            1,
+        );
+        assert_rows_affected(
+            conn.execute(&format!(
+                "INSERT INTO d VALUES ({}, {})",
+                2000 + i,
+                1000 + i
+            ))
+            .unwrap(),
+            1,
+        );
+        assert_rows_affected(
+            conn.execute(&format!(
+                "INSERT INTO e VALUES ({}, {})",
+                3000 + i,
+                2000 + i
+            ))
+            .unwrap(),
+            1,
+        );
+    }
+    assert_ok(conn.execute("COMMIT").unwrap());
+
+    assert_rows_affected(conn.execute("DELETE FROM a WHERE id = 1").unwrap(), 1);
+    for t in ["a", "b", "c", "d", "e"] {
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM {t}")), 0);
+    }
+}
+
+#[test]
+fn fk_self_reference_chain_terminates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE chain (id INTEGER PRIMARY KEY, parent INTEGER, \
+         FOREIGN KEY (parent) REFERENCES chain(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+
+    assert_ok(conn.execute("BEGIN").unwrap());
+    assert_rows_affected(
+        conn.execute("INSERT INTO chain VALUES (1, NULL)").unwrap(),
+        1,
+    );
+    for i in 2..=500 {
+        assert_rows_affected(
+            conn.execute(&format!("INSERT INTO chain VALUES ({i}, {})", i - 1))
+                .unwrap(),
+            1,
+        );
+    }
+    assert_ok(conn.execute("COMMIT").unwrap());
+
+    assert_rows_affected(conn.execute("DELETE FROM chain WHERE id = 1").unwrap(), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM chain"), 0);
+}
+
+#[test]
+fn fk_mixed_cascade_set_null_on_wide_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    for i in 0..5 {
+        conn.execute(&format!(
+            "CREATE TABLE c{i} (id INTEGER PRIMARY KEY, p_id INTEGER, \
+             FOREIGN KEY (p_id) REFERENCES p(id) ON DELETE CASCADE)"
+        ))
+        .unwrap();
+        conn.execute(&format!(
+            "CREATE TABLE n{i} (id INTEGER PRIMARY KEY, p_id INTEGER, \
+             FOREIGN KEY (p_id) REFERENCES p(id) ON DELETE SET NULL)"
+        ))
+        .unwrap();
+    }
+    assert_rows_affected(conn.execute("INSERT INTO p VALUES (1)").unwrap(), 1);
+    for i in 0..5 {
+        assert_rows_affected(
+            conn.execute(&format!("INSERT INTO c{i} VALUES (10, 1)"))
+                .unwrap(),
+            1,
+        );
+        assert_rows_affected(
+            conn.execute(&format!("INSERT INTO n{i} VALUES (20, 1)"))
+                .unwrap(),
+            1,
+        );
+    }
+
+    assert_rows_affected(conn.execute("DELETE FROM p WHERE id = 1").unwrap(), 1);
+    for i in 0..5 {
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM c{i}")), 0);
+        let qr = conn
+            .query(&format!("SELECT p_id FROM n{i} WHERE id = 20"))
+            .unwrap();
+        assert_eq!(qr.rows[0][0], Value::Null);
+    }
+}
+
+#[test]
+fn fk_bulk_update_cascade_propagates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER, \
+         FOREIGN KEY (p) REFERENCES parent(id) ON UPDATE CASCADE)",
+    )
+    .unwrap();
+
+    assert_ok(conn.execute("BEGIN").unwrap());
+    for i in 1..=100 {
+        assert_rows_affected(
+            conn.execute(&format!("INSERT INTO parent VALUES ({i})"))
+                .unwrap(),
+            1,
+        );
+        assert_rows_affected(
+            conn.execute(&format!("INSERT INTO child VALUES ({}, {i})", 1000 + i))
+                .unwrap(),
+            1,
+        );
+    }
+    assert_ok(conn.execute("COMMIT").unwrap());
+
+    assert_rows_affected(
+        conn.execute("UPDATE parent SET id = id + 10000 WHERE id <= 100")
+            .unwrap(),
+        100,
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM child WHERE p > 10000"),
+        100
+    );
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM child WHERE p <= 100"), 0);
+}
+
+#[test]
+fn fk_cascade_in_savepoint_rollback_restores() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER, \
+         FOREIGN KEY (p) REFERENCES parent(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    assert_rows_affected(conn.execute("INSERT INTO parent VALUES (1)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO child VALUES (10, 1)").unwrap(), 1);
+    assert_rows_affected(conn.execute("INSERT INTO child VALUES (11, 1)").unwrap(), 1);
+
+    assert_ok(conn.execute("BEGIN").unwrap());
+    assert_ok(conn.execute("SAVEPOINT sp").unwrap());
+    assert_rows_affected(conn.execute("DELETE FROM parent WHERE id = 1").unwrap(), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM child"), 0);
+    assert_ok(conn.execute("ROLLBACK TO sp").unwrap());
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM child"), 2);
+    assert_ok(conn.execute("COMMIT").unwrap());
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM child"), 2);
 }

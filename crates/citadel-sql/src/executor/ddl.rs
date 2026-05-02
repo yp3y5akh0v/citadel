@@ -172,6 +172,8 @@ pub(super) fn create_unique_auto_indices(
             name: idx_name,
             columns: col_idxs,
             unique: true,
+            predicate_sql: None,
+            predicate_expr: None,
         });
     }
     Ok(table_schema)
@@ -207,6 +209,8 @@ pub(super) fn create_fk_auto_indices(
             name: idx_name.clone(),
             columns: cols,
             unique: false,
+            predicate_sql: None,
+            predicate_expr: None,
         };
         let idx_table = TableSchema::index_table_name(&table_schema.name, &idx_name);
         wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
@@ -317,6 +321,8 @@ pub(super) fn exec_create_table(
                     .iter()
                     .map(|s| s.to_ascii_lowercase())
                     .collect(),
+                on_delete: fk.on_delete,
+                on_update: fk.on_update,
             })
         })
         .collect::<Result<_>>()?;
@@ -488,6 +494,8 @@ pub(super) fn exec_create_table_in_txn(
                     .iter()
                     .map(|s| s.to_ascii_lowercase())
                     .collect(),
+                on_delete: fk.on_delete,
+                on_update: fk.on_update,
             })
         })
         .collect::<Result<_>>()?;
@@ -557,6 +565,63 @@ pub(super) fn exec_drop_table_in_txn(
     Ok(ExecutionResult::Ok)
 }
 
+pub(super) fn exec_truncate(
+    db: &Database,
+    schema: &SchemaManager,
+    stmt: &TruncateStmt,
+) -> Result<ExecutionResult> {
+    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    let count = truncate_tables(&mut wtx, schema, stmt)?;
+    wtx.commit().map_err(SqlError::Storage)?;
+    Ok(ExecutionResult::RowsAffected(count))
+}
+
+pub(super) fn exec_truncate_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &TruncateStmt,
+) -> Result<ExecutionResult> {
+    let count = truncate_tables(wtx, schema, stmt)?;
+    Ok(ExecutionResult::RowsAffected(count))
+}
+
+fn truncate_tables(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &TruncateStmt,
+) -> Result<u64> {
+    let lower: Vec<String> = stmt.tables.iter().map(|t| t.to_ascii_lowercase()).collect();
+    let listed: rustc_hash::FxHashSet<&str> = lower.iter().map(String::as_str).collect();
+
+    for name in &lower {
+        if !schema.contains(name) {
+            return Err(SqlError::TableNotFound(name.clone()));
+        }
+        for (child, _fk) in schema.child_fks_for(name) {
+            if !listed.contains(child) {
+                return Err(SqlError::ForeignKeyViolation(format!(
+                    "cannot truncate table '{}': referenced by foreign key in '{}'",
+                    name, child
+                )));
+            }
+        }
+    }
+
+    let mut total = 0u64;
+    for name in &lower {
+        let table_schema = schema.get(name).unwrap();
+        let count = wtx
+            .table_truncate(name.as_bytes())
+            .map_err(SqlError::Storage)?;
+        for idx in &table_schema.indices {
+            let idx_table = TableSchema::index_table_name(name, &idx.name);
+            wtx.table_truncate(&idx_table).map_err(SqlError::Storage)?;
+        }
+        total += count;
+    }
+    Ok(total)
+}
+
 pub(super) fn exec_create_index(
     db: &Database,
     schema: &mut SchemaManager,
@@ -604,6 +669,8 @@ pub(super) fn exec_create_index(
         name: lower_idx.clone(),
         columns: col_indices,
         unique: stmt.unique,
+        predicate_sql: stmt.predicate_sql.clone(),
+        predicate_expr: stmt.predicate_expr.clone(),
     };
 
     let idx_table = TableSchema::index_table_name(&lower_table, &lower_idx);
@@ -737,6 +804,8 @@ pub(super) fn exec_create_index_in_txn(
         name: lower_idx.clone(),
         columns: col_indices,
         unique: stmt.unique,
+        predicate_sql: stmt.predicate_sql.clone(),
+        predicate_expr: stmt.predicate_expr.clone(),
     };
 
     let idx_table = TableSchema::index_table_name(&lower_table, &lower_idx);
@@ -1097,6 +1166,8 @@ pub(super) fn alter_add_column(
                 .iter()
                 .map(|s| s.to_ascii_lowercase())
                 .collect(),
+            on_delete: fk.on_delete,
+            on_update: fk.on_update,
         };
         new_schema.foreign_keys.push(fk_entry);
     }

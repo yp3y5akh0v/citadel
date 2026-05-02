@@ -832,6 +832,7 @@ pub(super) fn materialize_query_body(
             limit: comp.limit.clone(),
             offset: comp.offset.clone(),
         }))),
+        QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_) => Ok(body.clone()),
     }
 }
 
@@ -844,6 +845,9 @@ pub(super) fn exec_query_body(
     match body {
         QueryBody::Select(sel) => super::exec_select(db, schema, sel, ctes),
         QueryBody::Compound(comp) => exec_compound_select(db, schema, comp, ctes),
+        QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_) => Err(
+            SqlError::Unsupported("DML CTE bodies require an active write transaction".into()),
+        ),
     }
 }
 
@@ -856,6 +860,9 @@ pub(super) fn exec_query_body_in_txn(
     match body {
         QueryBody::Select(sel) => super::exec_select_in_txn(wtx, schema, sel, ctes),
         QueryBody::Compound(comp) => exec_compound_select_in_txn(wtx, schema, comp, ctes),
+        QueryBody::Insert(ins) => exec_insert_in_txn_with_ctes(wtx, schema, ins, &[], ctes),
+        QueryBody::Update(upd) => super::exec_update_in_txn(wtx, schema, upd),
+        QueryBody::Delete(del) => super::exec_delete_in_txn(wtx, schema, del),
     }
 }
 
@@ -1125,7 +1132,29 @@ pub fn exec_insert_in_txn(
     stmt: &InsertStmt,
     params: &[Value],
 ) -> Result<ExecutionResult> {
-    with_insert_scratch(|bufs| exec_insert_in_txn_impl(wtx, schema, stmt, params, bufs, None))
+    with_insert_scratch(|bufs| {
+        exec_insert_in_txn_impl(
+            wtx,
+            schema,
+            stmt,
+            params,
+            bufs,
+            None,
+            &CteContext::default(),
+        )
+    })
+}
+
+pub(super) fn exec_insert_in_txn_with_ctes(
+    wtx: &mut WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &InsertStmt,
+    params: &[Value],
+    outer_ctes: &CteContext,
+) -> Result<ExecutionResult> {
+    with_insert_scratch(|bufs| {
+        exec_insert_in_txn_impl(wtx, schema, stmt, params, bufs, None, outer_ctes)
+    })
 }
 
 fn exec_insert_in_txn_cached(
@@ -1136,7 +1165,15 @@ fn exec_insert_in_txn_cached(
     cache: &InsertCache,
 ) -> Result<ExecutionResult> {
     with_insert_scratch(|bufs| {
-        exec_insert_in_txn_impl(wtx, schema, stmt, params, bufs, Some(cache))
+        exec_insert_in_txn_impl(
+            wtx,
+            schema,
+            stmt,
+            params,
+            bufs,
+            Some(cache),
+            &CteContext::default(),
+        )
     })
 }
 
@@ -1147,6 +1184,7 @@ fn exec_insert_in_txn_impl(
     params: &[Value],
     bufs: &mut InsertBufs,
     cache: Option<&InsertCache>,
+    outer_ctes: &CteContext,
 ) -> Result<ExecutionResult> {
     let empty_ctes = CteContext::default();
     let materialized;
@@ -1318,10 +1356,12 @@ fn exec_insert_in_txn_impl(
 
     let select_rows = match &stmt.source {
         InsertSource::Select(sq) => {
-            let insert_ctes =
-                super::materialize_all_ctes(&sq.ctes, sq.recursive, &mut |body, ctx| {
-                    exec_query_body_write(wtx, schema, body, ctx)
-                })?;
+            let insert_ctes = super::materialize_all_ctes_with_outer(
+                &sq.ctes,
+                sq.recursive,
+                outer_ctes,
+                &mut |body, ctx| exec_query_body_write(wtx, schema, body, ctx),
+            )?;
             let qr = exec_query_body_write(wtx, schema, &sq.body, &insert_ctes)?;
             Some(qr.rows)
         }
@@ -1538,13 +1578,11 @@ fn exec_insert_in_txn_impl(
                 if any_null {
                     continue;
                 }
-                let fk_vals: Vec<Value> = fk
-                    .columns
-                    .iter()
-                    .map(|&ci| bufs.row[ci as usize].clone())
-                    .collect();
-                bufs.fk_key_buf.clear();
-                encode_composite_key_into(&fk_vals, &mut bufs.fk_key_buf);
+                crate::encoding::encode_composite_key_from_indices(
+                    &fk.columns,
+                    &bufs.row,
+                    &mut bufs.fk_key_buf,
+                );
                 let found = wtx
                     .table_get(fk.foreign_table.as_bytes(), &bufs.fk_key_buf)
                     .map_err(SqlError::Storage)?;
@@ -2642,23 +2680,35 @@ fn apply_do_update_with_old_row(
             &[(old_pk_key, new_value_buf.as_slice())],
         )
         .map_err(SqlError::Storage)?;
+        let col_map_partial =
+            any_partial_index(table_schema).then(|| ColumnMap::new(&table_schema.columns));
         for idx in &table_schema.indices {
-            if !index_columns_changed(idx, old_row, &new_row) {
-                continue;
-            }
+            let cols_changed = index_columns_changed(idx, old_row, &new_row);
+            let (del, ins) = partial_idx_update_actions(
+                idx,
+                old_row,
+                &new_row,
+                cols_changed,
+                false,
+                col_map_partial.as_ref(),
+            );
             let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
-            let old_idx_key = encode_index_key(idx, old_row, &old_pk_values);
-            wtx.table_delete(&idx_table, &old_idx_key)
-                .map_err(SqlError::Storage)?;
-            let new_idx_key = encode_index_key(idx, &new_row, &new_pk_values);
-            let new_idx_val = encode_index_value(idx, &new_row, &new_pk_values);
-            let is_new = wtx
-                .table_insert(&idx_table, &new_idx_key, &new_idx_val)
-                .map_err(SqlError::Storage)?;
-            if idx.unique && !is_new {
-                let any_null = idx.columns.iter().any(|&c| new_row[c as usize].is_null());
-                if !any_null {
-                    return Err(SqlError::UniqueViolation(idx.name.clone()));
+            if del {
+                let old_idx_key = encode_index_key(idx, old_row, &old_pk_values);
+                wtx.table_delete(&idx_table, &old_idx_key)
+                    .map_err(SqlError::Storage)?;
+            }
+            if ins {
+                let new_idx_key = encode_index_key(idx, &new_row, &new_pk_values);
+                let new_idx_val = encode_index_value(idx, &new_row, &new_pk_values);
+                let is_new = wtx
+                    .table_insert(&idx_table, &new_idx_key, &new_idx_val)
+                    .map_err(SqlError::Storage)?;
+                if idx.unique && !is_new {
+                    let any_null = idx.columns.iter().any(|&c| new_row[c as usize].is_null());
+                    if !any_null {
+                        return Err(SqlError::UniqueViolation(idx.name.clone()));
+                    }
                 }
             }
         }

@@ -355,3 +355,136 @@ fn recursive_in_transaction() {
     let qr2 = conn.query("SELECT COUNT(*) FROM tree").unwrap();
     assert_eq!(qr2.rows[0][0], Value::Integer(5));
 }
+
+fn assert_rows(r: ExecutionResult, expected: u64) {
+    match r {
+        ExecutionResult::RowsAffected(n) => assert_eq!(n, expected),
+        other => panic!("expected RowsAffected({expected}), got {other:?}"),
+    }
+}
+
+fn count(conn: &Connection<'_>, sql: &str) -> i64 {
+    let qr = conn.query(sql).unwrap();
+    match &qr.rows[0][0] {
+        Value::Integer(n) => *n,
+        v => panic!("expected integer count, got {v:?}"),
+    }
+}
+
+#[test]
+fn with_dml_bulk_move_1000_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE archive (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+
+    assert_ok(conn.execute("BEGIN").unwrap());
+    for i in 1..=1000 {
+        assert_rows(
+            conn.execute(&format!("INSERT INTO src VALUES ({i}, {})", i * 10))
+                .unwrap(),
+            1,
+        );
+    }
+    assert_ok(conn.execute("COMMIT").unwrap());
+
+    assert_rows(
+        conn.execute(
+            "WITH d AS (DELETE FROM src RETURNING *) \
+             INSERT INTO archive SELECT * FROM d",
+        )
+        .unwrap(),
+        1000,
+    );
+
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM src"), 0);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM archive"), 1000);
+}
+
+#[test]
+fn with_dml_chain_three_ctes_referencing_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE mid (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    for i in 1..=10 {
+        assert_rows(
+            conn.execute(&format!("INSERT INTO src VALUES ({i}, {})", i * 10))
+                .unwrap(),
+            1,
+        );
+    }
+
+    assert_rows(
+        conn.execute(
+            "WITH d AS (DELETE FROM src WHERE val >= 50 RETURNING *), \
+                  m AS (INSERT INTO mid SELECT * FROM d RETURNING *) \
+             INSERT INTO dst SELECT * FROM m",
+        )
+        .unwrap(),
+        6,
+    );
+
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM src"), 4);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM mid"), 6);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM dst"), 6);
+}
+
+#[test]
+fn with_dml_returning_count_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    assert_ok(conn.execute("BEGIN").unwrap());
+    for i in 1..=500 {
+        assert_rows(
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 10))
+                .unwrap(),
+            1,
+        );
+    }
+    assert_ok(conn.execute("COMMIT").unwrap());
+
+    let qr = conn
+        .query("WITH d AS (DELETE FROM t WHERE val < 2500 RETURNING *) SELECT COUNT(*) FROM d")
+        .unwrap();
+    assert_eq!(qr.rows[0][0], Value::Integer(249));
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 251);
+}
+
+#[test]
+fn with_dml_alternating_dml_and_plain_dml() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    for i in 0..50 {
+        assert_rows(
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 10))
+                .unwrap(),
+            1,
+        );
+        let qr = conn
+            .query(&format!(
+                "WITH x AS (DELETE FROM t WHERE id = {i} RETURNING *) SELECT COUNT(*) FROM x"
+            ))
+            .unwrap();
+        assert_eq!(qr.rows[0][0], Value::Integer(1));
+    }
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM t"), 0);
+}

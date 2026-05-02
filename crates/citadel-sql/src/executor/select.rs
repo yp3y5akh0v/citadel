@@ -1937,7 +1937,7 @@ impl CompiledSelect {
         }
         let sel = match &sq.body {
             QueryBody::Select(s) => s,
-            QueryBody::Compound(_) => return None,
+            _ => return None,
         };
         if !sel.joins.is_empty()
             || !sel.group_by.is_empty()
@@ -1996,7 +1996,7 @@ impl CompiledPlan for CompiledSelect {
         };
         let sel = match &sq.body {
             QueryBody::Select(s) => s,
-            QueryBody::Compound(_) => return None,
+            _ => return None,
         };
         if sel.where_clause.is_some()
             || !sel.order_by.is_empty()

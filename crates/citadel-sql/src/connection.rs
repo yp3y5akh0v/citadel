@@ -12,7 +12,7 @@ use citadel_txn::write_txn::{WriteTxn, WriteTxnSnapshot};
 use crate::error::{Result, SqlError};
 use crate::executor;
 use crate::parser;
-use crate::parser::Statement;
+use crate::parser::{QueryBody, SelectQuery, Statement};
 use crate::prepared::PreparedStatement;
 use crate::schema::{SchemaManager, SchemaSnapshot};
 use crate::types::{ExecutionResult, QueryResult, TableSchema, Value};
@@ -58,11 +58,12 @@ fn parse_fixed_offset(s: &str) -> Option<()> {
 }
 
 fn stmt_mutates(stmt: &Statement) -> bool {
-    matches!(
+    if matches!(
         stmt,
         Statement::Insert(_)
             | Statement::Update(_)
             | Statement::Delete(_)
+            | Statement::Truncate(_)
             | Statement::CreateTable(_)
             | Statement::DropTable(_)
             | Statement::AlterTable(_)
@@ -70,7 +71,27 @@ fn stmt_mutates(stmt: &Statement) -> bool {
             | Statement::DropIndex(_)
             | Statement::CreateView(_)
             | Statement::DropView(_)
-    )
+    ) {
+        return true;
+    }
+    if let Statement::Select(sq) = stmt {
+        if select_query_has_dml(sq) {
+            return true;
+        }
+    }
+    false
+}
+
+fn select_query_has_dml(sq: &SelectQuery) -> bool {
+    sq.ctes.iter().any(|cte| query_body_has_dml(&cte.body)) || query_body_has_dml(&sq.body)
+}
+
+fn query_body_has_dml(body: &QueryBody) -> bool {
+    match body {
+        QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_) => true,
+        QueryBody::Compound(c) => query_body_has_dml(&c.left) || query_body_has_dml(&c.right),
+        QueryBody::Select(_) => false,
+    }
 }
 
 fn try_normalize_insert(sql: &str) -> Option<(String, Vec<Value>)> {

@@ -110,11 +110,15 @@ fn schema_roundtrip_with_indices() {
                 name: "idx_customer".into(),
                 columns: vec![1],
                 unique: false,
+                predicate_sql: None,
+                predicate_expr: None,
             },
             IndexDef {
                 name: "idx_amount_uniq".into(),
                 columns: vec![2],
                 unique: true,
+                predicate_sql: None,
+                predicate_expr: None,
             },
         ],
         vec![],
@@ -244,6 +248,8 @@ fn schema_roundtrip_with_foreign_keys() {
             columns: vec![1],
             foreign_table: "users".into(),
             referred_columns: vec!["id".into()],
+            on_delete: crate::parser::ReferentialAction::NoAction,
+            on_update: crate::parser::ReferentialAction::NoAction,
         }],
     );
 

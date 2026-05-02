@@ -20,6 +20,7 @@ pub enum Statement {
     Select(Box<SelectQuery>),
     Update(UpdateStmt),
     Delete(DeleteStmt),
+    Truncate(TruncateStmt),
     Begin,
     Commit,
     Rollback,
@@ -86,6 +87,31 @@ pub struct ForeignKeyDef {
     pub columns: Vec<String>,
     pub foreign_table: String,
     pub referred_columns: Vec<String>,
+    pub on_delete: ReferentialAction,
+    pub on_update: ReferentialAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ReferentialAction {
+    NoAction = 0,
+    Restrict = 1,
+    Cascade = 2,
+    SetNull = 3,
+    SetDefault = 4,
+}
+
+impl ReferentialAction {
+    pub fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::NoAction),
+            1 => Some(Self::Restrict),
+            2 => Some(Self::Cascade),
+            3 => Some(Self::SetNull),
+            4 => Some(Self::SetDefault),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,12 +143,19 @@ pub struct DropTableStmt {
 }
 
 #[derive(Debug, Clone)]
+pub struct TruncateStmt {
+    pub tables: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct CreateIndexStmt {
     pub index_name: String,
     pub table_name: String,
     pub columns: Vec<String>,
     pub unique: bool,
     pub if_not_exists: bool,
+    pub predicate_sql: Option<String>,
+    pub predicate_expr: Option<Expr>,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +273,9 @@ pub struct CompoundSelect {
 pub enum QueryBody {
     Select(Box<SelectStmt>),
     Compound(Box<CompoundSelect>),
+    Insert(Box<InsertStmt>),
+    Update(Box<UpdateStmt>),
+    Delete(Box<DeleteStmt>),
 }
 
 #[derive(Debug, Clone)]
@@ -455,8 +491,6 @@ pub fn has_subquery(expr: &Expr) -> bool {
     }
 }
 
-/// Parse a SQL expression string back into an internal Expr.
-/// Used for deserializing stored DEFAULT/CHECK expressions from schema.
 pub fn parse_sql_expr(sql: &str) -> Result<Expr> {
     let dialect = GenericDialect {};
     let mut parser = Parser::new(&dialect)
@@ -562,6 +596,9 @@ fn visit_exprs_query_body(body: &QueryBody, visitor: &mut impl FnMut(&Expr)) {
                 visit_expr(o, visitor);
             }
         }
+        QueryBody::Insert(ins) => visit_exprs_stmt(&Statement::Insert((**ins).clone()), visitor),
+        QueryBody::Update(upd) => visit_exprs_stmt(&Statement::Update((**upd).clone()), visitor),
+        QueryBody::Delete(del) => visit_exprs_stmt(&Statement::Delete((**del).clone()), visitor),
     }
 }
 
@@ -744,6 +781,7 @@ fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
         sp::Statement::Query(query) => convert_query(*query),
         sp::Statement::Update(update) => convert_update(update),
         sp::Statement::Delete(delete) => convert_delete(delete),
+        sp::Statement::Truncate(t) => convert_truncate(t),
         sp::Statement::StartTransaction { .. } => Ok(Statement::Begin),
         sp::Statement::Commit { chain: true, .. } => {
             Err(SqlError::Unsupported("COMMIT AND CHAIN".into()))
@@ -836,7 +874,7 @@ fn convert_column_def(
                 check_name = check.name.as_ref().map(|n| n.value.clone());
             }
             sp::ColumnOption::ForeignKey(fk) => {
-                convert_fk_actions(&fk.on_delete, &fk.on_update)?;
+                let (on_delete, on_update) = convert_fk_actions(&fk.on_delete, &fk.on_update)?;
                 let ftable = object_name_to_string(&fk.foreign_table).to_ascii_lowercase();
                 let referred: Vec<String> = fk
                     .referred_columns
@@ -848,6 +886,8 @@ fn convert_column_def(
                     columns: vec![col_name.to_ascii_lowercase()],
                     foreign_table: ftable,
                     referred_columns: referred,
+                    on_delete,
+                    on_update,
                 });
             }
             sp::ColumnOption::Generated {
@@ -1026,7 +1066,7 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
                 });
             }
             sp::TableConstraint::ForeignKey(fk) => {
-                convert_fk_actions(&fk.on_delete, &fk.on_update)?;
+                let (on_delete, on_update) = convert_fk_actions(&fk.on_delete, &fk.on_update)?;
                 let cols: Vec<String> = fk
                     .columns
                     .iter()
@@ -1043,6 +1083,8 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
                     columns: cols,
                     foreign_table: ftable,
                     referred_columns: referred,
+                    on_delete,
+                    on_update,
                 });
             }
             sp::TableConstraint::Unique(u) => {
@@ -1141,20 +1183,18 @@ fn convert_alter_table(at: sp::AlterTable) -> Result<Statement> {
 fn convert_fk_actions(
     on_delete: &Option<sp::ReferentialAction>,
     on_update: &Option<sp::ReferentialAction>,
-) -> Result<()> {
-    for action in [on_delete, on_update] {
-        match action {
-            None
-            | Some(sp::ReferentialAction::Restrict)
-            | Some(sp::ReferentialAction::NoAction) => {}
-            Some(other) => {
-                return Err(SqlError::Unsupported(format!(
-                    "FOREIGN KEY action: {other}"
-                )));
-            }
-        }
+) -> Result<(ReferentialAction, ReferentialAction)> {
+    Ok((convert_fk_action(on_delete)?, convert_fk_action(on_update)?))
+}
+
+fn convert_fk_action(action: &Option<sp::ReferentialAction>) -> Result<ReferentialAction> {
+    match action {
+        None | Some(sp::ReferentialAction::NoAction) => Ok(ReferentialAction::NoAction),
+        Some(sp::ReferentialAction::Restrict) => Ok(ReferentialAction::Restrict),
+        Some(sp::ReferentialAction::Cascade) => Ok(ReferentialAction::Cascade),
+        Some(sp::ReferentialAction::SetNull) => Ok(ReferentialAction::SetNull),
+        Some(sp::ReferentialAction::SetDefault) => Ok(ReferentialAction::SetDefault),
     }
-    Ok(())
 }
 
 fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
@@ -1181,13 +1221,77 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
         ));
     }
 
+    let (predicate_sql, predicate_expr) = match &ci.predicate {
+        Some(sp_expr) => {
+            let expr = convert_expr(sp_expr)?;
+            validate_partial_index_predicate(&expr)?;
+            (Some(sp_expr.to_string()), Some(expr))
+        }
+        None => (None, None),
+    };
+
     Ok(Statement::CreateIndex(CreateIndexStmt {
         index_name,
         table_name,
         columns,
         unique: ci.unique,
         if_not_exists: ci.if_not_exists,
+        predicate_sql,
+        predicate_expr,
     }))
+}
+
+fn validate_partial_index_predicate(expr: &Expr) -> Result<()> {
+    let mut bad: Option<&'static str> = None;
+    visit_expr(expr, &mut |e| {
+        if bad.is_some() {
+            return;
+        }
+        match e {
+            Expr::ScalarSubquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+                bad = Some("subqueries");
+            }
+            Expr::CountStar => bad = Some("aggregates"),
+            Expr::WindowFunction { .. } => bad = Some("window functions"),
+            Expr::Parameter(_) => bad = Some("bound parameters"),
+            Expr::QualifiedColumn { .. } => bad = Some("cross-table references"),
+            Expr::Function { name, .. } => {
+                if is_aggregate_function(name) {
+                    bad = Some("aggregates");
+                } else if !is_immutable_function(name) {
+                    bad = Some("non-deterministic functions");
+                }
+            }
+            _ => {}
+        }
+    });
+    if let Some(reason) = bad {
+        return Err(SqlError::Unsupported(format!(
+            "partial index predicate cannot contain {reason}"
+        )));
+    }
+    Ok(())
+}
+
+fn is_aggregate_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "count" | "sum" | "avg" | "min" | "max" | "total" | "group_concat" | "string_agg"
+    )
+}
+
+fn is_immutable_function(name: &str) -> bool {
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "now"
+            | "current_timestamp"
+            | "current_date"
+            | "current_time"
+            | "localtimestamp"
+            | "localtime"
+            | "random"
+            | "rand"
+    )
 }
 
 fn convert_create_view(cv: sp::CreateView) -> Result<Statement> {
@@ -1418,6 +1522,18 @@ fn convert_select_body(select: &sp::Select) -> Result<SelectStmt> {
 fn convert_set_expr(set_expr: &sp::SetExpr) -> Result<QueryBody> {
     match set_expr {
         sp::SetExpr::Select(sel) => Ok(QueryBody::Select(Box::new(convert_select_body(sel)?))),
+        sp::SetExpr::Insert(stmt) => match convert_statement(stmt.clone())? {
+            Statement::Insert(ins) => Ok(QueryBody::Insert(Box::new(ins))),
+            _ => Err(SqlError::Parse("expected INSERT in WITH-DML body".into())),
+        },
+        sp::SetExpr::Update(stmt) => match convert_statement(stmt.clone())? {
+            Statement::Update(upd) => Ok(QueryBody::Update(Box::new(upd))),
+            _ => Err(SqlError::Parse("expected UPDATE in WITH-DML body".into())),
+        },
+        sp::SetExpr::Delete(stmt) => match convert_statement(stmt.clone())? {
+            Statement::Delete(del) => Ok(QueryBody::Delete(Box::new(del))),
+            _ => Err(SqlError::Parse("expected DELETE in WITH-DML body".into())),
+        },
         sp::SetExpr::SetOperation {
             op,
             set_quantifier,
@@ -1495,6 +1611,13 @@ fn convert_query_body(query: &sp::Query) -> Result<QueryBody> {
             comp.limit = limit;
             comp.offset = offset;
         }
+        QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_) => {
+            if !order_by.is_empty() || limit.is_some() || offset.is_some() {
+                return Err(SqlError::Parse(
+                    "ORDER BY / LIMIT / OFFSET not allowed on DML CTE body".into(),
+                ));
+            }
+        }
     }
 
     Ok(body)
@@ -1509,6 +1632,9 @@ fn convert_subquery(query: &sp::Query) -> Result<SelectStmt> {
         QueryBody::Compound(_) => Err(SqlError::Unsupported(
             "UNION/INTERSECT/EXCEPT in subqueries".into(),
         )),
+        QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_) => Err(
+            SqlError::Unsupported("WITH-DML inside subqueries (PG forbids)".into()),
+        ),
     }
 }
 
@@ -1614,6 +1740,36 @@ fn convert_update(update: sp::Update) -> Result<Statement> {
         where_clause,
         returning,
     }))
+}
+
+fn convert_truncate(t: sp::Truncate) -> Result<Statement> {
+    if matches!(t.cascade, Some(sp::CascadeOption::Cascade)) {
+        return Err(SqlError::Unsupported(
+            "TRUNCATE CASCADE is planned for v0.13".into(),
+        ));
+    }
+    if t.if_exists {
+        return Err(SqlError::Unsupported("TRUNCATE IF EXISTS".into()));
+    }
+    if t.partitions.is_some() {
+        return Err(SqlError::Unsupported("TRUNCATE PARTITION".into()));
+    }
+    if t.on_cluster.is_some() {
+        return Err(SqlError::Unsupported("TRUNCATE ON CLUSTER".into()));
+    }
+    if t.table_names.is_empty() {
+        return Err(SqlError::Parse(
+            "TRUNCATE requires at least one table".into(),
+        ));
+    }
+
+    let tables: Vec<String> = t
+        .table_names
+        .iter()
+        .map(|tt| object_name_to_string(&tt.name))
+        .collect();
+
+    Ok(Statement::Truncate(TruncateStmt { tables }))
 }
 
 fn convert_delete(delete: sp::Delete) -> Result<Statement> {

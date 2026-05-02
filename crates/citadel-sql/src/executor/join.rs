@@ -20,31 +20,39 @@ pub(super) fn resolve_table_name<'a>(
 }
 
 pub(super) fn build_joined_columns(tables: &[(String, &TableSchema)]) -> Vec<ColumnDef> {
-    let mut result = Vec::new();
-    let mut pos: u16 = 0;
-
-    for (alias, schema) in tables {
-        for col in &schema.columns {
-            result.push(ColumnDef {
-                name: format!("{}.{}", alias.to_ascii_lowercase(), col.name),
-                data_type: col.data_type,
-                nullable: col.nullable,
-                position: pos,
-                default_expr: None,
-                default_sql: None,
-                check_expr: None,
-                check_sql: None,
-                check_name: None,
-                is_with_timezone: false,
-                generated_expr: None,
-                generated_sql: None,
-                generated_kind: None,
-            });
-            pos += 1;
-        }
+    let total: usize = tables.iter().map(|(_, s)| s.columns.len()).sum();
+    let mut result = Vec::with_capacity(total);
+    for entry in tables {
+        extend_joined_columns(&mut result, entry);
     }
-
     result
+}
+
+pub(super) fn extend_joined_columns(out: &mut Vec<ColumnDef>, table: &(String, &TableSchema)) {
+    let (alias, schema) = table;
+    out.reserve(schema.columns.len());
+    let alias_lc = alias.to_ascii_lowercase();
+    for (pos, col) in (out.len() as u16..).zip(schema.columns.iter()) {
+        let mut name = String::with_capacity(alias_lc.len() + 1 + col.name.len());
+        name.push_str(&alias_lc);
+        name.push('.');
+        name.push_str(&col.name);
+        out.push(ColumnDef {
+            name,
+            data_type: col.data_type,
+            nullable: col.nullable,
+            position: pos,
+            default_expr: None,
+            default_sql: None,
+            check_expr: None,
+            check_sql: None,
+            check_name: None,
+            is_with_timezone: false,
+            generated_expr: None,
+            generated_sql: None,
+            generated_kind: None,
+        });
+    }
 }
 
 pub(super) fn extract_equi_join_keys(
@@ -854,7 +862,8 @@ pub(super) fn exec_select_join(
     let from_schema = resolve_table_name(schema, &stmt.from)?;
     let from_alias = table_alias_or_name(&stmt.from, &stmt.from_alias);
 
-    let mut all_tables: Vec<(String, &TableSchema)> = vec![(from_alias.clone(), from_schema)];
+    let mut all_tables: Vec<(String, &TableSchema)> = Vec::with_capacity(stmt.joins.len() + 1);
+    all_tables.push((from_alias, from_schema));
     for join in &stmt.joins {
         let inner_schema = resolve_table_name(schema, &join.table.name)?;
         let inner_alias = table_alias_or_name(&join.table.name, &join.table.alias);
@@ -871,7 +880,6 @@ pub(super) fn exec_select_join(
         _ => collect_all_rows_raw(&mut rtx, from_schema)?,
     };
 
-    let mut tables: Vec<(String, &TableSchema)> = vec![(from_alias.clone(), from_schema)];
     let mut cur_outer_pk_col: Option<usize> = if from_schema.primary_key_columns.len() == 1 {
         Some(from_schema.primary_key_columns[0] as usize)
     } else {
@@ -879,10 +887,9 @@ pub(super) fn exec_select_join(
     };
 
     let num_joins = stmt.joins.len();
-    let mut last_combined_cols: Option<Vec<ColumnDef>> = None;
+    let mut combined_cols: Vec<ColumnDef> = build_joined_columns(&all_tables[..1]);
     for (ji, join) in stmt.joins.iter().enumerate() {
-        let inner_schema = resolve_table_name(schema, &join.table.name)?;
-        let inner_alias = table_alias_or_name(&join.table.name, &join.table.alias);
+        let inner_schema = all_tables[ji + 1].1;
         let inner_rows = match &needed_per_table {
             Some(n) if ji + 1 < n.len() => {
                 collect_rows_partial(&mut rtx, inner_schema, &n[ji + 1])?
@@ -890,12 +897,13 @@ pub(super) fn exec_select_join(
             _ => collect_all_rows_raw(&mut rtx, inner_schema)?,
         };
 
-        let mut preview_tables = tables.clone();
-        preview_tables.push((inner_alias.clone(), inner_schema));
-        let combined_cols = build_joined_columns(&preview_tables);
+        extend_joined_columns(&mut combined_cols, &all_tables[ji + 1]);
 
         let outer_col_count = if outer_rows.is_empty() {
-            tables.iter().map(|(_, s)| s.columns.len()).sum()
+            all_tables[..ji + 1]
+                .iter()
+                .map(|(_, s)| s.columns.len())
+                .sum()
         } else {
             outer_rows[0].len()
         };
@@ -920,21 +928,18 @@ pub(super) fn exec_select_join(
             cur_outer_pk_col,
             proj.as_ref(),
         );
-        last_combined_cols = Some(combined_cols);
-        tables.push((inner_alias, inner_schema));
         cur_outer_pk_col = None;
     }
     drop(rtx);
 
-    let joined_cols = last_combined_cols.unwrap_or_else(|| build_joined_columns(&tables));
     if let Some(ref oc) = output_combined {
         let actual_width = outer_rows.first().map_or(0, |r| r.len());
         if actual_width == oc.len() {
-            let projected_cols = build_projected_columns(&joined_cols, oc);
+            let projected_cols = build_projected_columns(&combined_cols, oc);
             return super::process_select(&projected_cols, outer_rows, stmt, false);
         }
     }
-    super::process_select(&joined_cols, outer_rows, stmt, false)
+    super::process_select(&combined_cols, outer_rows, stmt, false)
 }
 
 pub(super) fn exec_select_join_in_txn(
@@ -945,7 +950,8 @@ pub(super) fn exec_select_join_in_txn(
     let from_schema = resolve_table_name(schema, &stmt.from)?;
     let from_alias = table_alias_or_name(&stmt.from, &stmt.from_alias);
 
-    let mut all_tables: Vec<(String, &TableSchema)> = vec![(from_alias.clone(), from_schema)];
+    let mut all_tables: Vec<(String, &TableSchema)> = Vec::with_capacity(stmt.joins.len() + 1);
+    all_tables.push((from_alias, from_schema));
     for join in &stmt.joins {
         let inner_schema = resolve_table_name(schema, &join.table.name)?;
         let inner_alias = table_alias_or_name(&join.table.name, &join.table.alias);
@@ -961,7 +967,6 @@ pub(super) fn exec_select_join_in_txn(
         _ => collect_all_rows_write(wtx, from_schema)?,
     };
 
-    let mut tables: Vec<(String, &TableSchema)> = vec![(from_alias.clone(), from_schema)];
     let mut cur_outer_pk_col: Option<usize> = if from_schema.primary_key_columns.len() == 1 {
         Some(from_schema.primary_key_columns[0] as usize)
     } else {
@@ -969,9 +974,9 @@ pub(super) fn exec_select_join_in_txn(
     };
 
     let num_joins = stmt.joins.len();
+    let mut combined_cols: Vec<ColumnDef> = build_joined_columns(&all_tables[..1]);
     for (ji, join) in stmt.joins.iter().enumerate() {
-        let inner_schema = resolve_table_name(schema, &join.table.name)?;
-        let inner_alias = table_alias_or_name(&join.table.name, &join.table.alias);
+        let inner_schema = all_tables[ji + 1].1;
         let inner_rows = match &needed_per_table {
             Some(n) if ji + 1 < n.len() => {
                 collect_rows_partial_write(wtx, inner_schema, &n[ji + 1])?
@@ -979,12 +984,13 @@ pub(super) fn exec_select_join_in_txn(
             _ => collect_all_rows_write(wtx, inner_schema)?,
         };
 
-        let mut preview_tables = tables.clone();
-        preview_tables.push((inner_alias.clone(), inner_schema));
-        let combined_cols = build_joined_columns(&preview_tables);
+        extend_joined_columns(&mut combined_cols, &all_tables[ji + 1]);
 
         let outer_col_count = if outer_rows.is_empty() {
-            tables.iter().map(|(_, s)| s.columns.len()).sum()
+            all_tables[..ji + 1]
+                .iter()
+                .map(|(_, s)| s.columns.len())
+                .sum()
         } else {
             outer_rows[0].len()
         };
@@ -1009,17 +1015,15 @@ pub(super) fn exec_select_join_in_txn(
             cur_outer_pk_col,
             proj.as_ref(),
         );
-        tables.push((inner_alias, inner_schema));
         cur_outer_pk_col = None;
     }
 
-    let joined_cols = build_joined_columns(&tables);
     if let Some(ref oc) = output_combined {
         let actual_width = outer_rows.first().map_or(0, |r| r.len());
         if actual_width == oc.len() {
-            let projected_cols = build_projected_columns(&joined_cols, oc);
+            let projected_cols = build_projected_columns(&combined_cols, oc);
             return super::process_select(&projected_cols, outer_rows, stmt, false);
         }
     }
-    super::process_select(&joined_cols, outer_rows, stmt, false)
+    super::process_select(&combined_cols, outer_rows, stmt, false)
 }

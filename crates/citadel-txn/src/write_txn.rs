@@ -14,6 +14,11 @@ use citadel_buffer::cursor::{Cursor, PageLoader, PageMap};
 use crate::catalog::TableDescriptor;
 use crate::manager::TxnManager;
 
+thread_local! {
+    static PATH_BUF: std::cell::RefCell<Vec<(PageId, usize)>> =
+        std::cell::RefCell::new(Vec::with_capacity(8));
+}
+
 #[derive(Debug, Clone)]
 pub enum InsertOutcome {
     Inserted,
@@ -614,10 +619,21 @@ impl<'db> WriteTxn<'db> {
         self.ensure_table(table)?;
 
         let root = self.named_trees[table].root;
-        self.preload_path(root, key)?;
-
-        let tree = self.named_trees.get_mut(table).unwrap();
-        tree.delete(&mut self.pages, &mut self.alloc, self.txn_id, key)
+        PATH_BUF.with(|pb| {
+            let mut path = pb.borrow_mut();
+            path.clear();
+            let leaf_id =
+                Self::walk_loading_into(&mut self.pages, self.manager, root, key, &mut path)?;
+            let tree = self.named_trees.get_mut(table).unwrap();
+            tree.delete_at_leaf(
+                &mut self.pages,
+                &mut self.alloc,
+                self.txn_id,
+                key,
+                &mut path,
+                leaf_id,
+            )
+        })
     }
 
     /// Drop all pages, reset to an empty leaf. Returns pre-truncation entry count.
@@ -639,10 +655,13 @@ impl<'db> WriteTxn<'db> {
 
     pub fn table_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.ensure_table(table)?;
-
-        let tree = self.named_trees[table].clone();
-        self.preload_path(tree.root, key)?;
-        self.search_in_tree(&tree, key)
+        let root = self.named_trees[table].root;
+        let leaf_id = Self::descend_to_leaf(&mut self.pages, self.manager, root, key)?;
+        match BTree::search_at_leaf(&self.pages, leaf_id, key)? {
+            Some((ValueType::Tombstone, _)) => Ok(None),
+            Some((_, value)) => Ok(Some(value)),
+            None => Ok(None),
+        }
     }
 
     pub fn commit(mut self) -> Result<()> {
@@ -668,8 +687,7 @@ impl<'db> WriteTxn<'db> {
         self.manager.abort_write();
     }
 
-    /// SAVEPOINT: snapshot state and advance txn_id so post-savepoint
-    /// mutations CoW into fresh PageIds.
+    /// SAVEPOINT: snapshot state and advance txn_id.
     pub fn begin_savepoint(&mut self) -> WriteTxnSnapshot {
         let snap = self.capture_snapshot();
         self.txn_id = self.manager.next_write_txn_id();
@@ -677,7 +695,6 @@ impl<'db> WriteTxn<'db> {
     }
 
     /// ROLLBACK TO SAVEPOINT: restore state and drop post-savepoint pages.
-    /// Advances txn_id again so repeated rollback-to works.
     pub fn restore_snapshot(&mut self, snap: WriteTxnSnapshot) {
         let pre_savepoint_alloc_len = snap.alloc_checkpoint.allocated_this_txn_len();
         for &page_id in self.alloc.allocated_since(pre_savepoint_alloc_len) {
@@ -950,15 +967,15 @@ impl<'db> WriteTxn<'db> {
     }
 
     fn preload_path(&mut self, root: PageId, key: &[u8]) -> Result<()> {
-        Self::preload_path_raw(&mut self.pages, self.manager, root, key)
+        Self::descend_to_leaf(&mut self.pages, self.manager, root, key).map(|_| ())
     }
 
-    fn preload_path_raw(
+    fn descend_to_leaf(
         pages: &mut FxHashMap<PageId, Page>,
         manager: &TxnManager,
         root: PageId,
         key: &[u8],
-    ) -> Result<()> {
+    ) -> Result<PageId> {
         let mut current = root;
         loop {
             let page = match pages.entry(current) {
@@ -969,7 +986,7 @@ impl<'db> WriteTxn<'db> {
                 }
             };
             match page.page_type() {
-                Some(PageType::Leaf) => return Ok(()),
+                Some(PageType::Leaf) => return Ok(current),
                 Some(PageType::Branch) => {
                     let idx = branch_node::search_child_index(page, key);
                     current = branch_node::get_child(page, idx);
@@ -979,6 +996,15 @@ impl<'db> WriteTxn<'db> {
         }
     }
 
+    fn preload_path_raw(
+        pages: &mut FxHashMap<PageId, Page>,
+        manager: &TxnManager,
+        root: PageId,
+        key: &[u8],
+    ) -> Result<()> {
+        Self::descend_to_leaf(pages, manager, root, key).map(|_| ())
+    }
+
     fn walk_loading(
         pages: &mut FxHashMap<PageId, Page>,
         manager: &TxnManager,
@@ -986,6 +1012,18 @@ impl<'db> WriteTxn<'db> {
         key: &[u8],
     ) -> Result<(Vec<(PageId, usize)>, PageId)> {
         let mut path = Vec::new();
+        let leaf_id = Self::walk_loading_into(pages, manager, root, key, &mut path)?;
+        Ok((path, leaf_id))
+    }
+
+    fn walk_loading_into(
+        pages: &mut FxHashMap<PageId, Page>,
+        manager: &TxnManager,
+        root: PageId,
+        key: &[u8],
+        path: &mut Vec<(PageId, usize)>,
+    ) -> Result<PageId> {
+        path.clear();
         let mut current = root;
         loop {
             let page = match pages.entry(current) {
@@ -996,7 +1034,7 @@ impl<'db> WriteTxn<'db> {
                 }
             };
             match page.page_type() {
-                Some(PageType::Leaf) => return Ok((path, current)),
+                Some(PageType::Leaf) => return Ok(current),
                 Some(PageType::Branch) => {
                     let idx = branch_node::search_child_index(page, key);
                     let child = branch_node::get_child(page, idx);

@@ -50,5 +50,9 @@ criterion_group!(
     h2h::insert_gen_virtual::bench,
     h2h::update_gen_propagate::bench,
     h2h::select_gen_virtual::bench,
+    h2h::truncate::bench,
+    h2h::partial_index_point::bench,
+    h2h::fk_cascade::bench,
+    h2h::with_dml::bench,
 );
 criterion_main!(benches);

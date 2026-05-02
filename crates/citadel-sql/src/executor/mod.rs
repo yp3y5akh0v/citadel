@@ -56,6 +56,7 @@ pub fn execute(
         Statement::Select(sq) => exec_select_query(db, schema, sq),
         Statement::Update(upd) => exec_update(db, schema, upd),
         Statement::Delete(del) => exec_delete(db, schema, del),
+        Statement::Truncate(t) => exec_truncate(db, schema, t),
         Statement::Explain(inner) => explain(schema, inner),
         Statement::Begin
         | Statement::Commit
@@ -88,6 +89,7 @@ pub fn execute_in_txn(
         Statement::Select(sq) => exec_select_query_in_txn(wtx, schema, sq),
         Statement::Update(upd) => exec_update_in_txn(wtx, schema, upd),
         Statement::Delete(del) => exec_delete_in_txn(wtx, schema, del),
+        Statement::Truncate(t) => exec_truncate_in_txn(wtx, schema, t),
         Statement::Explain(inner) => explain(schema, inner),
         Statement::Begin
         | Statement::Commit

@@ -34,16 +34,22 @@ fn test_schema() -> TableSchema {
                 name: "idx_name".into(),
                 columns: vec![1],
                 unique: false,
+                predicate_sql: None,
+                predicate_expr: None,
             },
             IndexDef {
                 name: "idx_email".into(),
                 columns: vec![3],
                 unique: true,
+                predicate_sql: None,
+                predicate_expr: None,
             },
             IndexDef {
                 name: "idx_name_age".into(),
                 columns: vec![1, 2],
                 unique: false,
+                predicate_sql: None,
+                predicate_expr: None,
             },
         ],
         vec![],
@@ -281,11 +287,15 @@ fn prefers_unique_index() {
                 name: "idx_code".into(),
                 columns: vec![1],
                 unique: false,
+                predicate_sql: None,
+                predicate_expr: None,
             },
             IndexDef {
                 name: "idx_code_uniq".into(),
                 columns: vec![1],
                 unique: true,
+                predicate_sql: None,
+                predicate_expr: None,
             },
         ],
         vec![],
@@ -338,4 +348,72 @@ fn prefers_more_equality_columns() {
         }
         other => panic!("expected IndexScan, got {other:?}"),
     }
+}
+
+fn schema_with_partial_index(name: &str, predicate_sql: &str) -> TableSchema {
+    let predicate_expr = crate::parser::parse_sql_expr(predicate_sql).unwrap();
+    TableSchema::new(
+        "users".into(),
+        vec![
+            col("id", DataType::Integer, false, 0),
+            col("email", DataType::Text, true, 1),
+            col("deleted_at", DataType::Integer, true, 2),
+        ],
+        vec![0],
+        vec![IndexDef {
+            name: name.into(),
+            columns: vec![1],
+            unique: true,
+            predicate_sql: Some(predicate_sql.into()),
+            predicate_expr: Some(predicate_expr),
+        }],
+        vec![],
+        vec![],
+    )
+}
+
+#[test]
+fn partial_index_picked_when_predicate_matches_exactly() {
+    let schema = schema_with_partial_index("u_active", "deleted_at IS NULL");
+    let where_clause =
+        Some(crate::parser::parse_sql_expr("email = 'a@x' AND deleted_at IS NULL").unwrap());
+    let plan = plan_select(&schema, &where_clause);
+    match plan {
+        ScanPlan::IndexScan { index_name, .. } => assert_eq!(index_name, "u_active"),
+        other => panic!("expected IndexScan, got {other:?}"),
+    }
+}
+
+#[test]
+fn partial_index_skipped_when_predicate_missing() {
+    let schema = schema_with_partial_index("u_active", "deleted_at IS NULL");
+    let where_clause = Some(crate::parser::parse_sql_expr("email = 'a@x'").unwrap());
+    let plan = plan_select(&schema, &where_clause);
+    assert!(
+        !matches!(plan, ScanPlan::IndexScan { .. }),
+        "expected non-index plan, got IndexScan"
+    );
+}
+
+#[test]
+fn partial_index_picked_via_is_not_null_implication() {
+    let schema = schema_with_partial_index("u_present", "email IS NOT NULL");
+    let where_clause = Some(crate::parser::parse_sql_expr("email = 'a@x'").unwrap());
+    let plan = plan_select(&schema, &where_clause);
+    match plan {
+        ScanPlan::IndexScan { index_name, .. } => assert_eq!(index_name, "u_present"),
+        other => panic!("expected IndexScan, got {other:?}"),
+    }
+}
+
+#[test]
+fn partial_index_skipped_when_unrelated_predicate() {
+    let schema = schema_with_partial_index("u_active", "deleted_at IS NULL");
+    let where_clause =
+        Some(crate::parser::parse_sql_expr("email = 'a@x' AND deleted_at = 100").unwrap());
+    let plan = plan_select(&schema, &where_clause);
+    assert!(
+        !matches!(plan, ScanPlan::IndexScan { .. }),
+        "expected non-index plan, got IndexScan"
+    );
 }

@@ -3766,3 +3766,298 @@ fn update_composite_pk_with_index() {
         .unwrap();
     assert_eq!(qr.rows[0][0], Value::Integer(1));
 }
+
+fn setup_users_soft_delete(conn: &Connection<'_>) {
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, deleted_at INTEGER)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX users_email_active ON users(email) WHERE deleted_at IS NULL")
+        .unwrap();
+}
+
+#[test]
+fn partial_unique_allows_dup_for_non_matching() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_users_soft_delete(&conn);
+
+    assert_rows_affected(
+        conn.execute("INSERT INTO users VALUES (1, 'a@x', NULL)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users VALUES (2, 'a@x', 100)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users VALUES (3, 'a@x', 200)")
+            .unwrap(),
+        1,
+    );
+}
+
+#[test]
+fn partial_unique_blocks_dup_for_matching() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_users_soft_delete(&conn);
+
+    assert_rows_affected(
+        conn.execute("INSERT INTO users VALUES (1, 'a@x', NULL)")
+            .unwrap(),
+        1,
+    );
+    let err = conn
+        .execute("INSERT INTO users VALUES (2, 'a@x', NULL)")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+}
+
+#[test]
+fn partial_unique_after_soft_delete_allows_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_users_soft_delete(&conn);
+
+    assert_rows_affected(
+        conn.execute("INSERT INTO users VALUES (1, 'a@x', NULL)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("UPDATE users SET deleted_at = 100 WHERE id = 1")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users VALUES (2, 'a@x', NULL)")
+            .unwrap(),
+        1,
+    );
+}
+
+#[test]
+fn partial_index_update_crosses_predicate_boundary_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_users_soft_delete(&conn);
+
+    assert_rows_affected(
+        conn.execute("INSERT INTO users VALUES (1, 'a@x', 100)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users VALUES (2, 'b@x', NULL)")
+            .unwrap(),
+        1,
+    );
+
+    assert_rows_affected(
+        conn.execute("UPDATE users SET deleted_at = NULL WHERE id = 1")
+            .unwrap(),
+        1,
+    );
+
+    let err = conn
+        .execute("INSERT INTO users VALUES (3, 'a@x', NULL)")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+}
+
+#[test]
+fn partial_index_update_crosses_predicate_boundary_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_users_soft_delete(&conn);
+
+    assert_rows_affected(
+        conn.execute("INSERT INTO users VALUES (1, 'a@x', NULL)")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("UPDATE users SET deleted_at = 100 WHERE id = 1")
+            .unwrap(),
+        1,
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO users VALUES (2, 'a@x', NULL)")
+            .unwrap(),
+        1,
+    );
+    let err = conn
+        .execute("INSERT INTO users VALUES (3, 'a@x', NULL)")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::UniqueViolation(_)));
+}
+
+#[test]
+fn partial_index_drop_cleans_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_users_soft_delete(&conn);
+
+    assert_rows_affected(
+        conn.execute("INSERT INTO users VALUES (1, 'a@x', NULL)")
+            .unwrap(),
+        1,
+    );
+    conn.execute("DROP INDEX users_email_active").unwrap();
+    assert_rows_affected(
+        conn.execute("INSERT INTO users VALUES (2, 'a@x', NULL)")
+            .unwrap(),
+        1,
+    );
+}
+
+#[test]
+fn partial_index_query_uses_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_users_soft_delete(&conn);
+    for i in 1..=10 {
+        assert_rows_affected(
+            conn.execute(&format!("INSERT INTO users VALUES ({i}, 'u{i}@x', NULL)"))
+                .unwrap(),
+            1,
+        );
+    }
+    let qr = conn
+        .query("EXPLAIN SELECT id FROM users WHERE email = 'u3@x' AND deleted_at IS NULL")
+        .unwrap();
+    let plan = match &qr.rows[0][0] {
+        Value::Text(s) => s.to_string(),
+        v => panic!("expected text plan, got {v:?}"),
+    };
+    assert!(plan.contains("users_email_active"), "plan was: {plan}");
+}
+
+#[test]
+fn partial_index_broader_query_does_not_pick_partial() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_users_soft_delete(&conn);
+    let qr = conn
+        .query("EXPLAIN SELECT id FROM users WHERE email = 'u3@x'")
+        .unwrap();
+    let plan = match &qr.rows[0][0] {
+        Value::Text(s) => s.to_string(),
+        v => panic!("expected text plan, got {v:?}"),
+    };
+    assert!(!plan.contains("users_email_active"), "plan was: {plan}");
+}
+
+#[test]
+fn partial_index_is_not_null_implication_from_eq() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_name_present ON t(name) WHERE name IS NOT NULL")
+        .unwrap();
+    assert_rows_affected(
+        conn.execute("INSERT INTO t VALUES (1, 'alice')").unwrap(),
+        1,
+    );
+    let qr = conn
+        .query("EXPLAIN SELECT id FROM t WHERE name = 'alice'")
+        .unwrap();
+    let plan = match &qr.rows[0][0] {
+        Value::Text(s) => s.to_string(),
+        v => panic!("expected text plan, got {v:?}"),
+    };
+    assert!(plan.contains("t_name_present"), "plan was: {plan}");
+}
+
+#[test]
+fn partial_index_rejects_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, ts INTEGER)")
+        .unwrap();
+    let err = conn
+        .execute("CREATE INDEX t_recent ON t(ts) WHERE ts > now()")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("non-deterministic")));
+}
+
+#[test]
+fn partial_index_rejects_random() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    let err = conn
+        .execute("CREATE INDEX t_rand ON t(val) WHERE val > random()")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(_)));
+}
+
+#[test]
+fn partial_index_rejects_aggregate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    let err = conn
+        .execute("CREATE INDEX t_top ON t(val) WHERE val > sum(val)")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("aggregates")));
+}
+
+#[test]
+fn partial_index_rejects_subquery() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let err = conn
+        .execute("CREATE INDEX t_in ON t(val) WHERE val IN (SELECT id FROM u)")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("subqueries")));
+}
+
+#[test]
+fn partial_index_persists_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = create_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        setup_users_soft_delete(&conn);
+        assert_rows_affected(
+            conn.execute("INSERT INTO users VALUES (1, 'a@x', NULL)")
+                .unwrap(),
+            1,
+        );
+    }
+    {
+        let db = open_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        let err = conn
+            .execute("INSERT INTO users VALUES (2, 'a@x', NULL)")
+            .unwrap_err();
+        assert!(matches!(err, SqlError::UniqueViolation(_)));
+        assert_rows_affected(
+            conn.execute("INSERT INTO users VALUES (3, 'a@x', 100)")
+                .unwrap(),
+            1,
+        );
+    }
+}

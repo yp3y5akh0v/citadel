@@ -914,3 +914,219 @@ fn parse_table_constraint_pk() {
         _ => panic!("expected CreateTable"),
     }
 }
+
+#[test]
+fn parse_truncate_single() {
+    let stmt = parse_sql("TRUNCATE TABLE t").unwrap();
+    match stmt {
+        Statement::Truncate(t) => assert_eq!(t.tables, vec!["t"]),
+        _ => panic!("expected Truncate"),
+    }
+}
+
+#[test]
+fn parse_truncate_table_keyword_optional() {
+    let stmt = parse_sql("TRUNCATE t").unwrap();
+    match stmt {
+        Statement::Truncate(t) => assert_eq!(t.tables, vec!["t"]),
+        _ => panic!("expected Truncate"),
+    }
+}
+
+#[test]
+fn parse_truncate_multi_table() {
+    let stmt = parse_sql("TRUNCATE TABLE a, b, c").unwrap();
+    match stmt {
+        Statement::Truncate(t) => assert_eq!(t.tables, vec!["a", "b", "c"]),
+        _ => panic!("expected Truncate"),
+    }
+}
+
+#[test]
+fn parse_truncate_only_keyword() {
+    let stmt = parse_sql("TRUNCATE TABLE ONLY t").unwrap();
+    match stmt {
+        Statement::Truncate(t) => assert_eq!(t.tables, vec!["t"]),
+        _ => panic!("expected Truncate"),
+    }
+}
+
+#[test]
+fn parse_truncate_restart_identity() {
+    let stmt = parse_sql("TRUNCATE TABLE t RESTART IDENTITY").unwrap();
+    assert!(matches!(stmt, Statement::Truncate(_)));
+}
+
+#[test]
+fn parse_truncate_continue_identity() {
+    let stmt = parse_sql("TRUNCATE TABLE t CONTINUE IDENTITY").unwrap();
+    assert!(matches!(stmt, Statement::Truncate(_)));
+}
+
+#[test]
+fn parse_truncate_cascade_unsupported() {
+    let err = parse_sql("TRUNCATE TABLE t CASCADE").unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("v0.13")));
+}
+
+#[test]
+fn parse_truncate_restrict_accepted() {
+    let stmt = parse_sql("TRUNCATE TABLE t RESTRICT").unwrap();
+    assert!(matches!(stmt, Statement::Truncate(_)));
+}
+
+#[test]
+fn parse_create_index_with_predicate() {
+    let stmt = parse_sql("CREATE INDEX i ON t (c) WHERE c IS NOT NULL").unwrap();
+    match stmt {
+        Statement::CreateIndex(ci) => {
+            assert!(ci.predicate_sql.is_some());
+            assert!(ci.predicate_expr.is_some());
+        }
+        _ => panic!("expected CreateIndex"),
+    }
+}
+
+#[test]
+fn parse_create_index_without_predicate() {
+    let stmt = parse_sql("CREATE INDEX i ON t (c)").unwrap();
+    match stmt {
+        Statement::CreateIndex(ci) => {
+            assert!(ci.predicate_sql.is_none());
+            assert!(ci.predicate_expr.is_none());
+        }
+        _ => panic!("expected CreateIndex"),
+    }
+}
+
+#[test]
+fn parse_create_unique_index_with_predicate() {
+    let stmt = parse_sql("CREATE UNIQUE INDEX i ON t (email) WHERE deleted_at IS NULL").unwrap();
+    match stmt {
+        Statement::CreateIndex(ci) => {
+            assert!(ci.unique);
+            assert!(ci.predicate_sql.is_some());
+        }
+        _ => panic!("expected CreateIndex"),
+    }
+}
+
+#[test]
+fn create_index_predicate_rejects_now() {
+    let err = parse_sql("CREATE INDEX i ON t (c) WHERE ts > now()").unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("non-deterministic")));
+}
+
+#[test]
+fn create_index_predicate_rejects_random() {
+    let err = parse_sql("CREATE INDEX i ON t (c) WHERE c > random()").unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(_)));
+}
+
+#[test]
+fn create_index_predicate_rejects_aggregate() {
+    let err = parse_sql("CREATE INDEX i ON t (c) WHERE c > sum(c)").unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("aggregates")));
+}
+
+#[test]
+fn create_index_predicate_rejects_subquery() {
+    let err = parse_sql("CREATE INDEX i ON t (c) WHERE c IN (SELECT id FROM u)").unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("subqueries")));
+}
+
+#[test]
+fn parse_fk_default_no_action() {
+    let stmt = parse_sql(
+        "CREATE TABLE c (id INT PRIMARY KEY, p INT, FOREIGN KEY (p) REFERENCES parent(id))",
+    )
+    .unwrap();
+    match stmt {
+        Statement::CreateTable(ct) => {
+            let fk = &ct.foreign_keys[0];
+            assert_eq!(fk.on_delete, ReferentialAction::NoAction);
+            assert_eq!(fk.on_update, ReferentialAction::NoAction);
+        }
+        _ => panic!("expected CreateTable"),
+    }
+}
+
+#[test]
+fn parse_fk_on_delete_cascade() {
+    let stmt = parse_sql(
+        "CREATE TABLE c (id INT PRIMARY KEY, p INT, \
+         FOREIGN KEY (p) REFERENCES parent(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    match stmt {
+        Statement::CreateTable(ct) => {
+            let fk = &ct.foreign_keys[0];
+            assert_eq!(fk.on_delete, ReferentialAction::Cascade);
+            assert_eq!(fk.on_update, ReferentialAction::NoAction);
+        }
+        _ => panic!("expected CreateTable"),
+    }
+}
+
+#[test]
+fn parse_fk_on_delete_set_null() {
+    let stmt = parse_sql(
+        "CREATE TABLE c (id INT PRIMARY KEY, p INT, \
+         FOREIGN KEY (p) REFERENCES parent(id) ON DELETE SET NULL)",
+    )
+    .unwrap();
+    match stmt {
+        Statement::CreateTable(ct) => {
+            assert_eq!(ct.foreign_keys[0].on_delete, ReferentialAction::SetNull);
+        }
+        _ => panic!("expected CreateTable"),
+    }
+}
+
+#[test]
+fn parse_fk_on_delete_set_default() {
+    let stmt = parse_sql(
+        "CREATE TABLE c (id INT PRIMARY KEY, p INT, \
+         FOREIGN KEY (p) REFERENCES parent(id) ON DELETE SET DEFAULT)",
+    )
+    .unwrap();
+    match stmt {
+        Statement::CreateTable(ct) => {
+            assert_eq!(ct.foreign_keys[0].on_delete, ReferentialAction::SetDefault);
+        }
+        _ => panic!("expected CreateTable"),
+    }
+}
+
+#[test]
+fn parse_fk_on_delete_restrict() {
+    let stmt = parse_sql(
+        "CREATE TABLE c (id INT PRIMARY KEY, p INT, \
+         FOREIGN KEY (p) REFERENCES parent(id) ON DELETE RESTRICT)",
+    )
+    .unwrap();
+    match stmt {
+        Statement::CreateTable(ct) => {
+            assert_eq!(ct.foreign_keys[0].on_delete, ReferentialAction::Restrict);
+        }
+        _ => panic!("expected CreateTable"),
+    }
+}
+
+#[test]
+fn parse_fk_mixed_actions() {
+    let stmt = parse_sql(
+        "CREATE TABLE c (id INT PRIMARY KEY, p INT, \
+         FOREIGN KEY (p) REFERENCES parent(id) \
+         ON DELETE CASCADE ON UPDATE RESTRICT)",
+    )
+    .unwrap();
+    match stmt {
+        Statement::CreateTable(ct) => {
+            let fk = &ct.foreign_keys[0];
+            assert_eq!(fk.on_delete, ReferentialAction::Cascade);
+            assert_eq!(fk.on_update, ReferentialAction::Restrict);
+        }
+        _ => panic!("expected CreateTable"),
+    }
+}

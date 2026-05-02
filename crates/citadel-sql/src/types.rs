@@ -466,6 +466,8 @@ pub struct IndexDef {
     pub name: String,
     pub columns: Vec<u16>,
     pub unique: bool,
+    pub predicate_sql: Option<String>,
+    pub predicate_expr: Option<crate::parser::Expr>,
 }
 
 /// View definition stored in the _views metadata table.
@@ -554,6 +556,8 @@ pub struct ForeignKeySchemaEntry {
     pub columns: Vec<u16>,
     pub foreign_table: String,
     pub referred_columns: Vec<String>,
+    pub on_delete: crate::parser::ReferentialAction,
+    pub on_update: crate::parser::ReferentialAction,
 }
 
 /// Table schema stored in the _schema table.
@@ -567,15 +571,11 @@ pub struct TableSchema {
     pub foreign_keys: Vec<ForeignKeySchemaEntry>,
     pk_idx_cache: Vec<usize>,
     non_pk_idx_cache: Vec<usize>,
-    /// Physical encoding slots dropped via DROP COLUMN. Sorted.
-    /// Old rows have data at these positions (skipped on decode);
-    /// new rows encode NULL to maintain position consistency.
+    /// Sorted physical slots dropped via DROP COLUMN.
     dropped_non_pk_slots: Vec<u16>,
-    /// Physical encoding position -> logical column index.
-    /// `usize::MAX` for dropped slots.
+    /// Physical position -> logical column index. `usize::MAX` for dropped slots.
     decode_mapping_cache: Vec<usize>,
     /// Logical non-PK order -> physical encoding position.
-    /// `encoding_positions_cache[i]` is the physical slot for `non_pk_idx_cache[i]`.
     encoding_positions_cache: Vec<u16>,
     has_virtual_columns_cache: bool,
 }
@@ -678,14 +678,12 @@ impl TableSchema {
         !self.check_constraints.is_empty() || self.columns.iter().any(|c| c.check_expr.is_some())
     }
 
-    /// Physical encoding position -> logical column index mapping.
-    /// Length = physical_non_pk_count. `usize::MAX` for dropped slots.
+    /// Physical position -> logical column index. `usize::MAX` for dropped slots.
     pub fn decode_col_mapping(&self) -> &[usize] {
         &self.decode_mapping_cache
     }
 
     /// Logical non-PK order -> physical encoding position.
-    /// `encoding_positions()[i]` is the physical slot for `non_pk_indices()[i]`.
     pub fn encoding_positions(&self) -> &[u16] {
         &self.encoding_positions_cache
     }
@@ -701,9 +699,6 @@ impl TableSchema {
     }
 
     /// Return a new schema with the column at `drop_pos` marked as dropped.
-    /// Row data is not rewritten; decode skips the slot. Logical positions
-    /// above `drop_pos` shift down; table-level CHECKs referencing it are
-    /// filtered out.
     pub fn without_column(&self, drop_pos: usize) -> Self {
         let non_pk_order = self
             .non_pk_idx_cache
@@ -753,6 +748,8 @@ impl TableSchema {
                     .map(|&c| if c > drop_pos_u16 { c - 1 } else { c })
                     .collect(),
                 unique: idx.unique,
+                predicate_sql: idx.predicate_sql.clone(),
+                predicate_expr: idx.predicate_expr.clone(),
             })
             .collect();
 
@@ -768,6 +765,8 @@ impl TableSchema {
                     .collect(),
                 foreign_table: fk.foreign_table.clone(),
                 referred_columns: fk.referred_columns.clone(),
+                on_delete: fk.on_delete,
+                on_update: fk.on_update,
             })
             .collect();
 
@@ -792,7 +791,7 @@ impl TableSchema {
     }
 }
 
-const SCHEMA_VERSION: u8 = 5;
+const SCHEMA_VERSION: u8 = 6;
 
 fn write_opt_string(buf: &mut Vec<u8>, s: &Option<String>) {
     match s {
@@ -930,13 +929,30 @@ impl TableSchema {
             }
         }
 
+        for idx in &self.indices {
+            match &idx.predicate_sql {
+                Some(sql) => {
+                    buf.push(1);
+                    let bytes = sql.as_bytes();
+                    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(bytes);
+                }
+                None => buf.push(0),
+            }
+        }
+
+        for fk in &self.foreign_keys {
+            buf.push(fk.on_delete as u8);
+            buf.push(fk.on_update as u8);
+        }
+
         buf
     }
 
     pub fn deserialize(data: &[u8]) -> crate::error::Result<Self> {
         let mut pos = 0;
 
-        if data.is_empty() || !matches!(data[0], 1 | 2 | 3 | 4 | SCHEMA_VERSION) {
+        if data.is_empty() || !matches!(data[0], 1 | 2 | 3 | 4 | 5 | SCHEMA_VERSION) {
             return Err(crate::error::SqlError::InvalidValue(
                 "invalid schema version".into(),
             ));
@@ -1015,6 +1031,8 @@ impl TableSchema {
                     name: idx_name,
                     columns: cols,
                     unique,
+                    predicate_sql: None,
+                    predicate_expr: None,
                 });
             }
             idxs
@@ -1087,6 +1105,8 @@ impl TableSchema {
                     columns: cols,
                     foreign_table,
                     referred_columns,
+                    on_delete: crate::parser::ReferentialAction::NoAction,
+                    on_update: crate::parser::ReferentialAction::NoAction,
                 });
             }
         }
@@ -1131,6 +1151,43 @@ impl TableSchema {
                         }
                     });
                 }
+            }
+        }
+        let mut indices = indices;
+        if version >= 6 && pos < data.len() {
+            for idx in &mut indices {
+                let flag = data[pos];
+                pos += 1;
+                if flag == 1 {
+                    let len = u32::from_le_bytes([
+                        data[pos],
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
+                    ]) as usize;
+                    pos += 4;
+                    let sql = String::from_utf8_lossy(&data[pos..pos + len]).into_owned();
+                    pos += len;
+                    let expr = crate::parser::parse_sql_expr(&sql).map_err(|_| {
+                        crate::error::SqlError::InvalidValue(format!(
+                            "cannot parse partial-index predicate: {sql}"
+                        ))
+                    })?;
+                    idx.predicate_sql = Some(sql);
+                    idx.predicate_expr = Some(expr);
+                }
+            }
+            for fk in &mut foreign_keys {
+                fk.on_delete =
+                    crate::parser::ReferentialAction::from_tag(data[pos]).ok_or_else(|| {
+                        crate::error::SqlError::InvalidValue("unknown FK on_delete tag".into())
+                    })?;
+                pos += 1;
+                fk.on_update =
+                    crate::parser::ReferentialAction::from_tag(data[pos]).ok_or_else(|| {
+                        crate::error::SqlError::InvalidValue("unknown FK on_update tag".into())
+                    })?;
+                pos += 1;
             }
         }
         let _ = pos;

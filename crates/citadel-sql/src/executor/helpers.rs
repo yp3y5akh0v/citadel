@@ -3,7 +3,7 @@ use crate::encoding::{
     decode_row_into, encode_composite_key, row_non_pk_count,
 };
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, ColumnMap, EvalCtx};
+use crate::eval::{eval_expr, is_truthy, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::types::*;
 
@@ -908,22 +908,28 @@ pub(super) fn infer_expr_type(expr: &Expr, columns: &[ColumnDef]) -> DataType {
 }
 
 pub(super) fn encode_index_key(idx: &IndexDef, row: &[Value], pk_values: &[Value]) -> Vec<u8> {
-    let indexed_values: Vec<Value> = idx
-        .columns
-        .iter()
-        .map(|&col_idx| row[col_idx as usize].clone())
-        .collect();
+    let mut buf = Vec::new();
+    encode_index_key_into(idx, row, pk_values, &mut buf);
+    buf
+}
 
-    if idx.unique {
-        let any_null = indexed_values.iter().any(|v| v.is_null());
-        if !any_null {
-            return encode_composite_key(&indexed_values);
+pub(super) fn encode_index_key_into(
+    idx: &IndexDef,
+    row: &[Value],
+    pk_values: &[Value],
+    buf: &mut Vec<u8>,
+) {
+    buf.clear();
+    let any_null = idx.unique && idx.columns.iter().any(|&c| row[c as usize].is_null());
+    let include_pk = !idx.unique || any_null;
+    for &col_idx in &idx.columns {
+        crate::encoding::encode_key_value_into(&row[col_idx as usize], buf);
+    }
+    if include_pk {
+        for v in pk_values {
+            crate::encoding::encode_key_value_into(v, buf);
         }
     }
-
-    let mut all_values = indexed_values;
-    all_values.extend_from_slice(pk_values);
-    encode_composite_key(&all_values)
 }
 
 pub(super) fn encode_index_value(idx: &IndexDef, row: &[Value], pk_values: &[Value]) -> Vec<u8> {
@@ -941,29 +947,54 @@ pub(super) fn encode_index_value(idx: &IndexDef, row: &[Value], pk_values: &[Val
     vec![]
 }
 
+thread_local! {
+    static IDX_KEY_BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(64));
+    static IDX_TABLE_BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(64));
+}
+
+fn fill_idx_table_name(buf: &mut Vec<u8>, table: &str, idx: &str) {
+    buf.clear();
+    buf.extend_from_slice(b"__idx_");
+    buf.extend_from_slice(table.as_bytes());
+    buf.push(b'_');
+    buf.extend_from_slice(idx.as_bytes());
+}
+
 pub(super) fn insert_index_entries(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     table_schema: &TableSchema,
     row: &[Value],
     pk_values: &[Value],
 ) -> Result<()> {
-    for idx in &table_schema.indices {
-        let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
-        let key = encode_index_key(idx, row, pk_values);
-        let value = encode_index_value(idx, row, pk_values);
+    let col_map = any_partial_index(table_schema).then(|| ColumnMap::new(&table_schema.columns));
+    IDX_KEY_BUF.with(|kb| {
+        IDX_TABLE_BUF.with(|tb| {
+            let mut key_buf = kb.borrow_mut();
+            let mut table_buf = tb.borrow_mut();
+            for idx in &table_schema.indices {
+                if let Some(cm) = col_map.as_ref() {
+                    if !row_matches_partial(idx, row, cm) {
+                        continue;
+                    }
+                }
+                fill_idx_table_name(&mut table_buf, &table_schema.name, &idx.name);
+                encode_index_key_into(idx, row, pk_values, &mut key_buf);
+                let value = encode_index_value(idx, row, pk_values);
 
-        let is_new = wtx
-            .table_insert(&idx_table, &key, &value)
-            .map_err(SqlError::Storage)?;
+                let is_new = wtx
+                    .table_insert(&table_buf, &key_buf, &value)
+                    .map_err(SqlError::Storage)?;
 
-        if idx.unique && !is_new {
-            let any_null = idx.columns.iter().any(|&c| row[c as usize].is_null());
-            if !any_null {
-                return Err(SqlError::UniqueViolation(idx.name.clone()));
+                if idx.unique && !is_new {
+                    let any_null = idx.columns.iter().any(|&c| row[c as usize].is_null());
+                    if !any_null {
+                        return Err(SqlError::UniqueViolation(idx.name.clone()));
+                    }
+                }
             }
-        }
-    }
-    Ok(())
+            Ok(())
+        })
+    })
 }
 
 pub(super) fn insert_index_entries_or_fetch(
@@ -973,7 +1004,13 @@ pub(super) fn insert_index_entries_or_fetch(
     pk_values: &[Value],
     inserted_keys: &mut Vec<(usize, Vec<u8>)>,
 ) -> Result<Option<usize>> {
+    let col_map = any_partial_index(table_schema).then(|| ColumnMap::new(&table_schema.columns));
     for (i, idx) in table_schema.indices.iter().enumerate() {
+        if let Some(cm) = col_map.as_ref() {
+            if !row_matches_partial(idx, row, cm) {
+                continue;
+            }
+        }
         let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
         let key = encode_index_key(idx, row, pk_values);
         let value = encode_index_value(idx, row, pk_values);
@@ -1037,7 +1074,13 @@ pub(super) fn delete_index_entries(
     row: &[Value],
     pk_values: &[Value],
 ) -> Result<()> {
+    let col_map = any_partial_index(table_schema).then(|| ColumnMap::new(&table_schema.columns));
     for idx in &table_schema.indices {
+        if let Some(cm) = col_map.as_ref() {
+            if !row_matches_partial(idx, row, cm) {
+                continue;
+            }
+        }
         let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
         let key = encode_index_key(idx, row, pk_values);
         wtx.table_delete(&idx_table, &key)
@@ -1050,4 +1093,356 @@ pub(super) fn index_columns_changed(idx: &IndexDef, old_row: &[Value], new_row: 
     idx.columns
         .iter()
         .any(|&col_idx| old_row[col_idx as usize] != new_row[col_idx as usize])
+}
+
+/// Evaluate a partial-index predicate against a row. NULL or eval errors → false.
+pub(super) fn row_matches_partial(idx: &IndexDef, row: &[Value], col_map: &ColumnMap) -> bool {
+    let Some(expr) = idx.predicate_expr.as_ref() else {
+        return true;
+    };
+    match crate::eval::eval_expr(expr, &EvalCtx::new(col_map, row)) {
+        Ok(v) => is_truthy(&v),
+        Err(_) => false,
+    }
+}
+
+pub(super) fn any_partial_index(table_schema: &TableSchema) -> bool {
+    table_schema
+        .indices
+        .iter()
+        .any(|idx| idx.predicate_sql.is_some())
+}
+
+/// 4-quadrant decision for UPDATE on a partial index.
+/// Returns (should_delete_old_entry, should_insert_new_entry).
+pub(super) fn partial_idx_update_actions(
+    idx: &IndexDef,
+    old_row: &[Value],
+    new_row: &[Value],
+    cols_changed: bool,
+    pk_changed: bool,
+    col_map: Option<&ColumnMap>,
+) -> (bool, bool) {
+    let key_changed = cols_changed || pk_changed;
+    let Some(cm) = col_map.filter(|_| idx.predicate_expr.is_some()) else {
+        return (key_changed, key_changed);
+    };
+    let old_match = row_matches_partial(idx, old_row, cm);
+    let new_match = row_matches_partial(idx, new_row, cm);
+    let del = old_match && (key_changed || !new_match);
+    let ins = new_match && (key_changed || !old_match);
+    (del, ins)
+}
+
+pub(super) struct FkChildHit {
+    pub pk_key: Vec<u8>,
+    pub fk_idx_key: Vec<u8>,
+}
+
+/// Scan a child's FK auto-index for entries matching `parent_pk_key`.
+pub(super) fn scan_fk_index_keys(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    child_schema: &TableSchema,
+    fk: &ForeignKeySchemaEntry,
+    parent_pk_key: &[u8],
+    out: &mut Vec<FkChildHit>,
+) -> Result<()> {
+    let Some(idx) = child_schema
+        .indices
+        .iter()
+        .find(|idx| idx.columns == fk.columns)
+    else {
+        return Ok(());
+    };
+    let idx_table = TableSchema::index_table_name(&child_schema.name, &idx.name);
+    let unique_no_null = idx.unique;
+    wtx.table_scan_from(&idx_table, parent_pk_key, |key, value| {
+        if !key.starts_with(parent_pk_key) {
+            return Ok(false);
+        }
+        let pk_key = if unique_no_null && !value.is_empty() {
+            value.to_vec()
+        } else {
+            key[parent_pk_key.len()..].to_vec()
+        };
+        out.push(FkChildHit {
+            pk_key,
+            fk_idx_key: key.to_vec(),
+        });
+        Ok(true)
+    })
+    .map_err(SqlError::Storage)
+}
+
+pub(super) fn cascade_after_parent_delete(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &crate::schema::SchemaManager,
+    parent_table: &str,
+    deleted_pk_keys: &[Vec<u8>],
+) -> Result<()> {
+    let mut worklist: Vec<(String, Vec<Vec<u8>>)> =
+        vec![(parent_table.to_string(), deleted_pk_keys.to_vec())];
+
+    while let Some((cur_table, cur_pks)) = worklist.pop() {
+        let child_fks = schema.child_fks_for(&cur_table);
+        if child_fks.is_empty() {
+            continue;
+        }
+        for &(child_table, fk) in &child_fks {
+            let child_schema = schema.get(child_table).unwrap();
+            let mut hits: Vec<FkChildHit> = Vec::new();
+            for parent_pk_key in &cur_pks {
+                scan_fk_index_keys(wtx, child_schema, fk, parent_pk_key, &mut hits)?;
+            }
+            if hits.is_empty() {
+                continue;
+            }
+            match fk.on_delete {
+                crate::parser::ReferentialAction::NoAction
+                | crate::parser::ReferentialAction::Restrict => {
+                    return Err(SqlError::ForeignKeyViolation(format!(
+                        "cannot delete from '{}': referenced by '{}'",
+                        cur_table, child_table
+                    )));
+                }
+                crate::parser::ReferentialAction::Cascade => {
+                    delete_cascade_hits(wtx, child_schema, fk, &hits)?;
+                    let pk_keys: Vec<Vec<u8>> = hits.into_iter().map(|h| h.pk_key).collect();
+                    worklist.push((child_table.to_string(), pk_keys));
+                }
+                crate::parser::ReferentialAction::SetNull => {
+                    let rows = fetch_child_rows(wtx, child_schema, &hits)?;
+                    set_fk_columns(wtx, child_schema, fk, &rows, |_| Value::Null)?;
+                }
+                crate::parser::ReferentialAction::SetDefault => {
+                    let defaults = fk_defaults(child_schema, fk);
+                    let rows = fetch_child_rows(wtx, child_schema, &hits)?;
+                    set_fk_columns(wtx, child_schema, fk, &rows, |i| defaults[i].clone())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn delete_cascade_hits(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    child_schema: &TableSchema,
+    cascading_fk: &ForeignKeySchemaEntry,
+    hits: &[FkChildHit],
+) -> Result<()> {
+    let child_table = child_schema.name.as_str();
+    let cascading_idx_name = child_schema
+        .indices
+        .iter()
+        .find(|idx| idx.columns == cascading_fk.columns)
+        .map(|idx| idx.name.as_str())
+        .unwrap();
+    let cascading_idx_table = TableSchema::index_table_name(child_table, cascading_idx_name);
+    let other_indices: Vec<&IndexDef> = child_schema
+        .indices
+        .iter()
+        .filter(|idx| idx.columns != cascading_fk.columns)
+        .collect();
+
+    if other_indices.is_empty() {
+        for hit in hits {
+            wtx.table_delete(&cascading_idx_table, &hit.fk_idx_key)
+                .map_err(SqlError::Storage)?;
+            wtx.table_delete(child_table.as_bytes(), &hit.pk_key)
+                .map_err(SqlError::Storage)?;
+        }
+    } else {
+        let rows = fetch_child_rows(wtx, child_schema, hits)?;
+        let pk_indices = child_schema.pk_indices();
+        let col_map_partial =
+            any_partial_index(child_schema).then(|| ColumnMap::new(&child_schema.columns));
+        for ((pk_key, row), hit) in rows.iter().zip(hits) {
+            wtx.table_delete(&cascading_idx_table, &hit.fk_idx_key)
+                .map_err(SqlError::Storage)?;
+            let pk_values: Vec<Value> = pk_indices.iter().map(|&j| row[j].clone()).collect();
+            for idx in &other_indices {
+                if let Some(cm) = col_map_partial.as_ref() {
+                    if !row_matches_partial(idx, row, cm) {
+                        continue;
+                    }
+                }
+                let key = encode_index_key(idx, row, &pk_values);
+                let idx_table = TableSchema::index_table_name(child_table, &idx.name);
+                wtx.table_delete(&idx_table, &key)
+                    .map_err(SqlError::Storage)?;
+            }
+            wtx.table_delete(child_table.as_bytes(), pk_key)
+                .map_err(SqlError::Storage)?;
+        }
+    }
+    Ok(())
+}
+
+fn fetch_child_rows(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    child_schema: &TableSchema,
+    hits: &[FkChildHit],
+) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    let mut rows = Vec::with_capacity(hits.len());
+    for hit in hits {
+        if let Some(value_bytes) = wtx
+            .table_get(child_schema.name.as_bytes(), &hit.pk_key)
+            .map_err(SqlError::Storage)?
+        {
+            let row = decode_full_row(child_schema, &hit.pk_key, &value_bytes)?;
+            rows.push((hit.pk_key.clone(), row));
+        }
+    }
+    Ok(rows)
+}
+
+fn fk_defaults(child_schema: &TableSchema, fk: &ForeignKeySchemaEntry) -> Vec<Value> {
+    fk.columns
+        .iter()
+        .map(|&col_idx| {
+            eval_default(&child_schema.columns[col_idx as usize]).unwrap_or(Value::Null)
+        })
+        .collect()
+}
+
+fn set_fk_columns<F: Fn(usize) -> Value>(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    child_schema: &TableSchema,
+    fk: &ForeignKeySchemaEntry,
+    rows: &[(Vec<u8>, Vec<Value>)],
+    value_for: F,
+) -> Result<()> {
+    for (i, &col_idx) in fk.columns.iter().enumerate() {
+        let new_val = value_for(i);
+        let col = &child_schema.columns[col_idx as usize];
+        if matches!(new_val, Value::Null) && !col.nullable {
+            return Err(SqlError::NotNullViolation(col.name.clone()));
+        }
+    }
+    let non_pk = child_schema.non_pk_indices();
+    let enc_pos = child_schema.encoding_positions();
+    let mut value_values: Vec<Value> = vec![Value::Null; non_pk.len()];
+    let col_map_partial =
+        any_partial_index(child_schema).then(|| ColumnMap::new(&child_schema.columns));
+    let pk_indices = child_schema.pk_indices();
+    let table_bytes = child_schema.name.as_bytes();
+    for (pk_key, old_row) in rows {
+        let mut new_row = old_row.clone();
+        for (i, &col_idx) in fk.columns.iter().enumerate() {
+            new_row[col_idx as usize] = value_for(i);
+        }
+        for v in value_values.iter_mut() {
+            *v = Value::Null;
+        }
+        for (j, &i) in non_pk.iter().enumerate() {
+            let col = &child_schema.columns[i];
+            value_values[enc_pos[j] as usize] = if matches!(
+                col.generated_kind,
+                Some(crate::parser::GeneratedKind::Virtual)
+            ) {
+                Value::Null
+            } else {
+                new_row[i].clone()
+            };
+        }
+        let new_value = crate::encoding::encode_row(&value_values);
+        wtx.table_update_sorted(table_bytes, &[(pk_key.as_slice(), new_value.as_slice())])
+            .map_err(SqlError::Storage)?;
+        let pk_values: Vec<Value> = pk_indices.iter().map(|&i| new_row[i].clone()).collect();
+        for idx in &child_schema.indices {
+            let cols_changed = index_columns_changed(idx, old_row, &new_row);
+            let (del, ins) = partial_idx_update_actions(
+                idx,
+                old_row,
+                &new_row,
+                cols_changed,
+                false,
+                col_map_partial.as_ref(),
+            );
+            let idx_table = TableSchema::index_table_name(&child_schema.name, &idx.name);
+            if del {
+                let old_idx_key = encode_index_key(idx, old_row, &pk_values);
+                wtx.table_delete(&idx_table, &old_idx_key)
+                    .map_err(SqlError::Storage)?;
+            }
+            if ins {
+                let new_idx_key = encode_index_key(idx, &new_row, &pk_values);
+                let new_idx_val = encode_index_value(idx, &new_row, &pk_values);
+                wtx.table_insert(&idx_table, &new_idx_key, &new_idx_val)
+                    .map_err(SqlError::Storage)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn eval_default(col: &ColumnDef) -> Option<Value> {
+    let expr = col.default_expr.as_ref()?;
+    let empty_cols: &[ColumnDef] = &[];
+    let cm = ColumnMap::new(empty_cols);
+    let row: &[Value] = &[];
+    crate::eval::eval_expr(expr, &EvalCtx::new(&cm, row)).ok()
+}
+
+pub(super) fn cascade_after_parent_update(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &crate::schema::SchemaManager,
+    parent_table: &str,
+    parent_schema: &TableSchema,
+    parent_changes: &[(Vec<u8>, Vec<Value>, Vec<Value>)],
+) -> Result<()> {
+    let child_fks = schema.child_fks_for(parent_table);
+    if child_fks.is_empty() {
+        return Ok(());
+    }
+
+    for &(child_table, fk) in &child_fks {
+        let child_schema = schema.get(child_table).unwrap();
+        let parent_ref_cols: Vec<usize> = fk
+            .referred_columns
+            .iter()
+            .map(|n| parent_schema.column_index(n).unwrap())
+            .collect();
+        for (old_pk_key, old_parent, new_parent) in parent_changes {
+            let changed = parent_ref_cols
+                .iter()
+                .any(|&j| old_parent[j] != new_parent[j]);
+            if !changed {
+                continue;
+            }
+            let mut hits: Vec<FkChildHit> = Vec::new();
+            scan_fk_index_keys(wtx, child_schema, fk, old_pk_key, &mut hits)?;
+            if hits.is_empty() {
+                continue;
+            }
+            match fk.on_update {
+                crate::parser::ReferentialAction::NoAction
+                | crate::parser::ReferentialAction::Restrict => {
+                    return Err(SqlError::ForeignKeyViolation(format!(
+                        "cannot update PK in '{}': referenced by '{}'",
+                        parent_table, child_table
+                    )));
+                }
+                crate::parser::ReferentialAction::Cascade => {
+                    let new_fk_vals: Vec<Value> = parent_ref_cols
+                        .iter()
+                        .map(|&j| new_parent[j].clone())
+                        .collect();
+                    let rows = fetch_child_rows(wtx, child_schema, &hits)?;
+                    set_fk_columns(wtx, child_schema, fk, &rows, |i| new_fk_vals[i].clone())?;
+                }
+                crate::parser::ReferentialAction::SetNull => {
+                    let rows = fetch_child_rows(wtx, child_schema, &hits)?;
+                    set_fk_columns(wtx, child_schema, fk, &rows, |_| Value::Null)?;
+                }
+                crate::parser::ReferentialAction::SetDefault => {
+                    let defaults = fk_defaults(child_schema, fk);
+                    let rows = fetch_child_rows(wtx, child_schema, &hits)?;
+                    set_fk_columns(wtx, child_schema, fk, &rows, |i| defaults[i].clone())?;
+                }
+            }
+        }
+    }
+    Ok(())
 }

@@ -13,12 +13,12 @@
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Wins all 38 head-to-head benchmarks against unencrypted SQLite at equal cache budgets.
+Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Wins all 42 head-to-head benchmarks against unencrypted SQLite at equal cache budgets.
 
 ## Features
 
 - **Encrypted at rest** - AES-256-CTR + HMAC-SHA256 per page, verified before decryption
-- **SQL** - JOINs, subqueries, CTEs (recursive), UNION/INTERSECT/EXCEPT, window functions, views, aggregates, indexes, constraints, generated columns (STORED + VIRTUAL), ALTER TABLE, UPSERT (`ON CONFLICT`), RETURNING (with `OLD/NEW`), prepared statements
+- **SQL** - JOINs, subqueries, CTEs (recursive + WITH-DML), UNION/INTERSECT/EXCEPT, window functions, views, aggregates, indexes (partial), constraints, generated columns (STORED + VIRTUAL), ALTER TABLE, TRUNCATE, UPSERT (`ON CONFLICT`), RETURNING (with `OLD/NEW`), full FK actions (CASCADE / SET NULL / SET DEFAULT / RESTRICT), prepared statements
 - **ACID** - Copy-on-Write B+ tree, shadow paging, no WAL. Snapshot isolation with concurrent readers
 - **P2P sync** - Merkle-based table diffing over Noise-encrypted channels with PSK auth
 - **CLI** - SQL shell with tab completion, syntax highlighting, dot-commands (.backup, .verify, .rekey, .sync, .dump, ...)
@@ -28,7 +28,7 @@ Every page is encrypted and authenticated before it hits disk. The database file
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. C FFI (37 functions), WebAssembly bindings
-- **3,100+ tests** - Unit, integration, torture tests across 10 crates
+- **3,200+ tests** - Unit, integration, torture tests across 10 crates
 
 ## Benchmarks
 
@@ -37,44 +37,48 @@ Single-threaded on 100K rows, schema `(id INTEGER PK, name TEXT, age INTEGER)`. 
 ```
 Benchmark              Citadel        SQLite         Ratio
 ----------------------------------------------------------
-correlated_in          5.92 ms        1.87 s         315.5x
-count                  146 ns         21.4 us        146.6x
-correlated_scalar      292 us         17.96 ms       61.5x
-point                  772 ns         12.4 us        16.0x
-group_by               1.27 ms        9.89 ms        7.81x
-cte                    1.16 ms        5.85 ms        5.03x
-view_point             2.78 us        12.4 us        4.44x
-upsert_returning       55.5 us        166 us         2.99x
-insert_returning       57.6 us        165 us         2.86x
-window_agg             31.7 ms        74.0 ms        2.34x
-filter                 769 us         1.76 ms        2.29x
-view_filter            768 us         1.74 ms        2.26x
-savepoint_create       316 ns         687 ns         2.17x
-sort                   1.22 ms        2.58 ms        2.11x
-upsert_counter         25.0 us        52.8 us        2.11x
-window_rank            60.2 ms        121 ms         2.01x
-delete_returning       86.5 us        161 us         1.86x
-upsert_dedup           18.7 us        31.7 us        1.70x
-update                 18.2 us        28.4 us        1.56x
-insert_select          720 us         1.12 ms        1.55x
-delete                 43.5 us        66.5 us        1.53x
-correlated_exists      4.32 ms        6.50 ms        1.50x
-savepoint_nested       216 us         303 us         1.41x
-savepoint_rollback     1.52 ms        2.10 ms        1.39x
-distinct               2.67 ms        3.63 ms        1.36x
-insert                 36.9 us        49.9 us        1.35x
-update_returning       110 us         144 us         1.31x
-scan                   6.35 ms        7.70 ms        1.21x
-union                  119 us         140 us         1.18x
-insert_gen_stored      47.6 us        55.7 us        1.17x
-insert_gen_virtual     44.9 us        52.4 us        1.17x
-sum                    1.60 ms        1.85 ms        1.16x
-update_gen_propagate   38.2 us        44.3 us        1.16x
-upsert_all_new         44.1 us        49.3 us        1.12x
-select_gen_virtual     15.5 us        17.5 us        1.12x
-recursive_cte          104 us         117 us         1.12x
-upsert_mixed           51.5 us        56.2 us        1.09x
-join                   91.4 us        93.8 us        1.025x
+correlated_in          5.82 ms        1.86 s         320x
+count                  154 ns         21.3 us        139x
+correlated_scalar      288 us         18.72 ms       65x
+point                  769 ns         12.4 us        16.1x
+group_by               1.27 ms        9.99 ms        7.89x
+cte                    1.17 ms        5.99 ms        5.10x
+partial_index_point    2.42 us        12.31 us       5.08x
+view_point             2.81 us        12.4 us        4.41x
+truncate               17.6 us        57.4 us        3.26x
+insert_returning       59.3 us        166 us         2.80x
+upsert_returning       60.1 us        166 us         2.77x
+filter                 747 us         1.79 ms        2.40x
+view_filter            757 us         1.71 ms        2.27x
+window_agg             32.1 ms        72.1 ms        2.25x
+savepoint_create       314 ns         701 ns         2.23x
+sort                   1.21 ms        2.63 ms        2.17x
+upsert_counter         24.7 us        52.0 us        2.11x
+window_rank            57.6 ms        121 ms         2.10x
+delete_returning       88.1 us        164 us         1.86x
+upsert_dedup           18.1 us        31.5 us        1.75x
+savepoint_nested       214 us         344 us         1.61x
+delete                 44.2 us        70.9 us        1.60x
+correlated_exists      4.34 ms        6.74 ms        1.55x
+update                 18.0 us        27.6 us        1.54x
+insert_select          718 us         1.09 ms        1.52x
+with_dml               73.4 us        107 us         1.46x
+distinct               2.66 ms        3.85 ms        1.45x
+savepoint_rollback     1.50 ms        2.15 ms        1.44x
+insert                 37.0 us        49.9 us        1.35x
+update_returning       111 us         145 us         1.31x
+scan                   6.28 ms        7.77 ms        1.24x
+insert_gen_virtual     44.5 us        53.9 us        1.21x
+sum                    1.58 ms        1.89 ms        1.20x
+insert_gen_stored      47.5 us        55.5 us        1.17x
+upsert_all_new         43.0 us        49.9 us        1.16x
+select_gen_virtual     15.6 us        17.6 us        1.13x
+recursive_cte          103 us         116 us         1.12x
+update_gen_propagate   39.7 us        44.5 us        1.12x
+upsert_mixed           51.4 us        57.2 us        1.11x
+union                  125 us         136 us         1.09x
+fk_cascade             84.9 us        88.2 us        1.04x
+join                   88.6 us        90.6 us        1.02x
 ```
 
 ### Native DATE / TIMESTAMP (Citadel only, SQLite has no native type)
@@ -82,11 +86,11 @@ join                   91.4 us        93.8 us        1.025x
 ```
 Benchmark          Citadel
 -------------------------------
-date_sort          1.32 ms
-date_range_scan    1.75 ms
-date_arith         1.76 ms
-date_groupby       9.12 ms
-date_extract       12.68 ms
+date_sort          1.33 ms
+date_range_scan    1.70 ms
+date_arith         1.74 ms
+date_groupby       9.50 ms
+date_extract       12.63 ms
 ```
 
 <details>
@@ -100,37 +104,41 @@ H2H benchmarks (sorted by ratio, highest first):
 - **point** - `SELECT * FROM t WHERE id = 50000`
 - **group_by** - `SELECT age, COUNT(*) FROM t GROUP BY age`
 - **cte** - `WITH filtered AS (SELECT ... WHERE age < 50) SELECT age, COUNT(*) FROM filtered GROUP BY age`
+- **partial_index_point** - `SELECT * FROM t WHERE email = ? AND deleted_at IS NULL`
 - **view_point** - `SELECT * FROM v WHERE id = 50000`
-- **upsert_returning** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1 RETURNING c`
+- **truncate** - `TRUNCATE TABLE t`
 - **insert_returning** - `INSERT INTO t (id, val) VALUES (...) RETURNING id, val`
-- **window_agg** - `SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING)`
+- **upsert_returning** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1 RETURNING c`
 - **filter** - `SELECT * FROM t WHERE age = 42`
 - **view_filter** - `SELECT * FROM v WHERE age = 42`
+- **window_agg** - `SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING)`
 - **savepoint_create** - `BEGIN; SAVEPOINT sp; RELEASE sp; COMMIT`
 - **sort** - `SELECT * FROM t ORDER BY age LIMIT 10`
 - **upsert_counter** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1`
 - **window_rank** - `ROW_NUMBER() OVER (PARTITION BY age ORDER BY id)`
 - **delete_returning** - `DELETE ... WHERE id = ? RETURNING id, val`
 - **upsert_dedup** - `INSERT ... ON CONFLICT (id) DO NOTHING`
-- **update** - `UPDATE t SET age = age + 1 WHERE id BETWEEN 10000 AND 10099`
-- **insert_select** - `INSERT INTO sink SELECT id, val FROM a`
+- **savepoint_nested** - `BEGIN; SAVEPOINT sp1; ... ; RELEASE/ROLLBACK TO sp1; COMMIT`
 - **delete** - `DELETE FROM t WHERE id = ?`
 - **correlated_exists** - `SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM ref_table WHERE ref_table.id = t.id)`
-- **savepoint_nested** - `BEGIN; SAVEPOINT sp1; ... ; RELEASE/ROLLBACK TO sp1; COMMIT`
-- **savepoint_rollback** - `BEGIN; INSERT 1K rows; SAVEPOINT sp; INSERT 10K rows; ROLLBACK TO sp; COMMIT`
+- **update** - `UPDATE t SET age = age + 1 WHERE id BETWEEN 10000 AND 10099`
+- **insert_select** - `INSERT INTO sink SELECT id, val FROM a`
+- **with_dml** - `WITH d AS (DELETE FROM src RETURNING *) INSERT INTO archive SELECT * FROM d`
 - **distinct** - `SELECT DISTINCT age FROM t`
+- **savepoint_rollback** - `BEGIN; INSERT 1K rows; SAVEPOINT sp; INSERT 10K rows; ROLLBACK TO sp; COMMIT`
 - **insert** - `INSERT INTO t (id, val) VALUES (?, ?)`
 - **update_returning** - `UPDATE t SET c = c + ? WHERE id = ? RETURNING c`
 - **scan** - `SELECT * FROM t`
-- **union** - `SELECT id, val FROM a UNION ALL SELECT id, data FROM b`
-- **insert_gen_stored** - `INSERT INTO t (id, a, b) VALUES (?, ?, ?)`
 - **insert_gen_virtual** - `INSERT INTO t (id, a, b) VALUES (?, ?, ?)`
 - **sum** - `SELECT SUM(age) FROM t`
-- **update_gen_propagate** - `UPDATE t SET a = a + ? WHERE id = ?`
+- **insert_gen_stored** - `INSERT INTO t (id, a, b) VALUES (?, ?, ?)`
 - **upsert_all_new** - `INSERT ... ON CONFLICT (id) DO NOTHING`
 - **select_gen_virtual** - `SELECT id, s FROM t WHERE s > ?`
 - **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq`
+- **update_gen_propagate** - `UPDATE t SET a = a + ? WHERE id = ?`
 - **upsert_mixed** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1`
+- **union** - `SELECT id, val FROM a UNION ALL SELECT id, data FROM b`
+- **fk_cascade** - `DELETE FROM A WHERE id = ?` cascading through `A→B→C→D→E`
 - **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id`
 
 Date benchmarks (Citadel-only, sorted by duration):
@@ -217,13 +225,13 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 ## SQL
 
-**Statements** - CREATE/DROP TABLE, ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE/DROP INDEX, CREATE/DROP VIEW, INSERT (VALUES, SELECT, ON CONFLICT DO NOTHING/DO UPDATE, ON CONSTRAINT), SELECT, UPDATE, DELETE, RETURNING (with `OLD`/`NEW`), BEGIN/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, SET TIME ZONE, EXPLAIN
+**Statements** - CREATE/DROP TABLE, ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE/DROP INDEX (incl. partial `WHERE`), CREATE/DROP VIEW, INSERT (VALUES, SELECT, ON CONFLICT DO NOTHING/DO UPDATE, ON CONSTRAINT), SELECT, UPDATE, DELETE, TRUNCATE TABLE, RETURNING (with `OLD`/`NEW`), BEGIN/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, SET TIME ZONE, EXPLAIN
 
-**Constraints** - PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK (column + table level), FOREIGN KEY (RESTRICT/NO ACTION), GENERATED ALWAYS AS (...) STORED|VIRTUAL
+**Constraints** - PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK (column + table level), FOREIGN KEY with full referential actions (`ON DELETE` / `ON UPDATE` `CASCADE` / `SET NULL` / `SET DEFAULT` / `RESTRICT` / `NO ACTION`), GENERATED ALWAYS AS (...) STORED|VIRTUAL
 
 **Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN, DATE, TIME, TIMESTAMP (WITH TIME ZONE), INTERVAL
 
-**Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS), subqueries (scalar, IN, EXISTS, correlated), CTEs (WITH / WITH RECURSIVE), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, GROUP BY/HAVING, ORDER BY, LIMIT/OFFSET
+**Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS), subqueries (scalar, IN, EXISTS, correlated), CTEs (`WITH` / `WITH RECURSIVE` / WITH-DML: `WITH x AS (INSERT/UPDATE/DELETE … [RETURNING *]) SELECT …`), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, GROUP BY/HAVING, ORDER BY, LIMIT/OFFSET
 
 **Window functions** - ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, SUM/COUNT/AVG/MIN/MAX OVER with PARTITION BY, ORDER BY, ROWS/RANGE frames
 

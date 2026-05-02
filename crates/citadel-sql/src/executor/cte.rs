@@ -14,6 +14,16 @@ pub(super) fn exec_select_query(
     schema: &SchemaManager,
     sq: &SelectQuery,
 ) -> Result<ExecutionResult> {
+    if sq.ctes.is_empty() {
+        let empty = CteContext::default();
+        return super::exec_query_body(db, schema, &sq.body, &empty);
+    }
+    if any_dml_cte(sq) {
+        let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+        let result = exec_select_query_in_txn(&mut wtx, schema, sq)?;
+        wtx.commit().map_err(SqlError::Storage)?;
+        return Ok(result);
+    }
     if let Some(fused) = try_fuse_cte(sq) {
         let empty = CteContext::default();
         return super::exec_query_body(db, schema, &fused, &empty);
@@ -24,11 +34,24 @@ pub(super) fn exec_select_query(
     super::exec_query_body(db, schema, &sq.body, &ctes)
 }
 
+fn any_dml_cte(sq: &SelectQuery) -> bool {
+    sq.ctes.iter().any(|cte| {
+        matches!(
+            &cte.body,
+            QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_)
+        )
+    })
+}
+
 pub(super) fn exec_select_query_in_txn(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &SchemaManager,
     sq: &SelectQuery,
 ) -> Result<ExecutionResult> {
+    if sq.ctes.is_empty() {
+        let empty = CteContext::default();
+        return super::exec_query_body_in_txn(wtx, schema, &sq.body, &empty);
+    }
     if let Some(fused) = try_fuse_cte(sq) {
         let empty = CteContext::default();
         return super::exec_query_body_in_txn(wtx, schema, &fused, &empty);
@@ -115,7 +138,28 @@ pub(super) fn materialize_all_ctes(
     recursive: bool,
     exec_body: &mut dyn FnMut(&QueryBody, &CteContext) -> Result<QueryResult>,
 ) -> Result<CteContext> {
-    let mut ctx = CteContext::default();
+    materialize_all_ctes_with_outer(defs, recursive, &CteContext::default(), exec_body)
+}
+
+pub(super) fn materialize_all_ctes_with_outer(
+    defs: &[CteDefinition],
+    recursive: bool,
+    outer: &CteContext,
+    exec_body: &mut dyn FnMut(&QueryBody, &CteContext) -> Result<QueryResult>,
+) -> Result<CteContext> {
+    if recursive {
+        for cte in defs {
+            if matches!(
+                &cte.body,
+                QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_)
+            ) {
+                return Err(SqlError::Unsupported(
+                    "Recursive self-references in data-modifying statements are not allowed".into(),
+                ));
+            }
+        }
+    }
+    let mut ctx = outer.clone();
     for cte in defs {
         let qr = if recursive && cte_body_references_self(&cte.body, &cte.name) {
             materialize_recursive_cte(cte, &ctx, exec_body)?
@@ -153,6 +197,14 @@ pub(super) fn materialize_recursive_cte(
     ctx: &CteContext,
     exec_body: &mut dyn FnMut(&QueryBody, &CteContext) -> Result<QueryResult>,
 ) -> Result<QueryResult> {
+    if matches!(
+        &cte.body,
+        QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_)
+    ) {
+        return Err(SqlError::Unsupported(
+            "Recursive self-references in data-modifying statements are not allowed".into(),
+        ));
+    }
     let (anchor_body, recursive_body, union_all) = match &cte.body {
         QueryBody::Compound(comp) if matches!(comp.op, SetOp::Union) => {
             (&*comp.left, &*comp.right, comp.all)
@@ -360,6 +412,7 @@ pub(super) fn cte_body_references_self(body: &QueryBody, name: &str) -> bool {
             cte_body_references_self(&comp.left, name)
                 || cte_body_references_self(&comp.right, name)
         }
+        QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_) => false,
     }
 }
 

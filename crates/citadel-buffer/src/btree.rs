@@ -57,7 +57,21 @@ impl BTree {
         }
     }
 
-    /// Search for a key. Returns `Some((val_type, value))` if found, `None` otherwise.
+    pub fn search_at_leaf(
+        pages: &FxHashMap<PageId, Page>,
+        leaf_id: PageId,
+        key: &[u8],
+    ) -> Result<Option<(ValueType, Vec<u8>)>> {
+        let page = pages.get(&leaf_id).ok_or(Error::PageOutOfBounds(leaf_id))?;
+        match leaf_node::search(page, key) {
+            Ok(idx) => {
+                let cell = leaf_node::read_cell(page, idx);
+                Ok(Some((cell.val_type, cell.value.to_vec())))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
     pub fn search(
         &self,
         pages: &FxHashMap<PageId, Page>,
@@ -906,8 +920,21 @@ impl BTree {
         txn_id: TxnId,
         key: &[u8],
     ) -> Result<bool> {
-        self.last_insert = None;
         let (mut path, leaf_id) = self.walk_to_leaf(pages, key)?;
+        self.delete_at_leaf(pages, alloc, txn_id, key, &mut path, leaf_id)
+    }
+
+    #[allow(clippy::ptr_arg)]
+    pub fn delete_at_leaf(
+        &mut self,
+        pages: &mut FxHashMap<PageId, Page>,
+        alloc: &mut PageAllocator,
+        txn_id: TxnId,
+        key: &[u8],
+        path: &mut Vec<(PageId, usize)>,
+        leaf_id: PageId,
+    ) -> Result<bool> {
+        self.last_insert = None;
 
         let found = {
             let page = pages.get(&leaf_id).unwrap();
@@ -930,7 +957,7 @@ impl BTree {
                 self.entry_count -= 1;
                 return Ok(true);
             }
-            self.root = propagate_cow_up(pages, alloc, txn_id, &mut path, new_leaf_id);
+            self.root = propagate_cow_up(pages, alloc, txn_id, path, new_leaf_id);
             self.entry_count -= 1;
             return Ok(true);
         }
@@ -938,7 +965,7 @@ impl BTree {
         alloc.free(new_leaf_id);
         pages.remove(&new_leaf_id);
 
-        self.root = propagate_remove_up(pages, alloc, txn_id, &mut path, &mut self.depth);
+        self.root = propagate_remove_up(pages, alloc, txn_id, path, &mut self.depth);
         self.entry_count -= 1;
         Ok(true)
     }
@@ -1007,9 +1034,6 @@ fn update_branch_child(page: &mut Page, child_idx: usize, new_child: PageId) {
     }
 }
 
-/// Propagate CoW up through ancestors. Updates `path` in place so callers
-/// caching the path (e.g. LIL) reuse current PageIds after CoW — critical
-/// across SAVEPOINT boundaries where txn_id changes invalidate the cache.
 pub fn propagate_cow_up(
     pages: &mut FxHashMap<PageId, Page>,
     alloc: &mut PageAllocator,
@@ -1308,18 +1332,15 @@ fn propagate_remove_up(
 
         if num_cells > 0 || level == 0 {
             if num_cells == 0 && level == 0 {
-                // Root collapsed - replace with its only child
                 let only_child = pages.get(&new_ancestor).unwrap().right_child();
                 alloc.free(new_ancestor);
                 pages.remove(&new_ancestor);
                 *depth -= 1;
                 return only_child;
             }
-            // Branch is non-empty, or it's the root with cells
             new_child = new_ancestor;
             need_remove_at_level = false;
         } else {
-            // Branch became empty (0 cells) - collapse to its right_child
             let only_child = pages.get(&new_ancestor).unwrap().right_child();
             alloc.free(new_ancestor);
             pages.remove(&new_ancestor);

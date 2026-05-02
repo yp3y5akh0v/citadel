@@ -1315,49 +1315,38 @@ pub(super) fn exec_update(
         }
     }
 
-    // FK parent-side: if PK changed, check no child references old PK
-    let child_fks = schema.child_fks_for(&lower_name);
-    if !child_fks.is_empty() {
-        for c in &changes {
-            if !c.pk_changed {
-                continue;
-            }
-            let old_pk: Vec<Value> = pk_indices.iter().map(|&i| c.old_row[i].clone()).collect();
-            let old_pk_key = encode_composite_key(&old_pk);
-            for &(child_table, fk) in &child_fks {
-                let child_schema = schema.get(child_table).unwrap();
-                let fk_idx = child_schema
-                    .indices
-                    .iter()
-                    .find(|idx| idx.columns == fk.columns);
-                if let Some(idx) = fk_idx {
-                    let idx_table = TableSchema::index_table_name(child_table, &idx.name);
-                    let mut has_child = false;
-                    wtx.table_scan_from(&idx_table, &old_pk_key, |key, _| {
-                        if key.starts_with(&old_pk_key) {
-                            has_child = true;
-                            Ok(false) // stop scanning
-                        } else {
-                            Ok(false) // past prefix, stop
-                        }
-                    })
-                    .map_err(SqlError::Storage)?;
-                    if has_child {
-                        return Err(SqlError::ForeignKeyViolation(format!(
-                            "cannot update PK in '{}': referenced by '{}'",
-                            lower_name, child_table
-                        )));
-                    }
-                }
-            }
-        }
+    if !schema.child_fks_for(&lower_name).is_empty() {
+        let parent_changes: Vec<(Vec<u8>, Vec<Value>, Vec<Value>)> = changes
+            .iter()
+            .map(|c| {
+                let old_pk: Vec<Value> = pk_indices.iter().map(|&i| c.old_row[i].clone()).collect();
+                (
+                    encode_composite_key(&old_pk),
+                    c.old_row.clone(),
+                    c.new_row.clone(),
+                )
+            })
+            .collect();
+        cascade_after_parent_update(&mut wtx, schema, &lower_name, table_schema, &parent_changes)?;
     }
+
+    let col_map_partial =
+        any_partial_index(table_schema).then(|| ColumnMap::new(&table_schema.columns));
 
     for c in &changes {
         let old_pk: Vec<Value> = pk_indices.iter().map(|&i| c.old_row[i].clone()).collect();
 
         for idx in &table_schema.indices {
-            if index_columns_changed(idx, &c.old_row, &c.new_row) || c.pk_changed {
+            let cols_changed = index_columns_changed(idx, &c.old_row, &c.new_row);
+            let (del, _) = partial_idx_update_actions(
+                idx,
+                &c.old_row,
+                &c.new_row,
+                cols_changed,
+                c.pk_changed,
+                col_map_partial.as_ref(),
+            );
+            if del {
                 let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
                 let old_idx_key = encode_index_key(idx, &c.old_row, &old_pk);
                 wtx.table_delete(&idx_table, &old_idx_key)
@@ -1387,7 +1376,16 @@ pub(super) fn exec_update(
         }
 
         for idx in &table_schema.indices {
-            if index_columns_changed(idx, &c.old_row, &c.new_row) || c.pk_changed {
+            let cols_changed = index_columns_changed(idx, &c.old_row, &c.new_row);
+            let (_, ins) = partial_idx_update_actions(
+                idx,
+                &c.old_row,
+                &c.new_row,
+                cols_changed,
+                c.pk_changed,
+                col_map_partial.as_ref(),
+            );
+            if ins {
                 let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
                 let new_idx_key = encode_index_key(idx, &c.new_row, &new_pk);
                 let new_idx_val = encode_index_value(idx, &c.new_row, &new_pk);
@@ -1541,47 +1539,25 @@ pub(super) fn exec_delete(
     }
 
     let pk_indices = table_schema.pk_indices();
-
-    // FK parent-side: check no child rows reference deleted PKs
-    let child_fks = schema.child_fks_for(&lower_name);
-    if !child_fks.is_empty() {
-        for (_key, row) in &rows_to_delete {
-            let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
-            let pk_key = encode_composite_key(&pk_values);
-            for &(child_table, fk) in &child_fks {
-                let child_schema = schema.get(child_table).unwrap();
-                let fk_idx = child_schema
-                    .indices
-                    .iter()
-                    .find(|idx| idx.columns == fk.columns);
-                if let Some(idx) = fk_idx {
-                    let idx_table = TableSchema::index_table_name(child_table, &idx.name);
-                    let mut has_child = false;
-                    wtx.table_scan_from(&idx_table, &pk_key, |key, _| {
-                        if key.starts_with(&pk_key) {
-                            has_child = true;
-                            Ok(false)
-                        } else {
-                            Ok(false)
-                        }
-                    })
-                    .map_err(SqlError::Storage)?;
-                    if has_child {
-                        return Err(SqlError::ForeignKeyViolation(format!(
-                            "cannot delete from '{}': referenced by '{}'",
-                            lower_name, child_table
-                        )));
-                    }
-                }
-            }
-        }
-    }
+    let has_child_fks = !schema.child_fks_for(&lower_name).is_empty();
+    let mut deleted_pk_keys: Vec<Vec<u8>> = if has_child_fks {
+        Vec::with_capacity(rows_to_delete.len())
+    } else {
+        Vec::new()
+    };
 
     for (key, row) in &rows_to_delete {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
         delete_index_entries(&mut wtx, table_schema, row, &pk_values)?;
         wtx.table_delete(lower_name.as_bytes(), key)
             .map_err(SqlError::Storage)?;
+        if has_child_fks {
+            deleted_pk_keys.push(encode_composite_key(&pk_values));
+        }
+    }
+
+    if has_child_fks {
+        cascade_after_parent_delete(&mut wtx, schema, &lower_name, &deleted_pk_keys)?;
     }
 
     if let Some(returning_cols) = stmt.returning.as_ref() {
@@ -2632,49 +2608,44 @@ pub(super) fn exec_update_in_txn(
         }
     }
 
-    // FK parent-side: if PK changed, check no child references old PK
-    let child_fks = schema.child_fks_for(&lower_name);
-    if !child_fks.is_empty() {
-        for c in &changes {
-            if !c.pk_changed {
-                continue;
-            }
-            let old_pk: Vec<Value> = pk_indices.iter().map(|&i| c.old_row[i].clone()).collect();
-            let old_pk_key = encode_composite_key(&old_pk);
-            for &(child_table, fk) in &child_fks {
-                let child_schema = schema.get(child_table).unwrap();
-                let fk_idx = child_schema
-                    .indices
-                    .iter()
-                    .find(|idx| idx.columns == fk.columns);
-                if let Some(idx) = fk_idx {
-                    let idx_table = TableSchema::index_table_name(child_table, &idx.name);
-                    let mut has_child = false;
-                    wtx.table_scan_from(&idx_table, &old_pk_key, |key, _| {
-                        if key.starts_with(&old_pk_key) {
-                            has_child = true;
-                            Ok(false)
-                        } else {
-                            Ok(false)
-                        }
-                    })
-                    .map_err(SqlError::Storage)?;
-                    if has_child {
-                        return Err(SqlError::ForeignKeyViolation(format!(
-                            "cannot update PK in '{}': referenced by '{}'",
-                            lower_name, child_table
-                        )));
-                    }
-                }
-            }
-        }
+    if !schema.child_fks_for(&lower_name).is_empty() {
+        let parent_changes: Vec<(Vec<u8>, Vec<Value>, Vec<Value>)> = changes
+            .iter()
+            .map(|c| {
+                let old_pk: Vec<Value> = pk_indices.iter().map(|&i| c.old_row[i].clone()).collect();
+                (
+                    encode_composite_key(&old_pk),
+                    c.old_row.clone(),
+                    c.new_row.clone(),
+                )
+            })
+            .collect();
+        cascade_after_parent_update(
+            &mut *wtx,
+            schema,
+            &lower_name,
+            table_schema,
+            &parent_changes,
+        )?;
     }
+
+    let col_map_partial =
+        any_partial_index(table_schema).then(|| ColumnMap::new(&table_schema.columns));
 
     for c in &changes {
         let old_pk: Vec<Value> = pk_indices.iter().map(|&i| c.old_row[i].clone()).collect();
 
         for idx in &table_schema.indices {
-            if index_columns_changed(idx, &c.old_row, &c.new_row) || c.pk_changed {
+            let cols_changed = index_columns_changed(idx, &c.old_row, &c.new_row);
+            let (del, _) = partial_idx_update_actions(
+                idx,
+                &c.old_row,
+                &c.new_row,
+                cols_changed,
+                c.pk_changed,
+                col_map_partial.as_ref(),
+            );
+            if del {
                 let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
                 let old_idx_key = encode_index_key(idx, &c.old_row, &old_pk);
                 wtx.table_delete(&idx_table, &old_idx_key)
@@ -2704,7 +2675,16 @@ pub(super) fn exec_update_in_txn(
         }
 
         for idx in &table_schema.indices {
-            if index_columns_changed(idx, &c.old_row, &c.new_row) || c.pk_changed {
+            let cols_changed = index_columns_changed(idx, &c.old_row, &c.new_row);
+            let (_, ins) = partial_idx_update_actions(
+                idx,
+                &c.old_row,
+                &c.new_row,
+                cols_changed,
+                c.pk_changed,
+                col_map_partial.as_ref(),
+            );
+            if ins {
                 let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
                 let new_idx_key = encode_index_key(idx, &c.new_row, &new_pk);
                 let new_idx_val = encode_index_value(idx, &c.new_row, &new_pk);
@@ -2791,47 +2771,25 @@ pub(super) fn exec_delete_in_txn(
     }
 
     let pk_indices = table_schema.pk_indices();
-
-    // FK parent-side: check no child rows reference deleted PKs
-    let child_fks = schema.child_fks_for(&lower_name);
-    if !child_fks.is_empty() {
-        for (_key, row) in &rows_to_delete {
-            let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
-            let pk_key = encode_composite_key(&pk_values);
-            for &(child_table, fk) in &child_fks {
-                let child_schema = schema.get(child_table).unwrap();
-                let fk_idx = child_schema
-                    .indices
-                    .iter()
-                    .find(|idx| idx.columns == fk.columns);
-                if let Some(idx) = fk_idx {
-                    let idx_table = TableSchema::index_table_name(child_table, &idx.name);
-                    let mut has_child = false;
-                    wtx.table_scan_from(&idx_table, &pk_key, |key, _| {
-                        if key.starts_with(&pk_key) {
-                            has_child = true;
-                            Ok(false)
-                        } else {
-                            Ok(false)
-                        }
-                    })
-                    .map_err(SqlError::Storage)?;
-                    if has_child {
-                        return Err(SqlError::ForeignKeyViolation(format!(
-                            "cannot delete from '{}': referenced by '{}'",
-                            lower_name, child_table
-                        )));
-                    }
-                }
-            }
-        }
-    }
+    let has_child_fks = !schema.child_fks_for(&lower_name).is_empty();
+    let mut deleted_pk_keys: Vec<Vec<u8>> = if has_child_fks {
+        Vec::with_capacity(rows_to_delete.len())
+    } else {
+        Vec::new()
+    };
 
     for (key, row) in &rows_to_delete {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
         delete_index_entries(wtx, table_schema, row, &pk_values)?;
         wtx.table_delete(lower_name.as_bytes(), key)
             .map_err(SqlError::Storage)?;
+        if has_child_fks {
+            deleted_pk_keys.push(encode_composite_key(&pk_values));
+        }
+    }
+
+    if has_child_fks {
+        cascade_after_parent_delete(&mut *wtx, schema, &lower_name, &deleted_pk_keys)?;
     }
 
     if let Some(returning_cols) = stmt.returning.as_ref() {
