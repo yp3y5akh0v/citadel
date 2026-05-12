@@ -1130,3 +1130,112 @@ fn parse_fk_mixed_actions() {
         _ => panic!("expected CreateTable"),
     }
 }
+
+#[test]
+fn parse_full_outer_join() {
+    let stmt = parse_sql("SELECT * FROM a FULL OUTER JOIN b ON a.id = b.a_id").unwrap();
+    let sq = match stmt {
+        Statement::Select(sq) => sq,
+        _ => panic!("expected Select"),
+    };
+    let sel = match &sq.body {
+        QueryBody::Select(s) => s,
+        _ => panic!("expected Select body"),
+    };
+    assert_eq!(sel.joins.len(), 1);
+    assert_eq!(sel.joins[0].join_type, JoinType::FullOuter);
+}
+
+#[test]
+fn parse_left_outer_join_maps_to_left() {
+    let stmt = parse_sql("SELECT * FROM a LEFT OUTER JOIN b ON a.id = b.a_id").unwrap();
+    let sq = match stmt {
+        Statement::Select(sq) => sq,
+        _ => panic!("expected Select"),
+    };
+    let sel = match &sq.body {
+        QueryBody::Select(s) => s,
+        _ => panic!("expected Select body"),
+    };
+    assert_eq!(sel.joins[0].join_type, JoinType::Left);
+}
+
+#[test]
+fn parse_right_outer_join_maps_to_right() {
+    let stmt = parse_sql("SELECT * FROM a RIGHT OUTER JOIN b ON a.id = b.a_id").unwrap();
+    let sq = match stmt {
+        Statement::Select(sq) => sq,
+        _ => panic!("expected Select"),
+    };
+    let sel = match &sq.body {
+        QueryBody::Select(s) => s,
+        _ => panic!("expected Select body"),
+    };
+    assert_eq!(sel.joins[0].join_type, JoinType::Right);
+}
+
+#[test]
+fn parse_derived_table_in_from() {
+    let stmt = parse_sql("SELECT sub.x FROM (SELECT 1 AS x) sub").unwrap();
+    let sq = match stmt {
+        Statement::Select(sq) => sq,
+        _ => panic!("expected Select"),
+    };
+    let sel = match &sq.body {
+        QueryBody::Select(s) => s,
+        _ => panic!("expected Select body"),
+    };
+    assert!(sel.from_subquery.is_some());
+    let d = sel.from_subquery.as_ref().unwrap();
+    assert_eq!(d.alias, "sub");
+    assert!(!d.lateral);
+}
+
+#[test]
+fn parse_lateral_in_join() {
+    let stmt = parse_sql(
+        "SELECT * FROM a LEFT JOIN LATERAL (SELECT * FROM b WHERE b.x = a.x) sub ON true",
+    )
+    .unwrap();
+    let sq = match stmt {
+        Statement::Select(sq) => sq,
+        _ => panic!("expected Select"),
+    };
+    let sel = match &sq.body {
+        QueryBody::Select(s) => s,
+        _ => panic!("expected Select body"),
+    };
+    assert_eq!(sel.joins.len(), 1);
+    let join_sub = sel.joins[0].subquery.as_ref().unwrap();
+    assert_eq!(join_sub.alias, "sub");
+    assert!(join_sub.lateral);
+}
+
+#[test]
+fn parse_lateral_comma_form() {
+    let stmt = parse_sql("SELECT * FROM a, LATERAL (SELECT * FROM b WHERE b.x = a.x) sub").unwrap();
+    let sq = match stmt {
+        Statement::Select(sq) => sq,
+        _ => panic!("expected Select"),
+    };
+    let sel = match &sq.body {
+        QueryBody::Select(s) => s,
+        _ => panic!("expected Select body"),
+    };
+    assert_eq!(sel.joins.len(), 1);
+    assert_eq!(sel.joins[0].join_type, JoinType::Cross);
+    let join_sub = sel.joins[0].subquery.as_ref().unwrap();
+    assert!(join_sub.lateral);
+}
+
+#[test]
+fn parse_lateral_with_right_join_rejected() {
+    let result = parse_sql("SELECT * FROM a RIGHT JOIN LATERAL (SELECT * FROM b) sub ON true");
+    assert!(matches!(result, Err(SqlError::Unsupported(_))));
+}
+
+#[test]
+fn parse_lateral_with_full_outer_rejected() {
+    let result = parse_sql("SELECT * FROM a FULL OUTER JOIN LATERAL (SELECT * FROM b) sub ON true");
+    assert!(matches!(result, Err(SqlError::Unsupported(_))));
+}

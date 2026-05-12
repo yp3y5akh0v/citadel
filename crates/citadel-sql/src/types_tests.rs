@@ -61,6 +61,7 @@ fn col(name: &str, dt: DataType, nullable: bool, pos: u16) -> ColumnDef {
         generated_expr: None,
         generated_sql: None,
         generated_kind: None,
+        collation: Collation::Binary,
     }
 }
 
@@ -112,6 +113,7 @@ fn schema_roundtrip_with_indices() {
                 unique: false,
                 predicate_sql: None,
                 predicate_expr: None,
+                collations: vec![],
             },
             IndexDef {
                 name: "idx_amount_uniq".into(),
@@ -119,6 +121,7 @@ fn schema_roundtrip_with_indices() {
                 unique: true,
                 predicate_sql: None,
                 predicate_expr: None,
+                collations: vec![],
             },
         ],
         vec![],

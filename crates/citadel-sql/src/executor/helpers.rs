@@ -9,6 +9,20 @@ use crate::types::*;
 
 pub(super) type ReturningRow = (Option<Vec<Value>>, Option<Vec<Value>>);
 
+#[inline]
+pub(super) fn coerce_for_column(value: Value, col: &ColumnDef, strict: bool) -> Result<Value> {
+    let got = value.data_type();
+    let coerced = if strict {
+        value.strict_coerce(col.data_type)
+    } else {
+        value.coerce_into(col.data_type)
+    };
+    coerced.ok_or_else(|| SqlError::TypeMismatch {
+        expected: col.data_type.to_string(),
+        got: got.to_string(),
+    })
+}
+
 #[derive(Clone)]
 pub(super) enum FastGenEval {
     None,
@@ -459,9 +473,24 @@ pub(super) fn sort_rows(
         indices.sort_by(|&a, &b| {
             compare_flat_key(&rows[a][col_idx], &rows[b][col_idx], desc, nulls_first)
         });
+    } else if let Some((col_idx, coll)) = try_resolve_collated_flat_sort(order_by, &col_map) {
+        let desc = order_by[0].descending;
+        let nulls_first = order_by[0].nulls_first.unwrap_or(!desc);
+        let keys = precompute_collated_keys(rows, col_idx, coll);
+        indices.sort_by(|&a, &b| {
+            compare_collated_key(
+                &keys[a],
+                &keys[b],
+                &rows[a][col_idx],
+                &rows[b][col_idx],
+                desc,
+                nulls_first,
+            )
+        });
     } else {
         let keys = extract_sort_keys(rows, order_by, &col_map);
-        indices.sort_by(|&a, &b| compare_sort_keys(&keys[a], &keys[b], order_by));
+        let collations = sort_key_collations(order_by, &col_map);
+        indices.sort_by(|&a, &b| compare_sort_keys(&keys[a], &keys[b], order_by, &collations));
     }
 
     let sorted: Vec<Vec<Value>> = indices
@@ -491,9 +520,27 @@ pub(super) fn topk_rows(
         };
         indices.select_nth_unstable_by(k - 1, cmp);
         indices[..k].sort_by(cmp);
+    } else if let Some((col_idx, coll)) = try_resolve_collated_flat_sort(order_by, &col_map) {
+        let desc = order_by[0].descending;
+        let nulls_first = order_by[0].nulls_first.unwrap_or(!desc);
+        let keys = precompute_collated_keys(rows, col_idx, coll);
+        let cmp = |&a: &usize, &b: &usize| {
+            compare_collated_key(
+                &keys[a],
+                &keys[b],
+                &rows[a][col_idx],
+                &rows[b][col_idx],
+                desc,
+                nulls_first,
+            )
+        };
+        indices.select_nth_unstable_by(k - 1, cmp);
+        indices[..k].sort_by(cmp);
     } else {
         let keys = extract_sort_keys(rows, order_by, &col_map);
-        let cmp = |&a: &usize, &b: &usize| compare_sort_keys(&keys[a], &keys[b], order_by);
+        let collations = sort_key_collations(order_by, &col_map);
+        let cmp =
+            |&a: &usize, &b: &usize| compare_sort_keys(&keys[a], &keys[b], order_by, &collations);
         indices.select_nth_unstable_by(k - 1, cmp);
         indices[..k].sort_by(cmp);
     }
@@ -517,7 +564,34 @@ pub(super) fn try_resolve_flat_sort_col(
         return None;
     }
     match &order_by[0].expr {
-        Expr::Column(name) => col_map.resolve(&name.to_ascii_lowercase()).ok(),
+        Expr::Column(name) => {
+            let idx = col_map.resolve(&name.to_ascii_lowercase()).ok()?;
+            (col_map.collation_at(idx) == crate::types::Collation::Binary).then_some(idx)
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn try_resolve_collated_flat_sort(
+    order_by: &[OrderByItem],
+    col_map: &ColumnMap,
+) -> Option<(usize, crate::types::Collation)> {
+    if order_by.len() != 1 {
+        return None;
+    }
+    match &order_by[0].expr {
+        Expr::Collate { expr: e, collation } => match e.as_ref() {
+            Expr::Column(name) => {
+                let idx = col_map.resolve(&name.to_ascii_lowercase()).ok()?;
+                Some((idx, *collation))
+            }
+            _ => None,
+        },
+        Expr::Column(name) => {
+            let idx = col_map.resolve(&name.to_ascii_lowercase()).ok()?;
+            let coll = col_map.collation_at(idx);
+            (coll != crate::types::Collation::Binary).then_some((idx, coll))
+        }
         _ => None,
     }
 }
@@ -555,6 +629,68 @@ pub(super) fn compare_flat_key(
     }
 }
 
+pub(super) enum CollatedKey {
+    Null,
+    Text(String),
+    Other,
+}
+
+pub(super) fn precompute_collated_keys(
+    rows: &[Vec<Value>],
+    col_idx: usize,
+    coll: crate::types::Collation,
+) -> Vec<CollatedKey> {
+    rows.iter()
+        .map(|row| match &row[col_idx] {
+            Value::Null => CollatedKey::Null,
+            Value::Text(s) => match coll {
+                crate::types::Collation::Binary => CollatedKey::Text(s.to_string()),
+                crate::types::Collation::NoCase => {
+                    CollatedKey::Text(s.as_str().to_ascii_lowercase())
+                }
+                crate::types::Collation::Rtrim => {
+                    CollatedKey::Text(s.trim_end_matches(' ').to_string())
+                }
+            },
+            _ => CollatedKey::Other,
+        })
+        .collect()
+}
+
+pub(super) fn compare_collated_key(
+    a: &CollatedKey,
+    b: &CollatedKey,
+    fallback_a: &Value,
+    fallback_b: &Value,
+    desc: bool,
+    nulls_first: bool,
+) -> std::cmp::Ordering {
+    let ord = match (a, b) {
+        (CollatedKey::Null, CollatedKey::Null) => std::cmp::Ordering::Equal,
+        (CollatedKey::Null, _) => {
+            return if nulls_first {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+        (_, CollatedKey::Null) => {
+            return if nulls_first {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            };
+        }
+        (CollatedKey::Text(x), CollatedKey::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
+        _ => fallback_a.cmp(fallback_b),
+    };
+    if desc {
+        ord.reverse()
+    } else {
+        ord
+    }
+}
+
 pub(super) fn extract_sort_keys(
     rows: &[Vec<Value>],
     order_by: &[OrderByItem],
@@ -576,6 +712,7 @@ pub(super) fn compare_sort_keys(
     a: &[Value],
     b: &[Value],
     order_by: &[OrderByItem],
+    collations: &[crate::types::Collation],
 ) -> std::cmp::Ordering {
     for (i, item) in order_by.iter().enumerate() {
         let nulls_first = item.nulls_first.unwrap_or(!item.descending);
@@ -596,7 +733,19 @@ pub(super) fn compare_sort_keys(
                 }
             }
             (false, false) => {
-                let cmp = a[i].cmp(&b[i]);
+                let coll = collations
+                    .get(i)
+                    .copied()
+                    .unwrap_or(crate::types::Collation::Binary);
+                let cmp = if coll != crate::types::Collation::Binary {
+                    if let (Value::Text(x), Value::Text(y)) = (&a[i], &b[i]) {
+                        coll.cmp_text(x, y)
+                    } else {
+                        a[i].cmp(&b[i])
+                    }
+                } else {
+                    a[i].cmp(&b[i])
+                };
                 if item.descending {
                     cmp.reverse()
                 } else {
@@ -609,6 +758,81 @@ pub(super) fn compare_sort_keys(
         }
     }
     std::cmp::Ordering::Equal
+}
+
+pub(super) fn sort_key_collations(
+    order_by: &[OrderByItem],
+    col_map: &ColumnMap,
+) -> Vec<crate::types::Collation> {
+    order_by
+        .iter()
+        .map(|item| match &item.expr {
+            Expr::Collate { collation, .. } => *collation,
+            Expr::Column(name) => col_map
+                .resolve(&name.to_ascii_lowercase())
+                .ok()
+                .map(|i| col_map.collation_at(i))
+                .unwrap_or(crate::types::Collation::Binary),
+            _ => crate::types::Collation::Binary,
+        })
+        .collect()
+}
+
+pub(super) fn try_identity_projection_names(
+    select_cols: &[SelectColumn],
+    columns: &[ColumnDef],
+) -> Option<Vec<String>> {
+    if select_cols.len() != columns.len() {
+        return None;
+    }
+    let mut names = Vec::with_capacity(columns.len());
+    for (i, sc) in select_cols.iter().enumerate() {
+        let SelectColumn::Expr { expr, alias } = sc else {
+            return None;
+        };
+        let col_name = columns[i].name.as_str();
+        match expr {
+            Expr::QualifiedColumn { table, column } => {
+                let lt = table.to_ascii_lowercase();
+                let lc = column.to_ascii_lowercase();
+                let expected_len = lt.len() + 1 + lc.len();
+                if col_name.len() != expected_len
+                    || col_name.as_bytes().get(lt.len()) != Some(&b'.')
+                    || !col_name.starts_with(lt.as_str())
+                    || !col_name.ends_with(lc.as_str())
+                {
+                    return None;
+                }
+            }
+            Expr::Column(name) => {
+                let lname = name.to_ascii_lowercase();
+                let mut count = 0;
+                let mut hit_idx = 0;
+                for (j, c) in columns.iter().enumerate() {
+                    let cn = c.name.as_str();
+                    let hit = cn == lname.as_str()
+                        || (cn.len() > lname.len() + 1
+                            && cn.as_bytes()[cn.len() - lname.len() - 1] == b'.'
+                            && cn.ends_with(lname.as_str()));
+                    if hit {
+                        if count == 0 {
+                            hit_idx = j;
+                        }
+                        count += 1;
+                        if count > 1 {
+                            return None;
+                        }
+                    }
+                }
+                if count != 1 || hit_idx != i {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        names.push(alias.clone().unwrap_or_else(|| expr_display_name(expr)));
+    }
+    Some(names)
 }
 
 pub(super) fn try_build_index_map(
@@ -657,6 +881,10 @@ pub(super) fn project_rows(
     if select_cols.len() == 1 && matches!(select_cols[0], SelectColumn::AllColumns) {
         let col_names = columns.iter().map(|c| c.name.clone()).collect();
         return Ok((col_names, rows));
+    }
+
+    if let Some(names) = try_identity_projection_names(select_cols, columns) {
+        return Ok((names, rows));
     }
 
     if let Some(map) = try_build_index_map(select_cols, columns) {
@@ -875,6 +1103,7 @@ pub(crate) fn build_output_columns(
             generated_expr: None,
             generated_sql: None,
             generated_kind: None,
+            collation: crate::types::Collation::Binary,
         });
     }
     out
@@ -922,8 +1151,17 @@ pub(super) fn encode_index_key_into(
     buf.clear();
     let any_null = idx.unique && idx.columns.iter().any(|&c| row[c as usize].is_null());
     let include_pk = !idx.unique || any_null;
-    for &col_idx in &idx.columns {
-        crate::encoding::encode_key_value_into(&row[col_idx as usize], buf);
+    for (i, &col_idx) in idx.columns.iter().enumerate() {
+        let coll = idx
+            .collations
+            .get(i)
+            .copied()
+            .unwrap_or(crate::types::Collation::Binary);
+        if coll == crate::types::Collation::Binary {
+            crate::encoding::encode_key_value_into(&row[col_idx as usize], buf);
+        } else {
+            crate::encoding::encode_key_value_collated_into(&row[col_idx as usize], coll, buf);
+        }
     }
     if include_pk {
         for v in pk_values {

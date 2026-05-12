@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::{ColumnDef, DataType};
+use crate::types::{Collation, ColumnDef, DataType};
 
 fn col(name: &str, dt: DataType, nullable: bool, pos: u16) -> ColumnDef {
     ColumnDef {
@@ -16,6 +16,7 @@ fn col(name: &str, dt: DataType, nullable: bool, pos: u16) -> ColumnDef {
         generated_expr: None,
         generated_sql: None,
         generated_kind: None,
+        collation: Collation::Binary,
     }
 }
 
@@ -36,6 +37,7 @@ fn test_schema() -> TableSchema {
                 unique: false,
                 predicate_sql: None,
                 predicate_expr: None,
+                collations: vec![],
             },
             IndexDef {
                 name: "idx_email".into(),
@@ -43,6 +45,7 @@ fn test_schema() -> TableSchema {
                 unique: true,
                 predicate_sql: None,
                 predicate_expr: None,
+                collations: vec![],
             },
             IndexDef {
                 name: "idx_name_age".into(),
@@ -50,6 +53,7 @@ fn test_schema() -> TableSchema {
                 unique: false,
                 predicate_sql: None,
                 predicate_expr: None,
+                collations: vec![],
             },
         ],
         vec![],
@@ -289,6 +293,7 @@ fn prefers_unique_index() {
                 unique: false,
                 predicate_sql: None,
                 predicate_expr: None,
+                collations: vec![],
             },
             IndexDef {
                 name: "idx_code_uniq".into(),
@@ -296,6 +301,7 @@ fn prefers_unique_index() {
                 unique: true,
                 predicate_sql: None,
                 predicate_expr: None,
+                collations: vec![],
             },
         ],
         vec![],
@@ -366,6 +372,7 @@ fn schema_with_partial_index(name: &str, predicate_sql: &str) -> TableSchema {
             unique: true,
             predicate_sql: Some(predicate_sql.into()),
             predicate_expr: Some(predicate_expr),
+            collations: vec![],
         }],
         vec![],
         vec![],

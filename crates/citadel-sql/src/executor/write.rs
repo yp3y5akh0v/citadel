@@ -770,6 +770,7 @@ pub(super) fn exec_update(
     let table_schema = schema
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    let strict = table_schema.is_strict();
 
     // Correlated subquery in UPDATE WHERE — check BEFORE materialization
     let corr_ctx = CorrelationCtx {
@@ -781,6 +782,7 @@ pub(super) fn exec_update(
             columns: vec![SelectColumn::AllColumns],
             from: stmt.table.clone(),
             from_alias: None,
+            from_subquery: None,
             joins: vec![],
             distinct: false,
             where_clause: stmt.where_clause.clone(),
@@ -1178,19 +1180,13 @@ pub(super) fn exec_update(
             }
             let new_val = eval_expr(expr, &EvalCtx::new(&col_map, row))?;
 
-            let got_type = new_val.data_type();
             let coerced = if new_val.is_null() {
                 if !col.nullable {
                     return Err(SqlError::NotNullViolation(col.name.clone()));
                 }
                 Value::Null
             } else {
-                new_val
-                    .coerce_into(col.data_type)
-                    .ok_or_else(|| SqlError::TypeMismatch {
-                        expected: col.data_type.to_string(),
-                        got: got_type.to_string(),
-                    })?
+                super::helpers::coerce_for_column(new_val, col, strict)?
             };
 
             evaluated.push((col_idx, coerced));
@@ -1444,6 +1440,7 @@ pub(super) fn exec_delete(
             columns: vec![SelectColumn::AllColumns],
             from: stmt.table.clone(),
             from_alias: None,
+            from_subquery: None,
             joins: vec![],
             distinct: false,
             where_clause: stmt.where_clause.clone(),
@@ -1575,13 +1572,17 @@ pub(super) fn exec_delete(
     Ok(ExecutionResult::RowsAffected(count))
 }
 
+fn has_derived_in_stmt(stmt: &SelectStmt) -> bool {
+    stmt.from_subquery.is_some() || stmt.joins.iter().any(|j| j.subquery.is_some())
+}
+
 pub(super) fn exec_select_in_txn(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
 ) -> Result<ExecutionResult> {
-    if stmt.from.is_empty() {
+    if stmt.from.is_empty() && stmt.from_subquery.is_none() {
         let materialized;
         let stmt = if stmt_has_subquery(stmt) {
             materialized =
@@ -1591,6 +1592,50 @@ pub(super) fn exec_select_in_txn(
             stmt
         };
         return super::exec_select_no_from(stmt);
+    }
+
+    if stmt
+        .joins
+        .iter()
+        .any(|j| j.subquery.as_ref().is_some_and(|s| s.lateral))
+    {
+        return super::select::exec_select_lateral_in_txn(wtx, schema, stmt, ctes);
+    }
+    if has_derived_in_stmt(stmt) {
+        let mut new_ctes = ctes.clone();
+        let mut new_stmt = stmt.clone();
+        if let Some(d) = stmt.from_subquery.as_ref() {
+            let inner_body = match &d.query.body {
+                QueryBody::Select(s) => s.as_ref(),
+                _ => return Err(SqlError::Unsupported("derived must be SELECT".into())),
+            };
+            let qr = match super::exec_select_in_txn(wtx, schema, inner_body, ctes)? {
+                ExecutionResult::Query(qr) => qr,
+                _ => return Err(SqlError::Unsupported("derived returned non-Query".into())),
+            };
+            new_ctes.insert(d.alias.to_ascii_lowercase(), qr);
+            new_stmt.from = d.alias.clone();
+            new_stmt.from_alias = None;
+            new_stmt.from_subquery = None;
+        }
+        for j in new_stmt.joins.iter_mut() {
+            if let Some(d) = j.subquery.take() {
+                let inner_body = match &d.query.body {
+                    QueryBody::Select(s) => s.as_ref(),
+                    _ => return Err(SqlError::Unsupported("derived must be SELECT".into())),
+                };
+                let qr = match super::exec_select_in_txn(wtx, schema, inner_body, ctes)? {
+                    ExecutionResult::Query(qr) => qr,
+                    _ => return Err(SqlError::Unsupported("derived returned non-Query".into())),
+                };
+                new_ctes.insert(d.alias.to_ascii_lowercase(), qr);
+                j.table = crate::parser::TableRef {
+                    name: d.alias.clone(),
+                    alias: None,
+                };
+            }
+        }
+        return super::exec_select_in_txn(wtx, schema, &new_stmt, &new_ctes);
     }
 
     let lower_name = stmt.from.to_ascii_lowercase();
@@ -1679,6 +1724,7 @@ pub(super) fn exec_select_in_txn(
             columns: stmt.columns.clone(),
             from: stmt.from.clone(),
             from_alias: stmt.from_alias.clone(),
+            from_subquery: stmt.from_subquery.clone(),
             joins: stmt.joins.clone(),
             distinct: stmt.distinct,
             order_by: stmt.order_by.clone(),
@@ -2405,6 +2451,7 @@ pub(super) fn exec_update_in_txn(
     let table_schema = schema
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    let strict = table_schema.is_strict();
 
     let col_map = ColumnMap::new(&table_schema.columns);
 
@@ -2470,19 +2517,13 @@ pub(super) fn exec_update_in_txn(
             }
             let new_val = eval_expr(expr, &EvalCtx::new(&col_map, row))?;
 
-            let got_type = new_val.data_type();
             let coerced = if new_val.is_null() {
                 if !col.nullable {
                     return Err(SqlError::NotNullViolation(col.name.clone()));
                 }
                 Value::Null
             } else {
-                new_val
-                    .coerce_into(col.data_type)
-                    .ok_or_else(|| SqlError::TypeMismatch {
-                        expected: col.data_type.to_string(),
-                        got: got_type.to_string(),
-                    })?
+                super::helpers::coerce_for_column(new_val, col, strict)?
             };
 
             evaluated.push((col_idx, coerced));

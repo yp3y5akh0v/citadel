@@ -169,6 +169,7 @@ pub(super) fn try_fuse_view(
         columns: outer.columns.clone(),
         from: inner.from.clone(),
         from_alias: fused_alias,
+        from_subquery: inner.from_subquery.clone(),
         joins: vec![],
         distinct: outer.distinct,
         where_clause: merged_where,

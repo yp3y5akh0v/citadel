@@ -66,6 +66,7 @@ pub(super) fn handle_correlated_select_read(
                                 generated_expr: None,
                                 generated_sql: None,
                                 generated_kind: None,
+                                collation: crate::types::Collation::Binary,
                             });
                             new_columns.push(SelectColumn::Expr {
                                 expr: Expr::Column(col_name),
@@ -102,6 +103,7 @@ pub(super) fn handle_correlated_select_read(
         columns: new_columns,
         from: stmt.from.clone(),
         from_alias: stmt.from_alias.clone(),
+        from_subquery: stmt.from_subquery.clone(),
         joins: stmt.joins.clone(),
         distinct: stmt.distinct,
         where_clause: stmt.where_clause.clone(),
@@ -738,6 +740,7 @@ pub(super) fn decorrelate_scalar_read(
         columns: select_cols,
         from: subquery.from.clone(),
         from_alias: subquery.from_alias.clone(),
+        from_subquery: subquery.from_subquery.clone(),
         joins: vec![],
         distinct: false,
         where_clause: inner_where,
@@ -881,6 +884,7 @@ pub(super) fn decorrelate_scalar_write(
         columns: select_cols,
         from: subquery.from.clone(),
         from_alias: subquery.from_alias.clone(),
+        from_subquery: subquery.from_subquery.clone(),
         joins: vec![],
         distinct: false,
         where_clause: inner_where,

@@ -16,6 +16,7 @@ fn col(name: &str, dt: DataType, nullable: bool, pos: u16) -> ColumnDef {
         generated_expr: None,
         generated_sql: None,
         generated_kind: None,
+        collation: crate::types::Collation::Binary,
     }
 }
 

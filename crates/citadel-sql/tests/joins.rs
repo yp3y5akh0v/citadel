@@ -774,3 +774,274 @@ fn join_table_not_found() {
     let result = conn.execute("SELECT * FROM t1 JOIN nonexistent ON t1.id = nonexistent.id");
     assert!(matches!(result, Err(SqlError::TableNotFound(_))));
 }
+
+#[test]
+fn full_outer_join_basic() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_users_orders(&conn);
+
+    let qr = query(
+        &conn,
+        "SELECT users.id, users.name, orders.amount FROM users
+         FULL OUTER JOIN orders ON users.id = orders.user_id
+         ORDER BY users.id NULLS LAST, orders.amount NULLS LAST",
+    );
+    assert_eq!(qr.rows.len(), 4);
+    assert_eq!(qr.rows[0][0], Value::Integer(1));
+    assert_eq!(qr.rows[0][2], Value::Real(30.0));
+    assert_eq!(qr.rows[1][0], Value::Integer(1));
+    assert_eq!(qr.rows[1][2], Value::Real(50.0));
+    assert_eq!(qr.rows[2][0], Value::Integer(2));
+    assert_eq!(qr.rows[2][2], Value::Real(100.0));
+    assert_eq!(qr.rows[3][0], Value::Integer(3));
+    assert_eq!(qr.rows[3][2], Value::Null);
+}
+
+#[test]
+fn full_outer_join_disjoint_both_sides() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE a (id INTEGER NOT NULL PRIMARY KEY, val TEXT)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE TABLE b (id INTEGER NOT NULL PRIMARY KEY, ref_id INTEGER, val TEXT)")
+            .unwrap(),
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO a (id, val) VALUES (1, 'a1'), (2, 'a2'), (3, 'a3')")
+            .unwrap(),
+        3,
+    );
+    assert_rows_affected(
+        conn.execute(
+            "INSERT INTO b (id, ref_id, val) VALUES (10, 2, 'b2'), (11, 4, 'b4'), (12, 5, 'b5')",
+        )
+        .unwrap(),
+        3,
+    );
+
+    let qr = query(
+        &conn,
+        "SELECT a.id, a.val, b.id, b.val FROM a
+         FULL OUTER JOIN b ON a.id = b.ref_id
+         ORDER BY a.id NULLS LAST, b.id NULLS LAST",
+    );
+    assert_eq!(qr.rows.len(), 5);
+    assert_eq!(qr.rows[0][0], Value::Integer(1));
+    assert_eq!(qr.rows[0][2], Value::Null);
+    assert_eq!(qr.rows[1][0], Value::Integer(2));
+    assert_eq!(qr.rows[1][2], Value::Integer(10));
+    assert_eq!(qr.rows[2][0], Value::Integer(3));
+    assert_eq!(qr.rows[2][2], Value::Null);
+    assert_eq!(qr.rows[3][0], Value::Null);
+    assert_eq!(qr.rows[3][2], Value::Integer(11));
+    assert_eq!(qr.rows[4][0], Value::Null);
+    assert_eq!(qr.rows[4][2], Value::Integer(12));
+}
+
+#[test]
+fn full_outer_join_n_to_m() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE a (id INTEGER NOT NULL PRIMARY KEY, k INTEGER, val TEXT)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE TABLE b (id INTEGER NOT NULL PRIMARY KEY, k INTEGER, val TEXT)")
+            .unwrap(),
+    );
+    for i in 0..3 {
+        conn.execute(&format!(
+            "INSERT INTO a (id, k, val) VALUES ({}, 1, 'a{i}')",
+            i + 1
+        ))
+        .unwrap();
+        conn.execute(&format!(
+            "INSERT INTO b (id, k, val) VALUES ({}, 1, 'b{i}')",
+            i + 10
+        ))
+        .unwrap();
+    }
+
+    let qr = query(
+        &conn,
+        "SELECT a.val, b.val FROM a FULL OUTER JOIN b ON a.k = b.k",
+    );
+    assert_eq!(qr.rows.len(), 9);
+    for row in &qr.rows {
+        assert_ne!(row[0], Value::Null);
+        assert_ne!(row[1], Value::Null);
+    }
+}
+
+#[test]
+fn full_outer_join_empty_inner() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE a (id INTEGER NOT NULL PRIMARY KEY)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE TABLE b (id INTEGER NOT NULL PRIMARY KEY, ref_id INTEGER)")
+            .unwrap(),
+    );
+    assert_rows_affected(
+        conn.execute("INSERT INTO a (id) VALUES (1), (2)").unwrap(),
+        2,
+    );
+
+    let qr = query(
+        &conn,
+        "SELECT a.id, b.id FROM a FULL OUTER JOIN b ON a.id = b.ref_id ORDER BY a.id",
+    );
+    assert_eq!(qr.rows.len(), 2);
+    assert_eq!(qr.rows[0][1], Value::Null);
+    assert_eq!(qr.rows[1][1], Value::Null);
+}
+
+#[test]
+fn full_outer_join_multi_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE a (id INTEGER NOT NULL PRIMARY KEY, x INTEGER, y INTEGER)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute(
+            "CREATE TABLE b (id INTEGER NOT NULL PRIMARY KEY, x INTEGER, y INTEGER, val TEXT)",
+        )
+        .unwrap(),
+    );
+    conn.execute("INSERT INTO a VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO b VALUES (10, 1, 1, 'b1'), (11, 9, 9, 'b9'), (12, 2, 99, 'mismatch')",
+    )
+    .unwrap();
+
+    let qr = query(
+        &conn,
+        "SELECT a.id, b.id FROM a FULL OUTER JOIN b ON a.x = b.x AND a.y = b.y
+         ORDER BY a.id NULLS LAST, b.id NULLS LAST",
+    );
+    assert_eq!(qr.rows.len(), 5);
+    assert_eq!(qr.rows[0][0], Value::Integer(1));
+    assert_eq!(qr.rows[0][1], Value::Integer(10));
+    assert_eq!(qr.rows[1][0], Value::Integer(2));
+    assert_eq!(qr.rows[1][1], Value::Null);
+    assert_eq!(qr.rows[2][0], Value::Integer(3));
+    assert_eq!(qr.rows[2][1], Value::Null);
+    assert_eq!(qr.rows[3][0], Value::Null);
+    assert_eq!(qr.rows[3][1], Value::Integer(11));
+    assert_eq!(qr.rows[4][0], Value::Null);
+    assert_eq!(qr.rows[4][1], Value::Integer(12));
+}
+
+#[test]
+fn full_outer_join_non_equi() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE a (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE TABLE b (id INTEGER NOT NULL PRIMARY KEY, lo INTEGER, hi INTEGER)")
+            .unwrap(),
+    );
+    conn.execute("INSERT INTO a VALUES (1, 5), (2, 15), (3, 50)")
+        .unwrap();
+    conn.execute("INSERT INTO b VALUES (10, 1, 10), (11, 100, 200)")
+        .unwrap();
+
+    let qr = query(
+        &conn,
+        "SELECT a.id, b.id FROM a FULL OUTER JOIN b ON a.val BETWEEN b.lo AND b.hi
+         ORDER BY a.id NULLS LAST, b.id NULLS LAST",
+    );
+    assert_eq!(qr.rows.len(), 4);
+    assert_eq!(qr.rows[0][0], Value::Integer(1));
+    assert_eq!(qr.rows[0][1], Value::Integer(10));
+    assert_eq!(qr.rows[1][0], Value::Integer(2));
+    assert_eq!(qr.rows[1][1], Value::Null);
+    assert_eq!(qr.rows[2][0], Value::Integer(3));
+    assert_eq!(qr.rows[2][1], Value::Null);
+    assert_eq!(qr.rows[3][0], Value::Null);
+    assert_eq!(qr.rows[3][1], Value::Integer(11));
+}
+
+#[test]
+fn full_outer_join_null_keys_never_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE a (id INTEGER NOT NULL PRIMARY KEY, k INTEGER)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE TABLE b (id INTEGER NOT NULL PRIMARY KEY, k INTEGER)")
+            .unwrap(),
+    );
+    conn.execute("INSERT INTO a VALUES (1, NULL), (2, 5)")
+        .unwrap();
+    conn.execute("INSERT INTO b VALUES (10, NULL), (11, 5)")
+        .unwrap();
+
+    let qr = query(
+        &conn,
+        "SELECT a.id, b.id FROM a FULL OUTER JOIN b ON a.k = b.k
+         ORDER BY a.id NULLS LAST, b.id NULLS LAST",
+    );
+    assert_eq!(qr.rows.len(), 3);
+    assert_eq!(qr.rows[0][0], Value::Integer(1));
+    assert_eq!(qr.rows[0][1], Value::Null);
+    assert_eq!(qr.rows[1][0], Value::Integer(2));
+    assert_eq!(qr.rows[1][1], Value::Integer(11));
+    assert_eq!(qr.rows[2][0], Value::Null);
+    assert_eq!(qr.rows[2][1], Value::Integer(10));
+}
+
+#[test]
+fn full_outer_join_explain_string() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert_ok(
+        conn.execute("CREATE TABLE a (id INTEGER NOT NULL PRIMARY KEY)")
+            .unwrap(),
+    );
+    assert_ok(
+        conn.execute("CREATE TABLE b (id INTEGER NOT NULL PRIMARY KEY, ref_id INTEGER)")
+            .unwrap(),
+    );
+
+    let qr = query(
+        &conn,
+        "EXPLAIN SELECT * FROM a FULL OUTER JOIN b ON a.id = b.ref_id",
+    );
+    let plan: Vec<String> = qr
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.to_string(),
+            _ => String::new(),
+        })
+        .collect();
+    assert!(
+        plan.iter().any(|s| s.contains("FULL OUTER JOIN")),
+        "expected FULL OUTER JOIN in plan: {plan:?}"
+    );
+}

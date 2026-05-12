@@ -9,6 +9,8 @@ use crate::types::{ColumnDef, CompactString, DataType, Value};
 pub struct ColumnMap {
     exact: FxHashMap<String, usize>,
     short: FxHashMap<String, ShortMatch>,
+    collations: Vec<crate::types::Collation>,
+    has_non_binary_collation: bool,
 }
 
 #[derive(Clone)]
@@ -22,6 +24,8 @@ impl Clone for ColumnMap {
         Self {
             exact: self.exact.clone(),
             short: self.short.clone(),
+            collations: self.collations.clone(),
+            has_non_binary_collation: self.has_non_binary_collation,
         }
     }
 }
@@ -31,6 +35,8 @@ impl ColumnMap {
         let mut exact = FxHashMap::with_capacity_and_hasher(columns.len() * 2, Default::default());
         let mut short: FxHashMap<String, ShortMatch> =
             FxHashMap::with_capacity_and_hasher(columns.len(), Default::default());
+        let mut collations = Vec::with_capacity(columns.len());
+        let mut has_non_binary_collation = false;
 
         for (i, col) in columns.iter().enumerate() {
             let lower = col.name.to_ascii_lowercase();
@@ -45,9 +51,30 @@ impl ColumnMap {
                 .entry(unqualified.to_string())
                 .and_modify(|e| *e = ShortMatch::Ambiguous)
                 .or_insert(ShortMatch::Unique(i));
+            collations.push(col.collation);
+            if col.collation != crate::types::Collation::Binary {
+                has_non_binary_collation = true;
+            }
         }
 
-        Self { exact, short }
+        Self {
+            exact,
+            short,
+            collations,
+            has_non_binary_collation,
+        }
+    }
+
+    pub(crate) fn collation_at(&self, idx: usize) -> crate::types::Collation {
+        self.collations
+            .get(idx)
+            .copied()
+            .unwrap_or(crate::types::Collation::Binary)
+    }
+
+    #[inline]
+    pub(crate) fn has_non_binary_collation(&self) -> bool {
+        self.has_non_binary_collation
     }
 
     pub(crate) fn resolve(&self, name: &str) -> Result<usize> {
@@ -236,6 +263,23 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         Expr::BinaryOp { left, op, right } => {
             let lval = eval_expr(left, ctx)?;
             let rval = eval_expr(right, ctx)?;
+            let needs_collation_check = ctx.col_map.has_non_binary_collation()
+                || matches!(left.as_ref(), Expr::Collate { .. })
+                || matches!(right.as_ref(), Expr::Collate { .. });
+            if needs_collation_check {
+                let coll = collation_of(left)
+                    .or_else(|| collation_of(right))
+                    .or_else(|| {
+                        column_collation(left, ctx).or_else(|| column_collation(right, ctx))
+                    });
+                if let Some(c) = coll {
+                    if c != crate::types::Collation::Binary {
+                        if let Some(b) = eval_text_compare(&lval, *op, &rval, c) {
+                            return Ok(Value::Boolean(b));
+                        }
+                    }
+                }
+            }
             eval_binary_op(&lval, *op, &rval)
         }
 
@@ -324,6 +368,8 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             eval_cast(&val, *data_type)
         }
 
+        Expr::Collate { expr: e, .. } => eval_expr(e, ctx),
+
         Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => Err(
             SqlError::Unsupported("subquery not materialized (internal error)".into()),
         ),
@@ -337,6 +383,52 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
 }
 
 /// Planner-level constant folding hook; shares semantics with row evaluation.
+fn collation_of(expr: &Expr) -> Option<crate::types::Collation> {
+    match expr {
+        Expr::Collate { collation, .. } => Some(*collation),
+        _ => None,
+    }
+}
+
+fn column_collation(expr: &Expr, ctx: &EvalCtx<'_>) -> Option<crate::types::Collation> {
+    match expr {
+        Expr::Column(name) => ctx
+            .col_map
+            .resolve(name)
+            .ok()
+            .map(|i| ctx.col_map.collation_at(i)),
+        Expr::QualifiedColumn { table, column } => ctx
+            .col_map
+            .resolve_qualified(table, column)
+            .ok()
+            .map(|i| ctx.col_map.collation_at(i)),
+        _ => None,
+    }
+}
+
+fn eval_text_compare(
+    left: &Value,
+    op: BinOp,
+    right: &Value,
+    coll: crate::types::Collation,
+) -> Option<bool> {
+    let (a, b) = match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => return None,
+        (Value::Text(a), Value::Text(b)) => (a.as_str(), b.as_str()),
+        _ => return None,
+    };
+    let ord = coll.cmp_text(a, b);
+    Some(match op {
+        BinOp::Eq => ord == std::cmp::Ordering::Equal,
+        BinOp::NotEq => ord != std::cmp::Ordering::Equal,
+        BinOp::Lt => ord == std::cmp::Ordering::Less,
+        BinOp::Gt => ord == std::cmp::Ordering::Greater,
+        BinOp::LtEq => ord != std::cmp::Ordering::Greater,
+        BinOp::GtEq => ord != std::cmp::Ordering::Less,
+        _ => return None,
+    })
+}
+
 pub fn eval_binary_op_public(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
     eval_binary_op(left, op, right)
 }
@@ -2082,26 +2174,38 @@ fn collect_column_refs(expr: &Expr, columns: &[ColumnDef], out: &mut Vec<usize>)
     match expr {
         Expr::Column(name) => {
             for (i, c) in columns.iter().enumerate() {
-                if c.name == *name || c.name.ends_with(&format!(".{name}")) {
+                if c.name == *name
+                    || (c.name.len() > name.len()
+                        && c.name.as_bytes()[c.name.len() - name.len() - 1] == b'.'
+                        && c.name.ends_with(name.as_str()))
+                {
                     out.push(i);
                     break;
                 }
             }
         }
         Expr::QualifiedColumn { table, column } => {
-            let qualified = format!("{table}.{column}");
-            if let Some(idx) = columns.iter().position(|c| c.name == qualified) {
-                out.push(idx);
-            } else {
-                let matches: Vec<usize> = columns
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| c.name == *column)
-                    .map(|(i, _)| i)
-                    .collect();
-                if matches.len() == 1 {
-                    out.push(matches[0]);
+            let mut found: Option<usize> = None;
+            let mut bare_match: Option<usize> = None;
+            let mut bare_count = 0usize;
+            for (i, c) in columns.iter().enumerate() {
+                if c.name.len() == table.len() + 1 + column.len()
+                    && c.name.as_bytes()[table.len()] == b'.'
+                    && c.name.starts_with(table.as_str())
+                    && c.name.ends_with(column.as_str())
+                {
+                    found = Some(i);
+                    break;
                 }
+                if c.name == *column {
+                    bare_match = Some(i);
+                    bare_count += 1;
+                }
+            }
+            if let Some(idx) = found {
+                out.push(idx);
+            } else if bare_count == 1 {
+                out.push(bare_match.unwrap());
             }
         }
         Expr::BinaryOp { left, right, .. } => {
@@ -2172,6 +2276,9 @@ fn collect_column_refs(expr: &Expr, columns: &[ColumnDef], out: &mut Vec<usize>)
             }
         }
         Expr::Cast { expr, .. } => {
+            collect_column_refs(expr, columns, out);
+        }
+        Expr::Collate { expr, .. } => {
             collect_column_refs(expr, columns, out);
         }
         Expr::WindowFunction { args, spec, .. } => {

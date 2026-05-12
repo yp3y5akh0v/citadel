@@ -1056,6 +1056,9 @@ pub(super) fn try_between_predicate(expr: &Expr, schema: &TableSchema) -> Option
     ) {
         return None;
     }
+    if schema.columns[col_idx].collation != crate::types::Collation::Binary {
+        return None;
+    }
     let non_pk = schema.non_pk_indices();
 
     if let Some(pk_pos) = schema
@@ -1122,6 +1125,9 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
         schema.columns[col_idx].generated_kind,
         Some(crate::parser::GeneratedKind::Virtual)
     ) {
+        return None;
+    }
+    if schema.columns[col_idx].collation != crate::types::Collation::Binary {
         return None;
     }
     let non_pk = schema.non_pk_indices();

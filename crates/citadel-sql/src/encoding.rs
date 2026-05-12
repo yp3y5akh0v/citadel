@@ -51,6 +51,22 @@ pub fn encode_int_key_into(val: i64, buf: &mut Vec<u8>) {
     encode_signed_varint(TAG_INTEGER, val, buf);
 }
 
+pub(crate) fn encode_key_value_collated_into(
+    value: &Value,
+    coll: crate::types::Collation,
+    buf: &mut Vec<u8>,
+) {
+    match (value, coll) {
+        (Value::Text(s), crate::types::Collation::NoCase) => {
+            encode_bytes_into(TAG_TEXT, s.to_ascii_lowercase().as_bytes(), buf);
+        }
+        (Value::Text(s), crate::types::Collation::Rtrim) => {
+            encode_bytes_into(TAG_TEXT, s.trim_end_matches(' ').as_bytes(), buf);
+        }
+        _ => encode_key_value_into(value, buf),
+    }
+}
+
 pub(crate) fn encode_key_value_into(value: &Value, buf: &mut Vec<u8>) {
     match value {
         Value::Null => buf.push(TAG_NULL),

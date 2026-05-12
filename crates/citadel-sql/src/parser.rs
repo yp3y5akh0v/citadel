@@ -66,6 +66,7 @@ pub struct CreateTableStmt {
     pub check_constraints: Vec<TableCheckConstraint>,
     pub foreign_keys: Vec<ForeignKeyDef>,
     pub unique_indices: Vec<UniqueIndexDef>,
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +135,7 @@ pub struct ColumnSpec {
     pub generated_expr: Option<Expr>,
     pub generated_sql: Option<String>,
     pub generated_kind: Option<GeneratedKind>,
+    pub collation: crate::types::Collation,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +158,7 @@ pub struct CreateIndexStmt {
     pub if_not_exists: bool,
     pub predicate_sql: Option<String>,
     pub predicate_expr: Option<Expr>,
+    pub collations: Vec<crate::types::Collation>,
 }
 
 #[derive(Debug, Clone)]
@@ -221,18 +224,27 @@ pub struct TableRef {
     pub alias: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DerivedTable {
+    pub query: Box<SelectQuery>,
+    pub lateral: bool,
+    pub alias: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JoinType {
     Inner,
     Cross,
     Left,
     Right,
+    FullOuter,
 }
 
 #[derive(Debug, Clone)]
 pub struct JoinClause {
     pub join_type: JoinType,
     pub table: TableRef,
+    pub subquery: Option<Box<DerivedTable>>,
     pub on_clause: Option<Expr>,
 }
 
@@ -241,6 +253,7 @@ pub struct SelectStmt {
     pub columns: Vec<SelectColumn>,
     pub from: String,
     pub from_alias: Option<String>,
+    pub from_subquery: Option<Box<DerivedTable>>,
     pub joins: Vec<JoinClause>,
     pub distinct: bool,
     pub where_clause: Option<Expr>,
@@ -396,6 +409,10 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
         spec: WindowSpec,
+    },
+    Collate {
+        expr: Box<Expr>,
+        collation: crate::types::Collation,
     },
 }
 
@@ -699,6 +716,7 @@ fn visit_expr(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
             }
         }
         Expr::Cast { expr: e, .. } => visit_expr(e, visitor),
+        Expr::Collate { expr: e, .. } => visit_expr(e, visitor),
         Expr::WindowFunction { args, spec, .. } => {
             for a in args {
                 visit_expr(a, visitor);
@@ -850,9 +868,18 @@ fn convert_column_def(
     let mut generated_sql = None;
     let mut generated_kind = None;
     let mut fk_def = None;
+    let mut collation = crate::types::Collation::Binary;
 
     for opt in &col_def.options {
         match &opt.option {
+            sp::ColumnOption::Collation(name) => {
+                let coll_name = object_name_to_string(name);
+                collation = crate::types::Collation::from_name(&coll_name).ok_or_else(|| {
+                    SqlError::Unsupported(format!(
+                        "collation '{coll_name}' not supported (BINARY/NOCASE/RTRIM only)"
+                    ))
+                })?;
+            }
             sp::ColumnOption::NotNull => nullable = false,
             sp::ColumnOption::Null => nullable = true,
             sp::ColumnOption::PrimaryKey(_) => {
@@ -947,6 +974,7 @@ fn convert_column_def(
         generated_expr,
         generated_sql,
         generated_kind,
+        collation,
     };
     Ok((spec, fk_def, is_primary_key, is_unique))
 }
@@ -1011,6 +1039,7 @@ fn reject_volatile_in_generated(expr: &Expr) -> Result<()> {
 fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
     let name = object_name_to_string(&ct.name);
     let if_not_exists = ct.if_not_exists;
+    let strict = ct.strict;
 
     let mut columns = Vec::new();
     let mut inline_pk: Vec<String> = Vec::new();
@@ -1115,6 +1144,7 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
         check_constraints,
         foreign_keys,
         unique_indices,
+        strict,
     }))
 }
 
@@ -1206,14 +1236,33 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
 
     let table_name = object_name_to_string(&ci.table_name);
 
-    let columns: Vec<String> = ci
-        .columns
-        .iter()
-        .map(|idx_col| match &idx_col.column.expr {
-            sp::Expr::Identifier(ident) => Ok(ident.value.clone()),
-            other => Err(SqlError::Unsupported(format!("expression index: {other}"))),
-        })
-        .collect::<Result<_>>()?;
+    let mut columns: Vec<String> = Vec::with_capacity(ci.columns.len());
+    let mut collations: Vec<crate::types::Collation> = Vec::with_capacity(ci.columns.len());
+    for idx_col in &ci.columns {
+        let (name, coll) = match &idx_col.column.expr {
+            sp::Expr::Identifier(ident) => (ident.value.clone(), crate::types::Collation::Binary),
+            sp::Expr::Collate {
+                expr: inner,
+                collation,
+            } => match inner.as_ref() {
+                sp::Expr::Identifier(ident) => {
+                    let coll_name = object_name_to_string(collation);
+                    let coll = crate::types::Collation::from_name(&coll_name).ok_or_else(|| {
+                        SqlError::Unsupported(format!(
+                            "collation '{coll_name}' not supported (BINARY/NOCASE/RTRIM only)"
+                        ))
+                    })?;
+                    (ident.value.clone(), coll)
+                }
+                other => {
+                    return Err(SqlError::Unsupported(format!("expression index: {other}")));
+                }
+            },
+            other => return Err(SqlError::Unsupported(format!("expression index: {other}"))),
+        };
+        columns.push(name);
+        collations.push(coll);
+    }
 
     if columns.is_empty() {
         return Err(SqlError::Parse(
@@ -1238,6 +1287,7 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
         if_not_exists: ci.if_not_exists,
         predicate_sql,
         predicate_expr,
+        collations,
     }))
 }
 
@@ -1463,27 +1513,43 @@ fn convert_select_body(select: &sp::Select) -> Result<SelectStmt> {
         _ => false,
     };
 
-    let (from, from_alias, joins) = if select.from.is_empty() {
-        (String::new(), None, vec![])
-    } else if select.from.len() == 1 {
-        let table_with_joins = &select.from[0];
-        let (name, alias) = match &table_with_joins.relation {
-            sp::TableFactor::Table { name, alias, .. } => {
-                let table_name = object_name_to_string(name);
-                let alias_str = alias.as_ref().map(|a| a.name.value.clone());
-                (table_name, alias_str)
-            }
-            _ => return Err(SqlError::Unsupported("non-table FROM source".into())),
-        };
-        let j = table_with_joins
+    let (from, from_alias, from_subquery, joins) = if select.from.is_empty() {
+        (String::new(), None, None, vec![])
+    } else {
+        let first_twj = &select.from[0];
+        let (first_name, first_alias, first_sub) = convert_from_relation(&first_twj.relation)?;
+        let mut joins: Vec<JoinClause> = first_twj
             .joins
             .iter()
             .map(convert_join)
             .collect::<Result<Vec<_>>>()?;
-        (name, alias, j)
-    } else {
-        return Err(SqlError::Unsupported("comma-separated FROM tables".into()));
+        for extra_twj in &select.from[1..] {
+            let (extra_name, extra_alias, extra_sub) = convert_from_relation(&extra_twj.relation)?;
+            joins.push(JoinClause {
+                join_type: JoinType::Cross,
+                table: TableRef {
+                    name: extra_name,
+                    alias: extra_alias,
+                },
+                subquery: extra_sub,
+                on_clause: None,
+            });
+            for j in &extra_twj.joins {
+                joins.push(convert_join(j)?);
+            }
+        }
+        (first_name, first_alias, first_sub, joins)
     };
+    for j in &joins {
+        if let Some(sub) = &j.subquery {
+            if sub.lateral && matches!(j.join_type, JoinType::Right | JoinType::FullOuter) {
+                return Err(SqlError::Unsupported(
+                    "LATERAL is not allowed on the right side of RIGHT JOIN or FULL OUTER JOIN"
+                        .into(),
+                ));
+            }
+        }
+    }
 
     let columns: Vec<SelectColumn> = select
         .projection
@@ -1508,6 +1574,7 @@ fn convert_select_body(select: &sp::Select) -> Result<SelectStmt> {
         columns,
         from,
         from_alias,
+        from_subquery,
         joins,
         distinct,
         where_clause,
@@ -1517,6 +1584,47 @@ fn convert_select_body(select: &sp::Select) -> Result<SelectStmt> {
         group_by,
         having,
     })
+}
+
+fn convert_from_relation(
+    relation: &sp::TableFactor,
+) -> Result<(String, Option<String>, Option<Box<DerivedTable>>)> {
+    match relation {
+        sp::TableFactor::Table { name, alias, .. } => {
+            let table_name = object_name_to_string(name);
+            let alias_str = alias.as_ref().map(|a| a.name.value.clone());
+            Ok((table_name, alias_str, None))
+        }
+        sp::TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+            ..
+        } => {
+            let alias_name = match alias {
+                Some(a) => a.name.value.clone(),
+                None => return Err(SqlError::Unsupported("derived table requires alias".into())),
+            };
+            let inner = convert_select_query(subquery)?;
+            for cte in &inner.ctes {
+                if matches!(
+                    &cte.body,
+                    QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_)
+                ) {
+                    return Err(SqlError::Unsupported(
+                        "WITH-DML inside subqueries (PG forbids)".into(),
+                    ));
+                }
+            }
+            let derived = DerivedTable {
+                query: Box::new(inner),
+                lateral: *lateral,
+                alias: alias_name.clone(),
+            };
+            Ok((alias_name, None, Some(Box::new(derived))))
+        }
+        _ => Err(SqlError::Unsupported("non-table FROM source".into())),
+    }
 }
 
 fn convert_set_expr(set_expr: &sp::SetExpr) -> Result<QueryBody> {
@@ -1663,17 +1771,22 @@ fn convert_with(with: &sp::With) -> Result<(Vec<CteDefinition>, bool)> {
 }
 
 fn convert_query(query: sp::Query) -> Result<Statement> {
+    let sq = convert_select_query(&query)?;
+    Ok(Statement::Select(Box::new(sq)))
+}
+
+fn convert_select_query(query: &sp::Query) -> Result<SelectQuery> {
     let (ctes, recursive) = if let Some(ref with) = query.with {
         convert_with(with)?
     } else {
         (vec![], false)
     };
-    let body = convert_query_body(&query)?;
-    Ok(Statement::Select(Box::new(SelectQuery {
+    let body = convert_query_body(query)?;
+    Ok(SelectQuery {
         ctes,
         recursive,
         body,
-    })))
+    })
 }
 
 fn convert_join(join: &sp::Join) -> Result<JoinClause> {
@@ -1681,23 +1794,17 @@ fn convert_join(join: &sp::Join) -> Result<JoinClause> {
         sp::JoinOperator::Inner(c) => (JoinType::Inner, Some(c)),
         sp::JoinOperator::Join(c) => (JoinType::Inner, Some(c)),
         sp::JoinOperator::CrossJoin(c) => (JoinType::Cross, Some(c)),
-        sp::JoinOperator::Left(c) => (JoinType::Left, Some(c)),
+        sp::JoinOperator::Left(c) | sp::JoinOperator::LeftOuter(c) => (JoinType::Left, Some(c)),
         sp::JoinOperator::LeftSemi(c) => (JoinType::Left, Some(c)),
         sp::JoinOperator::LeftAnti(c) => (JoinType::Left, Some(c)),
-        sp::JoinOperator::Right(c) => (JoinType::Right, Some(c)),
+        sp::JoinOperator::Right(c) | sp::JoinOperator::RightOuter(c) => (JoinType::Right, Some(c)),
         sp::JoinOperator::RightSemi(c) => (JoinType::Right, Some(c)),
         sp::JoinOperator::RightAnti(c) => (JoinType::Right, Some(c)),
+        sp::JoinOperator::FullOuter(c) => (JoinType::FullOuter, Some(c)),
         other => return Err(SqlError::Unsupported(format!("join type: {other:?}"))),
     };
 
-    let (name, alias) = match &join.relation {
-        sp::TableFactor::Table { name, alias, .. } => {
-            let table_name = object_name_to_string(name);
-            let alias_str = alias.as_ref().map(|a| a.name.value.clone());
-            (table_name, alias_str)
-        }
-        _ => return Err(SqlError::Unsupported("non-table JOIN source".into())),
-    };
+    let (name, alias, subquery) = convert_from_relation(&join.relation)?;
 
     let on_clause = match constraint {
         Some(sp::JoinConstraint::On(expr)) => Some(convert_expr(expr)?),
@@ -1708,6 +1815,7 @@ fn convert_join(join: &sp::Join) -> Result<JoinClause> {
     Ok(JoinClause {
         join_type,
         table: TableRef { name, alias },
+        subquery,
         on_clause,
     })
 }
@@ -1964,6 +2072,21 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
             Ok(Expr::Cast {
                 expr: Box::new(convert_expr(e)?),
                 data_type: target,
+            })
+        }
+        sp::Expr::Collate {
+            expr: e,
+            collation: name,
+        } => {
+            let coll_name = object_name_to_string(name);
+            let coll = crate::types::Collation::from_name(&coll_name).ok_or_else(|| {
+                SqlError::Unsupported(format!(
+                    "collation '{coll_name}' not supported (BINARY/NOCASE/RTRIM only)"
+                ))
+            })?;
+            Ok(Expr::Collate {
+                expr: Box::new(convert_expr(e)?),
+                collation: coll,
             })
         }
         sp::Expr::Substring {

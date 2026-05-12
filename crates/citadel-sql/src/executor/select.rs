@@ -102,7 +102,7 @@ pub(super) fn exec_select(
     stmt: &SelectStmt,
     ctes: &CteContext,
 ) -> Result<ExecutionResult> {
-    if stmt.from.is_empty() {
+    if stmt.from.is_empty() && stmt.from_subquery.is_none() {
         let materialized;
         let stmt = if stmt_has_subquery(stmt) {
             materialized =
@@ -112,6 +112,13 @@ pub(super) fn exec_select(
             stmt
         };
         return exec_select_no_from(stmt);
+    }
+
+    if has_lateral(stmt) {
+        return exec_select_lateral(db, schema, stmt, ctes);
+    }
+    if has_non_lateral_derived(stmt) {
+        return exec_select_with_derived(db, schema, stmt, ctes);
     }
 
     let lower_name = stmt.from.to_ascii_lowercase();
@@ -173,6 +180,7 @@ pub(super) fn exec_select(
                     columns: stmt.columns.clone(),
                     from: stmt.from.clone(),
                     from_alias: stmt.from_alias.clone(),
+                    from_subquery: stmt.from_subquery.clone(),
                     joins: vec![],
                     distinct: stmt.distinct,
                     order_by: stmt.order_by.clone(),
@@ -234,6 +242,7 @@ pub(super) fn exec_select(
             columns: stmt.columns.clone(),
             from: stmt.from.clone(),
             from_alias: stmt.from_alias.clone(),
+            from_subquery: stmt.from_subquery.clone(),
             joins: stmt.joins.clone(),
             distinct: stmt.distinct,
             order_by: stmt.order_by.clone(),
@@ -1403,6 +1412,7 @@ pub(super) struct TopKScanPlan {
     descending: bool,
     nulls_first: bool,
     keep: usize,
+    collation: crate::types::Collation,
 }
 
 impl TopKScanPlan {
@@ -1432,10 +1442,15 @@ impl TopKScanPlan {
 
         let ob = &stmt.order_by[0];
         let col_map = ColumnMap::new(&schema.columns);
-        let col_idx = match resolve_simple_col(&ob.expr, &col_map) {
+        let (sort_expr, explicit_coll): (&Expr, Option<crate::types::Collation>) = match &ob.expr {
+            Expr::Collate { expr: e, collation } => (e.as_ref(), Some(*collation)),
+            other => (other, None),
+        };
+        let col_idx = match resolve_simple_col(sort_expr, &col_map) {
             Some(idx) => idx,
             None => return Ok(None),
         };
+        let collation = explicit_coll.unwrap_or_else(|| schema.columns[col_idx].collation);
 
         let non_pk = schema.non_pk_indices();
         let enc_pos_arr = schema.encoding_positions();
@@ -1469,6 +1484,7 @@ impl TopKScanPlan {
             descending: ob.descending,
             nulls_first: ob.nulls_first.unwrap_or(!ob.descending),
             keep,
+            collation,
         }))
     }
 
@@ -1493,6 +1509,7 @@ impl TopKScanPlan {
             c: Candidate,
             descending: bool,
             nulls_first: bool,
+            collation: crate::types::Collation,
         }
 
         impl PartialEq for CandWrapper {
@@ -1527,7 +1544,19 @@ impl TopKScanPlan {
                             Ordering::Less
                         }
                     }
-                    (false, false) => self.c.sort_key.cmp(&other.c.sort_key),
+                    (false, false) => {
+                        if self.collation != crate::types::Collation::Binary {
+                            if let (Value::Text(a), Value::Text(b)) =
+                                (&self.c.sort_key, &other.c.sort_key)
+                            {
+                                self.collation.cmp_text(a, b)
+                            } else {
+                                self.c.sort_key.cmp(&other.c.sort_key)
+                            }
+                        } else {
+                            self.c.sort_key.cmp(&other.c.sort_key)
+                        }
+                    }
                 };
                 if self.descending {
                     ord.reverse()
@@ -1591,7 +1620,19 @@ impl TopKScanPlan {
                                 Ordering::Less
                             }
                         }
-                        (false, false) => sort_key.cmp(&top.c.sort_key),
+                        (false, false) => {
+                            if self.collation != crate::types::Collation::Binary {
+                                if let (Value::Text(a), Value::Text(b)) =
+                                    (&sort_key, &top.c.sort_key)
+                                {
+                                    self.collation.cmp_text(a, b)
+                                } else {
+                                    sort_key.cmp(&top.c.sort_key)
+                                }
+                            } else {
+                                sort_key.cmp(&top.c.sort_key)
+                            }
+                        }
                     };
                     let cmp = if self.descending { ord.reverse() } else { ord };
                     if cmp != Ordering::Less {
@@ -1608,6 +1649,7 @@ impl TopKScanPlan {
                 },
                 descending: self.descending,
                 nulls_first: self.nulls_first,
+                collation: self.collation,
             };
 
             if heap.len() < k {
@@ -1800,6 +1842,853 @@ fn try_streaming_distinct(
         columns: col_names,
         rows,
     })))
+}
+
+pub(super) trait LateralIo {
+    fn exec_select(&mut self, schema: &SchemaManager, sq: &SelectQuery) -> Result<QueryResult>;
+    fn scan_table(
+        &mut self,
+        schema: &SchemaManager,
+        name: &str,
+    ) -> Result<(TableSchema, Vec<Vec<Value>>)>;
+}
+
+pub(super) struct ReadIo<'a> {
+    pub db: &'a Database,
+}
+
+impl LateralIo for ReadIo<'_> {
+    fn exec_select(&mut self, schema: &SchemaManager, sq: &SelectQuery) -> Result<QueryResult> {
+        match super::cte::exec_select_query(self.db, schema, sq)? {
+            ExecutionResult::Query(qr) => Ok(qr),
+            _ => Err(SqlError::Plan("expected Query result".into())),
+        }
+    }
+    fn scan_table(
+        &mut self,
+        schema: &SchemaManager,
+        name: &str,
+    ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
+        super::scan_table_read_or_view(self.db, schema, name)
+    }
+}
+
+pub(super) struct WriteIo<'a, 'b> {
+    pub wtx: &'a mut citadel_txn::write_txn::WriteTxn<'b>,
+}
+
+impl LateralIo for WriteIo<'_, '_> {
+    fn exec_select(&mut self, schema: &SchemaManager, sq: &SelectQuery) -> Result<QueryResult> {
+        match super::cte::exec_select_query_in_txn(self.wtx, schema, sq)? {
+            ExecutionResult::Query(qr) => Ok(qr),
+            _ => Err(SqlError::Plan("expected Query result".into())),
+        }
+    }
+    fn scan_table(
+        &mut self,
+        schema: &SchemaManager,
+        name: &str,
+    ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
+        super::scan_table_write_or_view(self.wtx, schema, name)
+    }
+}
+
+fn has_lateral(stmt: &SelectStmt) -> bool {
+    stmt.joins
+        .iter()
+        .any(|j| j.subquery.as_ref().is_some_and(|s| s.lateral))
+}
+
+fn has_non_lateral_derived(stmt: &SelectStmt) -> bool {
+    let from_has = stmt.from_subquery.as_ref().is_some_and(|s| !s.lateral);
+    let join_has = stmt
+        .joins
+        .iter()
+        .any(|j| j.subquery.as_ref().is_some_and(|s| !s.lateral));
+    from_has || join_has
+}
+
+fn materialize_derived(
+    schema: &SchemaManager,
+    derived: &DerivedTable,
+    io: &mut dyn LateralIo,
+) -> Result<QueryResult> {
+    io.exec_select(schema, &derived.query)
+}
+
+fn exec_select_with_derived(
+    db: &Database,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+    ctes: &CteContext,
+) -> Result<ExecutionResult> {
+    let mut new_ctes = ctes.clone();
+    let mut new_stmt = stmt.clone();
+    let mut io = ReadIo { db };
+
+    if let Some(d) = stmt.from_subquery.as_ref() {
+        let qr = materialize_derived(schema, d, &mut io)?;
+        new_ctes.insert(d.alias.to_ascii_lowercase(), qr);
+        new_stmt.from = d.alias.clone();
+        new_stmt.from_alias = None;
+        new_stmt.from_subquery = None;
+    }
+    for j in new_stmt.joins.iter_mut() {
+        if let Some(d) = j.subquery.take() {
+            let qr = materialize_derived(schema, &d, &mut io)?;
+            new_ctes.insert(d.alias.to_ascii_lowercase(), qr);
+            j.table = TableRef {
+                name: d.alias.clone(),
+                alias: None,
+            };
+        }
+    }
+
+    exec_select(db, schema, &new_stmt, &new_ctes)
+}
+
+fn exec_select_lateral(
+    db: &Database,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+    ctes: &CteContext,
+) -> Result<ExecutionResult> {
+    let mut io = ReadIo { db };
+    exec_select_lateral_with_io(schema, stmt, ctes, &mut io)
+}
+
+pub(super) fn exec_select_lateral_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+    ctes: &CteContext,
+) -> Result<ExecutionResult> {
+    let mut io = WriteIo { wtx };
+    exec_select_lateral_with_io(schema, stmt, ctes, &mut io)
+}
+
+fn exec_select_lateral_with_io(
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+    ctes: &CteContext,
+    io: &mut dyn LateralIo,
+) -> Result<ExecutionResult> {
+    if !stmt.group_by.is_empty()
+        || stmt.having.is_some()
+        || stmt.distinct
+        || stmt
+            .columns
+            .iter()
+            .any(|c| matches!(c, SelectColumn::Expr { expr, .. } if is_aggregate_expr(expr)))
+    {
+        return Err(SqlError::Unsupported(
+            "GROUP BY / HAVING / DISTINCT / aggregates with LATERAL are not supported in v0.13"
+                .into(),
+        ));
+    }
+
+    let mut new_ctes = ctes.clone();
+    let mut from_name = stmt.from.clone();
+    let mut from_alias = stmt.from_alias.clone();
+    if let Some(d) = stmt.from_subquery.as_ref() {
+        if d.lateral {
+            return Err(SqlError::Unsupported(
+                "LATERAL is not allowed as the first FROM item".into(),
+            ));
+        }
+        let qr = materialize_derived(schema, d, io)?;
+        new_ctes.insert(d.alias.to_ascii_lowercase(), qr);
+        from_name = d.alias.clone();
+        from_alias = None;
+    }
+
+    let (outer_schema, mut outer_rows) = match new_ctes.get(&from_name.to_ascii_lowercase()) {
+        Some(cte_qr) => (
+            super::cte::build_cte_schema(&from_name, cte_qr),
+            cte_qr.rows.clone(),
+        ),
+        None => io.scan_table(schema, &from_name)?,
+    };
+    let outer_alias_str = super::join::table_alias_or_name(&from_name, &from_alias);
+
+    let mut combined_cols: Vec<ColumnDef> =
+        super::join::build_joined_columns(&[(outer_alias_str.clone(), &outer_schema)]);
+    let mut current_alias = outer_alias_str;
+
+    for join in &stmt.joins {
+        let derived = join.subquery.as_ref().ok_or_else(|| {
+            SqlError::Plan("exec_select_lateral encountered non-subquery join".into())
+        })?;
+        if !derived.lateral {
+            let qr = materialize_derived(schema, derived, io)?;
+            new_ctes.insert(derived.alias.to_ascii_lowercase(), qr);
+            current_alias = derived.alias.clone();
+            let mini = SelectStmt {
+                columns: vec![SelectColumn::AllColumns],
+                from: format!("__lateral_outer_{}", join.table.name),
+                from_alias: None,
+                from_subquery: None,
+                joins: vec![JoinClause {
+                    join_type: join.join_type,
+                    table: TableRef {
+                        name: derived.alias.clone(),
+                        alias: None,
+                    },
+                    subquery: None,
+                    on_clause: join.on_clause.clone(),
+                }],
+                distinct: false,
+                where_clause: None,
+                order_by: vec![],
+                limit: None,
+                offset: None,
+                group_by: vec![],
+                having: None,
+            };
+            let outer_qr = QueryResult {
+                columns: combined_cols.iter().map(|c| c.name.clone()).collect(),
+                rows: std::mem::take(&mut outer_rows),
+            };
+            new_ctes.insert(mini.from.clone(), outer_qr);
+            let qr = match super::exec_select_join_with_ctes(&mini, &new_ctes, &mut |n| {
+                io.scan_table(schema, n)
+            })? {
+                ExecutionResult::Query(qr) => qr,
+                _ => unreachable!(),
+            };
+            outer_rows = qr.rows;
+            combined_cols = qr
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, name)| ColumnDef {
+                    name: name.clone(),
+                    data_type: DataType::Null,
+                    nullable: true,
+                    position: i as u16,
+                    default_expr: None,
+                    default_sql: None,
+                    check_expr: None,
+                    check_sql: None,
+                    check_name: None,
+                    is_with_timezone: false,
+                    generated_expr: None,
+                    generated_sql: None,
+                    generated_kind: None,
+                    collation: crate::types::Collation::Binary,
+                })
+                .collect();
+            continue;
+        }
+
+        let outer_col_map = ColumnMap::new(&combined_cols);
+
+        if let Some(fast) = try_lateral_decorrelated(
+            schema,
+            derived,
+            &combined_cols,
+            &outer_col_map,
+            &outer_rows,
+            join.join_type,
+            join.on_clause.as_ref(),
+            io,
+        )? {
+            outer_rows = fast.0;
+            let alias_lc = derived.alias.to_ascii_lowercase();
+            let qualified: Vec<String> = fast.1.iter().map(|n| format!("{alias_lc}.{n}")).collect();
+            combined_cols = extend_lateral_cols(&combined_cols, &qualified)
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut c)| {
+                    c.position = i as u16;
+                    c
+                })
+                .collect();
+            current_alias = derived.alias.clone();
+            continue;
+        }
+
+        let mut new_rows: Vec<Vec<Value>> = Vec::new();
+        let mut probe_columns: Vec<String> = Vec::new();
+        let mut combined_col_map: Option<ColumnMap> = None;
+
+        for outer_row in outer_rows.drain(..) {
+            let bound_query = bind_query_with_outer(&derived.query, &outer_row, &outer_col_map)?;
+            let inner_qr = io.exec_select(schema, &bound_query)?;
+            if probe_columns.is_empty() {
+                probe_columns = inner_qr.columns.clone();
+                if join.on_clause.is_some() {
+                    combined_col_map = Some(ColumnMap::new(&extend_lateral_cols(
+                        &combined_cols,
+                        &probe_columns,
+                    )));
+                }
+            }
+            let inner_count = inner_qr.columns.len();
+            if inner_qr.rows.is_empty() {
+                if matches!(join.join_type, JoinType::Left) {
+                    let mut combined = outer_row.clone();
+                    combined.resize(combined.len() + inner_count, Value::Null);
+                    if let (Some(on), Some(cm)) = (&join.on_clause, &combined_col_map) {
+                        if !matches!(
+                            eval_expr(on, &EvalCtx::new(cm, &combined)),
+                            Ok(v) if is_truthy(&v)
+                        ) {
+                            continue;
+                        }
+                    }
+                    new_rows.push(combined);
+                }
+                continue;
+            }
+            let on_filter_needed = join.on_clause.is_some();
+            for inner_row in &inner_qr.rows {
+                let mut combined = outer_row.clone();
+                combined.extend(inner_row.iter().cloned());
+                if on_filter_needed {
+                    let on = join.on_clause.as_ref().unwrap();
+                    let cm = combined_col_map.as_ref().unwrap();
+                    if !matches!(
+                        eval_expr(on, &EvalCtx::new(cm, &combined)),
+                        Ok(v) if is_truthy(&v)
+                    ) {
+                        continue;
+                    }
+                }
+                new_rows.push(combined);
+            }
+        }
+
+        let alias_lc = derived.alias.to_ascii_lowercase();
+        let qualified: Vec<String> = probe_columns
+            .iter()
+            .map(|n| format!("{alias_lc}.{n}"))
+            .collect();
+        combined_cols = extend_lateral_cols(&combined_cols, &qualified)
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut c)| {
+                c.position = i as u16;
+                c
+            })
+            .collect();
+        outer_rows = new_rows;
+        current_alias = derived.alias.clone();
+    }
+
+    let clean_stmt = SelectStmt {
+        where_clause: stmt.where_clause.clone(),
+        columns: stmt.columns.clone(),
+        from: current_alias,
+        from_alias: None,
+        from_subquery: None,
+        joins: vec![],
+        distinct: stmt.distinct,
+        order_by: stmt.order_by.clone(),
+        limit: stmt.limit.clone(),
+        offset: stmt.offset.clone(),
+        group_by: stmt.group_by.clone(),
+        having: stmt.having.clone(),
+    };
+    process_select(&combined_cols, outer_rows, &clean_stmt, false)
+}
+
+type LateralRows = (Vec<Vec<Value>>, Vec<String>);
+
+#[allow(clippy::too_many_arguments)]
+fn try_lateral_decorrelated(
+    schema: &SchemaManager,
+    derived: &DerivedTable,
+    outer_cols: &[ColumnDef],
+    outer_col_map: &ColumnMap,
+    outer_rows: &[Vec<Value>],
+    join_type: JoinType,
+    on_clause: Option<&Expr>,
+    io: &mut dyn LateralIo,
+) -> Result<Option<LateralRows>> {
+    if !derived.query.ctes.is_empty() {
+        return Ok(None);
+    }
+    if on_clause.is_some() {
+        return Ok(None);
+    }
+    let sel = match &derived.query.body {
+        QueryBody::Select(s) => s,
+        _ => return Ok(None),
+    };
+    if !sel.joins.is_empty()
+        || !sel.group_by.is_empty()
+        || sel.having.is_some()
+        || sel.distinct
+        || sel.from_subquery.is_some()
+    {
+        return Ok(None);
+    }
+    let inner_table = sel.from.to_ascii_lowercase();
+    let inner_schema = match schema.get(&inner_table) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let inner_alias = sel
+        .from_alias
+        .clone()
+        .unwrap_or_else(|| inner_table.clone());
+
+    let where_expr = match &sel.where_clause {
+        Some(w) => w,
+        None => return Ok(None),
+    };
+    let conjuncts = super::correlated::flatten_and_exprs(where_expr);
+    let mut corr: Vec<(usize, usize)> = Vec::new();
+    let mut residual: Vec<Expr> = Vec::new();
+    for c in conjuncts {
+        if let Some(pair) = try_extract_corr(c, outer_col_map, &inner_alias, inner_schema) {
+            corr.push(pair);
+        } else if expr_uses_outer(c, outer_col_map, &inner_alias, inner_schema) {
+            return Ok(None);
+        } else {
+            residual.push(c.clone());
+        }
+    }
+    if corr.is_empty() {
+        return Ok(None);
+    }
+    if sel
+        .order_by
+        .iter()
+        .any(|o| expr_uses_outer(&o.expr, outer_col_map, &inner_alias, inner_schema))
+    {
+        return Ok(None);
+    }
+    if sel.columns.iter().any(|c| match c {
+        SelectColumn::Expr { expr, .. } => {
+            expr_uses_outer(expr, outer_col_map, &inner_alias, inner_schema)
+                || is_aggregate_expr(expr)
+        }
+        _ => false,
+    }) {
+        return Ok(None);
+    }
+
+    let limit_n = match &sel.limit {
+        Some(Expr::Literal(Value::Integer(n))) if *n >= 0 => Some(*n as usize),
+        Some(_) => return Ok(None),
+        None => None,
+    };
+
+    let residual_where = if residual.is_empty() {
+        None
+    } else {
+        let mut combined = residual.remove(0);
+        for r in residual {
+            combined = Expr::BinaryOp {
+                left: Box::new(combined),
+                op: BinOp::And,
+                right: Box::new(r),
+            };
+        }
+        Some(combined)
+    };
+
+    let inner_stmt = SelectStmt {
+        columns: vec![SelectColumn::AllColumns],
+        from: inner_table.clone(),
+        from_alias: sel.from_alias.clone(),
+        from_subquery: None,
+        joins: vec![],
+        distinct: false,
+        where_clause: residual_where,
+        order_by: sel.order_by.clone(),
+        limit: None,
+        offset: None,
+        group_by: vec![],
+        having: None,
+    };
+    let inner_qr = io.exec_select(
+        schema,
+        &SelectQuery {
+            ctes: vec![],
+            recursive: false,
+            body: QueryBody::Select(Box::new(inner_stmt)),
+        },
+    )?;
+
+    let proj_plan = build_projection_indices(&sel.columns, &inner_qr.columns);
+    let probe_columns: Vec<String> = match proj_plan.as_ref() {
+        Some(p) => p.iter().map(|(name, _)| name.clone()).collect(),
+        None => inner_qr.columns.clone(),
+    };
+
+    let mut groups: FxHashMap<Vec<Value>, Vec<Vec<Value>>> = FxHashMap::default();
+    let inner_col_idx: Vec<usize> = corr.iter().map(|&(_, inner_idx)| inner_idx).collect();
+    for row in inner_qr.rows {
+        let key: Vec<Value> = inner_col_idx.iter().map(|&i| row[i].clone()).collect();
+        if key.iter().any(|v| matches!(v, Value::Null)) {
+            continue;
+        }
+        groups.entry(key).or_default().push(row);
+    }
+    if let Some(n) = limit_n {
+        for v in groups.values_mut() {
+            v.truncate(n);
+        }
+    }
+
+    let outer_idx: Vec<usize> = corr.iter().map(|&(o, _)| o).collect();
+    let mut new_rows: Vec<Vec<Value>> = Vec::new();
+    for outer_row in outer_rows {
+        let key: Vec<Value> = outer_idx.iter().map(|&i| outer_row[i].clone()).collect();
+        let inner_rows = groups.get(&key);
+        match inner_rows {
+            Some(rows) if !rows.is_empty() => {
+                for inner_row in rows {
+                    let mut combined = outer_row.clone();
+                    if let Some(plan) = &proj_plan {
+                        for &(_, idx) in plan {
+                            combined.push(inner_row[idx].clone());
+                        }
+                    } else {
+                        combined.extend(inner_row.iter().cloned());
+                    }
+                    new_rows.push(combined);
+                }
+            }
+            _ => {
+                if matches!(join_type, JoinType::Left) {
+                    let mut combined = outer_row.clone();
+                    combined.resize(combined.len() + probe_columns.len(), Value::Null);
+                    new_rows.push(combined);
+                }
+            }
+        }
+    }
+    let _ = outer_cols;
+    Ok(Some((new_rows, probe_columns)))
+}
+
+fn try_extract_corr(
+    expr: &Expr,
+    outer_col_map: &ColumnMap,
+    inner_alias: &str,
+    inner_schema: &TableSchema,
+) -> Option<(usize, usize)> {
+    let (left, right) = match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => (left.as_ref(), right.as_ref()),
+        _ => return None,
+    };
+    let try_pair = |a: &Expr, b: &Expr| -> Option<(usize, usize)> {
+        let outer_idx = match a {
+            Expr::QualifiedColumn { table, column } => {
+                let q = format!(
+                    "{}.{}",
+                    table.to_ascii_lowercase(),
+                    column.to_ascii_lowercase()
+                );
+                outer_col_map.resolve(&q).ok()
+            }
+            _ => None,
+        }?;
+        let inner_idx = match b {
+            Expr::Column(name) => inner_schema.column_index(&name.to_ascii_lowercase()),
+            Expr::QualifiedColumn { table, column } => {
+                let t = table.to_ascii_lowercase();
+                if t == inner_alias.to_ascii_lowercase()
+                    || t == inner_schema.name.to_ascii_lowercase()
+                {
+                    inner_schema.column_index(&column.to_ascii_lowercase())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }?;
+        Some((outer_idx, inner_idx))
+    };
+    try_pair(left, right).or_else(|| try_pair(right, left))
+}
+
+fn expr_uses_outer(
+    expr: &Expr,
+    outer_col_map: &ColumnMap,
+    inner_alias: &str,
+    inner_schema: &TableSchema,
+) -> bool {
+    let inner_alias_lc = inner_alias.to_ascii_lowercase();
+    let inner_name_lc = inner_schema.name.to_ascii_lowercase();
+    fn walk(e: &Expr, f: &mut dyn FnMut(&Expr) -> bool) -> bool {
+        if f(e) {
+            return true;
+        }
+        match e {
+            Expr::BinaryOp { left, right, .. } => walk(left, f) || walk(right, f),
+            Expr::UnaryOp { expr, .. } => walk(expr, f),
+            Expr::IsNull(x) | Expr::IsNotNull(x) => walk(x, f),
+            Expr::Function { args, .. } | Expr::Coalesce(args) => args.iter().any(|a| walk(a, f)),
+            Expr::Cast { expr, .. } => walk(expr, f),
+            Expr::Between {
+                expr, low, high, ..
+            } => walk(expr, f) || walk(low, f) || walk(high, f),
+            Expr::InList { expr, list, .. } => walk(expr, f) || list.iter().any(|a| walk(a, f)),
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => walk(expr, f) || walk(pattern, f) || escape.as_ref().is_some_and(|e| walk(e, f)),
+            _ => false,
+        }
+    }
+    let mut probe = |e: &Expr| -> bool {
+        match e {
+            Expr::QualifiedColumn { table, column } => {
+                let t = table.to_ascii_lowercase();
+                if t == inner_alias_lc || t == inner_name_lc {
+                    return false;
+                }
+                let q = format!("{}.{}", t, column.to_ascii_lowercase());
+                outer_col_map.resolve(&q).is_ok()
+            }
+            Expr::Column(name) => {
+                if inner_schema
+                    .column_index(&name.to_ascii_lowercase())
+                    .is_some()
+                {
+                    return false;
+                }
+                outer_col_map.resolve(&name.to_ascii_lowercase()).is_ok()
+            }
+            _ => false,
+        }
+    };
+    walk(expr, &mut probe)
+}
+
+fn build_projection_indices(
+    select_cols: &[SelectColumn],
+    inner_columns: &[String],
+) -> Option<Vec<(String, usize)>> {
+    let mut out = Vec::new();
+    for c in select_cols {
+        match c {
+            SelectColumn::AllColumns => return None,
+            SelectColumn::Expr { expr, alias } => {
+                let (col_name, idx) = match expr {
+                    Expr::Column(name) => {
+                        let lower = name.to_ascii_lowercase();
+                        let idx = inner_columns
+                            .iter()
+                            .position(|c| c.to_ascii_lowercase() == lower)?;
+                        (alias.clone().unwrap_or_else(|| name.clone()), idx)
+                    }
+                    Expr::QualifiedColumn { column, .. } => {
+                        let lower = column.to_ascii_lowercase();
+                        let idx = inner_columns
+                            .iter()
+                            .position(|c| c.to_ascii_lowercase() == lower)?;
+                        (alias.clone().unwrap_or_else(|| column.clone()), idx)
+                    }
+                    _ => return None,
+                };
+                out.push((col_name, idx));
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn extend_lateral_cols(base: &[ColumnDef], probe_columns: &[String]) -> Vec<ColumnDef> {
+    let mut out: Vec<ColumnDef> = base.to_vec();
+    for name in probe_columns {
+        out.push(ColumnDef {
+            name: name.clone(),
+            data_type: DataType::Null,
+            nullable: true,
+            position: 0,
+            default_expr: None,
+            default_sql: None,
+            check_expr: None,
+            check_sql: None,
+            check_name: None,
+            is_with_timezone: false,
+            generated_expr: None,
+            generated_sql: None,
+            generated_kind: None,
+            collation: crate::types::Collation::Binary,
+        });
+    }
+    out
+}
+
+fn bind_query_with_outer(
+    query: &SelectQuery,
+    outer_row: &[Value],
+    outer_col_map: &ColumnMap,
+) -> Result<SelectQuery> {
+    let body = match &query.body {
+        QueryBody::Select(sel) => QueryBody::Select(Box::new(bind_select_with_outer(
+            sel,
+            outer_row,
+            outer_col_map,
+        )?)),
+        _ => {
+            return Err(SqlError::Unsupported(
+                "LATERAL subquery body must be a SELECT".into(),
+            ));
+        }
+    };
+    Ok(SelectQuery {
+        ctes: query.ctes.clone(),
+        recursive: query.recursive,
+        body,
+    })
+}
+
+fn bind_select_with_outer(
+    sel: &SelectStmt,
+    outer_row: &[Value],
+    outer_col_map: &ColumnMap,
+) -> Result<SelectStmt> {
+    let where_clause = sel
+        .where_clause
+        .as_ref()
+        .map(|w| bind_expr_with_outer(w, outer_row, outer_col_map))
+        .transpose()?;
+    let columns = sel
+        .columns
+        .iter()
+        .map(|c| match c {
+            SelectColumn::Expr { expr, alias } => Ok(SelectColumn::Expr {
+                expr: bind_expr_with_outer(expr, outer_row, outer_col_map)?,
+                alias: alias.clone(),
+            }),
+            other => Ok(other.clone()),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let order_by = sel
+        .order_by
+        .iter()
+        .map(|o| {
+            Ok(OrderByItem {
+                expr: bind_expr_with_outer(&o.expr, outer_row, outer_col_map)?,
+                descending: o.descending,
+                nulls_first: o.nulls_first,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(SelectStmt {
+        columns,
+        from: sel.from.clone(),
+        from_alias: sel.from_alias.clone(),
+        from_subquery: sel.from_subquery.clone(),
+        joins: sel.joins.clone(),
+        distinct: sel.distinct,
+        where_clause,
+        order_by,
+        limit: sel.limit.clone(),
+        offset: sel.offset.clone(),
+        group_by: sel.group_by.clone(),
+        having: sel.having.clone(),
+    })
+}
+
+fn bind_expr_with_outer(
+    expr: &Expr,
+    outer_row: &[Value],
+    outer_col_map: &ColumnMap,
+) -> Result<Expr> {
+    use Expr::*;
+    match expr {
+        Column(_) => Ok(expr.clone()),
+        QualifiedColumn { table, column } => {
+            let qualified = format!("{table}.{column}");
+            if let Ok(idx) = outer_col_map.resolve(&qualified) {
+                Ok(Literal(outer_row[idx].clone()))
+            } else {
+                Ok(expr.clone())
+            }
+        }
+        BinaryOp { left, op, right } => Ok(BinaryOp {
+            left: Box::new(bind_expr_with_outer(left, outer_row, outer_col_map)?),
+            op: *op,
+            right: Box::new(bind_expr_with_outer(right, outer_row, outer_col_map)?),
+        }),
+        UnaryOp { op, expr: inner } => Ok(UnaryOp {
+            op: *op,
+            expr: Box::new(bind_expr_with_outer(inner, outer_row, outer_col_map)?),
+        }),
+        Function {
+            name,
+            args,
+            distinct,
+        } => Ok(Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| bind_expr_with_outer(a, outer_row, outer_col_map))
+                .collect::<Result<Vec<_>>>()?,
+            distinct: *distinct,
+        }),
+        Cast {
+            expr: inner,
+            data_type,
+        } => Ok(Cast {
+            expr: Box::new(bind_expr_with_outer(inner, outer_row, outer_col_map)?),
+            data_type: *data_type,
+        }),
+        IsNull(inner) => Ok(IsNull(Box::new(bind_expr_with_outer(
+            inner,
+            outer_row,
+            outer_col_map,
+        )?))),
+        IsNotNull(inner) => Ok(IsNotNull(Box::new(bind_expr_with_outer(
+            inner,
+            outer_row,
+            outer_col_map,
+        )?))),
+        Between {
+            expr: inner,
+            low,
+            high,
+            negated,
+        } => Ok(Between {
+            expr: Box::new(bind_expr_with_outer(inner, outer_row, outer_col_map)?),
+            low: Box::new(bind_expr_with_outer(low, outer_row, outer_col_map)?),
+            high: Box::new(bind_expr_with_outer(high, outer_row, outer_col_map)?),
+            negated: *negated,
+        }),
+        InList {
+            expr: inner,
+            list,
+            negated,
+        } => Ok(InList {
+            expr: Box::new(bind_expr_with_outer(inner, outer_row, outer_col_map)?),
+            list: list
+                .iter()
+                .map(|e| bind_expr_with_outer(e, outer_row, outer_col_map))
+                .collect::<Result<Vec<_>>>()?,
+            negated: *negated,
+        }),
+        Like {
+            expr: inner,
+            pattern,
+            escape,
+            negated,
+        } => Ok(Like {
+            expr: Box::new(bind_expr_with_outer(inner, outer_row, outer_col_map)?),
+            pattern: Box::new(bind_expr_with_outer(pattern, outer_row, outer_col_map)?),
+            escape: match escape {
+                Some(e) => Some(Box::new(bind_expr_with_outer(e, outer_row, outer_col_map)?)),
+                None => None,
+            },
+            negated: *negated,
+        }),
+        _ => Ok(expr.clone()),
+    }
 }
 
 pub(super) fn exec_select_no_from(stmt: &SelectStmt) -> Result<ExecutionResult> {

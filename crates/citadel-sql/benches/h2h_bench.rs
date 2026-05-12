@@ -12,6 +12,7 @@ criterion_group!(
     h2h::scan::bench,
     h2h::filter::bench,
     h2h::sort::bench,
+    h2h::sort_nocase::bench,
     h2h::join::bench,
     h2h::sum::bench,
     h2h::group_by::bench,
@@ -54,5 +55,7 @@ criterion_group!(
     h2h::partial_index_point::bench,
     h2h::fk_cascade::bench,
     h2h::with_dml::bench,
+    h2h::full_outer_join::bench,
+    h2h::lateral::bench,
 );
 criterion_main!(benches);

@@ -191,8 +191,8 @@ impl<'db> ReadTxn<'db> {
         F: FnMut(&[u8], &[u8]) -> bool,
     {
         let desc = self.lookup_table(table)?;
-        self.preload_all_pages(desc.root_page)?;
-        let leaves = self.collect_leaves_ordered(desc.root_page)?;
+        let mut leaves = Vec::new();
+        self.load_and_collect_leaves(desc.root_page, &mut leaves)?;
         for page in &leaves {
             let n = page.num_cells();
             for i in 0..n {
@@ -201,6 +201,40 @@ impl<'db> ReadTxn<'db> {
                     return Ok(());
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Single DFS pass that loads each page into the cache AND collects leaves
+    /// in left-to-right order. Replaces preload + collect_leaves redundancy.
+    fn load_and_collect_leaves(
+        &mut self,
+        page_id: PageId,
+        leaves: &mut Vec<Arc<Page>>,
+    ) -> Result<()> {
+        let page = if let Some(p) = self.page_cache.get(&page_id) {
+            Arc::clone(p)
+        } else {
+            let arc = self.manager.fetch_page(page_id)?;
+            self.page_cache.insert(page_id, Arc::clone(&arc));
+            arc
+        };
+        match page.page_type() {
+            Some(PageType::Leaf) => {
+                leaves.push(page);
+            }
+            Some(PageType::Branch) => {
+                let n = page.num_cells() as usize;
+                for i in 0..n {
+                    let child = branch_node::get_child(&page, i);
+                    self.load_and_collect_leaves(child, leaves)?;
+                }
+                let right = page.right_child();
+                if right.is_valid() {
+                    self.load_and_collect_leaves(right, leaves)?;
+                }
+            }
+            _ => return Err(Error::InvalidPageType(page.page_type_raw(), page_id)),
         }
         Ok(())
     }
@@ -290,37 +324,6 @@ impl<'db> ReadTxn<'db> {
             self.page_cache.insert(page_id, arc);
         }
         Ok(self.page_cache.get(&page_id).unwrap())
-    }
-
-    fn collect_leaves_ordered(&self, root: PageId) -> Result<Vec<Arc<Page>>> {
-        let mut leaves = Vec::new();
-        self.collect_leaves_recursive(root, &mut leaves)?;
-        Ok(leaves)
-    }
-
-    fn collect_leaves_recursive(&self, page_id: PageId, leaves: &mut Vec<Arc<Page>>) -> Result<()> {
-        let page = self
-            .page_cache
-            .get(&page_id)
-            .ok_or(Error::PageOutOfBounds(page_id))?;
-        match page.page_type() {
-            Some(PageType::Leaf) => {
-                leaves.push(Arc::clone(page));
-            }
-            Some(PageType::Branch) => {
-                let n = page.num_cells() as usize;
-                for i in 0..n {
-                    let child = branch_node::get_child(page, i);
-                    self.collect_leaves_recursive(child, leaves)?;
-                }
-                let right = page.right_child();
-                if right.is_valid() {
-                    self.collect_leaves_recursive(right, leaves)?;
-                }
-            }
-            _ => return Err(Error::InvalidPageType(page.page_type_raw(), page_id)),
-        }
-        Ok(())
     }
 
     fn preload_all_pages(&mut self, root: PageId) -> Result<()> {

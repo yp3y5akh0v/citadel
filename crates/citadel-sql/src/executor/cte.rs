@@ -120,6 +120,7 @@ pub(super) fn try_fuse_cte(sq: &SelectQuery) -> Option<QueryBody> {
         columns: outer.columns.clone(),
         from: inner.from.clone(),
         from_alias: inner.from_alias.clone(),
+        from_subquery: inner.from_subquery.clone(),
         joins: vec![],
         distinct: outer.distinct,
         where_clause: merged_where,
@@ -276,6 +277,7 @@ pub(super) fn materialize_recursive_cte(
                 generated_expr: None,
                 generated_sql: None,
                 generated_kind: None,
+                collation: crate::types::Collation::Binary,
             })
             .collect();
         let col_map = ColumnMap::new(&cte_cols);
@@ -435,6 +437,7 @@ pub(super) fn build_cte_schema(name: &str, qr: &QueryResult) -> TableSchema {
             generated_expr: None,
             generated_sql: None,
             generated_kind: None,
+            collation: crate::types::Collation::Binary,
         })
         .collect();
     TableSchema::new(name.into(), columns, vec![], vec![], vec![], vec![])

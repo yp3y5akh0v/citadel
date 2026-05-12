@@ -88,6 +88,7 @@ pub(super) fn exec_insert(
         .collect();
 
     let has_checks = table_schema.has_checks();
+    let strict = table_schema.is_strict();
     let row_col_map_for_gen = if !generated_cols.is_empty() {
         Some(ColumnMap::new(&table_schema.columns))
     } else {
@@ -184,15 +185,10 @@ pub(super) fn exec_insert(
                 };
                 let col_idx = col_indices[i];
                 let col = &table_schema.columns[col_idx];
-                let got_type = val.data_type();
                 row[col_idx] = if val.is_null() {
                     Value::Null
                 } else {
-                    val.coerce_into(col.data_type)
-                        .ok_or_else(|| SqlError::TypeMismatch {
-                            expected: col.data_type.to_string(),
-                            got: got_type.to_string(),
-                        })?
+                    coerce_for_column(val, col, strict)?
                 };
             }
         } else if let Some(sel) = sel_rows {
@@ -200,16 +196,10 @@ pub(super) fn exec_insert(
             for (i, val) in sel_row.iter().enumerate() {
                 let col_idx = col_indices[i];
                 let col = &table_schema.columns[col_idx];
-                let got_type = val.data_type();
                 row[col_idx] = if val.is_null() {
                     Value::Null
                 } else {
-                    val.clone().coerce_into(col.data_type).ok_or_else(|| {
-                        SqlError::TypeMismatch {
-                            expected: col.data_type.to_string(),
-                            got: got_type.to_string(),
-                        }
-                    })?
+                    coerce_for_column(val.clone(), col, strict)?
                 };
             }
         }
@@ -218,13 +208,7 @@ pub(super) fn exec_insert(
             let val = eval_const_expr(def_expr)?;
             let col = &table_schema.columns[pos];
             if !val.is_null() {
-                let got_type = val.data_type();
-                row[pos] =
-                    val.coerce_into(col.data_type)
-                        .ok_or_else(|| SqlError::TypeMismatch {
-                            expected: col.data_type.to_string(),
-                            got: got_type.to_string(),
-                        })?;
+                row[pos] = coerce_for_column(val, col, strict)?;
             }
         }
 
@@ -235,12 +219,7 @@ pub(super) fn exec_insert(
                 row[pos] = if val.is_null() {
                     Value::Null
                 } else {
-                    let got_type = val.data_type();
-                    val.coerce_into(col.data_type)
-                        .ok_or_else(|| SqlError::TypeMismatch {
-                            expected: col.data_type.to_string(),
-                            got: got_type.to_string(),
-                        })?
+                    coerce_for_column(val, col, strict)?
                 };
             }
         }
@@ -661,6 +640,7 @@ pub(super) fn materialize_stmt(
             Ok(JoinClause {
                 join_type: j.join_type,
                 table: j.table.clone(),
+                subquery: j.subquery.clone(),
                 on_clause,
             })
         })
@@ -674,6 +654,7 @@ pub(super) fn materialize_stmt(
         columns,
         from: stmt.from.clone(),
         from_alias: stmt.from_alias.clone(),
+        from_subquery: stmt.from_subquery.clone(),
         joins,
         distinct: stmt.distinct,
         where_clause,
@@ -1053,6 +1034,7 @@ pub(super) fn apply_set_operation(
                 generated_expr: None,
                 generated_sql: None,
                 generated_kind: None,
+                collation: crate::types::Collation::Binary,
             })
             .collect();
         sort_rows(&mut rows, &comp.order_by, &col_defs)?;

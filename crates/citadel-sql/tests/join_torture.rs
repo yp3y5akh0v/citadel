@@ -2923,3 +2923,191 @@ fn right_join_scale() {
     assert_eq!(matched + unmatched, 200);
     assert_eq!(unmatched, 50);
 }
+
+#[test]
+fn full_outer_join_large_disjoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let c = Connection::open(&db).unwrap();
+    exec(&c, "CREATE TABLE a (id INTEGER PRIMARY KEY)");
+    exec(
+        &c,
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, ref_id INTEGER)",
+    );
+    exec(&c, "BEGIN");
+    for i in 0..1000 {
+        c.execute(&format!("INSERT INTO a VALUES ({i})")).unwrap();
+    }
+    for i in 0..1000 {
+        let ref_id = if i < 500 { i } else { i + 10000 };
+        c.execute(&format!("INSERT INTO b VALUES ({i}, {ref_id})"))
+            .unwrap();
+    }
+    exec(&c, "COMMIT");
+
+    let total = count(
+        &c,
+        "SELECT COUNT(*) FROM a FULL OUTER JOIN b ON a.id = b.ref_id",
+    );
+    let matched = count(
+        &c,
+        "SELECT COUNT(*) FROM a FULL OUTER JOIN b ON a.id = b.ref_id
+         WHERE a.id IS NOT NULL AND b.id IS NOT NULL",
+    );
+    let unmatched_a = count(
+        &c,
+        "SELECT COUNT(*) FROM a FULL OUTER JOIN b ON a.id = b.ref_id
+         WHERE b.id IS NULL",
+    );
+    let unmatched_b = count(
+        &c,
+        "SELECT COUNT(*) FROM a FULL OUTER JOIN b ON a.id = b.ref_id
+         WHERE a.id IS NULL",
+    );
+    assert_eq!(matched, 500);
+    assert_eq!(unmatched_a, 500);
+    assert_eq!(unmatched_b, 500);
+    assert_eq!(total, 1500);
+}
+
+#[test]
+fn full_outer_join_n_to_m_cardinality_explosion() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let c = Connection::open(&db).unwrap();
+    exec(&c, "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)");
+    exec(&c, "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)");
+    exec(&c, "BEGIN");
+    for i in 0..100 {
+        let k = i % 10;
+        c.execute(&format!("INSERT INTO a VALUES ({i}, {k})"))
+            .unwrap();
+        c.execute(&format!("INSERT INTO b VALUES ({}, {k})", i + 1000))
+            .unwrap();
+    }
+    exec(&c, "COMMIT");
+
+    let total = count(&c, "SELECT COUNT(*) FROM a FULL OUTER JOIN b ON a.k = b.k");
+    assert_eq!(total, 1000);
+}
+
+#[test]
+fn full_outer_join_consistent_with_left_right_inner() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let c = Connection::open(&db).unwrap();
+    exec(&c, "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)");
+    exec(&c, "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)");
+    exec(&c, "BEGIN");
+    for i in 0..200 {
+        let k = if i % 7 == 0 { 9999 } else { i % 50 };
+        c.execute(&format!("INSERT INTO a VALUES ({i}, {k})"))
+            .unwrap();
+    }
+    for i in 0..150 {
+        let k = if i % 5 == 0 { 8888 } else { i % 50 };
+        c.execute(&format!("INSERT INTO b VALUES ({}, {k})", i + 1000))
+            .unwrap();
+    }
+    exec(&c, "COMMIT");
+
+    let inner = count(&c, "SELECT COUNT(*) FROM a INNER JOIN b ON a.k = b.k");
+    let left = count(&c, "SELECT COUNT(*) FROM a LEFT JOIN b ON a.k = b.k");
+    let right = count(&c, "SELECT COUNT(*) FROM a RIGHT JOIN b ON a.k = b.k");
+    let full = count(&c, "SELECT COUNT(*) FROM a FULL OUTER JOIN b ON a.k = b.k");
+
+    let unmatched_a = left - inner;
+    let unmatched_b = right - inner;
+    assert_eq!(full, inner + unmatched_a + unmatched_b);
+}
+
+#[test]
+fn full_outer_join_three_way_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let c = Connection::open(&db).unwrap();
+    exec(&c, "CREATE TABLE a (id INTEGER PRIMARY KEY)");
+    exec(&c, "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER)");
+    exec(&c, "CREATE TABLE x (id INTEGER PRIMARY KEY, b_id INTEGER)");
+    exec(&c, "BEGIN");
+    for i in 1..=5 {
+        c.execute(&format!("INSERT INTO a VALUES ({i})")).unwrap();
+    }
+    for i in 1..=3 {
+        c.execute(&format!("INSERT INTO b VALUES ({i}, {i})"))
+            .unwrap();
+    }
+    for i in 1..=2 {
+        c.execute(&format!("INSERT INTO x VALUES ({i}, {i})"))
+            .unwrap();
+    }
+    exec(&c, "COMMIT");
+
+    let total = count(
+        &c,
+        "SELECT COUNT(*) FROM a
+         FULL OUTER JOIN b ON a.id = b.a_id
+         FULL OUTER JOIN x ON b.id = x.b_id",
+    );
+    assert!(total >= 5, "expected at least 5 result rows, got {total}");
+}
+
+#[test]
+fn full_outer_join_inside_savepoint_rollback_restores_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let c = Connection::open(&db).unwrap();
+    exec(&c, "CREATE TABLE a (id INTEGER PRIMARY KEY)");
+    exec(&c, "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER)");
+    for i in 1..=3 {
+        exec(&c, &format!("INSERT INTO a VALUES ({i})"));
+        exec(&c, &format!("INSERT INTO b VALUES ({}, {i})", i + 100));
+    }
+
+    let baseline = count(
+        &c,
+        "SELECT COUNT(*) FROM a FULL OUTER JOIN b ON a.id = b.a_id",
+    );
+
+    exec(&c, "BEGIN");
+    exec(&c, "SAVEPOINT sp");
+    exec(&c, "INSERT INTO a VALUES (99)");
+    exec(&c, "INSERT INTO b VALUES (200, 50)");
+    let mid = count(
+        &c,
+        "SELECT COUNT(*) FROM a FULL OUTER JOIN b ON a.id = b.a_id",
+    );
+    assert_eq!(mid, baseline + 2);
+    exec(&c, "ROLLBACK TO sp");
+    exec(&c, "COMMIT");
+
+    let after = count(
+        &c,
+        "SELECT COUNT(*) FROM a FULL OUTER JOIN b ON a.id = b.a_id",
+    );
+    assert_eq!(after, baseline);
+}
+
+#[test]
+fn full_outer_join_persists_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = create_db(dir.path());
+        let c = Connection::open(&db).unwrap();
+        exec(&c, "CREATE TABLE a (id INTEGER PRIMARY KEY)");
+        exec(&c, "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER)");
+        for i in 1..=10 {
+            exec(&c, &format!("INSERT INTO a VALUES ({i})"));
+        }
+        for i in 1..=5 {
+            exec(&c, &format!("INSERT INTO b VALUES ({}, {i})", i + 100));
+        }
+    }
+    let db = open_db(dir.path());
+    let c = Connection::open(&db).unwrap();
+    let total = count(
+        &c,
+        "SELECT COUNT(*) FROM a FULL OUTER JOIN b ON a.id = b.a_id",
+    );
+    assert_eq!(total, 10);
+}

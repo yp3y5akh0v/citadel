@@ -240,6 +240,78 @@ impl Value {
         }
     }
 
+    pub fn strict_coerce(&self, target: DataType) -> Option<Value> {
+        if matches!(self, Value::Null) {
+            return Some(Value::Null);
+        }
+        if self.data_type() == target {
+            return Some(self.clone());
+        }
+        match (self, target) {
+            (Value::Integer(i), DataType::Real) => {
+                if i.unsigned_abs() <= (1u64 << 53) {
+                    Some(Value::Real(*i as f64))
+                } else {
+                    None
+                }
+            }
+            (Value::Real(r), DataType::Integer) => {
+                if r.is_finite()
+                    && r.fract() == 0.0
+                    && (i64::MIN as f64..=i64::MAX as f64).contains(r)
+                {
+                    Some(Value::Integer(*r as i64))
+                } else {
+                    None
+                }
+            }
+            (Value::Boolean(b), DataType::Integer) => Some(Value::Integer(if *b { 1 } else { 0 })),
+            (Value::Integer(i), DataType::Boolean) => match i {
+                0 => Some(Value::Boolean(false)),
+                1 => Some(Value::Boolean(true)),
+                _ => None,
+            },
+            (Value::Text(s), DataType::Integer) => {
+                let trimmed = s.as_str();
+                let parsed: i64 = trimmed.parse().ok()?;
+                if parsed.to_string() == trimmed {
+                    Some(Value::Integer(parsed))
+                } else {
+                    None
+                }
+            }
+            (Value::Text(s), DataType::Real) => {
+                let trimmed = s.as_str();
+                let parsed: f64 = trimmed.parse().ok()?;
+                if parsed.is_finite() {
+                    Some(Value::Real(parsed))
+                } else {
+                    None
+                }
+            }
+            (Value::Text(_), DataType::Date)
+            | (Value::Text(_), DataType::Time)
+            | (Value::Text(_), DataType::Timestamp)
+            | (Value::Text(_), DataType::Interval) => self.clone().coerce_into(target),
+            (Value::Date(d), DataType::Timestamp) => (*d as i64)
+                .checked_mul(86_400_000_000)
+                .map(Value::Timestamp),
+            (Value::Timestamp(t), DataType::Date) => {
+                if t % 86_400_000_000 == 0 {
+                    let days = t.div_euclid(86_400_000_000);
+                    if days >= i32::MIN as i64 && days <= i32::MAX as i64 {
+                        Some(Value::Date(days as i32))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Numeric ordering for Integer and Real values (promotes to f64 for mixed).
     fn numeric_cmp(&self, other: &Value) -> Option<Ordering> {
         match (self, other) {
@@ -441,6 +513,58 @@ fn hex_encode(data: &[u8]) -> String {
     s
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Collation {
+    #[default]
+    Binary = 0,
+    NoCase = 1,
+    Rtrim = 2,
+}
+
+impl Collation {
+    pub fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Binary),
+            1 => Some(Self::NoCase),
+            2 => Some(Self::Rtrim),
+            _ => None,
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "BINARY" => Some(Self::Binary),
+            "NOCASE" => Some(Self::NoCase),
+            "RTRIM" => Some(Self::Rtrim),
+            _ => None,
+        }
+    }
+
+    pub fn cmp_text(self, a: &str, b: &str) -> std::cmp::Ordering {
+        match self {
+            Collation::Binary => a.cmp(b),
+            Collation::NoCase => Iterator::cmp(
+                a.chars().map(|c| c.to_ascii_lowercase()),
+                b.chars().map(|c| c.to_ascii_lowercase()),
+            ),
+            Collation::Rtrim => {
+                let la = a.trim_end_matches(' ');
+                let lb = b.trim_end_matches(' ');
+                la.cmp(lb)
+            }
+        }
+    }
+
+    pub fn eq_text(self, a: &str, b: &str) -> bool {
+        match self {
+            Collation::Binary => a == b,
+            Collation::NoCase => a.eq_ignore_ascii_case(b),
+            Collation::Rtrim => a.trim_end_matches(' ') == b.trim_end_matches(' '),
+        }
+    }
+}
+
 /// Column definition.
 #[derive(Debug, Clone)]
 pub struct ColumnDef {
@@ -458,6 +582,7 @@ pub struct ColumnDef {
     pub generated_expr: Option<Expr>,
     pub generated_sql: Option<String>,
     pub generated_kind: Option<crate::parser::GeneratedKind>,
+    pub collation: Collation,
 }
 
 /// Index definition stored as part of the table schema.
@@ -468,6 +593,7 @@ pub struct IndexDef {
     pub unique: bool,
     pub predicate_sql: Option<String>,
     pub predicate_expr: Option<crate::parser::Expr>,
+    pub collations: Vec<Collation>,
 }
 
 /// View definition stored in the _views metadata table.
@@ -569,6 +695,7 @@ pub struct TableSchema {
     pub indices: Vec<IndexDef>,
     pub check_constraints: Vec<TableCheckDef>,
     pub foreign_keys: Vec<ForeignKeySchemaEntry>,
+    pub flags: u8,
     pk_idx_cache: Vec<usize>,
     non_pk_idx_cache: Vec<usize>,
     /// Sorted physical slots dropped via DROP COLUMN.
@@ -646,6 +773,7 @@ impl TableSchema {
             indices,
             check_constraints,
             foreign_keys,
+            flags: 0,
             pk_idx_cache,
             non_pk_idx_cache,
             dropped_non_pk_slots,
@@ -653,6 +781,10 @@ impl TableSchema {
             encoding_positions_cache,
             has_virtual_columns_cache,
         }
+    }
+
+    pub fn is_strict(&self) -> bool {
+        self.flags & TABLE_FLAG_STRICT != 0
     }
 
     pub fn has_virtual_columns(&self) -> bool {
@@ -750,6 +882,7 @@ impl TableSchema {
                 unique: idx.unique,
                 predicate_sql: idx.predicate_sql.clone(),
                 predicate_expr: idx.predicate_expr.clone(),
+                collations: idx.collations.clone(),
             })
             .collect();
 
@@ -791,7 +924,8 @@ impl TableSchema {
     }
 }
 
-const SCHEMA_VERSION: u8 = 6;
+const SCHEMA_VERSION: u8 = 7;
+pub const TABLE_FLAG_STRICT: u8 = 0b0000_0001;
 
 fn write_opt_string(buf: &mut Vec<u8>, s: &Option<String>) {
     match s {
@@ -946,13 +1080,25 @@ impl TableSchema {
             buf.push(fk.on_update as u8);
         }
 
+        for col in &self.columns {
+            buf.push(col.collation as u8);
+        }
+        for idx in &self.indices {
+            let n = idx.collations.len() as u16;
+            buf.extend_from_slice(&n.to_le_bytes());
+            for c in &idx.collations {
+                buf.push(*c as u8);
+            }
+        }
+        buf.push(self.flags);
+
         buf
     }
 
     pub fn deserialize(data: &[u8]) -> crate::error::Result<Self> {
         let mut pos = 0;
 
-        if data.is_empty() || !matches!(data[0], 1 | 2 | 3 | 4 | 5 | SCHEMA_VERSION) {
+        if data.is_empty() || !matches!(data[0], 1 | 2 | 3 | 4 | 5 | 6 | SCHEMA_VERSION) {
             return Err(crate::error::SqlError::InvalidValue(
                 "invalid schema version".into(),
             ));
@@ -996,6 +1142,7 @@ impl TableSchema {
                 generated_expr: None,
                 generated_sql: None,
                 generated_kind: None,
+                collation: Collation::Binary,
             });
         }
 
@@ -1033,6 +1180,7 @@ impl TableSchema {
                     unique,
                     predicate_sql: None,
                     predicate_expr: None,
+                    collations: vec![],
                 });
             }
             idxs
@@ -1190,9 +1338,37 @@ impl TableSchema {
                 pos += 1;
             }
         }
+
+        let mut columns = columns;
+        let mut indices = indices;
+        let mut flags: u8 = 0;
+        if version >= 7 && pos < data.len() {
+            for col in &mut columns {
+                col.collation = Collation::from_tag(data[pos]).ok_or_else(|| {
+                    crate::error::SqlError::InvalidValue("unknown collation tag".into())
+                })?;
+                pos += 1;
+            }
+            for idx in &mut indices {
+                let n = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                pos += 2;
+                let mut colls = Vec::with_capacity(n);
+                for _ in 0..n {
+                    colls.push(Collation::from_tag(data[pos]).ok_or_else(|| {
+                        crate::error::SqlError::InvalidValue("unknown collation tag".into())
+                    })?);
+                    pos += 1;
+                }
+                idx.collations = colls;
+            }
+            if pos < data.len() {
+                flags = data[pos];
+                pos += 1;
+            }
+        }
         let _ = pos;
 
-        Ok(Self::with_drops(
+        let mut schema = Self::with_drops(
             name,
             columns,
             primary_key_columns,
@@ -1200,7 +1376,9 @@ impl TableSchema {
             check_constraints,
             foreign_keys,
             dropped_non_pk_slots,
-        ))
+        );
+        schema.flags = flags;
+        Ok(schema)
     }
 
     /// Get column index by name (case-insensitive).

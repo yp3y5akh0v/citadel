@@ -7,6 +7,25 @@ use crate::types::*;
 
 use super::helpers::*;
 
+fn resolve_index_collations(
+    col_indices: &[u16],
+    explicit: &[Collation],
+    table_schema: &TableSchema,
+) -> Vec<Collation> {
+    col_indices
+        .iter()
+        .enumerate()
+        .map(|(i, &col_idx)| {
+            let from_stmt = explicit.get(i).copied().unwrap_or(Collation::Binary);
+            if from_stmt != Collation::Binary {
+                from_stmt
+            } else {
+                table_schema.columns[col_idx as usize].collation
+            }
+        })
+        .collect()
+}
+
 pub(super) fn collect_column_refs(expr: &Expr, out: &mut Vec<String>) {
     match expr {
         Expr::Column(name) => out.push(name.to_ascii_lowercase()),
@@ -168,12 +187,17 @@ pub(super) fn create_unique_auto_indices(
 
         let idx_table = TableSchema::index_table_name(&table_schema.name, &idx_name);
         wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
+        let collations: Vec<crate::types::Collation> = col_idxs
+            .iter()
+            .map(|&i| table_schema.columns[i as usize].collation)
+            .collect();
         table_schema.indices.push(IndexDef {
             name: idx_name,
             columns: col_idxs,
             unique: true,
             predicate_sql: None,
             predicate_expr: None,
+            collations,
         });
     }
     Ok(table_schema)
@@ -211,6 +235,7 @@ pub(super) fn create_fk_auto_indices(
             unique: false,
             predicate_sql: None,
             predicate_expr: None,
+            collations: vec![],
         };
         let idx_table = TableSchema::index_table_name(&table_schema.name, &idx_name);
         wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
@@ -268,6 +293,7 @@ pub(super) fn exec_create_table(
             generated_expr: c.generated_expr.clone(),
             generated_sql: c.generated_sql.clone(),
             generated_kind: c.generated_kind,
+            collation: c.collation,
         })
         .collect();
 
@@ -327,7 +353,7 @@ pub(super) fn exec_create_table(
         })
         .collect::<Result<_>>()?;
 
-    let table_schema = TableSchema::new(
+    let mut table_schema = TableSchema::new(
         lower_name.clone(),
         columns,
         primary_key_columns,
@@ -335,6 +361,9 @@ pub(super) fn exec_create_table(
         check_constraints,
         foreign_keys,
     );
+    if stmt.strict {
+        table_schema.flags |= crate::types::TABLE_FLAG_STRICT;
+    }
 
     validate_foreign_keys(schema, &table_schema, &table_schema.foreign_keys)?;
 
@@ -441,6 +470,7 @@ pub(super) fn exec_create_table_in_txn(
             generated_expr: c.generated_expr.clone(),
             generated_sql: c.generated_sql.clone(),
             generated_kind: c.generated_kind,
+            collation: c.collation,
         })
         .collect();
 
@@ -500,7 +530,7 @@ pub(super) fn exec_create_table_in_txn(
         })
         .collect::<Result<_>>()?;
 
-    let table_schema = TableSchema::new(
+    let mut table_schema = TableSchema::new(
         lower_name.clone(),
         columns,
         primary_key_columns,
@@ -508,6 +538,9 @@ pub(super) fn exec_create_table_in_txn(
         check_constraints,
         foreign_keys,
     );
+    if stmt.strict {
+        table_schema.flags |= crate::types::TABLE_FLAG_STRICT;
+    }
 
     validate_foreign_keys(schema, &table_schema, &table_schema.foreign_keys)?;
 
@@ -665,12 +698,15 @@ pub(super) fn exec_create_index(
         }
     }
 
+    let collations = resolve_index_collations(&col_indices, &stmt.collations, table_schema);
+
     let idx_def = IndexDef {
         name: lower_idx.clone(),
         columns: col_indices,
         unique: stmt.unique,
         predicate_sql: stmt.predicate_sql.clone(),
         predicate_expr: stmt.predicate_expr.clone(),
+        collations,
     };
 
     let idx_table = TableSchema::index_table_name(&lower_table, &lower_idx);
@@ -800,12 +836,15 @@ pub(super) fn exec_create_index_in_txn(
         }
     }
 
+    let collations = resolve_index_collations(&col_indices, &stmt.collations, table_schema);
+
     let idx_def = IndexDef {
         name: lower_idx.clone(),
         columns: col_indices,
         unique: stmt.unique,
         predicate_sql: stmt.predicate_sql.clone(),
         predicate_expr: stmt.predicate_expr.clone(),
+        collations,
     };
 
     let idx_table = TableSchema::index_table_name(&lower_table, &lower_idx);
@@ -1148,6 +1187,7 @@ pub(super) fn alter_add_column(
         generated_expr: col_spec.generated_expr.clone(),
         generated_sql: col_spec.generated_sql.clone(),
         generated_kind: col_spec.generated_kind,
+        collation: col_spec.collation,
     };
 
     let mut new_schema = table_schema.clone();

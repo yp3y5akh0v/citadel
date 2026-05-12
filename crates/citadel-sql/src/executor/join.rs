@@ -51,6 +51,7 @@ pub(super) fn extend_joined_columns(out: &mut Vec<ColumnDef>, table: &(String, &
             generated_expr: None,
             generated_sql: None,
             generated_kind: None,
+            collation: crate::types::Collation::Binary,
         });
     }
 }
@@ -104,26 +105,33 @@ pub(super) fn extract_equi_join_keys(
 pub(super) fn resolve_col_idx(expr: &Expr, columns: &[ColumnDef]) -> Option<usize> {
     match expr {
         Expr::Column(name) => {
-            let matches: Vec<usize> = columns
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| {
-                    c.name == *name
-                        || (c.name.len() > name.len()
-                            && c.name.as_bytes()[c.name.len() - name.len() - 1] == b'.'
-                            && c.name.ends_with(name.as_str()))
-                })
-                .map(|(i, _)| i)
-                .collect();
-            if matches.len() == 1 {
-                Some(matches[0])
-            } else {
-                None
+            let mut found: Option<usize> = None;
+            for (i, c) in columns.iter().enumerate() {
+                let matches = c.name == *name
+                    || (c.name.len() > name.len()
+                        && c.name.as_bytes()[c.name.len() - name.len() - 1] == b'.'
+                        && c.name.ends_with(name.as_str()));
+                if matches {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(i);
+                }
             }
+            found
         }
         Expr::QualifiedColumn { table, column } => {
-            let qualified = format!("{table}.{column}");
-            columns.iter().position(|c| c.name == qualified)
+            let total_len = table.len() + 1 + column.len();
+            for (i, c) in columns.iter().enumerate() {
+                if c.name.len() == total_len
+                    && c.name.as_bytes()[table.len()] == b'.'
+                    && c.name.starts_with(table.as_str())
+                    && c.name.ends_with(column.as_str())
+                {
+                    return Some(i);
+                }
+            }
+            None
         }
         _ => None,
     }
@@ -213,6 +221,7 @@ pub(super) fn build_projected_columns(
                 generated_expr: None,
                 generated_sql: None,
                 generated_kind: None,
+                collation: crate::types::Collation::Binary,
             }
         })
         .collect()
@@ -395,6 +404,55 @@ pub(super) fn try_integer_join(
                 }
             }
         }
+        JoinType::FullOuter => {
+            let mut inner_matched = vec![false; inner_rows.len()];
+            for mut outer in outer_rows {
+                let mut matched = false;
+                if let Value::Integer(k) = outer[outer_key_col] {
+                    if let Some(indices) = inner_map.get(&k) {
+                        matched = true;
+                        if let Some(proj) = projection {
+                            for &idx in indices {
+                                result.push(combine_row_projected(&outer, &inner_rows[idx], proj));
+                                inner_matched[idx] = true;
+                            }
+                        } else {
+                            for &idx in &indices[..indices.len() - 1] {
+                                result.push(combine_row(&outer, &inner_rows[idx], cap));
+                                inner_matched[idx] = true;
+                            }
+                            let last_idx = *indices.last().unwrap();
+                            inner_matched[last_idx] = true;
+                            outer.extend(inner_rows[last_idx].iter().cloned());
+                            result.push(outer);
+                            continue;
+                        }
+                    }
+                }
+                if !matched {
+                    if let Some(proj) = projection {
+                        let null_inner = vec![Value::Null; inner_col_count];
+                        result.push(combine_row_projected(&outer, &null_inner, proj));
+                    } else {
+                        outer.resize(cap, Value::Null);
+                        result.push(outer);
+                    }
+                }
+            }
+            for (j, inner) in inner_rows.iter().enumerate() {
+                if !inner_matched[j] {
+                    if let Some(proj) = projection {
+                        let null_outer = vec![Value::Null; outer_col_count];
+                        result.push(combine_row_projected(&null_outer, inner, proj));
+                    } else {
+                        let mut padded = Vec::with_capacity(cap);
+                        padded.resize(outer_col_count, Value::Null);
+                        padded.extend(inner.iter().cloned());
+                        result.push(padded);
+                    }
+                }
+            }
+        }
     }
 
     Ok(result)
@@ -538,6 +596,54 @@ pub(super) fn exec_join_step(
                     }
                 }
             }
+            JoinType::FullOuter => {
+                let mut inner_matched = vec![false; inner_rows.len()];
+                for mut outer in outer_rows {
+                    let key = hash_key(&outer, &outer_key_cols);
+                    let indices = inner_map.get(&key);
+                    let has_match = indices.is_some();
+                    if let Some(indices) = indices {
+                        if let Some(proj) = effective_proj {
+                            for &idx in indices {
+                                result.push(combine_row_projected(&outer, &inner_rows[idx], proj));
+                                inner_matched[idx] = true;
+                            }
+                        } else {
+                            for &idx in &indices[..indices.len() - 1] {
+                                result.push(combine_row(&outer, &inner_rows[idx], cap));
+                                inner_matched[idx] = true;
+                            }
+                            let last_idx = *indices.last().unwrap();
+                            inner_matched[last_idx] = true;
+                            outer.extend(inner_rows[last_idx].iter().cloned());
+                            result.push(outer);
+                            continue;
+                        }
+                    }
+                    if !has_match {
+                        if let Some(proj) = effective_proj {
+                            let null_inner = vec![Value::Null; inner_col_count];
+                            result.push(combine_row_projected(&outer, &null_inner, proj));
+                        } else {
+                            outer.resize(cap, Value::Null);
+                            result.push(outer);
+                        }
+                    }
+                }
+                for (j, inner) in inner_rows.iter().enumerate() {
+                    if !inner_matched[j] {
+                        if let Some(proj) = effective_proj {
+                            let null_outer = vec![Value::Null; outer_col_count];
+                            result.push(combine_row_projected(&null_outer, inner, proj));
+                        } else {
+                            let mut padded = Vec::with_capacity(cap);
+                            padded.resize(outer_col_count, Value::Null);
+                            padded.extend(inner.iter().cloned());
+                            result.push(padded);
+                        }
+                    }
+                }
+            }
         }
     } else {
         let combined_map = ColumnMap::new(combined_cols);
@@ -608,6 +714,37 @@ pub(super) fn exec_join_step(
                     }
                 }
             }
+            JoinType::FullOuter => {
+                let mut inner_matched = vec![false; inner_rows.len()];
+                for outer in &outer_rows {
+                    let key = hash_key(outer, &outer_key_cols);
+                    let mut matched = false;
+                    if let Some(indices) = inner_map.get(&key) {
+                        for &idx in indices {
+                            let combined = combine_row(outer, &inner_rows[idx], cap);
+                            if on_matches(&combined) {
+                                result.push(combined);
+                                inner_matched[idx] = true;
+                                matched = true;
+                            }
+                        }
+                    }
+                    if !matched {
+                        let mut padded = Vec::with_capacity(cap);
+                        padded.extend(outer.iter().cloned());
+                        padded.resize(cap, Value::Null);
+                        result.push(padded);
+                    }
+                }
+                for (j, inner) in inner_rows.iter().enumerate() {
+                    if !inner_matched[j] {
+                        let mut padded = Vec::with_capacity(cap);
+                        padded.resize(outer_col_count, Value::Null);
+                        padded.extend(inner.iter().cloned());
+                        result.push(padded);
+                    }
+                }
+            }
         }
     }
 
@@ -657,9 +794,15 @@ pub(super) fn has_ambiguous_bare_ref(expr: &Expr, columns: &[ColumnDef]) -> bool
     match expr {
         Expr::Column(name) => {
             let lower = name.to_ascii_lowercase();
+            let lower_bytes = lower.as_bytes();
             columns
                 .iter()
-                .filter(|c| c.name == lower || c.name.ends_with(&format!(".{lower}")))
+                .filter(|c| {
+                    c.name == lower
+                        || (c.name.len() > lower.len()
+                            && c.name.as_bytes()[c.name.len() - lower.len() - 1] == b'.'
+                            && c.name.as_bytes().ends_with(lower_bytes))
+                })
                 .count()
                 > 1
         }

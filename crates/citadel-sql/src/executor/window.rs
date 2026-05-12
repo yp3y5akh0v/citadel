@@ -454,7 +454,9 @@ pub(super) fn eval_window_select(
                         .collect()
                 })
                 .collect();
-            indices.sort_by(|&a, &b| compare_sort_keys(&keys[a], &keys[b], &sort_keys));
+            let collations = sort_key_collations(&sort_keys, &col_map);
+            indices
+                .sort_by(|&a, &b| compare_sort_keys(&keys[a], &keys[b], &sort_keys, &collations));
         }
 
         let part_count = spec.partition_by.len();
@@ -811,6 +813,7 @@ pub(super) fn eval_window_select(
             generated_expr: None,
             generated_sql: None,
             generated_kind: None,
+            collation: crate::types::Collation::Binary,
         });
     }
 
@@ -823,9 +826,10 @@ pub(super) fn eval_window_select(
         columns: rewritten_columns,
         from: stmt.from.clone(),
         from_alias: stmt.from_alias.clone(),
+        from_subquery: stmt.from_subquery.clone(),
         joins: stmt.joins.clone(),
         distinct: stmt.distinct,
-        where_clause: None, // already applied
+        where_clause: None,
         order_by: stmt.order_by.clone(),
         limit: stmt.limit.clone(),
         offset: stmt.offset.clone(),

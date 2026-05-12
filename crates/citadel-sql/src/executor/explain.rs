@@ -262,6 +262,7 @@ pub(super) fn explain_select_cte(
             Some(JoinType::Left) => "LEFT JOIN",
             Some(JoinType::Right) => "RIGHT JOIN",
             Some(JoinType::Cross) => "CROSS JOIN",
+            Some(JoinType::FullOuter) => "FULL OUTER JOIN",
             _ => "NESTED LOOP",
         };
         lines.push(join_type_str.into());
