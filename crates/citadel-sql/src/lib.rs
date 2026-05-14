@@ -1,9 +1,11 @@
 pub mod connection;
 pub mod datetime;
+pub mod dialect;
 pub mod encoding;
 pub mod error;
 pub mod eval;
 pub mod executor;
+pub mod json;
 pub mod parser;
 pub mod planner;
 pub mod prepared;

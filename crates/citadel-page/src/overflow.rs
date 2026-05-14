@@ -63,6 +63,41 @@ pub fn pages_needed(total_len: usize) -> usize {
     total_len.div_ceil(OVERFLOW_DATA_CAPACITY)
 }
 
+/// Write `data` across a chain of overflow pages; returns the first page id.
+pub fn write_chain<F, S>(
+    data: &[u8],
+    txn_id: citadel_core::types::TxnId,
+    mut allocate: F,
+    mut sink: S,
+) -> citadel_core::types::PageId
+where
+    F: FnMut() -> citadel_core::types::PageId,
+    S: FnMut(citadel_core::types::PageId, Page),
+{
+    use citadel_core::types::{PageId, PageType};
+    let needed = pages_needed(data.len());
+    let mut ids: Vec<PageId> = Vec::with_capacity(needed);
+    for _ in 0..needed {
+        ids.push(allocate());
+    }
+    for i in 0..needed {
+        let pid = ids[i];
+        let mut p = Page::new(pid, PageType::Overflow, txn_id);
+        let start = i * OVERFLOW_DATA_CAPACITY;
+        let end = (start + OVERFLOW_DATA_CAPACITY).min(data.len());
+        write_data(&mut p, &data[start..end]);
+        let next = if i + 1 < needed {
+            ids[i + 1]
+        } else {
+            PageId(0)
+        };
+        set_next_page(&mut p, next);
+        p.update_checksum();
+        sink(pid, p);
+    }
+    ids[0]
+}
+
 #[cfg(test)]
 #[path = "overflow_tests.rs"]
 mod tests;

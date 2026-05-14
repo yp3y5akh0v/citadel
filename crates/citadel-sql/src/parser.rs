@@ -1,8 +1,6 @@
 //! SQL parser: converts SQL strings into the internal AST.
 
 use sqlparser::ast as sp;
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
 
 use crate::error::{Result, SqlError};
 use crate::types::{DataType, Value};
@@ -159,6 +157,7 @@ pub struct CreateIndexStmt {
     pub predicate_sql: Option<String>,
     pub predicate_expr: Option<Expr>,
     pub collations: Vec<crate::types::Collation>,
+    pub kind: crate::types::IndexKind,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +221,7 @@ pub enum OnConflictAction {
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
+    pub args: Option<Vec<Expr>>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +254,8 @@ pub struct SelectStmt {
     pub from: String,
     pub from_alias: Option<String>,
     pub from_subquery: Option<Box<DerivedTable>>,
+    pub from_args: Option<Vec<Expr>>,
+    pub from_json_table: Option<Box<JsonTableSpec>>,
     pub joins: Vec<JoinClause>,
     pub distinct: bool,
     pub where_clause: Option<Expr>,
@@ -262,6 +264,30 @@ pub struct SelectStmt {
     pub offset: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct JsonTableSpec {
+    pub source: Expr,
+    pub root_path: String,
+    pub columns: Vec<JsonTableCol>,
+}
+
+#[derive(Debug, Clone)]
+pub enum JsonTableCol {
+    Named {
+        name: String,
+        ty: DataType,
+        path: String,
+        exists: bool,
+    },
+    Ordinality {
+        name: String,
+    },
+    Nested {
+        path: String,
+        columns: Vec<JsonTableCol>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -462,6 +488,18 @@ pub enum BinOp {
     And,
     Or,
     Concat,
+    JsonGet,
+    JsonGetText,
+    JsonPath,
+    JsonPathText,
+    JsonContains,
+    JsonContainedBy,
+    JsonHasKey,
+    JsonHasAnyKey,
+    JsonHasAllKeys,
+    JsonDeletePath,
+    JsonPathExists,
+    JsonPathMatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -509,19 +547,13 @@ pub fn has_subquery(expr: &Expr) -> bool {
 }
 
 pub fn parse_sql_expr(sql: &str) -> Result<Expr> {
-    let dialect = GenericDialect {};
-    let mut parser = Parser::new(&dialect)
-        .try_with_sql(sql)
-        .map_err(|e| SqlError::Parse(e.to_string()))?;
-    let sp_expr = parser
-        .parse_expr()
-        .map_err(|e| SqlError::Parse(e.to_string()))?;
+    let sp_expr = crate::dialect::parse_expr(sql).map_err(|e| SqlError::Parse(e.to_string()))?;
     convert_expr(&sp_expr)
 }
 
 pub fn parse_sql(sql: &str) -> Result<Statement> {
-    let dialect = GenericDialect {};
-    let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| SqlError::Parse(e.to_string()))?;
+    let stmts =
+        crate::dialect::parse_statements(sql).map_err(|e| SqlError::Parse(e.to_string()))?;
 
     if stmts.is_empty() {
         return Err(SqlError::Parse("empty SQL".into()));
@@ -535,8 +567,8 @@ pub fn parse_sql(sql: &str) -> Result<Statement> {
 
 /// Parse one or more `;`-separated SQL statements.
 pub fn parse_sql_multi(sql: &str) -> Result<Vec<Statement>> {
-    let dialect = GenericDialect {};
-    let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| SqlError::Parse(e.to_string()))?;
+    let stmts =
+        crate::dialect::parse_statements(sql).map_err(|e| SqlError::Parse(e.to_string()))?;
 
     if stmts.is_empty() {
         return Err(SqlError::Parse("empty SQL".into()));
@@ -1279,6 +1311,19 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
         None => (None, None),
     };
 
+    let kind = match &ci.using {
+        None => crate::types::IndexKind::BTree,
+        Some(sp::IndexType::BTree) => crate::types::IndexKind::BTree,
+        Some(sp::IndexType::GIN) => {
+            crate::types::IndexKind::Gin(crate::types::GinOpsClass::JsonbOps)
+        }
+        Some(other) => {
+            return Err(SqlError::Unsupported(format!(
+                "index method {other}; supported: BTREE, GIN"
+            )));
+        }
+    };
+
     Ok(Statement::CreateIndex(CreateIndexStmt {
         index_name,
         table_name,
@@ -1288,6 +1333,7 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
         predicate_sql,
         predicate_expr,
         collations,
+        kind,
     }))
 }
 
@@ -1353,8 +1399,8 @@ fn convert_create_view(cv: sp::CreateView) -> Result<Statement> {
 
     let sql = cv.query.to_string();
 
-    let dialect = GenericDialect {};
-    let test = Parser::parse_sql(&dialect, &sql).map_err(|e| SqlError::Parse(e.to_string()))?;
+    let test =
+        crate::dialect::parse_statements(&sql).map_err(|e| SqlError::Parse(e.to_string()))?;
     if test.is_empty() {
         return Err(SqlError::Parse("empty view definition".into()));
     }
@@ -1513,33 +1559,49 @@ fn convert_select_body(select: &sp::Select) -> Result<SelectStmt> {
         _ => false,
     };
 
-    let (from, from_alias, from_subquery, joins) = if select.from.is_empty() {
-        (String::new(), None, None, vec![])
-    } else {
-        let first_twj = &select.from[0];
-        let (first_name, first_alias, first_sub) = convert_from_relation(&first_twj.relation)?;
-        let mut joins: Vec<JoinClause> = first_twj
-            .joins
-            .iter()
-            .map(convert_join)
-            .collect::<Result<Vec<_>>>()?;
-        for extra_twj in &select.from[1..] {
-            let (extra_name, extra_alias, extra_sub) = convert_from_relation(&extra_twj.relation)?;
-            joins.push(JoinClause {
-                join_type: JoinType::Cross,
-                table: TableRef {
-                    name: extra_name,
-                    alias: extra_alias,
-                },
-                subquery: extra_sub,
-                on_clause: None,
-            });
-            for j in &extra_twj.joins {
-                joins.push(convert_join(j)?);
+    let (from, from_alias, from_subquery, from_args, from_json_table, joins) =
+        if select.from.is_empty() {
+            (String::new(), None, None, None, None, vec![])
+        } else {
+            let first_twj = &select.from[0];
+            let (first_name, first_alias, first_sub, first_args, first_jt) =
+                convert_from_relation(&first_twj.relation)?;
+            let mut joins: Vec<JoinClause> = first_twj
+                .joins
+                .iter()
+                .map(convert_join)
+                .collect::<Result<Vec<_>>>()?;
+            for extra_twj in &select.from[1..] {
+                let (extra_name, extra_alias, extra_sub, extra_args, extra_jt) =
+                    convert_from_relation(&extra_twj.relation)?;
+                if extra_jt.is_some() {
+                    return Err(SqlError::Unsupported(
+                        "JSON_TABLE in extra FROM positions not supported".into(),
+                    ));
+                }
+                joins.push(JoinClause {
+                    join_type: JoinType::Cross,
+                    table: TableRef {
+                        name: extra_name,
+                        alias: extra_alias,
+                        args: extra_args,
+                    },
+                    subquery: extra_sub,
+                    on_clause: None,
+                });
+                for j in &extra_twj.joins {
+                    joins.push(convert_join(j)?);
+                }
             }
-        }
-        (first_name, first_alias, first_sub, joins)
-    };
+            (
+                first_name,
+                first_alias,
+                first_sub,
+                first_args,
+                first_jt,
+                joins,
+            )
+        };
     for j in &joins {
         if let Some(sub) = &j.subquery {
             if sub.lateral && matches!(j.join_type, JoinType::Right | JoinType::FullOuter) {
@@ -1575,6 +1637,8 @@ fn convert_select_body(select: &sp::Select) -> Result<SelectStmt> {
         from,
         from_alias,
         from_subquery,
+        from_args,
+        from_json_table,
         joins,
         distinct,
         where_clause,
@@ -1586,14 +1650,41 @@ fn convert_select_body(select: &sp::Select) -> Result<SelectStmt> {
     })
 }
 
-fn convert_from_relation(
-    relation: &sp::TableFactor,
-) -> Result<(String, Option<String>, Option<Box<DerivedTable>>)> {
+type FromRelation = (
+    String,
+    Option<String>,
+    Option<Box<DerivedTable>>,
+    Option<Vec<Expr>>,
+    Option<Box<JsonTableSpec>>,
+);
+
+fn convert_from_relation(relation: &sp::TableFactor) -> Result<FromRelation> {
     match relation {
-        sp::TableFactor::Table { name, alias, .. } => {
+        sp::TableFactor::Table {
+            name, alias, args, ..
+        } => {
             let table_name = object_name_to_string(name);
             let alias_str = alias.as_ref().map(|a| a.name.value.clone());
-            Ok((table_name, alias_str, None))
+            let args_converted = match args {
+                Some(table_args) => {
+                    let mut converted = Vec::with_capacity(table_args.args.len());
+                    for arg in &table_args.args {
+                        match arg {
+                            sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => {
+                                converted.push(convert_expr(e)?);
+                            }
+                            _ => {
+                                return Err(SqlError::Unsupported(
+                                    "non-positional table function argument".into(),
+                                ));
+                            }
+                        }
+                    }
+                    Some(converted)
+                }
+                None => None,
+            };
+            Ok((table_name, alias_str, None, args_converted, None))
         }
         sp::TableFactor::Derived {
             lateral,
@@ -1621,9 +1712,72 @@ fn convert_from_relation(
                 lateral: *lateral,
                 alias: alias_name.clone(),
             };
-            Ok((alias_name, None, Some(Box::new(derived))))
+            Ok((alias_name, None, Some(Box::new(derived)), None, None))
+        }
+        sp::TableFactor::JsonTable {
+            json_expr,
+            json_path,
+            columns,
+            alias,
+        } => {
+            let alias_name = match alias {
+                Some(a) => a.name.value.clone(),
+                None => "json_table".to_string(),
+            };
+            let source = convert_expr(json_expr)?;
+            let root_path = json_path_value_to_string(json_path)?;
+            let cols = columns
+                .iter()
+                .map(convert_json_table_column)
+                .collect::<Result<Vec<_>>>()?;
+            let spec = JsonTableSpec {
+                source,
+                root_path,
+                columns: cols,
+            };
+            Ok((alias_name, None, None, None, Some(Box::new(spec))))
         }
         _ => Err(SqlError::Unsupported("non-table FROM source".into())),
+    }
+}
+
+fn json_path_value_to_string(v: &sp::Value) -> Result<String> {
+    use sp::Value as V;
+    match v {
+        V::SingleQuotedString(s)
+        | V::DoubleQuotedString(s)
+        | V::DollarQuotedString(sp::DollarQuotedString { value: s, .. })
+        | V::TripleSingleQuotedString(s)
+        | V::TripleDoubleQuotedString(s) => Ok(s.clone()),
+        other => Err(SqlError::Unsupported(format!(
+            "JSON_TABLE path must be a string literal, got: {other}"
+        ))),
+    }
+}
+
+fn convert_json_table_column(c: &sp::JsonTableColumn) -> Result<JsonTableCol> {
+    match c {
+        sp::JsonTableColumn::Named(n) => {
+            let path = json_path_value_to_string(&n.path)?;
+            Ok(JsonTableCol::Named {
+                name: n.name.value.clone(),
+                ty: convert_data_type(&n.r#type)?,
+                path,
+                exists: n.exists,
+            })
+        }
+        sp::JsonTableColumn::ForOrdinality(ident) => Ok(JsonTableCol::Ordinality {
+            name: ident.value.clone(),
+        }),
+        sp::JsonTableColumn::Nested(n) => {
+            let path = json_path_value_to_string(&n.path)?;
+            let columns = n
+                .columns
+                .iter()
+                .map(convert_json_table_column)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(JsonTableCol::Nested { path, columns })
+        }
     }
 }
 
@@ -1804,7 +1958,12 @@ fn convert_join(join: &sp::Join) -> Result<JoinClause> {
         other => return Err(SqlError::Unsupported(format!("join type: {other:?}"))),
     };
 
-    let (name, alias, subquery) = convert_from_relation(&join.relation)?;
+    let (name, alias, subquery, args, json_table) = convert_from_relation(&join.relation)?;
+    if json_table.is_some() {
+        return Err(SqlError::Unsupported(
+            "JSON_TABLE on right side of JOIN".into(),
+        ));
+    }
 
     let on_clause = match constraint {
         Some(sp::JoinConstraint::On(expr)) => Some(convert_expr(expr)?),
@@ -1814,7 +1973,7 @@ fn convert_join(join: &sp::Join) -> Result<JoinClause> {
 
     Ok(JoinClause {
         join_type,
-        table: TableRef { name, alias },
+        table: TableRef { name, alias, args },
         subquery,
         on_clause,
     })
@@ -2069,8 +2228,20 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
             ..
         } => {
             let target = convert_data_type(dt)?;
+            let inner = convert_expr(e)?;
+            if matches!(target, DataType::Json | DataType::Jsonb) {
+                if let Expr::Literal(Value::Text(s)) = &inner {
+                    let v = if matches!(target, DataType::Json) {
+                        crate::json::validate_text(s.as_str())?;
+                        Value::Json(s.clone())
+                    } else {
+                        crate::json::text_to_jsonb(s.as_str())?
+                    };
+                    return Ok(Expr::Literal(v));
+                }
+            }
             Ok(Expr::Cast {
-                expr: Box::new(convert_expr(e)?),
+                expr: Box::new(inner),
                 data_type: target,
             })
         }
@@ -2343,6 +2514,18 @@ fn convert_bin_op(op: &sp::BinaryOperator) -> Result<BinOp> {
         sp::BinaryOperator::And => Ok(BinOp::And),
         sp::BinaryOperator::Or => Ok(BinOp::Or),
         sp::BinaryOperator::StringConcat => Ok(BinOp::Concat),
+        sp::BinaryOperator::Arrow => Ok(BinOp::JsonGet),
+        sp::BinaryOperator::LongArrow => Ok(BinOp::JsonGetText),
+        sp::BinaryOperator::HashArrow => Ok(BinOp::JsonPath),
+        sp::BinaryOperator::HashLongArrow => Ok(BinOp::JsonPathText),
+        sp::BinaryOperator::AtArrow => Ok(BinOp::JsonContains),
+        sp::BinaryOperator::ArrowAt => Ok(BinOp::JsonContainedBy),
+        sp::BinaryOperator::Question => Ok(BinOp::JsonHasKey),
+        sp::BinaryOperator::QuestionPipe => Ok(BinOp::JsonHasAnyKey),
+        sp::BinaryOperator::QuestionAnd => Ok(BinOp::JsonHasAllKeys),
+        sp::BinaryOperator::HashMinus => Ok(BinOp::JsonDeletePath),
+        sp::BinaryOperator::AtQuestion => Ok(BinOp::JsonPathExists),
+        sp::BinaryOperator::AtAt => Ok(BinOp::JsonPathMatch),
         _ => Err(SqlError::Unsupported(format!("binary op: {op}"))),
     }
 }
@@ -2716,6 +2899,9 @@ fn convert_data_type(dt: &sp::DataType) -> Result<DataType> {
         sp::DataType::Time(_, _) => Ok(DataType::Time),
         sp::DataType::Timestamp(_, _) => Ok(DataType::Timestamp),
         sp::DataType::Interval { .. } => Ok(DataType::Interval),
+
+        sp::DataType::JSON => Ok(DataType::Json),
+        sp::DataType::JSONB => Ok(DataType::Jsonb),
 
         _ => Err(SqlError::Unsupported(format!("data type: {dt}"))),
     }

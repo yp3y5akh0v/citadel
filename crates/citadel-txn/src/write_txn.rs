@@ -1,9 +1,11 @@
 //! Write transaction: CoW mutations with shadow-paging commit.
 
 use citadel_core::types::{PageId, PageType, TxnId, ValueType};
-use citadel_core::{Error, Result, MAX_INLINE_VALUE_SIZE, MAX_KEY_SIZE};
+use citadel_core::{Error, Result, MAX_INLINE_VALUE_SIZE, MAX_KEY_SIZE, MAX_VALUE_SIZE};
 use citadel_io::file_manager::CommitSlot;
 use citadel_page::branch_node;
+use citadel_page::leaf_node::OverflowRef;
+use citadel_page::overflow;
 use citadel_page::page::Page;
 use rustc_hash::FxHashMap;
 
@@ -13,6 +15,7 @@ use citadel_buffer::cursor::{Cursor, PageLoader, PageMap};
 
 use crate::catalog::TableDescriptor;
 use crate::manager::TxnManager;
+use crate::overflow_io;
 
 thread_local! {
     static PATH_BUF: std::cell::RefCell<Vec<(PageId, usize)>> =
@@ -130,36 +133,93 @@ impl<'db> WriteTxn<'db> {
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.preload_path(self.tree.root, key)?;
-        self.search_in_tree(&self.tree.clone(), key)
+        let tree = self.tree.clone();
+        match tree.search(&self.pages, key)? {
+            Some((ValueType::Tombstone, _)) => Ok(None),
+            Some((ValueType::Overflow, payload)) => {
+                let oref = OverflowRef::from_bytes(&payload);
+                self.materialize_overflow(&oref).map(Some)
+            }
+            Some((_, value)) => Ok(Some(value)),
+            None => Ok(None),
+        }
     }
 
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<bool> {
         Self::validate_key_value(key, value)?;
+        if value.len() > MAX_INLINE_VALUE_SIZE {
+            self.free_existing_overflow_in_tree(self.tree.root, key)?;
+        }
+        let (val_type, val_payload) = self.stage_value(value);
         self.preload_path(self.tree.root, key)?;
         self.tree.insert(
             &mut self.pages,
             &mut self.alloc,
             self.txn_id,
             key,
-            ValueType::Inline,
-            value,
+            val_type,
+            &val_payload,
         )
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
-        self.preload_path(self.tree.root, key)?;
-        self.tree
-            .delete(&mut self.pages, &mut self.alloc, self.txn_id, key)
+        let root = self.tree.root;
+        let overflow_head = self.peek_overflow_head(root, key)?;
+        self.preload_path(root, key)?;
+        let deleted = self
+            .tree
+            .delete(&mut self.pages, &mut self.alloc, self.txn_id, key)?;
+        if let Some(head) = overflow_head {
+            let mut view = WritePages {
+                pages: &mut self.pages,
+                manager: self.manager,
+            };
+            overflow_io::free_chain(&mut view, &mut self.alloc, head)?;
+        }
+        Ok(deleted)
+    }
+
+    fn peek_overflow_head(&mut self, root: PageId, key: &[u8]) -> Result<Option<PageId>> {
+        let leaf_id = Self::descend_to_leaf(&mut self.pages, self.manager, root, key)?;
+        match BTree::search_at_leaf(&self.pages, leaf_id, key)? {
+            Some((ValueType::Overflow, bytes)) => {
+                Ok(Some(OverflowRef::from_bytes(&bytes).first_page))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn free_existing_overflow_in_tree(&mut self, root: PageId, key: &[u8]) -> Result<()> {
+        let leaf_id = Self::descend_to_leaf(&mut self.pages, self.manager, root, key)?;
+        let oref = match BTree::search_at_leaf(&self.pages, leaf_id, key)? {
+            Some((ValueType::Overflow, bytes)) => OverflowRef::from_bytes(&bytes),
+            _ => return Ok(()),
+        };
+        let mut view = WritePages {
+            pages: &mut self.pages,
+            manager: self.manager,
+        };
+        overflow_io::free_chain(&mut view, &mut self.alloc, oref.first_page)
     }
 
     pub fn for_each<F>(&mut self, mut f: F) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> Result<()>,
     {
-        self.preload_all_pages(self.tree.root)?;
-        let mut cursor = Cursor::first(&self.pages, self.tree.root)?;
+        let root = self.tree.root;
+        self.preload_all_pages(root)?;
+        let mut cursor = Cursor::first(&self.pages, root)?;
         while cursor.is_valid() {
-            if let Some(entry) = cursor.current_ref(&self.pages) {
+            let overflow = cursor
+                .current_ref(&self.pages)
+                .and_then(|c| match c.val_type {
+                    ValueType::Overflow => Some((c.key.to_vec(), OverflowRef::from_bytes(c.value))),
+                    _ => None,
+                });
+            if let Some((key, oref)) = overflow {
+                let materialized = self.materialize_overflow(&oref)?;
+                f(&key, &materialized)?;
+            } else if let Some(entry) = cursor.current_ref(&self.pages) {
                 if entry.val_type != ValueType::Tombstone {
                     f(entry.key, entry.value)?;
                 }
@@ -167,6 +227,14 @@ impl<'db> WriteTxn<'db> {
             cursor.next(&self.pages)?;
         }
         Ok(())
+    }
+
+    fn materialize_overflow(&mut self, oref: &OverflowRef) -> Result<Vec<u8>> {
+        let mut view = WritePages {
+            pages: &mut self.pages,
+            manager: self.manager,
+        };
+        overflow_io::read_chain_value(&mut view, oref)
     }
 
     pub fn table_entry_count(&mut self, table: &[u8]) -> Result<u64> {
@@ -183,7 +251,16 @@ impl<'db> WriteTxn<'db> {
         self.preload_all_pages(root)?;
         let mut cursor = Cursor::first(&self.pages, root)?;
         while cursor.is_valid() {
-            if let Some(entry) = cursor.current_ref(&self.pages) {
+            let overflow = cursor
+                .current_ref(&self.pages)
+                .and_then(|c| match c.val_type {
+                    ValueType::Overflow => Some((c.key.to_vec(), OverflowRef::from_bytes(c.value))),
+                    _ => None,
+                });
+            if let Some((key, oref)) = overflow {
+                let materialized = self.materialize_overflow(&oref)?;
+                f(&key, &materialized)?;
+            } else if let Some(entry) = cursor.current_ref(&self.pages) {
                 if entry.val_type != ValueType::Tombstone {
                     f(entry.key, entry.value)?;
                 }
@@ -329,27 +406,37 @@ impl<'db> WriteTxn<'db> {
 
     pub fn table_insert(&mut self, table: &[u8], key: &[u8], value: &[u8]) -> Result<bool> {
         Self::validate_key_value(key, value)?;
+        // Skip the cleanup descent unless the new value spills — small inserts stay hot.
+        if value.len() > MAX_INLINE_VALUE_SIZE {
+            self.free_existing_overflow(table, key)?;
+        }
+        let (val_type, val_payload) = self.stage_value(value);
+        let val_bytes = val_payload.as_slice();
 
-        if let Some(tree) = self.named_trees.get_mut(table) {
-            if let Some(was_new) = tree.try_lil_insert(
-                &mut self.pages,
-                &mut self.alloc,
-                self.txn_id,
-                key,
-                ValueType::Inline,
-                value,
-            )? {
-                return Ok(was_new);
+        if self.named_trees.contains_key(table) {
+            let tree = self.named_trees.get_mut(table).unwrap();
+            if val_type == ValueType::Inline {
+                if let Some(was_new) = tree.try_lil_insert(
+                    &mut self.pages,
+                    &mut self.alloc,
+                    self.txn_id,
+                    key,
+                    val_type,
+                    val_bytes,
+                )? {
+                    return Ok(was_new);
+                }
             }
             let root = tree.root;
             let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
+            let tree = self.named_trees.get_mut(table).unwrap();
             return tree.insert_at_leaf(
                 &mut self.pages,
                 &mut self.alloc,
                 self.txn_id,
                 key,
-                ValueType::Inline,
-                value,
+                val_type,
+                val_bytes,
                 path,
                 leaf_id,
             );
@@ -358,13 +445,14 @@ impl<'db> WriteTxn<'db> {
         let tree = self.named_trees.get_mut(table).unwrap();
         let root = tree.root;
         let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
+        let tree = self.named_trees.get_mut(table).unwrap();
         tree.insert_at_leaf(
             &mut self.pages,
             &mut self.alloc,
             self.txn_id,
             key,
-            ValueType::Inline,
-            value,
+            val_type,
+            val_bytes,
             path,
             leaf_id,
         )
@@ -378,27 +466,49 @@ impl<'db> WriteTxn<'db> {
         value: &[u8],
     ) -> Result<bool> {
         Self::validate_key_value(key, value)?;
+        let (val_type, val_payload) = self.stage_value(value);
+        let val_bytes = val_payload.as_slice();
+        let inserted = self.insert_if_absent_staged(table, key, val_type, val_bytes)?;
+        if !inserted && val_type == ValueType::Overflow {
+            let oref = OverflowRef::from_bytes(val_bytes);
+            let mut view = WritePages {
+                pages: &mut self.pages,
+                manager: self.manager,
+            };
+            overflow_io::free_chain(&mut view, &mut self.alloc, oref.first_page)?;
+        }
+        Ok(inserted)
+    }
 
-        if let Some(tree) = self.named_trees.get_mut(table) {
+    fn insert_if_absent_staged(
+        &mut self,
+        table: &[u8],
+        key: &[u8],
+        val_type: ValueType,
+        val_bytes: &[u8],
+    ) -> Result<bool> {
+        if self.named_trees.contains_key(table) {
+            let tree = self.named_trees.get_mut(table).unwrap();
             let root = tree.root;
-            if tree.lil_would_hit(&self.pages, key) {
+            if val_type == ValueType::Inline && tree.lil_would_hit(&self.pages, key) {
                 return tree.insert_if_absent(
                     &mut self.pages,
                     &mut self.alloc,
                     self.txn_id,
                     key,
-                    ValueType::Inline,
-                    value,
+                    val_type,
+                    val_bytes,
                 );
             }
             let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
+            let tree = self.named_trees.get_mut(table).unwrap();
             return tree.insert_if_absent_at_leaf(
                 &mut self.pages,
                 &mut self.alloc,
                 self.txn_id,
                 key,
-                ValueType::Inline,
-                value,
+                val_type,
+                val_bytes,
                 path,
                 leaf_id,
             );
@@ -407,13 +517,14 @@ impl<'db> WriteTxn<'db> {
         let tree = self.named_trees.get_mut(table).unwrap();
         let root = tree.root;
         let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
+        let tree = self.named_trees.get_mut(table).unwrap();
         tree.insert_if_absent_at_leaf(
             &mut self.pages,
             &mut self.alloc,
             self.txn_id,
             key,
-            ValueType::Inline,
-            value,
+            val_type,
+            val_bytes,
             path,
             leaf_id,
         )
@@ -483,37 +594,50 @@ impl<'db> WriteTxn<'db> {
         value: &[u8],
     ) -> Result<InsertOutcome> {
         Self::validate_key_value(key, value)?;
+        let (val_type, val_payload) = self.stage_value(value);
+        let val_bytes = val_payload.as_slice();
 
-        if let Some(tree) = self.named_trees.get_mut(table) {
+        let outcome = if self.named_trees.contains_key(table) {
+            let tree = self.named_trees.get_mut(table).unwrap();
             let root = tree.root;
-            let lil_hit = tree.lil_would_hit(&self.pages, key);
+            let lil_hit = val_type == ValueType::Inline && tree.lil_would_hit(&self.pages, key);
             if !lil_hit {
                 Self::preload_path_raw(&mut self.pages, self.manager, root, key)?;
             }
-            return tree
-                .insert_or_fetch(
-                    &mut self.pages,
-                    &mut self.alloc,
-                    self.txn_id,
-                    key,
-                    ValueType::Inline,
-                    value,
-                )
-                .map(InsertOutcome::from);
+            let tree = self.named_trees.get_mut(table).unwrap();
+            tree.insert_or_fetch(
+                &mut self.pages,
+                &mut self.alloc,
+                self.txn_id,
+                key,
+                val_type,
+                val_bytes,
+            )?
+        } else {
+            self.ensure_table(table)?;
+            let tree = self.named_trees.get_mut(table).unwrap();
+            let root = tree.root;
+            Self::preload_path_raw(&mut self.pages, self.manager, root, key)?;
+            let tree = self.named_trees.get_mut(table).unwrap();
+            tree.insert_or_fetch(
+                &mut self.pages,
+                &mut self.alloc,
+                self.txn_id,
+                key,
+                val_type,
+                val_bytes,
+            )?
+        };
+        let existed = outcome.is_some();
+        if existed && val_type == ValueType::Overflow {
+            let oref = OverflowRef::from_bytes(val_bytes);
+            let mut view = WritePages {
+                pages: &mut self.pages,
+                manager: self.manager,
+            };
+            overflow_io::free_chain(&mut view, &mut self.alloc, oref.first_page)?;
         }
-        self.ensure_table(table)?;
-        let tree = self.named_trees.get_mut(table).unwrap();
-        let root = tree.root;
-        Self::preload_path_raw(&mut self.pages, self.manager, root, key)?;
-        tree.insert_or_fetch(
-            &mut self.pages,
-            &mut self.alloc,
-            self.txn_id,
-            key,
-            ValueType::Inline,
-            value,
-        )
-        .map(InsertOutcome::from)
+        Ok(InsertOutcome::from(outcome))
     }
 
     /// Batch-update existing keys. Keys must be sorted.
@@ -617,23 +741,39 @@ impl<'db> WriteTxn<'db> {
 
     pub fn table_delete(&mut self, table: &[u8], key: &[u8]) -> Result<bool> {
         self.ensure_table(table)?;
-
         let root = self.named_trees[table].root;
-        PATH_BUF.with(|pb| {
+
+        let (overflow_head, deleted) = PATH_BUF.with(|pb| -> Result<_> {
             let mut path = pb.borrow_mut();
             path.clear();
             let leaf_id =
                 Self::walk_loading_into(&mut self.pages, self.manager, root, key, &mut path)?;
+            let head = match BTree::search_at_leaf(&self.pages, leaf_id, key)? {
+                Some((ValueType::Overflow, bytes)) => {
+                    Some(OverflowRef::from_bytes(&bytes).first_page)
+                }
+                _ => None,
+            };
             let tree = self.named_trees.get_mut(table).unwrap();
-            tree.delete_at_leaf(
+            let d = tree.delete_at_leaf(
                 &mut self.pages,
                 &mut self.alloc,
                 self.txn_id,
                 key,
                 &mut path,
                 leaf_id,
-            )
-        })
+            )?;
+            Ok((head, d))
+        })?;
+
+        if let Some(head) = overflow_head {
+            let mut view = WritePages {
+                pages: &mut self.pages,
+                manager: self.manager,
+            };
+            overflow_io::free_chain(&mut view, &mut self.alloc, head)?;
+        }
+        Ok(deleted)
     }
 
     /// Drop all pages, reset to an empty leaf. Returns pre-truncation entry count.
@@ -659,6 +799,10 @@ impl<'db> WriteTxn<'db> {
         let leaf_id = Self::descend_to_leaf(&mut self.pages, self.manager, root, key)?;
         match BTree::search_at_leaf(&self.pages, leaf_id, key)? {
             Some((ValueType::Tombstone, _)) => Ok(None),
+            Some((ValueType::Overflow, payload)) => {
+                let oref = OverflowRef::from_bytes(&payload);
+                self.materialize_overflow(&oref).map(Some)
+            }
             Some((_, value)) => Ok(Some(value)),
             None => Ok(None),
         }
@@ -742,21 +886,56 @@ impl<'db> WriteTxn<'db> {
                 max: MAX_KEY_SIZE,
             });
         }
-        if value.len() > MAX_INLINE_VALUE_SIZE {
+        if value.len() > MAX_VALUE_SIZE {
             return Err(Error::ValueTooLarge {
                 size: value.len(),
-                max: MAX_INLINE_VALUE_SIZE,
+                max: MAX_VALUE_SIZE,
             });
         }
         Ok(())
     }
 
-    fn search_in_tree(&self, tree: &BTree, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        match tree.search(&self.pages, key)? {
-            Some((ValueType::Tombstone, _)) => Ok(None),
-            Some((_, value)) => Ok(Some(value)),
-            None => Ok(None),
+    /// Stage a value for insertion: inline if ≤ MAX_INLINE_VALUE_SIZE, otherwise
+    /// spill to an overflow chain and return the 8-byte OverflowRef payload.
+    fn stage_value(&mut self, value: &[u8]) -> (ValueType, Vec<u8>) {
+        if value.len() <= MAX_INLINE_VALUE_SIZE {
+            return (ValueType::Inline, value.to_vec());
         }
+        let txn_id = self.txn_id;
+        let alloc = &mut self.alloc;
+        let pages = &mut self.pages;
+        let first = overflow::write_chain(
+            value,
+            txn_id,
+            || alloc.allocate(),
+            |pid, page| {
+                pages.insert(pid, page);
+            },
+        );
+        let oref = OverflowRef {
+            first_page: first,
+            total_len: value.len() as u32,
+        };
+        (ValueType::Overflow, oref.to_bytes().to_vec())
+    }
+
+    /// If a cell at (table, key) already exists with `ValueType::Overflow`,
+    /// free its overflow chain so the cell can be overwritten cleanly.
+    fn free_existing_overflow(&mut self, table: &[u8], key: &[u8]) -> Result<()> {
+        if !self.named_trees.contains_key(table) {
+            return Ok(());
+        }
+        let root = self.named_trees[table].root;
+        let leaf_id = Self::descend_to_leaf(&mut self.pages, self.manager, root, key)?;
+        let oref = match BTree::search_at_leaf(&self.pages, leaf_id, key)? {
+            Some((ValueType::Overflow, bytes)) => OverflowRef::from_bytes(&bytes),
+            _ => return Ok(()),
+        };
+        let mut view = WritePages {
+            pages: &mut self.pages,
+            manager: self.manager,
+        };
+        overflow_io::free_chain(&mut view, &mut self.alloc, oref.first_page)
     }
 
     fn ensure_catalog(&mut self) -> Result<()> {
@@ -914,6 +1093,7 @@ impl<'db> WriteTxn<'db> {
 
     fn free_tree_pages(&mut self, root: PageId) -> Result<()> {
         let mut stack = vec![root];
+        let mut overflow_heads: Vec<PageId> = Vec::new();
         while let Some(current) = stack.pop() {
             if !self.pages.contains_key(&current) {
                 let page = self.manager.fetch_page_owned(current)?;
@@ -930,10 +1110,25 @@ impl<'db> WriteTxn<'db> {
                         stack.push(right);
                     }
                 }
-                Some(PageType::Leaf) => {}
+                Some(PageType::Leaf) => {
+                    for i in 0..page.num_cells() {
+                        let cell = citadel_page::leaf_node::read_cell(page, i);
+                        if cell.val_type == ValueType::Overflow {
+                            let oref = OverflowRef::from_bytes(cell.value);
+                            overflow_heads.push(oref.first_page);
+                        }
+                    }
+                }
                 _ => {}
             }
             self.alloc.free(current);
+        }
+        for head in overflow_heads {
+            let mut view = WritePages {
+                pages: &mut self.pages,
+                manager: self.manager,
+            };
+            overflow_io::free_chain(&mut view, &mut self.alloc, head)?;
         }
         Ok(())
     }

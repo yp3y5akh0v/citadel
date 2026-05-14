@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::{Collation, ColumnDef, DataType};
+use crate::types::{Collation, ColumnDef, DataType, IndexKind};
 
 fn col(name: &str, dt: DataType, nullable: bool, pos: u16) -> ColumnDef {
     ColumnDef {
@@ -38,6 +38,7 @@ fn test_schema() -> TableSchema {
                 predicate_sql: None,
                 predicate_expr: None,
                 collations: vec![],
+                kind: IndexKind::default(),
             },
             IndexDef {
                 name: "idx_email".into(),
@@ -46,6 +47,7 @@ fn test_schema() -> TableSchema {
                 predicate_sql: None,
                 predicate_expr: None,
                 collations: vec![],
+                kind: IndexKind::default(),
             },
             IndexDef {
                 name: "idx_name_age".into(),
@@ -54,6 +56,7 @@ fn test_schema() -> TableSchema {
                 predicate_sql: None,
                 predicate_expr: None,
                 collations: vec![],
+                kind: IndexKind::default(),
             },
         ],
         vec![],
@@ -294,6 +297,7 @@ fn prefers_unique_index() {
                 predicate_sql: None,
                 predicate_expr: None,
                 collations: vec![],
+                kind: IndexKind::default(),
             },
             IndexDef {
                 name: "idx_code_uniq".into(),
@@ -302,6 +306,7 @@ fn prefers_unique_index() {
                 predicate_sql: None,
                 predicate_expr: None,
                 collations: vec![],
+                kind: IndexKind::default(),
             },
         ],
         vec![],
@@ -373,6 +378,7 @@ fn schema_with_partial_index(name: &str, predicate_sql: &str) -> TableSchema {
             predicate_sql: Some(predicate_sql.into()),
             predicate_expr: Some(predicate_expr),
             collations: vec![],
+            kind: IndexKind::default(),
         }],
         vec![],
         vec![],

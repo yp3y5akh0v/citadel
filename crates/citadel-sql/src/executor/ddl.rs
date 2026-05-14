@@ -198,6 +198,7 @@ pub(super) fn create_unique_auto_indices(
             predicate_sql: None,
             predicate_expr: None,
             collations,
+            kind: crate::types::IndexKind::default(),
         });
     }
     Ok(table_schema)
@@ -236,6 +237,7 @@ pub(super) fn create_fk_auto_indices(
             predicate_sql: None,
             predicate_expr: None,
             collations: vec![],
+            kind: IndexKind::default(),
         };
         let idx_table = TableSchema::index_table_name(&table_schema.name, &idx_name);
         wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
@@ -707,6 +709,7 @@ pub(super) fn exec_create_index(
         predicate_sql: stmt.predicate_sql.clone(),
         predicate_expr: stmt.predicate_expr.clone(),
         collations,
+        kind: stmt.kind,
     };
 
     let idx_table = TableSchema::index_table_name(&lower_table, &lower_idx);
@@ -732,8 +735,42 @@ pub(super) fn exec_create_index(
         }
     }
 
+    let is_gin = matches!(idx_def.kind, crate::types::IndexKind::Gin(_));
+    if is_gin {
+        let col_idx = idx_def.columns[0] as usize;
+        let col_type = table_schema.columns[col_idx].data_type;
+        if !matches!(
+            col_type,
+            crate::types::DataType::Json | crate::types::DataType::Jsonb
+        ) {
+            return Err(SqlError::Unsupported(
+                "GIN index requires a JSON or JSONB column".into(),
+            ));
+        }
+        if idx_def.unique {
+            return Err(SqlError::Unsupported(
+                "UNIQUE not supported on GIN indexes".into(),
+            ));
+        }
+    }
+
     for row in &rows {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
+        if let crate::types::IndexKind::Gin(ops) = idx_def.kind {
+            let value = &row[idx_def.columns[0] as usize];
+            if !value.is_null() {
+                let entries = crate::json::extract_gin_entries(value, ops)?;
+                let pk_encoded = crate::encoding::encode_composite_key(&pk_values);
+                for entry in entries {
+                    let mut full_key = entry;
+                    full_key.push(0x1F);
+                    full_key.extend_from_slice(&pk_encoded);
+                    wtx.table_insert(&idx_table, &full_key, &[])
+                        .map_err(SqlError::Storage)?;
+                }
+            }
+            continue;
+        }
         let key = encode_index_key(&idx_def, row, &pk_values);
         let value = encode_index_value(&idx_def, row, &pk_values);
         let is_new = wtx
@@ -845,6 +882,7 @@ pub(super) fn exec_create_index_in_txn(
         predicate_sql: stmt.predicate_sql.clone(),
         predicate_expr: stmt.predicate_expr.clone(),
         collations,
+        kind: stmt.kind,
     };
 
     let idx_table = TableSchema::index_table_name(&lower_table, &lower_idx);

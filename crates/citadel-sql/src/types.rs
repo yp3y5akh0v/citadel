@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 pub use compact_str::CompactString;
 
@@ -19,6 +20,8 @@ pub enum DataType {
     Date,
     Timestamp,
     Interval,
+    Json,
+    Jsonb,
 }
 
 impl DataType {
@@ -34,6 +37,8 @@ impl DataType {
             DataType::Date => 7,
             DataType::Timestamp => 8,
             DataType::Interval => 9,
+            DataType::Json => 10,
+            DataType::Jsonb => 11,
         }
     }
 
@@ -49,6 +54,8 @@ impl DataType {
             7 => Some(DataType::Date),
             8 => Some(DataType::Timestamp),
             9 => Some(DataType::Interval),
+            10 => Some(DataType::Json),
+            11 => Some(DataType::Jsonb),
             _ => None,
         }
     }
@@ -67,6 +74,8 @@ impl fmt::Display for DataType {
             DataType::Date => write!(f, "DATE"),
             DataType::Timestamp => write!(f, "TIMESTAMP"),
             DataType::Interval => write!(f, "INTERVAL"),
+            DataType::Json => write!(f, "JSON"),
+            DataType::Jsonb => write!(f, "JSONB"),
         }
     }
 }
@@ -90,6 +99,8 @@ pub enum Value {
         days: i32,
         micros: i64,
     },
+    Json(CompactString),
+    Jsonb(Arc<[u8]>),
 }
 
 impl Value {
@@ -105,6 +116,8 @@ impl Value {
             Value::Date(_) => DataType::Date,
             Value::Timestamp(_) => DataType::Timestamp,
             Value::Interval { .. } => DataType::Interval,
+            Value::Json(_) => DataType::Json,
+            Value::Jsonb(_) => DataType::Jsonb,
         }
     }
 
@@ -236,6 +249,19 @@ impl Value {
             {
                 Some(Value::Text(v.to_string().into()))
             }
+            (Value::Text(s), DataType::Json) => {
+                crate::json::validate_text(&s).ok()?;
+                Some(Value::Json(s))
+            }
+            (Value::Text(s), DataType::Jsonb) => crate::json::text_to_jsonb(&s).ok(),
+            (Value::Json(s), DataType::Text) => Some(Value::Text(s)),
+            (Value::Json(s), DataType::Jsonb) => crate::json::text_to_jsonb(&s).ok(),
+            (Value::Jsonb(b), DataType::Text) => crate::json::decode_to_text(&b)
+                .ok()
+                .map(|t| Value::Text(t.into())),
+            (Value::Jsonb(b), DataType::Json) => crate::json::decode_to_text(&b)
+                .ok()
+                .map(|t| Value::Json(t.into())),
             _ => None,
         }
     }
@@ -292,7 +318,13 @@ impl Value {
             (Value::Text(_), DataType::Date)
             | (Value::Text(_), DataType::Time)
             | (Value::Text(_), DataType::Timestamp)
-            | (Value::Text(_), DataType::Interval) => self.clone().coerce_into(target),
+            | (Value::Text(_), DataType::Interval)
+            | (Value::Text(_), DataType::Json)
+            | (Value::Text(_), DataType::Jsonb)
+            | (Value::Json(_), DataType::Jsonb)
+            | (Value::Json(_), DataType::Text)
+            | (Value::Jsonb(_), DataType::Json)
+            | (Value::Jsonb(_), DataType::Text) => self.clone().coerce_into(target),
             (Value::Date(d), DataType::Timestamp) => (*d as i64)
                 .checked_mul(86_400_000_000)
                 .map(Value::Timestamp),
@@ -352,6 +384,8 @@ impl PartialEq for Value {
                     micros: bu,
                 },
             ) => am == bm && ad == bd && au == bu,
+            (Value::Json(a), Value::Json(b)) => a == b,
+            (Value::Jsonb(a), Value::Jsonb(b)) => a == b,
             _ => false,
         }
     }
@@ -406,6 +440,14 @@ impl Hash for Value {
                 months.hash(state);
                 days.hash(state);
                 micros.hash(state);
+            }
+            Value::Json(s) => {
+                9u8.hash(state);
+                s.hash(state);
+            }
+            Value::Jsonb(b) => {
+                10u8.hash(state);
+                b.hash(state);
             }
         }
     }
@@ -463,6 +505,14 @@ impl Ord for Value {
             (Value::Interval { .. }, _) => Ordering::Less,
             (_, Value::Interval { .. }) => Ordering::Greater,
 
+            (Value::Json(a), Value::Json(b)) => a.cmp(b),
+            (Value::Json(_), _) => Ordering::Less,
+            (_, Value::Json(_)) => Ordering::Greater,
+
+            (Value::Jsonb(a), Value::Jsonb(b)) => a.as_ref().cmp(b.as_ref()),
+            (Value::Jsonb(_), _) => Ordering::Less,
+            (_, Value::Jsonb(_)) => Ordering::Greater,
+
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
             (Value::Text(_), _) => Ordering::Less,
             (_, Value::Text(_)) => Ordering::Greater,
@@ -501,6 +551,11 @@ impl fmt::Display for Value {
                     crate::datetime::format_interval(*months, *days, *micros)
                 )
             }
+            Value::Json(s) => write!(f, "{s}"),
+            Value::Jsonb(b) => match crate::json::decode_to_text(b) {
+                Ok(s) => write!(f, "{s}"),
+                Err(_) => write!(f, "<invalid jsonb>"),
+            },
         }
     }
 }
@@ -585,6 +640,38 @@ pub struct ColumnDef {
     pub collation: Collation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GinOpsClass {
+    /// One entry per (key, value) pair; supports `@>` `?` `?|` `?&`.
+    JsonbOps,
+    /// One entry per hash(path‖value); supports `@>` only, ~3x smaller index.
+    JsonbPathOps,
+}
+
+impl GinOpsClass {
+    pub fn as_tag(self) -> u8 {
+        match self {
+            Self::JsonbOps => 0,
+            Self::JsonbPathOps => 1,
+        }
+    }
+
+    pub fn from_tag(t: u8) -> Option<Self> {
+        match t {
+            0 => Some(Self::JsonbOps),
+            1 => Some(Self::JsonbPathOps),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexKind {
+    #[default]
+    BTree,
+    Gin(GinOpsClass),
+}
+
 /// Index definition stored as part of the table schema.
 #[derive(Debug, Clone)]
 pub struct IndexDef {
@@ -594,6 +681,7 @@ pub struct IndexDef {
     pub predicate_sql: Option<String>,
     pub predicate_expr: Option<crate::parser::Expr>,
     pub collations: Vec<Collation>,
+    pub kind: IndexKind,
 }
 
 /// View definition stored in the _views metadata table.
@@ -883,6 +971,7 @@ impl TableSchema {
                 predicate_sql: idx.predicate_sql.clone(),
                 predicate_expr: idx.predicate_expr.clone(),
                 collations: idx.collations.clone(),
+                kind: idx.kind,
             })
             .collect();
 
@@ -924,7 +1013,7 @@ impl TableSchema {
     }
 }
 
-const SCHEMA_VERSION: u8 = 7;
+const SCHEMA_VERSION: u8 = 9;
 pub const TABLE_FLAG_STRICT: u8 = 0b0000_0001;
 
 fn write_opt_string(buf: &mut Vec<u8>, s: &Option<String>) {
@@ -1090,6 +1179,15 @@ impl TableSchema {
                 buf.push(*c as u8);
             }
         }
+        for idx in &self.indices {
+            match idx.kind {
+                IndexKind::BTree => buf.push(0),
+                IndexKind::Gin(ops) => {
+                    buf.push(1);
+                    buf.push(ops.as_tag());
+                }
+            }
+        }
         buf.push(self.flags);
 
         buf
@@ -1098,7 +1196,7 @@ impl TableSchema {
     pub fn deserialize(data: &[u8]) -> crate::error::Result<Self> {
         let mut pos = 0;
 
-        if data.is_empty() || !matches!(data[0], 1 | 2 | 3 | 4 | 5 | 6 | SCHEMA_VERSION) {
+        if data.is_empty() || !matches!(data[0], 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | SCHEMA_VERSION) {
             return Err(crate::error::SqlError::InvalidValue(
                 "invalid schema version".into(),
             ));
@@ -1181,6 +1279,7 @@ impl TableSchema {
                     predicate_sql: None,
                     predicate_expr: None,
                     collations: vec![],
+                    kind: IndexKind::default(),
                 });
             }
             idxs
@@ -1360,6 +1459,37 @@ impl TableSchema {
                     pos += 1;
                 }
                 idx.collations = colls;
+            }
+            if version >= 9 {
+                for idx in &mut indices {
+                    if pos >= data.len() {
+                        break;
+                    }
+                    let tag = data[pos];
+                    pos += 1;
+                    idx.kind = match tag {
+                        0 => IndexKind::BTree,
+                        1 => {
+                            if pos >= data.len() {
+                                return Err(crate::error::SqlError::InvalidValue(
+                                    "GIN index missing opclass tag".into(),
+                                ));
+                            }
+                            let ops = GinOpsClass::from_tag(data[pos]).ok_or_else(|| {
+                                crate::error::SqlError::InvalidValue(
+                                    "unknown GIN opclass tag".into(),
+                                )
+                            })?;
+                            pos += 1;
+                            IndexKind::Gin(ops)
+                        }
+                        _ => {
+                            return Err(crate::error::SqlError::InvalidValue(
+                                "unknown IndexKind tag".into(),
+                            ));
+                        }
+                    };
+                }
             }
             if pos < data.len() {
                 flags = data[pos];

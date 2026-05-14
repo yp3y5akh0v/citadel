@@ -1068,6 +1068,18 @@ pub(super) fn op_symbol(op: &BinOp) -> &'static str {
         BinOp::And => "AND",
         BinOp::Or => "OR",
         BinOp::Concat => "||",
+        BinOp::JsonGet => "->",
+        BinOp::JsonGetText => "->>",
+        BinOp::JsonPath => "#>",
+        BinOp::JsonPathText => "#>>",
+        BinOp::JsonContains => "@>",
+        BinOp::JsonContainedBy => "<@",
+        BinOp::JsonHasKey => "?",
+        BinOp::JsonHasAnyKey => "?|",
+        BinOp::JsonHasAllKeys => "?&",
+        BinOp::JsonDeletePath => "#-",
+        BinOp::JsonPathExists => "@?",
+        BinOp::JsonPathMatch => "@@",
     }
 }
 
@@ -1216,6 +1228,12 @@ pub(super) fn insert_index_entries(
                     }
                 }
                 fill_idx_table_name(&mut table_buf, &table_schema.name, &idx.name);
+
+                if let crate::types::IndexKind::Gin(ops) = idx.kind {
+                    insert_gin_entries(wtx, idx, ops, row, pk_values, &table_buf)?;
+                    continue;
+                }
+
                 encode_index_key_into(idx, row, pk_values, &mut key_buf);
                 let value = encode_index_value(idx, row, pk_values);
 
@@ -1233,6 +1251,31 @@ pub(super) fn insert_index_entries(
             Ok(())
         })
     })
+}
+
+fn insert_gin_entries(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    idx: &IndexDef,
+    ops: crate::types::GinOpsClass,
+    row: &[Value],
+    pk_values: &[Value],
+    idx_table: &[u8],
+) -> Result<()> {
+    let col_idx = idx.columns[0] as usize;
+    let value = &row[col_idx];
+    if value.is_null() {
+        return Ok(());
+    }
+    let entries = crate::json::extract_gin_entries(value, ops)?;
+    let pk_encoded = crate::encoding::encode_composite_key(pk_values);
+    for entry in entries {
+        let mut full_key = entry;
+        full_key.push(0x1F);
+        full_key.extend_from_slice(&pk_encoded);
+        wtx.table_insert(idx_table, &full_key, &[])
+            .map_err(SqlError::Storage)?;
+    }
+    Ok(())
 }
 
 pub(super) fn insert_index_entries_or_fetch(
@@ -1320,8 +1363,37 @@ pub(super) fn delete_index_entries(
             }
         }
         let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
+        if let crate::types::IndexKind::Gin(ops) = idx.kind {
+            delete_gin_entries(wtx, idx, ops, row, pk_values, &idx_table)?;
+            continue;
+        }
         let key = encode_index_key(idx, row, pk_values);
         wtx.table_delete(&idx_table, &key)
+            .map_err(SqlError::Storage)?;
+    }
+    Ok(())
+}
+
+fn delete_gin_entries(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    idx: &IndexDef,
+    ops: crate::types::GinOpsClass,
+    row: &[Value],
+    pk_values: &[Value],
+    idx_table: &[u8],
+) -> Result<()> {
+    let col_idx = idx.columns[0] as usize;
+    let value = &row[col_idx];
+    if value.is_null() {
+        return Ok(());
+    }
+    let entries = crate::json::extract_gin_entries(value, ops)?;
+    let pk_encoded = crate::encoding::encode_composite_key(pk_values);
+    for entry in entries {
+        let mut full_key = entry;
+        full_key.push(0x1F);
+        full_key.extend_from_slice(&pk_encoded);
+        wtx.table_delete(idx_table, &full_key)
             .map_err(SqlError::Storage)?;
     }
     Ok(())

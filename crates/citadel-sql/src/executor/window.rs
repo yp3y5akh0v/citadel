@@ -827,6 +827,8 @@ pub(super) fn eval_window_select(
         from: stmt.from.clone(),
         from_alias: stmt.from_alias.clone(),
         from_subquery: stmt.from_subquery.clone(),
+        from_args: stmt.from_args.clone(),
+        from_json_table: stmt.from_json_table.clone(),
         joins: stmt.joins.clone(),
         distinct: stmt.distinct,
         where_clause: None,

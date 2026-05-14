@@ -114,6 +114,7 @@ fn schema_roundtrip_with_indices() {
                 predicate_sql: None,
                 predicate_expr: None,
                 collations: vec![],
+                kind: IndexKind::default(),
             },
             IndexDef {
                 name: "idx_amount_uniq".into(),
@@ -122,6 +123,7 @@ fn schema_roundtrip_with_indices() {
                 predicate_sql: None,
                 predicate_expr: None,
                 collations: vec![],
+                kind: IndexKind::default(),
             },
         ],
         vec![],

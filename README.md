@@ -13,12 +13,12 @@
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Wins all 44 head-to-head benchmarks against unencrypted SQLite at equal cache budgets.
+Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Wins all 46 head-to-head benchmarks against unencrypted SQLite at equal cache budgets.
 
 ## Features
 
 - **Encrypted at rest** - AES-256-CTR + HMAC-SHA256 per page, verified before decryption
-- **SQL** - JOINs (INNER, LEFT, RIGHT, CROSS, FULL OUTER, LATERAL), subqueries, CTEs (recursive + WITH-DML), UNION/INTERSECT/EXCEPT, window functions, views, aggregates, indexes (partial, COLLATE), constraints, generated columns (STORED + VIRTUAL), STRICT tables, COLLATE (BINARY/NOCASE/RTRIM), ALTER TABLE, TRUNCATE, UPSERT (`ON CONFLICT`), RETURNING (with `OLD/NEW`), full FK actions (CASCADE / SET NULL / SET DEFAULT / RESTRICT), prepared statements
+- **SQL** - JOINs (INNER, LEFT, RIGHT, CROSS, FULL OUTER, LATERAL), subqueries, CTEs (recursive + WITH-DML), UNION/INTERSECT/EXCEPT, window functions, views, aggregates, indexes (partial, COLLATE, GIN), constraints, generated columns (STORED + VIRTUAL), STRICT tables, COLLATE (BINARY/NOCASE/RTRIM), JSON/JSONB types with 12 PG operators (`->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, `#-`, `@?`, `@@`), `JSON_TABLE` / `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` + SQL/JSON predicate path language, 16 JSON scalar functions + 4 JSONB aggregates, set-returning JSON functions (`jsonb_array_elements`, `jsonb_each`, `jsonb_object_keys`), ALTER TABLE, TRUNCATE, UPSERT (`ON CONFLICT`), RETURNING (with `OLD/NEW`), full FK actions (CASCADE / SET NULL / SET DEFAULT / RESTRICT), prepared statements
 - **ACID** - Copy-on-Write B+ tree, shadow paging, no WAL. Snapshot isolation with concurrent readers
 - **P2P sync** - Merkle-based table diffing over Noise-encrypted channels with PSK auth
 - **CLI** - SQL shell with tab completion, syntax highlighting, dot-commands (.backup, .verify, .rekey, .sync, .dump, ...)
@@ -28,7 +28,7 @@ Every page is encrypted and authenticated before it hits disk. The database file
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. C FFI (37 functions), WebAssembly bindings
-- **3,260+ tests** - Unit, integration, torture tests across 10 crates
+- **3,386+ tests** - Unit, integration, torture tests across 10 crates
 
 ## Benchmarks
 
@@ -52,12 +52,14 @@ upsert_returning       58.2 us        163.4 us       2.81x
 view_filter            737 us         1.70 ms        2.31x
 filter                 738 us         1.70 ms        2.30x
 window_agg             31.4 ms        71.1 ms        2.27x
+jsonb_contains         11.1 ms        24.9 ms        2.24x
 savepoint_create       324 ns         707 ns         2.20x
 sort                   1.18 ms        2.50 ms        2.12x
 upsert_counter         25.1 us        51.7 us        2.06x
 window_rank            59.5 ms        118.2 ms       1.99x
 delete_returning       87.9 us        160.2 us       1.82x
 upsert_dedup           18.0 us        31.8 us        1.77x
+json_extract           17.1 ms        29.9 ms        1.75x
 delete                 45.3 us        71.1 us        1.57x
 update                 17.8 us        27.5 us        1.54x
 correlated_exists      4.34 ms        6.59 ms        1.52x
@@ -86,20 +88,23 @@ join                   88.9 us        90.4 us        1.016x
 ### Citadel-only (no SQLite equivalent)
 
 ```
-Benchmark          Citadel        Notes
----------------------------------------------------------
-lateral            2.47 ms        LATERAL join (PG-syntax)
-date_sort          1.45 ms        native DATE/TIMESTAMP
-date_arith         1.71 ms        native DATE/TIMESTAMP
-date_range_scan    1.95 ms        native DATE/TIMESTAMP
-date_groupby       9.01 ms        native DATE/TIMESTAMP
-date_extract       12.43 ms       native DATE/TIMESTAMP
+Benchmark           Citadel
+-------------------------------
+date_extract        12.43 ms
+json_gin (no idx)   11.1 ms
+date_groupby        9.01 ms
+json_table          8.07 ms
+lateral             2.47 ms
+date_range_scan     1.95 ms
+date_arith          1.71 ms
+date_sort           1.45 ms
+json_gin (gin idx)  42.4 us
 ```
 
 <details>
 <summary>Methodology</summary>
 
-H2H benchmarks (sorted by ratio, highest first — matches table order above):
+H2H benchmarks:
 
 - **correlated_in** - `SELECT COUNT(*) FROM t WHERE id IN (SELECT id FROM ref_table WHERE ref_table.val = t.age)`
 - **full_outer_join** - `SELECT a.id, b.data FROM a FULL OUTER JOIN b ON a.id = b.a_id`
@@ -116,12 +121,14 @@ H2H benchmarks (sorted by ratio, highest first — matches table order above):
 - **view_filter** - `SELECT * FROM v WHERE age = 42`
 - **filter** - `SELECT * FROM t WHERE age = 42`
 - **window_agg** - `SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING)`
+- **jsonb_contains** - `SELECT id FROM users WHERE data @> '{"role":"admin"}'::jsonb`
 - **savepoint_create** - `BEGIN; SAVEPOINT sp; RELEASE sp; COMMIT`
 - **sort** - `SELECT * FROM t ORDER BY age LIMIT 10`
 - **upsert_counter** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1`
 - **window_rank** - `ROW_NUMBER() OVER (PARTITION BY age ORDER BY id)`
 - **delete_returning** - `DELETE ... WHERE id = ? RETURNING id, val`
 - **upsert_dedup** - `INSERT ... ON CONFLICT (id) DO NOTHING`
+- **json_extract** - `SELECT data ->> 'name' FROM users`
 - **delete** - `DELETE FROM t WHERE id = ?`
 - **update** - `UPDATE t SET age = age + 1 WHERE id BETWEEN 10000 AND 10099`
 - **correlated_exists** - `SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM ref_table WHERE ref_table.id = t.id)`
@@ -135,25 +142,27 @@ H2H benchmarks (sorted by ratio, highest first — matches table order above):
 - **scan** - `SELECT * FROM t`
 - **sort_nocase** - `SELECT name FROM t ORDER BY name COLLATE NOCASE LIMIT 10`
 - **sum** - `SELECT SUM(age) FROM t`
-- **insert_gen_virtual** - `INSERT INTO t (id, a, b) VALUES (?, ?, ?)` with VIRTUAL generated column
+- **insert_gen_virtual** - `INSERT INTO t (id, a, b) VALUES (?, ?, ?)`
 - **union** - `SELECT id, val FROM a UNION ALL SELECT id, data FROM b`
-- **select_gen_virtual** - `SELECT id, s FROM t WHERE s > ?` with VIRTUAL generated column
-- **update_gen_propagate** - `UPDATE t SET a = a + ? WHERE id = ?` propagating through generated column
-- **upsert_mixed** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1` (mixed hit/miss)
-- **upsert_all_new** - `INSERT ... ON CONFLICT (id) DO NOTHING` (all new rows)
+- **select_gen_virtual** - `SELECT id, s FROM t WHERE s > ?`
+- **update_gen_propagate** - `UPDATE t SET a = a + ? WHERE id = ?`
+- **upsert_mixed** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1`
+- **upsert_all_new** - `INSERT ... ON CONFLICT (id) DO NOTHING`
 - **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq`
-- **insert_gen_stored** - `INSERT INTO t (id, a, b) VALUES (?, ?, ?)` with STORED generated column
-- **fk_cascade** - `DELETE FROM parent WHERE id = ?` cascading to 100 child rows via FK
+- **insert_gen_stored** - `INSERT INTO t (id, a, b) VALUES (?, ?, ?)`
+- **fk_cascade** - `DELETE FROM parent WHERE id = ?`
 - **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id`
 
-Citadel-only benchmarks (no SQLite equivalent):
+Citadel-only benchmarks:
 
-- **lateral** - `SELECT c.id, p.name FROM c, LATERAL (SELECT name FROM p WHERE p.cat_id = c.id ORDER BY price DESC LIMIT 1) p`
-- **date_sort** - `SELECT id FROM events ORDER BY ts LIMIT 100`
-- **date_arith** - `SELECT COUNT(*) FROM events WHERE ts + INTERVAL '1 day' > TIMESTAMP '2024-06-01 00:00:00'`
-- **date_range_scan** - `SELECT COUNT(*) FROM events WHERE d BETWEEN DATE '2024-02-01' AND DATE '2024-03-31'`
-- **date_groupby** - `SELECT DATE_TRUNC('month', ts), COUNT(*) FROM events GROUP BY 1`
 - **date_extract** - `SELECT AVG(EXTRACT(HOUR FROM ts)) FROM events`
+- **date_groupby** - `SELECT DATE_TRUNC('month', ts), COUNT(*) FROM events GROUP BY 1`
+- **json_table** - `SELECT a, b, c FROM JSON_TABLE(j, '$[*]' COLUMNS (a INT PATH '$.a', b TEXT PATH '$.b', c INT PATH '$.c'))`
+- **lateral** - `SELECT c.id, p.name FROM c, LATERAL (SELECT name FROM p WHERE p.cat_id = c.id ORDER BY price DESC LIMIT 1) p`
+- **date_range_scan** - `SELECT COUNT(*) FROM events WHERE d BETWEEN DATE '2024-02-01' AND DATE '2024-03-31'`
+- **date_arith** - `SELECT COUNT(*) FROM events WHERE ts + INTERVAL '1 day' > TIMESTAMP '2024-06-01 00:00:00'`
+- **date_sort** - `SELECT id FROM events ORDER BY ts LIMIT 100`
+- **json_gin** - `SELECT id FROM users WHERE data @> '{"role":"admin"}'::jsonb` with vs without `CREATE INDEX ... USING gin (data)`
 
 SQLite config: `journal_mode=OFF, synchronous=OFF, cache_size=8192` (~32 MB).
 Citadel config: `SyncMode::Off, cache_size=4096` (~32 MB).

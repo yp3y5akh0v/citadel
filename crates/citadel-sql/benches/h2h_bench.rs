@@ -57,5 +57,9 @@ criterion_group!(
     h2h::with_dml::bench,
     h2h::full_outer_join::bench,
     h2h::lateral::bench,
+    h2h::json_extract::bench,
+    h2h::jsonb_contains::bench,
+    h2h::json_gin::bench,
+    h2h::json_table::bench,
 );
 criterion_main!(benches);

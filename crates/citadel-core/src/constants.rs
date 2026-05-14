@@ -50,6 +50,8 @@ pub const HKDF_INFO_BACKUP_MAC: &[u8] = b"citadel-backup-mac";
 pub const MAX_KEY_SIZE: usize = 2048;
 pub const MAX_INLINE_VALUE_SIZE: usize = 1920;
 pub const OVERFLOW_THRESHOLD: usize = MAX_INLINE_VALUE_SIZE;
+/// Hard cap including overflow chains; bounded by the cell's `val_len: u32`.
+pub const MAX_VALUE_SIZE: usize = 1 << 30; // 1 GiB
 
 pub const PENDING_FREE_ENTRY_SIZE: usize = 12; // page_id(4) + freed_at_txn(8)
 pub const PENDING_FREE_ENTRIES_PER_PAGE: usize = USABLE_SIZE / PENDING_FREE_ENTRY_SIZE; // 674

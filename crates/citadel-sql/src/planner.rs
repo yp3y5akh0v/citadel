@@ -2,7 +2,7 @@
 
 use crate::encoding::encode_composite_key;
 use crate::parser::{BinOp, Expr};
-use crate::types::{IndexDef, TableSchema, Value};
+use crate::types::{IndexDef, IndexKind, TableSchema, Value};
 
 #[derive(Debug, Clone)]
 pub enum ScanPlan {
@@ -23,6 +23,14 @@ pub enum ScanPlan {
         range_conds: Vec<(BinOp, Value)>,
         is_unique: bool,
         index_columns: Vec<u16>,
+    },
+    /// GIN inverted-index scan for `column @> predicate`. Returns candidate
+    /// row PKs; caller must recheck the full predicate on the heap row.
+    GinScan {
+        idx_table: Vec<u8>,
+        column_idx: u16,
+        probe_entries: Vec<Vec<u8>>,
+        recheck_expr: Expr,
     },
 }
 
@@ -150,6 +158,21 @@ fn flatten_between(expr: &Expr, schema: &TableSchema, out: &mut Vec<SimplePredic
 }
 
 pub fn plan_select(schema: &TableSchema, where_clause: &Option<Expr>) -> ScanPlan {
+    plan_select_inner(schema, where_clause, false)
+}
+
+/// Same as `plan_select` but allows returning `ScanPlan::GinScan` when an
+/// inverted index covers the predicate. The caller MUST handle the GinScan
+/// variant; non-supporting paths should use `plan_select` instead.
+pub fn plan_select_with_gin(schema: &TableSchema, where_clause: &Option<Expr>) -> ScanPlan {
+    plan_select_inner(schema, where_clause, true)
+}
+
+fn plan_select_inner(
+    schema: &TableSchema,
+    where_clause: &Option<Expr>,
+    allow_gin: bool,
+) -> ScanPlan {
     let where_expr = match where_clause {
         Some(e) => e,
         None => return ScanPlan::SeqScan,
@@ -186,11 +209,59 @@ pub fn plan_select(schema: &TableSchema, where_clause: &Option<Expr>) -> ScanPla
         return plan;
     }
 
+    if allow_gin {
+        if let Some(plan) = try_gin_scan(schema, where_expr) {
+            return plan;
+        }
+    }
+
     if let Some(plan) = try_best_index(schema, where_expr, &simple) {
         return plan;
     }
 
     ScanPlan::SeqScan
+}
+
+fn try_gin_scan(schema: &TableSchema, where_expr: &Expr) -> Option<ScanPlan> {
+    use crate::parser::BinOp as B;
+    let (col_idx, rhs_val) = match where_expr {
+        Expr::BinaryOp {
+            left,
+            op: B::JsonContains,
+            right,
+        } => {
+            let name = resolve_column_name(left)?;
+            let col_idx = schema.column_index(name)? as u16;
+            let rhs = resolve_literal(right)?;
+            (col_idx, rhs)
+        }
+        _ => return None,
+    };
+    let idx = schema.indices.iter().find(|i| {
+        matches!(i.kind, IndexKind::Gin(_))
+            && i.columns.first().is_some_and(|&c| c == col_idx)
+            && i.predicate_expr.is_none()
+    })?;
+    let ops = match idx.kind {
+        IndexKind::Gin(o) => o,
+        _ => return None,
+    };
+    // Skip 0x01 key-exists entries — they match every row with the key (no selectivity).
+    let probe_entries: Vec<Vec<u8>> = crate::json::extract_gin_entries(&rhs_val, ops)
+        .ok()?
+        .into_iter()
+        .filter(|e| !matches!(e.first(), Some(&0x01)))
+        .collect();
+    if probe_entries.is_empty() {
+        return None;
+    }
+    let idx_table = TableSchema::index_table_name(&schema.name, &idx.name);
+    Some(ScanPlan::GinScan {
+        idx_table,
+        column_idx: col_idx,
+        probe_entries,
+        recheck_expr: where_expr.clone(),
+    })
 }
 
 fn try_pk_range_scan(schema: &TableSchema, range_preds: &[SimplePredicate]) -> Option<ScanPlan> {
@@ -425,6 +496,8 @@ pub fn describe_plan(plan: &ScanPlan, table_schema: &TableSchema) -> String {
                 format!("USING INDEX {index_name} ({})", conditions.join(", "))
             }
         }
+
+        ScanPlan::GinScan { .. } => "USING GIN INDEX".to_string(),
     }
 }
 
@@ -447,6 +520,8 @@ fn format_value(val: &Value) -> String {
             "INTERVAL '{}'",
             crate::datetime::format_interval(*months, *days, *micros)
         ),
+        Value::Json(s) => format!("JSON '{s}'"),
+        Value::Jsonb(_) => "JSONB '<binary>'".into(),
     }
 }
 

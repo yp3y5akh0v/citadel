@@ -413,7 +413,7 @@ fn value_near_max_inline_size() {
 }
 
 #[test]
-fn value_exceeding_max_inline_size_is_rejected() {
+fn value_exceeding_max_inline_size_round_trips_via_overflow() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let conn = Connection::open(&db).unwrap();
@@ -421,15 +421,14 @@ fn value_exceeding_max_inline_size_is_rejected() {
     conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, data TEXT)")
         .unwrap();
 
-    // 1920 is MAX_INLINE_VALUE_SIZE. Row encoding overhead:
-    // col_count(2) + null_bitmap(1) + type_tag(1) + data_len(4) + data
-    // So a text value of 1920 bytes would produce an encoded row of 1928 bytes
-    let text = "B".repeat(1920);
-    let result = conn.execute(&format!("INSERT INTO t VALUES (1, '{text}')"));
-    assert!(
-        result.is_err(),
-        "value exceeding max inline size should be rejected"
-    );
+    let text = "B".repeat(50_000);
+    conn.execute(&format!("INSERT INTO t VALUES (1, '{text}')"))
+        .unwrap();
+    let qr = conn.query("SELECT data FROM t WHERE id = 1").unwrap();
+    match &qr.rows[0][0] {
+        Value::Text(s) => assert_eq!(s.len(), 50_000),
+        other => panic!("expected Text, got {other:?}"),
+    }
 }
 
 #[test]

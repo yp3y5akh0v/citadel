@@ -121,6 +121,8 @@ pub(super) fn try_fuse_cte(sq: &SelectQuery) -> Option<QueryBody> {
         from: inner.from.clone(),
         from_alias: inner.from_alias.clone(),
         from_subquery: inner.from_subquery.clone(),
+        from_args: inner.from_args.clone(),
+        from_json_table: inner.from_json_table.clone(),
         joins: vec![],
         distinct: outer.distinct,
         where_clause: merged_where,

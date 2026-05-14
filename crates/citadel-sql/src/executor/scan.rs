@@ -147,7 +147,7 @@ pub(super) fn collect_rows_read(
     where_clause: &Option<Expr>,
     limit: Option<usize>,
 ) -> Result<(Vec<Vec<Value>>, bool)> {
-    let plan = planner::plan_select(table_schema, where_clause);
+    let plan = planner::plan_select_with_gin(table_schema, where_clause);
     let lower_name = &table_schema.name;
     let columns = &table_schema.columns;
 
@@ -358,7 +358,69 @@ pub(super) fn collect_rows_read(
             }
             Ok((rows, where_clause.is_some()))
         }
+
+        ScanPlan::GinScan {
+            idx_table,
+            probe_entries,
+            recheck_expr,
+            ..
+        } => {
+            let candidate_pks = gin_intersect_candidates(db, &idx_table, &probe_entries)?;
+            let mut rows = Vec::new();
+            let mut rtx = db.begin_read();
+            let col_map = ColumnMap::new(columns);
+            for pk_key in &candidate_pks {
+                if let Some(value) = rtx
+                    .table_get(lower_name.as_bytes(), pk_key)
+                    .map_err(SqlError::Storage)?
+                {
+                    let row = decode_full_row(table_schema, pk_key, &value)?;
+                    match eval_expr(&recheck_expr, &EvalCtx::new(&col_map, &row)) {
+                        Ok(val) if is_truthy(&val) => rows.push(row),
+                        _ => {}
+                    }
+                }
+            }
+            Ok((rows, true))
+        }
     }
+}
+
+fn gin_intersect_candidates(
+    db: &Database,
+    idx_table: &[u8],
+    probe_entries: &[Vec<u8>],
+) -> Result<Vec<Vec<u8>>> {
+    use std::collections::BTreeSet;
+    let mut sets: Vec<BTreeSet<Vec<u8>>> = Vec::with_capacity(probe_entries.len());
+    let mut rtx = db.begin_read();
+    let mut scan_err: Option<SqlError> = None;
+    for entry in probe_entries {
+        let mut prefix = entry.clone();
+        prefix.push(0x1F);
+        let mut set = BTreeSet::new();
+        rtx.table_scan_from(idx_table, &prefix, |key, _value| {
+            if !key.starts_with(&prefix) {
+                return Ok(false);
+            }
+            set.insert(key[prefix.len()..].to_vec());
+            Ok(true)
+        })
+        .map_err(SqlError::Storage)?;
+        if let Some(e) = scan_err.take() {
+            return Err(e);
+        }
+        sets.push(set);
+    }
+    let mut iter = sets.into_iter();
+    let mut acc = match iter.next() {
+        Some(s) => s,
+        None => return Ok(Vec::new()),
+    };
+    for s in iter {
+        acc.retain(|x| s.contains(x));
+    }
+    Ok(acc.into_iter().collect())
 }
 
 /// Collect rows via WriteTxn using the scan plan.
@@ -581,6 +643,8 @@ pub(super) fn collect_rows_write(
             }
             Ok((rows, where_clause.is_some()))
         }
+
+        ScanPlan::GinScan { .. } => unreachable!("GinScan only from plan_select_with_gin"),
     }
 }
 
@@ -722,6 +786,8 @@ pub(super) fn collect_keyed_rows_read(
             }
             Ok(rows)
         }
+
+        ScanPlan::GinScan { .. } => unreachable!("GinScan only from plan_select_with_gin"),
     }
 }
 
@@ -860,6 +926,8 @@ pub(super) fn collect_keyed_rows_write(
             }
             Ok(rows)
         }
+
+        ScanPlan::GinScan { .. } => unreachable!("GinScan only from plan_select_with_gin"),
     }
 }
 

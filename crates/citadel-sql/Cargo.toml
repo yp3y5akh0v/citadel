@@ -26,6 +26,8 @@ lru = { workspace = true }
 compact_str = { workspace = true }
 jiff = { workspace = true }
 rustc-hash = { workspace = true }
+serde_json = { workspace = true }
+sql-json-path = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 jiff = { workspace = true, features = ["js"] }

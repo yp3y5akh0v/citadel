@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "blake3",
  "citadeldb-buffer",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-buffer"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "citadeldb-core",
  "citadeldb-crypto",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-cli"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "citadeldb",
  "citadeldb-core",
@@ -389,14 +389,14 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "citadeldb-crypto"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "aes",
  "aes-kw",
@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-ffi"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "cbindgen",
  "citadeldb",
@@ -428,7 +428,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-io"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "citadeldb-core",
  "io-uring",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-page"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "citadeldb-core",
  "xxhash-rust",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-sql"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "citadeldb",
  "citadeldb-buffer",
@@ -465,6 +465,8 @@ dependencies = [
  "rand",
  "rusqlite",
  "rustc-hash",
+ "serde_json",
+ "sql-json-path",
  "sqlparser",
  "tempfile",
  "thiserror",
@@ -472,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-sync"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "base64",
  "blake3",
@@ -489,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-txn"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "blake3",
  "citadeldb-buffer",
@@ -504,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "citadeldb-wasm"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "citadeldb",
  "citadeldb-core",
@@ -1264,6 +1266,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "minimal-lexical"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
 name = "nibble_vec"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1282,6 +1290,16 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "nom"
+version = "7.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
+dependencies = [
+ "memchr",
+ "minimal-lexical",
 ]
 
 [[package]]
@@ -1866,6 +1884,18 @@ dependencies = [
  "rustc_version",
  "sha2",
  "subtle",
+]
+
+[[package]]
+name = "sql-json-path"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa30c054bdeed860dd36c1e5a467ec4251d925246f7f57b55bfb77decc2e0ed4"
+dependencies = [
+ "nom",
+ "regex",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

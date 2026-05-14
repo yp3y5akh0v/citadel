@@ -212,5 +212,7 @@ fn cell_to_js(cell: &CellValue) -> JsValue {
         | CellValue::Time { iso, .. }
         | CellValue::Timestamp { iso, .. }
         | CellValue::Interval { iso, .. } => JsValue::from_str(iso),
+        CellValue::Json(s) => JsValue::from_str(s),
+        CellValue::Jsonb(b) => js_sys::Uint8Array::from(b.as_slice()).into(),
     }
 }

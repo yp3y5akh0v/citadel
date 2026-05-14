@@ -456,7 +456,10 @@ fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
         BinOp::LtEq => Ok(Value::Boolean(left <= right)),
         BinOp::GtEq => Ok(Value::Boolean(left >= right)),
         BinOp::Add => eval_arithmetic(left, right, i64::checked_add, |a, b| a + b),
-        BinOp::Sub => eval_arithmetic(left, right, i64::checked_sub, |a, b| a - b),
+        BinOp::Sub => match left {
+            Value::Json(_) | Value::Jsonb(_) => crate::json::op_delete_one(left, right),
+            _ => eval_arithmetic(left, right, i64::checked_sub, |a, b| a - b),
+        },
         BinOp::Mul => eval_arithmetic(left, right, i64::checked_mul, |a, b| a * b),
         BinOp::Div => {
             match right {
@@ -474,12 +477,48 @@ fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
             }
             eval_arithmetic(left, right, i64::checked_rem, |a, b| a % b)
         }
-        BinOp::Concat => {
-            let ls = value_to_text(left);
-            let rs = value_to_text(right);
-            Ok(Value::Text(format!("{ls}{rs}").into()))
-        }
+        BinOp::Concat => match (left, right) {
+            (Value::Json(_) | Value::Jsonb(_), _) | (_, Value::Json(_) | Value::Jsonb(_)) => {
+                crate::json::op_concat(left, right)
+            }
+            _ => {
+                let ls = value_to_text(left);
+                let rs = value_to_text(right);
+                Ok(Value::Text(format!("{ls}{rs}").into()))
+            }
+        },
+        BinOp::JsonGet
+        | BinOp::JsonGetText
+        | BinOp::JsonPath
+        | BinOp::JsonPathText
+        | BinOp::JsonContains
+        | BinOp::JsonContainedBy
+        | BinOp::JsonHasKey
+        | BinOp::JsonHasAnyKey
+        | BinOp::JsonHasAllKeys
+        | BinOp::JsonDeletePath
+        | BinOp::JsonPathExists
+        | BinOp::JsonPathMatch => eval_json_binary_op(left, op, right),
         BinOp::And | BinOp::Or => unreachable!(),
+    }
+}
+
+#[cold]
+fn eval_json_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
+    match op {
+        BinOp::JsonGet => crate::json::op_get(left, right),
+        BinOp::JsonGetText => crate::json::op_get_text(left, right),
+        BinOp::JsonPath => crate::json::op_path(left, right),
+        BinOp::JsonPathText => crate::json::op_path_text(left, right),
+        BinOp::JsonContains => crate::json::op_contains(left, right),
+        BinOp::JsonContainedBy => crate::json::op_contained_by(left, right),
+        BinOp::JsonHasKey => crate::json::op_has_key(left, right),
+        BinOp::JsonHasAnyKey => crate::json::op_has_any_key(left, right),
+        BinOp::JsonHasAllKeys => crate::json::op_has_all_keys(left, right),
+        BinOp::JsonDeletePath => crate::json::op_delete_path(left, right),
+        BinOp::JsonPathExists => crate::json::op_path_exists(left, right),
+        BinOp::JsonPathMatch => crate::json::op_path_match(left, right),
+        _ => unreachable!(),
     }
 }
 
@@ -494,6 +533,9 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
             Value::Date(_) | Value::Time(_) | Value::Timestamp(_) | Value::Interval { .. }
         )
     };
+    if !is_temporal(left) && !is_temporal(right) {
+        return None;
+    }
     if matches!(op, BinOp::Add | BinOp::Sub)
         && ((is_temporal(left) && matches!(right, Value::Real(_)))
             || (matches!(left, Value::Real(_)) && is_temporal(right)))
@@ -936,6 +978,8 @@ fn value_to_text(val: &Value) -> String {
             days,
             micros,
         } => crate::datetime::format_interval(*months, *days, *micros),
+        Value::Json(s) => s.to_string(),
+        Value::Jsonb(b) => crate::json::decode_to_text(b).unwrap_or_default(),
     }
 }
 
@@ -1197,6 +1241,12 @@ fn eval_cast(val: &Value, target: DataType) -> Result<Value> {
         }),
         DataType::Interval => val.clone().coerce_into(DataType::Interval).ok_or_else(|| {
             SqlError::InvalidValue(format!("cannot cast {} to INTERVAL", val.data_type()))
+        }),
+        DataType::Json => val.clone().coerce_into(DataType::Json).ok_or_else(|| {
+            SqlError::InvalidValue(format!("cannot cast {} to JSON", val.data_type()))
+        }),
+        DataType::Jsonb => val.clone().coerce_into(DataType::Jsonb).ok_or_else(|| {
+            SqlError::InvalidValue(format!("cannot cast {} to JSONB", val.data_type()))
         }),
     }
 }
@@ -1513,6 +1563,8 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 Value::Time(_) => "time",
                 Value::Timestamp(_) => "timestamp",
                 Value::Interval { .. } => "interval",
+                Value::Json(_) => "json",
+                Value::Jsonb(_) => "jsonb",
             };
             Ok(Value::Text(type_name.into()))
         }
@@ -2079,6 +2131,216 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             }
             let formatted = crate::datetime::format_timestamp_in_zone(ts, &zone)?;
             Ok(Value::Text(formatted.into()))
+        }
+        "JSONB_TYPEOF" | "JSON_TYPEOF" => {
+            check_args(name, &evaluated, 1)?;
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_typeof(&evaluated[0])
+        }
+        "JSONB_ARRAY_LENGTH" | "JSON_ARRAY_LENGTH" => {
+            check_args(name, &evaluated, 1)?;
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_array_length(&evaluated[0])
+        }
+        "JSONB_OBJECT_LENGTH" | "JSON_OBJECT_LENGTH" => {
+            check_args(name, &evaluated, 1)?;
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_object_length(&evaluated[0])
+        }
+        "JSONB_EXTRACT_PATH" | "JSON_EXTRACT_PATH" => {
+            if evaluated.is_empty() {
+                return Err(SqlError::InvalidValue(format!(
+                    "{name} requires at least 1 argument"
+                )));
+            }
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let target = if name.eq_ignore_ascii_case("JSONB_EXTRACT_PATH") {
+                crate::types::DataType::Jsonb
+            } else {
+                crate::types::DataType::Json
+            };
+            crate::json::fn_extract_path(&evaluated, target, false)
+        }
+        "JSONB_EXTRACT_PATH_TEXT" | "JSON_EXTRACT_PATH_TEXT" => {
+            if evaluated.is_empty() {
+                return Err(SqlError::InvalidValue(format!(
+                    "{name} requires at least 1 argument"
+                )));
+            }
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_extract_path(&evaluated, crate::types::DataType::Text, true)
+        }
+        "JSON_EXTRACT" => {
+            check_args(name, &evaluated, 2)?;
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_sqlite_extract(&evaluated[0], &evaluated[1])
+        }
+        "JSON_VALID" => {
+            check_args(name, &evaluated, 1)?;
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_valid(&evaluated[0])
+        }
+        "JSONB_STRIP_NULLS" | "JSON_STRIP_NULLS" => {
+            check_args(name, &evaluated, 1)?;
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let target = if name.eq_ignore_ascii_case("JSONB_STRIP_NULLS") {
+                crate::types::DataType::Jsonb
+            } else {
+                crate::types::DataType::Json
+            };
+            crate::json::fn_strip_nulls(&evaluated[0], target)
+        }
+        "JSONB_PRETTY" | "JSON_PRETTY" => {
+            check_args(name, &evaluated, 1)?;
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_pretty(&evaluated[0])
+        }
+        "JSONB_BUILD_OBJECT" | "JSON_BUILD_OBJECT" => {
+            let target = if name.eq_ignore_ascii_case("JSONB_BUILD_OBJECT") {
+                crate::types::DataType::Jsonb
+            } else {
+                crate::types::DataType::Json
+            };
+            crate::json::fn_build_object(&evaluated, target)
+        }
+        "JSONB_BUILD_ARRAY" | "JSON_BUILD_ARRAY" => {
+            let target = if name.eq_ignore_ascii_case("JSONB_BUILD_ARRAY") {
+                crate::types::DataType::Jsonb
+            } else {
+                crate::types::DataType::Json
+            };
+            crate::json::fn_build_array(&evaluated, target)
+        }
+        "JSONB_SET" | "JSON_SET" => {
+            if !(3..=4).contains(&evaluated.len()) {
+                return Err(SqlError::InvalidValue(format!(
+                    "{name} requires 3 or 4 arguments"
+                )));
+            }
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let target = if name.eq_ignore_ascii_case("JSONB_SET") {
+                crate::types::DataType::Jsonb
+            } else {
+                crate::types::DataType::Json
+            };
+            let create_missing = evaluated
+                .get(3)
+                .map(|v| matches!(v, Value::Boolean(true)))
+                .unwrap_or(true);
+            crate::json::fn_set(
+                &evaluated[0],
+                &evaluated[1],
+                &evaluated[2],
+                create_missing,
+                target,
+            )
+        }
+        "JSONB_INSERT" | "JSON_INSERT" => {
+            if !(3..=4).contains(&evaluated.len()) {
+                return Err(SqlError::InvalidValue(format!(
+                    "{name} requires 3 or 4 arguments"
+                )));
+            }
+            if evaluated[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let target = if name.eq_ignore_ascii_case("JSONB_INSERT") {
+                crate::types::DataType::Jsonb
+            } else {
+                crate::types::DataType::Json
+            };
+            let insert_after = evaluated
+                .get(3)
+                .map(|v| matches!(v, Value::Boolean(true)))
+                .unwrap_or(false);
+            crate::json::fn_insert(
+                &evaluated[0],
+                &evaluated[1],
+                &evaluated[2],
+                insert_after,
+                target,
+            )
+        }
+        "TO_JSONB" | "TO_JSON" => {
+            check_args(name, &evaluated, 1)?;
+            let target = if name.eq_ignore_ascii_case("TO_JSONB") {
+                crate::types::DataType::Jsonb
+            } else {
+                crate::types::DataType::Json
+            };
+            crate::json::fn_to_json(&evaluated[0], target)
+        }
+        "ROW_TO_JSON" | "ROW_TO_JSONB" => {
+            check_args(name, &evaluated, 1)?;
+            let target = if name.eq_ignore_ascii_case("ROW_TO_JSONB") {
+                crate::types::DataType::Jsonb
+            } else {
+                crate::types::DataType::Json
+            };
+            crate::json::fn_to_json(&evaluated[0], target)
+        }
+        "JSON_OBJECT" => crate::json::fn_json_object(&evaluated),
+        "JSON_EXISTS" => {
+            check_args(name, &evaluated, 2)?;
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_json_exists(&evaluated[0], &evaluated[1])
+        }
+        "JSON_VALUE" => {
+            check_args(name, &evaluated, 2)?;
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_json_value(&evaluated[0], &evaluated[1])
+        }
+        "JSON_QUERY" => {
+            check_args(name, &evaluated, 2)?;
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_json_query(&evaluated[0], &evaluated[1], crate::types::DataType::Jsonb)
+        }
+        "JSONB_HAS_KEY" | "JSON_HAS_KEY" => {
+            check_args(name, &evaluated, 2)?;
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::op_has_key(&evaluated[0], &evaluated[1])
+        }
+        "JSONB_HAS_ANY_KEY" | "JSON_HAS_ANY_KEY" => {
+            check_args(name, &evaluated, 2)?;
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::op_has_any_key(&evaluated[0], &evaluated[1])
+        }
+        "JSONB_HAS_ALL_KEYS" | "JSON_HAS_ALL_KEYS" => {
+            check_args(name, &evaluated, 2)?;
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::op_has_all_keys(&evaluated[0], &evaluated[1])
         }
         _ => Err(SqlError::Unsupported(format!("scalar function: {name}"))),
     }

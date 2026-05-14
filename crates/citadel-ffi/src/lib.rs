@@ -1052,6 +1052,8 @@ pub enum CitadelValueType {
     Time = 7,
     Timestamp = 8,
     Interval = 9,
+    Json = 10,
+    Jsonb = 11,
 }
 
 /// Get the type of a value in a query result cell.
@@ -1078,6 +1080,8 @@ pub extern "C" fn citadel_sql_value_type(
         Some(Value::Time(_)) => CitadelValueType::Time,
         Some(Value::Timestamp(_)) => CitadelValueType::Timestamp,
         Some(Value::Interval { .. }) => CitadelValueType::Interval,
+        Some(Value::Json(_)) => CitadelValueType::Json,
+        Some(Value::Jsonb(_)) => CitadelValueType::Jsonb,
     }
 }
 

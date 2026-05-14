@@ -3,6 +3,9 @@
 use citadel_buffer::cursor::{Cursor, PageLoader};
 use citadel_core::types::ValueType;
 use citadel_core::Result;
+use citadel_page::leaf_node::OverflowRef;
+
+use crate::overflow_io;
 
 /// Lending iterator over `(key, value)` byte pairs for a table scan.
 ///
@@ -43,12 +46,27 @@ impl<T: TxnScanAdapter> TableIter<T> {
             }
             let found = self.inner.with_loader(&mut |pages| {
                 let mut emit = false;
-                if let Some(entry) = cursor.current_ref_lazy(pages) {
-                    if entry.val_type != ValueType::Tombstone {
+                let kind = cursor.current_ref_lazy(pages).map(|c| c.val_type);
+                match kind {
+                    Some(ValueType::Tombstone) | None => {}
+                    Some(ValueType::Inline) => {
+                        let entry = cursor.current_ref_lazy(pages).unwrap();
                         key_buf.clear();
                         key_buf.extend_from_slice(entry.key);
                         value_buf.clear();
                         value_buf.extend_from_slice(entry.value);
+                        emit = true;
+                    }
+                    Some(ValueType::Overflow) => {
+                        let oref = {
+                            let c = cursor.current_ref_lazy(pages).unwrap();
+                            key_buf.clear();
+                            key_buf.extend_from_slice(c.key);
+                            OverflowRef::from_bytes(c.value)
+                        };
+                        let materialized = overflow_io::read_chain_value(pages, &oref)?;
+                        value_buf.clear();
+                        value_buf.extend_from_slice(&materialized);
                         emit = true;
                     }
                 }

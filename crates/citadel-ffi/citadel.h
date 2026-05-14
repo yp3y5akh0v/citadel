@@ -55,6 +55,8 @@ enum CitadelValueType
     Time = 7,
     Timestamp = 8,
     Interval = 9,
+    Json = 10,
+    Jsonb = 11,
 };
 #ifndef __cplusplus
 typedef int32_t CitadelValueType;

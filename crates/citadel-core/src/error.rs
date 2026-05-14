@@ -84,6 +84,9 @@ pub enum Error {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("corrupted overflow chain: {0}")]
+    CorruptOverflowChain(String),
 }
 
 #[cfg(test)]

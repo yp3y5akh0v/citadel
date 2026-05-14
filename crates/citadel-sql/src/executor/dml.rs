@@ -298,10 +298,10 @@ pub(super) fn exec_insert(
                 max: citadel_core::MAX_KEY_SIZE,
             });
         }
-        if value_buf.len() > citadel_core::MAX_INLINE_VALUE_SIZE {
+        if value_buf.len() > citadel_core::MAX_VALUE_SIZE {
             return Err(SqlError::RowTooLarge {
                 size: value_buf.len(),
-                max: citadel_core::MAX_INLINE_VALUE_SIZE,
+                max: citadel_core::MAX_VALUE_SIZE,
             });
         }
 
@@ -655,6 +655,8 @@ pub(super) fn materialize_stmt(
         from: stmt.from.clone(),
         from_alias: stmt.from_alias.clone(),
         from_subquery: stmt.from_subquery.clone(),
+        from_args: stmt.from_args.clone(),
+        from_json_table: stmt.from_json_table.clone(),
         joins,
         distinct: stmt.distinct,
         where_clause,
@@ -1620,10 +1622,10 @@ fn exec_insert_in_txn_impl(
                 max: citadel_core::MAX_KEY_SIZE,
             });
         }
-        if bufs.value_buf.len() > citadel_core::MAX_INLINE_VALUE_SIZE {
+        if bufs.value_buf.len() > citadel_core::MAX_VALUE_SIZE {
             return Err(SqlError::RowTooLarge {
                 size: bufs.value_buf.len(),
-                max: citadel_core::MAX_INLINE_VALUE_SIZE,
+                max: citadel_core::MAX_VALUE_SIZE,
             });
         }
 
@@ -2233,10 +2235,10 @@ fn apply_fast_path_patch(
             }
         }
 
-        if bufs.new_value_buf.len() > citadel_core::MAX_INLINE_VALUE_SIZE {
+        if bufs.new_value_buf.len() > citadel_core::MAX_VALUE_SIZE {
             return Err(SqlError::RowTooLarge {
                 size: bufs.new_value_buf.len(),
-                max: citadel_core::MAX_INLINE_VALUE_SIZE,
+                max: citadel_core::MAX_VALUE_SIZE,
             });
         }
 
@@ -2386,10 +2388,10 @@ fn apply_do_update_fused(
                 new_value_buf.clear();
                 crate::encoding::encode_row_into(value_values, new_value_buf);
 
-                if new_value_buf.len() > citadel_core::MAX_INLINE_VALUE_SIZE {
+                if new_value_buf.len() > citadel_core::MAX_VALUE_SIZE {
                     return Err(SqlError::RowTooLarge {
                         size: new_value_buf.len(),
-                        max: citadel_core::MAX_INLINE_VALUE_SIZE,
+                        max: citadel_core::MAX_VALUE_SIZE,
                     });
                 }
 
@@ -2622,10 +2624,10 @@ fn apply_do_update_with_old_row(
     let mut new_value_buf = Vec::with_capacity(256);
     crate::encoding::encode_row_into(&value_values, &mut new_value_buf);
 
-    if new_value_buf.len() > citadel_core::MAX_INLINE_VALUE_SIZE {
+    if new_value_buf.len() > citadel_core::MAX_VALUE_SIZE {
         return Err(SqlError::RowTooLarge {
             size: new_value_buf.len(),
-            max: citadel_core::MAX_INLINE_VALUE_SIZE,
+            max: citadel_core::MAX_VALUE_SIZE,
         });
     }
 

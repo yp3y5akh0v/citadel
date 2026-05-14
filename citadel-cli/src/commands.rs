@@ -760,6 +760,15 @@ fn sql_literal(v: &citadel_sql::Value) -> String {
             "INTERVAL '{}'",
             citadel_sql::datetime::format_interval(*months, *days, *micros)
         ),
+        citadel_sql::Value::Json(s) => {
+            let escaped = s.replace('\'', "''");
+            format!("'{escaped}'::json")
+        }
+        citadel_sql::Value::Jsonb(b) => {
+            let text = citadel_sql::json::decode_to_text(b).unwrap_or_default();
+            let escaped = text.replace('\'', "''");
+            format!("'{escaped}'::jsonb")
+        }
     }
 }
 

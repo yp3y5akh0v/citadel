@@ -194,6 +194,8 @@ pub enum CellValue {
         micros: i64,
         iso: String,
     },
+    Json(String),
+    Jsonb(Vec<u8>),
 }
 
 impl CellValue {
@@ -227,6 +229,8 @@ impl CellValue {
                 micros: *micros,
                 iso: citadel_sql::datetime::format_interval(*months, *days, *micros),
             },
+            Value::Json(s) => CellValue::Json(s.to_string()),
+            Value::Jsonb(b) => CellValue::Jsonb(b.to_vec()),
         }
     }
 }

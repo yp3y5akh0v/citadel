@@ -121,6 +121,13 @@ pub(super) fn exec_select(
         return exec_select_with_derived(db, schema, stmt, ctes);
     }
 
+    if stmt.from_args.is_some() && crate::json::is_srf_name(&stmt.from) {
+        return exec_select_with_srf(db, schema, stmt, ctes);
+    }
+    if stmt.from_json_table.is_some() {
+        return exec_select_with_json_table(db, schema, stmt, ctes);
+    }
+
     let lower_name = stmt.from.to_ascii_lowercase();
 
     // Built-in TVFs (reserved names — cannot collide with user tables).
@@ -181,6 +188,8 @@ pub(super) fn exec_select(
                     from: stmt.from.clone(),
                     from_alias: stmt.from_alias.clone(),
                     from_subquery: stmt.from_subquery.clone(),
+                    from_args: stmt.from_args.clone(),
+                    from_json_table: stmt.from_json_table.clone(),
                     joins: vec![],
                     distinct: stmt.distinct,
                     order_by: stmt.order_by.clone(),
@@ -243,6 +252,8 @@ pub(super) fn exec_select(
             from: stmt.from.clone(),
             from_alias: stmt.from_alias.clone(),
             from_subquery: stmt.from_subquery.clone(),
+            from_args: stmt.from_args.clone(),
+            from_json_table: stmt.from_json_table.clone(),
             joins: stmt.joins.clone(),
             distinct: stmt.distinct,
             order_by: stmt.order_by.clone(),
@@ -1916,6 +1927,62 @@ fn materialize_derived(
     io.exec_select(schema, &derived.query)
 }
 
+fn exec_select_with_srf(
+    db: &Database,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+    ctes: &CteContext,
+) -> Result<ExecutionResult> {
+    let args_exprs = stmt
+        .from_args
+        .as_ref()
+        .expect("from_args present when exec_select_with_srf called");
+    let arg_values: Vec<Value> = args_exprs
+        .iter()
+        .map(|e| {
+            let col_map = ColumnMap::new(&[]);
+            eval_expr(e, &EvalCtx::new(&col_map, &[]))
+        })
+        .collect::<Result<_>>()?;
+    let (columns, rows) = crate::json::dispatch_srf(&stmt.from, &arg_values)?;
+    let alias = stmt
+        .from_alias
+        .clone()
+        .unwrap_or_else(|| stmt.from.to_ascii_lowercase());
+
+    let mut new_ctes = ctes.clone();
+    new_ctes.insert(alias.to_ascii_lowercase(), QueryResult { columns, rows });
+
+    let mut new_stmt = stmt.clone();
+    new_stmt.from = alias;
+    new_stmt.from_args = None;
+    exec_select(db, schema, &new_stmt, &new_ctes)
+}
+
+fn exec_select_with_json_table(
+    db: &Database,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+    ctes: &CteContext,
+) -> Result<ExecutionResult> {
+    let spec = stmt
+        .from_json_table
+        .as_ref()
+        .expect("from_json_table present when exec_select_with_json_table called");
+    let col_map = ColumnMap::new(&[]);
+    let source_val = eval_expr(&spec.source, &EvalCtx::new(&col_map, &[]))?;
+    let (columns, rows) = crate::json::materialize_json_table(&source_val, spec)?;
+
+    let alias = stmt.from_alias.clone().unwrap_or_else(|| stmt.from.clone());
+    let mut new_ctes = ctes.clone();
+    new_ctes.insert(alias.to_ascii_lowercase(), QueryResult { columns, rows });
+
+    let mut new_stmt = stmt.clone();
+    new_stmt.from = alias;
+    new_stmt.from_json_table = None;
+    exec_select(db, schema, &new_stmt, &new_ctes)
+}
+
 fn exec_select_with_derived(
     db: &Database,
     schema: &SchemaManager,
@@ -1940,6 +2007,7 @@ fn exec_select_with_derived(
             j.table = TableRef {
                 name: d.alias.clone(),
                 alias: None,
+                args: None,
             };
         }
     }
@@ -2028,11 +2096,14 @@ fn exec_select_lateral_with_io(
                 from: format!("__lateral_outer_{}", join.table.name),
                 from_alias: None,
                 from_subquery: None,
+                from_args: None,
+                from_json_table: None,
                 joins: vec![JoinClause {
                     join_type: join.join_type,
                     table: TableRef {
                         name: derived.alias.clone(),
                         alias: None,
+                        args: None,
                     },
                     subquery: None,
                     on_clause: join.on_clause.clone(),
@@ -2182,6 +2253,8 @@ fn exec_select_lateral_with_io(
         from: current_alias,
         from_alias: None,
         from_subquery: None,
+        from_args: None,
+        from_json_table: None,
         joins: vec![],
         distinct: stmt.distinct,
         order_by: stmt.order_by.clone(),
@@ -2295,6 +2368,8 @@ fn try_lateral_decorrelated(
         from: inner_table.clone(),
         from_alias: sel.from_alias.clone(),
         from_subquery: None,
+        from_args: None,
+        from_json_table: None,
         joins: vec![],
         distinct: false,
         where_clause: residual_where,
@@ -2585,6 +2660,8 @@ fn bind_select_with_outer(
         from: sel.from.clone(),
         from_alias: sel.from_alias.clone(),
         from_subquery: sel.from_subquery.clone(),
+        from_args: sel.from_args.clone(),
+        from_json_table: sel.from_json_table.clone(),
         joins: sel.joins.clone(),
         distinct: sel.distinct,
         where_clause,

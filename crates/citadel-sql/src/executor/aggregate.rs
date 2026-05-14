@@ -131,6 +131,33 @@ pub(super) fn eval_aggregate_expr(
             distinct,
         } if is_aggregate_function(name, args.len()) => {
             let func = name.to_ascii_uppercase();
+            if matches!(func.as_str(), "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG") {
+                if args.len() != 2 {
+                    return Err(SqlError::Unsupported(format!(
+                        "{func} requires 2 arguments"
+                    )));
+                }
+                if *distinct {
+                    return Err(SqlError::Unsupported(format!(
+                        "DISTINCT not supported with {func}"
+                    )));
+                }
+                let pairs: Vec<(Value, Value)> = group_rows
+                    .iter()
+                    .map(|row| {
+                        let ctx = EvalCtx::new(col_map, row);
+                        let k = eval_expr(&args[0], &ctx)?;
+                        let v = eval_expr(&args[1], &ctx)?;
+                        Ok((k, v))
+                    })
+                    .collect::<Result<_>>()?;
+                let target = if func == "JSONB_OBJECT_AGG" {
+                    crate::types::DataType::Jsonb
+                } else {
+                    crate::types::DataType::Json
+                };
+                return crate::json::agg_object(&pairs, target);
+            }
             if args.len() != 1 {
                 return Err(SqlError::Unsupported(format!(
                     "{func} with {} args",
@@ -342,6 +369,14 @@ pub(super) fn eval_aggregate_expr(
                     }
                     Ok(max.cloned().unwrap_or(Value::Null))
                 }
+                "JSON_AGG" | "JSONB_AGG" => {
+                    let target = if func.eq_ignore_ascii_case("JSONB_AGG") {
+                        crate::types::DataType::Jsonb
+                    } else {
+                        crate::types::DataType::Json
+                    };
+                    crate::json::agg_array(&values, target)
+                }
                 _ => Err(SqlError::Unsupported(format!("aggregate function: {func}"))),
             }
         }
@@ -511,8 +546,11 @@ pub(super) fn eval_aggregate_expr(
 
 pub(super) fn is_aggregate_function(name: &str, arg_count: usize) -> bool {
     let u = name.to_ascii_uppercase();
-    matches!(u.as_str(), "COUNT" | "SUM" | "AVG")
-        || (matches!(u.as_str(), "MIN" | "MAX") && arg_count == 1)
+    matches!(
+        u.as_str(),
+        "COUNT" | "SUM" | "AVG" | "JSON_AGG" | "JSONB_AGG"
+    ) || (matches!(u.as_str(), "MIN" | "MAX") && arg_count == 1)
+        || (matches!(u.as_str(), "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG") && arg_count == 2)
 }
 
 pub(super) fn is_aggregate_expr(expr: &Expr) -> bool {

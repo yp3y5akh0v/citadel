@@ -783,6 +783,8 @@ pub(super) fn exec_update(
             from: stmt.table.clone(),
             from_alias: None,
             from_subquery: None,
+            from_args: None,
+            from_json_table: None,
             joins: vec![],
             distinct: false,
             where_clause: stmt.where_clause.clone(),
@@ -1441,6 +1443,8 @@ pub(super) fn exec_delete(
             from: stmt.table.clone(),
             from_alias: None,
             from_subquery: None,
+            from_args: None,
+            from_json_table: None,
             joins: vec![],
             distinct: false,
             where_clause: stmt.where_clause.clone(),
@@ -1632,6 +1636,7 @@ pub(super) fn exec_select_in_txn(
                 j.table = crate::parser::TableRef {
                     name: d.alias.clone(),
                     alias: None,
+                    args: None,
                 };
             }
         }
@@ -1725,6 +1730,8 @@ pub(super) fn exec_select_in_txn(
             from: stmt.from.clone(),
             from_alias: stmt.from_alias.clone(),
             from_subquery: stmt.from_subquery.clone(),
+            from_args: stmt.from_args.clone(),
+            from_json_table: stmt.from_json_table.clone(),
             joins: stmt.joins.clone(),
             distinct: stmt.distinct,
             order_by: stmt.order_by.clone(),

@@ -72,11 +72,13 @@ db.free();
 
 ## SQL Support
 
-**Statements** - CREATE/DROP TABLE (incl. `STRICT`), ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE/DROP INDEX (UNIQUE + multi-column + partial `WHERE` + per-column `COLLATE`), CREATE/DROP VIEW, INSERT (VALUES, SELECT, ON CONFLICT DO NOTHING/DO UPDATE), SELECT, UPDATE, DELETE, TRUNCATE TABLE, RETURNING (with `OLD`/`NEW` row aliases), generated columns (`GENERATED ALWAYS AS (...) STORED|VIRTUAL`), BEGIN/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, SET TIME ZONE, EXPLAIN
+**Statements** - CREATE/DROP TABLE (incl. `STRICT`), ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE/DROP INDEX (UNIQUE + multi-column + partial `WHERE` + per-column `COLLATE` + `USING gin` for JSONB), CREATE/DROP VIEW, INSERT (VALUES, SELECT, ON CONFLICT DO NOTHING/DO UPDATE), SELECT, UPDATE, DELETE, TRUNCATE TABLE, RETURNING (with `OLD`/`NEW` row aliases), generated columns (`GENERATED ALWAYS AS (...) STORED|VIRTUAL`), BEGIN/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, SET TIME ZONE, EXPLAIN
+
+**Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN, DATE, TIME, TIMESTAMP (with timezone), INTERVAL, **JSON** (lossless text), **JSONB** (canonical binary). Large values spill to overflow page chains transparently.
+
+**JSON / JSONB** - 12 PG operators (`->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, `#-`, `@?`, `@@`), 16 scalar functions (`jsonb_typeof`, `jsonb_extract_path`, `jsonb_set`, `jsonb_pretty`, `to_jsonb`, etc.), 4 aggregates (`json_agg`, `jsonb_agg`, `json_object_agg`, `jsonb_object_agg`), 5 set-returning functions (`jsonb_array_elements`, `jsonb_each`, `jsonb_object_keys`, etc.), `JSON_TABLE` / `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` with full SQL/JSON predicate path language (e.g. `$.items[*] ? (@.x > 5)`), GIN inverted indexes (`CREATE INDEX … USING gin`) for accelerated `@>` containment
 
 **Constraints** - PRIMARY KEY, NOT NULL, UNIQUE (column + table level, inline or `CREATE UNIQUE INDEX`), DEFAULT, CHECK (column + table level), FOREIGN KEY with full referential actions (`ON DELETE` / `ON UPDATE` `CASCADE` / `SET NULL` / `SET DEFAULT` / `RESTRICT` / `NO ACTION`)
-
-**Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN, DATE, TIME, TIMESTAMP (with timezone), INTERVAL
 
 **Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS, FULL OUTER, LATERAL), subqueries (scalar, IN, EXISTS, correlated), CTEs (`WITH` / `WITH RECURSIVE` / WITH-DML: `WITH x AS (INSERT/UPDATE/DELETE … [RETURNING *]) SELECT …`), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, GROUP BY/HAVING, ORDER BY (incl. `COLLATE`), LIMIT/OFFSET, `COLLATE` (BINARY/NOCASE/RTRIM)
 

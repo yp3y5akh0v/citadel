@@ -14,6 +14,8 @@ const TAG_TIME: u8 = 0x06;
 const TAG_DATE: u8 = 0x07;
 const TAG_TIMESTAMP: u8 = 0x08;
 const TAG_INTERVAL: u8 = 0x09;
+const TAG_JSON: u8 = 0x0A;
+const TAG_JSONB: u8 = 0x0B;
 
 /// Encode a single value into an order-preserving byte sequence.
 pub fn encode_key_value(value: &Value) -> Vec<u8> {
@@ -98,6 +100,8 @@ pub(crate) fn encode_key_value_into(value: &Value, buf: &mut Vec<u8>) {
             ub[0] ^= 0x80;
             buf.extend_from_slice(&ub);
         }
+        Value::Json(s) => encode_bytes_into(TAG_JSON, s.as_bytes(), buf),
+        Value::Jsonb(b) => encode_bytes_into(TAG_JSONB, b, buf),
     }
 }
 
@@ -213,6 +217,16 @@ pub fn decode_key_value(data: &[u8]) -> Result<(Value, usize)> {
         TAG_BLOB => {
             let (bytes, n) = decode_null_escaped(&data[1..])?;
             Ok((Value::Blob(bytes), n + 1))
+        }
+        TAG_JSON => {
+            let (bytes, n) = decode_null_escaped(&data[1..])?;
+            let s = String::from_utf8(bytes)
+                .map_err(|_| SqlError::InvalidValue("invalid UTF-8 in JSON key".into()))?;
+            Ok((Value::Json(CompactString::from(s)), n + 1))
+        }
+        TAG_JSONB => {
+            let (bytes, n) = decode_null_escaped(&data[1..])?;
+            Ok((Value::Jsonb(std::sync::Arc::from(bytes)), n + 1))
         }
         tag => Err(SqlError::InvalidValue(format!("unknown key tag: {tag:#x}"))),
     }
@@ -353,6 +367,17 @@ fn encode_cell_v2(v: &Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&days.to_le_bytes());
             buf.extend_from_slice(&micros.to_le_bytes());
         }
+        Value::Json(s) => {
+            let bytes = s.as_bytes();
+            buf.push(DataType::Json.type_tag());
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        Value::Jsonb(b) => {
+            buf.push(DataType::Jsonb.type_tag());
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
         Value::Null => unreachable!(),
     }
 }
@@ -474,6 +499,12 @@ fn decode_value(type_tag: u8, data: &[u8]) -> Result<Value> {
                 micros,
             })
         }
+        Some(DataType::Json) => {
+            let s = std::str::from_utf8(data)
+                .map_err(|_| SqlError::InvalidValue("invalid UTF-8 in JSON column".into()))?;
+            Ok(Value::Json(CompactString::from(s)))
+        }
+        Some(DataType::Jsonb) => Ok(Value::Jsonb(std::sync::Arc::from(data))),
         _ => Err(SqlError::InvalidValue(format!(
             "unknown column type tag: {type_tag}"
         ))),
@@ -498,7 +529,7 @@ pub(crate) fn fixed_width_size(type_tag: u8) -> Option<usize> {
         DataType::Date => Some(4),
         DataType::Boolean => Some(1),
         DataType::Interval => Some(16),
-        DataType::Text | DataType::Blob | DataType::Null => None,
+        DataType::Text | DataType::Blob | DataType::Json | DataType::Jsonb | DataType::Null => None,
     }
 }
 
@@ -734,6 +765,8 @@ pub enum RawColumn<'a> {
     Date(i32),
     Timestamp(i64),
     Interval { months: i32, days: i32, micros: i64 },
+    Json(&'a str),
+    Jsonb(&'a [u8]),
 }
 
 impl<'a> RawColumn<'a> {
@@ -757,6 +790,8 @@ impl<'a> RawColumn<'a> {
                 days,
                 micros,
             },
+            RawColumn::Json(s) => Value::Json(CompactString::from(s)),
+            RawColumn::Jsonb(b) => Value::Jsonb(std::sync::Arc::from(b)),
         }
     }
 
@@ -787,6 +822,8 @@ impl<'a> RawColumn<'a> {
                     micros: bu,
                 },
             ) => Some(am.cmp(bm).then(ad.cmp(bd)).then(au.cmp(bu))),
+            (RawColumn::Json(a), Value::Json(b)) => Some((*a).cmp(b.as_str())),
+            (RawColumn::Jsonb(a), Value::Jsonb(b)) => Some((*a).cmp(b.as_ref())),
             _ => None,
         }
     }
@@ -816,6 +853,8 @@ impl<'a> RawColumn<'a> {
                     micros: bu,
                 },
             ) => am == bm && ad == bd && au == bu,
+            (RawColumn::Json(a), Value::Json(b)) => *a == b.as_str(),
+            (RawColumn::Jsonb(a), Value::Jsonb(b)) => *a == b.as_ref(),
             _ => false,
         }
     }
@@ -876,6 +915,12 @@ fn decode_value_raw(type_tag: u8, data: &[u8]) -> Result<RawColumn<'_>> {
                 micros,
             })
         }
+        Some(DataType::Json) => {
+            let s = std::str::from_utf8(data)
+                .map_err(|_| SqlError::InvalidValue("invalid UTF-8 in JSON column".into()))?;
+            Ok(RawColumn::Json(s))
+        }
+        Some(DataType::Jsonb) => Ok(RawColumn::Jsonb(data)),
         _ => Err(SqlError::InvalidValue(format!(
             "unknown column type tag: {type_tag}"
         ))),
@@ -925,6 +970,8 @@ pub fn patch_column_in_place(data: &mut [u8], target: usize, new_val: &Value) ->
         Value::Boolean(_) => 1,
         Value::Text(s) => s.len(),
         Value::Blob(b) => b.len(),
+        Value::Json(s) => s.len(),
+        Value::Jsonb(b) => b.len(),
         Value::Null => return Ok(false),
     };
     if new_data_len != old_data_len {
@@ -940,6 +987,8 @@ pub fn patch_column_in_place(data: &mut [u8], target: usize, new_val: &Value) ->
         Value::Time(t) => data[val_start..val_start + 8].copy_from_slice(&t.to_le_bytes()),
         Value::Date(d) => data[val_start..val_start + 4].copy_from_slice(&d.to_le_bytes()),
         Value::Timestamp(t) => data[val_start..val_start + 8].copy_from_slice(&t.to_le_bytes()),
+        Value::Json(s) => data[val_start..val_start + s.len()].copy_from_slice(s.as_bytes()),
+        Value::Jsonb(b) => data[val_start..val_start + b.len()].copy_from_slice(b),
         Value::Interval {
             months,
             days,
@@ -1097,6 +1146,8 @@ pub fn patch_at_offset(data: &mut [u8], offset: usize, new_val: &Value) -> Resul
         Value::Boolean(_) => 1,
         Value::Text(s) => s.len(),
         Value::Blob(b) => b.len(),
+        Value::Json(s) => s.len(),
+        Value::Jsonb(b) => b.len(),
         Value::Null => return Ok(false),
     };
     if new_data_len != old_data_len {
@@ -1112,6 +1163,8 @@ pub fn patch_at_offset(data: &mut [u8], offset: usize, new_val: &Value) -> Resul
         Value::Time(t) => data[val_start..val_start + 8].copy_from_slice(&t.to_le_bytes()),
         Value::Date(d) => data[val_start..val_start + 4].copy_from_slice(&d.to_le_bytes()),
         Value::Timestamp(t) => data[val_start..val_start + 8].copy_from_slice(&t.to_le_bytes()),
+        Value::Json(s) => data[val_start..val_start + s.len()].copy_from_slice(s.as_bytes()),
+        Value::Jsonb(b) => data[val_start..val_start + b.len()].copy_from_slice(b),
         Value::Interval {
             months,
             days,

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use citadel_core::types::{PageId, PageType, TxnId, ValueType};
 use citadel_core::{Error, Result};
 use citadel_io::file_manager::CommitSlot;
+use citadel_page::leaf_node::OverflowRef;
 use citadel_page::page::Page;
 use citadel_page::{branch_node, leaf_node};
 
@@ -13,6 +14,7 @@ use citadel_buffer::cursor::{Cursor, PageLoader, PageMap};
 
 use crate::catalog::TableDescriptor;
 use crate::manager::TxnManager;
+use crate::overflow_io;
 
 struct ReadPages<'a> {
     cache: &'a mut FxHashMap<PageId, Arc<Page>>,
@@ -77,10 +79,20 @@ impl<'db> ReadTxn<'db> {
     where
         F: FnMut(&[u8], &[u8]) -> Result<()>,
     {
-        self.preload_all_pages(self.snapshot.tree_root)?;
-        let mut cursor = Cursor::first(&self.page_cache, self.snapshot.tree_root)?;
+        let root = self.snapshot.tree_root;
+        self.preload_all_pages(root)?;
+        let mut cursor = Cursor::first(&self.page_cache, root)?;
         while cursor.is_valid() {
-            if let Some(entry) = cursor.current_ref(&self.page_cache) {
+            let overflow = cursor
+                .current_ref(&self.page_cache)
+                .and_then(|c| match c.val_type {
+                    ValueType::Overflow => Some((c.key.to_vec(), OverflowRef::from_bytes(c.value))),
+                    _ => None,
+                });
+            if let Some((key, oref)) = overflow {
+                let materialized = self.materialize_overflow(&oref)?;
+                f(&key, &materialized)?;
+            } else if let Some(entry) = cursor.current_ref(&self.page_cache) {
                 if entry.val_type != ValueType::Tombstone {
                     f(entry.key, entry.value)?;
                 }
@@ -88,6 +100,14 @@ impl<'db> ReadTxn<'db> {
             cursor.next(&self.page_cache)?;
         }
         Ok(())
+    }
+
+    fn materialize_overflow(&mut self, oref: &OverflowRef) -> Result<Vec<u8>> {
+        let mut view = ReadPages {
+            cache: &mut self.page_cache,
+            manager: self.manager,
+        };
+        overflow_io::read_chain_value(&mut view, oref)
     }
 
     pub fn table_entry_count(&mut self, table: &[u8]) -> Result<u64> {
@@ -111,7 +131,16 @@ impl<'db> ReadTxn<'db> {
         self.preload_all_pages(desc.root_page)?;
         let mut cursor = Cursor::first(&self.page_cache, desc.root_page)?;
         while cursor.is_valid() {
-            if let Some(entry) = cursor.current_ref(&self.page_cache) {
+            let overflow = cursor
+                .current_ref(&self.page_cache)
+                .and_then(|c| match c.val_type {
+                    ValueType::Overflow => Some((c.key.to_vec(), OverflowRef::from_bytes(c.value))),
+                    _ => None,
+                });
+            if let Some((key, oref)) = overflow {
+                let materialized = self.materialize_overflow(&oref)?;
+                f(&key, &materialized)?;
+            } else if let Some(entry) = cursor.current_ref(&self.page_cache) {
                 if entry.val_type != ValueType::Tombstone {
                     f(entry.key, entry.value)?;
                 }
@@ -133,10 +162,25 @@ impl<'db> ReadTxn<'db> {
             manager: self.manager,
         };
         let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
-        while cursor.is_valid() {
-            if let Some(entry) = cursor.current_ref_lazy(&mut view) {
-                if entry.val_type != ValueType::Tombstone && !f(entry.key, entry.value)? {
-                    break;
+        while let Some(c) = cursor.current_ref_lazy(&mut view) {
+            let kind = c.val_type;
+            match kind {
+                ValueType::Tombstone => {}
+                ValueType::Inline => {
+                    let entry = cursor.current_ref_lazy(&mut view).unwrap();
+                    if !f(entry.key, entry.value)? {
+                        break;
+                    }
+                }
+                ValueType::Overflow => {
+                    let (key, oref) = {
+                        let c = cursor.current_ref_lazy(&mut view).unwrap();
+                        (c.key.to_vec(), OverflowRef::from_bytes(c.value))
+                    };
+                    let materialized = overflow_io::read_chain_value(&mut view, &oref)?;
+                    if !f(&key, &materialized)? {
+                        break;
+                    }
                 }
             }
             cursor.next_lazy(&mut view)?;
@@ -197,8 +241,25 @@ impl<'db> ReadTxn<'db> {
             let n = page.num_cells();
             for i in 0..n {
                 let cell = leaf_node::read_cell(page, i);
-                if cell.val_type != ValueType::Tombstone && !f(cell.key, cell.value) {
-                    return Ok(());
+                match cell.val_type {
+                    ValueType::Tombstone => continue,
+                    ValueType::Inline => {
+                        if !f(cell.key, cell.value) {
+                            return Ok(());
+                        }
+                    }
+                    ValueType::Overflow => {
+                        let oref = OverflowRef::from_bytes(cell.value);
+                        let key_owned = cell.key.to_vec();
+                        let mut view = ReadPages {
+                            cache: &mut self.page_cache,
+                            manager: self.manager,
+                        };
+                        let materialized = overflow_io::read_chain_value(&mut view, &oref)?;
+                        if !f(&key_owned, &materialized) {
+                            return Ok(());
+                        }
+                    }
                 }
             }
         }
@@ -292,19 +353,19 @@ impl<'db> ReadTxn<'db> {
     /// Search for a key in an arbitrary B+ tree starting at `root`.
     fn search_tree(&mut self, root: PageId, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut current = root;
-        loop {
+        let snapshot: Option<(ValueType, Vec<u8>)> = loop {
             let page = self.load_page(current)?;
             match page.page_type() {
                 Some(PageType::Leaf) => {
-                    return match leaf_node::search(page, key) {
+                    break match leaf_node::search(page, key) {
                         Ok(idx) => {
                             let cell = leaf_node::read_cell(page, idx);
                             match cell.val_type {
-                                ValueType::Tombstone => Ok(None),
-                                _ => Ok(Some(cell.value.to_vec())),
+                                ValueType::Tombstone => None,
+                                _ => Some((cell.val_type, cell.value.to_vec())),
                             }
                         }
-                        Err(_) => Ok(None),
+                        Err(_) => None,
                     };
                 }
                 Some(PageType::Branch) => {
@@ -315,6 +376,18 @@ impl<'db> ReadTxn<'db> {
                     return Err(Error::InvalidPageType(page.page_type_raw(), current));
                 }
             }
+        };
+        match snapshot {
+            None => Ok(None),
+            Some((ValueType::Overflow, payload)) => {
+                let oref = OverflowRef::from_bytes(&payload);
+                let mut view = ReadPages {
+                    cache: &mut self.page_cache,
+                    manager: self.manager,
+                };
+                overflow_io::read_chain_value(&mut view, &oref).map(Some)
+            }
+            Some((_, value)) => Ok(Some(value)),
         }
     }
 

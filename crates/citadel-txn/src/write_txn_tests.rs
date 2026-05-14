@@ -279,12 +279,21 @@ fn key_too_large() {
 }
 
 #[test]
-fn value_too_large() {
+fn value_above_inline_round_trips_via_overflow() {
     let mgr = create_test_manager();
     let mut wtx = mgr.begin_write().unwrap();
-    let big_val = vec![0u8; MAX_INLINE_VALUE_SIZE + 1];
+    let big_val = vec![0xAB; MAX_INLINE_VALUE_SIZE + 1];
+    assert!(wtx.insert(b"key", &big_val).unwrap());
+    assert_eq!(wtx.get(b"key").unwrap(), Some(big_val));
+}
+
+#[test]
+fn value_above_absolute_cap_is_rejected() {
+    let mgr = create_test_manager();
+    let mut wtx = mgr.begin_write().unwrap();
+    let too_big = vec![0u8; citadel_core::MAX_VALUE_SIZE + 1];
     assert!(matches!(
-        wtx.insert(b"key", &big_val),
+        wtx.insert(b"key", &too_big),
         Err(citadel_core::Error::ValueTooLarge { .. })
     ));
 }
