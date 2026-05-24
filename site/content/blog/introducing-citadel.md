@@ -32,13 +32,13 @@ Most databases use a write-ahead log for crash recovery. Citadel uses **shadow p
 
 ## Faster than unencrypted SQLite
 
-Citadel beats SQLite in all 44 head-to-head benchmarks, even though every page goes through AES-256-CTR + HMAC-SHA256 and SQLite runs without any encryption.
+Citadel beats SQLite in all 50 head-to-head benchmarks, even though every page goes through AES-256-CTR + HMAC-SHA256 and SQLite runs without any encryption.
 
 Full results are in the <a href="https://github.com/yp3y5akh0v/citadel#benchmarks" target="_blank" rel="noopener">README</a>.
 
 ## What it supports
 
-- **SQL** - JOINs (INNER, LEFT, RIGHT, CROSS, FULL OUTER, LATERAL), subqueries, CTEs (recursive + WITH-DML), UNION/INTERSECT/EXCEPT, window functions, aggregates, indexes (partial, COLLATE), STRICT tables, COLLATE (BINARY/NOCASE/RTRIM), constraints (DEFAULT, CHECK, FOREIGN KEY with CASCADE / SET NULL / SET DEFAULT / RESTRICT), generated columns (STORED + VIRTUAL), ALTER TABLE, TRUNCATE, UPSERT, RETURNING, prepared statements
+- **SQL** - JOINs (INNER, LEFT, RIGHT, CROSS, FULL OUTER, LATERAL), subqueries, CTEs (recursive + WITH-DML), UNION/INTERSECT/EXCEPT, window functions, aggregates, indexes (partial, COLLATE, GIN, FTS), STRICT tables, COLLATE (BINARY/NOCASE/RTRIM), constraints (DEFAULT, CHECK, FOREIGN KEY with CASCADE / SET NULL / SET DEFAULT / RESTRICT), generated columns (STORED + VIRTUAL), JSON / JSONB with PG operators, full-text search (`tsvector`/`tsquery`/`@@`/`ts_rank`), system catalog (`information_schema.*`), ALTER TABLE, TRUNCATE, UPSERT, RETURNING, prepared statements with snapshot-tagged plan caching
 - **ACID transactions** - snapshot isolation, concurrent readers, no WAL
 - **P2P encrypted sync** - Merkle-based diffing over Noise protocol
 - **Cross-platform** - C FFI, WebAssembly, CLI with tab completion
