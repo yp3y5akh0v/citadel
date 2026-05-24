@@ -4,7 +4,9 @@ version = "0.15.0"
 edition = "2021"
 description = "Vendored SQL/JSON Path implementation for Citadel. Forked from sql-json-path (RisingWave Labs, Apache-2.0)."
 license = "Apache-2.0"
-publish = false
+repository = "https://github.com/yp3y5akh0v/citadel"
+homepage = "https://citadeldb.dev"
+readme = "README.md"
 
 [lib]
 name = "sql_json_path"
