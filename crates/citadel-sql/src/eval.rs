@@ -6,6 +6,7 @@ use crate::error::{Result, SqlError};
 use crate::parser::{BinOp, Expr, UnaryOp};
 use crate::types::{ColumnDef, CompactString, DataType, Value};
 
+#[derive(Debug)]
 pub struct ColumnMap {
     exact: FxHashMap<String, usize>,
     short: FxHashMap<String, ShortMatch>,
@@ -13,7 +14,7 @@ pub struct ColumnMap {
     has_non_binary_collation: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum ShortMatch {
     Unique(usize),
     Ambiguous,
@@ -106,6 +107,7 @@ pub struct EvalCtx<'a> {
     pub params: &'a [Value],
     pub excluded: Option<ExcludedRow<'a>>,
     pub old_new: Option<OldNewRows<'a>>,
+    pub session_tz: Option<jiff::tz::TimeZone>,
 }
 
 pub struct ExcludedRow<'a> {
@@ -127,7 +129,13 @@ impl<'a> EvalCtx<'a> {
             params: &[],
             excluded: None,
             old_new: None,
+            session_tz: None,
         }
+    }
+
+    pub fn with_session_tz(mut self, tz: Option<jiff::tz::TimeZone>) -> Self {
+        self.session_tz = tz;
+        self
     }
 
     pub fn with_params(col_map: &'a ColumnMap, row: &'a [Value], params: &'a [Value]) -> Self {
@@ -137,6 +145,7 @@ impl<'a> EvalCtx<'a> {
             params,
             excluded: None,
             old_new: None,
+            session_tz: None,
         }
     }
 
@@ -155,6 +164,7 @@ impl<'a> EvalCtx<'a> {
                 row: excluded_row,
             }),
             old_new: None,
+            session_tz: None,
         }
     }
 
@@ -174,6 +184,7 @@ impl<'a> EvalCtx<'a> {
                 old_row,
                 new_row,
             }),
+            session_tz: None,
         }
     }
 }
@@ -379,6 +390,8 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         Expr::WindowFunction { .. } => Err(SqlError::Unsupported(
             "window functions are only allowed in SELECT columns".into(),
         )),
+
+        Expr::TypedNullRecord(_) => Ok(Value::Null),
     }
 }
 
@@ -517,8 +530,59 @@ fn eval_json_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> 
         BinOp::JsonHasAllKeys => crate::json::op_has_all_keys(left, right),
         BinOp::JsonDeletePath => crate::json::op_delete_path(left, right),
         BinOp::JsonPathExists => crate::json::op_path_exists(left, right),
-        BinOp::JsonPathMatch => crate::json::op_path_match(left, right),
+        BinOp::JsonPathMatch => eval_at_at(left, right),
         _ => unreachable!(),
+    }
+}
+
+fn eval_at_at(left: &Value, right: &Value) -> Result<Value> {
+    use crate::types::DataType as D;
+    if left.is_null() || right.is_null() {
+        return Ok(Value::Null);
+    }
+    match (left.data_type(), right.data_type()) {
+        (D::Json | D::Jsonb, D::Text) => crate::json::op_path_match(left, right),
+        (D::TsVector, D::TsQuery) => match (left, right) {
+            (Value::TsVector(v), Value::TsQuery(q)) => crate::fts::op_match(v, q),
+            _ => unreachable!(),
+        },
+        (D::TsQuery, D::TsVector) => match (left, right) {
+            (Value::TsQuery(q), Value::TsVector(v)) => crate::fts::op_match(v, q),
+            _ => unreachable!(),
+        },
+        (D::Text, D::TsQuery) => {
+            let s = match left {
+                Value::Text(s) => s.as_str(),
+                _ => unreachable!(),
+            };
+            let lhs = crate::fts::fn_to_tsvector(s)?;
+            eval_at_at(&lhs, right)
+        }
+        (D::TsVector, D::Text) => {
+            let s = match right {
+                Value::Text(s) => s.as_str(),
+                _ => unreachable!(),
+            };
+            let rhs = crate::fts::fn_plainto_tsquery(s)?;
+            eval_at_at(left, &rhs)
+        }
+        (D::Text, D::Text) => {
+            let ls = match left {
+                Value::Text(s) => s.as_str(),
+                _ => unreachable!(),
+            };
+            let rs = match right {
+                Value::Text(s) => s.as_str(),
+                _ => unreachable!(),
+            };
+            let lhs = crate::fts::fn_to_tsvector(ls)?;
+            let rhs = crate::fts::fn_plainto_tsquery(rs)?;
+            eval_at_at(&lhs, &rhs)
+        }
+        (lt, rt) => Err(SqlError::TypeMismatch {
+            expected: "JSONB @@ text, tsvector @@ tsquery".into(),
+            got: format!("{lt} @@ {rt}"),
+        }),
     }
 }
 
@@ -980,6 +1044,8 @@ fn value_to_text(val: &Value) -> String {
         } => crate::datetime::format_interval(*months, *days, *micros),
         Value::Json(s) => s.to_string(),
         Value::Jsonb(b) => crate::json::decode_to_text(b).unwrap_or_default(),
+        Value::TsVector(b) => crate::fts::tsvector_display(b),
+        Value::TsQuery(b) => crate::fts::tsquery_display(b),
     }
 }
 
@@ -1168,7 +1234,7 @@ fn eval_case(
     }
 }
 
-fn eval_cast(val: &Value, target: DataType) -> Result<Value> {
+pub(crate) fn eval_cast(val: &Value, target: DataType) -> Result<Value> {
     if val.is_null() {
         return Ok(Value::Null);
     }
@@ -1248,6 +1314,12 @@ fn eval_cast(val: &Value, target: DataType) -> Result<Value> {
         DataType::Jsonb => val.clone().coerce_into(DataType::Jsonb).ok_or_else(|| {
             SqlError::InvalidValue(format!("cannot cast {} to JSONB", val.data_type()))
         }),
+        DataType::TsVector => val.clone().coerce_into(DataType::TsVector).ok_or_else(|| {
+            SqlError::InvalidValue(format!("cannot cast {} to TSVECTOR", val.data_type()))
+        }),
+        DataType::TsQuery => val.clone().coerce_into(DataType::TsQuery).ok_or_else(|| {
+            SqlError::InvalidValue(format!("cannot cast {} to TSQUERY", val.data_type()))
+        }),
     }
 }
 
@@ -1264,6 +1336,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => Ok(Value::Integer(s.chars().count() as i64)),
                 Value::Blob(b) => Ok(Value::Integer(b.len() as i64)),
+                Value::TsVector(b) => crate::fts::fn_length_tsvector(b),
                 _ => Ok(Value::Integer(
                     value_to_text(&evaluated[0]).chars().count() as i64
                 )),
@@ -1565,6 +1638,8 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 Value::Interval { .. } => "interval",
                 Value::Json(_) => "json",
                 Value::Jsonb(_) => "jsonb",
+                Value::TsVector(_) => "tsvector",
+                Value::TsQuery(_) => "tsquery",
             };
             Ok(Value::Text(type_name.into()))
         }
@@ -2321,6 +2396,60 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             }
             crate::json::fn_json_query(&evaluated[0], &evaluated[1], crate::types::DataType::Jsonb)
         }
+        "JSONB_PATH_EXISTS" => {
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_jsonb_path_exists(&evaluated)
+        }
+        "JSONB_PATH_MATCH" => {
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_jsonb_path_match(&evaluated)
+        }
+        "JSONB_PATH_QUERY_FIRST" => {
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_jsonb_path_query_first(&evaluated)
+        }
+        "JSONB_PATH_QUERY_ARRAY" => {
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_jsonb_path_query_array(&evaluated)
+        }
+        "JSONB_PATH_EXISTS_TZ" => {
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_jsonb_path_exists_tz(&evaluated)
+        }
+        "JSONB_PATH_MATCH_TZ" => {
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_jsonb_path_match_tz(&evaluated)
+        }
+        "JSONB_PATH_QUERY_TZ" => {
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_jsonb_path_query_tz(&evaluated)
+        }
+        "JSONB_PATH_QUERY_FIRST_TZ" => {
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_jsonb_path_query_first_tz(&evaluated)
+        }
+        "JSONB_PATH_QUERY_ARRAY_TZ" => {
+            if evaluated[0].is_null() || evaluated[1].is_null() {
+                return Ok(Value::Null);
+            }
+            crate::json::fn_jsonb_path_query_array_tz(&evaluated)
+        }
         "JSONB_HAS_KEY" | "JSON_HAS_KEY" => {
             check_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
@@ -2342,8 +2471,284 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             }
             crate::json::op_has_all_keys(&evaluated[0], &evaluated[1])
         }
+        "TO_TSVECTOR" => fts_to_tsvector(&evaluated),
+        "TO_TSQUERY" => fts_to_tsquery(&evaluated),
+        "PLAINTO_TSQUERY" => fts_plainto_tsquery(&evaluated),
+        "PHRASETO_TSQUERY" => fts_phraseto_tsquery(&evaluated),
+        "WEBSEARCH_TO_TSQUERY" => fts_websearch_to_tsquery(&evaluated),
+        "TS_RANK" => fts_ts_rank(&evaluated, false),
+        "TS_RANK_CD" => fts_ts_rank(&evaluated, true),
+        "TS_HEADLINE" => fts_ts_headline(&evaluated),
+        "TS_LEXIZE" => fts_ts_lexize(&evaluated),
+        "NUMNODE" => fts_numnode(&evaluated),
+        "SETWEIGHT" => fts_setweight(&evaluated),
         _ => Err(SqlError::Unsupported(format!("scalar function: {name}"))),
     }
+}
+
+fn fts_resolve_config_and_text(
+    args: &[Value],
+    fname: &str,
+) -> Result<(crate::fts::TokenizerKind, String)> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(SqlError::InvalidValue(format!(
+            "{fname} requires 1 or 2 arguments"
+        )));
+    }
+    let (config_name, text) = if args.len() == 2 {
+        let cfg = match &args[0] {
+            Value::Text(s) => Some(s.as_str().to_string()),
+            v => {
+                return Err(SqlError::TypeMismatch {
+                    expected: "TEXT (config)".into(),
+                    got: v.data_type().to_string(),
+                })
+            }
+        };
+        let txt = match &args[1] {
+            Value::Text(s) => s.as_str().to_string(),
+            v => {
+                return Err(SqlError::TypeMismatch {
+                    expected: "TEXT".into(),
+                    got: v.data_type().to_string(),
+                })
+            }
+        };
+        (cfg, txt)
+    } else {
+        let txt = match &args[0] {
+            Value::Text(s) => s.as_str().to_string(),
+            v => {
+                return Err(SqlError::TypeMismatch {
+                    expected: "TEXT".into(),
+                    got: v.data_type().to_string(),
+                })
+            }
+        };
+        (None, txt)
+    };
+    let kind = match config_name {
+        Some(name) => crate::fts::TokenizerKind::from_name(&name)?,
+        None => crate::fts::TokenizerKind::English,
+    };
+    Ok((kind, text))
+}
+
+fn fts_to_tsvector(args: &[Value]) -> Result<Value> {
+    if args.iter().any(|v| v.is_null()) {
+        return Ok(Value::Null);
+    }
+    let (kind, text) = fts_resolve_config_and_text(args, "to_tsvector")?;
+    crate::fts::fn_to_tsvector_with(kind, &text)
+}
+
+fn fts_to_tsquery(args: &[Value]) -> Result<Value> {
+    if args.iter().any(|v| v.is_null()) {
+        return Ok(Value::Null);
+    }
+    let (kind, text) = fts_resolve_config_and_text(args, "to_tsquery")?;
+    crate::fts::fn_to_tsquery_with(kind, &text)
+}
+
+fn fts_plainto_tsquery(args: &[Value]) -> Result<Value> {
+    if args.iter().any(|v| v.is_null()) {
+        return Ok(Value::Null);
+    }
+    let (kind, text) = fts_resolve_config_and_text(args, "plainto_tsquery")?;
+    crate::fts::fn_plainto_tsquery_with(kind, &text)
+}
+
+fn fts_phraseto_tsquery(args: &[Value]) -> Result<Value> {
+    if args.iter().any(|v| v.is_null()) {
+        return Ok(Value::Null);
+    }
+    let (kind, text) = fts_resolve_config_and_text(args, "phraseto_tsquery")?;
+    crate::fts::fn_phraseto_tsquery_with(kind, &text)
+}
+
+fn fts_websearch_to_tsquery(args: &[Value]) -> Result<Value> {
+    if args.iter().any(|v| v.is_null()) {
+        return Ok(Value::Null);
+    }
+    let (kind, text) = fts_resolve_config_and_text(args, "websearch_to_tsquery")?;
+    crate::fts::fn_websearch_to_tsquery_with(kind, &text)
+}
+
+fn fts_ts_rank(args: &[Value], cover_density: bool) -> Result<Value> {
+    let fname = if cover_density {
+        "ts_rank_cd"
+    } else {
+        "ts_rank"
+    };
+    if args.len() != 2 && args.len() != 3 {
+        return Err(SqlError::InvalidValue(format!(
+            "{fname} requires 2 or 3 arguments"
+        )));
+    }
+    if args[0].is_null() || args[1].is_null() {
+        return Ok(Value::Null);
+    }
+    let tsv = match &args[0] {
+        Value::TsVector(b) => b,
+        v => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TSVECTOR".into(),
+                got: v.data_type().to_string(),
+            })
+        }
+    };
+    let tsq = match &args[1] {
+        Value::TsQuery(b) => b,
+        v => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TSQUERY".into(),
+                got: v.data_type().to_string(),
+            })
+        }
+    };
+    let norm = if args.len() == 3 {
+        match &args[2] {
+            Value::Integer(n) => *n,
+            Value::Null => return Ok(Value::Null),
+            v => {
+                return Err(SqlError::TypeMismatch {
+                    expected: "INTEGER (norm)".into(),
+                    got: v.data_type().to_string(),
+                })
+            }
+        }
+    } else {
+        0
+    };
+    if cover_density {
+        crate::fts::fn_ts_rank_cd(tsv, tsq, norm)
+    } else {
+        crate::fts::fn_ts_rank(tsv, tsq, norm)
+    }
+}
+
+fn fts_ts_headline(args: &[Value]) -> Result<Value> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err(SqlError::InvalidValue(
+            "ts_headline requires 2 to 4 arguments".into(),
+        ));
+    }
+    if args.iter().any(|v| v.is_null()) {
+        return Ok(Value::Null);
+    }
+    let kind = if args.len() >= 3 {
+        match &args[0] {
+            Value::Text(s) => crate::fts::TokenizerKind::from_name(s.as_str())?,
+            v => {
+                return Err(SqlError::TypeMismatch {
+                    expected: "TEXT (config)".into(),
+                    got: v.data_type().to_string(),
+                })
+            }
+        }
+    } else {
+        crate::fts::TokenizerKind::English
+    };
+    let text_idx = if args.len() >= 3 { 1 } else { 0 };
+    let tsq_idx = if args.len() >= 3 { 2 } else { 1 };
+    let text = match args.get(text_idx) {
+        Some(Value::Text(s)) => s.as_str(),
+        _ => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TEXT".into(),
+                got: "non-text".into(),
+            })
+        }
+    };
+    let tsq = match args.get(tsq_idx) {
+        Some(Value::TsQuery(b)) => b.as_ref(),
+        _ => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TSQUERY".into(),
+                got: "non-tsquery".into(),
+            })
+        }
+    };
+    crate::fts::fn_ts_headline_with(kind, text, tsq)
+}
+
+fn fts_ts_lexize(args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(SqlError::InvalidValue(
+            "ts_lexize requires 2 arguments (config, word)".into(),
+        ));
+    }
+    if args.iter().any(|v| v.is_null()) {
+        return Ok(Value::Null);
+    }
+    let kind = match &args[0] {
+        Value::Text(s) => crate::fts::TokenizerKind::from_name(s.as_str())?,
+        v => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TEXT (config)".into(),
+                got: v.data_type().to_string(),
+            })
+        }
+    };
+    let word = match &args[1] {
+        Value::Text(s) => s.as_str(),
+        v => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TEXT (word)".into(),
+                got: v.data_type().to_string(),
+            })
+        }
+    };
+    crate::fts::fn_ts_lexize_with(kind, word)
+}
+
+fn fts_numnode(args: &[Value]) -> Result<Value> {
+    check_args("numnode", args, 1)?;
+    if args[0].is_null() {
+        return Ok(Value::Null);
+    }
+    let tsq = match &args[0] {
+        Value::TsQuery(b) => b,
+        v => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TSQUERY".into(),
+                got: v.data_type().to_string(),
+            })
+        }
+    };
+    crate::fts::fn_numnode(tsq)
+}
+
+fn fts_setweight(args: &[Value]) -> Result<Value> {
+    if args.len() == 3 {
+        return Err(SqlError::Unsupported(
+            "setweight(tsvector, char, text[]) — 3-arg selective form deferred to v0.17".into(),
+        ));
+    }
+    check_args("setweight", args, 2)?;
+    if args[0].is_null() || args[1].is_null() {
+        return Ok(Value::Null);
+    }
+    let tsv = match &args[0] {
+        Value::TsVector(b) => b,
+        v => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TSVECTOR".into(),
+                got: v.data_type().to_string(),
+            })
+        }
+    };
+    let weight_text = match &args[1] {
+        Value::Text(s) => s.as_str(),
+        v => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TEXT".into(),
+                got: v.data_type().to_string(),
+            })
+        }
+    };
+    let weight = crate::fts::parse_weight_char(weight_text)?;
+    crate::fts::fn_setweight(tsv, weight)
 }
 
 /// Extract a timestamp (µs UTC) from a Value, coercing DATE → midnight.
@@ -2558,7 +2963,8 @@ fn collect_column_refs(expr: &Expr, columns: &[ColumnDef], out: &mut Vec<usize>)
         | Expr::Parameter(_)
         | Expr::CountStar
         | Expr::Exists { .. }
-        | Expr::ScalarSubquery(_) => {}
+        | Expr::ScalarSubquery(_)
+        | Expr::TypedNullRecord(_) => {}
     }
 }
 

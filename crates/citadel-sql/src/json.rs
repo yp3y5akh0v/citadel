@@ -517,7 +517,7 @@ fn decode_value(bytes: &[u8], pos: &mut usize) -> Result<serde_json::Value> {
     Ok(v)
 }
 
-fn value_to_serde(v: &Value) -> Result<serde_json::Value> {
+pub(crate) fn value_to_serde(v: &Value) -> Result<serde_json::Value> {
     match v {
         Value::Json(s) => serde_json::from_str(s)
             .map_err(|e| SqlError::InvalidValue(format!("invalid JSON: {e}"))),
@@ -807,46 +807,114 @@ pub fn op_concat(lhs: &Value, rhs: &Value) -> Result<Value> {
     serde_to_value(left, target)
 }
 
+fn coerce_path_arg(v: &Value) -> Result<String> {
+    match v {
+        Value::Text(s) => Ok(s.to_string()),
+        Value::Json(s) => Ok(s.to_string()),
+        _ => Err(SqlError::TypeMismatch {
+            expected: "TEXT path".into(),
+            got: v.data_type().to_string(),
+        }),
+    }
+}
+
+fn coerce_vars_arg(v: &Value) -> Result<Option<serde_json::Value>> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    let j = value_to_serde(v)?;
+    if !j.is_object() {
+        return Err(SqlError::InvalidValue(
+            "jsonpath vars argument must be a JSONB object".into(),
+        ));
+    }
+    Ok(Some(j))
+}
+
+fn coerce_silent_arg(v: &Value) -> Result<bool> {
+    if v.is_null() {
+        return Ok(false);
+    }
+    match v {
+        Value::Boolean(b) => Ok(*b),
+        _ => Err(SqlError::TypeMismatch {
+            expected: "BOOLEAN".into(),
+            got: v.data_type().to_string(),
+        }),
+    }
+}
+
+fn jp_query(
+    j: &serde_json::Value,
+    path_str: &str,
+    vars: Option<&serde_json::Value>,
+    silent: bool,
+) -> Result<Vec<serde_json::Value>> {
+    let jp = sql_json_path::JsonPath::new(path_str)
+        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
+    let result = match vars {
+        Some(v) => jp.query_with_vars(j, v),
+        None => jp.query(j),
+    };
+    match result {
+        Ok(nodes) => Ok(nodes.into_iter().map(|c| c.into_owned()).collect()),
+        Err(e) if silent && e.can_silent() => Ok(vec![]),
+        Err(e) => Err(SqlError::InvalidValue(format!("JSON path eval: {e}"))),
+    }
+}
+
+fn jp_query_first(
+    j: &serde_json::Value,
+    path_str: &str,
+    vars: Option<&serde_json::Value>,
+    silent: bool,
+) -> Result<Option<serde_json::Value>> {
+    let jp = sql_json_path::JsonPath::new(path_str)
+        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
+    let result = match vars {
+        Some(v) => jp.query_first_with_vars(j, v),
+        None => jp.query_first(j),
+    };
+    match result {
+        Ok(opt) => Ok(opt.map(|c| c.into_owned())),
+        Err(e) if silent && e.can_silent() => Ok(None),
+        Err(e) => Err(SqlError::InvalidValue(format!("JSON path eval: {e}"))),
+    }
+}
+
+fn jp_exists(
+    j: &serde_json::Value,
+    path_str: &str,
+    vars: Option<&serde_json::Value>,
+    silent: bool,
+) -> Result<Option<bool>> {
+    let jp = sql_json_path::JsonPath::new(path_str)
+        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
+    let result = match vars {
+        Some(v) => jp.exists_with_vars(j, v),
+        None => jp.exists(j),
+    };
+    match result {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if silent && e.can_silent() => Ok(None),
+        Err(e) => Err(SqlError::InvalidValue(format!("JSON path eval: {e}"))),
+    }
+}
+
 pub fn op_path_exists(lhs: &Value, path: &Value) -> Result<Value> {
     let j = value_to_serde(lhs)?;
-    let path_str = match path {
-        Value::Text(s) => s.to_string(),
-        Value::Json(s) => s.to_string(),
-        _ => {
-            return Err(SqlError::TypeMismatch {
-                expected: "TEXT path".into(),
-                got: path.data_type().to_string(),
-            })
-        }
-    };
-    let jp = sql_json_path::JsonPath::new(&path_str)
-        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
-    let exists = jp
-        .exists(&j)
-        .map_err(|e| SqlError::InvalidValue(format!("JSON path eval: {e}")))?;
+    let path_str = coerce_path_arg(path)?;
+    let exists = jp_exists(&j, &path_str, None, false)?.unwrap_or(false);
     Ok(Value::Boolean(exists))
 }
 
 pub fn op_path_match(lhs: &Value, path: &Value) -> Result<Value> {
     let j = value_to_serde(lhs)?;
-    let path_str = match path {
-        Value::Text(s) => s.to_string(),
-        Value::Json(s) => s.to_string(),
-        _ => {
-            return Err(SqlError::TypeMismatch {
-                expected: "TEXT path".into(),
-                got: path.data_type().to_string(),
-            })
-        }
-    };
-    let jp = sql_json_path::JsonPath::new(&path_str)
-        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
-    let result = jp
-        .query(&j)
-        .map_err(|e| SqlError::InvalidValue(format!("JSON path eval: {e}")))?;
-    let truthy = result
+    let path_str = coerce_path_arg(path)?;
+    let nodes = jp_query(&j, &path_str, None, false)?;
+    let truthy = nodes
         .iter()
-        .any(|node| matches!(node.as_ref(), serde_json::Value::Bool(true)));
+        .any(|node| matches!(node, serde_json::Value::Bool(true)));
     Ok(Value::Boolean(truthy))
 }
 
@@ -856,59 +924,279 @@ pub fn fn_json_exists(j_val: &Value, path: &Value) -> Result<Value> {
 
 pub fn fn_json_value(j_val: &Value, path: &Value) -> Result<Value> {
     let j = value_to_serde(j_val)?;
-    let path_str = match path {
-        Value::Text(s) => s.to_string(),
-        _ => {
-            return Err(SqlError::TypeMismatch {
-                expected: "TEXT path".into(),
-                got: path.data_type().to_string(),
-            })
-        }
-    };
-    let jp = sql_json_path::JsonPath::new(&path_str)
-        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
-    match jp
-        .query_first(&j)
-        .map_err(|e| SqlError::InvalidValue(format!("JSON path eval: {e}")))?
-    {
-        Some(node) => match node.into_owned() {
-            serde_json::Value::Null => Ok(Value::Null),
-            serde_json::Value::String(s) => Ok(Value::Text(s.into())),
-            other => Ok(Value::Text(
-                serde_json::to_string(&other)
-                    .map_err(|e| SqlError::InvalidValue(format!("JSON render: {e}")))?
-                    .into(),
-            )),
-        },
+    let path_str = coerce_path_arg(path)?;
+    match jp_query_first(&j, &path_str, None, false)? {
+        Some(serde_json::Value::Null) => Ok(Value::Null),
+        Some(serde_json::Value::String(s)) => Ok(Value::Text(s.into())),
+        Some(other) => Ok(Value::Text(
+            serde_json::to_string(&other)
+                .map_err(|e| SqlError::InvalidValue(format!("JSON render: {e}")))?
+                .into(),
+        )),
         None => Ok(Value::Null),
     }
 }
 
 pub fn fn_json_query(j_val: &Value, path: &Value, target: crate::types::DataType) -> Result<Value> {
     let j = value_to_serde(j_val)?;
-    let path_str = match path {
-        Value::Text(s) => s.to_string(),
-        _ => {
-            return Err(SqlError::TypeMismatch {
-                expected: "TEXT path".into(),
-                got: path.data_type().to_string(),
-            })
-        }
-    };
-    let jp = sql_json_path::JsonPath::new(&path_str)
-        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
-    let nodes = jp
-        .query(&j)
-        .map_err(|e| SqlError::InvalidValue(format!("JSON path eval: {e}")))?;
+    let path_str = coerce_path_arg(path)?;
+    let nodes = jp_query(&j, &path_str, None, false)?;
     if nodes.is_empty() {
         return Ok(Value::Null);
     }
     let result_json = if nodes.len() == 1 {
-        nodes[0].as_ref().clone()
+        nodes[0].clone()
     } else {
-        serde_json::Value::Array(nodes.iter().map(|n| n.as_ref().clone()).collect())
+        serde_json::Value::Array(nodes)
     };
     serde_to_value(result_json, target)
+}
+
+pub fn fn_jsonb_path_exists(args: &[Value]) -> Result<Value> {
+    if !(2..=4).contains(&args.len()) {
+        return Err(SqlError::InvalidValue(
+            "jsonb_path_exists: expected 2..=4 arguments".into(),
+        ));
+    }
+    let j = value_to_serde(&args[0])?;
+    let path_str = coerce_path_arg(&args[1])?;
+    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
+    let silent = args
+        .get(3)
+        .map(coerce_silent_arg)
+        .transpose()?
+        .unwrap_or(false);
+    match jp_exists(&j, &path_str, vars.as_ref(), silent)? {
+        Some(b) => Ok(Value::Boolean(b)),
+        None => Ok(Value::Null),
+    }
+}
+
+pub fn fn_jsonb_path_match(args: &[Value]) -> Result<Value> {
+    if !(2..=4).contains(&args.len()) {
+        return Err(SqlError::InvalidValue(
+            "jsonb_path_match: expected 2..=4 arguments".into(),
+        ));
+    }
+    let j = value_to_serde(&args[0])?;
+    let path_str = coerce_path_arg(&args[1])?;
+    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
+    let silent = args
+        .get(3)
+        .map(coerce_silent_arg)
+        .transpose()?
+        .unwrap_or(false);
+    let nodes = jp_query(&j, &path_str, vars.as_ref(), silent)?;
+    if nodes.len() != 1 {
+        if silent {
+            return Ok(Value::Null);
+        }
+        return Err(SqlError::InvalidValue(
+            "jsonb_path_match: expected exactly one boolean result".into(),
+        ));
+    }
+    match &nodes[0] {
+        serde_json::Value::Bool(b) => Ok(Value::Boolean(*b)),
+        _ if silent => Ok(Value::Null),
+        _ => Err(SqlError::InvalidValue(
+            "jsonb_path_match: result is not a boolean".into(),
+        )),
+    }
+}
+
+pub fn fn_jsonb_path_query_first(args: &[Value]) -> Result<Value> {
+    if !(2..=4).contains(&args.len()) {
+        return Err(SqlError::InvalidValue(
+            "jsonb_path_query_first: expected 2..=4 arguments".into(),
+        ));
+    }
+    let j = value_to_serde(&args[0])?;
+    let path_str = coerce_path_arg(&args[1])?;
+    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
+    let silent = args
+        .get(3)
+        .map(coerce_silent_arg)
+        .transpose()?
+        .unwrap_or(false);
+    match jp_query_first(&j, &path_str, vars.as_ref(), silent)? {
+        Some(v) => serde_to_value(v, crate::types::DataType::Jsonb),
+        None => Ok(Value::Null),
+    }
+}
+
+pub fn fn_jsonb_path_query_array(args: &[Value]) -> Result<Value> {
+    if !(2..=4).contains(&args.len()) {
+        return Err(SqlError::InvalidValue(
+            "jsonb_path_query_array: expected 2..=4 arguments".into(),
+        ));
+    }
+    let j = value_to_serde(&args[0])?;
+    let path_str = coerce_path_arg(&args[1])?;
+    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
+    let silent = args
+        .get(3)
+        .map(coerce_silent_arg)
+        .transpose()?
+        .unwrap_or(false);
+    let nodes = jp_query(&j, &path_str, vars.as_ref(), silent)?;
+    serde_to_value(
+        serde_json::Value::Array(nodes),
+        crate::types::DataType::Jsonb,
+    )
+}
+
+fn jp_query_tz(
+    j: &serde_json::Value,
+    path_str: &str,
+    vars: Option<&serde_json::Value>,
+    silent: bool,
+) -> Result<Vec<serde_json::Value>> {
+    let jp = sql_json_path::JsonPath::new(path_str)
+        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
+    let result = match vars {
+        Some(v) => jp.query_with_vars_tz(j, v),
+        None => jp.query_tz(j),
+    };
+    match result {
+        Ok(nodes) => Ok(nodes.into_iter().map(|c| c.into_owned()).collect()),
+        Err(e) if silent && e.can_silent() => Ok(vec![]),
+        Err(e) => Err(SqlError::InvalidValue(format!("JSON path eval: {e}"))),
+    }
+}
+
+fn jp_query_first_tz(
+    j: &serde_json::Value,
+    path_str: &str,
+    vars: Option<&serde_json::Value>,
+    silent: bool,
+) -> Result<Option<serde_json::Value>> {
+    let jp = sql_json_path::JsonPath::new(path_str)
+        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
+    let result = match vars {
+        Some(v) => jp.query_first_with_vars_tz(j, v),
+        None => jp.query_first_tz(j),
+    };
+    match result {
+        Ok(opt) => Ok(opt.map(|c| c.into_owned())),
+        Err(e) if silent && e.can_silent() => Ok(None),
+        Err(e) => Err(SqlError::InvalidValue(format!("JSON path eval: {e}"))),
+    }
+}
+
+fn jp_exists_tz(
+    j: &serde_json::Value,
+    path_str: &str,
+    vars: Option<&serde_json::Value>,
+    silent: bool,
+) -> Result<Option<bool>> {
+    let jp = sql_json_path::JsonPath::new(path_str)
+        .map_err(|e| SqlError::InvalidValue(format!("invalid JSON path: {e}")))?;
+    let result = match vars {
+        Some(v) => jp.exists_with_vars_tz(j, v),
+        None => jp.exists_tz(j),
+    };
+    match result {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if silent && e.can_silent() => Ok(None),
+        Err(e) => Err(SqlError::InvalidValue(format!("JSON path eval: {e}"))),
+    }
+}
+
+pub fn fn_jsonb_path_exists_tz(args: &[Value]) -> Result<Value> {
+    if !(2..=4).contains(&args.len()) {
+        return Err(SqlError::InvalidValue(
+            "jsonb_path_exists_tz: expected 2..=4 arguments".into(),
+        ));
+    }
+    let j = value_to_serde(&args[0])?;
+    let path_str = coerce_path_arg(&args[1])?;
+    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
+    let silent = args
+        .get(3)
+        .map(coerce_silent_arg)
+        .transpose()?
+        .unwrap_or(false);
+    match jp_exists_tz(&j, &path_str, vars.as_ref(), silent)? {
+        Some(b) => Ok(Value::Boolean(b)),
+        None => Ok(Value::Null),
+    }
+}
+
+pub fn fn_jsonb_path_match_tz(args: &[Value]) -> Result<Value> {
+    if !(2..=4).contains(&args.len()) {
+        return Err(SqlError::InvalidValue(
+            "jsonb_path_match_tz: expected 2..=4 arguments".into(),
+        ));
+    }
+    let j = value_to_serde(&args[0])?;
+    let path_str = coerce_path_arg(&args[1])?;
+    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
+    let silent = args
+        .get(3)
+        .map(coerce_silent_arg)
+        .transpose()?
+        .unwrap_or(false);
+    let nodes = jp_query_tz(&j, &path_str, vars.as_ref(), silent)?;
+    if nodes.len() != 1 {
+        if silent {
+            return Ok(Value::Null);
+        }
+        return Err(SqlError::InvalidValue(
+            "jsonb_path_match_tz: expected exactly one boolean result".into(),
+        ));
+    }
+    match &nodes[0] {
+        serde_json::Value::Bool(b) => Ok(Value::Boolean(*b)),
+        _ if silent => Ok(Value::Null),
+        _ => Err(SqlError::InvalidValue(
+            "jsonb_path_match_tz: result is not a boolean".into(),
+        )),
+    }
+}
+
+pub fn fn_jsonb_path_query_first_tz(args: &[Value]) -> Result<Value> {
+    if !(2..=4).contains(&args.len()) {
+        return Err(SqlError::InvalidValue(
+            "jsonb_path_query_first_tz: expected 2..=4 arguments".into(),
+        ));
+    }
+    let j = value_to_serde(&args[0])?;
+    let path_str = coerce_path_arg(&args[1])?;
+    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
+    let silent = args
+        .get(3)
+        .map(coerce_silent_arg)
+        .transpose()?
+        .unwrap_or(false);
+    match jp_query_first_tz(&j, &path_str, vars.as_ref(), silent)? {
+        Some(v) => serde_to_value(v, crate::types::DataType::Jsonb),
+        None => Ok(Value::Null),
+    }
+}
+
+pub fn fn_jsonb_path_query_array_tz(args: &[Value]) -> Result<Value> {
+    if !(2..=4).contains(&args.len()) {
+        return Err(SqlError::InvalidValue(
+            "jsonb_path_query_array_tz: expected 2..=4 arguments".into(),
+        ));
+    }
+    let j = value_to_serde(&args[0])?;
+    let path_str = coerce_path_arg(&args[1])?;
+    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
+    let silent = args
+        .get(3)
+        .map(coerce_silent_arg)
+        .transpose()?
+        .unwrap_or(false);
+    let nodes = jp_query_tz(&j, &path_str, vars.as_ref(), silent)?;
+    serde_to_value(
+        serde_json::Value::Array(nodes),
+        crate::types::DataType::Jsonb,
+    )
+}
+
+pub fn fn_jsonb_path_query_tz(args: &[Value]) -> Result<Value> {
+    fn_jsonb_path_query_first_tz(args)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1373,28 +1661,29 @@ fn json_table_coerce(v: &serde_json::Value, target: crate::types::DataType) -> R
 /// GIN entry layout (jsonb_ops): `0x01‖key` (key-exists, `?`),
 /// `0x02‖key‖0x00‖value` (pair, `@>`), `0x03‖value` (array element).
 pub fn extract_gin_entries(value: &Value, ops: crate::types::GinOpsClass) -> Result<Vec<Vec<u8>>> {
+    use crate::types::GinOpsClass;
     if value.is_null() {
         return Ok(vec![]);
     }
     let j = value_to_serde(value)?;
     let mut out: Vec<Vec<u8>> = Vec::new();
-    extract_gin_walk(&j, ops, &mut out);
+    match ops {
+        GinOpsClass::JsonbOps => extract_jsonb_ops_walk(&j, &mut out),
+        GinOpsClass::JsonbPathOps => extract_path_ops_walk(&j, 0, &mut out),
+    }
     out.sort();
     out.dedup();
     Ok(out)
 }
 
-fn extract_gin_walk(j: &serde_json::Value, ops: crate::types::GinOpsClass, out: &mut Vec<Vec<u8>>) {
-    use crate::types::GinOpsClass;
+fn extract_jsonb_ops_walk(j: &serde_json::Value, out: &mut Vec<Vec<u8>>) {
     match j {
         serde_json::Value::Object(m) => {
             for (k, v) in m {
-                if matches!(ops, GinOpsClass::JsonbOps) {
-                    let mut key_entry = Vec::with_capacity(k.len() + 1);
-                    key_entry.push(0x01);
-                    key_entry.extend_from_slice(k.as_bytes());
-                    out.push(key_entry);
-                }
+                let mut key_entry = Vec::with_capacity(k.len() + 1);
+                key_entry.push(0x01);
+                key_entry.extend_from_slice(k.as_bytes());
+                out.push(key_entry);
                 if let Some(s) = scalar_repr(v) {
                     let mut pair = Vec::with_capacity(k.len() + s.len() + 2);
                     pair.push(0x02);
@@ -1403,7 +1692,7 @@ fn extract_gin_walk(j: &serde_json::Value, ops: crate::types::GinOpsClass, out: 
                     pair.extend_from_slice(s.as_bytes());
                     out.push(pair);
                 }
-                extract_gin_walk(v, ops, out);
+                extract_jsonb_ops_walk(v, out);
             }
         }
         serde_json::Value::Array(arr) => {
@@ -1414,10 +1703,61 @@ fn extract_gin_walk(j: &serde_json::Value, ops: crate::types::GinOpsClass, out: 
                     entry.extend_from_slice(s.as_bytes());
                     out.push(entry);
                 }
-                extract_gin_walk(v, ops, out);
+                extract_jsonb_ops_walk(v, out);
             }
         }
         _ => {}
+    }
+}
+
+fn extract_path_ops_walk(j: &serde_json::Value, path: u32, out: &mut Vec<Vec<u8>>) {
+    match j {
+        serde_json::Value::Object(m) => {
+            for (k, v) in m {
+                let next = path.rotate_left(1) ^ fx_hash_u32(k.as_bytes());
+                extract_path_ops_walk(v, next, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                extract_path_ops_walk(v, path, out);
+            }
+        }
+        _ => {
+            let leaf = path.rotate_left(1) ^ hash_scalar_for_path(j);
+            out.push(leaf.to_le_bytes().to_vec());
+        }
+    }
+}
+
+fn fx_hash_u32(bytes: &[u8]) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    bytes.hash(&mut h);
+    h.finish() as u32
+}
+
+fn hash_scalar_for_path(v: &serde_json::Value) -> u32 {
+    match v {
+        serde_json::Value::Null => 0x0000_0001,
+        serde_json::Value::Bool(true) => 0x0000_0002,
+        serde_json::Value::Bool(false) => 0x0000_0004,
+        serde_json::Value::String(s) => fx_hash_u32(s.as_bytes()),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                return fx_hash_u32(&i.to_le_bytes());
+            }
+            if let Some(u) = n.as_u64() {
+                return fx_hash_u32(&u.to_le_bytes());
+            }
+            let f = n.as_f64().unwrap_or(0.0);
+            if f.is_finite() && f.fract() == 0.0 && f.abs() < i64::MAX as f64 {
+                fx_hash_u32(&(f as i64).to_le_bytes())
+            } else {
+                fx_hash_u32(&f.to_bits().to_le_bytes())
+            }
+        }
+        _ => 0,
     }
 }
 
@@ -1447,6 +1787,30 @@ pub fn agg_object(pairs: &[(Value, Value)], target: crate::types::DataType) -> R
         map.insert(key_str, val);
     }
     serde_to_value(serde_json::Value::Object(map), target)
+}
+
+pub fn populate_record_row(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    columns: &[crate::types::ColumnDef],
+) -> Result<Vec<Value>> {
+    columns
+        .iter()
+        .map(|col| match obj.get(&col.name) {
+            None | Some(serde_json::Value::Null) => Ok(Value::Null),
+            Some(v) => coerce_json_field(v, col.data_type),
+        })
+        .collect()
+}
+
+fn coerce_json_field(j: &serde_json::Value, target: crate::types::DataType) -> Result<Value> {
+    use crate::types::DataType;
+    match target {
+        DataType::Json | DataType::Jsonb => serde_to_value(j.clone(), target),
+        _ => {
+            let v = serde_to_scalar_value(j.clone());
+            crate::eval::eval_cast(&v, target)
+        }
+    }
 }
 
 pub fn dispatch_srf(name: &str, args: &[Value]) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
@@ -1593,6 +1957,8 @@ pub fn is_srf_name(name: &str) -> bool {
             | "JSON_EACH_TEXT"
             | "JSONB_OBJECT_KEYS"
             | "JSON_OBJECT_KEYS"
+            | "JSONB_POPULATE_RECORD"
+            | "JSONB_POPULATE_RECORDSET"
     )
 }
 
@@ -1955,6 +2321,7 @@ fn value_to_serde_lossy(v: &Value) -> Result<serde_json::Value> {
         Value::Date(_) | Value::Time(_) | Value::Timestamp(_) | Value::Interval { .. } => {
             Ok(serde_json::Value::String(format!("{v}")))
         }
+        Value::TsVector(_) | Value::TsQuery(_) => Ok(serde_json::Value::String(format!("{v}"))),
     }
 }
 

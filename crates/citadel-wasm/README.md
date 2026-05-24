@@ -78,6 +78,8 @@ db.free();
 
 **JSON / JSONB** - 12 PG operators (`->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, `#-`, `@?`, `@@`), 16 scalar functions (`jsonb_typeof`, `jsonb_extract_path`, `jsonb_set`, `jsonb_pretty`, `to_jsonb`, etc.), 4 aggregates (`json_agg`, `jsonb_agg`, `json_object_agg`, `jsonb_object_agg`), 5 set-returning functions (`jsonb_array_elements`, `jsonb_each`, `jsonb_object_keys`, etc.), `JSON_TABLE` / `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` with full SQL/JSON predicate path language (e.g. `$.items[*] ? (@.x > 5)`), GIN inverted indexes (`CREATE INDEX … USING gin`) for accelerated `@>` containment
 
+**Full-text search** - `tsvector` / `tsquery` types, `to_tsvector` / `to_tsquery` / `plainto_tsquery` / `phraseto_tsquery` / `websearch_to_tsquery` builders, `@@` match operator, `ts_rank` / `ts_rank_cd` ranking with weighted positions (A/B/C/D), prefix matching (`term:*`), phrase distance (`<N>`), inverted indexes via `CREATE INDEX … USING fts` for sub-millisecond search at scale
+
 **Constraints** - PRIMARY KEY, NOT NULL, UNIQUE (column + table level, inline or `CREATE UNIQUE INDEX`), DEFAULT, CHECK (column + table level), FOREIGN KEY with full referential actions (`ON DELETE` / `ON UPDATE` `CASCADE` / `SET NULL` / `SET DEFAULT` / `RESTRICT` / `NO ACTION`)
 
 **Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS, FULL OUTER, LATERAL), subqueries (scalar, IN, EXISTS, correlated), CTEs (`WITH` / `WITH RECURSIVE` / WITH-DML: `WITH x AS (INSERT/UPDATE/DELETE … [RETURNING *]) SELECT …`), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, GROUP BY/HAVING, ORDER BY (incl. `COLLATE`), LIMIT/OFFSET, `COLLATE` (BINARY/NOCASE/RTRIM)
@@ -100,7 +102,7 @@ db.free();
 - Arithmetic: AGE, TIMEDIFF, AT_TIMEZONE, JUSTIFY_DAYS, JUSTIFY_HOURS, JUSTIFY_INTERVAL, ISFINITE
 - IANA zone support, BC dates, `+infinity`/`-infinity` sentinels, PG-normalized INTERVAL comparison
 
-**Prepared statements** - `$1, $2, ...` positional parameters with LRU statement cache
+**Prepared statements** - `$1, $2, ...` positional parameters with LRU statement cache plus snapshot-tagged plan caching for joins and compound queries (cache invalidates only on commit, never per-call)
 
 ## License
 

@@ -71,7 +71,7 @@ fn assert_plan(db: &citadel::Database, sql: &str, expected: &str) {
             }
             "IndexScan"
         }
-        ScanPlan::GinScan { .. } => "GinScan",
+        ScanPlan::InvertedScan { .. } => "InvertedScan",
     };
     assert_eq!(
         plan_name, expected,

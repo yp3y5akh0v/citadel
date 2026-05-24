@@ -615,3 +615,40 @@ fn upsert_with_update_then_persist() {
     let got = rtx.table_get(b"ct", b"hot").unwrap().unwrap();
     assert_eq!(i64::from_le_bytes(got.try_into().unwrap()), 5);
 }
+
+#[test]
+fn shrink_overwrite_frees_overflow_chain() {
+    let mgr = create_test_manager();
+    let big = vec![0xAB; MAX_INLINE_VALUE_SIZE * 4 + 17];
+
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.create_table(b"t").unwrap();
+    wtx.table_insert(b"t", b"k", &big).unwrap();
+    let before = wtx.pending_free_count();
+    wtx.table_insert(b"t", b"k", b"small").unwrap();
+    let after = wtx.pending_free_count();
+
+    assert!(
+        after > before,
+        "expected overflow chain pages to be freed (before={before}, after={after})"
+    );
+    assert_eq!(wtx.table_get(b"t", b"k").unwrap(), Some(b"small".to_vec()));
+}
+
+#[test]
+fn shrink_overwrite_default_tree_frees_overflow_chain() {
+    let mgr = create_test_manager();
+    let big = vec![0xCD; MAX_INLINE_VALUE_SIZE * 4 + 17];
+
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.insert(b"k", &big).unwrap();
+    let before = wtx.pending_free_count();
+    wtx.insert(b"k", b"small").unwrap();
+    let after = wtx.pending_free_count();
+
+    assert!(
+        after > before,
+        "expected overflow chain pages to be freed (before={before}, after={after})"
+    );
+    assert_eq!(wtx.get(b"k").unwrap(), Some(b"small".to_vec()));
+}

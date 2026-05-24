@@ -3,11 +3,6 @@
 //! Format: linked list of PendingFree pages on disk.
 //! Each page contains an array of PendingFreeEntry structs.
 //! Chain head stored in CommitSlot.pending_free_root.
-//!
-//! Two-phase model:
-//! - Phase A: scan existing chain, reclaim entries older than oldest_active_reader
-//! - Phase B: write new chain with remaining + newly freed entries
-//! - Old chain pages are deferred to the NEXT commit (breaks circular dependency)
 
 use citadel_buffer::allocator::PageAllocator;
 use citadel_core::types::{PageId, PageType, TxnId};

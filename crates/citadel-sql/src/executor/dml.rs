@@ -261,12 +261,24 @@ pub(super) fn exec_insert(
                 .collect();
             fk_key_buf.clear();
             encode_composite_key_into(&fk_vals, &mut fk_key_buf);
-            let found = wtx
-                .table_get(fk.foreign_table.as_bytes(), &fk_key_buf)
-                .map_err(SqlError::Storage)?;
-            if found.is_none() {
-                let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
-                return Err(SqlError::ForeignKeyViolation(name.to_string()));
+            if fk.deferrable && fk.initially_deferred {
+                let name = fk.name.as_deref().unwrap_or(&fk.foreign_table).to_string();
+                wtx.defer_fk_check(citadel_txn::write_txn::DeferredFkCheck {
+                    fk_name: name,
+                    foreign_table: fk.foreign_table.as_bytes().to_vec(),
+                    parent_key: fk_key_buf.clone(),
+                });
+                continue;
+            }
+            if !wtx.fk_check_cached(fk.foreign_table.as_bytes(), &fk_key_buf) {
+                let found = wtx
+                    .table_get(fk.foreign_table.as_bytes(), &fk_key_buf)
+                    .map_err(SqlError::Storage)?;
+                if found.is_none() {
+                    let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
+                    return Err(SqlError::ForeignKeyViolation(name.to_string()));
+                }
+                wtx.mark_fk_verified(fk.foreign_table.as_bytes(), &fk_key_buf);
             }
         }
 
@@ -372,10 +384,12 @@ pub(super) fn exec_insert(
 
     if let (Some(returning_cols), Some(rows)) = (stmt.returning.as_ref(), returning_rows) {
         let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
+        super::helpers::drain_deferred_fk_checks(&mut wtx)?;
         wtx.commit().map_err(SqlError::Storage)?;
         return Ok(ExecutionResult::Query(qr));
     }
 
+    super::helpers::drain_deferred_fk_checks(&mut wtx)?;
     wtx.commit().map_err(SqlError::Storage)?;
     Ok(ExecutionResult::RowsAffected(count))
 }
@@ -944,7 +958,9 @@ pub(super) fn apply_set_operation(
 
     let mut rows = match (&comp.op, comp.all) {
         (SetOp::Union, true) => {
-            let mut rows = left_qr.rows;
+            let total = left_qr.rows.len().saturating_add(right_qr.rows.len());
+            let mut rows = Vec::with_capacity(total);
+            rows.extend(left_qr.rows);
             rows.extend(right_qr.rows);
             rows
         }
@@ -1567,12 +1583,24 @@ fn exec_insert_in_txn_impl(
                     &bufs.row,
                     &mut bufs.fk_key_buf,
                 );
-                let found = wtx
-                    .table_get(fk.foreign_table.as_bytes(), &bufs.fk_key_buf)
-                    .map_err(SqlError::Storage)?;
-                if found.is_none() {
-                    let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
-                    return Err(SqlError::ForeignKeyViolation(name.to_string()));
+                if fk.deferrable && fk.initially_deferred {
+                    let name = fk.name.as_deref().unwrap_or(&fk.foreign_table).to_string();
+                    wtx.defer_fk_check(citadel_txn::write_txn::DeferredFkCheck {
+                        fk_name: name,
+                        foreign_table: fk.foreign_table.as_bytes().to_vec(),
+                        parent_key: bufs.fk_key_buf.clone(),
+                    });
+                    continue;
+                }
+                if !wtx.fk_check_cached(fk.foreign_table.as_bytes(), &bufs.fk_key_buf) {
+                    let found = wtx
+                        .table_get(fk.foreign_table.as_bytes(), &bufs.fk_key_buf)
+                        .map_err(SqlError::Storage)?;
+                    if found.is_none() {
+                        let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
+                        return Err(SqlError::ForeignKeyViolation(name.to_string()));
+                    }
+                    wtx.mark_fk_verified(fk.foreign_table.as_bytes(), &bufs.fk_key_buf);
                 }
             }
         }
@@ -1735,6 +1763,7 @@ struct InsertCache {
     row_encoder: Option<crate::encoding::IntRowTemplate>,
     is_trivial_fast: bool,
     trivial_fast_program: Option<TrivialFastProgram>,
+    needs_scoped_params: bool,
 }
 
 #[derive(Clone)]
@@ -2581,12 +2610,24 @@ fn apply_do_update_with_old_row(
             .map(|&ci| new_row[ci as usize].clone())
             .collect();
         let fk_key = crate::encoding::encode_composite_key(&fk_vals);
-        let found = wtx
-            .table_get(fk.foreign_table.as_bytes(), &fk_key)
-            .map_err(SqlError::Storage)?;
-        if found.is_none() {
-            let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
-            return Err(SqlError::ForeignKeyViolation(name.to_string()));
+        if fk.deferrable && fk.initially_deferred {
+            let name = fk.name.as_deref().unwrap_or(&fk.foreign_table).to_string();
+            wtx.defer_fk_check(citadel_txn::write_txn::DeferredFkCheck {
+                fk_name: name,
+                foreign_table: fk.foreign_table.as_bytes().to_vec(),
+                parent_key: fk_key,
+            });
+            continue;
+        }
+        if !wtx.fk_check_cached(fk.foreign_table.as_bytes(), &fk_key) {
+            let found = wtx
+                .table_get(fk.foreign_table.as_bytes(), &fk_key)
+                .map_err(SqlError::Storage)?;
+            if found.is_none() {
+                let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
+                return Err(SqlError::ForeignKeyViolation(name.to_string()));
+            }
+            wtx.mark_fk_verified(fk.foreign_table.as_bytes(), &fk_key);
         }
     }
 
@@ -2664,8 +2705,7 @@ fn apply_do_update_with_old_row(
             &[(old_pk_key, new_value_buf.as_slice())],
         )
         .map_err(SqlError::Storage)?;
-        let col_map_partial =
-            any_partial_index(table_schema).then(|| ColumnMap::new(&table_schema.columns));
+        let col_map_partial = any_partial_index(table_schema).then(|| table_schema.column_map());
         for idx in &table_schema.indices {
             let cols_changed = index_columns_changed(idx, old_row, &new_row);
             let (del, ins) = partial_idx_update_actions(
@@ -2674,7 +2714,7 @@ fn apply_do_update_with_old_row(
                 &new_row,
                 cols_changed,
                 false,
-                col_map_partial.as_ref(),
+                col_map_partial,
             );
             let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
             if del {
@@ -3069,11 +3109,21 @@ impl CompiledInsert {
                 None
             };
             let is_trivial_fast = trivial_fast_program.is_some();
+            let has_checks = ts.has_checks();
+            let any_defaults = ts.columns.iter().any(|c| c.default_expr.is_some());
+            let needs_scoped_params = bind_plan.is_none()
+                || has_checks
+                || any_defaults
+                || !generated_col_positions.is_empty()
+                || on_conflict.is_some()
+                || stmt.returning.is_some()
+                || insert_has_subquery(stmt)
+                || super::helpers::any_partial_index(ts);
             Some(InsertCache {
                 col_indices,
                 has_subquery: insert_has_subquery(stmt),
-                any_defaults: ts.columns.iter().any(|c| c.default_expr.is_some()),
-                has_checks: ts.has_checks(),
+                any_defaults,
+                has_checks,
                 on_conflict,
                 row_col_map,
                 generated_col_positions,
@@ -3090,6 +3140,7 @@ impl CompiledInsert {
                 row_encoder,
                 is_trivial_fast,
                 trivial_fast_program,
+                needs_scoped_params,
             })
         } else if schema.get_view(&lower).is_some() {
             None
@@ -3134,7 +3185,7 @@ impl CompiledPlan for CompiledInsert {
 
     fn uses_scoped_params(&self) -> bool {
         match self.cached.as_ref() {
-            Some(c) => !c.is_trivial_fast,
+            Some(c) => !c.is_trivial_fast && c.needs_scoped_params,
             None => true,
         }
     }

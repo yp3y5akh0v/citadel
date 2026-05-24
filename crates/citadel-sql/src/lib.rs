@@ -5,11 +5,13 @@ pub mod encoding;
 pub mod error;
 pub mod eval;
 pub mod executor;
+pub mod fts;
 pub mod json;
 pub mod parser;
 pub mod planner;
 pub mod prepared;
 pub mod schema;
+pub mod system_tables;
 pub mod types;
 
 pub use connection::{Connection, ScriptExecution};

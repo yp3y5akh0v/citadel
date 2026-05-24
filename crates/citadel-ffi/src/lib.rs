@@ -1054,6 +1054,8 @@ pub enum CitadelValueType {
     Interval = 9,
     Json = 10,
     Jsonb = 11,
+    TsVector = 12,
+    TsQuery = 13,
 }
 
 /// Get the type of a value in a query result cell.
@@ -1082,6 +1084,8 @@ pub extern "C" fn citadel_sql_value_type(
         Some(Value::Interval { .. }) => CitadelValueType::Interval,
         Some(Value::Json(_)) => CitadelValueType::Json,
         Some(Value::Jsonb(_)) => CitadelValueType::Jsonb,
+        Some(Value::TsVector(_)) => CitadelValueType::TsVector,
+        Some(Value::TsQuery(_)) => CitadelValueType::TsQuery,
     }
 }
 

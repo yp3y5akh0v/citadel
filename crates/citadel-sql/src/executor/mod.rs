@@ -129,6 +129,11 @@ pub(super) fn scan_table_read_or_view(
         let vs = build_view_schema(name, &qr);
         return Ok((vs, qr.rows));
     }
+    if let Some(vt) = schema.get_virtual(name) {
+        let qr = vt.scan(db, schema)?;
+        let vs = build_view_schema(name, &qr);
+        return Ok((vs, qr.rows));
+    }
     Err(SqlError::TableNotFound(name.to_string()))
 }
 
@@ -200,7 +205,7 @@ pub(super) fn exec_select_join_with_ctes(
     for (ji, join) in stmt.joins.iter().enumerate() {
         let inner_schema = &tables[ji + 1].1;
         let inner_alias = &tables[ji + 1].0;
-        let inner_rows = &join_rows[ji];
+        let inner_rows = &mut join_rows[ji];
 
         let mut preview_tables = cur_tables.clone();
         preview_tables.push((inner_alias.clone(), inner_schema));
@@ -213,6 +218,8 @@ pub(super) fn exec_select_join_with_ctes(
         };
         let inner_col_count = inner_schema.columns.len();
 
+        let (equi_pairs, is_pure_equi) =
+            compute_equi_join_meta(join, &combined_cols, outer_col_count);
         outer_rows = exec_join_step(
             outer_rows,
             inner_rows,
@@ -222,6 +229,8 @@ pub(super) fn exec_select_join_with_ctes(
             inner_col_count,
             None,
             None,
+            &equi_pairs,
+            is_pure_equi,
         );
         cur_tables.push((inner_alias.clone(), inner_schema));
     }

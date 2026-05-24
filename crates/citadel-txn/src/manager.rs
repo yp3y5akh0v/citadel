@@ -35,6 +35,7 @@ pub struct TxnManager {
     epoch: u32,
     pool: Mutex<BufferPool>,
     next_txn_id: AtomicU64,
+    commit_generation: AtomicU64,
     write_active: AtomicBool,
     state: Mutex<ManagerState>,
     sync_mode: citadel_core::types::SyncMode,
@@ -84,6 +85,7 @@ impl TxnManager {
             epoch,
             pool: Mutex::new(BufferPool::new(cache_size)),
             next_txn_id: AtomicU64::new(next_txn_id),
+            commit_generation: AtomicU64::new(0),
             write_active: AtomicBool::new(false),
             state: Mutex::new(ManagerState {
                 active_slot,
@@ -187,6 +189,7 @@ impl TxnManager {
             epoch,
             pool: Mutex::new(BufferPool::new(cache_size)),
             next_txn_id: AtomicU64::new(2),
+            commit_generation: AtomicU64::new(0),
             write_active: AtomicBool::new(false),
             state: Mutex::new(ManagerState {
                 active_slot: 0,
@@ -212,10 +215,15 @@ impl TxnManager {
         let mut state = self.state.lock();
         let txn_id = TxnId(self.next_txn_id.fetch_add(1, Ordering::SeqCst));
         let snapshot = state.current_slot.clone();
+        let commit_generation = self.commit_generation.load(Ordering::Acquire);
 
         *state.reader_table.entry(txn_id).or_insert(0) += 1;
 
-        ReadTxn::new(self, txn_id, snapshot)
+        ReadTxn::new(self, txn_id, snapshot, commit_generation)
+    }
+
+    pub fn commit_generation(&self) -> u64 {
+        self.commit_generation.load(Ordering::Acquire)
     }
 
     pub fn begin_write(&self) -> Result<WriteTxn<'_>> {
@@ -551,6 +559,7 @@ impl TxnManager {
             state.reclaimed_pages = reclaimed;
             state.recycled_pages = Some(std::mem::take(pages));
             state.recycle_safe = no_pages_freed;
+            self.commit_generation.fetch_add(1, Ordering::Release);
         }
 
         self.write_active.store(false, Ordering::SeqCst);

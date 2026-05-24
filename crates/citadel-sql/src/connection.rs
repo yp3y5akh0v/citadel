@@ -520,11 +520,8 @@ impl<'a> ConnectionInner<'a> {
         stmt: &Statement,
         params: &[Value],
     ) -> Result<ExecutionResult> {
-        let cached_ts = self
-            .txn_start_ts
-            .or_else(|| Some(crate::datetime::now_micros()));
         let schema = &self.schema;
-        crate::datetime::with_txn_clock(cached_ts, || {
+        let exec = || {
             if params.is_empty() {
                 plan.execute(db, schema, stmt, params, None)
             } else {
@@ -532,7 +529,15 @@ impl<'a> ConnectionInner<'a> {
                     plan.execute(db, schema, stmt, params, None)
                 })
             }
-        })
+        };
+        if plan.needs_txn_clock() {
+            let cached_ts = self
+                .txn_start_ts
+                .or_else(|| Some(crate::datetime::now_micros()));
+            crate::datetime::with_txn_clock(cached_ts, exec)
+        } else {
+            exec()
+        }
     }
 
     pub(crate) fn parse_and_cache(
@@ -664,10 +669,11 @@ impl<'a> ConnectionInner<'a> {
                 Ok(ExecutionResult::Ok)
             }
             Statement::Commit => {
-                let wtx = self
+                let mut wtx = self
                     .active_txn
                     .take()
                     .ok_or(SqlError::NoActiveTransaction)?;
+                crate::executor::helpers::drain_deferred_fk_checks(&mut wtx)?;
                 wtx.commit().map_err(SqlError::Storage)?;
                 self.clear_savepoint_state();
                 self.txn_start_ts = None;

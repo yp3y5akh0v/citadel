@@ -26,74 +26,18 @@ use super::view::*;
 use super::window::*;
 use super::CteContext;
 
-fn try_tvf(name: &str) -> Option<QueryResult> {
-    match name {
-        "timezone_names" => Some(build_timezone_names()),
-        "timezone_abbrevs" => Some(build_timezone_abbrevs()),
-        _ => None,
-    }
-}
-
-fn build_timezone_names() -> QueryResult {
-    let columns = vec![
-        "name".to_string(),
-        "utc_offset".to_string(),
-        "is_dst".to_string(),
-    ];
-    let mut rows = Vec::new();
-    // Snapshot each zone's current offset + DST state.
-    let now = jiff::Timestamp::now();
-    let db = jiff::tz::db();
-    for name in db.available() {
-        if let Ok(tz) = db.get(name.as_str()) {
-            let info = tz.to_offset_info(now);
-            let (offset_seconds, is_dst) = (info.offset().seconds(), info.dst().is_dst());
-            let utc_offset = Value::Interval {
-                months: 0,
-                days: 0,
-                micros: i64::from(offset_seconds) * 1_000_000,
-            };
-            rows.push(vec![
-                Value::Text(name.to_string().into()),
-                utc_offset,
-                Value::Boolean(is_dst),
-            ]);
-        }
-    }
-    QueryResult { columns, rows }
-}
-
-fn build_timezone_abbrevs() -> QueryResult {
-    // Derived from each zone's current observed offset (approximate).
-    let columns = vec![
-        "abbrev".to_string(),
-        "utc_offset".to_string(),
-        "is_dst".to_string(),
-    ];
-    let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
-    let mut rows = Vec::new();
-    let now = jiff::Timestamp::now();
-    let db = jiff::tz::db();
-    for name in db.available() {
-        if let Ok(tz) = db.get(name.as_str()) {
-            let info = tz.to_offset_info(now);
-            let abbrev = info.abbreviation().to_string();
-            if !seen.insert(abbrev.clone()) {
-                continue;
-            }
-            let utc_offset = Value::Interval {
-                months: 0,
-                days: 0,
-                micros: i64::from(info.offset().seconds()) * 1_000_000,
-            };
-            rows.push(vec![
-                Value::Text(abbrev.into()),
-                utc_offset,
-                Value::Boolean(info.dst().is_dst()),
-            ]);
-        }
-    }
-    QueryResult { columns, rows }
+fn try_virtual_table(
+    name: &str,
+    db: &Database,
+    schema: &SchemaManager,
+) -> Option<Result<QueryResult>> {
+    let canonical = match name {
+        "timezone_names" => "pg_timezone_names",
+        "timezone_abbrevs" => "pg_timezone_abbrevs",
+        other => other,
+    };
+    let vt = schema.get_virtual(canonical)?;
+    Some(vt.scan(db, schema))
 }
 
 pub(super) fn exec_select(
@@ -130,16 +74,16 @@ pub(super) fn exec_select(
 
     let lower_name = stmt.from.to_ascii_lowercase();
 
-    // Built-in TVFs (reserved names — cannot collide with user tables).
-    if let Some(tvf_result) = try_tvf(&lower_name) {
+    if let Some(vt_result) = try_virtual_table(&lower_name, db, schema) {
+        let vt_result = vt_result?;
         if stmt.joins.is_empty() {
-            return exec_select_from_cte(&tvf_result, stmt, &mut |sub| {
+            return exec_select_from_cte(&vt_result, stmt, &mut |sub| {
                 exec_subquery_read(db, schema, sub, ctes)
             });
         }
-        let mut tvf_ctes = ctes.clone();
-        tvf_ctes.insert(lower_name.clone(), tvf_result);
-        return super::exec_select_join_with_ctes(stmt, &tvf_ctes, &mut |name| {
+        let mut vt_ctes = ctes.clone();
+        vt_ctes.insert(lower_name.clone(), vt_result);
+        return super::exec_select_join_with_ctes(stmt, &vt_ctes, &mut |name| {
             super::scan_table_read_or_view(db, schema, name)
         });
     }
@@ -243,7 +187,6 @@ pub(super) fn exec_select(
         outer_alias: stmt.from_alias.as_deref(),
     };
     if has_correlated_where(&stmt.where_clause, &corr_ctx, schema) {
-        // Phase 1: decorrelation maps (inner only), Phase 2: scan outer with probing
         let (mut rows, remaining_where) =
             build_and_scan_correlated_read(db, schema, stmt, table_schema, &corr_ctx)?;
         let clean_stmt = SelectStmt {
@@ -372,10 +315,930 @@ pub(super) fn exec_select(
         return Ok(result);
     }
 
+    if let Some(result) = try_inverted_ts_rank_topk(db, table_schema, stmt)? {
+        return Ok(result);
+    }
+
+    if let Some(result) = try_inverted_index_only(db, table_schema, stmt)? {
+        return Ok(result);
+    }
+
     let scan_limit = compute_scan_limit(stmt);
     let (rows, predicate_applied) =
         collect_rows_read(db, table_schema, &stmt.where_clause, scan_limit)?;
     process_select(&table_schema.columns, rows, stmt, predicate_applied)
+}
+
+fn fts_phrase_ast_from_predicate(expr: &Expr) -> Option<crate::fts::TsQueryAst> {
+    match expr {
+        Expr::BinaryOp {
+            op: BinOp::JsonPathMatch,
+            right,
+            ..
+        } => {
+            let col_map = crate::eval::ColumnMap::new(&[]);
+            let ctx = crate::eval::EvalCtx::new(&col_map, &[]);
+            match crate::eval::eval_expr(right, &ctx).ok()? {
+                Value::TsQuery(bytes) => crate::fts::TsQueryAst::decode(&bytes).ok(),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn fts_phrase_lexemes(ast: &crate::fts::TsQueryAst) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    fn walk(ast: &crate::fts::TsQueryAst, out: &mut Vec<Vec<u8>>) {
+        match ast {
+            crate::fts::TsQueryAst::Lexeme { lexeme, .. } => out.push(lexeme.clone()),
+            crate::fts::TsQueryAst::Phrase { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            _ => {}
+        }
+    }
+    walk(ast, &mut out);
+    out
+}
+
+fn compile_phrase_eval(ast: &crate::fts::TsQueryAst, phrase_lexemes: &[Vec<u8>]) -> CompiledPhrase {
+    fn walk(ast: &crate::fts::TsQueryAst, phrase_lexemes: &[Vec<u8>]) -> CompiledPhrase {
+        match ast {
+            crate::fts::TsQueryAst::Lexeme { lexeme, .. } => {
+                let idx = phrase_lexemes
+                    .iter()
+                    .position(|l| l == lexeme)
+                    .expect("phrase lexeme not in list");
+                CompiledPhrase::Leaf(idx)
+            }
+            crate::fts::TsQueryAst::Phrase {
+                distance,
+                left,
+                right,
+            } => CompiledPhrase::Phrase {
+                distance: *distance,
+                left: Box::new(walk(left, phrase_lexemes)),
+                right: Box::new(walk(right, phrase_lexemes)),
+            },
+            _ => unreachable!("pure-phrase AST only"),
+        }
+    }
+    walk(ast, phrase_lexemes)
+}
+
+enum CompiledPhrase {
+    Leaf(usize),
+    Phrase {
+        distance: u16,
+        left: Box<CompiledPhrase>,
+        right: Box<CompiledPhrase>,
+    },
+}
+
+fn eval_compiled(eval: &CompiledPhrase, per_probe_positions: &[Vec<u16>], out: &mut Vec<u16>) {
+    out.clear();
+    match eval {
+        CompiledPhrase::Leaf(idx) => {
+            out.extend_from_slice(&per_probe_positions[*idx]);
+        }
+        CompiledPhrase::Phrase {
+            distance,
+            left,
+            right,
+        } => {
+            let mut lp = Vec::new();
+            let mut rp = Vec::new();
+            eval_compiled(left, per_probe_positions, &mut lp);
+            eval_compiled(right, per_probe_positions, &mut rp);
+            if lp.is_empty() || rp.is_empty() {
+                return;
+            }
+            let (mut i, mut j) = (0usize, 0usize);
+            while i < lp.len() && j < rp.len() {
+                let l = lp[i] & 0x3FFF;
+                let r = rp[j] & 0x3FFF;
+                let target = l.saturating_add(*distance);
+                if r == target {
+                    if out.last().copied() != Some(rp[j]) {
+                        out.push(rp[j]);
+                    }
+                    j += 1;
+                } else if r < target {
+                    j += 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
+fn weight_default_score(packed: u16) -> f64 {
+    match packed >> 14 {
+        3 => 1.0,
+        2 => 0.4,
+        1 => 0.2,
+        _ => 0.1,
+    }
+}
+
+fn ts_rank_from_index_positions(positions_per_lex: &[&[u16]]) -> f64 {
+    let mut score = 0.0_f64;
+    for positions in positions_per_lex {
+        if positions.is_empty() {
+            continue;
+        }
+        let weight_sum: f64 = positions.iter().map(|&p| weight_default_score(p)).sum();
+        let tf = (positions.len() as f64).ln_1p();
+        score += weight_sum * (1.0 + tf);
+    }
+    score
+}
+
+fn try_inverted_ts_rank_topk(
+    db: &Database,
+    table_schema: &TableSchema,
+    stmt: &SelectStmt,
+) -> Result<Option<ExecutionResult>> {
+    if !stmt.joins.is_empty()
+        || !stmt.group_by.is_empty()
+        || stmt.distinct
+        || stmt.having.is_some()
+        || stmt.from_subquery.is_some()
+        || stmt.from_json_table.is_some()
+        || has_any_window_function(stmt)
+    {
+        return Ok(None);
+    }
+    if stmt.where_clause.is_none() {
+        return Ok(None);
+    }
+    let plan = crate::planner::plan_select_inverted(table_schema, &stmt.where_clause);
+    let (idx_table, probe_entries, fts_col_idx, _kind) = match plan {
+        crate::planner::ScanPlan::InvertedScan {
+            kind: crate::types::InvertedKind::Fts { .. },
+            idx_table,
+            probe_entries,
+            recheck_needed,
+            column_idx,
+            ..
+        } if !recheck_needed => (
+            idx_table,
+            probe_entries,
+            column_idx as usize,
+            crate::types::InvertedKind::Fts { config_id: 0 },
+        ),
+        _ => return Ok(None),
+    };
+    let fts_col_name = table_schema.columns[fts_col_idx].name.to_ascii_lowercase();
+
+    let pk_col_indices: Vec<usize> = table_schema
+        .primary_key_columns
+        .iter()
+        .map(|&i| i as usize)
+        .collect();
+    enum OutCol {
+        Pk,
+        TsRank,
+    }
+    let mut out_cols: Vec<OutCol> = Vec::with_capacity(stmt.columns.len());
+    let mut out_col_names: Vec<String> = Vec::with_capacity(stmt.columns.len());
+    let mut rank_alias: Option<String> = None;
+    let mut saw_rank = false;
+    for sc in &stmt.columns {
+        let (expr, alias) = match sc {
+            SelectColumn::Expr { expr, alias } => (expr, alias.clone()),
+            _ => return Ok(None),
+        };
+        match expr {
+            Expr::Column(n) | Expr::QualifiedColumn { column: n, .. } => {
+                let lower = n.to_ascii_lowercase();
+                let schema_idx = match table_schema.column_index(&lower) {
+                    Some(i) => i,
+                    None => return Ok(None),
+                };
+                if !pk_col_indices.contains(&schema_idx) {
+                    return Ok(None);
+                }
+                out_cols.push(OutCol::Pk);
+                out_col_names.push(alias.unwrap_or_else(|| n.clone()));
+            }
+            Expr::Function { name, args, .. }
+                if name.eq_ignore_ascii_case("ts_rank") && args.len() == 2 =>
+            {
+                let arg_col = match &args[0] {
+                    Expr::Column(c) => c.to_ascii_lowercase(),
+                    Expr::QualifiedColumn { column, .. } => column.to_ascii_lowercase(),
+                    _ => return Ok(None),
+                };
+                if arg_col != fts_col_name {
+                    return Ok(None);
+                }
+                let col_map = crate::eval::ColumnMap::new(&[]);
+                let ctx = crate::eval::EvalCtx::new(&col_map, &[]);
+                let q = match crate::eval::eval_expr(&args[1], &ctx) {
+                    Ok(Value::TsQuery(b)) => b,
+                    _ => return Ok(None),
+                };
+                let _ = q;
+                out_cols.push(OutCol::TsRank);
+                let name = alias.clone().unwrap_or_else(|| "ts_rank".to_string());
+                rank_alias = Some(name.clone());
+                out_col_names.push(name);
+                saw_rank = true;
+            }
+            _ => return Ok(None),
+        }
+    }
+    if !saw_rank {
+        return Ok(None);
+    }
+
+    let rank_alias = rank_alias.unwrap();
+    if stmt.order_by.len() != 1 {
+        return Ok(None);
+    }
+    let order = &stmt.order_by[0];
+    let order_name = match &order.expr {
+        Expr::Column(n) => n.to_ascii_lowercase(),
+        Expr::QualifiedColumn { column, .. } => column.to_ascii_lowercase(),
+        _ => return Ok(None),
+    };
+    if order_name != rank_alias.to_ascii_lowercase() {
+        return Ok(None);
+    }
+    let limit = match stmt.limit.as_ref() {
+        Some(expr) => eval_const_int(expr)?.max(0) as usize,
+        None => return Ok(None),
+    };
+    if limit == 0 || stmt.offset.is_some() {
+        return Ok(None);
+    }
+    let single_int_pk = pk_col_indices.len() == 1
+        && table_schema.columns[pk_col_indices[0]].data_type == DataType::Integer;
+    if !single_int_pk {
+        return Ok(None);
+    }
+
+    struct Probe {
+        pks: Vec<i64>,
+        offs: Vec<u32>,
+        data: Vec<u16>,
+    }
+    let mut probes: Vec<Probe> = Vec::with_capacity(probe_entries.len());
+    let mut rtx = db.begin_read();
+    for entry in &probe_entries {
+        let mut prefix = entry.clone();
+        prefix.push(0x1F);
+        let mut p = Probe {
+            pks: Vec::with_capacity(1024),
+            offs: Vec::with_capacity(1025),
+            data: Vec::with_capacity(2048),
+        };
+        p.offs.push(0);
+        let mut scan_err: Option<SqlError> = None;
+        rtx.table_scan_from_fast(&idx_table, &prefix, |key, value| {
+            if !key.starts_with(&prefix) {
+                return Ok(false);
+            }
+            match crate::encoding::decode_pk_integer(&key[prefix.len()..]) {
+                Ok(id) => p.pks.push(id),
+                Err(e) => {
+                    scan_err = Some(e);
+                    return Ok(false);
+                }
+            }
+            let mut i = 0;
+            while i + 2 <= value.len() {
+                p.data.push(u16::from_le_bytes([value[i], value[i + 1]]));
+                i += 2;
+            }
+            p.offs.push(p.data.len() as u32);
+            Ok(true)
+        })
+        .map_err(SqlError::Storage)?;
+        if let Some(e) = scan_err {
+            return Err(e);
+        }
+        if p.pks.is_empty() {
+            return Ok(Some(ExecutionResult::Query(QueryResult {
+                columns: out_col_names,
+                rows: Vec::new(),
+            })));
+        }
+        probes.push(p);
+    }
+
+    fn score_to_key(s: f64) -> i64 {
+        let bits = s.to_bits() as i64;
+        if bits < 0 {
+            !bits
+        } else {
+            bits ^ i64::MIN
+        }
+    }
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let mut heap: BinaryHeap<Reverse<(i64, i64)>> = BinaryHeap::with_capacity(limit + 1);
+
+    let driver_idx = probes
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, p)| p.pks.len())
+        .map(|(i, _)| i)
+        .unwrap();
+    let driver = probes.swap_remove(driver_idx);
+    let mut indices = vec![0usize; probes.len()];
+    let mut positions_per_lex: Vec<&[u16]> = vec![&[]; probe_entries.len()];
+
+    'outer: for di in 0..driver.pks.len() {
+        let pk = driver.pks[di];
+        for (pi, probe) in probes.iter().enumerate() {
+            while indices[pi] < probe.pks.len() && probe.pks[indices[pi]] < pk {
+                indices[pi] += 1;
+            }
+            if indices[pi] >= probe.pks.len() || probe.pks[indices[pi]] != pk {
+                continue 'outer;
+            }
+        }
+        let dr_s = driver.offs[di] as usize;
+        let dr_e = driver.offs[di + 1] as usize;
+        positions_per_lex[0] = &driver.data[dr_s..dr_e];
+        for (pi, probe) in probes.iter().enumerate() {
+            let idx = indices[pi];
+            let s = probe.offs[idx] as usize;
+            let e = probe.offs[idx + 1] as usize;
+            positions_per_lex[pi + 1] = &probe.data[s..e];
+        }
+        let score = ts_rank_from_index_positions(&positions_per_lex);
+        let key = score_to_key(score);
+        if heap.len() < limit {
+            heap.push(Reverse((key, pk)));
+        } else if let Some(Reverse((min_key, _))) = heap.peek() {
+            if key > *min_key {
+                heap.pop();
+                heap.push(Reverse((key, pk)));
+            }
+        }
+    }
+
+    fn key_to_score(k: i64) -> f64 {
+        let bits = if k < 0 { !k } else { k ^ i64::MIN };
+        f64::from_bits(bits as u64)
+    }
+    let mut sorted: Vec<(i64, i64)> = heap.into_iter().map(|r| r.0).collect();
+    sorted.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
+
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(sorted.len());
+    for (key, pk) in sorted {
+        let score = key_to_score(key);
+        let mut row = Vec::with_capacity(out_cols.len());
+        for col in &out_cols {
+            match col {
+                OutCol::Pk => row.push(Value::Integer(pk)),
+                OutCol::TsRank => row.push(Value::Real(score)),
+            }
+        }
+        rows.push(row);
+    }
+    Ok(Some(ExecutionResult::Query(QueryResult {
+        columns: out_col_names,
+        rows,
+    })))
+}
+
+fn try_inverted_index_only(
+    db: &Database,
+    table_schema: &TableSchema,
+    stmt: &SelectStmt,
+) -> Result<Option<ExecutionResult>> {
+    if !stmt.joins.is_empty()
+        || !stmt.group_by.is_empty()
+        || stmt.distinct
+        || stmt.having.is_some()
+        || stmt.from_subquery.is_some()
+        || stmt.from_json_table.is_some()
+        || has_any_window_function(stmt)
+    {
+        return Ok(None);
+    }
+    let where_expr = match &stmt.where_clause {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    let plan = crate::planner::plan_select_inverted(table_schema, &stmt.where_clause);
+    let (idx_table, probe_entries, phrase_ast) = match plan {
+        crate::planner::ScanPlan::InvertedScan {
+            kind: crate::types::InvertedKind::Fts { .. },
+            idx_table,
+            probe_entries,
+            recheck_needed,
+            recheck_expr,
+            ..
+        } => {
+            let ast = fts_phrase_ast_from_predicate(&recheck_expr);
+            if !recheck_needed {
+                (idx_table, probe_entries, None)
+            } else if let Some(ast) = ast {
+                if crate::planner::fts_ast_is_pure_phrase(&ast) {
+                    (idx_table, probe_entries, Some(ast))
+                } else {
+                    return Ok(None);
+                }
+            } else {
+                return Ok(None);
+            }
+        }
+        crate::planner::ScanPlan::InvertedScan {
+            idx_table,
+            probe_entries,
+            recheck_needed,
+            ..
+        } if !recheck_needed => (idx_table, probe_entries, None),
+        _ => return Ok(None),
+    };
+    let pk_col_indices: Vec<usize> = table_schema
+        .primary_key_columns
+        .iter()
+        .map(|&i| i as usize)
+        .collect();
+    let mut out_col_names: Vec<String> = Vec::with_capacity(stmt.columns.len());
+    let mut out_col_to_pk_pos: Vec<usize> = Vec::with_capacity(stmt.columns.len());
+    for sc in &stmt.columns {
+        match sc {
+            SelectColumn::Expr { expr, alias } => {
+                let col_name = match expr {
+                    Expr::Column(n) => n.clone(),
+                    Expr::QualifiedColumn { column, .. } => column.clone(),
+                    _ => return Ok(None),
+                };
+                let schema_idx = match table_schema.column_index(&col_name) {
+                    Some(i) => i,
+                    None => return Ok(None),
+                };
+                let pk_pos = match pk_col_indices.iter().position(|&i| i == schema_idx) {
+                    Some(p) => p,
+                    None => return Ok(None),
+                };
+                out_col_to_pk_pos.push(pk_pos);
+                out_col_names.push(alias.clone().unwrap_or(col_name));
+            }
+            _ => return Ok(None),
+        }
+    }
+    for order in &stmt.order_by {
+        let col_name = match &order.expr {
+            Expr::Column(n) => n,
+            Expr::QualifiedColumn { column, .. } => column,
+            _ => return Ok(None),
+        };
+        let schema_idx = match table_schema.column_index(col_name) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        if !pk_col_indices.contains(&schema_idx) {
+            return Ok(None);
+        }
+    }
+    let _ = where_expr;
+
+    let single_int_pk = pk_col_indices.len() == 1
+        && table_schema.columns[pk_col_indices[0]].data_type == DataType::Integer;
+
+    let mut rtx = db.begin_read();
+    let mut int_acc: Option<Vec<i64>> = None;
+
+    let acc = if let Some(ast) = phrase_ast.as_ref() {
+        let phrase_lexemes = fts_phrase_lexemes(ast);
+        let compiled = compile_phrase_eval(ast, &phrase_lexemes);
+
+        if single_int_pk {
+            struct Probe {
+                pks: Vec<i64>,
+                offs: Vec<u32>,
+                data: Vec<u16>,
+            }
+            let mut probes2: Vec<(Vec<u8>, Probe)> = Vec::with_capacity(phrase_lexemes.len());
+            for entry in &phrase_lexemes {
+                let mut prefix = entry.clone();
+                prefix.push(0x1F);
+                let mut p = Probe {
+                    pks: Vec::with_capacity(1024),
+                    offs: Vec::with_capacity(1025),
+                    data: Vec::with_capacity(2048),
+                };
+                p.offs.push(0);
+                let mut scan_err: Option<SqlError> = None;
+                rtx.table_scan_from_fast(&idx_table, &prefix, |key, value| {
+                    if !key.starts_with(&prefix) {
+                        return Ok(false);
+                    }
+                    match crate::encoding::decode_pk_integer(&key[prefix.len()..]) {
+                        Ok(id) => p.pks.push(id),
+                        Err(e) => {
+                            scan_err = Some(e);
+                            return Ok(false);
+                        }
+                    }
+                    let mut i = 0;
+                    while i + 2 <= value.len() {
+                        p.data.push(u16::from_le_bytes([value[i], value[i + 1]]));
+                        i += 2;
+                    }
+                    p.offs.push(p.data.len() as u32);
+                    Ok(true)
+                })
+                .map_err(SqlError::Storage)?;
+                if let Some(e) = scan_err {
+                    return Err(e);
+                }
+                if p.pks.is_empty() {
+                    return Ok(Some(ExecutionResult::Query(QueryResult {
+                        columns: out_col_names,
+                        rows: Vec::new(),
+                    })));
+                }
+                probes2.push((entry.clone(), p));
+            }
+            let driver_idx = probes2
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, p))| p.pks.len())
+                .map(|(i, _)| i)
+                .unwrap();
+            let (driver_lex, driver) = probes2.swap_remove(driver_idx);
+            let driver_phrase_idx = phrase_lexemes
+                .iter()
+                .position(|l| l == &driver_lex)
+                .unwrap();
+            let other_phrase_idx: Vec<usize> = probes2
+                .iter()
+                .map(|(lex, _)| phrase_lexemes.iter().position(|l| l == lex).unwrap())
+                .collect();
+
+            let mut matched: Vec<i64> = Vec::with_capacity(driver.pks.len() / 4);
+            let mut indices = vec![0usize; probes2.len()];
+
+            let two_lex: Option<(usize, usize, u16)> = match &compiled {
+                CompiledPhrase::Phrase {
+                    distance,
+                    left,
+                    right,
+                } => match (left.as_ref(), right.as_ref()) {
+                    (CompiledPhrase::Leaf(l), CompiledPhrase::Leaf(r)) => Some((*l, *r, *distance)),
+                    _ => None,
+                },
+                _ => None,
+            };
+
+            if let Some((l_lex, r_lex, dist)) = two_lex {
+                let l_is_driver = driver_phrase_idx == l_lex;
+                let r_is_driver = driver_phrase_idx == r_lex;
+                let l_pi = if l_is_driver {
+                    usize::MAX
+                } else {
+                    other_phrase_idx.iter().position(|&p| p == l_lex).unwrap()
+                };
+                let r_pi = if r_is_driver {
+                    usize::MAX
+                } else {
+                    other_phrase_idx.iter().position(|&p| p == r_lex).unwrap()
+                };
+
+                'outer: for di in 0..driver.pks.len() {
+                    let pk = driver.pks[di];
+                    for (pi, (_, probe)) in probes2.iter().enumerate() {
+                        while indices[pi] < probe.pks.len() && probe.pks[indices[pi]] < pk {
+                            indices[pi] += 1;
+                        }
+                        if indices[pi] >= probe.pks.len() || probe.pks[indices[pi]] != pk {
+                            continue 'outer;
+                        }
+                    }
+                    let l_slice: &[u16] = if l_is_driver {
+                        let s = driver.offs[di] as usize;
+                        let e = driver.offs[di + 1] as usize;
+                        &driver.data[s..e]
+                    } else {
+                        let probe = &probes2[l_pi].1;
+                        let idx = indices[l_pi];
+                        let s = probe.offs[idx] as usize;
+                        let e = probe.offs[idx + 1] as usize;
+                        &probe.data[s..e]
+                    };
+                    let r_slice: &[u16] = if r_is_driver {
+                        let s = driver.offs[di] as usize;
+                        let e = driver.offs[di + 1] as usize;
+                        &driver.data[s..e]
+                    } else {
+                        let probe = &probes2[r_pi].1;
+                        let idx = indices[r_pi];
+                        let s = probe.offs[idx] as usize;
+                        let e = probe.offs[idx + 1] as usize;
+                        &probe.data[s..e]
+                    };
+                    let (mut i, mut j) = (0usize, 0usize);
+                    while i < l_slice.len() && j < r_slice.len() {
+                        let l = l_slice[i] & 0x3FFF;
+                        let r = r_slice[j] & 0x3FFF;
+                        let target = l + dist;
+                        if r == target {
+                            matched.push(pk);
+                            continue 'outer;
+                        } else if r < target {
+                            j += 1;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+            } else {
+                let mut probe_positions: Vec<Vec<u16>> = vec![Vec::new(); phrase_lexemes.len()];
+                let mut out_pos: Vec<u16> = Vec::new();
+                'outer2: for di in 0..driver.pks.len() {
+                    let pk = driver.pks[di];
+                    for (pi, (_, probe)) in probes2.iter().enumerate() {
+                        while indices[pi] < probe.pks.len() && probe.pks[indices[pi]] < pk {
+                            indices[pi] += 1;
+                        }
+                        if indices[pi] >= probe.pks.len() || probe.pks[indices[pi]] != pk {
+                            continue 'outer2;
+                        }
+                    }
+                    let dr_start = driver.offs[di] as usize;
+                    let dr_end = driver.offs[di + 1] as usize;
+                    probe_positions[driver_phrase_idx].clear();
+                    probe_positions[driver_phrase_idx]
+                        .extend_from_slice(&driver.data[dr_start..dr_end]);
+                    for (pi, (_, probe)) in probes2.iter().enumerate() {
+                        let idx = indices[pi];
+                        let s = probe.offs[idx] as usize;
+                        let e = probe.offs[idx + 1] as usize;
+                        let lex_idx = other_phrase_idx[pi];
+                        probe_positions[lex_idx].clear();
+                        probe_positions[lex_idx].extend_from_slice(&probe.data[s..e]);
+                    }
+                    eval_compiled(&compiled, &probe_positions, &mut out_pos);
+                    if !out_pos.is_empty() {
+                        matched.push(pk);
+                    }
+                }
+            }
+            int_acc = Some(matched);
+            Vec::new()
+        } else {
+            let mut per_probe: Vec<Vec<(Vec<u8>, Vec<u16>)>> =
+                Vec::with_capacity(phrase_lexemes.len());
+            for entry in &phrase_lexemes {
+                let mut prefix = entry.clone();
+                prefix.push(0x1F);
+                let mut list: Vec<(Vec<u8>, Vec<u16>)> = Vec::new();
+                rtx.table_scan_from_fast(&idx_table, &prefix, |key, value| {
+                    if !key.starts_with(&prefix) {
+                        return Ok(false);
+                    }
+                    let pk = key[prefix.len()..].to_vec();
+                    let mut positions = Vec::with_capacity(value.len() / 2);
+                    let mut i = 0;
+                    while i + 2 <= value.len() {
+                        positions.push(u16::from_le_bytes([value[i], value[i + 1]]));
+                        i += 2;
+                    }
+                    list.push((pk, positions));
+                    Ok(true)
+                })
+                .map_err(SqlError::Storage)?;
+                if list.is_empty() {
+                    return Ok(Some(ExecutionResult::Query(QueryResult {
+                        columns: out_col_names,
+                        rows: Vec::new(),
+                    })));
+                }
+                per_probe.push(list);
+            }
+            per_probe.sort_by_key(|l| l.len());
+            let first = per_probe.remove(0);
+            let mut candidates: Vec<(Vec<u8>, Vec<Vec<u16>>)> = first
+                .into_iter()
+                .map(|(pk, positions)| (pk, vec![positions]))
+                .collect();
+            for other in per_probe {
+                let mut out: Vec<(Vec<u8>, Vec<Vec<u16>>)> =
+                    Vec::with_capacity(candidates.len().min(other.len()));
+                let (mut i, mut j) = (0usize, 0usize);
+                while i < candidates.len() && j < other.len() {
+                    match candidates[i].0.cmp(&other[j].0) {
+                        std::cmp::Ordering::Equal => {
+                            let mut entry = std::mem::take(&mut candidates[i]);
+                            entry.1.push(other[j].1.clone());
+                            out.push(entry);
+                            i += 1;
+                            j += 1;
+                        }
+                        std::cmp::Ordering::Less => i += 1,
+                        std::cmp::Ordering::Greater => j += 1,
+                    }
+                }
+                candidates = out;
+                if candidates.is_empty() {
+                    break;
+                }
+            }
+            let mut matched: Vec<Vec<u8>> = Vec::with_capacity(candidates.len());
+            let mut out_positions: Vec<u16> = Vec::new();
+            for (pk, per_probe_positions) in candidates {
+                eval_compiled(&compiled, &per_probe_positions, &mut out_positions);
+                if !out_positions.is_empty() {
+                    matched.push(pk);
+                }
+            }
+            matched
+        }
+    } else if single_int_pk {
+        let mut lists: Vec<Vec<i64>> = Vec::with_capacity(probe_entries.len());
+        for entry in &probe_entries {
+            let mut prefix = entry.clone();
+            prefix.push(0x1F);
+            let mut list: Vec<i64> = Vec::with_capacity(1024);
+            let mut scan_err: Option<SqlError> = None;
+            rtx.table_scan_from_fast(&idx_table, &prefix, |key, _v| {
+                if !key.starts_with(&prefix) {
+                    return Ok(false);
+                }
+                match crate::encoding::decode_pk_integer(&key[prefix.len()..]) {
+                    Ok(id) => list.push(id),
+                    Err(e) => {
+                        scan_err = Some(e);
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })
+            .map_err(SqlError::Storage)?;
+            if let Some(e) = scan_err {
+                return Err(e);
+            }
+            if list.is_empty() {
+                return Ok(Some(ExecutionResult::Query(QueryResult {
+                    columns: out_col_names,
+                    rows: Vec::new(),
+                })));
+            }
+            lists.push(list);
+        }
+        lists.sort_by_key(|l| l.len());
+        let mut acc = lists.remove(0);
+        for other in lists {
+            let mut out: Vec<i64> = Vec::with_capacity(acc.len().min(other.len()));
+            let (mut i, mut j) = (0usize, 0usize);
+            while i < acc.len() && j < other.len() {
+                match acc[i].cmp(&other[j]) {
+                    std::cmp::Ordering::Equal => {
+                        out.push(acc[i]);
+                        i += 1;
+                        j += 1;
+                    }
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                }
+            }
+            acc = out;
+            if acc.is_empty() {
+                break;
+            }
+        }
+        int_acc = Some(acc);
+        Vec::new()
+    } else {
+        let mut lists: Vec<Vec<Vec<u8>>> = Vec::with_capacity(probe_entries.len());
+        for entry in &probe_entries {
+            let mut prefix = entry.clone();
+            prefix.push(0x1F);
+            let mut list: Vec<Vec<u8>> = Vec::new();
+            rtx.table_scan_from_fast(&idx_table, &prefix, |key, _v| {
+                if !key.starts_with(&prefix) {
+                    return Ok(false);
+                }
+                list.push(key[prefix.len()..].to_vec());
+                Ok(true)
+            })
+            .map_err(SqlError::Storage)?;
+            if list.is_empty() {
+                return Ok(Some(ExecutionResult::Query(QueryResult {
+                    columns: out_col_names,
+                    rows: Vec::new(),
+                })));
+            }
+            lists.push(list);
+        }
+        lists.sort_by_key(|l| l.len());
+        let mut acc = lists.remove(0);
+        for other in lists {
+            let mut out = Vec::with_capacity(acc.len().min(other.len()));
+            let (mut i, mut j) = (0usize, 0usize);
+            while i < acc.len() && j < other.len() {
+                match acc[i].cmp(&other[j]) {
+                    std::cmp::Ordering::Equal => {
+                        out.push(std::mem::take(&mut acc[i]));
+                        i += 1;
+                        j += 1;
+                    }
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                }
+            }
+            acc = out;
+            if acc.is_empty() {
+                break;
+            }
+        }
+        acc
+    };
+
+    let num_pk_cols = pk_col_indices.len();
+    let single_int_fast = num_pk_cols == 1
+        && out_col_to_pk_pos.len() == 1
+        && out_col_to_pk_pos[0] == 0
+        && table_schema.columns[pk_col_indices[0]].data_type == DataType::Integer;
+    let mut result_rows: Vec<Vec<Value>> = if let Some(ints) = int_acc.take() {
+        ints.into_iter()
+            .map(|id| vec![Value::Integer(id)])
+            .collect()
+    } else if single_int_fast {
+        let mut rows = Vec::with_capacity(acc.len());
+        for pk_bytes in &acc {
+            let id = decode_pk_integer(pk_bytes)?;
+            rows.push(vec![Value::Integer(id)]);
+        }
+        rows
+    } else {
+        let mut rows = Vec::with_capacity(acc.len());
+        for pk_bytes in &acc {
+            let pk_vals = decode_composite_key(pk_bytes, num_pk_cols)?;
+            let mut out_row = Vec::with_capacity(out_col_to_pk_pos.len());
+            for &pos in &out_col_to_pk_pos {
+                out_row.push(pk_vals[pos].clone());
+            }
+            rows.push(out_row);
+        }
+        rows
+    };
+
+    if !stmt.order_by.is_empty() {
+        let order_cols: Vec<(usize, bool)> = stmt
+            .order_by
+            .iter()
+            .map(|o| {
+                let col_name = match &o.expr {
+                    Expr::Column(n) => n.clone(),
+                    Expr::QualifiedColumn { column, .. } => column.clone(),
+                    _ => unreachable!(),
+                };
+                let schema_idx = table_schema.column_index(&col_name).unwrap();
+                let pk_pos = pk_col_indices
+                    .iter()
+                    .position(|&i| i == schema_idx)
+                    .unwrap();
+                let out_pos = out_col_to_pk_pos
+                    .iter()
+                    .position(|&p| p == pk_pos)
+                    .unwrap_or(usize::MAX);
+                (out_pos, o.descending)
+            })
+            .collect();
+        if order_cols.iter().any(|&(p, _)| p == usize::MAX) {
+            return Ok(None);
+        }
+        result_rows.sort_by(|a, b| {
+            for &(pos, desc) in &order_cols {
+                let cmp = a[pos].cmp(&b[pos]);
+                if cmp != std::cmp::Ordering::Equal {
+                    return if desc { cmp.reverse() } else { cmp };
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
+    if let Some(ref limit_expr) = stmt.limit {
+        let limit = eval_const_int(limit_expr)?.max(0) as usize;
+        result_rows.truncate(limit);
+    }
+    if let Some(ref offset_expr) = stmt.offset {
+        let offset = eval_const_int(offset_expr)?.max(0) as usize;
+        if offset >= result_rows.len() {
+            result_rows.clear();
+        } else {
+            result_rows = result_rows.split_off(offset);
+        }
+    }
+
+    Ok(Some(ExecutionResult::Query(QueryResult {
+        columns: out_col_names,
+        rows: result_rows,
+    })))
 }
 
 pub(super) fn compute_scan_limit(stmt: &SelectStmt) -> Option<usize> {
@@ -1937,14 +2800,24 @@ fn exec_select_with_srf(
         .from_args
         .as_ref()
         .expect("from_args present when exec_select_with_srf called");
-    let arg_values: Vec<Value> = args_exprs
-        .iter()
-        .map(|e| {
-            let col_map = ColumnMap::new(&[]);
-            eval_expr(e, &EvalCtx::new(&col_map, &[]))
-        })
-        .collect::<Result<_>>()?;
-    let (columns, rows) = crate::json::dispatch_srf(&stmt.from, &arg_values)?;
+
+    let upper_name = stmt.from.to_ascii_uppercase();
+    let (columns, rows) = match upper_name.as_str() {
+        "JSONB_POPULATE_RECORD" | "JSONB_POPULATE_RECORDSET" => {
+            populate_record_dispatch(&upper_name, args_exprs, schema)?
+        }
+        _ => {
+            let arg_values: Vec<Value> = args_exprs
+                .iter()
+                .map(|e| {
+                    let col_map = ColumnMap::new(&[]);
+                    eval_expr(e, &EvalCtx::new(&col_map, &[]))
+                })
+                .collect::<Result<_>>()?;
+            crate::json::dispatch_srf(&stmt.from, &arg_values)?
+        }
+    };
+
     let alias = stmt
         .from_alias
         .clone()
@@ -1957,6 +2830,70 @@ fn exec_select_with_srf(
     new_stmt.from = alias;
     new_stmt.from_args = None;
     exec_select(db, schema, &new_stmt, &new_ctes)
+}
+
+fn populate_record_dispatch(
+    upper_name: &str,
+    args_exprs: &[Expr],
+    schema: &SchemaManager,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    if args_exprs.len() != 2 {
+        return Err(SqlError::InvalidValue(format!(
+            "{upper_name} requires 2 arguments: NULL::table_type, jsonb"
+        )));
+    }
+    let table_name = match &args_exprs[0] {
+        Expr::TypedNullRecord(name) => name,
+        _ => {
+            return Err(SqlError::InvalidValue(format!(
+                "{upper_name}: first argument must be NULL::table_type"
+            )))
+        }
+    };
+    let target_schema = schema
+        .get(&table_name.to_ascii_lowercase())
+        .ok_or_else(|| {
+            SqlError::TableNotFound(format!("row type '{table_name}' (used in {upper_name})"))
+        })?;
+    let col_map = ColumnMap::new(&[]);
+    let jsonb_val = eval_expr(&args_exprs[1], &EvalCtx::new(&col_map, &[]))?;
+    let columns: Vec<String> = target_schema
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    if jsonb_val.is_null() {
+        return Ok((columns, vec![]));
+    }
+    let j = crate::json::value_to_serde(&jsonb_val)?;
+    let rows = match upper_name {
+        "JSONB_POPULATE_RECORD" => {
+            let obj = j.as_object().ok_or_else(|| {
+                SqlError::InvalidValue("jsonb_populate_record requires JSON object".into())
+            })?;
+            vec![crate::json::populate_record_row(
+                obj,
+                &target_schema.columns,
+            )?]
+        }
+        "JSONB_POPULATE_RECORDSET" => {
+            let arr = j.as_array().ok_or_else(|| {
+                SqlError::InvalidValue("jsonb_populate_recordset requires JSON array".into())
+            })?;
+            arr.iter()
+                .map(|elem| {
+                    let obj = elem.as_object().ok_or_else(|| {
+                        SqlError::InvalidValue(
+                            "jsonb_populate_recordset array elements must be objects".into(),
+                        )
+                    })?;
+                    crate::json::populate_record_row(obj, &target_schema.columns)
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+        _ => unreachable!(),
+    };
+    Ok((columns, rows))
 }
 
 fn exec_select_with_json_table(
@@ -2894,35 +3831,102 @@ pub(super) fn process_select(
     }))
 }
 
-pub struct CompiledSelect;
+pub struct CompiledSelect {
+    join_plan: Option<Arc<JoinPlanStatic>>,
+    join_cache: Option<parking_lot::RwLock<Option<Arc<CachedJoin>>>>,
+    compound_plan: Option<Arc<CompoundPlanStatic>>,
+    compound_cache: Option<parking_lot::RwLock<Option<Arc<CachedCompound>>>>,
+}
+
+struct JoinPlanStatic {
+    table_lowers: Vec<String>,
+    table_schemas: Vec<Arc<TableSchema>>,
+    needed_per_table: Vec<Vec<usize>>,
+    output_combined: Option<Vec<usize>>,
+}
+
+struct CachedJoin {
+    cached_gen: u64,
+    inner_per_table: Vec<Vec<Vec<Value>>>,
+}
+
+struct CompoundPlanStatic {
+    op: SetOp,
+    all: bool,
+    branches: Vec<BranchPlan>,
+    columns: Vec<String>,
+}
+
+struct BranchPlan {
+    table_schema: Arc<TableSchema>,
+    needed_cols: Vec<usize>,
+}
+
+struct CachedCompound {
+    cached_gen: u64,
+    branch_rows: Vec<Vec<Vec<Value>>>,
+}
 
 impl CompiledSelect {
-    pub fn try_compile(_schema: &SchemaManager, sq: &SelectQuery) -> Option<Self> {
+    pub fn try_compile(schema: &SchemaManager, sq: &SelectQuery) -> Option<Self> {
         if sq.recursive || !sq.ctes.is_empty() {
             return None;
         }
+
+        let (compound_plan, compound_cache) = match &sq.body {
+            QueryBody::Compound(comp) => {
+                if let Some(plan) = build_compound_plan_static(schema, comp) {
+                    (Some(Arc::new(plan)), Some(parking_lot::RwLock::new(None)))
+                } else {
+                    return None;
+                }
+            }
+            QueryBody::Select(_) => (None, None),
+            _ => return None,
+        };
+
+        if compound_plan.is_some() {
+            return Some(Self {
+                join_plan: None,
+                join_cache: None,
+                compound_plan,
+                compound_cache,
+            });
+        }
+
         let sel = match &sq.body {
             QueryBody::Select(s) => s,
             _ => return None,
         };
-        if !sel.joins.is_empty()
-            || !sel.group_by.is_empty()
-            || sel.having.is_some()
-            || sel.distinct
-            || has_any_window_function(sel)
+        if has_any_window_function(sel)
             || sel.columns.iter().any(|c| match c {
-                SelectColumn::Expr { expr, .. } => {
-                    is_aggregate_expr(expr) || expr_has_subquery(expr)
-                }
+                SelectColumn::Expr { expr, .. } => crate::parser::has_subquery(expr),
                 SelectColumn::AllColumns | SelectColumn::AllFromOld | SelectColumn::AllFromNew => {
                     false
                 }
             })
-            || sel.where_clause.as_ref().is_some_and(expr_has_subquery)
+            || sel
+                .where_clause
+                .as_ref()
+                .is_some_and(crate::parser::has_subquery)
         {
             return None;
         }
-        Some(Self)
+
+        let (join_plan, join_cache) = if sel.joins.is_empty() {
+            (None, None)
+        } else if let Some(plan) = build_join_plan_static(schema, sel) {
+            (Some(Arc::new(plan)), Some(parking_lot::RwLock::new(None)))
+        } else {
+            (None, None)
+        };
+
+        Some(Self {
+            join_plan,
+            join_cache,
+            compound_plan: None,
+            compound_cache: None,
+        })
     }
 }
 
@@ -2943,6 +3947,21 @@ impl CompiledPlan for CompiledSelect {
                 ))
             }
         };
+
+        if let (Some(plan), Some(cache), None) =
+            (&self.compound_plan, &self.compound_cache, wtx.as_ref())
+        {
+            return execute_cached_compound(db, plan, cache);
+        }
+
+        if let (Some(plan), Some(cache), None) = (&self.join_plan, &self.join_cache, wtx.as_ref()) {
+            let sel = match &sq.body {
+                QueryBody::Select(s) => s,
+                _ => unreachable!("cached plan implies SelectBody::Select"),
+            };
+            return execute_cached_join(db, plan, cache, sel);
+        }
+
         match wtx {
             None => exec_select_query(db, schema, sq),
             Some(outer) => exec_select_query_in_txn(outer, schema, sq),
@@ -3060,42 +4079,416 @@ fn projection_column_names(select_cols: &[SelectColumn], columns: &[ColumnDef]) 
     out
 }
 
-fn expr_has_subquery(expr: &Expr) -> bool {
-    match expr {
-        Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::ScalarSubquery(_) => true,
-        Expr::BinaryOp { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
-        Expr::UnaryOp { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::Cast { expr, .. } => expr_has_subquery(expr),
-        Expr::Function { args, .. } | Expr::Coalesce(args) => args.iter().any(expr_has_subquery),
-        Expr::InList { expr, list, .. } => {
-            expr_has_subquery(expr) || list.iter().any(expr_has_subquery)
+fn build_join_plan_static(schema: &SchemaManager, sel: &SelectStmt) -> Option<JoinPlanStatic> {
+    for join in &sel.joins {
+        if join.subquery.is_some() {
+            return None;
         }
-        Expr::Between {
-            expr, low, high, ..
-        } => expr_has_subquery(expr) || expr_has_subquery(low) || expr_has_subquery(high),
-        Expr::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            expr_has_subquery(expr)
-                || expr_has_subquery(pattern)
-                || escape.as_deref().is_some_and(expr_has_subquery)
+    }
+    if sel.from_subquery.is_some() || sel.from_json_table.is_some() || sel.from_args.is_some() {
+        return None;
+    }
+    let from_lower = sel.from.to_ascii_lowercase();
+    let from_schema = schema.get(&from_lower)?.clone();
+
+    let mut table_lowers = vec![from_lower];
+    let mut table_schemas = vec![Arc::new(from_schema.clone())];
+    let mut all_refs: Vec<(String, &TableSchema)> = vec![(
+        super::join::table_alias_or_name(&sel.from, &sel.from_alias),
+        &from_schema,
+    )];
+    let mut inner_schemas: Vec<TableSchema> = Vec::with_capacity(sel.joins.len());
+    for join in &sel.joins {
+        let lname = join.table.name.to_ascii_lowercase();
+        let inner_schema = schema.get(&lname)?.clone();
+        table_lowers.push(lname);
+        inner_schemas.push(inner_schema);
+    }
+    for (idx, join) in sel.joins.iter().enumerate() {
+        let alias = super::join::table_alias_or_name(&join.table.name, &join.table.alias);
+        all_refs.push((alias, &inner_schemas[idx]));
+        table_schemas.push(Arc::new(inner_schemas[idx].clone()));
+    }
+
+    let needed_plan = super::join::compute_join_needed_columns(sel, &all_refs)?;
+    Some(JoinPlanStatic {
+        table_lowers,
+        table_schemas,
+        needed_per_table: needed_plan.per_table,
+        output_combined: Some(needed_plan.output_combined),
+    })
+}
+
+fn execute_cached_join(
+    db: &Database,
+    plan: &Arc<JoinPlanStatic>,
+    cache: &parking_lot::RwLock<Option<Arc<CachedJoin>>>,
+    sel: &SelectStmt,
+) -> Result<ExecutionResult> {
+    let mut rtx = db.begin_read();
+    let snapshot_gen = rtx.commit_generation();
+
+    let cached: Arc<CachedJoin> = {
+        let mut slot = cache.write();
+        match slot.as_ref() {
+            Some(c) if c.cached_gen == snapshot_gen => Arc::clone(c),
+            _ => {
+                let inner = build_inner_data(&mut rtx, plan)?;
+                let arc = Arc::new(CachedJoin {
+                    cached_gen: snapshot_gen,
+                    inner_per_table: inner,
+                });
+                *slot = Some(Arc::clone(&arc));
+                arc
+            }
         }
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-        } => {
-            operand.as_deref().is_some_and(expr_has_subquery)
-                || conditions
-                    .iter()
-                    .any(|(c, r)| expr_has_subquery(c) || expr_has_subquery(r))
-                || else_result.as_deref().is_some_and(expr_has_subquery)
+    };
+
+    let outer_schema = &plan.table_schemas[0];
+    let mut outer_rows =
+        super::join::collect_rows_partial(&mut rtx, outer_schema, &plan.needed_per_table[0])?;
+
+    let mut cur_outer_pk_col: Option<usize> = if outer_schema.primary_key_columns.len() == 1 {
+        Some(outer_schema.primary_key_columns[0] as usize)
+    } else {
+        None
+    };
+
+    let from_alias = super::join::table_alias_or_name(&sel.from, &sel.from_alias);
+    let mut all_refs: Vec<(String, &TableSchema)> =
+        vec![(from_alias, plan.table_schemas[0].as_ref())];
+    for (idx, join) in sel.joins.iter().enumerate() {
+        let alias = super::join::table_alias_or_name(&join.table.name, &join.table.alias);
+        all_refs.push((alias, plan.table_schemas[idx + 1].as_ref()));
+    }
+    let mut combined_cols = super::join::build_joined_columns(&all_refs[..1]);
+
+    let num_joins = sel.joins.len();
+    for (ji, join) in sel.joins.iter().enumerate() {
+        super::join::extend_joined_columns(&mut combined_cols, &all_refs[ji + 1]);
+
+        let outer_col_count = if outer_rows.is_empty() {
+            all_refs[..ji + 1]
+                .iter()
+                .map(|(_, s)| s.columns.len())
+                .sum()
+        } else {
+            outer_rows[0].len()
+        };
+        let inner_col_count = all_refs[ji + 1].1.columns.len();
+        let is_last = ji == num_joins - 1;
+        let proj = if is_last {
+            plan.output_combined
+                .as_ref()
+                .map(|oc| super::join::build_combine_projection(oc, outer_col_count))
+        } else {
+            None
+        };
+
+        let (equi_pairs, is_pure_equi) =
+            super::join::compute_equi_join_meta(join, &combined_cols, outer_col_count);
+
+        outer_rows = super::join::exec_join_step_borrowed(
+            outer_rows,
+            &cached.inner_per_table[ji],
+            join,
+            &combined_cols,
+            outer_col_count,
+            inner_col_count,
+            cur_outer_pk_col,
+            proj.as_ref(),
+            &equi_pairs,
+            is_pure_equi,
+        );
+        cur_outer_pk_col = None;
+    }
+    drop(rtx);
+
+    if let Some(ref oc) = plan.output_combined {
+        let actual_width = outer_rows.first().map_or(0, |r| r.len());
+        if actual_width == oc.len() {
+            let projected_cols = super::join::build_projected_columns(&combined_cols, oc);
+            return process_select(&projected_cols, outer_rows, sel, false);
+        }
+    }
+    process_select(&combined_cols, outer_rows, sel, false)
+}
+
+fn build_inner_data(
+    rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
+    plan: &Arc<JoinPlanStatic>,
+) -> Result<Vec<Vec<Vec<Value>>>> {
+    let mut out = Vec::with_capacity(plan.table_lowers.len() - 1);
+    for ji in 1..plan.table_lowers.len() {
+        let schema = &plan.table_schemas[ji];
+        let needed = &plan.needed_per_table[ji];
+        let rows = super::join::collect_rows_partial(rtx, schema, needed)?;
+        out.push(rows);
+    }
+    Ok(out)
+}
+
+fn build_compound_plan_static(
+    schema: &SchemaManager,
+    comp: &CompoundSelect,
+) -> Option<CompoundPlanStatic> {
+    if !comp.order_by.is_empty() || comp.limit.is_some() || comp.offset.is_some() {
+        return None;
+    }
+    let left_branch = compound_branch_plan(schema, &comp.left)?;
+    let right_branch = compound_branch_plan(schema, &comp.right)?;
+
+    let columns = compound_branch_columns(schema, &comp.left)?;
+    if columns.len() != left_branch.needed_cols.len()
+        || columns.len() != right_branch.needed_cols.len()
+    {
+        return None;
+    }
+
+    Some(CompoundPlanStatic {
+        op: comp.op.clone(),
+        all: comp.all,
+        branches: vec![left_branch, right_branch],
+        columns,
+    })
+}
+
+fn compound_branch_plan(schema: &SchemaManager, body: &QueryBody) -> Option<BranchPlan> {
+    let sel = match body {
+        QueryBody::Select(s) => s,
+        _ => return None,
+    };
+    if !sel.joins.is_empty()
+        || !sel.group_by.is_empty()
+        || sel.having.is_some()
+        || sel.distinct
+        || sel.where_clause.is_some()
+        || !sel.order_by.is_empty()
+        || sel.limit.is_some()
+        || sel.offset.is_some()
+        || sel.from_subquery.is_some()
+        || sel.from_json_table.is_some()
+        || sel.from_args.is_some()
+        || has_any_window_function(sel)
+    {
+        return None;
+    }
+    if sel.columns.iter().any(|c| match c {
+        SelectColumn::Expr { expr, .. } => {
+            is_aggregate_expr(expr) || crate::parser::has_subquery(expr)
         }
         _ => false,
+    }) {
+        return None;
     }
+
+    let table_lower = sel.from.to_ascii_lowercase();
+    let table_schema = schema.get(&table_lower)?.clone();
+    let needed_cols = resolve_branch_needed_cols(&sel.columns, &table_schema.columns)?;
+
+    Some(BranchPlan {
+        table_schema: Arc::new(table_schema),
+        needed_cols,
+    })
+}
+
+fn resolve_branch_needed_cols(
+    select_cols: &[SelectColumn],
+    table_cols: &[ColumnDef],
+) -> Option<Vec<usize>> {
+    let mut out = Vec::with_capacity(select_cols.len());
+    for sc in select_cols {
+        match sc {
+            SelectColumn::AllColumns => {
+                out.clear();
+                for i in 0..table_cols.len() {
+                    out.push(i);
+                }
+                return Some(out);
+            }
+            SelectColumn::Expr { expr, .. } => match expr {
+                Expr::Column(name) => {
+                    let lname = name.to_ascii_lowercase();
+                    let idx = table_cols.iter().position(|c| c.name == lname)?;
+                    out.push(idx);
+                }
+                Expr::QualifiedColumn { column, .. } => {
+                    let lname = column.to_ascii_lowercase();
+                    let idx = table_cols.iter().position(|c| c.name == lname)?;
+                    out.push(idx);
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn compound_branch_columns(schema: &SchemaManager, body: &QueryBody) -> Option<Vec<String>> {
+    let sel = match body {
+        QueryBody::Select(s) => s,
+        _ => return None,
+    };
+    let table_lower = sel.from.to_ascii_lowercase();
+    let table_schema = schema.get(&table_lower)?;
+    let mut out = Vec::with_capacity(sel.columns.len());
+    for sc in &sel.columns {
+        match sc {
+            SelectColumn::AllColumns => {
+                out.clear();
+                for c in &table_schema.columns {
+                    out.push(c.name.clone());
+                }
+                return Some(out);
+            }
+            SelectColumn::Expr { alias: Some(a), .. } => out.push(a.clone()),
+            SelectColumn::Expr {
+                expr: Expr::Column(name),
+                alias: None,
+            } => out.push(name.clone()),
+            SelectColumn::Expr {
+                expr: Expr::QualifiedColumn { column, .. },
+                alias: None,
+            } => out.push(column.clone()),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn execute_cached_compound(
+    db: &Database,
+    plan: &Arc<CompoundPlanStatic>,
+    cache: &parking_lot::RwLock<Option<Arc<CachedCompound>>>,
+) -> Result<ExecutionResult> {
+    let mut rtx = db.begin_read();
+    let snapshot_gen = rtx.commit_generation();
+
+    let cached: Arc<CachedCompound> = {
+        let mut slot = cache.write();
+        match slot.as_ref() {
+            Some(c) if c.cached_gen == snapshot_gen => Arc::clone(c),
+            _ => {
+                let branch_rows = build_compound_branches(&mut rtx, plan)?;
+                let arc = Arc::new(CachedCompound {
+                    cached_gen: snapshot_gen,
+                    branch_rows,
+                });
+                *slot = Some(Arc::clone(&arc));
+                arc
+            }
+        }
+    };
+
+    let total: usize = cached.branch_rows.iter().map(|b| b.len()).sum();
+    let rows = match (&plan.op, plan.all) {
+        (SetOp::Union, true) => {
+            let mut out = Vec::with_capacity(total);
+            for branch in &cached.branch_rows {
+                for row in branch {
+                    out.push(row.clone());
+                }
+            }
+            out
+        }
+        (SetOp::Union, false) => {
+            let mut seen: rustc_hash::FxHashSet<Vec<Value>> =
+                rustc_hash::FxHashSet::with_capacity_and_hasher(total, Default::default());
+            let mut out = Vec::with_capacity(total);
+            for branch in &cached.branch_rows {
+                for row in branch {
+                    if seen.insert(row.clone()) {
+                        out.push(row.clone());
+                    }
+                }
+            }
+            out
+        }
+        (SetOp::Intersect, true) => {
+            let left = &cached.branch_rows[0];
+            let right = &cached.branch_rows[1];
+            let mut right_counts: FxHashMap<&Vec<Value>, usize> = FxHashMap::default();
+            for row in right {
+                *right_counts.entry(row).or_insert(0) += 1;
+            }
+            let mut out = Vec::new();
+            for row in left {
+                if let Some(count) = right_counts.get_mut(row) {
+                    if *count > 0 {
+                        *count -= 1;
+                        out.push(row.clone());
+                    }
+                }
+            }
+            out
+        }
+        (SetOp::Intersect, false) => {
+            let left = &cached.branch_rows[0];
+            let right = &cached.branch_rows[1];
+            let right_set: rustc_hash::FxHashSet<&Vec<Value>> = right.iter().collect();
+            let mut seen: rustc_hash::FxHashSet<Vec<Value>> = rustc_hash::FxHashSet::default();
+            let mut out = Vec::new();
+            for row in left {
+                if right_set.contains(row) && seen.insert(row.clone()) {
+                    out.push(row.clone());
+                }
+            }
+            out
+        }
+        (SetOp::Except, true) => {
+            let left = &cached.branch_rows[0];
+            let right = &cached.branch_rows[1];
+            let mut right_counts: FxHashMap<&Vec<Value>, usize> = FxHashMap::default();
+            for row in right {
+                *right_counts.entry(row).or_insert(0) += 1;
+            }
+            let mut out = Vec::new();
+            for row in left {
+                if let Some(count) = right_counts.get_mut(row) {
+                    if *count > 0 {
+                        *count -= 1;
+                        continue;
+                    }
+                }
+                out.push(row.clone());
+            }
+            out
+        }
+        (SetOp::Except, false) => {
+            let left = &cached.branch_rows[0];
+            let right = &cached.branch_rows[1];
+            let right_set: rustc_hash::FxHashSet<&Vec<Value>> = right.iter().collect();
+            let mut seen: rustc_hash::FxHashSet<Vec<Value>> = rustc_hash::FxHashSet::default();
+            let mut out = Vec::new();
+            for row in left {
+                if !right_set.contains(row) && seen.insert(row.clone()) {
+                    out.push(row.clone());
+                }
+            }
+            out
+        }
+    };
+
+    Ok(ExecutionResult::Query(QueryResult {
+        columns: plan.columns.clone(),
+        rows,
+    }))
+}
+
+fn build_compound_branches(
+    rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
+    plan: &Arc<CompoundPlanStatic>,
+) -> Result<Vec<Vec<Vec<Value>>>> {
+    let mut out = Vec::with_capacity(plan.branches.len());
+    for branch in &plan.branches {
+        let raw =
+            super::join::collect_rows_partial(rtx, &branch.table_schema, &branch.needed_cols)?;
+        let projected: Vec<Vec<Value>> = raw
+            .into_iter()
+            .map(|row| branch.needed_cols.iter().map(|&i| row[i].clone()).collect())
+            .collect();
+        out.push(projected);
+    }
+    Ok(out)
 }

@@ -196,6 +196,8 @@ pub enum CellValue {
     },
     Json(String),
     Jsonb(Vec<u8>),
+    TsVector(Vec<u8>),
+    TsQuery(Vec<u8>),
 }
 
 impl CellValue {
@@ -231,6 +233,8 @@ impl CellValue {
             },
             Value::Json(s) => CellValue::Json(s.to_string()),
             Value::Jsonb(b) => CellValue::Jsonb(b.to_vec()),
+            Value::TsVector(b) => CellValue::TsVector(b.to_vec()),
+            Value::TsQuery(b) => CellValue::TsQuery(b.to_vec()),
         }
     }
 }

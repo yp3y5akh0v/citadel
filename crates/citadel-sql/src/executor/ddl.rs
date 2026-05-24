@@ -351,6 +351,8 @@ pub(super) fn exec_create_table(
                     .collect(),
                 on_delete: fk.on_delete,
                 on_update: fk.on_update,
+                deferrable: fk.deferrable,
+                initially_deferred: fk.initially_deferred,
             })
         })
         .collect::<Result<_>>()?;
@@ -528,6 +530,8 @@ pub(super) fn exec_create_table_in_txn(
                     .collect(),
                 on_delete: fk.on_delete,
                 on_update: fk.on_update,
+                deferrable: fk.deferrable,
+                initially_deferred: fk.initially_deferred,
             })
         })
         .collect::<Result<_>>()?;
@@ -735,37 +739,49 @@ pub(super) fn exec_create_index(
         }
     }
 
-    let is_gin = matches!(idx_def.kind, crate::types::IndexKind::Gin(_));
-    if is_gin {
+    if let crate::types::IndexKind::Inverted(inv_kind) = idx_def.kind {
         let col_idx = idx_def.columns[0] as usize;
         let col_type = table_schema.columns[col_idx].data_type;
-        if !matches!(
-            col_type,
-            crate::types::DataType::Json | crate::types::DataType::Jsonb
-        ) {
-            return Err(SqlError::Unsupported(
-                "GIN index requires a JSON or JSONB column".into(),
-            ));
+        match inv_kind {
+            crate::types::InvertedKind::Gin(_) => {
+                if !matches!(
+                    col_type,
+                    crate::types::DataType::Json | crate::types::DataType::Jsonb
+                ) {
+                    return Err(SqlError::Unsupported(
+                        "GIN index requires a JSON or JSONB column".into(),
+                    ));
+                }
+            }
+            crate::types::InvertedKind::Fts { .. } => {
+                if !matches!(
+                    col_type,
+                    crate::types::DataType::Text | crate::types::DataType::TsVector
+                ) {
+                    return Err(SqlError::Unsupported(format!(
+                        "FTS index requires a TEXT or TSVECTOR column, got {col_type}"
+                    )));
+                }
+            }
         }
         if idx_def.unique {
             return Err(SqlError::Unsupported(
-                "UNIQUE not supported on GIN indexes".into(),
+                "UNIQUE not supported on inverted indexes".into(),
             ));
         }
     }
 
     for row in &rows {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
-        if let crate::types::IndexKind::Gin(ops) = idx_def.kind {
+        if let crate::types::IndexKind::Inverted(inv_kind) = idx_def.kind {
             let value = &row[idx_def.columns[0] as usize];
             if !value.is_null() {
-                let entries = crate::json::extract_gin_entries(value, ops)?;
+                let entries =
+                    super::helpers::extract_inverted_entries_with_values(value, inv_kind)?;
                 let pk_encoded = crate::encoding::encode_composite_key(&pk_values);
-                for entry in entries {
-                    let mut full_key = entry;
-                    full_key.push(0x1F);
-                    full_key.extend_from_slice(&pk_encoded);
-                    wtx.table_insert(&idx_table, &full_key, &[])
+                for (entry, val_bytes) in entries {
+                    let full_key = super::helpers::build_inverted_key(&entry, &pk_encoded);
+                    wtx.table_insert(&idx_table, &full_key, &val_bytes)
                         .map_err(SqlError::Storage)?;
                 }
             }
@@ -1246,6 +1262,8 @@ pub(super) fn alter_add_column(
                 .collect(),
             on_delete: fk.on_delete,
             on_update: fk.on_update,
+            deferrable: fk.deferrable,
+            initially_deferred: fk.initially_deferred,
         };
         new_schema.foreign_keys.push(fk_entry);
     }

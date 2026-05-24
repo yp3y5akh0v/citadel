@@ -61,5 +61,9 @@ criterion_group!(
     h2h::jsonb_contains::bench,
     h2h::json_gin::bench,
     h2h::json_table::bench,
+    h2h::fts_match::bench,
+    h2h::fts_phrase::bench,
+    h2h::fts_rank::bench,
+    h2h::fts_index::bench,
 );
 criterion_main!(benches);

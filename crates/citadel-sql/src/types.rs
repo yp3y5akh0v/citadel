@@ -22,6 +22,8 @@ pub enum DataType {
     Interval,
     Json,
     Jsonb,
+    TsVector,
+    TsQuery,
 }
 
 impl DataType {
@@ -39,6 +41,8 @@ impl DataType {
             DataType::Interval => 9,
             DataType::Json => 10,
             DataType::Jsonb => 11,
+            DataType::TsVector => 12,
+            DataType::TsQuery => 13,
         }
     }
 
@@ -56,6 +60,8 @@ impl DataType {
             9 => Some(DataType::Interval),
             10 => Some(DataType::Json),
             11 => Some(DataType::Jsonb),
+            12 => Some(DataType::TsVector),
+            13 => Some(DataType::TsQuery),
             _ => None,
         }
     }
@@ -76,6 +82,8 @@ impl fmt::Display for DataType {
             DataType::Interval => write!(f, "INTERVAL"),
             DataType::Json => write!(f, "JSON"),
             DataType::Jsonb => write!(f, "JSONB"),
+            DataType::TsVector => write!(f, "TSVECTOR"),
+            DataType::TsQuery => write!(f, "TSQUERY"),
         }
     }
 }
@@ -101,6 +109,8 @@ pub enum Value {
     },
     Json(CompactString),
     Jsonb(Arc<[u8]>),
+    TsVector(Arc<[u8]>),
+    TsQuery(Arc<[u8]>),
 }
 
 impl Value {
@@ -118,6 +128,8 @@ impl Value {
             Value::Interval { .. } => DataType::Interval,
             Value::Json(_) => DataType::Json,
             Value::Jsonb(_) => DataType::Jsonb,
+            Value::TsVector(_) => DataType::TsVector,
+            Value::TsQuery(_) => DataType::TsQuery,
         }
     }
 
@@ -151,6 +163,8 @@ impl Value {
             (Value::Time(t), DataType::Time) => Some(Value::Time(*t)),
             (Value::Date(d), DataType::Date) => Some(Value::Date(*d)),
             (Value::Timestamp(t), DataType::Timestamp) => Some(Value::Timestamp(*t)),
+            (Value::TsVector(b), DataType::TsVector) => Some(Value::TsVector(b.clone())),
+            (Value::TsQuery(b), DataType::TsQuery) => Some(Value::TsQuery(b.clone())),
             (
                 Value::Interval {
                     months,
@@ -386,6 +400,8 @@ impl PartialEq for Value {
             ) => am == bm && ad == bd && au == bu,
             (Value::Json(a), Value::Json(b)) => a == b,
             (Value::Jsonb(a), Value::Jsonb(b)) => a == b,
+            (Value::TsVector(a), Value::TsVector(b)) => a == b,
+            (Value::TsQuery(a), Value::TsQuery(b)) => a == b,
             _ => false,
         }
     }
@@ -447,6 +463,14 @@ impl Hash for Value {
             }
             Value::Jsonb(b) => {
                 10u8.hash(state);
+                b.hash(state);
+            }
+            Value::TsVector(b) => {
+                11u8.hash(state);
+                b.hash(state);
+            }
+            Value::TsQuery(b) => {
+                12u8.hash(state);
                 b.hash(state);
             }
         }
@@ -513,6 +537,14 @@ impl Ord for Value {
             (Value::Jsonb(_), _) => Ordering::Less,
             (_, Value::Jsonb(_)) => Ordering::Greater,
 
+            (Value::TsVector(a), Value::TsVector(b)) => a.as_ref().cmp(b.as_ref()),
+            (Value::TsVector(_), _) => Ordering::Less,
+            (_, Value::TsVector(_)) => Ordering::Greater,
+
+            (Value::TsQuery(a), Value::TsQuery(b)) => a.as_ref().cmp(b.as_ref()),
+            (Value::TsQuery(_), _) => Ordering::Less,
+            (_, Value::TsQuery(_)) => Ordering::Greater,
+
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
             (Value::Text(_), _) => Ordering::Less,
             (_, Value::Text(_)) => Ordering::Greater,
@@ -556,6 +588,8 @@ impl fmt::Display for Value {
                 Ok(s) => write!(f, "{s}"),
                 Err(_) => write!(f, "<invalid jsonb>"),
             },
+            Value::TsVector(b) => write!(f, "{}", crate::fts::tsvector_display(b)),
+            Value::TsQuery(b) => write!(f, "{}", crate::fts::tsquery_display(b)),
         }
     }
 }
@@ -665,11 +699,17 @@ impl GinOpsClass {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvertedKind {
+    Gin(GinOpsClass),
+    Fts { config_id: u8 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IndexKind {
     #[default]
     BTree,
-    Gin(GinOpsClass),
+    Inverted(InvertedKind),
 }
 
 /// Index definition stored as part of the table schema.
@@ -772,10 +812,12 @@ pub struct ForeignKeySchemaEntry {
     pub referred_columns: Vec<String>,
     pub on_delete: crate::parser::ReferentialAction,
     pub on_update: crate::parser::ReferentialAction,
+    pub deferrable: bool,
+    pub initially_deferred: bool,
 }
 
 /// Table schema stored in the _schema table.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnDef>,
@@ -793,6 +835,28 @@ pub struct TableSchema {
     /// Logical non-PK order -> physical encoding position.
     encoding_positions_cache: Vec<u16>,
     has_virtual_columns_cache: bool,
+    column_map_cache: std::sync::OnceLock<crate::eval::ColumnMap>,
+}
+
+impl Clone for TableSchema {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            columns: self.columns.clone(),
+            primary_key_columns: self.primary_key_columns.clone(),
+            indices: self.indices.clone(),
+            check_constraints: self.check_constraints.clone(),
+            foreign_keys: self.foreign_keys.clone(),
+            flags: self.flags,
+            pk_idx_cache: self.pk_idx_cache.clone(),
+            non_pk_idx_cache: self.non_pk_idx_cache.clone(),
+            dropped_non_pk_slots: self.dropped_non_pk_slots.clone(),
+            decode_mapping_cache: self.decode_mapping_cache.clone(),
+            encoding_positions_cache: self.encoding_positions_cache.clone(),
+            has_virtual_columns_cache: self.has_virtual_columns_cache,
+            column_map_cache: std::sync::OnceLock::new(),
+        }
+    }
 }
 
 impl TableSchema {
@@ -868,7 +932,14 @@ impl TableSchema {
             decode_mapping_cache,
             encoding_positions_cache,
             has_virtual_columns_cache,
+            column_map_cache: std::sync::OnceLock::new(),
         }
+    }
+
+    #[inline]
+    pub fn column_map(&self) -> &crate::eval::ColumnMap {
+        self.column_map_cache
+            .get_or_init(|| crate::eval::ColumnMap::new(&self.columns))
     }
 
     pub fn is_strict(&self) -> bool {
@@ -989,6 +1060,8 @@ impl TableSchema {
                 referred_columns: fk.referred_columns.clone(),
                 on_delete: fk.on_delete,
                 on_update: fk.on_update,
+                deferrable: fk.deferrable,
+                initially_deferred: fk.initially_deferred,
             })
             .collect();
 
@@ -1013,7 +1086,7 @@ impl TableSchema {
     }
 }
 
-const SCHEMA_VERSION: u8 = 9;
+const SCHEMA_VERSION: u8 = 11;
 pub const TABLE_FLAG_STRICT: u8 = 0b0000_0001;
 
 fn write_opt_string(buf: &mut Vec<u8>, s: &Option<String>) {
@@ -1169,6 +1242,17 @@ impl TableSchema {
             buf.push(fk.on_update as u8);
         }
 
+        for fk in &self.foreign_keys {
+            let mut flags: u8 = 0;
+            if fk.deferrable {
+                flags |= 0b01;
+            }
+            if fk.initially_deferred {
+                flags |= 0b10;
+            }
+            buf.push(flags);
+        }
+
         for col in &self.columns {
             buf.push(col.collation as u8);
         }
@@ -1182,9 +1266,13 @@ impl TableSchema {
         for idx in &self.indices {
             match idx.kind {
                 IndexKind::BTree => buf.push(0),
-                IndexKind::Gin(ops) => {
+                IndexKind::Inverted(InvertedKind::Gin(ops)) => {
                     buf.push(1);
                     buf.push(ops.as_tag());
+                }
+                IndexKind::Inverted(InvertedKind::Fts { config_id }) => {
+                    buf.push(2);
+                    buf.push(config_id);
                 }
             }
         }
@@ -1196,7 +1284,12 @@ impl TableSchema {
     pub fn deserialize(data: &[u8]) -> crate::error::Result<Self> {
         let mut pos = 0;
 
-        if data.is_empty() || !matches!(data[0], 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | SCHEMA_VERSION) {
+        if data.is_empty()
+            || !matches!(
+                data[0],
+                1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | SCHEMA_VERSION
+            )
+        {
             return Err(crate::error::SqlError::InvalidValue(
                 "invalid schema version".into(),
             ));
@@ -1354,6 +1447,8 @@ impl TableSchema {
                     referred_columns,
                     on_delete: crate::parser::ReferentialAction::NoAction,
                     on_update: crate::parser::ReferentialAction::NoAction,
+                    deferrable: false,
+                    initially_deferred: false,
                 });
             }
         }
@@ -1436,6 +1531,17 @@ impl TableSchema {
                     })?;
                 pos += 1;
             }
+            if version >= 11 {
+                for fk in &mut foreign_keys {
+                    if pos >= data.len() {
+                        break;
+                    }
+                    let flags = data[pos];
+                    pos += 1;
+                    fk.deferrable = flags & 0b01 != 0;
+                    fk.initially_deferred = flags & 0b10 != 0;
+                }
+            }
         }
 
         let mut columns = columns;
@@ -1481,7 +1587,17 @@ impl TableSchema {
                                 )
                             })?;
                             pos += 1;
-                            IndexKind::Gin(ops)
+                            IndexKind::Inverted(InvertedKind::Gin(ops))
+                        }
+                        2 => {
+                            if pos >= data.len() {
+                                return Err(crate::error::SqlError::InvalidValue(
+                                    "FTS index missing config_id".into(),
+                                ));
+                            }
+                            let config_id = data[pos];
+                            pos += 1;
+                            IndexKind::Inverted(InvertedKind::Fts { config_id })
                         }
                         _ => {
                             return Err(crate::error::SqlError::InvalidValue(

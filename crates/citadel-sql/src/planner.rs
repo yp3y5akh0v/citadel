@@ -2,7 +2,7 @@
 
 use crate::encoding::encode_composite_key;
 use crate::parser::{BinOp, Expr};
-use crate::types::{IndexDef, IndexKind, TableSchema, Value};
+use crate::types::{IndexDef, IndexKind, InvertedKind, TableSchema, Value};
 
 #[derive(Debug, Clone)]
 pub enum ScanPlan {
@@ -24,13 +24,13 @@ pub enum ScanPlan {
         is_unique: bool,
         index_columns: Vec<u16>,
     },
-    /// GIN inverted-index scan for `column @> predicate`. Returns candidate
-    /// row PKs; caller must recheck the full predicate on the heap row.
-    GinScan {
+    InvertedScan {
+        kind: InvertedKind,
         idx_table: Vec<u8>,
         column_idx: u16,
         probe_entries: Vec<Vec<u8>>,
         recheck_expr: Expr,
+        recheck_needed: bool,
     },
 }
 
@@ -88,6 +88,11 @@ fn resolve_literal(expr: &Expr) -> Option<Value> {
     match expr {
         Expr::Literal(v) => Some(v.clone()),
         Expr::Parameter(n) => crate::eval::resolve_scoped_param(*n).ok(),
+        Expr::Function { .. } | Expr::Cast { .. } => {
+            let col_map = crate::eval::ColumnMap::new(&[]);
+            let ctx = crate::eval::EvalCtx::new(&col_map, &[]);
+            crate::eval::eval_expr(expr, &ctx).ok()
+        }
         _ => None,
     }
 }
@@ -161,17 +166,14 @@ pub fn plan_select(schema: &TableSchema, where_clause: &Option<Expr>) -> ScanPla
     plan_select_inner(schema, where_clause, false)
 }
 
-/// Same as `plan_select` but allows returning `ScanPlan::GinScan` when an
-/// inverted index covers the predicate. The caller MUST handle the GinScan
-/// variant; non-supporting paths should use `plan_select` instead.
-pub fn plan_select_with_gin(schema: &TableSchema, where_clause: &Option<Expr>) -> ScanPlan {
+pub fn plan_select_inverted(schema: &TableSchema, where_clause: &Option<Expr>) -> ScanPlan {
     plan_select_inner(schema, where_clause, true)
 }
 
 fn plan_select_inner(
     schema: &TableSchema,
     where_clause: &Option<Expr>,
-    allow_gin: bool,
+    allow_inverted: bool,
 ) -> ScanPlan {
     let where_expr = match where_clause {
         Some(e) => e,
@@ -209,8 +211,8 @@ fn plan_select_inner(
         return plan;
     }
 
-    if allow_gin {
-        if let Some(plan) = try_gin_scan(schema, where_expr) {
+    if allow_inverted {
+        if let Some(plan) = try_inverted_scan(schema, where_expr) {
             return plan;
         }
     }
@@ -222,9 +224,9 @@ fn plan_select_inner(
     ScanPlan::SeqScan
 }
 
-fn try_gin_scan(schema: &TableSchema, where_expr: &Expr) -> Option<ScanPlan> {
+fn try_inverted_scan(schema: &TableSchema, where_expr: &Expr) -> Option<ScanPlan> {
     use crate::parser::BinOp as B;
-    let (col_idx, rhs_val) = match where_expr {
+    let (col_idx, rhs_val, op) = match where_expr {
         Expr::BinaryOp {
             left,
             op: B::JsonContains,
@@ -233,35 +235,155 @@ fn try_gin_scan(schema: &TableSchema, where_expr: &Expr) -> Option<ScanPlan> {
             let name = resolve_column_name(left)?;
             let col_idx = schema.column_index(name)? as u16;
             let rhs = resolve_literal(right)?;
-            (col_idx, rhs)
+            (col_idx, rhs, B::JsonContains)
+        }
+        Expr::BinaryOp {
+            left,
+            op: B::JsonPathMatch,
+            right,
+        } => {
+            let name = resolve_column_name(left)?;
+            let col_idx = schema.column_index(name)? as u16;
+            let rhs = resolve_literal(right)?;
+            (col_idx, rhs, B::JsonPathMatch)
         }
         _ => return None,
     };
     let idx = schema.indices.iter().find(|i| {
-        matches!(i.kind, IndexKind::Gin(_))
+        matches!(i.kind, IndexKind::Inverted(_))
             && i.columns.first().is_some_and(|&c| c == col_idx)
             && i.predicate_expr.is_none()
     })?;
-    let ops = match idx.kind {
-        IndexKind::Gin(o) => o,
+    let kind = match idx.kind {
+        IndexKind::Inverted(k) => k,
         _ => return None,
     };
-    // Skip 0x01 key-exists entries — they match every row with the key (no selectivity).
-    let probe_entries: Vec<Vec<u8>> = crate::json::extract_gin_entries(&rhs_val, ops)
-        .ok()?
-        .into_iter()
-        .filter(|e| !matches!(e.first(), Some(&0x01)))
-        .collect();
+    match (kind, op) {
+        (InvertedKind::Gin(_), B::JsonContains) => {}
+        (InvertedKind::Fts { .. }, B::JsonPathMatch) => {}
+        _ => return None,
+    }
+    let probe_entries = extract_inverted_probe(&rhs_val, kind)?;
     if probe_entries.is_empty() {
         return None;
     }
+    let recheck_needed = inverted_recheck_needed(kind, &rhs_val);
     let idx_table = TableSchema::index_table_name(&schema.name, &idx.name);
-    Some(ScanPlan::GinScan {
+    Some(ScanPlan::InvertedScan {
+        kind,
         idx_table,
         column_idx: col_idx,
         probe_entries,
         recheck_expr: where_expr.clone(),
+        recheck_needed,
     })
+}
+
+fn inverted_recheck_needed(kind: InvertedKind, rhs: &Value) -> bool {
+    match kind {
+        InvertedKind::Gin(_) => true,
+        InvertedKind::Fts { .. } => match rhs {
+            Value::TsQuery(bytes) => match crate::fts::TsQueryAst::decode(bytes) {
+                Ok(ast) => !fts_ast_exact_for_index(&ast),
+                Err(_) => true,
+            },
+            _ => true,
+        },
+    }
+}
+
+fn fts_ast_exact_for_index(ast: &crate::fts::TsQueryAst) -> bool {
+    use crate::fts::TsQueryAst;
+    match ast {
+        TsQueryAst::Lexeme {
+            prefix: false,
+            weight_mask: 0,
+            ..
+        } => true,
+        TsQueryAst::Lexeme { .. } => false,
+        TsQueryAst::And(l, r) => fts_ast_exact_for_index(l) && fts_ast_exact_for_index(r),
+        _ => false,
+    }
+}
+
+pub(crate) fn fts_ast_is_pure_phrase(ast: &crate::fts::TsQueryAst) -> bool {
+    use crate::fts::TsQueryAst;
+    match ast {
+        TsQueryAst::Lexeme {
+            prefix: false,
+            weight_mask: 0,
+            ..
+        } => true,
+        TsQueryAst::Phrase { left, right, .. } => {
+            fts_ast_is_pure_phrase(left) && fts_ast_is_pure_phrase(right)
+        }
+        _ => false,
+    }
+}
+
+fn extract_inverted_probe(rhs: &Value, kind: InvertedKind) -> Option<Vec<Vec<u8>>> {
+    use crate::types::GinOpsClass;
+    match kind {
+        InvertedKind::Gin(ops) => {
+            let entries = crate::json::extract_gin_entries(rhs, ops).ok()?;
+            let filtered: Vec<Vec<u8>> = match ops {
+                GinOpsClass::JsonbOps => entries
+                    .into_iter()
+                    .filter(|e| !matches!(e.first(), Some(&0x01)))
+                    .collect(),
+                GinOpsClass::JsonbPathOps => entries,
+            };
+            Some(filtered)
+        }
+        InvertedKind::Fts { .. } => match rhs {
+            Value::TsQuery(bytes) => {
+                let ast = crate::fts::TsQueryAst::decode(bytes).ok()?;
+                let required = fts_required_lexemes(&ast)?;
+                if required.is_empty() {
+                    None
+                } else {
+                    Some(required)
+                }
+            }
+            _ => None,
+        },
+    }
+}
+
+fn fts_required_lexemes(ast: &crate::fts::TsQueryAst) -> Option<Vec<Vec<u8>>> {
+    let mut out: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    let ok = collect_required(ast, &mut out);
+    if !ok || out.is_empty() {
+        None
+    } else {
+        Some(out.into_iter().collect())
+    }
+}
+
+fn collect_required(
+    ast: &crate::fts::TsQueryAst,
+    out: &mut std::collections::BTreeSet<Vec<u8>>,
+) -> bool {
+    use crate::fts::TsQueryAst;
+    match ast {
+        TsQueryAst::Lexeme { prefix, .. } if *prefix => false,
+        TsQueryAst::Lexeme { lexeme, .. } => {
+            out.insert(lexeme.clone());
+            true
+        }
+        TsQueryAst::And(l, r) => {
+            let lo = collect_required(l, out);
+            let ro = collect_required(r, out);
+            lo || ro
+        }
+        TsQueryAst::Or(..) => false,
+        TsQueryAst::Not(_) => false,
+        TsQueryAst::Phrase { left, right, .. } => {
+            let lo = collect_required(left, out);
+            let ro = collect_required(right, out);
+            lo && ro
+        }
+    }
 }
 
 fn try_pk_range_scan(schema: &TableSchema, range_preds: &[SimplePredicate]) -> Option<ScanPlan> {
@@ -497,7 +619,7 @@ pub fn describe_plan(plan: &ScanPlan, table_schema: &TableSchema) -> String {
             }
         }
 
-        ScanPlan::GinScan { .. } => "USING GIN INDEX".to_string(),
+        ScanPlan::InvertedScan { .. } => "USING INVERTED INDEX".to_string(),
     }
 }
 
@@ -522,6 +644,8 @@ fn format_value(val: &Value) -> String {
         ),
         Value::Json(s) => format!("JSON '{s}'"),
         Value::Jsonb(_) => "JSONB '<binary>'".into(),
+        Value::TsVector(_) => "TSVECTOR '<binary>'".into(),
+        Value::TsQuery(_) => "TSQUERY '<binary>'".into(),
     }
 }
 

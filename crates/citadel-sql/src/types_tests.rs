@@ -255,6 +255,8 @@ fn schema_roundtrip_with_foreign_keys() {
             referred_columns: vec!["id".into()],
             on_delete: crate::parser::ReferentialAction::NoAction,
             on_update: crate::parser::ReferentialAction::NoAction,
+            deferrable: false,
+            initially_deferred: false,
         }],
     );
 

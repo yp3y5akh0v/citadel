@@ -16,6 +16,8 @@ const TAG_TIMESTAMP: u8 = 0x08;
 const TAG_INTERVAL: u8 = 0x09;
 const TAG_JSON: u8 = 0x0A;
 const TAG_JSONB: u8 = 0x0B;
+const TAG_TSVECTOR: u8 = 0x0C;
+const TAG_TSQUERY: u8 = 0x0D;
 
 /// Encode a single value into an order-preserving byte sequence.
 pub fn encode_key_value(value: &Value) -> Vec<u8> {
@@ -102,6 +104,8 @@ pub(crate) fn encode_key_value_into(value: &Value, buf: &mut Vec<u8>) {
         }
         Value::Json(s) => encode_bytes_into(TAG_JSON, s.as_bytes(), buf),
         Value::Jsonb(b) => encode_bytes_into(TAG_JSONB, b, buf),
+        Value::TsVector(b) => encode_bytes_into(TAG_TSVECTOR, b, buf),
+        Value::TsQuery(b) => encode_bytes_into(TAG_TSQUERY, b, buf),
     }
 }
 
@@ -227,6 +231,14 @@ pub fn decode_key_value(data: &[u8]) -> Result<(Value, usize)> {
         TAG_JSONB => {
             let (bytes, n) = decode_null_escaped(&data[1..])?;
             Ok((Value::Jsonb(std::sync::Arc::from(bytes)), n + 1))
+        }
+        TAG_TSVECTOR => {
+            let (bytes, n) = decode_null_escaped(&data[1..])?;
+            Ok((Value::TsVector(std::sync::Arc::from(bytes)), n + 1))
+        }
+        TAG_TSQUERY => {
+            let (bytes, n) = decode_null_escaped(&data[1..])?;
+            Ok((Value::TsQuery(std::sync::Arc::from(bytes)), n + 1))
         }
         tag => Err(SqlError::InvalidValue(format!("unknown key tag: {tag:#x}"))),
     }
@@ -378,6 +390,16 @@ fn encode_cell_v2(v: &Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
         }
+        Value::TsVector(b) => {
+            buf.push(DataType::TsVector.type_tag());
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
+        Value::TsQuery(b) => {
+            buf.push(DataType::TsQuery.type_tag());
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
         Value::Null => unreachable!(),
     }
 }
@@ -505,6 +527,8 @@ fn decode_value(type_tag: u8, data: &[u8]) -> Result<Value> {
             Ok(Value::Json(CompactString::from(s)))
         }
         Some(DataType::Jsonb) => Ok(Value::Jsonb(std::sync::Arc::from(data))),
+        Some(DataType::TsVector) => Ok(Value::TsVector(std::sync::Arc::from(data))),
+        Some(DataType::TsQuery) => Ok(Value::TsQuery(std::sync::Arc::from(data))),
         _ => Err(SqlError::InvalidValue(format!(
             "unknown column type tag: {type_tag}"
         ))),
@@ -529,7 +553,13 @@ pub(crate) fn fixed_width_size(type_tag: u8) -> Option<usize> {
         DataType::Date => Some(4),
         DataType::Boolean => Some(1),
         DataType::Interval => Some(16),
-        DataType::Text | DataType::Blob | DataType::Json | DataType::Jsonb | DataType::Null => None,
+        DataType::Text
+        | DataType::Blob
+        | DataType::Json
+        | DataType::Jsonb
+        | DataType::TsVector
+        | DataType::TsQuery
+        | DataType::Null => None,
     }
 }
 
@@ -767,6 +797,8 @@ pub enum RawColumn<'a> {
     Interval { months: i32, days: i32, micros: i64 },
     Json(&'a str),
     Jsonb(&'a [u8]),
+    TsVector(&'a [u8]),
+    TsQuery(&'a [u8]),
 }
 
 impl<'a> RawColumn<'a> {
@@ -792,6 +824,8 @@ impl<'a> RawColumn<'a> {
             },
             RawColumn::Json(s) => Value::Json(CompactString::from(s)),
             RawColumn::Jsonb(b) => Value::Jsonb(std::sync::Arc::from(b)),
+            RawColumn::TsVector(b) => Value::TsVector(std::sync::Arc::from(b)),
+            RawColumn::TsQuery(b) => Value::TsQuery(std::sync::Arc::from(b)),
         }
     }
 
@@ -824,6 +858,8 @@ impl<'a> RawColumn<'a> {
             ) => Some(am.cmp(bm).then(ad.cmp(bd)).then(au.cmp(bu))),
             (RawColumn::Json(a), Value::Json(b)) => Some((*a).cmp(b.as_str())),
             (RawColumn::Jsonb(a), Value::Jsonb(b)) => Some((*a).cmp(b.as_ref())),
+            (RawColumn::TsVector(a), Value::TsVector(b)) => Some((*a).cmp(b.as_ref())),
+            (RawColumn::TsQuery(a), Value::TsQuery(b)) => Some((*a).cmp(b.as_ref())),
             _ => None,
         }
     }
@@ -855,6 +891,8 @@ impl<'a> RawColumn<'a> {
             ) => am == bm && ad == bd && au == bu,
             (RawColumn::Json(a), Value::Json(b)) => *a == b.as_str(),
             (RawColumn::Jsonb(a), Value::Jsonb(b)) => *a == b.as_ref(),
+            (RawColumn::TsVector(a), Value::TsVector(b)) => *a == b.as_ref(),
+            (RawColumn::TsQuery(a), Value::TsQuery(b)) => *a == b.as_ref(),
             _ => false,
         }
     }
@@ -921,6 +959,8 @@ fn decode_value_raw(type_tag: u8, data: &[u8]) -> Result<RawColumn<'_>> {
             Ok(RawColumn::Json(s))
         }
         Some(DataType::Jsonb) => Ok(RawColumn::Jsonb(data)),
+        Some(DataType::TsVector) => Ok(RawColumn::TsVector(data)),
+        Some(DataType::TsQuery) => Ok(RawColumn::TsQuery(data)),
         _ => Err(SqlError::InvalidValue(format!(
             "unknown column type tag: {type_tag}"
         ))),
@@ -972,6 +1012,8 @@ pub fn patch_column_in_place(data: &mut [u8], target: usize, new_val: &Value) ->
         Value::Blob(b) => b.len(),
         Value::Json(s) => s.len(),
         Value::Jsonb(b) => b.len(),
+        Value::TsVector(b) => b.len(),
+        Value::TsQuery(b) => b.len(),
         Value::Null => return Ok(false),
     };
     if new_data_len != old_data_len {
@@ -989,6 +1031,8 @@ pub fn patch_column_in_place(data: &mut [u8], target: usize, new_val: &Value) ->
         Value::Timestamp(t) => data[val_start..val_start + 8].copy_from_slice(&t.to_le_bytes()),
         Value::Json(s) => data[val_start..val_start + s.len()].copy_from_slice(s.as_bytes()),
         Value::Jsonb(b) => data[val_start..val_start + b.len()].copy_from_slice(b),
+        Value::TsVector(b) => data[val_start..val_start + b.len()].copy_from_slice(b),
+        Value::TsQuery(b) => data[val_start..val_start + b.len()].copy_from_slice(b),
         Value::Interval {
             months,
             days,
@@ -1148,6 +1192,8 @@ pub fn patch_at_offset(data: &mut [u8], offset: usize, new_val: &Value) -> Resul
         Value::Blob(b) => b.len(),
         Value::Json(s) => s.len(),
         Value::Jsonb(b) => b.len(),
+        Value::TsVector(b) => b.len(),
+        Value::TsQuery(b) => b.len(),
         Value::Null => return Ok(false),
     };
     if new_data_len != old_data_len {
@@ -1165,6 +1211,8 @@ pub fn patch_at_offset(data: &mut [u8], offset: usize, new_val: &Value) -> Resul
         Value::Timestamp(t) => data[val_start..val_start + 8].copy_from_slice(&t.to_le_bytes()),
         Value::Json(s) => data[val_start..val_start + s.len()].copy_from_slice(s.as_bytes()),
         Value::Jsonb(b) => data[val_start..val_start + b.len()].copy_from_slice(b),
+        Value::TsVector(b) => data[val_start..val_start + b.len()].copy_from_slice(b),
+        Value::TsQuery(b) => data[val_start..val_start + b.len()].copy_from_slice(b),
         Value::Interval {
             months,
             days,

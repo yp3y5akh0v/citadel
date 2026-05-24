@@ -13,7 +13,7 @@ use crate::types::*;
 use super::helpers::*;
 
 /// Check PK range conditions. Returns: 0 = match, 1 = below lower (skip), 2 = above upper (stop).
-fn check_pk_range(pk_val: &Value, range_conds: &[(BinOp, Value)]) -> u8 {
+pub(super) fn check_pk_range(pk_val: &Value, range_conds: &[(BinOp, Value)]) -> u8 {
     for (op, bound) in range_conds {
         match op {
             BinOp::Lt if pk_val >= bound => return 2,
@@ -147,7 +147,7 @@ pub(super) fn collect_rows_read(
     where_clause: &Option<Expr>,
     limit: Option<usize>,
 ) -> Result<(Vec<Vec<Value>>, bool)> {
-    let plan = planner::plan_select_with_gin(table_schema, where_clause);
+    let plan = planner::plan_select_inverted(table_schema, where_clause);
     let lower_name = &table_schema.name;
     let columns = &table_schema.columns;
 
@@ -308,7 +308,7 @@ pub(super) fn collect_rows_read(
             {
                 let mut rtx = db.begin_read();
                 let mut scan_err: Option<SqlError> = None;
-                rtx.table_scan_from(&idx_table, &prefix, |key, value| {
+                rtx.table_scan_from_fast(&idx_table, &prefix, |key, value| {
                     if !key.starts_with(&prefix) {
                         return Ok(false);
                     }
@@ -359,13 +359,14 @@ pub(super) fn collect_rows_read(
             Ok((rows, where_clause.is_some()))
         }
 
-        ScanPlan::GinScan {
+        ScanPlan::InvertedScan {
             idx_table,
             probe_entries,
             recheck_expr,
+            recheck_needed,
             ..
         } => {
-            let candidate_pks = gin_intersect_candidates(db, &idx_table, &probe_entries)?;
+            let candidate_pks = inverted_intersect_candidates(db, &idx_table, &probe_entries)?;
             let mut rows = Vec::new();
             let mut rtx = db.begin_read();
             let col_map = ColumnMap::new(columns);
@@ -375,6 +376,10 @@ pub(super) fn collect_rows_read(
                     .map_err(SqlError::Storage)?
                 {
                     let row = decode_full_row(table_schema, pk_key, &value)?;
+                    if !recheck_needed {
+                        rows.push(row);
+                        continue;
+                    }
                     match eval_expr(&recheck_expr, &EvalCtx::new(&col_map, &row)) {
                         Ok(val) if is_truthy(&val) => rows.push(row),
                         _ => {}
@@ -386,41 +391,56 @@ pub(super) fn collect_rows_read(
     }
 }
 
-fn gin_intersect_candidates(
+fn inverted_intersect_candidates(
     db: &Database,
     idx_table: &[u8],
     probe_entries: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>> {
-    use std::collections::BTreeSet;
-    let mut sets: Vec<BTreeSet<Vec<u8>>> = Vec::with_capacity(probe_entries.len());
+    let mut lists: Vec<Vec<Vec<u8>>> = Vec::with_capacity(probe_entries.len());
     let mut rtx = db.begin_read();
-    let mut scan_err: Option<SqlError> = None;
     for entry in probe_entries {
         let mut prefix = entry.clone();
         prefix.push(0x1F);
-        let mut set = BTreeSet::new();
+        let mut list: Vec<Vec<u8>> = Vec::new();
         rtx.table_scan_from(idx_table, &prefix, |key, _value| {
             if !key.starts_with(&prefix) {
                 return Ok(false);
             }
-            set.insert(key[prefix.len()..].to_vec());
+            list.push(key[prefix.len()..].to_vec());
             Ok(true)
         })
         .map_err(SqlError::Storage)?;
-        if let Some(e) = scan_err.take() {
-            return Err(e);
+        if list.is_empty() {
+            return Ok(Vec::new());
         }
-        sets.push(set);
+        lists.push(list);
     }
-    let mut iter = sets.into_iter();
-    let mut acc = match iter.next() {
-        Some(s) => s,
-        None => return Ok(Vec::new()),
-    };
-    for s in iter {
-        acc.retain(|x| s.contains(x));
+    lists.sort_by_key(|l| l.len());
+    let mut acc = lists.remove(0);
+    for other in lists {
+        acc = sorted_intersect(&acc, &other);
+        if acc.is_empty() {
+            return Ok(acc);
+        }
     }
-    Ok(acc.into_iter().collect())
+    Ok(acc)
+}
+
+fn sorted_intersect(a: &[Vec<u8>], b: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(a.len().min(b.len()));
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => {
+                out.push(a[i].clone());
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    out
 }
 
 /// Collect rows via WriteTxn using the scan plan.
@@ -644,7 +664,9 @@ pub(super) fn collect_rows_write(
             Ok((rows, where_clause.is_some()))
         }
 
-        ScanPlan::GinScan { .. } => unreachable!("GinScan only from plan_select_with_gin"),
+        ScanPlan::InvertedScan { .. } => {
+            unreachable!("InvertedScan only from plan_select_inverted")
+        }
     }
 }
 
@@ -743,7 +765,7 @@ pub(super) fn collect_keyed_rows_read(
             {
                 let mut rtx = db.begin_read();
                 let mut scan_err: Option<SqlError> = None;
-                rtx.table_scan_from(&idx_table, &prefix, |key, value| {
+                rtx.table_scan_from_fast(&idx_table, &prefix, |key, value| {
                     if !key.starts_with(&prefix) {
                         return Ok(false);
                     }
@@ -787,7 +809,9 @@ pub(super) fn collect_keyed_rows_read(
             Ok(rows)
         }
 
-        ScanPlan::GinScan { .. } => unreachable!("GinScan only from plan_select_with_gin"),
+        ScanPlan::InvertedScan { .. } => {
+            unreachable!("InvertedScan only from plan_select_inverted")
+        }
     }
 }
 
@@ -927,7 +951,9 @@ pub(super) fn collect_keyed_rows_write(
             Ok(rows)
         }
 
-        ScanPlan::GinScan { .. } => unreachable!("GinScan only from plan_select_with_gin"),
+        ScanPlan::InvertedScan { .. } => {
+            unreachable!("InvertedScan only from plan_select_inverted")
+        }
     }
 }
 

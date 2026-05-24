@@ -42,21 +42,32 @@ pub struct ReadTxn<'a> {
     manager: &'a TxnManager,
     txn_id: TxnId,
     snapshot: CommitSlot,
+    commit_generation: u64,
     page_cache: FxHashMap<PageId, Arc<Page>>,
 }
 
 impl<'db> ReadTxn<'db> {
-    pub(crate) fn new(manager: &'db TxnManager, txn_id: TxnId, snapshot: CommitSlot) -> Self {
+    pub(crate) fn new(
+        manager: &'db TxnManager,
+        txn_id: TxnId,
+        snapshot: CommitSlot,
+        commit_generation: u64,
+    ) -> Self {
         Self {
             manager,
             txn_id,
             snapshot,
+            commit_generation,
             page_cache: FxHashMap::default(),
         }
     }
 
     pub fn txn_id(&self) -> TxnId {
         self.txn_id
+    }
+
+    pub fn commit_generation(&self) -> u64 {
+        self.commit_generation
     }
 
     pub fn root(&self) -> PageId {
@@ -188,6 +199,58 @@ impl<'db> ReadTxn<'db> {
         Ok(())
     }
 
+    pub fn table_scan_from_fast<F>(
+        &mut self,
+        table: &[u8],
+        start_key: &[u8],
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<bool>,
+    {
+        let desc = self.lookup_table(table)?;
+        let root = desc.root_page;
+        let mut view = ReadPages {
+            cache: &mut self.page_cache,
+            manager: self.manager,
+        };
+        let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
+        if !cursor.is_valid() {
+            return Ok(());
+        }
+        loop {
+            view.ensure_loaded(cursor.leaf_page_id())?;
+            let leaf_page = view
+                .get_page(&cursor.leaf_page_id())
+                .ok_or(Error::PageOutOfBounds(cursor.leaf_page_id()))?
+                .clone();
+            let n = leaf_page.num_cells();
+            let mut idx = cursor.cell_index();
+            while idx < n {
+                let cell = leaf_node::read_cell(&leaf_page, idx);
+                let continue_scan = match cell.val_type {
+                    ValueType::Tombstone => true,
+                    ValueType::Inline => f(cell.key, cell.value)?,
+                    ValueType::Overflow => {
+                        let oref = OverflowRef::from_bytes(cell.value);
+                        let key_owned = cell.key.to_vec();
+                        let materialized = overflow_io::read_chain_value(&mut view, &oref)?;
+                        f(&key_owned, &materialized)?
+                    }
+                };
+                if !continue_scan {
+                    return Ok(());
+                }
+                idx += 1;
+            }
+            cursor.set_cell_index(n);
+            if !cursor.advance_to_next_leaf(&mut view)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Pull-based scan from `start_key`. Returns a lending iterator.
     pub fn table_scan_iter<'a>(
         &'a mut self,
@@ -208,9 +271,6 @@ impl<'db> ReadTxn<'db> {
     }
 
     /// Consume self and return a lending iterator that owns the read txn.
-    ///
-    /// Useful when the caller needs the iterator to outlive a borrow scope —
-    /// the txn's snapshot is pinned for the iterator's lifetime.
     pub fn into_table_scan_iter(
         mut self,
         table: &[u8],
@@ -266,8 +326,7 @@ impl<'db> ReadTxn<'db> {
         Ok(())
     }
 
-    /// Single DFS pass that loads each page into the cache AND collects leaves
-    /// in left-to-right order. Replaces preload + collect_leaves redundancy.
+    /// DFS pass that loads each page into the cache and collects leaves in left-to-right order.
     fn load_and_collect_leaves(
         &mut self,
         page_id: PageId,

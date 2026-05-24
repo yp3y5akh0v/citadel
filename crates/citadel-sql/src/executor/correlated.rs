@@ -1200,7 +1200,6 @@ pub(super) fn build_and_scan_correlated_read(
         }
     };
 
-    // Phase 1: Pre-build all decorrelation maps (scans inner tables only — cheap).
     let conjuncts = flatten_and_exprs(where_clause);
     let mut exists_filters: Vec<ExistsFilter> = Vec::new();
     let mut in_filters: Vec<InFilter> = Vec::new();
@@ -1275,7 +1274,6 @@ pub(super) fn build_and_scan_correlated_read(
         return Ok((rows, remaining));
     }
 
-    // Phase 2: Scan outer table — only fully decode rows that pass all correlation filters.
     let lower = &outer_schema.name;
     let num_pk_cols = outer_schema.primary_key_columns.len();
     let non_pk = outer_schema.non_pk_indices();

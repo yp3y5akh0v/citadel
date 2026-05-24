@@ -35,6 +35,13 @@ pub trait CompiledPlan: Send + Sync {
     fn uses_scoped_params(&self) -> bool {
         true
     }
+
+    /// `false` when the plan never reads the txn clock (no NOW(),
+    /// CURRENT_TIMESTAMP, etc.). Lets the caller skip the
+    /// `with_txn_clock` thread-local wrapper.
+    fn needs_txn_clock(&self) -> bool {
+        true
+    }
 }
 
 /// Internal trait: object-safe streaming source over decoded rows.

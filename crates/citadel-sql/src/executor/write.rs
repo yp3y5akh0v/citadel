@@ -750,6 +750,7 @@ fn exec_update_compiled(
             },
         )?;
 
+        super::helpers::drain_deferred_fk_checks(&mut wtx)?;
         wtx.commit().map_err(SqlError::Storage)?;
         return Ok(ExecutionResult::RowsAffected(count));
     }
@@ -1120,6 +1121,7 @@ pub(super) fn exec_update(
                 .map_err(SqlError::Storage)?;
         }
         let count = patched.len() as u64;
+        super::helpers::drain_deferred_fk_checks(&mut wtx)?;
         wtx.commit().map_err(SqlError::Storage)?;
         return Ok(ExecutionResult::RowsAffected(count));
     }
@@ -1278,7 +1280,6 @@ pub(super) fn exec_update(
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
 
-    // FK child-side: validate new FK values exist in parent
     if !table_schema.foreign_keys.is_empty() {
         for c in &changes {
             for fk in &table_schema.foreign_keys {
@@ -1302,12 +1303,24 @@ pub(super) fn exec_update(
                     .map(|&ci| c.new_row[ci as usize].clone())
                     .collect();
                 let fk_key = encode_composite_key(&fk_vals);
-                let found = wtx
-                    .table_get(fk.foreign_table.as_bytes(), &fk_key)
-                    .map_err(SqlError::Storage)?;
-                if found.is_none() {
-                    let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
-                    return Err(SqlError::ForeignKeyViolation(name.to_string()));
+                if fk.deferrable && fk.initially_deferred {
+                    let name = fk.name.as_deref().unwrap_or(&fk.foreign_table).to_string();
+                    wtx.defer_fk_check(citadel_txn::write_txn::DeferredFkCheck {
+                        fk_name: name,
+                        foreign_table: fk.foreign_table.as_bytes().to_vec(),
+                        parent_key: fk_key,
+                    });
+                    continue;
+                }
+                if !wtx.fk_check_cached(fk.foreign_table.as_bytes(), &fk_key) {
+                    let found = wtx
+                        .table_get(fk.foreign_table.as_bytes(), &fk_key)
+                        .map_err(SqlError::Storage)?;
+                    if found.is_none() {
+                        let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
+                        return Err(SqlError::ForeignKeyViolation(name.to_string()));
+                    }
+                    wtx.mark_fk_verified(fk.foreign_table.as_bytes(), &fk_key);
                 }
             }
         }
@@ -1328,8 +1341,7 @@ pub(super) fn exec_update(
         cascade_after_parent_update(&mut wtx, schema, &lower_name, table_schema, &parent_changes)?;
     }
 
-    let col_map_partial =
-        any_partial_index(table_schema).then(|| ColumnMap::new(&table_schema.columns));
+    let col_map_partial = any_partial_index(table_schema).then(|| table_schema.column_map());
 
     for c in &changes {
         let old_pk: Vec<Value> = pk_indices.iter().map(|&i| c.old_row[i].clone()).collect();
@@ -1342,13 +1354,30 @@ pub(super) fn exec_update(
                 &c.new_row,
                 cols_changed,
                 c.pk_changed,
-                col_map_partial.as_ref(),
+                col_map_partial,
             );
-            if del {
-                let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
-                let old_idx_key = encode_index_key(idx, &c.old_row, &old_pk);
-                wtx.table_delete(&idx_table, &old_idx_key)
-                    .map_err(SqlError::Storage)?;
+            if !del {
+                continue;
+            }
+            let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
+            match idx.kind {
+                crate::types::IndexKind::BTree => {
+                    let old_idx_key = encode_index_key(idx, &c.old_row, &old_pk);
+                    wtx.table_delete(&idx_table, &old_idx_key)
+                        .map_err(SqlError::Storage)?;
+                }
+                crate::types::IndexKind::Inverted(inv_kind) => {
+                    let entries = super::helpers::extract_inverted_entries(
+                        &c.old_row[idx.columns[0] as usize],
+                        inv_kind,
+                    )?;
+                    let pk_encoded = encode_composite_key(&old_pk);
+                    for entry in entries {
+                        let full_key = super::helpers::build_inverted_key(&entry, &pk_encoded);
+                        wtx.table_delete(&idx_table, &full_key)
+                            .map_err(SqlError::Storage)?;
+                    }
+                }
             }
         }
 
@@ -1381,24 +1410,42 @@ pub(super) fn exec_update(
                 &c.new_row,
                 cols_changed,
                 c.pk_changed,
-                col_map_partial.as_ref(),
+                col_map_partial,
             );
-            if ins {
-                let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
-                let new_idx_key = encode_index_key(idx, &c.new_row, &new_pk);
-                let new_idx_val = encode_index_value(idx, &c.new_row, &new_pk);
-                let is_new = wtx
-                    .table_insert(&idx_table, &new_idx_key, &new_idx_val)
-                    .map_err(SqlError::Storage)?;
-                if idx.unique && !is_new {
-                    let indexed_values: Vec<Value> = idx
-                        .columns
-                        .iter()
-                        .map(|&col_idx| c.new_row[col_idx as usize].clone())
-                        .collect();
-                    let any_null = indexed_values.iter().any(|v| v.is_null());
-                    if !any_null {
-                        return Err(SqlError::UniqueViolation(idx.name.clone()));
+            if !ins {
+                continue;
+            }
+            let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
+            match idx.kind {
+                crate::types::IndexKind::BTree => {
+                    let new_idx_key = encode_index_key(idx, &c.new_row, &new_pk);
+                    let new_idx_val = encode_index_value(idx, &c.new_row, &new_pk);
+                    let is_new = wtx
+                        .table_insert(&idx_table, &new_idx_key, &new_idx_val)
+                        .map_err(SqlError::Storage)?;
+                    if idx.unique && !is_new {
+                        let indexed_values: Vec<Value> = idx
+                            .columns
+                            .iter()
+                            .map(|&col_idx| c.new_row[col_idx as usize].clone())
+                            .collect();
+                        let any_null = indexed_values.iter().any(|v| v.is_null());
+                        if !any_null {
+                            return Err(SqlError::UniqueViolation(idx.name.clone()));
+                        }
+                    }
+                }
+                crate::types::IndexKind::Inverted(inv_kind) => {
+                    let value = &c.new_row[idx.columns[0] as usize];
+                    if !value.is_null() {
+                        let entries =
+                            super::helpers::extract_inverted_entries_with_values(value, inv_kind)?;
+                        let pk_encoded = encode_composite_key(&new_pk);
+                        for (entry, val_bytes) in entries {
+                            let full_key = super::helpers::build_inverted_key(&entry, &pk_encoded);
+                            wtx.table_insert(&idx_table, &full_key, &val_bytes)
+                                .map_err(SqlError::Storage)?;
+                        }
                     }
                 }
             }
@@ -1411,6 +1458,7 @@ pub(super) fn exec_update(
             .map(|c| (Some(c.old_row.clone()), Some(c.new_row.clone())))
             .collect();
         let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
+        super::helpers::drain_deferred_fk_checks(&mut wtx)?;
         wtx.commit().map_err(SqlError::Storage)?;
         return Ok(ExecutionResult::Query(qr));
     }
@@ -1513,6 +1561,7 @@ pub(super) fn exec_delete(
             let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
             wtx.table_truncate(&idx_table).map_err(SqlError::Storage)?;
         }
+        super::helpers::drain_deferred_fk_checks(&mut wtx)?;
         wtx.commit().map_err(SqlError::Storage)?;
         return Ok(ExecutionResult::RowsAffected(count));
     }
@@ -1532,6 +1581,7 @@ pub(super) fn exec_delete(
     if rows_to_delete.is_empty() {
         if let Some(returning_cols) = stmt.returning.as_ref() {
             let qr = super::helpers::project_returning(table_schema, returning_cols, &[])?;
+            super::helpers::drain_deferred_fk_checks(&mut wtx)?;
             wtx.commit().map_err(SqlError::Storage)?;
             return Ok(ExecutionResult::Query(qr));
         }
@@ -1567,6 +1617,7 @@ pub(super) fn exec_delete(
             .map(|(_, row)| (Some(row.clone()), None))
             .collect();
         let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
+        super::helpers::drain_deferred_fk_checks(&mut wtx)?;
         wtx.commit().map_err(SqlError::Storage)?;
         return Ok(ExecutionResult::Query(qr));
     }
@@ -2621,7 +2672,6 @@ pub(super) fn exec_update_in_txn(
         }
     }
 
-    // FK child-side: validate new FK values exist in parent
     if !table_schema.foreign_keys.is_empty() {
         for c in &changes {
             for fk in &table_schema.foreign_keys {
@@ -2645,12 +2695,24 @@ pub(super) fn exec_update_in_txn(
                     .map(|&ci| c.new_row[ci as usize].clone())
                     .collect();
                 let fk_key = encode_composite_key(&fk_vals);
-                let found = wtx
-                    .table_get(fk.foreign_table.as_bytes(), &fk_key)
-                    .map_err(SqlError::Storage)?;
-                if found.is_none() {
-                    let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
-                    return Err(SqlError::ForeignKeyViolation(name.to_string()));
+                if fk.deferrable && fk.initially_deferred {
+                    let name = fk.name.as_deref().unwrap_or(&fk.foreign_table).to_string();
+                    wtx.defer_fk_check(citadel_txn::write_txn::DeferredFkCheck {
+                        fk_name: name,
+                        foreign_table: fk.foreign_table.as_bytes().to_vec(),
+                        parent_key: fk_key,
+                    });
+                    continue;
+                }
+                if !wtx.fk_check_cached(fk.foreign_table.as_bytes(), &fk_key) {
+                    let found = wtx
+                        .table_get(fk.foreign_table.as_bytes(), &fk_key)
+                        .map_err(SqlError::Storage)?;
+                    if found.is_none() {
+                        let name = fk.name.as_deref().unwrap_or(&fk.foreign_table);
+                        return Err(SqlError::ForeignKeyViolation(name.to_string()));
+                    }
+                    wtx.mark_fk_verified(fk.foreign_table.as_bytes(), &fk_key);
                 }
             }
         }
@@ -2677,8 +2739,7 @@ pub(super) fn exec_update_in_txn(
         )?;
     }
 
-    let col_map_partial =
-        any_partial_index(table_schema).then(|| ColumnMap::new(&table_schema.columns));
+    let col_map_partial = any_partial_index(table_schema).then(|| table_schema.column_map());
 
     for c in &changes {
         let old_pk: Vec<Value> = pk_indices.iter().map(|&i| c.old_row[i].clone()).collect();
@@ -2691,13 +2752,30 @@ pub(super) fn exec_update_in_txn(
                 &c.new_row,
                 cols_changed,
                 c.pk_changed,
-                col_map_partial.as_ref(),
+                col_map_partial,
             );
-            if del {
-                let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
-                let old_idx_key = encode_index_key(idx, &c.old_row, &old_pk);
-                wtx.table_delete(&idx_table, &old_idx_key)
-                    .map_err(SqlError::Storage)?;
+            if !del {
+                continue;
+            }
+            let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
+            match idx.kind {
+                crate::types::IndexKind::BTree => {
+                    let old_idx_key = encode_index_key(idx, &c.old_row, &old_pk);
+                    wtx.table_delete(&idx_table, &old_idx_key)
+                        .map_err(SqlError::Storage)?;
+                }
+                crate::types::IndexKind::Inverted(inv_kind) => {
+                    let entries = super::helpers::extract_inverted_entries(
+                        &c.old_row[idx.columns[0] as usize],
+                        inv_kind,
+                    )?;
+                    let pk_encoded = encode_composite_key(&old_pk);
+                    for entry in entries {
+                        let full_key = super::helpers::build_inverted_key(&entry, &pk_encoded);
+                        wtx.table_delete(&idx_table, &full_key)
+                            .map_err(SqlError::Storage)?;
+                    }
+                }
             }
         }
 
@@ -2730,24 +2808,42 @@ pub(super) fn exec_update_in_txn(
                 &c.new_row,
                 cols_changed,
                 c.pk_changed,
-                col_map_partial.as_ref(),
+                col_map_partial,
             );
-            if ins {
-                let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
-                let new_idx_key = encode_index_key(idx, &c.new_row, &new_pk);
-                let new_idx_val = encode_index_value(idx, &c.new_row, &new_pk);
-                let is_new = wtx
-                    .table_insert(&idx_table, &new_idx_key, &new_idx_val)
-                    .map_err(SqlError::Storage)?;
-                if idx.unique && !is_new {
-                    let indexed_values: Vec<Value> = idx
-                        .columns
-                        .iter()
-                        .map(|&col_idx| c.new_row[col_idx as usize].clone())
-                        .collect();
-                    let any_null = indexed_values.iter().any(|v| v.is_null());
-                    if !any_null {
-                        return Err(SqlError::UniqueViolation(idx.name.clone()));
+            if !ins {
+                continue;
+            }
+            let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
+            match idx.kind {
+                crate::types::IndexKind::BTree => {
+                    let new_idx_key = encode_index_key(idx, &c.new_row, &new_pk);
+                    let new_idx_val = encode_index_value(idx, &c.new_row, &new_pk);
+                    let is_new = wtx
+                        .table_insert(&idx_table, &new_idx_key, &new_idx_val)
+                        .map_err(SqlError::Storage)?;
+                    if idx.unique && !is_new {
+                        let indexed_values: Vec<Value> = idx
+                            .columns
+                            .iter()
+                            .map(|&col_idx| c.new_row[col_idx as usize].clone())
+                            .collect();
+                        let any_null = indexed_values.iter().any(|v| v.is_null());
+                        if !any_null {
+                            return Err(SqlError::UniqueViolation(idx.name.clone()));
+                        }
+                    }
+                }
+                crate::types::IndexKind::Inverted(inv_kind) => {
+                    let value = &c.new_row[idx.columns[0] as usize];
+                    if !value.is_null() {
+                        let entries =
+                            super::helpers::extract_inverted_entries_with_values(value, inv_kind)?;
+                        let pk_encoded = encode_composite_key(&new_pk);
+                        for (entry, val_bytes) in entries {
+                            let full_key = super::helpers::build_inverted_key(&entry, &pk_encoded);
+                            wtx.table_insert(&idx_table, &full_key, &val_bytes)
+                                .map_err(SqlError::Storage)?;
+                        }
                     }
                 }
             }

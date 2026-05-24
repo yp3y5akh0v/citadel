@@ -58,6 +58,13 @@ impl PageLoader for WritePages<'_> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DeferredFkCheck {
+    pub fk_name: String,
+    pub foreign_table: Vec<u8>,
+    pub parent_key: Vec<u8>,
+}
+
 pub struct WriteTxn<'a> {
     manager: &'a TxnManager,
     base_txn_id: TxnId,
@@ -72,6 +79,8 @@ pub struct WriteTxn<'a> {
     catalog: Option<BTree>,
     catalog_dirty: bool,
     loaded_tree_meta: FxHashMap<Vec<u8>, (PageId, u16)>,
+    deferred_fk_checks: Vec<DeferredFkCheck>,
+    fk_check_cache: FxHashMap<Vec<u8>, Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -83,6 +92,7 @@ pub struct WriteTxnSnapshot {
     catalog_dirty: bool,
     loaded_tree_meta: FxHashMap<Vec<u8>, (PageId, u16)>,
     deferred_free: Vec<PageId>,
+    deferred_fk_checks_len: usize,
 }
 
 impl<'db> WriteTxn<'db> {
@@ -120,7 +130,42 @@ impl<'db> WriteTxn<'db> {
             catalog: None,
             catalog_dirty: false,
             loaded_tree_meta: FxHashMap::default(),
+            deferred_fk_checks: Vec::new(),
+            fk_check_cache: FxHashMap::default(),
         }
+    }
+
+    #[inline]
+    pub fn fk_check_cached(&self, foreign_table: &[u8], key: &[u8]) -> bool {
+        self.fk_check_cache
+            .get(foreign_table)
+            .map(|cached| cached.as_slice() == key)
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    pub fn mark_fk_verified(&mut self, foreign_table: &[u8], key: &[u8]) {
+        self.fk_check_cache
+            .insert(foreign_table.to_vec(), key.to_vec());
+    }
+
+    #[inline]
+    fn invalidate_fk_cache_for(&mut self, table: &[u8]) {
+        if !self.fk_check_cache.is_empty() {
+            self.fk_check_cache.remove(table);
+        }
+    }
+
+    pub fn defer_fk_check(&mut self, check: DeferredFkCheck) {
+        self.deferred_fk_checks.push(check);
+    }
+
+    pub fn take_deferred_fk_checks(&mut self) -> Vec<DeferredFkCheck> {
+        std::mem::take(&mut self.deferred_fk_checks)
+    }
+
+    pub fn deferred_fk_check_count(&self) -> usize {
+        self.deferred_fk_checks.len()
     }
 
     pub fn txn_id(&self) -> TxnId {
@@ -129,6 +174,10 @@ impl<'db> WriteTxn<'db> {
 
     pub fn entry_count(&self) -> u64 {
         self.tree.entry_count
+    }
+
+    pub fn pending_free_count(&self) -> usize {
+        self.alloc.freed_count()
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -147,19 +196,48 @@ impl<'db> WriteTxn<'db> {
 
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<bool> {
         Self::validate_key_value(key, value)?;
-        if value.len() > MAX_INLINE_VALUE_SIZE {
-            self.free_existing_overflow_in_tree(self.tree.root, key)?;
-        }
         let (val_type, val_payload) = self.stage_value(value);
-        self.preload_path(self.tree.root, key)?;
-        self.tree.insert(
+        Self::insert_into_tree(
+            &mut self.tree,
             &mut self.pages,
             &mut self.alloc,
+            self.manager,
             self.txn_id,
             key,
             val_type,
             &val_payload,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_into_tree(
+        tree: &mut BTree,
+        pages: &mut FxHashMap<PageId, Page>,
+        alloc: &mut PageAllocator,
+        manager: &TxnManager,
+        txn_id: TxnId,
+        key: &[u8],
+        val_type: ValueType,
+        val_bytes: &[u8],
+    ) -> Result<bool> {
+        if val_type == ValueType::Inline {
+            if let Some(was_new) =
+                tree.try_lil_insert(pages, alloc, txn_id, key, val_type, val_bytes)?
+            {
+                return Ok(was_new);
+            }
+        }
+
+        let root = tree.root;
+        let (path, leaf_id) = Self::walk_loading(pages, manager, root, key)?;
+        let (was_new, replaced) = tree.insert_at_leaf(
+            pages, alloc, txn_id, key, val_type, val_bytes, path, leaf_id,
+        )?;
+        if let Some(head) = replaced {
+            let mut view = WritePages { pages, manager };
+            overflow_io::free_chain(&mut view, alloc, head)?;
+        }
+        Ok(was_new)
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
@@ -187,19 +265,6 @@ impl<'db> WriteTxn<'db> {
             }
             _ => Ok(None),
         }
-    }
-
-    fn free_existing_overflow_in_tree(&mut self, root: PageId, key: &[u8]) -> Result<()> {
-        let leaf_id = Self::descend_to_leaf(&mut self.pages, self.manager, root, key)?;
-        let oref = match BTree::search_at_leaf(&self.pages, leaf_id, key)? {
-            Some((ValueType::Overflow, bytes)) => OverflowRef::from_bytes(&bytes),
-            _ => return Ok(()),
-        };
-        let mut view = WritePages {
-            pages: &mut self.pages,
-            manager: self.manager,
-        };
-        overflow_io::free_chain(&mut view, &mut self.alloc, oref.first_page)
     }
 
     pub fn for_each<F>(&mut self, mut f: F) -> Result<()>
@@ -312,6 +377,7 @@ impl<'db> WriteTxn<'db> {
     }
 
     pub fn create_table(&mut self, name: &[u8]) -> Result<()> {
+        self.fk_check_cache.clear();
         self.ensure_catalog()?;
 
         if self.named_trees.contains_key(name) {
@@ -342,6 +408,7 @@ impl<'db> WriteTxn<'db> {
     }
 
     pub fn drop_table(&mut self, name: &[u8]) -> Result<()> {
+        self.fk_check_cache.clear();
         self.ensure_table(name)?;
         self.ensure_catalog()?;
 
@@ -362,6 +429,7 @@ impl<'db> WriteTxn<'db> {
 
     /// Rename a table in the catalog.
     pub fn rename_table(&mut self, old_name: &[u8], new_name: &[u8]) -> Result<()> {
+        self.fk_check_cache.clear();
         self.ensure_table(old_name)?;
 
         if self.named_trees.contains_key(new_name) {
@@ -406,55 +474,19 @@ impl<'db> WriteTxn<'db> {
 
     pub fn table_insert(&mut self, table: &[u8], key: &[u8], value: &[u8]) -> Result<bool> {
         Self::validate_key_value(key, value)?;
-        // Skip the cleanup descent unless the new value spills — small inserts stay hot.
-        if value.len() > MAX_INLINE_VALUE_SIZE {
-            self.free_existing_overflow(table, key)?;
-        }
-        let (val_type, val_payload) = self.stage_value(value);
-        let val_bytes = val_payload.as_slice();
-
-        if self.named_trees.contains_key(table) {
-            let tree = self.named_trees.get_mut(table).unwrap();
-            if val_type == ValueType::Inline {
-                if let Some(was_new) = tree.try_lil_insert(
-                    &mut self.pages,
-                    &mut self.alloc,
-                    self.txn_id,
-                    key,
-                    val_type,
-                    val_bytes,
-                )? {
-                    return Ok(was_new);
-                }
-            }
-            let root = tree.root;
-            let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
-            let tree = self.named_trees.get_mut(table).unwrap();
-            return tree.insert_at_leaf(
-                &mut self.pages,
-                &mut self.alloc,
-                self.txn_id,
-                key,
-                val_type,
-                val_bytes,
-                path,
-                leaf_id,
-            );
-        }
+        self.invalidate_fk_cache_for(table);
         self.ensure_table(table)?;
+        let (val_type, val_payload) = self.stage_value(value);
         let tree = self.named_trees.get_mut(table).unwrap();
-        let root = tree.root;
-        let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
-        let tree = self.named_trees.get_mut(table).unwrap();
-        tree.insert_at_leaf(
+        Self::insert_into_tree(
+            tree,
             &mut self.pages,
             &mut self.alloc,
+            self.manager,
             self.txn_id,
             key,
             val_type,
-            val_bytes,
-            path,
-            leaf_id,
+            &val_payload,
         )
     }
 
@@ -466,6 +498,7 @@ impl<'db> WriteTxn<'db> {
         value: &[u8],
     ) -> Result<bool> {
         Self::validate_key_value(key, value)?;
+        self.invalidate_fk_cache_for(table);
         let (val_type, val_payload) = self.stage_value(value);
         let val_bytes = val_payload.as_slice();
         let inserted = self.insert_if_absent_staged(table, key, val_type, val_bytes)?;
@@ -487,46 +520,28 @@ impl<'db> WriteTxn<'db> {
         val_type: ValueType,
         val_bytes: &[u8],
     ) -> Result<bool> {
-        if self.named_trees.contains_key(table) {
-            let tree = self.named_trees.get_mut(table).unwrap();
-            let root = tree.root;
-            if val_type == ValueType::Inline && tree.lil_would_hit(&self.pages, key) {
-                return tree.insert_if_absent(
-                    &mut self.pages,
-                    &mut self.alloc,
-                    self.txn_id,
-                    key,
-                    val_type,
-                    val_bytes,
-                );
-            }
-            let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
-            let tree = self.named_trees.get_mut(table).unwrap();
-            return tree.insert_if_absent_at_leaf(
-                &mut self.pages,
-                &mut self.alloc,
-                self.txn_id,
-                key,
-                val_type,
-                val_bytes,
-                path,
-                leaf_id,
-            );
+        if !self.named_trees.contains_key(table) {
+            self.ensure_table(table)?;
         }
-        self.ensure_table(table)?;
-        let tree = self.named_trees.get_mut(table).unwrap();
+        let Self {
+            named_trees,
+            pages,
+            alloc,
+            manager,
+            txn_id,
+            ..
+        } = self;
+        let tree = named_trees.get_mut(table).unwrap();
         let root = tree.root;
-        let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
-        let tree = self.named_trees.get_mut(table).unwrap();
+        let manager = *manager;
+        let txn_id = *txn_id;
+
+        if val_type == ValueType::Inline && tree.lil_would_hit(pages, key) {
+            return tree.insert_if_absent(pages, alloc, txn_id, key, val_type, val_bytes);
+        }
+        let (path, leaf_id) = Self::walk_loading(pages, manager, root, key)?;
         tree.insert_if_absent_at_leaf(
-            &mut self.pages,
-            &mut self.alloc,
-            self.txn_id,
-            key,
-            val_type,
-            val_bytes,
-            path,
-            leaf_id,
+            pages, alloc, txn_id, key, val_type, val_bytes, path, leaf_id,
         )
     }
 
@@ -543,41 +558,40 @@ impl<'db> WriteTxn<'db> {
         E: From<Error>,
     {
         Self::validate_key_value(key, default_value)?;
+        self.invalidate_fk_cache_for(table);
 
-        if let Some(tree) = self.named_trees.get_mut(table) {
-            let root = tree.root;
-            if tree.lil_would_hit(&self.pages, key) {
-                return tree.upsert_with(
-                    &mut self.pages,
-                    &mut self.alloc,
-                    self.txn_id,
-                    key,
-                    ValueType::Inline,
-                    default_value,
-                    f,
-                );
-            }
-            let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
-            return tree.upsert_with_at_leaf(
-                &mut self.pages,
-                &mut self.alloc,
-                self.txn_id,
+        if !self.named_trees.contains_key(table) {
+            self.ensure_table(table)?;
+        }
+        let Self {
+            named_trees,
+            pages,
+            alloc,
+            manager,
+            txn_id,
+            ..
+        } = self;
+        let tree = named_trees.get_mut(table).unwrap();
+        let root = tree.root;
+        let manager = *manager;
+        let txn_id = *txn_id;
+
+        if tree.lil_would_hit(pages, key) {
+            return tree.upsert_with(
+                pages,
+                alloc,
+                txn_id,
                 key,
                 ValueType::Inline,
                 default_value,
-                path,
-                leaf_id,
                 f,
             );
         }
-        self.ensure_table(table)?;
-        let tree = self.named_trees.get_mut(table).unwrap();
-        let root = tree.root;
-        let (path, leaf_id) = Self::walk_loading(&mut self.pages, self.manager, root, key)?;
+        let (path, leaf_id) = Self::walk_loading(pages, manager, root, key)?;
         tree.upsert_with_at_leaf(
-            &mut self.pages,
-            &mut self.alloc,
-            self.txn_id,
+            pages,
+            alloc,
+            txn_id,
             key,
             ValueType::Inline,
             default_value,
@@ -594,48 +608,36 @@ impl<'db> WriteTxn<'db> {
         value: &[u8],
     ) -> Result<InsertOutcome> {
         Self::validate_key_value(key, value)?;
+        self.invalidate_fk_cache_for(table);
+        if !self.named_trees.contains_key(table) {
+            self.ensure_table(table)?;
+        }
         let (val_type, val_payload) = self.stage_value(value);
         let val_bytes = val_payload.as_slice();
 
-        let outcome = if self.named_trees.contains_key(table) {
-            let tree = self.named_trees.get_mut(table).unwrap();
-            let root = tree.root;
-            let lil_hit = val_type == ValueType::Inline && tree.lil_would_hit(&self.pages, key);
-            if !lil_hit {
-                Self::preload_path_raw(&mut self.pages, self.manager, root, key)?;
-            }
-            let tree = self.named_trees.get_mut(table).unwrap();
-            tree.insert_or_fetch(
-                &mut self.pages,
-                &mut self.alloc,
-                self.txn_id,
-                key,
-                val_type,
-                val_bytes,
-            )?
-        } else {
-            self.ensure_table(table)?;
-            let tree = self.named_trees.get_mut(table).unwrap();
-            let root = tree.root;
-            Self::preload_path_raw(&mut self.pages, self.manager, root, key)?;
-            let tree = self.named_trees.get_mut(table).unwrap();
-            tree.insert_or_fetch(
-                &mut self.pages,
-                &mut self.alloc,
-                self.txn_id,
-                key,
-                val_type,
-                val_bytes,
-            )?
-        };
+        let Self {
+            named_trees,
+            pages,
+            alloc,
+            manager,
+            txn_id,
+            ..
+        } = self;
+        let tree = named_trees.get_mut(table).unwrap();
+        let root = tree.root;
+        let manager = *manager;
+        let txn_id = *txn_id;
+
+        let lil_hit = val_type == ValueType::Inline && tree.lil_would_hit(pages, key);
+        if !lil_hit {
+            Self::preload_path_raw(pages, manager, root, key)?;
+        }
+        let outcome = tree.insert_or_fetch(pages, alloc, txn_id, key, val_type, val_bytes)?;
         let existed = outcome.is_some();
         if existed && val_type == ValueType::Overflow {
             let oref = OverflowRef::from_bytes(val_bytes);
-            let mut view = WritePages {
-                pages: &mut self.pages,
-                manager: self.manager,
-            };
-            overflow_io::free_chain(&mut view, &mut self.alloc, oref.first_page)?;
+            let mut view = WritePages { pages, manager };
+            overflow_io::free_chain(&mut view, alloc, oref.first_page)?;
         }
         Ok(InsertOutcome::from(outcome))
     }
@@ -645,12 +647,19 @@ impl<'db> WriteTxn<'db> {
         if pairs.is_empty() {
             return Ok(0);
         }
+        self.invalidate_fk_cache_for(table);
         self.ensure_table(table)?;
-        let root = self.named_trees[table].root;
-        self.preload_path(root, pairs[0].0)?;
-
-        let tree = self.named_trees.get_mut(table).unwrap();
-        tree.update_sorted(&mut self.pages, &mut self.alloc, self.txn_id, pairs)
+        let Self {
+            named_trees,
+            pages,
+            alloc,
+            manager,
+            txn_id,
+            ..
+        } = self;
+        let tree = named_trees.get_mut(table).unwrap();
+        Self::descend_to_leaf(pages, manager, tree.root, pairs[0].0)?;
+        tree.update_sorted(pages, alloc, *txn_id, pairs)
     }
 
     /// Fused scan + in-place patch from `start_key`. Callback: `Some(true)`=modified, `None`=stop.
@@ -664,13 +673,22 @@ impl<'db> WriteTxn<'db> {
         F: FnMut(&[u8], &mut [u8]) -> std::result::Result<Option<bool>, E>,
         E: From<Error>,
     {
+        self.invalidate_fk_cache_for(table);
         self.ensure_table(table)?;
-        let root = self.named_trees[table].root;
+        let Self {
+            named_trees,
+            pages,
+            alloc,
+            manager,
+            txn_id,
+            ..
+        } = self;
+        let tree = named_trees.get_mut(table).unwrap();
+        let root = tree.root;
+        let manager = *manager;
+        let txn_id = *txn_id;
 
-        let mut view = WritePages {
-            pages: &mut self.pages,
-            manager: self.manager,
-        };
+        let mut view = WritePages { pages, manager };
         let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
 
         let mut count: u64 = 0;
@@ -690,22 +708,16 @@ impl<'db> WriteTxn<'db> {
             }
 
             if cow_leaf != leaf_id {
-                let new_id = btree::cow_page(view.pages, &mut self.alloc, leaf_id, self.txn_id);
+                let new_id = btree::cow_page(view.pages, alloc, leaf_id, txn_id);
                 if new_id != leaf_id {
-                    let tree = self.named_trees.get_mut(table).unwrap();
                     let cell = citadel_page::leaf_node::read_cell(
                         view.pages.get(&new_id).unwrap(),
                         cursor.cell_index(),
                     );
                     let key_for_walk = cell.key.to_vec();
                     let (mut path, _) = tree.walk_to_leaf(view.pages, &key_for_walk)?;
-                    tree.root = btree::propagate_cow_up(
-                        view.pages,
-                        &mut self.alloc,
-                        self.txn_id,
-                        &mut path,
-                        new_id,
-                    );
+                    tree.root =
+                        btree::propagate_cow_up(view.pages, alloc, txn_id, &mut path, new_id);
                     cursor.set_leaf_page_id(new_id);
                 }
                 cow_leaf = new_id;
@@ -740,44 +752,56 @@ impl<'db> WriteTxn<'db> {
     }
 
     pub fn table_delete(&mut self, table: &[u8], key: &[u8]) -> Result<bool> {
+        self.invalidate_fk_cache_for(table);
         self.ensure_table(table)?;
-        let root = self.named_trees[table].root;
+        let Self {
+            named_trees,
+            pages,
+            alloc,
+            manager,
+            txn_id,
+            ..
+        } = self;
+        let tree = named_trees.get_mut(table).unwrap();
+        let manager = *manager;
+        let txn_id = *txn_id;
 
+        // LIL fast path: most cascade deletes hit the same leaf as the previous
+        // delete. `try_lil_delete` returns Some on cache hit, None on miss.
+        if let Some((deleted, overflow_head)) = tree.try_lil_delete(pages, alloc, txn_id, key)? {
+            if let Some(head) = overflow_head {
+                let mut view = WritePages { pages, manager };
+                overflow_io::free_chain(&mut view, alloc, head)?;
+            }
+            return Ok(deleted);
+        }
+
+        // Slow path: walk + delete.
+        let root = tree.root;
         let (overflow_head, deleted) = PATH_BUF.with(|pb| -> Result<_> {
             let mut path = pb.borrow_mut();
             path.clear();
-            let leaf_id =
-                Self::walk_loading_into(&mut self.pages, self.manager, root, key, &mut path)?;
-            let head = match BTree::search_at_leaf(&self.pages, leaf_id, key)? {
+            let leaf_id = Self::walk_loading_into(pages, manager, root, key, &mut path)?;
+            let head = match BTree::search_at_leaf(pages, leaf_id, key)? {
                 Some((ValueType::Overflow, bytes)) => {
                     Some(OverflowRef::from_bytes(&bytes).first_page)
                 }
                 _ => None,
             };
-            let tree = self.named_trees.get_mut(table).unwrap();
-            let d = tree.delete_at_leaf(
-                &mut self.pages,
-                &mut self.alloc,
-                self.txn_id,
-                key,
-                &mut path,
-                leaf_id,
-            )?;
+            let d = tree.delete_at_leaf(pages, alloc, txn_id, key, &mut path, leaf_id)?;
             Ok((head, d))
         })?;
 
         if let Some(head) = overflow_head {
-            let mut view = WritePages {
-                pages: &mut self.pages,
-                manager: self.manager,
-            };
-            overflow_io::free_chain(&mut view, &mut self.alloc, head)?;
+            let mut view = WritePages { pages, manager };
+            overflow_io::free_chain(&mut view, alloc, head)?;
         }
         Ok(deleted)
     }
 
     /// Drop all pages, reset to an empty leaf. Returns pre-truncation entry count.
     pub fn table_truncate(&mut self, table: &[u8]) -> Result<u64> {
+        self.invalidate_fk_cache_for(table);
         self.ensure_table(table)?;
 
         let old_tree = self.named_trees[table].clone();
@@ -851,6 +875,9 @@ impl<'db> WriteTxn<'db> {
         self.catalog_dirty = snap.catalog_dirty;
         self.loaded_tree_meta = snap.loaded_tree_meta;
         self.deferred_free = snap.deferred_free;
+        self.deferred_fk_checks
+            .truncate(snap.deferred_fk_checks_len);
+        self.fk_check_cache.clear();
         self.txn_id = self.manager.next_write_txn_id();
     }
 
@@ -863,6 +890,7 @@ impl<'db> WriteTxn<'db> {
             catalog_dirty: self.catalog_dirty,
             loaded_tree_meta: self.loaded_tree_meta.clone(),
             deferred_free: self.deferred_free.clone(),
+            deferred_fk_checks_len: self.deferred_fk_checks.len(),
         }
     }
 
@@ -917,25 +945,6 @@ impl<'db> WriteTxn<'db> {
             total_len: value.len() as u32,
         };
         (ValueType::Overflow, oref.to_bytes().to_vec())
-    }
-
-    /// If a cell at (table, key) already exists with `ValueType::Overflow`,
-    /// free its overflow chain so the cell can be overwritten cleanly.
-    fn free_existing_overflow(&mut self, table: &[u8], key: &[u8]) -> Result<()> {
-        if !self.named_trees.contains_key(table) {
-            return Ok(());
-        }
-        let root = self.named_trees[table].root;
-        let leaf_id = Self::descend_to_leaf(&mut self.pages, self.manager, root, key)?;
-        let oref = match BTree::search_at_leaf(&self.pages, leaf_id, key)? {
-            Some((ValueType::Overflow, bytes)) => OverflowRef::from_bytes(&bytes),
-            _ => return Ok(()),
-        };
-        let mut view = WritePages {
-            pages: &mut self.pages,
-            manager: self.manager,
-        };
-        overflow_io::free_chain(&mut view, &mut self.alloc, oref.first_page)
     }
 
     fn ensure_catalog(&mut self) -> Result<()> {

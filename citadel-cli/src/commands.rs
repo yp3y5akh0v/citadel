@@ -769,6 +769,14 @@ fn sql_literal(v: &citadel_sql::Value) -> String {
             let escaped = text.replace('\'', "''");
             format!("'{escaped}'::jsonb")
         }
+        citadel_sql::Value::TsVector(b) => {
+            let text = citadel_sql::fts::tsvector_display(b).replace('\'', "''");
+            format!("'{text}'::tsvector")
+        }
+        citadel_sql::Value::TsQuery(b) => {
+            let text = citadel_sql::fts::tsquery_display(b).replace('\'', "''");
+            format!("'{text}'::tsquery")
+        }
     }
 }
 

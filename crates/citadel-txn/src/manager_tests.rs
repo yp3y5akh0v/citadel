@@ -170,3 +170,62 @@ fn oldest_active_reader_tracks_minimum() {
     let oldest = mgr.oldest_active_reader();
     assert_eq!(oldest, r1.txn_id());
 }
+
+#[test]
+fn read_txn_does_not_advance_commit_generation() {
+    let mgr = create_test_manager();
+    let gen0 = mgr.commit_generation();
+    let _r1 = mgr.begin_read();
+    let _r2 = mgr.begin_read();
+    let _r3 = mgr.begin_read();
+    assert_eq!(mgr.commit_generation(), gen0);
+}
+
+#[test]
+fn single_commit_bumps_commit_generation() {
+    let mgr = create_test_manager();
+    let gen0 = mgr.commit_generation();
+
+    let mut wtx = mgr.begin_write().unwrap();
+    assert!(wtx.insert(b"key", b"val").unwrap());
+    wtx.commit().unwrap();
+
+    assert_eq!(mgr.commit_generation(), gen0 + 1);
+}
+
+#[test]
+fn noop_commit_does_not_bump_commit_generation() {
+    let mgr = create_test_manager();
+    let gen0 = mgr.commit_generation();
+
+    let wtx = mgr.begin_write().unwrap();
+    wtx.commit().unwrap();
+
+    assert_eq!(mgr.commit_generation(), gen0);
+}
+
+#[test]
+fn concurrent_commit_does_not_corrupt_existing_reader_snapshot() {
+    let mgr = create_test_manager();
+
+    {
+        let mut wtx = mgr.begin_write().unwrap();
+        assert!(wtx.insert(b"key", b"v1").unwrap());
+        wtx.commit().unwrap();
+    }
+    let baseline = mgr.commit_generation();
+
+    let mut reader = mgr.begin_read();
+    let reader_gen = reader.commit_generation();
+    assert_eq!(reader_gen, baseline);
+
+    {
+        let mut wtx = mgr.begin_write().unwrap();
+        assert!(!wtx.insert(b"key", b"v2").unwrap());
+        wtx.commit().unwrap();
+    }
+    assert_eq!(mgr.commit_generation(), baseline + 1);
+
+    assert_eq!(reader.commit_generation(), reader_gen);
+    assert_eq!(reader.get(b"key").unwrap(), Some(b"v1".to_vec()));
+}

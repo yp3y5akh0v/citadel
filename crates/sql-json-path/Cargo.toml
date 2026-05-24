@@ -1,0 +1,27 @@
+[package]
+name = "citadeldb-sql-json-path"
+version = "0.15.0"
+edition = "2021"
+description = "Vendored SQL/JSON Path implementation for Citadel. Forked from sql-json-path (RisingWave Labs, Apache-2.0)."
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "sql_json_path"
+path = "src/lib.rs"
+
+[dependencies]
+jiff = { workspace = true }
+nom = "7"
+regex = "1"
+rustc-hash = { workspace = true }
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
+thiserror = "2"
+
+[dev-dependencies]
+libtest-mimic = "0.6"
+
+[[test]]
+name = "pg_jsonb_jsonpath"
+path = "tests/pg_jsonb_jsonpath.rs"
+harness = false

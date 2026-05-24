@@ -181,6 +181,14 @@ impl Cursor {
         self.leaf = id;
     }
 
+    pub fn set_cell_index(&mut self, idx: u16) {
+        self.cell_idx = idx;
+    }
+
+    pub fn advance_to_next_leaf<P: PageLoader + ?Sized>(&mut self, pages: &mut P) -> Result<bool> {
+        self.advance_leaf_lazy(pages)
+    }
+
     pub fn current(&self, pages: &impl PageMap) -> Option<CursorEntry> {
         if !self.valid {
             return None;

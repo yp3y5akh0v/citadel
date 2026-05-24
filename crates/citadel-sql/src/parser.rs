@@ -88,6 +88,8 @@ pub struct ForeignKeyDef {
     pub referred_columns: Vec<String>,
     pub on_delete: ReferentialAction,
     pub on_update: ReferentialAction,
+    pub deferrable: bool,
+    pub initially_deferred: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,6 +442,7 @@ pub enum Expr {
         expr: Box<Expr>,
         collation: crate::types::Collation,
     },
+    TypedNullRecord(String),
 }
 
 #[derive(Debug, Clone)]
@@ -775,7 +778,8 @@ fn visit_expr(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
         | Expr::Column(_)
         | Expr::QualifiedColumn { .. }
         | Expr::CountStar
-        | Expr::Parameter(_) => {}
+        | Expr::Parameter(_)
+        | Expr::TypedNullRecord(_) => {}
     }
 }
 
@@ -934,6 +938,8 @@ fn convert_column_def(
             }
             sp::ColumnOption::ForeignKey(fk) => {
                 let (on_delete, on_update) = convert_fk_actions(&fk.on_delete, &fk.on_update)?;
+                let (deferrable, initially_deferred) =
+                    convert_fk_characteristics(&fk.characteristics);
                 let ftable = object_name_to_string(&fk.foreign_table).to_ascii_lowercase();
                 let referred: Vec<String> = fk
                     .referred_columns
@@ -947,6 +953,8 @@ fn convert_column_def(
                     referred_columns: referred,
                     on_delete,
                     on_update,
+                    deferrable,
+                    initially_deferred,
                 });
             }
             sp::ColumnOption::Generated {
@@ -1128,6 +1136,8 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
             }
             sp::TableConstraint::ForeignKey(fk) => {
                 let (on_delete, on_update) = convert_fk_actions(&fk.on_delete, &fk.on_update)?;
+                let (deferrable, initially_deferred) =
+                    convert_fk_characteristics(&fk.characteristics);
                 let cols: Vec<String> = fk
                     .columns
                     .iter()
@@ -1146,6 +1156,8 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
                     referred_columns: referred,
                     on_delete,
                     on_update,
+                    deferrable,
+                    initially_deferred,
                 });
             }
             sp::TableConstraint::Unique(u) => {
@@ -1259,6 +1271,15 @@ fn convert_fk_action(action: &Option<sp::ReferentialAction>) -> Result<Referenti
     }
 }
 
+fn convert_fk_characteristics(ch: &Option<sp::ConstraintCharacteristics>) -> (bool, bool) {
+    let Some(c) = ch else {
+        return (false, false);
+    };
+    let deferrable = c.deferrable.unwrap_or(false);
+    let initially_deferred = matches!(c.initially, Some(sp::DeferrableInitial::Deferred));
+    (deferrable, initially_deferred)
+}
+
 fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
     let index_name = ci
         .name
@@ -1315,11 +1336,16 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
         None => crate::types::IndexKind::BTree,
         Some(sp::IndexType::BTree) => crate::types::IndexKind::BTree,
         Some(sp::IndexType::GIN) => {
-            crate::types::IndexKind::Gin(crate::types::GinOpsClass::JsonbOps)
+            let ops = parse_gin_with_ops(&ci.with)?;
+            crate::types::IndexKind::Inverted(crate::types::InvertedKind::Gin(ops))
+        }
+        Some(sp::IndexType::Custom(ident)) if ident.value.eq_ignore_ascii_case("fts") => {
+            let config_id = parse_fts_with_config(&ci.with)?;
+            crate::types::IndexKind::Inverted(crate::types::InvertedKind::Fts { config_id })
         }
         Some(other) => {
             return Err(SqlError::Unsupported(format!(
-                "index method {other}; supported: BTREE, GIN"
+                "index method {other}; supported: BTREE, GIN, FTS"
             )));
         }
     };
@@ -1335,6 +1361,117 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
         collations,
         kind,
     }))
+}
+
+fn parse_gin_with_ops(with: &[sp::Expr]) -> Result<crate::types::GinOpsClass> {
+    use crate::types::GinOpsClass;
+    let mut ops_name: Option<String> = None;
+    for expr in with {
+        match expr {
+            sp::Expr::BinaryOp {
+                left,
+                op: sp::BinaryOperator::Eq,
+                right,
+            } => {
+                let key = match left.as_ref() {
+                    sp::Expr::Identifier(id) => id.value.to_ascii_lowercase(),
+                    other => {
+                        return Err(SqlError::Unsupported(format!(
+                            "GIN WITH option key: {other}"
+                        )));
+                    }
+                };
+                if key != "ops" {
+                    return Err(SqlError::Unsupported(format!(
+                        "GIN WITH option: unknown key '{key}' (only 'ops' supported)"
+                    )));
+                }
+                let val = match right.as_ref() {
+                    sp::Expr::Value(v) => match &v.value {
+                        sp::Value::SingleQuotedString(s) => s.clone(),
+                        sp::Value::DoubleQuotedString(s) => s.clone(),
+                        other => {
+                            return Err(SqlError::Parse(format!(
+                                "GIN ops value must be a string literal, got: {other}"
+                            )))
+                        }
+                    },
+                    sp::Expr::Identifier(id) => id.value.clone(),
+                    other => {
+                        return Err(SqlError::Parse(format!(
+                            "GIN ops value must be a string literal, got: {other}"
+                        )));
+                    }
+                };
+                ops_name = Some(val);
+            }
+            other => {
+                return Err(SqlError::Unsupported(format!(
+                    "GIN WITH option must be `key = value`, got: {other}"
+                )));
+            }
+        }
+    }
+    let lower = ops_name.as_deref().map(|s| s.to_ascii_lowercase());
+    match lower.as_deref() {
+        None | Some("jsonb_ops") => Ok(GinOpsClass::JsonbOps),
+        Some("jsonb_path_ops") => Ok(GinOpsClass::JsonbPathOps),
+        Some(other) => Err(SqlError::Unsupported(format!(
+            "GIN opclass '{other}'; supported: jsonb_ops, jsonb_path_ops"
+        ))),
+    }
+}
+
+fn parse_fts_with_config(with: &[sp::Expr]) -> Result<u8> {
+    let mut config_name: Option<String> = None;
+    for expr in with {
+        match expr {
+            sp::Expr::BinaryOp {
+                left,
+                op: sp::BinaryOperator::Eq,
+                right,
+            } => {
+                let key = match left.as_ref() {
+                    sp::Expr::Identifier(id) => id.value.to_ascii_lowercase(),
+                    other => {
+                        return Err(SqlError::Unsupported(format!(
+                            "FTS WITH option key: {other}"
+                        )));
+                    }
+                };
+                if key != "config" {
+                    return Err(SqlError::Unsupported(format!(
+                        "FTS WITH option: unknown key '{key}' (only 'config' supported)"
+                    )));
+                }
+                let val = match right.as_ref() {
+                    sp::Expr::Value(v) => match &v.value {
+                        sp::Value::SingleQuotedString(s) => s.clone(),
+                        sp::Value::DoubleQuotedString(s) => s.clone(),
+                        other => {
+                            return Err(SqlError::Parse(format!(
+                                "FTS config value must be a string literal, got: {other}"
+                            )))
+                        }
+                    },
+                    sp::Expr::Identifier(id) => id.value.clone(),
+                    other => {
+                        return Err(SqlError::Parse(format!(
+                            "FTS config value must be a string literal, got: {other}"
+                        )));
+                    }
+                };
+                config_name = Some(val);
+            }
+            other => {
+                return Err(SqlError::Unsupported(format!(
+                    "FTS WITH option must be `key = value`, got: {other}"
+                )));
+            }
+        }
+    }
+    let name = config_name.unwrap_or_else(|| "english".to_string());
+    Ok(crate::fts::TokenizerKind::from_name(&name)?.as_config_id())
 }
 
 fn validate_partial_index_predicate(expr: &Expr) -> Result<()> {
@@ -2227,6 +2364,13 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
             data_type: dt,
             ..
         } => {
+            if let (sp::DataType::Custom(name, modifiers), sp::Expr::Value(v)) = (dt, e.as_ref()) {
+                if modifiers.is_empty() && name.0.len() == 1 && matches!(v.value, sp::Value::Null) {
+                    if let sp::ObjectNamePart::Identifier(id) = &name.0[0] {
+                        return Ok(Expr::TypedNullRecord(id.value.clone()));
+                    }
+                }
+            }
             let target = convert_data_type(dt)?;
             let inner = convert_expr(e)?;
             if matches!(target, DataType::Json | DataType::Jsonb) {
@@ -2902,6 +3046,9 @@ fn convert_data_type(dt: &sp::DataType) -> Result<DataType> {
 
         sp::DataType::JSON => Ok(DataType::Json),
         sp::DataType::JSONB => Ok(DataType::Jsonb),
+
+        sp::DataType::TsVector => Ok(DataType::TsVector),
+        sp::DataType::TsQuery => Ok(DataType::TsQuery),
 
         _ => Err(SqlError::Unsupported(format!("data type: {dt}"))),
     }

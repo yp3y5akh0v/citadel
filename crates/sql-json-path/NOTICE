@@ -1,0 +1,19 @@
+Citadel — Vendored sql-json-path crate (citadeldb-sql-json-path)
+================================================================
+
+This crate is a fork of `sql-json-path` v0.1.1, originally authored by
+RisingWave Labs and licensed under the Apache License, Version 2.0.
+
+Upstream:
+  https://github.com/risingwavelabs/sql-json-path
+
+Original copyright:
+  Copyright 2024 RisingWave Labs
+
+The original LICENSE is preserved verbatim in this directory.
+
+This work has been modified by Citadel contributors. Modifications are
+noted at the top of each modified file.
+
+Citadel modifications: Copyright (c) Citadel contributors. Released under
+the Apache License, Version 2.0 (same as upstream).

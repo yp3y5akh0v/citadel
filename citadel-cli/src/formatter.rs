@@ -100,6 +100,8 @@ fn value_to_string(v: &Value, settings: &Settings) -> String {
         } => citadel_sql::datetime::format_interval(*months, *days, *micros),
         Value::Json(s) => s.to_string(),
         Value::Jsonb(b) => citadel_sql::json::decode_to_text(b).unwrap_or_default(),
+        Value::TsVector(b) => citadel_sql::fts::tsvector_display(b),
+        Value::TsQuery(b) => citadel_sql::fts::tsquery_display(b),
     }
 }
 
@@ -243,6 +245,8 @@ fn value_to_json(v: &Value, _settings: &Settings) -> serde_json::Value {
             serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.to_string()))
         }
         Value::Jsonb(b) => citadel_sql::json::decode_to_serde(b).unwrap_or(serde_json::Value::Null),
+        Value::TsVector(b) => serde_json::Value::String(citadel_sql::fts::tsvector_display(b)),
+        Value::TsQuery(b) => serde_json::Value::String(citadel_sql::fts::tsquery_display(b)),
     }
 }
 

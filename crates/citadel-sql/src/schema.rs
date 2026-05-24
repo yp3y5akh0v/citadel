@@ -1,10 +1,13 @@
 //! Schema manager: in-memory cache of table schemas.
 
+use std::sync::Arc;
+
 use rustc_hash::FxHashMap;
 
 use citadel::Database;
 
 use crate::error::{Result, SqlError};
+use crate::system_tables::{self, VirtualTable};
 use crate::types::{ForeignKeySchemaEntry, TableSchema, ViewDef};
 
 const SCHEMA_TABLE: &[u8] = b"_schema";
@@ -14,6 +17,7 @@ const VIEWS_TABLE: &[u8] = b"_views";
 pub struct SchemaManager {
     tables: FxHashMap<String, TableSchema>,
     views: FxHashMap<String, ViewDef>,
+    virtual_tables: FxHashMap<String, Arc<dyn VirtualTable>>,
     generation: u64,
 }
 
@@ -76,11 +80,23 @@ impl SchemaManager {
             return Err(e);
         }
 
-        Ok(Self {
+        let mut mgr = Self {
             tables,
             views,
+            virtual_tables: FxHashMap::default(),
             generation: 0,
-        })
+        };
+        system_tables::register_builtins(&mut mgr);
+        Ok(mgr)
+    }
+
+    pub fn get_virtual(&self, name: &str) -> Option<&Arc<dyn VirtualTable>> {
+        self.virtual_tables.get(name)
+    }
+
+    pub fn register_virtual(&mut self, vt: Arc<dyn VirtualTable>) {
+        let name = vt.name().to_ascii_lowercase();
+        self.virtual_tables.insert(name, vt);
     }
 
     pub fn get(&self, name: &str) -> Option<&TableSchema> {
