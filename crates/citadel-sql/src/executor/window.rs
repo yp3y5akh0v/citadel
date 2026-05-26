@@ -385,7 +385,6 @@ pub(super) fn eval_window_select(
         }));
     }
 
-    // 1. Extract window functions from SELECT columns
     let mut slot_counter = 0usize;
     let mut all_extracted: Vec<(String, String, Vec<Expr>, WindowSpec)> = Vec::new();
     let mut rewritten_columns: Vec<SelectColumn> = Vec::new();
@@ -409,7 +408,6 @@ pub(super) fn eval_window_select(
         return super::process_select(columns, rows, stmt, false);
     }
 
-    // 2. Pre-evaluate window function argument expressions per row
     let col_map = ColumnMap::new(columns);
     let num_win = all_extracted.len();
     let mut arg_values: Vec<Vec<Vec<Value>>> = Vec::with_capacity(num_win);
@@ -425,7 +423,6 @@ pub(super) fn eval_window_select(
         arg_values.push(per_row);
     }
 
-    // 3. Group window functions by (partition_by, order_by) for sort sharing
     let n = rows.len();
     let mut row_results: Vec<Vec<Value>> = (0..n).map(|_| vec![Value::Null; num_win]).collect();
 
@@ -795,7 +792,6 @@ pub(super) fn eval_window_select(
         }
     }
 
-    // 4. Extend rows with window results
     let base_col_count = columns.len();
     let mut extended_columns: Vec<ColumnDef> = columns.to_vec();
     for (i, (slot_name, _, _, _)) in all_extracted.iter().enumerate() {
@@ -821,7 +817,6 @@ pub(super) fn eval_window_select(
         row.extend_from_slice(&row_results[row_idx]);
     }
 
-    // 5. Build rewritten statement for final processing
     let rewritten_stmt = SelectStmt {
         columns: rewritten_columns,
         from: stmt.from.clone(),

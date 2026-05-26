@@ -34,13 +34,10 @@ pub enum SyncError {
 /// Bidirectional message transport for sync protocol.
 /// Uses `&self` with interior mutability for shared access during Merkle diff.
 pub trait SyncTransport: Send {
-    /// Send a message to the remote peer.
     fn send(&self, msg: &SyncMessage) -> std::result::Result<(), SyncError>;
 
-    /// Receive the next message from the remote peer.
     fn recv(&self) -> std::result::Result<SyncMessage, SyncError>;
 
-    /// Close the transport connection.
     fn close(&self) -> std::result::Result<(), SyncError>;
 }
 

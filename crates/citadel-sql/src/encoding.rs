@@ -18,6 +18,7 @@ const TAG_JSON: u8 = 0x0A;
 const TAG_JSONB: u8 = 0x0B;
 const TAG_TSVECTOR: u8 = 0x0C;
 const TAG_TSQUERY: u8 = 0x0D;
+const TAG_ARRAY: u8 = 0x0E;
 
 /// Encode a single value into an order-preserving byte sequence.
 pub fn encode_key_value(value: &Value) -> Vec<u8> {
@@ -106,7 +107,29 @@ pub(crate) fn encode_key_value_into(value: &Value, buf: &mut Vec<u8>) {
         Value::Jsonb(b) => encode_bytes_into(TAG_JSONB, b, buf),
         Value::TsVector(b) => encode_bytes_into(TAG_TSVECTOR, b, buf),
         Value::TsQuery(b) => encode_bytes_into(TAG_TSQUERY, b, buf),
+        Value::Array(a) => encode_array_into(a, buf),
     }
+}
+
+fn encode_array_into(elems: &[Value], buf: &mut Vec<u8>) {
+    buf.push(TAG_ARRAY);
+    let mut inner = Vec::new();
+    for v in elems {
+        encode_key_value_into(v, &mut inner);
+    }
+    encode_bytes_into_no_tag(&inner, buf);
+}
+
+fn encode_bytes_into_no_tag(data: &[u8], buf: &mut Vec<u8>) {
+    for &b in data {
+        if b == 0x00 {
+            buf.push(0x00);
+            buf.push(0xFF);
+        } else {
+            buf.push(b);
+        }
+    }
+    buf.push(0x00);
 }
 
 fn encode_integer_into(val: i64, buf: &mut Vec<u8>) {
@@ -239,6 +262,17 @@ pub fn decode_key_value(data: &[u8]) -> Result<(Value, usize)> {
         TAG_TSQUERY => {
             let (bytes, n) = decode_null_escaped(&data[1..])?;
             Ok((Value::TsQuery(std::sync::Arc::from(bytes)), n + 1))
+        }
+        TAG_ARRAY => {
+            let (inner, n) = decode_null_escaped(&data[1..])?;
+            let mut elems = Vec::new();
+            let mut pos = 0;
+            while pos < inner.len() {
+                let (v, vlen) = decode_key_value(&inner[pos..])?;
+                elems.push(v);
+                pos += vlen;
+            }
+            Ok((Value::Array(std::sync::Arc::new(elems)), n + 1))
         }
         tag => Err(SqlError::InvalidValue(format!("unknown key tag: {tag:#x}"))),
     }
@@ -400,6 +434,14 @@ fn encode_cell_v2(v: &Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
         }
+        Value::Array(a) => {
+            buf.push(DataType::Array.type_tag());
+            let len = encoded_array_v2_size(a);
+            buf.extend_from_slice(&(len as u32).to_le_bytes());
+            let start = buf.len();
+            buf.resize(start + len, 0);
+            write_array_v2_into_slice(a, &mut buf[start..start + len]);
+        }
         Value::Null => unreachable!(),
     }
 }
@@ -529,10 +571,169 @@ fn decode_value(type_tag: u8, data: &[u8]) -> Result<Value> {
         Some(DataType::Jsonb) => Ok(Value::Jsonb(std::sync::Arc::from(data))),
         Some(DataType::TsVector) => Ok(Value::TsVector(std::sync::Arc::from(data))),
         Some(DataType::TsQuery) => Ok(Value::TsQuery(std::sync::Arc::from(data))),
+        Some(DataType::Array) => decode_array_v2(data),
         _ => Err(SqlError::InvalidValue(format!(
             "unknown column type tag: {type_tag}"
         ))),
     }
+}
+
+fn encoded_array_v2_size(elems: &[Value]) -> usize {
+    let mut total = 4;
+    for elem in elems {
+        if elem.is_null() {
+            total += 1;
+            continue;
+        }
+        total += 1 + 1;
+        let tag = elem.data_type().type_tag();
+        match fixed_width_size(tag) {
+            Some(n) => total += n,
+            None => total += 4 + variable_cell_payload_size(elem),
+        }
+    }
+    total
+}
+
+fn variable_cell_payload_size(v: &Value) -> usize {
+    match v {
+        Value::Text(s) => s.len(),
+        Value::Blob(b) => b.len(),
+        Value::Json(s) => s.len(),
+        Value::Jsonb(b) => b.len(),
+        Value::TsVector(b) => b.len(),
+        Value::TsQuery(b) => b.len(),
+        Value::Array(a) => encoded_array_v2_size(a),
+        _ => unreachable!("variable_cell_payload_size called on fixed-width value"),
+    }
+}
+
+fn value_encoded_size_v2(v: &Value) -> Option<usize> {
+    if v.is_null() {
+        return None;
+    }
+    Some(match fixed_width_size(v.data_type().type_tag()) {
+        Some(n) => n,
+        None => variable_cell_payload_size(v),
+    })
+}
+
+fn write_value_payload_v2(v: &Value, out: &mut [u8]) {
+    match v {
+        Value::Integer(i) => out[..8].copy_from_slice(&i.to_le_bytes()),
+        Value::Real(r) => out[..8].copy_from_slice(&r.to_le_bytes()),
+        Value::Boolean(b) => out[0] = if *b { 1 } else { 0 },
+        Value::Text(s) => out[..s.len()].copy_from_slice(s.as_bytes()),
+        Value::Blob(b) => out[..b.len()].copy_from_slice(b),
+        Value::Time(t) => out[..8].copy_from_slice(&t.to_le_bytes()),
+        Value::Date(d) => out[..4].copy_from_slice(&d.to_le_bytes()),
+        Value::Timestamp(t) => out[..8].copy_from_slice(&t.to_le_bytes()),
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            out[..4].copy_from_slice(&months.to_le_bytes());
+            out[4..8].copy_from_slice(&days.to_le_bytes());
+            out[8..16].copy_from_slice(&micros.to_le_bytes());
+        }
+        Value::Json(s) => out[..s.len()].copy_from_slice(s.as_bytes()),
+        Value::Jsonb(b) => out[..b.len()].copy_from_slice(b),
+        Value::TsVector(b) => out[..b.len()].copy_from_slice(b),
+        Value::TsQuery(b) => out[..b.len()].copy_from_slice(b),
+        Value::Array(a) => write_array_v2_into_slice(a, out),
+        Value::Null => unreachable!(),
+    }
+}
+
+fn write_array_v2_into_slice(elems: &[Value], out: &mut [u8]) {
+    out[..4].copy_from_slice(&(elems.len() as u32).to_le_bytes());
+    let mut pos = 4;
+    for elem in elems {
+        if elem.is_null() {
+            out[pos] = 0xFF;
+            pos += 1;
+            continue;
+        }
+        out[pos] = 0x00;
+        pos += 1;
+        let tag = elem.data_type().type_tag();
+        out[pos] = tag;
+        pos += 1;
+        match fixed_width_size(tag) {
+            Some(n) => {
+                write_value_payload_v2(elem, &mut out[pos..pos + n]);
+                pos += n;
+            }
+            None => {
+                let payload_len = variable_cell_payload_size(elem);
+                out[pos..pos + 4].copy_from_slice(&(payload_len as u32).to_le_bytes());
+                pos += 4;
+                write_value_payload_v2(elem, &mut out[pos..pos + payload_len]);
+                pos += payload_len;
+            }
+        }
+    }
+}
+
+fn decode_array_v2(data: &[u8]) -> Result<Value> {
+    if data.len() < 4 {
+        return Err(SqlError::InvalidValue("truncated array length".into()));
+    }
+    let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let mut pos = 4;
+    let mut elems = Vec::with_capacity(count);
+    for _ in 0..count {
+        if pos >= data.len() {
+            return Err(SqlError::InvalidValue("truncated array elements".into()));
+        }
+        if data[pos] == 0xFF {
+            elems.push(Value::Null);
+            pos += 1;
+            continue;
+        }
+        if data[pos] != 0x00 {
+            return Err(SqlError::InvalidValue(
+                "invalid array element marker".into(),
+            ));
+        }
+        pos += 1;
+        if pos >= data.len() {
+            return Err(SqlError::InvalidValue("truncated array element".into()));
+        }
+        let type_tag = data[pos];
+        pos += 1;
+        let (val, advance) = match fixed_width_size(type_tag) {
+            Some(n) => {
+                if pos + n > data.len() {
+                    return Err(SqlError::InvalidValue(
+                        "truncated fixed-width array element".into(),
+                    ));
+                }
+                let v = decode_value(type_tag, &data[pos..pos + n])?;
+                (v, n)
+            }
+            None => {
+                if pos + 4 > data.len() {
+                    return Err(SqlError::InvalidValue(
+                        "truncated array element length".into(),
+                    ));
+                }
+                let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                if pos + len > data.len() {
+                    return Err(SqlError::InvalidValue(
+                        "truncated variable-width array element".into(),
+                    ));
+                }
+                let v = decode_value(type_tag, &data[pos..pos + len])?;
+                (v, len)
+            }
+        };
+        pos += advance;
+        elems.push(val);
+    }
+    Ok(Value::Array(std::sync::Arc::new(elems)))
 }
 
 /// V1 cells: `[tag:u8][len:u32][data]`. V2 cells drop `len` for fixed-width types.
@@ -559,6 +760,7 @@ pub(crate) fn fixed_width_size(type_tag: u8) -> Option<usize> {
         | DataType::Jsonb
         | DataType::TsVector
         | DataType::TsQuery
+        | DataType::Array
         | DataType::Null => None,
     }
 }
@@ -799,6 +1001,7 @@ pub enum RawColumn<'a> {
     Jsonb(&'a [u8]),
     TsVector(&'a [u8]),
     TsQuery(&'a [u8]),
+    Array(&'a [u8]),
 }
 
 impl<'a> RawColumn<'a> {
@@ -826,6 +1029,7 @@ impl<'a> RawColumn<'a> {
             RawColumn::Jsonb(b) => Value::Jsonb(std::sync::Arc::from(b)),
             RawColumn::TsVector(b) => Value::TsVector(std::sync::Arc::from(b)),
             RawColumn::TsQuery(b) => Value::TsQuery(std::sync::Arc::from(b)),
+            RawColumn::Array(bytes) => decode_array_v2(bytes).unwrap_or(Value::Null),
         }
     }
 
@@ -860,6 +1064,10 @@ impl<'a> RawColumn<'a> {
             (RawColumn::Jsonb(a), Value::Jsonb(b)) => Some((*a).cmp(b.as_ref())),
             (RawColumn::TsVector(a), Value::TsVector(b)) => Some((*a).cmp(b.as_ref())),
             (RawColumn::TsQuery(a), Value::TsQuery(b)) => Some((*a).cmp(b.as_ref())),
+            (RawColumn::Array(bytes), Value::Array(b)) => match decode_array_v2(bytes).ok()? {
+                Value::Array(a) => Some(a.as_ref().cmp(b.as_ref())),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -893,6 +1101,10 @@ impl<'a> RawColumn<'a> {
             (RawColumn::Jsonb(a), Value::Jsonb(b)) => *a == b.as_ref(),
             (RawColumn::TsVector(a), Value::TsVector(b)) => *a == b.as_ref(),
             (RawColumn::TsQuery(a), Value::TsQuery(b)) => *a == b.as_ref(),
+            (RawColumn::Array(bytes), Value::Array(b)) => match decode_array_v2(bytes) {
+                Ok(Value::Array(a)) => a.as_ref() == b.as_ref(),
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -961,6 +1173,7 @@ fn decode_value_raw(type_tag: u8, data: &[u8]) -> Result<RawColumn<'_>> {
         Some(DataType::Jsonb) => Ok(RawColumn::Jsonb(data)),
         Some(DataType::TsVector) => Ok(RawColumn::TsVector(data)),
         Some(DataType::TsQuery) => Ok(RawColumn::TsQuery(data)),
+        Some(DataType::Array) => Ok(RawColumn::Array(data)),
         _ => Err(SqlError::InvalidValue(format!(
             "unknown column type tag: {type_tag}"
         ))),
@@ -1003,47 +1216,15 @@ pub fn patch_column_in_place(data: &mut [u8], target: usize, new_val: &Value) ->
             (len, pos + 5)
         }
     };
-    let new_data_len = match new_val {
-        Value::Integer(_) | Value::Real(_) | Value::Time(_) | Value::Timestamp(_) => 8,
-        Value::Date(_) => 4,
-        Value::Interval { .. } => 16,
-        Value::Boolean(_) => 1,
-        Value::Text(s) => s.len(),
-        Value::Blob(b) => b.len(),
-        Value::Json(s) => s.len(),
-        Value::Jsonb(b) => b.len(),
-        Value::TsVector(b) => b.len(),
-        Value::TsQuery(b) => b.len(),
-        Value::Null => return Ok(false),
+    let new_data_len = match value_encoded_size_v2(new_val) {
+        Some(n) => n,
+        None => return Ok(false),
     };
     if new_data_len != old_data_len {
         return Ok(false);
     }
     data[pos] = new_val.data_type().type_tag();
-    match new_val {
-        Value::Integer(v) => data[val_start..val_start + 8].copy_from_slice(&v.to_le_bytes()),
-        Value::Real(r) => data[val_start..val_start + 8].copy_from_slice(&r.to_le_bytes()),
-        Value::Boolean(b) => data[val_start] = if *b { 1 } else { 0 },
-        Value::Text(s) => data[val_start..val_start + s.len()].copy_from_slice(s.as_bytes()),
-        Value::Blob(d) => data[val_start..val_start + d.len()].copy_from_slice(d),
-        Value::Time(t) => data[val_start..val_start + 8].copy_from_slice(&t.to_le_bytes()),
-        Value::Date(d) => data[val_start..val_start + 4].copy_from_slice(&d.to_le_bytes()),
-        Value::Timestamp(t) => data[val_start..val_start + 8].copy_from_slice(&t.to_le_bytes()),
-        Value::Json(s) => data[val_start..val_start + s.len()].copy_from_slice(s.as_bytes()),
-        Value::Jsonb(b) => data[val_start..val_start + b.len()].copy_from_slice(b),
-        Value::TsVector(b) => data[val_start..val_start + b.len()].copy_from_slice(b),
-        Value::TsQuery(b) => data[val_start..val_start + b.len()].copy_from_slice(b),
-        Value::Interval {
-            months,
-            days,
-            micros,
-        } => {
-            data[val_start..val_start + 4].copy_from_slice(&months.to_le_bytes());
-            data[val_start + 4..val_start + 8].copy_from_slice(&days.to_le_bytes());
-            data[val_start + 8..val_start + 16].copy_from_slice(&micros.to_le_bytes());
-        }
-        Value::Null => unreachable!(),
-    }
+    write_value_payload_v2(new_val, &mut data[val_start..val_start + new_data_len]);
     Ok(true)
 }
 
@@ -1183,47 +1364,15 @@ pub fn patch_at_offset(data: &mut [u8], offset: usize, new_val: &Value) -> Resul
             (len, offset + 5)
         }
     };
-    let new_data_len = match new_val {
-        Value::Integer(_) | Value::Real(_) | Value::Time(_) | Value::Timestamp(_) => 8,
-        Value::Date(_) => 4,
-        Value::Interval { .. } => 16,
-        Value::Boolean(_) => 1,
-        Value::Text(s) => s.len(),
-        Value::Blob(b) => b.len(),
-        Value::Json(s) => s.len(),
-        Value::Jsonb(b) => b.len(),
-        Value::TsVector(b) => b.len(),
-        Value::TsQuery(b) => b.len(),
-        Value::Null => return Ok(false),
+    let new_data_len = match value_encoded_size_v2(new_val) {
+        Some(n) => n,
+        None => return Ok(false),
     };
     if new_data_len != old_data_len {
         return Ok(false);
     }
     data[offset] = new_val.data_type().type_tag();
-    match new_val {
-        Value::Integer(v) => data[val_start..val_start + 8].copy_from_slice(&v.to_le_bytes()),
-        Value::Real(r) => data[val_start..val_start + 8].copy_from_slice(&r.to_le_bytes()),
-        Value::Boolean(b) => data[val_start] = if *b { 1 } else { 0 },
-        Value::Text(s) => data[val_start..val_start + s.len()].copy_from_slice(s.as_bytes()),
-        Value::Blob(d) => data[val_start..val_start + d.len()].copy_from_slice(d),
-        Value::Time(t) => data[val_start..val_start + 8].copy_from_slice(&t.to_le_bytes()),
-        Value::Date(d) => data[val_start..val_start + 4].copy_from_slice(&d.to_le_bytes()),
-        Value::Timestamp(t) => data[val_start..val_start + 8].copy_from_slice(&t.to_le_bytes()),
-        Value::Json(s) => data[val_start..val_start + s.len()].copy_from_slice(s.as_bytes()),
-        Value::Jsonb(b) => data[val_start..val_start + b.len()].copy_from_slice(b),
-        Value::TsVector(b) => data[val_start..val_start + b.len()].copy_from_slice(b),
-        Value::TsQuery(b) => data[val_start..val_start + b.len()].copy_from_slice(b),
-        Value::Interval {
-            months,
-            days,
-            micros,
-        } => {
-            data[val_start..val_start + 4].copy_from_slice(&months.to_le_bytes());
-            data[val_start + 4..val_start + 8].copy_from_slice(&days.to_le_bytes());
-            data[val_start + 8..val_start + 16].copy_from_slice(&micros.to_le_bytes());
-        }
-        Value::Null => unreachable!(),
-    }
+    write_value_payload_v2(new_val, &mut data[val_start..val_start + new_data_len]);
     Ok(true)
 }
 

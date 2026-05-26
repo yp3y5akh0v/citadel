@@ -12,7 +12,6 @@ use citadel_core::{
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Audit log configuration.
 #[derive(Debug, Clone)]
 pub struct AuditConfig {
     pub enabled: bool,
@@ -30,7 +29,6 @@ impl Default for AuditConfig {
     }
 }
 
-/// Audit event types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum AuditEventType {
@@ -60,7 +58,6 @@ impl AuditEventType {
     }
 }
 
-/// A single audit log entry.
 #[derive(Debug, Clone)]
 pub struct AuditEntry {
     pub timestamp: u64,
@@ -181,7 +178,6 @@ impl AuditLog {
         &self.audit_key
     }
 
-    /// Create a new audit log file.
     pub(crate) fn create(
         path: &Path,
         file_id: u64,
@@ -289,7 +285,6 @@ impl AuditLog {
         })
     }
 
-    /// Log an audit event.
     pub(crate) fn log(
         &mut self,
         event_type: AuditEventType,
@@ -381,7 +376,6 @@ fn rotated_path(base: &Path, index: u32) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Resolve the audit log path for a database file.
 pub(crate) fn resolve_audit_path(data_path: &Path) -> PathBuf {
     let mut name = data_path.as_os_str().to_os_string();
     name.push(".citadel-audit");

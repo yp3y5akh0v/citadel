@@ -9,8 +9,10 @@ mod dml;
 mod explain;
 pub(crate) mod helpers;
 mod join;
+pub(crate) mod matviews;
 mod scan;
 mod select;
+pub(crate) mod triggers;
 mod view;
 mod window;
 pub(crate) mod write;
@@ -58,7 +60,12 @@ pub fn execute(
         Statement::Delete(del) => exec_delete(db, schema, del),
         Statement::Truncate(t) => exec_truncate(db, schema, t),
         Statement::Explain(inner) => explain(schema, inner),
-        Statement::Begin
+        Statement::CreateTrigger(ct) => triggers::exec_create_trigger(db, schema, ct),
+        Statement::DropTrigger(dt) => triggers::exec_drop_trigger(db, schema, dt),
+        Statement::CreateMaterializedView(mv) => matviews::exec_create_matview(db, schema, mv),
+        Statement::RefreshMaterializedView(rmv) => matviews::exec_refresh_matview(db, schema, rmv),
+        Statement::DropMaterializedView(dmv) => matviews::exec_drop_matview(db, schema, dmv),
+        Statement::Begin { .. }
         | Statement::Commit
         | Statement::Rollback
         | Statement::Savepoint(_)
@@ -91,7 +98,18 @@ pub fn execute_in_txn(
         Statement::Delete(del) => exec_delete_in_txn(wtx, schema, del),
         Statement::Truncate(t) => exec_truncate_in_txn(wtx, schema, t),
         Statement::Explain(inner) => explain(schema, inner),
-        Statement::Begin
+        Statement::CreateTrigger(ct) => triggers::exec_create_trigger_in_txn(wtx, schema, ct),
+        Statement::DropTrigger(dt) => triggers::exec_drop_trigger_in_txn(wtx, schema, dt),
+        Statement::CreateMaterializedView(mv) => {
+            matviews::exec_create_matview_in_txn(wtx, schema, mv)
+        }
+        Statement::RefreshMaterializedView(rmv) => {
+            matviews::exec_refresh_matview_in_txn(wtx, schema, rmv)
+        }
+        Statement::DropMaterializedView(dmv) => {
+            matviews::exec_drop_matview_in_txn(wtx, schema, dmv)
+        }
+        Statement::Begin { .. }
         | Statement::Commit
         | Statement::Rollback
         | Statement::Savepoint(_)

@@ -36,8 +36,26 @@ pub(super) fn exec_insert(
     };
 
     let lower_name = stmt.table.to_ascii_lowercase();
-    if schema.get_view(&lower_name).is_some() {
+    if let Some(view_def) = schema.get_view(&lower_name) {
+        if super::triggers::has_instead_of(schema, &lower_name, super::triggers::FireEvent::Insert)
+        {
+            let aliases = view_def.column_aliases.clone();
+            return exec_instead_of_view_insert_auto(
+                db,
+                schema,
+                &lower_name,
+                &aliases,
+                stmt,
+                params,
+            );
+        }
         return Err(SqlError::CannotModifyView(stmt.table.clone()));
+    }
+    if schema.get_matview(&lower_name).is_some() {
+        return Err(SqlError::CannotModifyView(format!(
+            "materialized view '{}' is read-only — use REFRESH MATERIALIZED VIEW",
+            stmt.table
+        )));
     }
     let table_schema = schema
         .get(&lower_name)
@@ -158,6 +176,32 @@ pub(super) fn exec_insert(
                 sel[0].len()
             )));
         }
+    }
+
+    let has_insert_statement_triggers = schema.triggers_for(&table_schema.name).iter().any(|t| {
+        t.enabled
+            && t.granularity == crate::parser::TriggerGranularity::ForEachStatement
+            && t.events
+                .iter()
+                .any(|e| matches!(e, crate::parser::TriggerEvent::Insert))
+    });
+    let mut stmt_new_rows: Vec<Vec<Value>> = if has_insert_statement_triggers {
+        Vec::with_capacity(total)
+    } else {
+        Vec::new()
+    };
+
+    if has_insert_statement_triggers {
+        super::triggers::fire_statement_triggers(
+            &mut wtx,
+            schema,
+            &table_schema.name,
+            crate::parser::TriggerTiming::Before,
+            super::triggers::FireEvent::Insert,
+            &table_schema.columns,
+            &[],
+            &[],
+        )?;
     }
 
     for idx in 0..total {
@@ -284,6 +328,32 @@ pub(super) fn exec_insert(
 
         let proposed_row_for_returning: Option<Vec<Value>> =
             returning_rows.as_ref().map(|_| row.clone());
+        let row_for_stmt_trigger: Option<Vec<Value>> = if has_insert_statement_triggers {
+            Some(row.clone())
+        } else {
+            None
+        };
+
+        let has_before_insert_triggers = schema.triggers_for(&table_schema.name).iter().any(|t| {
+            t.enabled
+                && t.timing == crate::parser::TriggerTiming::Before
+                && t.granularity == crate::parser::TriggerGranularity::ForEachRow
+                && t.events
+                    .iter()
+                    .any(|e| matches!(e, crate::parser::TriggerEvent::Insert))
+        });
+        if has_before_insert_triggers {
+            super::triggers::fire_row_triggers(
+                &mut wtx,
+                schema,
+                &table_schema.name,
+                crate::parser::TriggerTiming::Before,
+                super::triggers::FireEvent::Insert,
+                None,
+                Some(row.clone()),
+                &table_schema.columns,
+            )?;
+        }
 
         for (j, &i) in pk_indices.iter().enumerate() {
             pk_values[j] = std::mem::replace(&mut row[i], Value::Null);
@@ -320,12 +390,21 @@ pub(super) fn exec_insert(
         match compiled_conflict.as_ref() {
             None => {
                 let is_new = wtx
-                    .table_insert(stmt.table.as_bytes(), &key_buf, &value_buf)
+                    .table_insert(table_schema.name.as_bytes(), &key_buf, &value_buf)
                     .map_err(SqlError::Storage)?;
                 if !is_new {
                     return Err(SqlError::DuplicateKey);
                 }
-                if !table_schema.indices.is_empty() {
+                let has_after_insert_triggers =
+                    schema.triggers_for(&table_schema.name).iter().any(|t| {
+                        t.enabled
+                            && t.timing == crate::parser::TriggerTiming::After
+                            && t.granularity == crate::parser::TriggerGranularity::ForEachRow
+                            && t.events
+                                .iter()
+                                .any(|e| matches!(e, crate::parser::TriggerEvent::Insert))
+                    });
+                if !table_schema.indices.is_empty() || has_after_insert_triggers {
                     for (j, &i) in pk_indices.iter().enumerate() {
                         row[i] = pk_values[j].clone();
                     }
@@ -333,7 +412,24 @@ pub(super) fn exec_insert(
                         row[i] =
                             std::mem::replace(&mut value_values[enc_pos[j] as usize], Value::Null);
                     }
-                    insert_index_entries(&mut wtx, table_schema, &row, &pk_values)?;
+                    if !table_schema.indices.is_empty() {
+                        insert_index_entries(&mut wtx, table_schema, &row, &pk_values)?;
+                    }
+                    if has_after_insert_triggers {
+                        super::triggers::fire_row_triggers(
+                            &mut wtx,
+                            schema,
+                            &table_schema.name,
+                            crate::parser::TriggerTiming::After,
+                            super::triggers::FireEvent::Insert,
+                            None,
+                            Some(row.clone()),
+                            &table_schema.columns,
+                        )?;
+                    }
+                }
+                if let Some(r) = row_for_stmt_trigger.clone() {
+                    stmt_new_rows.push(r);
                 }
                 count += 1;
                 if let Some(buf) = returning_rows.as_mut() {
@@ -369,17 +465,86 @@ pub(super) fn exec_insert(
                         if let Some(buf) = returning_rows.as_mut() {
                             buf.push((None, proposed_row_for_returning));
                         }
+                        if let Some(r) = row_for_stmt_trigger.clone() {
+                            stmt_new_rows.push(r);
+                        }
+                        let has_after_insert_triggers =
+                            schema.triggers_for(&table_schema.name).iter().any(|t| {
+                                t.enabled
+                                    && t.timing == crate::parser::TriggerTiming::After
+                                    && t.granularity
+                                        == crate::parser::TriggerGranularity::ForEachRow
+                                    && t.events
+                                        .iter()
+                                        .any(|e| matches!(e, crate::parser::TriggerEvent::Insert))
+                            });
+                        if has_after_insert_triggers {
+                            super::triggers::fire_row_triggers(
+                                &mut wtx,
+                                schema,
+                                &table_schema.name,
+                                crate::parser::TriggerTiming::After,
+                                super::triggers::FireEvent::Insert,
+                                None,
+                                Some(row.clone()),
+                                &table_schema.columns,
+                            )?;
+                        }
                     }
                     InsertRowOutcome::Updated { old, new } => {
                         count += 1;
                         if let Some(buf) = returning_rows.as_mut() {
-                            buf.push((Some(old), Some(new)));
+                            buf.push((Some(old.clone()), Some(new.clone())));
+                        }
+                        let has_after_update_triggers =
+                            schema.triggers_for(&table_schema.name).iter().any(|t| {
+                                t.enabled
+                                    && t.timing == crate::parser::TriggerTiming::After
+                                    && t.granularity
+                                        == crate::parser::TriggerGranularity::ForEachRow
+                                    && t.events.iter().any(|e| {
+                                        matches!(e, crate::parser::TriggerEvent::Update(_))
+                                    })
+                            });
+                        if has_after_update_triggers {
+                            let changed_cols: Vec<String> = match oc_ref {
+                                CompiledOnConflict::DoUpdate { assignments, .. } => assignments
+                                    .iter()
+                                    .map(|(col_idx, _)| table_schema.columns[*col_idx].name.clone())
+                                    .collect(),
+                                _ => Vec::new(),
+                            };
+                            super::triggers::fire_row_triggers(
+                                &mut wtx,
+                                schema,
+                                &table_schema.name,
+                                crate::parser::TriggerTiming::After,
+                                super::triggers::FireEvent::Update {
+                                    changed_columns: &changed_cols,
+                                },
+                                Some(old),
+                                Some(new),
+                                &table_schema.columns,
+                            )?;
                         }
                     }
                     InsertRowOutcome::Skipped => {}
                 }
             }
         }
+    }
+
+    if has_insert_statement_triggers {
+        super::triggers::fire_statement_triggers(
+            &mut wtx,
+            schema,
+            &table_schema.name,
+            crate::parser::TriggerTiming::After,
+            super::triggers::FireEvent::Insert,
+            &table_schema.columns,
+            &[],
+            &stmt_new_rows,
+        )?;
     }
 
     if let (Some(returning_cols), Some(rows)) = (stmt.returning.as_ref(), returning_rows) {
@@ -1105,7 +1270,13 @@ thread_local! {
 }
 
 fn with_insert_scratch<R>(f: impl FnOnce(&mut InsertBufs) -> R) -> R {
-    INSERT_SCRATCH.with(|slot| f(&mut slot.borrow_mut()))
+    INSERT_SCRATCH.with(|slot| match slot.try_borrow_mut() {
+        Ok(mut borrowed) => f(&mut borrowed),
+        Err(_) => {
+            let mut local = InsertBufs::new();
+            f(&mut local)
+        }
+    })
 }
 
 pub(super) struct UpsertBufs {
@@ -1200,6 +1371,26 @@ fn exec_insert_in_txn_impl(
     } else {
         stmt
     };
+
+    let view_lookup_key = stmt.table.to_ascii_lowercase();
+    if let Some(view_def) = schema.get_view(&view_lookup_key) {
+        if super::triggers::has_instead_of(
+            schema,
+            &view_lookup_key,
+            super::triggers::FireEvent::Insert,
+        ) {
+            let aliases = view_def.column_aliases.clone();
+            return exec_instead_of_view_insert_in_txn(
+                wtx,
+                schema,
+                &view_lookup_key,
+                &aliases,
+                stmt,
+                params,
+            );
+        }
+        return Err(SqlError::CannotModifyView(stmt.table.clone()));
+    }
 
     let table_schema = schema
         .get(&stmt.table)
@@ -1333,7 +1524,7 @@ fn exec_insert_in_txn_impl(
     bufs.pk_values.resize(pk_indices.len(), Value::Null);
     bufs.value_values.resize(phys_count, Value::Null);
 
-    let table_bytes = stmt.table.as_bytes();
+    let table_bytes = table_schema.name.as_bytes();
     let has_fks = !table_schema.foreign_keys.is_empty();
     let has_indices = !table_schema.indices.is_empty();
     let has_defaults = !defaults.is_empty();
@@ -1392,6 +1583,32 @@ fn exec_insert_in_txn_impl(
                 sel[0].len()
             )));
         }
+    }
+
+    let has_insert_statement_triggers_impl =
+        schema.triggers_for(&table_schema.name).iter().any(|t| {
+            t.enabled
+                && t.granularity == crate::parser::TriggerGranularity::ForEachStatement
+                && t.events
+                    .iter()
+                    .any(|e| matches!(e, crate::parser::TriggerEvent::Insert))
+        });
+    let mut stmt_new_rows_impl: Vec<Vec<Value>> = if has_insert_statement_triggers_impl {
+        Vec::with_capacity(total)
+    } else {
+        Vec::new()
+    };
+    if has_insert_statement_triggers_impl {
+        super::triggers::fire_statement_triggers(
+            wtx,
+            schema,
+            &table_schema.name,
+            crate::parser::TriggerTiming::Before,
+            super::triggers::FireEvent::Insert,
+            &table_schema.columns,
+            &[],
+            &[],
+        )?;
     }
 
     let skip_row_clear = cache.is_some_and(|c| c.row_fully_overwritten);
@@ -1607,6 +1824,32 @@ fn exec_insert_in_txn_impl(
 
         let proposed_row_for_returning: Option<Vec<Value>> =
             returning_rows.as_ref().map(|_| bufs.row.clone());
+        let row_for_stmt_trigger_impl: Option<Vec<Value>> = if has_insert_statement_triggers_impl {
+            Some(bufs.row.clone())
+        } else {
+            None
+        };
+
+        let has_before_insert_triggers = schema.triggers_for(&table_schema.name).iter().any(|t| {
+            t.enabled
+                && t.timing == crate::parser::TriggerTiming::Before
+                && t.granularity == crate::parser::TriggerGranularity::ForEachRow
+                && t.events
+                    .iter()
+                    .any(|e| matches!(e, crate::parser::TriggerEvent::Insert))
+        });
+        if has_before_insert_triggers {
+            super::triggers::fire_row_triggers(
+                wtx,
+                schema,
+                &table_schema.name,
+                crate::parser::TriggerTiming::Before,
+                super::triggers::FireEvent::Insert,
+                None,
+                Some(bufs.row.clone()),
+                &table_schema.columns,
+            )?;
+        }
 
         for (j, &i) in pk_indices.iter().enumerate() {
             bufs.pk_values[j] = std::mem::replace(&mut bufs.row[i], Value::Null);
@@ -1665,7 +1908,16 @@ fn exec_insert_in_txn_impl(
                 if !is_new {
                     return Err(SqlError::DuplicateKey);
                 }
-                if has_indices {
+                let has_after_insert_triggers =
+                    schema.triggers_for(&table_schema.name).iter().any(|t| {
+                        t.enabled
+                            && t.timing == crate::parser::TriggerTiming::After
+                            && t.granularity == crate::parser::TriggerGranularity::ForEachRow
+                            && t.events
+                                .iter()
+                                .any(|e| matches!(e, crate::parser::TriggerEvent::Insert))
+                    });
+                if has_indices || has_after_insert_triggers {
                     for (j, &i) in pk_indices.iter().enumerate() {
                         bufs.row[i] = bufs.pk_values[j].clone();
                     }
@@ -1675,7 +1927,24 @@ fn exec_insert_in_txn_impl(
                             Value::Null,
                         );
                     }
-                    insert_index_entries(wtx, table_schema, &bufs.row, &bufs.pk_values)?;
+                    if has_indices {
+                        insert_index_entries(wtx, table_schema, &bufs.row, &bufs.pk_values)?;
+                    }
+                    if has_after_insert_triggers {
+                        super::triggers::fire_row_triggers(
+                            wtx,
+                            schema,
+                            &table_schema.name,
+                            crate::parser::TriggerTiming::After,
+                            super::triggers::FireEvent::Insert,
+                            None,
+                            Some(bufs.row.clone()),
+                            &table_schema.columns,
+                        )?;
+                    }
+                }
+                if let Some(r) = row_for_stmt_trigger_impl.clone() {
+                    stmt_new_rows_impl.push(r);
                 }
                 count += 1;
                 if let Some(buf) = returning_rows.as_mut() {
@@ -1713,11 +1982,67 @@ fn exec_insert_in_txn_impl(
                         if let Some(buf) = returning_rows.as_mut() {
                             buf.push((None, proposed_row_for_returning));
                         }
+                        if let Some(r) = row_for_stmt_trigger_impl.clone() {
+                            stmt_new_rows_impl.push(r);
+                        }
+                        let has_after_insert_triggers =
+                            schema.triggers_for(&table_schema.name).iter().any(|t| {
+                                t.enabled
+                                    && t.timing == crate::parser::TriggerTiming::After
+                                    && t.granularity
+                                        == crate::parser::TriggerGranularity::ForEachRow
+                                    && t.events
+                                        .iter()
+                                        .any(|e| matches!(e, crate::parser::TriggerEvent::Insert))
+                            });
+                        if has_after_insert_triggers {
+                            super::triggers::fire_row_triggers(
+                                wtx,
+                                schema,
+                                &table_schema.name,
+                                crate::parser::TriggerTiming::After,
+                                super::triggers::FireEvent::Insert,
+                                None,
+                                Some(bufs.row.clone()),
+                                &table_schema.columns,
+                            )?;
+                        }
                     }
                     InsertRowOutcome::Updated { old, new } => {
                         count += 1;
                         if let Some(buf) = returning_rows.as_mut() {
-                            buf.push((Some(old), Some(new)));
+                            buf.push((Some(old.clone()), Some(new.clone())));
+                        }
+                        let has_after_update_triggers =
+                            schema.triggers_for(&table_schema.name).iter().any(|t| {
+                                t.enabled
+                                    && t.timing == crate::parser::TriggerTiming::After
+                                    && t.granularity
+                                        == crate::parser::TriggerGranularity::ForEachRow
+                                    && t.events.iter().any(|e| {
+                                        matches!(e, crate::parser::TriggerEvent::Update(_))
+                                    })
+                            });
+                        if has_after_update_triggers {
+                            let changed_cols: Vec<String> = match oc_ref {
+                                CompiledOnConflict::DoUpdate { assignments, .. } => assignments
+                                    .iter()
+                                    .map(|(col_idx, _)| table_schema.columns[*col_idx].name.clone())
+                                    .collect(),
+                                _ => Vec::new(),
+                            };
+                            super::triggers::fire_row_triggers(
+                                wtx,
+                                schema,
+                                &table_schema.name,
+                                crate::parser::TriggerTiming::After,
+                                super::triggers::FireEvent::Update {
+                                    changed_columns: &changed_cols,
+                                },
+                                Some(old),
+                                Some(new),
+                                &table_schema.columns,
+                            )?;
                         }
                     }
                     InsertRowOutcome::Skipped => {}
@@ -1727,11 +2052,36 @@ fn exec_insert_in_txn_impl(
     }
 
     if let (Some(returning_cols), Some(rows)) = (stmt.returning.as_ref(), returning_rows) {
+        if has_insert_statement_triggers_impl {
+            super::triggers::fire_statement_triggers(
+                wtx,
+                schema,
+                &table_schema.name,
+                crate::parser::TriggerTiming::After,
+                super::triggers::FireEvent::Insert,
+                &table_schema.columns,
+                &[],
+                &stmt_new_rows_impl,
+            )?;
+        }
         return Ok(ExecutionResult::Query(super::helpers::project_returning(
             table_schema,
             returning_cols,
             &rows,
         )?));
+    }
+
+    if has_insert_statement_triggers_impl {
+        super::triggers::fire_statement_triggers(
+            wtx,
+            schema,
+            &table_schema.name,
+            crate::parser::TriggerTiming::After,
+            super::triggers::FireEvent::Insert,
+            &table_schema.columns,
+            &[],
+            &stmt_new_rows_impl,
+        )?;
     }
 
     Ok(ExecutionResult::RowsAffected(count))
@@ -2021,7 +2371,7 @@ fn resolve_conflict_target(target: &ConflictTarget, ts: &TableSchema) -> Result<
                 return Ok(ConflictKind::PrimaryKey);
             }
             for (index_idx, idx) in ts.indices.iter().enumerate() {
-                if idx.unique && set_equal(&col_idx_set, &idx.columns) {
+                if idx.unique && set_equal(&col_idx_set, &idx.columns_vec()) {
                     return Ok(ConflictKind::UniqueIndex { index_idx });
                 }
             }
@@ -2456,9 +2806,8 @@ fn fetch_unique_index_pk(
     let idx = &table_schema.indices[index_idx];
     let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
     let indexed: Vec<Value> = idx
-        .columns
-        .iter()
-        .map(|&col_idx| row[col_idx as usize].clone())
+        .column_positions_iter()
+        .map(|col_idx| row[col_idx as usize].clone())
         .collect();
     let key = crate::encoding::encode_composite_key(&indexed);
     let value = wtx
@@ -2684,16 +3033,20 @@ fn apply_do_update_with_old_row(
             .map_err(SqlError::Storage)?;
         for idx in &table_schema.indices {
             let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
-            let old_idx_key = encode_index_key(idx, old_row, &old_pk_values);
+            let old_idx_key =
+                encode_index_key_with_schema(idx, old_row, &old_pk_values, table_schema);
             wtx.table_delete(&idx_table, &old_idx_key)
                 .map_err(SqlError::Storage)?;
-            let new_idx_key = encode_index_key(idx, &new_row, &new_pk_values);
+            let new_idx_key =
+                encode_index_key_with_schema(idx, &new_row, &new_pk_values, table_schema);
             let new_idx_val = encode_index_value(idx, &new_row, &new_pk_values);
             let is_new = wtx
                 .table_insert(&idx_table, &new_idx_key, &new_idx_val)
                 .map_err(SqlError::Storage)?;
             if idx.unique && !is_new {
-                let any_null = idx.columns.iter().any(|&c| new_row[c as usize].is_null());
+                let any_null = idx
+                    .column_positions_iter()
+                    .any(|c| new_row[c as usize].is_null());
                 if !any_null {
                     return Err(SqlError::UniqueViolation(idx.name.clone()));
                 }
@@ -2718,18 +3071,22 @@ fn apply_do_update_with_old_row(
             );
             let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
             if del {
-                let old_idx_key = encode_index_key(idx, old_row, &old_pk_values);
+                let old_idx_key =
+                    encode_index_key_with_schema(idx, old_row, &old_pk_values, table_schema);
                 wtx.table_delete(&idx_table, &old_idx_key)
                     .map_err(SqlError::Storage)?;
             }
             if ins {
-                let new_idx_key = encode_index_key(idx, &new_row, &new_pk_values);
+                let new_idx_key =
+                    encode_index_key_with_schema(idx, &new_row, &new_pk_values, table_schema);
                 let new_idx_val = encode_index_value(idx, &new_row, &new_pk_values);
                 let is_new = wtx
                     .table_insert(&idx_table, &new_idx_key, &new_idx_val)
                     .map_err(SqlError::Storage)?;
                 if idx.unique && !is_new {
-                    let any_null = idx.columns.iter().any(|&c| new_row[c as usize].is_null());
+                    let any_null = idx
+                        .column_positions_iter()
+                        .any(|c| new_row[c as usize].is_null());
                     if !any_null {
                         return Err(SqlError::UniqueViolation(idx.name.clone()));
                     }
@@ -3225,5 +3582,150 @@ impl CompiledPlan for CompiledDelete {
             None => super::write::exec_delete(db, schema, del),
             Some(outer) => super::write::exec_delete_in_txn(outer, schema, del),
         }
+    }
+}
+
+fn exec_instead_of_view_insert_auto(
+    db: &Database,
+    schema: &SchemaManager,
+    view_name: &str,
+    aliases: &[String],
+    stmt: &InsertStmt,
+    params: &[Value],
+) -> Result<ExecutionResult> {
+    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    let r = exec_instead_of_view_insert_in_txn(&mut wtx, schema, view_name, aliases, stmt, params)?;
+    wtx.commit().map_err(SqlError::Storage)?;
+    Ok(r)
+}
+
+fn exec_instead_of_view_insert_in_txn(
+    wtx: &mut WriteTxn<'_>,
+    schema: &SchemaManager,
+    view_name: &str,
+    aliases: &[String],
+    stmt: &InsertStmt,
+    params: &[Value],
+) -> Result<ExecutionResult> {
+    // CREATE VIEW without explicit aliases stores an empty vec — derive at runtime.
+    let resolved_aliases: Vec<String> = if aliases.is_empty() {
+        derive_view_columns(wtx, schema, view_name)?
+    } else {
+        aliases.to_vec()
+    };
+    let view_cols = super::triggers::view_columns_from_aliases(&resolved_aliases);
+    let alias_map: rustc_hash::FxHashMap<String, usize> = resolved_aliases
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.to_ascii_lowercase(), i))
+        .collect();
+
+    let target_positions: Vec<usize> = if stmt.columns.is_empty() {
+        (0..resolved_aliases.len()).collect()
+    } else {
+        stmt.columns
+            .iter()
+            .map(|c| {
+                alias_map
+                    .get(&c.to_ascii_lowercase())
+                    .copied()
+                    .ok_or_else(|| SqlError::ColumnNotFound(c.clone()))
+            })
+            .collect::<Result<_>>()?
+    };
+
+    let source_rows: Vec<Vec<Value>> = match &stmt.source {
+        InsertSource::Values(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                if row.len() != target_positions.len() {
+                    return Err(SqlError::InvalidValue(format!(
+                        "expected {} values, got {}",
+                        target_positions.len(),
+                        row.len()
+                    )));
+                }
+                let mut vals = Vec::with_capacity(row.len());
+                for expr in row {
+                    let v = match expr {
+                        Expr::Parameter(n) => params
+                            .get(n - 1)
+                            .cloned()
+                            .ok_or_else(|| SqlError::Parse(format!("unbound parameter ${n}")))?,
+                        Expr::Literal(v) => v.clone(),
+                        other => eval_const_expr(other)?,
+                    };
+                    vals.push(v);
+                }
+                out.push(vals);
+            }
+            out
+        }
+        InsertSource::Select(sq) => {
+            let empty_ctes = CteContext::default();
+            let qr = exec_query_body_write(wtx, schema, &sq.body, &empty_ctes)?;
+            qr.rows
+        }
+    };
+
+    let mut count: u64 = 0;
+    for row in source_rows {
+        if row.len() != target_positions.len() {
+            return Err(SqlError::InvalidValue(format!(
+                "expected {} values, got {}",
+                target_positions.len(),
+                row.len()
+            )));
+        }
+        let mut new_row = vec![Value::Null; resolved_aliases.len()];
+        for (slot, val) in target_positions.iter().zip(row) {
+            new_row[*slot] = val;
+        }
+        super::triggers::fire_row_triggers(
+            wtx,
+            schema,
+            view_name,
+            crate::parser::TriggerTiming::InsteadOf,
+            super::triggers::FireEvent::Insert,
+            None,
+            Some(new_row),
+            &view_cols,
+        )?;
+        count += 1;
+    }
+    Ok(ExecutionResult::RowsAffected(count))
+}
+
+fn derive_view_columns(
+    wtx: &mut WriteTxn<'_>,
+    schema: &SchemaManager,
+    view_name: &str,
+) -> Result<Vec<String>> {
+    use crate::parser::{QueryBody, SelectColumn, SelectQuery, SelectStmt};
+    let sel = SelectStmt {
+        columns: vec![SelectColumn::AllColumns],
+        from: view_name.to_string(),
+        from_alias: None,
+        from_subquery: None,
+        from_args: None,
+        from_json_table: None,
+        joins: vec![],
+        distinct: false,
+        where_clause: None,
+        order_by: vec![],
+        limit: Some(Expr::Literal(Value::Integer(1))),
+        offset: None,
+        group_by: vec![],
+        having: None,
+    };
+    let sq = SelectQuery {
+        ctes: vec![],
+        recursive: false,
+        body: QueryBody::Select(Box::new(sel)),
+    };
+    let qr = super::cte::exec_select_query_in_txn(wtx, schema, &sq)?;
+    match qr {
+        ExecutionResult::Query(q) => Ok(q.columns),
+        _ => Ok(Vec::new()),
     }
 }

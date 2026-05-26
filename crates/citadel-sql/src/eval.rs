@@ -194,7 +194,6 @@ thread_local! {
         const { std::cell::Cell::new((std::ptr::null(), 0)) };
 }
 
-/// Install positional parameters for `Expr::Parameter` resolution during `f`.
 pub fn with_scoped_params<R>(params: &[Value], f: impl FnOnce() -> R) -> R {
     struct Guard((*const Value, usize));
     impl Drop for Guard {
@@ -232,8 +231,7 @@ pub fn resolve_scoped_param(n: usize) -> Result<Value> {
                 got: len,
             });
         }
-        // SAFETY: `with_scoped_params` keeps the slice alive for the duration of `f()`
-        // and restores the previous pointer on return. Reads only happen inside `f()`.
+        // SAFETY: `with_scoped_params` keeps the slice alive for the body's run.
         unsafe { Ok((*ptr.add(n - 1)).clone()) }
     })
 }
@@ -265,6 +263,21 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                     let lowered = column.to_ascii_lowercase();
                     let idx = on.col_map.resolve(&lowered)?;
                     return Ok(on.new_row.map(|r| r[idx].clone()).unwrap_or(Value::Null));
+                }
+            }
+            // Trigger-body fallback: nested executor calls don't carry `ctx.old_new`.
+            if table.eq_ignore_ascii_case("old") || table.eq_ignore_ascii_case("new") {
+                if let Some(b) = crate::executor::triggers::current_bindings() {
+                    let lowered = column.to_ascii_lowercase();
+                    if table.eq_ignore_ascii_case("old") {
+                        let cm = ColumnMap::new(&b.old_columns);
+                        let idx = cm.resolve(&lowered)?;
+                        return Ok(b.old_row.map(|r| r[idx].clone()).unwrap_or(Value::Null));
+                    } else {
+                        let cm = ColumnMap::new(&b.new_columns);
+                        let idx = cm.resolve(&lowered)?;
+                        return Ok(b.new_row.map(|r| r[idx].clone()).unwrap_or(Value::Null));
+                    }
                 }
             }
             let idx = ctx.col_map.resolve_qualified(table, column)?;
@@ -392,10 +405,135 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         )),
 
         Expr::TypedNullRecord(_) => Ok(Value::Null),
+
+        Expr::ArrayLiteral(elems) => {
+            let mut out = Vec::with_capacity(elems.len());
+            for e in elems {
+                out.push(eval_expr(e, ctx)?);
+            }
+            Ok(Value::Array(std::sync::Arc::new(out)))
+        }
+
+        Expr::Quantified {
+            left,
+            op,
+            quantifier,
+            right,
+        } => eval_quantified(left, *op, *quantifier, right, ctx),
     }
 }
 
-/// Planner-level constant folding hook; shares semantics with row evaluation.
+fn eval_quantified(
+    left: &Expr,
+    op: crate::parser::BinOp,
+    quantifier: crate::parser::Quantifier,
+    right: &crate::parser::QuantifiedRhs,
+    ctx: &EvalCtx,
+) -> Result<Value> {
+    use crate::parser::{QuantifiedRhs, Quantifier};
+    let lhs = eval_expr(left, ctx)?;
+    let elems: Vec<Value> = match right {
+        QuantifiedRhs::Array(e) => match eval_expr(e, ctx)? {
+            Value::Array(a) => (*a).clone(),
+            Value::Null => return Ok(Value::Null),
+            other => {
+                return Err(SqlError::TypeMismatch {
+                    expected: "ARRAY".into(),
+                    got: other.data_type().to_string(),
+                });
+            }
+        },
+        QuantifiedRhs::Subquery(_) => {
+            return Err(SqlError::Unsupported(
+                "ANY/ALL subquery not materialized (internal error)".into(),
+            ));
+        }
+    };
+
+    if lhs.is_null() {
+        return if elems.is_empty() {
+            match quantifier {
+                Quantifier::Any => Ok(Value::Boolean(false)),
+                Quantifier::All => Ok(Value::Boolean(true)),
+            }
+        } else {
+            Ok(Value::Null)
+        };
+    }
+
+    let mut any_unknown = false;
+    let mut any_match = false;
+    let mut any_mismatch = false;
+    for elem in &elems {
+        if elem.is_null() {
+            any_unknown = true;
+            continue;
+        }
+        let result = eval_binary_compare(&lhs, op, elem)?;
+        match result {
+            Value::Boolean(true) => any_match = true,
+            Value::Boolean(false) => any_mismatch = true,
+            Value::Null => any_unknown = true,
+            _ => {
+                return Err(SqlError::TypeMismatch {
+                    expected: "BOOLEAN".into(),
+                    got: result.data_type().to_string(),
+                });
+            }
+        }
+    }
+
+    match quantifier {
+        Quantifier::Any => {
+            if any_match {
+                Ok(Value::Boolean(true))
+            } else if any_unknown {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Boolean(false))
+            }
+        }
+        Quantifier::All => {
+            if any_mismatch {
+                Ok(Value::Boolean(false))
+            } else if any_unknown {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Boolean(true))
+            }
+        }
+    }
+}
+
+fn eval_binary_compare(left: &Value, op: crate::parser::BinOp, right: &Value) -> Result<Value> {
+    use crate::parser::BinOp;
+    if left.is_null() || right.is_null() {
+        return Ok(Value::Null);
+    }
+    let cmp = match (left, right) {
+        (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
+        _ => left.partial_cmp(right),
+    };
+    let Some(cmp) = cmp else {
+        return Ok(Value::Null);
+    };
+    use std::cmp::Ordering;
+    let result = match op {
+        BinOp::Eq => cmp == Ordering::Equal,
+        BinOp::NotEq => cmp != Ordering::Equal,
+        BinOp::Lt => cmp == Ordering::Less,
+        BinOp::Gt => cmp == Ordering::Greater,
+        BinOp::LtEq => cmp != Ordering::Greater,
+        BinOp::GtEq => cmp != Ordering::Less,
+        _ => {
+            return Err(SqlError::Unsupported(format!(
+                "ANY/ALL comparison op {op:?}"
+            )));
+        }
+    };
+    Ok(Value::Boolean(result))
+}
+
 fn collation_of(expr: &Expr) -> Option<crate::types::Collation> {
     match expr {
         Expr::Collate { collation, .. } => Some(*collation),
@@ -491,6 +629,7 @@ fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
             eval_arithmetic(left, right, i64::checked_rem, |a, b| a % b)
         }
         BinOp::Concat => match (left, right) {
+            (Value::TsVector(a), Value::TsVector(b)) => crate::fts::op_concat(a, b),
             (Value::Json(_) | Value::Jsonb(_), _) | (_, Value::Json(_) | Value::Jsonb(_)) => {
                 crate::json::op_concat(left, right)
             }
@@ -511,7 +650,9 @@ fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
         | BinOp::JsonHasAllKeys
         | BinOp::JsonDeletePath
         | BinOp::JsonPathExists
-        | BinOp::JsonPathMatch => eval_json_binary_op(left, op, right),
+        | BinOp::JsonPathMatch
+        | BinOp::JsonPathExistsTz
+        | BinOp::JsonPathMatchTz => eval_json_binary_op(left, op, right),
         BinOp::And | BinOp::Or => unreachable!(),
     }
 }
@@ -531,6 +672,12 @@ fn eval_json_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> 
         BinOp::JsonDeletePath => crate::json::op_delete_path(left, right),
         BinOp::JsonPathExists => crate::json::op_path_exists(left, right),
         BinOp::JsonPathMatch => eval_at_at(left, right),
+        BinOp::JsonPathExistsTz => {
+            crate::json::fn_jsonb_path_exists_tz(&[left.clone(), right.clone()])
+        }
+        BinOp::JsonPathMatchTz => {
+            crate::json::fn_jsonb_path_match_tz(&[left.clone(), right.clone()])
+        }
         _ => unreachable!(),
     }
 }
@@ -1046,6 +1193,7 @@ fn value_to_text(val: &Value) -> String {
         Value::Jsonb(b) => crate::json::decode_to_text(b).unwrap_or_default(),
         Value::TsVector(b) => crate::fts::tsvector_display(b),
         Value::TsQuery(b) => crate::fts::tsquery_display(b),
+        Value::Array(_) => val.to_string(),
     }
 }
 
@@ -1319,6 +1467,9 @@ pub(crate) fn eval_cast(val: &Value, target: DataType) -> Result<Value> {
         }),
         DataType::TsQuery => val.clone().coerce_into(DataType::TsQuery).ok_or_else(|| {
             SqlError::InvalidValue(format!("cannot cast {} to TSQUERY", val.data_type()))
+        }),
+        DataType::Array => val.clone().coerce_into(DataType::Array).ok_or_else(|| {
+            SqlError::InvalidValue(format!("cannot cast {} to ARRAY", val.data_type()))
         }),
     }
 }
@@ -1640,6 +1791,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 Value::Jsonb(_) => "jsonb",
                 Value::TsVector(_) => "tsvector",
                 Value::TsQuery(_) => "tsquery",
+                Value::Array(_) => "array",
             };
             Ok(Value::Text(type_name.into()))
         }
@@ -1718,7 +1870,6 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
         }
         "EXTRACT" | "DATE_PART" | "DATEPART" => {
             check_args(name, &evaluated, 2)?;
-            // Borrow the field str without allocating; datetime::extract accepts &str.
             let field: &str = match &evaluated[0] {
                 Value::Null => return Ok(Value::Null),
                 Value::Text(s) => s.as_str(),
@@ -2482,6 +2633,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
         "TS_LEXIZE" => fts_ts_lexize(&evaluated),
         "NUMNODE" => fts_numnode(&evaluated),
         "SETWEIGHT" => fts_setweight(&evaluated),
+        "STRIP" => fts_strip(&evaluated),
         _ => Err(SqlError::Unsupported(format!("scalar function: {name}"))),
     }
 }
@@ -2721,9 +2873,7 @@ fn fts_numnode(args: &[Value]) -> Result<Value> {
 
 fn fts_setweight(args: &[Value]) -> Result<Value> {
     if args.len() == 3 {
-        return Err(SqlError::Unsupported(
-            "setweight(tsvector, char, text[]) — 3-arg selective form deferred to v0.17".into(),
-        ));
+        return fts_setweight_selective(args);
     }
     check_args("setweight", args, 2)?;
     if args[0].is_null() || args[1].is_null() {
@@ -2749,6 +2899,59 @@ fn fts_setweight(args: &[Value]) -> Result<Value> {
     };
     let weight = crate::fts::parse_weight_char(weight_text)?;
     crate::fts::fn_setweight(tsv, weight)
+}
+
+fn fts_setweight_selective(args: &[Value]) -> Result<Value> {
+    check_args("setweight", args, 3)?;
+    if args[0].is_null() || args[1].is_null() || args[2].is_null() {
+        return Ok(Value::Null);
+    }
+    let tsv = match &args[0] {
+        Value::TsVector(b) => b,
+        v => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TSVECTOR".into(),
+                got: v.data_type().to_string(),
+            })
+        }
+    };
+    let weight_text = match &args[1] {
+        Value::Text(s) => s.as_str(),
+        v => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TEXT".into(),
+                got: v.data_type().to_string(),
+            })
+        }
+    };
+    let weight = crate::fts::parse_weight_char(weight_text)?;
+    let filter = match &args[2] {
+        Value::Array(a) => a.as_ref().as_slice(),
+        v => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TEXT[]".into(),
+                got: v.data_type().to_string(),
+            })
+        }
+    };
+    crate::fts::fn_setweight_selective(tsv, weight, filter)
+}
+
+fn fts_strip(args: &[Value]) -> Result<Value> {
+    check_args("strip", args, 1)?;
+    if args[0].is_null() {
+        return Ok(Value::Null);
+    }
+    let tsv = match &args[0] {
+        Value::TsVector(b) => b,
+        v => {
+            return Err(SqlError::TypeMismatch {
+                expected: "TSVECTOR".into(),
+                got: v.data_type().to_string(),
+            })
+        }
+    };
+    crate::fts::fn_strip(tsv)
 }
 
 /// Extract a timestamp (µs UTC) from a Value, coercing DATE → midnight.
@@ -2959,6 +3162,17 @@ fn collect_column_refs(expr: &Expr, columns: &[ColumnDef], out: &mut Vec<usize>)
                 collect_column_refs(&ob.expr, columns, out);
             }
         }
+        Expr::ArrayLiteral(elems) => {
+            for e in elems {
+                collect_column_refs(e, columns, out);
+            }
+        }
+        Expr::Quantified { left, right, .. } => {
+            collect_column_refs(left, columns, out);
+            if let crate::parser::QuantifiedRhs::Array(e) = right {
+                collect_column_refs(e, columns, out);
+            }
+        }
         Expr::Literal(_)
         | Expr::Parameter(_)
         | Expr::CountStar
@@ -2968,7 +3182,6 @@ fn collect_column_refs(expr: &Expr, columns: &[ColumnDef], out: &mut Vec<usize>)
     }
 }
 
-/// Check if an expression result is truthy (for WHERE/HAVING).
 pub fn is_truthy(val: &Value) -> bool {
     match val {
         Value::Boolean(b) => *b,

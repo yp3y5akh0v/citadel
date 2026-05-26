@@ -439,11 +439,11 @@ impl CompiledPlan for CompiledUpdate {
 }
 
 fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<CompiledUpdate> {
-    let table_name_lower = stmt.table.to_ascii_lowercase();
-    let is_view = schema.get_view(&table_name_lower).is_some();
+    let user_name = stmt.table.to_ascii_lowercase();
+    let is_view = schema.get_view(&user_name).is_some();
     if is_view {
         return Ok(CompiledUpdate {
-            table_name_lower,
+            table_name_lower: user_name,
             is_view: true,
             has_correlated_where: false,
             has_subquery: false,
@@ -453,8 +453,10 @@ fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Comp
     }
 
     let table_schema = schema
-        .get(&table_name_lower)
+        .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    // Storage name (post-TEMP-alias resolution) — what wtx.table_* calls below use.
+    let table_name_lower = table_schema.name.clone();
 
     let corr_ctx = CorrelationCtx {
         outer_schema: table_schema,
@@ -587,7 +589,8 @@ fn exec_update_compiled(
     bufs: &mut UpdateBufs,
 ) -> Result<ExecutionResult> {
     if compiled.is_view {
-        return Err(SqlError::CannotModifyView(stmt.table.clone()));
+        // exec_update handles INSTEAD OF view dispatch (or returns CannotModifyView).
+        return exec_update(db, schema, stmt);
     }
     if compiled.has_correlated_where
         || compiled.has_subquery
@@ -764,13 +767,35 @@ pub(super) fn exec_update(
     schema: &SchemaManager,
     stmt: &UpdateStmt,
 ) -> Result<ExecutionResult> {
-    let lower_name = stmt.table.to_ascii_lowercase();
-    if schema.get_view(&lower_name).is_some() {
+    let user_name = stmt.table.to_ascii_lowercase();
+    if let Some(view_def) = schema.get_view(&user_name) {
+        if super::triggers::has_instead_of(
+            schema,
+            &user_name,
+            super::triggers::FireEvent::Update {
+                changed_columns: &[],
+            },
+        ) {
+            let aliases = view_def.column_aliases.clone();
+            let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+            let r =
+                exec_instead_of_view_update_in_txn(&mut wtx, schema, &user_name, &aliases, stmt)?;
+            wtx.commit().map_err(SqlError::Storage)?;
+            return Ok(r);
+        }
         return Err(SqlError::CannotModifyView(stmt.table.clone()));
     }
+    if schema.get_matview(&user_name).is_some() {
+        return Err(SqlError::CannotModifyView(format!(
+            "materialized view '{}' is read-only — use REFRESH MATERIALIZED VIEW",
+            stmt.table
+        )));
+    }
     let table_schema = schema
-        .get(&lower_name)
+        .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    // Use storage name (post-TEMP-alias resolution) for all wtx.* storage calls below.
+    let lower_name = table_schema.name.clone();
     let strict = table_schema.is_strict();
 
     // Correlated subquery in UPDATE WHERE — check BEFORE materialization
@@ -857,10 +882,21 @@ pub(super) fn exec_update(
         .columns
         .iter()
         .any(|c| matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored)));
+    // Fast paths skip the trigger-firing site at the slow path's tail. Gate on
+    // "no UPDATE triggers" so AFTER UPDATE row triggers always run.
+    let has_update_triggers = schema.triggers_for(&table_schema.name).iter().any(|t| {
+        t.enabled
+            && (t.timing == crate::parser::TriggerTiming::After
+                || t.timing == crate::parser::TriggerTiming::Before)
+            && t.events
+                .iter()
+                .any(|e| matches!(e, crate::parser::TriggerEvent::Update(_)))
+    });
     if !pk_changed_by_set
         && !has_fk
         && !has_indices
         && !has_child_fk
+        && !has_update_triggers
         && !table_schema.has_checks()
         && stmt.returning.is_none()
     {
@@ -1341,6 +1377,53 @@ pub(super) fn exec_update(
         cascade_after_parent_update(&mut wtx, schema, &lower_name, table_schema, &parent_changes)?;
     }
 
+    let before_update_triggers: Vec<crate::types::TriggerDef> = schema
+        .triggers_for(&table_schema.name)
+        .iter()
+        .filter(|t| {
+            t.enabled
+                && t.timing == crate::parser::TriggerTiming::Before
+                && t.granularity == crate::parser::TriggerGranularity::ForEachRow
+                && t.events
+                    .iter()
+                    .any(|e| matches!(e, crate::parser::TriggerEvent::Update(_)))
+        })
+        .cloned()
+        .collect();
+    if !before_update_triggers.is_empty() {
+        let changed_cols: Vec<String> = stmt.assignments.iter().map(|(c, _)| c.clone()).collect();
+        for c in &changes {
+            super::triggers::fire_row_triggers(
+                &mut wtx,
+                schema,
+                &table_schema.name,
+                crate::parser::TriggerTiming::Before,
+                super::triggers::FireEvent::Update {
+                    changed_columns: &changed_cols,
+                },
+                Some(c.old_row.clone()),
+                Some(c.new_row.clone()),
+                &table_schema.columns,
+            )?;
+        }
+    }
+
+    let stmt_changed_cols: Vec<String> = stmt.assignments.iter().map(|(c, _)| c.clone()).collect();
+    let stmt_old_rows: Vec<Vec<Value>> = changes.iter().map(|c| c.old_row.clone()).collect();
+    let stmt_new_rows: Vec<Vec<Value>> = changes.iter().map(|c| c.new_row.clone()).collect();
+    super::triggers::fire_statement_triggers(
+        &mut wtx,
+        schema,
+        &table_schema.name,
+        crate::parser::TriggerTiming::Before,
+        super::triggers::FireEvent::Update {
+            changed_columns: &stmt_changed_cols,
+        },
+        &table_schema.columns,
+        &stmt_old_rows,
+        &stmt_new_rows,
+    )?;
+
     let col_map_partial = any_partial_index(table_schema).then(|| table_schema.column_map());
 
     for c in &changes {
@@ -1362,15 +1445,19 @@ pub(super) fn exec_update(
             let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
             match idx.kind {
                 crate::types::IndexKind::BTree => {
-                    let old_idx_key = encode_index_key(idx, &c.old_row, &old_pk);
+                    let old_idx_key =
+                        encode_index_key_with_schema(idx, &c.old_row, &old_pk, table_schema);
                     wtx.table_delete(&idx_table, &old_idx_key)
                         .map_err(SqlError::Storage)?;
                 }
                 crate::types::IndexKind::Inverted(inv_kind) => {
-                    let entries = super::helpers::extract_inverted_entries(
-                        &c.old_row[idx.columns[0] as usize],
-                        inv_kind,
-                    )?;
+                    let col0 = idx.column_positions_iter().next().ok_or_else(|| {
+                        SqlError::Unsupported(
+                            "inverted index requires at least one column key".into(),
+                        )
+                    })? as usize;
+                    let entries =
+                        super::helpers::extract_inverted_entries(&c.old_row[col0], inv_kind)?;
                     let pk_encoded = encode_composite_key(&old_pk);
                     for entry in entries {
                         let full_key = super::helpers::build_inverted_key(&entry, &pk_encoded);
@@ -1418,16 +1505,16 @@ pub(super) fn exec_update(
             let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
             match idx.kind {
                 crate::types::IndexKind::BTree => {
-                    let new_idx_key = encode_index_key(idx, &c.new_row, &new_pk);
+                    let new_idx_key =
+                        encode_index_key_with_schema(idx, &c.new_row, &new_pk, table_schema);
                     let new_idx_val = encode_index_value(idx, &c.new_row, &new_pk);
                     let is_new = wtx
                         .table_insert(&idx_table, &new_idx_key, &new_idx_val)
                         .map_err(SqlError::Storage)?;
                     if idx.unique && !is_new {
                         let indexed_values: Vec<Value> = idx
-                            .columns
-                            .iter()
-                            .map(|&col_idx| c.new_row[col_idx as usize].clone())
+                            .column_positions_iter()
+                            .map(|col_idx| c.new_row[col_idx as usize].clone())
                             .collect();
                         let any_null = indexed_values.iter().any(|v| v.is_null());
                         if !any_null {
@@ -1436,7 +1523,12 @@ pub(super) fn exec_update(
                     }
                 }
                 crate::types::IndexKind::Inverted(inv_kind) => {
-                    let value = &c.new_row[idx.columns[0] as usize];
+                    let col0 = idx.column_positions_iter().next().ok_or_else(|| {
+                        SqlError::Unsupported(
+                            "inverted index requires at least one column key".into(),
+                        )
+                    })? as usize;
+                    let value = &c.new_row[col0];
                     if !value.is_null() {
                         let entries =
                             super::helpers::extract_inverted_entries_with_values(value, inv_kind)?;
@@ -1451,6 +1543,50 @@ pub(super) fn exec_update(
             }
         }
     }
+
+    let after_update_triggers: Vec<crate::types::TriggerDef> = schema
+        .triggers_for(&table_schema.name)
+        .iter()
+        .filter(|t| {
+            t.enabled
+                && t.timing == crate::parser::TriggerTiming::After
+                && t.granularity == crate::parser::TriggerGranularity::ForEachRow
+                && t.events
+                    .iter()
+                    .any(|e| matches!(e, crate::parser::TriggerEvent::Update(_)))
+        })
+        .cloned()
+        .collect();
+    if !after_update_triggers.is_empty() {
+        let changed_cols: Vec<String> = stmt.assignments.iter().map(|(c, _)| c.clone()).collect();
+        for c in &changes {
+            super::triggers::fire_row_triggers(
+                &mut wtx,
+                schema,
+                &table_schema.name,
+                crate::parser::TriggerTiming::After,
+                super::triggers::FireEvent::Update {
+                    changed_columns: &changed_cols,
+                },
+                Some(c.old_row.clone()),
+                Some(c.new_row.clone()),
+                &table_schema.columns,
+            )?;
+        }
+    }
+
+    super::triggers::fire_statement_triggers(
+        &mut wtx,
+        schema,
+        &table_schema.name,
+        crate::parser::TriggerTiming::After,
+        super::triggers::FireEvent::Update {
+            changed_columns: &stmt_changed_cols,
+        },
+        &table_schema.columns,
+        &stmt_old_rows,
+        &stmt_new_rows,
+    )?;
 
     if let Some(returning_cols) = stmt.returning.as_ref() {
         let rows: Vec<super::helpers::ReturningRow> = changes
@@ -1473,13 +1609,28 @@ pub(super) fn exec_delete(
     schema: &SchemaManager,
     stmt: &DeleteStmt,
 ) -> Result<ExecutionResult> {
-    let lower_name = stmt.table.to_ascii_lowercase();
-    if schema.get_view(&lower_name).is_some() {
+    let user_name = stmt.table.to_ascii_lowercase();
+    if let Some(view_def) = schema.get_view(&user_name) {
+        if super::triggers::has_instead_of(schema, &user_name, super::triggers::FireEvent::Delete) {
+            let aliases = view_def.column_aliases.clone();
+            let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+            let r =
+                exec_instead_of_view_delete_in_txn(&mut wtx, schema, &user_name, &aliases, stmt)?;
+            wtx.commit().map_err(SqlError::Storage)?;
+            return Ok(r);
+        }
         return Err(SqlError::CannotModifyView(stmt.table.clone()));
     }
+    if schema.get_matview(&user_name).is_some() {
+        return Err(SqlError::CannotModifyView(format!(
+            "materialized view '{}' is read-only — use REFRESH MATERIALIZED VIEW",
+            stmt.table
+        )));
+    }
     let table_schema = schema
-        .get(&lower_name)
+        .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    let lower_name = table_schema.name.clone();
 
     let corr_ctx = CorrelationCtx {
         outer_schema: table_schema,
@@ -1550,9 +1701,19 @@ pub(super) fn exec_delete(
     let col_map = ColumnMap::new(&table_schema.columns);
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
 
+    // Fast TRUNCATE path skips per-row firing — gate on no DELETE triggers (ROW + STATEMENT).
+    let has_delete_triggers = schema.triggers_for(&table_schema.name).iter().any(|t| {
+        t.enabled
+            && (t.timing == crate::parser::TriggerTiming::After
+                || t.timing == crate::parser::TriggerTiming::Before)
+            && t.events
+                .iter()
+                .any(|e| matches!(e, crate::parser::TriggerEvent::Delete))
+    });
     if stmt.where_clause.is_none()
         && schema.child_fks_for(&lower_name).is_empty()
         && stmt.returning.is_none()
+        && !has_delete_triggers
     {
         let count = wtx
             .table_truncate(lower_name.as_bytes())
@@ -1597,6 +1758,47 @@ pub(super) fn exec_delete(
         Vec::new()
     };
 
+    let before_delete_triggers: Vec<crate::types::TriggerDef> = schema
+        .triggers_for(&table_schema.name)
+        .iter()
+        .filter(|t| {
+            t.enabled
+                && t.timing == crate::parser::TriggerTiming::Before
+                && t.granularity == crate::parser::TriggerGranularity::ForEachRow
+                && t.events
+                    .iter()
+                    .any(|e| matches!(e, crate::parser::TriggerEvent::Delete))
+        })
+        .cloned()
+        .collect();
+    if !before_delete_triggers.is_empty() {
+        for (_, row) in &rows_to_delete {
+            super::triggers::fire_row_triggers(
+                &mut wtx,
+                schema,
+                &table_schema.name,
+                crate::parser::TriggerTiming::Before,
+                super::triggers::FireEvent::Delete,
+                Some(row.clone()),
+                None,
+                &table_schema.columns,
+            )?;
+        }
+    }
+
+    let old_rows_for_stmt: Vec<Vec<Value>> =
+        rows_to_delete.iter().map(|(_, r)| r.clone()).collect();
+    super::triggers::fire_statement_triggers(
+        &mut wtx,
+        schema,
+        &table_schema.name,
+        crate::parser::TriggerTiming::Before,
+        super::triggers::FireEvent::Delete,
+        &table_schema.columns,
+        &old_rows_for_stmt,
+        &[],
+    )?;
+
     for (key, row) in &rows_to_delete {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
         delete_index_entries(&mut wtx, table_schema, row, &pk_values)?;
@@ -1610,6 +1812,45 @@ pub(super) fn exec_delete(
     if has_child_fks {
         cascade_after_parent_delete(&mut wtx, schema, &lower_name, &deleted_pk_keys)?;
     }
+
+    let after_delete_triggers: Vec<crate::types::TriggerDef> = schema
+        .triggers_for(&table_schema.name)
+        .iter()
+        .filter(|t| {
+            t.enabled
+                && t.timing == crate::parser::TriggerTiming::After
+                && t.granularity == crate::parser::TriggerGranularity::ForEachRow
+                && t.events
+                    .iter()
+                    .any(|e| matches!(e, crate::parser::TriggerEvent::Delete))
+        })
+        .cloned()
+        .collect();
+    if !after_delete_triggers.is_empty() {
+        for (_, row) in &rows_to_delete {
+            super::triggers::fire_row_triggers(
+                &mut wtx,
+                schema,
+                &table_schema.name,
+                crate::parser::TriggerTiming::After,
+                super::triggers::FireEvent::Delete,
+                Some(row.clone()),
+                None,
+                &table_schema.columns,
+            )?;
+        }
+    }
+
+    super::triggers::fire_statement_triggers(
+        &mut wtx,
+        schema,
+        &table_schema.name,
+        crate::parser::TriggerTiming::After,
+        super::triggers::FireEvent::Delete,
+        &table_schema.columns,
+        &old_rows_for_stmt,
+        &[],
+    )?;
 
     if let Some(returning_cols) = stmt.returning.as_ref() {
         let rows: Vec<super::helpers::ReturningRow> = rows_to_delete
@@ -1762,10 +2003,11 @@ pub(super) fn exec_select_in_txn(
         return super::exec_select_join_in_txn(wtx, schema, stmt);
     }
 
-    let lower_name = stmt.from.to_ascii_lowercase();
+    let user_name = stmt.from.to_ascii_lowercase();
     let table_schema = schema
-        .get(&lower_name)
+        .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
+    let lower_name = table_schema.name.clone();
 
     let corr_ctx = CorrelationCtx {
         outer_schema: table_schema,
@@ -1876,7 +2118,7 @@ fn exec_update_in_txn_compiled(
     bufs: &mut UpdateBufs,
 ) -> Result<ExecutionResult> {
     if compiled.is_view {
-        return Err(SqlError::CannotModifyView(stmt.table.clone()));
+        return exec_update_in_txn(wtx, schema, stmt);
     }
     if compiled.has_correlated_where || compiled.has_subquery || !compiled.can_fast_path {
         return exec_update_in_txn(wtx, schema, stmt);
@@ -2505,10 +2747,24 @@ pub(super) fn exec_update_in_txn(
         stmt
     };
 
-    let lower_name = stmt.table.to_ascii_lowercase();
+    let user_name = stmt.table.to_ascii_lowercase();
+    if let Some(view_def) = schema.get_view(&user_name) {
+        if super::triggers::has_instead_of(
+            schema,
+            &user_name,
+            super::triggers::FireEvent::Update {
+                changed_columns: &[],
+            },
+        ) {
+            let aliases = view_def.column_aliases.clone();
+            return exec_instead_of_view_update_in_txn(wtx, schema, &user_name, &aliases, stmt);
+        }
+        return Err(SqlError::CannotModifyView(stmt.table.clone()));
+    }
     let table_schema = schema
-        .get(&lower_name)
+        .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    let lower_name = table_schema.name.clone();
     let strict = table_schema.is_strict();
 
     let col_map = ColumnMap::new(&table_schema.columns);
@@ -2739,6 +2995,54 @@ pub(super) fn exec_update_in_txn(
         )?;
     }
 
+    let before_update_triggers_in_txn: Vec<crate::types::TriggerDef> = schema
+        .triggers_for(&table_schema.name)
+        .iter()
+        .filter(|t| {
+            t.enabled
+                && t.timing == crate::parser::TriggerTiming::Before
+                && t.granularity == crate::parser::TriggerGranularity::ForEachRow
+                && t.events
+                    .iter()
+                    .any(|e| matches!(e, crate::parser::TriggerEvent::Update(_)))
+        })
+        .cloned()
+        .collect();
+    let stmt_changed_cols_in_txn: Vec<String> =
+        stmt.assignments.iter().map(|(c, _)| c.clone()).collect();
+    let stmt_old_rows_in_txn: Vec<Vec<Value>> = changes.iter().map(|c| c.old_row.clone()).collect();
+    let stmt_new_rows_in_txn: Vec<Vec<Value>> = changes.iter().map(|c| c.new_row.clone()).collect();
+    super::triggers::fire_statement_triggers(
+        wtx,
+        schema,
+        &table_schema.name,
+        crate::parser::TriggerTiming::Before,
+        super::triggers::FireEvent::Update {
+            changed_columns: &stmt_changed_cols_in_txn,
+        },
+        &table_schema.columns,
+        &stmt_old_rows_in_txn,
+        &stmt_new_rows_in_txn,
+    )?;
+
+    if !before_update_triggers_in_txn.is_empty() {
+        let changed_cols: Vec<String> = stmt.assignments.iter().map(|(c, _)| c.clone()).collect();
+        for c in &changes {
+            super::triggers::fire_row_triggers(
+                wtx,
+                schema,
+                &table_schema.name,
+                crate::parser::TriggerTiming::Before,
+                super::triggers::FireEvent::Update {
+                    changed_columns: &changed_cols,
+                },
+                Some(c.old_row.clone()),
+                Some(c.new_row.clone()),
+                &table_schema.columns,
+            )?;
+        }
+    }
+
     let col_map_partial = any_partial_index(table_schema).then(|| table_schema.column_map());
 
     for c in &changes {
@@ -2760,15 +3064,19 @@ pub(super) fn exec_update_in_txn(
             let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
             match idx.kind {
                 crate::types::IndexKind::BTree => {
-                    let old_idx_key = encode_index_key(idx, &c.old_row, &old_pk);
+                    let old_idx_key =
+                        encode_index_key_with_schema(idx, &c.old_row, &old_pk, table_schema);
                     wtx.table_delete(&idx_table, &old_idx_key)
                         .map_err(SqlError::Storage)?;
                 }
                 crate::types::IndexKind::Inverted(inv_kind) => {
-                    let entries = super::helpers::extract_inverted_entries(
-                        &c.old_row[idx.columns[0] as usize],
-                        inv_kind,
-                    )?;
+                    let col0 = idx.column_positions_iter().next().ok_or_else(|| {
+                        SqlError::Unsupported(
+                            "inverted index requires at least one column key".into(),
+                        )
+                    })? as usize;
+                    let entries =
+                        super::helpers::extract_inverted_entries(&c.old_row[col0], inv_kind)?;
                     let pk_encoded = encode_composite_key(&old_pk);
                     for entry in entries {
                         let full_key = super::helpers::build_inverted_key(&entry, &pk_encoded);
@@ -2816,16 +3124,16 @@ pub(super) fn exec_update_in_txn(
             let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
             match idx.kind {
                 crate::types::IndexKind::BTree => {
-                    let new_idx_key = encode_index_key(idx, &c.new_row, &new_pk);
+                    let new_idx_key =
+                        encode_index_key_with_schema(idx, &c.new_row, &new_pk, table_schema);
                     let new_idx_val = encode_index_value(idx, &c.new_row, &new_pk);
                     let is_new = wtx
                         .table_insert(&idx_table, &new_idx_key, &new_idx_val)
                         .map_err(SqlError::Storage)?;
                     if idx.unique && !is_new {
                         let indexed_values: Vec<Value> = idx
-                            .columns
-                            .iter()
-                            .map(|&col_idx| c.new_row[col_idx as usize].clone())
+                            .column_positions_iter()
+                            .map(|col_idx| c.new_row[col_idx as usize].clone())
                             .collect();
                         let any_null = indexed_values.iter().any(|v| v.is_null());
                         if !any_null {
@@ -2834,7 +3142,12 @@ pub(super) fn exec_update_in_txn(
                     }
                 }
                 crate::types::IndexKind::Inverted(inv_kind) => {
-                    let value = &c.new_row[idx.columns[0] as usize];
+                    let col0 = idx.column_positions_iter().next().ok_or_else(|| {
+                        SqlError::Unsupported(
+                            "inverted index requires at least one column key".into(),
+                        )
+                    })? as usize;
+                    let value = &c.new_row[col0];
                     if !value.is_null() {
                         let entries =
                             super::helpers::extract_inverted_entries_with_values(value, inv_kind)?;
@@ -2849,6 +3162,50 @@ pub(super) fn exec_update_in_txn(
             }
         }
     }
+
+    let after_update_triggers_in_txn: Vec<crate::types::TriggerDef> = schema
+        .triggers_for(&table_schema.name)
+        .iter()
+        .filter(|t| {
+            t.enabled
+                && t.timing == crate::parser::TriggerTiming::After
+                && t.granularity == crate::parser::TriggerGranularity::ForEachRow
+                && t.events
+                    .iter()
+                    .any(|e| matches!(e, crate::parser::TriggerEvent::Update(_)))
+        })
+        .cloned()
+        .collect();
+    if !after_update_triggers_in_txn.is_empty() {
+        let changed_cols: Vec<String> = stmt.assignments.iter().map(|(c, _)| c.clone()).collect();
+        for c in &changes {
+            super::triggers::fire_row_triggers(
+                wtx,
+                schema,
+                &table_schema.name,
+                crate::parser::TriggerTiming::After,
+                super::triggers::FireEvent::Update {
+                    changed_columns: &changed_cols,
+                },
+                Some(c.old_row.clone()),
+                Some(c.new_row.clone()),
+                &table_schema.columns,
+            )?;
+        }
+    }
+
+    super::triggers::fire_statement_triggers(
+        wtx,
+        schema,
+        &table_schema.name,
+        crate::parser::TriggerTiming::After,
+        super::triggers::FireEvent::Update {
+            changed_columns: &stmt_changed_cols_in_txn,
+        },
+        &table_schema.columns,
+        &stmt_old_rows_in_txn,
+        &stmt_new_rows_in_txn,
+    )?;
 
     if let Some(returning_cols) = stmt.returning.as_ref() {
         let rows: Vec<super::helpers::ReturningRow> = changes
@@ -2878,14 +3235,31 @@ pub(super) fn exec_delete_in_txn(
         stmt
     };
 
-    let lower_name = stmt.table.to_ascii_lowercase();
+    let user_name = stmt.table.to_ascii_lowercase();
+    if let Some(view_def) = schema.get_view(&user_name) {
+        if super::triggers::has_instead_of(schema, &user_name, super::triggers::FireEvent::Delete) {
+            let aliases = view_def.column_aliases.clone();
+            return exec_instead_of_view_delete_in_txn(wtx, schema, &user_name, &aliases, stmt);
+        }
+        return Err(SqlError::CannotModifyView(stmt.table.clone()));
+    }
     let table_schema = schema
-        .get(&lower_name)
+        .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    let lower_name = table_schema.name.clone();
 
+    let has_delete_triggers_in_txn = schema.triggers_for(&table_schema.name).iter().any(|t| {
+        t.enabled
+            && (t.timing == crate::parser::TriggerTiming::After
+                || t.timing == crate::parser::TriggerTiming::Before)
+            && t.events
+                .iter()
+                .any(|e| matches!(e, crate::parser::TriggerEvent::Delete))
+    });
     if stmt.where_clause.is_none()
-        && schema.child_fks_for(&lower_name).is_empty()
+        && schema.child_fks_for(&user_name).is_empty()
         && stmt.returning.is_none()
+        && !has_delete_triggers_in_txn
     {
         let count = wtx
             .table_truncate(lower_name.as_bytes())
@@ -2922,6 +3296,47 @@ pub(super) fn exec_delete_in_txn(
         Vec::new()
     };
 
+    let before_delete_triggers_in_txn: Vec<crate::types::TriggerDef> = schema
+        .triggers_for(&table_schema.name)
+        .iter()
+        .filter(|t| {
+            t.enabled
+                && t.timing == crate::parser::TriggerTiming::Before
+                && t.granularity == crate::parser::TriggerGranularity::ForEachRow
+                && t.events
+                    .iter()
+                    .any(|e| matches!(e, crate::parser::TriggerEvent::Delete))
+        })
+        .cloned()
+        .collect();
+    if !before_delete_triggers_in_txn.is_empty() {
+        for (_, row) in &rows_to_delete {
+            super::triggers::fire_row_triggers(
+                wtx,
+                schema,
+                &table_schema.name,
+                crate::parser::TriggerTiming::Before,
+                super::triggers::FireEvent::Delete,
+                Some(row.clone()),
+                None,
+                &table_schema.columns,
+            )?;
+        }
+    }
+
+    let stmt_old_rows_in_txn: Vec<Vec<Value>> =
+        rows_to_delete.iter().map(|(_, r)| r.clone()).collect();
+    super::triggers::fire_statement_triggers(
+        wtx,
+        schema,
+        &table_schema.name,
+        crate::parser::TriggerTiming::Before,
+        super::triggers::FireEvent::Delete,
+        &table_schema.columns,
+        &stmt_old_rows_in_txn,
+        &[],
+    )?;
+
     for (key, row) in &rows_to_delete {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
         delete_index_entries(wtx, table_schema, row, &pk_values)?;
@@ -2936,6 +3351,45 @@ pub(super) fn exec_delete_in_txn(
         cascade_after_parent_delete(&mut *wtx, schema, &lower_name, &deleted_pk_keys)?;
     }
 
+    let after_delete_triggers_in_txn: Vec<crate::types::TriggerDef> = schema
+        .triggers_for(&table_schema.name)
+        .iter()
+        .filter(|t| {
+            t.enabled
+                && t.timing == crate::parser::TriggerTiming::After
+                && t.granularity == crate::parser::TriggerGranularity::ForEachRow
+                && t.events
+                    .iter()
+                    .any(|e| matches!(e, crate::parser::TriggerEvent::Delete))
+        })
+        .cloned()
+        .collect();
+    if !after_delete_triggers_in_txn.is_empty() {
+        for (_, row) in &rows_to_delete {
+            super::triggers::fire_row_triggers(
+                wtx,
+                schema,
+                &table_schema.name,
+                crate::parser::TriggerTiming::After,
+                super::triggers::FireEvent::Delete,
+                Some(row.clone()),
+                None,
+                &table_schema.columns,
+            )?;
+        }
+    }
+
+    super::triggers::fire_statement_triggers(
+        wtx,
+        schema,
+        &table_schema.name,
+        crate::parser::TriggerTiming::After,
+        super::triggers::FireEvent::Delete,
+        &table_schema.columns,
+        &stmt_old_rows_in_txn,
+        &[],
+    )?;
+
     if let Some(returning_cols) = stmt.returning.as_ref() {
         let rows: Vec<super::helpers::ReturningRow> = rows_to_delete
             .iter()
@@ -2947,4 +3401,143 @@ pub(super) fn exec_delete_in_txn(
 
     let count = rows_to_delete.len() as u64;
     Ok(ExecutionResult::RowsAffected(count))
+}
+
+fn exec_instead_of_view_update_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    view_name: &str,
+    aliases: &[String],
+    stmt: &UpdateStmt,
+) -> Result<ExecutionResult> {
+    let select_sq = build_select_for_view(view_name, &stmt.where_clause);
+    let qr = super::cte::exec_select_query_in_txn(wtx, schema, &select_sq)?;
+    let (resolved_aliases, rows) = match qr {
+        ExecutionResult::Query(q) => {
+            let cols = if aliases.is_empty() {
+                q.columns
+            } else {
+                aliases.to_vec()
+            };
+            (cols, q.rows)
+        }
+        _ => (aliases.to_vec(), Vec::new()),
+    };
+    let view_cols = super::triggers::view_columns_from_aliases(&resolved_aliases);
+
+    let view_col_map = crate::eval::ColumnMap::new(&view_cols);
+
+    let assignment_targets: Vec<(usize, &Expr)> = stmt
+        .assignments
+        .iter()
+        .map(|(col, expr)| {
+            let lower = col.to_ascii_lowercase();
+            let idx = resolved_aliases
+                .iter()
+                .position(|a| a.eq_ignore_ascii_case(&lower))
+                .ok_or_else(|| SqlError::ColumnNotFound(col.clone()))?;
+            Ok((idx, expr))
+        })
+        .collect::<Result<_>>()?;
+
+    let mut count: u64 = 0;
+    for old_row in rows {
+        if old_row.len() != resolved_aliases.len() {
+            return Err(SqlError::Unsupported(
+                "view source row width does not match column aliases".into(),
+            ));
+        }
+        let mut new_row = old_row.clone();
+        for (idx, expr) in &assignment_targets {
+            let v = eval_expr(expr, &EvalCtx::new(&view_col_map, &old_row))?;
+            new_row[*idx] = v;
+        }
+        let changed_cols: Vec<String> = stmt.assignments.iter().map(|(c, _)| c.clone()).collect();
+        super::triggers::fire_row_triggers(
+            wtx,
+            schema,
+            view_name,
+            crate::parser::TriggerTiming::InsteadOf,
+            super::triggers::FireEvent::Update {
+                changed_columns: &changed_cols,
+            },
+            Some(old_row),
+            Some(new_row),
+            &view_cols,
+        )?;
+        count += 1;
+    }
+    Ok(ExecutionResult::RowsAffected(count))
+}
+
+fn exec_instead_of_view_delete_in_txn(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &SchemaManager,
+    view_name: &str,
+    aliases: &[String],
+    stmt: &DeleteStmt,
+) -> Result<ExecutionResult> {
+    let select_sq = build_select_for_view(view_name, &stmt.where_clause);
+    let qr = super::cte::exec_select_query_in_txn(wtx, schema, &select_sq)?;
+    let (resolved_aliases, rows) = match qr {
+        ExecutionResult::Query(q) => {
+            let cols = if aliases.is_empty() {
+                q.columns
+            } else {
+                aliases.to_vec()
+            };
+            (cols, q.rows)
+        }
+        _ => (aliases.to_vec(), Vec::new()),
+    };
+    let view_cols = super::triggers::view_columns_from_aliases(&resolved_aliases);
+
+    let mut count: u64 = 0;
+    for old_row in rows {
+        if old_row.len() != resolved_aliases.len() {
+            return Err(SqlError::Unsupported(
+                "view source row width does not match column aliases".into(),
+            ));
+        }
+        super::triggers::fire_row_triggers(
+            wtx,
+            schema,
+            view_name,
+            crate::parser::TriggerTiming::InsteadOf,
+            super::triggers::FireEvent::Delete,
+            Some(old_row),
+            None,
+            &view_cols,
+        )?;
+        count += 1;
+    }
+    Ok(ExecutionResult::RowsAffected(count))
+}
+
+fn build_select_for_view(
+    view_name: &str,
+    where_clause: &Option<Expr>,
+) -> crate::parser::SelectQuery {
+    use crate::parser::{QueryBody, SelectColumn, SelectQuery, SelectStmt};
+    let sel = SelectStmt {
+        columns: vec![SelectColumn::AllColumns],
+        from: view_name.to_string(),
+        from_alias: None,
+        from_subquery: None,
+        from_args: None,
+        from_json_table: None,
+        joins: vec![],
+        distinct: false,
+        where_clause: where_clause.clone(),
+        order_by: vec![],
+        limit: None,
+        offset: None,
+        group_by: vec![],
+        having: None,
+    };
+    SelectQuery {
+        ctes: vec![],
+        recursive: false,
+        body: QueryBody::Select(Box::new(sel)),
+    }
 }

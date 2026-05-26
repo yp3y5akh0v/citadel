@@ -281,3 +281,238 @@ fn is_truthy_values() {
     assert!(is_truthy(&Value::Integer(1)));
     assert!(!is_truthy(&Value::Integer(0)));
 }
+
+fn array_lit(elems: Vec<Value>) -> Expr {
+    Expr::ArrayLiteral(elems.into_iter().map(Expr::Literal).collect())
+}
+
+fn quantified(lhs: Value, op: BinOp, q: crate::parser::Quantifier, rhs: Expr) -> Expr {
+    use crate::parser::QuantifiedRhs;
+    Expr::Quantified {
+        left: Box::new(Expr::Literal(lhs)),
+        op,
+        quantifier: q,
+        right: QuantifiedRhs::Array(Box::new(rhs)),
+    }
+}
+
+#[test]
+fn array_literal_evaluates_to_value_array() {
+    let cols = test_columns();
+    let cm = ColumnMap::new(&cols);
+    let row = test_row();
+    let expr = array_lit(vec![
+        Value::Integer(1),
+        Value::Integer(2),
+        Value::Integer(3),
+    ]);
+    let val = eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap();
+    match val {
+        Value::Array(a) => {
+            assert_eq!(a.len(), 3);
+            assert_eq!(a[0], Value::Integer(1));
+            assert_eq!(a[2], Value::Integer(3));
+        }
+        other => panic!("expected array, got {other:?}"),
+    }
+}
+
+#[test]
+fn any_eq_matches() {
+    use crate::parser::Quantifier::Any;
+    let cols = test_columns();
+    let cm = ColumnMap::new(&cols);
+    let row = test_row();
+    let expr = quantified(
+        Value::Integer(2),
+        BinOp::Eq,
+        Any,
+        array_lit(vec![
+            Value::Integer(1),
+            Value::Integer(2),
+            Value::Integer(3),
+        ]),
+    );
+    assert_eq!(
+        eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+        Value::Boolean(true)
+    );
+}
+
+#[test]
+fn any_eq_no_match_returns_false() {
+    use crate::parser::Quantifier::Any;
+    let cols = test_columns();
+    let cm = ColumnMap::new(&cols);
+    let row = test_row();
+    let expr = quantified(
+        Value::Integer(99),
+        BinOp::Eq,
+        Any,
+        array_lit(vec![Value::Integer(1), Value::Integer(2)]),
+    );
+    assert_eq!(
+        eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+        Value::Boolean(false)
+    );
+}
+
+#[test]
+fn any_eq_no_match_with_null_returns_null() {
+    use crate::parser::Quantifier::Any;
+    let cols = test_columns();
+    let cm = ColumnMap::new(&cols);
+    let row = test_row();
+    let expr = quantified(
+        Value::Integer(99),
+        BinOp::Eq,
+        Any,
+        array_lit(vec![Value::Integer(1), Value::Null]),
+    );
+    assert_eq!(
+        eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+        Value::Null
+    );
+}
+
+#[test]
+fn all_eq_all_match_returns_true() {
+    use crate::parser::Quantifier::All;
+    let cols = test_columns();
+    let cm = ColumnMap::new(&cols);
+    let row = test_row();
+    let expr = quantified(
+        Value::Integer(5),
+        BinOp::Eq,
+        All,
+        array_lit(vec![Value::Integer(5), Value::Integer(5)]),
+    );
+    assert_eq!(
+        eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+        Value::Boolean(true)
+    );
+}
+
+#[test]
+fn all_eq_one_mismatch_returns_false_short_circuit() {
+    use crate::parser::Quantifier::All;
+    let cols = test_columns();
+    let cm = ColumnMap::new(&cols);
+    let row = test_row();
+    let expr = quantified(
+        Value::Integer(5),
+        BinOp::Eq,
+        All,
+        array_lit(vec![Value::Integer(5), Value::Integer(6), Value::Null]),
+    );
+    assert_eq!(
+        eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+        Value::Boolean(false)
+    );
+}
+
+#[test]
+fn all_eq_with_null_no_mismatch_returns_null() {
+    use crate::parser::Quantifier::All;
+    let cols = test_columns();
+    let cm = ColumnMap::new(&cols);
+    let row = test_row();
+    let expr = quantified(
+        Value::Integer(5),
+        BinOp::Eq,
+        All,
+        array_lit(vec![Value::Integer(5), Value::Null]),
+    );
+    assert_eq!(
+        eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+        Value::Null
+    );
+}
+
+#[test]
+fn any_lhs_null_with_empty_returns_false() {
+    use crate::parser::Quantifier::Any;
+    let cols = test_columns();
+    let cm = ColumnMap::new(&cols);
+    let row = test_row();
+    let expr = quantified(Value::Null, BinOp::Eq, Any, array_lit(vec![]));
+    assert_eq!(
+        eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+        Value::Boolean(false)
+    );
+}
+
+#[test]
+fn all_lhs_null_with_empty_returns_true() {
+    use crate::parser::Quantifier::All;
+    let cols = test_columns();
+    let cm = ColumnMap::new(&cols);
+    let row = test_row();
+    let expr = quantified(Value::Null, BinOp::Eq, All, array_lit(vec![]));
+    assert_eq!(
+        eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+        Value::Boolean(true)
+    );
+}
+
+#[test]
+fn any_lhs_null_with_nonempty_returns_null() {
+    use crate::parser::Quantifier::Any;
+    let cols = test_columns();
+    let cm = ColumnMap::new(&cols);
+    let row = test_row();
+    let expr = quantified(
+        Value::Null,
+        BinOp::Eq,
+        Any,
+        array_lit(vec![Value::Integer(1)]),
+    );
+    assert_eq!(
+        eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+        Value::Null
+    );
+}
+
+#[test]
+fn any_lt_finds_greater_element() {
+    use crate::parser::Quantifier::Any;
+    let cols = test_columns();
+    let cm = ColumnMap::new(&cols);
+    let row = test_row();
+    let expr = quantified(
+        Value::Integer(2),
+        BinOp::Lt,
+        Any,
+        array_lit(vec![
+            Value::Integer(1),
+            Value::Integer(3),
+            Value::Integer(5),
+        ]),
+    );
+    assert_eq!(
+        eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+        Value::Boolean(true)
+    );
+}
+
+#[test]
+fn all_gt_threshold() {
+    use crate::parser::Quantifier::All;
+    let cols = test_columns();
+    let cm = ColumnMap::new(&cols);
+    let row = test_row();
+    let expr = quantified(
+        Value::Integer(10),
+        BinOp::Gt,
+        All,
+        array_lit(vec![
+            Value::Integer(1),
+            Value::Integer(2),
+            Value::Integer(3),
+        ]),
+    );
+    assert_eq!(
+        eval_expr(&expr, &EvalCtx::new(&cm, &row)).unwrap(),
+        Value::Boolean(true)
+    );
+}

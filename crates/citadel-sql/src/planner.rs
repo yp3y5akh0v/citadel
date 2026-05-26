@@ -2,7 +2,71 @@
 
 use crate::encoding::encode_composite_key;
 use crate::parser::{BinOp, Expr};
-use crate::types::{IndexDef, IndexKind, InvertedKind, TableSchema, Value};
+use crate::types::{IndexDef, IndexKey, IndexKind, InvertedKind, TableSchema, Value};
+
+/// Canonical form of an expression for symbolic-equivalence matching against expression indexes.
+/// Strips table qualifiers, lowercases identifiers and function names, sorts commutative operands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CanonicalExpr {
+    Literal(String),
+    Column(String),
+    Function {
+        name: String,
+        args: Vec<CanonicalExpr>,
+    },
+    BinaryOp {
+        op: BinOp,
+        operands: Vec<CanonicalExpr>,
+    },
+    UnaryOp {
+        op: crate::parser::UnaryOp,
+        operand: Box<CanonicalExpr>,
+    },
+    Cast {
+        expr: Box<CanonicalExpr>,
+        data_type: crate::types::DataType,
+    },
+    Other(String),
+}
+
+fn canonicalize(expr: &Expr) -> CanonicalExpr {
+    match expr {
+        Expr::Literal(v) => CanonicalExpr::Literal(format!("{v:?}")),
+        Expr::Column(name) => CanonicalExpr::Column(name.to_ascii_lowercase()),
+        Expr::QualifiedColumn { column, .. } => CanonicalExpr::Column(column.to_ascii_lowercase()),
+        Expr::Function { name, args, .. } => {
+            let canon_args: Vec<CanonicalExpr> = args.iter().map(canonicalize).collect();
+            CanonicalExpr::Function {
+                name: name.to_ascii_lowercase(),
+                args: canon_args,
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let mut operands = vec![canonicalize(left), canonicalize(right)];
+            if is_commutative(*op) {
+                operands.sort_by_key(|e| format!("{e:?}"));
+            }
+            CanonicalExpr::BinaryOp { op: *op, operands }
+        }
+        Expr::UnaryOp { op, expr: inner } => CanonicalExpr::UnaryOp {
+            op: *op,
+            operand: Box::new(canonicalize(inner)),
+        },
+        Expr::Cast {
+            expr: inner,
+            data_type,
+        } => CanonicalExpr::Cast {
+            expr: Box::new(canonicalize(inner)),
+            data_type: *data_type,
+        },
+        Expr::Collate { expr: inner, .. } => canonicalize(inner),
+        other => CanonicalExpr::Other(format!("{other:?}")),
+    }
+}
+
+fn is_commutative(op: BinOp) -> bool {
+    matches!(op, BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or)
+}
 
 #[derive(Debug, Clone)]
 pub enum ScanPlan {
@@ -251,7 +315,9 @@ fn try_inverted_scan(schema: &TableSchema, where_expr: &Expr) -> Option<ScanPlan
     };
     let idx = schema.indices.iter().find(|i| {
         matches!(i.kind, IndexKind::Inverted(_))
-            && i.columns.first().is_some_and(|&c| c == col_idx)
+            && i.column_positions_iter()
+                .next()
+                .is_some_and(|c| c == col_idx)
             && i.predicate_expr.is_none()
     })?;
     let kind = match idx.kind {
@@ -414,6 +480,10 @@ fn try_pk_range_scan(schema: &TableSchema, range_preds: &[SimplePredicate]) -> O
 
 fn try_pk_lookup(schema: &TableSchema, predicates: &[Option<SimplePredicate>]) -> Option<ScanPlan> {
     let pk_cols = &schema.primary_key_columns;
+    // No PK → fall through to SeqScan. An empty-key PkLookup would silently match 0 rows.
+    if pk_cols.is_empty() {
+        return None;
+    }
     let mut pk_values: Vec<Option<Value>> = vec![None; pk_cols.len()];
 
     for pred in predicates.iter().flatten() {
@@ -458,9 +528,71 @@ fn try_best_index(
                 best_plan = Some(plan);
             }
         }
+        if !idx.is_pure_column_index() {
+            if let Some((score, plan)) = try_expr_index_scan(schema, idx, &conjuncts) {
+                if best_score.is_none() || score > *best_score.as_ref().unwrap() {
+                    best_score = Some(score);
+                    best_plan = Some(plan);
+                }
+            }
+        }
     }
 
     best_plan
+}
+
+fn try_expr_index_scan(
+    schema: &TableSchema,
+    idx: &IndexDef,
+    conjuncts: &[&Expr],
+) -> Option<(IndexScore, ScanPlan)> {
+    // v0.16 supports only equality on the first expression key (`WHERE LOWER(email) = ?`).
+    let first_key = idx.keys.first()?;
+    let key_expr = match first_key {
+        IndexKey::Expr { expr, .. } => expr,
+        IndexKey::Column { .. } => return None,
+    };
+    let canonical_key = canonicalize(key_expr);
+
+    let mut matched: Option<Value> = None;
+    for conj in conjuncts {
+        if let Expr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } = conj
+        {
+            let (expr_side, value_side) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Literal(v), other) | (other, Expr::Literal(v)) => (other, v.clone()),
+                _ => continue,
+            };
+            if canonicalize(expr_side) == canonical_key {
+                matched = Some(value_side);
+                break;
+            }
+        }
+    }
+
+    let value = matched?;
+    let score = IndexScore {
+        num_equality: 1,
+        has_range: false,
+        is_unique: idx.unique,
+    };
+    let prefix = encode_composite_key(&[value]);
+    let idx_table = TableSchema::index_table_name(&schema.name, &idx.name);
+    Some((
+        score,
+        ScanPlan::IndexScan {
+            index_name: idx.name.clone(),
+            idx_table,
+            prefix,
+            num_prefix_cols: 1,
+            range_conds: vec![],
+            is_unique: idx.unique,
+            index_columns: vec![],
+        },
+    ))
 }
 
 fn partial_predicate_implied(idx: &IndexDef, where_expr: &Expr, conjuncts: &[&Expr]) -> bool {
@@ -507,7 +639,12 @@ fn try_index_scan(
     let mut equality_values: Vec<Value> = Vec::new();
     let mut range_conds: Vec<(BinOp, Value)> = Vec::new();
 
-    for &col_idx in &idx.columns {
+    // Expression-key indexes go through `try_expr_index_scan`, not the column path.
+    if !idx.is_pure_column_index() {
+        return None;
+    }
+    let idx_columns = idx.columns_vec();
+    for &col_idx in &idx_columns {
         let mut found_eq = false;
         for (i, pred) in predicates.iter().enumerate() {
             if used.contains(&i) {
@@ -560,7 +697,7 @@ fn try_index_scan(
             num_prefix_cols: equality_values.len(),
             range_conds,
             is_unique: idx.unique,
-            index_columns: idx.columns.clone(),
+            index_columns: idx_columns.clone(),
         },
     ))
 }
@@ -646,6 +783,7 @@ fn format_value(val: &Value) -> String {
         Value::Jsonb(_) => "JSONB '<binary>'".into(),
         Value::TsVector(_) => "TSVECTOR '<binary>'".into(),
         Value::TsQuery(_) => "TSQUERY '<binary>'".into(),
+        Value::Array(_) => val.to_string(),
     }
 }
 

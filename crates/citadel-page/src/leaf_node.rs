@@ -6,7 +6,6 @@ use citadel_core::types::{PageId, ValueType};
 /// Fixed-size fields in a leaf cell (key_len: 2 + val_len: 4 + val_type: 1).
 const LEAF_CELL_FIXED: usize = 7;
 
-/// A parsed leaf cell.
 pub struct LeafCell<'a> {
     pub key: &'a [u8],
     pub val_type: ValueType,
@@ -36,7 +35,6 @@ impl OverflowRef {
     }
 }
 
-/// Read leaf cell at index `i`.
 pub fn read_cell(page: &Page, i: u16) -> LeafCell<'_> {
     let offset = page.cell_offset(i) as usize;
     let key_len = u16::from_le_bytes(page.data[offset..offset + 2].try_into().unwrap()) as usize;
@@ -58,7 +56,6 @@ pub fn cell_size(key_len: usize, val_len: usize) -> usize {
     LEAF_CELL_FIXED + key_len + val_len
 }
 
-/// Get the cell byte size for the cell at index `i`.
 pub fn get_cell_size(page: &Page, i: u16) -> usize {
     let offset = page.cell_offset(i) as usize;
     let key_len = u16::from_le_bytes(page.data[offset..offset + 2].try_into().unwrap()) as usize;

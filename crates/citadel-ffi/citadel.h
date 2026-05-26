@@ -59,6 +59,7 @@ enum CitadelValueType
     Jsonb = 11,
     TsVector = 12,
     TsQuery = 13,
+    Array = 14,
 };
 #ifndef __cplusplus
 typedef int32_t CitadelValueType;

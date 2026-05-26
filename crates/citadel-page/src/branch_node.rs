@@ -13,13 +13,11 @@ use citadel_core::types::PageId;
 /// Size of fixed fields in a branch cell (child: 4 + key_len: 2).
 const BRANCH_CELL_FIXED: usize = 6;
 
-/// A parsed branch cell.
 pub struct BranchCell<'a> {
     pub child: PageId,
     pub key: &'a [u8],
 }
 
-/// Read branch cell at index `i`.
 pub fn read_cell(page: &Page, i: u16) -> BranchCell<'_> {
     let offset = page.cell_offset(i) as usize;
     let child = u32::from_le_bytes(page.data[offset..offset + 4].try_into().unwrap());
@@ -46,7 +44,6 @@ pub fn build_cell(child: PageId, key: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Get the cell byte size for the cell at index `i`.
 pub fn get_cell_size(page: &Page, i: u16) -> usize {
     let offset = page.cell_offset(i) as usize;
     let key_len =

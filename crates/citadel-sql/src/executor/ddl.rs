@@ -7,25 +7,6 @@ use crate::types::*;
 
 use super::helpers::*;
 
-fn resolve_index_collations(
-    col_indices: &[u16],
-    explicit: &[Collation],
-    table_schema: &TableSchema,
-) -> Vec<Collation> {
-    col_indices
-        .iter()
-        .enumerate()
-        .map(|(i, &col_idx)| {
-            let from_stmt = explicit.get(i).copied().unwrap_or(Collation::Binary);
-            if from_stmt != Collation::Binary {
-                from_stmt
-            } else {
-                table_schema.columns[col_idx as usize].collation
-            }
-        })
-        .collect()
-}
-
 pub(super) fn collect_column_refs(expr: &Expr, out: &mut Vec<String>) {
     match expr {
         Expr::Column(name) => out.push(name.to_ascii_lowercase()),
@@ -130,7 +111,7 @@ pub(super) fn validate_foreign_keys(
             && parent
                 .indices
                 .iter()
-                .any(|idx| idx.unique && idx.columns == ref_col_indices);
+                .any(|idx| idx.unique && idx.columns_vec() == ref_col_indices);
 
         if !is_pk && !has_unique {
             return Err(SqlError::Unsupported(format!(
@@ -167,7 +148,7 @@ pub(super) fn create_unique_auto_indices(
         if table_schema
             .indices
             .iter()
-            .any(|idx| idx.unique && idx.columns == col_idxs)
+            .any(|idx| idx.unique && idx.columns_vec() == col_idxs)
         {
             continue;
         }
@@ -191,15 +172,15 @@ pub(super) fn create_unique_auto_indices(
             .iter()
             .map(|&i| table_schema.columns[i as usize].collation)
             .collect();
-        table_schema.indices.push(IndexDef {
-            name: idx_name,
-            columns: col_idxs,
-            unique: true,
-            predicate_sql: None,
-            predicate_expr: None,
+        table_schema.indices.push(IndexDef::from_column_lists(
+            idx_name,
+            col_idxs,
             collations,
-            kind: crate::types::IndexKind::default(),
-        });
+            true,
+            None,
+            None,
+            crate::types::IndexKind::default(),
+        ));
     }
     Ok(table_schema)
 }
@@ -225,20 +206,23 @@ pub(super) fn create_fk_auto_indices(
 
     for (cols, idx_name) in fks {
         // Skip if an index already covers these columns
-        let already_covered = table_schema.indices.iter().any(|idx| idx.columns == cols);
+        let already_covered = table_schema
+            .indices
+            .iter()
+            .any(|idx| idx.columns_vec() == cols);
         if already_covered {
             continue;
         }
 
-        let idx_def = IndexDef {
-            name: idx_name.clone(),
-            columns: cols,
-            unique: false,
-            predicate_sql: None,
-            predicate_expr: None,
-            collations: vec![],
-            kind: IndexKind::default(),
-        };
+        let idx_def = IndexDef::from_column_lists(
+            idx_name.clone(),
+            cols,
+            vec![],
+            false,
+            None,
+            None,
+            IndexKind::default(),
+        );
         let idx_table = TableSchema::index_table_name(&table_schema.name, &idx_name);
         wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
         // Table is empty at CREATE TABLE time - no rows to populate
@@ -411,22 +395,33 @@ pub(super) fn exec_drop_table(
     }
 
     let table_schema = schema.get(&lower_name).unwrap();
+    let storage_name = table_schema.name.clone();
     let idx_tables: Vec<Vec<u8>> = table_schema
         .indices
         .iter()
-        .map(|idx| TableSchema::index_table_name(&lower_name, &idx.name))
+        .map(|idx| TableSchema::index_table_name(&storage_name, &idx.name))
+        .collect();
+
+    let trigger_names: Vec<String> = schema
+        .triggers_for(&storage_name)
+        .iter()
+        .map(|t| t.name.clone())
         .collect();
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     for idx_table in &idx_tables {
         wtx.drop_table(idx_table).map_err(SqlError::Storage)?;
     }
-    wtx.drop_table(lower_name.as_bytes())
+    wtx.drop_table(storage_name.as_bytes())
         .map_err(SqlError::Storage)?;
-    SchemaManager::delete_schema(&mut wtx, &lower_name)?;
+    for tname in &trigger_names {
+        SchemaManager::delete_trigger(&mut wtx, tname)?;
+    }
+    SchemaManager::delete_schema(&mut wtx, &storage_name)?;
     wtx.commit().map_err(SqlError::Storage)?;
 
-    schema.remove(&lower_name);
+    schema.remove_triggers_for(&storage_name);
+    schema.remove(&storage_name);
     Ok(ExecutionResult::Ok)
 }
 
@@ -593,13 +588,23 @@ pub(super) fn exec_drop_table_in_txn(
         .map(|idx| TableSchema::index_table_name(&lower_name, &idx.name))
         .collect();
 
+    let trigger_names: Vec<String> = schema
+        .triggers_for(&lower_name)
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+
     for idx_table in &idx_tables {
         wtx.drop_table(idx_table).map_err(SqlError::Storage)?;
     }
     wtx.drop_table(lower_name.as_bytes())
         .map_err(SqlError::Storage)?;
+    for tname in &trigger_names {
+        SchemaManager::delete_trigger(wtx, tname)?;
+    }
     SchemaManager::delete_schema(wtx, &lower_name)?;
 
+    schema.remove_triggers_for(&lower_name);
     schema.remove(&lower_name);
     Ok(ExecutionResult::Ok)
 }
@@ -661,6 +666,59 @@ fn truncate_tables(
     Ok(total)
 }
 
+fn build_index_def_for_create(
+    stmt: &CreateIndexStmt,
+    table_schema: &TableSchema,
+    name: String,
+) -> Result<IndexDef> {
+    let mut keys: Vec<crate::types::IndexKey> = Vec::with_capacity(stmt.columns.len());
+    for (i, raw_name) in stmt.columns.iter().enumerate() {
+        if let Some(Some((expr, sql))) = stmt.key_exprs.get(i) {
+            keys.push(crate::types::IndexKey::Expr {
+                expr: expr.clone(),
+                original_sql: sql.clone(),
+            });
+            continue;
+        }
+        let lower = raw_name.to_ascii_lowercase();
+        let col_idx = table_schema
+            .column_index(&lower)
+            .ok_or_else(|| SqlError::ColumnNotFound(raw_name.clone()))?
+            as u16;
+        if matches!(
+            table_schema.columns[col_idx as usize].generated_kind,
+            Some(crate::parser::GeneratedKind::Virtual)
+        ) {
+            return Err(SqlError::Unsupported(format!(
+                "cannot CREATE INDEX on VIRTUAL generated column '{}'",
+                table_schema.columns[col_idx as usize].name
+            )));
+        }
+        let explicit_collate = stmt
+            .collations
+            .get(i)
+            .copied()
+            .unwrap_or(crate::types::Collation::Binary);
+        let collate = if explicit_collate != crate::types::Collation::Binary {
+            explicit_collate
+        } else {
+            table_schema.columns[col_idx as usize].collation
+        };
+        keys.push(crate::types::IndexKey::Column {
+            idx: col_idx,
+            collate,
+        });
+    }
+    Ok(IndexDef {
+        name,
+        keys,
+        unique: stmt.unique,
+        predicate_sql: stmt.predicate_sql.clone(),
+        predicate_expr: stmt.predicate_expr.clone(),
+        kind: stmt.kind,
+    })
+}
+
 pub(super) fn exec_create_index(
     db: &Database,
     schema: &mut SchemaManager,
@@ -672,6 +730,8 @@ pub(super) fn exec_create_index(
     let table_schema = schema
         .get(&lower_table)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table_name.clone()))?;
+    // Resolve through any TEMP alias: storage operations must use the schema's actual `name`.
+    let storage_table = table_schema.name.clone();
 
     if table_schema.index_by_name(&lower_idx).is_some() {
         if stmt.if_not_exists {
@@ -680,53 +740,62 @@ pub(super) fn exec_create_index(
         return Err(SqlError::IndexAlreadyExists(stmt.index_name.clone()));
     }
 
-    let col_indices: Vec<u16> = stmt
-        .columns
-        .iter()
-        .map(|col_name| {
-            let lower = col_name.to_ascii_lowercase();
-            table_schema
-                .column_index(&lower)
-                .map(|i| i as u16)
-                .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))
+    let idx_def = build_index_def_for_create(stmt, table_schema, lower_idx.clone())?;
+
+    let idx_table = TableSchema::index_table_name(&storage_table, &lower_idx);
+
+    let pk_indices = table_schema.pk_indices();
+    // CONCURRENTLY: pre-scan rows under a ReadTxn (no write lock held). Other writers can
+    // proceed during the scan. If a writer commits between our snapshot and the merge,
+    // we re-scan under the WriteTxn to ensure correctness.
+    let (mut rows, prescan_gen): (Vec<Vec<Value>>, Option<u64>) = if stmt.concurrently {
+        let mut rtx = db.begin_read();
+        let g1 = rtx.commit_generation();
+        let mut prescan: Vec<Vec<Value>> = Vec::new();
+        let mut scan_err: Option<SqlError> = None;
+        rtx.table_for_each(storage_table.as_bytes(), |key, value| {
+            match decode_full_row(table_schema, key, value) {
+                Ok(row) => prescan.push(row),
+                Err(e) => scan_err = Some(e),
+            }
+            Ok(())
         })
-        .collect::<Result<_>>()?;
-
-    for &ci in &col_indices {
-        if matches!(
-            table_schema.columns[ci as usize].generated_kind,
-            Some(crate::parser::GeneratedKind::Virtual)
-        ) {
-            return Err(SqlError::Unsupported(format!(
-                "cannot CREATE INDEX on VIRTUAL generated column '{}'",
-                table_schema.columns[ci as usize].name
-            )));
+        .map_err(SqlError::Storage)?;
+        drop(rtx);
+        if let Some(e) = scan_err {
+            return Err(e);
         }
-    }
-
-    let collations = resolve_index_collations(&col_indices, &stmt.collations, table_schema);
-
-    let idx_def = IndexDef {
-        name: lower_idx.clone(),
-        columns: col_indices,
-        unique: stmt.unique,
-        predicate_sql: stmt.predicate_sql.clone(),
-        predicate_expr: stmt.predicate_expr.clone(),
-        collations,
-        kind: stmt.kind,
+        (prescan, Some(g1))
+    } else {
+        (Vec::new(), None)
     };
-
-    let idx_table = TableSchema::index_table_name(&lower_table, &lower_idx);
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     SchemaManager::ensure_schema_table(&mut wtx)?;
     wtx.create_table(&idx_table).map_err(SqlError::Storage)?;
 
-    let pk_indices = table_schema.pk_indices();
-    let mut rows: Vec<Vec<Value>> = Vec::new();
-    {
+    // For non-concurrent path, scan under the write lock. For concurrent path, re-scan only
+    // if commit_generation moved (a writer committed between our snapshot and now).
+    if let Some(g1) = prescan_gen {
+        let g_now = db.manager().commit_generation();
+        if g_now != g1 {
+            rows.clear();
+            let mut scan_err: Option<SqlError> = None;
+            wtx.table_for_each(storage_table.as_bytes(), |key, value| {
+                match decode_full_row(table_schema, key, value) {
+                    Ok(row) => rows.push(row),
+                    Err(e) => scan_err = Some(e),
+                }
+                Ok(())
+            })
+            .map_err(SqlError::Storage)?;
+            if let Some(e) = scan_err {
+                return Err(e);
+            }
+        }
+    } else {
         let mut scan_err: Option<SqlError> = None;
-        wtx.table_for_each(lower_table.as_bytes(), |key, value| {
+        wtx.table_for_each(storage_table.as_bytes(), |key, value| {
             match decode_full_row(table_schema, key, value) {
                 Ok(row) => rows.push(row),
                 Err(e) => scan_err = Some(e),
@@ -740,7 +809,9 @@ pub(super) fn exec_create_index(
     }
 
     if let crate::types::IndexKind::Inverted(inv_kind) = idx_def.kind {
-        let col_idx = idx_def.columns[0] as usize;
+        let col_idx = idx_def.column_positions_iter().next().ok_or_else(|| {
+            SqlError::Unsupported("inverted index requires at least one column key".into())
+        })? as usize;
         let col_type = table_schema.columns[col_idx].data_type;
         match inv_kind {
             crate::types::InvertedKind::Gin(_) => {
@@ -774,7 +845,7 @@ pub(super) fn exec_create_index(
     for row in &rows {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
         if let crate::types::IndexKind::Inverted(inv_kind) = idx_def.kind {
-            let value = &row[idx_def.columns[0] as usize];
+            let value = &row[idx_def.column_positions_iter().next().unwrap() as usize];
             if !value.is_null() {
                 let entries =
                     super::helpers::extract_inverted_entries_with_values(value, inv_kind)?;
@@ -787,16 +858,15 @@ pub(super) fn exec_create_index(
             }
             continue;
         }
-        let key = encode_index_key(&idx_def, row, &pk_values);
+        let key = encode_index_key_with_schema(&idx_def, row, &pk_values, table_schema);
         let value = encode_index_value(&idx_def, row, &pk_values);
         let is_new = wtx
             .table_insert(&idx_table, &key, &value)
             .map_err(SqlError::Storage)?;
         if idx_def.unique && !is_new {
             let indexed_values: Vec<Value> = idx_def
-                .columns
-                .iter()
-                .map(|&col_idx| row[col_idx as usize].clone())
+                .column_positions_iter()
+                .map(|col_idx| row[col_idx as usize].clone())
                 .collect();
             let any_null = indexed_values.iter().any(|v| v.is_null());
             if !any_null {
@@ -865,41 +935,7 @@ pub(super) fn exec_create_index_in_txn(
         return Err(SqlError::IndexAlreadyExists(stmt.index_name.clone()));
     }
 
-    let col_indices: Vec<u16> = stmt
-        .columns
-        .iter()
-        .map(|col_name| {
-            let lower = col_name.to_ascii_lowercase();
-            table_schema
-                .column_index(&lower)
-                .map(|i| i as u16)
-                .ok_or_else(|| SqlError::ColumnNotFound(col_name.clone()))
-        })
-        .collect::<Result<_>>()?;
-
-    for &ci in &col_indices {
-        if matches!(
-            table_schema.columns[ci as usize].generated_kind,
-            Some(crate::parser::GeneratedKind::Virtual)
-        ) {
-            return Err(SqlError::Unsupported(format!(
-                "cannot CREATE INDEX on VIRTUAL generated column '{}'",
-                table_schema.columns[ci as usize].name
-            )));
-        }
-    }
-
-    let collations = resolve_index_collations(&col_indices, &stmt.collations, table_schema);
-
-    let idx_def = IndexDef {
-        name: lower_idx.clone(),
-        columns: col_indices,
-        unique: stmt.unique,
-        predicate_sql: stmt.predicate_sql.clone(),
-        predicate_expr: stmt.predicate_expr.clone(),
-        collations,
-        kind: stmt.kind,
-    };
+    let idx_def = build_index_def_for_create(stmt, table_schema, lower_idx.clone())?;
 
     let idx_table = TableSchema::index_table_name(&lower_table, &lower_idx);
 
@@ -925,16 +961,15 @@ pub(super) fn exec_create_index_in_txn(
 
     for row in &rows {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
-        let key = encode_index_key(&idx_def, row, &pk_values);
+        let key = encode_index_key_with_schema(&idx_def, row, &pk_values, table_schema);
         let value = encode_index_value(&idx_def, row, &pk_values);
         let is_new = wtx
             .table_insert(&idx_table, &key, &value)
             .map_err(SqlError::Storage)?;
         if idx_def.unique && !is_new {
             let indexed_values: Vec<Value> = idx_def
-                .columns
-                .iter()
-                .map(|&col_idx| row[col_idx as usize].clone())
+                .column_positions_iter()
+                .map(|col_idx| row[col_idx as usize].clone())
                 .collect();
             let any_null = indexed_values.iter().any(|v| v.is_null());
             if !any_null {
@@ -1169,7 +1204,49 @@ pub(super) fn alter_table_impl(
         AlterTableOp::RenameTable { new_name } => {
             alter_rename_table(wtx, schema, &lower_name, new_name)
         }
+        AlterTableOp::DisableTrigger { name } => {
+            alter_set_trigger_enabled(wtx, schema, name, false)
+        }
+        AlterTableOp::EnableTrigger { name } => alter_set_trigger_enabled(wtx, schema, name, true),
+        AlterTableOp::DisableAllTriggers => {
+            alter_set_all_triggers_enabled(wtx, schema, &lower_name, false)
+        }
+        AlterTableOp::EnableAllTriggers => {
+            alter_set_all_triggers_enabled(wtx, schema, &lower_name, true)
+        }
     }
+}
+
+fn alter_set_trigger_enabled(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    name: &str,
+    enabled: bool,
+) -> Result<()> {
+    let trig = schema
+        .find_trigger(name)
+        .map(|(_, t)| t.clone())
+        .ok_or_else(|| SqlError::Unsupported(format!("trigger '{name}' not found")))?;
+    let mut updated = trig.clone();
+    updated.enabled = enabled;
+    SchemaManager::save_trigger(wtx, &updated)?;
+    schema.set_trigger_enabled(name, enabled);
+    Ok(())
+}
+
+fn alter_set_all_triggers_enabled(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &mut SchemaManager,
+    target: &str,
+    enabled: bool,
+) -> Result<()> {
+    let triggers: Vec<crate::types::TriggerDef> = schema.triggers_for(target).to_vec();
+    for mut t in triggers {
+        t.enabled = enabled;
+        SchemaManager::save_trigger(wtx, &t)?;
+    }
+    schema.set_all_triggers_enabled(target, enabled);
+    Ok(())
 }
 
 pub(super) fn alter_add_column(
@@ -1310,7 +1387,7 @@ pub(super) fn alter_drop_column(
     }
 
     for idx in &table_schema.indices {
-        if idx.columns.contains(&drop_pos_u16) {
+        if idx.column_positions_iter().any(|c| c == drop_pos_u16) {
             return Err(SqlError::Unsupported(format!(
                 "column '{}' is indexed by '{}'; drop the index first",
                 col_lower, idx.name

@@ -490,3 +490,106 @@ fn op_match_nested_phrase() {
         crate::types::Value::Boolean(true)
     );
 }
+
+#[test]
+fn strip_drops_positions_and_weights() {
+    let v = tsv_with(&[
+        (b"alpha", &[(1, Weight::A), (3, Weight::B)]),
+        (b"beta", &[(2, Weight::C)]),
+    ]);
+    let stripped = match fn_strip(&v).unwrap() {
+        crate::types::Value::TsVector(b) => b,
+        _ => panic!("strip must return TsVector"),
+    };
+    let display = tsvector_display(&stripped);
+    assert_eq!(display, "'alpha' 'beta'");
+}
+
+#[test]
+fn strip_preserves_lexeme_dedup() {
+    let v = tsv_with(&[
+        (b"x", &[(1, Weight::D), (2, Weight::A)]),
+        (b"y", &[(5, Weight::D)]),
+    ]);
+    let stripped = match fn_strip(&v).unwrap() {
+        crate::types::Value::TsVector(b) => b,
+        _ => panic!(),
+    };
+    assert_eq!(tsvector_display(&stripped), "'x' 'y'");
+}
+
+#[test]
+fn op_concat_merges_disjoint_lexemes() {
+    let a = tsv_with(&[(b"alpha", &[(1, Weight::A)])]);
+    let b = tsv_with(&[(b"beta", &[(1, Weight::B)])]);
+    let merged = match op_concat(&a, &b).unwrap() {
+        crate::types::Value::TsVector(out) => out,
+        _ => panic!(),
+    };
+    let display = tsvector_display(&merged);
+    assert!(display.contains("'alpha'"));
+    assert!(display.contains("'beta'"));
+}
+
+#[test]
+fn op_concat_merges_overlapping_lexeme_positions() {
+    let a = tsv_with(&[(b"shared", &[(1, Weight::A)])]);
+    let b = tsv_with(&[(b"shared", &[(5, Weight::D)])]);
+    let merged = match op_concat(&a, &b).unwrap() {
+        crate::types::Value::TsVector(out) => out,
+        _ => panic!(),
+    };
+    let display = tsvector_display(&merged);
+    // Both positions present, sorted ascending; weight A printed, weight D suppressed
+    assert_eq!(display, "'shared':1A,5");
+}
+
+#[test]
+fn op_concat_idempotent_for_identical_inputs() {
+    let v = tsv_with(&[(b"x", &[(1, Weight::A)]), (b"y", &[(2, Weight::B)])]);
+    let merged = match op_concat(&v, &v).unwrap() {
+        crate::types::Value::TsVector(out) => out,
+        _ => panic!(),
+    };
+    assert_eq!(merged.as_ref(), v.as_slice());
+}
+
+#[test]
+fn setweight_selective_reweights_only_matching_lexemes() {
+    use crate::types::Value;
+    let v = tsv_with(&[
+        (b"foo", &[(1, Weight::D)]),
+        (b"bar", &[(2, Weight::D)]),
+        (b"baz", &[(3, Weight::D)]),
+    ]);
+    let filter = vec![Value::Text("foo".into()), Value::Text("baz".into())];
+    let out = match fn_setweight_selective(&v, Weight::A, &filter).unwrap() {
+        Value::TsVector(b) => b,
+        _ => panic!(),
+    };
+    let display = tsvector_display(&out);
+    assert_eq!(display, "'bar':2 'baz':3A 'foo':1A");
+}
+
+#[test]
+fn setweight_selective_empty_filter_is_noop() {
+    use crate::types::Value;
+    let v = tsv_with(&[(b"foo", &[(1, Weight::D)])]);
+    let out = match fn_setweight_selective(&v, Weight::A, &[]).unwrap() {
+        Value::TsVector(b) => b,
+        _ => panic!(),
+    };
+    assert_eq!(out.as_ref(), v.as_slice());
+}
+
+#[test]
+fn setweight_selective_unknown_lexeme_in_filter_is_ignored() {
+    use crate::types::Value;
+    let v = tsv_with(&[(b"foo", &[(1, Weight::D)])]);
+    let filter = vec![Value::Text("not_in_vector".into())];
+    let out = match fn_setweight_selective(&v, Weight::A, &filter).unwrap() {
+        Value::TsVector(b) => b,
+        _ => panic!(),
+    };
+    assert_eq!(out.as_ref(), v.as_slice());
+}

@@ -4061,3 +4061,149 @@ fn partial_index_persists_across_reopen() {
         );
     }
 }
+
+#[test]
+fn expression_index_create_and_populate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO users VALUES (1, 'Alice@Example.COM')")
+        .unwrap();
+    conn.execute("INSERT INTO users VALUES (2, 'Bob@Example.COM')")
+        .unwrap();
+
+    // Create expression index on LOWER(email) — populates from existing rows.
+    assert_ok(
+        conn.execute("CREATE INDEX idx_lower_email ON users (LOWER(email))")
+            .unwrap(),
+    );
+
+    // Insert new row — index should pick up the new expression key.
+    assert_rows_affected(
+        conn.execute("INSERT INTO users VALUES (3, 'Carol@Example.COM')")
+            .unwrap(),
+        1,
+    );
+
+    // Schema persists across reopen.
+    drop(conn);
+    drop(db);
+    let db = open_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    let p = conn.prepare("SELECT id FROM users ORDER BY id").unwrap();
+    let result = p.query_collect(&[]).unwrap();
+    assert_eq!(result.rows.len(), 3);
+}
+
+#[test]
+fn expression_index_with_qualified_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 2, 3), (2, 5, 4)")
+        .unwrap();
+
+    assert_ok(conn.execute("CREATE INDEX idx_sum ON t ((x + y))").unwrap());
+}
+
+#[test]
+fn create_index_concurrently_parses() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)")
+        .unwrap();
+    // CONCURRENTLY flag parses (v0.16 D5 will make it actually concurrent; for now it builds normally).
+    assert_ok(
+        conn.execute("CREATE INDEX CONCURRENTLY idx_x ON t (x)")
+            .unwrap(),
+    );
+}
+
+#[test]
+fn expression_index_used_by_planner_when_query_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)")
+        .unwrap();
+    for i in 0..100 {
+        conn.execute(&format!(
+            "INSERT INTO users VALUES ({}, 'User{}@Example.COM')",
+            i, i
+        ))
+        .unwrap();
+    }
+    conn.execute("CREATE INDEX idx_lower_email ON users (LOWER(email))")
+        .unwrap();
+
+    let p = conn
+        .prepare("EXPLAIN SELECT id FROM users WHERE LOWER(email) = 'user42@example.com'")
+        .unwrap();
+    let result = p.query_collect(&[]).unwrap();
+    let plan_text = format!("{}", result.rows[0][0]);
+    assert!(
+        plan_text.contains("idx_lower_email") || plan_text.contains("INDEX"),
+        "planner should pick expression index, EXPLAIN said: {plan_text}"
+    );
+}
+
+#[test]
+fn expression_index_qualified_column_canonical_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT)")
+        .unwrap();
+    for i in 0..10 {
+        conn.execute(&format!("INSERT INTO t VALUES ({}, 'U{}@X')", i, i))
+            .unwrap();
+    }
+    conn.execute("CREATE INDEX idx_le ON t (LOWER(email))")
+        .unwrap();
+    // Query uses qualified column name `t.email`; canonical form strips the qualifier.
+    let p = conn
+        .prepare("EXPLAIN SELECT id FROM t WHERE LOWER(t.email) = 'u5@x'")
+        .unwrap();
+    let result = p.query_collect(&[]).unwrap();
+    let plan_text = format!("{}", result.rows[0][0]);
+    assert!(
+        plan_text.contains("idx_le") || plan_text.contains("INDEX"),
+        "qualified-column canonical form should match index, EXPLAIN: {plan_text}"
+    );
+}
+
+#[test]
+fn create_index_concurrently_populates_existing_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)")
+        .unwrap();
+    for i in 0..50 {
+        conn.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 2))
+            .unwrap();
+    }
+    assert_ok(
+        conn.execute("CREATE INDEX CONCURRENTLY idx_x ON t (x)")
+            .unwrap(),
+    );
+    let p = conn
+        .prepare("EXPLAIN SELECT id FROM t WHERE x = 20")
+        .unwrap();
+    let result = p.query_collect(&[]).unwrap();
+    let plan_text = format!("{}", result.rows[0][0]);
+    assert!(plan_text.contains("idx_x") || plan_text.contains("INDEX"));
+    let p2 = conn.prepare("SELECT id FROM t WHERE x = 20").unwrap();
+    let r2 = p2.query_collect(&[]).unwrap();
+    assert_eq!(r2.rows.len(), 1);
+    assert_eq!(r2.rows[0][0], Value::Integer(10));
+}

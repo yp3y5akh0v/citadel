@@ -140,7 +140,6 @@ fn scan_step(
     }
 }
 
-/// Collect rows via ReadTxn using the scan plan.
 pub(super) fn collect_rows_read(
     db: &Database,
     table_schema: &TableSchema,
@@ -443,7 +442,6 @@ fn sorted_intersect(a: &[Vec<u8>], b: &[Vec<u8>]) -> Vec<Vec<u8>> {
     out
 }
 
-/// Collect rows via WriteTxn using the scan plan.
 pub(super) fn collect_rows_write(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     table_schema: &TableSchema,
@@ -670,7 +668,6 @@ pub(super) fn collect_rows_write(
     }
 }
 
-/// Collect (encoded_key, full_row) pairs via ReadTxn. Used by UPDATE/DELETE.
 pub(super) fn collect_keyed_rows_read(
     db: &Database,
     table_schema: &TableSchema,
@@ -815,7 +812,6 @@ pub(super) fn collect_keyed_rows_read(
     }
 }
 
-/// Collect (encoded_key, full_row) pairs via WriteTxn using the scan plan.
 pub(super) fn collect_keyed_rows_write(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     table_schema: &TableSchema,

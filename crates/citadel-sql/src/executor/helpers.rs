@@ -456,7 +456,6 @@ pub(crate) fn materialize_virtual(schema: &TableSchema, row: &mut [Value]) -> Re
     Ok(())
 }
 
-/// Evaluate a constant expression (no column references).
 pub(super) fn eval_const_expr(expr: &Expr) -> Result<Value> {
     static EMPTY: std::sync::OnceLock<ColumnMap> = std::sync::OnceLock::new();
     let empty = EMPTY.get_or_init(|| ColumnMap::new(&[]));
@@ -1097,6 +1096,8 @@ pub(super) fn op_symbol(op: &BinOp) -> &'static str {
         BinOp::JsonDeletePath => "#-",
         BinOp::JsonPathExists => "@?",
         BinOp::JsonPathMatch => "@@",
+        BinOp::JsonPathExistsTz => "@?_tz",
+        BinOp::JsonPathMatchTz => "@@_tz",
     }
 }
 
@@ -1165,31 +1166,35 @@ pub(super) fn infer_expr_type(expr: &Expr, columns: &[ColumnDef]) -> DataType {
     }
 }
 
-pub(super) fn encode_index_key(idx: &IndexDef, row: &[Value], pk_values: &[Value]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    encode_index_key_into(idx, row, pk_values, &mut buf);
-    buf
-}
-
-pub(super) fn encode_index_key_into(
+pub(super) fn encode_index_key_with_schema(
     idx: &IndexDef,
     row: &[Value],
     pk_values: &[Value],
+    schema: &TableSchema,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    encode_index_key_into_with_schema(idx, row, pk_values, Some(schema), &mut buf);
+    buf
+}
+
+/// If the index has expression keys but `schema` is None, expression results are NULL.
+pub(super) fn encode_index_key_into_with_schema(
+    idx: &IndexDef,
+    row: &[Value],
+    pk_values: &[Value],
+    schema: Option<&TableSchema>,
     buf: &mut Vec<u8>,
 ) {
     buf.clear();
-    let any_null = idx.unique && idx.columns.iter().any(|&c| row[c as usize].is_null());
+    let key_values = materialize_index_key_values(idx, row, schema);
+    let any_null = idx.unique && key_values.iter().any(|v| v.is_null());
     let include_pk = !idx.unique || any_null;
-    for (i, &col_idx) in idx.columns.iter().enumerate() {
-        let coll = idx
-            .collations
-            .get(i)
-            .copied()
-            .unwrap_or(crate::types::Collation::Binary);
+    for (i, value) in key_values.iter().enumerate() {
+        let coll = idx.collation_at(i);
         if coll == crate::types::Collation::Binary {
-            crate::encoding::encode_key_value_into(&row[col_idx as usize], buf);
+            crate::encoding::encode_key_value_into(value, buf);
         } else {
-            crate::encoding::encode_key_value_collated_into(&row[col_idx as usize], coll, buf);
+            crate::encoding::encode_key_value_collated_into(value, coll, buf);
         }
     }
     if include_pk {
@@ -1199,12 +1204,33 @@ pub(super) fn encode_index_key_into(
     }
 }
 
+/// Expression eval errors (or missing schema) materialize as `Value::Null` — PG semantics.
+pub(super) fn materialize_index_key_values(
+    idx: &IndexDef,
+    row: &[Value],
+    schema: Option<&TableSchema>,
+) -> Vec<Value> {
+    let col_map = schema.map(|s| s.column_map());
+    idx.keys
+        .iter()
+        .map(|key| match key {
+            crate::types::IndexKey::Column { idx: col_idx, .. } => row[*col_idx as usize].clone(),
+            crate::types::IndexKey::Expr { expr, .. } => match col_map.as_ref() {
+                Some(cm) => {
+                    let ctx = crate::eval::EvalCtx::new(cm, row);
+                    crate::eval::eval_expr(expr, &ctx).unwrap_or(Value::Null)
+                }
+                None => Value::Null,
+            },
+        })
+        .collect()
+}
+
 pub(super) fn encode_index_value(idx: &IndexDef, row: &[Value], pk_values: &[Value]) -> Vec<u8> {
     if idx.unique {
         let indexed_values: Vec<Value> = idx
-            .columns
-            .iter()
-            .map(|&col_idx| row[col_idx as usize].clone())
+            .column_positions_iter()
+            .map(|col_idx| row[col_idx as usize].clone())
             .collect();
         let any_null = indexed_values.iter().any(|v| v.is_null());
         if !any_null {
@@ -1251,7 +1277,13 @@ pub(super) fn insert_index_entries(
                     continue;
                 }
 
-                encode_index_key_into(idx, row, pk_values, &mut key_buf);
+                encode_index_key_into_with_schema(
+                    idx,
+                    row,
+                    pk_values,
+                    Some(table_schema),
+                    &mut key_buf,
+                );
                 let value = encode_index_value(idx, row, pk_values);
 
                 let is_new = wtx
@@ -1259,7 +1291,9 @@ pub(super) fn insert_index_entries(
                     .map_err(SqlError::Storage)?;
 
                 if idx.unique && !is_new {
-                    let any_null = idx.columns.iter().any(|&c| row[c as usize].is_null());
+                    let any_null = idx
+                        .column_positions_iter()
+                        .any(|c| row[c as usize].is_null());
                     if !any_null {
                         return Err(SqlError::UniqueViolation(idx.name.clone()));
                     }
@@ -1389,7 +1423,9 @@ fn insert_inverted_entries(
     pk_values: &[Value],
     idx_table: &[u8],
 ) -> Result<()> {
-    let col_idx = idx.columns[0] as usize;
+    let col_idx = idx.column_positions_iter().next().ok_or_else(|| {
+        SqlError::Unsupported("inverted index requires at least one column key".into())
+    })? as usize;
     let value = &row[col_idx];
     if value.is_null() {
         return Ok(());
@@ -1419,14 +1455,13 @@ pub(super) fn insert_index_entries_or_fetch(
             }
         }
         let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
-        let key = encode_index_key(idx, row, pk_values);
+        let key = encode_index_key_with_schema(idx, row, pk_values, table_schema);
         let value = encode_index_value(idx, row, pk_values);
 
         if idx.unique {
             let indexed_values: Vec<Value> = idx
-                .columns
-                .iter()
-                .map(|&col_idx| row[col_idx as usize].clone())
+                .column_positions_iter()
+                .map(|col_idx| row[col_idx as usize].clone())
                 .collect();
             let any_null = indexed_values.iter().any(|v| v.is_null());
             if any_null {
@@ -1493,7 +1528,7 @@ pub(super) fn delete_index_entries(
             delete_inverted_entries(wtx, idx, inv_kind, row, pk_values, &idx_table)?;
             continue;
         }
-        let key = encode_index_key(idx, row, pk_values);
+        let key = encode_index_key_with_schema(idx, row, pk_values, table_schema);
         wtx.table_delete(&idx_table, &key)
             .map_err(SqlError::Storage)?;
     }
@@ -1508,7 +1543,9 @@ fn delete_inverted_entries(
     pk_values: &[Value],
     idx_table: &[u8],
 ) -> Result<()> {
-    let col_idx = idx.columns[0] as usize;
+    let col_idx = idx.column_positions_iter().next().ok_or_else(|| {
+        SqlError::Unsupported("inverted index requires at least one column key".into())
+    })? as usize;
     let value = &row[col_idx];
     if value.is_null() {
         return Ok(());
@@ -1524,12 +1561,11 @@ fn delete_inverted_entries(
 }
 
 pub(super) fn index_columns_changed(idx: &IndexDef, old_row: &[Value], new_row: &[Value]) -> bool {
-    idx.columns
-        .iter()
-        .any(|&col_idx| old_row[col_idx as usize] != new_row[col_idx as usize])
+    idx.column_positions_iter()
+        .any(|col_idx| old_row[col_idx as usize] != new_row[col_idx as usize])
 }
 
-/// Evaluate a partial-index predicate against a row. NULL or eval errors → false.
+/// NULL or eval errors → false (treated as predicate-false).
 pub(super) fn row_matches_partial(idx: &IndexDef, row: &[Value], col_map: &ColumnMap) -> bool {
     let Some(expr) = idx.predicate_expr.as_ref() else {
         return true;
@@ -1594,7 +1630,6 @@ impl FkChildHit {
     }
 }
 
-/// Find the auto-index on `child_schema` that backs FK `fk`.
 fn find_cascading_idx<'a>(
     child_schema: &'a TableSchema,
     fk: &ForeignKeySchemaEntry,
@@ -1602,10 +1637,9 @@ fn find_cascading_idx<'a>(
     child_schema
         .indices
         .iter()
-        .find(|idx| idx.columns == fk.columns)
+        .find(|idx| idx.columns_vec() == fk.columns)
 }
 
-/// Scan the FK auto-index for entries matching `parent_pk_key`.
 pub(super) fn scan_fk_index_keys(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     child_schema: &TableSchema,
@@ -1669,7 +1703,7 @@ pub(super) fn cascade_after_parent_delete(
                     )));
                 }
                 crate::parser::ReferentialAction::Cascade => {
-                    delete_cascade_hits(wtx, child_schema, cascading_idx, &hits)?;
+                    delete_cascade_hits(wtx, schema, child_schema, cascading_idx, &hits)?;
                     let pk_keys: Vec<Vec<u8>> = hits.into_iter().map(|h| h.into_pk_key()).collect();
                     worklist.push((child_table.to_string(), pk_keys));
                 }
@@ -1690,19 +1724,30 @@ pub(super) fn cascade_after_parent_delete(
 
 fn delete_cascade_hits(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    schema: &crate::schema::SchemaManager,
     child_schema: &TableSchema,
     cascading_idx: &IndexDef,
     hits: &[FkChildHit],
 ) -> Result<()> {
     let child_table = child_schema.name.as_str();
     let cascading_idx_table = TableSchema::index_table_name(child_table, &cascading_idx.name);
+    let cascading_cols = cascading_idx.columns_vec();
     let other_indices: Vec<&IndexDef> = child_schema
         .indices
         .iter()
-        .filter(|idx| idx.columns != cascading_idx.columns)
+        .filter(|idx| idx.columns_vec() != cascading_cols)
         .collect();
 
-    if other_indices.is_empty() {
+    let has_after_delete_triggers = schema.triggers_for(child_table).iter().any(|t| {
+        t.enabled
+            && t.timing == crate::parser::TriggerTiming::After
+            && t.granularity == crate::parser::TriggerGranularity::ForEachRow
+            && t.events
+                .iter()
+                .any(|e| matches!(e, crate::parser::TriggerEvent::Delete))
+    });
+
+    if other_indices.is_empty() && !has_after_delete_triggers {
         for hit in hits {
             wtx.table_delete(&cascading_idx_table, &hit.fk_idx_key)
                 .map_err(SqlError::Storage)?;
@@ -1730,12 +1775,30 @@ fn delete_cascade_hits(
                         continue;
                     }
                 }
-                encode_index_key_into(idx, row, &pk_values_buf, &mut idx_key_buf);
+                encode_index_key_into_with_schema(
+                    idx,
+                    row,
+                    &pk_values_buf,
+                    Some(child_schema),
+                    &mut idx_key_buf,
+                );
                 wtx.table_delete(idx_table, &idx_key_buf)
                     .map_err(SqlError::Storage)?;
             }
             wtx.table_delete(child_table.as_bytes(), pk_key)
                 .map_err(SqlError::Storage)?;
+            if has_after_delete_triggers {
+                super::triggers::fire_row_triggers(
+                    wtx,
+                    schema,
+                    child_table,
+                    crate::parser::TriggerTiming::After,
+                    super::triggers::FireEvent::Delete,
+                    Some(row.clone()),
+                    None,
+                    &child_schema.columns,
+                )?;
+            }
         }
     }
     Ok(())
@@ -1824,12 +1887,14 @@ fn set_fk_columns<F: Fn(usize) -> Value>(
             );
             let idx_table = TableSchema::index_table_name(&child_schema.name, &idx.name);
             if del {
-                let old_idx_key = encode_index_key(idx, old_row, &pk_values);
+                let old_idx_key =
+                    encode_index_key_with_schema(idx, old_row, &pk_values, child_schema);
                 wtx.table_delete(&idx_table, &old_idx_key)
                     .map_err(SqlError::Storage)?;
             }
             if ins {
-                let new_idx_key = encode_index_key(idx, &new_row, &pk_values);
+                let new_idx_key =
+                    encode_index_key_with_schema(idx, &new_row, &pk_values, child_schema);
                 let new_idx_val = encode_index_value(idx, &new_row, &pk_values);
                 wtx.table_insert(&idx_table, &new_idx_key, &new_idx_val)
                     .map_err(SqlError::Storage)?;

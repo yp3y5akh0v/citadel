@@ -18,7 +18,7 @@ Every page is encrypted and authenticated before it hits disk. The database file
 ## Features
 
 - **Encrypted at rest** - AES-256-CTR + HMAC-SHA256 per page, verified before decryption
-- **SQL** - JOINs (INNER, LEFT, RIGHT, CROSS, FULL OUTER, LATERAL), subqueries, CTEs (recursive + WITH-DML), UNION/INTERSECT/EXCEPT, window functions, views, aggregates, indexes (partial, COLLATE, GIN, FTS), constraints, generated columns (STORED + VIRTUAL), STRICT tables, COLLATE (BINARY/NOCASE/RTRIM), JSON/JSONB types with 12 PG operators (`->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, `#-`, `@?`, `@@`), `JSON_TABLE` / `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` + SQL/JSON predicate path language, 16 JSON scalar functions + 4 JSONB aggregates, set-returning JSON functions (`jsonb_array_elements`, `jsonb_each`, `jsonb_object_keys`), full-text search (FTS) with `tsvector`/`tsquery` types, `@@` match operator, ranking (`ts_rank`, `ts_rank_cd`), inverted FTS indexes (`CREATE INDEX … USING fts`), system catalog (`information_schema.*`, `pg_timezone_names`, `pg_timezone_abbrevs`), ALTER TABLE, TRUNCATE, UPSERT (`ON CONFLICT`), RETURNING (with `OLD/NEW`), full FK actions (CASCADE / SET NULL / SET DEFAULT / RESTRICT), prepared statements with snapshot-tagged plan caching
+- **SQL** - JOINs (INNER, LEFT, RIGHT, CROSS, FULL OUTER, LATERAL), subqueries, CTEs (recursive + WITH-DML), UNION/INTERSECT/EXCEPT, window functions, views, materialized views (with `REFRESH [CONCURRENTLY]`), triggers (BEFORE/AFTER/INSTEAD OF × ROW/STATEMENT, transition tables, WHEN, UPDATE OF, ENABLE/DISABLE), TEMP tables (per-connection in-memory), aggregates, indexes (partial, COLLATE, GIN, FTS, expression, CONCURRENTLY), constraints, generated columns (STORED + VIRTUAL), STRICT tables, COLLATE (BINARY/NOCASE/RTRIM), `BEGIN READ ONLY` snapshot transactions, `ANY` / `ALL` quantified comparisons, `ARRAY` type, JSON/JSONB types with 14 PG operators (`->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, `#-`, `@?`, `@@`, `@?_tz`, `@@_tz`), `JSON_TABLE` / `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` + SQL/JSON predicate path language, 16 JSON scalar functions + 4 JSONB aggregates, set-returning JSON functions (`jsonb_array_elements`, `jsonb_each`, `jsonb_object_keys`), full-text search (FTS) with `tsvector`/`tsquery` types, `@@` match operator, ranking (`ts_rank`, `ts_rank_cd`), `strip`, `setweight` (2- and 3-arg), `tsvector || tsvector`, inverted FTS indexes (`CREATE INDEX … USING fts`), system catalog (`information_schema.*` incl. `triggers`, `pg_timezone_names`, `pg_timezone_abbrevs`, `pg_matviews`), ALTER TABLE, TRUNCATE, UPSERT (`ON CONFLICT`), RETURNING (with `OLD/NEW`), full FK actions (CASCADE / SET NULL / SET DEFAULT / RESTRICT), prepared statements with snapshot-tagged plan caching
 - **ACID** - Copy-on-Write B+ tree, shadow paging, no WAL. Snapshot isolation with concurrent readers
 - **P2P sync** - Merkle-based table diffing over Noise-encrypted channels with PSK auth
 - **CLI** - SQL shell with tab completion, syntax highlighting, dot-commands (.backup, .verify, .rekey, .sync, .dump, ...)
@@ -28,7 +28,7 @@ Every page is encrypted and authenticated before it hits disk. The database file
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. C FFI (37 functions), WebAssembly bindings
-- **4,000+ tests** - Unit, integration, torture tests across 11 crates
+- **4,300+ tests** - Unit, integration, torture tests across 11 crates
 
 ## Benchmarks
 
@@ -258,17 +258,23 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 ## SQL
 
-**Statements** - CREATE/DROP TABLE, ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE/DROP INDEX (incl. partial `WHERE`), CREATE/DROP VIEW, INSERT (VALUES, SELECT, ON CONFLICT DO NOTHING/DO UPDATE, ON CONSTRAINT), SELECT, UPDATE, DELETE, TRUNCATE TABLE, RETURNING (with `OLD`/`NEW`), BEGIN/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, SET TIME ZONE, EXPLAIN
+**Statements** - CREATE/DROP TABLE (incl. `TEMP`), ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE, DISABLE/ENABLE TRIGGER), CREATE/DROP INDEX (incl. partial `WHERE`, expression keys, `CONCURRENTLY`), CREATE/DROP VIEW, CREATE/DROP MATERIALIZED VIEW (with `REFRESH [CONCURRENTLY]`), CREATE/DROP TRIGGER (BEFORE/AFTER/INSTEAD OF, FOR EACH ROW/STATEMENT, `REFERENCING NEW/OLD TABLE`, `WHEN`, `UPDATE OF cols`), INSERT (VALUES, SELECT, ON CONFLICT DO NOTHING/DO UPDATE, ON CONSTRAINT), SELECT, UPDATE, DELETE, TRUNCATE TABLE, RETURNING (with `OLD`/`NEW`), BEGIN [READ ONLY | READ WRITE]/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, SET TIME ZONE, EXPLAIN, REFRESH MATERIALIZED VIEW
 
 **Constraints** - PRIMARY KEY, NOT NULL, UNIQUE, DEFAULT, CHECK (column + table level), FOREIGN KEY with full referential actions (`ON DELETE` / `ON UPDATE` `CASCADE` / `SET NULL` / `SET DEFAULT` / `RESTRICT` / `NO ACTION`), GENERATED ALWAYS AS (...) STORED|VIRTUAL
 
-**Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN, DATE, TIME, TIMESTAMP (WITH TIME ZONE), INTERVAL
+**Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN, DATE, TIME, TIMESTAMP (WITH TIME ZONE), INTERVAL, JSON, JSONB, TSVECTOR, TSQUERY, ARRAY
 
-**Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS), subqueries (scalar, IN, EXISTS, correlated), CTEs (`WITH` / `WITH RECURSIVE` / WITH-DML: `WITH x AS (INSERT/UPDATE/DELETE … [RETURNING *]) SELECT …`), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, GROUP BY/HAVING, ORDER BY, LIMIT/OFFSET
+**Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS, FULL OUTER, LATERAL), subqueries (scalar, IN, EXISTS, correlated), CTEs (`WITH` / `WITH RECURSIVE` / WITH-DML: `WITH x AS (INSERT/UPDATE/DELETE … [RETURNING *]) SELECT …`), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, `ANY` / `ALL` (subquery + array forms), GROUP BY/HAVING, ORDER BY, LIMIT/OFFSET
 
 **Window functions** - ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, SUM/COUNT/AVG/MIN/MAX OVER with PARTITION BY, ORDER BY, ROWS/RANGE frames
 
 **Views** - CREATE/DROP VIEW, OR REPLACE, IF NOT EXISTS/IF EXISTS, column aliases, nested views
+
+**Materialized views** - `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name AS SELECT …`, `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name` (diff-merge requires a UNIQUE index on the matview; CONCURRENTLY holds only a brief WriteTxn for the merge, not the long scan), `DROP MATERIALIZED VIEW [CASCADE]`, full backing-table semantics (indexes, joins, planner sees a real table), `pg_matviews` introspection
+
+**Triggers** - `CREATE TRIGGER name {BEFORE|AFTER|INSTEAD OF} {INSERT|UPDATE [OF cols]|DELETE} ON table FOR EACH {ROW|STATEMENT} [REFERENCING NEW TABLE AS new_t OLD TABLE AS old_t] [WHEN (expr)] BEGIN ... END`. INSTEAD OF triggers make views writable. Transition tables work as virtual tables in trigger bodies. `ALTER TABLE … DISABLE/ENABLE TRIGGER [name|ALL]`. PG-faithful name-order firing. Introspection via `information_schema.triggers` and `SHOW TRIGGERS [ON table]`.
+
+**TEMP tables** - `CREATE TEMP TABLE …` lives in a per-connection in-memory database, dropped on disconnect. Full DDL/DML/index/constraint/trigger parity with persistent tables.
 
 **Functions** - COUNT, SUM, AVG, MIN, MAX, LENGTH, UPPER, LOWER, SUBSTR/SUBSTRING, TRIM/LTRIM/RTRIM, REPLACE, INSTR, CONCAT, HEX, ABS, ROUND, CEIL/CEILING, FLOOR, SIGN, SQRT, RANDOM, COALESCE, NULLIF, CAST, TYPEOF, IIF
 
@@ -276,7 +282,7 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 **Full-text search** - `tsvector` / `tsquery` types, `to_tsvector` / `to_tsquery` / `plainto_tsquery` / `phraseto_tsquery` / `websearch_to_tsquery` builders, `@@` match operator, `ts_rank` / `ts_rank_cd` ranking with weighted positions (A/B/C/D), prefix matching (`term:*`), phrase distance (`<N>`), inverted indexes via `CREATE INDEX … USING fts` for ~400× speedup over sequential scan
 
-**System catalog** - `information_schema.tables`, `information_schema.columns`, `information_schema.key_column_usage`, `information_schema.table_constraints`, `pg_timezone_names`, `pg_timezone_abbrevs` (virtual tables, queryable)
+**System catalog** - `information_schema.tables`, `information_schema.columns`, `information_schema.key_column_usage`, `information_schema.table_constraints`, `information_schema.triggers`, `pg_timezone_names`, `pg_timezone_abbrevs`, `pg_matviews` (virtual tables, queryable). `SHOW TRIGGERS [ON table]` and `SHOW MATERIALIZED VIEWS` as MySQL-compatible conveniences.
 
 **Prepared statements** - `$1, $2, ...` positional parameters with LRU statement cache plus snapshot-tagged plan caching for joins and compound queries (cache invalidates only on commit, never per-call)
 

@@ -746,20 +746,27 @@ fn setweight_invalid_char_errors() {
 }
 
 #[test]
-fn setweight_three_arg_form_deferred() {
+fn setweight_three_arg_form_reweights_listed_lexemes_only() {
     let (_d, db) = conn();
     let conn = Connection::open(&db).unwrap();
-    let res = conn.prepare(
-        "SELECT setweight(to_tsvector('english', 'apple banana'), 'A', \
-            ARRAY['apple'])",
-    );
-    let err = match res {
-        Err(e) => e.to_string(),
-        Ok(p) => p.query_collect(&[]).unwrap_err().to_string(),
-    };
+    // PG semantic: filter lexemes must match the post-stemming form stored in the tsvector
+    // ('apple' stems to 'appl' under 'english').
+    let p = conn
+        .prepare(
+            "SELECT setweight(to_tsvector('english', 'apple banana'), 'A', \
+            ARRAY['appl'])",
+        )
+        .unwrap();
+    let result = p.query_collect(&[]).unwrap();
+    assert_eq!(result.rows.len(), 1);
+    let tsvector_text = format!("{}", result.rows[0][0]);
     assert!(
-        err.contains("Unsupported") || err.contains("ARRAY") || err.contains("3-arg"),
-        "expected deferred-feature error, got: {err}"
+        tsvector_text.contains("'appl':1A"),
+        "filter-listed lexeme should be reweighted to A, got: {tsvector_text}"
+    );
+    assert!(
+        !tsvector_text.contains("'banana':2A"),
+        "non-filter lexeme must keep its original weight, got: {tsvector_text}"
     );
 }
 

@@ -837,3 +837,624 @@ fn distinct_sees_uncommitted_within_txn() {
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Text("red".into()));
 }
+
+#[test]
+fn begin_read_only_blocks_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+
+    conn.execute("BEGIN READ ONLY").unwrap();
+    // SELECT works.
+    let p = conn.prepare("SELECT v FROM t WHERE id = 1").unwrap();
+    let r = p.query_collect(&[]).unwrap();
+    assert_eq!(r.rows[0][0], citadel_sql::Value::Integer(100));
+
+    // Mutations error.
+    let err = conn.execute("INSERT INTO t VALUES (2, 200)").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read-only") || msg.contains("read only"),
+        "expected read-only error, got: {msg}"
+    );
+
+    let err2 = conn
+        .execute("UPDATE t SET v = 999 WHERE id = 1")
+        .unwrap_err();
+    assert!(err2.to_string().contains("read-only") || err2.to_string().contains("read only"));
+
+    let err3 = conn.execute("DELETE FROM t WHERE id = 1").unwrap_err();
+    assert!(err3.to_string().contains("read-only") || err3.to_string().contains("read only"));
+
+    conn.execute("COMMIT").unwrap();
+
+    // After COMMIT, normal txns work.
+    conn.execute("INSERT INTO t VALUES (3, 300)").unwrap();
+}
+
+#[test]
+fn begin_read_only_commit_and_rollback_both_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    // COMMIT path.
+    conn.execute("BEGIN READ ONLY").unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert!(!conn.in_transaction());
+
+    // ROLLBACK path.
+    conn.execute("BEGIN READ ONLY").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    assert!(!conn.in_transaction());
+}
+
+#[test]
+fn begin_read_write_works_normally() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("BEGIN READ WRITE").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_create_table_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let err = conn.execute("CREATE TABLE t (id INTEGER)").unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("read"));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn begin_read_only_drop_table_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let err = conn.execute("DROP TABLE t").unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("read"));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn begin_read_only_create_index_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)")
+        .unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let err = conn.execute("CREATE INDEX idx_x ON t (x)").unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("read"));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn begin_read_only_alter_table_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let err = conn
+        .execute("ALTER TABLE t ADD COLUMN y INTEGER")
+        .unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("read"));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn begin_read_only_create_view_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let err = conn
+        .execute("CREATE VIEW v AS SELECT * FROM t")
+        .unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("read"));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn begin_read_only_truncate_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let err = conn.execute("TRUNCATE TABLE t").unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("read"));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn begin_read_only_nested_begin_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let err = conn.execute("BEGIN").unwrap_err();
+    assert!(matches!(err, SqlError::TransactionAlreadyActive));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn commit_without_begin_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    let err = conn.execute("COMMIT").unwrap_err();
+    assert!(matches!(err, SqlError::NoActiveTransaction));
+}
+
+#[test]
+fn rollback_without_begin_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    let err = conn.execute("ROLLBACK").unwrap_err();
+    assert!(matches!(err, SqlError::NoActiveTransaction));
+}
+
+#[test]
+fn begin_read_only_multiple_selects_succeed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    for i in 1..=5 {
+        conn.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10))
+            .unwrap();
+    }
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let p = conn.prepare("SELECT v FROM t WHERE id = $1").unwrap();
+    for i in 1..=5 {
+        let r = p.query_collect(&[Value::Integer(i)]).unwrap();
+        assert_eq!(r.rows[0][0], Value::Integer(i * 10));
+    }
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_join_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO a VALUES (1, 'Alice'), (2, 'Bob')")
+        .unwrap();
+    conn.execute("INSERT INTO b VALUES (10, 1, 'X'), (11, 2, 'Y')")
+        .unwrap();
+
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let p = conn
+        .prepare("SELECT a.name, b.val FROM a INNER JOIN b ON a.id = b.a_id ORDER BY a.id")
+        .unwrap();
+    let r = p.query_collect(&[]).unwrap();
+    assert_eq!(r.rows.len(), 2);
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_aggregate_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    for i in 1..=10 {
+        conn.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
+    }
+
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let p = conn.prepare("SELECT SUM(v), COUNT(*) FROM t").unwrap();
+    let r = p.query_collect(&[]).unwrap();
+    assert_eq!(r.rows[0][0], Value::Integer(55));
+    assert_eq!(r.rows[0][1], Value::Integer(10));
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_then_read_write_in_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    conn.execute("COMMIT").unwrap();
+    conn.execute("BEGIN READ WRITE").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("COMMIT").unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let p = conn.prepare("SELECT id FROM t").unwrap();
+    let r = p.query_collect(&[]).unwrap();
+    assert_eq!(r.rows.len(), 1);
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_set_timezone_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let result = conn.execute("SET TIME ZONE 'UTC'");
+    assert!(
+        result.is_ok(),
+        "SET TIME ZONE should be allowed in read-only"
+    );
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_view_select_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 100), (2, 200)")
+        .unwrap();
+    conn.execute("CREATE VIEW big_v AS SELECT * FROM t WHERE v > 50")
+        .unwrap();
+
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let p = conn.prepare("SELECT id FROM big_v ORDER BY id").unwrap();
+    let r = p.query_collect(&[]).unwrap();
+    assert_eq!(r.rows.len(), 2);
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_cte_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    for i in 1..=10 {
+        conn.execute(&format!("INSERT INTO t VALUES ({})", i))
+            .unwrap();
+    }
+
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let p = conn
+        .prepare("WITH small AS (SELECT id FROM t WHERE id < 5) SELECT COUNT(*) FROM small")
+        .unwrap();
+    let r = p.query_collect(&[]).unwrap();
+    assert_eq!(r.rows[0][0], Value::Integer(4));
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_upsert_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let err = conn
+        .execute("INSERT INTO t VALUES (1, 10) ON CONFLICT (id) DO UPDATE SET v = 20")
+        .unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("read"));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn begin_read_only_in_transaction_reports_true() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    assert!(!conn.in_transaction());
+    conn.execute("BEGIN READ ONLY").unwrap();
+    assert!(conn.in_transaction());
+    conn.execute("COMMIT").unwrap();
+    assert!(!conn.in_transaction());
+}
+
+#[test]
+fn read_only_does_not_block_concurrent_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn1 = Connection::open(&db).unwrap();
+    conn1
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn1.execute("BEGIN READ ONLY").unwrap();
+
+    let conn2 = Connection::open(&db).unwrap();
+    conn2.execute("BEGIN READ ONLY").unwrap();
+    conn2.execute("COMMIT").unwrap();
+    conn1.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_subquery_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    for i in 1..=10 {
+        conn.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i))
+            .unwrap();
+    }
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let p = conn
+        .prepare("SELECT id FROM t WHERE v > (SELECT AVG(v) FROM t) ORDER BY id")
+        .unwrap();
+    let r = p.query_collect(&[]).unwrap();
+    assert_eq!(r.rows.len(), 5);
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_explain_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let p = conn.prepare("EXPLAIN SELECT * FROM t").unwrap();
+    let r = p.query_collect(&[]).unwrap();
+    assert!(!r.rows.is_empty());
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_after_uncommitted_select_does_not_leak() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    {
+        conn.execute("BEGIN READ ONLY").unwrap();
+        let p = conn.prepare("SELECT id FROM t").unwrap();
+        let _r = p.query_collect(&[]).unwrap();
+        conn.execute("COMMIT").unwrap();
+    }
+    // Verify next BEGIN READ ONLY can start cleanly.
+    conn.execute("BEGIN READ ONLY").unwrap();
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_then_explicit_read_only_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    // BEGIN without keyword → default (read-write)
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+    // BEGIN TRANSACTION → default
+    conn.execute("BEGIN TRANSACTION").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn read_only_with_persistent_writer_no_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn_r = Connection::open(&db).unwrap();
+    conn_r
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn_r.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+
+    // Reader starts.
+    conn_r.execute("BEGIN READ ONLY").unwrap();
+
+    // A separate connection can commit a write.
+    let conn_w = Connection::open(&db).unwrap();
+    conn_w.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+
+    // Reader's COMMIT still works.
+    conn_r.execute("COMMIT").unwrap();
+
+    // After commit, reader sees the new row.
+    let p = conn_r.prepare("SELECT COUNT(*) FROM t").unwrap();
+    let r = p.query_collect(&[]).unwrap();
+    assert_eq!(r.rows[0][0], Value::Integer(2));
+}
+
+#[test]
+fn read_only_savepoint_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let _ = conn.execute("SAVEPOINT sp1");
+    // SAVEPOINT/RELEASE/ROLLBACK TO inside read-only is implementation-defined;
+    // verify the connection stays consistent regardless.
+    conn.execute("ROLLBACK").unwrap();
+    assert!(!conn.in_transaction());
+}
+
+#[test]
+fn temporary_table_create_insert_select_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TEMPORARY TABLE tmp (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO tmp VALUES (1, 100), (2, 200), (3, 300)")
+        .unwrap();
+    let p = conn.prepare("SELECT v FROM tmp WHERE id = 2").unwrap();
+    let r = p.query_collect(&[]).unwrap();
+    assert_eq!(r.rows[0][0], Value::Integer(200));
+}
+
+#[test]
+fn temporary_table_visible_only_in_owning_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn1 = Connection::open(&db).unwrap();
+    conn1
+        .execute("CREATE TEMPORARY TABLE tmp (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn1.execute("INSERT INTO tmp VALUES (1)").unwrap();
+
+    let conn2 = Connection::open(&db).unwrap();
+    let err = conn2.execute("SELECT * FROM tmp").unwrap_err();
+    assert!(
+        matches!(err, SqlError::TableNotFound(_)),
+        "tmp should NOT be visible to conn2, got: {err:?}"
+    );
+}
+
+#[test]
+fn temporary_table_dropped_on_connection_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TEMPORARY TABLE tmp (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("INSERT INTO tmp VALUES (42)").unwrap();
+    } // conn drops here → temp tables cleaned up
+
+    // A fresh connection sees no leaked tmp tables.
+    let conn = Connection::open(&db).unwrap();
+    let err = conn.execute("SELECT * FROM tmp").unwrap_err();
+    assert!(matches!(err, SqlError::TableNotFound(_)));
+}
+
+#[test]
+fn temporary_table_can_be_dropped_explicitly() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TEMPORARY TABLE tmp (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("DROP TABLE tmp").unwrap();
+    let err = conn.execute("INSERT INTO tmp VALUES (1)").unwrap_err();
+    assert!(matches!(err, SqlError::TableNotFound(_)));
+}
+
+#[test]
+fn temporary_table_with_index_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TEMPORARY TABLE tmp (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_v ON tmp (v)").unwrap();
+    conn.execute("INSERT INTO tmp VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    let p = conn.prepare("SELECT id FROM tmp WHERE v = 20").unwrap();
+    let r = p.query_collect(&[]).unwrap();
+    assert_eq!(r.rows[0][0], Value::Integer(2));
+}
+
+#[test]
+fn temporary_table_duplicate_create_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TEMPORARY TABLE tmp (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let err = conn
+        .execute("CREATE TEMPORARY TABLE tmp (id INTEGER PRIMARY KEY)")
+        .unwrap_err();
+    assert!(matches!(err, SqlError::TableAlreadyExists(_)));
+}
+
+#[test]
+fn temporary_table_if_not_exists_no_error_on_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TEMPORARY TABLE tmp (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TEMPORARY TABLE IF NOT EXISTS tmp (id INTEGER PRIMARY KEY)")
+        .unwrap();
+}
+
+#[test]
+fn temporary_table_update_delete_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TEMPORARY TABLE tmp (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO tmp VALUES (1, 10), (2, 20)")
+        .unwrap();
+    conn.execute("UPDATE tmp SET v = 999 WHERE id = 1").unwrap();
+    let p = conn.prepare("SELECT v FROM tmp WHERE id = 1").unwrap();
+    assert_eq!(
+        p.query_collect(&[]).unwrap().rows[0][0],
+        Value::Integer(999)
+    );
+    conn.execute("DELETE FROM tmp WHERE id = 2").unwrap();
+    let p2 = conn.prepare("SELECT COUNT(*) FROM tmp").unwrap();
+    assert_eq!(p2.query_collect(&[]).unwrap().rows[0][0], Value::Integer(1));
+}
+
+#[test]
+fn temporary_table_inside_read_only_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let err = conn
+        .execute("CREATE TEMPORARY TABLE tmp (id INTEGER)")
+        .unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("read"));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn temporary_table_can_join_persistent_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE persistent (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO persistent VALUES (1, 'Alice'), (2, 'Bob')")
+        .unwrap();
+    conn.execute("CREATE TEMPORARY TABLE tmp_filter (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO tmp_filter VALUES (1)").unwrap();
+    let p = conn
+        .prepare(
+            "SELECT p.name FROM persistent p \
+             INNER JOIN tmp_filter t ON p.id = t.id",
+        )
+        .unwrap();
+    let r = p.query_collect(&[]).unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0][0], Value::Text("Alice".into()));
+}

@@ -579,13 +579,45 @@ fn parse_alias() {
 #[test]
 fn parse_begin() {
     let stmt = parse_sql("BEGIN").unwrap();
-    assert!(matches!(stmt, Statement::Begin));
+    assert!(matches!(
+        stmt,
+        Statement::Begin {
+            access_mode: BeginAccessMode::Default
+        }
+    ));
 }
 
 #[test]
 fn parse_begin_transaction() {
     let stmt = parse_sql("BEGIN TRANSACTION").unwrap();
-    assert!(matches!(stmt, Statement::Begin));
+    assert!(matches!(
+        stmt,
+        Statement::Begin {
+            access_mode: BeginAccessMode::Default
+        }
+    ));
+}
+
+#[test]
+fn parse_begin_read_only() {
+    let stmt = parse_sql("BEGIN READ ONLY").unwrap();
+    assert!(matches!(
+        stmt,
+        Statement::Begin {
+            access_mode: BeginAccessMode::ReadOnly
+        }
+    ));
+}
+
+#[test]
+fn parse_begin_read_write() {
+    let stmt = parse_sql("BEGIN READ WRITE").unwrap();
+    assert!(matches!(
+        stmt,
+        Statement::Begin {
+            access_mode: BeginAccessMode::ReadWrite
+        }
+    ));
 }
 
 #[test]

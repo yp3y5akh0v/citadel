@@ -117,7 +117,6 @@ pub(super) fn handle_correlated_select_read(
     })
 }
 
-/// Resolve a table or view name to its schema.
 pub(super) fn resolve_inner_schema(
     db: &Database,
     schema: &SchemaManager,
@@ -167,13 +166,11 @@ impl<'a> CorrelationCtx<'a> {
     }
 }
 
-/// Check if a column name resolves in the given schema.
 pub(super) fn resolves_in(name: &str, schema: &TableSchema) -> bool {
     let lower = name.to_ascii_lowercase();
     schema.columns.iter().any(|c| c.name == lower)
 }
 
-/// Collect column names referenced in an expression.
 pub(super) fn collect_column_names(expr: &Expr, out: &mut Vec<String>) {
     match expr {
         Expr::Column(name) => out.push(name.to_ascii_lowercase()),
@@ -343,7 +340,6 @@ pub(super) fn extract_correlation_predicates(
     (corr_pairs, remaining_expr)
 }
 
-/// Flatten AND-connected expressions into a list.
 pub(super) fn flatten_and_exprs(expr: &Expr) -> Vec<&Expr> {
     match expr {
         Expr::BinaryOp {
@@ -410,8 +406,8 @@ pub(super) fn try_match_corr_pair(
     let inner_col = match maybe_inner {
         Expr::QualifiedColumn { table, column } => {
             let t = table.to_ascii_lowercase();
-            let inner_name = &inner_schema.name;
-            if t == *inner_name || inner_alias.is_some_and(|a| a.eq_ignore_ascii_case(&t)) {
+            let inner_name = inner_schema.name.to_ascii_lowercase();
+            if t == inner_name || inner_alias.is_some_and(|a| a.eq_ignore_ascii_case(&t)) {
                 column.to_ascii_lowercase()
             } else {
                 return None;

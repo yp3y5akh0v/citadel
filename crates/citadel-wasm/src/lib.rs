@@ -198,6 +198,7 @@ pub enum CellValue {
     Jsonb(Vec<u8>),
     TsVector(Vec<u8>),
     TsQuery(Vec<u8>),
+    Array(Vec<CellValue>),
 }
 
 impl CellValue {
@@ -235,6 +236,7 @@ impl CellValue {
             Value::Jsonb(b) => CellValue::Jsonb(b.to_vec()),
             Value::TsVector(b) => CellValue::TsVector(b.to_vec()),
             Value::TsQuery(b) => CellValue::TsQuery(b.to_vec()),
+            Value::Array(a) => CellValue::Array(a.iter().map(CellValue::from_value).collect()),
         }
     }
 }

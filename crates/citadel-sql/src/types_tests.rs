@@ -107,24 +107,24 @@ fn schema_roundtrip_with_indices() {
         ],
         vec![0],
         vec![
-            IndexDef {
-                name: "idx_customer".into(),
-                columns: vec![1],
-                unique: false,
-                predicate_sql: None,
-                predicate_expr: None,
-                collations: vec![],
-                kind: IndexKind::default(),
-            },
-            IndexDef {
-                name: "idx_amount_uniq".into(),
-                columns: vec![2],
-                unique: true,
-                predicate_sql: None,
-                predicate_expr: None,
-                collations: vec![],
-                kind: IndexKind::default(),
-            },
+            IndexDef::from_column_lists(
+                "idx_customer".into(),
+                vec![1],
+                vec![],
+                false,
+                None,
+                None,
+                IndexKind::default(),
+            ),
+            IndexDef::from_column_lists(
+                "idx_amount_uniq".into(),
+                vec![2],
+                vec![],
+                true,
+                None,
+                None,
+                IndexKind::default(),
+            ),
         ],
         vec![],
         vec![],
@@ -135,10 +135,10 @@ fn schema_roundtrip_with_indices() {
 
     assert_eq!(restored.indices.len(), 2);
     assert_eq!(restored.indices[0].name, "idx_customer");
-    assert_eq!(restored.indices[0].columns, vec![1]);
+    assert_eq!(restored.indices[0].columns_vec(), vec![1]);
     assert!(!restored.indices[0].unique);
     assert_eq!(restored.indices[1].name, "idx_amount_uniq");
-    assert_eq!(restored.indices[1].columns, vec![2]);
+    assert_eq!(restored.indices[1].columns_vec(), vec![2]);
     assert!(restored.indices[1].unique);
 }
 
@@ -275,4 +275,110 @@ fn data_type_display() {
     assert_eq!(format!("{}", DataType::Integer), "INTEGER");
     assert_eq!(format!("{}", DataType::Text), "TEXT");
     assert_eq!(format!("{}", DataType::Boolean), "BOOLEAN");
+}
+
+fn sample_trigger(name: &str, target: &str) -> TriggerDef {
+    TriggerDef {
+        name: name.into(),
+        timing: crate::parser::TriggerTiming::After,
+        events: vec![crate::parser::TriggerEvent::Insert],
+        target: target.into(),
+        granularity: crate::parser::TriggerGranularity::ForEachRow,
+        referencing: None,
+        when_sql: None,
+        body_sql: "BEGIN INSERT INTO audit VALUES (1); END".into(),
+        enabled: true,
+        created_at_micros: 1234567,
+    }
+}
+
+#[test]
+fn trigger_def_roundtrip_simple() {
+    use crate::parser::{TriggerGranularity, TriggerTiming};
+    let td = sample_trigger("t1", "users");
+    let bytes = td.serialize();
+    let back = TriggerDef::deserialize(&bytes).unwrap();
+    assert_eq!(back.name, "t1");
+    assert_eq!(back.target, "users");
+    assert!(matches!(back.timing, TriggerTiming::After));
+    assert!(matches!(back.granularity, TriggerGranularity::ForEachRow));
+    assert!(back.enabled);
+    assert!(back.referencing.is_none());
+    assert!(back.when_sql.is_none());
+    assert_eq!(back.body_sql, td.body_sql);
+}
+
+#[test]
+fn trigger_def_roundtrip_all_timings() {
+    use crate::parser::TriggerTiming;
+    for timing in [
+        TriggerTiming::Before,
+        TriggerTiming::After,
+        TriggerTiming::InsteadOf,
+    ] {
+        let mut td = sample_trigger("t", "x");
+        td.timing = timing;
+        let back = TriggerDef::deserialize(&td.serialize()).unwrap();
+        assert!(matches!(back.timing, t if t == timing));
+    }
+}
+
+#[test]
+fn trigger_def_roundtrip_update_with_columns() {
+    use crate::parser::TriggerEvent;
+    let mut td = sample_trigger("t", "x");
+    td.events = vec![TriggerEvent::Update(vec!["email".into(), "name".into()])];
+    let back = TriggerDef::deserialize(&td.serialize()).unwrap();
+    match &back.events[0] {
+        TriggerEvent::Update(cols) => {
+            assert_eq!(cols.len(), 2);
+            assert_eq!(cols[0], "email");
+            assert_eq!(cols[1], "name");
+        }
+        other => panic!("expected Update, got {other:?}"),
+    }
+}
+
+#[test]
+fn trigger_def_roundtrip_multiple_events() {
+    use crate::parser::TriggerEvent;
+    let mut td = sample_trigger("t", "x");
+    td.events = vec![
+        TriggerEvent::Insert,
+        TriggerEvent::Update(vec![]),
+        TriggerEvent::Delete,
+    ];
+    let back = TriggerDef::deserialize(&td.serialize()).unwrap();
+    assert_eq!(back.events.len(), 3);
+    assert!(matches!(back.events[0], TriggerEvent::Insert));
+    assert!(matches!(back.events[2], TriggerEvent::Delete));
+}
+
+#[test]
+fn trigger_def_roundtrip_with_referencing_and_when() {
+    use crate::parser::{TransitionTables, TriggerGranularity};
+    let mut td = sample_trigger("t", "x");
+    td.granularity = TriggerGranularity::ForEachStatement;
+    td.referencing = Some(TransitionTables {
+        new_table_alias: Some("new_t".into()),
+        old_table_alias: Some("old_t".into()),
+    });
+    td.when_sql = Some("NEW.age > 18".into());
+    let back = TriggerDef::deserialize(&td.serialize()).unwrap();
+    assert!(matches!(
+        back.granularity,
+        TriggerGranularity::ForEachStatement
+    ));
+    let r = back.referencing.as_ref().unwrap();
+    assert_eq!(r.new_table_alias.as_deref(), Some("new_t"));
+    assert_eq!(r.old_table_alias.as_deref(), Some("old_t"));
+    assert_eq!(back.when_sql.as_deref(), Some("NEW.age > 18"));
+}
+
+#[test]
+fn trigger_def_roundtrip_disabled() {
+    let mut td = sample_trigger("t", "x");
+    td.enabled = false;
+    let back = TriggerDef::deserialize(&td.serialize()).unwrap();
+    assert!(!back.enabled);
 }

@@ -180,6 +180,8 @@ pub(super) fn exec_select(
     let table_schema = schema
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
+    // Storage operations below must use the resolved name (post-TEMP-alias).
+    let lower_name = table_schema.name.clone();
 
     // Correlated subquery handling: decorrelate before materialization
     let corr_ctx = CorrelationCtx {

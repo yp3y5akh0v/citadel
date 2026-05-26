@@ -59,7 +59,6 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
         })
     }
 
-    /// The original SQL text.
     pub fn sql(&self) -> &str {
         &self.sql
     }
@@ -256,12 +255,10 @@ impl<'a> Rows<'a> {
         }
     }
 
-    /// Number of output columns.
     pub fn column_count(&self) -> usize {
         self.columns.len()
     }
 
-    /// Output column names.
     pub fn column_names(&self) -> &[String] {
         &self.columns
     }
@@ -299,7 +296,6 @@ impl<'a> Row<'a> {
             .and_then(|i| self.values.get(i))
     }
 
-    /// Number of columns in this row.
     pub fn column_count(&self) -> usize {
         self.values.len()
     }
@@ -309,12 +305,10 @@ impl<'a> Row<'a> {
         self.columns.get(i).map(|s| s.as_str())
     }
 
-    /// Borrow the raw values slice.
     pub fn as_slice(&self) -> &[Value] {
         self.values
     }
 
-    /// Clone into an owned `Vec<Value>`.
     pub fn to_vec(&self) -> Vec<Value> {
         self.values.to_vec()
     }

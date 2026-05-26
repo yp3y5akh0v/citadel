@@ -217,5 +217,12 @@ fn cell_to_js(cell: &CellValue) -> JsValue {
         CellValue::TsVector(b) | CellValue::TsQuery(b) => {
             js_sys::Uint8Array::from(b.as_slice()).into()
         }
+        CellValue::Array(elems) => {
+            let arr = Array::new();
+            for elem in elems {
+                arr.push(&cell_to_js(elem));
+            }
+            arr.into()
+        }
     }
 }

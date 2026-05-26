@@ -10,7 +10,7 @@ use crate::overflow_io;
 /// Lending iterator over `(key, value)` byte pairs for a table scan.
 ///
 /// Created by [`crate::ReadTxn::table_scan_iter`] or [`crate::WriteTxn::table_scan_iter`].
-/// The adapter `T` carries whatever txn borrow or ownership is required.
+/// The adapter `T` carries the txn borrow or ownership.
 pub struct TableIter<T: TxnScanAdapter> {
     inner: T,
     cursor: Cursor,

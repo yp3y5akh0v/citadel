@@ -1566,6 +1566,90 @@ pub fn fn_setweight(tsv: &[u8], weight: Weight) -> Result<crate::types::Value> {
     Ok(crate::types::Value::TsVector(b.build()))
 }
 
+/// Apply `weight` only to lexemes appearing in `filter`; leave others unchanged.
+pub fn fn_setweight_selective(
+    tsv: &[u8],
+    weight: Weight,
+    filter: &[crate::types::Value],
+) -> Result<crate::types::Value> {
+    let mut filter_set: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    for v in filter {
+        match v {
+            crate::types::Value::Text(s) => {
+                filter_set.insert(s.as_bytes().to_vec());
+            }
+            crate::types::Value::Null => continue,
+            other => {
+                return Err(crate::error::SqlError::TypeMismatch {
+                    expected: "TEXT[]".into(),
+                    got: other.data_type().to_string(),
+                });
+            }
+        }
+    }
+    let (_flags, reader) = TsVectorReader::open(tsv)?;
+    let mut b = TsVectorBuilder::new();
+    for item in reader {
+        let (lex, positions) = item?;
+        let should_reweight = filter_set.contains(lex);
+        if positions.is_empty() {
+            b.push_no_position(lex);
+            continue;
+        }
+        for packed in positions {
+            let pos = packed & MAX_POSITION;
+            if should_reweight {
+                b.push(lex, pos, weight);
+            } else {
+                let (_p, w) = unpack_position(packed);
+                b.push(lex, pos, w);
+            }
+        }
+    }
+    Ok(crate::types::Value::TsVector(b.build()))
+}
+
+/// Strip positions and weights from a TSVECTOR, keeping only the distinct lexeme set.
+pub fn fn_strip(tsv: &[u8]) -> Result<crate::types::Value> {
+    let (_flags, reader) = TsVectorReader::open(tsv)?;
+    let mut b = TsVectorBuilder::new();
+    for item in reader {
+        let (lex, _positions) = item?;
+        b.push_no_position(lex);
+    }
+    Ok(crate::types::Value::TsVector(b.build()))
+}
+
+/// `tsvector || tsvector`: union the lexeme sets, merging positions per lexeme.
+pub fn op_concat(a: &[u8], b: &[u8]) -> Result<crate::types::Value> {
+    let (_, reader_a) = TsVectorReader::open(a)?;
+    let (_, reader_b) = TsVectorReader::open(b)?;
+    let mut builder = TsVectorBuilder::new();
+    for item in reader_a {
+        let (lex, positions) = item?;
+        if positions.is_empty() {
+            builder.push_no_position(lex);
+            continue;
+        }
+        for packed in positions {
+            let (pos, w) = unpack_position(packed);
+            builder.push(lex, pos, w);
+        }
+    }
+    for item in reader_b {
+        let (lex, positions) = item?;
+        if positions.is_empty() {
+            builder.push_no_position(lex);
+            continue;
+        }
+        for packed in positions {
+            let (pos, w) = unpack_position(packed);
+            builder.push(lex, pos, w);
+        }
+    }
+    Ok(crate::types::Value::TsVector(builder.build()))
+}
+
 #[cfg(test)]
 #[path = "fts_tests.rs"]
 mod tests;

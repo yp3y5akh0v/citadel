@@ -7,7 +7,6 @@ pub use compact_str::CompactString;
 
 use crate::parser::Expr;
 
-/// SQL data types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     Null,
@@ -24,6 +23,7 @@ pub enum DataType {
     Jsonb,
     TsVector,
     TsQuery,
+    Array,
 }
 
 impl DataType {
@@ -43,6 +43,7 @@ impl DataType {
             DataType::Jsonb => 11,
             DataType::TsVector => 12,
             DataType::TsQuery => 13,
+            DataType::Array => 14,
         }
     }
 
@@ -62,6 +63,7 @@ impl DataType {
             11 => Some(DataType::Jsonb),
             12 => Some(DataType::TsVector),
             13 => Some(DataType::TsQuery),
+            14 => Some(DataType::Array),
             _ => None,
         }
     }
@@ -84,6 +86,7 @@ impl fmt::Display for DataType {
             DataType::Jsonb => write!(f, "JSONB"),
             DataType::TsVector => write!(f, "TSVECTOR"),
             DataType::TsQuery => write!(f, "TSQUERY"),
+            DataType::Array => write!(f, "ARRAY"),
         }
     }
 }
@@ -111,6 +114,7 @@ pub enum Value {
     Jsonb(Arc<[u8]>),
     TsVector(Arc<[u8]>),
     TsQuery(Arc<[u8]>),
+    Array(Arc<Vec<Value>>),
 }
 
 impl Value {
@@ -130,6 +134,7 @@ impl Value {
             Value::Jsonb(_) => DataType::Jsonb,
             Value::TsVector(_) => DataType::TsVector,
             Value::TsQuery(_) => DataType::TsQuery,
+            Value::Array(_) => DataType::Array,
         }
     }
 
@@ -137,7 +142,6 @@ impl Value {
         matches!(self, Value::Null)
     }
 
-    /// Returns true for `±infinity` sentinel values on DATE / TIMESTAMP; false otherwise.
     pub fn is_finite_temporal(&self) -> bool {
         match self {
             Value::Date(d) => *d != i32::MAX && *d != i32::MIN,
@@ -146,7 +150,6 @@ impl Value {
         }
     }
 
-    /// Attempt to coerce this value to the target type.
     pub fn coerce_to(&self, target: DataType) -> Option<Value> {
         match (self, target) {
             (_, DataType::Null) => Some(Value::Null),
@@ -165,6 +168,7 @@ impl Value {
             (Value::Timestamp(t), DataType::Timestamp) => Some(Value::Timestamp(*t)),
             (Value::TsVector(b), DataType::TsVector) => Some(Value::TsVector(b.clone())),
             (Value::TsQuery(b), DataType::TsQuery) => Some(Value::TsQuery(b.clone())),
+            (Value::Array(a), DataType::Array) => Some(Value::Array(a.clone())),
             (
                 Value::Interval {
                     months,
@@ -402,6 +406,7 @@ impl PartialEq for Value {
             (Value::Jsonb(a), Value::Jsonb(b)) => a == b,
             (Value::TsVector(a), Value::TsVector(b)) => a == b,
             (Value::TsQuery(a), Value::TsQuery(b)) => a == b,
+            (Value::Array(a), Value::Array(b)) => a == b,
             _ => false,
         }
     }
@@ -472,6 +477,10 @@ impl Hash for Value {
             Value::TsQuery(b) => {
                 12u8.hash(state);
                 b.hash(state);
+            }
+            Value::Array(a) => {
+                13u8.hash(state);
+                a.hash(state);
             }
         }
     }
@@ -545,6 +554,10 @@ impl Ord for Value {
             (Value::TsQuery(_), _) => Ordering::Less,
             (_, Value::TsQuery(_)) => Ordering::Greater,
 
+            (Value::Array(a), Value::Array(b)) => a.as_ref().cmp(b.as_ref()),
+            (Value::Array(_), _) => Ordering::Less,
+            (_, Value::Array(_)) => Ordering::Greater,
+
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
             (Value::Text(_), _) => Ordering::Less,
             (_, Value::Text(_)) => Ordering::Greater,
@@ -590,6 +603,22 @@ impl fmt::Display for Value {
             },
             Value::TsVector(b) => write!(f, "{}", crate::fts::tsvector_display(b)),
             Value::TsQuery(b) => write!(f, "{}", crate::fts::tsquery_display(b)),
+            Value::Array(a) => {
+                write!(f, "{{")?;
+                for (i, elem) in a.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
+                    match elem {
+                        Value::Null => write!(f, "NULL")?,
+                        Value::Text(s) => {
+                            write!(f, "\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))?
+                        }
+                        other => write!(f, "{other}")?,
+                    }
+                }
+                write!(f, "}}")
+            }
         }
     }
 }
@@ -654,7 +683,6 @@ impl Collation {
     }
 }
 
-/// Column definition.
 #[derive(Debug, Clone)]
 pub struct ColumnDef {
     pub name: String,
@@ -712,19 +740,108 @@ pub enum IndexKind {
     Inverted(InvertedKind),
 }
 
-/// Index definition stored as part of the table schema.
+/// `IndexKey::Column` for `CREATE INDEX ON t (email)`, `IndexKey::Expr` for `LOWER(email)`.
 #[derive(Debug, Clone)]
 pub struct IndexDef {
     pub name: String,
-    pub columns: Vec<u16>,
+    pub keys: Vec<IndexKey>,
     pub unique: bool,
     pub predicate_sql: Option<String>,
     pub predicate_expr: Option<crate::parser::Expr>,
-    pub collations: Vec<Collation>,
     pub kind: IndexKind,
 }
 
-/// View definition stored in the _views metadata table.
+#[derive(Debug, Clone)]
+pub enum IndexKey {
+    Column {
+        idx: u16,
+        collate: Collation,
+    },
+    Expr {
+        expr: crate::parser::Expr,
+        original_sql: String,
+    },
+}
+
+impl IndexDef {
+    /// Used by FK/UNIQUE auto-indexes; expression-key indexes go through a different path.
+    pub fn from_column_lists(
+        name: String,
+        columns: Vec<u16>,
+        collations: Vec<Collation>,
+        unique: bool,
+        predicate_sql: Option<String>,
+        predicate_expr: Option<crate::parser::Expr>,
+        kind: IndexKind,
+    ) -> Self {
+        let keys = if collations.is_empty() {
+            columns
+                .into_iter()
+                .map(|idx| IndexKey::Column {
+                    idx,
+                    collate: Collation::Binary,
+                })
+                .collect()
+        } else {
+            columns
+                .into_iter()
+                .zip(collations)
+                .map(|(idx, collate)| IndexKey::Column { idx, collate })
+                .collect()
+        };
+        Self {
+            name,
+            keys,
+            unique,
+            predicate_sql,
+            predicate_expr,
+            kind,
+        }
+    }
+
+    /// Expression keys are skipped (positions only come from `IndexKey::Column`).
+    pub fn columns_vec(&self) -> Vec<u16> {
+        self.keys
+            .iter()
+            .filter_map(|k| match k {
+                IndexKey::Column { idx, .. } => Some(*idx),
+                IndexKey::Expr { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Expression keys default to Binary.
+    pub fn collations_vec(&self) -> Vec<Collation> {
+        self.keys
+            .iter()
+            .map(|k| match k {
+                IndexKey::Column { collate, .. } => *collate,
+                IndexKey::Expr { .. } => Collation::Binary,
+            })
+            .collect()
+    }
+
+    pub fn column_positions_iter(&self) -> impl Iterator<Item = u16> + '_ {
+        self.keys.iter().filter_map(|k| match k {
+            IndexKey::Column { idx, .. } => Some(*idx),
+            IndexKey::Expr { .. } => None,
+        })
+    }
+
+    pub fn collation_at(&self, i: usize) -> Collation {
+        match self.keys.get(i) {
+            Some(IndexKey::Column { collate, .. }) => *collate,
+            _ => Collation::Binary,
+        }
+    }
+
+    pub fn is_pure_column_index(&self) -> bool {
+        self.keys
+            .iter()
+            .all(|k| matches!(k, IndexKey::Column { .. }))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ViewDef {
     pub name: String,
@@ -795,7 +912,277 @@ impl ViewDef {
     }
 }
 
-/// Table-level CHECK constraint stored in schema.
+/// Backing table shares the matview's name and is repopulated on REFRESH.
+#[derive(Debug, Clone)]
+pub struct MatviewDef {
+    pub name: String,
+    pub select_sql: String,
+    pub backing_table: String,
+    pub with_data: bool,
+    pub created_at_micros: i64,
+}
+
+const MATVIEW_DEF_VERSION: u8 = 1;
+
+impl MatviewDef {
+    pub fn backing_table_name(name: &str) -> String {
+        name.to_ascii_lowercase()
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(MATVIEW_DEF_VERSION);
+        write_short_str(&mut buf, &self.name);
+        write_long_str(&mut buf, &self.select_sql);
+        write_short_str(&mut buf, &self.backing_table);
+        buf.push(if self.with_data { 1 } else { 0 });
+        buf.extend_from_slice(&self.created_at_micros.to_le_bytes());
+        buf
+    }
+
+    pub fn deserialize(data: &[u8]) -> crate::error::Result<Self> {
+        if data.is_empty() || data[0] != MATVIEW_DEF_VERSION {
+            return Err(crate::error::SqlError::InvalidValue(
+                "invalid matview definition version".into(),
+            ));
+        }
+        let mut pos = 1usize;
+        let name = read_short_str(data, &mut pos);
+        let select_sql = read_long_str(data, &mut pos);
+        let backing_table = read_short_str(data, &mut pos);
+        let with_data = data[pos] != 0;
+        pos += 1;
+        let created_at_micros = i64::from_le_bytes([
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
+        ]);
+        Ok(Self {
+            name,
+            select_sql,
+            backing_table,
+            with_data,
+            created_at_micros,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TriggerDef {
+    pub name: String,
+    pub timing: crate::parser::TriggerTiming,
+    pub events: Vec<crate::parser::TriggerEvent>,
+    pub target: String,
+    pub granularity: crate::parser::TriggerGranularity,
+    pub referencing: Option<crate::parser::TransitionTables>,
+    pub when_sql: Option<String>,
+    pub body_sql: String,
+    pub enabled: bool,
+    pub created_at_micros: i64,
+}
+
+const TRIGGER_DEF_VERSION: u8 = 1;
+
+impl TriggerDef {
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(TRIGGER_DEF_VERSION);
+
+        write_short_str(&mut buf, &self.name);
+        buf.push(match self.timing {
+            crate::parser::TriggerTiming::Before => 0,
+            crate::parser::TriggerTiming::After => 1,
+            crate::parser::TriggerTiming::InsteadOf => 2,
+        });
+
+        buf.extend_from_slice(&(self.events.len() as u16).to_le_bytes());
+        for ev in &self.events {
+            match ev {
+                crate::parser::TriggerEvent::Insert => buf.push(0),
+                crate::parser::TriggerEvent::Delete => buf.push(1),
+                crate::parser::TriggerEvent::Update(cols) => {
+                    buf.push(2);
+                    buf.extend_from_slice(&(cols.len() as u16).to_le_bytes());
+                    for c in cols {
+                        write_short_str(&mut buf, c);
+                    }
+                }
+            }
+        }
+
+        write_short_str(&mut buf, &self.target);
+        buf.push(match self.granularity {
+            crate::parser::TriggerGranularity::ForEachRow => 0,
+            crate::parser::TriggerGranularity::ForEachStatement => 1,
+        });
+
+        match &self.referencing {
+            None => buf.push(0),
+            Some(r) => {
+                buf.push(1);
+                write_opt_string(&mut buf, &r.new_table_alias);
+                write_opt_string(&mut buf, &r.old_table_alias);
+            }
+        }
+
+        match &self.when_sql {
+            None => buf.push(0),
+            Some(s) => {
+                buf.push(1);
+                write_long_str(&mut buf, s);
+            }
+        }
+
+        write_long_str(&mut buf, &self.body_sql);
+        buf.push(if self.enabled { 1 } else { 0 });
+        buf.extend_from_slice(&self.created_at_micros.to_le_bytes());
+
+        buf
+    }
+
+    pub fn deserialize(data: &[u8]) -> crate::error::Result<Self> {
+        if data.is_empty() || data[0] != TRIGGER_DEF_VERSION {
+            return Err(crate::error::SqlError::InvalidValue(
+                "invalid trigger definition version".into(),
+            ));
+        }
+        let mut pos = 1;
+        let name = read_short_str(data, &mut pos);
+        let timing = match data[pos] {
+            0 => crate::parser::TriggerTiming::Before,
+            1 => crate::parser::TriggerTiming::After,
+            2 => crate::parser::TriggerTiming::InsteadOf,
+            _ => {
+                return Err(crate::error::SqlError::InvalidValue(
+                    "invalid trigger timing tag".into(),
+                ))
+            }
+        };
+        pos += 1;
+
+        let event_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        let mut events = Vec::with_capacity(event_count);
+        for _ in 0..event_count {
+            let tag = data[pos];
+            pos += 1;
+            let ev = match tag {
+                0 => crate::parser::TriggerEvent::Insert,
+                1 => crate::parser::TriggerEvent::Delete,
+                2 => {
+                    let cnt = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                    pos += 2;
+                    let mut cols = Vec::with_capacity(cnt);
+                    for _ in 0..cnt {
+                        cols.push(read_short_str(data, &mut pos));
+                    }
+                    crate::parser::TriggerEvent::Update(cols)
+                }
+                _ => {
+                    return Err(crate::error::SqlError::InvalidValue(
+                        "invalid trigger event tag".into(),
+                    ))
+                }
+            };
+            events.push(ev);
+        }
+
+        let target = read_short_str(data, &mut pos);
+        let granularity = match data[pos] {
+            0 => crate::parser::TriggerGranularity::ForEachRow,
+            1 => crate::parser::TriggerGranularity::ForEachStatement,
+            _ => {
+                return Err(crate::error::SqlError::InvalidValue(
+                    "invalid trigger granularity tag".into(),
+                ))
+            }
+        };
+        pos += 1;
+
+        let referencing = if data[pos] == 0 {
+            pos += 1;
+            None
+        } else {
+            pos += 1;
+            let new_table_alias = read_opt_string(data, &mut pos);
+            let old_table_alias = read_opt_string(data, &mut pos);
+            Some(crate::parser::TransitionTables {
+                new_table_alias,
+                old_table_alias,
+            })
+        };
+
+        let when_sql = if data[pos] == 0 {
+            pos += 1;
+            None
+        } else {
+            pos += 1;
+            Some(read_long_str(data, &mut pos))
+        };
+
+        let body_sql = read_long_str(data, &mut pos);
+        let enabled = data[pos] != 0;
+        pos += 1;
+        let created_at_micros = i64::from_le_bytes([
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
+        ]);
+
+        Ok(Self {
+            name,
+            timing,
+            events,
+            target,
+            granularity,
+            referencing,
+            when_sql,
+            body_sql,
+            enabled,
+            created_at_micros,
+        })
+    }
+}
+
+fn write_short_str(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn read_short_str(data: &[u8], pos: &mut usize) -> String {
+    let len = u16::from_le_bytes([data[*pos], data[*pos + 1]]) as usize;
+    *pos += 2;
+    let s = String::from_utf8_lossy(&data[*pos..*pos + len]).into_owned();
+    *pos += len;
+    s
+}
+
+fn write_long_str(buf: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn read_long_str(data: &[u8], pos: &mut usize) -> String {
+    let len =
+        u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]) as usize;
+    *pos += 4;
+    let s = String::from_utf8_lossy(&data[*pos..*pos + len]).into_owned();
+    *pos += len;
+    s
+}
+
 #[derive(Debug, Clone)]
 pub struct TableCheckDef {
     pub name: Option<String>,
@@ -803,7 +1190,6 @@ pub struct TableCheckDef {
     pub sql: String,
 }
 
-/// Foreign key definition stored in schema.
 #[derive(Debug, Clone)]
 pub struct ForeignKeySchemaEntry {
     pub name: Option<String>,
@@ -816,7 +1202,6 @@ pub struct ForeignKeySchemaEntry {
     pub initially_deferred: bool,
 }
 
-/// Table schema stored in the _schema table.
 #[derive(Debug)]
 pub struct TableSchema {
     pub name: String,
@@ -964,7 +1349,6 @@ impl TableSchema {
         )
     }
 
-    /// Returns true if any column-level or table-level CHECK constraints exist.
     pub fn has_checks(&self) -> bool {
         !self.check_constraints.is_empty() || self.columns.iter().any(|c| c.check_expr.is_some())
     }
@@ -984,12 +1368,10 @@ impl TableSchema {
         self.non_pk_idx_cache.len() + self.dropped_non_pk_slots.len()
     }
 
-    /// Physical encoding slots that have been dropped via DROP COLUMN.
     pub fn dropped_non_pk_slots(&self) -> &[u16] {
         &self.dropped_non_pk_slots
     }
 
-    /// Return a new schema with the column at `drop_pos` marked as dropped.
     pub fn without_column(&self, drop_pos: usize) -> Self {
         let non_pk_order = self
             .non_pk_idx_cache
@@ -1033,15 +1415,23 @@ impl TableSchema {
             .iter()
             .map(|idx| IndexDef {
                 name: idx.name.clone(),
-                columns: idx
-                    .columns
+                keys: idx
+                    .keys
                     .iter()
-                    .map(|&c| if c > drop_pos_u16 { c - 1 } else { c })
+                    .map(|k| match k {
+                        IndexKey::Column { idx, collate } => IndexKey::Column {
+                            idx: if *idx > drop_pos_u16 { *idx - 1 } else { *idx },
+                            collate: *collate,
+                        },
+                        IndexKey::Expr { expr, original_sql } => IndexKey::Expr {
+                            expr: expr.clone(),
+                            original_sql: original_sql.clone(),
+                        },
+                    })
                     .collect(),
                 unique: idx.unique,
                 predicate_sql: idx.predicate_sql.clone(),
                 predicate_expr: idx.predicate_expr.clone(),
-                collations: idx.collations.clone(),
                 kind: idx.kind,
             })
             .collect();
@@ -1086,7 +1476,7 @@ impl TableSchema {
     }
 }
 
-const SCHEMA_VERSION: u8 = 11;
+const SCHEMA_VERSION: u8 = 12;
 pub const TABLE_FLAG_STRICT: u8 = 0b0000_0001;
 
 fn write_opt_string(buf: &mut Vec<u8>, s: &Option<String>) {
@@ -1150,8 +1540,12 @@ impl TableSchema {
             let idx_name = idx.name.as_bytes();
             buf.extend_from_slice(&(idx_name.len() as u16).to_le_bytes());
             buf.extend_from_slice(idx_name);
-            buf.extend_from_slice(&(idx.columns.len() as u16).to_le_bytes());
-            for &col_idx in &idx.columns {
+            buf.extend_from_slice(&(idx.keys.len() as u16).to_le_bytes());
+            for key in &idx.keys {
+                let col_idx = match key {
+                    IndexKey::Column { idx, .. } => *idx,
+                    IndexKey::Expr { .. } => u16::MAX,
+                };
                 buf.extend_from_slice(&col_idx.to_le_bytes());
             }
             buf.push(if idx.unique { 1 } else { 0 });
@@ -1257,10 +1651,14 @@ impl TableSchema {
             buf.push(col.collation as u8);
         }
         for idx in &self.indices {
-            let n = idx.collations.len() as u16;
+            let n = idx.keys.len() as u16;
             buf.extend_from_slice(&n.to_le_bytes());
-            for c in &idx.collations {
-                buf.push(*c as u8);
+            for key in &idx.keys {
+                let c = match key {
+                    IndexKey::Column { collate, .. } => *collate,
+                    IndexKey::Expr { .. } => Collation::Binary,
+                };
+                buf.push(c as u8);
             }
         }
         for idx in &self.indices {
@@ -1278,6 +1676,25 @@ impl TableSchema {
         }
         buf.push(self.flags);
 
+        // v12: per-index expression-key extension. Emit (position, SQL) for each Expr key.
+        // v11 readers stop before this section; v12 readers consume it.
+        for idx in &self.indices {
+            let expr_count = idx
+                .keys
+                .iter()
+                .filter(|k| matches!(k, IndexKey::Expr { .. }))
+                .count() as u16;
+            buf.extend_from_slice(&expr_count.to_le_bytes());
+            for (pos, key) in idx.keys.iter().enumerate() {
+                if let IndexKey::Expr { original_sql, .. } = key {
+                    buf.extend_from_slice(&(pos as u16).to_le_bytes());
+                    let bytes = original_sql.as_bytes();
+                    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(bytes);
+                }
+            }
+        }
+
         buf
     }
 
@@ -1287,7 +1704,7 @@ impl TableSchema {
         if data.is_empty()
             || !matches!(
                 data[0],
-                1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | SCHEMA_VERSION
+                1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | SCHEMA_VERSION
             )
         {
             return Err(crate::error::SqlError::InvalidValue(
@@ -1357,21 +1774,25 @@ impl TableSchema {
                 pos += idx_name_len;
                 let col_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
                 pos += 2;
-                let mut cols = Vec::with_capacity(col_count);
+                let mut keys: Vec<IndexKey> = Vec::with_capacity(col_count);
                 for _ in 0..col_count {
                     let col_idx = u16::from_le_bytes([data[pos], data[pos + 1]]);
                     pos += 2;
-                    cols.push(col_idx);
+                    // u16::MAX marks an expression key that the v12 section will fill in below.
+                    // For v11 indexes (no expression section), this stays as a column placeholder.
+                    keys.push(IndexKey::Column {
+                        idx: col_idx,
+                        collate: Collation::Binary,
+                    });
                 }
                 let unique = data[pos] != 0;
                 pos += 1;
                 idxs.push(IndexDef {
                     name: idx_name,
-                    columns: cols,
+                    keys,
                     unique,
                     predicate_sql: None,
                     predicate_expr: None,
-                    collations: vec![],
                     kind: IndexKind::default(),
                 });
             }
@@ -1557,14 +1978,15 @@ impl TableSchema {
             for idx in &mut indices {
                 let n = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
                 pos += 2;
-                let mut colls = Vec::with_capacity(n);
-                for _ in 0..n {
-                    colls.push(Collation::from_tag(data[pos]).ok_or_else(|| {
+                for i in 0..n {
+                    let collate = Collation::from_tag(data[pos]).ok_or_else(|| {
                         crate::error::SqlError::InvalidValue("unknown collation tag".into())
-                    })?);
+                    })?;
                     pos += 1;
+                    if let Some(IndexKey::Column { collate: c, .. }) = idx.keys.get_mut(i) {
+                        *c = collate;
+                    }
                 }
-                idx.collations = colls;
             }
             if version >= 9 {
                 for idx in &mut indices {
@@ -1611,6 +2033,49 @@ impl TableSchema {
                 flags = data[pos];
                 pos += 1;
             }
+            if version >= 12 {
+                for idx in &mut indices {
+                    if pos + 2 > data.len() {
+                        break;
+                    }
+                    let expr_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                    pos += 2;
+                    for _ in 0..expr_count {
+                        if pos + 6 > data.len() {
+                            return Err(crate::error::SqlError::InvalidValue(
+                                "truncated index expression key".into(),
+                            ));
+                        }
+                        let key_pos = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                        pos += 2;
+                        let sql_len = u32::from_le_bytes([
+                            data[pos],
+                            data[pos + 1],
+                            data[pos + 2],
+                            data[pos + 3],
+                        ]) as usize;
+                        pos += 4;
+                        if pos + sql_len > data.len() {
+                            return Err(crate::error::SqlError::InvalidValue(
+                                "truncated expression-key SQL".into(),
+                            ));
+                        }
+                        let sql = String::from_utf8_lossy(&data[pos..pos + sql_len]).into_owned();
+                        pos += sql_len;
+                        let expr = crate::parser::parse_sql_expr(&sql).map_err(|_| {
+                            crate::error::SqlError::InvalidValue(format!(
+                                "cannot parse index expression: {sql}"
+                            ))
+                        })?;
+                        if key_pos < idx.keys.len() {
+                            idx.keys[key_pos] = IndexKey::Expr {
+                                expr,
+                                original_sql: sql,
+                            };
+                        }
+                    }
+                }
+            }
         }
         let _ = pos;
 
@@ -1627,36 +2092,30 @@ impl TableSchema {
         Ok(schema)
     }
 
-    /// Get column index by name (case-insensitive).
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.columns
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(name))
     }
 
-    /// Get indices of non-PK columns (columns stored in the B+ tree value).
     pub fn non_pk_indices(&self) -> &[usize] {
         &self.non_pk_idx_cache
     }
 
-    /// Get the PK column indices as usize.
     pub fn pk_indices(&self) -> &[usize] {
         &self.pk_idx_cache
     }
 
-    /// Get index definition by name (case-insensitive).
     pub fn index_by_name(&self, name: &str) -> Option<&IndexDef> {
         let lower = name.to_ascii_lowercase();
         self.indices.iter().find(|i| i.name == lower)
     }
 
-    /// Get the KV table name for an index.
     pub fn index_table_name(table_name: &str, index_name: &str) -> Vec<u8> {
         format!("__idx_{table_name}_{index_name}").into_bytes()
     }
 }
 
-/// Result of executing a SQL statement.
 #[derive(Debug)]
 pub enum ExecutionResult {
     RowsAffected(u64),
@@ -1664,7 +2123,6 @@ pub enum ExecutionResult {
     Ok,
 }
 
-/// Result of a SELECT query.
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     pub columns: Vec<String>,

@@ -533,3 +533,146 @@ fn int_row_template_matches_generic_encoder() {
         );
     }
 }
+
+fn arr(elems: Vec<Value>) -> Value {
+    Value::Array(std::sync::Arc::new(elems))
+}
+
+#[test]
+fn key_array_empty_roundtrip() {
+    let v = arr(vec![]);
+    let encoded = encode_key_value(&v);
+    let (decoded, n) = decode_key_value(&encoded).unwrap();
+    assert_eq!(decoded, v);
+    assert_eq!(n, encoded.len());
+}
+
+#[test]
+fn key_array_int_roundtrip() {
+    let v = arr(vec![
+        Value::Integer(1),
+        Value::Integer(2),
+        Value::Integer(3),
+    ]);
+    let encoded = encode_key_value(&v);
+    let (decoded, _) = decode_key_value(&encoded).unwrap();
+    assert_eq!(decoded, v);
+}
+
+#[test]
+fn key_array_mixed_roundtrip() {
+    let v = arr(vec![
+        Value::Integer(42),
+        Value::Text("hello".into()),
+        Value::Null,
+        Value::Real(3.25),
+        Value::Boolean(true),
+    ]);
+    let encoded = encode_key_value(&v);
+    let (decoded, _) = decode_key_value(&encoded).unwrap();
+    assert_eq!(decoded, v);
+}
+
+#[test]
+fn key_array_nested_roundtrip() {
+    let v = arr(vec![
+        arr(vec![Value::Integer(1), Value::Integer(2)]),
+        arr(vec![Value::Integer(3), Value::Integer(4)]),
+        arr(vec![]),
+    ]);
+    let encoded = encode_key_value(&v);
+    let (decoded, _) = decode_key_value(&encoded).unwrap();
+    assert_eq!(decoded, v);
+}
+
+#[test]
+fn key_array_sort_order_lexicographic() {
+    let a = arr(vec![Value::Integer(1)]);
+    let b = arr(vec![Value::Integer(2)]);
+    let c = arr(vec![Value::Integer(1), Value::Integer(2)]);
+    let ea = encode_key_value(&a);
+    let eb = encode_key_value(&b);
+    let ec = encode_key_value(&c);
+    assert!(ea < eb, "[1] < [2] in lex order");
+    assert!(ea < ec, "[1] < [1, 2] (shorter sorts first)");
+    assert!(ec < eb, "[1, 2] < [2]");
+}
+
+#[test]
+fn row_array_int_roundtrip() {
+    let values = vec![
+        Value::Integer(1),
+        arr(vec![
+            Value::Integer(10),
+            Value::Integer(20),
+            Value::Integer(30),
+        ]),
+        Value::Text("after".into()),
+    ];
+    let encoded = encode_row(&values);
+    let decoded = decode_row(&encoded).unwrap();
+    assert_eq!(decoded, values);
+}
+
+#[test]
+fn row_array_mixed_roundtrip() {
+    let values = vec![arr(vec![
+        Value::Integer(1),
+        Value::Null,
+        Value::Text("two".into()),
+        Value::Boolean(false),
+        Value::Real(3.5),
+    ])];
+    let encoded = encode_row(&values);
+    let decoded = decode_row(&encoded).unwrap();
+    assert_eq!(decoded, values);
+}
+
+#[test]
+fn row_array_nested_roundtrip() {
+    let values = vec![arr(vec![
+        arr(vec![Value::Integer(1), Value::Integer(2)]),
+        arr(vec![Value::Text("a".into()), Value::Text("b".into())]),
+        Value::Null,
+    ])];
+    let encoded = encode_row(&values);
+    let decoded = decode_row(&encoded).unwrap();
+    assert_eq!(decoded, values);
+}
+
+#[test]
+fn row_array_empty_roundtrip() {
+    let values = vec![arr(vec![])];
+    let encoded = encode_row(&values);
+    let decoded = decode_row(&encoded).unwrap();
+    assert_eq!(decoded, values);
+}
+
+#[test]
+fn patch_array_same_size_in_place_succeeds() {
+    let original = arr(vec![Value::Integer(1), Value::Integer(2)]);
+    let replacement = arr(vec![Value::Integer(99), Value::Integer(100)]);
+    let mut encoded = encode_row(&[original]);
+    let ok = patch_column_in_place(&mut encoded, 0, &replacement).unwrap();
+    assert!(ok, "same-size array patch must succeed in place");
+    let decoded = decode_row(&encoded).unwrap();
+    assert_eq!(decoded[0], replacement);
+}
+
+#[test]
+fn patch_array_different_size_returns_false() {
+    let original = arr(vec![Value::Integer(1), Value::Integer(2)]);
+    let replacement = arr(vec![Value::Integer(1)]);
+    let mut encoded = encode_row(&[original]);
+    let ok = patch_column_in_place(&mut encoded, 0, &replacement).unwrap();
+    assert!(!ok, "different-size array patch must report size mismatch");
+}
+
+#[test]
+fn raw_column_array_decodes() {
+    let v = arr(vec![Value::Integer(7), Value::Text("x".into())]);
+    let encoded = encode_row(std::slice::from_ref(&v));
+    let raw = decode_column_raw(&encoded, 0).unwrap();
+    assert!(matches!(raw, RawColumn::Array(_)));
+    assert_eq!(raw.to_value(), v);
+}

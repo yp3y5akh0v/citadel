@@ -427,7 +427,6 @@ impl<'db> WriteTxn<'db> {
         Ok(())
     }
 
-    /// Rename a table in the catalog.
     pub fn rename_table(&mut self, old_name: &[u8], new_name: &[u8]) -> Result<()> {
         self.fk_check_cache.clear();
         self.ensure_table(old_name)?;

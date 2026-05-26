@@ -96,12 +96,10 @@ impl Database {
         }
     }
 
-    /// Path to the data file.
     pub fn data_path(&self) -> &Path {
         &self.data_path
     }
 
-    /// Path to the key file.
     pub fn key_path(&self) -> &Path {
         &self.key_path
     }
@@ -163,7 +161,6 @@ impl Database {
         Ok(())
     }
 
-    /// Run an integrity check on the database.
     pub fn integrity_check(&self) -> Result<IntegrityReport> {
         let report = self.manager.integrity_check()?;
 

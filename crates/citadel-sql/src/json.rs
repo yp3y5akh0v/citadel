@@ -2322,6 +2322,13 @@ fn value_to_serde_lossy(v: &Value) -> Result<serde_json::Value> {
             Ok(serde_json::Value::String(format!("{v}")))
         }
         Value::TsVector(_) | Value::TsQuery(_) => Ok(serde_json::Value::String(format!("{v}"))),
+        Value::Array(a) => {
+            let mut out = Vec::with_capacity(a.len());
+            for elem in a.iter() {
+                out.push(value_to_serde_lossy(elem)?);
+            }
+            Ok(serde_json::Value::Array(out))
+        }
     }
 }
 

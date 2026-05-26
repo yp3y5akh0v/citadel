@@ -2,7 +2,22 @@
 
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+fn generate_temp_id() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    (nanos << 32) | (counter & 0xFFFF_FFFF)
+}
+
+fn temp_storage_name(temp_id: u64, user_name: &str) -> String {
+    format!("__temp_{temp_id}_{}", user_name.to_ascii_lowercase())
+}
 
 use lru::LruCache;
 
@@ -12,7 +27,7 @@ use citadel_txn::write_txn::{WriteTxn, WriteTxnSnapshot};
 use crate::error::{Result, SqlError};
 use crate::executor;
 use crate::parser;
-use crate::parser::{QueryBody, SelectQuery, Statement};
+use crate::parser::{BeginAccessMode, QueryBody, SelectQuery, Statement};
 use crate::prepared::PreparedStatement;
 use crate::schema::{SchemaManager, SchemaSnapshot};
 use crate::types::{ExecutionResult, QueryResult, TableSchema, Value};
@@ -34,10 +49,9 @@ fn parse_fixed_offset(s: &str) -> Option<()> {
     if bytes.is_empty() {
         return None;
     }
-    let sign = match bytes[0] {
-        b'+' | b'-' => bytes[0] as char,
-        _ => return None,
-    };
+    if !matches!(bytes[0], b'+' | b'-') {
+        return None;
+    }
     let rest = &s[1..];
     let (hh, mm) = if let Some((h, m)) = rest.split_once(':') {
         (h, m)
@@ -53,8 +67,48 @@ fn parse_fixed_offset(s: &str) -> Option<()> {
     if h > 23 || m > 59 {
         return None;
     }
-    let _ = sign;
     Some(())
+}
+
+fn rewrite_show_triggers(sql: &str) -> Option<String> {
+    let trimmed = sql.trim();
+    let trimmed = trimmed.trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("show triggers") {
+        return None;
+    }
+    let after = lower["show triggers".len()..].trim_start();
+    let base = "SELECT trigger_name, event_object_table AS table_name, action_timing, \
+                event_manipulation, action_orientation, action_statement \
+                FROM information_schema.triggers";
+    if after.is_empty() {
+        return Some(format!("{base} ORDER BY trigger_name"));
+    }
+    if let Some(rest) = after.strip_prefix("on ") {
+        let table = rest.trim().trim_end_matches(';').trim();
+        if table.is_empty() {
+            return None;
+        }
+        let escaped = table.replace('\'', "''");
+        return Some(format!(
+            "{base} WHERE LOWER(event_object_table) = LOWER('{escaped}') ORDER BY trigger_name"
+        ));
+    }
+    None
+}
+
+fn rewrite_show_matviews(sql: &str) -> Option<String> {
+    let trimmed = sql.trim();
+    let trimmed = trimmed.trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower != "show materialized views" {
+        return None;
+    }
+    Some(
+        "SELECT matviewname, ispopulated, hasindexes, definition \
+         FROM pg_matviews ORDER BY matviewname"
+            .to_string(),
+    )
 }
 
 fn stmt_mutates(stmt: &Statement) -> bool {
@@ -71,6 +125,11 @@ fn stmt_mutates(stmt: &Statement) -> bool {
             | Statement::DropIndex(_)
             | Statement::CreateView(_)
             | Statement::DropView(_)
+            | Statement::CreateTrigger(_)
+            | Statement::DropTrigger(_)
+            | Statement::CreateMaterializedView(_)
+            | Statement::RefreshMaterializedView(_)
+            | Statement::DropMaterializedView(_)
     ) {
         return true;
     }
@@ -288,37 +347,71 @@ struct SavepointSnapshot {
     schema_snap: SchemaSnapshot,
 }
 
+/// Active transaction held by a Connection. `None` outside BEGIN/COMMIT; `Write` for normal
+/// BEGIN (or BEGIN READ WRITE); `Read` for BEGIN READ ONLY.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ActiveTxn<'a> {
+    None,
+    Write(WriteTxn<'a>),
+    Read(citadel_txn::read_txn::ReadTxn<'a>),
+}
+
+impl<'a> ActiveTxn<'a> {
+    fn is_none(&self) -> bool {
+        matches!(self, ActiveTxn::None)
+    }
+    fn is_active(&self) -> bool {
+        !self.is_none()
+    }
+    fn is_read_only(&self) -> bool {
+        matches!(self, ActiveTxn::Read(_))
+    }
+    fn as_write_mut(&mut self) -> Option<&mut WriteTxn<'a>> {
+        match self {
+            ActiveTxn::Write(w) => Some(w),
+            _ => None,
+        }
+    }
+    fn take(&mut self) -> ActiveTxn<'a> {
+        std::mem::replace(self, ActiveTxn::None)
+    }
+}
+
 pub(crate) struct ConnectionInner<'a> {
     pub(crate) schema: SchemaManager,
-    active_txn: Option<WriteTxn<'a>>,
+    active_txn: ActiveTxn<'a>,
     savepoint_stack: Vec<SavepointEntry>,
     in_place_saved: Option<bool>,
     pub(crate) stmt_cache: LruCache<String, CacheEntry>,
     txn_start_ts: Option<i64>,
     session_timezone: String,
+    /// Namespaces TEMP tables as `__temp_<id>_<name>`. Cleaned up on Connection drop.
+    temp_id: u64,
+    temp_table_names: Vec<String>,
 }
 
-/// SQL connection with LRU statement cache.
 pub struct Connection<'a> {
     pub(crate) db: &'a Database,
     pub(crate) inner: RefCell<ConnectionInner<'a>>,
 }
 
 impl<'a> Connection<'a> {
-    /// Open a SQL connection to a database.
     pub fn open(db: &'a Database) -> Result<Self> {
         let schema = SchemaManager::load(db)?;
         let stmt_cache = LruCache::new(NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).unwrap());
+        let temp_id = generate_temp_id();
         Ok(Self {
             db,
             inner: RefCell::new(ConnectionInner {
                 schema,
-                active_txn: None,
+                active_txn: ActiveTxn::None,
                 savepoint_stack: Vec::new(),
                 in_place_saved: None,
                 stmt_cache,
                 txn_start_ts: None,
                 session_timezone: "UTC".to_string(),
+                temp_id,
+                temp_table_names: Vec::new(),
             }),
         })
     }
@@ -338,12 +431,10 @@ impl<'a> Connection<'a> {
         self.inner.borrow_mut().set_session_timezone_impl(tz)
     }
 
-    /// Execute a SQL statement. Returns the result.
     pub fn execute(&self, sql: &str) -> Result<ExecutionResult> {
         self.inner.borrow_mut().execute_impl(self.db, sql)
     }
 
-    /// Execute a SQL statement with positional parameters ($1, $2, ...).
     pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<ExecutionResult> {
         self.inner
             .borrow_mut()
@@ -379,12 +470,10 @@ impl<'a> Connection<'a> {
         }
     }
 
-    /// Execute a SQL query and return the result set.
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
         self.query_params(sql, &[])
     }
 
-    /// Execute a SQL query with positional parameters ($1, $2, ...).
     pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
         match self.execute_params(sql, params)? {
             ExecutionResult::Query(qr) => Ok(qr),
@@ -399,12 +488,16 @@ impl<'a> Connection<'a> {
         }
     }
 
-    /// Prepare a SQL statement for repeated execution with parameters.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_, 'a>> {
+        if let Some(rewritten) = rewrite_show_triggers(sql) {
+            return PreparedStatement::new(self, &rewritten);
+        }
+        if let Some(rewritten) = rewrite_show_matviews(sql) {
+            return PreparedStatement::new(self, &rewritten);
+        }
         PreparedStatement::new(self, sql)
     }
 
-    /// List all table names.
     pub fn tables(&self) -> Vec<String> {
         self.inner
             .borrow()
@@ -417,15 +510,13 @@ impl<'a> Connection<'a> {
 
     /// Returns true if an explicit transaction is active (BEGIN was issued).
     pub fn in_transaction(&self) -> bool {
-        self.inner.borrow().active_txn.is_some()
+        self.inner.borrow().active_txn.is_active()
     }
 
-    /// Get the schema for a named table.
     pub fn table_schema(&self, name: &str) -> Option<TableSchema> {
         self.inner.borrow().schema.get(name).cloned()
     }
 
-    /// Reload schemas from the database.
     pub fn refresh_schema(&self) -> Result<()> {
         let new_schema = SchemaManager::load(self.db)?;
         self.inner.borrow_mut().schema = new_schema;
@@ -435,7 +526,7 @@ impl<'a> Connection<'a> {
 
 impl<'a> ConnectionInner<'a> {
     pub(crate) fn active_txn_is_some(&self) -> bool {
-        self.active_txn.is_some()
+        self.active_txn.is_active()
     }
 
     fn set_session_timezone_impl(&mut self, tz: &str) -> Result<()> {
@@ -455,6 +546,12 @@ impl<'a> ConnectionInner<'a> {
     }
 
     fn execute_impl(&mut self, db: &'a Database, sql: &str) -> Result<ExecutionResult> {
+        if let Some(rewritten) = rewrite_show_triggers(sql) {
+            return self.execute_params_impl(db, &rewritten, &[]);
+        }
+        if let Some(rewritten) = rewrite_show_matviews(sql) {
+            return self.execute_params_impl(db, &rewritten, &[]);
+        }
         if matches!(sql.as_bytes().first(), Some(b'I' | b'i')) {
             if let Some((normalized_key, extracted)) = try_normalize_insert(sql) {
                 let gen = self.schema.generation();
@@ -624,7 +721,7 @@ impl<'a> ConnectionInner<'a> {
         params: &[Value],
     ) -> Result<ExecutionResult> {
         let schema = &self.schema;
-        let wtx = self.active_txn.as_mut();
+        let wtx = self.active_txn.as_write_mut();
         if params.is_empty() || !plan.uses_scoped_params() {
             plan.execute(db, schema, stmt, params, wtx)
         } else {
@@ -657,37 +754,49 @@ impl<'a> ConnectionInner<'a> {
         params: &[Value],
     ) -> Result<ExecutionResult> {
         match stmt {
-            Statement::Begin => {
-                if self.active_txn.is_some() {
+            Statement::Begin { access_mode } => {
+                if self.active_txn.is_active() {
                     return Err(SqlError::TransactionAlreadyActive);
                 }
-                let wtx = db.begin_write().map_err(SqlError::Storage)?;
-                self.active_txn = Some(wtx);
                 let ts = crate::datetime::txn_or_clock_micros();
+                match access_mode {
+                    BeginAccessMode::ReadOnly => {
+                        let rtx = db.begin_read();
+                        self.active_txn = ActiveTxn::Read(rtx);
+                    }
+                    BeginAccessMode::ReadWrite | BeginAccessMode::Default => {
+                        let wtx = db.begin_write().map_err(SqlError::Storage)?;
+                        self.active_txn = ActiveTxn::Write(wtx);
+                    }
+                }
                 self.txn_start_ts = Some(ts);
                 crate::datetime::set_txn_clock(Some(ts));
                 Ok(ExecutionResult::Ok)
             }
             Statement::Commit => {
-                let mut wtx = self
-                    .active_txn
-                    .take()
-                    .ok_or(SqlError::NoActiveTransaction)?;
-                crate::executor::helpers::drain_deferred_fk_checks(&mut wtx)?;
-                wtx.commit().map_err(SqlError::Storage)?;
+                match self.active_txn.take() {
+                    ActiveTxn::None => return Err(SqlError::NoActiveTransaction),
+                    ActiveTxn::Write(mut wtx) => {
+                        crate::executor::helpers::drain_deferred_fk_checks(&mut wtx)?;
+                        wtx.commit().map_err(SqlError::Storage)?;
+                    }
+                    ActiveTxn::Read(_rtx) => {}
+                }
                 self.clear_savepoint_state();
                 self.txn_start_ts = None;
                 crate::datetime::set_txn_clock(None);
                 Ok(ExecutionResult::Ok)
             }
             Statement::Rollback => {
-                let wtx = self
-                    .active_txn
-                    .take()
-                    .ok_or(SqlError::NoActiveTransaction)?;
-                wtx.abort();
+                match self.active_txn.take() {
+                    ActiveTxn::None => return Err(SqlError::NoActiveTransaction),
+                    ActiveTxn::Write(wtx) => {
+                        wtx.abort();
+                        self.schema = SchemaManager::load(db)?;
+                    }
+                    ActiveTxn::Read(_rtx) => {}
+                }
                 self.clear_savepoint_state();
-                self.schema = SchemaManager::load(db)?;
                 self.txn_start_ts = None;
                 crate::datetime::set_txn_clock(None);
                 Ok(ExecutionResult::Ok)
@@ -699,20 +808,57 @@ impl<'a> ConnectionInner<'a> {
                 self.set_session_timezone_impl(zone)?;
                 Ok(ExecutionResult::Ok)
             }
-            Statement::Insert(ins) if self.active_txn.is_some() => {
+            Statement::CreateTable(ct) if ct.temporary => {
+                if self.active_txn.is_read_only() {
+                    return Err(SqlError::Unsupported(
+                        "cannot execute mutating statement inside a read-only transaction".into(),
+                    ));
+                }
+                let user_name = ct.name.clone();
+                let prefixed = temp_storage_name(self.temp_id, &user_name);
+                if self.schema.contains(&user_name) {
+                    if ct.if_not_exists {
+                        return Ok(ExecutionResult::Ok);
+                    }
+                    return Err(SqlError::TableAlreadyExists(user_name));
+                }
+                let mut clone = ct.clone();
+                clone.name = prefixed.clone();
+                clone.temporary = false;
+                let stmt_concrete = Statement::CreateTable(clone);
+                let outcome = if let Some(wtx) = self.active_txn.as_write_mut() {
+                    executor::execute_in_txn(wtx, &mut self.schema, &stmt_concrete, params)?
+                } else {
+                    executor::execute(db, &mut self.schema, &stmt_concrete, params)?
+                };
+                self.schema
+                    .register_temp_alias(&user_name, prefixed.clone());
+                self.temp_table_names.push(prefixed);
+                Ok(outcome)
+            }
+            Statement::Insert(ins) if self.active_txn.as_write_mut().is_some() => {
                 self.capture_pending_snapshots();
-                let wtx = self.active_txn.as_mut().unwrap();
+                let wtx = self.active_txn.as_write_mut().unwrap();
                 executor::exec_insert_in_txn(wtx, &self.schema, ins, params)
             }
             _ => {
-                if self.active_txn.is_some() && stmt_mutates(stmt) {
+                if self.active_txn.is_read_only() && stmt_mutates(stmt) {
+                    return Err(SqlError::Unsupported(
+                        "cannot execute mutating statement inside a read-only transaction".into(),
+                    ));
+                }
+                if self.active_txn.as_write_mut().is_some() && stmt_mutates(stmt) {
                     self.capture_pending_snapshots();
                 }
-                if let Some(ref mut wtx) = self.active_txn {
-                    executor::execute_in_txn(wtx, &mut self.schema, stmt, params)
+                let outcome = if let Some(wtx) = self.active_txn.as_write_mut() {
+                    executor::execute_in_txn(wtx, &mut self.schema, stmt, params)?
                 } else {
-                    executor::execute(db, &mut self.schema, stmt, params)
+                    executor::execute(db, &mut self.schema, stmt, params)?
+                };
+                if let Statement::DropTable(dt) = stmt {
+                    self.schema.unregister_temp_alias(&dt.name);
                 }
+                Ok(outcome)
             }
         }
     }
@@ -725,7 +871,7 @@ impl<'a> ConnectionInner<'a> {
     fn do_savepoint(&mut self, name: &str) -> Result<ExecutionResult> {
         let wtx = self
             .active_txn
-            .as_mut()
+            .as_write_mut()
             .ok_or(SqlError::NoActiveTransaction)?;
 
         if self.savepoint_stack.is_empty() {
@@ -750,7 +896,7 @@ impl<'a> ConnectionInner<'a> {
             Some(i) => i,
             None => return,
         };
-        let wtx = match self.active_txn.as_mut() {
+        let wtx = match self.active_txn.as_write_mut() {
             Some(w) => w,
             None => return,
         };
@@ -772,7 +918,7 @@ impl<'a> ConnectionInner<'a> {
     }
 
     fn do_release(&mut self, name: &str) -> Result<ExecutionResult> {
-        if self.active_txn.is_none() {
+        if !self.active_txn.is_active() {
             return Err(SqlError::NoActiveTransaction);
         }
 
@@ -785,7 +931,7 @@ impl<'a> ConnectionInner<'a> {
 
         if self.savepoint_stack.is_empty() {
             if let (Some(wtx), Some(original)) =
-                (self.active_txn.as_mut(), self.in_place_saved.take())
+                (self.active_txn.as_write_mut(), self.in_place_saved.take())
             {
                 wtx.set_in_place(original);
             }
@@ -795,7 +941,7 @@ impl<'a> ConnectionInner<'a> {
     }
 
     fn do_rollback_to(&mut self, name: &str) -> Result<ExecutionResult> {
-        if self.active_txn.is_none() {
+        if !self.active_txn.is_active() {
             return Err(SqlError::NoActiveTransaction);
         }
 
@@ -812,10 +958,28 @@ impl<'a> ConnectionInner<'a> {
             None => return Ok(ExecutionResult::Ok),
         };
 
-        let wtx = self.active_txn.as_mut().unwrap();
+        let wtx = match self.active_txn.as_write_mut() {
+            Some(w) => w,
+            None => return Err(SqlError::NoActiveTransaction),
+        };
         wtx.restore_snapshot(snapshot.wtx_snap);
         self.schema.restore_snapshot(snapshot.schema_snap);
 
         Ok(ExecutionResult::Ok)
+    }
+}
+
+impl<'a> Drop for Connection<'a> {
+    fn drop(&mut self) {
+        let temp_names = std::mem::take(&mut self.inner.borrow_mut().temp_table_names);
+        if temp_names.is_empty() {
+            return;
+        }
+        if let Ok(mut wtx) = self.db.begin_write() {
+            for prefixed in &temp_names {
+                let _ = wtx.drop_table(prefixed.as_bytes());
+            }
+            let _ = wtx.commit();
+        }
     }
 }

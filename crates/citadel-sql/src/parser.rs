@@ -13,13 +13,18 @@ pub enum Statement {
     DropIndex(DropIndexStmt),
     CreateView(CreateViewStmt),
     DropView(DropViewStmt),
+    CreateMaterializedView(Box<CreateMatviewStmt>),
+    RefreshMaterializedView(RefreshMatviewStmt),
+    DropMaterializedView(DropMatviewStmt),
+    CreateTrigger(Box<CreateTriggerStmt>),
+    DropTrigger(DropTriggerStmt),
     AlterTable(Box<AlterTableStmt>),
     Insert(InsertStmt),
     Select(Box<SelectQuery>),
     Update(UpdateStmt),
     Delete(DeleteStmt),
     Truncate(TruncateStmt),
-    Begin,
+    Begin { access_mode: BeginAccessMode },
     Commit,
     Rollback,
     Savepoint(String),
@@ -27,6 +32,13 @@ pub enum Statement {
     RollbackTo(String),
     SetTimezone(String),
     Explain(Box<Statement>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeginAccessMode {
+    Default,
+    ReadWrite,
+    ReadOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +65,14 @@ pub enum AlterTableOp {
     RenameTable {
         new_name: String,
     },
+    DisableTrigger {
+        name: String,
+    },
+    EnableTrigger {
+        name: String,
+    },
+    DisableAllTriggers,
+    EnableAllTriggers,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +85,7 @@ pub struct CreateTableStmt {
     pub foreign_keys: Vec<ForeignKeyDef>,
     pub unique_indices: Vec<UniqueIndexDef>,
     pub strict: bool,
+    pub temporary: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -153,13 +174,89 @@ pub struct TruncateStmt {
 pub struct CreateIndexStmt {
     pub index_name: String,
     pub table_name: String,
+    /// Per-key column name for `IndexColSpec::Column` entries; ignored for `Expr` entries
+    /// (those resolve through `key_exprs[i]`).
     pub columns: Vec<String>,
+    /// Parallel to `columns`: `None` means the key is a column reference, `Some((expr, sql))`
+    /// means the key is an expression. Empty Vec = all-column index (the v0.15 norm).
+    pub key_exprs: Vec<Option<(Expr, String)>>,
     pub unique: bool,
     pub if_not_exists: bool,
     pub predicate_sql: Option<String>,
     pub predicate_expr: Option<Expr>,
     pub collations: Vec<crate::types::Collation>,
     pub kind: crate::types::IndexKind,
+    pub concurrently: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateMatviewStmt {
+    pub name: String,
+    pub select_sql: String,
+    pub select_parsed: SelectQuery,
+    pub with_data: bool,
+    pub if_not_exists: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RefreshMatviewStmt {
+    pub name: String,
+    pub concurrently: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DropMatviewStmt {
+    pub name: String,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+    InsteadOf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Insert,
+    Update(Vec<String>),
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerGranularity {
+    ForEachRow,
+    ForEachStatement,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransitionTables {
+    pub new_table_alias: Option<String>,
+    pub old_table_alias: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateTriggerStmt {
+    pub name: String,
+    pub timing: TriggerTiming,
+    pub events: Vec<TriggerEvent>,
+    pub target: String,
+    pub granularity: TriggerGranularity,
+    pub referencing: Option<TransitionTables>,
+    pub when_sql: Option<String>,
+    pub when_expr: Option<Expr>,
+    pub body_sql: String,
+    pub body: Vec<Statement>,
+    pub if_not_exists: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DropTriggerStmt {
+    pub name: String,
+    pub table: Option<String>,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -443,6 +540,25 @@ pub enum Expr {
         collation: crate::types::Collation,
     },
     TypedNullRecord(String),
+    ArrayLiteral(Vec<Expr>),
+    Quantified {
+        left: Box<Expr>,
+        op: BinOp,
+        quantifier: Quantifier,
+        right: QuantifiedRhs,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quantifier {
+    Any,
+    All,
+}
+
+#[derive(Debug, Clone)]
+pub enum QuantifiedRhs {
+    Subquery(Box<SelectStmt>),
+    Array(Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -503,6 +619,10 @@ pub enum BinOp {
     JsonDeletePath,
     JsonPathExists,
     JsonPathMatch,
+    /// `@?_tz` — tz-aware variant of `@?`.
+    JsonPathExistsTz,
+    /// `@@_tz` — tz-aware variant of `@@`.
+    JsonPathMatchTz,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,6 +665,14 @@ pub fn has_subquery(expr: &Expr) -> bool {
         }
         Expr::Coalesce(args) | Expr::Function { args, .. } => args.iter().any(has_subquery),
         Expr::Cast { expr, .. } => has_subquery(expr),
+        Expr::ArrayLiteral(elems) => elems.iter().any(has_subquery),
+        Expr::Quantified { left, right, .. } => {
+            has_subquery(left)
+                || match right {
+                    QuantifiedRhs::Subquery(_) => true,
+                    QuantifiedRhs::Array(e) => has_subquery(e),
+                }
+        }
         _ => false,
     }
 }
@@ -555,6 +683,9 @@ pub fn parse_sql_expr(sql: &str) -> Result<Expr> {
 }
 
 pub fn parse_sql(sql: &str) -> Result<Statement> {
+    if let Some(stmt) = try_parse_refresh_matview(sql) {
+        return stmt;
+    }
     let stmts =
         crate::dialect::parse_statements(sql).map_err(|e| SqlError::Parse(e.to_string()))?;
 
@@ -568,8 +699,10 @@ pub fn parse_sql(sql: &str) -> Result<Statement> {
     convert_statement(stmts.into_iter().next().unwrap())
 }
 
-/// Parse one or more `;`-separated SQL statements.
 pub fn parse_sql_multi(sql: &str) -> Result<Vec<Statement>> {
+    if let Some(stmt) = try_parse_refresh_matview(sql) {
+        return Ok(vec![stmt?]);
+    }
     let stmts =
         crate::dialect::parse_statements(sql).map_err(|e| SqlError::Parse(e.to_string()))?;
 
@@ -580,7 +713,38 @@ pub fn parse_sql_multi(sql: &str) -> Result<Vec<Statement>> {
     stmts.into_iter().map(convert_statement).collect()
 }
 
-/// Returns the number of distinct parameters in a statement (max $N found).
+/// sqlparser 0.61 doesn't natively parse REFRESH MATERIALIZED VIEW [CONCURRENTLY] <name>.
+fn try_parse_refresh_matview(sql: &str) -> Option<Result<Statement>> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let after = lower.strip_prefix("refresh materialized view")?;
+    let after = after.trim_start();
+    let (concurrently, rest_lower) = match after.strip_prefix("concurrently") {
+        Some(r) if r.starts_with(char::is_whitespace) => (true, r.trim_start()),
+        _ => (false, after),
+    };
+    if rest_lower.is_empty() {
+        return Some(Err(SqlError::Parse(
+            "REFRESH MATERIALIZED VIEW requires a name".into(),
+        )));
+    }
+    let name = rest_lower
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| c == '"' || c == ';')
+        .to_string();
+    if name.is_empty() {
+        return Some(Err(SqlError::Parse(
+            "REFRESH MATERIALIZED VIEW requires a name".into(),
+        )));
+    }
+    Some(Ok(Statement::RefreshMaterializedView(RefreshMatviewStmt {
+        name,
+        concurrently,
+    })))
+}
+
 pub fn count_params(stmt: &Statement) -> usize {
     let mut max_idx = 0usize;
     visit_exprs_stmt(stmt, &mut |e| {
@@ -774,6 +938,18 @@ fn visit_expr(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
                 }
             }
         }
+        Expr::ArrayLiteral(elems) => {
+            for e in elems {
+                visit_expr(e, visitor);
+            }
+        }
+        Expr::Quantified { left, right, .. } => {
+            visit_expr(left, visitor);
+            match right {
+                QuantifiedRhs::Subquery(sq) => visit_exprs_select(sq, visitor),
+                QuantifiedRhs::Array(e) => visit_expr(e, visitor),
+            }
+        }
         Expr::Literal(_)
         | Expr::Column(_)
         | Expr::QualifiedColumn { .. }
@@ -830,13 +1006,46 @@ fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
                 if_exists,
             }))
         }
+        sp::Statement::Drop {
+            object_type: sp::ObjectType::MaterializedView,
+            if_exists,
+            names,
+            cascade,
+            ..
+        } => {
+            if names.len() != 1 {
+                return Err(SqlError::Unsupported("multi-matview DROP".into()));
+            }
+            Ok(Statement::DropMaterializedView(DropMatviewStmt {
+                name: object_name_to_string(&names[0]),
+                if_exists,
+                cascade,
+            }))
+        }
+        sp::Statement::CreateTrigger(ct) => convert_create_trigger(ct),
+        sp::Statement::DropTrigger(dt) => Ok(Statement::DropTrigger(DropTriggerStmt {
+            name: object_name_to_string(&dt.trigger_name),
+            table: dt.table_name.as_ref().map(object_name_to_string),
+            if_exists: dt.if_exists,
+        })),
         sp::Statement::AlterTable(at) => convert_alter_table(at),
         sp::Statement::Insert(insert) => convert_insert(insert),
         sp::Statement::Query(query) => convert_query(*query),
         sp::Statement::Update(update) => convert_update(update),
         sp::Statement::Delete(delete) => convert_delete(delete),
         sp::Statement::Truncate(t) => convert_truncate(t),
-        sp::Statement::StartTransaction { .. } => Ok(Statement::Begin),
+        sp::Statement::StartTransaction { modes, .. } => {
+            let mut access_mode = BeginAccessMode::Default;
+            for mode in modes {
+                if let sp::TransactionMode::AccessMode(am) = mode {
+                    access_mode = match am {
+                        sp::TransactionAccessMode::ReadOnly => BeginAccessMode::ReadOnly,
+                        sp::TransactionAccessMode::ReadWrite => BeginAccessMode::ReadWrite,
+                    };
+                }
+            }
+            Ok(Statement::Begin { access_mode })
+        }
         sp::Statement::Commit { chain: true, .. } => {
             Err(SqlError::Unsupported("COMMIT AND CHAIN".into()))
         }
@@ -885,7 +1094,6 @@ fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
     }
 }
 
-/// Parse column options (NOT NULL, DEFAULT, CHECK, FK, UNIQUE) from a sqlparser ColumnDef.
 /// Returns (ColumnSpec, Option<ForeignKeyDef>, was_inline_pk, was_unique).
 fn convert_column_def(
     col_def: &sp::ColumnDef,
@@ -1080,6 +1288,7 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
     let name = object_name_to_string(&ct.name);
     let if_not_exists = ct.if_not_exists;
     let strict = ct.strict;
+    let temporary = ct.temporary;
 
     let mut columns = Vec::new();
     let mut inline_pk: Vec<String> = Vec::new();
@@ -1189,6 +1398,7 @@ fn convert_create_table(ct: sp::CreateTable) -> Result<Statement> {
         foreign_keys,
         unique_indices,
         strict,
+        temporary,
     }))
 }
 
@@ -1242,6 +1452,24 @@ fn convert_alter_table(at: sp::AlterTable) -> Result<Statement> {
             };
             AlterTableOp::RenameTable { new_name }
         }
+        sp::AlterTableOperation::DisableTrigger { name } => {
+            if name.value.eq_ignore_ascii_case("all") {
+                AlterTableOp::DisableAllTriggers
+            } else {
+                AlterTableOp::DisableTrigger {
+                    name: name.value.to_ascii_lowercase(),
+                }
+            }
+        }
+        sp::AlterTableOperation::EnableTrigger { name } => {
+            if name.value.eq_ignore_ascii_case("all") {
+                AlterTableOp::EnableAllTriggers
+            } else {
+                AlterTableOp::EnableTrigger {
+                    name: name.value.to_ascii_lowercase(),
+                }
+            }
+        }
         other => {
             return Err(SqlError::Unsupported(format!(
                 "ALTER TABLE operation: {other}"
@@ -1291,9 +1519,12 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
 
     let mut columns: Vec<String> = Vec::with_capacity(ci.columns.len());
     let mut collations: Vec<crate::types::Collation> = Vec::with_capacity(ci.columns.len());
+    let mut key_exprs: Vec<Option<(Expr, String)>> = Vec::with_capacity(ci.columns.len());
     for idx_col in &ci.columns {
-        let (name, coll) = match &idx_col.column.expr {
-            sp::Expr::Identifier(ident) => (ident.value.clone(), crate::types::Collation::Binary),
+        let (name, coll, expr_entry) = match &idx_col.column.expr {
+            sp::Expr::Identifier(ident) => {
+                (ident.value.clone(), crate::types::Collation::Binary, None)
+            }
             sp::Expr::Collate {
                 expr: inner,
                 collation,
@@ -1305,16 +1536,31 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
                             "collation '{coll_name}' not supported (BINARY/NOCASE/RTRIM only)"
                         ))
                     })?;
-                    (ident.value.clone(), coll)
+                    (ident.value.clone(), coll, None)
                 }
-                other => {
-                    return Err(SqlError::Unsupported(format!("expression index: {other}")));
+                inner_expr => {
+                    let sql = inner_expr.to_string();
+                    let expr = convert_expr(inner_expr)?;
+                    (
+                        sql.clone(),
+                        crate::types::Collation::Binary,
+                        Some((expr, sql)),
+                    )
                 }
             },
-            other => return Err(SqlError::Unsupported(format!("expression index: {other}"))),
+            other => {
+                let sql = other.to_string();
+                let expr = convert_expr(other)?;
+                (
+                    sql.clone(),
+                    crate::types::Collation::Binary,
+                    Some((expr, sql)),
+                )
+            }
         };
         columns.push(name);
         collations.push(coll);
+        key_exprs.push(expr_entry);
     }
 
     if columns.is_empty() {
@@ -1354,12 +1600,14 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
         index_name,
         table_name,
         columns,
+        key_exprs,
         unique: ci.unique,
         if_not_exists: ci.if_not_exists,
         predicate_sql,
         predicate_expr,
         collations,
         kind,
+        concurrently: ci.concurrently,
     }))
 }
 
@@ -1527,27 +1775,133 @@ fn is_immutable_function(name: &str) -> bool {
     )
 }
 
-fn convert_create_view(cv: sp::CreateView) -> Result<Statement> {
-    let name = object_name_to_string(&cv.name);
+fn convert_create_trigger(ct: sp::CreateTrigger) -> Result<Statement> {
+    let name = object_name_to_string(&ct.name);
+    let target = object_name_to_string(&ct.table_name);
 
-    if cv.materialized {
-        return Err(SqlError::Unsupported("MATERIALIZED VIEW".into()));
-    }
-
-    let sql = cv.query.to_string();
-
-    let test =
-        crate::dialect::parse_statements(&sql).map_err(|e| SqlError::Parse(e.to_string()))?;
-    if test.is_empty() {
-        return Err(SqlError::Parse("empty view definition".into()));
-    }
-    match &test[0] {
-        sp::Statement::Query(_) => {}
+    let timing = match ct.period {
+        Some(sp::TriggerPeriod::Before) => TriggerTiming::Before,
+        Some(sp::TriggerPeriod::After) => TriggerTiming::After,
+        Some(sp::TriggerPeriod::InsteadOf) => TriggerTiming::InsteadOf,
         _ => {
             return Err(SqlError::Parse(
-                "view body must be a SELECT statement".into(),
-            ))
+                "CREATE TRIGGER requires BEFORE, AFTER, or INSTEAD OF".into(),
+            ));
         }
+    };
+
+    let mut events: Vec<TriggerEvent> = Vec::with_capacity(ct.events.len());
+    for ev in &ct.events {
+        let mapped = match ev {
+            sp::TriggerEvent::Insert => TriggerEvent::Insert,
+            sp::TriggerEvent::Delete => TriggerEvent::Delete,
+            sp::TriggerEvent::Update(cols) => {
+                TriggerEvent::Update(cols.iter().map(|i| i.value.to_ascii_lowercase()).collect())
+            }
+            sp::TriggerEvent::Truncate => {
+                return Err(SqlError::Unsupported(
+                    "TRUNCATE triggers are not supported".into(),
+                ));
+            }
+        };
+        events.push(mapped);
+    }
+    if events.is_empty() {
+        return Err(SqlError::Parse(
+            "CREATE TRIGGER requires at least one event (INSERT/UPDATE/DELETE)".into(),
+        ));
+    }
+
+    let granularity = match ct.trigger_object {
+        Some(sp::TriggerObjectKind::For(sp::TriggerObject::Statement))
+        | Some(sp::TriggerObjectKind::ForEach(sp::TriggerObject::Statement)) => {
+            TriggerGranularity::ForEachStatement
+        }
+        // FOR EACH ROW is the default per SQLite semantics when omitted.
+        _ => TriggerGranularity::ForEachRow,
+    };
+
+    if timing == TriggerTiming::InsteadOf && granularity == TriggerGranularity::ForEachStatement {
+        return Err(SqlError::Unsupported(
+            "INSTEAD OF triggers must be FOR EACH ROW".into(),
+        ));
+    }
+
+    let mut referencing: Option<TransitionTables> = None;
+    if !ct.referencing.is_empty() {
+        let mut new_alias: Option<String> = None;
+        let mut old_alias: Option<String> = None;
+        for r in &ct.referencing {
+            let alias = object_name_to_string(&r.transition_relation_name);
+            match r.refer_type {
+                sp::TriggerReferencingType::NewTable => new_alias = Some(alias),
+                sp::TriggerReferencingType::OldTable => old_alias = Some(alias),
+            }
+        }
+        referencing = Some(TransitionTables {
+            new_table_alias: new_alias,
+            old_table_alias: old_alias,
+        });
+    }
+
+    let when_expr = ct.condition.as_ref().map(convert_expr).transpose()?;
+    let when_sql = ct.condition.as_ref().map(|e| e.to_string());
+
+    let inner_statements: &[sp::Statement] = match &ct.statements {
+        Some(sp::ConditionalStatements::Sequence { statements })
+        | Some(sp::ConditionalStatements::BeginEnd(sp::BeginEndStatements {
+            statements, ..
+        })) => statements,
+        None => {
+            return Err(SqlError::Parse(
+                "CREATE TRIGGER body must contain BEGIN ... END or one or more statements".into(),
+            ));
+        }
+    };
+    let body: Vec<Statement> = inner_statements
+        .iter()
+        .cloned()
+        .map(convert_statement)
+        .collect::<Result<Vec<_>>>()?;
+    // Store body as `;`-joined statement strings (no BEGIN/END wrapper) so the body
+    // executor can parse it via `parse_sql_multi`.
+    let body_sql: String = inner_statements
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join(";");
+
+    Ok(Statement::CreateTrigger(Box::new(CreateTriggerStmt {
+        name,
+        timing,
+        events,
+        target,
+        granularity,
+        referencing,
+        when_sql,
+        when_expr,
+        body_sql,
+        body,
+        if_not_exists: false,
+    })))
+}
+
+fn convert_create_view(cv: sp::CreateView) -> Result<Statement> {
+    let name = object_name_to_string(&cv.name);
+    let sql = cv.query.to_string();
+
+    let parsed_select = parse_select_query(&sql)?;
+
+    if cv.materialized {
+        return Ok(Statement::CreateMaterializedView(Box::new(
+            CreateMatviewStmt {
+                name,
+                select_sql: sql,
+                select_parsed: parsed_select,
+                with_data: true,
+                if_not_exists: cv.if_not_exists,
+            },
+        )));
     }
 
     let column_aliases: Vec<String> = cv
@@ -1563,6 +1917,21 @@ fn convert_create_view(cv: sp::CreateView) -> Result<Statement> {
         or_replace: cv.or_replace,
         if_not_exists: cv.if_not_exists,
     }))
+}
+
+fn parse_select_query(sql: &str) -> Result<SelectQuery> {
+    let stmts = parse_sql_multi(sql)?;
+    if stmts.len() != 1 {
+        return Err(SqlError::Parse(
+            "matview body must be a single SELECT statement".into(),
+        ));
+    }
+    match stmts.into_iter().next().unwrap() {
+        Statement::Select(sq) => Ok(*sq),
+        _ => Err(SqlError::Parse(
+            "matview body must be a SELECT statement".into(),
+        )),
+    }
 }
 
 fn convert_insert(insert: sp::Insert) -> Result<Statement> {
@@ -2284,6 +2653,21 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
             let stmt = convert_subquery(query)?;
             Ok(Expr::ScalarSubquery(Box::new(stmt)))
         }
+        sp::Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => convert_quantified(left, compare_op, right, Quantifier::Any),
+        sp::Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } => convert_quantified(left, compare_op, right, Quantifier::All),
+        sp::Expr::Array(sp::Array { elem, .. }) => {
+            let elems: Result<Vec<Expr>> = elem.iter().map(convert_expr).collect();
+            Ok(Expr::ArrayLiteral(elems?))
+        }
         sp::Expr::Between {
             expr: e,
             negated,
@@ -2642,6 +3026,37 @@ fn convert_escape_value(val: &sp::Value) -> Result<Expr> {
     }
 }
 
+fn convert_quantified(
+    left: &sp::Expr,
+    compare_op: &sp::BinaryOperator,
+    right: &sp::Expr,
+    quantifier: Quantifier,
+) -> Result<Expr> {
+    let left_expr = convert_expr(left)?;
+    let op = convert_bin_op(compare_op)?;
+    if !matches!(
+        op,
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq
+    ) {
+        return Err(SqlError::Unsupported(format!(
+            "ANY/ALL only supports comparison operators, got {op:?}"
+        )));
+    }
+    let rhs = match right {
+        sp::Expr::Subquery(query) => {
+            let stmt = convert_subquery(query)?;
+            QuantifiedRhs::Subquery(Box::new(stmt))
+        }
+        other => QuantifiedRhs::Array(Box::new(convert_expr(other)?)),
+    };
+    Ok(Expr::Quantified {
+        left: Box::new(left_expr),
+        op,
+        quantifier,
+        right: rhs,
+    })
+}
+
 fn convert_bin_op(op: &sp::BinaryOperator) -> Result<BinOp> {
     match op {
         sp::BinaryOperator::Plus => Ok(BinOp::Add),
@@ -2670,6 +3085,8 @@ fn convert_bin_op(op: &sp::BinaryOperator) -> Result<BinOp> {
         sp::BinaryOperator::HashMinus => Ok(BinOp::JsonDeletePath),
         sp::BinaryOperator::AtQuestion => Ok(BinOp::JsonPathExists),
         sp::BinaryOperator::AtAt => Ok(BinOp::JsonPathMatch),
+        sp::BinaryOperator::Custom(s) if s == "@?_tz" => Ok(BinOp::JsonPathExistsTz),
+        sp::BinaryOperator::Custom(s) if s == "@@_tz" => Ok(BinOp::JsonPathMatchTz),
         _ => Err(SqlError::Unsupported(format!("binary op: {op}"))),
     }
 }

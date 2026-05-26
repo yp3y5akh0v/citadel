@@ -362,10 +362,9 @@ fn cmd_indexes(args: &[&str], conn: &Connection<'_>, out: &mut dyn Write) {
         if let Some(schema) = conn.table_schema(name) {
             for idx in &schema.indices {
                 let unique = if idx.unique { " UNIQUE" } else { "" };
-                let col_names: Vec<&str> = idx
-                    .columns
-                    .iter()
-                    .filter_map(|&ci| schema.columns.get(ci as usize).map(|c| c.name.as_str()))
+                let col_names: Vec<String> = idx
+                    .column_positions_iter()
+                    .filter_map(|ci| schema.columns.get(ci as usize).map(|c| c.name.clone()))
                     .collect();
                 let _ = writeln!(
                     out,
@@ -620,10 +619,9 @@ fn cmd_dump(args: &[&str], conn: &Connection<'_>, out: &mut dyn Write) {
 
             for idx in &schema.indices {
                 let unique = if idx.unique { "UNIQUE " } else { "" };
-                let col_names: Vec<&str> = idx
-                    .columns
-                    .iter()
-                    .filter_map(|&ci| schema.columns.get(ci as usize).map(|c| c.name.as_str()))
+                let col_names: Vec<String> = idx
+                    .column_positions_iter()
+                    .filter_map(|ci| schema.columns.get(ci as usize).map(|c| c.name.clone()))
                     .collect();
                 let _ = writeln!(
                     out,
@@ -680,10 +678,9 @@ pub fn dump_data(
 
             for idx in &schema.indices {
                 let unique = if idx.unique { "UNIQUE " } else { "" };
-                let col_names: Vec<&str> = idx
-                    .columns
-                    .iter()
-                    .filter_map(|&ci| schema.columns.get(ci as usize).map(|c| c.name.as_str()))
+                let col_names: Vec<String> = idx
+                    .column_positions_iter()
+                    .filter_map(|ci| schema.columns.get(ci as usize).map(|c| c.name.clone()))
                     .collect();
                 let _ = writeln!(
                     out,
@@ -776,6 +773,10 @@ fn sql_literal(v: &citadel_sql::Value) -> String {
         citadel_sql::Value::TsQuery(b) => {
             let text = citadel_sql::fts::tsquery_display(b).replace('\'', "''");
             format!("'{text}'::tsquery")
+        }
+        citadel_sql::Value::Array(elems) => {
+            let inner: Vec<String> = elems.iter().map(sql_literal).collect();
+            format!("ARRAY[{}]", inner.join(", "))
         }
     }
 }

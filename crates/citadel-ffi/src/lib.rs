@@ -1056,6 +1056,7 @@ pub enum CitadelValueType {
     Jsonb = 11,
     TsVector = 12,
     TsQuery = 13,
+    Array = 14,
 }
 
 /// Get the type of a value in a query result cell.
@@ -1086,6 +1087,7 @@ pub extern "C" fn citadel_sql_value_type(
         Some(Value::Jsonb(_)) => CitadelValueType::Jsonb,
         Some(Value::TsVector(_)) => CitadelValueType::TsVector,
         Some(Value::TsQuery(_)) => CitadelValueType::TsQuery,
+        Some(Value::Array(_)) => CitadelValueType::Array,
     }
 }
 

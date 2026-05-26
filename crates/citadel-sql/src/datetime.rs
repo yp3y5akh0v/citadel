@@ -10,13 +10,9 @@ use jiff::civil::{Date as JDate, DateTime as JDateTime, Time as JTime};
 use jiff::tz::TimeZone;
 use jiff::{Span, Timestamp as JTimestamp, ToSpan, Unit, Zoned};
 
-/// Microseconds per second.
 pub const MICROS_PER_SEC: i64 = 1_000_000;
-/// Microseconds per minute.
 pub const MICROS_PER_MIN: i64 = 60 * MICROS_PER_SEC;
-/// Microseconds per hour.
 pub const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MIN;
-/// Microseconds per day.
 pub const MICROS_PER_DAY: i64 = 24 * MICROS_PER_HOUR;
 
 /// i64 µs / 86_400_000_000 wraps to i32 for max representable date: ~292k years.

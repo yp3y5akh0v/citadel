@@ -72,6 +72,18 @@ pub(super) fn explain(schema: &SchemaManager, stmt: &Statement) -> Result<Execut
                 AlterTableOp::RenameTable { new_name } => {
                     format!("ALTER TABLE {} RENAME TO {}", at.table, new_name)
                 }
+                AlterTableOp::DisableTrigger { name } => {
+                    format!("ALTER TABLE {} DISABLE TRIGGER {}", at.table, name)
+                }
+                AlterTableOp::EnableTrigger { name } => {
+                    format!("ALTER TABLE {} ENABLE TRIGGER {}", at.table, name)
+                }
+                AlterTableOp::DisableAllTriggers => {
+                    format!("ALTER TABLE {} DISABLE TRIGGER ALL", at.table)
+                }
+                AlterTableOp::EnableAllTriggers => {
+                    format!("ALTER TABLE {} ENABLE TRIGGER ALL", at.table)
+                }
             };
             vec![desc]
         }

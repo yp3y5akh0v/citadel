@@ -17,13 +17,16 @@ pub trait VirtualTable: Send + Sync {
 }
 
 pub fn register_builtins(schema: &mut SchemaManager) {
-    let entries: [Arc<dyn VirtualTable>; 6] = [
+    let entries: [Arc<dyn VirtualTable>; 9] = [
         Arc::new(PgTimezoneNames),
         Arc::new(PgTimezoneAbbrevs),
         Arc::new(InfoSchemaTables),
         Arc::new(InfoSchemaColumns),
         Arc::new(InfoSchemaKeyColumnUsage),
         Arc::new(InfoSchemaTableConstraints),
+        Arc::new(InfoSchemaTriggers),
+        Arc::new(CitadelTriggersStatus),
+        Arc::new(PgMatviews),
     ];
     for vt in entries {
         schema.register_virtual(vt);
@@ -115,6 +118,10 @@ impl VirtualTable for InfoSchemaTables {
         ];
         let mut rows = Vec::new();
         for ts in schema.all_schemas() {
+            // Listed separately below as MATERIALIZED VIEW.
+            if schema.get_matview(&ts.name).is_some() {
+                continue;
+            }
             rows.push(vec![
                 Value::Text("citadel".into()),
                 Value::Text("public".into()),
@@ -128,6 +135,14 @@ impl VirtualTable for InfoSchemaTables {
                 Value::Text("public".into()),
                 Value::Text(vn.to_string().into()),
                 Value::Text("VIEW".into()),
+            ]);
+        }
+        for mv in schema.all_matviews() {
+            rows.push(vec![
+                Value::Text("citadel".into()),
+                Value::Text("public".into()),
+                Value::Text(mv.name.clone().into()),
+                Value::Text("MATERIALIZED VIEW".into()),
             ]);
         }
         rows.sort_by(|a, b| match (&a[2], &b[2]) {
@@ -333,5 +348,171 @@ fn data_type_name(dt: &DataType) -> &'static str {
         DataType::Null => "NULL",
         DataType::TsVector => "TSVECTOR",
         DataType::TsQuery => "TSQUERY",
+        DataType::Array => "ARRAY",
+    }
+}
+
+/// One row per event for multi-event triggers (per SQL spec).
+pub struct InfoSchemaTriggers;
+impl VirtualTable for InfoSchemaTriggers {
+    fn name(&self) -> &str {
+        "information_schema.triggers"
+    }
+    fn scan(&self, _db: &Database, schema: &SchemaManager) -> Result<QueryResult> {
+        let columns = vec![
+            "trigger_catalog".to_string(),
+            "trigger_schema".to_string(),
+            "trigger_name".to_string(),
+            "event_manipulation".to_string(),
+            "event_object_catalog".to_string(),
+            "event_object_schema".to_string(),
+            "event_object_table".to_string(),
+            "action_order".to_string(),
+            "action_condition".to_string(),
+            "action_statement".to_string(),
+            "action_orientation".to_string(),
+            "action_timing".to_string(),
+            "action_reference_old_table".to_string(),
+            "action_reference_new_table".to_string(),
+            "action_reference_old_row".to_string(),
+            "action_reference_new_row".to_string(),
+            "created".to_string(),
+        ];
+        let mut all: Vec<&crate::types::TriggerDef> = schema.all_triggers().collect();
+        all.sort_by(|a, b| a.target.cmp(&b.target).then(a.name.cmp(&b.name)));
+        let mut order_in_group: rustc_hash::FxHashMap<(String, String, String, String), i64> =
+            rustc_hash::FxHashMap::default();
+        let mut rows = Vec::new();
+        for td in all {
+            for ev in &td.events {
+                let event_name = match ev {
+                    crate::parser::TriggerEvent::Insert => "INSERT".to_string(),
+                    crate::parser::TriggerEvent::Update(_) => "UPDATE".to_string(),
+                    crate::parser::TriggerEvent::Delete => "DELETE".to_string(),
+                };
+                let timing_name = match td.timing {
+                    crate::parser::TriggerTiming::Before => "BEFORE".to_string(),
+                    crate::parser::TriggerTiming::After => "AFTER".to_string(),
+                    crate::parser::TriggerTiming::InsteadOf => "INSTEAD OF".to_string(),
+                };
+                let orientation = match td.granularity {
+                    crate::parser::TriggerGranularity::ForEachRow => "ROW".to_string(),
+                    crate::parser::TriggerGranularity::ForEachStatement => "STATEMENT".to_string(),
+                };
+                let key = (
+                    td.target.clone(),
+                    event_name.clone(),
+                    timing_name.clone(),
+                    orientation.clone(),
+                );
+                let order = order_in_group.entry(key).or_insert(0);
+                *order += 1;
+                let order_val = *order;
+                let action_condition = match &td.when_sql {
+                    Some(s) => Value::Text(s.clone().into()),
+                    None => Value::Null,
+                };
+                let old_table_alias = td
+                    .referencing
+                    .as_ref()
+                    .and_then(|r| r.old_table_alias.clone());
+                let new_table_alias = td
+                    .referencing
+                    .as_ref()
+                    .and_then(|r| r.new_table_alias.clone());
+                rows.push(vec![
+                    Value::Text("citadel".into()),
+                    Value::Text("public".into()),
+                    Value::Text(td.name.clone().into()),
+                    Value::Text(event_name.into()),
+                    Value::Text("citadel".into()),
+                    Value::Text("public".into()),
+                    Value::Text(td.target.clone().into()),
+                    Value::Integer(order_val),
+                    action_condition,
+                    Value::Text(td.body_sql.clone().into()),
+                    Value::Text(orientation.into()),
+                    Value::Text(timing_name.into()),
+                    old_table_alias
+                        .map(|s| Value::Text(s.into()))
+                        .unwrap_or(Value::Null),
+                    new_table_alias
+                        .map(|s| Value::Text(s.into()))
+                        .unwrap_or(Value::Null),
+                    Value::Null,
+                    Value::Null,
+                    Value::Timestamp(td.created_at_micros),
+                ]);
+            }
+        }
+        Ok(QueryResult { columns, rows })
+    }
+}
+
+/// Surfaces `enabled` status — PG hides this from `information_schema.triggers`.
+pub struct CitadelTriggersStatus;
+impl VirtualTable for CitadelTriggersStatus {
+    fn name(&self) -> &str {
+        "citadel_triggers_status"
+    }
+    fn scan(&self, _db: &Database, schema: &SchemaManager) -> Result<QueryResult> {
+        let columns = vec![
+            "trigger_name".to_string(),
+            "table_name".to_string(),
+            "enabled".to_string(),
+        ];
+        let mut all: Vec<&crate::types::TriggerDef> = schema.all_triggers().collect();
+        all.sort_by(|a, b| a.target.cmp(&b.target).then(a.name.cmp(&b.name)));
+        let rows = all
+            .into_iter()
+            .map(|td| {
+                vec![
+                    Value::Text(td.name.clone().into()),
+                    Value::Text(td.target.clone().into()),
+                    Value::Boolean(td.enabled),
+                ]
+            })
+            .collect();
+        Ok(QueryResult { columns, rows })
+    }
+}
+
+/// `matviewowner` and `tablespace` are constants — citadel has no permission/storage concept.
+pub struct PgMatviews;
+impl VirtualTable for PgMatviews {
+    fn name(&self) -> &str {
+        "pg_matviews"
+    }
+    fn scan(&self, _db: &Database, schema: &SchemaManager) -> Result<QueryResult> {
+        let columns = vec![
+            "schemaname".to_string(),
+            "matviewname".to_string(),
+            "matviewowner".to_string(),
+            "tablespace".to_string(),
+            "hasindexes".to_string(),
+            "ispopulated".to_string(),
+            "definition".to_string(),
+        ];
+        let mut entries: Vec<&crate::types::MatviewDef> = schema.all_matviews().collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let rows = entries
+            .into_iter()
+            .map(|mv| {
+                let hasindexes = schema
+                    .get(&mv.backing_table)
+                    .map(|ts| !ts.indices.is_empty())
+                    .unwrap_or(false);
+                vec![
+                    Value::Text("public".into()),
+                    Value::Text(mv.name.clone().into()),
+                    Value::Text("citadel".into()),
+                    Value::Null,
+                    Value::Boolean(hasindexes),
+                    Value::Boolean(mv.with_data),
+                    Value::Text(mv.select_sql.clone().into()),
+                ]
+            })
+            .collect();
+        Ok(QueryResult { columns, rows })
     }
 }

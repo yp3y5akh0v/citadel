@@ -12,12 +12,57 @@ use crate::types::{ForeignKeySchemaEntry, TableSchema, ViewDef};
 
 const SCHEMA_TABLE: &[u8] = b"_schema";
 const VIEWS_TABLE: &[u8] = b"_views";
+const TRIGGERS_TABLE: &[u8] = b"_triggers";
+const MATVIEWS_TABLE: &[u8] = b"_matviews";
+
+thread_local! {
+    /// Stack of `(alias → storage_name)` frames pushed by FOR EACH STATEMENT trigger
+    /// firings so `REFERENCING NEW TABLE AS new_t` resolves while the body runs.
+    static TRANSITION_TABLES: std::cell::RefCell<Vec<FxHashMap<String, String>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn transition_table_lookup(name_lower: &str) -> Option<String> {
+    TRANSITION_TABLES.with(|cell| {
+        let stack = cell.borrow();
+        for frame in stack.iter().rev() {
+            if let Some(storage) = frame.get(name_lower) {
+                return Some(storage.clone());
+            }
+        }
+        None
+    })
+}
+
+pub(crate) fn push_transition_tables(aliases: FxHashMap<String, String>) -> TransitionGuard {
+    TRANSITION_TABLES.with(|cell| cell.borrow_mut().push(aliases));
+    TransitionGuard
+}
+
+pub(crate) struct TransitionGuard;
+impl Drop for TransitionGuard {
+    fn drop(&mut self) {
+        TRANSITION_TABLES.with(|cell| {
+            cell.borrow_mut().pop();
+        });
+    }
+}
 
 /// Manages table schemas in memory, backed by the `_schema` table.
 pub struct SchemaManager {
     tables: FxHashMap<String, TableSchema>,
     views: FxHashMap<String, ViewDef>,
     virtual_tables: FxHashMap<String, Arc<dyn VirtualTable>>,
+    /// Within a `(target, timing, event)` group, triggers fire in name order.
+    triggers: FxHashMap<String, Vec<crate::types::TriggerDef>>,
+    /// Matview catalog. Backing table shares the matview's name in `tables`; this map
+    /// also gates DML rejection (matviews are read-only outside REFRESH).
+    matviews: FxHashMap<String, crate::types::MatviewDef>,
+    /// Maps user-typed TEMP name to prefixed storage name (`__temp_<conn_id>_<name>`).
+    temp_aliases: FxHashMap<String, String>,
+    /// Each entry is leaked once via `Box::leak` so `get()` can hand out a `&TableSchema`
+    /// from inside `&self` methods. Bounded by `(active triggers × transition aliases)`.
+    transition_schemas: std::cell::RefCell<FxHashMap<String, &'static TableSchema>>,
     generation: u64,
 }
 
@@ -29,7 +74,48 @@ pub struct SchemaSnapshot {
 }
 
 impl SchemaManager {
-    /// Load all schemas from the database's `_schema` table.
+    pub fn empty() -> Self {
+        Self {
+            tables: FxHashMap::default(),
+            views: FxHashMap::default(),
+            virtual_tables: FxHashMap::default(),
+            triggers: FxHashMap::default(),
+            matviews: FxHashMap::default(),
+            temp_aliases: FxHashMap::default(),
+            transition_schemas: std::cell::RefCell::new(FxHashMap::default()),
+            generation: 0,
+        }
+    }
+
+    pub fn register_temp_alias(&mut self, user_name: &str, prefixed_name: String) {
+        self.temp_aliases
+            .insert(user_name.to_ascii_lowercase(), prefixed_name);
+        self.generation += 1;
+    }
+
+    pub fn unregister_temp_alias(&mut self, user_name: &str) -> Option<String> {
+        let lower = user_name.to_ascii_lowercase();
+        let removed = self.temp_aliases.remove(&lower);
+        if removed.is_some() {
+            self.generation += 1;
+        }
+        removed
+    }
+
+    pub fn temp_alias_iter(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.temp_aliases
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    pub fn resolve_temp(&self, name: &str) -> String {
+        let lower = name.to_ascii_lowercase();
+        if let Some(prefixed) = self.temp_aliases.get(&lower) {
+            return prefixed.clone();
+        }
+        name.to_string()
+    }
+
     pub fn load(db: &Database) -> Result<Self> {
         let mut tables = FxHashMap::default();
 
@@ -80,10 +166,67 @@ impl SchemaManager {
             return Err(e);
         }
 
+        let mut triggers: FxHashMap<String, Vec<crate::types::TriggerDef>> = FxHashMap::default();
+        let mut rtx3 = db.begin_read();
+        let mut trig_err: Option<crate::error::SqlError> = None;
+        let trig_scan = rtx3.table_for_each(TRIGGERS_TABLE, |_key, value| {
+            match crate::types::TriggerDef::deserialize(value) {
+                Ok(td) => {
+                    triggers
+                        .entry(td.target.to_ascii_lowercase())
+                        .or_default()
+                        .push(td);
+                }
+                Err(e) => {
+                    trig_err = Some(e);
+                }
+            }
+            Ok(())
+        });
+        match trig_scan {
+            Ok(()) => {}
+            Err(citadel_core::Error::TableNotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        if let Some(e) = trig_err {
+            return Err(e);
+        }
+        // PG-faithful: triggers fire in name order within a (target, timing, event) group.
+        for v in triggers.values_mut() {
+            v.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+
+        let mut matviews: FxHashMap<String, crate::types::MatviewDef> = FxHashMap::default();
+        let mut rtx4 = db.begin_read();
+        let mut mv_err: Option<crate::error::SqlError> = None;
+        let mv_scan = rtx4.table_for_each(MATVIEWS_TABLE, |_key, value| {
+            match crate::types::MatviewDef::deserialize(value) {
+                Ok(mv) => {
+                    matviews.insert(mv.name.to_ascii_lowercase(), mv);
+                }
+                Err(e) => {
+                    mv_err = Some(e);
+                }
+            }
+            Ok(())
+        });
+        match mv_scan {
+            Ok(()) => {}
+            Err(citadel_core::Error::TableNotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        if let Some(e) = mv_err {
+            return Err(e);
+        }
+
         let mut mgr = Self {
             tables,
             views,
             virtual_tables: FxHashMap::default(),
+            triggers,
+            matviews,
+            temp_aliases: FxHashMap::default(),
+            transition_schemas: std::cell::RefCell::new(FxHashMap::default()),
             generation: 0,
         };
         system_tables::register_builtins(&mut mgr);
@@ -100,22 +243,58 @@ impl SchemaManager {
     }
 
     pub fn get(&self, name: &str) -> Option<&TableSchema> {
+        let lower = name.to_ascii_lowercase();
+        if let Some(prefixed) = transition_table_lookup(&lower) {
+            if let Some(s) = self.tables.get(&prefixed) {
+                return Some(s);
+            }
+            if let Some(&leaked) = self.transition_schemas.borrow().get(&prefixed) {
+                return Some(leaked);
+            }
+        }
+        if let Some(mv) = self.matviews.get(&lower) {
+            return self.tables.get(&mv.backing_table);
+        }
+        if let Some(prefixed) = self.temp_aliases.get(&lower) {
+            return self.tables.get(prefixed);
+        }
         if let Some(s) = self.tables.get(name) {
             return Some(s);
         }
         if name.bytes().any(|b| b.is_ascii_uppercase()) {
-            self.tables.get(&name.to_ascii_lowercase())
+            self.tables.get(&lower)
         } else {
             None
         }
     }
 
+    pub fn register_transition_schema(&self, storage_name: String, schema: TableSchema) {
+        let leaked: &'static TableSchema = Box::leak(Box::new(schema));
+        self.transition_schemas
+            .borrow_mut()
+            .insert(storage_name, leaked);
+    }
+
+    pub fn unregister_transition_schema(&self, storage_name: &str) {
+        self.transition_schemas.borrow_mut().remove(storage_name);
+    }
+
     pub fn contains(&self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        if transition_table_lookup(&lower).is_some() {
+            return true;
+        }
+        if self.matviews.contains_key(&lower) {
+            return true;
+        }
+        if self.temp_aliases.contains_key(&lower) {
+            return true;
+        }
         if self.tables.contains_key(name) {
             return true;
         }
         if name.bytes().any(|b| b.is_ascii_uppercase()) {
-            self.tables.contains_key(&name.to_ascii_lowercase())
+            self.tables.contains_key(&lower)
         } else {
             false
         }
@@ -144,7 +323,6 @@ impl SchemaManager {
         self.tables.keys().map(|s| s.as_str()).collect()
     }
 
-    /// Returns all table schemas.
     pub fn all_schemas(&self) -> impl Iterator<Item = &TableSchema> {
         self.tables.values()
     }
@@ -179,6 +357,123 @@ impl SchemaManager {
         self.views.keys().map(|s| s.as_str()).collect()
     }
 
+    pub fn triggers_for(&self, target: &str) -> &[crate::types::TriggerDef] {
+        let key = target.to_ascii_lowercase();
+        self.triggers.get(&key).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    pub fn all_triggers(&self) -> impl Iterator<Item = &crate::types::TriggerDef> + '_ {
+        self.triggers.values().flatten()
+    }
+
+    pub fn register_trigger(&mut self, trig: crate::types::TriggerDef) {
+        let target = trig.target.to_ascii_lowercase();
+        let bucket = self.triggers.entry(target).or_default();
+        bucket.push(trig);
+        bucket.sort_by(|a, b| a.name.cmp(&b.name));
+        self.generation += 1;
+    }
+
+    pub fn remove_trigger(&mut self, name: &str) -> Option<crate::types::TriggerDef> {
+        let lower = name.to_ascii_lowercase();
+        let mut result = None;
+        for bucket in self.triggers.values_mut() {
+            if let Some(pos) = bucket
+                .iter()
+                .position(|t| t.name.eq_ignore_ascii_case(&lower))
+            {
+                result = Some(bucket.remove(pos));
+                break;
+            }
+        }
+        if result.is_some() {
+            self.generation += 1;
+        }
+        result
+    }
+
+    /// Caller is responsible for dropping the returned triggers' on-disk catalog rows.
+    pub fn remove_triggers_for(&mut self, target: &str) -> Vec<crate::types::TriggerDef> {
+        let key = target.to_ascii_lowercase();
+        let removed = self.triggers.remove(&key).unwrap_or_default();
+        if !removed.is_empty() {
+            self.generation += 1;
+        }
+        removed
+    }
+
+    pub fn find_trigger(&self, name: &str) -> Option<(&str, &crate::types::TriggerDef)> {
+        let lower = name.to_ascii_lowercase();
+        for (target, bucket) in &self.triggers {
+            if let Some(t) = bucket.iter().find(|t| t.name.eq_ignore_ascii_case(&lower)) {
+                return Some((target.as_str(), t));
+            }
+        }
+        None
+    }
+
+    pub fn set_trigger_enabled(&mut self, name: &str, enabled: bool) -> bool {
+        let lower = name.to_ascii_lowercase();
+        for bucket in self.triggers.values_mut() {
+            if let Some(t) = bucket
+                .iter_mut()
+                .find(|t| t.name.eq_ignore_ascii_case(&lower))
+            {
+                t.enabled = enabled;
+                self.generation += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn set_all_triggers_enabled(&mut self, target: &str, enabled: bool) -> usize {
+        let key = target.to_ascii_lowercase();
+        let bucket = match self.triggers.get_mut(&key) {
+            Some(b) => b,
+            None => return 0,
+        };
+        let count = bucket.len();
+        for t in bucket {
+            t.enabled = enabled;
+        }
+        if count > 0 {
+            self.generation += 1;
+        }
+        count
+    }
+
+    pub fn ensure_triggers_table(wtx: &mut citadel_txn::write_txn::WriteTxn<'_>) -> Result<()> {
+        match wtx.create_table(TRIGGERS_TABLE) {
+            Ok(()) => Ok(()),
+            Err(citadel_core::Error::TableAlreadyExists(_)) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn save_trigger(
+        wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+        trig: &crate::types::TriggerDef,
+    ) -> Result<()> {
+        Self::ensure_triggers_table(wtx)?;
+        let data = trig.serialize();
+        let lower = trig.name.to_ascii_lowercase();
+        wtx.table_insert(TRIGGERS_TABLE, lower.as_bytes(), &data)
+            .map_err(crate::error::SqlError::from)?;
+        Ok(())
+    }
+
+    pub fn delete_trigger(
+        wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+        name: &str,
+    ) -> Result<()> {
+        Self::ensure_triggers_table(wtx)?;
+        let lower = name.to_ascii_lowercase();
+        wtx.table_delete(TRIGGERS_TABLE, lower.as_bytes())
+            .map_err(crate::error::SqlError::from)?;
+        Ok(())
+    }
+
     pub fn save_view(wtx: &mut citadel_txn::write_txn::WriteTxn<'_>, view: &ViewDef) -> Result<()> {
         let lower = view.name.to_ascii_lowercase();
         let data = view.serialize();
@@ -204,7 +499,64 @@ impl SchemaManager {
         }
     }
 
-    /// Find all FKs in other tables that reference `parent` table.
+    pub fn get_matview(&self, name: &str) -> Option<&crate::types::MatviewDef> {
+        let lower = name.to_ascii_lowercase();
+        self.matviews.get(&lower)
+    }
+
+    pub fn matview_names(&self) -> Vec<&str> {
+        self.matviews.keys().map(|s| s.as_str()).collect()
+    }
+
+    pub fn all_matviews(&self) -> impl Iterator<Item = &crate::types::MatviewDef> + '_ {
+        self.matviews.values()
+    }
+
+    pub fn register_matview(&mut self, mv: crate::types::MatviewDef) {
+        let lower = mv.name.to_ascii_lowercase();
+        self.matviews.insert(lower, mv);
+        self.generation += 1;
+    }
+
+    pub fn remove_matview(&mut self, name: &str) -> Option<crate::types::MatviewDef> {
+        let lower = name.to_ascii_lowercase();
+        let removed = self.matviews.remove(&lower);
+        if removed.is_some() {
+            self.generation += 1;
+        }
+        removed
+    }
+
+    pub fn ensure_matviews_table(wtx: &mut citadel_txn::write_txn::WriteTxn<'_>) -> Result<()> {
+        match wtx.create_table(MATVIEWS_TABLE) {
+            Ok(()) => Ok(()),
+            Err(citadel_core::Error::TableAlreadyExists(_)) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn save_matview(
+        wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+        mv: &crate::types::MatviewDef,
+    ) -> Result<()> {
+        Self::ensure_matviews_table(wtx)?;
+        let lower = mv.name.to_ascii_lowercase();
+        let data = mv.serialize();
+        wtx.table_insert(MATVIEWS_TABLE, lower.as_bytes(), &data)?;
+        Ok(())
+    }
+
+    pub fn delete_matview(
+        wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+        name: &str,
+    ) -> Result<()> {
+        Self::ensure_matviews_table(wtx)?;
+        let lower = name.to_ascii_lowercase();
+        wtx.table_delete(MATVIEWS_TABLE, lower.as_bytes())
+            .map_err(crate::error::SqlError::from)?;
+        Ok(())
+    }
+
     pub fn child_fks_for(&self, parent: &str) -> Vec<(&str, &ForeignKeySchemaEntry)> {
         self.tables
             .iter()
@@ -218,7 +570,6 @@ impl SchemaManager {
             .collect()
     }
 
-    /// Persist a schema to the _schema table (called within a write txn).
     pub fn save_schema(
         wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
         schema: &TableSchema,
@@ -229,7 +580,6 @@ impl SchemaManager {
         Ok(())
     }
 
-    /// Remove a schema from the _schema table (called within a write txn).
     pub fn delete_schema(wtx: &mut citadel_txn::write_txn::WriteTxn<'_>, name: &str) -> Result<()> {
         let lower = name.to_ascii_lowercase();
         wtx.table_delete(SCHEMA_TABLE, lower.as_bytes())
@@ -240,7 +590,6 @@ impl SchemaManager {
         Ok(())
     }
 
-    /// Ensure the _schema table exists (called once per write).
     pub fn ensure_schema_table(wtx: &mut citadel_txn::write_txn::WriteTxn<'_>) -> Result<()> {
         match wtx.create_table(SCHEMA_TABLE) {
             Ok(()) => Ok(()),
@@ -263,3 +612,7 @@ impl SchemaManager {
         self.generation = snap.generation;
     }
 }
+
+#[cfg(test)]
+#[path = "schema_tests.rs"]
+mod tests;
