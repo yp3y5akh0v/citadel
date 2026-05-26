@@ -282,7 +282,7 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 **Full-text search** - `tsvector` / `tsquery` types, `to_tsvector` / `to_tsquery` / `plainto_tsquery` / `phraseto_tsquery` / `websearch_to_tsquery` builders, `@@` match operator, `ts_rank` / `ts_rank_cd` ranking with weighted positions (A/B/C/D), prefix matching (`term:*`), phrase distance (`<N>`), inverted indexes via `CREATE INDEX … USING fts` for ~400× speedup over sequential scan
 
-**System catalog** - `information_schema.tables`, `information_schema.columns`, `information_schema.key_column_usage`, `information_schema.table_constraints`, `information_schema.triggers`, `pg_timezone_names`, `pg_timezone_abbrevs`, `pg_matviews` (virtual tables, queryable). `SHOW TRIGGERS [ON table]` and `SHOW MATERIALIZED VIEWS` as MySQL-compatible conveniences.
+**System catalog** - `information_schema.tables`, `information_schema.columns`, `information_schema.key_column_usage`, `information_schema.table_constraints`, `information_schema.triggers`, `pg_timezone_names`, `pg_timezone_abbrevs`, `pg_matviews` (virtual tables, queryable). `SHOW TRIGGERS [ON table]` and `SHOW MATERIALIZED VIEWS` shorthands for the corresponding catalog queries.
 
 **Prepared statements** - `$1, $2, ...` positional parameters with LRU statement cache plus snapshot-tagged plan caching for joins and compound queries (cache invalidates only on commit, never per-call)
 
