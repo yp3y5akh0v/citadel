@@ -33,6 +33,9 @@ jobs:
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked
 
+      - name: Install binaryen (provides wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
       - name: Build WASM
         run: |
           wasm-pack build crates/citadel-wasm --target web --release
