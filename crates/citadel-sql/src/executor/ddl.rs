@@ -1614,3 +1614,7 @@ pub(super) fn find_index_in_schemas(
     }
     None
 }
+
+#[cfg(test)]
+#[path = "ddl_tests.rs"]
+mod tests;

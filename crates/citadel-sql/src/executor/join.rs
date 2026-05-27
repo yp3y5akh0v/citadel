@@ -1,4 +1,4 @@
-use citadel::Database;
+use citadel_txn::read_txn::ReadTxn;
 use rustc_hash::FxHashMap;
 
 use crate::error::{Result, SqlError};
@@ -1103,8 +1103,8 @@ pub(super) fn collect_rows_partial_write_with_ctx(
     Ok(rows)
 }
 
-pub(super) fn exec_select_join(
-    db: &Database,
+pub(super) fn exec_select_join_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
 ) -> Result<ExecutionResult> {
@@ -1123,10 +1123,9 @@ pub(super) fn exec_select_join(
         None => (None, None),
     };
 
-    let mut rtx = db.begin_read();
     let mut outer_rows = match &needed_per_table {
-        Some(n) if !n.is_empty() => collect_rows_partial(&mut rtx, from_schema, &n[0])?,
-        _ => collect_all_rows_raw(&mut rtx, from_schema)?,
+        Some(n) if !n.is_empty() => collect_rows_partial(rtx, from_schema, &n[0])?,
+        _ => collect_all_rows_raw(rtx, from_schema)?,
     };
 
     let mut cur_outer_pk_col: Option<usize> = if from_schema.primary_key_columns.len() == 1 {
@@ -1140,10 +1139,8 @@ pub(super) fn exec_select_join(
     for (ji, join) in stmt.joins.iter().enumerate() {
         let inner_schema = all_tables[ji + 1].1;
         let mut inner_rows = match &needed_per_table {
-            Some(n) if ji + 1 < n.len() => {
-                collect_rows_partial(&mut rtx, inner_schema, &n[ji + 1])?
-            }
-            _ => collect_all_rows_raw(&mut rtx, inner_schema)?,
+            Some(n) if ji + 1 < n.len() => collect_rows_partial(rtx, inner_schema, &n[ji + 1])?,
+            _ => collect_all_rows_raw(rtx, inner_schema)?,
         };
 
         extend_joined_columns(&mut combined_cols, &all_tables[ji + 1]);
@@ -1183,7 +1180,6 @@ pub(super) fn exec_select_join(
         );
         cur_outer_pk_col = None;
     }
-    drop(rtx);
 
     if let Some(ref oc) = output_combined {
         let actual_width = outer_rows.first().map_or(0, |r| r.len());
@@ -1764,3 +1760,7 @@ pub(super) fn exec_join_step_borrowed(
     }
     result
 }
+
+#[cfg(test)]
+#[path = "join_tests.rs"]
+mod tests;

@@ -208,7 +208,7 @@ fn cascade_delete_with_initially_deferred_fk_fires_immediately() {
     let qr = conn.query("SELECT COUNT(*) FROM c").unwrap();
     assert!(
         matches!(qr.rows[0][0], citadel_sql::Value::Integer(0)),
-        "cascade fires immediately even with INITIALLY DEFERRED — v0.17 ratchet"
+        "cascade fires immediately even with INITIALLY DEFERRED"
     );
 }
 

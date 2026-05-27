@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 
 use citadel::Database;
-use citadel_txn::write_txn::WriteTxn;
 
 use crate::encoding::{
     decode_column_raw, decode_column_with_offset, decode_composite_key, decode_pk_integer,
@@ -419,7 +418,7 @@ impl CompiledPlan for CompiledUpdate {
         schema: &SchemaManager,
         stmt: &Statement,
         _params: &[Value],
-        wtx: Option<&mut WriteTxn<'_>>,
+        txn: super::compile::ActiveTxnRef<'_, '_>,
     ) -> Result<ExecutionResult> {
         let upd = match stmt {
             Statement::Update(u) => u,
@@ -429,9 +428,15 @@ impl CompiledPlan for CompiledUpdate {
                 ))
             }
         };
-        match wtx {
-            None => with_update_scratch(|bufs| exec_update_compiled(db, schema, upd, self, bufs)),
-            Some(outer) => with_update_scratch(|bufs| {
+        use super::compile::ActiveTxnRef;
+        match txn {
+            ActiveTxnRef::None => {
+                with_update_scratch(|bufs| exec_update_compiled(db, schema, upd, self, bufs))
+            }
+            ActiveTxnRef::Read(_) => Err(SqlError::Unsupported(
+                "cannot execute mutating statement inside a read-only transaction".into(),
+            )),
+            ActiveTxnRef::Write(outer) => with_update_scratch(|bufs| {
                 exec_update_in_txn_compiled(outer, schema, upd, self, bufs)
             }),
         }
@@ -3541,3 +3546,7 @@ fn build_select_for_view(
         body: QueryBody::Select(Box::new(sel)),
     }
 }
+
+#[cfg(test)]
+#[path = "write_tests.rs"]
+mod tests;

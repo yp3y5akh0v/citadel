@@ -213,7 +213,10 @@ fn cell_to_js(cell: &CellValue) -> JsValue {
         | CellValue::Timestamp { iso, .. }
         | CellValue::Interval { iso, .. } => JsValue::from_str(iso),
         CellValue::Json(s) => JsValue::from_str(s),
-        CellValue::Jsonb(b) => js_sys::Uint8Array::from(b.as_slice()).into(),
+        CellValue::Jsonb(b) => match citadel_sql::json::decode_to_text(b) {
+            Ok(s) => js_sys::JSON::parse(&s).unwrap_or(JsValue::NULL),
+            Err(_) => JsValue::NULL,
+        },
         CellValue::TsVector(b) | CellValue::TsQuery(b) => {
             js_sys::Uint8Array::from(b.as_slice()).into()
         }

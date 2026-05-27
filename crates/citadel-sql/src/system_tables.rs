@@ -4,7 +4,6 @@
 
 use std::sync::Arc;
 
-use citadel::Database;
 use rustc_hash::FxHashSet;
 
 use crate::error::Result;
@@ -13,7 +12,7 @@ use crate::types::{DataType, QueryResult, Value};
 
 pub trait VirtualTable: Send + Sync {
     fn name(&self) -> &str;
-    fn scan(&self, db: &Database, schema: &SchemaManager) -> Result<QueryResult>;
+    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult>;
 }
 
 pub fn register_builtins(schema: &mut SchemaManager) {
@@ -38,7 +37,7 @@ impl VirtualTable for PgTimezoneNames {
     fn name(&self) -> &str {
         "pg_timezone_names"
     }
-    fn scan(&self, _db: &Database, _schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(&self, _schema: &SchemaManager) -> Result<QueryResult> {
         let columns = vec![
             "name".to_string(),
             "utc_offset".to_string(),
@@ -71,7 +70,7 @@ impl VirtualTable for PgTimezoneAbbrevs {
     fn name(&self) -> &str {
         "pg_timezone_abbrevs"
     }
-    fn scan(&self, _db: &Database, _schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(&self, _schema: &SchemaManager) -> Result<QueryResult> {
         let columns = vec![
             "abbrev".to_string(),
             "utc_offset".to_string(),
@@ -109,7 +108,7 @@ impl VirtualTable for InfoSchemaTables {
     fn name(&self) -> &str {
         "information_schema.tables"
     }
-    fn scan(&self, _db: &Database, schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult> {
         let columns = vec![
             "table_catalog".to_string(),
             "table_schema".to_string(),
@@ -158,7 +157,7 @@ impl VirtualTable for InfoSchemaColumns {
     fn name(&self) -> &str {
         "information_schema.columns"
     }
-    fn scan(&self, _db: &Database, schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult> {
         let columns = vec![
             "table_catalog".to_string(),
             "table_schema".to_string(),
@@ -202,7 +201,7 @@ impl VirtualTable for InfoSchemaKeyColumnUsage {
     fn name(&self) -> &str {
         "information_schema.key_column_usage"
     }
-    fn scan(&self, _db: &Database, schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult> {
         let columns = vec![
             "constraint_catalog".to_string(),
             "constraint_schema".to_string(),
@@ -266,7 +265,7 @@ impl VirtualTable for InfoSchemaTableConstraints {
     fn name(&self) -> &str {
         "information_schema.table_constraints"
     }
-    fn scan(&self, _db: &Database, schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult> {
         let columns = vec![
             "constraint_catalog".to_string(),
             "constraint_schema".to_string(),
@@ -358,7 +357,7 @@ impl VirtualTable for InfoSchemaTriggers {
     fn name(&self) -> &str {
         "information_schema.triggers"
     }
-    fn scan(&self, _db: &Database, schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult> {
         let columns = vec![
             "trigger_catalog".to_string(),
             "trigger_schema".to_string(),
@@ -455,7 +454,7 @@ impl VirtualTable for CitadelTriggersStatus {
     fn name(&self) -> &str {
         "citadel_triggers_status"
     }
-    fn scan(&self, _db: &Database, schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult> {
         let columns = vec![
             "trigger_name".to_string(),
             "table_name".to_string(),
@@ -483,7 +482,7 @@ impl VirtualTable for PgMatviews {
     fn name(&self) -> &str {
         "pg_matviews"
     }
-    fn scan(&self, _db: &Database, schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult> {
         let columns = vec![
             "schemaname".to_string(),
             "matviewname".to_string(),

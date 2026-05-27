@@ -1,4 +1,5 @@
 use citadel::Database;
+use citadel_txn::read_txn::ReadTxn;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::encoding::{decode_column_raw, decode_composite_key, decode_pk_integer};
@@ -14,8 +15,8 @@ use super::CteContext;
 pub(super) type InMap = (FxHashMap<Vec<Value>, FxHashSet<Value>>, bool);
 
 #[allow(clippy::type_complexity)]
-pub(super) fn handle_correlated_select_read(
-    db: &Database,
+pub(super) fn handle_correlated_select_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctx: &CorrelationCtx,
@@ -44,7 +45,8 @@ pub(super) fn handle_correlated_select_read(
                             sub.from_alias.as_deref(),
                         );
                         if !corr_pairs.is_empty() {
-                            let map = decorrelate_scalar_read(db, schema, sub, &corr_pairs, ctx)?;
+                            let map =
+                                decorrelate_scalar_with_read(rtx, schema, sub, &corr_pairs, ctx)?;
                             let outer_indices: Vec<usize> =
                                 corr_pairs.iter().map(|p| p.outer_col_idx).collect();
                             scalar_maps.push((map, outer_indices));
@@ -117,8 +119,8 @@ pub(super) fn handle_correlated_select_read(
     })
 }
 
-pub(super) fn resolve_inner_schema(
-    db: &Database,
+pub(super) fn resolve_inner_schema_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     name: &str,
 ) -> Result<TableSchema> {
@@ -126,7 +128,7 @@ pub(super) fn resolve_inner_schema(
         return Ok(ts.clone());
     }
     if let Some(vd) = schema.get_view(name) {
-        let qr = super::exec_view_read(db, schema, vd)?;
+        let qr = super::exec_view_with_read(rtx, schema, vd)?;
         return Ok(super::build_view_schema(name, &qr));
     }
     Err(SqlError::TableNotFound(name.to_string()))
@@ -575,8 +577,8 @@ pub(super) struct ExistsFilterData {
     inner_schema: TableSchema,
 }
 
-pub(super) fn decorrelate_exists_read(
-    db: &Database,
+pub(super) fn decorrelate_exists_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     subquery: &SelectStmt,
     corr_pairs: &[CorrEqPair],
@@ -587,10 +589,10 @@ pub(super) fn decorrelate_exists_read(
     let (inner_schema_owned, inner_rows) = if let Some(ts) = schema.get(&inner_name) {
         let (inner_where, _) =
             strip_correlation_predicates(&subquery.where_clause, corr_pairs, ctx, ts);
-        let (rows, _) = super::collect_rows_read(db, ts, &inner_where, None)?;
+        let (rows, _) = super::collect_rows_with_read(rtx, ts, &inner_where, None)?;
         (ts.clone(), rows)
     } else if let Some(vd) = schema.get_view(&inner_name) {
-        let vqr = super::exec_view_read(db, schema, vd)?;
+        let vqr = super::exec_view_with_read(rtx, schema, vd)?;
         let vs = super::build_view_schema(&inner_name, &vqr);
         let (inner_where, _) =
             strip_correlation_predicates(&subquery.where_clause, corr_pairs, ctx, &vs);
@@ -648,8 +650,8 @@ pub(super) fn decorrelate_exists_read(
 }
 
 /// Decorrelate IN/NOT IN subquery. Returns correlation key → IN-column value set.
-pub(super) fn decorrelate_in_read(
-    db: &Database,
+pub(super) fn decorrelate_in_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     subquery: &SelectStmt,
     corr_pairs: &[CorrEqPair],
@@ -673,7 +675,7 @@ pub(super) fn decorrelate_in_read(
 
     let (inner_where, _non_eq) =
         strip_correlation_predicates(&subquery.where_clause, corr_pairs, ctx, inner_schema);
-    let (inner_rows, _) = super::collect_rows_read(db, inner_schema, &inner_where, None)?;
+    let (inner_rows, _) = super::collect_rows_with_read(rtx, inner_schema, &inner_where, None)?;
 
     let inner_corr_indices: Vec<usize> = corr_pairs
         .iter()
@@ -700,8 +702,8 @@ pub(super) fn decorrelate_in_read(
 }
 
 /// Decorrelate scalar subquery. Returns correlation key → scalar result.
-pub(super) fn decorrelate_scalar_read(
-    db: &Database,
+pub(super) fn decorrelate_scalar_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     subquery: &SelectStmt,
     corr_pairs: &[CorrEqPair],
@@ -752,7 +754,7 @@ pub(super) fn decorrelate_scalar_read(
     };
 
     let empty_ctes = CteContext::default();
-    let qr = match super::exec_select(db, schema, &rewritten, &empty_ctes)? {
+    let qr = match super::exec_select_with_read(rtx, schema, &rewritten, &empty_ctes)? {
         ExecutionResult::Query(qr) => qr,
         _ => return Ok(FxHashMap::default()),
     };
@@ -1181,8 +1183,8 @@ pub(super) fn has_correlated_in_expr(
 }
 
 /// Decorrelate + partial-decode scan: only fully decode rows matching correlation.
-pub(super) fn build_and_scan_correlated_read(
-    db: &Database,
+pub(super) fn build_and_scan_correlated_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     outer_schema: &TableSchema,
@@ -1191,7 +1193,7 @@ pub(super) fn build_and_scan_correlated_read(
     let where_clause = match &stmt.where_clause {
         Some(w) => w,
         None => {
-            let (rows, _) = super::collect_rows_read(db, outer_schema, &None, None)?;
+            let (rows, _) = super::collect_rows_with_read(rtx, outer_schema, &None, None)?;
             return Ok((rows, None));
         }
     };
@@ -1204,8 +1206,11 @@ pub(super) fn build_and_scan_correlated_read(
     for conj in &conjuncts {
         match conj {
             Expr::Exists { subquery, negated } if is_correlated_subquery(subquery, ctx, schema) => {
-                let inner_schema =
-                    resolve_inner_schema(db, schema, &subquery.from.to_ascii_lowercase())?;
+                let inner_schema = resolve_inner_schema_with_read(
+                    rtx,
+                    schema,
+                    &subquery.from.to_ascii_lowercase(),
+                )?;
                 let (corr_pairs, _) = extract_correlation_predicates(
                     subquery
                         .where_clause
@@ -1219,7 +1224,7 @@ pub(super) fn build_and_scan_correlated_read(
                     remaining_conjuncts.push((*conj).clone());
                     continue;
                 }
-                let result = decorrelate_exists_read(db, schema, subquery, &corr_pairs, ctx)?;
+                let result = decorrelate_exists_with_read(rtx, schema, subquery, &corr_pairs, ctx)?;
                 let outer_col_indices: Vec<usize> =
                     corr_pairs.iter().map(|p| p.outer_col_idx).collect();
                 exists_filters.push(ExistsFilter {
@@ -1233,8 +1238,11 @@ pub(super) fn build_and_scan_correlated_read(
                 subquery,
                 negated,
             } if is_correlated_subquery(subquery, ctx, schema) => {
-                let inner_schema =
-                    resolve_inner_schema(db, schema, &subquery.from.to_ascii_lowercase())?;
+                let inner_schema = resolve_inner_schema_with_read(
+                    rtx,
+                    schema,
+                    &subquery.from.to_ascii_lowercase(),
+                )?;
                 let (corr_pairs, _) = extract_correlation_predicates(
                     subquery
                         .where_clause
@@ -1248,7 +1256,8 @@ pub(super) fn build_and_scan_correlated_read(
                     remaining_conjuncts.push((*conj).clone());
                     continue;
                 }
-                let (map, has_null) = decorrelate_in_read(db, schema, subquery, &corr_pairs, ctx)?;
+                let (map, has_null) =
+                    decorrelate_in_with_read(rtx, schema, subquery, &corr_pairs, ctx)?;
                 let outer_col_indices: Vec<usize> =
                     corr_pairs.iter().map(|p| p.outer_col_idx).collect();
                 in_filters.push(InFilter {
@@ -1265,8 +1274,8 @@ pub(super) fn build_and_scan_correlated_read(
 
     // If no optimizable filters, fall back to generic path
     if exists_filters.is_empty() && in_filters.is_empty() {
-        let (mut rows, _) = super::collect_rows_read(db, outer_schema, &None, None)?;
-        let remaining = handle_correlated_where_read(db, schema, stmt, ctx, &mut rows)?;
+        let (mut rows, _) = super::collect_rows_with_read(rtx, outer_schema, &None, None)?;
+        let remaining = handle_correlated_where_with_read(rtx, schema, stmt, ctx, &mut rows)?;
         return Ok((rows, remaining));
     }
 
@@ -1295,7 +1304,6 @@ pub(super) fn build_and_scan_correlated_read(
 
     let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut scan_err: Option<SqlError> = None;
-    let mut rtx = db.begin_read();
 
     let mut col_vals: Vec<(usize, Value)> = Vec::with_capacity(needed_raw.len());
     let max_key_cols = exists_filters
@@ -1528,6 +1536,17 @@ pub(super) fn handle_correlated_where_read(
     ctx: &CorrelationCtx,
     rows: &mut Vec<Vec<Value>>,
 ) -> Result<Option<Expr>> {
+    let mut rtx = db.begin_read();
+    handle_correlated_where_with_read(&mut rtx, schema, stmt, ctx, rows)
+}
+
+pub(super) fn handle_correlated_where_with_read(
+    rtx: &mut ReadTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+    ctx: &CorrelationCtx,
+    rows: &mut Vec<Vec<Value>>,
+) -> Result<Option<Expr>> {
     let where_clause = match &stmt.where_clause {
         Some(w) => w,
         None => return Ok(None),
@@ -1540,8 +1559,11 @@ pub(super) fn handle_correlated_where_read(
         match conj {
             Expr::Exists { subquery, negated } => {
                 if is_correlated_subquery(subquery, ctx, schema) {
-                    let inner_schema =
-                        resolve_inner_schema(db, schema, &subquery.from.to_ascii_lowercase())?;
+                    let inner_schema = resolve_inner_schema_with_read(
+                        rtx,
+                        schema,
+                        &subquery.from.to_ascii_lowercase(),
+                    )?;
                     let (corr_pairs, _) = extract_correlation_predicates(
                         subquery
                             .where_clause
@@ -1556,7 +1578,7 @@ pub(super) fn handle_correlated_where_read(
                         continue;
                     }
                     let exists_result =
-                        decorrelate_exists_read(db, schema, subquery, &corr_pairs, ctx)?;
+                        decorrelate_exists_with_read(rtx, schema, subquery, &corr_pairs, ctx)?;
                     let outer_col_indices: Vec<usize> =
                         corr_pairs.iter().map(|p| p.outer_col_idx).collect();
                     let is_negated = *negated;
@@ -1627,8 +1649,11 @@ pub(super) fn handle_correlated_where_read(
                 negated,
             } => {
                 if is_correlated_subquery(subquery, ctx, schema) {
-                    let inner_schema =
-                        resolve_inner_schema(db, schema, &subquery.from.to_ascii_lowercase())?;
+                    let inner_schema = resolve_inner_schema_with_read(
+                        rtx,
+                        schema,
+                        &subquery.from.to_ascii_lowercase(),
+                    )?;
                     let (corr_pairs, _) = extract_correlation_predicates(
                         subquery
                             .where_clause
@@ -1643,7 +1668,7 @@ pub(super) fn handle_correlated_where_read(
                         continue;
                     }
                     let (in_map, has_null) =
-                        decorrelate_in_read(db, schema, subquery, &corr_pairs, ctx)?;
+                        decorrelate_in_with_read(rtx, schema, subquery, &corr_pairs, ctx)?;
                     let outer_col_indices: Vec<usize> =
                         corr_pairs.iter().map(|p| p.outer_col_idx).collect();
                     let is_negated = *negated;
@@ -1682,8 +1707,11 @@ pub(super) fn handle_correlated_where_read(
                 if let Expr::BinaryOp { left, op, right } = conj {
                     if let Expr::ScalarSubquery(sub) = right.as_ref() {
                         if is_correlated_subquery(sub, ctx, schema) {
-                            let inner_schema =
-                                resolve_inner_schema(db, schema, &sub.from.to_ascii_lowercase())?;
+                            let inner_schema = resolve_inner_schema_with_read(
+                                rtx,
+                                schema,
+                                &sub.from.to_ascii_lowercase(),
+                            )?;
                             let (corr_pairs, _) = extract_correlation_predicates(
                                 sub.where_clause
                                     .as_ref()
@@ -1693,8 +1721,13 @@ pub(super) fn handle_correlated_where_read(
                                 sub.from_alias.as_deref(),
                             );
                             if !corr_pairs.is_empty() {
-                                let scalar_map =
-                                    decorrelate_scalar_read(db, schema, sub, &corr_pairs, ctx)?;
+                                let scalar_map = decorrelate_scalar_with_read(
+                                    rtx,
+                                    schema,
+                                    sub,
+                                    &corr_pairs,
+                                    ctx,
+                                )?;
                                 let outer_col_indices: Vec<usize> =
                                     corr_pairs.iter().map(|p| p.outer_col_idx).collect();
                                 let cmp_op = *op;
@@ -1746,3 +1779,7 @@ pub(super) fn handle_correlated_where_read(
         Ok(Some(combined))
     }
 }
+
+#[cfg(test)]
+#[path = "correlated_tests.rs"]
+mod tests;

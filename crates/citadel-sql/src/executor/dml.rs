@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use citadel::Database;
 use citadel_buffer::btree::{UpsertAction, UpsertOutcome};
+use citadel_txn::read_txn::ReadTxn;
 use citadel_txn::write_txn::WriteTxn;
 use rustc_hash::FxHashMap;
 
@@ -853,7 +854,17 @@ pub(super) fn exec_subquery_read(
     stmt: &SelectStmt,
     ctes: &CteContext,
 ) -> Result<QueryResult> {
-    match super::exec_select(db, schema, stmt, ctes)? {
+    let mut rtx = db.begin_read();
+    exec_subquery_with_read(&mut rtx, schema, stmt, ctes)
+}
+
+pub(super) fn exec_subquery_with_read(
+    rtx: &mut ReadTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &SelectStmt,
+    ctes: &CteContext,
+) -> Result<QueryResult> {
+    match super::exec_select_with_read(rtx, schema, stmt, ctes)? {
         ExecutionResult::Query(qr) => Ok(qr),
         _ => Ok(QueryResult {
             columns: vec![],
@@ -998,15 +1009,15 @@ pub(super) fn materialize_query_body(
     }
 }
 
-pub(super) fn exec_query_body(
-    db: &Database,
+pub(super) fn exec_query_body_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     body: &QueryBody,
     ctes: &CteContext,
 ) -> Result<ExecutionResult> {
     match body {
-        QueryBody::Select(sel) => super::exec_select(db, schema, sel, ctes),
-        QueryBody::Compound(comp) => exec_compound_select(db, schema, comp, ctes),
+        QueryBody::Select(sel) => super::exec_select_with_read(rtx, schema, sel, ctes),
+        QueryBody::Compound(comp) => exec_compound_select_with_read(rtx, schema, comp, ctes),
         QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_) => Err(
             SqlError::Unsupported("DML CTE bodies require an active write transaction".into()),
         ),
@@ -1034,7 +1045,17 @@ pub(super) fn exec_query_body_read(
     body: &QueryBody,
     ctes: &CteContext,
 ) -> Result<QueryResult> {
-    match exec_query_body(db, schema, body, ctes)? {
+    let mut rtx = db.begin_read();
+    exec_query_body_with_read_qr(&mut rtx, schema, body, ctes)
+}
+
+pub(super) fn exec_query_body_with_read_qr(
+    rtx: &mut ReadTxn<'_>,
+    schema: &SchemaManager,
+    body: &QueryBody,
+    ctes: &CteContext,
+) -> Result<QueryResult> {
+    match exec_query_body_with_read(rtx, schema, body, ctes)? {
         ExecutionResult::Query(qr) => Ok(qr),
         _ => Ok(QueryResult {
             columns: vec![],
@@ -1058,20 +1079,20 @@ pub(super) fn exec_query_body_write(
     }
 }
 
-pub(super) fn exec_compound_select(
-    db: &Database,
+pub(super) fn exec_compound_select_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     comp: &CompoundSelect,
     ctes: &CteContext,
 ) -> Result<ExecutionResult> {
-    let left_qr = match exec_query_body(db, schema, &comp.left, ctes)? {
+    let left_qr = match exec_query_body_with_read(rtx, schema, &comp.left, ctes)? {
         ExecutionResult::Query(qr) => qr,
         _ => QueryResult {
             columns: vec![],
             rows: vec![],
         },
     };
-    let right_qr = match exec_query_body(db, schema, &comp.right, ctes)? {
+    let right_qr = match exec_query_body_with_read(rtx, schema, &comp.right, ctes)? {
         ExecutionResult::Query(qr) => qr,
         _ => QueryResult {
             columns: vec![],
@@ -3518,7 +3539,7 @@ impl CompiledPlan for CompiledInsert {
         schema: &SchemaManager,
         stmt: &Statement,
         params: &[Value],
-        wtx: Option<&mut WriteTxn<'_>>,
+        txn: super::compile::ActiveTxnRef<'_, '_>,
     ) -> Result<ExecutionResult> {
         let ins = match stmt {
             Statement::Insert(i) => i,
@@ -3528,9 +3549,13 @@ impl CompiledPlan for CompiledInsert {
                 ))
             }
         };
-        match wtx {
-            None => exec_insert(db, schema, ins, params),
-            Some(outer) => match self.cached.as_ref() {
+        use super::compile::ActiveTxnRef;
+        match txn {
+            ActiveTxnRef::None => exec_insert(db, schema, ins, params),
+            ActiveTxnRef::Read(_) => Err(SqlError::Unsupported(
+                "cannot execute mutating statement inside a read-only transaction".into(),
+            )),
+            ActiveTxnRef::Write(outer) => match self.cached.as_ref() {
                 Some(c) if c.is_trivial_fast => with_insert_scratch(|bufs| {
                     exec_insert_trivial_fast(outer, &self.table_lower, c, bufs, params)
                 }),
@@ -3567,7 +3592,7 @@ impl CompiledPlan for CompiledDelete {
         schema: &SchemaManager,
         stmt: &Statement,
         _params: &[Value],
-        wtx: Option<&mut WriteTxn<'_>>,
+        txn: super::compile::ActiveTxnRef<'_, '_>,
     ) -> Result<ExecutionResult> {
         let del = match stmt {
             Statement::Delete(d) => d,
@@ -3578,9 +3603,13 @@ impl CompiledPlan for CompiledDelete {
             }
         };
         let _ = &self.table_lower;
-        match wtx {
-            None => super::write::exec_delete(db, schema, del),
-            Some(outer) => super::write::exec_delete_in_txn(outer, schema, del),
+        use super::compile::ActiveTxnRef;
+        match txn {
+            ActiveTxnRef::None => super::write::exec_delete(db, schema, del),
+            ActiveTxnRef::Read(_) => Err(SqlError::Unsupported(
+                "cannot execute mutating statement inside a read-only transaction".into(),
+            )),
+            ActiveTxnRef::Write(outer) => super::write::exec_delete_in_txn(outer, schema, del),
         }
     }
 }
@@ -3729,3 +3758,7 @@ fn derive_view_columns(
         _ => Ok(Vec::new()),
     }
 }
+
+#[cfg(test)]
+#[path = "dml_tests.rs"]
+mod tests;

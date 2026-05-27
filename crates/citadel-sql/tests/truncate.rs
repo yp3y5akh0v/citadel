@@ -240,7 +240,7 @@ fn truncate_cascade_unsupported() {
     let conn = Connection::open(&db).unwrap();
     setup_t(&conn);
     let err = conn.execute("TRUNCATE TABLE t CASCADE").unwrap_err();
-    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("v0.13")));
+    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("CASCADE")));
 }
 
 #[test]

@@ -593,3 +593,7 @@ pub(super) fn is_aggregate_expr(expr: &Expr) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+#[path = "aggregate_tests.rs"]
+mod tests;

@@ -546,7 +546,7 @@ fn try_expr_index_scan(
     idx: &IndexDef,
     conjuncts: &[&Expr],
 ) -> Option<(IndexScore, ScanPlan)> {
-    // v0.16 supports only equality on the first expression key (`WHERE LOWER(email) = ?`).
+    // Only equality on the first expression key supported (`WHERE LOWER(email) = ?`).
     let first_key = idx.keys.first()?;
     let key_expr = match first_key {
         IndexKey::Expr { expr, .. } => expr,

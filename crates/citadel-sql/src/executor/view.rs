@@ -1,6 +1,6 @@
 use std::cell::Cell;
 
-use citadel::Database;
+use citadel_txn::read_txn::ReadTxn;
 
 use crate::error::{Result, SqlError};
 use crate::parser::*;
@@ -13,8 +13,8 @@ thread_local! {
 
 const MAX_VIEW_DEPTH: u32 = 32;
 
-pub(super) fn exec_view_read(
-    db: &Database,
+pub(super) fn exec_view_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     view_def: &ViewDef,
 ) -> Result<QueryResult> {
@@ -34,7 +34,7 @@ pub(super) fn exec_view_read(
             Statement::Select(sq) => sq,
             _ => return Err(SqlError::InvalidValue("view body is not a SELECT".into())),
         };
-        match super::exec_select_query(db, schema, &sq)? {
+        match super::exec_select_query_with_read(rtx, schema, &sq)? {
             ExecutionResult::Query(mut qr) => {
                 apply_view_aliases(&mut qr, &view_def.column_aliases);
                 Ok(qr)
@@ -186,3 +186,7 @@ pub(super) fn try_fuse_view(
 pub(super) fn build_view_schema(name: &str, qr: &QueryResult) -> TableSchema {
     super::build_cte_schema(name, qr)
 }
+
+#[cfg(test)]
+#[path = "view_tests.rs"]
+mod tests;

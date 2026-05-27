@@ -30,6 +30,7 @@ use window::*;
 use write::*;
 
 use citadel::Database;
+use citadel_txn::read_txn::ReadTxn;
 use rustc_hash::FxHashMap;
 
 use crate::error::{Result, SqlError};
@@ -65,6 +66,45 @@ pub fn execute(
         Statement::CreateMaterializedView(mv) => matviews::exec_create_matview(db, schema, mv),
         Statement::RefreshMaterializedView(rmv) => matviews::exec_refresh_matview(db, schema, rmv),
         Statement::DropMaterializedView(dmv) => matviews::exec_drop_matview(db, schema, dmv),
+        Statement::Begin { .. }
+        | Statement::Commit
+        | Statement::Rollback
+        | Statement::Savepoint(_)
+        | Statement::ReleaseSavepoint(_)
+        | Statement::RollbackTo(_)
+        | Statement::SetTimezone(_) => Err(SqlError::Unsupported(
+            "transaction / session control handled by Connection".into(),
+        )),
+    }
+}
+
+pub fn execute_with_read(
+    rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
+    schema: &SchemaManager,
+    stmt: &Statement,
+    _params: &[Value],
+) -> Result<ExecutionResult> {
+    match stmt {
+        Statement::Select(sq) => cte::exec_select_query_with_read(rtx, schema, sq),
+        Statement::Explain(inner) => explain(schema, inner),
+        Statement::CreateTable(_)
+        | Statement::DropTable(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_)
+        | Statement::CreateView(_)
+        | Statement::DropView(_)
+        | Statement::AlterTable(_)
+        | Statement::Insert(_)
+        | Statement::Update(_)
+        | Statement::Delete(_)
+        | Statement::Truncate(_)
+        | Statement::CreateTrigger(_)
+        | Statement::DropTrigger(_)
+        | Statement::CreateMaterializedView(_)
+        | Statement::RefreshMaterializedView(_)
+        | Statement::DropMaterializedView(_) => Err(SqlError::Unsupported(
+            "cannot execute mutating statement inside a read-only transaction".into(),
+        )),
         Statement::Begin { .. }
         | Statement::Commit
         | Statement::Rollback
@@ -121,34 +161,34 @@ pub fn execute_in_txn(
     }
 }
 
-pub(super) fn scan_table_read(
-    db: &Database,
+pub(super) fn scan_table_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     name: &str,
 ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
     let table_schema = schema
         .get(name)
         .ok_or_else(|| SqlError::TableNotFound(name.to_string()))?;
-    let (rows, _) = collect_rows_read(db, table_schema, &None, None)?;
+    let (rows, _) = collect_rows_with_read(rtx, table_schema, &None, None)?;
     Ok((table_schema.clone(), rows))
 }
 
-pub(super) fn scan_table_read_or_view(
-    db: &Database,
+pub(super) fn scan_table_with_read_or_view(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     name: &str,
 ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
     if let Some(ts) = schema.get(name) {
-        let (rows, _) = collect_rows_read(db, ts, &None, None)?;
+        let (rows, _) = collect_rows_with_read(rtx, ts, &None, None)?;
         return Ok((ts.clone(), rows));
     }
     if let Some(vd) = schema.get_view(name) {
-        let qr = exec_view_read(db, schema, vd)?;
+        let qr = exec_view_with_read(rtx, schema, vd)?;
         let vs = build_view_schema(name, &qr);
         return Ok((vs, qr.rows));
     }
     if let Some(vt) = schema.get_virtual(name) {
-        let qr = vt.scan(db, schema)?;
+        let qr = vt.scan(schema)?;
         let vs = build_view_schema(name, &qr);
         return Ok((vs, qr.rows));
     }

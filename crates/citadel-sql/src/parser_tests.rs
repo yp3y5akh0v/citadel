@@ -998,7 +998,7 @@ fn parse_truncate_continue_identity() {
 #[test]
 fn parse_truncate_cascade_unsupported() {
     let err = parse_sql("TRUNCATE TABLE t CASCADE").unwrap_err();
-    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("v0.13")));
+    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("CASCADE")));
 }
 
 #[test]
@@ -1270,4 +1270,258 @@ fn parse_lateral_with_right_join_rejected() {
 fn parse_lateral_with_full_outer_rejected() {
     let result = parse_sql("SELECT * FROM a FULL OUTER JOIN LATERAL (SELECT * FROM b) sub ON true");
     assert!(matches!(result, Err(SqlError::Unsupported(_))));
+}
+
+#[test]
+fn parse_create_matview_with_no_data_sets_flag_false() {
+    let stmt = parse_sql("CREATE MATERIALIZED VIEW v AS SELECT 1 AS x WITH NO DATA").unwrap();
+    match stmt {
+        Statement::CreateMaterializedView(mv) => {
+            assert_eq!(mv.name, "v");
+            assert!(!mv.with_data);
+        }
+        _ => panic!("expected CreateMaterializedView"),
+    }
+}
+
+#[test]
+fn parse_create_matview_without_clause_sets_flag_true() {
+    let stmt = parse_sql("CREATE MATERIALIZED VIEW v AS SELECT 1 AS x").unwrap();
+    match stmt {
+        Statement::CreateMaterializedView(mv) => {
+            assert!(mv.with_data);
+        }
+        _ => panic!("expected CreateMaterializedView"),
+    }
+}
+
+#[test]
+fn parse_sql_multi_two_matviews_one_with_no_data() {
+    let sql = "CREATE MATERIALIZED VIEW a AS SELECT 1 AS x WITH NO DATA; \
+               CREATE MATERIALIZED VIEW b AS SELECT 2 AS y;";
+    let stmts = parse_sql_multi(sql).unwrap();
+    assert_eq!(stmts.len(), 2);
+    match &stmts[0] {
+        Statement::CreateMaterializedView(mv) => assert!(!mv.with_data, "first should be NoData"),
+        _ => panic!("expected CreateMaterializedView for first stmt"),
+    }
+    match &stmts[1] {
+        Statement::CreateMaterializedView(mv) => {
+            assert!(mv.with_data, "second should be populated")
+        }
+        _ => panic!("expected CreateMaterializedView for second stmt"),
+    }
+}
+
+#[test]
+fn parse_create_matview_with_no_data_case_insensitive() {
+    for variant in [
+        "with no data",
+        "WITH NO DATA",
+        "With No Data",
+        "WiTh   nO\tdAtA",
+    ] {
+        let sql = format!("CREATE MATERIALIZED VIEW v AS SELECT 1 AS x {variant}");
+        let stmt = parse_sql(&sql).unwrap();
+        match stmt {
+            Statement::CreateMaterializedView(mv) => {
+                assert!(!mv.with_data, "variant {variant:?} should strip");
+            }
+            _ => panic!("expected CreateMaterializedView for variant {variant:?}"),
+        }
+    }
+}
+
+#[test]
+fn parse_create_matview_with_no_data_inside_string_literal_unchanged() {
+    let stmt = parse_sql("CREATE MATERIALIZED VIEW v AS SELECT 'WITH NO DATA' AS x").unwrap();
+    match stmt {
+        Statement::CreateMaterializedView(mv) => {
+            assert!(mv.with_data, "literal must not be stripped");
+            assert!(
+                mv.select_sql.contains("WITH NO DATA"),
+                "literal preserved in stored sql"
+            );
+        }
+        _ => panic!("expected CreateMaterializedView"),
+    }
+}
+
+#[test]
+fn parse_create_matview_trailing_semicolon_with_no_data() {
+    let stmt = parse_sql("CREATE MATERIALIZED VIEW v AS SELECT 1 AS x WITH NO DATA;").unwrap();
+    match stmt {
+        Statement::CreateMaterializedView(mv) => assert!(!mv.with_data),
+        _ => panic!("expected CreateMaterializedView"),
+    }
+}
+
+#[test]
+fn parse_create_matview_or_replace_with_no_data() {
+    let stmt = parse_sql("CREATE OR REPLACE MATERIALIZED VIEW v AS SELECT 1 AS x WITH NO DATA");
+    if let Ok(Statement::CreateMaterializedView(mv)) = stmt {
+        assert!(!mv.with_data);
+    }
+}
+
+#[test]
+fn split_spans_empty_string() {
+    assert!(split_statement_spans("").is_empty());
+}
+
+#[test]
+fn split_spans_whitespace_only_is_empty() {
+    assert!(split_statement_spans("   \t\n\r  ").is_empty());
+}
+
+#[test]
+fn split_spans_single_statement_no_semicolon() {
+    let s = "SELECT 1";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans, vec![(0, s.len())]);
+}
+
+#[test]
+fn split_spans_single_statement_with_trailing_semicolon() {
+    let s = "SELECT 1;";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans, vec![(0, 8)]);
+    assert_eq!(&s[spans[0].0..spans[0].1], "SELECT 1");
+}
+
+#[test]
+fn split_spans_two_statements() {
+    let s = "SELECT 1;SELECT 2";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 2);
+    assert_eq!(&s[spans[0].0..spans[0].1], "SELECT 1");
+    assert_eq!(&s[spans[1].0..spans[1].1], "SELECT 2");
+}
+
+#[test]
+fn split_spans_three_statements_with_whitespace() {
+    let s = "CREATE TABLE t (id INT); INSERT INTO t VALUES (1); SELECT * FROM t;";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 3);
+    assert!(s[spans[0].0..spans[0].1].contains("CREATE"));
+    assert!(s[spans[1].0..spans[1].1].contains("INSERT"));
+    assert!(s[spans[2].0..spans[2].1].contains("SELECT"));
+}
+
+#[test]
+fn split_spans_consecutive_semicolons_skip_empty() {
+    let s = "SELECT 1;;SELECT 2;";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 2);
+    assert!(s[spans[0].0..spans[0].1].contains("SELECT 1"));
+    assert!(s[spans[1].0..spans[1].1].contains("SELECT 2"));
+}
+
+#[test]
+fn split_spans_semicolon_inside_single_quoted_string_kept_in_statement() {
+    let s = "INSERT INTO t VALUES ('a;b'); SELECT * FROM t";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 2);
+    assert!(s[spans[0].0..spans[0].1].contains("'a;b'"));
+}
+
+#[test]
+fn split_spans_escaped_single_quote_inside_string() {
+    let s = "INSERT INTO t VALUES ('a''b;c'); SELECT 1";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 2);
+    assert!(s[spans[0].0..spans[0].1].contains("'a''b;c'"));
+}
+
+#[test]
+fn split_spans_semicolon_inside_double_quoted_identifier() {
+    let s = "SELECT \"col;name\" FROM t; SELECT 2";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 2);
+    assert!(s[spans[0].0..spans[0].1].contains("\"col;name\""));
+}
+
+#[test]
+fn split_spans_semicolon_inside_line_comment() {
+    let s = "SELECT 1 -- comment with ; in it\n; SELECT 2";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 2);
+    assert!(s[spans[0].0..spans[0].1].contains("-- comment with ; in it"));
+}
+
+#[test]
+fn split_spans_semicolon_inside_block_comment() {
+    let s = "SELECT 1 /* block ; with ; semis */; SELECT 2";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 2);
+    assert!(s[spans[0].0..spans[0].1].contains("/* block ; with ; semis */"));
+}
+
+#[test]
+fn split_spans_semicolon_inside_dollar_quoted_string() {
+    let s = "SELECT $tag$body;with;semis$tag$ AS s; SELECT 2";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 2);
+    assert!(s[spans[0].0..spans[0].1].contains("$tag$body;with;semis$tag$"));
+}
+
+#[test]
+fn split_spans_anonymous_dollar_quote() {
+    let s = "SELECT $$has;semi$$ AS s; SELECT 2";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 2);
+    assert!(s[spans[0].0..spans[0].1].contains("$$has;semi$$"));
+}
+
+#[test]
+fn split_spans_dollar_sign_not_a_quote_passes_through() {
+    let s = "SELECT $1 + 2; SELECT $1";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 2);
+    assert!(s[spans[0].0..spans[0].1].contains("$1 + 2"));
+}
+
+#[test]
+fn split_spans_multiline_statement() {
+    let s = "CREATE TABLE t (\n  id INTEGER PRIMARY KEY,\n  name TEXT\n); SELECT 1";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 2);
+    assert!(s[spans[0].0..spans[0].1].contains("CREATE TABLE t"));
+    assert!(s[spans[0].0..spans[0].1].contains("name TEXT"));
+}
+
+#[test]
+fn split_spans_leading_whitespace_preserved_in_first_span() {
+    let s = "   SELECT 1";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0], (0, s.len()));
+}
+
+#[test]
+fn split_spans_utf8_payload_byte_offsets_correct() {
+    let s = "INSERT INTO t VALUES ('café'); SELECT 1";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 2);
+    assert!(s[spans[0].0..spans[0].1].contains("café"));
+    assert!(s[spans[1].0..spans[1].1].contains("SELECT 1"));
+}
+
+#[test]
+fn split_spans_unterminated_string_keeps_rest_in_one_span() {
+    let s = "SELECT 'oops; never closed";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(&s[spans[0].0..spans[0].1], s);
+}
+
+#[test]
+fn split_spans_refresh_in_middle_of_script() {
+    let s =
+        "CREATE MATERIALIZED VIEW mv AS SELECT 1; REFRESH MATERIALIZED VIEW mv; SELECT * FROM mv";
+    let spans = split_statement_spans(s);
+    assert_eq!(spans.len(), 3);
+    assert!(s[spans[0].0..spans[0].1].contains("CREATE MATERIALIZED VIEW"));
+    assert!(s[spans[1].0..spans[1].1].trim().starts_with("REFRESH"));
+    assert!(s[spans[2].0..spans[2].1].contains("SELECT * FROM mv"));
 }

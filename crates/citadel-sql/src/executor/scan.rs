@@ -1,4 +1,5 @@
 use citadel::Database;
+use citadel_txn::read_txn::ReadTxn;
 
 use crate::encoding::{
     decode_column_raw, decode_composite_key, decode_key_value, decode_pk_integer,
@@ -146,6 +147,16 @@ pub(super) fn collect_rows_read(
     where_clause: &Option<Expr>,
     limit: Option<usize>,
 ) -> Result<(Vec<Vec<Value>>, bool)> {
+    let mut rtx = db.begin_read();
+    collect_rows_with_read(&mut rtx, table_schema, where_clause, limit)
+}
+
+pub(super) fn collect_rows_with_read(
+    rtx: &mut ReadTxn<'_>,
+    table_schema: &TableSchema,
+    where_clause: &Option<Expr>,
+    limit: Option<usize>,
+) -> Result<(Vec<Vec<Value>>, bool)> {
     let plan = planner::plan_select_inverted(table_schema, where_clause);
     let lower_name = &table_schema.name;
     let columns = &table_schema.columns;
@@ -183,7 +194,6 @@ pub(super) fn collect_rows_read(
                 None
             };
 
-            let mut rtx = db.begin_read();
             let entry_count = rtx.table_entry_count(lower_name.as_bytes()).unwrap_or(0) as usize;
             let capacity = if where_clause.is_some() {
                 entry_count / 4
@@ -223,7 +233,6 @@ pub(super) fn collect_rows_read(
 
         ScanPlan::PkLookup { pk_values } => {
             let key = encode_composite_key(&pk_values);
-            let mut rtx = db.begin_read();
             match rtx
                 .table_get(lower_name.as_bytes(), &key)
                 .map_err(SqlError::Storage)?
@@ -250,7 +259,6 @@ pub(super) fn collect_rows_read(
             num_pk_cols,
         } => {
             let mut rows = Vec::new();
-            let mut rtx = db.begin_read();
             let mut scan_err: Option<SqlError> = None;
             let col_map = ColumnMap::new(columns);
             rtx.table_scan_from(lower_name.as_bytes(), start_key, |key, value| {
@@ -305,7 +313,6 @@ pub(super) fn collect_rows_read(
             let mut pk_keys: Vec<Vec<u8>> = Vec::new();
 
             {
-                let mut rtx = db.begin_read();
                 let mut scan_err: Option<SqlError> = None;
                 rtx.table_scan_from_fast(&idx_table, &prefix, |key, value| {
                     if !key.starts_with(&prefix) {
@@ -337,7 +344,6 @@ pub(super) fn collect_rows_read(
             }
 
             let mut rows = Vec::new();
-            let mut rtx = db.begin_read();
             let col_map = ColumnMap::new(columns);
             for pk_key in &pk_keys {
                 if let Some(value) = rtx
@@ -365,9 +371,8 @@ pub(super) fn collect_rows_read(
             recheck_needed,
             ..
         } => {
-            let candidate_pks = inverted_intersect_candidates(db, &idx_table, &probe_entries)?;
+            let candidate_pks = inverted_intersect_candidates(rtx, &idx_table, &probe_entries)?;
             let mut rows = Vec::new();
-            let mut rtx = db.begin_read();
             let col_map = ColumnMap::new(columns);
             for pk_key in &candidate_pks {
                 if let Some(value) = rtx
@@ -391,12 +396,11 @@ pub(super) fn collect_rows_read(
 }
 
 fn inverted_intersect_candidates(
-    db: &Database,
+    rtx: &mut ReadTxn<'_>,
     idx_table: &[u8],
     probe_entries: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>> {
     let mut lists: Vec<Vec<Vec<u8>>> = Vec::with_capacity(probe_entries.len());
-    let mut rtx = db.begin_read();
     for entry in probe_entries {
         let mut prefix = entry.clone();
         prefix.push(0x1F);
@@ -673,13 +677,21 @@ pub(super) fn collect_keyed_rows_read(
     table_schema: &TableSchema,
     where_clause: &Option<Expr>,
 ) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    let mut rtx = db.begin_read();
+    collect_keyed_rows_with_read(&mut rtx, table_schema, where_clause)
+}
+
+pub(super) fn collect_keyed_rows_with_read(
+    rtx: &mut ReadTxn<'_>,
+    table_schema: &TableSchema,
+    where_clause: &Option<Expr>,
+) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
     let plan = planner::plan_select(table_schema, where_clause);
     let lower_name = &table_schema.name;
 
     match plan {
         ScanPlan::SeqScan => {
             let mut rows = Vec::new();
-            let mut rtx = db.begin_read();
             let mut scan_err: Option<SqlError> = None;
             rtx.table_for_each(lower_name.as_bytes(), |key, value| {
                 match decode_full_row(table_schema, key, value) {
@@ -697,7 +709,6 @@ pub(super) fn collect_keyed_rows_read(
 
         ScanPlan::PkLookup { pk_values } => {
             let key = encode_composite_key(&pk_values);
-            let mut rtx = db.begin_read();
             match rtx
                 .table_get(lower_name.as_bytes(), &key)
                 .map_err(SqlError::Storage)?
@@ -716,7 +727,6 @@ pub(super) fn collect_keyed_rows_read(
             num_pk_cols,
         } => {
             let mut rows = Vec::new();
-            let mut rtx = db.begin_read();
             let mut scan_err: Option<SqlError> = None;
             rtx.table_scan_from(lower_name.as_bytes(), start_key, |key, value| {
                 let pk_vals = match decode_composite_key(key, num_pk_cols) {
@@ -760,7 +770,6 @@ pub(super) fn collect_keyed_rows_read(
             let num_index_cols = index_columns.len();
             let mut pk_keys: Vec<Vec<u8>> = Vec::new();
             {
-                let mut rtx = db.begin_read();
                 let mut scan_err: Option<SqlError> = None;
                 rtx.table_scan_from_fast(&idx_table, &prefix, |key, value| {
                     if !key.starts_with(&prefix) {
@@ -791,7 +800,6 @@ pub(super) fn collect_keyed_rows_read(
                 }
             }
             let mut rows = Vec::new();
-            let mut rtx = db.begin_read();
             for pk_key in &pk_keys {
                 if let Some(value) = rtx
                     .table_get(lower_name.as_bytes(), pk_key)
@@ -1372,3 +1380,7 @@ pub(super) fn raw_matches_op_value(val: &Value, op: BinOp, literal: &Value) -> b
         _ => false,
     }
 }
+
+#[cfg(test)]
+#[path = "scan_tests.rs"]
+mod tests;

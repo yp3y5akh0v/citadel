@@ -836,3 +836,7 @@ pub(super) fn eval_window_select(
 
     super::process_select(&extended_columns, rows, &rewritten_stmt, true)
 }
+
+#[cfg(test)]
+#[path = "window_tests.rs"]
+mod tests;

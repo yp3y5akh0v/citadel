@@ -410,3 +410,7 @@ pub(super) fn format_scan_line(
         format!("SEARCH TABLE {table_name}{alias_part} {desc}")
     }
 }
+
+#[cfg(test)]
+#[path = "explain_tests.rs"]
+mod tests;

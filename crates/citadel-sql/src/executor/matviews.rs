@@ -98,10 +98,76 @@ pub(super) fn exec_refresh_matview(
     schema: &mut SchemaManager,
     stmt: &RefreshMatviewStmt,
 ) -> Result<ExecutionResult> {
+    if !stmt.concurrently {
+        let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+        let r = exec_refresh_matview_in_txn(&mut wtx, schema, stmt)?;
+        wtx.commit().map_err(SqlError::Storage)?;
+        return Ok(r);
+    }
+
+    let name_lower = stmt.name.to_ascii_lowercase();
+
+    let mv_snapshot = {
+        let mv = schema
+            .get_matview(&name_lower)
+            .ok_or_else(|| SqlError::TableNotFound(stmt.name.clone()))?
+            .clone();
+        if !mv.with_data {
+            return Err(SqlError::Unsupported(format!(
+                "REFRESH MATERIALIZED VIEW CONCURRENTLY cannot be used when the materialized view '{}' is not populated",
+                stmt.name
+            )));
+        }
+        let backing = schema
+            .get(&mv.backing_table)
+            .ok_or_else(|| SqlError::TableNotFound(mv.backing_table.clone()))?;
+        if !backing.indices.iter().any(|idx| idx.unique) {
+            return Err(SqlError::Unsupported(format!(
+                "cannot refresh materialized view '{}' concurrently — it requires a UNIQUE index",
+                stmt.name
+            )));
+        }
+        mv
+    };
+
+    let parsed = crate::parser::parse_sql(&mv_snapshot.select_sql)?;
+    let sq = match parsed {
+        crate::parser::Statement::Select(sq) => *sq,
+        _ => {
+            return Err(SqlError::Unsupported(
+                "stored matview body is not SELECT".into(),
+            ));
+        }
+    };
+    reject_non_deterministic(&sq)?;
+    let rows = {
+        let mut rtx = db.begin_read();
+        let qr = super::cte::exec_select_query_with_read(&mut rtx, schema, &sq)?;
+        match qr {
+            ExecutionResult::Query(q) => q.rows,
+            _ => Vec::new(),
+        }
+    };
+
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    let r = exec_refresh_matview_in_txn(&mut wtx, schema, stmt)?;
+
+    let mv = schema
+        .get_matview(&name_lower)
+        .ok_or_else(|| SqlError::TableNotFound(stmt.name.clone()))?
+        .clone();
+    let backing = schema
+        .get(&mv.backing_table)
+        .ok_or_else(|| SqlError::TableNotFound(mv.backing_table.clone()))?;
+    if !backing.indices.iter().any(|idx| idx.unique) {
+        return Err(SqlError::Unsupported(format!(
+            "cannot refresh materialized view '{}' concurrently — it requires a UNIQUE index",
+            stmt.name
+        )));
+    }
+
+    diff_merge_concurrent(&mut wtx, &mv, &rows)?;
     wtx.commit().map_err(SqlError::Storage)?;
-    Ok(r)
+    Ok(ExecutionResult::Ok)
 }
 
 pub(super) fn exec_refresh_matview_in_txn(
@@ -114,6 +180,25 @@ pub(super) fn exec_refresh_matview_in_txn(
         .get_matview(&name_lower)
         .ok_or_else(|| SqlError::TableNotFound(stmt.name.clone()))?
         .clone();
+
+    if stmt.concurrently && !mv.with_data {
+        return Err(SqlError::Unsupported(format!(
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY cannot be used when the materialized view '{}' is not populated",
+            stmt.name
+        )));
+    }
+
+    if stmt.concurrently {
+        let backing = schema
+            .get(&mv.backing_table)
+            .ok_or_else(|| SqlError::TableNotFound(mv.backing_table.clone()))?;
+        if !backing.indices.iter().any(|idx| idx.unique) {
+            return Err(SqlError::Unsupported(format!(
+                "cannot refresh materialized view '{}' concurrently — it requires a UNIQUE index",
+                stmt.name
+            )));
+        }
+    }
 
     let parsed = crate::parser::parse_sql(&mv.select_sql)?;
     let sq = match parsed {
@@ -137,6 +222,13 @@ pub(super) fn exec_refresh_matview_in_txn(
         wtx.table_truncate(mv.backing_table.as_bytes())
             .map_err(SqlError::Storage)?;
         populate_backing_table(wtx, &mv.backing_table, &rows)?;
+    }
+
+    if !mv.with_data {
+        let mut updated = mv.clone();
+        updated.with_data = true;
+        SchemaManager::save_matview(wtx, &updated)?;
+        schema.register_matview(updated);
     }
 
     Ok(ExecutionResult::Ok)
@@ -499,3 +591,7 @@ fn references_matview(sql: &str, name: &str) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+#[path = "matviews_tests.rs"]
+mod tests;

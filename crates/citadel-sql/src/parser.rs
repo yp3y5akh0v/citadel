@@ -178,7 +178,7 @@ pub struct CreateIndexStmt {
     /// (those resolve through `key_exprs[i]`).
     pub columns: Vec<String>,
     /// Parallel to `columns`: `None` means the key is a column reference, `Some((expr, sql))`
-    /// means the key is an expression. Empty Vec = all-column index (the v0.15 norm).
+    /// means the key is an expression. Empty Vec = all-column index.
     pub key_exprs: Vec<Option<(Expr, String)>>,
     pub unique: bool,
     pub if_not_exists: bool,
@@ -686,8 +686,9 @@ pub fn parse_sql(sql: &str) -> Result<Statement> {
     if let Some(stmt) = try_parse_refresh_matview(sql) {
         return stmt;
     }
+    let (rewritten, no_data_flags) = strip_matview_with_no_data(sql);
     let stmts =
-        crate::dialect::parse_statements(sql).map_err(|e| SqlError::Parse(e.to_string()))?;
+        crate::dialect::parse_statements(&rewritten).map_err(|e| SqlError::Parse(e.to_string()))?;
 
     if stmts.is_empty() {
         return Err(SqlError::Parse("empty SQL".into()));
@@ -696,21 +697,133 @@ pub fn parse_sql(sql: &str) -> Result<Statement> {
         return Err(SqlError::Unsupported("multiple statements".into()));
     }
 
-    convert_statement(stmts.into_iter().next().unwrap())
+    let mut converted = convert_statement(stmts.into_iter().next().unwrap())?;
+    apply_no_data_flags(std::slice::from_mut(&mut converted), &no_data_flags);
+    Ok(converted)
 }
 
 pub fn parse_sql_multi(sql: &str) -> Result<Vec<Statement>> {
-    if let Some(stmt) = try_parse_refresh_matview(sql) {
-        return Ok(vec![stmt?]);
+    let (rewritten, no_data_flags) = strip_matview_with_no_data(sql);
+    let mut out: Vec<Statement> = Vec::new();
+    for (start, end) in split_statement_spans(&rewritten) {
+        let stmt_sql = &rewritten[start..end];
+        if let Some(parsed) = try_parse_refresh_matview(stmt_sql) {
+            out.push(parsed?);
+        } else {
+            let raw = crate::dialect::parse_statements(stmt_sql)
+                .map_err(|e| SqlError::Parse(e.to_string()))?;
+            for s in raw {
+                out.push(convert_statement(s)?);
+            }
+        }
     }
-    let stmts =
-        crate::dialect::parse_statements(sql).map_err(|e| SqlError::Parse(e.to_string()))?;
-
-    if stmts.is_empty() {
+    if out.is_empty() {
         return Err(SqlError::Parse("empty SQL".into()));
     }
+    apply_no_data_flags(&mut out, &no_data_flags);
+    Ok(out)
+}
 
-    stmts.into_iter().map(convert_statement).collect()
+fn split_statement_spans(sql: &str) -> Vec<(usize, usize)> {
+    let bytes = sql.as_bytes();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut stmt_start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            }
+            continue;
+        }
+        if b == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if b == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if b == b'$' {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'$' {
+                let tag_len = j - i + 1;
+                i = j + 1;
+                while i + tag_len <= bytes.len() {
+                    if bytes[i..i + tag_len] == bytes[(j - tag_len + 1)..=j] {
+                        i += tag_len;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b';' {
+            if !sql[stmt_start..i].trim().is_empty() {
+                spans.push((stmt_start, i));
+            }
+            i += 1;
+            stmt_start = i;
+            continue;
+        }
+        i += 1;
+    }
+    if stmt_start < bytes.len() && !sql[stmt_start..].trim().is_empty() {
+        spans.push((stmt_start, bytes.len()));
+    }
+    spans
+}
+
+fn apply_no_data_flags(stmts: &mut [Statement], flags: &[bool]) {
+    let mut iter = flags.iter();
+    for stmt in stmts.iter_mut() {
+        if let Statement::CreateMaterializedView(boxed) = stmt {
+            if let Some(&no_data) = iter.next() {
+                boxed.with_data = !no_data;
+            }
+        }
+    }
 }
 
 /// sqlparser 0.61 doesn't natively parse REFRESH MATERIALIZED VIEW [CONCURRENTLY] <name>.
@@ -743,6 +856,260 @@ fn try_parse_refresh_matview(sql: &str) -> Option<Result<Statement>> {
         name,
         concurrently,
     })))
+}
+
+fn strip_matview_with_no_data(sql: &str) -> (String, Vec<bool>) {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut flags: Vec<bool> = Vec::new();
+    let mut stmt_start = 0usize;
+    let mut i = 0usize;
+
+    let push_one = |out: &mut String, i: &mut usize, bytes: &[u8], sql: &str| {
+        let b = bytes[*i];
+        if b < 0x80 {
+            out.push(b as char);
+            *i += 1;
+        } else {
+            let len = if b >= 0xF0 {
+                4
+            } else if b >= 0xE0 {
+                3
+            } else if b >= 0xC0 {
+                2
+            } else {
+                1
+            };
+            let end = (*i + len).min(bytes.len());
+            out.push_str(&sql[*i..end]);
+            *i = end;
+        }
+    };
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                push_one(&mut out, &mut i, bytes, sql);
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            out.push('/');
+            out.push('*');
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                push_one(&mut out, &mut i, bytes, sql);
+            }
+            if i + 1 < bytes.len() {
+                out.push('*');
+                out.push('/');
+                i += 2;
+            }
+            continue;
+        }
+        if b == b'\'' {
+            out.push('\'');
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        out.push('\'');
+                        out.push('\'');
+                        i += 2;
+                    } else {
+                        out.push('\'');
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    push_one(&mut out, &mut i, bytes, sql);
+                }
+            }
+            continue;
+        }
+        if b == b'"' {
+            out.push('"');
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        out.push('"');
+                        out.push('"');
+                        i += 2;
+                    } else {
+                        out.push('"');
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    push_one(&mut out, &mut i, bytes, sql);
+                }
+            }
+            continue;
+        }
+        if b == b'$' {
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'$' {
+                let tag_len = j - i + 1;
+                out.push_str(&sql[i..=j]);
+                i = j + 1;
+                while i + tag_len <= bytes.len() {
+                    if bytes[i..i + tag_len] == bytes[(j - tag_len + 1)..=j] {
+                        out.push_str(&sql[i..i + tag_len]);
+                        i += tag_len;
+                        break;
+                    }
+                    push_one(&mut out, &mut i, bytes, sql);
+                }
+                continue;
+            }
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        if b == b';' {
+            let stmt_text = &out[stmt_start..];
+            if statement_is_create_matview(stmt_text) {
+                match find_with_no_data_suffix(stmt_text) {
+                    Some(truncate_to) => {
+                        out.truncate(stmt_start + truncate_to);
+                        flags.push(true);
+                    }
+                    None => flags.push(false),
+                }
+            }
+            out.push(';');
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            stmt_start = out.len();
+            continue;
+        }
+        push_one(&mut out, &mut i, bytes, sql);
+    }
+
+    let stmt_text = &out[stmt_start..];
+    if !stmt_text.trim().is_empty() && statement_is_create_matview(stmt_text) {
+        match find_with_no_data_suffix(stmt_text) {
+            Some(truncate_to) => {
+                out.truncate(stmt_start + truncate_to);
+                flags.push(true);
+            }
+            None => flags.push(false),
+        }
+    }
+
+    (out, flags)
+}
+
+fn statement_is_create_matview(stmt: &str) -> bool {
+    let stripped = strip_leading_ws_and_comments(stmt);
+    let lower = stripped.to_ascii_lowercase();
+    let s = lower.as_str();
+    let after_create = match strip_kw_lower(s, "create") {
+        Some(r) => r,
+        None => return false,
+    };
+    let after_orrep = if let Some(r) = strip_kw_lower(after_create, "or") {
+        if let Some(r2) = strip_kw_lower(r, "replace") {
+            r2
+        } else {
+            after_create
+        }
+    } else {
+        after_create
+    };
+    let after_temp = if let Some(r) = strip_kw_lower(after_orrep, "temporary") {
+        r
+    } else if let Some(r) = strip_kw_lower(after_orrep, "temp") {
+        r
+    } else {
+        after_orrep
+    };
+    let after_mv = match strip_kw_lower(after_temp, "materialized") {
+        Some(r) => r,
+        None => return false,
+    };
+    strip_kw_lower(after_mv, "view").is_some()
+}
+
+fn strip_leading_ws_and_comments(s: &str) -> &str {
+    let mut rest = s;
+    loop {
+        let trimmed = rest.trim_start();
+        if let Some(after) = trimmed.strip_prefix("--") {
+            if let Some(nl) = after.find('\n') {
+                rest = &after[nl..];
+                continue;
+            }
+            return "";
+        }
+        if let Some(after) = trimmed.strip_prefix("/*") {
+            if let Some(end) = after.find("*/") {
+                rest = &after[end + 2..];
+                continue;
+            }
+            return "";
+        }
+        return trimmed;
+    }
+}
+
+fn strip_kw_lower<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+    let rest = s.strip_prefix(kw)?;
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        Some(rest.trim_start())
+    } else {
+        None
+    }
+}
+
+fn find_with_no_data_suffix(stmt: &str) -> Option<usize> {
+    let bytes = stmt.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end < 4 || !bytes[end - 4..end].eq_ignore_ascii_case(b"data") {
+        return None;
+    }
+    let mut p = end - 4;
+    let ws_start = p;
+    while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+        p -= 1;
+    }
+    if p == ws_start {
+        return None;
+    }
+    if p < 2 || !bytes[p - 2..p].eq_ignore_ascii_case(b"no") {
+        return None;
+    }
+    p -= 2;
+    let ws_start = p;
+    while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+        p -= 1;
+    }
+    if p == ws_start {
+        return None;
+    }
+    if p < 4 || !bytes[p - 4..p].eq_ignore_ascii_case(b"with") {
+        return None;
+    }
+    p -= 4;
+    let ws_start = p;
+    while p > 0 && bytes[p - 1].is_ascii_whitespace() {
+        p -= 1;
+    }
+    if p == ws_start {
+        return None;
+    }
+    Some(p)
 }
 
 pub fn count_params(stmt: &Statement) -> usize {
@@ -1863,8 +2230,6 @@ fn convert_create_trigger(ct: sp::CreateTrigger) -> Result<Statement> {
         .cloned()
         .map(convert_statement)
         .collect::<Result<Vec<_>>>()?;
-    // Store body as `;`-joined statement strings (no BEGIN/END wrapper) so the body
-    // executor can parse it via `parse_sql_multi`.
     let body_sql: String = inner_statements
         .iter()
         .map(|s| s.to_string())
@@ -2517,9 +2882,7 @@ fn convert_update(update: sp::Update) -> Result<Statement> {
 
 fn convert_truncate(t: sp::Truncate) -> Result<Statement> {
     if matches!(t.cascade, Some(sp::CascadeOption::Cascade)) {
-        return Err(SqlError::Unsupported(
-            "TRUNCATE CASCADE is planned for v0.13".into(),
-        ));
+        return Err(SqlError::Unsupported("TRUNCATE CASCADE".into()));
     }
     if t.if_exists {
         return Err(SqlError::Unsupported("TRUNCATE IF EXISTS".into()));
@@ -2847,7 +3210,6 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
             args: vec![convert_expr(r#in)?, convert_expr(e)?],
             distinct: false,
         }),
-        // Typed literal: `DATE '2024-01-15'`, `TIMESTAMP '...'`, etc.
         sp::Expr::TypedString(ts) => {
             let raw = match &ts.value.value {
                 sp::Value::SingleQuotedString(s) => s.clone(),
@@ -2856,9 +3218,7 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
             };
             convert_typed_string(&ts.data_type, &raw)
         }
-        // INTERVAL '...' — sqlparser emits Expr::Interval with a boxed Expr value + field qualifiers
         sp::Expr::Interval(iv) => convert_interval_expr(iv),
-        // EXTRACT(field FROM src)
         sp::Expr::Extract { field, expr: e, .. } => {
             let field_name = match field {
                 sp::DateTimeField::Year => "year",
@@ -2896,7 +3256,6 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
                 distinct: false,
             })
         }
-        // `AT TIME ZONE 'zone'` operator — desugars to AT_TIMEZONE(ts, zone) scalar function.
         sp::Expr::AtTimeZone {
             timestamp,
             time_zone,
@@ -2990,7 +3349,6 @@ fn convert_interval_expr(iv: &sp::Interval) -> Result<Expr> {
         }
     };
 
-    // SQL-standard form `INTERVAL '5' DAY` — append the unit to the literal.
     let with_unit = if let Some(field) = &iv.leading_field {
         let unit_name = match field {
             sp::DateTimeField::Year => "years",
@@ -3141,7 +3499,6 @@ fn convert_function(func: &sp::Function) -> Result<Expr> {
         }
     };
 
-    // Window function: check OVER before any other special handling
     if let Some(over) = &func.over {
         let spec = match over {
             sp::WindowType::WindowSpec(ws) => convert_window_spec(ws)?,
@@ -3152,7 +3509,6 @@ fn convert_function(func: &sp::Function) -> Result<Expr> {
         return Ok(Expr::WindowFunction { name, args, spec });
     }
 
-    // Non-window special forms
     if is_count_star {
         return Ok(Expr::CountStar);
     }

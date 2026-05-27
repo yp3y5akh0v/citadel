@@ -1764,9 +1764,8 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             check_args(name, &evaluated, 0)?;
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
-            use std::time::SystemTime;
             let mut hasher = DefaultHasher::new();
-            SystemTime::now().hash(&mut hasher);
+            crate::datetime::now_micros().hash(&mut hasher);
             std::thread::current().id().hash(&mut hasher);
             let mut val = hasher.finish() as i64;
             if val == i64::MIN {

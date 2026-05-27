@@ -1,12 +1,19 @@
 use std::sync::Arc;
 
 use citadel::Database;
+use citadel_txn::read_txn::ReadTxn;
 use citadel_txn::write_txn::WriteTxn;
 
 use crate::error::Result;
 use crate::parser::Statement;
 use crate::schema::SchemaManager;
 use crate::types::{ExecutionResult, Value};
+
+pub enum ActiveTxnRef<'a, 'db: 'a> {
+    None,
+    Read(&'a mut ReadTxn<'db>),
+    Write(&'a mut WriteTxn<'db>),
+}
 
 pub trait CompiledPlan: Send + Sync {
     fn execute(
@@ -15,7 +22,7 @@ pub trait CompiledPlan: Send + Sync {
         schema: &SchemaManager,
         stmt: &Statement,
         params: &[Value],
-        wtx: Option<&mut WriteTxn<'_>>,
+        txn: ActiveTxnRef<'_, '_>,
     ) -> Result<ExecutionResult>;
 
     /// Attempt to produce a streaming row source. Returns `None` if this plan
@@ -65,3 +72,7 @@ pub fn compile(schema: &SchemaManager, stmt: &Statement) -> Option<Arc<dyn Compi
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "compile_tests.rs"]
+mod tests;

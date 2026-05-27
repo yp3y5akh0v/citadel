@@ -4119,7 +4119,6 @@ fn create_index_concurrently_parses() {
     let conn = Connection::open(&db).unwrap();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)")
         .unwrap();
-    // CONCURRENTLY flag parses (v0.16 D5 will make it actually concurrent; for now it builds normally).
     assert_ok(
         conn.execute("CREATE INDEX CONCURRENTLY idx_x ON t (x)")
             .unwrap(),

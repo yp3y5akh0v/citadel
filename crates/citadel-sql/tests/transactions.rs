@@ -1458,3 +1458,330 @@ fn temporary_table_can_join_persistent_table() {
     assert_eq!(r.rows.len(), 1);
     assert_eq!(r.rows[0][0], Value::Text("Alice".into()));
 }
+
+fn count_rows(conn: &Connection<'_>, table: &str) -> i64 {
+    let qr = conn
+        .query(&format!("SELECT COUNT(*) FROM {table}"))
+        .unwrap();
+    match qr.rows[0][0] {
+        Value::Integer(n) => n,
+        ref other => panic!("expected integer count, got {other:?}"),
+    }
+}
+
+#[test]
+fn begin_read_only_holds_snapshot_across_selects() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+
+    let writer = Connection::open(&db).unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO t (id, val) VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+
+    let reader = Connection::open(&db).unwrap();
+    reader.execute("BEGIN READ ONLY").unwrap();
+    assert_eq!(count_rows(&reader, "t"), 2);
+
+    writer
+        .execute("INSERT INTO t (id, val) VALUES (3, 'c')")
+        .unwrap();
+
+    assert_eq!(count_rows(&reader, "t"), 2);
+
+    let qr = reader.query("SELECT id FROM t ORDER BY id").unwrap();
+    assert_eq!(qr.rows.len(), 2);
+    assert_eq!(qr.rows[0][0], Value::Integer(1));
+    assert_eq!(qr.rows[1][0], Value::Integer(2));
+
+    reader.execute("COMMIT").unwrap();
+    assert_eq!(count_rows(&reader, "t"), 3);
+}
+
+#[test]
+fn begin_read_only_concurrent_with_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+
+    let setup = Connection::open(&db).unwrap();
+    setup
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")
+        .unwrap();
+
+    let reader = Connection::open(&db).unwrap();
+    let writer = Connection::open(&db).unwrap();
+
+    reader.execute("BEGIN READ ONLY").unwrap();
+    let before = reader.query("SELECT SUM(v) FROM t").unwrap();
+    assert_eq!(before.rows[0][0], Value::Integer(30));
+
+    for i in 3..8 {
+        writer
+            .execute(&format!("INSERT INTO t (id, v) VALUES ({i}, {})", i * 100))
+            .unwrap();
+    }
+
+    let after = reader.query("SELECT SUM(v) FROM t").unwrap();
+    assert_eq!(after.rows[0][0], Value::Integer(30));
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_concurrent_with_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+
+    let writer = Connection::open(&db).unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    writer.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+
+    let r1 = Connection::open(&db).unwrap();
+    r1.execute("BEGIN READ ONLY").unwrap();
+    assert_eq!(count_rows(&r1, "t"), 1);
+
+    writer.execute("INSERT INTO t (id) VALUES (2)").unwrap();
+
+    let r2 = Connection::open(&db).unwrap();
+    r2.execute("BEGIN READ ONLY").unwrap();
+
+    assert_eq!(count_rows(&r1, "t"), 1);
+    assert_eq!(count_rows(&r2, "t"), 2);
+
+    writer.execute("INSERT INTO t (id) VALUES (3)").unwrap();
+
+    assert_eq!(count_rows(&r1, "t"), 1);
+    assert_eq!(count_rows(&r2, "t"), 2);
+
+    r1.execute("COMMIT").unwrap();
+    r2.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_subquery_uses_held_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+
+    let writer = Connection::open(&db).unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO t (id, v) VALUES (1, 5), (2, 10)")
+        .unwrap();
+
+    let reader = Connection::open(&db).unwrap();
+    reader.execute("BEGIN READ ONLY").unwrap();
+
+    let _ = reader.query("SELECT id FROM t").unwrap();
+
+    writer
+        .execute("INSERT INTO t (id, v) VALUES (3, 999)")
+        .unwrap();
+
+    let qr = reader
+        .query("SELECT id, (SELECT MAX(v) FROM t) FROM t ORDER BY id")
+        .unwrap();
+    assert_eq!(qr.rows.len(), 2);
+    for row in &qr.rows {
+        assert_eq!(row[1], Value::Integer(10));
+    }
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_view_uses_held_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+
+    let writer = Connection::open(&db).unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, kind TEXT)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO t (id, kind) VALUES (1, 'a'), (2, 'b'), (3, 'a')")
+        .unwrap();
+    writer
+        .execute("CREATE VIEW va AS SELECT id FROM t WHERE kind = 'a'")
+        .unwrap();
+
+    let reader = Connection::open(&db).unwrap();
+    reader.execute("BEGIN READ ONLY").unwrap();
+    assert_eq!(count_rows(&reader, "va"), 2);
+
+    writer
+        .execute("INSERT INTO t (id, kind) VALUES (4, 'a')")
+        .unwrap();
+
+    assert_eq!(count_rows(&reader, "va"), 2);
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_cte_uses_held_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+
+    let writer = Connection::open(&db).unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO t (id, v) VALUES (1, 1), (2, 2), (3, 3)")
+        .unwrap();
+
+    let reader = Connection::open(&db).unwrap();
+    reader.execute("BEGIN READ ONLY").unwrap();
+    let before = reader
+        .query("WITH s AS (SELECT v FROM t) SELECT SUM(v) FROM s")
+        .unwrap();
+    assert_eq!(before.rows[0][0], Value::Integer(6));
+
+    writer
+        .execute("INSERT INTO t (id, v) VALUES (4, 100)")
+        .unwrap();
+
+    let after = reader
+        .query("WITH s AS (SELECT v FROM t) SELECT SUM(v) FROM s")
+        .unwrap();
+    assert_eq!(after.rows[0][0], Value::Integer(6));
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_join_uses_held_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+
+    let writer = Connection::open(&db).unwrap();
+    writer
+        .execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, w INTEGER)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO a (id, v) VALUES (1, 10), (2, 20)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO b (id, a_id, w) VALUES (11, 1, 100), (12, 2, 200)")
+        .unwrap();
+
+    let reader = Connection::open(&db).unwrap();
+    reader.execute("BEGIN READ ONLY").unwrap();
+    let qr = reader
+        .query("SELECT a.v, b.w FROM a JOIN b ON b.a_id = a.id ORDER BY a.id")
+        .unwrap();
+    assert_eq!(qr.rows.len(), 2);
+
+    writer
+        .execute("INSERT INTO a (id, v) VALUES (3, 30)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO b (id, a_id, w) VALUES (13, 3, 300)")
+        .unwrap();
+
+    let qr2 = reader
+        .query("SELECT a.v, b.w FROM a JOIN b ON b.a_id = a.id ORDER BY a.id")
+        .unwrap();
+    assert_eq!(qr2.rows.len(), 2);
+    assert_eq!(qr2.rows[1][0], Value::Integer(20));
+    assert_eq!(qr2.rows[1][1], Value::Integer(200));
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn begin_read_only_prepared_stmt_uses_held_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+
+    let writer = Connection::open(&db).unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO t (id, v) VALUES (1, 10)")
+        .unwrap();
+
+    let reader = Connection::open(&db).unwrap();
+    let p = reader.prepare("SELECT v FROM t WHERE id = $1").unwrap();
+
+    reader.execute("BEGIN READ ONLY").unwrap();
+    let qr = p.query_collect(&[Value::Integer(1)]).unwrap();
+    assert_eq!(qr.rows[0][0], Value::Integer(10));
+
+    writer.execute("UPDATE t SET v = 999 WHERE id = 1").unwrap();
+
+    let qr2 = p.query_collect(&[Value::Integer(1)]).unwrap();
+    assert_eq!(qr2.rows[0][0], Value::Integer(10));
+
+    reader.execute("COMMIT").unwrap();
+    let qr3 = p.query_collect(&[Value::Integer(1)]).unwrap();
+    assert_eq!(qr3.rows[0][0], Value::Integer(999));
+}
+
+#[test]
+fn begin_read_only_mutation_rejected_regression() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    for stmt in [
+        "INSERT INTO t (id) VALUES (1)",
+        "UPDATE t SET id = 2",
+        "DELETE FROM t",
+        "CREATE INDEX ix ON t (id)",
+        "DROP TABLE t",
+        "TRUNCATE t",
+    ] {
+        let err = conn.execute(stmt).unwrap_err();
+        assert!(
+            matches!(err, SqlError::Unsupported(_)),
+            "expected Unsupported for `{stmt}`, got {err:?}"
+        );
+    }
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn begin_read_only_through_matview() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+
+    let writer = Connection::open(&db).unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, kind TEXT)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO t (id, kind) VALUES (1, 'a'), (2, 'b'), (3, 'a')")
+        .unwrap();
+    writer
+        .execute("CREATE MATERIALIZED VIEW mv AS SELECT id, kind FROM t WHERE kind = 'a'")
+        .unwrap();
+
+    let reader = Connection::open(&db).unwrap();
+    reader.execute("BEGIN READ ONLY").unwrap();
+    let before = reader.query("SELECT COUNT(*) FROM mv").unwrap();
+    assert_eq!(before.rows[0][0], Value::Integer(2));
+
+    writer
+        .execute("INSERT INTO t (id, kind) VALUES (4, 'a')")
+        .unwrap();
+    writer.execute("REFRESH MATERIALIZED VIEW mv").unwrap();
+
+    let after = reader.query("SELECT COUNT(*) FROM mv").unwrap();
+    assert_eq!(after.rows[0][0], Value::Integer(2));
+    reader.execute("COMMIT").unwrap();
+
+    let fresh = reader.query("SELECT COUNT(*) FROM mv").unwrap();
+    assert_eq!(fresh.rows[0][0], Value::Integer(3));
+}

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use citadel::Database;
+use citadel_txn::read_txn::ReadTxn;
 use rustc_hash::FxHashMap;
 
 use crate::encoding::{
@@ -13,8 +14,6 @@ use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
 
-use citadel_txn::write_txn::WriteTxn;
-
 use super::aggregate::*;
 use super::compile::CompiledPlan;
 use super::correlated::*;
@@ -26,22 +25,18 @@ use super::view::*;
 use super::window::*;
 use super::CteContext;
 
-fn try_virtual_table(
-    name: &str,
-    db: &Database,
-    schema: &SchemaManager,
-) -> Option<Result<QueryResult>> {
+fn try_virtual_table(name: &str, schema: &SchemaManager) -> Option<Result<QueryResult>> {
     let canonical = match name {
         "timezone_names" => "pg_timezone_names",
         "timezone_abbrevs" => "pg_timezone_abbrevs",
         other => other,
     };
     let vt = schema.get_virtual(canonical)?;
-    Some(vt.scan(db, schema))
+    Some(vt.scan(schema))
 }
 
-pub(super) fn exec_select(
-    db: &Database,
+pub(super) fn exec_select_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
@@ -49,8 +44,9 @@ pub(super) fn exec_select(
     if stmt.from.is_empty() && stmt.from_subquery.is_none() {
         let materialized;
         let stmt = if stmt_has_subquery(stmt) {
-            materialized =
-                materialize_stmt(stmt, &mut |sub| exec_subquery_read(db, schema, sub, ctes))?;
+            materialized = materialize_stmt(stmt, &mut |sub| {
+                exec_subquery_with_read(rtx, schema, sub, ctes)
+            })?;
             &materialized
         } else {
             stmt
@@ -59,43 +55,43 @@ pub(super) fn exec_select(
     }
 
     if has_lateral(stmt) {
-        return exec_select_lateral(db, schema, stmt, ctes);
+        return exec_select_lateral_with_read(rtx, schema, stmt, ctes);
     }
     if has_non_lateral_derived(stmt) {
-        return exec_select_with_derived(db, schema, stmt, ctes);
+        return exec_select_with_derived_with_read(rtx, schema, stmt, ctes);
     }
 
     if stmt.from_args.is_some() && crate::json::is_srf_name(&stmt.from) {
-        return exec_select_with_srf(db, schema, stmt, ctes);
+        return exec_select_with_srf_with_read(rtx, schema, stmt, ctes);
     }
     if stmt.from_json_table.is_some() {
-        return exec_select_with_json_table(db, schema, stmt, ctes);
+        return exec_select_with_json_table_with_read(rtx, schema, stmt, ctes);
     }
 
     let lower_name = stmt.from.to_ascii_lowercase();
 
-    if let Some(vt_result) = try_virtual_table(&lower_name, db, schema) {
+    if let Some(vt_result) = try_virtual_table(&lower_name, schema) {
         let vt_result = vt_result?;
         if stmt.joins.is_empty() {
             return exec_select_from_cte(&vt_result, stmt, &mut |sub| {
-                exec_subquery_read(db, schema, sub, ctes)
+                exec_subquery_with_read(rtx, schema, sub, ctes)
             });
         }
         let mut vt_ctes = ctes.clone();
         vt_ctes.insert(lower_name.clone(), vt_result);
         return super::exec_select_join_with_ctes(stmt, &vt_ctes, &mut |name| {
-            super::scan_table_read_or_view(db, schema, name)
+            super::scan_table_with_read_or_view(rtx, schema, name)
         });
     }
 
     if let Some(cte_result) = ctes.get(&lower_name) {
         if stmt.joins.is_empty() {
             return exec_select_from_cte(cte_result, stmt, &mut |sub| {
-                exec_subquery_read(db, schema, sub, ctes)
+                exec_subquery_with_read(rtx, schema, sub, ctes)
             });
         } else {
             return super::exec_select_join_with_ctes(stmt, ctes, &mut |name| {
-                super::scan_table_read(db, schema, name)
+                super::scan_table_with_read(rtx, schema, name)
             });
         }
     }
@@ -107,15 +103,15 @@ pub(super) fn exec_select(
             .any(|j| ctes.contains_key(&j.table.name.to_ascii_lowercase()))
     {
         return super::exec_select_join_with_ctes(stmt, ctes, &mut |name| {
-            super::scan_table_read_or_view(db, schema, name)
+            super::scan_table_with_read_or_view(rtx, schema, name)
         });
     }
 
     if let Some(view_def) = schema.get_view(&lower_name) {
         if let Some(fused) = try_fuse_view(stmt, schema, view_def)? {
-            return exec_select(db, schema, &fused, ctes);
+            return exec_select_with_read(rtx, schema, &fused, ctes);
         }
-        let view_qr = exec_view_read(db, schema, view_def)?;
+        let view_qr = exec_view_with_read(rtx, schema, view_def)?;
         if stmt.joins.is_empty() {
             let view_schema = build_view_schema(&lower_name, &view_qr);
             let view_ctx = CorrelationCtx {
@@ -125,7 +121,7 @@ pub(super) fn exec_select(
             if has_correlated_where(&stmt.where_clause, &view_ctx, schema) {
                 let mut rows = view_qr.rows.clone();
                 let remaining =
-                    handle_correlated_where_read(db, schema, stmt, &view_ctx, &mut rows)?;
+                    handle_correlated_where_with_read(rtx, schema, stmt, &view_ctx, &mut rows)?;
                 let clean_stmt = SelectStmt {
                     where_clause: remaining,
                     columns: stmt.columns.clone(),
@@ -145,13 +141,13 @@ pub(super) fn exec_select(
                 return process_select(&view_schema.columns, rows, &clean_stmt, false);
             }
             return exec_select_from_cte(&view_qr, stmt, &mut |sub| {
-                exec_subquery_read(db, schema, sub, ctes)
+                exec_subquery_with_read(rtx, schema, sub, ctes)
             });
         } else {
             let mut view_ctes = ctes.clone();
             view_ctes.insert(lower_name.clone(), view_qr);
             return super::exec_select_join_with_ctes(stmt, &view_ctes, &mut |name| {
-                super::scan_table_read_or_view(db, schema, name)
+                super::scan_table_with_read_or_view(rtx, schema, name)
             });
         }
     }
@@ -167,13 +163,13 @@ pub(super) fn exec_select(
             let jname = j.table.name.to_ascii_lowercase();
             if let Some(vd) = schema.get_view(&jname) {
                 if let std::collections::hash_map::Entry::Vacant(e) = view_ctes.entry(jname) {
-                    let vqr = exec_view_read(db, schema, vd)?;
+                    let vqr = exec_view_with_read(rtx, schema, vd)?;
                     e.insert(vqr);
                 }
             }
         }
         return super::exec_select_join_with_ctes(stmt, &view_ctes, &mut |name| {
-            super::scan_table_read(db, schema, name)
+            super::scan_table_with_read(rtx, schema, name)
         });
     }
 
@@ -190,7 +186,7 @@ pub(super) fn exec_select(
     };
     if has_correlated_where(&stmt.where_clause, &corr_ctx, schema) {
         let (mut rows, remaining_where) =
-            build_and_scan_correlated_read(db, schema, stmt, table_schema, &corr_ctx)?;
+            build_and_scan_correlated_with_read(rtx, schema, stmt, table_schema, &corr_ctx)?;
         let clean_stmt = SelectStmt {
             where_clause: remaining_where,
             columns: stmt.columns.clone(),
@@ -209,8 +205,8 @@ pub(super) fn exec_select(
         };
         // Handle correlated scalar in SELECT
         let mut ext_cols = table_schema.columns.clone();
-        let clean_stmt = handle_correlated_select_read(
-            db,
+        let clean_stmt = handle_correlated_select_with_read(
+            rtx,
             schema,
             &clean_stmt,
             &corr_ctx,
@@ -221,7 +217,7 @@ pub(super) fn exec_select(
         let final_stmt;
         let s = if stmt_has_subquery(&clean_stmt) {
             final_stmt = materialize_stmt(&clean_stmt, &mut |sub| {
-                exec_subquery_read(db, schema, sub, ctes)
+                exec_subquery_with_read(rtx, schema, sub, ctes)
             })?;
             &final_stmt
         } else {
@@ -231,14 +227,20 @@ pub(super) fn exec_select(
     }
 
     if has_correlated_select(&stmt.columns, &corr_ctx, schema) {
-        let (mut rows, _) = collect_rows_read(db, table_schema, &stmt.where_clause, None)?;
+        let (mut rows, _) = collect_rows_with_read(rtx, table_schema, &stmt.where_clause, None)?;
         let mut ext_cols = table_schema.columns.clone();
-        let clean_stmt =
-            handle_correlated_select_read(db, schema, stmt, &corr_ctx, &mut rows, &mut ext_cols)?;
+        let clean_stmt = handle_correlated_select_with_read(
+            rtx,
+            schema,
+            stmt,
+            &corr_ctx,
+            &mut rows,
+            &mut ext_cols,
+        )?;
         let final_stmt;
         let s = if stmt_has_subquery(&clean_stmt) {
             final_stmt = materialize_stmt(&clean_stmt, &mut |sub| {
-                exec_subquery_read(db, schema, sub, ctes)
+                exec_subquery_with_read(rtx, schema, sub, ctes)
             })?;
             &final_stmt
         } else {
@@ -249,19 +251,19 @@ pub(super) fn exec_select(
 
     let materialized;
     let stmt = if stmt_has_subquery(stmt) {
-        materialized =
-            materialize_stmt(stmt, &mut |sub| exec_subquery_read(db, schema, sub, ctes))?;
+        materialized = materialize_stmt(stmt, &mut |sub| {
+            exec_subquery_with_read(rtx, schema, sub, ctes)
+        })?;
         &materialized
     } else {
         stmt
     };
 
     if !stmt.joins.is_empty() {
-        return super::exec_select_join(db, schema, stmt);
+        return super::exec_select_join_with_read(rtx, schema, stmt);
     }
 
     if let Some(result) = try_count_star_shortcut(stmt, || {
-        let mut rtx = db.begin_read();
         rtx.table_entry_count(lower_name.as_bytes())
             .map_err(SqlError::Storage)
     })? {
@@ -271,7 +273,6 @@ pub(super) fn exec_select(
     if let Some(plan) = StreamAggPlan::try_new(stmt, table_schema)? {
         let mut states: Vec<AggState> = plan.ops.iter().map(|(op, _)| AggState::new(op)).collect();
         let mut scan_err: Option<SqlError> = None;
-        let mut rtx = db.begin_read();
         if stmt.where_clause.is_none() {
             rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
                 plan.feed_row_raw(key, value, &mut states, &mut scan_err)
@@ -300,34 +301,32 @@ pub(super) fn exec_select(
 
     if let Some(plan) = StreamGroupByPlan::try_new(stmt, table_schema)? {
         let lower = lower_name.clone();
-        let mut rtx = db.begin_read();
         return plan
             .execute_scan(|cb| rtx.table_scan_raw(lower.as_bytes(), |key, value| cb(key, value)));
     }
 
     if let Some(plan) = TopKScanPlan::try_new(stmt, table_schema)? {
         let lower = lower_name.clone();
-        let mut rtx = db.begin_read();
         return plan.execute_scan(table_schema, stmt, |cb| {
             rtx.table_scan_raw(lower.as_bytes(), |key, value| cb(key, value))
         });
     }
 
-    if let Some(result) = try_streaming_distinct(stmt, table_schema, db)? {
+    if let Some(result) = try_streaming_distinct_with_read(rtx, stmt, table_schema)? {
         return Ok(result);
     }
 
-    if let Some(result) = try_inverted_ts_rank_topk(db, table_schema, stmt)? {
+    if let Some(result) = try_inverted_ts_rank_topk_with_read(rtx, table_schema, stmt)? {
         return Ok(result);
     }
 
-    if let Some(result) = try_inverted_index_only(db, table_schema, stmt)? {
+    if let Some(result) = try_inverted_index_only_with_read(rtx, table_schema, stmt)? {
         return Ok(result);
     }
 
     let scan_limit = compute_scan_limit(stmt);
     let (rows, predicate_applied) =
-        collect_rows_read(db, table_schema, &stmt.where_clause, scan_limit)?;
+        collect_rows_with_read(rtx, table_schema, &stmt.where_clause, scan_limit)?;
     process_select(&table_schema.columns, rows, stmt, predicate_applied)
 }
 
@@ -459,8 +458,8 @@ fn ts_rank_from_index_positions(positions_per_lex: &[&[u16]]) -> f64 {
     score
 }
 
-fn try_inverted_ts_rank_topk(
-    db: &Database,
+fn try_inverted_ts_rank_topk_with_read(
+    rtx: &mut ReadTxn<'_>,
     table_schema: &TableSchema,
     stmt: &SelectStmt,
 ) -> Result<Option<ExecutionResult>> {
@@ -590,7 +589,6 @@ fn try_inverted_ts_rank_topk(
         data: Vec<u16>,
     }
     let mut probes: Vec<Probe> = Vec::with_capacity(probe_entries.len());
-    let mut rtx = db.begin_read();
     for entry in &probe_entries {
         let mut prefix = entry.clone();
         prefix.push(0x1F);
@@ -711,8 +709,8 @@ fn try_inverted_ts_rank_topk(
     })))
 }
 
-fn try_inverted_index_only(
-    db: &Database,
+fn try_inverted_index_only_with_read(
+    rtx: &mut ReadTxn<'_>,
     table_schema: &TableSchema,
     stmt: &SelectStmt,
 ) -> Result<Option<ExecutionResult>> {
@@ -809,7 +807,6 @@ fn try_inverted_index_only(
     let single_int_pk = pk_col_indices.len() == 1
         && table_schema.columns[pk_col_indices[0]].data_type == DataType::Integer;
 
-    let mut rtx = db.begin_read();
     let mut int_acc: Option<Vec<i64>> = None;
 
     let acc = if let Some(ast) = phrase_ast.as_ref() {
@@ -2572,10 +2569,10 @@ impl TopKScanPlan {
 }
 
 /// Streaming DISTINCT: extract only needed columns from raw scan, dedup inline.
-fn try_streaming_distinct(
+fn try_streaming_distinct_with_read(
+    rtx: &mut ReadTxn<'_>,
     stmt: &SelectStmt,
     table_schema: &TableSchema,
-    db: &Database,
 ) -> Result<Option<ExecutionResult>> {
     if !stmt.distinct
         || stmt.where_clause.is_some()
@@ -2629,7 +2626,6 @@ fn try_streaming_distinct(
     let mut scan_err: Option<SqlError> = None;
     let mut raw_key_buf: Vec<u8> = Vec::with_capacity(64);
 
-    let mut rtx = db.begin_read();
     rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
         raw_key_buf.clear();
         for target in &targets {
@@ -2729,13 +2725,13 @@ pub(super) trait LateralIo {
     ) -> Result<(TableSchema, Vec<Vec<Value>>)>;
 }
 
-pub(super) struct ReadIo<'a> {
-    pub db: &'a Database,
+pub(super) struct ReadHeldIo<'a, 'db: 'a> {
+    pub rtx: &'a mut ReadTxn<'db>,
 }
 
-impl LateralIo for ReadIo<'_> {
+impl LateralIo for ReadHeldIo<'_, '_> {
     fn exec_select(&mut self, schema: &SchemaManager, sq: &SelectQuery) -> Result<QueryResult> {
-        match super::cte::exec_select_query(self.db, schema, sq)? {
+        match super::cte::exec_select_query_with_read(self.rtx, schema, sq)? {
             ExecutionResult::Query(qr) => Ok(qr),
             _ => Err(SqlError::Plan("expected Query result".into())),
         }
@@ -2745,7 +2741,7 @@ impl LateralIo for ReadIo<'_> {
         schema: &SchemaManager,
         name: &str,
     ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
-        super::scan_table_read_or_view(self.db, schema, name)
+        super::scan_table_with_read_or_view(self.rtx, schema, name)
     }
 }
 
@@ -2792,8 +2788,8 @@ fn materialize_derived(
     io.exec_select(schema, &derived.query)
 }
 
-fn exec_select_with_srf(
-    db: &Database,
+fn exec_select_with_srf_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
@@ -2831,7 +2827,7 @@ fn exec_select_with_srf(
     let mut new_stmt = stmt.clone();
     new_stmt.from = alias;
     new_stmt.from_args = None;
-    exec_select(db, schema, &new_stmt, &new_ctes)
+    exec_select_with_read(rtx, schema, &new_stmt, &new_ctes)
 }
 
 fn populate_record_dispatch(
@@ -2898,8 +2894,8 @@ fn populate_record_dispatch(
     Ok((columns, rows))
 }
 
-fn exec_select_with_json_table(
-    db: &Database,
+fn exec_select_with_json_table_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
@@ -2919,48 +2915,51 @@ fn exec_select_with_json_table(
     let mut new_stmt = stmt.clone();
     new_stmt.from = alias;
     new_stmt.from_json_table = None;
-    exec_select(db, schema, &new_stmt, &new_ctes)
+    exec_select_with_read(rtx, schema, &new_stmt, &new_ctes)
 }
 
-fn exec_select_with_derived(
-    db: &Database,
+fn exec_select_with_derived_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
 ) -> Result<ExecutionResult> {
     let mut new_ctes = ctes.clone();
     let mut new_stmt = stmt.clone();
-    let mut io = ReadIo { db };
 
-    if let Some(d) = stmt.from_subquery.as_ref() {
-        let qr = materialize_derived(schema, d, &mut io)?;
-        new_ctes.insert(d.alias.to_ascii_lowercase(), qr);
-        new_stmt.from = d.alias.clone();
-        new_stmt.from_alias = None;
-        new_stmt.from_subquery = None;
-    }
-    for j in new_stmt.joins.iter_mut() {
-        if let Some(d) = j.subquery.take() {
-            let qr = materialize_derived(schema, &d, &mut io)?;
+    {
+        let mut io = ReadHeldIo { rtx: &mut *rtx };
+
+        if let Some(d) = stmt.from_subquery.as_ref() {
+            let qr = materialize_derived(schema, d, &mut io)?;
             new_ctes.insert(d.alias.to_ascii_lowercase(), qr);
-            j.table = TableRef {
-                name: d.alias.clone(),
-                alias: None,
-                args: None,
-            };
+            new_stmt.from = d.alias.clone();
+            new_stmt.from_alias = None;
+            new_stmt.from_subquery = None;
+        }
+        for j in new_stmt.joins.iter_mut() {
+            if let Some(d) = j.subquery.take() {
+                let qr = materialize_derived(schema, &d, &mut io)?;
+                new_ctes.insert(d.alias.to_ascii_lowercase(), qr);
+                j.table = TableRef {
+                    name: d.alias.clone(),
+                    alias: None,
+                    args: None,
+                };
+            }
         }
     }
 
-    exec_select(db, schema, &new_stmt, &new_ctes)
+    exec_select_with_read(rtx, schema, &new_stmt, &new_ctes)
 }
 
-fn exec_select_lateral(
-    db: &Database,
+fn exec_select_lateral_with_read(
+    rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
 ) -> Result<ExecutionResult> {
-    let mut io = ReadIo { db };
+    let mut io = ReadHeldIo { rtx };
     exec_select_lateral_with_io(schema, stmt, ctes, &mut io)
 }
 
@@ -2989,8 +2988,7 @@ fn exec_select_lateral_with_io(
             .any(|c| matches!(c, SelectColumn::Expr { expr, .. } if is_aggregate_expr(expr)))
     {
         return Err(SqlError::Unsupported(
-            "GROUP BY / HAVING / DISTINCT / aggregates with LATERAL are not supported in v0.13"
-                .into(),
+            "GROUP BY / HAVING / DISTINCT / aggregates with LATERAL".into(),
         ));
     }
 
@@ -3939,7 +3937,7 @@ impl CompiledPlan for CompiledSelect {
         schema: &SchemaManager,
         stmt: &Statement,
         _params: &[Value],
-        wtx: Option<&mut WriteTxn<'_>>,
+        txn: super::compile::ActiveTxnRef<'_, '_>,
     ) -> Result<ExecutionResult> {
         let sq = match stmt {
             Statement::Select(s) => s,
@@ -3950,23 +3948,31 @@ impl CompiledPlan for CompiledSelect {
             }
         };
 
-        if let (Some(plan), Some(cache), None) =
-            (&self.compound_plan, &self.compound_cache, wtx.as_ref())
-        {
-            return execute_cached_compound(db, plan, cache);
+        use super::compile::ActiveTxnRef;
+
+        if matches!(txn, ActiveTxnRef::None | ActiveTxnRef::Read(_)) {
+            if let (Some(plan), Some(cache)) = (&self.compound_plan, &self.compound_cache) {
+                return match txn {
+                    ActiveTxnRef::Read(rtx) => execute_cached_compound_with_read(rtx, plan, cache),
+                    _ => execute_cached_compound(db, plan, cache),
+                };
+            }
+            if let (Some(plan), Some(cache)) = (&self.join_plan, &self.join_cache) {
+                let sel = match &sq.body {
+                    QueryBody::Select(s) => s,
+                    _ => unreachable!("cached plan implies SelectBody::Select"),
+                };
+                return match txn {
+                    ActiveTxnRef::Read(rtx) => execute_cached_join_with_read(rtx, plan, cache, sel),
+                    _ => execute_cached_join(db, plan, cache, sel),
+                };
+            }
         }
 
-        if let (Some(plan), Some(cache), None) = (&self.join_plan, &self.join_cache, wtx.as_ref()) {
-            let sel = match &sq.body {
-                QueryBody::Select(s) => s,
-                _ => unreachable!("cached plan implies SelectBody::Select"),
-            };
-            return execute_cached_join(db, plan, cache, sel);
-        }
-
-        match wtx {
-            None => exec_select_query(db, schema, sq),
-            Some(outer) => exec_select_query_in_txn(outer, schema, sq),
+        match txn {
+            ActiveTxnRef::None => exec_select_query(db, schema, sq),
+            ActiveTxnRef::Read(rtx) => exec_select_query_with_read(rtx, schema, sq),
+            ActiveTxnRef::Write(outer) => exec_select_query_in_txn(outer, schema, sq),
         }
     }
 
@@ -4128,6 +4134,15 @@ fn execute_cached_join(
     sel: &SelectStmt,
 ) -> Result<ExecutionResult> {
     let mut rtx = db.begin_read();
+    execute_cached_join_with_read(&mut rtx, plan, cache, sel)
+}
+
+fn execute_cached_join_with_read(
+    rtx: &mut ReadTxn<'_>,
+    plan: &Arc<JoinPlanStatic>,
+    cache: &parking_lot::RwLock<Option<Arc<CachedJoin>>>,
+    sel: &SelectStmt,
+) -> Result<ExecutionResult> {
     let snapshot_gen = rtx.commit_generation();
 
     let cached: Arc<CachedJoin> = {
@@ -4135,7 +4150,7 @@ fn execute_cached_join(
         match slot.as_ref() {
             Some(c) if c.cached_gen == snapshot_gen => Arc::clone(c),
             _ => {
-                let inner = build_inner_data(&mut rtx, plan)?;
+                let inner = build_inner_data(rtx, plan)?;
                 let arc = Arc::new(CachedJoin {
                     cached_gen: snapshot_gen,
                     inner_per_table: inner,
@@ -4148,7 +4163,7 @@ fn execute_cached_join(
 
     let outer_schema = &plan.table_schemas[0];
     let mut outer_rows =
-        super::join::collect_rows_partial(&mut rtx, outer_schema, &plan.needed_per_table[0])?;
+        super::join::collect_rows_partial(rtx, outer_schema, &plan.needed_per_table[0])?;
 
     let mut cur_outer_pk_col: Option<usize> = if outer_schema.primary_key_columns.len() == 1 {
         Some(outer_schema.primary_key_columns[0] as usize)
@@ -4204,7 +4219,6 @@ fn execute_cached_join(
         );
         cur_outer_pk_col = None;
     }
-    drop(rtx);
 
     if let Some(ref oc) = plan.output_combined {
         let actual_width = outer_rows.first().map_or(0, |r| r.len());
@@ -4365,6 +4379,14 @@ fn execute_cached_compound(
     cache: &parking_lot::RwLock<Option<Arc<CachedCompound>>>,
 ) -> Result<ExecutionResult> {
     let mut rtx = db.begin_read();
+    execute_cached_compound_with_read(&mut rtx, plan, cache)
+}
+
+fn execute_cached_compound_with_read(
+    rtx: &mut ReadTxn<'_>,
+    plan: &Arc<CompoundPlanStatic>,
+    cache: &parking_lot::RwLock<Option<Arc<CachedCompound>>>,
+) -> Result<ExecutionResult> {
     let snapshot_gen = rtx.commit_generation();
 
     let cached: Arc<CachedCompound> = {
@@ -4372,7 +4394,7 @@ fn execute_cached_compound(
         match slot.as_ref() {
             Some(c) if c.cached_gen == snapshot_gen => Arc::clone(c),
             _ => {
-                let branch_rows = build_compound_branches(&mut rtx, plan)?;
+                let branch_rows = build_compound_branches(rtx, plan)?;
                 let arc = Arc::new(CachedCompound {
                     cached_gen: snapshot_gen,
                     branch_rows,
@@ -4494,3 +4516,7 @@ fn build_compound_branches(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "select_tests.rs"]
+mod tests;

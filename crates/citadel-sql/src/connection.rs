@@ -8,10 +8,7 @@ use std::sync::Arc;
 fn generate_temp_id() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0);
+    let nanos = (crate::datetime::now_micros() as u64) & 0xFFFF_FFFF;
     (nanos << 32) | (counter & 0xFFFF_FFFF)
 }
 
@@ -617,13 +614,14 @@ impl<'a> ConnectionInner<'a> {
         stmt: &Statement,
         params: &[Value],
     ) -> Result<ExecutionResult> {
+        use executor::compile::ActiveTxnRef;
         let schema = &self.schema;
         let exec = || {
             if params.is_empty() {
-                plan.execute(db, schema, stmt, params, None)
+                plan.execute(db, schema, stmt, params, ActiveTxnRef::None)
             } else {
                 crate::eval::with_scoped_params(params, || {
-                    plan.execute(db, schema, stmt, params, None)
+                    plan.execute(db, schema, stmt, params, ActiveTxnRef::None)
                 })
             }
         };
@@ -720,12 +718,17 @@ impl<'a> ConnectionInner<'a> {
         stmt: &Statement,
         params: &[Value],
     ) -> Result<ExecutionResult> {
+        use executor::compile::ActiveTxnRef;
         let schema = &self.schema;
-        let wtx = self.active_txn.as_write_mut();
+        let txn = match &mut self.active_txn {
+            ActiveTxn::Write(wtx) => ActiveTxnRef::Write(wtx),
+            ActiveTxn::Read(rtx) => ActiveTxnRef::Read(rtx),
+            ActiveTxn::None => ActiveTxnRef::None,
+        };
         if params.is_empty() || !plan.uses_scoped_params() {
-            plan.execute(db, schema, stmt, params, wtx)
+            plan.execute(db, schema, stmt, params, txn)
         } else {
-            crate::eval::with_scoped_params(params, || plan.execute(db, schema, stmt, params, wtx))
+            crate::eval::with_scoped_params(params, || plan.execute(db, schema, stmt, params, txn))
         }
     }
 
@@ -850,10 +853,14 @@ impl<'a> ConnectionInner<'a> {
                 if self.active_txn.as_write_mut().is_some() && stmt_mutates(stmt) {
                     self.capture_pending_snapshots();
                 }
-                let outcome = if let Some(wtx) = self.active_txn.as_write_mut() {
-                    executor::execute_in_txn(wtx, &mut self.schema, stmt, params)?
-                } else {
-                    executor::execute(db, &mut self.schema, stmt, params)?
+                let outcome = match &mut self.active_txn {
+                    ActiveTxn::Write(wtx) => {
+                        executor::execute_in_txn(wtx, &mut self.schema, stmt, params)?
+                    }
+                    ActiveTxn::Read(rtx) => {
+                        executor::execute_with_read(rtx, &self.schema, stmt, params)?
+                    }
+                    ActiveTxn::None => executor::execute(db, &mut self.schema, stmt, params)?,
                 };
                 if let Statement::DropTable(dt) = stmt {
                     self.schema.unregister_temp_alias(&dt.name);

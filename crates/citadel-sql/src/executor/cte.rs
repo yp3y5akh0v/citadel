@@ -1,4 +1,5 @@
 use citadel::Database;
+use citadel_txn::read_txn::ReadTxn;
 
 use crate::error::{Result, SqlError};
 use crate::eval::{eval_expr, is_truthy, ColumnMap, EvalCtx};
@@ -14,24 +15,38 @@ pub(super) fn exec_select_query(
     schema: &SchemaManager,
     sq: &SelectQuery,
 ) -> Result<ExecutionResult> {
-    if sq.ctes.is_empty() {
-        let empty = CteContext::default();
-        return super::exec_query_body(db, schema, &sq.body, &empty);
-    }
     if any_dml_cte(sq) {
         let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
         let result = exec_select_query_in_txn(&mut wtx, schema, sq)?;
         wtx.commit().map_err(SqlError::Storage)?;
         return Ok(result);
     }
+    let mut rtx = db.begin_read();
+    exec_select_query_with_read(&mut rtx, schema, sq)
+}
+
+pub(super) fn exec_select_query_with_read(
+    rtx: &mut ReadTxn<'_>,
+    schema: &SchemaManager,
+    sq: &SelectQuery,
+) -> Result<ExecutionResult> {
+    if any_dml_cte(sq) {
+        return Err(SqlError::Unsupported(
+            "DML CTE bodies require an active write transaction".into(),
+        ));
+    }
+    if sq.ctes.is_empty() {
+        let empty = CteContext::default();
+        return super::exec_query_body_with_read(rtx, schema, &sq.body, &empty);
+    }
     if let Some(fused) = try_fuse_cte(sq) {
         let empty = CteContext::default();
-        return super::exec_query_body(db, schema, &fused, &empty);
+        return super::exec_query_body_with_read(rtx, schema, &fused, &empty);
     }
     let ctes = materialize_all_ctes(&sq.ctes, sq.recursive, &mut |body, ctx| {
-        super::exec_query_body_read(db, schema, body, ctx)
+        super::exec_query_body_with_read_qr(rtx, schema, body, ctx)
     })?;
-    super::exec_query_body(db, schema, &sq.body, &ctes)
+    super::exec_query_body_with_read(rtx, schema, &sq.body, &ctes)
 }
 
 fn any_dml_cte(sq: &SelectQuery) -> bool {
@@ -485,3 +500,7 @@ pub(super) fn exec_select_from_cte(
 
     super::process_select(&cte_schema.columns, cte_result.rows.clone(), s, false)
 }
+
+#[cfg(test)]
+#[path = "cte_tests.rs"]
+mod tests;
