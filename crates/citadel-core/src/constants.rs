@@ -40,6 +40,21 @@ pub const HKDF_INFO_KEYFILE_MAC: &[u8] = b"citadel-keyfile-mac";
 pub const HKDF_INFO_KMS_MASTER: &[u8] = b"citadel-master-key";
 pub const HKDF_KMS_SALT: &[u8] = b"citadel-v1";
 
+pub const REGION_STORE_MAGIC: u32 = 0x5247_4E53; // "RGNS"
+pub const REGION_STORE_VERSION: u32 = 1;
+pub const REGION_STORE_BLOCK: usize = 512; // sector-aligned header/slot copy size
+pub const REGION_STORE_PREALLOC_SLOTS: u32 = 64; // initial capacity (grows append-only)
+pub const HKDF_INFO_REGION_STORE_MAC: &[u8] = b"citadel-region-store-mac-v1";
+pub const HKDF_INFO_REGION_WRAP: &[u8] = b"citadel-region-wrap-v1";
+pub const HKDF_INFO_RCK_DEK: &[u8] = b"citadel-rck-dek-v1";
+pub const HKDF_INFO_RCK_MAC: &[u8] = b"citadel-rck-mac-v1";
+// Per-atom erasure: each atom's random content key (ACK) is AES-KW-wrapped under a KEK
+// derived from the region RCK and stored as the SOLE copy in the atom key store, so
+// destroying that slot erases one atom and destroying the RCK erases the whole region.
+pub const HKDF_INFO_ATOM_WRAP: &[u8] = b"citadel-atom-wrap-v1";
+pub const ATOM_STORE_MAGIC: u32 = 0x4154_4D53; // "ATMS"
+pub const ATOM_STORE_PREALLOC_SLOTS: u32 = 256; // initial capacity (grows append-only)
+
 pub const PBKDF2_MIN_ITERATIONS: u32 = 600_000;
 
 pub const KEY_BACKUP_MAGIC: u32 = 0x4B45_5942; // "KEYB"

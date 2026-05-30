@@ -10,7 +10,10 @@ use citadel_core::{
     WRAPPED_KEY_SIZE,
 };
 
-use crate::hkdf_utils::{derive_keyfile_mac_key, derive_keys_from_rek, DerivedKeys};
+use crate::hkdf_utils::{
+    derive_keyfile_mac_key, derive_keys_from_rek, derive_region_wrap_keys, DerivedKeys,
+    RegionWrapKeys,
+};
 use crate::kdf::derive_mk;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -161,6 +164,31 @@ pub fn create_key_file(
     t_cost: u32,
     p_cost: u32,
 ) -> citadel_core::Result<(KeyFile, DerivedKeys)> {
+    let (kf, keys, _region) = create_key_file_with_region_keys(
+        passphrase,
+        file_id,
+        cipher_id,
+        kdf_algorithm,
+        m_cost,
+        t_cost,
+        p_cost,
+    )?;
+    Ok((kf, keys))
+}
+
+/// Like [`create_key_file`] but also returns the region wrap keys used by citadel-mem
+/// for per-region cryptographic erasure. Derived from the REK before it is zeroized;
+/// callers that do not enable region keys use [`create_key_file`] so no region key
+/// material is held.
+pub fn create_key_file_with_region_keys(
+    passphrase: &[u8],
+    file_id: u64,
+    cipher_id: CipherId,
+    kdf_algorithm: KdfAlgorithm,
+    m_cost: u32,
+    t_cost: u32,
+    p_cost: u32,
+) -> citadel_core::Result<(KeyFile, DerivedKeys, RegionWrapKeys)> {
     use rand::RngCore;
 
     let salt = crate::kdf::generate_salt();
@@ -171,6 +199,7 @@ pub fn create_key_file(
 
     let wrapped = wrap_rek(&mk, &rek);
     let keys = derive_keys_from_rek(&rek);
+    let region = derive_region_wrap_keys(&rek);
 
     let mut kf = KeyFile {
         magic: KEY_FILE_MAGIC,
@@ -193,7 +222,7 @@ pub fn create_key_file(
 
     rek.zeroize();
 
-    Ok((kf, keys))
+    Ok((kf, keys, region))
 }
 
 /// Open an existing key file with a passphrase.
@@ -202,6 +231,17 @@ pub fn open_key_file(
     passphrase: &[u8],
     expected_file_id: u64,
 ) -> citadel_core::Result<(KeyFile, DerivedKeys)> {
+    let (kf, keys, _region) = open_key_file_with_region_keys(buf, passphrase, expected_file_id)?;
+    Ok((kf, keys))
+}
+
+/// Like [`open_key_file`] but also returns the region wrap keys (see
+/// [`create_key_file_with_region_keys`]).
+pub fn open_key_file_with_region_keys(
+    buf: &[u8; KEY_FILE_SIZE],
+    passphrase: &[u8],
+    expected_file_id: u64,
+) -> citadel_core::Result<(KeyFile, DerivedKeys, RegionWrapKeys)> {
     let kf = KeyFile::deserialize(buf)?;
 
     if kf.file_id != expected_file_id {
@@ -224,9 +264,10 @@ pub fn open_key_file(
         unwrap_rek(&mk, &kf.wrapped_rek).map_err(|_| citadel_core::Error::BadPassphrase)?;
 
     let keys = derive_keys_from_rek(&rek);
+    let region = derive_region_wrap_keys(&rek);
     rek.zeroize();
 
-    Ok((kf, keys))
+    Ok((kf, keys, region))
 }
 
 #[cfg(test)]

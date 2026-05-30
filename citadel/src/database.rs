@@ -1,9 +1,12 @@
+use std::any::Any;
 use std::fs;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use citadel_core::{Error, Result, KEY_FILE_SIZE, MERKLE_HASH_SIZE};
+use citadel_core::{Error, Result, KEY_FILE_SIZE, KEY_SIZE, MERKLE_HASH_SIZE, WRAPPED_KEY_SIZE};
+use citadel_crypto::hkdf_utils::RegionWrapKeys;
 use citadel_io::durable;
 #[cfg(not(target_arch = "wasm32"))]
 use citadel_io::mmap_io::MmapPageIO;
@@ -11,9 +14,20 @@ use citadel_txn::integrity::IntegrityReport;
 use citadel_txn::manager::TxnManager;
 use citadel_txn::read_txn::ReadTxn;
 use citadel_txn::write_txn::WriteTxn;
+use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
 
+use crate::atom_store::AtomKeyStore;
 #[cfg(feature = "audit-log")]
 use crate::audit::{AuditEventType, AuditLog};
+use crate::key_codec::SlotRecord;
+use crate::region_store::RegionKeyStore;
+
+/// Type-erased cache of `Arc<T>` entries shared across connections to one DB.
+pub type SharedCache = Mutex<FxHashMap<String, Arc<dyn Any + Send + Sync>>>;
+
+/// Cloneable handle to the per-Database shared cache.
+pub type SqlCacheHandle = Arc<SharedCache>;
 
 /// Database statistics read from the current commit slot.
 #[derive(Debug, Clone)]
@@ -32,8 +46,21 @@ pub struct Database {
     manager: TxnManager,
     data_path: PathBuf,
     key_path: PathBuf,
+    /// Database file_id (from the file header), binding the region key store.
+    file_id: u64,
     #[cfg(feature = "audit-log")]
-    audit_log: Option<parking_lot::Mutex<AuditLog>>,
+    audit_log: Option<Mutex<AuditLog>>,
+    /// Shared cache for higher-level crates (e.g. citadel-sql ANN indexes).
+    /// Held here so it spans all connections without a dependency cycle.
+    sql_caches: Arc<SharedCache>,
+    /// Region wrap keys for per-region cryptographic erasure (citadel-mem).
+    /// `Some` only when the builder enabled region keys; derived from the REK
+    /// and zeroized on drop. The raw REK is never retained here.
+    region_keys: Option<RegionWrapKeys>,
+    /// Sidecar region key store (lazy); shared by every `MemoryEngine` over this db.
+    region_store: Mutex<Option<RegionKeyStore>>,
+    /// Sidecar per-atom key store (lazy); holds each atom's wrapped ACK.
+    atom_store: Mutex<Option<AtomKeyStore>>,
 }
 
 impl std::fmt::Debug for Database {
@@ -55,23 +82,73 @@ impl Database {
         manager: TxnManager,
         data_path: PathBuf,
         key_path: PathBuf,
+        file_id: u64,
+        region_keys: Option<RegionWrapKeys>,
         audit_log: Option<AuditLog>,
     ) -> Self {
         Self {
             manager,
             data_path,
             key_path,
-            audit_log: audit_log.map(parking_lot::Mutex::new),
+            file_id,
+            audit_log: audit_log.map(Mutex::new),
+            sql_caches: Arc::new(Mutex::new(FxHashMap::default())),
+            region_keys,
+            region_store: Mutex::new(None),
+            atom_store: Mutex::new(None),
         }
     }
 
     #[cfg(not(feature = "audit-log"))]
-    pub(crate) fn new(manager: TxnManager, data_path: PathBuf, key_path: PathBuf) -> Self {
+    pub(crate) fn new(
+        manager: TxnManager,
+        data_path: PathBuf,
+        key_path: PathBuf,
+        file_id: u64,
+        region_keys: Option<RegionWrapKeys>,
+    ) -> Self {
         Self {
             manager,
             data_path,
             key_path,
+            file_id,
+            sql_caches: Arc::new(Mutex::new(FxHashMap::default())),
+            region_keys,
+            region_store: Mutex::new(None),
+            atom_store: Mutex::new(None),
         }
+    }
+
+    /// Fetch a typed entry from the shared SQL cache.
+    /// Returns `None` if the key is missing or stored under a different type.
+    pub fn sql_cache_get<T: Any + Send + Sync>(&self, key: &str) -> Option<Arc<T>> {
+        let guard = self.sql_caches.lock();
+        let entry = guard.get(key)?;
+        Arc::clone(entry).downcast::<T>().ok()
+    }
+
+    /// Insert (or overwrite) a typed entry in the shared SQL cache.
+    pub fn sql_cache_insert<T: Any + Send + Sync>(&self, key: String, value: Arc<T>) {
+        self.sql_caches.lock().insert(key, value);
+    }
+
+    /// Remove every entry whose key starts with `prefix`.
+    /// Returns the number of entries removed.
+    pub fn sql_cache_invalidate_prefix(&self, prefix: &str) -> usize {
+        let mut guard = self.sql_caches.lock();
+        let before = guard.len();
+        guard.retain(|k, _| !k.starts_with(prefix));
+        before - guard.len()
+    }
+
+    /// Total number of cache entries (test/diagnostics helper).
+    pub fn sql_cache_len(&self) -> usize {
+        self.sql_caches.lock().len()
+    }
+
+    /// Cloneable handle to the shared cache.
+    pub fn sql_cache_handle(&self) -> SqlCacheHandle {
+        Arc::clone(&self.sql_caches)
     }
 
     /// Begin a read-only transaction with snapshot isolation.
@@ -102,6 +179,173 @@ impl Database {
 
     pub fn key_path(&self) -> &Path {
         &self.key_path
+    }
+
+    /// Database file identifier from the file header. citadel-mem binds the
+    /// region key store to this value so a mismatched sidecar is rejected.
+    pub fn file_id(&self) -> u64 {
+        self.file_id
+    }
+
+    /// Whether per-region cryptographic erasure keys are available.
+    /// `true` only when the database was opened with `enable_region_keys(true)`.
+    pub fn region_keys_enabled(&self) -> bool {
+        self.region_keys.is_some()
+    }
+
+    /// Wrap a region's random content key (RCK) under the region KEK (AES-256-KW).
+    /// The 40-byte result is the sole copy of the RCK; citadel-mem stores it in the
+    /// sidecar key store and overwrites it in place to erase the region.
+    pub fn wrap_region_key(&self, rck: &[u8; KEY_SIZE]) -> Result<[u8; WRAPPED_KEY_SIZE]> {
+        self.region_keys
+            .as_ref()
+            .map(|rk| rk.wrap_region_key(rck))
+            .ok_or(Error::RegionKeysDisabled)
+    }
+
+    /// Unwrap a region content key. Fails if the slot was erased (zeroed wrap).
+    pub fn unwrap_region_key(&self, wrapped: &[u8; WRAPPED_KEY_SIZE]) -> Result<[u8; KEY_SIZE]> {
+        self.region_keys
+            .as_ref()
+            .ok_or(Error::RegionKeysDisabled)?
+            .unwrap_region_key(wrapped)
+    }
+
+    /// HMAC key authenticating the region key store's header and slots
+    /// (torn-write detection only; RCK secrecy is protected by AES-KW).
+    pub fn region_store_mac_key(&self) -> Result<[u8; KEY_SIZE]> {
+        self.region_keys
+            .as_ref()
+            .map(|rk| rk.store_mac_key)
+            .ok_or(Error::RegionKeysDisabled)
+    }
+
+    /// Path to the sidecar region key store, `{key_path}` with the
+    /// `citadel-regions` extension. Pure path math; valid even when region keys
+    /// are disabled (the file only exists once an encrypted region is created).
+    pub fn region_store_path(&self) -> PathBuf {
+        region_store_path_for(&self.key_path)
+    }
+
+    /// Run `f` against the lazily-opened sidecar store under its lock.
+    fn with_region_store<T>(&self, f: impl FnOnce(&mut RegionKeyStore) -> Result<T>) -> Result<T> {
+        let mut guard = self.region_store.lock();
+        if guard.is_none() {
+            let mac_key = self.region_store_mac_key()?;
+            *guard = Some(RegionKeyStore::create_or_open(
+                &self.region_store_path(),
+                self.file_id,
+                mac_key,
+            )?);
+        }
+        f(guard.as_mut().expect("region store initialized above"))
+    }
+
+    /// Allocate a slot and store the wrapped RCK (fsync'd); returns `(slot, gen)`.
+    pub fn region_store_allocate_write(
+        &self,
+        region_id: u64,
+        wrapped: &[u8; WRAPPED_KEY_SIZE],
+    ) -> Result<(u32, u64)> {
+        self.with_region_store(|s| {
+            let slot = s.allocate_slot()?;
+            let gen = s.write_live(slot, region_id, wrapped)?;
+            Ok((slot, gen))
+        })
+    }
+
+    /// The authoritative record of region key `slot`.
+    pub fn region_store_slot(&self, slot: u32) -> Result<SlotRecord> {
+        self.with_region_store(|s| s.read_slot(slot))
+    }
+
+    /// Cryptographically erase region key `slot` (no-op if already erased).
+    pub fn region_store_tombstone(&self, slot: u32, region_id: u64) -> Result<()> {
+        self.with_region_store(|s| s.tombstone(slot, region_id))
+    }
+
+    /// `(slot, region_id)` for every LIVE region key slot.
+    pub fn region_store_live_owners(&self) -> Result<Vec<(u32, u64)>> {
+        self.with_region_store(|s| s.live_owners())
+    }
+
+    /// Path to the sidecar per-atom key store, `{key_path}` with the `citadel-atomkeys`
+    /// extension. Pure path math; the file only exists once an encrypted atom is written.
+    pub fn atom_store_path(&self) -> PathBuf {
+        atom_store_path_for(&self.key_path)
+    }
+
+    /// Run `f` against the lazily-opened atom key store under its lock.
+    fn with_atom_store<T>(&self, f: impl FnOnce(&mut AtomKeyStore) -> Result<T>) -> Result<T> {
+        let mut guard = self.atom_store.lock();
+        if guard.is_none() {
+            let mac_key = self.region_store_mac_key()?;
+            *guard = Some(AtomKeyStore::create_or_open(
+                &self.atom_store_path(),
+                self.file_id,
+                mac_key,
+            )?);
+        }
+        f(guard.as_mut().expect("atom store initialized above"))
+    }
+
+    /// Allocate a slot and store one atom's wrapped ACK (fsync'd); returns `(slot, gen)`.
+    pub fn atom_store_allocate_write(
+        &self,
+        atom_id: u64,
+        wrapped: &[u8; WRAPPED_KEY_SIZE],
+    ) -> Result<(u32, u64)> {
+        self.with_atom_store(|s| {
+            let slot = s.allocate_slot()?;
+            let gen = s.write_live(slot, atom_id, wrapped)?;
+            Ok((slot, gen))
+        })
+    }
+
+    /// Allocate and durably write a batch of `(atom_id, wrapped)` ACKs with ONE fsync;
+    /// returns `(slot, gen)` per item in order.
+    pub fn atom_store_allocate_batch(
+        &self,
+        items: &[(u64, [u8; WRAPPED_KEY_SIZE])],
+    ) -> Result<Vec<(u32, u64)>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_atom_store(|s| {
+            let slots = s.allocate_batch(items.len())?;
+            let writes: Vec<(u32, u64, [u8; WRAPPED_KEY_SIZE])> = slots
+                .iter()
+                .zip(items)
+                .map(|(&slot, (atom_id, wrapped))| (slot, *atom_id, *wrapped))
+                .collect();
+            let gens = s.write_live_batch(&writes)?;
+            Ok(slots.into_iter().zip(gens).collect())
+        })
+    }
+
+    /// The authoritative record of atom key `slot` (its wrapped ACK and state).
+    pub fn atom_store_slot(&self, slot: u32) -> Result<SlotRecord> {
+        self.with_atom_store(|s| s.read_slot(slot))
+    }
+
+    /// Cryptographically erase atom key `slot` (no-op if already erased).
+    pub fn atom_store_tombstone(&self, slot: u32, atom_id: u64) -> Result<()> {
+        self.with_atom_store(|s| s.tombstone(slot, atom_id))
+    }
+
+    /// Erase a batch of atom key slots with two fsyncs total (not 2N). Items are `(slot, atom_id)`.
+    pub fn atom_store_tombstone_batch(&self, items: &[(u32, u64)]) -> Result<()> {
+        self.with_atom_store(|s| s.tombstone_batch(items))
+    }
+
+    /// Every LIVE atom key's `atom_id -> wrapped ACK`, in one whole-file pass.
+    pub fn atom_store_live_wrapped(&self) -> Result<FxHashMap<u64, [u8; WRAPPED_KEY_SIZE]>> {
+        self.with_atom_store(|s| s.live_wrapped())
+    }
+
+    /// `(slot, atom_id)` for every LIVE atom key slot.
+    pub fn atom_store_live_owners(&self) -> Result<Vec<(u32, u64)>> {
+        self.with_atom_store(|s| s.live_owners())
     }
 
     /// Number of currently active readers.
@@ -189,6 +433,7 @@ impl Database {
 
         let dest_key_path = resolve_key_path_for(dest_path);
         fs::copy(&self.key_path, &dest_key_path)?;
+        self.copy_region_store_to(&dest_key_path)?;
 
         #[cfg(feature = "audit-log")]
         self.log_audit_with_path(AuditEventType::BackupCreated, dest_path);
@@ -331,10 +576,31 @@ impl Database {
 
         let dest_key_path = resolve_key_path_for(dest_path);
         fs::copy(&self.key_path, &dest_key_path)?;
+        self.copy_region_store_to(&dest_key_path)?;
 
         #[cfg(feature = "audit-log")]
         self.log_audit_with_path(AuditEventType::CompactionPerformed, dest_path);
 
+        Ok(())
+    }
+
+    /// Copy the sidecar region key store next to `dest_key_path`, if it exists.
+    ///
+    /// A backup/compaction must carry the wrapped region keys so encrypted
+    /// regions remain openable from the copy. Note: a backup taken while a
+    /// region is live retains a recoverable key; `forget` cannot reach it, so
+    /// backup retention is the operator's responsibility (see `region_store_path`).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn copy_region_store_to(&self, dest_key_path: &Path) -> Result<()> {
+        let src = self.region_store_path();
+        if src.exists() {
+            let dest = region_store_path_for(dest_key_path);
+            fs::copy(&src, &dest)?;
+        }
+        let atom_src = self.atom_store_path();
+        if atom_src.exists() {
+            fs::copy(&atom_src, atom_store_path_for(dest_key_path))?;
+        }
         Ok(())
     }
 }
@@ -495,4 +761,104 @@ fn resolve_key_path_for(data_path: &Path) -> PathBuf {
     let mut name = data_path.as_os_str().to_os_string();
     name.push(".citadel-keys");
     PathBuf::from(name)
+}
+
+/// Sidecar region key store path: `key_path` with the `citadel-regions` extension,
+/// e.g. `mydb.citadel.citadel-keys` -> `mydb.citadel.citadel-regions`.
+fn region_store_path_for(key_path: &Path) -> PathBuf {
+    key_path.with_extension("citadel-regions")
+}
+
+/// Sidecar atom key store path: `key_path` with the `citadel-atomkeys` extension.
+fn atom_store_path_for(key_path: &Path) -> PathBuf {
+    key_path.with_extension("citadel-atomkeys")
+}
+
+#[cfg(test)]
+mod sql_cache_tests {
+    use super::*;
+    use crate::builder::DatabaseBuilder;
+    use citadel_core::types::Argon2Profile;
+
+    fn open_db(dir: &Path) -> Database {
+        DatabaseBuilder::new(dir.join("test.db"))
+            .passphrase(b"x")
+            .argon2_profile(Argon2Profile::Iot)
+            .create()
+            .unwrap()
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Marker(u32);
+
+    #[test]
+    fn insert_then_get_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        db.sql_cache_insert("k".to_string(), Arc::new(Marker(42)));
+        let got = db.sql_cache_get::<Marker>("k").unwrap();
+        assert_eq!(*got, Marker(42));
+    }
+
+    #[test]
+    fn get_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        assert!(db.sql_cache_get::<Marker>("missing").is_none());
+    }
+
+    #[test]
+    fn get_wrong_type_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        db.sql_cache_insert("k".to_string(), Arc::new(Marker(1)));
+        assert!(db.sql_cache_get::<String>("k").is_none());
+    }
+
+    #[test]
+    fn insert_overwrites_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        db.sql_cache_insert("k".to_string(), Arc::new(Marker(1)));
+        db.sql_cache_insert("k".to_string(), Arc::new(Marker(2)));
+        assert_eq!(*db.sql_cache_get::<Marker>("k").unwrap(), Marker(2));
+    }
+
+    #[test]
+    fn invalidate_prefix_removes_matching_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        db.sql_cache_insert("ann:t1:ix_v".to_string(), Arc::new(Marker(1)));
+        db.sql_cache_insert("ann:t1:ix_w".to_string(), Arc::new(Marker(2)));
+        db.sql_cache_insert("ann:t2:ix_v".to_string(), Arc::new(Marker(3)));
+        db.sql_cache_insert("other:x".to_string(), Arc::new(Marker(4)));
+
+        let removed = db.sql_cache_invalidate_prefix("ann:t1:");
+        assert_eq!(removed, 2);
+        assert!(db.sql_cache_get::<Marker>("ann:t1:ix_v").is_none());
+        assert!(db.sql_cache_get::<Marker>("ann:t1:ix_w").is_none());
+        assert!(db.sql_cache_get::<Marker>("ann:t2:ix_v").is_some());
+        assert!(db.sql_cache_get::<Marker>("other:x").is_some());
+    }
+
+    #[test]
+    fn invalidate_prefix_no_match_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        db.sql_cache_insert("a:1".to_string(), Arc::new(Marker(1)));
+        assert_eq!(db.sql_cache_invalidate_prefix("z:"), 0);
+        assert_eq!(db.sql_cache_len(), 1);
+    }
+
+    #[test]
+    fn shared_arc_observed_by_two_borrows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(dir.path());
+        let value = Arc::new(Marker(7));
+        db.sql_cache_insert("k".to_string(), Arc::clone(&value));
+        let a = db.sql_cache_get::<Marker>("k").unwrap();
+        let b = db.sql_cache_get::<Marker>("k").unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(Arc::ptr_eq(&a, &value));
+    }
 }

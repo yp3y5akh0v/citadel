@@ -87,6 +87,18 @@ pub enum Error {
 
     #[error("corrupted overflow chain: {0}")]
     CorruptOverflowChain(String),
+
+    #[error("region content failed authentication (wrong key or erased region)")]
+    RegionSealTampered,
+
+    #[error("region key store is corrupt: {0}")]
+    RegionStoreCorrupt(String),
+
+    #[error("per-region cryptographic erasure is not enabled for this database")]
+    RegionKeysDisabled,
+
+    #[error("per-region cryptographic erasure requires a file-backed database (not in-memory)")]
+    RegionKeysRequireFile,
 }
 
 #[cfg(test)]

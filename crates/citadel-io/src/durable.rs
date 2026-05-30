@@ -6,65 +6,39 @@
 #[cfg(unix)]
 use std::fs::File;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
-/// Write data to a file durably using temp-file + rename.
-///
-/// Sequence:
-/// 1. Write data to `{path}.tmp`
-/// 2. fsync the temp file (data is on disk)
-/// 3. Rename temp file to final path (atomic on POSIX)
-/// 4. fsync the parent directory (rename is durable)
-///
-/// On crash at any point, either the old file or the new file is present,
-/// never a partial write.
+/// Write data durably: temp file + atomic rename + directory fsync.
+/// Crash-safe: always leaves either old or new file, never partial.
 pub fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let temp_path = path.with_extension("tmp");
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temp_path)?;
-
-    file.write_all(data)?;
-    file.sync_data()?;
-    drop(file);
-
+    // `write_synced` closes before rename; Windows refuses to rename an open file.
+    write_synced(&temp_path, data)?;
     fs::rename(&temp_path, path)?;
-
     fsync_directory(path)?;
-
     Ok(())
 }
 
-/// Write data to a file and fsync it (no atomic rename).
-///
-/// Use this for initial file creation where there is no previous
-/// version to protect. Fsyncs both the file and the parent directory.
+/// Write data and fsync; for new files (no rename protection needed).
 pub fn write_and_sync(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    write_synced(path, data)?;
+    fsync_directory(path)?;
+    Ok(())
+}
+
+/// Write `data`, fsync, and close, so callers can rename or sync the dir after.
+fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .open(path)?;
-
     file.write_all(data)?;
-    file.sync_data()?;
-    drop(file);
-
-    fsync_directory(path)?;
-
-    Ok(())
+    file.sync_data()
 }
 
-/// Fsync a file's parent directory to make directory entries durable.
-///
-/// On Linux, directory entries (file creation, rename) are not durable until
-/// the directory inode is fsynced. On macOS (F_FULLFSYNC) and Windows
-/// (FlushFileBuffers), this is a no-op because the OS flushes directory
-/// metadata as part of file sync.
+/// Fsync parent directory to durably record file creation/rename (Linux only).
 fn fsync_directory(file_path: &Path) -> std::io::Result<()> {
     let dir = file_path.parent().unwrap_or(Path::new("."));
 
@@ -80,6 +54,49 @@ fn fsync_directory(file_path: &Path) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Overwrite `bytes` at `offset` in an EXISTING file, in place, then fsync the data.
+///
+/// Does NOT create, truncate, or rename - it reuses the same physical byte range.
+/// This is what cryptographic erasure of a key slot relies on: there is no temp file
+/// or rename that would orphan a prior copy of the bytes being destroyed.
+pub fn overwrite_in_place(path: &Path, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(bytes)?;
+    file.sync_data()
+}
+
+/// Overwrite several fixed byte ranges of an EXISTING file through one open handle, then
+/// fsync once: one durability barrier for the batch, not one per block. Durable on `Ok`.
+pub fn write_blocks_synced<const N: usize>(
+    path: &Path,
+    blocks: &[(u64, [u8; N])],
+) -> std::io::Result<()> {
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new().write(true).open(path)?;
+    for (offset, bytes) in blocks {
+        file.seek(SeekFrom::Start(*offset))?;
+        file.write_all(bytes)?;
+    }
+    file.sync_data()
+}
+
+/// Append bytes to an existing file and fsync (no truncate/rename).
+pub fn append_and_sync(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().append(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_data()
+}
+
+/// Truncate to `len` bytes and fsync (removes torn tail from crash recovery).
+pub fn truncate_and_sync(path: &Path, len: u64) -> std::io::Result<()> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(len)?;
+    file.sync_all()
 }
 
 #[cfg(test)]

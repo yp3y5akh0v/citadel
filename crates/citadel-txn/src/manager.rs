@@ -40,6 +40,8 @@ pub struct TxnManager {
     state: Mutex<ManagerState>,
     sync_mode: citadel_core::types::SyncMode,
     hmac_state: page_cipher::HmacState,
+    /// When true, freed pages past all readers are zero-filled on commit (secure delete).
+    secure_delete: AtomicBool,
 }
 
 struct ManagerState {
@@ -100,6 +102,7 @@ impl TxnManager {
             }),
             sync_mode,
             hmac_state: page_cipher::HmacState::new(&mac_key, epoch),
+            secure_delete: AtomicBool::new(false),
         })
     }
 
@@ -204,11 +207,17 @@ impl TxnManager {
             }),
             sync_mode,
             hmac_state: page_cipher::HmacState::new(&mac_key, epoch),
+            secure_delete: AtomicBool::new(false),
         })
     }
 
     pub fn sync_mode(&self) -> citadel_core::types::SyncMode {
         self.sync_mode
+    }
+
+    /// Enable/disable secure delete: zero-fill freed pages once they are past all readers.
+    pub fn set_secure_delete(&self, on: bool) {
+        self.secure_delete.store(on, Ordering::Release);
     }
 
     pub fn begin_read(&self) -> ReadTxn<'_> {
@@ -471,6 +480,15 @@ impl TxnManager {
                     })
                     .collect();
                 self.io.write_pages(&encrypted_pages)?;
+            }
+        }
+
+        // Secure delete: zero freed pages now past all readers (reader-safe, and
+        // unreferenced by either commit slot so crash-safe). The zeros ride the commit fsync.
+        if self.secure_delete.load(Ordering::Relaxed) && !reclaimed.is_empty() {
+            let zeros = [0u8; PAGE_SIZE];
+            for &page_id in &reclaimed {
+                self.io.write_page(page_offset(page_id), &zeros)?;
             }
         }
 

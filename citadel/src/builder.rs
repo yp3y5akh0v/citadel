@@ -8,9 +8,10 @@ use citadel_core::types::{Argon2Profile, CipherId, KdfAlgorithm, SyncMode};
 use citadel_core::{Error, Result, DEFAULT_BUFFER_POOL_SIZE, PBKDF2_MIN_ITERATIONS};
 #[cfg(not(target_arch = "wasm32"))]
 use citadel_core::{FILE_HEADER_SIZE, KEY_FILE_SIZE};
-use citadel_crypto::key_manager::create_key_file;
+use citadel_crypto::hkdf_utils::RegionWrapKeys;
+use citadel_crypto::key_manager::{create_key_file, create_key_file_with_region_keys};
 #[cfg(not(target_arch = "wasm32"))]
-use citadel_crypto::key_manager::open_key_file;
+use citadel_crypto::key_manager::{open_key_file, open_key_file_with_region_keys};
 use citadel_crypto::page_cipher::compute_dek_id;
 #[cfg(not(target_arch = "wasm32"))]
 use citadel_io::durable;
@@ -48,6 +49,8 @@ pub struct DatabaseBuilder {
     kdf_algorithm: KdfAlgorithm,
     pbkdf2_iterations: u32,
     sync_mode: SyncMode,
+    enable_region_keys: bool,
+    secure_delete: bool,
     #[cfg(feature = "audit-log")]
     audit_config: crate::audit::AuditConfig,
 }
@@ -64,6 +67,8 @@ impl DatabaseBuilder {
             kdf_algorithm: KdfAlgorithm::Argon2id,
             pbkdf2_iterations: PBKDF2_MIN_ITERATIONS,
             sync_mode: SyncMode::Full,
+            enable_region_keys: false,
+            secure_delete: false,
             #[cfg(feature = "audit-log")]
             audit_config: crate::audit::AuditConfig::default(),
         }
@@ -114,6 +119,25 @@ impl DatabaseBuilder {
 
     pub fn sync_mode(mut self, mode: SyncMode) -> Self {
         self.sync_mode = mode;
+        self
+    }
+
+    /// Enable per-region cryptographic erasure (used by citadel-mem).
+    ///
+    /// When set, a region wrap key is derived from the REK at create/open and
+    /// retained for the database lifetime so encrypted memory regions can be
+    /// sealed under random per-region keys and erased on `forget`. Off by
+    /// default; the plaintext storage path is unaffected either way.
+    pub fn enable_region_keys(mut self, enable: bool) -> Self {
+        self.enable_region_keys = enable;
+        self
+    }
+
+    /// Zero-fill freed B+ tree pages once they are past all readers, so a passphrase holder
+    /// with disk access cannot recover deleted-row residue from stale pages. Off by default
+    /// (a small write cost on delete-heavy workloads).
+    pub fn enable_secure_delete(mut self, enable: bool) -> Self {
+        self.secure_delete = enable;
         self
     }
 
@@ -186,6 +210,7 @@ impl DatabaseBuilder {
         key_path: PathBuf,
         file_id: u64,
         audit_key: [u8; citadel_core::KEY_SIZE],
+        region_keys: Option<RegionWrapKeys>,
         initial_event: Option<(crate::audit::AuditEventType, Vec<u8>)>,
     ) -> Result<Database> {
         use crate::audit;
@@ -202,7 +227,15 @@ impl DatabaseBuilder {
             None
         };
 
-        let db = Database::new(manager, self.path, key_path, audit_log);
+        manager.set_secure_delete(self.secure_delete);
+        let db = Database::new(
+            manager,
+            self.path,
+            key_path,
+            file_id,
+            region_keys,
+            audit_log,
+        );
 
         if let Some((event, detail)) = initial_event {
             db.log_audit(event, &detail);
@@ -216,11 +249,19 @@ impl DatabaseBuilder {
         self,
         manager: TxnManager,
         key_path: PathBuf,
-        _file_id: u64,
+        file_id: u64,
         _audit_key: [u8; citadel_core::KEY_SIZE],
+        region_keys: Option<RegionWrapKeys>,
         _initial_event: Option<((), Vec<u8>)>,
     ) -> Result<Database> {
-        Ok(Database::new(manager, self.path, key_path))
+        manager.set_secure_delete(self.secure_delete);
+        Ok(Database::new(
+            manager,
+            self.path,
+            key_path,
+            file_id,
+            region_keys,
+        ))
     }
 
     /// Create a new database. Fails if the data file already exists.
@@ -236,17 +277,8 @@ impl DatabaseBuilder {
 
         let key_path = self.resolve_key_path();
         let file_id: u64 = rand::random();
-        let (m_cost, t_cost, p_cost) = self.resolve_kdf_params();
 
-        let (kf, keys) = create_key_file(
-            passphrase,
-            file_id,
-            self.cipher,
-            self.kdf_algorithm,
-            m_cost,
-            t_cost,
-            p_cost,
-        )?;
+        let (kf, keys, region_keys) = self.create_keys(passphrase, file_id)?;
 
         durable::write_and_sync(&key_path, &kf.serialize())?;
 
@@ -280,7 +312,14 @@ impl DatabaseBuilder {
         #[cfg(not(feature = "audit-log"))]
         let event: Option<((), Vec<u8>)> = None;
 
-        self.finish(manager, key_path, file_id, keys.audit_key, event)
+        self.finish(
+            manager,
+            key_path,
+            file_id,
+            keys.audit_key,
+            region_keys,
+            event,
+        )
     }
 
     /// Create a new in-memory database (volatile, no file I/O).
@@ -291,23 +330,20 @@ impl DatabaseBuilder {
         #[cfg(feature = "fips")]
         self.validate_fips()?;
 
+        // Per-region cryptographic erasure needs a durable overwrite-in-place sidecar,
+        // which an in-memory database cannot provide; reject the combination up front.
+        if self.enable_region_keys {
+            return Err(Error::RegionKeysRequireFile);
+        }
+
         let passphrase = self
             .passphrase
             .as_deref()
             .ok_or(Error::PassphraseRequired)?;
 
         let file_id: u64 = rand::random();
-        let (m_cost, t_cost, p_cost) = self.resolve_kdf_params();
 
-        let (_kf, keys) = create_key_file(
-            passphrase,
-            file_id,
-            self.cipher,
-            self.kdf_algorithm,
-            m_cost,
-            t_cost,
-            p_cost,
-        )?;
+        let (_kf, keys, region_keys) = self.create_keys(passphrase, file_id)?;
 
         let dek_id = compute_dek_id(&keys.mac_key, &keys.dek);
         let io: Box<dyn PageIO> = Box::new(citadel_io::memory_io::MemoryPageIO::new());
@@ -325,7 +361,14 @@ impl DatabaseBuilder {
 
         // Clear path so finish() won't create an audit log file on disk
         self.path = PathBuf::new();
-        self.finish(manager, PathBuf::new(), file_id, keys.audit_key, None)
+        self.finish(
+            manager,
+            PathBuf::new(),
+            file_id,
+            keys.audit_key,
+            region_keys,
+            None,
+        )
     }
 
     /// Open an existing database. Fails if the data file does not exist.
@@ -355,7 +398,7 @@ impl DatabaseBuilder {
             )));
         }
         let key_buf: [u8; KEY_FILE_SIZE] = key_data.try_into().unwrap();
-        let (kf, keys) = open_key_file(&key_buf, passphrase, header.file_id)?;
+        let (kf, keys, region_keys) = self.open_keys(&key_buf, passphrase, header.file_id)?;
 
         let dek_id = compute_dek_id(&keys.mac_key, &keys.dek);
 
@@ -380,6 +423,75 @@ impl DatabaseBuilder {
         #[cfg(not(feature = "audit-log"))]
         let event: Option<((), Vec<u8>)> = None;
 
-        self.finish(manager, key_path, header.file_id, keys.audit_key, event)
+        self.finish(
+            manager,
+            key_path,
+            header.file_id,
+            keys.audit_key,
+            region_keys,
+            event,
+        )
+    }
+
+    /// Create a key file, deriving region wrap keys only when `enable_region_keys`
+    /// is set. Returns the wrap keys to retain (`Some`) or `None` so the plaintext
+    /// path holds no region key material.
+    #[allow(clippy::type_complexity)]
+    fn create_keys(
+        &self,
+        passphrase: &[u8],
+        file_id: u64,
+    ) -> Result<(
+        citadel_crypto::key_manager::KeyFile,
+        citadel_crypto::hkdf_utils::DerivedKeys,
+        Option<RegionWrapKeys>,
+    )> {
+        let (m_cost, t_cost, p_cost) = self.resolve_kdf_params();
+        if self.enable_region_keys {
+            let (kf, keys, region) = create_key_file_with_region_keys(
+                passphrase,
+                file_id,
+                self.cipher,
+                self.kdf_algorithm,
+                m_cost,
+                t_cost,
+                p_cost,
+            )?;
+            Ok((kf, keys, Some(region)))
+        } else {
+            let (kf, keys) = create_key_file(
+                passphrase,
+                file_id,
+                self.cipher,
+                self.kdf_algorithm,
+                m_cost,
+                t_cost,
+                p_cost,
+            )?;
+            Ok((kf, keys, None))
+        }
+    }
+
+    /// Open a key file, deriving region wrap keys only when `enable_region_keys`.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::type_complexity)]
+    fn open_keys(
+        &self,
+        key_buf: &[u8; KEY_FILE_SIZE],
+        passphrase: &[u8],
+        expected_file_id: u64,
+    ) -> Result<(
+        citadel_crypto::key_manager::KeyFile,
+        citadel_crypto::hkdf_utils::DerivedKeys,
+        Option<RegionWrapKeys>,
+    )> {
+        if self.enable_region_keys {
+            let (kf, keys, region) =
+                open_key_file_with_region_keys(key_buf, passphrase, expected_file_id)?;
+            Ok((kf, keys, Some(region)))
+        } else {
+            let (kf, keys) = open_key_file(key_buf, passphrase, expected_file_id)?;
+            Ok((kf, keys, None))
+        }
     }
 }
