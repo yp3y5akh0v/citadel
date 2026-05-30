@@ -199,6 +199,7 @@ pub enum CellValue {
     TsVector(Vec<u8>),
     TsQuery(Vec<u8>),
     Array(Vec<CellValue>),
+    Vector(Vec<f32>),
 }
 
 impl CellValue {
@@ -237,6 +238,7 @@ impl CellValue {
             Value::TsVector(b) => CellValue::TsVector(b.to_vec()),
             Value::TsQuery(b) => CellValue::TsQuery(b.to_vec()),
             Value::Array(a) => CellValue::Array(a.iter().map(CellValue::from_value).collect()),
+            Value::Vector(v) => CellValue::Vector(v.to_vec()),
         }
     }
 }

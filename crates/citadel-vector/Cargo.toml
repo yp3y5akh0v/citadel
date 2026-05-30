@@ -1,0 +1,28 @@
+[package]
+name = "citadeldb-vector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "VECTOR(N) type and filtered ANN index for Citadel encrypted database"
+
+[lib]
+name = "citadel_vector"
+
+[dependencies]
+citadel-core = { workspace = true }
+citadel-crypto = { workspace = true }
+citadel-page = { workspace = true }
+citadel-buffer = { workspace = true }
+citadel-txn = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+byteorder = "1.5"
+memmap2 = { workspace = true }

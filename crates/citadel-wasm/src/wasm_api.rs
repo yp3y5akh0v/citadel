@@ -227,5 +227,6 @@ fn cell_to_js(cell: &CellValue) -> JsValue {
             }
             arr.into()
         }
+        CellValue::Vector(v) => js_sys::Float32Array::from(v.as_slice()).into(),
     }
 }

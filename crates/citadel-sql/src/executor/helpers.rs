@@ -1098,6 +1098,9 @@ pub(super) fn op_symbol(op: &BinOp) -> &'static str {
         BinOp::JsonPathMatch => "@@",
         BinOp::JsonPathExistsTz => "@?_tz",
         BinOp::JsonPathMatchTz => "@@_tz",
+        BinOp::VectorL2 => "<->",
+        BinOp::VectorInner => "<#>",
+        BinOp::VectorCosine => "<=>",
     }
 }
 
@@ -1319,6 +1322,7 @@ pub(crate) fn extract_inverted_entries(
     match kind {
         crate::types::InvertedKind::Gin(ops) => crate::json::extract_gin_entries(value, ops),
         crate::types::InvertedKind::Fts { config_id } => extract_fts_lexemes(value, config_id),
+        crate::types::InvertedKind::Ann { .. } => Ok(Vec::new()),
     }
 }
 
@@ -1334,6 +1338,7 @@ pub(crate) fn extract_inverted_entries_with_values(
         crate::types::InvertedKind::Fts { config_id } => {
             extract_fts_lexemes_with_positions(value, config_id)
         }
+        crate::types::InvertedKind::Ann { .. } => Ok(Vec::new()),
     }
 }
 

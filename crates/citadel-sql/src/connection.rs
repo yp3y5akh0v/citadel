@@ -31,6 +31,13 @@ use crate::types::{ExecutionResult, QueryResult, TableSchema, Value};
 
 const DEFAULT_CACHE_CAPACITY: usize = 64;
 
+/// On commit, evict shared caches (e.g. ANN indexes) for DML-touched tables.
+fn invalidate_dml_caches(schema: &SchemaManager, db: &Database) {
+    for table in schema.drain_dml_dirty() {
+        db.sql_cache_invalidate_prefix(&format!("ann:{table}:"));
+    }
+}
+
 #[derive(Debug)]
 pub struct ScriptExecution {
     pub completed: Vec<ExecutionResult>,
@@ -625,14 +632,16 @@ impl<'a> ConnectionInner<'a> {
                 })
             }
         };
-        if plan.needs_txn_clock() {
+        let outcome = if plan.needs_txn_clock() {
             let cached_ts = self
                 .txn_start_ts
                 .or_else(|| Some(crate::datetime::now_micros()));
             crate::datetime::with_txn_clock(cached_ts, exec)
         } else {
             exec()
-        }
+        }?;
+        invalidate_dml_caches(&self.schema, db);
+        Ok(outcome)
     }
 
     pub(crate) fn parse_and_cache(
@@ -782,6 +791,7 @@ impl<'a> ConnectionInner<'a> {
                     ActiveTxn::Write(mut wtx) => {
                         crate::executor::helpers::drain_deferred_fk_checks(&mut wtx)?;
                         wtx.commit().map_err(SqlError::Storage)?;
+                        invalidate_dml_caches(&self.schema, db);
                     }
                     ActiveTxn::Read(_rtx) => {}
                 }
@@ -853,6 +863,7 @@ impl<'a> ConnectionInner<'a> {
                 if self.active_txn.as_write_mut().is_some() && stmt_mutates(stmt) {
                     self.capture_pending_snapshots();
                 }
+                let was_auto_commit = matches!(self.active_txn, ActiveTxn::None);
                 let outcome = match &mut self.active_txn {
                     ActiveTxn::Write(wtx) => {
                         executor::execute_in_txn(wtx, &mut self.schema, stmt, params)?
@@ -862,6 +873,9 @@ impl<'a> ConnectionInner<'a> {
                     }
                     ActiveTxn::None => executor::execute(db, &mut self.schema, stmt, params)?,
                 };
+                if was_auto_commit {
+                    invalidate_dml_caches(&self.schema, db);
+                }
                 if let Statement::DropTable(dt) = stmt {
                     self.schema.unregister_temp_alias(&dt.name);
                 }

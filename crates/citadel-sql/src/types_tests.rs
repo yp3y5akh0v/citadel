@@ -143,6 +143,73 @@ fn schema_roundtrip_with_indices() {
 }
 
 #[test]
+fn schema_roundtrip_ann_filter_cols() {
+    let mut ann = IndexDef::from_column_lists(
+        "ix_v".into(),
+        vec![3],
+        vec![],
+        false,
+        None,
+        None,
+        IndexKind::Inverted(InvertedKind::Ann {
+            metric: AnnMetric::Cosine,
+        }),
+    );
+    ann.ann_filter_cols = vec![1, 2];
+
+    let schema = TableSchema::new(
+        "atoms".into(),
+        vec![
+            col("id", DataType::Integer, false, 0),
+            col("region", DataType::Integer, false, 1),
+            col("kind", DataType::Text, false, 2),
+            col("v", DataType::Vector { dim: 4 }, false, 3),
+        ],
+        vec![0],
+        vec![ann],
+        vec![],
+        vec![],
+    );
+
+    let restored = TableSchema::deserialize(&schema.serialize()).unwrap();
+    assert_eq!(restored.indices.len(), 1);
+    assert_eq!(restored.indices[0].ann_filter_cols, vec![1, 2]);
+    assert!(matches!(
+        restored.indices[0].kind,
+        IndexKind::Inverted(InvertedKind::Ann {
+            metric: AnnMetric::Cosine
+        })
+    ));
+}
+
+#[test]
+fn schema_roundtrip_no_filter_cols_is_empty() {
+    let schema = TableSchema::new(
+        "t".into(),
+        vec![
+            col("id", DataType::Integer, false, 0),
+            col("v", DataType::Vector { dim: 4 }, false, 1),
+        ],
+        vec![0],
+        vec![IndexDef::from_column_lists(
+            "ix_v".into(),
+            vec![1],
+            vec![],
+            false,
+            None,
+            None,
+            IndexKind::Inverted(InvertedKind::Ann {
+                metric: AnnMetric::L2,
+            }),
+        )],
+        vec![],
+        vec![],
+    );
+    let restored = TableSchema::deserialize(&schema.serialize()).unwrap();
+    assert!(restored.indices[0].ann_filter_cols.is_empty());
+}
+
+#[test]
 fn schema_v1_backward_compat() {
     let old_schema = TableSchema::new(
         "test".into(),

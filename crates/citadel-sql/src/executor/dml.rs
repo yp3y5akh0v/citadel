@@ -61,6 +61,7 @@ pub(super) fn exec_insert(
     let table_schema = schema
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    schema.mark_dml(&table_schema.name);
 
     let insert_columns = if stmt.columns.is_empty() {
         table_schema
@@ -1416,6 +1417,7 @@ fn exec_insert_in_txn_impl(
     let table_schema = schema
         .get(&stmt.table)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    schema.mark_dml(&table_schema.name);
 
     let default_columns;
     let insert_columns: &[String] = if stmt.columns.is_empty() {

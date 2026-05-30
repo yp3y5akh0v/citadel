@@ -355,6 +355,7 @@ fn inverted_recheck_needed(kind: InvertedKind, rhs: &Value) -> bool {
             },
             _ => true,
         },
+        InvertedKind::Ann { .. } => true,
     }
 }
 
@@ -413,6 +414,7 @@ fn extract_inverted_probe(rhs: &Value, kind: InvertedKind) -> Option<Vec<Vec<u8>
             }
             _ => None,
         },
+        InvertedKind::Ann { .. } => None,
     }
 }
 
@@ -784,6 +786,7 @@ fn format_value(val: &Value) -> String {
         Value::TsVector(_) => "TSVECTOR '<binary>'".into(),
         Value::TsQuery(_) => "TSQUERY '<binary>'".into(),
         Value::Array(_) => val.to_string(),
+        Value::Vector(v) => format!("VECTOR({})", v.len()),
     }
 }
 

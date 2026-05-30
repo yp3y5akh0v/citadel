@@ -2,9 +2,10 @@
 
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use citadel::Database;
+use citadel::{Database, SqlCacheHandle};
+use parking_lot::Mutex;
 
 use crate::error::{Result, SqlError};
 use crate::system_tables::{self, VirtualTable};
@@ -64,6 +65,13 @@ pub struct SchemaManager {
     /// from inside `&self` methods. Bounded by `(active triggers × transition aliases)`.
     transition_schemas: std::cell::RefCell<FxHashMap<String, &'static TableSchema>>,
     generation: u64,
+    /// Per-Database shared cache (e.g. ANN indexes). Cloned from the Database
+    /// when the Connection opens; all Connections to the same DB share entries.
+    /// Tests created via `empty()` get their own isolated cache.
+    pub sql_caches: SqlCacheHandle,
+    /// Tables modified by DML since the last commit/rollback. Drained on
+    /// commit to invalidate dependent shared caches (e.g. ANN indexes).
+    dml_dirty_tables: std::cell::RefCell<FxHashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -84,7 +92,29 @@ impl SchemaManager {
             temp_aliases: FxHashMap::default(),
             transition_schemas: std::cell::RefCell::new(FxHashMap::default()),
             generation: 0,
+            sql_caches: Arc::new(Mutex::new(FxHashMap::default())),
+            dml_dirty_tables: std::cell::RefCell::new(FxHashSet::default()),
         }
+    }
+
+    /// Mark a table as modified by DML. Caller should normalize the name
+    /// (lowercase) so dedup works correctly.
+    pub fn mark_dml(&self, table_name: &str) {
+        self.dml_dirty_tables
+            .borrow_mut()
+            .insert(table_name.to_ascii_lowercase());
+    }
+
+    /// Take the set of tables modified since the last drain. Returns an empty
+    /// vec if no DML has run since the last commit/rollback.
+    pub fn drain_dml_dirty(&self) -> Vec<String> {
+        self.dml_dirty_tables.borrow_mut().drain().collect()
+    }
+
+    /// Forget pending DML markers without invalidating downstream caches.
+    /// Used on rollback (uncommitted writes leave no caches stale).
+    pub fn clear_dml_dirty(&self) {
+        self.dml_dirty_tables.borrow_mut().clear();
     }
 
     pub fn register_temp_alias(&mut self, user_name: &str, prefixed_name: String) {
@@ -228,6 +258,8 @@ impl SchemaManager {
             temp_aliases: FxHashMap::default(),
             transition_schemas: std::cell::RefCell::new(FxHashMap::default()),
             generation: 0,
+            sql_caches: db.sql_cache_handle(),
+            dml_dirty_tables: std::cell::RefCell::new(FxHashSet::default()),
         };
         system_tables::register_builtins(&mut mgr);
         Ok(mgr)

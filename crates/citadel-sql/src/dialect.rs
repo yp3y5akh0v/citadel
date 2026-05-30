@@ -170,7 +170,8 @@ impl Dialect for CitadelDialect {
         self.inner.allow_extract_single_quotes()
     }
 
-    /// Without this hook sqlparser sees `@?` followed by identifier `_tz` and parse-errors.
+    /// Token-stitching hook for citadel-specific composite operators that sqlparser
+    /// does not natively recognize: `@?_tz`, `@@_tz`, `<#>`.
     fn parse_infix(
         &self,
         parser: &mut Parser,
@@ -178,6 +179,23 @@ impl Dialect for CitadelDialect {
         precedence: u8,
     ) -> Option<Result<SpExpr, ParserError>> {
         let next = parser.peek_token().token;
+
+        if matches!(next, Token::Lt) {
+            if let Token::HashArrow = parser.peek_nth_token(1).token {
+                parser.advance_token();
+                parser.advance_token();
+                let right = match parser.parse_subexpr(precedence) {
+                    Ok(r) => r,
+                    Err(e) => return Some(Err(e)),
+                };
+                return Some(Ok(SpExpr::BinaryOp {
+                    left: Box::new(expr.clone()),
+                    op: BinaryOperator::Custom("<#>".to_string()),
+                    right: Box::new(right),
+                }));
+            }
+        }
+
         let custom_op = match next {
             Token::AtQuestion => "@?_tz",
             Token::AtAt => "@@_tz",

@@ -653,6 +653,9 @@ fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
         | BinOp::JsonPathMatch
         | BinOp::JsonPathExistsTz
         | BinOp::JsonPathMatchTz => eval_json_binary_op(left, op, right),
+        BinOp::VectorL2 => eval_vector_distance(left, right, VectorMetric::L2),
+        BinOp::VectorInner => eval_vector_distance(left, right, VectorMetric::Inner),
+        BinOp::VectorCosine => eval_vector_distance(left, right, VectorMetric::Cosine),
         BinOp::And | BinOp::Or => unreachable!(),
     }
 }
@@ -678,8 +681,75 @@ fn eval_json_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> 
         BinOp::JsonPathMatchTz => {
             crate::json::fn_jsonb_path_match_tz(&[left.clone(), right.clone()])
         }
+        BinOp::VectorL2 => eval_vector_distance(left, right, VectorMetric::L2),
+        BinOp::VectorInner => eval_vector_distance(left, right, VectorMetric::Inner),
+        BinOp::VectorCosine => eval_vector_distance(left, right, VectorMetric::Cosine),
         _ => unreachable!(),
     }
+}
+
+#[derive(Copy, Clone)]
+enum VectorMetric {
+    L2,
+    Inner,
+    Cosine,
+}
+
+fn eval_vector_distance(left: &Value, right: &Value, metric: VectorMetric) -> Result<Value> {
+    if left.is_null() || right.is_null() {
+        return Ok(Value::Null);
+    }
+    let (a, b) = match (left, right) {
+        (Value::Vector(a), Value::Vector(b)) => (a.as_ref(), b.as_ref()),
+        _ => {
+            return Err(SqlError::TypeMismatch {
+                expected: "VECTOR".into(),
+                got: format!("{} vs {}", left.data_type(), right.data_type()),
+            });
+        }
+    };
+    if a.len() != b.len() {
+        return Err(SqlError::InvalidValue(format!(
+            "vector dimension mismatch: {} vs {}",
+            a.len(),
+            b.len()
+        )));
+    }
+    let d = match metric {
+        VectorMetric::L2 => {
+            let mut sum = 0.0f64;
+            for (x, y) in a.iter().zip(b.iter()) {
+                let diff = (*x as f64) - (*y as f64);
+                sum += diff * diff;
+            }
+            sum.sqrt()
+        }
+        VectorMetric::Inner => {
+            let mut sum = 0.0f64;
+            for (x, y) in a.iter().zip(b.iter()) {
+                sum += (*x as f64) * (*y as f64);
+            }
+            -sum
+        }
+        VectorMetric::Cosine => {
+            let mut dot = 0.0f64;
+            let mut na = 0.0f64;
+            let mut nb = 0.0f64;
+            for (x, y) in a.iter().zip(b.iter()) {
+                let xf = *x as f64;
+                let yf = *y as f64;
+                dot += xf * yf;
+                na += xf * xf;
+                nb += yf * yf;
+            }
+            let denom = na.sqrt() * nb.sqrt();
+            if denom == 0.0 {
+                return Ok(Value::Null);
+            }
+            1.0 - dot / denom
+        }
+    };
+    Ok(Value::Real(d))
 }
 
 fn eval_at_at(left: &Value, right: &Value) -> Result<Value> {
@@ -1194,6 +1264,7 @@ fn value_to_text(val: &Value) -> String {
         Value::TsVector(b) => crate::fts::tsvector_display(b),
         Value::TsQuery(b) => crate::fts::tsquery_display(b),
         Value::Array(_) => val.to_string(),
+        Value::Vector(_) => val.to_string(),
     }
 }
 
@@ -1471,7 +1542,45 @@ pub(crate) fn eval_cast(val: &Value, target: DataType) -> Result<Value> {
         DataType::Array => val.clone().coerce_into(DataType::Array).ok_or_else(|| {
             SqlError::InvalidValue(format!("cannot cast {} to ARRAY", val.data_type()))
         }),
+        DataType::Vector { dim } => match val {
+            Value::Vector(v) if v.len() as u16 == dim => Ok(val.clone()),
+            Value::Vector(_) => Err(SqlError::InvalidValue(format!(
+                "cannot cast {} to VECTOR({dim}) (dim mismatch)",
+                val.data_type()
+            ))),
+            Value::Text(s) => parse_vector_literal(s.as_str(), dim).map(Value::Vector),
+            _ => Err(SqlError::InvalidValue(format!(
+                "cannot cast {} to VECTOR({dim})",
+                val.data_type()
+            ))),
+        },
     }
+}
+
+fn parse_vector_literal(s: &str, expected_dim: u16) -> Result<std::sync::Arc<[f32]>> {
+    let trimmed = s.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    let mut out: Vec<f32> = Vec::with_capacity(expected_dim as usize);
+    for tok in inner.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let x: f32 = tok
+            .parse()
+            .map_err(|_| SqlError::InvalidValue(format!("invalid vector element: '{tok}'")))?;
+        out.push(x);
+    }
+    if out.len() as u16 != expected_dim {
+        return Err(SqlError::InvalidValue(format!(
+            "vector literal has {} elements, expected {expected_dim}",
+            out.len()
+        )));
+    }
+    Ok(std::sync::Arc::from(out.into_boxed_slice()))
 }
 
 fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Value> {
@@ -1791,6 +1900,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 Value::TsVector(_) => "tsvector",
                 Value::TsQuery(_) => "tsquery",
                 Value::Array(_) => "array",
+                Value::Vector(_) => "vector",
             };
             Ok(Value::Text(type_name.into()))
         }

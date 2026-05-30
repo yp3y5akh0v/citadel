@@ -348,6 +348,7 @@ fn data_type_name(dt: &DataType) -> &'static str {
         DataType::TsVector => "TSVECTOR",
         DataType::TsQuery => "TSQUERY",
         DataType::Array => "ARRAY",
+        DataType::Vector { .. } => "VECTOR",
     }
 }
 

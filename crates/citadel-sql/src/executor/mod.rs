@@ -1,6 +1,7 @@
 //! SQL executor: DDL and DML operations.
 
 mod aggregate;
+mod ann_topk;
 pub(crate) mod compile;
 mod correlated;
 mod cte;

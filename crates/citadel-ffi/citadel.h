@@ -60,6 +60,7 @@ enum CitadelValueType
     TsVector = 12,
     TsQuery = 13,
     Array = 14,
+    Vector = 15,
 };
 #ifndef __cplusplus
 typedef int32_t CitadelValueType;

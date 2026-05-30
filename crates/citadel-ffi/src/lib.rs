@@ -1057,6 +1057,7 @@ pub enum CitadelValueType {
     TsVector = 12,
     TsQuery = 13,
     Array = 14,
+    Vector = 15,
 }
 
 /// Get the type of a value in a query result cell.
@@ -1088,6 +1089,7 @@ pub extern "C" fn citadel_sql_value_type(
         Some(Value::TsVector(_)) => CitadelValueType::TsVector,
         Some(Value::TsQuery(_)) => CitadelValueType::TsQuery,
         Some(Value::Array(_)) => CitadelValueType::Array,
+        Some(Value::Vector(_)) => CitadelValueType::Vector,
     }
 }
 

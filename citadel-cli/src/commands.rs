@@ -778,6 +778,10 @@ fn sql_literal(v: &citadel_sql::Value) -> String {
             let inner: Vec<String> = elems.iter().map(sql_literal).collect();
             format!("ARRAY[{}]", inner.join(", "))
         }
+        citadel_sql::Value::Vector(v) => {
+            let inner: Vec<String> = v.iter().map(|x| x.to_string()).collect();
+            format!("'[{}]'::VECTOR({})", inner.join(","), v.len())
+        }
     }
 }
 

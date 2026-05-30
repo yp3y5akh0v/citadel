@@ -19,6 +19,7 @@ const TAG_JSONB: u8 = 0x0B;
 const TAG_TSVECTOR: u8 = 0x0C;
 const TAG_TSQUERY: u8 = 0x0D;
 const TAG_ARRAY: u8 = 0x0E;
+const TAG_VECTOR: u8 = 0x0F;
 
 /// Encode a single value into an order-preserving byte sequence.
 pub fn encode_key_value(value: &Value) -> Vec<u8> {
@@ -108,7 +109,18 @@ pub(crate) fn encode_key_value_into(value: &Value, buf: &mut Vec<u8>) {
         Value::TsVector(b) => encode_bytes_into(TAG_TSVECTOR, b, buf),
         Value::TsQuery(b) => encode_bytes_into(TAG_TSQUERY, b, buf),
         Value::Array(a) => encode_array_into(a, buf),
+        Value::Vector(v) => encode_vector_into(v, buf),
     }
+}
+
+fn encode_vector_into(v: &[f32], buf: &mut Vec<u8>) {
+    buf.push(TAG_VECTOR);
+    let mut inner = Vec::with_capacity(2 + v.len() * 4);
+    inner.extend_from_slice(&(v.len() as u16).to_le_bytes());
+    for &x in v {
+        inner.extend_from_slice(&x.to_le_bytes());
+    }
+    encode_bytes_into_no_tag(&inner, buf);
 }
 
 fn encode_array_into(elems: &[Value], buf: &mut Vec<u8>) {
@@ -442,6 +454,20 @@ fn encode_cell_v2(v: &Value, buf: &mut Vec<u8>) {
             buf.resize(start + len, 0);
             write_array_v2_into_slice(a, &mut buf[start..start + len]);
         }
+        Value::Vector(v) => {
+            buf.push(
+                DataType::Vector {
+                    dim: v.len() as u16,
+                }
+                .type_tag(),
+            );
+            let len = 2 + v.len() * 4;
+            buf.extend_from_slice(&(len as u32).to_le_bytes());
+            buf.extend_from_slice(&(v.len() as u16).to_le_bytes());
+            for &x in v.iter() {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+        }
         Value::Null => unreachable!(),
     }
 }
@@ -572,10 +598,27 @@ fn decode_value(type_tag: u8, data: &[u8]) -> Result<Value> {
         Some(DataType::TsVector) => Ok(Value::TsVector(std::sync::Arc::from(data))),
         Some(DataType::TsQuery) => Ok(Value::TsQuery(std::sync::Arc::from(data))),
         Some(DataType::Array) => decode_array_v2(data),
+        Some(DataType::Vector { .. }) => decode_vector(data),
         _ => Err(SqlError::InvalidValue(format!(
             "unknown column type tag: {type_tag}"
         ))),
     }
+}
+
+fn decode_vector(data: &[u8]) -> Result<Value> {
+    if data.len() < 2 {
+        return Err(SqlError::InvalidValue("truncated vector".into()));
+    }
+    let dim = u16::from_le_bytes([data[0], data[1]]) as usize;
+    if data.len() < 2 + dim * 4 {
+        return Err(SqlError::InvalidValue("truncated vector payload".into()));
+    }
+    let mut v = Vec::with_capacity(dim);
+    for i in 0..dim {
+        let off = 2 + i * 4;
+        v.push(f32::from_le_bytes(data[off..off + 4].try_into().unwrap()));
+    }
+    Ok(Value::Vector(std::sync::Arc::from(v.into_boxed_slice())))
 }
 
 fn encoded_array_v2_size(elems: &[Value]) -> usize {
@@ -604,6 +647,7 @@ fn variable_cell_payload_size(v: &Value) -> usize {
         Value::TsVector(b) => b.len(),
         Value::TsQuery(b) => b.len(),
         Value::Array(a) => encoded_array_v2_size(a),
+        Value::Vector(v) => 2 + v.len() * 4,
         _ => unreachable!("variable_cell_payload_size called on fixed-width value"),
     }
 }
@@ -642,6 +686,14 @@ fn write_value_payload_v2(v: &Value, out: &mut [u8]) {
         Value::TsVector(b) => out[..b.len()].copy_from_slice(b),
         Value::TsQuery(b) => out[..b.len()].copy_from_slice(b),
         Value::Array(a) => write_array_v2_into_slice(a, out),
+        Value::Vector(v) => {
+            out[..2].copy_from_slice(&(v.len() as u16).to_le_bytes());
+            let mut pos = 2;
+            for &x in v.iter() {
+                out[pos..pos + 4].copy_from_slice(&x.to_le_bytes());
+                pos += 4;
+            }
+        }
         Value::Null => unreachable!(),
     }
 }
@@ -761,6 +813,7 @@ pub(crate) fn fixed_width_size(type_tag: u8) -> Option<usize> {
         | DataType::TsVector
         | DataType::TsQuery
         | DataType::Array
+        | DataType::Vector { .. }
         | DataType::Null => None,
     }
 }
@@ -1002,6 +1055,7 @@ pub enum RawColumn<'a> {
     TsVector(&'a [u8]),
     TsQuery(&'a [u8]),
     Array(&'a [u8]),
+    Vector(&'a [u8]),
 }
 
 impl<'a> RawColumn<'a> {
@@ -1030,6 +1084,7 @@ impl<'a> RawColumn<'a> {
             RawColumn::TsVector(b) => Value::TsVector(std::sync::Arc::from(b)),
             RawColumn::TsQuery(b) => Value::TsQuery(std::sync::Arc::from(b)),
             RawColumn::Array(bytes) => decode_array_v2(bytes).unwrap_or(Value::Null),
+            RawColumn::Vector(bytes) => decode_vector(bytes).unwrap_or(Value::Null),
         }
     }
 
@@ -1174,6 +1229,7 @@ fn decode_value_raw(type_tag: u8, data: &[u8]) -> Result<RawColumn<'_>> {
         Some(DataType::TsVector) => Ok(RawColumn::TsVector(data)),
         Some(DataType::TsQuery) => Ok(RawColumn::TsQuery(data)),
         Some(DataType::Array) => Ok(RawColumn::Array(data)),
+        Some(DataType::Vector { .. }) => Ok(RawColumn::Vector(data)),
         _ => Err(SqlError::InvalidValue(format!(
             "unknown column type tag: {type_tag}"
         ))),

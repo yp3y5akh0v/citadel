@@ -186,6 +186,9 @@ pub struct CreateIndexStmt {
     pub predicate_expr: Option<Expr>,
     pub collations: Vec<crate::types::Collation>,
     pub kind: crate::types::IndexKind,
+    /// ANN-only: filter-column names from `WITH (filters = '...')`, resolved to
+    /// schema column indices in `build_index_def_for_create`. Empty otherwise.
+    pub ann_filter_cols: Vec<String>,
     pub concurrently: bool,
 }
 
@@ -623,6 +626,9 @@ pub enum BinOp {
     JsonPathExistsTz,
     /// `@@_tz` — tz-aware variant of `@@`.
     JsonPathMatchTz,
+    VectorL2,
+    VectorInner,
+    VectorCosine,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1945,6 +1951,7 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
         None => (None, None),
     };
 
+    let mut ann_filter_cols: Vec<String> = Vec::new();
     let kind = match &ci.using {
         None => crate::types::IndexKind::BTree,
         Some(sp::IndexType::BTree) => crate::types::IndexKind::BTree,
@@ -1956,9 +1963,14 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
             let config_id = parse_fts_with_config(&ci.with)?;
             crate::types::IndexKind::Inverted(crate::types::InvertedKind::Fts { config_id })
         }
+        Some(sp::IndexType::Custom(ident)) if ident.value.eq_ignore_ascii_case("ann") => {
+            let (metric, filter_cols) = parse_ann_with_opts(&ci.with)?;
+            ann_filter_cols = filter_cols;
+            crate::types::IndexKind::Inverted(crate::types::InvertedKind::Ann { metric })
+        }
         Some(other) => {
             return Err(SqlError::Unsupported(format!(
-                "index method {other}; supported: BTREE, GIN, FTS"
+                "index method {other}; supported: BTREE, GIN, FTS, ANN"
             )));
         }
     };
@@ -1974,6 +1986,7 @@ fn convert_create_index(ci: sp::CreateIndex) -> Result<Statement> {
         predicate_expr,
         collations,
         kind,
+        ann_filter_cols,
         concurrently: ci.concurrently,
     }))
 }
@@ -2087,6 +2100,82 @@ fn parse_fts_with_config(with: &[sp::Expr]) -> Result<u8> {
     }
     let name = config_name.unwrap_or_else(|| "english".to_string());
     Ok(crate::fts::TokenizerKind::from_name(&name)?.as_config_id())
+}
+
+/// Parse the ANN `WITH (...)` options. Supported keys: `metric` (l2|inner|cosine)
+/// and `filters` (comma-separated low-cardinality column names pushed into the
+/// PRISM cell filter). Returns the metric and the raw, lowercased filter names.
+fn parse_ann_with_opts(with: &[sp::Expr]) -> Result<(crate::types::AnnMetric, Vec<String>)> {
+    use crate::types::AnnMetric;
+    let mut metric_name: Option<String> = None;
+    let mut filter_cols: Vec<String> = Vec::new();
+    for expr in with {
+        match expr {
+            sp::Expr::BinaryOp {
+                left,
+                op: sp::BinaryOperator::Eq,
+                right,
+            } => {
+                let key = match left.as_ref() {
+                    sp::Expr::Identifier(id) => id.value.to_ascii_lowercase(),
+                    other => {
+                        return Err(SqlError::Unsupported(format!(
+                            "ANN WITH option key: {other}"
+                        )));
+                    }
+                };
+                let val = match right.as_ref() {
+                    sp::Expr::Value(v) => match &v.value {
+                        sp::Value::SingleQuotedString(s) => s.clone(),
+                        sp::Value::DoubleQuotedString(s) => s.clone(),
+                        other => {
+                            return Err(SqlError::Parse(format!(
+                                "ANN '{key}' value must be a string literal, got: {other}"
+                            )))
+                        }
+                    },
+                    sp::Expr::Identifier(id) => id.value.clone(),
+                    other => {
+                        return Err(SqlError::Parse(format!(
+                            "ANN '{key}' value must be a string literal, got: {other}"
+                        )));
+                    }
+                };
+                match key.as_str() {
+                    "metric" => metric_name = Some(val),
+                    "filters" => {
+                        filter_cols = val
+                            .split(',')
+                            .map(|s| s.trim().to_ascii_lowercase())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                    }
+                    other => {
+                        return Err(SqlError::Unsupported(format!(
+                            "ANN WITH option: unknown key '{other}' (supported: metric, filters)"
+                        )));
+                    }
+                }
+            }
+            other => {
+                return Err(SqlError::Unsupported(format!(
+                    "ANN WITH option must be `key = value`, got: {other}"
+                )));
+            }
+        }
+    }
+    let lower = metric_name.as_deref().map(|s| s.to_ascii_lowercase());
+    let metric = match lower.as_deref() {
+        None | Some("l2") => AnnMetric::L2,
+        Some("inner") | Some("inner_product") | Some("ip") => AnnMetric::Inner,
+        Some("cosine") => AnnMetric::Cosine,
+        Some(other) => {
+            return Err(SqlError::Unsupported(format!(
+                "ANN metric '{other}'; supported: l2, inner, cosine"
+            )))
+        }
+    };
+    Ok((metric, filter_cols))
 }
 
 fn validate_partial_index_predicate(expr: &Expr) -> Result<()> {
@@ -3445,6 +3534,9 @@ fn convert_bin_op(op: &sp::BinaryOperator) -> Result<BinOp> {
         sp::BinaryOperator::AtAt => Ok(BinOp::JsonPathMatch),
         sp::BinaryOperator::Custom(s) if s == "@?_tz" => Ok(BinOp::JsonPathExistsTz),
         sp::BinaryOperator::Custom(s) if s == "@@_tz" => Ok(BinOp::JsonPathMatchTz),
+        sp::BinaryOperator::LtDashGt => Ok(BinOp::VectorL2),
+        sp::BinaryOperator::Spaceship => Ok(BinOp::VectorCosine),
+        sp::BinaryOperator::Custom(s) if s == "<#>" => Ok(BinOp::VectorInner),
         _ => Err(SqlError::Unsupported(format!("binary op: {op}"))),
     }
 }
@@ -3822,6 +3914,31 @@ fn convert_data_type(dt: &sp::DataType) -> Result<DataType> {
 
         sp::DataType::TsVector => Ok(DataType::TsVector),
         sp::DataType::TsQuery => Ok(DataType::TsQuery),
+
+        sp::DataType::Custom(name, modifiers) => {
+            if name.0.len() == 1 {
+                if let sp::ObjectNamePart::Identifier(id) = &name.0[0] {
+                    if id.value.eq_ignore_ascii_case("vector") {
+                        if modifiers.len() != 1 {
+                            return Err(SqlError::Parse(
+                                "VECTOR requires exactly one dimension argument".into(),
+                            ));
+                        }
+                        let dim: u16 = modifiers[0].parse().map_err(|_| {
+                            SqlError::Parse(format!(
+                                "VECTOR dimension must be a positive integer, got '{}'",
+                                modifiers[0]
+                            ))
+                        })?;
+                        if dim == 0 {
+                            return Err(SqlError::Parse("VECTOR dimension must be >= 1".into()));
+                        }
+                        return Ok(DataType::Vector { dim });
+                    }
+                }
+            }
+            Err(SqlError::Unsupported(format!("data type: {dt}")))
+        }
 
         _ => Err(SqlError::Unsupported(format!("data type: {dt}"))),
     }

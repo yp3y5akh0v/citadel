@@ -2329,6 +2329,17 @@ fn value_to_serde_lossy(v: &Value) -> Result<serde_json::Value> {
             }
             Ok(serde_json::Value::Array(out))
         }
+        Value::Vector(v) => {
+            let out: Vec<serde_json::Value> = v
+                .iter()
+                .map(|&x| {
+                    serde_json::Number::from_f64(x as f64)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                })
+                .collect();
+            Ok(serde_json::Value::Array(out))
+        }
     }
 }
 

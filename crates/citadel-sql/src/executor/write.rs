@@ -799,6 +799,7 @@ pub(super) fn exec_update(
     let table_schema = schema
         .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    schema.mark_dml(&table_schema.name);
     // Use storage name (post-TEMP-alias resolution) for all wtx.* storage calls below.
     let lower_name = table_schema.name.clone();
     let strict = table_schema.is_strict();
@@ -1635,6 +1636,7 @@ pub(super) fn exec_delete(
     let table_schema = schema
         .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    schema.mark_dml(&table_schema.name);
     let lower_name = table_schema.name.clone();
 
     let corr_ctx = CorrelationCtx {
@@ -2769,6 +2771,7 @@ pub(super) fn exec_update_in_txn(
     let table_schema = schema
         .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    schema.mark_dml(&table_schema.name);
     let lower_name = table_schema.name.clone();
     let strict = table_schema.is_strict();
 
@@ -3251,6 +3254,7 @@ pub(super) fn exec_delete_in_txn(
     let table_schema = schema
         .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
+    schema.mark_dml(&table_schema.name);
     let lower_name = table_schema.name.clone();
 
     let has_delete_triggers_in_txn = schema.triggers_for(&table_schema.name).iter().any(|t| {

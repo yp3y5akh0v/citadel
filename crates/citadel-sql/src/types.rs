@@ -24,6 +24,7 @@ pub enum DataType {
     TsVector,
     TsQuery,
     Array,
+    Vector { dim: u16 },
 }
 
 impl DataType {
@@ -44,9 +45,11 @@ impl DataType {
             DataType::TsVector => 12,
             DataType::TsQuery => 13,
             DataType::Array => 14,
+            DataType::Vector { .. } => 15,
         }
     }
 
+    /// Vector returns a `dim: 0` sentinel; the real dim is read at the schema layer.
     pub fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             0 => Some(DataType::Null),
@@ -64,6 +67,7 @@ impl DataType {
             12 => Some(DataType::TsVector),
             13 => Some(DataType::TsQuery),
             14 => Some(DataType::Array),
+            15 => Some(DataType::Vector { dim: 0 }),
             _ => None,
         }
     }
@@ -87,6 +91,7 @@ impl fmt::Display for DataType {
             DataType::TsVector => write!(f, "TSVECTOR"),
             DataType::TsQuery => write!(f, "TSQUERY"),
             DataType::Array => write!(f, "ARRAY"),
+            DataType::Vector { dim } => write!(f, "VECTOR({dim})"),
         }
     }
 }
@@ -115,6 +120,7 @@ pub enum Value {
     TsVector(Arc<[u8]>),
     TsQuery(Arc<[u8]>),
     Array(Arc<Vec<Value>>),
+    Vector(Arc<[f32]>),
 }
 
 impl Value {
@@ -135,6 +141,9 @@ impl Value {
             Value::TsVector(_) => DataType::TsVector,
             Value::TsQuery(_) => DataType::TsQuery,
             Value::Array(_) => DataType::Array,
+            Value::Vector(v) => DataType::Vector {
+                dim: v.len() as u16,
+            },
         }
     }
 
@@ -482,6 +491,13 @@ impl Hash for Value {
                 13u8.hash(state);
                 a.hash(state);
             }
+            Value::Vector(v) => {
+                14u8.hash(state);
+                v.len().hash(state);
+                for &x in v.iter() {
+                    x.to_bits().hash(state);
+                }
+            }
         }
     }
 }
@@ -558,6 +574,18 @@ impl Ord for Value {
             (Value::Array(_), _) => Ordering::Less,
             (_, Value::Array(_)) => Ordering::Greater,
 
+            (Value::Vector(a), Value::Vector(b)) => a.len().cmp(&b.len()).then_with(|| {
+                for (x, y) in a.iter().zip(b.iter()) {
+                    let ord = x.total_cmp(y);
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+                Ordering::Equal
+            }),
+            (Value::Vector(_), _) => Ordering::Less,
+            (_, Value::Vector(_)) => Ordering::Greater,
+
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
             (Value::Text(_), _) => Ordering::Less,
             (_, Value::Text(_)) => Ordering::Greater,
@@ -618,6 +646,16 @@ impl fmt::Display for Value {
                     }
                 }
                 write!(f, "}}")
+            }
+            Value::Vector(v) => {
+                write!(f, "[")?;
+                for (i, &x) in v.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "{x}")?;
+                }
+                write!(f, "]")
             }
         }
     }
@@ -731,6 +769,33 @@ impl GinOpsClass {
 pub enum InvertedKind {
     Gin(GinOpsClass),
     Fts { config_id: u8 },
+    Ann { metric: AnnMetric },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnMetric {
+    L2,
+    Inner,
+    Cosine,
+}
+
+impl AnnMetric {
+    pub fn as_tag(self) -> u8 {
+        match self {
+            Self::L2 => 0,
+            Self::Inner => 1,
+            Self::Cosine => 2,
+        }
+    }
+
+    pub fn from_tag(t: u8) -> Option<Self> {
+        match t {
+            0 => Some(Self::L2),
+            1 => Some(Self::Inner),
+            2 => Some(Self::Cosine),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -749,6 +814,9 @@ pub struct IndexDef {
     pub predicate_sql: Option<String>,
     pub predicate_expr: Option<crate::parser::Expr>,
     pub kind: IndexKind,
+    /// ANN-only: schema column indices pushed into the PRISM cell filter.
+    /// Empty for every other index kind.
+    pub ann_filter_cols: Vec<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -796,6 +864,7 @@ impl IndexDef {
             predicate_sql,
             predicate_expr,
             kind,
+            ann_filter_cols: Vec::new(),
         }
     }
 
@@ -1433,6 +1502,12 @@ impl TableSchema {
                 predicate_sql: idx.predicate_sql.clone(),
                 predicate_expr: idx.predicate_expr.clone(),
                 kind: idx.kind,
+                ann_filter_cols: idx
+                    .ann_filter_cols
+                    .iter()
+                    .filter(|&&p| p != drop_pos_u16)
+                    .map(|&p| if p > drop_pos_u16 { p - 1 } else { p })
+                    .collect(),
             })
             .collect();
 
@@ -1476,7 +1551,7 @@ impl TableSchema {
     }
 }
 
-const SCHEMA_VERSION: u8 = 12;
+const SCHEMA_VERSION: u8 = 14;
 pub const TABLE_FLAG_STRICT: u8 = 0b0000_0001;
 
 fn write_opt_string(buf: &mut Vec<u8>, s: &Option<String>) {
@@ -1526,6 +1601,9 @@ impl TableSchema {
             buf.extend_from_slice(&(col_name.len() as u16).to_le_bytes());
             buf.extend_from_slice(col_name);
             buf.push(col.data_type.type_tag());
+            if let DataType::Vector { dim } = col.data_type {
+                buf.extend_from_slice(&dim.to_le_bytes());
+            }
             buf.push(if col.nullable { 1 } else { 0 });
             buf.extend_from_slice(&col.position.to_le_bytes());
         }
@@ -1672,6 +1750,10 @@ impl TableSchema {
                     buf.push(2);
                     buf.push(config_id);
                 }
+                IndexKind::Inverted(InvertedKind::Ann { metric }) => {
+                    buf.push(3);
+                    buf.push(metric.as_tag());
+                }
             }
         }
         buf.push(self.flags);
@@ -1695,6 +1777,14 @@ impl TableSchema {
             }
         }
 
+        // v14: per-index ANN filter columns.
+        for idx in &self.indices {
+            buf.extend_from_slice(&(idx.ann_filter_cols.len() as u16).to_le_bytes());
+            for &col in &idx.ann_filter_cols {
+                buf.extend_from_slice(&col.to_le_bytes());
+            }
+        }
+
         buf
     }
 
@@ -1704,7 +1794,7 @@ impl TableSchema {
         if data.is_empty()
             || !matches!(
                 data[0],
-                1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | SCHEMA_VERSION
+                1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | SCHEMA_VERSION
             )
         {
             return Err(crate::error::SqlError::InvalidValue(
@@ -1728,10 +1818,17 @@ impl TableSchema {
             pos += 2;
             let col_name = String::from_utf8_lossy(&data[pos..pos + col_name_len]).into_owned();
             pos += col_name_len;
-            let data_type = DataType::from_tag(data[pos]).ok_or_else(|| {
-                crate::error::SqlError::InvalidValue("unknown data type tag".into())
-            })?;
+            let tag = data[pos];
             pos += 1;
+            let data_type = if tag == 15 {
+                let dim = u16::from_le_bytes([data[pos], data[pos + 1]]);
+                pos += 2;
+                DataType::Vector { dim }
+            } else {
+                DataType::from_tag(tag).ok_or_else(|| {
+                    crate::error::SqlError::InvalidValue("unknown data type tag".into())
+                })?
+            };
             let nullable = data[pos] != 0;
             pos += 1;
             let position = u16::from_le_bytes([data[pos], data[pos + 1]]);
@@ -1794,6 +1891,7 @@ impl TableSchema {
                     predicate_sql: None,
                     predicate_expr: None,
                     kind: IndexKind::default(),
+                    ann_filter_cols: Vec::new(),
                 });
             }
             idxs
@@ -2021,6 +2119,20 @@ impl TableSchema {
                             pos += 1;
                             IndexKind::Inverted(InvertedKind::Fts { config_id })
                         }
+                        3 => {
+                            if pos >= data.len() {
+                                return Err(crate::error::SqlError::InvalidValue(
+                                    "ANN index missing metric tag".into(),
+                                ));
+                            }
+                            let metric = AnnMetric::from_tag(data[pos]).ok_or_else(|| {
+                                crate::error::SqlError::InvalidValue(
+                                    "unknown ANN metric tag".into(),
+                                )
+                            })?;
+                            pos += 1;
+                            IndexKind::Inverted(InvertedKind::Ann { metric })
+                        }
                         _ => {
                             return Err(crate::error::SqlError::InvalidValue(
                                 "unknown IndexKind tag".into(),
@@ -2074,6 +2186,26 @@ impl TableSchema {
                             };
                         }
                     }
+                }
+            }
+            if version >= 14 {
+                for idx in &mut indices {
+                    if pos + 2 > data.len() {
+                        break;
+                    }
+                    let fcount = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                    pos += 2;
+                    let mut fcols = Vec::with_capacity(fcount);
+                    for _ in 0..fcount {
+                        if pos + 2 > data.len() {
+                            return Err(crate::error::SqlError::InvalidValue(
+                                "truncated ANN filter columns".into(),
+                            ));
+                        }
+                        fcols.push(u16::from_le_bytes([data[pos], data[pos + 1]]));
+                        pos += 2;
+                    }
+                    idx.ann_filter_cols = fcols;
                 }
             }
         }

@@ -20,6 +20,7 @@ citadel-core = { workspace = true }
 citadel-buffer = { workspace = true }
 citadel-txn = { workspace = true }
 citadel = { workspace = true }
+citadel-vector = { workspace = true }
 sqlparser = { workspace = true }
 thiserror = { workspace = true }
 lru = { workspace = true }

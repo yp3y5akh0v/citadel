@@ -661,6 +661,7 @@ fn truncate_tables(
             let idx_table = TableSchema::index_table_name(name, &idx.name);
             wtx.table_truncate(&idx_table).map_err(SqlError::Storage)?;
         }
+        schema.mark_dml(name);
         total += count;
     }
     Ok(total)
@@ -709,6 +710,7 @@ fn build_index_def_for_create(
             collate,
         });
     }
+    let ann_filter_cols = resolve_ann_filter_cols(stmt, table_schema, &keys)?;
     Ok(IndexDef {
         name,
         keys,
@@ -716,7 +718,59 @@ fn build_index_def_for_create(
         predicate_sql: stmt.predicate_sql.clone(),
         predicate_expr: stmt.predicate_expr.clone(),
         kind: stmt.kind,
+        ann_filter_cols,
     })
+}
+
+/// Resolve `WITH (filters = '...')` column names to schema indices. ANN-only;
+/// rejects the indexed vector column, VIRTUAL columns, and unknown names.
+fn resolve_ann_filter_cols(
+    stmt: &CreateIndexStmt,
+    table_schema: &TableSchema,
+    keys: &[crate::types::IndexKey],
+) -> Result<Vec<u16>> {
+    if stmt.ann_filter_cols.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !matches!(
+        stmt.kind,
+        crate::types::IndexKind::Inverted(crate::types::InvertedKind::Ann { .. })
+    ) {
+        return Err(SqlError::Unsupported(
+            "WITH (filters = ...) is only valid for USING ann indexes".into(),
+        ));
+    }
+    let key_cols: std::collections::HashSet<u16> = keys
+        .iter()
+        .filter_map(|k| match k {
+            crate::types::IndexKey::Column { idx, .. } => Some(*idx),
+            crate::types::IndexKey::Expr { .. } => None,
+        })
+        .collect();
+    let mut out: Vec<u16> = Vec::with_capacity(stmt.ann_filter_cols.len());
+    for raw in &stmt.ann_filter_cols {
+        let lower = raw.to_ascii_lowercase();
+        let col_idx = table_schema
+            .column_index(&lower)
+            .ok_or_else(|| SqlError::ColumnNotFound(raw.clone()))? as u16;
+        if key_cols.contains(&col_idx) {
+            return Err(SqlError::Unsupported(format!(
+                "ANN filter column '{raw}' cannot also be the indexed vector column"
+            )));
+        }
+        if matches!(
+            table_schema.columns[col_idx as usize].generated_kind,
+            Some(crate::parser::GeneratedKind::Virtual)
+        ) {
+            return Err(SqlError::Unsupported(format!(
+                "ANN filter column '{raw}' cannot be a VIRTUAL generated column"
+            )));
+        }
+        if !out.contains(&col_idx) {
+            out.push(col_idx);
+        }
+    }
+    Ok(out)
 }
 
 pub(super) fn exec_create_index(
@@ -831,6 +885,13 @@ pub(super) fn exec_create_index(
                 ) {
                     return Err(SqlError::Unsupported(format!(
                         "FTS index requires a TEXT or TSVECTOR column, got {col_type}"
+                    )));
+                }
+            }
+            crate::types::InvertedKind::Ann { .. } => {
+                if !matches!(col_type, crate::types::DataType::Vector { .. }) {
+                    return Err(SqlError::Unsupported(format!(
+                        "ANN index requires a VECTOR column, got {col_type}"
                     )));
                 }
             }

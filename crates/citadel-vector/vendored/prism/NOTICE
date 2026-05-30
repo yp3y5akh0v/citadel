@@ -1,0 +1,29 @@
+Citadel - Vendored PRISM filtered-ANN core
+==========================================
+
+This directory vendors source files from the PRISM project (prism-ann),
+originally authored by Yuriy Peysakhov and licensed under the Apache
+License, Version 2.0.
+
+Upstream:
+  https://github.com/yp3y5akh0v/prism
+
+Original copyright:
+  Copyright 2025 Yuriy Peysakhov
+
+Vendored files (from `crates/prism-core/src/` of upstream):
+  binary.rs   - Hamming-distance binary codes for pre-filter
+  construct.rs - Index build: per-cell Vamana + greedy cross-partition + random overlay
+  distance.rs - L2 / Inner / Hamming SIMD kernels (cosine added by Citadel)
+  filter.rs   - Conjunctive attribute constraint matching
+  graph.rs    - CSR graph adjacency
+  io.rs       - Dataset loaders (fvecs, bvecs, ivecs)
+  ivf.rs      - IVF^2 index for YFCC-style filtered search at scale
+  partition.rs - PartitionTree (attribute-grouped cells)
+  point.rs    - PointStore (flat vectors + attribute columns)
+  quantize.rs - SQ8 scalar quantization
+  search.rs   - Filtered search: regime routing + MQCB batch search
+
+Modifications by Citadel are marked at the top of each modified file.
+Citadel modifications: Copyright (c) Citadel contributors. Released
+under the Apache License, Version 2.0.

@@ -103,6 +103,7 @@ fn value_to_string(v: &Value, settings: &Settings) -> String {
         Value::TsVector(b) => citadel_sql::fts::tsvector_display(b),
         Value::TsQuery(b) => citadel_sql::fts::tsquery_display(b),
         Value::Array(_) => v.to_string(),
+        Value::Vector(_) => v.to_string(),
     }
 }
 
@@ -251,6 +252,15 @@ fn value_to_json(v: &Value, _settings: &Settings) -> serde_json::Value {
         Value::Array(a) => serde_json::Value::Array(
             a.iter()
                 .map(|elem| value_to_json(elem, _settings))
+                .collect(),
+        ),
+        Value::Vector(v) => serde_json::Value::Array(
+            v.iter()
+                .map(|&x| {
+                    serde_json::Number::from_f64(x as f64)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null)
+                })
                 .collect(),
         ),
     }

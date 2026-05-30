@@ -305,6 +305,10 @@ pub(super) fn exec_select_with_read(
             .execute_scan(|cb| rtx.table_scan_raw(lower.as_bytes(), |key, value| cb(key, value)));
     }
 
+    if let Some(plan) = super::ann_topk::AnnTopKPlan::try_new(stmt, table_schema)? {
+        return plan.execute_with_read(rtx, schema, stmt, table_schema);
+    }
+
     if let Some(plan) = TopKScanPlan::try_new(stmt, table_schema)? {
         let lower = lower_name.clone();
         return plan.execute_scan(table_schema, stmt, |cb| {
