@@ -1,0 +1,54 @@
+[package]
+name = "citadeldb-ai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Autonomous agent runtime for Citadel: ReAct + Reflexion + memory-backed plan caching"
+
+[lib]
+name = "citadel_ai"
+
+# Opt-in MCP stdio server.
+[[bin]]
+name = "citadel-mcp"
+path = "src/bin/mcp.rs"
+required-features = ["mcp-server"]
+
+[dependencies]
+citadel-mem = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+rustc-hash = { workspace = true }
+# Only the MCP server opens a Database (optional).
+citadel = { workspace = true, optional = true }
+
+# Native-only: ureq does blocking std::net I/O (no wasm).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { workspace = true, optional = true }
+# run_command kill-timeout; native-only.
+wait-timeout = { workspace = true, optional = true }
+
+[dev-dependencies]
+citadel = { workspace = true }
+tempfile = "3"
+
+[features]
+default = []
+claude = ["dep:ureq"]
+openai = ["dep:ureq"]
+# Ollama uses the OpenAI wire format, so it reuses that adapter.
+ollama = ["openai"]
+mcp-server = ["dep:citadel"]
+# Allowlisted file_read/file_write tools.
+file-tools = []
+# Allowlisted run_command tool; wait-timeout enforces the kill deadline.
+command-tool = ["dep:wait-timeout"]
+# Real Candle embeddings via citadel-mem (else MockEmbedder only).
+candle-embed = ["citadel-mem/candle-embed"]

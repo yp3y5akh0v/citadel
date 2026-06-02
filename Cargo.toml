@@ -13,6 +13,7 @@ members = [
     "crates/sql-json-path",
     "crates/citadel-vector",
     "crates/citadel-mem",
+    "crates/citadel-ai",
     "citadel",
     "citadel-cli",
 ]
@@ -42,6 +43,7 @@ citadel = { package = "citadeldb", path = "citadel", version = "0.16.1" }
 citadel-sql = { package = "citadeldb-sql", path = "crates/citadel-sql", version = "0.16.1" }
 citadel-vector = { package = "citadeldb-vector", path = "crates/citadel-vector", version = "0.16.1" }
 citadel-mem = { package = "citadeldb-mem", path = "crates/citadel-mem", version = "0.16.1" }
+citadel-ai = { package = "citadeldb-ai", path = "crates/citadel-ai", version = "0.16.1" }
 
 aes = "0.8"
 ctr = "0.9"
@@ -90,6 +92,8 @@ owo-colors = "4"
 rpassword = "7"
 dirs = "6"
 serde_json = "1"
+ureq = { version = "3", features = ["json"] }
+wait-timeout = "0.2"
 sql-json-path = { package = "citadeldb-sql-json-path", path = "crates/sql-json-path", version = "0.16.1" }
 tantivy-stemmers = "0.4"
 unicode-normalization = "0.1"

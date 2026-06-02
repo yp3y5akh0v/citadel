@@ -70,3 +70,26 @@ jobs:
         with:
           key: ${{ matrix.name }}
       - run: cargo test --workspace ${{ matrix.features }}
+
+  # Opt-in citadel-ai backends the default workspace test skips; also proves wasm cfg-away.
+  ai-backends:
+    needs: [fmt, clippy]
+    runs-on: ubuntu-latest
+    name: citadel-ai backends
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ai-backends
+      - name: clippy (backend + mcp + file-tools + command-tool features)
+        run: cargo clippy -p citadeldb-ai --all-targets --features claude,openai,ollama,mcp-server,file-tools,command-tool -- -D warnings
+      - name: test (backend + mcp + file-tools + command-tool features)
+        run: cargo test -p citadeldb-ai --features claude,openai,ollama,mcp-server,file-tools,command-tool
+      - name: mcp stdio server binary builds
+        run: cargo build -p citadeldb-ai --bin citadel-mcp --features mcp-server
+      - name: wasm32 compiles with features gated away to mock-only
+        run: cargo build -p citadeldb-ai --target wasm32-unknown-unknown --features claude,openai,ollama
