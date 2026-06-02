@@ -1,14 +1,14 @@
-//! Routes `SELECT ... ORDER BY col <dist> :q LIMIT k` to a cached PRISM index.
-//!
-//! `col = v` / `col IN (...)` on the index's declared filter columns push into
-//! the PRISM cell filter; remaining predicates recheck decoded candidates. A
-//! WHERE with no pushable predicate declines so the exact filtered scan runs.
-//! Single INTEGER primary key only; no JOIN/GROUP/HAVING/DISTINCT/window/agg.
+//! Plans for `SELECT ... ORDER BY col <dist> :q LIMIT k`: [`AnnTopKPlan`] uses a
+//! cached PRISM index; [`VectorTopKPlan`] streams a bounded-heap top-k when no
+//! index applies or inside a write txn (uncommitted rows).
 
 use std::any::Any;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use citadel_txn::read_txn::ReadTxn;
+use citadel_txn::write_txn::WriteTxn;
 use citadel_vector::{AnnIndex, Filter, Metric};
 use rustc_hash::FxHashMap;
 
@@ -24,6 +24,56 @@ use crate::types::*;
 use super::aggregate::is_aggregate_expr;
 use super::helpers::{decode_full_row, eval_const_expr, eval_const_int, project_rows};
 use super::window::has_any_window_function;
+
+type StorageResult<T> = std::result::Result<T, citadel_core::Error>;
+type ScanRow<'a> = dyn FnMut(&[u8], &[u8]) -> Result<bool> + 'a;
+type RawScanRow<'a> = dyn FnMut(&[u8], &[u8]) -> StorageResult<bool> + 'a;
+
+/// Scan + point-get over a read or write txn, materializing overflow values.
+pub(super) trait AnnScan {
+    fn ann_scan(&mut self, table: &[u8], f: &mut ScanRow<'_>) -> Result<()>;
+    fn ann_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>>;
+}
+
+/// Adapt a storage-level scan to report `SqlError`, surfacing the first callback error.
+fn bridge_scan(
+    scan: impl FnOnce(&mut RawScanRow<'_>) -> StorageResult<()>,
+    f: &mut ScanRow<'_>,
+) -> Result<()> {
+    let mut cb_err: Option<SqlError> = None;
+    scan(&mut |key, value| match f(key, value) {
+        Ok(go) => Ok(go),
+        Err(e) => {
+            cb_err = Some(e);
+            Ok(false)
+        }
+    })
+    .map_err(SqlError::Storage)?;
+    match cb_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+impl AnnScan for ReadTxn<'_> {
+    fn ann_scan(&mut self, table: &[u8], f: &mut ScanRow<'_>) -> Result<()> {
+        bridge_scan(|cb| self.table_scan_from(table, b"", cb), f)
+    }
+
+    fn ann_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.table_get(table, key).map_err(SqlError::Storage)
+    }
+}
+
+impl AnnScan for WriteTxn<'_> {
+    fn ann_scan(&mut self, table: &[u8], f: &mut ScanRow<'_>) -> Result<()> {
+        bridge_scan(|cb| self.table_scan_from(table, b"", cb), f)
+    }
+
+    fn ann_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.table_get(table, key).map_err(SqlError::Storage)
+    }
+}
 
 /// A cached ANN index plus the metadata needed to push SQL filters into it.
 struct CachedAnnIndex {
@@ -47,33 +97,28 @@ pub(super) struct AnnTopKPlan {
     residual: Option<Expr>,
 }
 
+/// Gate for single-key ascending ORDER BY ... LIMIT k (no group/having/join/distinct/window/agg).
+fn topk_shape_ok(stmt: &SelectStmt) -> bool {
+    stmt.order_by.len() == 1
+        && !stmt.order_by[0].descending
+        && stmt.limit.is_some()
+        && stmt.group_by.is_empty()
+        && stmt.having.is_none()
+        && stmt.joins.is_empty()
+        && !stmt.distinct
+        && !has_any_window_function(stmt)
+        && !stmt
+            .columns
+            .iter()
+            .any(|c| matches!(c, SelectColumn::Expr { expr, .. } if is_aggregate_expr(expr)))
+}
+
 impl AnnTopKPlan {
     pub(super) fn try_new(stmt: &SelectStmt, table_schema: &TableSchema) -> Result<Option<Self>> {
-        if stmt.order_by.len() != 1
-            || stmt.limit.is_none()
-            || !stmt.group_by.is_empty()
-            || stmt.having.is_some()
-            || !stmt.joins.is_empty()
-            || stmt.distinct
-        {
+        if !topk_shape_ok(stmt) {
             return Ok(None);
         }
-        if has_any_window_function(stmt) {
-            return Ok(None);
-        }
-        let has_agg = stmt.columns.iter().any(|c| {
-            matches!(c,
-                SelectColumn::Expr { expr, .. } if is_aggregate_expr(expr)
-            )
-        });
-        if has_agg {
-            return Ok(None);
-        }
-
         let ob = &stmt.order_by[0];
-        if ob.descending {
-            return Ok(None);
-        }
 
         let (col_idx, dim, op_metric, query_vec) = match &ob.expr {
             Expr::BinaryOp { left, op, right } => {
@@ -189,8 +234,21 @@ impl AnnTopKPlan {
         table_schema: &TableSchema,
     ) -> Result<ExecutionResult> {
         let cache_key = cache_key(&table_schema.name, self.col_idx, self.metric);
-        let cached = self.load_or_build_index(rtx, schema, &cache_key, table_schema)?;
+        // Empty table: nothing to build, ORDER BY ... LIMIT yields no rows.
+        let Some(cached) = self.load_or_build_index(rtx, schema, &cache_key, table_schema)? else {
+            return empty_result(table_schema, stmt);
+        };
+        self.run_query(rtx, &cached, stmt, table_schema)
+    }
 
+    /// Search the index, apply filters and the residual recheck, then page and project.
+    fn run_query(
+        &self,
+        txn: &mut dyn AnnScan,
+        cached: &CachedAnnIndex,
+        stmt: &SelectStmt,
+        table_schema: &TableSchema,
+    ) -> Result<ExecutionResult> {
         // Map values to codes; a value absent from the dictionary matches no row.
         let mut constraints: Vec<(usize, Vec<u32>)> = Vec::with_capacity(self.pushable.len());
         for (dim, values) in &self.pushable {
@@ -213,7 +271,7 @@ impl AnnTopKPlan {
         };
 
         let want = self.k.saturating_add(self.offset).max(1);
-        let mut rows = self.collect_survivors(rtx, &cached.index, &filter, table_schema, want)?;
+        let mut rows = self.collect_survivors(txn, &cached.index, &filter, table_schema, want)?;
 
         if self.offset >= rows.len() {
             rows.clear();
@@ -234,7 +292,7 @@ impl AnnTopKPlan {
     /// index is exhausted. Distance order is preserved.
     fn collect_survivors(
         &self,
-        rtx: &mut ReadTxn<'_>,
+        txn: &mut dyn AnnScan,
         index: &AnnIndex,
         filter: &Filter,
         table_schema: &TableSchema,
@@ -250,10 +308,7 @@ impl AnnTopKPlan {
             let mut survivors: Vec<Vec<Value>> = Vec::with_capacity(want);
             for (id, _dist) in &hits {
                 encode_int_key_into(*id as i64, &mut key_buf);
-                let Some(row_bytes) = rtx
-                    .table_get(table_schema.name.as_bytes(), &key_buf)
-                    .map_err(SqlError::Storage)?
-                else {
+                let Some(row_bytes) = txn.ann_get(table_schema.name.as_bytes(), &key_buf)? else {
                     continue;
                 };
                 let row = decode_full_row(table_schema, &key_buf, &row_bytes)?;
@@ -282,35 +337,39 @@ impl AnnTopKPlan {
 
     fn load_or_build_index(
         &self,
-        rtx: &mut ReadTxn<'_>,
+        txn: &mut dyn AnnScan,
         schema: &SchemaManager,
         cache_key: &str,
         table_schema: &TableSchema,
-    ) -> Result<Arc<CachedAnnIndex>> {
+    ) -> Result<Option<Arc<CachedAnnIndex>>> {
         if let Some(existing) = lookup_cached(schema, cache_key)? {
-            return Ok(existing);
+            return Ok(Some(existing));
         }
-        let built = self.build_index(rtx, table_schema)?;
+        let Some(built) = self.build_index(txn, table_schema)? else {
+            return Ok(None);
+        };
         let arc: Arc<CachedAnnIndex> = Arc::new(built);
         let mut guard = schema.sql_caches.lock();
         if let Some(existing) = guard.get(cache_key) {
             // Another thread won the race; prefer that one and drop ours.
             return Arc::clone(existing)
                 .downcast::<CachedAnnIndex>()
+                .map(Some)
                 .map_err(|_| {
                     SqlError::InvalidValue(format!("ANN cache type mismatch for {cache_key}"))
                 });
         }
         let as_any: Arc<dyn Any + Send + Sync> = arc.clone();
         guard.insert(cache_key.to_string(), as_any);
-        Ok(arc)
+        Ok(Some(arc))
     }
 
+    /// Build the index from a scan; `None` if there are no indexable rows.
     fn build_index(
         &self,
-        rtx: &mut ReadTxn<'_>,
+        txn: &mut dyn AnnScan,
         table_schema: &TableSchema,
-    ) -> Result<CachedAnnIndex> {
+    ) -> Result<Option<CachedAnnIndex>> {
         let non_pk = table_schema.non_pk_indices();
         let enc_pos = table_schema.encoding_positions();
         let nonpk_order = non_pk
@@ -330,42 +389,22 @@ impl AnnTopKPlan {
         let mut dicts: Vec<FxHashMap<Vec<u8>, u32>> = vec![FxHashMap::default(); num_attrs];
 
         let mut rows: Vec<(u64, Vec<f32>, Vec<u32>)> = Vec::new();
-        let mut scan_err: Option<SqlError> = None;
 
-        rtx.table_scan_raw(table_schema.name.as_bytes(), |key, value| {
-            let id = match decode_pk_integer(key) {
-                Ok(v) => v as u64,
-                Err(e) => {
-                    scan_err = Some(e);
-                    return false;
+        txn.ann_scan(table_schema.name.as_bytes(), &mut |key, value| {
+            let vector = match decode_column_raw(value, enc_idx)?.to_value() {
+                Value::Vector(arr) => arr.to_vec(),
+                Value::Null => return Ok(true), // null vectors are not indexed
+                _ => {
+                    return Err(SqlError::InvalidValue(
+                        "ANN column produced non-vector value".into(),
+                    ))
                 }
             };
-            let vector = match decode_column_raw(value, enc_idx) {
-                Ok(raw) => match raw.to_value() {
-                    Value::Vector(arr) => arr.to_vec(),
-                    Value::Null => return true, // null vectors are not indexed
-                    _ => {
-                        scan_err = Some(SqlError::InvalidValue(
-                            "ANN column produced non-vector value".into(),
-                        ));
-                        return false;
-                    }
-                },
-                Err(e) => {
-                    scan_err = Some(e);
-                    return false;
-                }
-            };
+            let id = decode_pk_integer(key)? as u64;
 
             let mut codes: Vec<u32> = Vec::with_capacity(num_attrs);
             for (j, ex) in extracts.iter().enumerate() {
-                let v = match ex.extract(key, value) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        scan_err = Some(e);
-                        return false;
-                    }
-                };
+                let v = ex.extract(key, value)?;
                 let encoded = encode_key_value(&v);
                 let next = dicts[j].len() as u32;
                 let code = *dicts[j].entry(encoded).or_insert(next);
@@ -373,23 +412,167 @@ impl AnnTopKPlan {
             }
 
             rows.push((id, vector, codes));
-            true
-        })
-        .map_err(SqlError::Storage)?;
+            Ok(true)
+        })?;
 
-        if let Some(e) = scan_err {
-            return Err(e);
-        }
         if rows.is_empty() {
-            return Err(SqlError::InvalidValue(
-                "ANN build requires at least one non-null vector row".into(),
-            ));
+            return Ok(None);
         }
 
         let index =
             AnnIndex::build_with_attrs(rows, num_attrs, ann_metric_to_prism(self.metric), self.dim)
                 .map_err(|e| SqlError::InvalidValue(format!("ANN build failed: {e}")))?;
-        Ok(CachedAnnIndex { index, dicts })
+        Ok(Some(CachedAnnIndex { index, dicts }))
+    }
+}
+
+/// Streaming brute-force top-k for `ORDER BY <distance> LIMIT k` when no ANN
+/// index applies (or inside a write txn); bounded heap, O(k) memory.
+pub(super) struct VectorTopKPlan {
+    order_expr: Expr,
+    where_clause: Option<Expr>,
+    k: usize,
+    offset: usize,
+    nulls_first: bool,
+}
+
+/// A candidate keyed by (distance, scan position); `seq` breaks ties by scan
+/// order so the bounded heap matches the stable sort.
+struct Ranked {
+    dist: f64,
+    seq: u64,
+    row: Vec<Value>,
+}
+
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for Ranked {}
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.dist
+            .total_cmp(&other.dist)
+            .then_with(|| self.seq.cmp(&other.seq))
+    }
+}
+
+impl VectorTopKPlan {
+    pub(super) fn try_new(stmt: &SelectStmt, table_schema: &TableSchema) -> Result<Option<Self>> {
+        if !topk_shape_ok(stmt) {
+            return Ok(None);
+        }
+        let ob = &stmt.order_by[0];
+        let Expr::BinaryOp { left, op, .. } = &ob.expr else {
+            return Ok(None);
+        };
+        if !matches!(
+            op,
+            BinOp::VectorL2 | BinOp::VectorInner | BinOp::VectorCosine
+        ) {
+            return Ok(None);
+        }
+        // Only claim a vector-distance sort key; anything else uses the general path.
+        let Expr::Column(name) = left.as_ref() else {
+            return Ok(None);
+        };
+        let name = name.to_ascii_lowercase();
+        let is_vector_col = table_schema.columns.iter().any(|c| {
+            c.name.to_ascii_lowercase() == name && matches!(c.data_type, DataType::Vector { .. })
+        });
+        if !is_vector_col {
+            return Ok(None);
+        }
+
+        let k = eval_const_int(stmt.limit.as_ref().unwrap())?.max(0) as usize;
+        if k == 0 {
+            return Ok(None);
+        }
+        let offset = stmt
+            .offset
+            .as_ref()
+            .map(eval_const_int)
+            .transpose()?
+            .unwrap_or(0)
+            .max(0) as usize;
+
+        Ok(Some(Self {
+            order_expr: ob.expr.clone(),
+            where_clause: stmt.where_clause.clone(),
+            k,
+            offset,
+            // citadel defaults to NULLS FIRST for ascending order.
+            nulls_first: ob.nulls_first.unwrap_or(true),
+        }))
+    }
+
+    pub(super) fn execute(
+        &self,
+        txn: &mut dyn AnnScan,
+        table_schema: &TableSchema,
+        stmt: &SelectStmt,
+    ) -> Result<ExecutionResult> {
+        let want = self.k.saturating_add(self.offset);
+        let col_map = ColumnMap::new(&table_schema.columns);
+        // NULL distances sort like NULLs under the requested ordering.
+        let null_dist = if self.nulls_first {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+        let mut heap: BinaryHeap<Ranked> = BinaryHeap::new();
+        let mut seq: u64 = 0;
+
+        txn.ann_scan(table_schema.name.as_bytes(), &mut |key, value| {
+            let row = decode_full_row(table_schema, key, value)?;
+            let ctx = EvalCtx::new(&col_map, &row);
+            if let Some(w) = &self.where_clause {
+                if !is_truthy(&eval_expr(w, &ctx)?) {
+                    return Ok(true);
+                }
+            }
+            let dist = match eval_expr(&self.order_expr, &ctx)? {
+                Value::Real(d) => d,
+                Value::Integer(i) => i as f64,
+                Value::Null => null_dist,
+                other => {
+                    return Err(SqlError::InvalidValue(format!(
+                        "ORDER BY vector distance produced a non-numeric {}",
+                        other.data_type()
+                    )))
+                }
+            };
+            let cand = Ranked { dist, seq, row };
+            seq += 1;
+            // `seq` only grows, so ties never evict an earlier row (stable-sort order).
+            if heap.len() < want {
+                heap.push(cand);
+            } else if heap.peek().is_some_and(|top| cand < *top) {
+                heap.pop();
+                heap.push(cand);
+            }
+            Ok(true)
+        })?;
+
+        let mut rows: Vec<Vec<Value>> = heap.into_sorted_vec().into_iter().map(|r| r.row).collect();
+        if self.offset >= rows.len() {
+            rows.clear();
+        } else if self.offset > 0 {
+            rows = rows.split_off(self.offset);
+        }
+        rows.truncate(self.k);
+
+        let (col_names, projected) = project_rows(&table_schema.columns, &stmt.columns, rows)?;
+        Ok(ExecutionResult::Query(QueryResult {
+            columns: col_names,
+            rows: projected,
+        }))
     }
 }
 

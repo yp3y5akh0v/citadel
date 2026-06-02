@@ -12,6 +12,7 @@ members = [
     "crates/citadel-wasm",
     "crates/sql-json-path",
     "crates/citadel-vector",
+    "crates/citadel-mem",
     "citadel",
     "citadel-cli",
 ]
@@ -40,6 +41,7 @@ citadel-sync = { package = "citadeldb-sync", path = "crates/citadel-sync", versi
 citadel = { package = "citadeldb", path = "citadel", version = "0.16.1" }
 citadel-sql = { package = "citadeldb-sql", path = "crates/citadel-sql", version = "0.16.1" }
 citadel-vector = { package = "citadeldb-vector", path = "crates/citadel-vector", version = "0.16.1" }
+citadel-mem = { package = "citadeldb-mem", path = "crates/citadel-mem", version = "0.16.1" }
 
 aes = "0.8"
 ctr = "0.9"
@@ -92,6 +94,10 @@ sql-json-path = { package = "citadeldb-sql-json-path", path = "crates/sql-json-p
 tantivy-stemmers = "0.4"
 unicode-normalization = "0.1"
 unicode-segmentation = "1.12"
+
+# candle/gemm matmul is unusable at opt-level 0; optimize deps (not our crates) in dev.
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 lto = "fat"

@@ -1,0 +1,68 @@
+[package]
+name = "citadeldb-mem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Encrypted-first agent memory engine for Citadel"
+
+[lib]
+name = "citadel_mem"
+
+[dependencies]
+citadel = { workspace = true }
+citadel-core = { workspace = true }
+citadel-crypto = { workspace = true }
+citadel-io = { workspace = true }
+citadel-sql = { workspace = true }
+citadel-vector = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+zeroize = { workspace = true }
+rand = { workspace = true }
+rustc-hash = { workspace = true }
+unicode-segmentation = { workspace = true }
+# Optional pure-Rust embedding backend (Candle BERT); default build stays light.
+candle-core = { version = "0.10", optional = true }
+candle-nn = { version = "0.10", optional = true }
+candle-transformers = { version = "0.10", optional = true }
+
+# tokenizers regex backend is target-specific: onig natively, fancy-regex on wasm.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["unstable_wasm"] }
+# Browser RNG for getrandom (pulled by Candle's rand); mirrors citadel-wasm.
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { workspace = true }
+mimalloc = { workspace = true }
+
+[[bench]]
+name = "recall_bench"
+harness = false
+
+[features]
+default = []
+candle-embed = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+]
+# Native-only: run the Candle embedder + cross-encoder on an NVIDIA GPU (CUDA).
+cuda-embed = [
+    "candle-embed",
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+]

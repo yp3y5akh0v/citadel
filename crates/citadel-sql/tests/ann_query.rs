@@ -181,6 +181,60 @@ fn insert_after_index_build_invalidates_cache() {
 }
 
 #[test]
+fn ann_in_write_txn_scans_live_view_not_stale_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(3))")
+        .unwrap();
+    conn.execute("CREATE INDEX ix_v ON t USING ann (v) WITH (metric = 'l2')")
+        .unwrap();
+    for (id, vec) in [
+        (1, "[1.0, 0.0, 0.0]"),
+        (2, "[0.0, 1.0, 0.0]"),
+        (3, "[0.0, 0.0, 1.0]"),
+        (4, "[0.9, 0.1, 0.0]"),
+        (5, "[1.0, 1.0, 1.0]"),
+    ] {
+        conn.execute(&format!("INSERT INTO t VALUES ({id}, '{vec}'::VECTOR(3))"))
+            .unwrap();
+    }
+
+    // Prime the cache via the read path.
+    let _ = conn
+        .execute("SELECT id FROM t ORDER BY v <-> '[1.0, 0.0, 0.0]'::VECTOR(3) LIMIT 1")
+        .unwrap();
+    assert_eq!(db.sql_cache_len(), 1, "read-path query caches the index");
+
+    conn.execute("BEGIN").unwrap();
+    // Uncommitted closest row: ANN must stream the live view, not the stale cache.
+    conn.execute("INSERT INTO t VALUES (6, '[0.99, 0.0, 0.0]'::VECTOR(3))")
+        .unwrap();
+    let qr = match conn
+        .execute("SELECT id FROM t ORDER BY v <-> '[1.0, 0.0, 0.0]'::VECTOR(3) LIMIT 3")
+        .unwrap()
+    {
+        ExecutionResult::Query(qr) => qr,
+        _ => panic!(),
+    };
+    conn.execute("COMMIT").unwrap();
+
+    let ids: Vec<i64> = qr
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(i) => *i,
+            _ => panic!(),
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1, 6, 4],
+        "in-txn ANN sees uncommitted id=6 in distance order"
+    );
+}
+
+#[test]
 fn rollback_keeps_cache_intact() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
@@ -338,6 +392,26 @@ fn ann_rejects_wrong_passphrase_on_reopen() {
             || lower.contains("mac"),
         "expected key-file MAC failure, got {err:?}"
     );
+}
+
+#[test]
+fn ann_query_on_empty_table_returns_no_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(3))")
+        .unwrap();
+    conn.execute("CREATE INDEX ix_v ON t USING ann (v) WITH (metric = 'l2')")
+        .unwrap();
+    // Empty table must return [], not error.
+    let qr = match conn
+        .execute("SELECT id FROM t ORDER BY v <-> '[1.0, 0.0, 0.0]'::VECTOR(3) LIMIT 5")
+        .unwrap()
+    {
+        ExecutionResult::Query(qr) => qr,
+        _ => panic!(),
+    };
+    assert!(qr.rows.is_empty());
 }
 
 #[test]

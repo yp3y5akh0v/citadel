@@ -1785,3 +1785,35 @@ fn begin_read_only_through_matview() {
     let fresh = reader.query("SELECT COUNT(*) FROM mv").unwrap();
     assert_eq!(fresh.rows[0][0], Value::Integer(3));
 }
+
+#[test]
+fn overflow_rows_readable_in_write_txn() {
+    // Row over MAX_INLINE_VALUE_SIZE overflows; the write-txn scan must materialize it.
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    let big = "x".repeat(5000);
+    conn.execute(&format!("INSERT INTO t (id, body) VALUES (1, '{big}')"))
+        .unwrap();
+    conn.execute("INSERT INTO t (id, body) VALUES (2, 'small')")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    // Seq, filtered, and aggregate scans all read via the write-txn path.
+    let all = conn.query("SELECT body FROM t ORDER BY id").unwrap();
+    let filtered = conn
+        .query("SELECT body FROM t WHERE body LIKE 'x%'")
+        .unwrap();
+    let agg = conn.query("SELECT MAX(LENGTH(body)) FROM t").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    assert_eq!(all.rows.len(), 2);
+    assert_eq!(all.rows[0][0], Value::Text(big.clone().into()));
+    assert_eq!(all.rows[1][0], Value::Text("small".into()));
+    assert_eq!(filtered.rows.len(), 1);
+    assert_eq!(filtered.rows[0][0], Value::Text(big.into()));
+    assert_eq!(agg.rows[0][0], Value::Integer(5000));
+}

@@ -2104,6 +2104,10 @@ pub(super) fn exec_select_in_txn(
         });
     }
 
+    if let Some(plan) = super::ann_topk::VectorTopKPlan::try_new(stmt, table_schema)? {
+        return plan.execute(wtx, table_schema, stmt);
+    }
+
     if let Some(plan) = TopKScanPlan::try_new(stmt, table_schema)? {
         let lower = lower_name.clone();
         return plan.execute_scan(table_schema, stmt, |cb| {

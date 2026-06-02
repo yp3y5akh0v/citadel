@@ -346,10 +346,24 @@ impl<'db> WriteTxn<'db> {
             manager: self.manager,
         };
         let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
-        while cursor.is_valid() {
-            if let Some(entry) = cursor.current_ref_lazy(&mut view) {
-                if entry.val_type != ValueType::Tombstone && !f(entry.key, entry.value)? {
-                    break;
+        while let Some(cell) = cursor.current_ref_lazy(&mut view) {
+            match cell.val_type {
+                ValueType::Tombstone => {}
+                ValueType::Inline => {
+                    let entry = cursor.current_ref_lazy(&mut view).unwrap();
+                    if !f(entry.key, entry.value)? {
+                        break;
+                    }
+                }
+                ValueType::Overflow => {
+                    let (key, oref) = {
+                        let c = cursor.current_ref_lazy(&mut view).unwrap();
+                        (c.key.to_vec(), OverflowRef::from_bytes(c.value))
+                    };
+                    let materialized = overflow_io::read_chain_value(&mut view, &oref)?;
+                    if !f(&key, &materialized)? {
+                        break;
+                    }
                 }
             }
             cursor.next_lazy(&mut view)?;
