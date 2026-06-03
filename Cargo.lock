@@ -638,6 +638,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "citadeldb-membench"
+version = "0.16.1"
+dependencies = [
+ "citadeldb",
+ "citadeldb-ai",
+ "citadeldb-mem",
+ "rayon",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "citadeldb-page"
 version = "0.16.1"
 dependencies = [

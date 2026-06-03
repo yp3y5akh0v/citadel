@@ -1,0 +1,7 @@
+/runs/
+/paper/
+
+*-live.jsonl
+*-audit.json
+*-report.json
+*.log

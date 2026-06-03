@@ -1,0 +1,40 @@
+[package]
+name = "citadeldb-membench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "LoCoMo long-term-conversational-memory benchmark harness for citadel-mem"
+publish = false
+
+[lib]
+name = "citadel_membench"
+
+[dependencies]
+citadel-mem = { workspace = true }
+citadel-ai = { workspace = true }
+citadel = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+rustc-hash = { workspace = true }
+rayon = { workspace = true }
+sha2 = { workspace = true }
+# A bin target cannot see dev-dependencies, so this is a normal dep (used by both).
+tempfile = "3"
+
+[features]
+openai = ["citadel-ai/openai"]
+candle-embed = ["citadel-mem/candle-embed"]
+# Run the embedder + cross-encoder on the GPU (CUDA); implies candle-embed. Needs the CUDA toolkit.
+cuda-embed = ["candle-embed", "citadel-mem/cuda-embed"]
+
+# The live runner needs openai + candle-embed; gating keeps default/CI builds network-free.
+[[bin]]
+name = "locomo"
+required-features = ["openai", "candle-embed"]

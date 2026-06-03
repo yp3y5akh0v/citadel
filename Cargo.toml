@@ -14,6 +14,7 @@ members = [
     "crates/citadel-vector",
     "crates/citadel-mem",
     "crates/citadel-ai",
+    "crates/citadel-membench",
     "citadel",
     "citadel-cli",
 ]
@@ -44,6 +45,7 @@ citadel-sql = { package = "citadeldb-sql", path = "crates/citadel-sql", version 
 citadel-vector = { package = "citadeldb-vector", path = "crates/citadel-vector", version = "0.16.1" }
 citadel-mem = { package = "citadeldb-mem", path = "crates/citadel-mem", version = "0.16.1" }
 citadel-ai = { package = "citadeldb-ai", path = "crates/citadel-ai", version = "0.16.1" }
+citadel-membench = { package = "citadeldb-membench", path = "crates/citadel-membench", version = "0.16.1" }
 
 aes = "0.8"
 ctr = "0.9"
