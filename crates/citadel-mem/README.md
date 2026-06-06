@@ -1,0 +1,19 @@
+# citadeldb-mem
+
+Encrypted-first agent-memory engine, built on the
+[Citadel](https://github.com/yp3y5akh0v/citadel) encrypted embedded database. Stores memory as
+regions of typed atoms connected by typed edges, retrieves through a hybrid pipeline (vector
+ANN + BM25 keyword + cross-encoder reranker), and **forgets by destroying keys** -
+cryptographic erasure at whole-store, per-region, and per-atom granularity, not just logical
+deletion.
+
+On the LoCoMo long-term conversational-memory benchmark, on encrypted regions with a matched
+`gpt-4o-mini` reader and judge, it scores 84.1% (3-run mean) against a 91.6% retrieval ceiling.
+Full protocol, audit, and numbers:
+[citadel-membench](https://github.com/yp3y5akh0v/citadel/tree/master/crates/citadel-membench).
+
+This crate is part of the Citadel workspace.
+
+## License
+
+MIT OR Apache-2.0

@@ -10,6 +10,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Autonomous agent runtime for Citadel: ReAct + Reflexion + memory-backed plan caching"
+readme = "README.md"
 
 [lib]
 name = "citadel_ai"

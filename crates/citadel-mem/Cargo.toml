@@ -10,6 +10,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Encrypted-first agent memory engine for Citadel"
+readme = "README.md"
 
 [lib]
 name = "citadel_mem"

@@ -10,6 +10,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "VECTOR(N) type and filtered ANN index for Citadel encrypted database"
+readme = "README.md"
 
 [lib]
 name = "citadel_vector"
