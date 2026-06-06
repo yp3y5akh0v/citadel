@@ -366,8 +366,8 @@ impl AtomKeyStore {
         Ok(())
     }
 
-    /// Erase many slots with TWO fsyncs (not 2N): overwrite all live copies (commit point)
-    /// + fsync + marker read-back, then all sibling copies + fsync. Skips already-tombstoned
+    /// Erase many slots with TWO fsyncs (not 2N): overwrite all live copies (the commit point),
+    /// fsync, marker read-back, then all sibling copies and fsync. Skips already-tombstoned
     /// slots; EMPTY or owner mismatch aborts before any write. Returns each erased slot as
     /// `(slot, atom_id, old_gen, new_gen)`, confirmed Live -> Tombstone, for an erasure receipt.
     pub(crate) fn tombstone_batch(
