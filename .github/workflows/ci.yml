@@ -85,11 +85,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ai-backends
-      - name: clippy (backend + mcp + file-tools + command-tool features)
-        run: cargo clippy -p citadeldb-ai --all-targets --features claude,openai,ollama,mcp-server,file-tools,command-tool -- -D warnings
-      - name: test (backend + mcp + file-tools + command-tool features)
-        run: cargo test -p citadeldb-ai --features claude,openai,ollama,mcp-server,file-tools,command-tool
-      - name: mcp stdio server binary builds
-        run: cargo build -p citadeldb-ai --bin citadel-mcp --features mcp-server
+      - name: clippy (backend + file-tools + command-tool features)
+        run: cargo clippy -p citadeldb-ai --all-targets --features claude,openai,ollama,file-tools,command-tool -- -D warnings
+      - name: test (backend + file-tools + command-tool features)
+        run: cargo test -p citadeldb-ai --features claude,openai,ollama,file-tools,command-tool
+      - name: citadel-mcp non-default combos (default candle-embed+hub is covered by the workspace jobs; cuda-embed is GPU-only/local)
+        run: |
+          cargo clippy -p citadeldb-mcp --all-targets --no-default-features -- -D warnings
+          cargo clippy -p citadeldb-mcp --all-targets --no-default-features --features candle-embed -- -D warnings
+          cargo test -p citadeldb-mcp --no-default-features
       - name: wasm32 compiles with features gated away to mock-only
         run: cargo build -p citadeldb-ai --target wasm32-unknown-unknown --features claude,openai,ollama

@@ -4,8 +4,6 @@ pub mod agent;
 pub mod budget;
 pub mod graph;
 pub mod llm;
-#[cfg(feature = "mcp-server")]
-pub mod mcp;
 pub mod prompts;
 pub mod propose;
 pub mod tools;

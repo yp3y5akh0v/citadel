@@ -248,6 +248,87 @@ pub struct EvictionReport {
     pub removed: u64,
 }
 
+/// One per-atom key slot proven destroyed (Live -> Tombstone at `new_gen` = `old_gen` + 1).
+#[derive(Debug, Clone)]
+pub struct SlotErasure {
+    pub slot: u32,
+    pub atom_id: AtomId,
+    pub old_gen: u64,
+    pub new_gen: u64,
+}
+
+/// Scope caveat carried by every [`ErasureReceipt`].
+pub const ERASURE_SCOPE_CAVEAT: &str =
+    "Cryptographic erasure destroys the per-atom AES-256 key (AES-KW / RFC 3394 wrapped); the \
+     sealed ciphertext becomes computationally unrecoverable (NIST SP 800-88 cryptographic erase). \
+     This is logical-copy destruction, not physical-media destruction: storage wear-leveling may \
+     retain stale physical copies, and any external backup, replica, or escrowed key is out of \
+     scope. Plaintext regions are logically deleted only, not cryptographically erased.";
+
+/// Result of [`forget_atoms`](crate::MemoryEngine::forget_atoms). On a plaintext region
+/// `cryptographic_erasure` is false (logical delete only).
+#[derive(Debug, Clone)]
+pub struct ErasureReceipt {
+    /// True only on an encrypted region (else a logical row delete).
+    pub cryptographic_erasure: bool,
+    pub rows_deleted: u64,
+    /// Keys destroyed (`== slots_erased.len()`); may be fewer than ids requested.
+    pub erased_count: u64,
+    pub slots_erased: Vec<SlotErasure>,
+    /// Ids skipped as immutable (when `force` is false).
+    pub immutable_skipped: Vec<AtomId>,
+    /// Key-wrap algorithm, or "" on a plaintext region.
+    pub algorithm: &'static str,
+    /// Wrapped-key size in bytes (0 on a plaintext region).
+    pub wrapped_key_size: u32,
+    /// Key store fsynced the erasure (encrypted only).
+    pub fsync: bool,
+    /// Each tombstone was read back and confirmed (encrypted only).
+    pub readback_confirmed: bool,
+    pub scope_caveat: &'static str,
+}
+
+/// One atom's integrity verdict from [`verify_atoms`](crate::MemoryEngine::verify_atoms).
+#[derive(Debug, Clone)]
+pub struct AtomAttestation {
+    pub atom_id: AtomId,
+    pub verdict: AttestVerdict,
+    /// Verdict came from an HMAC bound to the atom id (proves origin, not just integrity);
+    /// false for key-erased/missing/plaintext.
+    pub aad_bound: bool,
+    /// Key slot and generation (encrypted regions only).
+    pub key_slot: Option<u32>,
+    pub key_gen: Option<u64>,
+}
+
+/// `Authentic` proves byte-integrity and origin-binding, NOT that the content is benign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttestVerdict {
+    /// Sealed bytes re-authenticated and bound to this id.
+    Authentic,
+    /// HMAC did not verify: bytes altered or key slot corrupt.
+    Tampered,
+    /// Key was erased (forgotten); content unrecoverable.
+    KeyErased,
+    /// No atom with this id exists in the region.
+    Missing,
+    /// Plaintext region: no per-atom MAC to attest.
+    PlaintextUnattested,
+}
+
+impl AttestVerdict {
+    /// Stable snake_case wire name.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AttestVerdict::Authentic => "authentic",
+            AttestVerdict::Tampered => "tampered",
+            AttestVerdict::KeyErased => "key_erased",
+            AttestVerdict::Missing => "missing",
+            AttestVerdict::PlaintextUnattested => "plaintext_unattested",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EvolutionReport {
     pub links_added: usize,

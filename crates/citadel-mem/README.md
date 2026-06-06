@@ -5,7 +5,8 @@ Encrypted-first agent-memory engine, built on the
 regions of typed atoms connected by typed edges, retrieves through a hybrid pipeline (vector
 ANN + BM25 keyword + cross-encoder reranker), and **forgets by destroying keys** -
 cryptographic erasure at whole-store, per-region, and per-atom granularity, not just logical
-deletion.
+deletion. On encrypted regions every atom is sealed and HMAC-authenticated, and can be
+re-verified off disk.
 
 On the LoCoMo long-term conversational-memory benchmark, on encrypted regions with a matched
 `gpt-4o-mini` reader and judge, it scores 84.1% (3-run mean) against a 91.6% retrieval ceiling.

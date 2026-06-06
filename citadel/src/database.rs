@@ -334,7 +334,12 @@ impl Database {
     }
 
     /// Erase a batch of atom key slots with two fsyncs total (not 2N). Items are `(slot, atom_id)`.
-    pub fn atom_store_tombstone_batch(&self, items: &[(u32, u64)]) -> Result<()> {
+    /// Returns the slots actually erased as `(slot, atom_id, old_gen, new_gen)`, confirmed
+    /// through the key store's read-back gate, for building a verifiable erasure receipt.
+    pub fn atom_store_tombstone_batch(
+        &self,
+        items: &[(u32, u64)],
+    ) -> Result<Vec<(u32, u64, u64, u64)>> {
         self.with_atom_store(|s| s.tombstone_batch(items))
     }
 

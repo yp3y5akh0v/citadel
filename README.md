@@ -15,13 +15,14 @@
 
 Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Wins all 50 head-to-head benchmarks against unencrypted SQLite at equal cache budgets.
 
-## v1.0: Encrypted agent memory
+## Encrypted agent memory
 
-Citadel v1.0 adds three layers on top of the encrypted engine, turning it into an embedded **agent-memory** substrate - the storage and forgetting are encrypted-first, not bolted on:
+Citadel adds embedded agent-memory layers on top of the encrypted engine:
 
 - **[citadeldb-vector](crates/citadel-vector)** - a `VECTOR(N)` SQL type, distance operators (`<->` L2, `<#>` inner, `<=>` cosine), and a PRISM-backed filtered ANN index that reads through the encrypted page store.
 - **[citadeldb-mem](crates/citadel-mem)** - an agent-memory engine (regions, atoms, edges) with hybrid recall (vector + BM25 keyword + cross-encoder reranker) and **cryptographic forgetting**: an atom or region is erased by destroying its key, at whole-store, per-region, and per-atom granularity. On the LoCoMo long-term-memory benchmark it scores 84.1% (3-run mean) on encrypted regions - protocol and numbers in [citadel-membench](crates/citadel-membench/RESULTS.md).
-- **[citadeldb-ai](crates/citadel-ai)** - an autonomous agent runtime (ReAct + Reflexion, tool registry, budget caps, pluggable LLM backends, MCP server) that uses citadeldb-mem for persistence.
+- **[citadeldb-ai](crates/citadel-ai)** - an autonomous agent runtime (ReAct + Reflexion, tool registry, budget caps, pluggable LLM backends) that uses citadeldb-mem for persistence.
+- **[citadeldb-mcp](crates/citadel-mcp)** - a Model Context Protocol server exposing a Citadel memory region (encrypted by default) to any MCP client (Claude Desktop, IDEs) as recall/remember/link/evolve/forget/verify tools.
 
 ## Features
 
@@ -37,7 +38,7 @@ Citadel v1.0 adds three layers on top of the encrypted engine, turning it into a
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. C FFI (37 functions), WebAssembly bindings
-- **5,000+ tests** - Unit, integration, torture tests across 17 crates
+- **5,000+ tests** - Unit, integration, torture tests across 18 crates
 
 ## Benchmarks
 
@@ -314,10 +315,10 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 ## Architecture
 
 ```
-Agent memory layer (v1.0):
-+---------------------------------------------+
-|                 citadel-ai                   |  Agent runtime: ReAct + Reflexion, tools, MCP
-+---------------------------------------------+
+Agent memory layer:
++----------------------+----------------------+
+|      citadel-ai      |     citadel-mcp      |  Agent runtime (ReAct + Reflexion) + MCP server
++----------------------+----------------------+
 |                 citadel-mem                  |  Agent memory: regions, atoms, recall, erasure
 +---------------------------------------------+
 |               citadel-vector                 |  VECTOR(N) type + PRISM filtered ANN index

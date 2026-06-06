@@ -442,6 +442,352 @@ fn forget_atom_destroys_only_its_key() {
     );
 }
 
+#[test]
+fn forget_atoms_encrypted_yields_verifiable_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng.remember("s", AtomInput::new("fact", "alpha")).unwrap();
+    let b = eng.remember("s", AtomInput::new("fact", "beta")).unwrap();
+
+    let r = eng.forget_atoms("s", &[a], false).unwrap();
+    assert!(
+        r.cryptographic_erasure,
+        "encrypted region forgets by destroying keys"
+    );
+    assert_eq!(r.erased_count, 1);
+    assert_eq!(r.slots_erased.len(), 1);
+    assert_eq!(r.rows_deleted, 1);
+    assert!(r.fsync && r.readback_confirmed);
+    assert_eq!(r.algorithm, "AES-256-KW(RFC3394)");
+    let slot = &r.slots_erased[0];
+    assert_eq!(slot.atom_id, a);
+    assert_eq!(
+        slot.new_gen,
+        slot.old_gen + 1,
+        "the tombstone supersedes the live key"
+    );
+    assert!(
+        eng.fetch_one("s", a).unwrap().is_none(),
+        "target is forgotten"
+    );
+    assert!(eng.fetch_one("s", b).unwrap().is_some(), "sibling survives");
+}
+
+#[test]
+fn forget_atoms_plaintext_is_logical_delete_not_crypto_erasure() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("p", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng.remember("p", AtomInput::new("fact", "alpha")).unwrap();
+
+    let r = eng.forget_atoms("p", &[a], false).unwrap();
+    assert!(
+        !r.cryptographic_erasure,
+        "plaintext region is a logical delete, not cryptographic erasure"
+    );
+    assert_eq!(r.erased_count, 0);
+    assert!(r.slots_erased.is_empty());
+    assert!(!r.fsync && !r.readback_confirmed);
+    assert_eq!(r.algorithm, "");
+    assert_eq!(r.rows_deleted, 1, "the row is still deleted");
+    assert!(eng.fetch_one("p", a).unwrap().is_none());
+}
+
+#[test]
+fn forget_atoms_skips_immutable_unless_forced() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let t = eng
+        .remember("s", AtomInput::new("fact", "protected").immutable())
+        .unwrap();
+
+    let r = eng.forget_atoms("s", &[t], false).unwrap();
+    assert_eq!(r.immutable_skipped, vec![t], "immutable atom is skipped");
+    assert_eq!(r.erased_count, 0);
+    assert_eq!(r.rows_deleted, 0);
+    assert!(
+        eng.fetch_one("s", t).unwrap().is_some(),
+        "immutable atom survives an unforced forget"
+    );
+
+    let r = eng.forget_atoms("s", &[t], true).unwrap();
+    assert!(r.immutable_skipped.is_empty(), "force erases immutable too");
+    assert_eq!(r.erased_count, 1);
+    assert!(eng.fetch_one("s", t).unwrap().is_none());
+}
+
+#[test]
+fn forget_atoms_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng.remember("s", AtomInput::new("fact", "alpha")).unwrap();
+
+    assert_eq!(eng.forget_atoms("s", &[a], false).unwrap().erased_count, 1);
+    // Forgetting an already-erased id destroys no further keys and deletes no rows.
+    let again = eng.forget_atoms("s", &[a], false).unwrap();
+    assert_eq!(again.erased_count, 0);
+    assert_eq!(again.rows_deleted, 0);
+}
+
+/// Flip a byte of an atom's stored sealed ciphertext on disk (simulating tampering).
+fn corrupt_sealed(db: &Arc<Database>, table: &str, id: AtomId) {
+    let conn = Connection::open(db).unwrap();
+    let qr = conn
+        .query_params(
+            &format!("SELECT sealed FROM {table} WHERE id=$1"),
+            &[Value::Integer(id)],
+        )
+        .unwrap();
+    let mut sealed = match &qr.rows[0][0] {
+        Value::Blob(b) => b.clone(),
+        o => panic!("sealed is not a blob: {o:?}"),
+    };
+    sealed[0] ^= 0xff;
+    conn.execute("BEGIN").unwrap();
+    conn.execute_params(
+        &format!("UPDATE {table} SET sealed=$1 WHERE id=$2"),
+        &[Value::Blob(sealed), Value::Integer(id)],
+    )
+    .unwrap();
+    conn.execute("COMMIT").unwrap();
+}
+
+/// `verify_atoms` re-authenticates sealed bytes off disk: an intact atom is Authentic, and
+/// flipping a byte of its stored ciphertext is caught as Tampered (CTR is malleable, so only
+/// the HMAC catches it) - and the batch does not abort on the bad atom.
+#[test]
+fn verify_atoms_detects_tampering_off_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(db.clone()).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng.remember("s", AtomInput::new("fact", "alpha")).unwrap();
+    let b = eng.remember("s", AtomInput::new("fact", "beta")).unwrap();
+
+    let v = eng.verify_atoms("s", &[a, b]).unwrap();
+    assert_eq!(v.len(), 2);
+    assert!(v
+        .iter()
+        .all(|x| x.verdict == AttestVerdict::Authentic && x.aad_bound));
+
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    corrupt_sealed(&db, &table, a);
+
+    let v = eng.verify_atoms("s", &[a, b]).unwrap();
+    assert_eq!(
+        v[0].verdict,
+        AttestVerdict::Tampered,
+        "tampered atom detected"
+    );
+    assert!(
+        v[0].aad_bound,
+        "verdict came from an aad-bound HMAC recomputation"
+    );
+    assert_eq!(
+        v[1].verdict,
+        AttestVerdict::Authentic,
+        "sibling unaffected, no abort on the bad atom"
+    );
+}
+
+/// KeyErased is the crash-recovery state: `forget` destroys the key BEFORE deleting the row,
+/// so a crash in between leaves the row present with its key gone. verify must report KeyErased
+/// (content unrecoverable), distinct from a never-stored id (Missing). A clean forget deletes
+/// the row too, which would read as Missing - so we simulate the partial state directly.
+#[test]
+fn verify_atoms_reports_key_erased_and_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(db.clone()).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng.remember("s", AtomInput::new("fact", "alpha")).unwrap();
+
+    // Destroy the atom's key but leave its row (the crash-recovery state).
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let conn = Connection::open(&db).unwrap();
+    let qr = conn
+        .query_params(
+            &format!("SELECT key_slot FROM {table} WHERE id=$1"),
+            &[Value::Integer(a)],
+        )
+        .unwrap();
+    let slot = match &qr.rows[0][0] {
+        Value::Integer(s) => *s as u32,
+        o => panic!("key_slot is not an integer: {o:?}"),
+    };
+    drop(conn);
+    db.atom_store_tombstone(slot, a as u64).unwrap();
+
+    let v = eng.verify_atoms("s", &[a, 9999]).unwrap();
+    assert_eq!(
+        v[0].verdict,
+        AttestVerdict::KeyErased,
+        "key destroyed but row present"
+    );
+    assert!(!v[0].aad_bound);
+    assert_eq!(v[1].verdict, AttestVerdict::Missing, "never-stored id");
+}
+
+/// Origin-binding: a blob replayed from another atom's row fails because the HMAC is recomputed
+/// with the target id as authenticated data.
+#[test]
+fn verify_atoms_rejects_replayed_blob_from_another_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(db.clone()).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng.remember("s", AtomInput::new("fact", "alpha")).unwrap();
+    let b = eng.remember("s", AtomInput::new("fact", "beta")).unwrap();
+
+    // Copy a's sealed bytes into b's row: byte-valid, but bound to a's id, not b's.
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let conn = Connection::open(&db).unwrap();
+    let qr = conn
+        .query_params(
+            &format!("SELECT sealed FROM {table} WHERE id=$1"),
+            &[Value::Integer(a)],
+        )
+        .unwrap();
+    let a_sealed = match &qr.rows[0][0] {
+        Value::Blob(x) => x.clone(),
+        o => panic!("sealed is not a blob: {o:?}"),
+    };
+    conn.execute("BEGIN").unwrap();
+    conn.execute_params(
+        &format!("UPDATE {table} SET sealed=$1 WHERE id=$2"),
+        &[Value::Blob(a_sealed), Value::Integer(b)],
+    )
+    .unwrap();
+    conn.execute("COMMIT").unwrap();
+    drop(conn);
+
+    let v = eng.verify_atoms("s", &[b]).unwrap();
+    assert_eq!(
+        v[0].verdict,
+        AttestVerdict::Tampered,
+        "a blob replayed from another row is rejected by the aad-bound MAC"
+    );
+}
+
+/// Plaintext region: no per-atom MAC, so attestation is PlaintextUnattested (never a false
+/// Authentic); absent ids are Missing.
+#[test]
+fn verify_atoms_plaintext_is_unattested() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("p", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng.remember("p", AtomInput::new("fact", "alpha")).unwrap();
+
+    let v = eng.verify_atoms("p", &[a, 9999]).unwrap();
+    assert_eq!(v[0].verdict, AttestVerdict::PlaintextUnattested);
+    assert!(!v[0].aad_bound);
+    assert_eq!(v[1].verdict, AttestVerdict::Missing);
+}
+
+/// update_atom_payload (encrypted): payload replaced; edges, embedding, and seal integrity
+/// preserved; immutable/absent rejected.
+#[test]
+fn update_atom_payload_encrypted_preserves_embedding_edges_and_integrity() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng
+        .remember(
+            "s",
+            AtomInput::new("fact", "the sky is blue today")
+                .with_payload(serde_json::json!({"v": 1})),
+        )
+        .unwrap();
+    let b = eng
+        .remember("s", AtomInput::new("fact", "sibling"))
+        .unwrap();
+    eng.link(a, b, EdgeKind::DerivedFrom, 1.0).unwrap();
+
+    eng.update_atom_payload("s", a, &serde_json::json!({"v": 2, "note": "updated"}))
+        .unwrap();
+
+    assert_eq!(
+        eng.fetch_one("s", a).unwrap().unwrap().payload,
+        serde_json::json!({"v": 2, "note": "updated"})
+    );
+    let hits = eng.recall("s", RecallQuery::by_text("sky", 5)).unwrap();
+    assert!(hits.iter().any(|h| h.id == a));
+    let edges = eng.fetch_edges(Some(a), None, None).unwrap();
+    assert!(edges
+        .iter()
+        .any(|e| e.dst_id == b && e.kind == EdgeKind::DerivedFrom));
+    assert_eq!(
+        eng.verify_atoms("s", &[a]).unwrap()[0].verdict,
+        AttestVerdict::Authentic
+    );
+
+    let imm = eng
+        .remember("s", AtomInput::new("fact", "locked").immutable())
+        .unwrap();
+    assert!(eng
+        .update_atom_payload("s", imm, &serde_json::json!({"x": 1}))
+        .is_err());
+    assert!(eng
+        .update_atom_payload("s", 99999, &serde_json::json!({"x": 1}))
+        .is_err());
+}
+
+/// update_atom_payload (plaintext): payload replaced; recall + edge preserved; immutable/absent rejected.
+#[test]
+fn update_atom_payload_plaintext_preserves_recall_and_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("p", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng
+        .remember(
+            "p",
+            AtomInput::new("fact", "the sky is blue today")
+                .with_payload(serde_json::json!({"v": 1})),
+        )
+        .unwrap();
+    let b = eng
+        .remember("p", AtomInput::new("fact", "sibling"))
+        .unwrap();
+    eng.link(a, b, EdgeKind::DerivedFrom, 1.0).unwrap();
+
+    eng.update_atom_payload("p", a, &serde_json::json!({"v": 9}))
+        .unwrap();
+
+    assert_eq!(
+        eng.fetch_one("p", a).unwrap().unwrap().payload,
+        serde_json::json!({"v": 9})
+    );
+    let hits = eng.recall("p", RecallQuery::by_text("sky", 5)).unwrap();
+    assert!(hits.iter().any(|h| h.id == a));
+    let edges = eng.fetch_edges(Some(a), None, None).unwrap();
+    assert!(edges
+        .iter()
+        .any(|e| e.dst_id == b && e.kind == EdgeKind::DerivedFrom));
+
+    let imm = eng
+        .remember("p", AtomInput::new("fact", "locked").immutable())
+        .unwrap();
+    assert!(eng
+        .update_atom_payload("p", imm, &serde_json::json!({"x": 1}))
+        .is_err());
+    assert!(eng
+        .update_atom_payload("p", 99999, &serde_json::json!({"x": 1}))
+        .is_err());
+}
+
 /// A region whose key was destroyed while its row survives (the crash window between
 /// key-destroy and row-delete) must refuse to attach with `RegionForgotten`.
 #[test]

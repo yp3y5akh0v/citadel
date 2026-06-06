@@ -1,0 +1,44 @@
+[package]
+name = "citadeldb-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Model Context Protocol (MCP) server exposing Citadel encrypted memory as tools"
+readme = "README.md"
+# autobins off so src/bin/mcp_tests.rs stays a test module, not a second binary.
+autobins = false
+
+[lib]
+name = "citadel_mcp"
+
+[[bin]]
+name = "citadel-mcp"
+path = "src/bin/mcp.rs"
+
+[dependencies]
+citadel-mem = { workspace = true }
+citadel = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+rustc-hash = { workspace = true }
+# sync HTTPS (rustls, no tokio) for the `hub` pull subcommand.
+ureq = { version = "2", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# Candle CPU embedder + pull built in; recall is keyword-only until a model is pulled.
+default = ["candle-embed", "hub"]
+# CPU Candle embedders (BGE / MiniLM / E5).
+candle-embed = ["citadel-mem/candle-embed"]
+# On-demand model download for `citadel-mcp pull`.
+hub = ["candle-embed", "dep:ureq"]
+# GPU (CUDA) embeddings; needs the CUDA toolkit.
+cuda-embed = ["candle-embed", "citadel-mem/cuda-embed"]

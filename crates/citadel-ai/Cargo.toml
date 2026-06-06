@@ -15,20 +15,12 @@ readme = "README.md"
 [lib]
 name = "citadel_ai"
 
-# Opt-in MCP stdio server.
-[[bin]]
-name = "citadel-mcp"
-path = "src/bin/mcp.rs"
-required-features = ["mcp-server"]
-
 [dependencies]
 citadel-mem = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
 rustc-hash = { workspace = true }
-# Only the MCP server opens a Database (optional).
-citadel = { workspace = true, optional = true }
 
 # Native-only: ureq does blocking std::net I/O (no wasm).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -46,7 +38,6 @@ claude = ["dep:ureq"]
 openai = ["dep:ureq"]
 # Ollama uses the OpenAI wire format, so it reuses that adapter.
 ollama = ["openai"]
-mcp-server = ["dep:citadel"]
 # Allowlisted file_read/file_write tools.
 file-tools = []
 # Allowlisted run_command tool; wait-timeout enforces the kill deadline.

@@ -1,15 +1,13 @@
 //! Crash-safe per-atom key store with random-access slot I/O and an O(1) free-list
 //! allocator, for per-atom cryptographic erasure.
 //!
-//! Same double-buffered slot/header codec as the region store (see [`crate::key_codec`])
-//! and the same overwrite-in-place + fsync + read-back tombstone, but scaled to atom
-//! cardinality: a slot is read by seeking to its offset (never the whole file), and
-//! tombstoned/empty slots are reused via an in-memory free list so allocation is O(1)
-//! amortized. `forget_atom` destroys one atom's wrapped ACK; destroying the region's RCK
-//! makes every ACK (wrapped under a key derived from RCK) unrecoverable at once.
+//! Same double-buffered codec and overwrite-in-place + fsync + read-back tombstone as the
+//! region store ([`crate::key_codec`]), scaled to atom cardinality: slots are read by seek,
+//! and tombstoned/empty slots are reused via an in-memory free list. Destroying an atom's
+//! wrapped ACK forgets that atom; destroying the region RCK forgets every ACK at once.
 //!
-//! "Erase" is CRYPTOGRAPHIC erasure (destroy the sole wrapped copy of a random key), not
-//! physical NAND destruction: SSD FTL remapping may keep stale copies.
+//! "Erase" is cryptographic (destroy the sole wrapped copy of a random key), not physical
+//! NAND destruction: SSD FTL remapping may keep stale copies.
 
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
@@ -43,9 +41,8 @@ fn parse_header(mac_key: &[u8; KEY_SIZE], file_id: u64, b: &[u8]) -> Option<(u32
     key_codec::parse_header_block(mac_key, ATOM_STORE_MAGIC, VERSION, file_id, b)
 }
 
-/// Random-access per-atom key store. Holds the store MAC key (zeroized on drop); the
-/// engine owns ACK generation and AES-KW wrap/unwrap. Allocation reuses tombstoned slots
-/// via the in-memory free list before bumping the high-water mark / growing the file.
+/// Random-access per-atom key store. Holds the store MAC key (zeroized on drop); the engine
+/// owns ACK generation and AES-KW wrap/unwrap.
 pub(crate) struct AtomKeyStore {
     path: PathBuf,
     file_id: u64,
@@ -166,7 +163,6 @@ impl AtomKeyStore {
         pick_view(&self.mac_key, i, &ba, &bb)
     }
 
-    /// The authoritative record of slot `slot`.
     pub(crate) fn read_slot(&self, slot: u32) -> Result<SlotRecord> {
         Ok(self.view(slot)?.record)
     }
@@ -370,12 +366,16 @@ impl AtomKeyStore {
         Ok(())
     }
 
-    /// Erase many slots with TWO fsyncs for the batch (not 2N): overwrite all live copies
-    /// (commit point) + fsync + marker read-back, then all sibling copies + fsync. Skips
-    /// already-tombstoned slots; EMPTY or owner mismatch aborts before any write.
-    pub(crate) fn tombstone_batch(&mut self, items: &[(u32, u64)]) -> Result<()> {
+    /// Erase many slots with TWO fsyncs (not 2N): overwrite all live copies (commit point)
+    /// + fsync + marker read-back, then all sibling copies + fsync. Skips already-tombstoned
+    /// slots; EMPTY or owner mismatch aborts before any write. Returns each erased slot as
+    /// `(slot, atom_id, old_gen, new_gen)`, confirmed Live -> Tombstone, for an erasure receipt.
+    pub(crate) fn tombstone_batch(
+        &mut self,
+        items: &[(u32, u64)],
+    ) -> Result<Vec<(u32, u64, u64, u64)>> {
         if items.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let image = std::fs::read(&self.path)?;
         let tomb_block = |gen: u64| {
@@ -389,7 +389,7 @@ impl AtomKeyStore {
         };
         let mut live_writes: Vec<(u64, [u8; BLOCK])> = Vec::with_capacity(items.len());
         let mut sibling_writes: Vec<(u64, [u8; BLOCK])> = Vec::with_capacity(items.len());
-        let mut to_free: Vec<u32> = Vec::with_capacity(items.len());
+        let mut confirmed: Vec<(u32, u64, u64, u64)> = Vec::with_capacity(items.len());
         let mut marker: Option<(u64, u64)> = None;
         for &(slot, atom_id) in items {
             let view = view_from(&self.mac_key, &image, slot)?;
@@ -414,10 +414,10 @@ impl AtomKeyStore {
             live_writes.push((live_off, tomb));
             sibling_writes.push((slot_offset(slot, !view.authoritative_b), tomb));
             marker = Some((live_off, new_gen));
-            to_free.push(slot);
+            confirmed.push((slot, atom_id, view.record.gen, new_gen));
         }
         if live_writes.is_empty() {
-            return Ok(()); // every slot was already tombstoned
+            return Ok(Vec::new()); // every slot was already tombstoned
         }
         // Overwrite all live copies, one fsync: the batch commit point.
         write_blocks_synced(&self.path, &live_writes)?;
@@ -433,10 +433,10 @@ impl AtomKeyStore {
         }
         // Overwrite all sibling copies, one fsync; free the slots.
         write_blocks_synced(&self.path, &sibling_writes)?;
-        for slot in to_free {
+        for &(slot, ..) in &confirmed {
             self.free.push(slot);
         }
-        Ok(())
+        Ok(confirmed)
     }
 
     #[cfg(test)]

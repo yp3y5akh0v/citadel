@@ -17,8 +17,9 @@ use crate::embed::{Embedder, EmbeddingMetric, Reranker};
 use crate::error::{MemError, Result};
 use crate::fusion::{fuse_rank, fuse_rerank, Candidate};
 use crate::types::{
-    AtomHit, AtomId, AtomInput, Edge, EdgeKind, EvictionPolicy, EvictionReport, EvolutionReport,
-    GraphExpand, KindDigest, RecallQuery, RerankStrategy, SummaryReport,
+    AtomAttestation, AtomHit, AtomId, AtomInput, AttestVerdict, Edge, EdgeKind, ErasureReceipt,
+    EvictionPolicy, EvictionReport, EvolutionReport, GraphExpand, KindDigest, RecallQuery,
+    RerankStrategy, SlotErasure, SummaryReport, ERASURE_SCOPE_CAVEAT,
 };
 use citadel::SlotState;
 
@@ -683,7 +684,7 @@ impl MemoryEngine {
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
         if h.atom_wrap.is_some() {
-            self.update_atom_payload_sealed(&h, atom_id, payload)?;
+            self.update_atom_payload_sealed(&key, &h, atom_id, payload)?;
             // The cached recall index holds the pre-update payload; rebuild on next recall.
             *h.ann.write().unwrap() = None;
             return Ok(());
@@ -966,27 +967,25 @@ impl MemoryEngine {
         })
     }
 
-    /// Delete atoms. For an encrypted region this is per-atom cryptographic erasure: each
-    /// atom's key is destroyed in the atom key store (overwrite-in-place + fsync +
-    /// read-back) BEFORE its row is deleted, so a crash in between still leaves that
-    /// atom's content permanently undecryptable. Sibling atoms and the region are intact.
-    pub fn delete_atoms(&self, region: &str, ids: &[AtomId]) -> Result<EvictionReport> {
-        if ids.is_empty() {
-            return Ok(EvictionReport { removed: 0 });
-        }
-        let key = region.to_ascii_lowercase();
-        let h = self.region_handle(&key)?;
-        let table = h.table.clone();
+    /// Erase the keys of `ids` (encrypted regions only) then delete their rows and edges,
+    /// returning `(rows_deleted, slots_erased)`. Shared by `delete_atoms` and `forget_atoms`.
+    fn erase_and_delete(
+        &self,
+        h: &RegionHandle,
+        ids: &[AtomId],
+    ) -> Result<(u64, Vec<SlotErasure>)> {
+        let table = &h.table;
         let in_list = ids
             .iter()
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-
         let conn = Connection::open(&self.db)?;
 
-        // Erase every atom's key (commit point) before deleting its row.
-        if h.atom_wrap.is_some() {
+        // Encrypted path: destroy each atom's key (commit point) BEFORE the row delete, so a
+        // crash in between still leaves the content permanently undecryptable. Plaintext path:
+        // there is no key to destroy - the row delete below is the whole operation.
+        let slots_erased = if h.atom_wrap.is_some() {
             let qr = conn.query_params(
                 &format!(
                     "SELECT id, key_slot FROM {table} WHERE region_id = $1 AND id IN ({in_list})"
@@ -998,10 +997,23 @@ impl MemoryEngine {
                 .iter()
                 .map(|row| Ok((as_int(&row[1])? as u32, as_int(&row[0])? as u64)))
                 .collect::<Result<Vec<_>>>()?;
-            self.db.atom_store_tombstone_batch(&slots)?;
-        }
+            self.db
+                .atom_store_tombstone_batch(&slots)?
+                .into_iter()
+                .map(|(slot, atom_id, old_gen, new_gen)| SlotErasure {
+                    slot,
+                    atom_id: atom_id as AtomId,
+                    old_gen,
+                    new_gen,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        with_write_txn(&conn, |c| {
+        // Both paths: delete incident edges, then the rows. The row DELETE's own affected-row
+        // count is the honest `rows_deleted` for either path.
+        let rows_deleted = with_write_txn(&conn, |c| {
             c.execute_params(
                 &format!(
                     "DELETE FROM memory_edges WHERE \
@@ -1010,16 +1022,100 @@ impl MemoryEngine {
                 ),
                 &[Value::Integer(h.id)],
             )?;
-            c.execute_params(
+            let deleted = c.execute_params(
                 &format!("DELETE FROM {table} WHERE region_id = $1 AND id IN ({in_list})"),
                 &[Value::Integer(h.id)],
             )?;
-            Ok(())
+            Ok(match deleted {
+                ExecutionResult::RowsAffected(n) => n,
+                _ => 0,
+            })
         })?;
+
         // Drop the cached ANN index so erased atoms are not re-ranked on the next recall.
         *h.ann.write().unwrap() = None;
+        Ok((rows_deleted, slots_erased))
+    }
+
+    /// Delete atoms. For an encrypted region this is per-atom cryptographic erasure: each
+    /// atom's key is destroyed in the atom key store (overwrite-in-place + fsync +
+    /// read-back) BEFORE its row is deleted, so a crash in between still leaves that
+    /// atom's content permanently undecryptable. Sibling atoms and the region are intact.
+    /// Privileged: ignores the `immutable` flag. [`forget_atoms`](Self::forget_atoms) is
+    /// the model-safe variant with a verifiable receipt.
+    pub fn delete_atoms(&self, region: &str, ids: &[AtomId]) -> Result<EvictionReport> {
+        if ids.is_empty() {
+            return Ok(EvictionReport { removed: 0 });
+        }
+        let h = self.region_handle(&region.to_ascii_lowercase())?;
+        self.erase_and_delete(&h, ids)?;
         Ok(EvictionReport {
             removed: ids.len() as u64,
+        })
+    }
+
+    /// Forget atoms and return a verifiable [`ErasureReceipt`]. On an encrypted region each
+    /// atom's key is cryptographically destroyed; on a plaintext region this is a logical
+    /// delete (the receipt's `cryptographic_erasure` is false). Immutable atoms are skipped
+    /// (reported in `immutable_skipped`) unless `force` is set.
+    pub fn forget_atoms(
+        &self,
+        region: &str,
+        ids: &[AtomId],
+        force: bool,
+    ) -> Result<ErasureReceipt> {
+        let h = self.region_handle(&region.to_ascii_lowercase())?;
+        let encrypted = h.atom_wrap.is_some();
+
+        let mut immutable_skipped = Vec::new();
+        let mut targets: Vec<AtomId> = ids.to_vec();
+        if !force && !ids.is_empty() {
+            let in_list = ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let conn = Connection::open(&self.db)?;
+            let qr = conn.query_params(
+                &format!(
+                    "SELECT id FROM {} WHERE region_id = $1 AND id IN ({in_list}) AND immutable = 1",
+                    h.table
+                ),
+                &[Value::Integer(h.id)],
+            )?;
+            let skip: FxHashSet<AtomId> = qr
+                .rows
+                .iter()
+                .map(|r| as_int(&r[0]))
+                .collect::<Result<_>>()?;
+            if !skip.is_empty() {
+                targets.retain(|id| !skip.contains(id));
+                immutable_skipped = skip.into_iter().collect();
+                immutable_skipped.sort_unstable();
+            }
+        }
+
+        let (rows_deleted, slots_erased) = if targets.is_empty() {
+            (0, Vec::new())
+        } else {
+            self.erase_and_delete(&h, &targets)?
+        };
+
+        Ok(ErasureReceipt {
+            cryptographic_erasure: encrypted,
+            rows_deleted,
+            erased_count: slots_erased.len() as u64,
+            slots_erased,
+            immutable_skipped,
+            algorithm: if encrypted { "AES-256-KW(RFC3394)" } else { "" },
+            wrapped_key_size: if encrypted {
+                WRAPPED_KEY_SIZE as u32
+            } else {
+                0
+            },
+            fsync: encrypted,
+            readback_confirmed: encrypted,
+            scope_caveat: ERASURE_SCOPE_CAVEAT,
         })
     }
 
@@ -1027,6 +1123,123 @@ impl MemoryEngine {
     /// fsync + read-back) and delete its row. Sibling atoms and the region are untouched.
     pub fn forget_atom(&self, region: &str, id: AtomId) -> Result<()> {
         self.delete_atoms(region, &[id]).map(|_| ())
+    }
+
+    /// Re-authenticate atoms by id, returning one [`AtomAttestation`] per requested id (in
+    /// order). Reads each atom's sealed bytes FRESH from disk - never the in-RAM recall cache -
+    /// and recomputes the HMAC bound to the atom id, so a verdict reflects on-disk truth and
+    /// catches tampering (a flipped ciphertext byte) or a blob replayed from another row. Never
+    /// aborts on a bad atom; every id gets a verdict.
+    pub fn verify_atoms(&self, region: &str, ids: &[AtomId]) -> Result<Vec<AtomAttestation>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let h = self.region_handle(&region.to_ascii_lowercase())?;
+        let table = &h.table;
+        let in_list = ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let conn = Connection::open(&self.db)?;
+
+        // Plaintext region: atoms carry no per-atom MAC. Present ids are PlaintextUnattested
+        // (there is nothing to recompute); absent ids are Missing.
+        let Some(atom_wrap) = h.atom_wrap.as_ref() else {
+            let qr = conn.query_params(
+                &format!("SELECT id FROM {table} WHERE region_id = $1 AND id IN ({in_list})"),
+                &[Value::Integer(h.id)],
+            )?;
+            let present: FxHashSet<AtomId> = qr
+                .rows
+                .iter()
+                .map(|r| as_int(&r[0]))
+                .collect::<Result<_>>()?;
+            return Ok(ids
+                .iter()
+                .map(|&id| AtomAttestation {
+                    atom_id: id,
+                    verdict: if present.contains(&id) {
+                        AttestVerdict::PlaintextUnattested
+                    } else {
+                        AttestVerdict::Missing
+                    },
+                    aad_bound: false,
+                    key_slot: None,
+                    key_gen: None,
+                })
+                .collect());
+        };
+
+        // Encrypted region: read sealed + key_slot fresh (off the recall cache), then
+        // re-authenticate each off disk.
+        let qr = conn.query_params(
+            &format!(
+                "SELECT id, key_slot, sealed FROM {table} WHERE region_id = $1 AND id IN ({in_list})"
+            ),
+            &[Value::Integer(h.id)],
+        )?;
+        let mut found: FxHashMap<AtomId, (u32, Vec<u8>)> = FxHashMap::default();
+        for row in &qr.rows {
+            let id = as_int(&row[0])?;
+            let slot = as_int(&row[1])? as u32;
+            let sealed = match &row[2] {
+                Value::Blob(b) => b.clone(),
+                _ => return Err(MemError::Invalid("sealed column is not a blob".into())),
+            };
+            found.insert(id, (slot, sealed));
+        }
+
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let Some((slot, sealed)) = found.get(&id) else {
+                out.push(AtomAttestation {
+                    atom_id: id,
+                    verdict: AttestVerdict::Missing,
+                    aad_bound: false,
+                    key_slot: None,
+                    key_gen: None,
+                });
+                continue;
+            };
+            let rec = self.db.atom_store_slot(*slot)?;
+            if rec.state != SlotState::Live {
+                // The key was destroyed (forgotten): content is permanently unrecoverable.
+                out.push(AtomAttestation {
+                    atom_id: id,
+                    verdict: AttestVerdict::KeyErased,
+                    aad_bound: false,
+                    key_slot: Some(*slot),
+                    key_gen: Some(rec.gen),
+                });
+                continue;
+            }
+            let (verdict, aad_bound) = match atom_wrap.unwrap_atom_key(&rec.wrapped) {
+                Ok(mut ack) => {
+                    let seal_keys = derive_seal_keys(&ack);
+                    ack.zeroize();
+                    // The HMAC is recomputed with aad = atom id, so a flipped byte (CTR is
+                    // malleable) or a blob replayed from another row both fail here.
+                    match blob_seal::open(&seal_keys, id as u64, sealed) {
+                        Ok(mut pt) => {
+                            pt.zeroize();
+                            (AttestVerdict::Authentic, true)
+                        }
+                        Err(_) => (AttestVerdict::Tampered, true),
+                    }
+                }
+                // A live slot whose wrapped ACK will not unwrap means key-slot corruption.
+                Err(_) => (AttestVerdict::Tampered, false),
+            };
+            out.push(AtomAttestation {
+                atom_id: id,
+                verdict,
+                aad_bound,
+                key_slot: Some(*slot),
+                key_gen: Some(rec.gen),
+            });
+        }
+        Ok(out)
     }
 
     /// Per-kind counts, time span, and avg score/confidence since `since_micros` (no LLM).
@@ -1568,6 +1781,7 @@ impl MemoryEngine {
     /// Re-seal an atom with a replaced payload (embedding and text preserved).
     fn update_atom_payload_sealed(
         &self,
+        key: &str,
         h: &RegionHandle,
         atom_id: AtomId,
         payload: &serde_json::Value,
@@ -1590,8 +1804,7 @@ impl MemoryEngine {
             )?;
             let Some(row) = qr.rows.first() else {
                 return Err(MemError::Invalid(format!(
-                    "atom {atom_id} not found, or immutable, in region '{}'",
-                    h.id
+                    "atom {atom_id} not found, or immutable, in region '{key}'"
                 )));
             };
             // Re-seal under the SAME ACK (the atom's key is unchanged; only its payload).
