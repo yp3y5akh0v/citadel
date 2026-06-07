@@ -127,35 +127,31 @@
 
   <section class="sec">
     <div class="about-grid">
-      <div class="sec-index"><span class="num">04</span><span class="label">What's real, what's demo</span></div>
+      <div class="sec-index"><span class="num">04</span><span class="label">Grounded in the source</span></div>
       <div>
         <p style="margin:0 0 22px; color:var(--fg-2); font-size:14.5px; line-height:1.65; max-width:62ch;">
-          Honesty note. The repo is real; a few touches on <i>this website</i> are presentation. Here's the split:
+          Each capability below lives in the open-source tree. Here is where to find it:
         </p>
         <div class="audit">
-          <div class="audit-row yes">
-            <div class="tag">real</div>
-            <div class="claim"><b>Cipher, MAC, KDF, page size, shadow paging, 5,000+ tests, 50/50 head-to-head, 18 crates, 37 FFI functions, 13 MCP tools.</b> All grounded in the README and source tree.</div>
+          <div class="audit-row">
+            <div class="cat">core</div>
+            <div class="claim">Cipher, MAC, KDF, page size, shadow paging, 5,000+ tests, 50/50 head-to-head, 18 crates, 37 FFI functions, and 13 MCP tools, all grounded in the README and source tree.</div>
           </div>
-          <div class="audit-row yes">
-            <div class="tag">real</div>
-            <div class="claim"><b>SQL surface:</b> FULL OUTER + LATERAL joins, recursive and with-DML CTEs, UPSERT (<code>ON CONFLICT</code>), RETURNING, generated columns, JSON/JSONB with 14 PostgreSQL operators, triggers, materialized views, full-text search, partial / GIN indexes, native DATE/TIMESTAMP, and a <code>VECTOR(N)</code> type with an ANN index. Implemented in <code>citadel-sql</code> and <code>citadel-vector</code>.</div>
+          <div class="audit-row">
+            <div class="cat">sql</div>
+            <div class="claim">FULL OUTER + LATERAL joins, recursive and with-DML CTEs, UPSERT (<code>ON CONFLICT</code>), RETURNING, generated columns, JSON/JSONB with 14 PostgreSQL operators, triggers, materialized views, full-text search, partial / GIN indexes, native DATE/TIMESTAMP, and a <code>VECTOR(N)</code> type with an ANN index. Implemented in <code>citadel-sql</code> and <code>citadel-vector</code>.</div>
           </div>
-          <div class="audit-row yes">
-            <div class="tag">real</div>
-            <div class="claim"><b>Agent memory:</b>&nbsp;<code>citadel-mem</code> stores regions of typed atoms and edges with hybrid recall and cryptographic erasure; <code>citadel-mcp</code> serves it over the Model Context Protocol; the 84.1% LoCoMo score is measured by <code>citadel-membench</code>.</div>
+          <div class="audit-row">
+            <div class="cat">memory</div>
+            <div class="claim"><code>citadel-mem</code> stores regions of typed atoms and edges with hybrid recall and cryptographic erasure; <code>citadel-mcp</code> serves it over the Model Context Protocol; the 84.1% LoCoMo score is measured by <code>citadel-membench</code>.</div>
           </div>
-          <div class="audit-row yes">
-            <div class="tag">real</div>
-            <div class="claim"><b>Language targets:</b> Rust on crates.io, WebAssembly on npm, C ABI via <code>citadel-ffi</code>, and the <code>citadel</code> CLI. There is no Python binding yet.</div>
+          <div class="audit-row">
+            <div class="cat">targets</div>
+            <div class="claim">Rust on crates.io, WebAssembly on npm, C ABI via <code>citadel-ffi</code>, and the <code>citadel</code> CLI. There is no Python binding yet.</div>
           </div>
-          <div class="audit-row yes">
-            <div class="tag">real</div>
+          <div class="audit-row">
+            <div class="cat">playground</div>
             <div class="claim">The <a href="{{ get_url(path='@/demo/_index.md') }}">Playground</a> runs the actual engine compiled to WebAssembly. Your SQL executes in your browser against a real encrypted in-memory database; nothing is sent to a server.</div>
-          </div>
-          <div class="audit-row demo">
-            <div class="tag">demo</div>
-            <div class="claim">In the playground, query results, errors, EXPLAIN plans, exec timings, and row counts are real engine output; the schema panel and table list mirror the seeded tables. Only the page-ring and the storage / key-hierarchy facts are a fixed illustration of the encrypted file format.</div>
           </div>
         </div>
       </div>
