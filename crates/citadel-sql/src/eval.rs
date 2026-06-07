@@ -1064,7 +1064,62 @@ fn eval_temporal_op(left: &Value, op: BinOp, right: &Value) -> Option<Result<Val
                 got: format!("{} and {}", left.data_type(), right.data_type()),
             }))
         }
+        // Comparison with one temporal side: coerce the literal to that type.
+        (l, op, r)
+            if matches!(
+                op,
+                BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq
+            ) =>
+        {
+            temporal_compare(l, op, r)
+        }
         _ => None,
+    }
+}
+
+/// Compares values where one side is temporal, coercing the other to match.
+fn temporal_compare(left: &Value, op: BinOp, right: &Value) -> Option<Result<Value>> {
+    let (a, b) = coerce_temporal_pair(left, right)?;
+    let ord = a.cmp(&b);
+    use std::cmp::Ordering;
+    let result = match op {
+        BinOp::Eq => ord == Ordering::Equal,
+        BinOp::NotEq => ord != Ordering::Equal,
+        BinOp::Lt => ord == Ordering::Less,
+        BinOp::Gt => ord == Ordering::Greater,
+        BinOp::LtEq => ord != Ordering::Greater,
+        BinOp::GtEq => ord != Ordering::Less,
+        _ => return None,
+    };
+    Some(Ok(Value::Boolean(result)))
+}
+
+/// Coerces a TEXT/INTEGER (or DATE/TIMESTAMP) operand to match the temporal side.
+fn coerce_temporal_pair(left: &Value, right: &Value) -> Option<(Value, Value)> {
+    use crate::types::DataType;
+    let temporal_type = |v: &Value| match v {
+        Value::Date(_) => Some(DataType::Date),
+        Value::Time(_) => Some(DataType::Time),
+        Value::Timestamp(_) => Some(DataType::Timestamp),
+        Value::Interval { .. } => Some(DataType::Interval),
+        _ => None,
+    };
+    match (temporal_type(left), temporal_type(right)) {
+        (Some(DataType::Date), Some(DataType::Timestamp))
+        | (Some(DataType::Timestamp), Some(DataType::Date)) => Some((
+            left.clone().coerce_into(DataType::Timestamp)?,
+            right.clone().coerce_into(DataType::Timestamp)?,
+        )),
+        (Some(_), Some(_)) => None,
+        (Some(t), None) => {
+            let coerced = right.clone().coerce_into(t)?;
+            Some((left.clone(), coerced))
+        }
+        (None, Some(t)) => {
+            let coerced = left.clone().coerce_into(t)?;
+            Some((coerced, right.clone()))
+        }
+        (None, None) => None,
     }
 }
 
@@ -1269,32 +1324,27 @@ fn value_to_text(val: &Value) -> String {
 }
 
 fn eval_between(val: &Value, low: &Value, high: &Value, negated: bool) -> Result<Value> {
-    if val.is_null() || low.is_null() || high.is_null() {
-        let ge = if val.is_null() || low.is_null() {
-            None
-        } else {
-            Some(*val >= *low)
-        };
-        let le = if val.is_null() || high.is_null() {
-            None
-        } else {
-            Some(*val <= *high)
-        };
+    // BETWEEN routed through eval_binary_op so comparison logic lives in one place.
+    let ge = eval_binary_op(val, BinOp::GtEq, low)?;
+    let le = eval_binary_op(val, BinOp::LtEq, high)?;
 
-        let result = match (ge, le) {
-            (Some(false), _) | (_, Some(false)) => Some(false),
-            (Some(true), Some(true)) => Some(true),
-            _ => None,
-        };
+    let result = match (as_bool(&ge), as_bool(&le)) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    };
 
-        return match result {
-            Some(b) => Ok(Value::Boolean(if negated { !b } else { b })),
-            None => Ok(Value::Null),
-        };
+    match result {
+        Some(b) => Ok(Value::Boolean(if negated { !b } else { b })),
+        None => Ok(Value::Null),
     }
+}
 
-    let in_range = *val >= *low && *val <= *high;
-    Ok(Value::Boolean(if negated { !in_range } else { in_range }))
+fn as_bool(v: &Value) -> Option<bool> {
+    match v {
+        Value::Boolean(b) => Some(*b),
+        _ => None,
+    }
 }
 
 const MAX_LIKE_PATTERN_LEN: usize = 10_000;

@@ -13,7 +13,8 @@ pub(super) fn exec_aggregate(
     stmt: &SelectStmt,
 ) -> Result<ExecutionResult> {
     let col_map = ColumnMap::new(columns);
-    let groups: BTreeMap<Vec<Value>, Vec<&Vec<Value>>> = if stmt.group_by.is_empty() {
+    let group_exprs = resolve_group_by_exprs(&stmt.group_by, &stmt.columns, &col_map)?;
+    let groups: BTreeMap<Vec<Value>, Vec<&Vec<Value>>> = if group_exprs.is_empty() {
         let mut m = BTreeMap::new();
         m.insert(vec![], rows.iter().collect());
         m
@@ -21,8 +22,7 @@ pub(super) fn exec_aggregate(
         let mut m: BTreeMap<Vec<Value>, Vec<&Vec<Value>>> = BTreeMap::new();
         for row in rows {
             let ctx = EvalCtx::new(&col_map, row);
-            let group_key: Vec<Value> = stmt
-                .group_by
+            let group_key: Vec<Value> = group_exprs
                 .iter()
                 .map(|expr| eval_expr(expr, &ctx))
                 .collect::<Result<_>>()?;
@@ -115,6 +115,46 @@ pub(super) fn exec_aggregate(
         columns: col_names,
         rows: result_rows,
     }))
+}
+
+/// Resolves GROUP BY ordinals (1-based) and output aliases to their expressions.
+fn resolve_group_by_exprs<'a>(
+    group_by: &'a [Expr],
+    select_cols: &'a [SelectColumn],
+    col_map: &ColumnMap,
+) -> Result<Vec<&'a Expr>> {
+    group_by
+        .iter()
+        .map(|expr| match expr {
+            Expr::Literal(Value::Integer(n)) => {
+                let idx = usize::try_from(*n)
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .filter(|&i| i < select_cols.len())
+                    .ok_or_else(|| {
+                        SqlError::InvalidValue(format!("GROUP BY position {n} out of range"))
+                    })?;
+                match &select_cols[idx] {
+                    SelectColumn::Expr { expr, .. } => Ok(expr),
+                    _ => Err(SqlError::Unsupported(
+                        "GROUP BY position references SELECT *".into(),
+                    )),
+                }
+            }
+            // Bare identifier: base column wins (PG precedence), else a matching alias.
+            Expr::Column(name) if col_map.resolve(name).is_err() => {
+                let aliased = select_cols.iter().find_map(|sc| match sc {
+                    SelectColumn::Expr {
+                        expr,
+                        alias: Some(a),
+                    } if a.eq_ignore_ascii_case(name) => Some(expr),
+                    _ => None,
+                });
+                Ok(aliased.unwrap_or(expr))
+            }
+            _ => Ok(expr),
+        })
+        .collect()
 }
 
 pub(super) fn eval_aggregate_expr(

@@ -1157,6 +1157,23 @@ pub(super) fn try_between_predicate(expr: &Expr, schema: &TableSchema) -> Option
     if schema.columns[col_idx].collation != crate::types::Collation::Binary {
         return None;
     }
+
+    // Coerce TEXT/INTEGER bounds to the column's temporal type for same-typed compare.
+    let col_type = schema.columns[col_idx].data_type;
+    let coerce_bound = |v: Value| -> Option<Value> {
+        if matches!(
+            col_type,
+            DataType::Date | DataType::Time | DataType::Timestamp | DataType::Interval
+        ) && matches!(v, Value::Text(_) | Value::Integer(_))
+        {
+            v.coerce_into(col_type)
+        } else {
+            Some(v)
+        }
+    };
+    let low = coerce_bound(low)?;
+    let high = coerce_bound(high)?;
+
     let non_pk = schema.non_pk_indices();
 
     if let Some(pk_pos) = schema
@@ -1216,7 +1233,6 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
     ) {
         return None;
     }
-    let literal = &literal;
 
     let col_idx = schema.column_index(col_name)?;
     if matches!(
@@ -1228,6 +1244,19 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
     if schema.columns[col_idx].collation != crate::types::Collation::Binary {
         return None;
     }
+
+    // Coerce a TEXT/INTEGER literal to the column's temporal type for same-typed compare.
+    let col_type = schema.columns[col_idx].data_type;
+    let literal = if matches!(
+        col_type,
+        DataType::Date | DataType::Time | DataType::Timestamp | DataType::Interval
+    ) && matches!(literal, Value::Text(_) | Value::Integer(_))
+    {
+        literal.coerce_into(col_type)?
+    } else {
+        literal
+    };
+    let literal = &literal;
     let non_pk = schema.non_pk_indices();
 
     if let Some(pk_pos) = schema
