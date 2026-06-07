@@ -1,46 +1,56 @@
 +++
 title = "Introducing Citadel"
-date = 2026-04-11
-description = "Why I built an encrypted-first embedded database engine in Rust."
+date = 2026-06-07
+description = "An embedded database that encrypts every page, with a memory engine for AI agents."
 authors = ["Yuriy Peysakhov"]
 
 [taxonomies]
 tags = ["announcement"]
 +++
 
-Citadel is an embedded database engine where every page is encrypted at rest. There is no "unencrypted mode" - the database file is always opaque.
+Citadel is an embedded database. Every page is encrypted before it reaches disk, so the file is always ciphertext - there is no unencrypted mode. It also includes a memory engine for AI agents, on the same encrypted storage.
 
-## Why?
+## Why encryption first
 
-SQLite doesn't ship with encryption. The official extension (SEE) is paid and closed-source. Most key-value stores skip encryption entirely. If your app runs on a phone, a Raspberry Pi, or anything that might get lost or stolen, you're on your own.
+SQLite has no built-in encryption. The official extension (SEE) is paid and closed-source, and most embedded key-value stores have none at all. That is fine until the device is lost or stolen.
 
-I wanted a database that encrypts by default, not one where I bolt encryption on after the fact and hope nothing leaks.
+I did not want encryption as a layer on top. In Citadel there is no code path that writes a plaintext page.
 
 ## How it works
 
-Citadel uses a 3-tier key hierarchy:
+Citadel derives its keys in three steps:
 
-1. Your **passphrase** derives a master key via Argon2id (or PBKDF2 for FIPS)
-2. The master key unwraps a **root encryption key** via AES Key Wrap
-3. The root key derives per-purpose **data encryption** and **MAC keys** via HKDF
+1. Your **passphrase** derives a master key with Argon2id (or PBKDF2 for FIPS).
+2. The master key unwraps a **root key** with AES Key Wrap.
+3. The root key derives the **data** and **MAC** keys with HKDF.
 
-Every page on disk is 8,208 bytes: a 16-byte IV, 8,160 bytes of AES-256-CTR ciphertext, and a 32-byte HMAC-SHA256. The MAC is verified before decryption - AES-CTR is malleable, so we never decrypt unauthenticated data.
+Each page on disk is 8,208 bytes: a 16-byte IV, 8,160 bytes of AES-256-CTR ciphertext, and a 32-byte HMAC-SHA256. The MAC is checked before anything is decrypted, so tampered pages are rejected.
 
 ## No WAL
 
-Most databases use a write-ahead log for crash recovery. Citadel uses **shadow paging**: dirty pages are written to new locations (copy-on-write), and a single "god byte" flip atomically switches the active commit slot. This means no WAL to checkpoint, instant crash recovery, and every reader gets a consistent snapshot for free.
+Most databases keep a write-ahead log for crash recovery. Citadel does not. Changed pages are written to new locations, and one byte flip switches to the new version. Recovery is immediate, and readers always see a consistent snapshot.
 
 ## Faster than unencrypted SQLite
 
-Citadel beats SQLite in all 50 head-to-head benchmarks, even though every page goes through AES-256-CTR + HMAC-SHA256 and SQLite runs without any encryption.
+Citadel beats SQLite on all 50 head-to-head benchmarks, even with encryption on every page. The numbers are in the <a href="https://github.com/yp3y5akh0v/citadel#benchmarks" target="_blank" rel="noopener">README</a>.
 
-Full results are in the <a href="https://github.com/yp3y5akh0v/citadel#benchmarks" target="_blank" rel="noopener">README</a>.
+## Memory for AI agents
+
+Agents keep a lot of long-lived, private context, and you do not want that in plaintext. Citadel's memory layer covers:
+
+- **Typed memory** - `citadel-mem` stores **atoms** in **regions**, linked by typed **edges**. They are stored and encrypted like normal rows.
+- **Vector recall** - a `VECTOR(N)` column with a filtered ANN index from <a href="https://github.com/yp3y5akh0v/prism" target="_blank" rel="noopener">PRISM</a>. Recall mixes vector distance, keyword match, and recency, with an optional reranker.
+- **MCP server** - `citadel-mcp` serves a memory region over MCP (JSON-RPC on stdio, 13 tools), so Claude Desktop or any MCP client can use it.
+- **Forgetting** - to delete data you destroy its key instead of overwriting it. This works per atom, per region, or for the whole store, and returns a receipt. The ciphertext left behind cannot be read.
+
+It scores 84.1% on the LoCoMo memory benchmark, with everything encrypted.
 
 ## What it supports
 
-- **SQL** - JOINs (INNER, LEFT, RIGHT, CROSS, FULL OUTER, LATERAL), subqueries, CTEs (recursive + WITH-DML), UNION/INTERSECT/EXCEPT, window functions, aggregates, indexes (partial, COLLATE, GIN, FTS), STRICT tables, COLLATE (BINARY/NOCASE/RTRIM), constraints (DEFAULT, CHECK, FOREIGN KEY with CASCADE / SET NULL / SET DEFAULT / RESTRICT), generated columns (STORED + VIRTUAL), JSON / JSONB with PG operators, full-text search (`tsvector`/`tsquery`/`@@`/`ts_rank`), system catalog (`information_schema.*`), ALTER TABLE, TRUNCATE, UPSERT, RETURNING, prepared statements with snapshot-tagged plan caching
-- **ACID transactions** - snapshot isolation, concurrent readers, no WAL
-- **P2P encrypted sync** - Merkle-based diffing over Noise protocol
-- **Cross-platform** - C FFI, WebAssembly, CLI with tab completion
+- **SQL** - every join type (including FULL OUTER and LATERAL), recursive CTEs, window functions, JSON/JSONB with Postgres operators, full-text search, triggers, materialized views, and generated columns. Full list on the [features page](/#sql).
+- **Vectors and memory** - `VECTOR(N)` with a PRISM ANN index, the `citadel-mem` atom/edge store, and the `citadel-mcp` server.
+- **Transactions** - ACID with snapshot isolation and concurrent readers.
+- **Sync** - encrypted peer-to-peer diffing over the Noise protocol.
+- **Bindings** - Rust, WebAssembly, a C API, and a CLI.
 
-Head over to the [playground](@/demo/_index.md) to try it in your browser, or check out the <a href="https://github.com/yp3y5akh0v/citadel" target="_blank" rel="noopener">source on GitHub</a>.
+Citadel is now at v1.1.0: 18 crates, 5,000+ tests, one encrypted file. Try it in the [playground](@/demo/_index.md), or read the <a href="https://github.com/yp3y5akh0v/citadel" target="_blank" rel="noopener">source</a>.

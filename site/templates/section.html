@@ -3,6 +3,8 @@
 {% block title %}{{ section.title | default(value=config.title) }}{% endblock %}
 
 {% block content %}
-<h1>{{ section.title | default(value="") }}</h1>
-{{ section.content | safe }}
+<section class="page-wrap">
+    {% if section.title %}<h1>{{ section.title }}</h1>{% endif %}
+    <div class="prose">{{ section.content | safe }}</div>
+</section>
 {% endblock %}

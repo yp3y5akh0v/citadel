@@ -1,61 +1,813 @@
 {% extends "base.html" %}
 
-{% block title %}Citadel - Encrypted-First Embedded Database{% endblock %}
+{% block title %}Citadel - Encrypted-first database and agent-memory engine{% endblock %}
+{% block description %}Encrypted-first embedded database and agent-memory engine. Every page AES-256-CTR + HMAC-SHA256. Wins all 50 head-to-head benchmarks against unencrypted SQLite, with vector recall, an MCP server, and cryptographic forgetting.{% endblock %}
 
 {% block content %}
-<section class="hero">
-    <h1>Citadel</h1>
-    <p class="hero-tagline">Encrypted-first embedded database engine that outperforms unencrypted SQLite.</p>
-    <p class="hero-sub">AES-256-CTR + HMAC-SHA256 on every page. Written in Rust.</p>
-    <div class="hero-buttons">
-        <a href="{{ config.extra.github }}" class="btn btn-primary" target="_blank" rel="noopener">View on GitHub</a>
-        <a href="{{ get_url(path='@/demo/_index.md') }}" class="btn btn-secondary">Try in Browser</a>
+{% set base = config.base_url %}
+
+<section class="hero shell">
+  <div class="hero-inner">
+    <div>
+      <div class="eyebrow">MIT or Apache-2.0 &nbsp;/&nbsp; Rust 1.75+ &nbsp;/&nbsp; v1.1.0</div>
+      <h1>Encrypted-first database and agent memory, <span class="ac">faster than SQLite.</span></h1>
+      <p class="lede">
+        Every page is encrypted and authenticated before it touches disk. A full SQL engine that wins all 50 head-to-head benchmarks against unencrypted SQLite - and, on the same encrypted pages, an agent-memory engine with vector recall, an MCP server, and cryptographic forgetting.
+      </p>
+      <div class="hero-cta">
+        <a class="btn" href="#install">Get started
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 8h10M9 4l4 4-4 4"/></svg>
+        </a>
+        <a class="btn ghost" href="{{ get_url(path='@/demo/_index.md') }}">Try in browser</a>
+      </div>
+      <div class="hero-meta">
+        <span>Argon2id</span><span class="sep">/</span>
+        <span>AES-256-CTR</span><span class="sep">/</span>
+        <span>HMAC-SHA256</span><span class="sep">/</span>
+        <span>BLAKE3 Merkle</span><span class="sep">/</span>
+        <span>PRISM ANN</span>
+      </div>
+      <div class="install" id="install">
+        <span class="prompt">$</span>
+        <code id="installCmd">cargo add citadeldb citadeldb-sql</code>
+        <button id="copyInstall" aria-label="copy">copy</button>
+      </div>
     </div>
+
+    <div class="unlock" id="unlock" aria-label="Open a sealed Citadel database. Type the passphrase to decrypt.">
+      <p class="unlock-caption">A live model of Citadel's on-disk format: <code>my.db</code> is opaque ciphertext until the passphrase decrypts the page. Nothing is stored - to run real SQL, open the <a href="{{ get_url(path='@/demo/_index.md') }}">playground</a>.</p>
+      <div class="unlock-head">
+        <div class="unlock-file">
+          <svg width="14" height="16" viewBox="0 0 14 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 1.5h7l3 3v10h-10zM9 1.5v3h3"/></svg>
+          <span>my.db</span>
+          <span class="unlock-status" id="unlockStatus">sealed</span>
+        </div>
+        <div class="unlock-meta">1 page / 8,208 B / IV &#8214; ciphertext &#8214; MAC</div>
+      </div>
+      <div class="unlock-view">
+        <pre class="unlock-hex" id="unlockHex" aria-hidden="true"></pre>
+        <pre class="unlock-rows" id="unlockRows" aria-hidden="true"></pre>
+      </div>
+      <div class="unlock-bar">
+        <form class="unlock-input" id="unlockForm" autocomplete="off">
+          <span class="prompt">$</span>
+          <input id="unlockPass" type="text" placeholder="passphrase (try: open-sesame)" spellcheck="false" autocomplete="off" autocapitalize="off" data-1p-ignore data-lpignore="true" aria-label="Demo passphrase">
+          <button type="submit" id="unlockBtn">open</button>
+        </form>
+        <div class="unlock-err" id="unlockErr">Argon2id / AES-256-CTR / HMAC-SHA256 / enter passphrase to decrypt</div>
+      </div>
+    </div>
+  </div>
 </section>
 
-<section class="features">
-    <div class="feature-grid">
-        <div class="feature">
-            <h3>Encrypted at Rest</h3>
-            <p>AES-256-CTR or ChaCha20, HMAC-SHA256 per page. No plaintext ever touches disk.</p>
-        </div>
-        <div class="feature">
-            <h3>Full SQL Engine</h3>
-            <p>JOINs, subqueries, CTEs, UNION/INTERSECT/EXCEPT, aggregates, indexes, constraints, ALTER TABLE.</p>
-        </div>
-        <div class="feature">
-            <h3>ACID Transactions</h3>
-            <p>Copy-on-Write B+ tree with shadow paging. Snapshot isolation, no WAL.</p>
-        </div>
-        <div class="feature">
-            <h3>P2P Encrypted Sync</h3>
-            <p>Merkle tree diffing over Noise protocol. Forward secrecy with ephemeral keys.</p>
-        </div>
-        <div class="feature">
-            <h3>Cross-Platform</h3>
-            <p>Windows, Linux, macOS, and more. C FFI and WebAssembly bindings.</p>
-        </div>
-        <div class="feature">
-            <h3>Self-Contained</h3>
-            <p>Single-file database. No external services, no runtime, no config.</p>
-        </div>
+<div class="shell">
+  <div class="proof">
+    <div class="proof-label">// proven in</div>
+    <div class="proof-items">
+      <span><b>50/50</b> wins vs SQLite</span>
+      <span><b>362&times;</b> on full&nbsp;outer&nbsp;join</span>
+      <span><b>5,000+</b> tests, 18 crates</span>
+      <span><b>84.1%</b> LoCoMo score</span>
     </div>
+  </div>
+</div>
+
+<section class="block shell">
+  <div class="sec-head">
+    <div class="eyebrow">One substrate, two faces</div>
+    <h2>An encrypted file format that is both a database and a memory.</h2>
+    <p>The same AES-256-CTR + HMAC pages, copy-on-write B+ tree, and shadow-paging commit power both halves. Use the SQL engine, the agent-memory engine, or both in one file.</p>
+  </div>
+  <div class="pillars">
+    <div class="pillar">
+      <div class="tag">citadeldb / citadeldb-sql</div>
+      <h3>Encrypted database</h3>
+      <p>A complete embedded SQL + key-value engine. ACID without a WAL, snapshot isolation, and a single self-contained file - faster than unencrypted SQLite at equal cache budgets.</p>
+      <ul>
+        <li>SQL: FULL OUTER &amp; LATERAL joins, recursive CTEs, window functions, triggers, materialized views</li>
+        <li>JSON / JSONB with 14 PostgreSQL operators, GIN indexes, full-text search</li>
+        <li>Key-value API and SQL share one transaction</li>
+        <li>P2P encrypted sync over Noise; CLI, C FFI, and WebAssembly bindings</li>
+      </ul>
+    </div>
+    <div class="pillar">
+      <div class="tag">citadeldb-vector / -mem / -ai / -mcp</div>
+      <h3>Agent memory engine</h3>
+      <p>Memory for AI agents that lives encrypted at rest. Typed atoms and edges, hybrid recall, and a Model Context Protocol server so Claude Desktop or any MCP client can read and write it.</p>
+      <ul>
+        <li><code>VECTOR(N)</code> type with a <a class="ilink" href="https://github.com/yp3y5akh0v/prism" target="_blank" rel="noopener">PRISM</a>-backed filtered ANN index</li>
+        <li>Hybrid recall: vector ANN + BM25 keyword + recency + optional cross-encoder reranker</li>
+        <li>Cryptographic forgetting: erase an atom or region by destroying its key</li>
+        <li>13-tool MCP server; 84.1% on the LoCoMo long-memory benchmark</li>
+      </ul>
+    </div>
+  </div>
 </section>
 
-{{ section.content | safe }}
+<section class="block shell" id="features">
+  <div class="sec-head">
+    <div class="eyebrow">Features</div>
+    <h2>A complete engine in a single file.</h2>
+    <p>Full SQL, real ACID, encrypted sync, and an agent-memory layer. Key hierarchy built around RFC&nbsp;3394, RFC&nbsp;5869, and a Rust-only crypto core.</p>
+  </div>
 
-{% set blog_section = get_section(path="blog/_index.md") %}
-{% if blog_section.pages | length > 0 %}
-<section class="recent-posts">
-    <h2>Recent Posts</h2>
-    <ul class="post-list">
-    {% for page in blog_section.pages | slice(end=3) %}
-        <li>
-            <a href="{{ page.permalink }}">{{ page.title }}</a>
-            <time>{{ page.date | date(format="%B %d, %Y") }}</time>
-        </li>
+  <div class="features">
+    <div class="feat">
+      <svg class="feat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="10" width="16" height="11" rx="1"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.5" r="1.2" fill="currentColor"/></svg>
+      <h3>Encrypted at rest</h3>
+      <p>AES-256-CTR + HMAC-SHA256 per page, verified before decryption. Fresh random IV on every write. ChaCha20 available.</p>
+    </div>
+    <div class="feat">
+      <svg class="feat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><ellipse cx="12" cy="6" rx="8" ry="2.5"/><path d="M4 6v6c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5V6"/><path d="M4 12v6c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5v-6"/></svg>
+      <h3>Real SQL</h3>
+      <p>FULL OUTER + LATERAL joins, recursive CTEs (with-DML), window functions, triggers, materialized views, UPSERT, RETURNING, JSON/JSONB.</p>
+    </div>
+    <div class="feat">
+      <svg class="feat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 7h12l4 4v10H4z"/><path d="M4 11h16"/><path d="M16 7v4"/></svg>
+      <h3>ACID, no WAL</h3>
+      <p>Copy-on-Write B+ tree with shadow paging. Snapshot isolation with concurrent readers, atomic single-byte commits.</p>
+    </div>
+    <div class="feat">
+      <svg class="feat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="19" cy="18" r="2"/><path d="M7 7l3 3M17 7l-3 3M17 17l-3-3"/></svg>
+      <h3>Vector + agent memory</h3>
+      <p><code>VECTOR(N)</code> with a PRISM filtered ANN index, plus a memory engine of typed atoms with hybrid vector + keyword recall.</p>
+    </div>
+    <div class="feat">
+      <svg class="feat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9l3 3-3 3M13 15h4"/></svg>
+      <h3>MCP server</h3>
+      <p>Expose encrypted memory to Claude Desktop or any MCP client over stdio. 13 tools for recall, remember, link, evolve, and forget.</p>
+    </div>
+    <div class="feat">
+      <svg class="feat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 3l8 4v5c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V7z"/><path d="M9 12l2 2 4-4"/></svg>
+      <h3>Cryptographic forgetting</h3>
+      <p>Erase data by destroying its key, not by overwriting. Whole-store, per-region, and per-atom, with verifiable erasure receipts.</p>
+    </div>
+    <div class="feat">
+      <svg class="feat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="5" cy="12" r="2.5"/><circle cx="19" cy="12" r="2.5"/><path d="M7.5 12H16"/><path d="M9 8l4-3M15 8l-4-3M9 16l4 3M15 16l-4 3"/></svg>
+      <h3>P2P encrypted sync</h3>
+      <p>Merkle-based table diffing over Noise (<code>NNpsk0_25519_ChaChaPoly_BLAKE2s</code>) with ephemeral forward secrecy.</p>
+    </div>
+    <div class="feat">
+      <svg class="feat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M7 3v18M3 7h18M3 12h18M3 17h18M12 3v18"/></svg>
+      <h3>Three-tier key hierarchy</h3>
+      <p>Passphrase &rarr; Argon2id &rarr; Master Key &rarr; AES-KW &rarr; REK &rarr; HKDF &rarr; DEK + MAC. Instant rekey, no page re-encryption.</p>
+    </div>
+    <div class="feat">
+      <svg class="feat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="18" height="12" rx="1"/><path d="M8 20h8M12 16v4"/></svg>
+      <h3>Cross-platform bindings</h3>
+      <p>Windows, Linux, macOS. C FFI (37 functions) and WebAssembly from one Rust core. Tamper-evident HMAC-chained audit log.</p>
+    </div>
+  </div>
+</section>
+
+<section class="block shell" id="quickstart">
+  <div class="sec-head">
+    <div class="eyebrow">Quickstart</div>
+    <h2>Open a database in six lines.</h2>
+    <p>The API is small on purpose. One builder, one connection, one passphrase.</p>
+  </div>
+
+  <div class="qs">
+    <div>
+      <div class="qs-steps">
+        <div class="qs-step"><div class="n">1</div><div><h4>Add the crates</h4><p>Engine + SQL frontend from crates.io.</p></div></div>
+        <div class="qs-step"><div class="n">2</div><div><h4>Open with a passphrase</h4><p>Argon2id derives the master key in memory. Keys live in <code>{dbname}.citadel-keys</code>, not inside the database.</p></div></div>
+        <div class="qs-step"><div class="n">3</div><div><h4>Run SQL, or use the KV API</h4><p>Both are first class. Mix them in the same transaction.</p></div></div>
+        <div class="qs-step"><div class="n">4</div><div><h4>Ship a single file</h4><p>Embedded, zero-config. No servers, no daemons, no runtime dependencies.</p></div></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="qs-tabs" role="tablist">
+        <button class="qs-tab active" data-tab="rust">Rust</button>
+        <button class="qs-tab" data-tab="sql">SQL</button>
+        <button class="qs-tab" data-tab="kv">Key-Value</button>
+        <button class="qs-tab" data-tab="wasm">WebAssembly</button>
+        <button class="qs-tab" data-tab="c">C / FFI</button>
+      </div>
+      <div class="qs-code-wrap">
+        <div class="bar">
+          <span id="qsFile">src/main.rs</span>
+          <button class="copy" id="qsCopy">copy</button>
+        </div>
+        <pre class="code" id="qsCode"></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="block shell" id="seal">
+  <div class="sec-head">
+    <div class="eyebrow">How the seal works</div>
+    <h2>What "open my.db" actually does.</h2>
+    <p>Six stages from passphrase to a sealed 8,208-byte page on disk. Real algorithm names, real byte counts, drawn from the citadel-crypto source.</p>
+  </div>
+
+  <div class="kh" id="keyHierarchy" aria-label="Walkthrough of Citadel's page encryption: passphrase plus salt through Argon2id, AES-KW unwrap, HKDF split into DEK and MAC key, AES-256-CTR encrypt, HMAC-SHA256 sign, then the 8,208-byte page written to my.db.">
+    <div class="kh-head">
+      <div class="kh-title">
+        citadel-crypto &nbsp;/&nbsp; page seal pipeline
+        <b>What happens when Citadel writes one page to disk.</b>
+      </div>
+      <div class="kh-progress" id="khProgress" aria-hidden="true"></div>
+    </div>
+
+    <div class="kh-body">
+      <div class="kh-pipe" id="khPipe">
+        <div class="kh-stage" data-stage="0">
+          <div class="kh-slabel"><span>stdin + keyfile</span><b>Gather inputs</b></div>
+          <div class="kh-vis">
+            <div class="row">
+              <div class="kh-pass">
+                <span class="p">$</span>
+                <span class="label">passphrase:</span>
+                <span class="mask" id="khPassMask"></span><span class="caret"></span>
+              </div>
+              <span class="kh-arrow">+</span>
+              <div class="kh-chip" id="khSaltChip">
+                <span class="tag">salt</span>
+                <span class="hex" id="khSaltHex">-</span>
+                <span class="size">16 B</span>
+              </div>
+            </div>
+            <div class="row narrate" id="khN0">Read 16-byte salt from <code>my.db.citadel-keys</code>. The passphrase stays in memory only; never touches disk.</div>
+          </div>
+        </div>
+
+        <div class="kh-stage" data-stage="1">
+          <div class="kh-slabel"><span>memory-hard KDF</span><b>Argon2id</b></div>
+          <div class="kh-vis">
+            <div class="row"><div class="kh-argon" id="khArgon" aria-hidden="true"></div></div>
+            <div class="row">
+              <span class="kh-stat">params: <b>t=3, m=64 MiB, p=4</b></span>
+              <span class="kh-stat" id="khArgonProg">filling memory...</span>
+            </div>
+            <div class="row narrate" id="khN1">Fills 64 MiB of memory across three passes. Slow by design: a GPU attacker pays the same cost you do.</div>
+            <div class="row" style="margin-top:2px">
+              <span class="kh-arrow">&rarr;</span>
+              <div class="kh-chip derived" id="khMkChip"><span class="tag">master key</span><span class="hex" id="khMkHex">-</span><span class="size">32 B</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="kh-stage" data-stage="2">
+          <div class="kh-slabel"><span>RFC 3394</span><b>AES-KW unwrap</b></div>
+          <div class="kh-vis">
+            <div class="row">
+              <div class="kh-chip" id="khWrappedChip"><span class="tag">wrapped REK</span><span class="hex">40 B blob</span></div>
+              <span class="kh-arrow">&oplus;</span>
+              <div class="kh-chip" id="khMkRef"><span class="tag">master key</span></div>
+              <span class="kh-arrow">&rarr;</span>
+              <div class="kh-chip derived" id="khRekChip"><span class="tag">REK</span><span class="hex" id="khRekHex">-</span><span class="size">32 B</span></div>
+            </div>
+            <div class="row narrate" id="khN2">Unwraps the root encryption key. Rekeying only rewraps this 40-byte blob; no pages re-encrypted.</div>
+          </div>
+        </div>
+
+        <div class="kh-stage" data-stage="3">
+          <div class="kh-slabel"><span>RFC 5869 / once per open</span><b>HKDF-SHA256 split</b></div>
+          <div class="kh-vis">
+            <div class="row">
+              <div class="kh-chip" id="khRekRef"><span class="tag">REK</span><span class="size">32 B</span></div>
+              <span class="kh-arrow">&rarr;</span>
+              <span class="kh-stat">salt = <code style="color:var(--fg-2)">zeros(32)</code></span>
+            </div>
+            <div class="row">
+              <span class="kh-arrow">&rarr;</span>
+              <span class="kh-stat">info=<code style="color:var(--fg-2)">"citadel-dek-v1"</code></span>
+              <span class="kh-arrow">&rarr;</span>
+              <div class="kh-chip derived" id="khDekChip"><span class="tag">DEK</span><span class="hex" id="khDekHex">-</span><span class="size">32 B</span></div>
+            </div>
+            <div class="row">
+              <span class="kh-arrow">&rarr;</span>
+              <span class="kh-stat">info=<code style="color:var(--fg-2)">"citadel-mac-key-v1"</code></span>
+              <span class="kh-arrow">&rarr;</span>
+              <div class="kh-chip derived" id="khMacChip"><span class="tag">MAC key</span><span class="hex" id="khMacHex">-</span><span class="size">32 B</span></div>
+            </div>
+            <div class="row narrate" id="khN3">Domain-separated expansion: one call per label. DEK, MAC key, and an audit key live in memory for the session.</div>
+          </div>
+        </div>
+
+        <div class="kh-stage" data-stage="4">
+          <div class="kh-slabel"><span>AES-256-CTR + HMAC-SHA256</span><b>Seal the page</b></div>
+          <div class="kh-vis">
+            <div class="row">
+              <div class="kh-chip" id="khIvChip"><span class="tag">IV</span><span class="hex" id="khIvHex">-</span><span class="size">16 B</span></div>
+              <div class="kh-chip" id="khPtChip"><span class="tag">plaintext</span><span class="size">8,160 B</span></div>
+            </div>
+            <div class="row"><div class="kh-page" id="khPage" aria-hidden="true">
+              <div class="p-iv">IV</div>
+              <div class="p-ct">ciphertext</div>
+              <div class="p-mac">MAC</div>
+            </div></div>
+            <div class="row narrate" id="khN4">AES-256-CTR encrypts with a fresh random IV per page. HMAC signs <code>epoch &#8214; page_id &#8214; IV &#8214; ciphertext</code>, so a forged page id or replay from another epoch fails the tag. Page = <b style="color:var(--fg-2)">16 + 8,160 + 32 = 8,208 bytes</b>.</div>
+          </div>
+        </div>
+
+        <div class="kh-stage" data-stage="5">
+          <div class="kh-slabel"><span>citadel-io</span><b>fsync to disk</b></div>
+          <div class="kh-vis">
+            <div class="kh-disk">
+              <div class="df" id="khDfDb">
+                <span class="name">
+                  <svg width="11" height="13" viewBox="0 0 12 14" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M1.5 1.5h6l3 3v8h-9zM7.5 1.5v3h3"/></svg>
+                  my.db
+                </span>
+                <span class="contains">appended page <span id="khDfPage">#42</span> / IV &#8214; CT &#8214; MAC</span>
+                <span class="size" id="khDfDbSize">+ 8,208 B</span>
+              </div>
+              <div class="df" id="khDfKeys">
+                <span class="name">
+                  <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="5" cy="7" r="3"/><path d="M8 7h5M11 7v2M13 7v2"/></svg>
+                  my.db.citadel-keys
+                </span>
+                <span class="contains">unchanged / salt + wrapped REK + file MAC</span>
+                <span class="size">172 B</span>
+              </div>
+            </div>
+            <div class="row narrate" id="khN5">Two files, two secrets. Steal <code>my.db</code> alone and you get opaque ciphertext. Lose the passphrase and nothing opens.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="kh-foot">
+        <div>
+          <b>One derivation chain, one sealed page.</b> The passphrase never touches disk. Argon2id re-derives the master key in memory on every open.
+        </div>
+        <div class="counter" id="khCounter">keys derived once / seals page <span id="khCounterPage">42</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="block shell" id="memory">
+  <div class="sec-head">
+    <div class="eyebrow">Agent memory</div>
+    <h2>Encrypted memory for AI agents.</h2>
+    <p>citadel-mem stores memory as typed <b>atoms</b> grouped into <b>regions</b> and connected by typed <b>edges</b>. Recall blends vector similarity, keyword scoring, and recency; forgetting destroys keys, not just rows.</p>
+  </div>
+
+  <div class="ops">
+    <div class="op"><div class="name">remember</div><div class="desc">Store an atom with its embedding, payload, score, and TTL.</div></div>
+    <div class="op"><div class="name">recall</div><div class="desc">Hybrid retrieval: ANN + BM25 + recency + optional reranker.</div></div>
+    <div class="op"><div class="name">fetch</div><div class="desc">Deterministic listing by kind, no ranking.</div></div>
+    <div class="op"><div class="name">update</div><div class="desc">Replace an atom's payload in place.</div></div>
+    <div class="op"><div class="name">link</div><div class="desc">Typed directed edges between atoms; cycles rejected on DAG kinds.</div></div>
+    <div class="op"><div class="name">evolve</div><div class="desc">Recompute neighbors and decay scores over time.</div></div>
+    <div class="op"><div class="name">summarize</div><div class="desc">Per-kind digest of a region.</div></div>
+    <div class="op"><div class="name">evict</div><div class="desc">Selective forgetting by policy.</div></div>
+    <div class="op"><div class="name">forget</div><div class="desc">Cryptographic erasure with a verifiable receipt.</div></div>
+  </div>
+
+  <div class="arch" style="margin-top:36px">
+    <div class="arch-copy">
+      <p><b style="color:var(--fg)">Hybrid fusion recall.</b> A query over-fetches ANN candidates, then scores each on normalized semantic distance, BM25 keyword overlap, recency (30-day half-life), and importance. An optional cross-encoder reranker (replace or reciprocal-rank-fusion) sharpens the top results, and a graph walk pulls in linked neighbors.</p>
+      <p><b style="color:var(--fg)">Forgetting that is real.</b> On encrypted regions every atom is sealed under its own key, wrapped by a per-region key. <code>forget</code> and <code>evict</code> destroy those keys and return an erasure receipt; the ciphertext that remains is unrecoverable. Re-verify any atom off disk: authentic, tampered, or key-erased.</p>
+      <p><b style="color:var(--fg)">Bring your own embedder.</b> A keyword-only mock for tests, or Candle models (BGE small/base/large, MiniLM, E5-large) and a cross-encoder reranker, pulled on demand. CUDA optional.</p>
+    </div>
+    <div>
+      <div class="bench-kpis cols-2" style="margin-bottom:0">
+        <div class="kpi"><div class="val"><em>84.1</em>%</div><div class="lab">LoCoMo score (3-run mean)</div></div>
+        <div class="kpi"><div class="val"><em>91.6</em>%</div><div class="lab">retrieval ceiling</div></div>
+        <div class="kpi"><div class="val"><em>7</em></div><div class="lab">typed edge kinds</div></div>
+        <div class="kpi"><div class="val"><em>9</em></div><div class="lab">memory operations</div></div>
+      </div>
+      <p class="bench-note">LoCoMo long-term conversational-memory benchmark, encrypted regions, gpt-4o-mini reader and judge. Protocol and full numbers in <code>citadeldb-membench</code>.</p>
+    </div>
+  </div>
+</section>
+
+<section class="block shell" id="mcp">
+  <div class="sec-head">
+    <div class="eyebrow">Model Context Protocol</div>
+    <h2>Plug encrypted memory into Claude Desktop.</h2>
+    <p>citadel-mcp serves one memory region over MCP (JSON-RPC 2.0 on stdio) with 13 tools. Encrypted by default, with per-atom sealing and cryptographic erasure. Any MCP client - Claude Desktop, an IDE - can read and write it.</p>
+  </div>
+
+  <div class="qs">
+    <div class="sql-caps cols-2">
+      <div class="sql-cap">
+        <h5>Read tools</h5>
+        <ul>
+          <li>mem_recall</li>
+          <li>mem_fetch</li>
+          <li>mem_edges</li>
+          <li>mem_profile</li>
+          <li>mem_summarize</li>
+          <li>mem_verify</li>
+        </ul>
+      </div>
+      <div class="sql-cap">
+        <h5>Write &amp; forget tools</h5>
+        <ul>
+          <li>mem_remember</li>
+          <li>mem_remember_batch</li>
+          <li>mem_update</li>
+          <li>mem_link</li>
+          <li>mem_evolve</li>
+          <li>mem_evict</li>
+          <li>mem_forget</li>
+        </ul>
+      </div>
+    </div>
+    <div>
+      <div class="qs-code-wrap">
+        <div class="bar"><span>claude_desktop_config.json</span></div>
+        <pre class="code">{% raw %}{
+  "mcpServers": {
+    "citadel": {
+      "command": "citadel-mcp",
+      "args": [
+        "--db", "memory.citadel",
+        "--region", "agent",
+        "--embedder", "bge-small"
+      ],
+      "env": { "CITADEL_KEY": "your-passphrase" }
+    }
+  }
+}{% endraw %}</pre>
+      </div>
+      <p class="bench-note">Recall hits carry provenance, per-hit integrity verdicts, and <code>memory://atom/{id}</code> resource links. <code>mem_forget</code> returns an erasure receipt.</p>
+    </div>
+  </div>
+</section>
+
+<section class="block shell" id="benchmarks">
+  <div class="sec-head">
+    <div class="eyebrow">Benchmarks</div>
+    <h2>50 of 50 head-to-head, won.</h2>
+    <p>Single-threaded, 100K rows, <code class="mono" style="color:var(--accent)">(id INTEGER PK, name TEXT, age INTEGER)</code>. Equal cache budgets (~32 MB). Ratio is SQLite / Citadel time; higher means Citadel wins by more. Geometric mean ~2.8&times;.</p>
+  </div>
+
+  <div class="bench-kpis">
+    <div class="kpi"><div class="val"><em>362&times;</em></div><div class="lab">full_outer_join</div></div>
+    <div class="kpi"><div class="val"><em>318&times;</em></div><div class="lab">correlated_in</div></div>
+    <div class="kpi"><div class="val"><em>144&times;</em></div><div class="lab">count</div></div>
+    <div class="kpi"><div class="val"><em>1.03&times;</em></div><div class="lab">slowest (still wins)</div></div>
+  </div>
+
+  <div class="bench-table" id="benchTable">
+    <div class="row h">
+      <div>Benchmark</div>
+      <div>Relative speed</div>
+      <div>Citadel</div>
+      <div>SQLite</div>
+      <div>Ratio</div>
+    </div>
+  </div>
+  <div class="bench-note">SQLite: <code>journal_mode=OFF, synchronous=OFF, cache_size=8192</code>. Citadel: <code>SyncMode::Off, cache_size=4096</code>. Reproduce: <code>cargo bench -p citadeldb-sql --bench h2h_bench</code>.</div>
+</section>
+
+<section class="block shell" id="arch">
+  <div class="sec-head">
+    <div class="eyebrow">Architecture</div>
+    <h2>Eighteen crates, one file format.</h2>
+    <p>A layered engine: each crate has one job, depends only on the layers beneath it, and can be read on its own.</p>
+  </div>
+
+  <div class="arch">
+    <div class="arch-stack">
+      <div class="arch-row multi">
+        <div><span class="crate">citadel-cli</span><span class="desc">interactive shell</span></div>
+        <div><span class="crate">citadel-ffi</span><span class="desc">37 C-ABI functions</span></div>
+        <div><span class="crate">citadel-wasm</span><span class="desc">browser builds</span></div>
+      </div>
+      <div class="arch-row multi">
+        <div><span class="crate">citadel-mcp</span><span class="desc">MCP server</span></div>
+        <div><span class="crate">citadel-ai</span><span class="desc">agent runtime</span></div>
+        <div><span class="crate">citadel-membench</span><span class="desc">LoCoMo harness</span></div>
+      </div>
+      <div class="arch-row"><span class="crate">citadel-mem</span><span class="desc">regions / atoms / edges</span></div>
+      <div class="arch-row multi">
+        <div><span class="crate">citadel-sql</span><span class="desc">parser / planner / executor</span></div>
+        <div><span class="crate">citadel-vector</span><span class="desc">VECTOR / ANN</span></div>
+        <div><span class="crate">sql-json-path</span><span class="desc">SQL/JSON paths</span></div>
+      </div>
+      <div class="arch-row"><span class="crate">citadel</span><span class="desc">database API / builder / sync</span></div>
+      <div class="arch-row multi">
+        <div><span class="crate">citadel-txn</span><span class="desc">transactions</span></div>
+        <div><span class="crate">citadel-sync</span><span class="desc">replication</span></div>
+        <div><span class="crate">citadel-crypto</span><span class="desc">keys / ciphers</span></div>
+      </div>
+      <div class="arch-row double">
+        <div><span class="crate">citadel-buffer</span><span class="desc">SIEVE buffer pool</span></div>
+        <div><span class="crate">citadel-page</span><span class="desc">page codec</span></div>
+      </div>
+      <div class="arch-row"><span class="crate">citadel-io</span><span class="desc">file I/O / fsync / io_uring</span></div>
+      <div class="arch-row"><span class="crate">citadel-core</span><span class="desc">types / errors / constants</span></div>
+    </div>
+
+    <div class="arch-copy">
+      <p><b style="color:var(--fg)">Page layout is 8,208 bytes.</b> Sixteen bytes of random IV, 8,160 bytes of ciphertext, 32 bytes of HMAC-SHA256. Corrupt pages fail loud, not silent.</p>
+      <p><b style="color:var(--fg)">Commit protocol is shadow paging.</b> Dirty pages go to new locations, BLAKE3 Merkle hashes climb bottom-up, the inactive 240-byte commit slot is updated, then one byte in the file header flips to publish the new root. No write-ahead log.</p>
+      <p><b style="color:var(--fg)">The memory layers reuse the same pages.</b> Vectors, atoms, and edges are stored, encrypted, and committed exactly like table rows - one file format, one crypto path. <code>citadel-membench</code> is the LoCoMo harness that measures recall on top.</p>
+    </div>
+  </div>
+
+  <div class="commit-anim" id="commitAnim" aria-label="Animated walkthrough of the commit protocol: copy-on-write, Merkle roll-up, inactive slot update, god byte flip.">
+    <div class="ca-head">
+      <div class="ca-title">Commit Protocol</div>
+      <div class="ca-step-label"><span id="caStep">1</span> / 4 &nbsp;/&nbsp; <span id="caLabel">Copy-on-write new pages</span></div>
+      <div class="ca-controls">
+        <button type="button" data-ca="pause" title="Pause / resume">
+          <svg class="ico-pause" width="12" height="12" viewBox="0 0 12 12" fill="none"><rect x="3" y="2" width="2" height="8" fill="currentColor"/><rect x="7" y="2" width="2" height="8" fill="currentColor"/></svg>
+          <svg class="ico-play" width="12" height="12" viewBox="0 0 12 12" fill="none" style="display:none"><path d="M3 2l7 4-7 4V2z" fill="currentColor"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="ca-narr" id="caNarr" aria-live="polite">
+      <span class="ca-narr-bullet"></span>
+      <span class="ca-narr-text" id="caNarrText">Two dirty pages in the buffer pool are ready to commit. Before a single byte touches disk, the active slot stays untouched, so a crash right now leaves the last good snapshot intact.</span>
+    </div>
+
+    <div class="ca-scene">
+      <div class="ca-col ca-col-buffer">
+        <div class="ca-col-title">citadel-buffer &nbsp;<span class="hint">in memory</span></div>
+        <div class="ca-buffer">
+          <div class="bp-row">
+            <div class="bp-page dirty" data-pid="p1"><span class="dot"></span><span class="pid">page #42</span><span class="state">modified</span></div>
+            <div class="bp-page clean" data-pid="p2"><span class="dot"></span><span class="pid">page #43</span><span class="state">clean</span></div>
+          </div>
+          <div class="bp-row">
+            <div class="bp-page dirty" data-pid="p3"><span class="dot"></span><span class="pid">page #44</span><span class="state">modified</span></div>
+            <div class="bp-page clean" data-pid="p4"><span class="dot"></span><span class="pid">page #45</span><span class="state">clean</span></div>
+          </div>
+        </div>
+        <div class="ca-col-note">SIEVE pool / 4,096 frames</div>
+      </div>
+
+      <div class="ca-arrow">
+        <svg viewBox="0 0 80 140" preserveAspectRatio="none">
+          <defs>
+            <marker id="caArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+              <path d="M0,0 L10,5 L0,10 Z" fill="currentColor"/>
+            </marker>
+          </defs>
+          <path d="M0,70 L70,70" stroke="currentColor" stroke-width="1.2" marker-end="url(#caArrow)" fill="none"/>
+        </svg>
+        <div class="ca-arrow-label" id="caArrowLabel">encode / seal</div>
+      </div>
+
+      <div class="ca-col ca-col-file">
+        <div class="ca-col-title">my.db &nbsp;<span class="hint">on disk</span></div>
+        <div class="ca-file">
+          <div class="ca-godbyte" data-slot="A">
+            <div class="gb-label">god byte / 1 B</div>
+            <div class="gb-bits" aria-label="Eight bits in the god byte">
+              <span class="gb-bit" data-bit="7">0</span>
+              <span class="gb-bit" data-bit="6">0</span>
+              <span class="gb-bit" data-bit="5">0</span>
+              <span class="gb-bit" data-bit="4">0</span>
+              <span class="gb-bit" data-bit="3">0</span>
+              <span class="gb-bit" data-bit="2">0</span>
+              <span class="gb-bit" data-bit="1">0</span>
+              <span class="gb-bit active" id="gbBit0" data-bit="0">0</span>
+            </div>
+            <div class="gb-legend">
+              <span class="gb-legend-row"><span class="gb-legend-dot"></span>bit 0 / active slot</span>
+              <span class="gb-legend-val">
+                <span class="gb-opt active" data-slot="A">A</span>
+                <span class="gb-sep">/</span>
+                <span class="gb-opt" data-slot="B">B</span>
+              </span>
+            </div>
+          </div>
+
+          <div class="ca-slots">
+            <div class="ca-slot" data-slot="A">
+              <div class="slot-head">
+                <span>slot A / 240 B</span>
+                <span class="root">merkle: <span class="h">8a1c...e4f2</span></span>
+                <span class="badge active">active</span>
+              </div>
+              <div class="slot-pages">
+                <div class="sp old" data-pid="p1"><span>#42</span></div>
+                <div class="sp" data-pid="p2"><span>#43</span></div>
+                <div class="sp old" data-pid="p3"><span>#44</span></div>
+                <div class="sp" data-pid="p4"><span>#45</span></div>
+              </div>
+            </div>
+
+            <div class="ca-slot" data-slot="B">
+              <div class="slot-head">
+                <span>slot B / 240 B</span>
+                <span class="root">merkle: <span class="h" data-slot-root="B">-</span></span>
+                <span class="badge shadow">shadow</span>
+              </div>
+              <div class="slot-pages">
+                <div class="sp ghost" data-pid="p1"></div>
+                <div class="sp ghost" data-pid="p2"></div>
+                <div class="sp ghost" data-pid="p3"></div>
+                <div class="sp ghost" data-pid="p4"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ca-merkle" id="caMerkle" aria-label="Merkle tree rolled up from the four page hashes; root summarizes the snapshot.">
+          <div class="m-header">
+            <span class="m-title">Merkle tree</span>
+            <span class="m-cap">leaves = page hashes / root = BLAKE3, 28 B</span>
+          </div>
+          <svg viewBox="0 0 480 170" preserveAspectRatio="xMidYMin meet" role="img">
+            <g class="m-edges" stroke-linecap="round">
+              <line x1="60" y1="140" x2="120" y2="80" data-edge="l0"/>
+              <line x1="180" y1="140" x2="120" y2="80" data-edge="l1"/>
+              <line x1="300" y1="140" x2="360" y2="80" data-edge="l2"/>
+              <line x1="420" y1="140" x2="360" y2="80" data-edge="l3"/>
+              <line x1="120" y1="80" x2="240" y2="28" data-edge="m0"/>
+              <line x1="360" y1="80" x2="240" y2="28" data-edge="m1"/>
+            </g>
+            <g class="m-leaves">
+              <g class="m-node" data-pid="p1" transform="translate(60 140)"><circle r="16"/><text>#42</text></g>
+              <g class="m-node" data-pid="p2" transform="translate(180 140)"><circle r="16"/><text>#43</text></g>
+              <g class="m-node" data-pid="p3" transform="translate(300 140)"><circle r="16"/><text>#44</text></g>
+              <g class="m-node" data-pid="p4" transform="translate(420 140)"><circle r="16"/><text>#45</text></g>
+            </g>
+            <g class="m-mids">
+              <g class="m-node m-mid" data-mid="0" transform="translate(120 80)"><circle r="15"/><text>h&#8321;&#8322;</text></g>
+              <g class="m-node m-mid" data-mid="1" transform="translate(360 80)"><circle r="15"/><text>h&#8323;&#8324;</text></g>
+            </g>
+            <g class="m-node m-root" id="caMerkleRoot" transform="translate(240 28)">
+              <circle r="18"/>
+              <text>root</text>
+            </g>
+          </svg>
+        </div>
+      </div>
+    </div>
+
+    <div class="ca-steps">
+      <button type="button" class="ca-chip active" data-step="1"><span class="n">1</span>Write dirty pages to new locations (CoW)</button>
+      <button type="button" class="ca-chip" data-step="2"><span class="n">2</span>Compute BLAKE3 Merkle hashes bottom-up</button>
+      <button type="button" class="ca-chip" data-step="3"><span class="n">3</span>Update the inactive 240-byte commit slot</button>
+      <button type="button" class="ca-chip" data-step="4"><span class="n">4</span>Flip one byte in the file header</button>
+    </div>
+  </div>
+</section>
+
+<section class="block shell" id="sql">
+  <div class="sec-head">
+    <div class="eyebrow">SQL</div>
+    <h2>A SQL dialect that doesn't disappoint.</h2>
+    <p>FULL OUTER and LATERAL joins, recursive and DML-bearing CTEs, triggers, materialized views, window frames, JSON/JSONB with PostgreSQL operators, full-text search, and a native <code class="mono">VECTOR</code> type.</p>
+  </div>
+
+  <div class="sql-caps">
+    <div class="sql-cap">
+      <h5>Statements</h5>
+      <ul>
+        <li>CREATE / DROP / ALTER TABLE</li>
+        <li>CREATE INDEX (partial / expr)</li>
+        <li>CREATE VIEW / MATERIALIZED VIEW</li>
+        <li>CREATE TRIGGER</li>
+        <li>UPSERT (ON CONFLICT)</li>
+        <li>RETURNING (OLD / NEW)</li>
+        <li>TRUNCATE / SAVEPOINT</li>
+        <li>PREPARED / $1, $2, ...</li>
+        <li>EXPLAIN</li>
+      </ul>
+    </div>
+    <div class="sql-cap">
+      <h5>Clauses &amp; joins</h5>
+      <ul>
+        <li>INNER / LEFT / RIGHT / CROSS</li>
+        <li>FULL OUTER / LATERAL</li>
+        <li>Subq.: scalar / IN / EXISTS / ANY/ALL</li>
+        <li>Correlated subqueries</li>
+        <li>WITH / WITH RECURSIVE</li>
+        <li>WITH-DML (RETURNING)</li>
+        <li>UNION / INTERSECT / EXCEPT</li>
+        <li>GROUP BY / HAVING</li>
+        <li>Window frames (ROWS / RANGE)</li>
+      </ul>
+    </div>
+    <div class="sql-cap">
+      <h5>JSON / JSONB &amp; search</h5>
+      <ul>
+        <li>14 PostgreSQL operators</li>
+        <li><code>-&gt;</code> / <code>-&gt;&gt;</code> / <code>#&gt;</code> / <code>#&gt;&gt;</code></li>
+        <li><code>@&gt;</code> / <code>&lt;@</code> / <code>?</code> / <code>?|</code> / <code>?&amp;</code></li>
+        <li>16 scalar / 4 aggregate fns</li>
+        <li>GIN indexes on JSONB</li>
+        <li>FTS: tsvector / ts_rank / phrase</li>
+        <li><code>VECTOR(N)</code> + ANN index</li>
+        <li><code>&lt;-&gt;</code> L2 / <code>&lt;#&gt;</code> inner / <code>&lt;=&gt;</code> cosine</li>
+      </ul>
+    </div>
+    <div class="sql-cap">
+      <h5>Types / constraints / windows</h5>
+      <ul>
+        <li>INT / REAL / TEXT / BLOB / BOOL</li>
+        <li>DATE / TIME / TIMESTAMP(TZ)</li>
+        <li>INTERVAL / IANA zones (jiff)</li>
+        <li>Generated cols (STORED / VIRTUAL)</li>
+        <li>STRICT tables</li>
+        <li>COLLATE BINARY / NOCASE / RTRIM</li>
+        <li>FK: CASCADE / SET NULL / DEFERRABLE</li>
+        <li>ROW_NUMBER / RANK / LAG / LEAD</li>
+        <li>SUM / AVG OVER / PARTITION BY</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="block shell" id="security">
+  <div class="sec-head">
+    <div class="eyebrow">Security</div>
+    <h2>Keys are handled like they matter.</h2>
+  </div>
+
+  <div class="sec-grid">
+    <div class="sec-card">
+      <h4><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="10" width="16" height="11" rx="1"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>No plaintext on disk</h4>
+      <p>Every page is encrypted before writing, authenticated before reading. The database file is indistinguishable from random.</p>
+    </div>
+    <div class="sec-card">
+      <h4><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h18M12 3v18M7 7l10 10M17 7L7 17"/></svg>Keys live outside the database</h4>
+      <p>Encryption material lives in <code>{dbname}.citadel-keys</code>. The passphrase derives a master key in memory via Argon2id and never touches disk.</p>
+    </div>
+    <div class="sec-card">
+      <h4><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 12a8 8 0 1 1 16 0M20 12l-3-3M20 12l3-3"/><path d="M20 12a8 8 0 0 1-16 0M4 12l3 3M4 12l-3 3"/></svg>Instant rekey</h4>
+      <p>Changing a passphrase re-wraps the root key only. No pages are re-encrypted. The operation is instant regardless of database size.</p>
+    </div>
+    <div class="sec-card">
+      <h4><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l8 4v5c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V7z"/><path d="M9 12l2 2 4-4"/></svg>Cryptographic erasure</h4>
+      <p>citadel-mem seals each atom and region under its own key. Forgetting destroys the key and issues a receipt; the remaining ciphertext cannot be recovered.</p>
+    </div>
+    <div class="sec-card">
+      <h4><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="6" cy="12" r="3"/><circle cx="18" cy="12" r="3"/><path d="M9 12h6"/></svg>Forward-secret sync</h4>
+      <p>Noise <code>NNpsk0_25519_ChaChaPoly_BLAKE2s</code> with a 256-bit PSK. Ephemeral Curve25519 keys per session; compromise of one doesn't leak prior traffic.</p>
+    </div>
+    <div class="sec-card">
+      <h4><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 3v9l6 3"/></svg>FIPS 140-3 mode</h4>
+      <p>A feature flag swaps Argon2id for PBKDF2-HMAC-SHA256 (600,000+ iterations) with AES-256-CTR only, for compliance environments.</p>
+    </div>
+  </div>
+</section>
+
+<section class="block shell" id="bindings">
+  <div class="sec-head">
+    <div class="eyebrow">Distribution</div>
+    <h2>Rust, C, WebAssembly, and a CLI.</h2>
+  </div>
+  <div class="bindings">
+    <div class="binding">
+      <div class="top"><h4>Rust</h4><span class="ver">crates.io / citadeldb</span></div>
+      <p>The reference API. Builder-style open, typed transactions, no hidden allocation. 15 crates published.</p>
+      <div class="inst"><span class="prompt">$</span> cargo add citadeldb citadeldb-sql</div>
+    </div>
+    <div class="binding">
+      <div class="top"><h4>C / C++</h4><span class="ver">cbindgen / citadel.h</span></div>
+      <p>37 panic-safe functions, static or dynamic linkage. Drop into any toolchain that speaks C ABI.</p>
+      <div class="inst"><span class="prompt">&gt;</span> #include &lt;citadel.h&gt;</div>
+    </div>
+    <div class="binding">
+      <div class="top"><h4>WebAssembly</h4><span class="ver">npm / @citadeldb/wasm</span></div>
+      <p>A real encrypted database in your browser tab. Compiled with <code>wasm-pack</code>. Powers the playground.</p>
+      <div class="inst"><span class="prompt">$</span> npm install @citadeldb/wasm</div>
+    </div>
+    <div class="binding">
+      <div class="top"><h4>CLI</h4><span class="ver">crates.io / citadeldb-cli</span></div>
+      <p>An interactive SQL shell with tab completion, syntax highlighting, and 26 dot-commands.</p>
+      <div class="inst"><span class="prompt">$</span> cargo install citadeldb-cli</div>
+    </div>
+  </div>
+</section>
+
+{% set blog = get_section(path="blog/_index.md") %}
+{% if blog.pages | length > 0 %}
+<section class="block shell">
+  <div class="sec-head">
+    <div class="eyebrow">Writing</div>
+    <h2>From the blog.</h2>
+  </div>
+  <ul class="post-list">
+    {% for page in blog.pages | slice(end=3) %}
+    <li>
+      <a href="{{ page.permalink }}">{{ page.title }}</a>
+      <time>{{ page.date | date(format="%B %-d, %Y") }}</time>
+      {% if page.description %}<p class="post-summary">{{ page.description }}</p>{% endif %}
+    </li>
     {% endfor %}
-    </ul>
+  </ul>
 </section>
 {% endif %}
+
+<section class="shell">
+  <div class="cta-band">
+    <div>
+      <h3>Start with the browser build.</h3>
+      <p>No install, no signup. Run real SQL against an encrypted database compiled to WebAssembly.</p>
+    </div>
+    <div class="cta-actions">
+      <a class="btn" href="{{ get_url(path='@/demo/_index.md') }}">Open playground</a>
+    </div>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ get_url(path='js/home.js') }}"></script>
 {% endblock %}

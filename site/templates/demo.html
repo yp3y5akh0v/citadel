@@ -1,0 +1,158 @@
+{% extends "base.html" %}
+
+{% block title %}Playground - Citadel{% endblock %}
+{% block description %}Run real SQL against an encrypted Citadel database compiled to WebAssembly, right in your browser. No server, nothing leaves your machine.{% endblock %}
+
+{% block content %}
+<main class="shell demo-wrap">
+  <div class="demo-head">
+    <div>
+      <div class="eyebrow">Playground / runs in your browser</div>
+      <h1>Explore SQL against a <span class="ac">sealed</span> database.</h1>
+      <p>A real Citadel database compiled to WebAssembly. Your SQL runs locally against an encrypted in-memory engine - no server, nothing leaves your machine.</p>
+    </div>
+    <div class="demo-kpi">
+      <div><b id="kpiTables">4</b>tables</div>
+      <div><b id="kpiRows">34</b>rows</div>
+      <div><b id="kpiMs">0.0<span style="color:var(--fg-3);font-weight:400;font-size:14px;margin-left:2px">ms</span></b>last query</div>
+    </div>
+  </div>
+
+  <div class="demo" id="demo">
+    <div class="demo-top">
+      <div class="db-info">
+        <img class="db-logo" src="{{ get_url(path='logo.png') }}" alt="" aria-hidden="true">
+        <div class="db-name">playground.db</div>
+        <div class="meta">
+          <span>AES-256-CTR</span>
+          <span>HMAC-SHA256</span>
+          <span>page 8,208 B</span>
+          <span id="pgStatus" class="meta-status">loading...</span>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="runBtn" class="primary" title="Ctrl/Cmd+Enter" disabled>Run</button>
+        <button id="fmtBtn">Format</button>
+        <button id="resetBtn">Reset</button>
+      </div>
+      <div class="runtime">WASM / @citadeldb/wasm</div>
+    </div>
+
+    <aside class="demo-sidebar">
+      <div class="sidebar-sect"><span>Tables</span><span class="count">4</span></div>
+      <div class="tbl-list">
+        <div class="tbl-item active" data-tbl="users"><span class="icon">&#8862;</span><span>users</span><span class="count">12</span></div>
+        <div class="tbl-item" data-tbl="events"><span class="icon">&#8862;</span><span>events</span><span class="count">8</span></div>
+        <div class="tbl-item" data-tbl="ref_table"><span class="icon">&#8862;</span><span>ref_table</span><span class="count">10</span></div>
+        <div class="tbl-item" data-tbl="docs"><span class="icon">&#8862;</span><span>docs</span><span class="count">4</span></div>
+      </div>
+
+      <div class="snippets">
+        <div class="sidebar-sect" style="border-top:1px solid var(--line);border-bottom:1px solid var(--line)"><span>Snippets</span></div>
+        <div class="snippet-item" data-snippet="point"><span class="sk">Basic</span>Point lookup on users</div>
+        <div class="snippet-item" data-snippet="window"><span class="sk">Window</span>ROW_NUMBER + rolling SUM</div>
+        <div class="snippet-item" data-snippet="cte"><span class="sk">Recursive CTE</span>Sum of 1..100</div>
+        <div class="snippet-item" data-snippet="dates"><span class="sk">Dates</span>DATE_TRUNC by month</div>
+        <div class="snippet-item" data-snippet="groupby"><span class="sk">Aggregate</span>GROUP BY kind</div>
+        <div class="snippet-item" data-snippet="correlated"><span class="sk">Correlated</span>EXISTS subquery</div>
+        <div class="snippet-item" data-snippet="json"><span class="sk">JSON / JSONB</span>Extract with -&gt;&gt;</div>
+        <div class="snippet-item" data-snippet="upsert"><span class="sk">UPSERT</span>ON CONFLICT ... RETURNING</div>
+        <div class="snippet-item" data-snippet="explain"><span class="sk">EXPLAIN</span>B+ tree query plan</div>
+      </div>
+    </aside>
+
+    <section class="demo-main">
+      <div class="editor">
+        <div class="gutter" id="gutter"></div>
+        <div class="editor-area">
+          <pre class="hl" id="hl"></pre>
+          <textarea id="sqlInput" spellcheck="false"></textarea>
+        </div>
+      </div>
+    </section>
+
+    <section class="demo-result">
+      <div class="result-tabs">
+        <button class="result-tab active" data-panel="rows">Result <span class="badge" id="rowCount">0</span></button>
+        <button class="result-tab" data-panel="plan">Plan</button>
+        <button class="result-tab" data-panel="log">Log</button>
+      </div>
+      <div class="result-body" id="resultBody"></div>
+    </section>
+
+    <aside class="demo-inspector">
+      <div class="insp-head"><span>Inspector</span><span class="live">live</span></div>
+      <div class="insp-body">
+        <div class="insp-card">
+          <h5>Storage</h5>
+          <div class="insp-row"><span>mode</span><span>in-memory</span></div>
+          <div class="insp-row"><span>on disk</span><span style="color:var(--accent)">100% ciphertext</span></div>
+          <div class="insp-row"><span>page</span><span>8,208 B</span></div>
+          <div class="insp-row"><span>cipher</span><span>aes-256-ctr</span></div>
+          <div class="insp-row"><span>mac</span><span>hmac-sha256</span></div>
+          <div class="page-ring" id="pageRing"></div>
+        </div>
+        <div class="insp-card">
+          <h5 id="schemaTitle">users</h5>
+          <div class="schema" id="schema"></div>
+        </div>
+        <div class="insp-card">
+          <h5>Last query</h5>
+          <div class="insp-row"><span>exec</span><span id="mExec">-</span></div>
+          <div class="insp-row"><span>rows</span><span id="mRows">0</span></div>
+          <div class="insp-row"><span>isolation</span><span>snapshot</span></div>
+        </div>
+        <div class="insp-card">
+          <h5>Key hierarchy</h5>
+          <div class="insp-row"><span>kdf</span><span>argon2id</span></div>
+          <div class="insp-row"><span>wrap</span><span>aes-kw</span></div>
+          <div class="insp-row"><span>per-page IV</span><span>random</span></div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <div class="demo-status">
+    <div><span class="lab">Runtime</span><span class="val"><em>WASM</em> / in-browser</span></div>
+    <div><span class="lab">On-disk</span><span class="val"><em>100%</em> ciphertext</span></div>
+    <div><span class="lab">Isolation</span><span class="val"><em>snapshot</em> (CoW B+tree)</span></div>
+    <div><span class="lab">Session</span><span class="val" id="sessTime">00:00:00</span></div>
+    <div><span class="lab">Build</span><span class="val">v1.1.0</span></div>
+  </div>
+
+  <div class="explainers">
+    <div class="explainer">
+      <div class="num">01 / this is the real engine</div>
+      <h4>Not a simulation.</h4>
+      <p>Citadel is compiled to WebAssembly and runs entirely in your tab via <code>@citadeldb/wasm</code>. Your SQL executes against a real encrypted in-memory database; nothing is sent anywhere.</p>
+    </div>
+    <div class="explainer">
+      <div class="num">02 / every page is 8,208 B</div>
+      <h4>16 IV + 8,160 ct + 32 MAC.</h4>
+      <p>A 16-byte random IV, 8,160 bytes of AES-256-CTR ciphertext, and a 32-byte HMAC-SHA256 tag, verified before decryption. The same format on disk, in memory, and in the browser.</p>
+    </div>
+    <div class="explainer">
+      <div class="num">03 / the benchmark numbers</div>
+      <h4>Reproduce with one command.</h4>
+      <p><code>cargo bench -p citadeldb-sql --bench h2h_bench</code> runs the 50 head-to-head benchmarks against unencrypted SQLite at equal cache budgets.</p>
+    </div>
+  </div>
+</main>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ get_url(path='js/playground.js') }}"></script>
+<script type="module">
+  import init, { CitadelDb } from '{{ get_url(path="wasm/citadel_wasm.js") | safe }}';
+  (async () => {
+    try {
+      await init({ module_or_path: '{{ get_url(path="wasm/citadel_wasm_bg.wasm") | safe }}' });
+      const db = new CitadelDb("playground");
+      for (const stmt of window.CitadelPlayground.SEED) db.run(stmt);
+      window.CitadelPlayground.onReady((sql) => db.run(sql));
+    } catch (e) {
+      window.CitadelPlayground.onError(String(e));
+    }
+  })();
+</script>
+{% endblock %}

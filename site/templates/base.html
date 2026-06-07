@@ -4,33 +4,96 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}{{ config.title }}{% endblock %}</title>
-    <meta name="description" content="{{ config.description }}">
+    <meta name="description" content="{% block description %}{{ config.description }}{% endblock %}">
     <link rel="icon" href="{{ get_url(path='favicon.ico') }}" sizes="any">
     <link rel="icon" type="image/png" sizes="32x32" href="{{ get_url(path='favicon-32x32.png') }}">
     <link rel="icon" type="image/png" sizes="16x16" href="{{ get_url(path='favicon-16x16.png') }}">
     <link rel="apple-touch-icon" sizes="180x180" href="{{ get_url(path='apple-touch-icon.png') }}">
     <link rel="manifest" href="{{ get_url(path='site.webmanifest') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{{ get_url(path='css/style.css', cachebust=true) }}">
     {% block head %}{% endblock %}
 </head>
 <body>
     <nav class="nav">
-        <div class="nav-inner">
-            <a class="nav-logo" href="{{ config.base_url }}"><img src="{{ get_url(path='logo.png') }}" alt="" width="56" height="56">Citadel</a>
-            <button class="nav-toggle" aria-label="Menu" onclick="this.classList.toggle('open');document.querySelector('.nav-links').classList.toggle('open')">
+        <div class="shell nav-inner">
+            <a class="brand" href="{{ config.base_url }}">
+                <span class="brand-mark"><img src="{{ get_url(path='logo.png') }}" alt="Citadel logo"></span>
+                Citadel
+            </a>
+            <button class="nav-toggle" aria-label="Menu" aria-expanded="false" aria-controls="navLinks" onclick="const o=this.classList.toggle('open');document.getElementById('navLinks').classList.toggle('open');this.setAttribute('aria-expanded',o)">
                 <span></span><span></span><span></span>
             </button>
-            <div class="nav-links">
-                <a href="{{ get_url(path='@/blog/_index.md') }}">Blog</a>
-                <a href="{{ get_url(path='@/demo/_index.md') }}">Playground</a>
-                <a href="{{ get_url(path='@/about/_index.md') }}">About</a>
-                <a href="{{ config.extra.github }}" target="_blank" rel="noopener">GitHub</a>
+            <div class="nav-links" id="navLinks">
+                <a href="{{ config.base_url }}/" {% if current_path == "/" %}class="active"{% endif %} data-top="1">Home</a>
+                <a href="{{ config.base_url }}/#features">Features</a>
+                <a href="{{ config.base_url }}/#memory">Memory</a>
+                <a href="{{ config.base_url }}/#benchmarks">Benchmarks</a>
+                <a href="{{ get_url(path='@/demo/_index.md') }}" {% if current_path is starting_with("/demo") %}class="active"{% endif %}>Playground</a>
+                <a href="{{ get_url(path='@/blog/_index.md') }}" {% if current_path is starting_with("/blog") %}class="active"{% endif %}>Blog</a>
+                <a href="{{ get_url(path='@/about/_index.md') }}" {% if current_path is starting_with("/about") %}class="active"{% endif %}>About</a>
+            </div>
+            <div class="nav-right">
+                <a class="chip" href="https://crates.io/crates/citadeldb" target="_blank" rel="noopener" data-version-chip><span class="dot"></span><span data-version-label>citadeldb</span></a>
+                <a class="btn ghost sm" href="{{ config.extra.github }}" target="_blank" rel="noopener">
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+                    GitHub
+                </a>
             </div>
         </div>
     </nav>
-    <main class="content">
+
+    <main>
         {% block content %}{% endblock %}
     </main>
-    <footer class="footer"></footer>
+
+    <footer class="foot">
+        <div class="shell">
+            <div class="foot-grid">
+                <div>
+                    <div class="brand" style="margin-bottom:12px">
+                        <span class="brand-mark"><img src="{{ get_url(path='logo.png') }}" alt="Citadel logo"></span>
+                        Citadel
+                    </div>
+                    <p class="muted" style="max-width:36ch;margin:0;font-size:13px">Encrypted-first embedded database and agent-memory engine. Written in Rust. MIT or Apache-2.0.</p>
+                </div>
+                <div>
+                    <h4>Product</h4>
+                    <ul>
+                        <li><a href="{{ config.base_url }}/#features">Features</a></li>
+                        <li><a href="{{ config.base_url }}/#memory">Agent memory</a></li>
+                        <li><a href="{{ config.base_url }}/#benchmarks">Benchmarks</a></li>
+                        <li><a href="{{ get_url(path='@/demo/_index.md') }}">Playground</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Resources</h4>
+                    <ul>
+                        <li><a href="{{ get_url(path='@/blog/_index.md') }}">Blog</a></li>
+                        <li><a href="{{ get_url(path='@/about/_index.md') }}">About</a></li>
+                        <li><a href="{{ config.extra.github }}#license" target="_blank" rel="noopener">License</a></li>
+                        <li><a href="{{ config.extra.github }}/blob/master/SECURITY.md" target="_blank" rel="noopener">Security</a></li>
+                    </ul>
+                </div>
+                <div>
+                    <h4>Community</h4>
+                    <ul>
+                        <li><a href="{{ config.extra.github }}" target="_blank" rel="noopener">GitHub <span aria-hidden="true">&#8599;</span></a></li>
+                        <li><a href="https://crates.io/crates/citadeldb" target="_blank" rel="noopener">crates.io <span aria-hidden="true">&#8599;</span></a></li>
+                        <li><a href="https://www.npmjs.com/package/@citadeldb/wasm" target="_blank" rel="noopener">npm <span aria-hidden="true">&#8599;</span></a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="foot-bottom">
+                <span>&copy; 2026 Citadel</span>
+                <span>MIT / Apache-2.0</span>
+            </div>
+        </div>
+    </footer>
+
+    {% block scripts %}{% endblock %}
+    <script src="{{ get_url(path='js/version-chip.js') }}"></script>
 </body>
 </html>
