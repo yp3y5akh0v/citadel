@@ -8,7 +8,8 @@ publish = false
 description = "WASM bindings for Citadel encrypted database"
 homepage.workspace = true
 repository.workspace = true
-keywords = ["database", "embedded-database", "encryption", "encrypted-database", "sql", "wasm", "webassembly"]
+keywords = ["database", "encryption", "wasm", "webassembly", "sql"]
+categories = ["wasm", "database-implementations", "cryptography"]
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ["--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-sign-ext", "--enable-mutable-globals"]

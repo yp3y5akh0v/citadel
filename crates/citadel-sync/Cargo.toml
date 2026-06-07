@@ -7,8 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["database-sync", "replication", "crdt", "merkle-tree", "distributed"]
+categories = ["database-implementations", "network-programming", "algorithms", "data-structures"]
 description = "Replication and sync layer for Citadel encrypted database"
 readme = "README.md"
 

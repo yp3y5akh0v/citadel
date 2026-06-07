@@ -7,8 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["sql", "database", "query-engine", "sql-parser", "transactions"]
+categories = ["database-implementations", "database", "parsing", "encoding"]
 description = "SQL parser, planner, and executor for Citadel encrypted database"
 readme = "README.md"
 

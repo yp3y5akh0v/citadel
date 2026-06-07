@@ -7,8 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["vector-search", "embeddings", "ann", "vector", "database"]
+categories = ["database-implementations", "data-structures", "algorithms"]
 description = "VECTOR(N) type and filtered ANN index for Citadel encrypted database"
 readme = "README.md"
 

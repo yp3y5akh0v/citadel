@@ -7,8 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["agent-memory", "ai", "embeddings", "vector-search", "encrypted-memory"]
+categories = ["database-implementations", "artificial-intelligence", "cryptography", "data-structures", "caching"]
 description = "Encrypted-first agent memory engine for Citadel"
 readme = "README.md"
 

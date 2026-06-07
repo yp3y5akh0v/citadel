@@ -7,8 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["database", "buffer-pool", "sieve-cache", "b-plus-tree", "copy-on-write"]
+categories = ["database-implementations", "caching", "cryptography"]
 description = "Buffer pool with SIEVE eviction and encrypt/decrypt pipeline for Citadel"
 readme = "README.md"
 

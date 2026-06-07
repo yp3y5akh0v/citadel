@@ -7,8 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["ai", "llm", "agent", "autonomous", "memory"]
+categories = ["artificial-intelligence", "api-bindings"]
 description = "Autonomous agent runtime for Citadel: ReAct + Reflexion + memory-backed plan caching"
 readme = "README.md"
 

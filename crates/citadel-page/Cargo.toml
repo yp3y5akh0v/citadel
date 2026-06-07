@@ -7,8 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["database", "b-plus-tree", "page-format", "slotted-pages", "checksum"]
+categories = ["database-implementations", "data-structures", "encoding"]
 description = "Page format, serialization, and checksum for Citadel B+ tree pages"
 readme = "README.md"
 

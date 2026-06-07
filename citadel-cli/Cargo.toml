@@ -7,8 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["sql-shell", "repl", "encrypted-database", "cli", "database-client"]
+categories = ["command-line-utilities", "database"]
 description = "Interactive SQL shell for Citadel encrypted database"
 readme = "README.md"
 

@@ -7,8 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["encryption", "cryptography", "aes-256", "hmac", "key-derivation"]
+categories = ["cryptography", "database-implementations", "algorithms"]
 description = "Cryptographic primitives for Citadel: AES-256-CTR + HMAC-SHA256, key management, Argon2id"
 readme = "README.md"
 

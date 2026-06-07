@@ -7,8 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["mcp", "ai", "agent", "memory", "llm"]
+categories = ["artificial-intelligence", "database", "cryptography"]
 description = "Model Context Protocol (MCP) server exposing Citadel encrypted memory as tools"
 readme = "README.md"
 # autobins off so src/bin/mcp_tests.rs stays a test module, not a second binary.

@@ -7,8 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords.workspace = true
-categories.workspace = true
+keywords = ["database", "page-io", "file-locking", "memory-mapping", "io-uring"]
+categories = ["database-implementations", "filesystem"]
 description = "I/O layer for Citadel: PageIO trait, sync I/O, file locking, file management"
 readme = "README.md"
 
