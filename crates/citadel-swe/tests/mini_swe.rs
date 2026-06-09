@@ -25,8 +25,7 @@ fn gold_self_test_all_tasks() {
     }
 }
 
-/// Real agent + real tools, only the LLM mocked: the agent writes the fix and the
-/// independent scorer confirms it solved the task.
+/// Gold fix, green cargo test: verifier certifies, scorer confirms solved.
 #[test]
 fn mock_smoke_agent_solves_a_task() {
     let id = "off_by_one_window";
@@ -41,7 +40,11 @@ fn mock_smoke_agent_solves_a_task() {
             "file_write",
             json!({ "path": src_path.to_str().unwrap(), "contents": gold }),
         ),
-        CompletionResponse::text("applied the fix"),
+        tool_call(
+            "run_command",
+            json!({ "program": "cargo", "args": ["test"] }),
+        ),
+        CompletionResponse::text("applied the fix; cargo test is green"),
     ]);
     let (_memdir, agent) = build_agent(&scratch, &m, llm, AgentBudget::default());
     let report: AgentReport = agent.run(build_prompt(&scratch, &m)).unwrap();
@@ -55,7 +58,7 @@ fn mock_smoke_agent_solves_a_task() {
     );
 }
 
-/// A gutted fix scores not-solved even when the agent's loop reports success.
+/// Gutted fix, red cargo test: verifier refuses Success, scorer confirms not-solved.
 #[test]
 fn mock_smoke_bad_fix_scores_zero() {
     let id = "off_by_one_window";
@@ -70,21 +73,22 @@ fn mock_smoke_bad_fix_scores_zero() {
             "file_write",
             json!({ "path": src_path.to_str().unwrap(), "contents": bad }),
         ),
+        tool_call(
+            "run_command",
+            json!({ "program": "cargo", "args": ["test"] }),
+        ),
         CompletionResponse::text("done"),
     ]);
     let (_memdir, agent) = build_agent(&scratch, &m, llm, AgentBudget::default());
     let report = agent.run(build_prompt(&scratch, &m)).unwrap();
-    assert_eq!(
+    assert_ne!(
         report.terminated_by,
         TerminatedBy::Success,
-        "agent claims success"
+        "gutted fix must not converge to Success"
     );
 
     restore_and_inject_tests(&scratch, id);
-    assert!(
-        !score_task(&scratch, &m),
-        "a gutted fix must score not-solved despite the agent's claim"
-    );
+    assert!(!score_task(&scratch, &m), "a gutted fix scores not-solved");
 }
 
 /// The agent cannot edit a test file (only src/ is writable).
