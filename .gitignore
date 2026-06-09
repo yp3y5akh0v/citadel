@@ -7,4 +7,4 @@
 site/public/
 site/static/wasm/*.wasm
 site/static/wasm/*.js
-crates/citadel-wasm/pkg/
+/notes/
