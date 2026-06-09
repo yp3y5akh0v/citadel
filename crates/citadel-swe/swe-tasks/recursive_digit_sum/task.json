@@ -1,0 +1,7 @@
+{
+  "id": "recursive_digit_sum",
+  "difficulty": "medium",
+  "symptom": "digit_sum sums the decimal digits of n recursively, but for multi-digit numbers it omits some digits.",
+  "fail_to_pass": ["visible", "hidden"],
+  "pass_to_pass": ["pass_to_pass"]
+}

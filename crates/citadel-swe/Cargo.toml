@@ -1,0 +1,34 @@
+[package]
+name = "citadeldb-swe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["benchmark", "agent", "swe", "evaluation", "sandbox"]
+categories = ["development-tools"]
+description = "mini-SWE benchmark harness for evaluating citadel-ai agents on sandboxed code-edit tasks"
+publish = false
+
+[lib]
+name = "citadel_swe"
+
+# Harness lives in tests/, so deps are dev-only (file-tools + command-tool always on).
+[dev-dependencies]
+citadel-ai = { workspace = true, features = ["file-tools", "command-tool", "test-util"] }
+citadel-mem = { workspace = true }
+citadel = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+
+[features]
+# `live` is the aggregate gate for the real-LLM bench + harness; each provider implies it.
+live = []
+claude = ["citadel-ai/claude", "live"]
+openai = ["citadel-ai/openai", "live"]
+ollama = ["citadel-ai/ollama", "live"]
+candle-embed = ["citadel-mem/candle-embed"]
+# Run the embedder on the GPU (CUDA); implies candle-embed. Needs the CUDA toolkit.
+cuda-embed = ["candle-embed", "citadel-mem/cuda-embed"]

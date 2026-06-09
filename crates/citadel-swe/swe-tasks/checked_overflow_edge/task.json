@@ -1,0 +1,7 @@
+{
+  "id": "checked_overflow_edge",
+  "difficulty": "hard",
+  "symptom": "avg returns the integer average of two i32 values, but it overflows for large inputs (and panics in the test profile).",
+  "fail_to_pass": ["visible", "hidden"],
+  "pass_to_pass": ["pass_to_pass"]
+}

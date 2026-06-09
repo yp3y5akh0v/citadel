@@ -519,6 +519,7 @@ version = "1.1.0"
 dependencies = [
  "blake3",
  "citadeldb",
+ "citadeldb-ai",
  "citadeldb-mem",
  "rustc-hash",
  "serde_json",
@@ -714,6 +715,17 @@ dependencies = [
  "rustc-hash",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "citadeldb-swe"
+version = "1.1.0"
+dependencies = [
+ "citadeldb",
+ "citadeldb-ai",
+ "citadeldb-mem",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -1,0 +1,7 @@
+{
+  "id": "operator_precedence",
+  "difficulty": "medium",
+  "symptom": "shift_add should return a + (b << k), but the result is wrong when a and k are both nonzero.",
+  "fail_to_pass": ["visible", "hidden"],
+  "pass_to_pass": ["pass_to_pass"]
+}

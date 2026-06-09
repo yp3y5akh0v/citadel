@@ -1,0 +1,12 @@
+# Standalone benchmark fixture: a self-contained workspace root (so `cargo test`
+# in the cloned tempdir never walks up into a parent workspace) with no deps.
+[workspace]
+
+[package]
+name = "swe_off_by_one_window"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"

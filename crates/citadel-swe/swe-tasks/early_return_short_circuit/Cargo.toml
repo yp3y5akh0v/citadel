@@ -1,0 +1,10 @@
+[workspace]
+
+[package]
+name = "swe_early_return_short_circuit"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"

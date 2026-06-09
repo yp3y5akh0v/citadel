@@ -1,0 +1,7 @@
+{
+  "id": "early_return_short_circuit",
+  "difficulty": "hard",
+  "symptom": "first_index_gt should return the index of the FIRST element greater than the threshold, but when several elements exceed it the function returns the wrong index.",
+  "fail_to_pass": ["visible", "hidden"],
+  "pass_to_pass": ["pass_to_pass"]
+}

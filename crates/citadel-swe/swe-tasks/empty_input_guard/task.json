@@ -1,0 +1,7 @@
+{
+  "id": "empty_input_guard",
+  "difficulty": "medium",
+  "symptom": "mean returns the arithmetic mean of a slice, or None when the slice is empty, but it mishandles the empty case.",
+  "fail_to_pass": ["visible", "hidden"],
+  "pass_to_pass": ["pass_to_pass"]
+}

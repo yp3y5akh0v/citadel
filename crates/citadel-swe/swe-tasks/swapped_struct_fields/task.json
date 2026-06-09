@@ -1,0 +1,7 @@
+{
+  "id": "swapped_struct_fields",
+  "difficulty": "medium",
+  "symptom": "Rect::new takes a width and a height and the width()/height() accessors should return them, but for a non-square rectangle the accessors return the wrong values (area and perimeter are correct).",
+  "fail_to_pass": ["visible", "hidden"],
+  "pass_to_pass": ["pass_to_pass"]
+}

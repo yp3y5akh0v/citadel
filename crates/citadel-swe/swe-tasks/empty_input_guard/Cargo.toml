@@ -1,0 +1,10 @@
+[workspace]
+
+[package]
+name = "swe_empty_input_guard"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"

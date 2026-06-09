@@ -16,6 +16,7 @@ members = [
     "crates/citadel-ai",
     "crates/citadel-mcp",
     "crates/citadel-membench",
+    "crates/citadel-swe",
     "citadel",
     "citadel-cli",
 ]

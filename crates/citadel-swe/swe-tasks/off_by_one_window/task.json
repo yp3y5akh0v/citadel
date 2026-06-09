@@ -1,0 +1,7 @@
+{
+  "id": "off_by_one_window",
+  "difficulty": "easy",
+  "symptom": "window_maxes returns the maximum of each contiguous window of size k over a slice, but for some inputs it omits a window.",
+  "fail_to_pass": ["visible", "hidden"],
+  "pass_to_pass": ["pass_to_pass"]
+}

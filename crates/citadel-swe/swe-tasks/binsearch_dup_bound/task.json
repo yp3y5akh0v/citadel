@@ -1,0 +1,7 @@
+{
+  "id": "binsearch_dup_bound",
+  "difficulty": "medium",
+  "symptom": "lower_bound should return the index of the first element >= key (the first occurrence when key is present), but with duplicate keys it returns the wrong index.",
+  "fail_to_pass": ["visible", "hidden"],
+  "pass_to_pass": ["pass_to_pass"]
+}
