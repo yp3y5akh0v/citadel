@@ -6,7 +6,7 @@ Model Context Protocol (MCP) server for the
 
 Memory lives in a local [`citadeldb-mem`](https://crates.io/crates/citadeldb-mem) region:
 AES-256 encrypted at rest, per-atom sealed and HMAC-authenticated, recalled through a hybrid
-vector + keyword + recency + importance fusion over a PRISM approximate nearest-neighbor index,
+vector + keyword + recency + importance fusion over a [PRISM](https://github.com/yp3y5akh0v/prism) approximate nearest-neighbor index,
 connected by a typed edge graph, and forgotten by **destroying keys** (cryptographic erasure).
 
 Tools (over a synchronous, hand-rolled JSON-RPC 2.0 stdio transport):

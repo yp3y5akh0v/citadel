@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/yp3y5akh0v/citadel/master/.github/banner.png" alt="Citadel" width="600">
+  <img src="https://raw.githubusercontent.com/yp3y5akh0v/citadel/HEAD/.github/banner.png" alt="Citadel" width="600">
 </p>
 
 <h1 align="center">Citadel</h1>
@@ -19,10 +19,10 @@ Every page is encrypted and authenticated before it hits disk. The database file
 
 Citadel adds embedded agent-memory layers on top of the encrypted engine:
 
-- **[citadeldb-vector](crates/citadel-vector)** - a `VECTOR(N)` SQL type, distance operators (`<->` L2, `<#>` inner, `<=>` cosine), and a PRISM-backed filtered ANN index that reads through the encrypted page store.
-- **[citadeldb-mem](crates/citadel-mem)** - an agent-memory engine (regions, atoms, edges) with hybrid recall (vector + BM25 keyword + cross-encoder reranker) and **cryptographic forgetting**: an atom or region is erased by destroying its key, at whole-store, per-region, and per-atom granularity. On the LoCoMo long-term-memory benchmark it scores 84.1% (3-run mean) on encrypted regions - protocol and numbers in [citadel-membench](crates/citadel-membench/RESULTS.md).
-- **[citadeldb-ai](crates/citadel-ai)** - an autonomous agent runtime (ReAct + Reflexion, tool registry, budget caps, pluggable LLM backends) that uses citadeldb-mem for persistence.
-- **[citadeldb-mcp](crates/citadel-mcp)** - a Model Context Protocol server exposing a Citadel memory region (encrypted by default) to any MCP client (Claude Desktop, IDEs) as recall/remember/link/evolve/forget/verify tools.
+- **[citadeldb-vector](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-vector)** - a `VECTOR(N)` SQL type, distance operators (`<->` L2, `<#>` inner, `<=>` cosine), and a [PRISM](https://github.com/yp3y5akh0v/prism)-backed filtered ANN index that reads through the encrypted page store.
+- **[citadeldb-mem](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mem)** - an agent-memory engine (regions, atoms, edges) with hybrid recall (vector + BM25 keyword + cross-encoder reranker) and **cryptographic forgetting**: an atom or region is erased by destroying its key, at whole-store, per-region, and per-atom granularity. On the LoCoMo long-term-memory benchmark it scores 84.1% (3-run mean) on encrypted regions - protocol and numbers in [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md).
+- **[citadeldb-ai](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-ai)** - an autonomous agent runtime (ReAct + Reflexion, tool registry, budget caps, pluggable LLM backends) that uses citadeldb-mem for persistence.
+- **[citadeldb-mcp](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mcp)** - a Model Context Protocol server exposing a Citadel memory region (encrypted by default) to any MCP client (Claude Desktop, IDEs) as recall/remember/link/evolve/forget/verify tools.
 
 ## Features
 
@@ -32,7 +32,7 @@ Citadel adds embedded agent-memory layers on top of the encrypted engine:
 - **P2P sync** - Merkle-based table diffing over Noise-encrypted channels with PSK auth
 - **CLI** - SQL shell with tab completion, syntax highlighting, dot-commands (.backup, .verify, .rekey, .sync, .dump, ...)
 - **3-tier key hierarchy** - Passphrase -> Argon2id -> Master Key -> AES-KW -> REK -> HKDF -> DEK + MAC
-- **Cryptographic forgetting** - Erase data by destroying its key, not by overwriting: whole-store, and per-region / per-atom via [citadeldb-mem](crates/citadel-mem). A forgotten region or atom is unrecoverable
+- **Cryptographic forgetting** - Erase data by destroying its key, not by overwriting: whole-store, and per-region / per-atom via [citadeldb-mem](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mem). A forgotten region or atom is unrecoverable
 - **FIPS 140-3** - PBKDF2-HMAC-SHA256 + AES-256-CTR when compliance requires it
 - **Audit log** - HMAC-SHA256 chained, tamper-evident
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
@@ -423,4 +423,4 @@ cargo build --release
 
 ## License
 
-[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)
+[MIT](https://github.com/yp3y5akh0v/citadel/blob/HEAD/LICENSE-MIT) OR [Apache-2.0](https://github.com/yp3y5akh0v/citadel/blob/HEAD/LICENSE-APACHE)

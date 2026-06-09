@@ -1,7 +1,7 @@
 # citadeldb-membench
 
 LoCoMo long-term conversational-memory benchmark harness for
-[`citadeldb-mem`](https://github.com/yp3y5akh0v/citadel/tree/master/crates/citadel-mem). Runs
+[`citadeldb-mem`](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mem). Runs
 the benchmark on encrypted regions, scores answers with an LLM judge, and emits a reproducible,
 self-describing report.
 

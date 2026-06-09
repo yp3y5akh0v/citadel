@@ -11,7 +11,7 @@ re-verified off disk.
 On the LoCoMo long-term conversational-memory benchmark, on encrypted regions with a matched
 `gpt-4o-mini` reader and judge, it scores 84.1% (3-run mean) against a 91.6% retrieval ceiling.
 Full protocol, audit, and numbers:
-[citadel-membench](https://github.com/yp3y5akh0v/citadel/tree/master/crates/citadel-membench).
+[citadel-membench](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-membench).
 
 This crate is part of the Citadel workspace.
 

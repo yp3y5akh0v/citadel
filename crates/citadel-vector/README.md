@@ -2,7 +2,7 @@
 
 Vector search for the [Citadel](https://github.com/yp3y5akh0v/citadel) encrypted embedded
 database engine. Provides the `VECTOR(N)` SQL type, distance operators (`<->` L2, `<#>` inner
-product, `<=>` cosine), and a PRISM-backed filtered approximate-nearest-neighbor index that
+product, `<=>` cosine), and a [PRISM](https://github.com/yp3y5akh0v/prism)-backed filtered approximate-nearest-neighbor index that
 reads through Citadel's encrypted page storage, so the index is encrypted at rest like every
 other page.
 
