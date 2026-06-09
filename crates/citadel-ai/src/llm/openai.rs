@@ -19,7 +19,7 @@ const OPENAI_MAX_TOKENS_FIELD: &str = "max_completion_tokens";
 
 /// Calls an OpenAI-compatible `/chat/completions` endpoint. The API key is held
 /// only in memory and never logged or persisted.
-pub struct OpenAiClient {
+pub(crate) struct OpenAiClient {
     model: String,
     base_url: String,
     api_key: String,
@@ -33,14 +33,14 @@ pub struct OpenAiClient {
 
 impl OpenAiClient {
     /// A client for the official OpenAI API.
-    pub fn new(model: impl Into<String>, api_key: impl Into<String>) -> Self {
+    pub(crate) fn new(model: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self::with_base_url(model, DEFAULT_BASE_URL, api_key)
     }
 
     /// A client for any OpenAI-compatible endpoint (Together, OpenRouter, a
     /// local Ollama `/v1`, ...). `base_url` is the path up to but excluding
     /// `/chat/completions`.
-    pub fn with_base_url(
+    pub(crate) fn with_base_url(
         model: impl Into<String>,
         base_url: impl Into<String>,
         api_key: impl Into<String>,
@@ -55,16 +55,14 @@ impl OpenAiClient {
         }
     }
 
-    /// Override the output-token-cap field for a compatible server. Only the
-    /// Ollama backend reuses this, so it is gated to its feature to stay free
-    /// of dead code in an openai-only build.
+    /// Override the output-token-cap field for a compatible server (Ollama uses `max_tokens`).
     #[cfg(feature = "ollama")]
     pub(super) fn max_tokens_field(mut self, field: &'static str) -> Self {
         self.max_tokens_field = field;
         self
     }
 
-    /// Report no cost (a free/local endpoint). Ollama-only, as above.
+    /// Report no cost (a free/local endpoint).
     #[cfg(feature = "ollama")]
     pub(super) fn unpriced(mut self) -> Self {
         self.priced = false;
@@ -82,7 +80,11 @@ impl LLMClient for OpenAiClient {
             ("content-type", "application/json"),
         ];
         let resp = post_json(&self.agent, &url, &headers, &body)?;
-        from_wire(&resp, &self.model, self.priced)
+        // A forced tool_choice means a tool was mandatory here; pass that and the offered
+        // tool names so from_wire can recover a call a local model leaked into content.
+        let forced_tool = !matches!(req.tool_choice, ToolChoice::Auto);
+        let tool_names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        from_wire(&resp, &self.model, self.priced, forced_tool, &tool_names)
     }
 
     fn model_id(&self) -> &str {
@@ -186,7 +188,13 @@ fn message_to_wire(m: &Message) -> Value {
     }
 }
 
-fn from_wire(resp: &Value, model: &str, priced: bool) -> Result<CompletionResponse, LlmError> {
+fn from_wire(
+    resp: &Value,
+    model: &str,
+    priced: bool,
+    forced_tool: bool,
+    tool_names: &[&str],
+) -> Result<CompletionResponse, LlmError> {
     let choice = resp
         .get("choices")
         .and_then(Value::as_array)
@@ -229,10 +237,24 @@ fn from_wire(resp: &Value, model: &str, priced: bool) -> Result<CompletionRespon
         }
     }
 
-    let finish_reason = match choice.get("finish_reason").and_then(Value::as_str) {
-        Some("length") => FinishReason::Length,
-        Some("tool_calls") => FinishReason::ToolUse,
-        _ => FinishReason::Stop,
+    // Some local models emit a forced tool call as a JSON blob in `content` with an
+    // empty tool_calls array; recover it. Gated on `forced_tool` so the Auto path (a
+    // plain-text reply is a valid answer there) is never reinterpreted.
+    if forced_tool && tool_calls.is_empty() {
+        if let Some(call) = recover_tool_call(&content, tool_names) {
+            tool_calls.push(call);
+        }
+    }
+
+    // A recovered call reports ToolUse even when the provider said "stop".
+    let finish_reason = if !tool_calls.is_empty() {
+        FinishReason::ToolUse
+    } else {
+        match choice.get("finish_reason").and_then(Value::as_str) {
+            Some("length") => FinishReason::Length,
+            Some("tool_calls") => FinishReason::ToolUse,
+            _ => FinishReason::Stop,
+        }
     };
 
     Ok(CompletionResponse {
@@ -261,6 +283,66 @@ fn parse_usage(raw: Option<&Value>, model: &str, priced: bool) -> TokenUsage {
         usage.cost_usd = pricing::cost_for(model, &usage);
     }
     usage
+}
+
+/// Recover a tool call a local model emitted as a JSON object in `content` instead of the
+/// structured `tool_calls` array. Returns a call only when the content names a known tool,
+/// or - when exactly one tool was offered - a bare arguments object for it.
+fn recover_tool_call(content: &str, tool_names: &[&str]) -> Option<ToolCall> {
+    let obj = extract_json_object(content)?;
+    let recovered = |name: &str, arguments: Value| ToolCall {
+        id: format!("recovered_{name}"),
+        name: name.to_string(),
+        arguments,
+    };
+    if let Some(name) = obj.get("name").and_then(Value::as_str) {
+        return tool_names.contains(&name).then(|| {
+            let args = obj
+                .get("parameters")
+                .or_else(|| obj.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+            recovered(name, args)
+        });
+    }
+    // No name wrapper: a call offering exactly one tool means the object is its arguments.
+    match tool_names {
+        &[only] if !obj.contains_key("tool_calls") => Some(recovered(only, Value::Object(obj))),
+        _ => None,
+    }
+}
+
+/// The first balanced top-level JSON object in `s` (string- and escape-aware), tolerating
+/// code fences, language tags, and surrounding prose. `None` if none parses.
+fn extract_json_object(s: &str) -> Option<serde_json::Map<String, Value>> {
+    let start = s.find('{')?;
+    let mut depth = 0u32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, ch) in s.char_indices().skip_while(|&(i, _)| i < start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return serde_json::from_str(&s[start..=i]).ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -295,19 +377,15 @@ mod tests {
         let with_tools =
             CompletionRequest::new(vec![Message::user("u")]).with_tools(vec![spec.clone()]);
         let wire = |r: &CompletionRequest| to_wire(r, "gpt", OPENAI_MAX_TOKENS_FIELD);
-        // Auto: omitted.
         assert!(wire(&with_tools).get("tool_choice").is_none());
-        // Any -> "required".
         assert_eq!(
             wire(&with_tools.clone().with_tool_choice(ToolChoice::Any))["tool_choice"],
             json!("required")
         );
-        // A forced tool -> {"type":"function","function":{"name":...}}.
         assert_eq!(
             wire(&with_tools.with_tool_choice(ToolChoice::Tool("search".into())))["tool_choice"],
             json!({ "type": "function", "function": { "name": "search" } })
         );
-        // No tools -> omitted.
         let no_tools =
             CompletionRequest::new(vec![Message::user("u")]).with_tool_choice(ToolChoice::Any);
         assert!(wire(&no_tools).get("tool_choice").is_none());
@@ -355,7 +433,7 @@ mod tests {
         let openai = to_wire(&req, "gpt", OPENAI_MAX_TOKENS_FIELD);
         assert_eq!(openai["max_completion_tokens"], json!(256));
         assert!(openai.get("max_tokens").is_none());
-        let ollama = to_wire(&req, "qwen", "max_tokens");
+        let ollama = to_wire(&req, "llama", "max_tokens");
         assert_eq!(ollama["max_tokens"], json!(256));
         assert!(ollama.get("max_completion_tokens").is_none());
     }
@@ -376,7 +454,7 @@ mod tests {
             }],
             "usage": { "prompt_tokens": 12, "completion_tokens": 4 }
         });
-        let r = from_wire(&resp, "gpt", true).unwrap();
+        let r = from_wire(&resp, "gpt", true, false, &[]).unwrap();
         assert_eq!(r.finish_reason, FinishReason::ToolUse);
         assert_eq!(r.message.content, "");
         assert_eq!(
@@ -395,9 +473,91 @@ mod tests {
             "choices": [{ "message": { "content": "hello" }, "finish_reason": "stop" }],
             "usage": { "prompt_tokens": 3, "completion_tokens": 1 }
         });
-        let r = from_wire(&resp, "gpt", true).unwrap();
+        let r = from_wire(&resp, "gpt", true, false, &[]).unwrap();
         assert_eq!(r.message.content, "hello");
         assert!(r.message.tool_calls.is_empty());
         assert_eq!(r.finish_reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn recovers_forced_tool_call_leaked_into_fenced_content() {
+        // Ollama/small-model behavior: the call is a fenced JSON blob in content with an
+        // empty tool_calls array and finish_reason "stop". A forced tool recovers it.
+        let resp = json!({
+            "choices": [{
+                "message": { "content": "```json\n{\"name\": \"submit_plan\", \"parameters\": {\"goal\": {\"prompt\": \"fix\"}}}\n```" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 3 }
+        });
+        let r = from_wire(&resp, "llama", false, true, &["submit_plan"]).unwrap();
+        assert_eq!(
+            r.finish_reason,
+            FinishReason::ToolUse,
+            "recovered call -> ToolUse"
+        );
+        assert_eq!(r.message.tool_calls.len(), 1);
+        let call = &r.message.tool_calls[0];
+        assert_eq!(call.name, "submit_plan");
+        assert_eq!(
+            call.id, "recovered_submit_plan",
+            "marked recovered in the trace"
+        );
+        assert_eq!(call.arguments, json!({ "goal": { "prompt": "fix" } }));
+    }
+
+    #[test]
+    fn recovery_is_inert_on_the_auto_path() {
+        // Not forced: a plain-text reply (even JSON naming a tool) stays the final answer,
+        // so OpenAI's "text answer = done" control flow is preserved.
+        let resp = json!({
+            "choices": [{
+                "message": { "content": "{\"name\": \"submit_plan\", \"parameters\": {}}" },
+                "finish_reason": "stop"
+            }],
+            "usage": {}
+        });
+        let r = from_wire(&resp, "gpt", true, false, &["submit_plan"]).unwrap();
+        assert!(
+            r.message.tool_calls.is_empty(),
+            "no phantom tool call on the auto path"
+        );
+        assert_eq!(r.finish_reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn recovery_ignores_an_unknown_tool_name() {
+        let resp = json!({
+            "choices": [{
+                "message": { "content": "{\"name\": \"other\", \"parameters\": {}}" },
+                "finish_reason": "stop"
+            }],
+            "usage": {}
+        });
+        let r = from_wire(&resp, "llama", false, true, &["submit_plan"]).unwrap();
+        assert!(
+            r.message.tool_calls.is_empty(),
+            "unknown tool name is not recovered"
+        );
+    }
+
+    #[test]
+    fn recovers_bare_arguments_for_a_single_forced_tool() {
+        // Some models emit the arguments object directly, with no {name, ...} wrapper.
+        let resp = json!({
+            "choices": [{
+                "message": { "content": "Here is my verdict: {\"satisfied\": true, \"reason\": \"ok\"}" },
+                "finish_reason": "stop"
+            }],
+            "usage": {}
+        });
+        let r = from_wire(&resp, "llama", false, true, &["verdict"]).unwrap();
+        assert_eq!(r.message.tool_calls.len(), 1);
+        assert_eq!(r.message.tool_calls[0].name, "verdict");
+        assert_eq!(
+            r.message.tool_calls[0].arguments,
+            json!({ "satisfied": true, "reason": "ok" }),
+            "prose-prefixed bare args recovered for the single offered tool"
+        );
     }
 }

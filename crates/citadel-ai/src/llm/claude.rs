@@ -21,14 +21,14 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 /// Calls api.anthropic.com. The API key is held only in memory and never
 /// logged or persisted.
-pub struct ClaudeClient {
+pub(crate) struct ClaudeClient {
     model: String,
     api_key: String,
     agent: Agent,
 }
 
 impl ClaudeClient {
-    pub fn new(model: impl Into<String>, api_key: impl Into<String>) -> Self {
+    pub(crate) fn new(model: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
             model: model.into(),
             api_key: api_key.into(),
@@ -68,7 +68,6 @@ fn rejects_sampling_params(model: &str) -> bool {
         .is_some_and(|minor| minor >= 7)
 }
 
-/// Build the Anthropic request body.
 fn to_wire(req: &CompletionRequest, model: &str) -> Value {
     let mut system = String::new();
     let mut messages: Vec<Value> = Vec::new();
@@ -148,8 +147,7 @@ fn to_wire(req: &CompletionRequest, model: &str) -> Value {
             }
         }
     }
-    // Opus 4.7+ reject a non-default temperature with a 400 (see rejects_sampling_params);
-    // omit it for those models. Others pass it through (provider validates the range).
+    // Omit temperature for models that 400 on it (see rejects_sampling_params).
     if let Some(t) = req.temperature {
         if !rejects_sampling_params(model) {
             obj.insert("temperature".to_string(), json!(t));
@@ -161,7 +159,6 @@ fn to_wire(req: &CompletionRequest, model: &str) -> Value {
     body
 }
 
-/// Parse an Anthropic response into a [`CompletionResponse`].
 fn from_wire(resp: &Value, model: &str) -> Result<CompletionResponse, LlmError> {
     let content = resp
         .get("content")
@@ -256,7 +253,6 @@ mod tests {
 
     #[test]
     fn temperature_omitted_only_for_opus_4_7_plus() {
-        // The rule (Opus 4.7+ reject sampling params; others accept a lone temp).
         assert!(rejects_sampling_params("claude-opus-4-7"));
         assert!(rejects_sampling_params("claude-opus-4-8"));
         assert!(rejects_sampling_params("claude-opus-4-8-20260101"));
@@ -264,8 +260,6 @@ mod tests {
         assert!(!rejects_sampling_params("claude-sonnet-4-6"));
         assert!(!rejects_sampling_params("claude-haiku-4-5"));
 
-        // The wire body reflects it: Opus omits temperature (else a 400), Sonnet
-        // keeps it. The CompletionRequest is unchanged either way (replay-stable).
         let req = CompletionRequest {
             temperature: Some(0.9),
             ..CompletionRequest::new(vec![Message::user("x")])
@@ -294,14 +288,11 @@ mod tests {
     #[test]
     fn tool_choice_maps_only_with_tools() {
         let with_tools = CompletionRequest::new(vec![Message::user("x")]).with_tools(vec![spec()]);
-        // Auto: omitted (matches the provider default).
         assert!(to_wire(&with_tools, "m").get("tool_choice").is_none());
-        // Any -> {"type":"any"}.
         assert_eq!(
             to_wire(&with_tools.clone().with_tool_choice(ToolChoice::Any), "m")["tool_choice"],
             json!({ "type": "any" })
         );
-        // A forced tool -> {"type":"tool","name":...}.
         assert_eq!(
             to_wire(
                 &with_tools.with_tool_choice(ToolChoice::Tool("search".into())),
@@ -309,7 +300,6 @@ mod tests {
             )["tool_choice"],
             json!({ "type": "tool", "name": "search" })
         );
-        // No tools -> no tool_choice even if set.
         let no_tools =
             CompletionRequest::new(vec![Message::user("x")]).with_tool_choice(ToolChoice::Any);
         assert!(to_wire(&no_tools, "m").get("tool_choice").is_none());
@@ -348,7 +338,6 @@ mod tests {
             json!({ "q": "rust" }),
             "object, not a string"
         );
-        // Empty assistant text emits no text block.
         assert_eq!(w["messages"][0]["content"].as_array().unwrap().len(), 1);
     }
 

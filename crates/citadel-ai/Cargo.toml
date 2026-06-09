@@ -31,9 +31,13 @@ wait-timeout = { workspace = true, optional = true }
 [dev-dependencies]
 citadel = { workspace = true }
 tempfile = "3"
+# Self dev-dep with test-util so this crate's own integration tests see `testing`.
+citadeldb-ai = { path = ".", features = ["test-util"] }
 
 [features]
 default = []
+# Opt-in test-client toolkit (closure adapter + `testing` doubles); never published API.
+test-util = []
 claude = ["dep:ureq"]
 openai = ["dep:ureq"]
 # Ollama uses the OpenAI wire format, so it reuses that adapter.

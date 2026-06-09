@@ -3,21 +3,22 @@
 //! Sync and one-shot (no tokio) to match citadel; parallel tool calls fan out via
 //! rayon at the loop, not here. Backends are feature-gated; `MockClient` is always built.
 
-pub mod mock;
+pub(crate) mod mock;
 
-// HTTP backends are native-only (ureq does blocking std::net I/O). On wasm the
-// crate compiles with mock only; the features select which adapters build.
+pub mod factory;
+
+// HTTP backends are native-only (ureq is blocking std I/O); wasm builds mock only.
 #[cfg(all(not(target_arch = "wasm32"), feature = "claude"))]
-pub mod claude;
+pub(crate) mod claude;
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(feature = "claude", feature = "openai")
 ))]
 mod http;
 #[cfg(all(not(target_arch = "wasm32"), feature = "ollama"))]
-pub mod ollama;
+pub(crate) mod ollama;
 #[cfg(all(not(target_arch = "wasm32"), feature = "openai"))]
-pub mod openai;
+pub(crate) mod openai;
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(feature = "claude", feature = "openai")

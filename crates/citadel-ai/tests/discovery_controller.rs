@@ -1,16 +1,16 @@
 //! In-crate coverage of the GENERAL discovery controller (`Agent::run_discovery`)
 //! with a problem-agnostic `MockVerifier`. Proves the controller archives, scores,
-//! mints, and converges with ANY deterministic checker - independent of the
-//! concyclic plugin (which lives in citadel-erdos and is tested there).
+//! mints, and converges with ANY deterministic checker - independent of any concrete
+//! problem plugin (tested in its own crate).
 
 use std::sync::Arc;
 
 use citadel::{Argon2Profile, DatabaseBuilder};
+use citadel_ai::testing;
 use citadel_ai::{
     Agent, AgentBudget, AgentConfig, BeliefGraph, Candidate, CheckerAttestation, Completer,
-    DiscoveryGoal, Goal, LLMClient, MockClient, ProposalContext, ProposalOperator, ProposeError,
-    ScoredOutcome, TerminatedBy, ToolRegistry, VerifiedKind, Verifier, VerifyError, VerifyOutcome,
-    VerifyRequest,
+    DiscoveryGoal, Goal, ProposalContext, ProposalOperator, ProposeError, ScoredOutcome,
+    TerminatedBy, ToolRegistry, VerifiedKind, Verifier, VerifyError, VerifyOutcome, VerifyRequest,
 };
 use citadel_mem::{MemoryEngine, MockEmbedder};
 use serde_json::json;
@@ -82,7 +82,7 @@ fn run_discovery_climbs_and_mints_with_a_mock_verifier() {
         proposal_operator: Some(Arc::new(FixedProposer)),
         ..Default::default()
     };
-    let llm: Arc<dyn LLMClient> = Arc::new(MockClient::scripted(vec![]));
+    let llm = testing::scripted(vec![]);
     let agent = Agent::new(
         llm,
         graph,

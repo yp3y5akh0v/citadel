@@ -24,7 +24,7 @@ use crate::graph::{
 };
 use crate::llm::{
     request_hash, AssistantMessage, CompletionRequest, CompletionResponse, FinishReason, LLMClient,
-    LlmError, Message, TokenUsage, ToolCall, ToolSpec,
+    LlmError, Message, TokenUsage, ToolCall, ToolChoice, ToolSpec,
 };
 use crate::prompts::{PromptId, PromptLibrary, ResolvedPrompt};
 use crate::propose::{Completer, Elite, ProposalContext, ProposalOperator, ProposeError};
@@ -165,6 +165,9 @@ pub struct AgentConfig {
     /// Discovery candidate generator. `None` (default) runs the ordinary loop; the
     /// opt-in discovery controller requires it.
     pub proposal_operator: Option<Arc<dyn ProposalOperator>>,
+    /// Sampling temperature for every agent LLM call; 0.0 (default) keeps planning,
+    /// tool-calling, and critique deterministic and schema-adherent.
+    pub temperature: f32,
 }
 
 impl Default for AgentConfig {
@@ -179,6 +182,7 @@ impl Default for AgentConfig {
             verifier: None,
             prompt_library: Arc::new(PromptLibrary::default()),
             proposal_operator: None,
+            temperature: 0.0,
         }
     }
 }
@@ -227,8 +231,8 @@ pub struct DiscoveryReport {
     pub best_valid_score: f64,
     /// Diagnostic: how many proposed candidates were valid (any size).
     pub valid_candidates: u32,
-    /// Diagnostic: one example reject reason (bounds vs concyclic), or None if all
-    /// valid - tells a format/bounds problem from the hard constraint.
+    /// Diagnostic: one example reject reason (a format/bounds issue vs the hard
+    /// constraint), or None if all valid.
     pub sample_reject_reason: Option<String>,
     /// Would-be mints rejected because the checker's independent oracle disagreed
     /// (a bug tripwire on the novel-mint path; should be 0 in a healthy run).
@@ -382,11 +386,14 @@ impl Ctx<'_> {
     /// records an immutable `llm_trace` atom for replay/audit.
     fn complete(
         &mut self,
-        req: &CompletionRequest,
+        mut req: CompletionRequest,
         prompt: &ResolvedPrompt,
     ) -> AgentResult<CompletionResponse> {
-        let resp = self.call_with_retry(req)?;
-        self.accrue_and_record(req, &resp, prompt)?;
+        // Every control call runs at the configured temperature (0 by default) so tool
+        // output is deterministic and schema-adherent across backends.
+        req.temperature = Some(self.config.temperature);
+        let resp = self.call_with_retry(&req)?;
+        self.accrue_and_record(&req, &resp, prompt)?;
         Ok(resp)
     }
 
@@ -462,8 +469,9 @@ impl Ctx<'_> {
         }
         let sys = self.config.prompt_library.resolve(PromptId::Planner);
         let req = CompletionRequest::new(vec![sys.as_system(), Message::user(self.prompt.clone())])
-            .with_tools(vec![submit_plan_spec()]);
-        let resp = self.complete(&req, &sys)?;
+            .with_tools(vec![submit_plan_spec()])
+            .with_tool_choice(ToolChoice::Tool("submit_plan".into()));
+        let resp = self.complete(req, &sys)?;
 
         let plan_args = match resp
             .message
@@ -552,7 +560,7 @@ impl Ctx<'_> {
         let sys = self.config.prompt_library.resolve(PromptId::Execute);
         let context = self.assemble_context(&task, &sys, &[])?;
         let req = CompletionRequest::new(context).with_tools(self.tools.specs());
-        let resp = self.complete(&req, &sys)?;
+        let resp = self.complete(req, &sys)?;
         self.graph
             .set_task_status(task_id, TaskStatus::InProgress)?;
 
@@ -581,7 +589,7 @@ impl Ctx<'_> {
         let sys = self.config.prompt_library.resolve(PromptId::Execute);
         let context = self.assemble_context(&task_atom, &sys, &transcript)?;
         let req = CompletionRequest::new(context).with_tools(self.tools.specs());
-        let resp = self.complete(&req, &sys)?;
+        let resp = self.complete(req, &sys)?;
         Ok(self.turn_outcome(task, round, transcript, resp))
     }
 
@@ -914,8 +922,9 @@ impl Ctx<'_> {
             .prompt_library
             .resolve(PromptId::ConstraintCritic);
         let req = CompletionRequest::new(vec![sys.as_system(), Message::user(prompt)])
-            .with_tools(vec![verdict_spec()]);
-        let resp = self.complete(&req, &sys)?;
+            .with_tools(vec![verdict_spec()])
+            .with_tool_choice(ToolChoice::Tool("verdict".into()));
+        let resp = self.complete(req, &sys)?;
         // No verdict -> lenient (the structural pass already gate-kept the call).
         Ok(match parse_verdict(&resp) {
             Some((satisfied, _)) => satisfied,
@@ -957,7 +966,7 @@ impl Ctx<'_> {
             sys.as_system(),
             Message::user(format!("Situation: {reason:?}. How should the plan adapt?")),
         ]);
-        let resp = self.complete(&req, &sys)?;
+        let resp = self.complete(req, &sys)?;
         Ok(resp.message.content)
     }
 
@@ -1008,23 +1017,15 @@ impl Ctx<'_> {
             .get_goal(goal_id)?
             .ok_or_else(|| AgentError::Other("goal vanished".into()))?;
 
-        let met = if goal.acceptance_criteria.is_empty() {
-            true // nothing to verify
-        } else {
-            let evidence = self.graph.evidence_for_goal(goal_id)?;
-            if let Some(verifier) = self.config.verifier.clone() {
-                match verifier.verify(&VerifyRequest {
-                    kind: VerifyKind::Acceptance,
-                    goal: &goal,
-                    tool_calls: &[],
-                    evidence: &evidence,
-                }) {
-                    Ok(outcome) => outcome.satisfied,
-                    Err(_) => false, // fail-CLOSED: never falsely Achieved
-                }
-            } else {
-                self.acceptance_critic(&goal, &evidence)?
-            }
+        // An attested verifier is the sole acceptance authority: it runs even with no
+        // criteria, so the model cannot self-close by omission (fail-closed on error).
+        // Without one, an empty-criteria goal finishes; else verifier or critic judges.
+        let evidence = self.graph.evidence_for_goal(goal_id)?;
+        let met = match self.config.verifier.clone() {
+            Some(v) if v.attestation().is_some() => verifier_accepts(v.as_ref(), &goal, &evidence),
+            _ if goal.acceptance_criteria.is_empty() => true,
+            Some(v) => verifier_accepts(v.as_ref(), &goal, &evidence),
+            None => self.acceptance_critic(&goal, &evidence)?,
         };
 
         // Record the acceptance decision in the same audit chain (anchor = goal).
@@ -1079,8 +1080,9 @@ impl Ctx<'_> {
             .prompt_library
             .resolve(PromptId::AcceptanceCritic);
         let req = CompletionRequest::new(vec![sys.as_system(), Message::user(prompt)])
-            .with_tools(vec![verdict_spec()]);
-        let resp = self.complete(&req, &sys)?;
+            .with_tools(vec![verdict_spec()])
+            .with_tool_choice(ToolChoice::Tool("verdict".into()));
+        let resp = self.complete(req, &sys)?;
         // No verdict -> conservative: acceptance is not met.
         Ok(match parse_verdict(&resp) {
             Some((satisfied, _)) => satisfied,
@@ -1130,6 +1132,20 @@ impl Ctx<'_> {
             chain_valid,
         })
     }
+}
+
+/// Whether `v` accepts the goal given the gathered evidence (fail-closed: an error is
+/// not acceptance). The shared acceptance check for `converge`'s verifier arms.
+fn verifier_accepts(v: &dyn Verifier, goal: &Goal, evidence: &[(String, String)]) -> bool {
+    matches!(
+        v.verify(&VerifyRequest {
+            kind: VerifyKind::Acceptance,
+            goal,
+            tool_calls: &[],
+            evidence,
+        }),
+        Ok(o) if o.satisfied
+    )
 }
 
 /// Append one ReAct round to the transcript: the assistant turn, then each tool
@@ -1311,9 +1327,11 @@ struct CtxCompleter<'c, 'a> {
 
 impl Completer for CtxCompleter<'_, '_> {
     fn complete(&mut self, req: &CompletionRequest) -> Result<CompletionResponse, ProposeError> {
-        let resp = self.ctx.call_with_retry(req).map_err(ProposeError::Llm)?;
+        let mut req = req.clone();
+        req.temperature = Some(self.ctx.config.temperature);
+        let resp = self.ctx.call_with_retry(&req).map_err(ProposeError::Llm)?;
         self.ctx
-            .accrue_and_record(req, &resp, self.prompt)
+            .accrue_and_record(&req, &resp, self.prompt)
             .map_err(|e| ProposeError::Failed(e.to_string()))?;
         Ok(resp)
     }
@@ -1541,7 +1559,7 @@ fn value_to_response(v: &Value) -> CompletionResponse {
 /// An [`LLMClient`] that replays recorded responses by `request_hash` (zero live
 /// calls). Seed from [`BeliefGraph::load_llm_traces`]; an unrecorded request bumps
 /// [`ReplayClient::misses`] and errors, so a faithful replay has `misses() == 0`.
-pub struct ReplayClient {
+pub(crate) struct ReplayClient {
     responses: FxHashMap<String, CompletionResponse>,
     model_id: String,
     misses: AtomicU32,
@@ -1599,7 +1617,7 @@ impl LLMClient for ReplayClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::mock::MockClient;
+    use crate::llm::factory::testing;
     use crate::verify::{CheckerAttestation, VerifyError, VerifyOutcome};
     use citadel::{Argon2Profile, DatabaseBuilder};
     use citadel_mem::{MemoryEngine, MockEmbedder};
@@ -1623,7 +1641,7 @@ mod tests {
     ) -> (tempfile::TempDir, Agent) {
         let (dir, eng) = region();
         let graph = BeliefGraph::new(eng, "agent");
-        let llm: Arc<dyn LLMClient> = Arc::new(MockClient::scripted(responses));
+        let llm = testing::scripted(responses);
         let agent = Agent::new(
             llm,
             graph,
@@ -1640,7 +1658,7 @@ mod tests {
     ) -> (tempfile::TempDir, Agent) {
         let (dir, eng) = region();
         let graph = BeliefGraph::new(eng, "agent");
-        let llm: Arc<dyn LLMClient> = Arc::new(MockClient::scripted(responses));
+        let llm = testing::scripted(responses);
         let agent = Agent::new(
             llm,
             graph,
@@ -1664,49 +1682,15 @@ mod tests {
         (dir, agent)
     }
 
-    /// Fails its first `fail_times` calls with an HTTP `status`, then replies
-    /// with plain text. `calls` counts every invocation so a test can assert
-    /// exactly how many attempts the retry loop made.
-    struct FlakyClient {
-        remaining: AtomicU32,
-        status: u16,
-        calls: AtomicU32,
-    }
-
-    impl FlakyClient {
-        fn new(fail_times: u32, status: u16) -> Self {
-            Self {
-                remaining: AtomicU32::new(fail_times),
-                status,
-                calls: AtomicU32::new(0),
-            }
-        }
-    }
-
-    impl LLMClient for FlakyClient {
-        fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, LlmError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let was_failing = self
-                .remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok();
-            if was_failing {
-                return Err(LlmError::Http {
-                    status: self.status,
-                    retry_after: None,
-                    message: "flaky".into(),
-                });
-            }
-            Ok(CompletionResponse::text("plain reply, no plan"))
-        }
-
-        fn model_id(&self) -> &str {
-            "flaky"
-        }
-
-        fn count_tokens(&self, _messages: &[Message]) -> usize {
-            1
-        }
+    /// A storm/flaky client: fails its first `fail` calls with `status`, then
+    /// replies with plain text. Surfaces a call counter for attempt assertions.
+    fn flaky(fail: u32, status: u16) -> testing::Probe {
+        testing::http_storm(
+            fail,
+            status,
+            "flaky",
+            CompletionResponse::text("plain reply, no plan"),
+        )
     }
 
     fn fast_retry(attempts: u32) -> AgentConfig {
@@ -1740,9 +1724,7 @@ mod tests {
 
     #[test]
     fn retryable_error_is_retried_until_success() {
-        // Two 503s then success; attempts = 3 covers it, so the run proceeds.
-        let llm: Arc<dyn LLMClient> = Arc::new(FlakyClient::new(2, 503));
-        let (_d, agent) = agent_with_llm(llm, fast_retry(3));
+        let (_d, agent) = agent_with_llm(flaky(2, 503).client(), fast_retry(3));
         assert!(
             agent.run("do it").is_ok(),
             "a transient error must not abort the run when retries cover it"
@@ -1751,25 +1733,21 @@ mod tests {
 
     #[test]
     fn non_retryable_error_is_not_retried() {
-        let flaky = Arc::new(FlakyClient::new(1, 400));
-        let (_d, agent) = agent_with_llm(flaky.clone(), fast_retry(5));
+        let flaky = flaky(1, 400);
+        let (_d, agent) = agent_with_llm(flaky.client(), fast_retry(5));
         let err = agent.run("do it").unwrap_err();
         assert!(matches!(err, AgentError::Llm(_)), "a 4xx propagates");
-        assert_eq!(
-            flaky.calls.load(Ordering::SeqCst),
-            1,
-            "a terminal error is not retried"
-        );
+        assert_eq!(flaky.calls(), 1, "a terminal error is not retried");
     }
 
     #[test]
     fn retries_are_exhausted_then_error() {
-        let flaky = Arc::new(FlakyClient::new(10, 503));
-        let (_d, agent) = agent_with_llm(flaky.clone(), fast_retry(3));
+        let flaky = flaky(10, 503);
+        let (_d, agent) = agent_with_llm(flaky.client(), fast_retry(3));
         let err = agent.run("do it").unwrap_err();
         assert!(matches!(err, AgentError::Llm(_)));
         assert_eq!(
-            flaky.calls.load(Ordering::SeqCst),
+            flaky.calls(),
             3,
             "first attempt plus two retries, then give up"
         );
@@ -1849,7 +1827,6 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].0, "do it");
 
-        // A fully stringified goal object is tolerated too.
         let args2 = json!({
             "goal": "{\"prompt\": \"g2\", \"acceptance_criteria\": [\"c\"]}",
             "tasks": "[]",
@@ -1877,7 +1854,7 @@ mod tests {
     #[test]
     fn loop_uses_overridden_prompt_library() {
         // An operator prompt override threads through AgentConfig without breaking
-        // the loop (MockClient ignores content, so this guards wiring, not effect).
+        // the loop (the scripted mock ignores content, so this guards wiring).
         let plan = plan_response(&[], &["step one"]);
         let exec = CompletionResponse::text("completed step one");
         let config = AgentConfig {
@@ -1941,10 +1918,10 @@ mod tests {
         };
         let (dir, eng) = region();
         let graph = BeliefGraph::new(eng, "agent");
-        let llm: Arc<dyn LLMClient> = Arc::new(MockClient::scripted(vec![
+        let llm = testing::scripted(vec![
             plan_response(&["the criterion"], &["t"]),
             CompletionResponse::text("done"),
-        ]));
+        ]);
         let agent = Agent::new(
             llm,
             graph,
@@ -1964,6 +1941,50 @@ mod tests {
         // plan + execute calls were traced - the mint ran free, past the cap.
         assert_eq!(agent.graph().load_llm_traces().unwrap().len(), 2);
         drop(dir);
+    }
+
+    #[test]
+    fn attested_verifier_gates_empty_criteria() {
+        // A plan with NO acceptance criteria must not self-close when an attested
+        // verifier is configured: the verifier (here rejecting) is the sole authority.
+        let config = AgentConfig {
+            max_replans: 0,
+            verifier: Some(Arc::new(AttestedVerifier(false))),
+            ..Default::default()
+        };
+        let (_d, agent) = agent_with_config(
+            vec![
+                plan_response(&[], &["step"]),
+                CompletionResponse::text("done"),
+            ],
+            config,
+        );
+        let report = agent.run("do the thing").unwrap();
+        assert_ne!(
+            report.terminated_by,
+            TerminatedBy::Success,
+            "empty criteria must not bypass an attested verifier that rejects acceptance"
+        );
+    }
+
+    #[test]
+    fn attested_verifier_accepts_empty_criteria() {
+        // The positive side: empty criteria + an attested verifier that ACCEPTS is now
+        // consulted (previously skipped) and converges to Success.
+        let config = AgentConfig {
+            verifier: Some(Arc::new(AttestedVerifier(true))),
+            ..Default::default()
+        };
+        let (_d, agent) = agent_with_config(
+            vec![
+                plan_response(&[], &["step"]),
+                CompletionResponse::text("done"),
+            ],
+            config,
+        );
+        let report = agent.run("do the thing").unwrap();
+        assert_eq!(report.terminated_by, TerminatedBy::Success);
+        assert!(report.chain_valid);
     }
 
     #[test]
@@ -1987,9 +2008,9 @@ mod tests {
         // from_graph recovers the original model id from the traces (no magic string).
         let (_d2, eng2) = region();
         let graph2 = BeliefGraph::new(eng2, "agent");
-        let replay = Arc::new(ReplayClient::from_graph(agent1.graph()).unwrap());
+        let replay = crate::llm::factory::replay_from_graph(agent1.graph()).unwrap();
         let agent2 = Agent::new(
-            replay.clone(),
+            replay.client(),
             graph2,
             ToolRegistry::new(),
             AgentBudget::default(),
@@ -2073,9 +2094,6 @@ mod tests {
 
     // --- ReAct inner loop ---
 
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
-
     fn agent_full(
         llm: Arc<dyn LLMClient>,
         budget: AgentBudget,
@@ -2125,37 +2143,6 @@ mod tests {
         }
     }
 
-    /// Scripted like `MockClient` but records every request, so a test can assert
-    /// what context a given ReAct round was handed.
-    struct CapturingClient {
-        scripted: Mutex<VecDeque<CompletionResponse>>,
-        requests: Mutex<Vec<CompletionRequest>>,
-    }
-    impl CapturingClient {
-        fn new(responses: Vec<CompletionResponse>) -> Self {
-            Self {
-                scripted: Mutex::new(responses.into()),
-                requests: Mutex::new(Vec::new()),
-            }
-        }
-    }
-    impl LLMClient for CapturingClient {
-        fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, LlmError> {
-            self.requests.lock().unwrap().push(req.clone());
-            self.scripted
-                .lock()
-                .unwrap()
-                .pop_front()
-                .ok_or_else(|| LlmError::Backend("capturing: exhausted".into()))
-        }
-        fn model_id(&self) -> &str {
-            "capturing"
-        }
-        fn count_tokens(&self, _messages: &[Message]) -> usize {
-            1
-        }
-    }
-
     fn one_tool_call(name: &str) -> CompletionResponse {
         CompletionResponse::tool_calls(vec![ToolCall {
             id: format!("{name}-call"),
@@ -2172,13 +2159,17 @@ mod tests {
             name: "read_src".into(),
             output: marker.into(),
         }));
-        let llm = Arc::new(CapturingClient::new(vec![
+        let cap = testing::capturing(vec![
             plan_response(&[], &["diagnose then fix"]),
             one_tool_call("read_src"),
             CompletionResponse::text("fixed it using what the source showed"),
-        ]));
-        let handle = Arc::clone(&llm);
-        let (_d, agent) = agent_full(llm, AgentBudget::default(), AgentConfig::default(), tools);
+        ]);
+        let (_d, agent) = agent_full(
+            cap.client(),
+            AgentBudget::default(),
+            AgentConfig::default(),
+            tools,
+        );
 
         let report = agent.run("fix the bug").unwrap();
         assert_eq!(report.terminated_by, TerminatedBy::Success);
@@ -2190,14 +2181,13 @@ mod tests {
         );
 
         // Round 1 (plan=0, round0=1, round1=2) must carry the tool result forward.
-        let reqs = handle.requests.lock().unwrap();
+        let reqs = cap.requests();
         assert_eq!(reqs.len(), 3, "plan + 2 react rounds");
         let fed_back = reqs[2]
             .messages
             .iter()
             .any(|m| matches!(m, Message::Tool { content, .. } if content == marker));
         assert!(fed_back, "round-1 prompt must include the tool observation");
-        // Round 0 carries no prior observations (backward-compatible prompt shape).
         let round0_has_tool = reqs[1]
             .messages
             .iter()
@@ -2207,8 +2197,6 @@ mod tests {
 
     #[test]
     fn text_only_exec_completes_in_one_round() {
-        // Backward-compat: a text Execute response closes the task in exactly one
-        // round (plan + 1 execute trace), as before the ReAct loop existed.
         let (_d, agent) = agent_with(
             vec![
                 plan_response(&[], &["step"]),
@@ -2242,7 +2230,7 @@ mod tests {
             ..Default::default()
         };
         let (_d, agent) = agent_full(
-            Arc::new(MockClient::scripted(responses)),
+            testing::scripted(responses),
             AgentBudget {
                 max_steps: 100,
                 ..Default::default()
@@ -2275,7 +2263,7 @@ mod tests {
             ..Default::default()
         };
         let (_d, agent) = agent_full(
-            Arc::new(MockClient::scripted(responses)),
+            testing::scripted(responses),
             AgentBudget {
                 max_steps: 4,
                 ..Default::default()
@@ -2306,11 +2294,11 @@ mod tests {
             ..Default::default()
         };
         let (_d, agent) = agent_full(
-            Arc::new(MockClient::scripted(vec![
+            testing::scripted(vec![
                 plan_full(&[], &["must be polite"], &["t"]),
                 one_tool_call("noop"),
                 CompletionResponse::text("reflecting"),
-            ])),
+            ]),
             AgentBudget::default(),
             config,
             tools,
@@ -2333,19 +2321,23 @@ mod tests {
         tools.register(Box::new(FailingTool {
             name: "always_fails".into(),
         }));
-        let llm = Arc::new(CapturingClient::new(vec![
+        let cap = testing::capturing(vec![
             plan_response(&[], &["use the tool"]),
             one_tool_call("always_fails"),
             CompletionResponse::text("recovered: proceeding without it"),
-        ]));
-        let handle = Arc::clone(&llm);
-        let (_d, agent) = agent_full(llm, AgentBudget::default(), AgentConfig::default(), tools);
+        ]);
+        let (_d, agent) = agent_full(
+            cap.client(),
+            AgentBudget::default(),
+            AgentConfig::default(),
+            tools,
+        );
 
         let report = agent.run("x").unwrap();
         assert_eq!(report.terminated_by, TerminatedBy::Success);
         assert_eq!(report.tasks_done, 1);
         assert!(report.chain_valid);
-        let reqs = handle.requests.lock().unwrap();
+        let reqs = cap.requests();
         let err_fed_back = reqs[2].messages.iter().any(|m| {
             matches!(m, Message::Tool { is_error, content, .. }
                 if *is_error && content.contains("tool error"))
@@ -2428,11 +2420,11 @@ mod tests {
             calls: Arc::clone(&calls),
         }));
         let (_d, agent) = agent_full(
-            Arc::new(MockClient::scripted(vec![
+            testing::scripted(vec![
                 plan_response(&[], &["w"]),
                 one_tool_call("write_thing"),
                 CompletionResponse::text("done without it"),
-            ])),
+            ]),
             AgentBudget::default(),
             AgentConfig::default(),
             tools,

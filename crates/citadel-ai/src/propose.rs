@@ -221,10 +221,10 @@ mod tests {
     use crate::llm::{CompletionResponse, ToolCall};
     use crate::prompts::{PromptId, PromptLibrary};
 
-    /// Build a `{"points":[[x,y],...]}` artifact string (local: no problem-specific dep).
-    fn points_to_artifact(points: &[(i64, i64)]) -> String {
-        let pts: Vec<[i64; 2]> = points.iter().map(|&(x, y)| [x, y]).collect();
-        serde_json::json!({ "points": pts }).to_string()
+    /// Build a `{"values":[[a,b],...]}` artifact string (local: no problem-specific dep).
+    fn artifact_with(rows: &[(i64, i64)]) -> String {
+        let vals: Vec<[i64; 2]> = rows.iter().map(|&(a, b)| [a, b]).collect();
+        serde_json::json!({ "values": vals }).to_string()
     }
 
     /// A [`Completer`] that returns one fixed reply (stands in for the traced channel).
@@ -247,7 +247,7 @@ mod tests {
     }
 
     fn propose_with(reply: CompletionResponse) -> Vec<Candidate> {
-        let goal = Goal::new("produce a no-four-concyclic set in [3]^2");
+        let goal = Goal::new("produce a candidate satisfying the constraints");
         let lib = PromptLibrary::default();
         let system = lib.resolve(PromptId::Proposer);
         let mut llm = OneShot(reply);
@@ -258,11 +258,11 @@ mod tests {
 
     #[test]
     fn parses_json_array_of_artifacts() {
-        let a = points_to_artifact(&[(1, 1), (2, 1)]);
-        let b = points_to_artifact(&[(1, 1), (1, 2), (2, 1)]);
+        let a = artifact_with(&[(1, 1), (2, 1)]);
+        let b = artifact_with(&[(1, 1), (1, 2), (2, 1)]);
         let cands = propose_with(CompletionResponse::text(format!("[{a},{b}]")));
         assert_eq!(cands.len(), 2);
-        assert!(cands.iter().all(|c| c.artifact.get("points").is_some()));
+        assert!(cands.iter().all(|c| c.artifact.get("values").is_some()));
     }
 
     #[test]
@@ -270,10 +270,10 @@ mod tests {
         let cands = propose_with(CompletionResponse::tool_calls(vec![ToolCall {
             id: "p".into(),
             name: "propose".into(),
-            arguments: serde_json::json!({ "points": [[1, 1], [2, 1]] }),
+            arguments: serde_json::json!({ "values": [[1, 1], [2, 1]] }),
         }]));
         assert_eq!(cands.len(), 1);
-        assert!(cands[0].artifact.get("points").is_some());
+        assert!(cands[0].artifact.get("values").is_some());
     }
 
     #[test]
@@ -284,47 +284,47 @@ mod tests {
 
     #[test]
     fn parses_fenced_json_array() {
-        let a = points_to_artifact(&[(1, 1), (2, 1)]);
+        let a = artifact_with(&[(1, 1), (2, 1)]);
         let cands = propose_with(CompletionResponse::text(format!("```json\n[{a}]\n```")));
         assert_eq!(cands.len(), 1);
-        assert!(cands[0].artifact.get("points").is_some());
+        assert!(cands[0].artifact.get("values").is_some());
     }
 
     #[test]
     fn parses_prose_wrapped_json() {
-        let a = points_to_artifact(&[(1, 1), (1, 2), (2, 1)]);
+        let a = artifact_with(&[(1, 1), (1, 2), (2, 1)]);
         let cands = propose_with(CompletionResponse::text(format!(
             "Sure, here is a candidate: [{a}] - hope it helps!"
         )));
         assert_eq!(cands.len(), 1);
-        assert!(cands[0].artifact.get("points").is_some());
+        assert!(cands[0].artifact.get("values").is_some());
     }
 
     #[test]
     fn single_object_is_one_candidate() {
-        let a = points_to_artifact(&[(1, 1), (2, 1), (3, 1)]);
+        let a = artifact_with(&[(1, 1), (2, 1), (3, 1)]);
         let cands = propose_with(CompletionResponse::text(a));
         assert_eq!(cands.len(), 1);
-        assert!(cands[0].artifact.get("points").is_some());
+        assert!(cands[0].artifact.get("values").is_some());
     }
 
     #[test]
-    fn nested_point_arrays_are_not_mis_split() {
-        let a = points_to_artifact(&[(1, 1), (2, 1), (3, 2), (1, 4)]);
+    fn nested_arrays_are_not_mis_split() {
+        let a = artifact_with(&[(1, 1), (2, 1), (3, 2), (1, 4)]);
         let cands = propose_with(CompletionResponse::text(format!("[{a}]")));
         assert_eq!(cands.len(), 1);
-        let pts = cands[0].artifact["points"].as_array().unwrap();
+        let vals = cands[0].artifact["values"].as_array().unwrap();
         assert_eq!(
-            pts.len(),
+            vals.len(),
             4,
-            "outer array closed at depth 0, not at an inner pair"
+            "outer array closed at depth 0, not at an inner array"
         );
     }
 
     #[test]
     fn first_of_multiple_text_blocks_wins() {
-        let a = points_to_artifact(&[(1, 1), (2, 1)]);
-        let b = points_to_artifact(&[(3, 3), (4, 4)]);
+        let a = artifact_with(&[(1, 1), (2, 1)]);
+        let b = artifact_with(&[(3, 3), (4, 4)]);
         let cands = propose_with(CompletionResponse::text(format!("[{a}] and also [{b}]")));
         assert_eq!(cands.len(), 1, "only the first balanced span is taken");
     }
@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn invalid_json_yields_no_candidates() {
         // Balanced span found but serde rejects the trailing comma: barren, not a panic.
-        let cands = propose_with(CompletionResponse::text("[ {\"points\": [[1,1]],} ]"));
+        let cands = propose_with(CompletionResponse::text("[ {\"values\": [[1,1]],} ]"));
         assert!(cands.is_empty());
     }
 

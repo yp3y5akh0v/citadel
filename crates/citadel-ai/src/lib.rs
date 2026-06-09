@@ -11,7 +11,7 @@ pub mod verify;
 
 pub use agent::{
     Agent, AgentConfig, AgentError, AgentReport, AgentResult, CognitionState, DiscoveryGoal,
-    DiscoveryReport, ReflectReason, ReplayClient, RetryPolicy, TerminatedBy,
+    DiscoveryReport, ReflectReason, RetryPolicy, TerminatedBy,
 };
 pub use budget::{AgentBudget, BudgetExceeded, BudgetUsage};
 pub use graph::{
@@ -19,13 +19,10 @@ pub use graph::{
     GraphError, GraphResult, Hypothesis, Reflection, SelfModel, Task, TaskStatus,
     TraceEvictionPolicy, Verdict, VerifiedExport, VerifiedKind,
 };
-#[cfg(all(not(target_arch = "wasm32"), feature = "claude"))]
-pub use llm::claude::ClaudeClient;
-pub use llm::mock::MockClient;
-#[cfg(all(not(target_arch = "wasm32"), feature = "ollama"))]
-pub use llm::ollama::OllamaClient;
-#[cfg(all(not(target_arch = "wasm32"), feature = "openai"))]
-pub use llm::openai::OpenAiClient;
+// The one door to an LLMClient; no concrete client type is re-exported.
+pub use llm::factory;
+#[cfg(any(test, feature = "test-util"))]
+pub use llm::factory::testing;
 pub use llm::{
     AssistantMessage, CompletionRequest, CompletionResponse, FinishReason, LLMClient, LlmError,
     Message, TokenUsage, ToolCall, ToolChoice, ToolSpec,
