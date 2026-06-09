@@ -1,7 +1,7 @@
 //! GPU semantic-recall integration test (local-only; not run in CI).
 //!
 //! Requires a real embedder build and a local bge-large model:
-//!   set CITADEL_AI_BGE_LARGE_DIR to a bge-large-en-v1.5 directory, then
+//!   set CITADEL_BGE_LARGE_DIR to a bge-large-en-v1.5 directory, then
 //!   cargo test -p citadeldb-mcp --features cuda-embed -- --ignored
 //! (omit cuda-embed for a CPU candle build via `--features candle-embed`).
 //!
@@ -15,10 +15,10 @@ use std::process::{Command, Stdio};
 use serde_json::Value;
 
 #[test]
-#[ignore = "needs a candle/cuda build + CITADEL_AI_BGE_LARGE_DIR -> bge-large model dir"]
+#[ignore = "needs a candle/cuda build + CITADEL_BGE_LARGE_DIR -> bge-large model dir"]
 fn bge_large_semantic_recall() {
-    let model_dir = std::env::var("CITADEL_AI_BGE_LARGE_DIR")
-        .expect("set CITADEL_AI_BGE_LARGE_DIR to a local bge-large-en-v1.5 directory");
+    let model_dir = std::env::var("CITADEL_BGE_LARGE_DIR")
+        .expect("set CITADEL_BGE_LARGE_DIR to a local bge-large-en-v1.5 directory");
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("gpu.cdl");
 

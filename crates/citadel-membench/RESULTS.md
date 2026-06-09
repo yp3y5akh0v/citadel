@@ -118,7 +118,7 @@ dataset_sha256:    79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698
   question; it never receives the question's category, and sees the top-30 retrieved
   turns, not the full conversation.
 - Serial and concurrent runs score identically (the harness adds no nondeterminism);
-  `LOCOMO_CONCURRENCY=1` forces a serial path. Concurrency changes wall-clock time, not
+  `CITADEL_LOCOMO_CONCURRENCY=1` forces a serial path. Concurrency changes wall-clock time, not
   the score.
 - A per-question audit and a live trace are written for every question. The report
   includes the configuration and the limitations.
@@ -146,9 +146,9 @@ pwsh -File run.ps1 -Label full-enc-mini -Reader gpt-4o-mini -Judge gpt-4o-mini `
 Token-free retrieval diagnostic (no key, no spend) - prints the layered A/B/C/D recall:
 
 ```bash
-LOCOMO_ENCRYPTED=true LOCOMO_RETRIEVAL_DIAG=1 LOCOMO_EMBEDDER=bge-large \
-  CITADEL_AI_BGE_SMALL_DIR=/path/to/bge-large-en-v1.5 \
-  CITADEL_AI_RERANKER_DIR=/path/to/ms-marco-MiniLM-L-6-v2 \
+CITADEL_LOCOMO_ENCRYPTED=true CITADEL_LOCOMO_RETRIEVAL_DIAG=1 CITADEL_LOCOMO_EMBEDDER=bge-large \
+  CITADEL_BGE_SMALL_DIR=/path/to/bge-large-en-v1.5 \
+  CITADEL_RERANKER_DIR=/path/to/ms-marco-MiniLM-L-6-v2 \
   ./target/debug/locomo locomo10.json
 ```
 
@@ -166,7 +166,7 @@ temporal 72 (15 gap, 57 reader), open_domain 31 (9 gap, 22 reader). Some reader 
 are LoCoMo gold-key errors (the gold turn is attributed to the wrong speaker); the audit
 flags candidates by a speaker-mismatch heuristic.
 
-Layered retrieval diagnostic (recall@30, n=1536, token-free, `LOCOMO_RETRIEVAL_DIAG`):
+Layered retrieval diagnostic (recall@30, n=1536, token-free, `CITADEL_LOCOMO_RETRIEVAL_DIAG`):
 A exact-cosine over raw bge embeddings 67.9%; B + citadel vector recall 87.2%; C + linear
 fusion (BM25 keyword, recency, importance) 89.2%; D + cross-encoder reranker 91.5%. Recall increases
 monotonically (A < B < C < D) and D matches the recall@30 ceiling within run noise, so

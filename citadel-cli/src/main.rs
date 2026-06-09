@@ -46,7 +46,7 @@ struct Cli {
 
     /// NULL display string
     #[arg(long, default_value = "NULL")]
-    nullvalue: String,
+    null_value: String,
 
     /// Disable colors
     #[arg(long)]
@@ -132,7 +132,7 @@ fn main() {
     let mut settings = repl::Settings {
         mode: output_mode,
         show_headers: cli.header != "off",
-        null_display: cli.nullvalue.clone(),
+        null_display: cli.null_value.clone(),
         timer: false,
         show_changes: false,
         use_color,

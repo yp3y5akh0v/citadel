@@ -162,10 +162,10 @@ pub struct BenchReport {
 }
 
 /// Whether to use encrypted regions (per-atom sealed + crypto erasure). Env vars are
-/// strings, so `LOCOMO_ENCRYPTED` is parsed as a bool ("true"/"false", case-insensitive);
+/// strings, so `CITADEL_LOCOMO_ENCRYPTED` is parsed as a bool ("true"/"false", case-insensitive);
 /// unset = false.
 pub fn encrypted_regions() -> bool {
-    std::env::var("LOCOMO_ENCRYPTED")
+    std::env::var("CITADEL_LOCOMO_ENCRYPTED")
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -228,15 +228,15 @@ pub fn run_sample_observed(
     // Reader and judge keep independent in-flight caps (Gates); `pacer` enforces
     // per-model TPM. Questions run on a fixed pool of OS threads, NOT rayon: each task
     // blocks (HTTP, gate waits) and recall() uses rayon internally, so a rayon pool
-    // would nest and deadlock once workers park. LOCOMO_CONCURRENCY=1 = serial.
-    let legacy = std::env::var("LOCOMO_CONCURRENCY")
+    // would nest and deadlock once workers park. CITADEL_LOCOMO_CONCURRENCY=1 = serial.
+    let legacy = std::env::var("CITADEL_LOCOMO_CONCURRENCY")
         .ok()
         .and_then(|s| s.parse::<usize>().ok());
     let (reader_n, judge_n) = match legacy {
         Some(1) => (1, 1),
         _ => (
-            env_usize("LOCOMO_READER_CONCURRENCY", 3),
-            env_usize("LOCOMO_JUDGE_CONCURRENCY", 12),
+            env_usize("CITADEL_LOCOMO_READER_CONCURRENCY", 3),
+            env_usize("CITADEL_LOCOMO_JUDGE_CONCURRENCY", 12),
         ),
     };
     let workers = legacy.unwrap_or(8).max(reader_n).max(judge_n);

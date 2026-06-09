@@ -118,9 +118,9 @@ pub struct Pacer {
 
 impl Pacer {
     /// Build buckets for the reader and judge models. Equal ids collapse to one
-    /// shared bucket. `LOCOMO_TPM_BURST_FRAC` (default 1.0) scales capacity.
+    /// shared bucket. `CITADEL_LOCOMO_TPM_BURST_FRAC` (default 1.0) scales capacity.
     pub fn new(reader_model: &str, reader_tpm: u64, judge_model: &str, judge_tpm: u64) -> Self {
-        let burst = std::env::var("LOCOMO_TPM_BURST_FRAC")
+        let burst = std::env::var("CITADEL_LOCOMO_TPM_BURST_FRAC")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|f| *f > 0.0)

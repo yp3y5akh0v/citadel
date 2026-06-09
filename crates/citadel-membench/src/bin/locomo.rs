@@ -2,24 +2,24 @@
 //! gated behind `openai` + `candle-embed` so default/CI builds never compile it.
 //!
 //! Usage:
-//!   OPENAI_API_KEY=...  CITADEL_AI_BGE_SMALL_DIR=/path/to/bge-small  \
+//!   OPENAI_API_KEY=...  CITADEL_BGE_SMALL_DIR=/path/to/bge-small  \
 //!     cargo run -p citadeldb-membench --features openai,candle-embed \
 //!     --bin locomo -- path/to/locomo10.json
 //!
-//! Dataset path: argv[1] or LOCOMO_DATASET. Env knobs:
-//!   LOCOMO_READER_MODEL=m     answer-generation model (default gpt-4o-mini)
-//!   LOCOMO_JUDGE_MODEL=m      scoring model (default gpt-4o-mini)
-//!   LOCOMO_RERANK_STRATEGY    replace|rrf (default rrf)
-//!   LOCOMO_READER_CONCURRENCY reader calls in flight (default 3)
-//!   LOCOMO_JUDGE_CONCURRENCY  judge calls in flight (default 12, mini)
-//!   LOCOMO_CONCURRENCY=1      force TRUE serial (both caps -> 1); else legacy floor
-//!   LOCOMO_READER_TPM / LOCOMO_JUDGE_TPM  per-model token/min cap (30000 / 1000000)
-//!   LOCOMO_RETRY_MAX_ELAPSED_SECS  per-call retry wall-clock budget (default 240)
-//!   LOCOMO_MAX_SAMPLES=N      cap the run to the first N conversations
-//!   LOCOMO_LIVE_TRACE=path    stream one JSON line per scored question
-//!   LOCOMO_AUDIT_PATH=path    per-question audit JSON written at the end
-//!   LOCOMO_DRY_RUN=1          load + print dataset stats, then exit (no LLM/key)
-//!   LOCOMO_RETRIEVAL_DIAG=1   token-free layered evidence recall@k, then exit
+//! Dataset path: argv[1] or CITADEL_LOCOMO_DATASET. Env knobs:
+//!   CITADEL_LOCOMO_READER_MODEL=m     answer-generation model (default gpt-4o-mini)
+//!   CITADEL_LOCOMO_JUDGE_MODEL=m      scoring model (default gpt-4o-mini)
+//!   CITADEL_LOCOMO_RERANK_STRATEGY    replace|rrf (default rrf)
+//!   CITADEL_LOCOMO_READER_CONCURRENCY reader calls in flight (default 3)
+//!   CITADEL_LOCOMO_JUDGE_CONCURRENCY  judge calls in flight (default 12, mini)
+//!   CITADEL_LOCOMO_CONCURRENCY=1      force TRUE serial (both caps -> 1); else legacy floor
+//!   CITADEL_LOCOMO_READER_TPM / CITADEL_LOCOMO_JUDGE_TPM  per-model token/min cap (30000 / 1000000)
+//!   CITADEL_LOCOMO_RETRY_MAX_ELAPSED_SECS  per-call retry wall-clock budget (default 240)
+//!   CITADEL_LOCOMO_MAX_SAMPLES=N      cap the run to the first N conversations
+//!   CITADEL_LOCOMO_LIVE_TRACE=path    stream one JSON line per scored question
+//!   CITADEL_LOCOMO_AUDIT_PATH=path    per-question audit JSON written at the end
+//!   CITADEL_LOCOMO_DRY_RUN=1          load + print dataset stats, then exit (no LLM/key)
+//!   CITADEL_LOCOMO_RETRIEVAL_DIAG=1   token-free layered evidence recall@k, then exit
 //!                             (needs bge, no key; pinpoints the lossy layer)
 
 use std::collections::BTreeMap;
@@ -28,7 +28,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use citadel::{Argon2Profile, DatabaseBuilder};
-use citadel_ai::{LLMClient, OpenAiClient};
+use citadel_ai::LLMClient;
 use citadel_mem::{
     AtomHit, CandleEmbedder, CrossEncoder, Embedder, FusionWeights, MemoryEngine, RecallQuery,
     RerankStrategy, Reranker,
@@ -40,43 +40,43 @@ use citadel_membench::{
 use rustc_hash::FxHashMap;
 
 /// Reader generates answers, judge scores them (distinct roles, may differ). Override
-/// via LOCOMO_READER_MODEL / LOCOMO_JUDGE_MODEL; both are pinned in Provenance.
+/// via CITADEL_LOCOMO_READER_MODEL / CITADEL_LOCOMO_JUDGE_MODEL; both are pinned in Provenance.
 const DEFAULT_READER_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_JUDGE_MODEL: &str = "gpt-4o-mini";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let dataset_path = std::env::args()
         .nth(1)
-        .or_else(|| std::env::var("LOCOMO_DATASET").ok())
-        .ok_or("dataset path required: argv[1] or LOCOMO_DATASET")?;
+        .or_else(|| std::env::var("CITADEL_LOCOMO_DATASET").ok())
+        .ok_or("dataset path required: argv[1] or CITADEL_LOCOMO_DATASET")?;
 
     let config = BenchConfig::default();
     let (mut samples, dataset_sha256) = citadel_membench::load_with_hash(&dataset_path)?;
 
-    if let Ok(raw) = std::env::var("LOCOMO_MAX_SAMPLES") {
+    if let Ok(raw) = std::env::var("CITADEL_LOCOMO_MAX_SAMPLES") {
         let n: usize = raw
             .parse()
-            .map_err(|_| "LOCOMO_MAX_SAMPLES must be a non-negative integer")?;
+            .map_err(|_| "CITADEL_LOCOMO_MAX_SAMPLES must be a non-negative integer")?;
         samples.truncate(n);
     }
 
     print_dataset_stats(&samples, &dataset_path, &dataset_sha256);
 
-    if std::env::var("LOCOMO_DRY_RUN").is_ok() {
+    if std::env::var("CITADEL_LOCOMO_DRY_RUN").is_ok() {
         eprintln!("dry run: dataset parsed OK, no LLM calls made.");
         return Ok(());
     }
 
-    // LOCOMO_MOCK_EMBED uses a deterministic embedder: fine for the DB dump
+    // CITADEL_LOCOMO_MOCK_EMBED uses a deterministic embedder: fine for the DB dump
     // (embedder-independent), NOT for the diag or full run (need real bge semantics).
-    let embedder: Arc<dyn Embedder> = if std::env::var("LOCOMO_MOCK_EMBED").is_ok() {
+    let embedder: Arc<dyn Embedder> = if std::env::var("CITADEL_LOCOMO_MOCK_EMBED").is_ok() {
         Arc::new(citadel_mem::MockEmbedder::new(384))
     } else {
-        let bge_dir = std::env::var("CITADEL_AI_BGE_SMALL_DIR")
-            .map_err(|_| "CITADEL_AI_BGE_SMALL_DIR not set")?;
-        // LOCOMO_EMBEDDER selects the model (default bge-small); dim/layers come from
+        let bge_dir =
+            std::env::var("CITADEL_BGE_SMALL_DIR").map_err(|_| "CITADEL_BGE_SMALL_DIR not set")?;
+        // CITADEL_LOCOMO_EMBEDDER selects the model (default bge-small); dim/layers come from
         // its config.json, and the choice is recorded in Provenance.
-        let ce = match std::env::var("LOCOMO_EMBEDDER")
+        let ce = match std::env::var("CITADEL_LOCOMO_EMBEDDER")
             .unwrap_or_default()
             .as_str()
         {
@@ -88,14 +88,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         Arc::new(ce)
     };
 
-    // LOCOMO_ENCRYPTED seals atoms per-key and enables per-atom/region erasure.
-    // LOCOMO_DB_PATH persists the (encrypted) DB for table/sidecar inspection; else temp.
-    let encrypted =
-        citadel_membench::encrypted_regions() || std::env::var("LOCOMO_ERASURE_DEMO").is_ok();
-    let db_path = std::env::var("LOCOMO_DB_PATH").ok();
+    // CITADEL_LOCOMO_ENCRYPTED seals atoms per-key and enables per-atom/region erasure.
+    // CITADEL_LOCOMO_DB_PATH persists the (encrypted) DB for table/sidecar inspection; else temp.
+    let encrypted = citadel_membench::encrypted_regions()
+        || std::env::var("CITADEL_LOCOMO_ERASURE_DEMO").is_ok();
+    let db_path = std::env::var("CITADEL_LOCOMO_DB_PATH").ok();
     if let Some(p) = &db_path {
         if std::path::Path::new(p).exists() {
-            return Err(format!("LOCOMO_DB_PATH exists: {p} (remove it for a fresh run)").into());
+            return Err(
+                format!("CITADEL_LOCOMO_DB_PATH exists: {p} (remove it for a fresh run)").into(),
+            );
         }
     }
     let tmp = if db_path.is_none() {
@@ -118,23 +120,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut eng = MemoryEngine::open(db.clone())?;
 
     // Inspect what is actually stored: ingest one conversation, dump its atoms.
-    if std::env::var("LOCOMO_DUMP_DB").is_ok() {
+    if std::env::var("CITADEL_LOCOMO_DUMP_DB").is_ok() {
         return run_db_dump(&eng, &samples, embedder);
     }
 
     // Token-free: does top-k recall surface the gold evidence turns? No key.
-    if std::env::var("LOCOMO_RETRIEVAL_DIAG").is_ok() {
+    if std::env::var("CITADEL_LOCOMO_RETRIEVAL_DIAG").is_ok() {
         return run_retrieval_diag(&mut eng, &samples, embedder);
     }
 
     // Behind-the-scenes encryption + erasure verification (token-free, no key).
-    if std::env::var("LOCOMO_ERASURE_DEMO").is_ok() {
+    if std::env::var("CITADEL_LOCOMO_ERASURE_DEMO").is_ok() {
         return run_erasure_demo(&eng, db, &samples, embedder);
     }
 
     // Optional cross-encoder reranker re-orders the candidate pool before the reader's
-    // top-k. LOCOMO_RERANK_STRATEGY=replace|rrf (default rrf blends cross-encoder + fusion).
-    let reranker_model = match std::env::var("CITADEL_AI_RERANKER_DIR") {
+    // top-k. CITADEL_LOCOMO_RERANK_STRATEGY=replace|rrf (default rrf blends cross-encoder + fusion).
+    let reranker_model = match std::env::var("CITADEL_RERANKER_DIR") {
         Ok(rr_dir) => {
             let ce = CrossEncoder::ms_marco_minilm_l6(&rr_dir)?;
             let model = ce.model_id().to_string();
@@ -144,41 +146,47 @@ fn main() -> Result<(), Box<dyn Error>> {
             format!("{model} ({strategy:?})")
         }
         Err(_) => {
-            eprintln!("reranker: none (set CITADEL_AI_RERANKER_DIR to enable)");
+            eprintln!("reranker: none (set CITADEL_RERANKER_DIR to enable)");
             "none".to_string()
         }
     };
 
-    let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY not set")?;
-    let reader_model =
-        std::env::var("LOCOMO_READER_MODEL").unwrap_or_else(|_| DEFAULT_READER_MODEL.to_string());
-    let judge_model =
-        std::env::var("LOCOMO_JUDGE_MODEL").unwrap_or_else(|_| DEFAULT_JUDGE_MODEL.to_string());
-    let reader: Arc<dyn LLMClient> = Arc::new(OpenAiClient::new(&reader_model, api_key.clone()));
+    // Reader/judge selected via the shared citadel-ai backend factory: CITADEL_LOCOMO_READER_*
+    // / CITADEL_LOCOMO_JUDGE_* (default openai; OPENAI_API_KEY is read inside the factory).
+    let reader: Arc<dyn LLMClient> =
+        citadel_ai::factory::from_env("CITADEL_LOCOMO_READER", "openai", DEFAULT_READER_MODEL)
+            .map_err(|e| format!("reader LLM: {e}"))?;
+    let reader_model = reader.model_id().to_string();
+
+    let judge_candidate: Arc<dyn LLMClient> =
+        citadel_ai::factory::from_env("CITADEL_LOCOMO_JUDGE", "openai", DEFAULT_JUDGE_MODEL)
+            .map_err(|e| format!("judge LLM: {e}"))?;
+    let judge_model = judge_candidate.model_id().to_string();
+    // Reuse the reader Arc when the judge resolves to the same model.
     let judge: Arc<dyn LLMClient> = if judge_model == reader_model {
         Arc::clone(&reader)
     } else {
-        Arc::new(OpenAiClient::new(&judge_model, api_key))
+        judge_candidate
     };
     eprintln!("reader: {reader_model}  judge: {judge_model}");
 
     // Per-model TPM pacing keeps submissions under the OpenAI limit so a burst can't
-    // trigger a 429 storm. Override via LOCOMO_READER_TPM / LOCOMO_JUDGE_TPM.
+    // trigger a 429 storm. Override via CITADEL_LOCOMO_READER_TPM / CITADEL_LOCOMO_JUDGE_TPM.
     const DEFAULT_READER_TPM: u64 = 30_000;
     const DEFAULT_JUDGE_TPM: u64 = 1_000_000;
-    let reader_tpm = std::env::var("LOCOMO_READER_TPM")
+    let reader_tpm = std::env::var("CITADEL_LOCOMO_READER_TPM")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_READER_TPM);
-    let judge_tpm = std::env::var("LOCOMO_JUDGE_TPM")
+    let judge_tpm = std::env::var("CITADEL_LOCOMO_JUDGE_TPM")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_JUDGE_TPM);
     let pacer = citadel_membench::Pacer::new(&reader_model, reader_tpm, &judge_model, judge_tpm);
 
-    // LOCOMO_LIVE_TRACE=path writes one JSON line per question (a plain File, so each
+    // CITADEL_LOCOMO_LIVE_TRACE=path writes one JSON line per question (a plain File, so each
     // writeln is a direct, tailable syscall).
-    let mut live_trace = std::env::var("LOCOMO_LIVE_TRACE")
+    let mut live_trace = std::env::var("CITADEL_LOCOMO_LIVE_TRACE")
         .ok()
         .map(std::fs::File::create)
         .transpose()?;
@@ -219,7 +227,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let report = aggregate(&results, prov);
 
     // Per-question audit trail (question, gold, predicted, verdict) for spot-checking.
-    if let Ok(path) = std::env::var("LOCOMO_AUDIT_PATH") {
+    if let Ok(path) = std::env::var("CITADEL_LOCOMO_AUDIT_PATH") {
         std::fs::write(&path, serde_json::to_string_pretty(&results)?)?;
         eprintln!(
             "per-question audit ({} questions) written to {path}",
@@ -313,9 +321,9 @@ impl LiveProgress {
     }
 }
 
-/// Parse `LOCOMO_RERANK_STRATEGY` (replace|rrf, default rrf) into a strategy.
+/// Parse `CITADEL_LOCOMO_RERANK_STRATEGY` (replace|rrf, default rrf) into a strategy.
 fn rerank_strategy_from_env() -> RerankStrategy {
-    match std::env::var("LOCOMO_RERANK_STRATEGY")
+    match std::env::var("CITADEL_LOCOMO_RERANK_STRATEGY")
         .unwrap_or_default()
         .to_ascii_lowercase()
         .as_str()
@@ -339,13 +347,13 @@ fn run_retrieval_diag(
     const KS: [usize; 3] = [10, 30, 50];
     const MAX_K: usize = 50;
     // D is only populated when a reranker dir is set; its name reflects the strategy.
-    let rr_dir = std::env::var("CITADEL_AI_RERANKER_DIR").ok();
+    let rr_dir = std::env::var("CITADEL_RERANKER_DIR").ok();
     let d_name = match &rr_dir {
         Some(_) => format!(
             "D: fusion + reranker {:?} (the order the reader sees)",
             rerank_strategy_from_env()
         ),
-        None => "D: (skipped; set CITADEL_AI_RERANKER_DIR to measure)".to_string(),
+        None => "D: (skipped; set CITADEL_RERANKER_DIR to measure)".to_string(),
     };
     let mode_names = [
         "A: exact-cosine (bge ceiling, no citadel)".to_string(),

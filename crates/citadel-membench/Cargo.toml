@@ -29,8 +29,15 @@ sha2 = { workspace = true }
 # A bin target cannot see dev-dependencies, so this is a normal dep (used by both).
 tempfile = "3"
 
+[dev-dependencies]
+# Test/bench targets (tests/harness.rs) need the `testing` toolkit; the `locomo`
+# bin (a normal build) must NOT get test-util, keeping it out of the shipped path.
+citadel-ai = { workspace = true, features = ["test-util"] }
+
 [features]
 openai = ["citadel-ai/openai"]
+claude = ["citadel-ai/claude"]
+ollama = ["citadel-ai/ollama"]
 candle-embed = ["citadel-mem/candle-embed"]
 # Run the embedder + cross-encoder on the GPU (CUDA); implies candle-embed. Needs the CUDA toolkit.
 cuda-embed = ["candle-embed", "citadel-mem/cuda-embed"]

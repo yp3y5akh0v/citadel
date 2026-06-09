@@ -43,10 +43,10 @@ impl RetryConfig {
                 .unwrap_or(d)
         };
         Self {
-            max_elapsed: Duration::from_secs(g("LOCOMO_RETRY_MAX_ELAPSED_SECS", 240)),
-            max_attempts: g("LOCOMO_RETRY_MAX_ATTEMPTS", 12) as u32,
-            base_ms: g("LOCOMO_RETRY_BASE_MS", 500),
-            cap_ms: g("LOCOMO_RETRY_CAP_MS", 60_000),
+            max_elapsed: Duration::from_secs(g("CITADEL_LOCOMO_RETRY_MAX_ELAPSED_SECS", 240)),
+            max_attempts: g("CITADEL_LOCOMO_RETRY_MAX_ATTEMPTS", 12) as u32,
+            base_ms: g("CITADEL_LOCOMO_RETRY_BASE_MS", 500),
+            cap_ms: g("CITADEL_LOCOMO_RETRY_CAP_MS", 60_000),
         }
     }
 

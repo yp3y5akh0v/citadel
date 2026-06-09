@@ -1,10 +1,12 @@
 //! Token-free harness tests: no network, no real model files. Everything runs
-//! against an inline LoCoMo-shaped fixture, a `MockEmbedder`, and a `MockClient`.
+//! against an inline LoCoMo-shaped fixture, a `MockEmbedder`, and the
+//! `citadel_ai::testing` client toolkit.
 
 use std::sync::Arc;
 
 use citadel::{Argon2Profile, DatabaseBuilder};
-use citadel_ai::{CompletionRequest, CompletionResponse, LLMClient, LlmError, Message, MockClient};
+use citadel_ai::testing;
+use citadel_ai::{CompletionResponse, LlmError, Message};
 use citadel_mem::{Embedder, MemoryEngine, MockEmbedder};
 use citadel_membench::{
     aggregate, build_reader_prompt, ingest_sample, judge_correct, parse_root, provenance,
@@ -214,29 +216,17 @@ fn aggregate_excludes_adversarial_from_overall_and_reports_abstention() {
 #[test]
 fn judge_parses_correct_wrong_including_the_not_correct_trap() {
     let pacer = citadel_membench::Pacer::unbounded();
-    let (ok, _) = judge_correct(
-        &MockClient::replying("CORRECT"),
-        &pacer,
-        "q",
-        "gold",
-        "pred",
-    )
-    .unwrap();
+    let correct = testing::reply_once("CORRECT");
+    let (ok, _) = judge_correct(&*correct, &pacer, "q", "gold", "pred").unwrap();
     assert!(ok);
 
-    let (bad, _) =
-        judge_correct(&MockClient::replying("WRONG"), &pacer, "q", "gold", "pred").unwrap();
+    let wrong = testing::reply_once("WRONG");
+    let (bad, _) = judge_correct(&*wrong, &pacer, "q", "gold", "pred").unwrap();
     assert!(!bad);
 
     // The trap: a reply that CONTAINS "correct" but is a rejection must be WRONG.
-    let (trap, _) = judge_correct(
-        &MockClient::replying("This is not correct, it is WRONG"),
-        &pacer,
-        "q",
-        "gold",
-        "pred",
-    )
-    .unwrap();
+    let trap_client = testing::reply_once("This is not correct, it is WRONG");
+    let (trap, _) = judge_correct(&*trap_client, &pacer, "q", "gold", "pred").unwrap();
     assert!(!trap, "must parse by prefix, not contains(\"correct\")");
 }
 
@@ -248,15 +238,15 @@ fn run_sample_is_token_free_end_to_end() {
     let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
 
     // Separate reader/judge scripts: one answer and one verdict per question.
-    let reader = MockClient::scripted(repeat_text("an answer", s.qa.len()));
-    let judge = MockClient::scripted(repeat_text("CORRECT", s.qa.len()));
+    let reader = testing::scripted(repeat_text("an answer", s.qa.len()));
+    let judge = testing::scripted(repeat_text("CORRECT", s.qa.len()));
 
     let results = run_sample(
         &eng,
         s,
         embedder,
-        &reader,
-        &judge,
+        &*reader,
+        &*judge,
         BenchConfig::default().top_k,
     )
     .unwrap();
@@ -303,15 +293,15 @@ fn run_sample_marks_empty_gold_scored_question_unscorable() {
 
     // Exactly ONE scripted reader+judge response: the unscorable question must
     // consume neither (else the mock drains and errors).
-    let reader = MockClient::scripted(repeat_text("golden retriever", 1));
-    let judge = MockClient::scripted(repeat_text("CORRECT", 1));
+    let reader = testing::scripted(repeat_text("golden retriever", 1));
+    let judge = testing::scripted(repeat_text("CORRECT", 1));
 
     let results = run_sample(
         &eng,
         s,
         embedder,
-        &reader,
-        &judge,
+        &*reader,
+        &*judge,
         BenchConfig::default().top_k,
     )
     .unwrap();
@@ -335,11 +325,11 @@ fn observer_fires_once_per_question_and_error_aborts() {
     let samples = parse_root(&fixture()).unwrap();
     let s = &samples[0];
     let top_k = BenchConfig::default().top_k;
-    let reader = ConstClient("golden retriever");
-    let judge = ConstClient("CORRECT");
+    let reader = testing::constant("golden retriever");
+    let judge = testing::constant("CORRECT");
 
     // Happy path under concurrency: one callback per question, run completes.
-    std::env::set_var("LOCOMO_CONCURRENCY", "8");
+    std::env::set_var("CITADEL_LOCOMO_CONCURRENCY", "8");
     let (_dir, eng) = open_engine();
     let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
     let seen = std::sync::atomic::AtomicUsize::new(0);
@@ -347,8 +337,8 @@ fn observer_fires_once_per_question_and_error_aborts() {
         &eng,
         s,
         embedder,
-        &reader,
-        &judge,
+        &*reader,
+        &*judge,
         top_k,
         &Pacer::unbounded(),
         &mut |_| {
@@ -357,7 +347,7 @@ fn observer_fires_once_per_question_and_error_aborts() {
         },
     )
     .unwrap();
-    std::env::remove_var("LOCOMO_CONCURRENCY");
+    std::env::remove_var("CITADEL_LOCOMO_CONCURRENCY");
     assert_eq!(out.len(), s.qa.len(), "a result per question");
     assert_eq!(
         seen.load(std::sync::atomic::Ordering::Relaxed),
@@ -372,68 +362,13 @@ fn observer_fires_once_per_question_and_error_aborts() {
         &eng2,
         s,
         embedder2,
-        &reader,
-        &judge,
+        &*reader,
+        &*judge,
         top_k,
         &Pacer::unbounded(),
         &mut |_| Err(BenchError::Dataset("observer boom".into())),
     );
     assert!(aborted.is_err(), "observer error aborts the run");
-}
-
-struct ConstClient(&'static str);
-impl LLMClient for ConstClient {
-    fn complete(
-        &self,
-        _req: &CompletionRequest,
-    ) -> std::result::Result<CompletionResponse, LlmError> {
-        Ok(CompletionResponse::text(self.0))
-    }
-    fn model_id(&self) -> &str {
-        "const"
-    }
-    fn count_tokens(&self, messages: &[Message]) -> usize {
-        messages.len()
-    }
-}
-
-/// Returns a 429 for its first `storm` calls then succeeds; the 429 carries a
-/// "try again in" body so the Retry-After body-parse is exercised.
-struct StormClient {
-    remaining: std::sync::atomic::AtomicU32,
-}
-impl StormClient {
-    fn new(storm: u32) -> Self {
-        Self {
-            remaining: std::sync::atomic::AtomicU32::new(storm),
-        }
-    }
-}
-impl LLMClient for StormClient {
-    fn complete(
-        &self,
-        _req: &CompletionRequest,
-    ) -> std::result::Result<CompletionResponse, LlmError> {
-        if self
-            .remaining
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
-            > 0
-        {
-            Err(LlmError::Http {
-                status: 429,
-                retry_after: None,
-                message: "Rate limit reached. Please try again in 1ms.".into(),
-            })
-        } else {
-            Ok(CompletionResponse::text("CORRECT"))
-        }
-    }
-    fn model_id(&self) -> &str {
-        "storm"
-    }
-    fn count_tokens(&self, _m: &[Message]) -> usize {
-        10
-    }
 }
 
 /// A sustained 429 storm must be ridden out, not fatal: `paced_complete` retries
@@ -442,19 +377,27 @@ impl LLMClient for StormClient {
 fn paced_complete_rides_out_a_429_storm() {
     // Tiny backoff so 40 retries finish fast; config is read fresh per call so these
     // overrides apply. MAX_ELAPSED is a hard ceiling against a hang.
-    std::env::set_var("LOCOMO_RETRY_BASE_MS", "1");
-    std::env::set_var("LOCOMO_RETRY_CAP_MS", "2");
-    std::env::set_var("LOCOMO_RETRY_MAX_ELAPSED_SECS", "30");
-    std::env::set_var("LOCOMO_RETRY_MAX_ATTEMPTS", "100");
+    std::env::set_var("CITADEL_LOCOMO_RETRY_BASE_MS", "1");
+    std::env::set_var("CITADEL_LOCOMO_RETRY_CAP_MS", "2");
+    std::env::set_var("CITADEL_LOCOMO_RETRY_MAX_ELAPSED_SECS", "30");
+    std::env::set_var("CITADEL_LOCOMO_RETRY_MAX_ATTEMPTS", "100");
 
-    let storm = StormClient::new(40); // 40 consecutive 429s, then success
+    // 40 consecutive 429s then success; the body carries a "try again in" phrase
+    // so the Retry-After body-parse path is exercised.
+    let storm = testing::http_storm(
+        40,
+        429,
+        "Rate limit reached. Please try again in 1ms.",
+        CompletionResponse::text("CORRECT"),
+    );
+    let client = storm.client();
     let pacer = citadel_membench::Pacer::unbounded();
-    let res = judge_correct(&storm, &pacer, "q", "gold", "pred");
+    let res = judge_correct(&*client, &pacer, "q", "gold", "pred");
 
-    std::env::remove_var("LOCOMO_RETRY_BASE_MS");
-    std::env::remove_var("LOCOMO_RETRY_CAP_MS");
-    std::env::remove_var("LOCOMO_RETRY_MAX_ELAPSED_SECS");
-    std::env::remove_var("LOCOMO_RETRY_MAX_ATTEMPTS");
+    std::env::remove_var("CITADEL_LOCOMO_RETRY_BASE_MS");
+    std::env::remove_var("CITADEL_LOCOMO_RETRY_CAP_MS");
+    std::env::remove_var("CITADEL_LOCOMO_RETRY_MAX_ELAPSED_SECS");
+    std::env::remove_var("CITADEL_LOCOMO_RETRY_MAX_ATTEMPTS");
 
     let (correct, _) = res.expect("a 40-deep 429 storm must be ridden out, not fatal");
     assert!(correct, "the eventual CORRECT response is returned");
@@ -463,29 +406,15 @@ fn paced_complete_rides_out_a_429_storm() {
 /// A terminal (non-retryable) error fails fast - we do NOT retry 4xx/Backend.
 #[test]
 fn paced_complete_fails_fast_on_terminal_error() {
-    struct DeadClient;
-    impl LLMClient for DeadClient {
-        fn complete(
-            &self,
-            _req: &CompletionRequest,
-        ) -> std::result::Result<CompletionResponse, LlmError> {
-            Err(LlmError::Backend("malformed".into()))
-        }
-        fn model_id(&self) -> &str {
-            "dead"
-        }
-        fn count_tokens(&self, _m: &[Message]) -> usize {
-            1
-        }
-    }
+    let dead = testing::error(|| LlmError::Backend("malformed".into()));
     let pacer = citadel_membench::Pacer::unbounded();
     assert!(
-        judge_correct(&DeadClient, &pacer, "q", "gold", "pred").is_err(),
+        judge_correct(&*dead, &pacer, "q", "gold", "pred").is_err(),
         "a terminal Backend error must not be retried"
     );
 }
 
-/// Serial (LOCOMO_CONCURRENCY=1) vs concurrent (=8) must produce a byte-identical
+/// Serial (CITADEL_LOCOMO_CONCURRENCY=1) vs concurrent (=8) must produce a byte-identical
 /// result vector - proving concurrency is a latency optimization, never a score change.
 #[test]
 fn concurrent_questions_match_serial_byte_for_byte() {
@@ -493,17 +422,17 @@ fn concurrent_questions_match_serial_byte_for_byte() {
     let s = &samples[0];
 
     let run = |concurrency: &str| -> Vec<QuestionResult> {
-        std::env::set_var("LOCOMO_CONCURRENCY", concurrency);
+        std::env::set_var("CITADEL_LOCOMO_CONCURRENCY", concurrency);
         let (_dir, eng) = open_engine();
         let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
-        let reader = ConstClient("golden retriever");
-        let judge = ConstClient("CORRECT");
+        let reader = testing::constant("golden retriever");
+        let judge = testing::constant("CORRECT");
         run_sample(
             &eng,
             s,
             embedder,
-            &reader,
-            &judge,
+            &*reader,
+            &*judge,
             BenchConfig::default().top_k,
         )
         .unwrap()
@@ -511,7 +440,7 @@ fn concurrent_questions_match_serial_byte_for_byte() {
 
     let serial = run("1");
     let concurrent = run("8");
-    std::env::remove_var("LOCOMO_CONCURRENCY");
+    std::env::remove_var("CITADEL_LOCOMO_CONCURRENCY");
 
     assert_eq!(serial.len(), concurrent.len(), "same question count");
     for (a, b) in serial.iter().zip(&concurrent) {

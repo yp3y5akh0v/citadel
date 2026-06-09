@@ -12,6 +12,8 @@ categories = ["external-ffi-bindings", "database"]
 
 [features]
 fips = ["citadel/fips"]
+audit-log = ["citadel/audit-log"]
+io-uring = ["citadel/io-uring"]
 
 [lib]
 name = "citadel_ffi"
