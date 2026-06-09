@@ -4,7 +4,7 @@
 
 [package]
 name = "swe_off_by_one_window"
-version = "0.0.0"
+version = "1.2.0"
 edition = "2021"
 publish = false
 
