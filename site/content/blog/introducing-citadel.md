@@ -53,4 +53,4 @@ It scores 84.1% on the LoCoMo memory benchmark, with everything encrypted.
 - **Sync** - encrypted peer-to-peer diffing over the Noise protocol.
 - **Bindings** - Rust, WebAssembly, a C API, and a CLI.
 
-Citadel is now at v1.1.0: 18 crates, 5,000+ tests, one encrypted file. Try it in the [playground](@/demo/_index.md), or read the <a href="https://github.com/yp3y5akh0v/citadel" target="_blank" rel="noopener">source</a>.
+Citadel is a Rust workspace with thousands of tests, all in one encrypted file. Try it in the [playground](@/demo/_index.md), or read the <a href="https://github.com/yp3y5akh0v/citadel" target="_blank" rel="noopener">source</a>.

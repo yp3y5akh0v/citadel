@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
 {% block title %}About - Citadel{% endblock %}
-{% block description %}Citadel is a single-author Rust workspace: an encrypted-first embedded database and agent-memory engine. 18 crates, encryption as the load-bearing layer, reproducible benchmarks against SQLite.{% endblock %}
+{% block description %}Citadel is a single-author Rust workspace: an encrypted-first embedded database and agent-memory engine. {{ config.extra.crates }} crates, encryption as the load-bearing layer, reproducible benchmarks against SQLite.{% endblock %}
 
 {% block content %}
 <main class="shell">
@@ -10,13 +10,13 @@
     <div>
       <div class="kicker">About / The project</div>
       <h1>A single-author Rust project that treats encryption as <em>load-bearing</em>.</h1>
-      <p class="sub">Not an option, not an extension, not a wrapper. An 18-crate Rust workspace: a full SQL engine, a key-value API, AES-256-CTR + HMAC encryption at the page level, shadow paging, an encrypted agent-memory engine, and a reproducible benchmark suite against SQLite.</p>
+      <p class="sub">Not an option, not an extension, not a wrapper. A {{ config.extra.crates }}-crate Rust workspace: a full SQL engine, a key-value API, AES-256-CTR + HMAC encryption at the page level, shadow paging, an encrypted agent-memory engine, and a reproducible benchmark suite against SQLite.</p>
     </div>
     <aside class="card">
-      <div class="row"><span class="k">version</span><span class="v"><span class="ac">v1.1.0</span> / stable</span></div>
+      <div class="row"><span class="k">version</span><span class="v"><span class="ac">v{{ config.extra.version }}</span> / stable</span></div>
       <div class="row"><span class="k">license</span><span class="v">MIT / Apache-2.0</span></div>
-      <div class="row"><span class="k">crates</span><span class="v">18</span></div>
-      <div class="row"><span class="k">tests</span><span class="v">5,000+ / 100% pass</span></div>
+      <div class="row"><span class="k">crates</span><span class="v">{{ config.extra.crates }}</span></div>
+      <div class="row"><span class="k">tests</span><span class="v">{{ config.extra.tests }} / 100% pass</span></div>
       <div class="row"><span class="k">authors</span><span class="v">1</span></div>
       <div class="row"><span class="k">status</span><span class="v" style="color:var(--ok)">open source</span></div>
     </aside>
@@ -59,7 +59,7 @@
             <div class="t-num">v.</div>
             <div>
               <h3>The benchmarks are <span class="ac">reproducible</span>.</h3>
-              <p>The 50 head-to-head benchmarks against unencrypted SQLite live in <code>citadeldb-sql/benches/h2h_bench.rs</code>. Run them yourself with <code>cargo bench</code>. We publish what the bench output says, not a marketing average.</p>
+              <p>The {{ config.extra.benchmarks }} head-to-head benchmarks against unencrypted SQLite live in <code>citadeldb-sql/benches/h2h_bench.rs</code>. Run them yourself with <code>cargo bench</code>. We publish what the bench output says, not a marketing average.</p>
             </div>
           </div>
         </div>
@@ -72,7 +72,7 @@
       <div class="sec-index"><span class="num">02</span><span class="label">Repo shape</span></div>
       <div>
         <p style="margin:0 0 24px; color:var(--fg-2); font-size:14.5px; line-height:1.65; max-width:62ch;">
-          A Cargo workspace of 18 crates, layered from the bytes on disk up to the SQL frontend, the agent-memory engine, and the bindings. Each crate has its own tests; 5,000+ in total, with 100% pass on <code>cargo test --workspace</code>. 15 crates publish to crates.io.
+          A Cargo workspace of {{ config.extra.crates }} crates, layered from the bytes on disk up to the SQL frontend, the agent-memory engine, and the bindings. Each crate has its own tests; {{ config.extra.tests }} in total, with 100% pass on <code>cargo test --workspace</code>. {{ config.extra.published }} crates publish to crates.io.
         </p>
         <div class="crates">
           <div class="crate"><div class="name">citadel-core</div><div class="desc">Shared types, errors, constants.</div></div>
@@ -88,11 +88,12 @@
           <div class="crate"><div class="name">citadel-vector</div><div class="desc">VECTOR(N) type and <a class="ilink" href="https://github.com/yp3y5akh0v/prism" target="_blank" rel="noopener">PRISM</a> filtered ANN index.</div></div>
           <div class="crate"><div class="name">citadel-mem</div><div class="desc">Agent-memory engine: regions, atoms, edges, traces.</div></div>
           <div class="crate"><div class="name">citadel-ai</div><div class="desc">Agent runtime: ReAct + Reflexion, budget caps.</div></div>
-          <div class="crate"><div class="name">citadel-mcp</div><div class="desc">MCP server exposing memory as 13 tools.</div></div>
+          <div class="crate"><div class="name">citadel-mcp</div><div class="desc">MCP server exposing memory as {{ config.extra.mcp_tools }} tools.</div></div>
           <div class="crate"><div class="name">citadel-cli</div><div class="desc">REPL with 26 dot-commands, tab completion.</div></div>
-          <div class="crate"><div class="name">citadel-ffi</div><div class="desc">37 C-ABI functions. cbindgen header.</div></div>
+          <div class="crate"><div class="name">citadel-ffi</div><div class="desc">{{ config.extra.ffi_functions }} C-ABI functions. cbindgen header.</div></div>
           <div class="crate"><div class="name">citadel-wasm</div><div class="desc">WebAssembly build. <code>@citadeldb/wasm</code> on npm.</div></div>
           <div class="crate"><div class="name">citadel-membench</div><div class="desc">LoCoMo long-memory benchmark harness.</div></div>
+          <div class="crate"><div class="name">citadel-swe</div><div class="desc">Mini-SWE agent benchmark harness.</div></div>
         </div>
       </div>
     </div>
@@ -108,18 +109,18 @@
         <div class="spec-table">
           <div class="spec-row"><div class="k">Language</div><div class="v"><code>Rust 1.75+</code></div><div class="note">stable toolchain</div></div>
           <div class="spec-row"><div class="k">License</div><div class="v"><span class="ac">MIT</span> or <span class="ac">Apache-2.0</span></div><div class="note">dual</div></div>
-          <div class="spec-row"><div class="k">Workspace crates</div><div class="v"><span class="ac">18</span> / 15 published</div><div class="note">see section 02</div></div>
-          <div class="spec-row"><div class="k">Tests</div><div class="v"><span class="ac">5,000+</span> / 100% pass</div><div class="note">cargo test --workspace</div></div>
-          <div class="spec-row"><div class="k">Head-to-head wins</div><div class="v"><span class="ac">50 / 50</span> vs SQLite</div><div class="note">geo mean ~2.8&times;</div></div>
+          <div class="spec-row"><div class="k">Workspace crates</div><div class="v"><span class="ac">{{ config.extra.crates }}</span> / {{ config.extra.published }} published</div><div class="note">see section 02</div></div>
+          <div class="spec-row"><div class="k">Tests</div><div class="v"><span class="ac">{{ config.extra.tests }}</span> / 100% pass</div><div class="note">cargo test --workspace</div></div>
+          <div class="spec-row"><div class="k">Head-to-head wins</div><div class="v"><span class="ac">{{ config.extra.benchmarks }} / {{ config.extra.benchmarks }}</span> vs SQLite</div><div class="note">geo mean ~2.8&times;</div></div>
           <div class="spec-row"><div class="k">Page size</div><div class="v"><span class="ac">8,208 B</span> on disk</div><div class="note">16 IV + 8,160 ct + 32 MAC</div></div>
           <div class="spec-row"><div class="k">Cipher</div><div class="v"><code>AES-256-CTR</code></div><div class="note">ChaCha20 available</div></div>
           <div class="spec-row"><div class="k">MAC</div><div class="v"><code>HMAC-SHA256</code></div><div class="note">per-page tag</div></div>
           <div class="spec-row"><div class="k">KDF</div><div class="v"><code>Argon2id</code></div><div class="note">PBKDF2 in FIPS mode</div></div>
           <div class="spec-row"><div class="k">Commit</div><div class="v">Shadow paging / god-byte flip</div><div class="note">no WAL</div></div>
           <div class="spec-row"><div class="k">Isolation</div><div class="v">Snapshot / CoW B+tree</div><div class="note">single-writer MVCC</div></div>
-          <div class="spec-row"><div class="k">FFI surface</div><div class="v"><span class="ac">37</span> C-ABI functions</div><div class="note">citadel-ffi</div></div>
-          <div class="spec-row"><div class="k">MCP tools</div><div class="v"><span class="ac">13</span> over stdio</div><div class="note">citadel-mcp</div></div>
-          <div class="spec-row"><div class="k">LoCoMo score</div><div class="v"><span class="ac">84.1%</span> (3-run mean)</div><div class="note">encrypted / vs 91.6% recall ceiling</div></div>
+          <div class="spec-row"><div class="k">FFI surface</div><div class="v"><span class="ac">{{ config.extra.ffi_functions }}</span> C-ABI functions</div><div class="note">citadel-ffi</div></div>
+          <div class="spec-row"><div class="k">MCP tools</div><div class="v"><span class="ac">{{ config.extra.mcp_tools }}</span> over stdio</div><div class="note">citadel-mcp</div></div>
+          <div class="spec-row"><div class="k">LoCoMo score</div><div class="v"><span class="ac">{{ config.extra.locomo }}%</span> (3-run mean)</div><div class="note">encrypted / vs 91.6% recall ceiling</div></div>
         </div>
       </div>
     </div>
@@ -135,7 +136,7 @@
         <div class="audit">
           <div class="audit-row">
             <div class="cat">core</div>
-            <div class="claim">Cipher, MAC, KDF, page size, shadow paging, 5,000+ tests, 50/50 head-to-head, 18 crates, 37 FFI functions, and 13 MCP tools, all grounded in the README and source tree.</div>
+            <div class="claim">Cipher, MAC, KDF, page size, shadow paging, {{ config.extra.tests }} tests, {{ config.extra.benchmarks }}/{{ config.extra.benchmarks }} head-to-head, {{ config.extra.crates }} crates, {{ config.extra.ffi_functions }} FFI functions, and {{ config.extra.mcp_tools }} MCP tools, all grounded in the README and source tree.</div>
           </div>
           <div class="audit-row">
             <div class="cat">sql</div>
@@ -143,7 +144,7 @@
           </div>
           <div class="audit-row">
             <div class="cat">memory</div>
-            <div class="claim"><code>citadel-mem</code> stores regions of typed atoms and edges with hybrid recall and cryptographic erasure; <code>citadel-mcp</code> serves it over the Model Context Protocol; the 84.1% LoCoMo score is measured by <code>citadel-membench</code>.</div>
+            <div class="claim"><code>citadel-mem</code> stores regions of typed atoms and edges with hybrid recall and cryptographic erasure; <code>citadel-mcp</code> serves it over the Model Context Protocol; the {{ config.extra.locomo }}% LoCoMo score is measured by <code>citadel-membench</code>.</div>
           </div>
           <div class="audit-row">
             <div class="cat">targets</div>
@@ -184,7 +185,7 @@
     <blockquote>
       Encrypted <span class="ac">by construction</span>. Not by option.
     </blockquote>
-    <div class="sig">citadel / v1.1.0</div>
+    <div class="sig">citadel / v{{ config.extra.version }}</div>
     <div class="final-actions">
       <a class="btn" href="{{ get_url(path='@/demo/_index.md') }}">Open playground</a>
       <a class="btn ghost" href="{{ config.base_url }}/">Back to overview</a>

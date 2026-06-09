@@ -117,7 +117,7 @@
     <div><span class="lab">On-disk</span><span class="val"><em>100%</em> ciphertext</span></div>
     <div><span class="lab">Isolation</span><span class="val"><em>snapshot</em> (CoW B+tree)</span></div>
     <div><span class="lab">Session</span><span class="val" id="sessTime">00:00:00</span></div>
-    <div><span class="lab">Build</span><span class="val">v1.1.0</span></div>
+    <div><span class="lab">Build</span><span class="val">v{{ config.extra.version }}</span></div>
   </div>
 
   <div class="explainers">
@@ -134,7 +134,7 @@
     <div class="explainer">
       <div class="num">03 / the benchmark numbers</div>
       <h4>Reproduce with one command.</h4>
-      <p><code>cargo bench -p citadeldb-sql --bench h2h_bench</code> runs the 50 head-to-head benchmarks against unencrypted SQLite at equal cache budgets.</p>
+      <p><code>cargo bench -p citadeldb-sql --bench h2h_bench</code> runs the {{ config.extra.benchmarks }} head-to-head benchmarks against unencrypted SQLite at equal cache budgets.</p>
     </div>
   </div>
 </main>
