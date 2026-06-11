@@ -1,11 +1,13 @@
-//! BERT sentence embeddings via Candle (feature `candle-embed`).
-//! Pooling is model-specific: BGE uses CLS, MiniLM/E5 use masked mean.
+//! Sentence embeddings via Candle (feature `candle-embed`), over two encoder
+//! backbones: classic BERT (BGE, MiniLM, E5) and ModernBERT (IBM granite-r2).
+//! Pooling is model-specific: BGE/granite use CLS, MiniLM/E5 use masked mean.
 
 use std::path::Path;
 
 use candle_core::{Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
+use candle_transformers::models::modernbert::{Config as ModernBertConfig, ModernBert};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use crate::embed::{EmbedError, Embedder, EmbeddingMetric, Reranker};
@@ -19,16 +21,26 @@ const MICRO_BATCH: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pooling {
-    /// First-token (`[CLS]`) hidden state. Used by BGE models.
+    /// First-token (`[CLS]`) hidden state. Used by BGE and granite models.
     Cls,
     /// Attention-masked mean over tokens. Used by MiniLM and E5.
     Mean,
+}
+
+/// The encoder architecture behind an embedding model - decides which config
+/// shape `config.json` parses as and which forward signature runs (BERT takes
+/// token-type ids; ModernBERT has none and builds rotary/local attention).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arch {
+    Bert,
+    ModernBert,
 }
 
 /// Settings for [`CandleEmbedder::from_dir`] (`dim` comes from the model config).
 #[derive(Debug, Clone)]
 pub struct CandleConfig {
     pub model_id: String,
+    pub arch: Arch,
     pub metric: EmbeddingMetric,
     pub pooling: Pooling,
     /// L2-normalize each output vector (required for cosine similarity).
@@ -43,6 +55,7 @@ impl CandleConfig {
     pub fn bge_small() -> Self {
         Self {
             model_id: "bge-small-en-v1.5".into(),
+            arch: Arch::Bert,
             metric: EmbeddingMetric::Cosine,
             pooling: Pooling::Cls,
             normalize: true,
@@ -71,6 +84,7 @@ impl CandleConfig {
     pub fn minilm_l6() -> Self {
         Self {
             model_id: "all-MiniLM-L6-v2".into(),
+            arch: Arch::Bert,
             metric: EmbeddingMetric::Cosine,
             pooling: Pooling::Mean,
             normalize: true,
@@ -83,6 +97,7 @@ impl CandleConfig {
     pub fn e5_large() -> Self {
         Self {
             model_id: "e5-large-v2".into(),
+            arch: Arch::Bert,
             metric: EmbeddingMetric::Cosine,
             pooling: Pooling::Mean,
             normalize: true,
@@ -90,11 +105,49 @@ impl CandleConfig {
             max_length: 512,
         }
     }
+
+    /// `ibm-granite/granite-embedding-english-r2` (768d, cosine, CLS pooling, NO
+    /// prefixes - natively symmetric). ModernBERT backbone with a byte-BPE
+    /// tokenizer: 0% UNK on symbol-dense text (Lean statements), where the
+    /// BERT-vocab tier maps `∀ ∃ ≠` to `[UNK]` and collapses `=`/`≠`.
+    pub fn granite_r2() -> Self {
+        Self {
+            model_id: "granite-embedding-english-r2".into(),
+            arch: Arch::ModernBert,
+            metric: EmbeddingMetric::Cosine,
+            pooling: Pooling::Cls,
+            normalize: true,
+            query_prefix: None,
+            max_length: 512,
+        }
+    }
 }
 
-/// A local BERT sentence-embedding model (Candle backend).
+/// The loaded encoder. BERT consumes `(ids, type_ids, mask)`; ModernBERT has no
+/// token-type embedding and consumes `(ids, mask)`. Boxed: the BERT struct is
+/// several times the ModernBERT one (clippy::large_enum_variant).
+enum Backbone {
+    Bert(Box<BertModel>),
+    ModernBert(Box<ModernBert>),
+}
+
+impl Backbone {
+    fn forward(
+        &self,
+        ids: &Tensor,
+        type_ids: &Tensor,
+        mask: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        match self {
+            Backbone::Bert(m) => m.forward(ids, type_ids, Some(mask)),
+            Backbone::ModernBert(m) => m.forward(ids, mask),
+        }
+    }
+}
+
+/// A local sentence-embedding model (Candle backend).
 pub struct CandleEmbedder {
-    model: BertModel,
+    model: Backbone,
     tokenizer: Tokenizer,
     device: Device,
     dim: usize,
@@ -133,23 +186,53 @@ impl CandleEmbedder {
     ) -> Result<Self, EmbedError> {
         let device = select_device();
 
-        let config: Config = serde_json::from_slice(config_json).map_err(backend)?;
-        let dim = config.hidden_size;
-
         let mut tokenizer = Tokenizer::from_bytes(tokenizer_json).map_err(backend)?;
-        tokenizer.with_padding(Some(PaddingParams {
+        let mut padding = PaddingParams {
             strategy: PaddingStrategy::BatchLongest,
             ..Default::default()
-        }));
+        };
+        let vb = VarBuilder::from_buffered_safetensors(weights, DTYPE, &device).map_err(backend)?;
+        let (model, dim) = match cfg.arch {
+            Arch::Bert => {
+                let config: Config = serde_json::from_slice(config_json).map_err(backend)?;
+                let dim = config.hidden_size;
+                (
+                    Backbone::Bert(Box::new(BertModel::load(vb, &config).map_err(backend)?)),
+                    dim,
+                )
+            }
+            Arch::ModernBert => {
+                let config: ModernBertConfig =
+                    serde_json::from_slice(config_json).map_err(backend)?;
+                // ModernBERT vocabs don't put [PAD] at id 0; take it from the config.
+                padding.pad_id = config.pad_token_id;
+                if let Some(tok) = tokenizer.id_to_token(config.pad_token_id) {
+                    padding.pad_token = tok;
+                }
+                let dim = config.hidden_size;
+                // Candle's loader addresses the backbone under a `model.` prefix
+                // (the ForMaskedLM layout); a bare ModernBertModel checkpoint
+                // (granite-r2) stores tensors unprefixed - strip it on lookup.
+                let vb = if vb.contains_tensor("model.embeddings.tok_embeddings.weight") {
+                    vb
+                } else {
+                    vb.rename_f(|name: &str| {
+                        name.strip_prefix("model.").unwrap_or(name).to_string()
+                    })
+                };
+                (
+                    Backbone::ModernBert(Box::new(ModernBert::load(vb, &config).map_err(backend)?)),
+                    dim,
+                )
+            }
+        };
+        tokenizer.with_padding(Some(padding));
         tokenizer
             .with_truncation(Some(TruncationParams {
                 max_length: cfg.max_length,
                 ..Default::default()
             }))
             .map_err(backend)?;
-
-        let vb = VarBuilder::from_buffered_safetensors(weights, DTYPE, &device).map_err(backend)?;
-        let model = BertModel::load(vb, &config).map_err(backend)?;
 
         Ok(Self {
             model,
@@ -198,6 +281,11 @@ impl CandleEmbedder {
         Self::from_dir(dir, CandleConfig::e5_large())
     }
 
+    /// `ibm-granite/granite-embedding-english-r2` from a directory.
+    pub fn granite_r2(dir: impl AsRef<Path>) -> Result<Self, EmbedError> {
+        Self::from_dir(dir, CandleConfig::granite_r2())
+    }
+
     fn run(&self, texts: &[&str]) -> candle_core::Result<Tensor> {
         let inputs: Vec<String> = match &self.prefix {
             Some(p) => texts.iter().map(|t| format!("{p}{t}")).collect(),
@@ -223,7 +311,7 @@ impl CandleEmbedder {
         let type_ids = Tensor::from_vec(type_ids, (bsz, seq), &self.device)?;
         let attn = Tensor::from_vec(mask, (bsz, seq), &self.device)?;
 
-        let hidden = self.model.forward(&input_ids, &type_ids, Some(&attn))?;
+        let hidden = self.model.forward(&input_ids, &type_ids, &attn)?;
         let pooled = match self.pooling {
             Pooling::Cls => cls_pool(&hidden)?,
             Pooling::Mean => masked_mean_pool(&hidden, &attn)?,
@@ -376,7 +464,6 @@ impl CrossEncoder {
             let type_ids = Tensor::from_vec(type_ids, (bsz, seq), &self.device)?;
             let attn = Tensor::from_vec(mask, (bsz, seq), &self.device)?;
 
-            // [CLS] hidden -> pooler (dense + tanh) -> classifier -> one logit per row.
             let hidden = self.model.forward(&input_ids, &type_ids, Some(&attn))?;
             // narrow+squeeze is non-contiguous; candle's CUDA matmul needs contiguous.
             let cls = hidden.narrow(1, 0, 1)?.squeeze(1)?.contiguous()?;
@@ -440,7 +527,6 @@ mod tests {
     #[test]
     fn masked_mean_pool_averages_unmasked_tokens() {
         let dev = Device::Cpu;
-        // One row, 2 tokens, 2 dims: [[1,2],[3,4]].
         let hidden = Tensor::from_vec(vec![1f32, 2., 3., 4.], (1, 2, 2), &dev).unwrap();
         let m_all = Tensor::from_vec(vec![1f32, 1.], (1, 2), &dev).unwrap();
         let out = masked_mean_pool(&hidden, &m_all)
@@ -516,7 +602,7 @@ mod tests {
         let model = BertModel::load(vb, &config).unwrap();
 
         CandleEmbedder {
-            model,
+            model: Backbone::Bert(Box::new(model)),
             tokenizer,
             device,
             dim: config.hidden_size,
@@ -573,6 +659,53 @@ mod tests {
         assert!(
             related > unrelated,
             "semantic ordering broke: related={related} unrelated={unrelated}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs CITADEL_GRANITE_R2_DIR pointing at a local granite-embedding-english-r2 dir"]
+    fn granite_r2_loads_and_distinguishes_lean_negation() {
+        let dir = std::env::var("CITADEL_GRANITE_R2_DIR")
+            .expect("set CITADEL_GRANITE_R2_DIR to a local granite-embedding-english-r2 directory");
+        let e = CandleEmbedder::granite_r2(&dir).expect("load granite-r2 from dir");
+        assert_eq!(e.dim(), 768, "granite-embedding-english-r2 is 768-dim");
+
+        // The property that disqualified the BERT-vocab tier: a negation-only
+        // difference must be VISIBLE at the input layer. With NFD+strip-accents
+        // WordPiece, `=` and `≠` tokenize identically and these two statements
+        // collapse; granite's byte-BPE must keep them apart.
+        let out = e
+            .embed(&[
+                "\u{2200} (a b : \u{2115}), a + b = b + a",
+                "\u{2200} (a b : \u{2115}), a + b \u{2260} b + a",
+                "\u{2200} (n m : \u{2115}), n + m = m + n",
+                "theorem about continuous functions on compact spaces",
+            ])
+            .unwrap();
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().all(|v| v.len() == 768));
+        for v in &out {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(approx(norm, 1.0, 1e-3), "L2-normalized, got {norm}");
+        }
+
+        let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let negation = cos(&out[0], &out[1]);
+        let renamed = cos(&out[0], &out[2]);
+        let unrelated = cos(&out[0], &out[3]);
+        eprintln!("GRANITE cos: negation={negation} alpha-renamed={renamed} unrelated={unrelated}");
+        // The negation may legitimately sit CLOSER than a rename (one character of
+        // surface difference vs four) - the vector tier is a recall widener and a
+        // recalled negation is refuted downstream by the kernel. What must hold:
+        // the pair is not INPUT-IDENTICAL (the BERT-vocab failure mode, cos ~1.0),
+        // and both restatements rank far above unrelated text.
+        assert!(
+            negation < 0.999,
+            "negation-only pair must not collapse to identity: {negation}"
+        );
+        assert!(
+            renamed > unrelated && negation > unrelated,
+            "restatements must outrank unrelated text: renamed={renamed} negation={negation} unrelated={unrelated}"
         );
     }
 

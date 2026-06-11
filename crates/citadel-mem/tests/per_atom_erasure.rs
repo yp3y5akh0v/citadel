@@ -24,6 +24,29 @@ fn engine(dir: &std::path::Path) -> MemoryEngine {
 }
 
 #[test]
+fn count_in_sealed_region_excludes_erased_atoms() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    eng.create_encrypted_region("r", embedder()).unwrap();
+
+    let target = eng
+        .remember("r", AtomInput::new("fact", "to be erased"))
+        .unwrap();
+    eng.remember("r", AtomInput::new("fact", "kept one"))
+        .unwrap();
+    eng.remember("r", AtomInput::new("fact", "kept two"))
+        .unwrap();
+    eng.remember("r", AtomInput::new("event", "other kind"))
+        .unwrap();
+    assert_eq!(eng.count("r", "fact").unwrap(), 3);
+    assert_eq!(eng.count("r", "event").unwrap(), 1);
+
+    // A crypto-erased atom still has a row; its dead key must not count.
+    eng.forget_atom("r", target).unwrap();
+    assert_eq!(eng.count("r", "fact").unwrap(), 2);
+}
+
+#[test]
 fn forget_atom_removes_one_keeps_siblings() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());

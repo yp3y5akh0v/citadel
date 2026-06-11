@@ -9,6 +9,7 @@ use citadel::Database;
 use citadel_core::WRAPPED_KEY_SIZE;
 use citadel_crypto::blob_seal;
 use citadel_crypto::hkdf_utils::{derive_atom_wrap_key, derive_seal_keys, AtomWrapKey};
+use citadel_sql::executor::{AnnIndexSource, AnnSegmentInfo};
 use citadel_sql::{Connection, ExecutionResult, Value};
 use citadel_vector::{AnnIndex, Filter, Metric};
 use zeroize::Zeroize;
@@ -69,7 +70,13 @@ struct RegionHandle {
 
 /// Ephemeral, per-region in-RAM PRISM index over DECRYPTED vectors, built lazily on the
 /// first sealed recall. The plaintext vectors are zeroized when the index drops (see
-/// `PointStore`'s `Drop`), so they never outlive the region key. Never persisted.
+/// `PointStore`'s `Drop`), so they never outlive the region key.
+///
+/// The GRAPH (not the vectors) may be persisted as a sealed segment: the
+/// segment ciphertext lives under its own random key held in the ERASABLE atom
+/// key store, so destroying that one slot crypto-erases every on-disk
+/// derivative (SQ8 codes are near-lossless embedding reconstructions - they
+/// must never outlive erasure any more than the atoms themselves).
 struct SealedAnn {
     index: AnnIndex,
     /// Atom `kind` -> PRISM attribute code, so a kind-filtered recall maps to a `Filter`.
@@ -79,6 +86,8 @@ struct SealedAnn {
     /// 400-element `WHERE id IN (...)` per recall) and re-decrypting on every call.
     /// Plaintext, so zeroized on drop alongside the index vectors (never outlives the key).
     cached: FxHashMap<AtomId, CachedAtom>,
+    /// Whether this index came from the persisted sealed segment or a scan build.
+    source: AnnIndexSource,
 }
 
 /// The per-atom fields a sealed recall needs to build a `Candidate`, decrypted once at
@@ -228,6 +237,29 @@ impl MemoryEngine {
             let qr = conn.query_params(&format!("SELECT id, key_slot FROM {table}"), &[])?;
             for r in &qr.rows {
                 valid.insert((as_int(&r[1])? as u32, as_int(&r[0])? as u64));
+            }
+        }
+        // Persisted sealed-segment keys are row-less BY DESIGN (a pseudo-atom
+        // id owns the slot; the ciphertext lives in a hidden chunk tree): the
+        // meta rows are their committed reference.
+        let qr = conn.query_params(
+            "SELECT key, value FROM memory_meta WHERE key LIKE 'annseg_%'",
+            &[],
+        )?;
+        let mut seg_slots: FxHashMap<String, u32> = FxHashMap::default();
+        let mut seg_ids: FxHashMap<String, u64> = FxHashMap::default();
+        for row in &qr.rows {
+            let key = as_text(&row[0])?;
+            let value = as_int(&row[1])?;
+            if let Some(region) = key.strip_prefix("annseg_slot:") {
+                seg_slots.insert(region.to_string(), value as u32);
+            } else if let Some(region) = key.strip_prefix("annseg_id:") {
+                seg_ids.insert(region.to_string(), value as u64);
+            }
+        }
+        for (region, slot) in &seg_slots {
+            if let Some(&id) = seg_ids.get(region) {
+                valid.insert((*slot, id));
             }
         }
         for (slot, owner) in live {
@@ -599,6 +631,352 @@ impl MemoryEngine {
         qr.rows.iter().map(|row| parse_fetched(row)).collect()
     }
 
+    /// Count atoms of `kind` without materializing them - manifest verification
+    /// over a large reference corpus must not pay a full fetch. `kind` is a SQL
+    /// column in both region flavors, so no decryption is involved; in a sealed
+    /// region a crypto-erased atom still has a row but its key is gone, so the
+    /// count includes only atoms whose key is live (uncapped - this is a count,
+    /// not the `EXACT_SCAN_LIMIT`-bounded decrypting fetch).
+    pub fn count(&self, region: &str, kind: &str) -> Result<u64> {
+        let key = region.to_ascii_lowercase();
+        let h = self.region_handle(&key)?;
+        let conn = Connection::open(&self.db)?;
+        if h.atom_wrap.is_some() {
+            let wrapped = self.db.atom_store_live_wrapped()?;
+            let qr = conn.query_params(
+                &format!(
+                    "SELECT id FROM {table} WHERE region_id = $1 AND kind = $2",
+                    table = h.table
+                ),
+                &[Value::Integer(h.id), Value::Text(kind.into())],
+            )?;
+            let mut live = 0u64;
+            for row in &qr.rows {
+                if wrapped.contains_key(&(as_int(&row[0])? as u64)) {
+                    live += 1;
+                }
+            }
+            return Ok(live);
+        }
+        let qr = conn.query_params(
+            &format!(
+                "SELECT COUNT(*) FROM {table} WHERE region_id = $1 AND kind = $2",
+                table = h.table
+            ),
+            &[Value::Integer(h.id), Value::Text(kind.into())],
+        )?;
+        match qr.rows.first().and_then(|r| r.first()) {
+            Some(Value::Integer(n)) => Ok(*n as u64),
+            other => Err(MemError::Invalid(format!(
+                "COUNT returned no integer: {other:?}"
+            ))),
+        }
+    }
+
+    /// Freeze the region's ANN index into a persisted segment: subsequent cold
+    /// attaches LOAD it in seconds instead of paying the PRISM rebuild, with
+    /// the load-time scan re-proving freshness by content. Plaintext regions
+    /// persist through the SQL layer (`Connection::persist_ann_index`). SEALED
+    /// regions persist the segment as ONE ciphertext under a random key held
+    /// in the erasable atom key store: destroying that slot crypto-erases all
+    /// on-disk derivatives of the region's embeddings, preserving per-atom
+    /// erasure semantics end to end.
+    pub fn persist_ann_index(&self, region: &str) -> Result<AnnSegmentInfo> {
+        let key = region.to_ascii_lowercase();
+        let h = self.region_handle(&key)?;
+        if h.atom_wrap.is_some() {
+            return self.persist_sealed_segment(&h);
+        }
+        let conn = Connection::open(&self.db)?;
+        Ok(conn.persist_ann_index(&h.table, "embedding")?)
+    }
+
+    /// The identity of the ANN index currently serving this region's recalls:
+    /// `Loaded {{ segment_b3 }}` (the persisted segment) or `Built` (a scan
+    /// rebuild, with the segment-refusal reason if one was rejected). `None`
+    /// when nothing is cached/built yet.
+    pub fn ann_cache_status(&self, region: &str) -> Result<Option<AnnIndexSource>> {
+        let key = region.to_ascii_lowercase();
+        let h = self.region_handle(&key)?;
+        if h.atom_wrap.is_some() {
+            return Ok(h.ann.read().unwrap().as_ref().map(|sa| sa.source.clone()));
+        }
+        let conn = Connection::open(&self.db)?;
+        Ok(conn
+            .ann_cache_status(&h.table, "embedding")?
+            .map(|(source, _)| source))
+    }
+
+    /// Persist a SEALED region's ANN graph: scan + decrypt (computing the
+    /// liveness-aware fingerprint), pay the PRISM build once, encode the
+    /// segment, and seal it under a fresh random segment key whose ONLY copy
+    /// lives in the erasable atom key store under a pseudo-atom id. Chunks go
+    /// to the hidden `__annseg_{table}` tree, which every SQL mutation of the
+    /// region already drops transactionally; the key slot is retired by the
+    /// engine's own invalidation sites and healed at load.
+    fn persist_sealed_segment(&self, h: &RegionHandle) -> Result<AnnSegmentInfo> {
+        use zeroize::Zeroize;
+        let atom_wrap = h.atom_wrap.as_ref().expect("sealed persist");
+        let conn = Connection::open(&self.db)?;
+        let wrapped = self.db.atom_store_live_wrapped()?;
+
+        let mut kind_codes: FxHashMap<String, u32> = FxHashMap::default();
+        let mut triples: Vec<(u64, Vec<f32>, Vec<u32>)> = Vec::new();
+        let fingerprint = sealed_fp_scan(&conn, h, &wrapped, &mut |id, kind, sealed, _, _, _| {
+            let w = wrapped.get(&(id as u64)).expect("live row has a key");
+            let (emb, mut text, _payload) = open_atom(atom_wrap, w, id, sealed)?;
+            text.zeroize();
+            let next = kind_codes.len() as u32;
+            let code = *kind_codes.entry(kind.to_string()).or_insert(next);
+            triples.push((id as u64, emb, vec![code]));
+            Ok(true)
+        })?
+        .0;
+        if triples.is_empty() {
+            return Err(MemError::Invalid(
+                "nothing to persist: the sealed region has no live atoms".into(),
+            ));
+        }
+        let n = triples.len() as u64;
+        let index = AnnIndex::build_with_attrs(triples, 1, ann_metric(h.metric), h.dim)
+            .map_err(|e| MemError::Invalid(format!("sealed ANN build: {e}")))?;
+
+        // Inner plaintext: [fp 32][kind_codes][segment body]; zeroized after seal.
+        let body = citadel_vector::segment::encode(&index);
+        let mut inner = Vec::with_capacity(body.len() + 256);
+        inner.extend_from_slice(&fingerprint);
+        inner.extend_from_slice(&(kind_codes.len() as u32).to_le_bytes());
+        let mut kinds: Vec<(&String, &u32)> = kind_codes.iter().collect();
+        kinds.sort_by_key(|&(_, code)| *code);
+        for (kind, &code) in kinds {
+            inner.extend_from_slice(&(kind.len() as u32).to_le_bytes());
+            inner.extend_from_slice(kind.as_bytes());
+            inner.extend_from_slice(&code.to_le_bytes());
+        }
+        inner.extend_from_slice(&body);
+
+        // Seal under a fresh segment key; the pseudo-atom id binds the AAD and
+        // owns the erasable key-store slot.
+        // The pseudo-atom id comes from the SAME sequence as real atoms, so the
+        // segment's key-store slot can never collide with an atom's.
+        let pseudo_id = with_write_txn(&conn, |c| next_id(c, "next_atom_id"))?;
+        use rand::RngCore;
+        let mut sk = [0u8; citadel_core::KEY_SIZE];
+        rand::thread_rng().fill_bytes(&mut sk);
+        let seal_keys = derive_seal_keys(&sk);
+        let sealed = blob_seal::seal(&seal_keys, pseudo_id as u64, &inner);
+        let wrapped_sk = atom_wrap.wrap_atom_key(&sk);
+        sk.zeroize();
+        inner.zeroize();
+
+        // Retire any previous segment FIRST (old key must not survive as
+        // decryptable residue), then key-before-data like atoms.
+        self.retire_sealed_segment(h, &conn)?;
+        let (slot, gen) = self
+            .db
+            .atom_store_allocate_write(pseudo_id as u64, &wrapped_sk)?;
+        let seg_table = sealed_segment_table(&h.table, h.id);
+        {
+            let mut wtx = self.db.begin_write()?;
+            match wtx.drop_table(seg_table.as_bytes()) {
+                Ok(()) | Err(citadel_core::Error::TableNotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+            wtx.create_table(seg_table.as_bytes())?;
+            let chunk_count = sealed.len().div_ceil(SEALED_SEG_CHUNK) as u32;
+            wtx.table_insert(
+                seg_table.as_bytes(),
+                &0u32.to_be_bytes(),
+                &chunk_count.to_le_bytes(),
+            )?;
+            for (i, chunk) in sealed.chunks(SEALED_SEG_CHUNK).enumerate() {
+                wtx.table_insert(seg_table.as_bytes(), &((i + 1) as u32).to_be_bytes(), chunk)?;
+            }
+            wtx.commit()?;
+        }
+        write_annseg_meta(&conn, h.id, slot, gen, pseudo_id)?;
+
+        Ok(AnnSegmentInfo {
+            segment_b3: *blake3::hash(&sealed).as_bytes(),
+            content_fingerprint: fingerprint,
+            n,
+            dim: h.dim,
+            metric_tag: citadel_vector::segment::metric_tag(ann_metric(h.metric)),
+            chunk_count: sealed.len().div_ceil(SEALED_SEG_CHUNK) as u32,
+        })
+    }
+
+    /// Try to serve the sealed region's persisted segment: unwrap the segment
+    /// key from its erasable slot, decrypt, decode, and rehydrate vectors (and
+    /// the recall cache) by decrypting the live rows - whose liveness-aware
+    /// fingerprint must match the one sealed inside the segment. ANY failure
+    /// heals (retires the orphan key) and falls back to the scan build, with
+    /// the refusal reason carried in `Err(Some(reason))` so the rebuilt index
+    /// stays queryable about WHY the segment was not used.
+    #[allow(clippy::type_complexity)]
+    fn try_load_sealed_segment(
+        &self,
+        h: &RegionHandle,
+        conn: &Connection<'_>,
+    ) -> Result<std::result::Result<SealedAnn, Option<String>>> {
+        use zeroize::Zeroize;
+        let atom_wrap = h.atom_wrap.as_ref().expect("sealed load");
+        let Some((slot, gen, pseudo_id)) = read_annseg_meta(conn, h.id)? else {
+            return Ok(Err(None));
+        };
+        let heal =
+            |this: &Self, why: &str| -> Result<std::result::Result<SealedAnn, Option<String>>> {
+                this.retire_sealed_segment(h, conn)?;
+                Ok(Err(Some(why.to_string())))
+            };
+        let rec = match self.db.atom_store_slot(slot) {
+            Ok(rec) => rec,
+            Err(e) => return heal(self, &format!("slot read: {e}")),
+        };
+        if rec.state != citadel::SlotState::Live
+            || rec.region_id != pseudo_id as u64
+            || rec.gen != gen
+        {
+            return heal(
+                self,
+                &format!(
+                    "slot mismatch: state={:?} owner={} (want {pseudo_id}) gen={} (want {gen})",
+                    rec.state, rec.region_id, rec.gen
+                ),
+            );
+        }
+
+        let seg_table = sealed_segment_table(&h.table, h.id);
+        let sealed = {
+            let mut rtx = self.db.begin_read();
+            let Ok(Some(count_bytes)) = rtx.table_get(seg_table.as_bytes(), &0u32.to_be_bytes())
+            else {
+                return heal(self, "chunk count row missing");
+            };
+            let count = u32::from_le_bytes(match count_bytes.as_slice().try_into() {
+                Ok(b) => b,
+                Err(_) => return heal(self, "chunk count malformed"),
+            });
+            let mut sealed = Vec::new();
+            for i in 1..=count {
+                match rtx.table_get(seg_table.as_bytes(), &i.to_be_bytes()) {
+                    Ok(Some(chunk)) => sealed.extend_from_slice(&chunk),
+                    _ => return heal(self, "chunk missing"),
+                }
+            }
+            sealed
+        };
+
+        let mut sk = match atom_wrap.unwrap_atom_key(&rec.wrapped) {
+            Ok(sk) => sk,
+            Err(_) => return heal(self, "segment key unwrap failed"),
+        };
+        let seal_keys = derive_seal_keys(&sk);
+        sk.zeroize();
+        let mut inner = match blob_seal::open(&seal_keys, pseudo_id as u64, &sealed) {
+            Ok(inner) => inner,
+            Err(_) => {
+                eprintln!(
+                    "citadel-mem: sealed ANN segment for region {} failed authenticated \
+                     decryption (corrupt); rebuilding from scan",
+                    h.id
+                );
+                return heal(self, "authenticated decryption failed");
+            }
+        };
+        let parsed = parse_sealed_segment(&inner);
+        let Some((stored_fp, kind_codes, parts)) = parsed else {
+            inner.zeroize();
+            return heal(self, "inner parse/decode failed");
+        };
+
+        // Rehydrate by decrypting live rows, placed by the id_map PERMUTATION;
+        // the recall cache comes from the same decrypt pass for free.
+        let wrapped = self.db.atom_store_live_wrapped()?;
+        let slot_of = parts.internal_of_row();
+        let dim = h.dim as usize;
+        let mut vectors = vec![0.0f32; parts.n() * dim];
+        let mut filled = 0usize;
+        let mut cached: FxHashMap<AtomId, CachedAtom> = FxHashMap::default();
+        let mut unknown = false;
+        let (live_fp, _) = sealed_fp_scan(
+            conn,
+            h,
+            &wrapped,
+            &mut |id, kind, sealed_row, score, created, immutable| {
+                let Some(&slot) = slot_of.get(&(id as u64)) else {
+                    unknown = true;
+                    return Ok(false);
+                };
+                let w = wrapped.get(&(id as u64)).expect("live row has a key");
+                let (emb, text, payload) = open_atom(atom_wrap, w, id, sealed_row)?;
+                vectors[slot as usize * dim..(slot as usize + 1) * dim].copy_from_slice(&emb);
+                filled += 1;
+                cached.insert(
+                    id,
+                    CachedAtom {
+                        kind: kind.to_string(),
+                        text,
+                        payload,
+                        importance: score,
+                        created_micros: created,
+                        immutable,
+                    },
+                );
+                Ok(true)
+            },
+        )?;
+        if unknown || live_fp != stored_fp || filled != parts.n() {
+            inner.zeroize();
+            // Stale (liveness or content moved): expected after forgets that
+            // bypassed explicit retirement - rebuild honestly.
+            return heal(
+                self,
+                &format!(
+                    "stale: unknown={unknown} fp_match={} filled={filled}/{}",
+                    live_fp == stored_fp,
+                    parts.n()
+                ),
+            );
+        }
+        let segment_b3 = *blake3::hash(&sealed).as_bytes();
+        let index = match parts.into_index(vectors, filled) {
+            Ok(i) => i,
+            Err(e) => {
+                inner.zeroize();
+                return heal(self, &format!("into_index: {e}"));
+            }
+        };
+        inner.zeroize();
+        Ok(Ok(SealedAnn {
+            index,
+            kind_codes,
+            cached,
+            source: AnnIndexSource::Loaded { segment_b3 },
+        }))
+    }
+
+    /// Destroy the sealed segment's key slot (crypto-erasing all on-disk
+    /// segment residue), delete ITS OWN chunk keys (other regions may share
+    /// the tree), and clear the meta rows. Safe when nothing is persisted.
+    fn retire_sealed_segment(&self, h: &RegionHandle, conn: &Connection<'_>) -> Result<()> {
+        let Some((slot, _gen, pseudo_id)) = read_annseg_meta(conn, h.id)? else {
+            return Ok(());
+        };
+        self.db.atom_store_tombstone(slot, pseudo_id as u64)?;
+        let seg_table = sealed_segment_table(&h.table, h.id);
+        {
+            let mut wtx = self.db.begin_write()?;
+            match wtx.drop_table(seg_table.as_bytes()) {
+                Ok(()) | Err(citadel_core::Error::TableNotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+            wtx.commit()?;
+        }
+        clear_annseg_meta(conn, h.id)?;
+        Ok(())
+    }
+
     pub fn fetch_one(&self, region: &str, atom_id: AtomId) -> Result<Option<AtomHit>> {
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
@@ -687,6 +1065,8 @@ impl MemoryEngine {
             self.update_atom_payload_sealed(&key, &h, atom_id, payload)?;
             // The cached recall index holds the pre-update payload; rebuild on next recall.
             *h.ann.write().unwrap() = None;
+            let conn = Connection::open(&self.db)?;
+            self.retire_sealed_segment(&h, &conn)?;
             return Ok(());
         }
         let js = serde_json::to_string(payload)
@@ -903,6 +1283,9 @@ impl MemoryEngine {
         })?;
         // The cached recall index holds the pre-evolve score; rebuild it on next recall.
         *h.ann.write().unwrap() = None;
+        if h.atom_wrap.is_some() {
+            self.retire_sealed_segment(&h, &conn)?;
+        }
 
         Ok(EvolutionReport {
             links_added: found.len(),
@@ -962,6 +1345,9 @@ impl MemoryEngine {
             Ok(())
         })?;
         *h.ann.write().unwrap() = None;
+        if h.atom_wrap.is_some() {
+            self.retire_sealed_segment(&h, &conn)?;
+        }
         Ok(EvictionReport {
             removed: ids.len() as u64,
         })
@@ -1032,8 +1418,13 @@ impl MemoryEngine {
             })
         })?;
 
-        // Drop the cached ANN index so erased atoms are not re-ranked on the next recall.
+        // Drop the cached ANN index so erased atoms are not re-ranked on the next
+        // recall, and crypto-erase the persisted segment's key: its SQ8 codes are
+        // embedding-derived residue that must not outlive the atoms' own keys.
         *h.ann.write().unwrap() = None;
+        if h.atom_wrap.is_some() {
+            self.retire_sealed_segment(h, &conn)?;
+        }
         Ok((rows_deleted, slots_erased))
     }
 
@@ -1612,7 +2003,9 @@ impl MemoryEngine {
             }
         }
 
-        // Slow path: rebuild under the write lock, re-checking in case another writer won.
+        // Slow path: load the persisted sealed segment if one verifies, else
+        // rebuild from a decrypt scan - under the write lock, re-checking in
+        // case another writer won.
         {
             let mut guard = h.ann.write().unwrap();
             let need_full = guard
@@ -1620,42 +2013,58 @@ impl MemoryEngine {
                 .map(|sa| sealed_index_stale(sa, max_id))
                 .unwrap_or(true);
             if need_full {
-                let wrapped = self.db.atom_store_live_wrapped()?;
-                let rows = decrypt_scan(conn, atom_wrap, &wrapped, &h.table, h.id, None)?;
-                if rows.is_empty() {
-                    *guard = None;
-                    return Ok(Vec::new());
-                }
-                let mut kind_codes: FxHashMap<String, u32> = FxHashMap::default();
-                let mut cached: FxHashMap<AtomId, CachedAtom> = FxHashMap::default();
-                let triples: Vec<(u64, Vec<f32>, Vec<u32>)> = rows
-                    .into_iter()
-                    .map(
-                        |(id, emb, kind, text, payload, importance, created_micros, immutable)| {
-                            let next = kind_codes.len() as u32;
-                            let code = *kind_codes.entry(kind.clone()).or_insert(next);
-                            cached.insert(
+                let load = self.try_load_sealed_segment(h, conn)?;
+                if let Ok(loaded) = load {
+                    *guard = Some(loaded);
+                } else {
+                    let refusal = load.err().flatten();
+                    let wrapped = self.db.atom_store_live_wrapped()?;
+                    let rows = decrypt_scan(conn, atom_wrap, &wrapped, &h.table, h.id, None)?;
+                    if rows.is_empty() {
+                        *guard = None;
+                        return Ok(Vec::new());
+                    }
+                    let mut kind_codes: FxHashMap<String, u32> = FxHashMap::default();
+                    let mut cached: FxHashMap<AtomId, CachedAtom> = FxHashMap::default();
+                    let triples: Vec<(u64, Vec<f32>, Vec<u32>)> = rows
+                        .into_iter()
+                        .map(
+                            |(
                                 id,
-                                CachedAtom {
-                                    kind,
-                                    text,
-                                    payload,
-                                    importance,
-                                    created_micros,
-                                    immutable,
-                                },
-                            );
-                            (id as u64, emb, vec![code])
-                        },
-                    )
-                    .collect();
-                let index = AnnIndex::build_with_attrs(triples, 1, ann_metric(h.metric), h.dim)
-                    .map_err(|e| MemError::Invalid(format!("sealed ANN index build: {e}")))?;
-                *guard = Some(SealedAnn {
-                    index,
-                    kind_codes,
-                    cached,
-                });
+                                emb,
+                                kind,
+                                text,
+                                payload,
+                                importance,
+                                created_micros,
+                                immutable,
+                            )| {
+                                let next = kind_codes.len() as u32;
+                                let code = *kind_codes.entry(kind.clone()).or_insert(next);
+                                cached.insert(
+                                    id,
+                                    CachedAtom {
+                                        kind,
+                                        text,
+                                        payload,
+                                        importance,
+                                        created_micros,
+                                        immutable,
+                                    },
+                                );
+                                (id as u64, emb, vec![code])
+                            },
+                        )
+                        .collect();
+                    let index = AnnIndex::build_with_attrs(triples, 1, ann_metric(h.metric), h.dim)
+                        .map_err(|e| MemError::Invalid(format!("sealed ANN index build: {e}")))?;
+                    *guard = Some(SealedAnn {
+                        index,
+                        kind_codes,
+                        cached,
+                        source: AnnIndexSource::Built { refusal },
+                    });
+                }
             }
         }
 
@@ -2097,6 +2506,168 @@ fn sealed_max_id(conn: &Connection<'_>, table: &str, region_id: RegionId) -> Res
         Some(Value::Integer(m)) => Ok(*m),
         _ => Ok(0),
     }
+}
+
+/// Sealed-segment ciphertext chunk size (storage chains pages anyway; this
+/// only bounds per-value buffers).
+const SEALED_SEG_CHUNK: usize = 1024 * 1024;
+
+/// The hidden chunk tree for ONE sealed region's segment. PER-REGION (the
+/// region is the sealed lifecycle unit; regions sharing an atoms table must
+/// not destroy each other's segments) and deliberately NOT the SQL layer's
+/// `__annseg_{table}` name: sealed staleness is owned by the engine's explicit
+/// retirement at every mutation site, with the liveness-aware fingerprint
+/// refusing - at load - anything that changed through a channel the engine
+/// does not own.
+fn sealed_segment_table(table: &str, region_id: RegionId) -> String {
+    format!("__annseg_r{region_id}__{table}")
+}
+
+/// One LIVE sealed row delivered to a scan consumer:
+/// `(id, kind, sealed_bytes, score, created_micros, immutable)`. Returning
+/// `false` stops delivery (the fingerprint still covers the remaining rows).
+type SealedRowFn<'a> = dyn FnMut(AtomId, &str, &[u8], f32, i64, bool) -> Result<bool> + 'a;
+
+/// The liveness-aware content fingerprint of a sealed region, computed by ONE
+/// deterministic scan (ORDER BY id): every row contributes its id, its sealed
+/// ciphertext (length-framed), and its key-liveness bit - so both row content
+/// changes AND crypto-erasures (which flip liveness without touching rows)
+/// invalidate a persisted segment.
+fn sealed_fp_scan(
+    conn: &Connection<'_>,
+    h: &RegionHandle,
+    wrapped: &FxHashMap<u64, [u8; WRAPPED_KEY_SIZE]>,
+    live: &mut SealedRowFn<'_>,
+) -> Result<([u8; 32], bool)> {
+    let mut fp = blake3::Hasher::new();
+    fp.update(b"citadel-annseg-sealed-fp-v1");
+    fp.update(&h.id.to_le_bytes());
+    fp.update(&h.dim.to_le_bytes());
+    fp.update(&[citadel_vector::segment::metric_tag(ann_metric(h.metric))]);
+
+    let qr = conn.query_params(
+        &format!(
+            "SELECT id, kind, sealed, score, created_at, immutable FROM {table} \
+             WHERE region_id = $1 ORDER BY id",
+            table = h.table
+        ),
+        &[Value::Integer(h.id)],
+    )?;
+    let mut completed = true;
+    for row in &qr.rows {
+        let id = as_int(&row[0])?;
+        let sealed = as_blob(&row[2])?;
+        let is_live = wrapped.contains_key(&(id as u64));
+        fp.update(&id.to_le_bytes());
+        fp.update(&(sealed.len() as u64).to_le_bytes());
+        fp.update(sealed);
+        fp.update(&[u8::from(is_live)]);
+        if is_live && completed {
+            let kind = as_text(&row[1])?;
+            if !live(
+                id,
+                kind,
+                sealed,
+                as_f32(&row[3]),
+                as_ts(&row[4]),
+                as_bool(&row[5]),
+            )? {
+                // Keep hashing the remaining rows (the fingerprint must cover
+                // the whole table) but stop delivering them.
+                completed = false;
+            }
+        }
+    }
+    Ok((*fp.finalize().as_bytes(), completed))
+}
+
+/// Parse the sealed segment's inner plaintext:
+/// `[fp 32][kind_count u32][(len u32, kind, code u32)*][segment body]`.
+fn parse_sealed_segment(
+    inner: &[u8],
+) -> Option<(
+    [u8; 32],
+    FxHashMap<String, u32>,
+    citadel_vector::segment::SegmentParts,
+)> {
+    let mut at = 0usize;
+    let take = |at: &mut usize, n: usize| -> Option<&[u8]> {
+        let end = at.checked_add(n).filter(|&e| e <= inner.len())?;
+        let s = &inner[*at..end];
+        *at = end;
+        Some(s)
+    };
+    let fp: [u8; 32] = take(&mut at, 32)?.try_into().ok()?;
+    let count = u32::from_le_bytes(take(&mut at, 4)?.try_into().ok()?) as usize;
+    let mut kind_codes = FxHashMap::default();
+    for _ in 0..count {
+        let len = u32::from_le_bytes(take(&mut at, 4)?.try_into().ok()?) as usize;
+        let kind = String::from_utf8(take(&mut at, len)?.to_vec()).ok()?;
+        let code = u32::from_le_bytes(take(&mut at, 4)?.try_into().ok()?);
+        kind_codes.insert(kind, code);
+    }
+    let parts = citadel_vector::segment::decode(&inner[at..]).ok()?;
+    Some((fp, kind_codes, parts))
+}
+
+fn annseg_meta_key(region_id: RegionId, field: &str) -> String {
+    format!("annseg_{field}:{region_id}")
+}
+
+fn read_annseg_meta(conn: &Connection<'_>, region_id: RegionId) -> Result<Option<(u32, u64, i64)>> {
+    let read = |field: &str| -> Result<Option<i64>> {
+        let qr = conn.query_params(
+            "SELECT value FROM memory_meta WHERE key = $1",
+            &[Value::Text(annseg_meta_key(region_id, field).into())],
+        )?;
+        Ok(match qr.rows.first().map(|r| &r[0]) {
+            Some(Value::Integer(v)) => Some(*v),
+            _ => None,
+        })
+    };
+    let (Some(slot), Some(gen), Some(id)) = (read("slot")?, read("gen")?, read("id")?) else {
+        return Ok(None);
+    };
+    Ok(Some((slot as u32, gen as u64, id)))
+}
+
+fn write_annseg_meta(
+    conn: &Connection<'_>,
+    region_id: RegionId,
+    slot: u32,
+    gen: u64,
+    pseudo_id: i64,
+) -> Result<()> {
+    with_write_txn(conn, |c| {
+        for (field, value) in [
+            ("slot", slot as i64),
+            ("gen", gen as i64),
+            ("id", pseudo_id),
+        ] {
+            let key = annseg_meta_key(region_id, field);
+            c.execute_params(
+                "DELETE FROM memory_meta WHERE key = $1",
+                &[Value::Text(key.clone().into())],
+            )?;
+            c.execute_params(
+                "INSERT INTO memory_meta (key, value) VALUES ($1, $2)",
+                &[Value::Text(key.into()), Value::Integer(value)],
+            )?;
+        }
+        Ok(())
+    })
+}
+
+fn clear_annseg_meta(conn: &Connection<'_>, region_id: RegionId) -> Result<()> {
+    with_write_txn(conn, |c| {
+        for field in ["slot", "gen", "id"] {
+            c.execute_params(
+                "DELETE FROM memory_meta WHERE key = $1",
+                &[Value::Text(annseg_meta_key(region_id, field).into())],
+            )?;
+        }
+        Ok(())
+    })
 }
 
 /// Open one sealed atom: unwrap its ACK (wrapped under the region atom-wrap key) and

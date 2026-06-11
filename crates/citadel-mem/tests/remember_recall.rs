@@ -48,6 +48,23 @@ fn remember_then_recall_returns_top_hit() {
 }
 
 #[test]
+fn count_counts_by_kind_without_materializing() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    region(&eng, "notes");
+    for i in 0..5 {
+        eng.remember("notes", AtomInput::new("fact", format!("fact {i}")))
+            .unwrap();
+    }
+    eng.remember("notes", AtomInput::new("event", "one event"))
+        .unwrap();
+
+    assert_eq!(eng.count("notes", "fact").unwrap(), 5);
+    assert_eq!(eng.count("notes", "event").unwrap(), 1);
+    assert_eq!(eng.count("notes", "absent").unwrap(), 0);
+}
+
+#[test]
 fn regions_are_isolated() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());

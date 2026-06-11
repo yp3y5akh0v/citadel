@@ -77,6 +77,19 @@ impl Default for FusionWeights {
     }
 }
 
+impl FusionWeights {
+    /// Pure vector similarity - for immutable reference corpora, where recency
+    /// and access patterns carry no signal.
+    pub fn semantic_only() -> Self {
+        Self {
+            semantic: 1.0,
+            keyword: 0.0,
+            recency: 0.0,
+            importance: 0.0,
+        }
+    }
+}
+
 /// How a reranker combines with linear fusion.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RerankStrategy {

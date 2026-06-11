@@ -10,6 +10,7 @@ pub mod types;
 
 #[cfg(feature = "candle-embed")]
 pub use candle::{CandleConfig, CandleEmbedder, CrossEncoder, Pooling};
+pub use citadel_sql::executor::{AnnIndexSource, AnnSegmentInfo};
 pub use embed::{EmbedError, Embedder, EmbeddingMetric, MockEmbedder, MockReranker, Reranker};
 pub use engine::{MemoryEngine, RegionId};
 pub use error::{MemError, Result};

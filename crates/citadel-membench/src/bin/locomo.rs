@@ -83,6 +83,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "bge-base" => CandleEmbedder::bge_base(&bge_dir)?,
             "bge-large" => CandleEmbedder::bge_large(&bge_dir)?,
             "e5-large" => CandleEmbedder::e5_large(&bge_dir)?,
+            "granite-r2" => CandleEmbedder::granite_r2(&bge_dir)?,
             _ => CandleEmbedder::bge_small(&bge_dir)?,
         };
         Arc::new(ce)
