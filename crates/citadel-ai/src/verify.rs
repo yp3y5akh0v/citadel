@@ -19,7 +19,7 @@ pub enum VerifyKind {
     Rank,
 }
 
-/// The context handed to a [`Verifier`]. Borrows everything; nothing is owned.
+/// The context handed to a [`Verifier`] (borrows everything).
 pub struct VerifyRequest<'a> {
     pub kind: VerifyKind,
     /// The immutable charter: prompt, acceptance criteria, constraints.
@@ -37,15 +37,20 @@ pub struct VerifyOutcome {
     pub reason: String,
 }
 
-/// A verdict plus a scalar `score` for ranking discovery candidates. Admission
-/// stays gated on `satisfied` (a buggy score can mis-rank, never admit a false
-/// positive); higher is better. Callers must reject non-finite scores (NaN
-/// corrupts a heap).
+/// A verdict + ranking score for discovery candidates (admission stays gated on
+/// `satisfied`; callers must reject non-finite scores).
+///
+/// `cell`: the closed-vocabulary mint-bar cell this competes in ("" = global);
+/// an open-ended cell would let candidates farm fresh cells and mint forever.
+/// `terminal`: kernel-confirmed as proving the goal's pinned target (always
+/// `false` for undirected runs).
 #[derive(Debug, Clone)]
 pub struct ScoredOutcome {
     pub satisfied: bool,
     pub score: f64,
     pub reason: String,
+    pub cell: String,
+    pub terminal: bool,
 }
 
 /// Self-identification of a deterministic checker. Only a real checker returns
@@ -86,6 +91,8 @@ pub trait Verifier: Send + Sync {
             score: if o.satisfied { 1.0 } else { 0.0 },
             satisfied: o.satisfied,
             reason: o.reason,
+            cell: String::new(),
+            terminal: false,
         })
     }
 
@@ -97,12 +104,17 @@ pub trait Verifier: Send + Sync {
         None
     }
 
-    /// Independent re-validation for the high-stakes novel-mint path: a second oracle
-    /// must AGREE with [`Verifier::verify`] before a `verified_*` record is stamped
-    /// (fail-closed against a latent checker bug). Default `Ok(true)` = no second
-    /// oracle; the controller refuses to mint on `Ok(false)`. Run only at mint time.
+    /// Mint-time re-validation: a second oracle must AGREE with [`Verifier::verify`]
+    /// before a `verified_*` record is stamped. Default `Ok(true)` = no second
+    /// oracle; the controller refuses to mint on `Ok(false)`.
     fn cross_check(&self, _req: &VerifyRequest<'_>) -> Result<bool, VerifyError> {
         Ok(true)
+    }
+
+    /// Batched [`Verifier::cross_check`] for mint flushes: one verdict per
+    /// request, same order. An `Err` aborts the whole flush (fail closed).
+    fn cross_check_batch(&self, reqs: &[VerifyRequest<'_>]) -> Result<Vec<bool>, VerifyError> {
+        reqs.iter().map(|r| self.cross_check(r)).collect()
     }
 }
 

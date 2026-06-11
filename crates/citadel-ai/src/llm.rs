@@ -15,6 +15,11 @@ pub(crate) mod claude;
     any(feature = "claude", feature = "openai")
 ))]
 mod http;
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "claude", feature = "openai")
+))]
+pub use http::LlmTimeouts;
 #[cfg(all(not(target_arch = "wasm32"), feature = "ollama"))]
 pub(crate) mod ollama;
 #[cfg(all(not(target_arch = "wasm32"), feature = "openai"))]
@@ -66,7 +71,6 @@ impl LlmError {
     }
 }
 
-/// One message in a conversation.
 #[derive(Debug, Clone)]
 pub enum Message {
     System(String),
@@ -98,7 +102,7 @@ impl Message {
     }
 }
 
-/// An assistant turn: free-text plus any tool calls it requested.
+/// An assistant turn: text plus requested tool calls.
 #[derive(Debug, Clone, Default)]
 pub struct AssistantMessage {
     pub content: String,
@@ -136,6 +140,28 @@ pub enum ToolChoice {
     Tool(String),
 }
 
+/// Reasoning-spend cap for adaptive-thinking models (Anthropic
+/// `output_config.effort`). Without it a thinking model may spend the whole
+/// `max_tokens` budget reasoning and emit no text at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl Effort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Max => "max",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CompletionRequest {
     pub messages: Vec<Message>,
@@ -143,6 +169,12 @@ pub struct CompletionRequest {
     pub tool_choice: ToolChoice,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// Reasoning-spend cap; omitted from the wire when `None`. Only set it for
+    /// models that accept `effort` (it 400s on e.g. Sonnet 4.5 / Haiku 4.5).
+    pub effort: Option<Effort>,
+    /// JSON Schema the reply must satisfy via provider structured outputs,
+    /// guaranteeing the first content block is text with valid JSON.
+    pub output_schema: Option<Value>,
     pub stop: Vec<String>,
 }
 
@@ -239,6 +271,8 @@ pub fn canonical_json(req: &CompletionRequest) -> String {
         "tool_choice": tool_choice_to_value(&req.tool_choice),
         "max_tokens": req.max_tokens,
         "temperature": req.temperature,
+        "effort": req.effort.map(Effort::as_str),
+        "output_schema": req.output_schema,
         "stop": req.stop,
     });
     serde_json::to_string(&value).unwrap_or_default()
@@ -336,6 +370,21 @@ mod canonical_tests {
             request_hash("m2", &r1),
             "model_id is part of the key"
         );
+    }
+
+    #[test]
+    fn effort_and_output_schema_are_part_of_the_key() {
+        let base = || CompletionRequest::new(vec![Message::user("u")]);
+        let with_effort = CompletionRequest {
+            effort: Some(Effort::Low),
+            ..base()
+        };
+        let with_schema = CompletionRequest {
+            output_schema: Some(json!({ "type": "array" })),
+            ..base()
+        };
+        assert_ne!(request_hash("m", &base()), request_hash("m", &with_effort));
+        assert_ne!(request_hash("m", &base()), request_hash("m", &with_schema));
     }
 
     #[test]

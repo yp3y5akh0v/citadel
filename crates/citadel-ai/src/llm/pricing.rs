@@ -13,10 +13,12 @@ pub(super) struct ModelPricing {
     pub output_per_mtok: f64,
 }
 
-/// Known pricing for `model_id`, or `None` if we have no confident rate for it.
+/// Known pricing for `model_id`, or `None` if there is no confident rate for it.
 /// Matched by family prefix so date-suffixed ids resolve.
 pub(super) fn pricing_for(model_id: &str) -> Option<ModelPricing> {
-    let (input_per_mtok, output_per_mtok) = if model_id.starts_with("claude-opus-4") {
+    let (input_per_mtok, output_per_mtok) = if model_id.starts_with("claude-fable-5") {
+        (10.0, 50.0)
+    } else if model_id.starts_with("claude-opus-4") {
         (5.0, 25.0)
     } else if model_id.starts_with("claude-sonnet-4") {
         (3.0, 15.0)
@@ -51,6 +53,8 @@ mod tests {
             cost_usd: None,
         };
         assert_eq!(cost_for("claude-opus-4-8", &usage), Some(5.0 + 25.0));
+        assert_eq!(cost_for("claude-fable-5", &usage), Some(10.0 + 50.0));
+        assert_eq!(cost_for("claude-fable-5-20260609", &usage), Some(60.0));
         assert_eq!(
             cost_for("claude-haiku-4-5-20251001", &usage),
             Some(1.0 + 5.0),

@@ -22,8 +22,8 @@ use citadel_mem::{
 
 use crate::verify::CheckerAttestation;
 
-/// Upper bound on tasks in one belief graph; crossing it signals a runaway, so we
-/// error rather than truncate silently.
+/// Upper bound on tasks in one belief graph; crossing it signals a runaway, so it
+/// errors rather than truncating silently.
 const MAX_TASKS: usize = 10_000;
 /// Verify-time backstop on audit-chain length (the real bound is the loop's
 /// drift-abort + budget caps; this only guards `verify_chain`/`export`).
@@ -250,6 +250,11 @@ pub struct Goal {
     pub prompt: String,
     pub acceptance_criteria: Vec<String>,
     pub constraints: Vec<String>,
+    /// A DIRECTED discovery's pinned target statement (e.g. a Lean theorem the
+    /// run tries to prove). `None` reproduces undirected behavior bit-for-bit.
+    /// The verifier - never the prompt - decides what relation a candidate
+    /// bears to the target.
+    pub target: Option<String>,
 }
 
 impl Goal {
@@ -258,7 +263,14 @@ impl Goal {
             prompt: prompt.into(),
             acceptance_criteria: Vec::new(),
             constraints: Vec::new(),
+            target: None,
         }
+    }
+
+    /// Direct this goal at a pinned target statement.
+    pub fn with_target(mut self, target: impl Into<String>) -> Self {
+        self.target = Some(target.into());
+        self
     }
 
     fn to_json(&self) -> Value {
@@ -266,6 +278,7 @@ impl Goal {
             "prompt": self.prompt,
             "acceptance_criteria": self.acceptance_criteria,
             "constraints": self.constraints,
+            "target": self.target,
         })
     }
 
@@ -274,6 +287,7 @@ impl Goal {
             prompt: req_str(v, "prompt", "goal")?,
             acceptance_criteria: str_vec(v, "acceptance_criteria"),
             constraints: str_vec(v, "constraints"),
+            target: v.get("target").and_then(Value::as_str).map(str::to_string),
         })
     }
 }
@@ -562,8 +576,6 @@ impl BeliefGraph {
         }
     }
 
-    // --- goals, tasks, hypotheses, evidence, reflections ---
-
     /// Store an immutable goal atom; returns its id.
     pub fn add_goal(&self, goal: &Goal) -> GraphResult<AtomId> {
         let id = self.mem.remember(
@@ -619,8 +631,6 @@ impl BeliefGraph {
         self.mem.link(id, about, EdgeKind::DerivedFrom, 1.0)?;
         Ok(id)
     }
-
-    // --- discovery: candidates + checker-verified artifacts ---
 
     /// Store a discovery candidate: a MUTABLE `candidate` atom with the raw artifact
     /// and a provisional score. Only a checker-stamped `verified_*` atom is durable
@@ -852,8 +862,6 @@ impl BeliefGraph {
         Ok(ready)
     }
 
-    // --- self-model (write-once + supersession) ---
-
     /// Set the region's initial self-model (write-once). Errors with
     /// [`GraphError::SelfModelExists`] if present - evolve via `supersede_self_model`.
     pub fn set_self_model(&self, sm: &SelfModel) -> GraphResult<AtomId> {
@@ -950,8 +958,6 @@ impl BeliefGraph {
             _ => Err(GraphError::SelfModelBranch),
         }
     }
-
-    // --- co-instantiation audit chain ---
 
     /// Record a co-instantiation check as an immutable, hash-linked audit atom.
     /// Gates on present+immutable goal/self-model anchors, stamps the chain hashes,
@@ -1148,8 +1154,7 @@ impl BeliefGraph {
             "recorded_at_micros": now_micros(),
             "cost_usd": cost_usd,
         });
-        // Prompt provenance (node/version/hash/source) for human-auditable
-        // attribution; omitted when the caller has no prompt context.
+        // Optional prompt provenance for human-auditable attribution.
         if let Some(p) = prompt {
             payload["prompt"] = p.clone();
         }

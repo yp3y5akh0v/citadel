@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 use ureq::Agent;
 
-use super::http::{agent, estimate_tokens, post_json};
+use super::http::{agent, estimate_tokens, post_json, LlmTimeouts};
 use super::pricing;
 use super::{
     AssistantMessage, CompletionRequest, CompletionResponse, FinishReason, LLMClient, LlmError,
@@ -32,8 +32,14 @@ impl ClaudeClient {
         Self {
             model: model.into(),
             api_key: api_key.into(),
-            agent: agent(),
+            agent: agent(&LlmTimeouts::default()),
         }
+    }
+
+    /// Replace the default HTTP deadlines.
+    pub(crate) fn with_timeouts(mut self, timeouts: LlmTimeouts) -> Self {
+        self.agent = agent(&timeouts);
+        self
     }
 }
 
@@ -58,9 +64,13 @@ impl LLMClient for ClaudeClient {
     }
 }
 
-/// Opus 4.7+ reject any non-default `temperature`/`top_p`/`top_k` with a 400 (per the
-/// migration guide); omit them for those models. Sonnet/Haiku/Opus<=4.6 accept temperature.
+/// Opus 4.7+ and the Fable family reject any non-default `temperature`/`top_p`/
+/// `top_k` with a 400 ("`temperature` is deprecated for this model"); omit them
+/// for those models. Sonnet/Haiku/Opus<=4.6 accept temperature.
 fn rejects_sampling_params(model: &str) -> bool {
+    if model.starts_with("claude-fable-") {
+        return true;
+    }
     model
         .strip_prefix("claude-opus-4-")
         .and_then(|rest| rest.split('-').next())
@@ -153,6 +163,22 @@ fn to_wire(req: &CompletionRequest, model: &str) -> Value {
             obj.insert("temperature".to_string(), json!(t));
         }
     }
+    // effort caps invisible reasoning spend; the json_schema format guarantees
+    // the first block is text with valid JSON (an adaptive-thinking model can
+    // otherwise burn the whole max_tokens budget thinking and emit no text).
+    let mut output_config = serde_json::Map::new();
+    if let Some(effort) = req.effort {
+        output_config.insert("effort".to_string(), json!(effort.as_str()));
+    }
+    if let Some(schema) = &req.output_schema {
+        output_config.insert(
+            "format".to_string(),
+            json!({ "type": "json_schema", "schema": schema }),
+        );
+    }
+    if !output_config.is_empty() {
+        obj.insert("output_config".to_string(), Value::Object(output_config));
+    }
     if !req.stop.is_empty() {
         obj.insert("stop_sequences".to_string(), json!(req.stop));
     }
@@ -167,6 +193,8 @@ fn from_wire(resp: &Value, model: &str) -> Result<CompletionResponse, LlmError> 
 
     let mut text = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
+    // Track skipped blocks so an all-thinking reply is diagnosable.
+    let mut skipped: Vec<&str> = Vec::new();
     for block in content {
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
@@ -179,7 +207,7 @@ fn from_wire(resp: &Value, model: &str) -> Result<CompletionResponse, LlmError> 
                 name: str_field(block, "name"),
                 arguments: block.get("input").cloned().unwrap_or(Value::Null),
             }),
-            _ => {}
+            other => skipped.push(other.unwrap_or("untyped")),
         }
     }
 
@@ -188,6 +216,15 @@ fn from_wire(resp: &Value, model: &str) -> Result<CompletionResponse, LlmError> 
         Some("tool_use") => FinishReason::ToolUse,
         _ => FinishReason::Stop,
     };
+
+    // All-thinking reply at the cap silently burns budget; fail loud.
+    if finish_reason == FinishReason::Length && text.is_empty() && tool_calls.is_empty() {
+        return Err(LlmError::Backend(format!(
+            "anthropic: hit max_tokens with no text or tool_use (skipped blocks: [{}]); \
+             raise max_tokens or cap reasoning via output_config effort",
+            skipped.join(", ")
+        )));
+    }
 
     Ok(CompletionResponse {
         message: AssistantMessage {
@@ -256,6 +293,7 @@ mod tests {
         assert!(rejects_sampling_params("claude-opus-4-7"));
         assert!(rejects_sampling_params("claude-opus-4-8"));
         assert!(rejects_sampling_params("claude-opus-4-8-20260101"));
+        assert!(rejects_sampling_params("claude-fable-5"));
         assert!(!rejects_sampling_params("claude-opus-4-6"));
         assert!(!rejects_sampling_params("claude-sonnet-4-6"));
         assert!(!rejects_sampling_params("claude-haiku-4-5"));
@@ -368,7 +406,12 @@ mod tests {
 
     #[test]
     fn from_wire_maps_stop_reasons() {
-        let base = |reason: &str| json!({ "content": [], "stop_reason": reason });
+        let base = |reason: &str| {
+            json!({
+                "content": [{ "type": "text", "text": "t" }],
+                "stop_reason": reason
+            })
+        };
         assert_eq!(
             from_wire(&base("end_turn"), "m").unwrap().finish_reason,
             FinishReason::Stop
@@ -377,5 +420,55 @@ mod tests {
             from_wire(&base("max_tokens"), "m").unwrap().finish_reason,
             FinishReason::Length
         );
+    }
+
+    #[test]
+    fn output_config_carries_effort_and_json_schema_format() {
+        use crate::llm::Effort;
+        let schema = json!({ "type": "array", "items": { "type": "object" } });
+        let req = CompletionRequest {
+            effort: Some(Effort::Low),
+            output_schema: Some(schema.clone()),
+            ..CompletionRequest::new(vec![Message::user("x")])
+        };
+        let w = to_wire(&req, "claude-fable-5");
+        assert_eq!(w["output_config"]["effort"], json!("low"));
+        assert_eq!(w["output_config"]["format"]["type"], json!("json_schema"));
+        assert_eq!(w["output_config"]["format"]["schema"], schema);
+
+        let bare = CompletionRequest::new(vec![Message::user("x")]);
+        assert!(
+            to_wire(&bare, "claude-fable-5")
+                .get("output_config")
+                .is_none(),
+            "no output_config unless requested"
+        );
+    }
+
+    #[test]
+    fn from_wire_errors_on_max_tokens_with_only_thinking_blocks() {
+        let resp = json!({
+            "content": [{ "type": "thinking", "thinking": "", "signature": "s" }],
+            "stop_reason": "max_tokens"
+        });
+        let err = from_wire(&resp, "m").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("max_tokens"), "{msg}");
+        assert!(
+            msg.contains("thinking"),
+            "names the skipped block type: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_wire_keeps_truncated_text_on_max_tokens() {
+        // Partial text at the cap is still a (Length-flagged) reply, not an error.
+        let resp = json!({
+            "content": [{ "type": "text", "text": "[{\"points\":" }],
+            "stop_reason": "max_tokens"
+        });
+        let r = from_wire(&resp, "m").unwrap();
+        assert_eq!(r.finish_reason, FinishReason::Length);
+        assert_eq!(r.message.content, "[{\"points\":");
     }
 }

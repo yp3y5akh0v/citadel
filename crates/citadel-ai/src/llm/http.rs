@@ -10,15 +10,46 @@ use ureq::Agent;
 
 use super::{LlmError, Message};
 
-/// Per-phase deadlines. A global timeout alone does not reliably interrupt a read
-/// stalled on a half-closed (peer-dropped) socket; the recv deadlines do, so a dead
-/// connection errors promptly instead of blocking forever.
 const TIMEOUT_CONNECT_SECS: u64 = 15;
-const TIMEOUT_SEND_SECS: u64 = 30;
+/// Floor for the send deadline; see [`LlmTimeouts::send_secs`].
+const TIMEOUT_SEND_FLOOR_SECS: u64 = 30;
 const TIMEOUT_RECV_SECS: u64 = 120;
-const TIMEOUT_GLOBAL_SECS: u64 = 180;
+/// Headroom the global deadline keeps above the receive budget.
+const TIMEOUT_GLOBAL_MARGIN_SECS: u64 = 60;
 /// Keep provider error bodies bounded in the error message / trace.
 const MAX_ERROR_BODY: usize = 500;
+
+/// HTTP deadlines for the LLM backends, derived from one receive budget.
+///
+/// Per-phase deadlines: a global timeout alone won't interrupt a read stalled
+/// on a half-closed socket; recv deadlines do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LlmTimeouts {
+    /// Seconds allowed for the response to start and the body to arrive.
+    /// Generous: deep-reasoning models can take minutes before responding.
+    pub recv_secs: u64,
+}
+
+impl Default for LlmTimeouts {
+    fn default() -> Self {
+        Self {
+            recv_secs: TIMEOUT_RECV_SECS,
+        }
+    }
+}
+
+impl LlmTimeouts {
+    /// Send scales with recv: API edges hold the socket before reading the body
+    /// for capacity-queued model tiers, and some stacks bill that to send.
+    fn send_secs(&self) -> u64 {
+        TIMEOUT_SEND_FLOOR_SECS.max(self.recv_secs / 2)
+    }
+
+    /// The global deadline bounds the whole exchange above send + recv.
+    fn global_secs(&self) -> u64 {
+        self.recv_secs + TIMEOUT_GLOBAL_MARGIN_SECS
+    }
+}
 
 /// The shared ureq agent: per-phase + global deadlines, non-2xx surfaced as a normal
 /// response so the provider error body is readable.
@@ -26,13 +57,13 @@ const MAX_ERROR_BODY: usize = 500;
 /// Connection pooling is disabled (`max_idle_connections* = 0`): on a long, rate-paced
 /// run the peer drops idle keep-alive sockets, and reusing a half-closed one could block
 /// a read past even the recv deadline. A fresh connection per request avoids it.
-pub(super) fn agent() -> Agent {
+pub(super) fn agent(timeouts: &LlmTimeouts) -> Agent {
     Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(TIMEOUT_CONNECT_SECS)))
-        .timeout_send_request(Some(Duration::from_secs(TIMEOUT_SEND_SECS)))
-        .timeout_recv_response(Some(Duration::from_secs(TIMEOUT_RECV_SECS)))
-        .timeout_recv_body(Some(Duration::from_secs(TIMEOUT_RECV_SECS)))
-        .timeout_global(Some(Duration::from_secs(TIMEOUT_GLOBAL_SECS)))
+        .timeout_send_request(Some(Duration::from_secs(timeouts.send_secs())))
+        .timeout_recv_response(Some(Duration::from_secs(timeouts.recv_secs)))
+        .timeout_recv_body(Some(Duration::from_secs(timeouts.recv_secs)))
+        .timeout_global(Some(Duration::from_secs(timeouts.global_secs())))
         .max_idle_connections(0)
         .max_idle_connections_per_host(0)
         .http_status_as_error(false)
@@ -112,6 +143,35 @@ fn message_chars(m: &Message) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_timeouts_derive_send_and_global() {
+        let t = LlmTimeouts::default();
+        assert_eq!(t.recv_secs, 120);
+        assert_eq!(t.send_secs(), 60);
+        assert_eq!(t.global_secs(), 180);
+    }
+
+    #[test]
+    fn send_scales_with_recv_above_a_floor() {
+        assert_eq!(LlmTimeouts { recv_secs: 10 }.send_secs(), 30, "floor");
+        assert_eq!(LlmTimeouts { recv_secs: 600 }.send_secs(), 300, "recv / 2");
+    }
+
+    #[test]
+    fn global_keeps_headroom_above_recv() {
+        assert_eq!(LlmTimeouts { recv_secs: 600 }.global_secs(), 660);
+    }
+
+    #[test]
+    fn agent_applies_the_derived_deadlines() {
+        let t = agent(&LlmTimeouts { recv_secs: 300 }).config().timeouts();
+        assert_eq!(t.connect, Some(Duration::from_secs(15)));
+        assert_eq!(t.send_request, Some(Duration::from_secs(150)));
+        assert_eq!(t.recv_response, Some(Duration::from_secs(300)));
+        assert_eq!(t.recv_body, Some(Duration::from_secs(300)));
+        assert_eq!(t.global, Some(Duration::from_secs(360)));
+    }
 
     #[test]
     fn estimate_scales_and_is_never_zero() {

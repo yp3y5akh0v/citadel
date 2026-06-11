@@ -1,12 +1,10 @@
 //! The cognition loop: a sequential state machine over the Belief-and-Goal graph.
 //!
-//! `run` drives one agent `Plan -> Execute -> Tool -> Observe -> Reflect/Converge ->
-//! Done`, checking the [`AgentBudget`] before every transition and recording each LLM
-//! call as an immutable `llm_trace` (via [`Ctx::complete`], the single chokepoint).
-//! `Observe` enforces co-instantiation: each step is gated on structural provenance to
-//! the immutable goal + constraint compliance, recorded RECORD-BEFORE-ABORT into the
-//! BLAKE3 chain with a bounded drift counter. Constraints/acceptance use a supplied
-//! [`Verifier`] or a bounded critic. Sync, single-agent, no tokio.
+//! `run` drives `Plan -> Execute -> Tool -> Observe -> Reflect/Converge -> Done`,
+//! checking the [`AgentBudget`] before every transition and recording each LLM call
+//! as an immutable `llm_trace`. `Observe` enforces co-instantiation: each step is
+//! gated on structural provenance to the immutable goal, recorded RECORD-BEFORE-ABORT
+//! into the BLAKE3 chain. Sync, single-agent, no tokio.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -31,7 +29,7 @@ use crate::propose::{Completer, Elite, ProposalContext, ProposalOperator, Propos
 use crate::tools::{
     structural_constraints_ok, ExecPolicy, FsPolicy, Tool, ToolError, ToolPermissions, ToolRegistry,
 };
-use crate::verify::{Verifier, VerifyKind, VerifyRequest};
+use crate::verify::{CheckerAttestation, Verifier, VerifyKind, VerifyRequest};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -51,8 +49,7 @@ pub type AgentResult<T> = Result<T, AgentError>;
 pub enum CognitionState {
     Plan,
     Execute,
-    /// A ReAct re-entry: continue the same in-progress task for another round,
-    /// carrying the running tool transcript so the model sees prior observations.
+    /// ReAct re-entry: continue the in-progress task, carrying the tool transcript.
     Reason {
         task: AtomId,
         round: u32,
@@ -61,8 +58,7 @@ pub enum CognitionState {
     Tool {
         task: AtomId,
         round: u32,
-        /// The assistant turn that requested these calls (replayed in the next
-        /// round's transcript so tool results stay paired with the call_id).
+        /// Replayed next round so tool results stay paired with the call_id.
         assistant: AssistantMessage,
         transcript: Vec<Message>,
     },
@@ -71,8 +67,7 @@ pub enum CognitionState {
         round: u32,
         answer: Option<String>,
         results: Vec<(ToolCall, Result<String, ToolError>)>,
-        /// `Some` on a tool round (so a continue can replay it), `None` on a
-        /// text-answer round.
+        /// `Some` on a tool round (replayable), `None` on a text-answer round.
         assistant: Option<AssistantMessage>,
         transcript: Vec<Message>,
     },
@@ -94,7 +89,8 @@ pub enum ReflectReason {
     BudgetPressure,
 }
 
-/// How a run ended (surfaced in the report and as the goal's final status).
+/// How a run ended. `Success` = the search converged (verified work exists), not
+/// "problem solved".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminatedBy {
     Success,
@@ -103,8 +99,7 @@ pub enum TerminatedBy {
     BudgetExceeded(BudgetExceeded),
 }
 
-/// Bounded backoff for a transient LLM error (the agent owns retry since
-/// [`LLMClient`] is one-shot); capped so it can never blow the wall-clock budget.
+/// Bounded backoff for a transient LLM error; capped under the wall-clock budget.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
     /// Total attempts including the first (1 disables retry).
@@ -136,8 +131,7 @@ impl RetryPolicy {
     }
 }
 
-/// Sleep for `ms`. On wasm there is no blocking sleep (and the HTTP backends
-/// that emit retryable errors do not exist there), so it is a no-op.
+/// Sleep `ms`. No-op on wasm (no blocking sleep; retryable HTTP backends absent).
 #[cfg(not(target_arch = "wasm32"))]
 fn backoff_sleep(ms: u64) {
     std::thread::sleep(std::time::Duration::from_millis(ms));
@@ -145,28 +139,22 @@ fn backoff_sleep(ms: u64) {
 #[cfg(target_arch = "wasm32")]
 fn backoff_sleep(_ms: u64) {}
 
-/// Tunables for a run. `verifier` is the deterministic-oracle seam; when `None`,
-/// constraints and acceptance fall back to a bounded, audited critic LLM call.
+/// Tunables for a run. `verifier` None = fall back to a bounded audited critic.
 pub struct AgentConfig {
     pub drift_bound: u32,
     pub max_replans: u32,
     pub max_tool_attempts: u32,
-    /// Cap on the ReAct rounds Execute spends on one task before failing it. Each
-    /// round is one `step()`, so the global budget also bounds the whole run.
+    /// Max ReAct rounds per task before failing it (each round is one step()).
     pub max_react_steps: u32,
-    /// Relevant prior atoms semantic recall injects into each subtask prompt. `0`
-    /// disables recall (the A/B off arm); recall is recency-free, so replay-stable.
+    /// Prior atoms recall injects per subtask; 0 disables. Recency-free = replay-stable.
     pub recall_context_k: usize,
     pub retry: RetryPolicy,
     pub verifier: Option<Arc<dyn Verifier>>,
-    /// Curated, versioned, overridable prompts for the loop's LLM call sites.
-    /// Default = no overrides (every node uses its shipped default).
+    /// Versioned, overridable prompts for the loop's LLM call sites.
     pub prompt_library: Arc<PromptLibrary>,
-    /// Discovery candidate generator. `None` (default) runs the ordinary loop; the
-    /// opt-in discovery controller requires it.
+    /// Discovery candidate generator; required only by run_discovery.
     pub proposal_operator: Option<Arc<dyn ProposalOperator>>,
-    /// Sampling temperature for every agent LLM call; 0.0 (default) keeps planning,
-    /// tool-calling, and critique deterministic and schema-adherent.
+    /// Sampling temperature for control calls; 0.0 keeps them deterministic.
     pub temperature: f32,
 }
 
@@ -187,8 +175,7 @@ impl Default for AgentConfig {
     }
 }
 
-/// The outcome of a run: how it ended, what got done, and whether the audit
-/// chain still verifies.
+/// The outcome of a run.
 #[derive(Debug, Clone)]
 pub struct AgentReport {
     pub goal_id: Option<AtomId>,
@@ -200,42 +187,42 @@ pub struct AgentReport {
 
 /// Configures a discovery search ([`Agent::run_discovery`]).
 pub struct DiscoveryGoal {
-    /// Target description: `prompt` seeds the proposer, `acceptance_criteria` are
-    /// available to the verifier. Admission is the verifier's, not the prompt's.
+    /// `prompt` seeds the proposer; admission is the verifier's, not the prompt's.
     pub goal: Goal,
     /// The atom kind minted when a candidate strictly beats the baseline.
     pub kind: VerifiedKind,
-    /// Version-pinned published baseline a candidate must STRICTLY beat to be
-    /// minted as a verified record (guards against substrate-A/B inflation).
+    /// Published baseline a candidate must STRICTLY beat to mint.
     pub baseline_score: f64,
     /// How many top candidates seed each proposal round.
     pub archive_width: usize,
     /// Stop after this many consecutive rounds with no new best (convergence).
     pub max_idle_rounds: u32,
+    /// Hard cap on verified mints (overflow skips, never fails the run).
+    pub max_mints: u32,
 }
 
 /// The outcome of a discovery run.
 #[derive(Debug, Clone)]
 pub struct DiscoveryReport {
-    /// Best score among candidates that CLEARED the mint bar, or `NEG_INFINITY` if
-    /// none (below-bar valid sets are in `best_valid_score`).
+    /// Best score among candidates that cleared the mint bar; NEG_INFINITY if none.
     pub best_score: f64,
     /// The best artifact that cleared the bar, if any.
     pub best_artifact: Option<Value>,
-    /// The verified atom minted for the best record above baseline, if any.
+    /// The MAX-SCORE mint's atom; full set is `minted`.
     pub verified: Option<AtomId>,
+    /// Every verified atom this run minted, in mint order.
+    pub minted: Vec<AtomId>,
     pub proposals: u32,
     pub checker_calls: u32,
-    /// Diagnostic: the largest VALID set seen even BELOW the mint bar (`|A|`; 0 if
-    /// the model never produced a valid set). Shows how close a no-mint run got.
+    /// Diagnostic: largest valid set seen below the mint bar (0 if none).
     pub best_valid_score: f64,
-    /// Diagnostic: how many proposed candidates were valid (any size).
+    /// Diagnostic: valid candidate count (any size).
     pub valid_candidates: u32,
-    /// Diagnostic: one example reject reason (a format/bounds issue vs the hard
-    /// constraint), or None if all valid.
+    /// Diagnostic: one example reject reason, or None if all valid.
     pub sample_reject_reason: Option<String>,
-    /// Would-be mints rejected because the checker's independent oracle disagreed
-    /// (a bug tripwire on the novel-mint path; should be 0 in a healthy run).
+    /// Diagnostic: rounds the proposer yielded zero candidates (also logged to stderr).
+    pub barren_rounds: u32,
+    /// Would-be mints the independent oracle rejected; should be 0 in a healthy run.
     pub cross_check_failures: u32,
     pub terminated_by: TerminatedBy,
     pub chain_valid: bool,
@@ -277,10 +264,8 @@ impl Agent {
         &self.graph
     }
 
-    /// Drive the loop from `prompt` to a terminal state, returning the report.
-    /// Budget is checked at the top of every iteration, so a breach stops the
-    /// loop before spending more. Infrastructure/LLM errors propagate as `Err`;
-    /// every graceful end (success, incomplete, drift, budget) returns `Ok`.
+    /// Drive the loop to a terminal state. Infra/LLM errors are `Err`; every
+    /// graceful end is `Ok`.
     pub fn run(&self, prompt: impl Into<String>) -> AgentResult<AgentReport> {
         let mut ctx = self.new_ctx(prompt.into());
 
@@ -290,10 +275,8 @@ impl Agent {
                 return ctx.finish(*terminated_by);
             }
             ctx.usage.wall_secs = ctx.started.elapsed().as_secs();
-            // The budget caps WORK, not the terminal mint: a returned Converge was
-            // already justified (verified acceptance or all tasks done), so let it run
-            // even at the cap. converge() makes no LLM call under an attested verifier,
-            // and a replan re-trips the guard next iteration (Plan is not exempt).
+            // Converge is exempt: already justified, makes no LLM call under an
+            // attested verifier; a replan re-trips the guard next iteration.
             if !matches!(state, CognitionState::Converge) {
                 if let Err(cap) = ctx.budget.check(&ctx.usage) {
                     state = CognitionState::Done {
@@ -326,9 +309,8 @@ impl Agent {
         }
     }
 
-    /// Run an opt-in discovery search: recall elites -> propose -> check -> archive ->
-    /// mint, bounded by the proposal/checker caps. Requires a `proposal_operator` and a
-    /// DETERMINISTIC `verifier` (a critic cannot mint); every call is traced for replay.
+    /// Run a discovery search (recall -> propose -> check -> mint). Requires a
+    /// proposal_operator and a DETERMINISTIC verifier (a critic cannot mint).
     pub fn run_discovery(&self, goal: DiscoveryGoal) -> AgentResult<DiscoveryReport> {
         let mut ctx = self.new_ctx(goal.goal.prompt.clone());
         ctx.discover(goal)
@@ -404,11 +386,20 @@ impl Ctx<'_> {
         req: &CompletionRequest,
         resp: &CompletionResponse,
         prompt: &ResolvedPrompt,
-    ) -> Result<(), GraphError> {
+    ) -> AgentResult<()> {
         self.usage.tokens +=
             u64::from(resp.usage.input_tokens) + u64::from(resp.usage.output_tokens);
-        if let Some(cost) = resp.usage.cost_usd {
-            self.usage.cost_usd += cost;
+        match resp.usage.cost_usd {
+            Some(cost) => self.usage.cost_usd += cost,
+            // Unpriced response accrues $0, so a cost cap could never engage - fail closed.
+            None if self.budget.max_cost_usd.is_some() => {
+                return Err(AgentError::Other(format!(
+                    "max_cost_usd is set but model '{}' returned an unpriced response; \
+                     add the model to llm pricing or unset the cost cap",
+                    self.llm.model_id()
+                )));
+            }
+            None => {}
         }
         let hash = request_hash(self.llm.model_id(), req);
         let provenance = json!({
@@ -457,8 +448,6 @@ impl Ctx<'_> {
         let elapsed = self.started.elapsed().as_secs();
         elapsed.saturating_add(delay_secs) >= self.budget.max_wall_secs
     }
-
-    // --- Plan ---
 
     fn plan(&mut self) -> AgentResult<CognitionState> {
         // A replan re-attempts the EXISTING task DAG (reflect() reset unfinished tasks
@@ -536,8 +525,6 @@ impl Ctx<'_> {
             }
         })
     }
-
-    // --- Execute ---
 
     fn execute(&mut self) -> AgentResult<CognitionState> {
         if self.budget_pressure()? {
@@ -682,8 +669,6 @@ impl Ctx<'_> {
         Ok(pending > 0 && remaining_steps < pending)
     }
 
-    // --- Tool ---
-
     fn tool(
         &mut self,
         task: AtomId,
@@ -738,8 +723,6 @@ impl Ctx<'_> {
             None => false,
         }
     }
-
-    // --- Observe (co-instantiation enforcement, RECORD-BEFORE-ABORT) ---
 
     fn observe(
         &mut self,
@@ -815,8 +798,7 @@ impl Ctx<'_> {
         let verdict = check.verdict;
         self.graph.record_check(check, task)?; // RECORD-BEFORE-ABORT
 
-        // Verdict takes precedence over recovery/continue: a Drift/Violation this
-        // round wins over feeding a tool result back (already RECORD-BEFORE-ABORT'd).
+        // Verdict wins over continue: a Drift/Violation this round preempts feeding results back.
         match verdict {
             Verdict::Drift => {
                 return Ok(CognitionState::Done {
@@ -932,8 +914,6 @@ impl Ctx<'_> {
         })
     }
 
-    // --- Reflect ---
-
     fn reflect(&mut self, reason: ReflectReason) -> AgentResult<CognitionState> {
         let insight = self.reflect_insight(reason)?;
         if let Some(goal_id) = self.goal_id {
@@ -969,8 +949,6 @@ impl Ctx<'_> {
         let resp = self.complete(req, &sys)?;
         Ok(resp.message.content)
     }
-
-    // --- Converge ---
 
     /// Has the goal's acceptance been deterministically verified THIS round? Lets
     /// `observe` route to Converge the instant an attested checker certifies it, even
@@ -1017,9 +995,8 @@ impl Ctx<'_> {
             .get_goal(goal_id)?
             .ok_or_else(|| AgentError::Other("goal vanished".into()))?;
 
-        // An attested verifier is the sole acceptance authority: it runs even with no
-        // criteria, so the model cannot self-close by omission (fail-closed on error).
-        // Without one, an empty-criteria goal finishes; else verifier or critic judges.
+        // Attested verifier is sole authority (runs even with no criteria,
+        // fail-closed); else empty-criteria finishes or the critic judges.
         let evidence = self.graph.evidence_for_goal(goal_id)?;
         let met = match self.config.verifier.clone() {
             Some(v) if v.attestation().is_some() => verifier_accepts(v.as_ref(), &goal, &evidence),
@@ -1089,8 +1066,6 @@ impl Ctx<'_> {
             None => false,
         })
     }
-
-    // --- terminal ---
 
     fn finish(&self, terminated_by: TerminatedBy) -> AgentResult<AgentReport> {
         if let Some(goal_id) = self.goal_id {
@@ -1318,21 +1293,46 @@ fn parse_verdict(resp: &CompletionResponse) -> Option<(bool, String)> {
     Some((satisfied, reason))
 }
 
+/// What a barren-round diagnostic needs from the round's last model reply
+/// (raw replies are otherwise consumed inside the proposal operator).
+struct ReplyDigest {
+    head: String,
+    tool_calls: usize,
+    finish_reason: FinishReason,
+}
+
+/// Enough of the reply text to show WHAT failed to parse, without dumping it.
+const REPLY_DIGEST_HEAD_CHARS: usize = 200;
+
 /// Adapts a [`Ctx`] into a [`Completer`] for the proposer: routes each call through
 /// the same traced, budgeted, replayable path as the cognition loop.
 struct CtxCompleter<'c, 'a> {
     ctx: &'c mut Ctx<'a>,
     prompt: &'c ResolvedPrompt,
+    last_reply: &'c mut Option<ReplyDigest>,
 }
 
 impl Completer for CtxCompleter<'_, '_> {
     fn complete(&mut self, req: &CompletionRequest) -> Result<CompletionResponse, ProposeError> {
-        let mut req = req.clone();
-        req.temperature = Some(self.ctx.config.temperature);
+        // The proposal operator OWNS its request's sampling: its explore/exploit
+        // temperature schedule (or its deliberate omission, for models that
+        // deprecate the parameter) must pass through untouched. The agent's
+        // deterministic default applies only to its own control calls.
+        let req = req.clone();
         let resp = self.ctx.call_with_retry(&req).map_err(ProposeError::Llm)?;
         self.ctx
             .accrue_and_record(&req, &resp, self.prompt)
             .map_err(|e| ProposeError::Failed(e.to_string()))?;
+        *self.last_reply = Some(ReplyDigest {
+            head: resp
+                .message
+                .content
+                .chars()
+                .take(REPLY_DIGEST_HEAD_CHARS)
+                .collect(),
+            tool_calls: resp.message.tool_calls.len(),
+            finish_reason: resp.finish_reason,
+        });
         Ok(resp)
     }
 }
@@ -1368,16 +1368,21 @@ impl Ctx<'_> {
 
         let mut best_score = f64::NEG_INFINITY;
         let mut best_artifact: Option<Value> = None;
-        let mut verified: Option<AtomId> = None;
-        // A candidate must strictly beat the published baseline to be minted.
-        let mut minted_score = dgoal.baseline_score;
+        // Per-cell mint bars so diverse candidates stop blocking each other;
+        // max_mints caps the run.
+        let mut bars: FxHashMap<String, f64> = FxHashMap::default();
+        let mut minted: Vec<AtomId> = Vec::new();
+        let mut best_verified: Option<(f64, AtomId)> = None;
         let mut cross_check_failures = 0u32;
         let mut idle = 0u32;
-        // Diagnostics (do not affect the search): the largest VALID set seen even
-        // below the mint bar, so a no-mint run still shows how close the model got.
+        // Above-bar candidates queue and flush in ONE batched cross-check;
+        // flushed before any budget break so no earned mint is dropped.
+        let mut mint_queue: Vec<PendingMint> = Vec::new();
+        // Diagnostics only (do not affect the search).
         let mut best_valid_score = 0.0f64;
         let mut valid_candidates = 0u32;
         let mut sample_reject_reason: Option<String> = None;
+        let mut barren_rounds = 0u32;
 
         let terminated_by = 'search: loop {
             self.usage.wall_secs = self.started.elapsed().as_secs();
@@ -1397,6 +1402,7 @@ impl Ctx<'_> {
                 .collect();
 
             self.usage.proposals += 1;
+            let mut last_reply: Option<ReplyDigest> = None;
             let candidates = {
                 let pctx = ProposalContext {
                     goal: &dgoal.goal,
@@ -1406,17 +1412,48 @@ impl Ctx<'_> {
                 let mut completer = CtxCompleter {
                     ctx: self,
                     prompt: &system,
+                    last_reply: &mut last_reply,
                 };
                 op.propose(&pctx, &mut completer)
             }
             .map_err(|e| AgentError::Other(format!("proposer: {e}")))?;
 
-            let had_candidates = !candidates.is_empty();
+            // Barren rounds are LOUD: a $-burning structural failure (every reply
+            // unparseable) must be visible per round, not after the budget dies.
+            if candidates.is_empty() {
+                barren_rounds += 1;
+                let round = self.usage.proposals;
+                match &last_reply {
+                    Some(r) => eprintln!(
+                        "[discovery] barren round {round}: 0 candidates \
+                         (finish={:?}, tool_calls={}, text head: {:?})",
+                        r.finish_reason, r.tool_calls, r.head
+                    ),
+                    None => eprintln!(
+                        "[discovery] barren round {round}: operator yielded 0 \
+                         candidates without an LLM reply"
+                    ),
+                }
+            }
             let mut improved = false;
             for cand in candidates {
-                // Check before the increment (mirrors the proposals path), so
-                // max_checker_calls = N permits exactly N score calls.
+                // Check before increment so max_checker_calls = N permits exactly
+                // N calls; flush first so no earned mint is dropped.
+                self.usage.wall_secs = self.started.elapsed().as_secs();
                 if let Err(cap) = self.budget.check(&self.usage) {
+                    flush_mints(
+                        &mut mint_queue,
+                        verifier.as_ref(),
+                        &dgoal,
+                        self.graph,
+                        &attestation,
+                        MintLedger {
+                            bars: &mut bars,
+                            minted: &mut minted,
+                            best_verified: &mut best_verified,
+                            cross_check_failures: &mut cross_check_failures,
+                        },
+                    )?;
                     break 'search TerminatedBy::BudgetExceeded(cap);
                 }
                 self.usage.checker_calls += 1;
@@ -1449,39 +1486,44 @@ impl Ctx<'_> {
                     best_artifact = Some(cand.artifact.clone());
                     improved = true;
                 }
-                if scored.score > minted_score {
-                    // High-stakes novel mint: the checker's independent oracle must
-                    // AGREE before stamping, else a checker bug -> fail closed.
-                    let agree = verifier
-                        .cross_check(&VerifyRequest {
-                            kind: VerifyKind::Rank,
-                            goal: &dgoal.goal,
-                            tool_calls: &[],
-                            evidence: &evidence,
-                        })
-                        .map_err(|e| AgentError::Other(format!("cross-check: {e}")))?;
-                    if agree {
-                        minted_score = scored.score;
-                        verified = Some(self.graph.add_verified_artifact(
-                            atom,
-                            dgoal.kind,
-                            attestation.clone(),
-                            scored.score,
-                        )?);
-                    } else {
-                        cross_check_failures += 1;
-                    }
+                let bar = bars
+                    .get(&scored.cell)
+                    .copied()
+                    .unwrap_or(dgoal.baseline_score);
+                if scored.score > bar {
+                    mint_queue.push(PendingMint {
+                        atom,
+                        artifact,
+                        score: scored.score,
+                        cell: scored.cell,
+                        terminal: scored.terminal,
+                    });
                 }
             }
 
-            // A barren round (proposer returned nothing) is no attempt: a transient
-            // parse miss can't stall the search. Only a round with candidates moves idle.
-            if had_candidates {
-                idle = if improved { 0 } else { idle + 1 };
+            // End-of-round flush before idle bookkeeping, so a converging final round still mints.
+            self.usage.wall_secs = self.started.elapsed().as_secs();
+            let terminal_minted = flush_mints(
+                &mut mint_queue,
+                verifier.as_ref(),
+                &dgoal,
+                self.graph,
+                &attestation,
+                MintLedger {
+                    bars: &mut bars,
+                    minted: &mut minted,
+                    best_verified: &mut best_verified,
+                    cross_check_failures: &mut cross_check_failures,
+                },
+            )?;
+            // A minted TERMINAL candidate ends a directed search (its proof is stamped).
+            if terminal_minted {
+                break 'search TerminatedBy::Success;
             }
-            // Converge after `max_idle_rounds` non-improving rounds, but ONLY with a
-            // real best - idling out empty is reported as Incomplete, never Success.
-            // The `!improved` guard stops an improving round converging at cap 0.
+
+            // Barren rounds count as idle, so a broken proposer dies after max_idle_rounds.
+            idle = if improved { 0 } else { idle + 1 };
+            // Converge after max_idle_rounds, but only with a real best (else Incomplete).
             if !improved && idle >= dgoal.max_idle_rounds {
                 break 'search if best_score.is_finite() {
                     TerminatedBy::Success
@@ -1495,17 +1537,115 @@ impl Ctx<'_> {
         Ok(DiscoveryReport {
             best_score,
             best_artifact,
-            verified,
+            verified: best_verified.map(|(_, atom)| atom),
+            minted,
             proposals: self.usage.proposals,
             checker_calls: self.usage.checker_calls,
             best_valid_score,
             valid_candidates,
             sample_reject_reason,
+            barren_rounds,
             cross_check_failures,
             terminated_by,
             chain_valid,
         })
     }
+}
+
+/// An above-bar discovery candidate awaiting the end-of-round mint flush.
+struct PendingMint {
+    atom: AtomId,
+    artifact: String,
+    score: f64,
+    cell: String,
+    terminal: bool,
+}
+
+/// The mutable mint state a flush advances: the per-cell score bars, every
+/// minted atom (`minted[0]` need not be the best; see `best_verified`), and the
+/// failed-cross-check counter.
+struct MintLedger<'a> {
+    bars: &'a mut FxHashMap<String, f64>,
+    minted: &'a mut Vec<AtomId>,
+    best_verified: &'a mut Option<(f64, AtomId)>,
+    cross_check_failures: &'a mut u32,
+}
+
+impl MintLedger<'_> {
+    /// The score a candidate in `cell` must strictly beat: the cell's best mint,
+    /// or the published baseline while the cell is unminted. Every cell starts
+    /// at the SAME version-pinned baseline - diversity earns extra mints, never
+    /// a lower bar.
+    fn bar(&self, cell: &str, baseline: f64) -> f64 {
+        self.bars.get(cell).copied().unwrap_or(baseline)
+    }
+}
+
+/// Flush the mint queue through ONE batched cross-check. Consume order is
+/// arrival order with each member's PER-CELL bar re-applied, which reproduces
+/// the immediate-mint minted set exactly (same-cell arrivals 5, 3, 7 over bar 0
+/// mint {5, 7}); a member skipped by its bar or by the `max_mints` cap
+/// contributes to neither counter (cell diversity can never inflate the mint
+/// count past the cap). An `Err` from the batch aborts the run loudly - no
+/// verdicts, nothing stamped (fail closed). Returns whether a TERMINAL member
+/// minted: the directed-run stop signal (the search converged on its target;
+/// the claim itself lives in the minted evidence records, never in this bool).
+fn flush_mints(
+    queue: &mut Vec<PendingMint>,
+    verifier: &dyn Verifier,
+    dgoal: &DiscoveryGoal,
+    graph: &BeliefGraph,
+    attestation: &CheckerAttestation,
+    ledger: MintLedger<'_>,
+) -> AgentResult<bool> {
+    if queue.is_empty() {
+        return Ok(false);
+    }
+    let evidence: Vec<[(String, String); 1]> = queue
+        .iter()
+        .map(|p| [("candidate".to_string(), p.artifact.clone())])
+        .collect();
+    let reqs: Vec<VerifyRequest<'_>> = evidence
+        .iter()
+        .map(|ev| VerifyRequest {
+            kind: VerifyKind::Rank,
+            goal: &dgoal.goal,
+            tool_calls: &[],
+            evidence: ev,
+        })
+        .collect();
+    let agrees = verifier
+        .cross_check_batch(&reqs)
+        .map_err(|e| AgentError::Other(format!("cross-check: {e}")))?;
+    if agrees.len() != queue.len() {
+        return Err(AgentError::Other(
+            "cross-check batch verdict count mismatch".into(),
+        ));
+    }
+    let mut terminal_minted = false;
+    for (p, agree) in queue.drain(..).zip(agrees) {
+        if p.score <= ledger.bar(&p.cell, dgoal.baseline_score)
+            || ledger.minted.len() as u32 >= dgoal.max_mints
+        {
+            continue;
+        }
+        if agree {
+            ledger.bars.insert(p.cell, p.score);
+            let atom =
+                graph.add_verified_artifact(p.atom, dgoal.kind, attestation.clone(), p.score)?;
+            ledger.minted.push(atom);
+            terminal_minted |= p.terminal;
+            if ledger
+                .best_verified
+                .map_or(true, |(best, _)| p.score > best)
+            {
+                *ledger.best_verified = Some((p.score, atom));
+            }
+        } else {
+            *ledger.cross_check_failures += 1;
+        }
+    }
+    Ok(terminal_minted)
 }
 
 fn response_to_value(resp: &CompletionResponse) -> Value {
@@ -1702,6 +1842,22 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn cost_cap_with_an_unpriced_model_fails_closed() {
+        // An unpriced response accrues $0, so a configured max_cost_usd could
+        // never engage - the run must refuse instead of silently not capping.
+        let budget = AgentBudget {
+            max_cost_usd: Some(1.0),
+            ..Default::default()
+        };
+        let (_dir, agent) = agent_with(vec![CompletionResponse::text("hi")], budget);
+        let err = agent.run("goal").expect_err("unpriced + cost cap refuses");
+        assert!(
+            err.to_string().contains("unpriced"),
+            "the refusal names the cause: {err}"
+        );
     }
 
     #[test]
@@ -1969,8 +2125,8 @@ mod tests {
 
     #[test]
     fn attested_verifier_accepts_empty_criteria() {
-        // The positive side: empty criteria + an attested verifier that ACCEPTS is now
-        // consulted (previously skipped) and converges to Success.
+        // Empty criteria + an attested verifier that ACCEPTS is consulted and
+        // converges to Success.
         let config = AgentConfig {
             verifier: Some(Arc::new(AttestedVerifier(true))),
             ..Default::default()
@@ -2091,8 +2247,6 @@ mod tests {
             "the constraint violation is recorded in the audit chain"
         );
     }
-
-    // --- ReAct inner loop ---
 
     fn agent_full(
         llm: Arc<dyn LLMClient>,
@@ -2249,8 +2403,8 @@ mod tests {
 
     #[test]
     fn global_budget_bounds_inner_loop() {
-        // HARD CONSTRAINT 1: each react round is one step(), so the global step
-        // cap stops a runaway inner loop even with max_react_steps set high.
+        // Each react round is one step(), so the global step cap stops a runaway
+        // inner loop even with max_react_steps set high.
         let mut tools = ToolRegistry::new();
         tools.register(Box::new(StubTool {
             name: "noop".into(),

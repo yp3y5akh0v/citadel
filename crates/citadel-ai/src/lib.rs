@@ -19,17 +19,23 @@ pub use graph::{
     GraphError, GraphResult, Hypothesis, Reflection, SelfModel, Task, TaskStatus,
     TraceEvictionPolicy, Verdict, VerifiedExport, VerifiedKind,
 };
-// The one door to an LLMClient; no concrete client type is re-exported.
+// Only door to an LLMClient; no concrete client re-exported.
 pub use llm::factory;
 #[cfg(any(test, feature = "test-util"))]
 pub use llm::factory::testing;
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "claude", feature = "openai")
+))]
+pub use llm::LlmTimeouts;
 pub use llm::{
-    AssistantMessage, CompletionRequest, CompletionResponse, FinishReason, LLMClient, LlmError,
-    Message, TokenUsage, ToolCall, ToolChoice, ToolSpec,
+    AssistantMessage, CompletionRequest, CompletionResponse, Effort, FinishReason, LLMClient,
+    LlmError, Message, TokenUsage, ToolCall, ToolChoice, ToolSpec,
 };
 pub use prompts::{Prompt, PromptId, PromptLibrary, PromptSource, ResolvedPrompt};
 pub use propose::{
-    Candidate, Completer, Elite, LlmProposer, ProposalContext, ProposalOperator, ProposeError,
+    parse_artifacts, Candidate, Completer, Elite, LlmProposer, ProposalContext, ProposalOperator,
+    ProposeError,
 };
 #[cfg(all(feature = "command-tool", not(target_arch = "wasm32")))]
 pub use tools::RunCommandTool;

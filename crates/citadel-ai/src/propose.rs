@@ -11,7 +11,7 @@ use citadel_mem::AtomId;
 
 use crate::graph::Goal;
 use crate::llm::{
-    AssistantMessage, CompletionRequest, CompletionResponse, LlmError, Message, ToolChoice,
+    AssistantMessage, CompletionRequest, CompletionResponse, Effort, LlmError, Message, ToolChoice,
     ToolSpec,
 };
 use crate::prompts::ResolvedPrompt;
@@ -70,15 +70,19 @@ pub trait ProposalOperator: Send + Sync {
 /// candidate artifacts. Stateless apart from the sampling temperature.
 pub struct LlmProposer {
     temperature: f32,
+    max_tokens: Option<u32>,
     artifact_schema: Value,
+    plain_json: bool,
 }
 
 impl Default for LlmProposer {
     fn default() -> Self {
         Self {
             temperature: 0.9,
+            max_tokens: None,
             // Permissive: goal + checker define the shape; tighten via with_artifact_schema.
             artifact_schema: json!({ "type": "object" }),
+            plain_json: false,
         }
     }
 }
@@ -94,9 +98,27 @@ impl LlmProposer {
         self
     }
 
+    /// Per-reply token budget (default: the backend's). Adaptive-thinking
+    /// models spend reply tokens reasoning BEFORE any text begins, so a
+    /// proposal call needs far more headroom than the JSON alone.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+
     /// Constrain the propose tool's input to a JSON Schema (default: any object).
     pub fn with_artifact_schema(mut self, schema: Value) -> Self {
         self.artifact_schema = schema;
+        self
+    }
+
+    /// For models that reject forced tool use (`tool_choice` incompatibility):
+    /// the request carries NO tools and asks for bare JSON, which
+    /// [`parse_artifacts`]' free-text path already handles. The reply is
+    /// constrained via structured outputs (an array of `artifact_schema`) and
+    /// reasoning spend is effort-capped, so a text block actually begins.
+    pub fn with_plain_json(mut self) -> Self {
+        self.plain_json = true;
         self
     }
 
@@ -115,56 +137,89 @@ impl LlmProposer {
     fn build_request(&self, ctx: &ProposalContext<'_>) -> CompletionRequest {
         let best: Vec<&Value> = ctx.elites.iter().map(|e| &e.artifact).collect();
         let best = serde_json::to_string(&best).unwrap_or_else(|_| "[]".to_string());
-        let user = format!(
-            "Goal: {}\nBest-known artifacts (mutate or improve on these): {best}\n\
-             Call the propose tool once per candidate artifact.",
-            ctx.goal.prompt
-        );
-        let mut req = CompletionRequest::new(vec![ctx.system.as_system(), Message::user(user)])
-            .with_tools(vec![self.propose_tool()])
-            .with_tool_choice(ToolChoice::Any);
+        let mut req = if self.plain_json {
+            // The verification delegation is load-bearing for adaptive-thinking
+            // models: without it the model re-implements the external checker
+            // inside its billed, invisible reasoning and can emit no text at all.
+            let user = format!(
+                "Goal: {}\nBest-known artifacts (mutate or improve on these): {best}\n\
+                 Immediately output candidate objects in the required JSON schema (an \
+                 object with a \"candidates\" array). Use minimal reasoning: propose \
+                 quick heuristic mutations. Do NOT attempt to verify or optimize your \
+                 candidates - an external checker validates every one of them.",
+                ctx.goal.prompt
+            );
+            CompletionRequest::new(vec![ctx.system.as_system(), Message::user(user)])
+        } else {
+            let user = format!(
+                "Goal: {}\nBest-known artifacts (mutate or improve on these): {best}\n\
+                 Call the propose tool once per candidate artifact.",
+                ctx.goal.prompt
+            );
+            CompletionRequest::new(vec![ctx.system.as_system(), Message::user(user)])
+                .with_tools(vec![self.propose_tool()])
+                .with_tool_choice(ToolChoice::Any)
+        };
+        if self.plain_json {
+            // Cap reasoning + force a schema-valid block; object root is the
+            // canonical structured-output shape (the prompt names "candidates").
+            req.effort = Some(Effort::Low);
+            req.output_schema = Some(json!({
+                "type": "object",
+                "properties": {
+                    "candidates": {
+                        "type": "array",
+                        "items": self.artifact_schema.clone(),
+                    }
+                },
+                "required": ["candidates"],
+                "additionalProperties": false,
+            }));
+        }
+        req.max_tokens = self.max_tokens;
         req.temperature = Some(self.temperature);
         req
     }
 }
 
-/// Extract candidate artifacts from a model reply: each tool call's arguments is
-/// one artifact; otherwise the first balanced JSON value in the text (tolerating
-/// markdown fences and surrounding prose) is parsed - an array yields one
-/// candidate per element, any other value yields a single candidate. Text with no
-/// parseable JSON yields no candidates rather than an error - a barren round.
-fn parse_candidates(msg: &AssistantMessage) -> Vec<Candidate> {
+/// Extract artifact values from a model reply: each tool call's arguments is one
+/// artifact; otherwise the first balanced JSON value in the text (tolerating
+/// markdown fences and surrounding prose) - an array yields one artifact per
+/// element, an object whose sole shape is the structured-output envelope
+/// `{"candidates": [...]}` yields its elements, any other value yields one.
+/// Text with no parseable JSON yields none (a barren round, not an error).
+/// Shared by every `ProposalOperator` so the reply-parsing has a single source
+/// (e.g. `citadel-lean`'s conjecture generator).
+pub fn parse_artifacts(msg: &AssistantMessage) -> Vec<Value> {
     if !msg.tool_calls.is_empty() {
-        return msg
-            .tool_calls
-            .iter()
-            .map(|c| Candidate {
-                artifact: c.arguments.clone(),
-                parent: None,
-                rationale: format!("tool_call {}", c.name),
-            })
-            .collect();
+        return msg.tool_calls.iter().map(|c| c.arguments.clone()).collect();
     }
-    // Free-text fallback: pull the first balanced JSON value out of any markdown
-    // fence or prose. Unparseable = a barren round, not an error.
-    let parsed = extract_first_json(msg.content.trim())
-        .and_then(|span| serde_json::from_str::<Value>(span).ok());
-    match parsed {
-        Some(Value::Array(items)) => items
-            .into_iter()
-            .map(|artifact| Candidate {
-                artifact,
-                parent: None,
-                rationale: "proposed".to_string(),
-            })
-            .collect(),
-        Some(artifact) => vec![Candidate {
+    match extract_first_json(msg.content.trim())
+        .and_then(|span| serde_json::from_str::<Value>(span).ok())
+    {
+        Some(Value::Array(items)) => items,
+        Some(Value::Object(mut obj)) if obj.len() == 1 && obj.contains_key("candidates") => {
+            match obj.remove("candidates") {
+                Some(Value::Array(items)) => items,
+                Some(other) => vec![other],
+                None => Vec::new(),
+            }
+        }
+        Some(value) => vec![value],
+        None => Vec::new(),
+    }
+}
+
+/// Wrap [`parse_artifacts`] as fresh proposer candidates (no mutation parent).
+fn parse_candidates(msg: &AssistantMessage) -> Vec<Candidate> {
+    parse_artifacts(msg)
+        .into_iter()
+        .map(|artifact| Candidate {
             artifact,
             parent: None,
             rationale: "proposed".to_string(),
-        }],
-        None => Vec::new(),
-    }
+        })
+        .collect()
 }
 
 /// First balanced top-level `[...]`/`{...}` span, ignoring fences/prose. String-aware
@@ -346,5 +401,98 @@ mod tests {
         assert_eq!(req.tools[0].name, "propose");
         assert_eq!(req.tool_choice, ToolChoice::Any);
         assert_eq!(req.temperature, Some(0.9));
+        assert_eq!(req.effort, None, "tool mode leaves reasoning uncapped");
+        assert_eq!(req.output_schema, None, "tool inputs are the structure");
+    }
+
+    #[test]
+    fn with_max_tokens_sets_the_budget_in_both_modes() {
+        let goal = Goal::new("g");
+        let lib = PromptLibrary::default();
+        let system = lib.resolve(PromptId::Proposer);
+        let tool_req = LlmProposer::new()
+            .with_max_tokens(16_384)
+            .build_request(&ctx_for(&goal, &system));
+        assert_eq!(tool_req.max_tokens, Some(16_384));
+        let plain_req = LlmProposer::new()
+            .with_plain_json()
+            .with_max_tokens(16_384)
+            .build_request(&ctx_for(&goal, &system));
+        assert_eq!(plain_req.max_tokens, Some(16_384));
+        let default_req = LlmProposer::new().build_request(&ctx_for(&goal, &system));
+        assert_eq!(
+            default_req.max_tokens, None,
+            "unset keeps the backend default"
+        );
+    }
+
+    #[test]
+    fn plain_json_caps_effort_and_constrains_the_reply_schema() {
+        let goal = Goal::new("g");
+        let lib = PromptLibrary::default();
+        let system = lib.resolve(PromptId::Proposer);
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "points": { "type": "array" } },
+            "required": ["points"],
+            "additionalProperties": false
+        });
+        let req = LlmProposer::new()
+            .with_artifact_schema(schema.clone())
+            .with_plain_json()
+            .build_request(&ctx_for(&goal, &system));
+        assert_eq!(req.effort, Some(crate::llm::Effort::Low));
+        assert_eq!(
+            req.output_schema,
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": { "candidates": { "type": "array", "items": schema } },
+                "required": ["candidates"],
+                "additionalProperties": false,
+            })),
+            "object-rooted envelope holding the artifact array"
+        );
+        let Message::User(user) = &req.messages[1] else {
+            panic!("second message is the user prompt");
+        };
+        assert!(user.contains("Do NOT attempt to verify"));
+        assert!(user.contains("\"candidates\""));
+        assert!(
+            !user.contains("ONLY a JSON array"),
+            "schema-contradicting phrasing removed"
+        );
+    }
+
+    #[test]
+    fn parse_artifacts_unwraps_the_candidates_envelope() {
+        let cands = propose_with(CompletionResponse::text(
+            "{\"candidates\": [{\"points\": [[1,2]]}, {\"points\": [[3,4]]}]}",
+        ));
+        assert_eq!(cands.len(), 2, "envelope elements become candidates");
+        // An object that is NOT the envelope still yields itself (e.g. lean
+        // conjecture artifacts carry statement/proof keys).
+        let single = propose_with(CompletionResponse::text(
+            "{\"statement\": \"theorem t : 1 = 1\", \"proof\": \"rfl\"}",
+        ));
+        assert_eq!(single.len(), 1);
+    }
+
+    #[test]
+    fn plain_json_request_carries_no_tools_and_parses_text_candidates() {
+        // For models that reject forced tool use: NO tools in the request,
+        // and the free-text parser still produces the candidates.
+        let goal = Goal::new("g");
+        let lib = PromptLibrary::default();
+        let system = lib.resolve(PromptId::Proposer);
+        let req = LlmProposer::new()
+            .with_plain_json()
+            .build_request(&ctx_for(&goal, &system));
+        assert!(req.tools.is_empty(), "no tools for plain-json models");
+        assert_eq!(req.tool_choice, ToolChoice::Auto);
+
+        let cands = propose_with(CompletionResponse::text(
+            "[{\"points\": [[1,2]]}, {\"points\": [[3,4]]}]",
+        ));
+        assert_eq!(cands.len(), 2, "bare-array text replies still parse");
     }
 }

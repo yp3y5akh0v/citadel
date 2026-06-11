@@ -9,6 +9,11 @@ use std::sync::Arc;
 use crate::graph::{BeliefGraph, GraphError};
 use crate::llm::mock::MockClient;
 use crate::llm::LLMClient;
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "claude", feature = "openai", feature = "ollama")
+))]
+use crate::llm::LlmTimeouts;
 #[cfg(any(test, feature = "test-util"))]
 use crate::llm::{CompletionRequest, CompletionResponse, LlmError, Message};
 
@@ -22,50 +27,113 @@ const KNOWN_PROVIDERS: &[&str] = &["mock", "claude", "openai", "ollama"];
 /// `{prefix}_MODEL`, each falling back to the given default. API keys are read
 /// per provider (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`); ollama needs none. An
 /// endpoint override is honored per provider (`OPENAI_BASE_URL` / `OLLAMA_BASE_URL`).
+/// The HTTP receive deadline comes from `CITADEL_AI_LLM_TIMEOUT_SECS` (seconds,
+/// default 120; the send and global deadlines derive from it); HTTP-backend
+/// builds can set it programmatically via `from_env_with_timeouts` instead.
 pub fn from_env(
     prefix: &str,
     default_provider: &str,
     default_model: &str,
 ) -> Result<Arc<dyn LLMClient>, String> {
+    let (provider, model) = provider_model(prefix, default_provider, default_model);
+    build(&provider, &model)
+}
+
+/// [`from_env`] with explicit HTTP deadlines instead of
+/// `CITADEL_AI_LLM_TIMEOUT_SECS`.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "claude", feature = "openai", feature = "ollama")
+))]
+pub fn from_env_with_timeouts(
+    prefix: &str,
+    default_provider: &str,
+    default_model: &str,
+    timeouts: LlmTimeouts,
+) -> Result<Arc<dyn LLMClient>, String> {
+    let (provider, model) = provider_model(prefix, default_provider, default_model);
+    build_with_timeouts(&provider, &model, timeouts)
+}
+
+/// `{prefix}_PROVIDER` / `{prefix}_MODEL`, each falling back to its default.
+fn provider_model(prefix: &str, default_provider: &str, default_model: &str) -> (String, String) {
     let provider = std::env::var(format!("{prefix}_PROVIDER"))
         .unwrap_or_else(|_| default_provider.to_string());
     let model =
         std::env::var(format!("{prefix}_MODEL")).unwrap_or_else(|_| default_model.to_string());
-    build(&provider, &model)
+    (provider, model)
 }
 
-/// Build an HTTP-backed client for `provider` + `model`; any other name defers to
-/// [`fallback`]. Compiled only when at least one HTTP backend is enabled.
+/// Build an HTTP-backed client for `provider` + `model`, with HTTP deadlines
+/// from `CITADEL_AI_LLM_TIMEOUT_SECS`; any other name defers to [`fallback`].
+/// Compiled only when at least one HTTP backend is enabled.
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(feature = "claude", feature = "openai", feature = "ollama")
 ))]
 pub fn build(provider: &str, model: &str) -> Result<Arc<dyn LLMClient>, String> {
+    build_with_timeouts(provider, model, timeouts_from_env())
+}
+
+/// [`build`] with explicit HTTP deadlines.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "claude", feature = "openai", feature = "ollama")
+))]
+pub fn build_with_timeouts(
+    provider: &str,
+    model: &str,
+    timeouts: LlmTimeouts,
+) -> Result<Arc<dyn LLMClient>, String> {
     match provider {
         #[cfg(feature = "claude")]
         "claude" => {
             let key = require_key("ANTHROPIC_API_KEY", "claude")?;
-            Ok(Arc::new(crate::llm::claude::ClaudeClient::new(model, key)))
+            let client = crate::llm::claude::ClaudeClient::new(model, key);
+            Ok(Arc::new(client.with_timeouts(timeouts)))
         }
         #[cfg(feature = "openai")]
         "openai" => {
             let key = require_key("OPENAI_API_KEY", "openai")?;
-            match std::env::var("OPENAI_BASE_URL") {
-                Ok(base) => Ok(Arc::new(crate::llm::openai::OpenAiClient::with_base_url(
-                    model, base, key,
-                ))),
-                Err(_) => Ok(Arc::new(crate::llm::openai::OpenAiClient::new(model, key))),
-            }
+            let client = match std::env::var("OPENAI_BASE_URL") {
+                Ok(base) => crate::llm::openai::OpenAiClient::with_base_url(model, base, key),
+                Err(_) => crate::llm::openai::OpenAiClient::new(model, key),
+            };
+            Ok(Arc::new(client.with_timeouts(timeouts)))
         }
         #[cfg(feature = "ollama")]
-        "ollama" => match std::env::var("OLLAMA_BASE_URL") {
-            Ok(base) => Ok(Arc::new(crate::llm::ollama::OllamaClient::with_base_url(
-                model, base,
-            ))),
-            Err(_) => Ok(Arc::new(crate::llm::ollama::OllamaClient::new(model))),
-        },
+        "ollama" => {
+            let client = match std::env::var("OLLAMA_BASE_URL") {
+                Ok(base) => crate::llm::ollama::OllamaClient::with_base_url(model, base),
+                Err(_) => crate::llm::ollama::OllamaClient::new(model),
+            };
+            Ok(Arc::new(client.with_timeouts(timeouts)))
+        }
         other => fallback(other),
     }
+}
+
+/// `CITADEL_AI_LLM_TIMEOUT_SECS` parsed into deadlines; env config belongs to
+/// the factory, the explicit `*_with_timeouts` paths bypass it.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "claude", feature = "openai", feature = "ollama")
+))]
+fn timeouts_from_env() -> LlmTimeouts {
+    parse_timeouts(std::env::var("CITADEL_AI_LLM_TIMEOUT_SECS").ok().as_deref())
+}
+
+/// Pure half of [`timeouts_from_env`]: a numeric value sets the receive
+/// budget; unset or malformed keeps the default.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "claude", feature = "openai", feature = "ollama")
+))]
+fn parse_timeouts(value: Option<&str>) -> LlmTimeouts {
+    value
+        .and_then(|v| v.parse().ok())
+        .map(|recv_secs| LlmTimeouts { recv_secs })
+        .unwrap_or_default()
 }
 
 /// Mock-only build (wasm, or no HTTP backend enabled): every non-mock provider is
@@ -240,6 +308,19 @@ mod tests {
             panic!("expected an error");
         };
         assert!(err.contains("--features claude"), "{err}");
+    }
+
+    // The pure half of the env read; mutating CITADEL_AI_LLM_TIMEOUT_SECS in
+    // a parallel test run would race other tests.
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(feature = "claude", feature = "openai", feature = "ollama")
+    ))]
+    #[test]
+    fn timeout_parses_seconds_and_keeps_default_otherwise() {
+        assert_eq!(parse_timeouts(Some("300")), LlmTimeouts { recv_secs: 300 });
+        assert_eq!(parse_timeouts(Some("not-a-number")), LlmTimeouts::default());
+        assert_eq!(parse_timeouts(None), LlmTimeouts::default());
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "ollama"))]

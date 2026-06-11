@@ -1,6 +1,7 @@
 //! Ollama backend (native-only, `ollama` feature): the OpenAI adapter pointed at
 //! the local daemon, since Ollama's `/v1` is wire-identical to OpenAI.
 
+use super::http::LlmTimeouts;
 use super::openai::OpenAiClient;
 use super::{CompletionRequest, CompletionResponse, LLMClient, LlmError, Message};
 
@@ -22,6 +23,12 @@ impl OllamaClient {
                 .max_tokens_field("max_tokens")
                 .unpriced(),
         }
+    }
+
+    /// Replace the default HTTP deadlines.
+    pub(crate) fn with_timeouts(mut self, timeouts: LlmTimeouts) -> Self {
+        self.inner = self.inner.with_timeouts(timeouts);
+        self
     }
 }
 

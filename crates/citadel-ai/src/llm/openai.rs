@@ -6,7 +6,7 @@
 use serde_json::{json, Value};
 use ureq::Agent;
 
-use super::http::{agent, estimate_tokens, post_json};
+use super::http::{agent, estimate_tokens, post_json, LlmTimeouts};
 use super::pricing;
 use super::{
     AssistantMessage, CompletionRequest, CompletionResponse, FinishReason, LLMClient, LlmError,
@@ -51,8 +51,14 @@ impl OpenAiClient {
             api_key: api_key.into(),
             max_tokens_field: OPENAI_MAX_TOKENS_FIELD,
             priced: true,
-            agent: agent(),
+            agent: agent(&LlmTimeouts::default()),
         }
+    }
+
+    /// Replace the default HTTP deadlines.
+    pub(crate) fn with_timeouts(mut self, timeouts: LlmTimeouts) -> Self {
+        self.agent = agent(&timeouts);
+        self
     }
 
     /// Override the output-token-cap field for a compatible server (Ollama uses `max_tokens`).
@@ -508,8 +514,7 @@ mod tests {
 
     #[test]
     fn recovery_is_inert_on_the_auto_path() {
-        // Not forced: a plain-text reply (even JSON naming a tool) stays the final answer,
-        // so OpenAI's "text answer = done" control flow is preserved.
+        // Auto path: a JSON-naming-a-tool text reply stays the final answer.
         let resp = json!({
             "choices": [{
                 "message": { "content": "{\"name\": \"submit_plan\", \"parameters\": {}}" },
