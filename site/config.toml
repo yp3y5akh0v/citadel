@@ -17,7 +17,7 @@ name = "tags"
 [extra]
 author = "Yuriy Peysakhov"
 github = "https://github.com/yp3y5akh0v/citadel"
-version = "1.2.0"
+version = "1.3.0"
 crates = 19
 published = 15
 tests = "5,000+"
