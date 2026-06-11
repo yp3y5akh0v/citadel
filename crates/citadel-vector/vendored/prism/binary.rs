@@ -12,6 +12,35 @@ pub struct BinaryStore {
 }
 
 impl BinaryStore {
+    /// Reassemble from persisted parts (the ANN segment decode path). The
+    /// SIGNS are persisted rather than re-derived from the seed, so a future
+    /// seed change can never silently desynchronize codes from queries.
+    pub fn from_parts(
+        codes: Vec<u64>,
+        code_words: usize,
+        signs: Vec<f32>,
+        block_size: usize,
+    ) -> Self {
+        Self {
+            codes,
+            code_words,
+            signs,
+            block_size,
+        }
+    }
+
+    pub fn codes(&self) -> &[u64] {
+        &self.codes
+    }
+
+    pub fn signs(&self) -> &[f32] {
+        &self.signs
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
     /// Build binary codes: random sign flips (D) + Walsh-Hadamard in blocks of
     /// `largest_pow2_factor(dim)`. Fixed seed for build/query consistency.
     pub fn build(store: &PointStore) -> Self {
@@ -78,7 +107,7 @@ fn encode_vector(vec: &[f32], signs: &[f32], block_size: usize, out: &mut [u64])
 }
 
 /// In-place Walsh-Hadamard transform on a slice of length 2^k.
-/// O(n log n) butterfly operations. Not normalized (unnecessary for sign extraction).
+/// Not normalized (irrelevant for sign extraction).
 fn walsh_hadamard(data: &mut [f32]) {
     let n = data.len();
     debug_assert!(n.is_power_of_two());
@@ -115,7 +144,6 @@ mod tests {
 
     #[test]
     fn test_walsh_hadamard_identity() {
-        // WHT of [1, 0, 0, 0] = [1, 1, 1, 1]
         let mut data = vec![1.0, 0.0, 0.0, 0.0];
         walsh_hadamard(&mut data);
         assert_eq!(data, vec![1.0, 1.0, 1.0, 1.0]);
@@ -123,12 +151,10 @@ mod tests {
 
     #[test]
     fn test_walsh_hadamard_butterfly() {
-        // WHT of [1, 1] = [2, 0]
         let mut data = vec![1.0, 1.0];
         walsh_hadamard(&mut data);
         assert_eq!(data, vec![2.0, 0.0]);
 
-        // WHT of [1, -1] = [0, 2]
         let mut data = vec![1.0, -1.0];
         walsh_hadamard(&mut data);
         assert_eq!(data, vec![0.0, 2.0]);
@@ -136,16 +162,15 @@ mod tests {
 
     #[test]
     fn test_largest_pow2_factor() {
-        assert_eq!(largest_pow2_factor(384), 128); // 384 = 3 × 128
+        assert_eq!(largest_pow2_factor(384), 128);
         assert_eq!(largest_pow2_factor(128), 128);
         assert_eq!(largest_pow2_factor(256), 256);
-        assert_eq!(largest_pow2_factor(12), 4); // 12 = 3 × 4
+        assert_eq!(largest_pow2_factor(12), 4);
         assert_eq!(largest_pow2_factor(1), 1);
     }
 
     #[test]
     fn test_binary_query_encoding() {
-        // Encoding the same vector should produce the same binary code
         let dim = 128;
         let p0: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.1).sin()).collect();
         let mut vecs = Vec::with_capacity(dim);
@@ -163,11 +188,8 @@ mod tests {
     fn test_hamming_distance_ordering() {
         use super::super::distance;
         let dim = 128;
-        // p0: smooth signal
         let p0: Vec<f32> = (0..dim).map(|i| (i as f32 + 1.0) / dim as f32).collect();
-        // p1: tiny perturbation of p0
         let p1: Vec<f32> = p0.iter().map(|&v| v + 0.001).collect();
-        // p2: negation of p0 (maximum angular distance)
         let p2: Vec<f32> = p0.iter().map(|&v| -v).collect();
 
         let mut vecs = Vec::with_capacity(3 * dim);
@@ -192,7 +214,6 @@ mod tests {
 
     #[test]
     fn test_binary_code_words() {
-        // 128d → 2 u64 words, 384d → 6 u64 words
         let store = PointStore::from_parts(vec![0.0; 128], 128, vec![vec![0]]);
         let binary = BinaryStore::build(&store);
         assert_eq!(binary.code_words(), 2);

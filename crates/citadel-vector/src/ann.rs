@@ -136,6 +136,40 @@ impl AnnIndex {
         })
     }
 
+    /// Reassemble from persisted parts (the ANN segment decode path). The
+    /// caller is responsible for `prism.store.vectors` being in PRISM-internal
+    /// (cell-reordered) order - see `segment::SegmentParts::into_index`.
+    pub fn from_parts(
+        prism: PrismIndex,
+        id_map: Vec<u64>,
+        snapshot_max: u64,
+        metric: Metric,
+        dim: u16,
+    ) -> Self {
+        Self {
+            prism,
+            id_map,
+            snapshot_max,
+            metric,
+            dim,
+        }
+    }
+
+    pub fn prism(&self) -> &PrismIndex {
+        &self.prism
+    }
+
+    /// PRISM internal id -> external row_id.
+    pub fn id_map(&self) -> &[u64] {
+        &self.id_map
+    }
+
+    /// The PRISM configuration this index family builds with - part of the
+    /// persisted segment's binding (a config change invalidates segments).
+    pub fn active_config(metric: Metric) -> PrismConfig {
+        prism_config(metric)
+    }
+
     /// Top-k search returning `(row_id, distance)` ascending, at the default ef.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
         let ef = (k * OVER_FETCH).max(self.prism.config.beam_width);

@@ -143,6 +143,10 @@ pub(super) fn exec_insert(
         .map(|_| ColumnMap::new(&table_schema.columns));
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    // DML invalidates the table's persisted ANN segment in the SAME txn
+    // (rollback restores it; commit makes table-changed-but-segment-survives
+    // unrepresentable for this path).
+    super::ann_persist::purge_segment(&mut wtx, &table_schema.name)?;
     let mut count: u64 = 0;
     let mut returning_rows: Option<Vec<super::helpers::ReturningRow>> =
         stmt.returning.as_ref().map(|_| Vec::new());
@@ -1418,6 +1422,7 @@ fn exec_insert_in_txn_impl(
         .get(&stmt.table)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
     schema.mark_dml(&table_schema.name);
+    super::ann_persist::purge_segment(wtx, &table_schema.name)?;
 
     let default_columns;
     let insert_columns: &[String] = if stmt.columns.is_empty() {
@@ -3638,7 +3643,7 @@ fn exec_instead_of_view_insert_in_txn(
     stmt: &InsertStmt,
     params: &[Value],
 ) -> Result<ExecutionResult> {
-    // CREATE VIEW without explicit aliases stores an empty vec — derive at runtime.
+    // CREATE VIEW without explicit aliases stores an empty vec; derive at runtime.
     let resolved_aliases: Vec<String> = if aliases.is_empty() {
         derive_view_columns(wtx, schema, view_name)?
     } else {

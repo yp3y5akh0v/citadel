@@ -31,10 +31,19 @@ use crate::types::{ExecutionResult, QueryResult, TableSchema, Value};
 
 const DEFAULT_CACHE_CAPACITY: usize = 64;
 
-/// On commit, evict shared caches (e.g. ANN indexes) for DML-touched tables.
+/// On commit, evict shared caches (e.g. ANN indexes) for DML-touched tables,
+/// and stamp each table's last-DML generation marker: an index whose snapshot
+/// predates the marker is refused at lookup AND at insert, closing the
+/// build-races-a-commit window that prefix eviction alone leaves open.
 fn invalidate_dml_caches(schema: &SchemaManager, db: &Database) {
+    let gen = db.manager().commit_generation();
     for table in schema.drain_dml_dirty() {
         db.sql_cache_invalidate_prefix(&format!("ann:{table}:"));
+        let marker: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(gen);
+        schema
+            .sql_caches
+            .lock()
+            .insert(crate::executor::ann_dml_gen_key(&table), marker);
     }
 }
 
@@ -525,6 +534,54 @@ impl<'a> Connection<'a> {
         let new_schema = SchemaManager::load(self.db)?;
         self.inner.borrow_mut().schema = new_schema;
         Ok(())
+    }
+
+    /// Freeze the ANN index for `table.column` into a persisted segment: one
+    /// write txn scans, builds, serializes, and commits atomically; subsequent
+    /// cold attaches LOAD it (seconds) instead of rebuilding (minutes), with
+    /// the load-time scan re-proving freshness by content. The single writer
+    /// lock is held for the whole build - an offline/builder operation.
+    /// Refused inside an explicit transaction (it owns its own txn), and for
+    /// TEMP tables (their storage bypasses the DDL paths that purge segments).
+    pub fn persist_ann_index(
+        &self,
+        table: &str,
+        column: &str,
+    ) -> Result<crate::executor::AnnSegmentInfo> {
+        if self.in_transaction() {
+            return Err(SqlError::InvalidValue(
+                "persist_ann_index: not allowed inside an explicit transaction".into(),
+            ));
+        }
+        let inner = self.inner.borrow();
+        let lower = table.to_ascii_lowercase();
+        if inner.schema.resolve_temp(&lower) != lower {
+            return Err(SqlError::InvalidValue(
+                "persist_ann_index: TEMP tables are not persistable".into(),
+            ));
+        }
+        let table_schema = inner
+            .schema
+            .get(&lower)
+            .ok_or_else(|| SqlError::TableNotFound(table.to_string()))?;
+        crate::executor::persist_ann_index(self.db, &inner.schema, table_schema, column)
+    }
+
+    /// The identity of the index currently cached for `table.column`:
+    /// `(source, snapshot generation)` - `Loaded{segment_b3}` means queries are
+    /// served by the persisted segment; `Built{refusal}` carries why a segment
+    /// was rejected, if one was.
+    pub fn ann_cache_status(
+        &self,
+        table: &str,
+        column: &str,
+    ) -> Result<Option<(crate::executor::AnnIndexSource, u64)>> {
+        let inner = self.inner.borrow();
+        let table_schema = inner
+            .schema
+            .get(&table.to_ascii_lowercase())
+            .ok_or_else(|| SqlError::TableNotFound(table.to_string()))?;
+        crate::executor::ann_cache_status(&inner.schema, table_schema, column)
     }
 }
 

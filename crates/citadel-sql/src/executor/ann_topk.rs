@@ -22,6 +22,7 @@ use crate::schema::SchemaManager;
 use crate::types::*;
 
 use super::aggregate::is_aggregate_expr;
+use super::ann_persist;
 use super::helpers::{decode_full_row, eval_const_expr, eval_const_int, project_rows};
 use super::window::has_any_window_function;
 
@@ -33,6 +34,10 @@ type RawScanRow<'a> = dyn FnMut(&[u8], &[u8]) -> StorageResult<bool> + 'a;
 pub(super) trait AnnScan {
     fn ann_scan(&mut self, table: &[u8], f: &mut ScanRow<'_>) -> Result<()>;
     fn ann_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>>;
+    /// The commit generation this txn's snapshot reflects, or `None` when the
+    /// view includes uncommitted writes - an index over such a view must NEVER
+    /// enter the shared cache.
+    fn cache_generation(&self) -> Option<u64>;
 }
 
 /// Adapt a storage-level scan to report `SqlError`, surfacing the first callback error.
@@ -63,6 +68,10 @@ impl AnnScan for ReadTxn<'_> {
     fn ann_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.table_get(table, key).map_err(SqlError::Storage)
     }
+
+    fn cache_generation(&self) -> Option<u64> {
+        Some(self.commit_generation())
+    }
 }
 
 impl AnnScan for WriteTxn<'_> {
@@ -73,6 +82,23 @@ impl AnnScan for WriteTxn<'_> {
     fn ann_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.table_get(table, key).map_err(SqlError::Storage)
     }
+
+    fn cache_generation(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// Where a cached index came from - queryable via `ann_cache_status`, and the
+/// carrier for load-refusal diagnostics (a refused segment degrades to the
+/// slow rebuild, but the refusal reason must stay visible, never a log-only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnnIndexSource {
+    /// Built from a table scan this process. `refusal` records why a persisted
+    /// segment was NOT used, if one existed and was rejected.
+    Built { refusal: Option<String> },
+    /// Loaded from a persisted segment whose body BLAKE3 is `segment_b3` and
+    /// whose content fingerprint matched the rehydration scan.
+    Loaded { segment_b3: [u8; 32] },
 }
 
 /// A cached ANN index plus the metadata needed to push SQL filters into it.
@@ -80,6 +106,11 @@ struct CachedAnnIndex {
     index: AnnIndex,
     /// Per attribute dim: maps an encoded filter-column value to its PRISM code.
     dicts: Vec<FxHashMap<Vec<u8>, u32>>,
+    source: AnnIndexSource,
+    /// The commit generation the index reflects: inserts into the shared cache
+    /// are declined if the database moved past it (the build/load raced a
+    /// commit), so a cached index can never describe a superseded snapshot.
+    cached_gen: u64,
 }
 
 pub(super) struct AnnTopKPlan {
@@ -342,88 +373,409 @@ impl AnnTopKPlan {
         cache_key: &str,
         table_schema: &TableSchema,
     ) -> Result<Option<Arc<CachedAnnIndex>>> {
-        if let Some(existing) = lookup_cached(schema, cache_key)? {
+        if let Some(existing) = lookup_cached(schema, cache_key, &table_schema.name)? {
             return Ok(Some(existing));
         }
-        let Some(built) = self.build_index(txn, table_schema)? else {
-            return Ok(None);
+        let spec = AnnSpec {
+            col_idx: self.col_idx,
+            dim: self.dim,
+            metric: self.metric,
+            filter_cols: self.filter_cols.clone(),
         };
-        let arc: Arc<CachedAnnIndex> = Arc::new(built);
-        let mut guard = schema.sql_caches.lock();
-        if let Some(existing) = guard.get(cache_key) {
-            // Another thread won the race; prefer that one and drop ours.
-            return Arc::clone(existing)
-                .downcast::<CachedAnnIndex>()
-                .map(Some)
-                .map_err(|_| {
-                    SqlError::InvalidValue(format!("ANN cache type mismatch for {cache_key}"))
-                });
-        }
-        let as_any: Arc<dyn Any + Send + Sync> = arc.clone();
-        guard.insert(cache_key.to_string(), as_any);
-        Ok(Some(arc))
+        load_or_build(txn, schema, cache_key, table_schema, &spec)
     }
+}
 
-    /// Build the index from a scan; `None` if there are no indexable rows.
-    fn build_index(
-        &self,
-        txn: &mut dyn AnnScan,
-        table_schema: &TableSchema,
-    ) -> Result<Option<CachedAnnIndex>> {
-        let non_pk = table_schema.non_pk_indices();
-        let enc_pos = table_schema.encoding_positions();
-        let nonpk_order = non_pk
-            .iter()
-            .position(|&i| i == self.col_idx)
-            .ok_or_else(|| {
-                SqlError::InvalidValue("vector column must be non-PK for ANN build".into())
-            })?;
-        let enc_idx = enc_pos[nonpk_order] as usize;
+/// The index identity a build/load/persist operates on - what `AnnTopKPlan`
+/// resolves from the statement, and what `persist_ann_index` resolves from the
+/// declared index.
+pub(super) struct AnnSpec {
+    pub col_idx: usize,
+    pub dim: u16,
+    pub metric: AnnMetric,
+    pub filter_cols: Vec<u16>,
+}
 
-        let num_attrs = self.filter_cols.len();
-        let extracts: Vec<Extract> = self
+impl AnnSpec {
+    fn metric_tag(&self) -> u8 {
+        citadel_vector::segment::metric_tag(ann_metric_to_prism(self.metric))
+    }
+}
+
+/// One scan pass: the build rows, the filter dictionaries (codes in first-seen
+/// order), and the injective content fingerprint. Build, persist, and load all
+/// decode rows through HERE - one decode path, one fingerprint definition.
+struct ScanOutcome {
+    rows: Vec<(u64, Vec<f32>, Vec<u32>)>,
+    dicts: Vec<FxHashMap<Vec<u8>, u32>>,
+    fingerprint: [u8; 32],
+}
+
+fn scan_rows(
+    txn: &mut dyn AnnScan,
+    table_schema: &TableSchema,
+    spec: &AnnSpec,
+) -> Result<ScanOutcome> {
+    let non_pk = table_schema.non_pk_indices();
+    let enc_pos = table_schema.encoding_positions();
+    let nonpk_order = non_pk
+        .iter()
+        .position(|&i| i == spec.col_idx)
+        .ok_or_else(|| {
+            SqlError::InvalidValue("vector column must be non-PK for ANN build".into())
+        })?;
+    let enc_idx = enc_pos[nonpk_order] as usize;
+
+    let num_attrs = spec.filter_cols.len();
+    let extracts: Vec<Extract> = spec
+        .filter_cols
+        .iter()
+        .map(|&c| extract_plan(c, table_schema, non_pk, enc_pos))
+        .collect::<Result<_>>()?;
+    let mut dicts: Vec<FxHashMap<Vec<u8>, u32>> = vec![FxHashMap::default(); num_attrs];
+    let mut fp = ann_persist::FingerprintHasher::new(
+        &table_schema.name,
+        spec.col_idx as u32,
+        &spec
             .filter_cols
             .iter()
-            .map(|&c| extract_plan(c, table_schema, non_pk, enc_pos))
-            .collect::<Result<_>>()?;
-        let mut dicts: Vec<FxHashMap<Vec<u8>, u32>> = vec![FxHashMap::default(); num_attrs];
+            .map(|&c| c as u32)
+            .collect::<Vec<_>>(),
+        spec.dim,
+        spec.metric_tag(),
+    );
+    let mut rows: Vec<(u64, Vec<f32>, Vec<u32>)> = Vec::new();
 
-        let mut rows: Vec<(u64, Vec<f32>, Vec<u32>)> = Vec::new();
-
-        txn.ann_scan(table_schema.name.as_bytes(), &mut |key, value| {
-            let vector = match decode_column_raw(value, enc_idx)?.to_value() {
-                Value::Vector(arr) => arr.to_vec(),
-                Value::Null => return Ok(true), // null vectors are not indexed
-                _ => {
-                    return Err(SqlError::InvalidValue(
-                        "ANN column produced non-vector value".into(),
-                    ))
-                }
-            };
-            let id = decode_pk_integer(key)? as u64;
-
-            let mut codes: Vec<u32> = Vec::with_capacity(num_attrs);
-            for (j, ex) in extracts.iter().enumerate() {
-                let v = ex.extract(key, value)?;
-                let encoded = encode_key_value(&v);
-                let next = dicts[j].len() as u32;
-                let code = *dicts[j].entry(encoded).or_insert(next);
-                codes.push(code);
+    txn.ann_scan(table_schema.name.as_bytes(), &mut |key, value| {
+        let vector = match decode_column_raw(value, enc_idx)?.to_value() {
+            Value::Vector(arr) => Some(arr.to_vec()),
+            Value::Null => None, // null vectors are content, but not indexed
+            _ => {
+                return Err(SqlError::InvalidValue(
+                    "ANN column produced non-vector value".into(),
+                ))
             }
-
-            rows.push((id, vector, codes));
-            Ok(true)
-        })?;
-
-        if rows.is_empty() {
-            return Ok(None);
+        };
+        let mut encoded_filters: Vec<Vec<u8>> = Vec::with_capacity(num_attrs);
+        for ex in &extracts {
+            encoded_filters.push(encode_key_value(&ex.extract(key, value)?));
         }
+        let vec_bytes: Vec<u8> = vector
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        fp.row(
+            key,
+            &vec_bytes,
+            &encoded_filters
+                .iter()
+                .map(Vec::as_slice)
+                .collect::<Vec<_>>(),
+        );
+        let Some(vector) = vector else {
+            return Ok(true);
+        };
+        let id = decode_pk_integer(key)? as u64;
+        let mut codes: Vec<u32> = Vec::with_capacity(num_attrs);
+        for (j, encoded) in encoded_filters.into_iter().enumerate() {
+            let next = dicts[j].len() as u32;
+            codes.push(*dicts[j].entry(encoded).or_insert(next));
+        }
+        rows.push((id, vector, codes));
+        Ok(true)
+    })?;
 
-        let index =
-            AnnIndex::build_with_attrs(rows, num_attrs, ann_metric_to_prism(self.metric), self.dim)
-                .map_err(|e| SqlError::InvalidValue(format!("ANN build failed: {e}")))?;
-        Ok(Some(CachedAnnIndex { index, dicts }))
+    Ok(ScanOutcome {
+        rows,
+        dicts,
+        fingerprint: fp.finish(),
+    })
+}
+
+/// Build the index from a scan; `None` if there are no indexable rows.
+fn build_index(
+    txn: &mut dyn AnnScan,
+    table_schema: &TableSchema,
+    spec: &AnnSpec,
+    refusal: Option<String>,
+    cached_gen: u64,
+) -> Result<Option<CachedAnnIndex>> {
+    let outcome = scan_rows(txn, table_schema, spec)?;
+    if outcome.rows.is_empty() {
+        return Ok(None);
     }
+    let index = AnnIndex::build_with_attrs(
+        outcome.rows,
+        spec.filter_cols.len(),
+        ann_metric_to_prism(spec.metric),
+        spec.dim,
+    )
+    .map_err(|e| SqlError::InvalidValue(format!("ANN build failed: {e}")))?;
+    Ok(Some(CachedAnnIndex {
+        index,
+        dicts: outcome.dicts,
+        source: AnnIndexSource::Built { refusal },
+        cached_gen,
+    }))
+}
+
+/// How a persisted segment answered the load attempt. `Refused` always falls
+/// back to a rebuild - corrupt segments additionally report loudly (an
+/// HMAC-authenticated page with a failing BLAKE3 means a writer bug).
+enum LoadOutcome {
+    Loaded(Box<CachedAnnIndex>),
+    NoSegment,
+    Refused { reason: String, corrupt: bool },
+}
+
+/// Try to serve the table's persisted segment: header pins, body decode, and
+/// the rehydration scan whose fingerprint PROVES the index describes exactly
+/// the rows this snapshot holds.
+fn try_load_segment(
+    txn: &mut dyn AnnScan,
+    table_schema: &TableSchema,
+    spec: &AnnSpec,
+    cached_gen: u64,
+) -> Result<LoadOutcome> {
+    let seg_table = ann_persist::segment_table_name(&table_schema.name);
+    let header_bytes = match txn.ann_get(&seg_table, &ann_persist::segment_key(0)) {
+        Ok(Some(b)) => b,
+        // Missing tree and missing header are both "never persisted".
+        Ok(None) | Err(_) => return Ok(LoadOutcome::NoSegment),
+    };
+    let refuse = |reason: String, corrupt: bool| Ok(LoadOutcome::Refused { reason, corrupt });
+    let header = match ann_persist::SegmentHeader::decode(&header_bytes) {
+        Ok(h) => h,
+        Err(e) => return refuse(format!("header: {e}"), true),
+    };
+    if header.format_version != ann_persist::ANNSEG_FORMAT_VERSION {
+        return refuse(
+            format!("format v{} (this binary reads v1)", header.format_version),
+            false,
+        );
+    }
+    let active_cfg = citadel_vector::segment::prism_config_hash(&AnnIndex::active_config(
+        ann_metric_to_prism(spec.metric),
+    ));
+    if header.prism_config_hash != active_cfg {
+        return refuse(
+            "PRISM config drift (segment built by another geometry)".into(),
+            false,
+        );
+    }
+    if header.dim != spec.dim
+        || header.metric_tag != spec.metric_tag()
+        || header.col_idx != spec.col_idx as u32
+        || header.filter_cols
+            != spec
+                .filter_cols
+                .iter()
+                .map(|&c| c as u32)
+                .collect::<Vec<_>>()
+    {
+        return refuse(
+            "index identity mismatch (column/metric/filter set)".into(),
+            false,
+        );
+    }
+
+    let mut body = Vec::new();
+    for chunk_no in 1..=header.chunk_count {
+        match txn.ann_get(&seg_table, &ann_persist::segment_key(chunk_no)) {
+            Ok(Some(c)) => body.extend_from_slice(&c),
+            _ => return refuse(format!("missing chunk {chunk_no}"), true),
+        }
+    }
+    if *blake3::hash(&body).as_bytes() != header.segment_b3 {
+        return refuse("segment body BLAKE3 mismatch (corrupt)".into(), true);
+    }
+    let parts = match citadel_vector::segment::decode(&body) {
+        Ok(p) => p,
+        Err(e) => return refuse(format!("segment decode: {e}"), true),
+    };
+    if parts.n() as u64 != header.n || parts.dim() != header.dim {
+        return refuse("segment body disagrees with header counts".into(), true);
+    }
+
+    // The rehydration scan: vectors placed by the id_map PERMUTATION (scan
+    // order is NOT internal order), fingerprint computed over ALL rows.
+    let slot_of = parts.internal_of_row();
+    let dim = spec.dim as usize;
+    let mut vectors = vec![0.0f32; parts.n() * dim];
+    let mut filled = 0usize;
+    let outcome = scan_rows_rehydrate(txn, table_schema, spec, &mut |row_id, vector| {
+        let Some(&slot) = slot_of.get(&row_id) else {
+            return false; // a row the segment does not know: stale
+        };
+        vectors[slot as usize * dim..(slot as usize + 1) * dim].copy_from_slice(vector);
+        filled += 1;
+        true
+    })?;
+    let Some(fingerprint) = outcome else {
+        return refuse(
+            "a scanned row is unknown to the segment (stale)".into(),
+            false,
+        );
+    };
+    if fingerprint != header.content_fingerprint {
+        return refuse("content fingerprint mismatch (stale)".into(), false);
+    }
+    let index = match parts.into_index(vectors, filled) {
+        Ok(i) => i,
+        Err(e) => return refuse(format!("rehydration: {e}"), true),
+    };
+    Ok(LoadOutcome::Loaded(Box::new(CachedAnnIndex {
+        index,
+        dicts: header.dict_maps(),
+        source: AnnIndexSource::Loaded {
+            segment_b3: header.segment_b3,
+        },
+        cached_gen,
+    })))
+}
+
+/// The rehydration variant of the scan: same decode + fingerprint as
+/// [`scan_rows`], but vectors stream to the placer instead of accumulating.
+/// Returns `None` if the placer rejects a row (unknown to the segment).
+fn scan_rows_rehydrate(
+    txn: &mut dyn AnnScan,
+    table_schema: &TableSchema,
+    spec: &AnnSpec,
+    place: &mut dyn FnMut(u64, &[f32]) -> bool,
+) -> Result<Option<[u8; 32]>> {
+    let non_pk = table_schema.non_pk_indices();
+    let enc_pos = table_schema.encoding_positions();
+    let nonpk_order = non_pk
+        .iter()
+        .position(|&i| i == spec.col_idx)
+        .ok_or_else(|| {
+            SqlError::InvalidValue("vector column must be non-PK for ANN build".into())
+        })?;
+    let enc_idx = enc_pos[nonpk_order] as usize;
+    let extracts: Vec<Extract> = spec
+        .filter_cols
+        .iter()
+        .map(|&c| extract_plan(c, table_schema, non_pk, enc_pos))
+        .collect::<Result<_>>()?;
+    let mut fp = ann_persist::FingerprintHasher::new(
+        &table_schema.name,
+        spec.col_idx as u32,
+        &spec
+            .filter_cols
+            .iter()
+            .map(|&c| c as u32)
+            .collect::<Vec<_>>(),
+        spec.dim,
+        spec.metric_tag(),
+    );
+    let mut unknown_row = false;
+
+    txn.ann_scan(table_schema.name.as_bytes(), &mut |key, value| {
+        let vector = match decode_column_raw(value, enc_idx)?.to_value() {
+            Value::Vector(arr) => Some(arr.to_vec()),
+            Value::Null => None,
+            _ => {
+                return Err(SqlError::InvalidValue(
+                    "ANN column produced non-vector value".into(),
+                ))
+            }
+        };
+        let mut encoded_filters: Vec<Vec<u8>> = Vec::with_capacity(extracts.len());
+        for ex in &extracts {
+            encoded_filters.push(encode_key_value(&ex.extract(key, value)?));
+        }
+        let vec_bytes: Vec<u8> = vector
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        fp.row(
+            key,
+            &vec_bytes,
+            &encoded_filters
+                .iter()
+                .map(Vec::as_slice)
+                .collect::<Vec<_>>(),
+        );
+        if let Some(vector) = vector {
+            let id = decode_pk_integer(key)? as u64;
+            if !place(id, &vector) {
+                unknown_row = true;
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })?;
+
+    Ok(if unknown_row { None } else { Some(fp.finish()) })
+}
+
+/// The shared load-then-build flow: try the persisted segment, fall back to a
+/// scan build carrying the refusal as a diagnostic, and insert into the shared
+/// cache ONLY if no DML on this table committed past the snapshot the index
+/// reflects (and never from a write-txn view).
+fn load_or_build(
+    txn: &mut dyn AnnScan,
+    schema: &SchemaManager,
+    cache_key: &str,
+    table_schema: &TableSchema,
+    spec: &AnnSpec,
+) -> Result<Option<Arc<CachedAnnIndex>>> {
+    let gen = txn.cache_generation();
+    let cached_gen = gen.unwrap_or(u64::MAX);
+    let loaded = match try_load_segment(txn, table_schema, spec, cached_gen)? {
+        LoadOutcome::Loaded(c) => Some(*c),
+        LoadOutcome::NoSegment => None,
+        LoadOutcome::Refused { reason, corrupt } => {
+            if corrupt {
+                eprintln!(
+                    "citadel-sql: ANN segment for `{}` REFUSED as corrupt ({reason}); \
+                     rebuilding from scan - investigate before re-persisting",
+                    table_schema.name
+                );
+            }
+            // Stale/drift refusals are the expected degradation path; the
+            // reason stays queryable on the rebuilt entry either way.
+            match build_index(txn, table_schema, spec, Some(reason), cached_gen)? {
+                Some(c) => Some(c),
+                None => return Ok(None),
+            }
+        }
+    };
+    let built = match loaded {
+        Some(c) => c,
+        None => match build_index(txn, table_schema, spec, None, cached_gen)? {
+            Some(c) => c,
+            None => return Ok(None),
+        },
+    };
+    let arc: Arc<CachedAnnIndex> = Arc::new(built);
+    if gen.is_none() {
+        // A write-txn view may include uncommitted rows: serve, never cache.
+        return Ok(Some(arc));
+    }
+    let mut guard = schema.sql_caches.lock();
+    if let Some(existing) = guard.get(cache_key) {
+        // Another thread won the race; prefer that one and drop ours.
+        return Arc::clone(existing)
+            .downcast::<CachedAnnIndex>()
+            .map(Some)
+            .map_err(|_| {
+                SqlError::InvalidValue(format!("ANN cache type mismatch for {cache_key}"))
+            });
+    }
+    let marker = marker_gen_locked(&guard, &table_schema.name);
+    if marker.is_some_and(|g| arc.cached_gen < g) {
+        // DML committed while the scan/build ran: the index is a superseded
+        // snapshot. Serve it to THIS query, decline the cache.
+        return Ok(Some(arc));
+    }
+    let as_any: Arc<dyn Any + Send + Sync> = arc.clone();
+    guard.insert(cache_key.to_string(), as_any);
+    Ok(Some(arc))
 }
 
 /// Streaming brute-force top-k for `ORDER BY <distance> LIMIT k` when no ANN
@@ -702,17 +1054,204 @@ fn empty_result(table_schema: &TableSchema, stmt: &SelectStmt) -> Result<Executi
     }))
 }
 
-fn lookup_cached(schema: &SchemaManager, cache_key: &str) -> Result<Option<Arc<CachedAnnIndex>>> {
-    let guard = schema.sql_caches.lock();
-    match guard.get(cache_key) {
-        Some(entry) => Arc::clone(entry)
-            .downcast::<CachedAnnIndex>()
-            .map(Some)
-            .map_err(|_| {
-                SqlError::InvalidValue(format!("ANN cache type mismatch for {cache_key}"))
-            }),
-        None => Ok(None),
+/// The explicit freeze operation behind `Connection::persist_ann_index`: ONE
+/// write txn scans the table (computing the content fingerprint), pays the
+/// PRISM build, serializes the segment, replaces any prior one, and commits -
+/// atomic by shadow paging. The single writer lock is held for the full build
+/// (minutes on large tables): an offline/builder operation by design. The
+/// fresh index also warms the shared RAM cache, so the NEXT attach is the
+/// fast loaded one and THIS process serves queries immediately.
+pub(crate) fn persist_ann_index(
+    db: &citadel::Database,
+    schema: &SchemaManager,
+    table_schema: &TableSchema,
+    column: &str,
+) -> Result<ann_persist::AnnSegmentInfo> {
+    let col_lower = column.to_ascii_lowercase();
+    let col_idx = table_schema
+        .columns
+        .iter()
+        .position(|c| c.name == col_lower)
+        .ok_or_else(|| SqlError::ColumnNotFound(column.to_string()))?;
+    let DataType::Vector { dim } = table_schema.columns[col_idx].data_type else {
+        return Err(SqlError::InvalidValue(format!(
+            "column `{column}` is not VECTOR(N)"
+        )));
+    };
+    // Same admission as AnnTopKPlan::try_new: a table no plan can serve must
+    // not get a persisted segment (it would be unservable dead weight with
+    // mis-decoded row ids).
+    if table_schema.primary_key_columns.len() != 1
+        || !matches!(
+            table_schema.columns[table_schema.primary_key_columns[0] as usize].data_type,
+            DataType::Integer
+        )
+    {
+        return Err(SqlError::InvalidValue(
+            "ANN persistence requires a single INTEGER primary key (same rule as the \
+             ANN query plan)"
+                .into(),
+        ));
     }
+    let ann_index = table_schema
+        .indices
+        .iter()
+        .find(|ix| {
+            matches!(ix.kind, IndexKind::Inverted(InvertedKind::Ann { .. }))
+                && ix.keys.len() == 1
+                && matches!(ix.keys[0], IndexKey::Column { idx, .. } if idx as usize == col_idx)
+        })
+        .ok_or_else(|| SqlError::InvalidValue(format!("no ANN index declared on `{column}`")))?;
+    let IndexKind::Inverted(InvertedKind::Ann { metric }) = ann_index.kind else {
+        unreachable!("matched above");
+    };
+    let spec = AnnSpec {
+        col_idx,
+        dim,
+        metric,
+        filter_cols: ann_index.ann_filter_cols.clone(),
+    };
+
+    let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    let outcome = scan_rows(&mut wtx, table_schema, &spec)?;
+    if outcome.rows.is_empty() {
+        return Err(SqlError::InvalidValue(
+            "nothing to persist: the table has no indexable (non-NULL) vectors".into(),
+        ));
+    }
+    let n = outcome.rows.len() as u64;
+    let index = AnnIndex::build_with_attrs(
+        outcome.rows,
+        spec.filter_cols.len(),
+        ann_metric_to_prism(spec.metric),
+        spec.dim,
+    )
+    .map_err(|e| SqlError::InvalidValue(format!("ANN build failed: {e}")))?;
+
+    let body = citadel_vector::segment::encode(&index);
+    let segment_b3 = *blake3::hash(&body).as_bytes();
+    // Dict entries ordered by code (codes are assigned in first-seen scan
+    // order, so by-code IS scan order).
+    let dicts_ordered: Vec<Vec<(Vec<u8>, u32)>> = outcome
+        .dicts
+        .iter()
+        .map(|d| {
+            let mut entries: Vec<(Vec<u8>, u32)> = d.iter().map(|(k, &v)| (k.clone(), v)).collect();
+            entries.sort_by_key(|&(_, code)| code);
+            entries
+        })
+        .collect();
+    let header = ann_persist::SegmentHeader {
+        format_version: ann_persist::ANNSEG_FORMAT_VERSION,
+        prism_config_hash: ann_persist::active_config_hash(ann_metric_to_prism(spec.metric)),
+        dim: spec.dim,
+        metric_tag: spec.metric_tag(),
+        n,
+        snapshot_max: index.snapshot_max,
+        col_idx: spec.col_idx as u32,
+        filter_cols: spec.filter_cols.iter().map(|&c| c as u32).collect(),
+        dicts: dicts_ordered,
+        content_fingerprint: outcome.fingerprint,
+        segment_b3,
+        chunk_count: body.len().div_ceil(ann_persist::CHUNK_BYTES) as u32,
+        writer: format!("citadel-sql {}", env!("CARGO_PKG_VERSION")),
+    };
+
+    let seg_table = ann_persist::segment_table_name(&table_schema.name);
+    ann_persist::purge_segment(&mut wtx, &table_schema.name)?;
+    wtx.create_table(&seg_table).map_err(SqlError::Storage)?;
+    wtx.table_insert(&seg_table, &ann_persist::segment_key(0), &header.encode())
+        .map_err(SqlError::Storage)?;
+    for (chunk_no, chunk) in ann_persist::chunks(&body) {
+        wtx.table_insert(&seg_table, &ann_persist::segment_key(chunk_no), chunk)
+            .map_err(SqlError::Storage)?;
+    }
+    wtx.commit().map_err(SqlError::Storage)?;
+
+    // Warm the shared cache: this index reflects exactly the just-committed
+    // state (single writer - our commit is the current generation).
+    let cached = CachedAnnIndex {
+        index,
+        dicts: outcome.dicts,
+        source: AnnIndexSource::Built { refusal: None },
+        cached_gen: db.manager().commit_generation(),
+    };
+    let key = cache_key(&table_schema.name, spec.col_idx, spec.metric);
+    let as_any: Arc<dyn Any + Send + Sync> = Arc::new(cached);
+    schema.sql_caches.lock().insert(key, as_any);
+
+    Ok(ann_persist::AnnSegmentInfo {
+        segment_b3,
+        content_fingerprint: header.content_fingerprint,
+        n,
+        dim: spec.dim,
+        metric_tag: header.metric_tag,
+        chunk_count: header.chunk_count,
+    })
+}
+
+/// The queryable identity of the index currently cached for `table.column`:
+/// `(source, snapshot generation)`, or `None` when nothing is cached.
+pub(crate) fn ann_cache_status(
+    schema: &SchemaManager,
+    table_schema: &TableSchema,
+    column: &str,
+) -> Result<Option<(AnnIndexSource, u64)>> {
+    let col_lower = column.to_ascii_lowercase();
+    let col_idx = table_schema
+        .columns
+        .iter()
+        .position(|c| c.name == col_lower)
+        .ok_or_else(|| SqlError::ColumnNotFound(column.to_string()))?;
+    let guard = schema.sql_caches.lock();
+    for metric in [AnnMetric::L2, AnnMetric::Inner, AnnMetric::Cosine] {
+        let key = cache_key(&table_schema.name, col_idx, metric);
+        if let Some(entry) = guard.get(&key) {
+            if let Ok(c) = Arc::clone(entry).downcast::<CachedAnnIndex>() {
+                return Ok(Some((c.source.clone(), c.cached_gen)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The per-table last-DML generation marker's cache key. Stamped by the
+/// commit-time invalidation in `connection.rs`; read here to refuse any index
+/// whose snapshot predates the most recent DML commit on its table.
+pub(crate) fn ann_dml_gen_key(table_name: &str) -> String {
+    format!("ann_dml_gen:{table_name}")
+}
+
+/// Read the marker under an already-held cache lock.
+fn marker_gen_locked(
+    entries: &FxHashMap<String, Arc<dyn Any + Send + Sync>>,
+    table_name: &str,
+) -> Option<u64> {
+    entries
+        .get(&ann_dml_gen_key(table_name))
+        .and_then(|e| e.downcast_ref::<u64>())
+        .copied()
+}
+
+fn lookup_cached(
+    schema: &SchemaManager,
+    cache_key: &str,
+    table_name: &str,
+) -> Result<Option<Arc<CachedAnnIndex>>> {
+    let mut guard = schema.sql_caches.lock();
+    let Some(entry) = guard.get(cache_key) else {
+        return Ok(None);
+    };
+    let entry = Arc::clone(entry)
+        .downcast::<CachedAnnIndex>()
+        .map_err(|_| SqlError::InvalidValue(format!("ANN cache type mismatch for {cache_key}")))?;
+    if marker_gen_locked(&guard, table_name).is_some_and(|g| entry.cached_gen < g) {
+        // The entry predates a DML commit on this table (a build that raced a
+        // commit slipped past eviction): drop it and rebuild/reload.
+        guard.remove(cache_key);
+        return Ok(None);
+    }
+    Ok(Some(entry))
 }
 
 pub(super) fn cache_key(table_name: &str, col_idx: usize, metric: AnnMetric) -> String {

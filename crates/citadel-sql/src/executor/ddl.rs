@@ -409,6 +409,7 @@ pub(super) fn exec_drop_table(
         .collect();
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    super::ann_persist::purge_segment(&mut wtx, &storage_name)?;
     for idx_table in &idx_tables {
         wtx.drop_table(idx_table).map_err(SqlError::Storage)?;
     }
@@ -594,6 +595,7 @@ pub(super) fn exec_drop_table_in_txn(
         .map(|t| t.name.clone())
         .collect();
 
+    super::ann_persist::purge_segment(wtx, &lower_name)?;
     for idx_table in &idx_tables {
         wtx.drop_table(idx_table).map_err(SqlError::Storage)?;
     }
@@ -662,6 +664,7 @@ fn truncate_tables(
             wtx.table_truncate(&idx_table).map_err(SqlError::Storage)?;
         }
         schema.mark_dml(name);
+        super::ann_persist::purge_segment(wtx, name)?;
         total += count;
     }
     Ok(total)
@@ -800,8 +803,8 @@ pub(super) fn exec_create_index(
 
     let pk_indices = table_schema.pk_indices();
     // CONCURRENTLY: pre-scan rows under a ReadTxn (no write lock held). Other writers can
-    // proceed during the scan. If a writer commits between our snapshot and the merge,
-    // we re-scan under the WriteTxn to ensure correctness.
+    // proceed during the scan. If a writer commits between the snapshot and the merge,
+    // re-scan under the WriteTxn to ensure correctness.
     let (mut rows, prescan_gen): (Vec<Vec<Value>>, Option<u64>) = if stmt.concurrently {
         let mut rtx = db.begin_read();
         let g1 = rtx.commit_generation();
@@ -968,6 +971,13 @@ pub(super) fn exec_drop_index(
     wtx.drop_table(&idx_table).map_err(SqlError::Storage)?;
 
     let table_schema = schema.get(&table_name).unwrap();
+    // Dropping the ANN index orphans its persisted segment - drop it with us.
+    if table_schema
+        .index_by_name(&lower_idx)
+        .is_some_and(|ix| matches!(ix.kind, IndexKind::Inverted(InvertedKind::Ann { .. })))
+    {
+        super::ann_persist::purge_segment(&mut wtx, &table_name)?;
+    }
     let mut updated_schema = table_schema.clone();
     updated_schema.indices.retain(|i| i.name != lower_idx);
     SchemaManager::save_schema(&mut wtx, &updated_schema)?;
@@ -1068,6 +1078,13 @@ pub(super) fn exec_drop_index_in_txn(
     wtx.drop_table(&idx_table).map_err(SqlError::Storage)?;
 
     let table_schema = schema.get(&table_name).unwrap();
+    // Dropping the ANN index orphans its persisted segment - drop it with us.
+    if table_schema
+        .index_by_name(&lower_idx)
+        .is_some_and(|ix| matches!(ix.kind, IndexKind::Inverted(InvertedKind::Ann { .. })))
+    {
+        super::ann_persist::purge_segment(wtx, &table_name)?;
+    }
     let mut updated_schema = table_schema.clone();
     updated_schema.indices.retain(|i| i.name != lower_idx);
     SchemaManager::save_schema(wtx, &updated_schema)?;
@@ -1242,6 +1259,19 @@ pub(super) fn alter_table_impl(
     let lower_name = stmt.table.to_ascii_lowercase();
     if lower_name == "_schema" {
         return Err(SqlError::Unsupported("cannot alter internal table".into()));
+    }
+    // Structure-changing ops shift encodings or names out from under a
+    // persisted ANN segment; drop it in the same txn. (RenameTable would
+    // otherwise orphan `__annseg_{old}` forever.) Trigger toggles don't touch
+    // row data and keep the segment.
+    if matches!(
+        &stmt.op,
+        AlterTableOp::AddColumn { .. }
+            | AlterTableOp::DropColumn { .. }
+            | AlterTableOp::RenameColumn { .. }
+            | AlterTableOp::RenameTable { .. }
+    ) {
+        super::ann_persist::purge_segment(wtx, &lower_name)?;
     }
     match &stmt.op {
         AlterTableOp::AddColumn {

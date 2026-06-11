@@ -460,7 +460,7 @@ fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Comp
     let table_schema = schema
         .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
-    // Storage name (post-TEMP-alias resolution) — what wtx.table_* calls below use.
+    // Storage name (post-TEMP-alias resolution); used by wtx.table_* calls below.
     let table_name_lower = table_schema.name.clone();
 
     let corr_ctx = CorrelationCtx {
@@ -607,6 +607,9 @@ fn exec_update_compiled(
 
     let fast = compiled.fast.as_ref().unwrap();
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    // Mark + purge the persisted segment in the same txn, like every DML path.
+    schema.mark_dml(&compiled.table_name_lower);
+    super::ann_persist::purge_segment(&mut wtx, &compiled.table_name_lower)?;
 
     if let crate::planner::ScanPlan::PkRangeScan {
         ref start_key,
@@ -804,7 +807,7 @@ pub(super) fn exec_update(
     let lower_name = table_schema.name.clone();
     let strict = table_schema.is_strict();
 
-    // Correlated subquery in UPDATE WHERE — check BEFORE materialization
+    // Correlated subquery in UPDATE WHERE: check BEFORE materialization.
     let corr_ctx = CorrelationCtx {
         outer_schema: table_schema,
         outer_alias: None,
@@ -953,6 +956,7 @@ pub(super) fn exec_update(
         let patch_safe = pk_range_patch_safe(&set_cols, &gen_cols);
 
         let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+        super::ann_persist::purge_segment(&mut wtx, &lower_name)?;
 
         // `value: &mut [u8]` can't grow; nullable/variable-width fall through.
         if let (
@@ -1321,6 +1325,7 @@ pub(super) fn exec_update(
     }
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    super::ann_persist::purge_segment(&mut wtx, &lower_name)?;
 
     if !table_schema.foreign_keys.is_empty() {
         for c in &changes {
@@ -1707,8 +1712,9 @@ pub(super) fn exec_delete(
 
     let col_map = ColumnMap::new(&table_schema.columns);
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    super::ann_persist::purge_segment(&mut wtx, &lower_name)?;
 
-    // Fast TRUNCATE path skips per-row firing — gate on no DELETE triggers (ROW + STATEMENT).
+    // Fast TRUNCATE path skips per-row firing; gate on no DELETE triggers (ROW + STATEMENT).
     let has_delete_triggers = schema.triggers_for(&table_schema.name).iter().any(|t| {
         t.enabled
             && (t.timing == crate::parser::TriggerTiming::After
@@ -2776,6 +2782,7 @@ pub(super) fn exec_update_in_txn(
         .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
     schema.mark_dml(&table_schema.name);
+    super::ann_persist::purge_segment(wtx, &table_schema.name)?;
     let lower_name = table_schema.name.clone();
     let strict = table_schema.is_strict();
 
@@ -3259,6 +3266,7 @@ pub(super) fn exec_delete_in_txn(
         .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
     schema.mark_dml(&table_schema.name);
+    super::ann_persist::purge_segment(wtx, &table_schema.name)?;
     let lower_name = table_schema.name.clone();
 
     let has_delete_triggers_in_txn = schema.triggers_for(&table_schema.name).iter().any(|t| {

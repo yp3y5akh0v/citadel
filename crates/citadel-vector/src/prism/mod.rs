@@ -23,7 +23,11 @@ pub mod quantize;
 #[path = "../../vendored/prism/search.rs"]
 pub mod search;
 
+pub use binary::BinaryStore;
 pub use construct::{PrismConfig, PrismIndex};
 pub use distance::Metric;
 pub use filter::Filter;
+pub use graph::Graph;
+pub use partition::{Cell, PartitionTree};
 pub use point::PointStore;
+pub use quantize::SQ8Store;

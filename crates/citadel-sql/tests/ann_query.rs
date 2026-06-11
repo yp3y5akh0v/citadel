@@ -149,13 +149,15 @@ fn insert_after_index_build_invalidates_cache() {
     let _ = conn
         .execute("SELECT id FROM t ORDER BY v <-> '[1.0, 0.0, 0.0]'::VECTOR(3) LIMIT 1")
         .unwrap();
-    assert_eq!(db.sql_cache_len(), 1, "cache should be populated");
+    assert!(
+        conn.ann_cache_status("t", "v").unwrap().is_some(),
+        "cache should be populated"
+    );
 
     conn.execute("INSERT INTO t VALUES (99, '[1.0, 0.0, 0.0]'::VECTOR(3))")
         .unwrap();
-    assert_eq!(
-        db.sql_cache_len(),
-        0,
+    assert!(
+        conn.ann_cache_status("t", "v").unwrap().is_none(),
         "auto-commit INSERT should evict the stale ANN cache"
     );
 
@@ -204,7 +206,10 @@ fn ann_in_write_txn_scans_live_view_not_stale_cache() {
     let _ = conn
         .execute("SELECT id FROM t ORDER BY v <-> '[1.0, 0.0, 0.0]'::VECTOR(3) LIMIT 1")
         .unwrap();
-    assert_eq!(db.sql_cache_len(), 1, "read-path query caches the index");
+    assert!(
+        conn.ann_cache_status("t", "v").unwrap().is_some(),
+        "read-path query caches the index"
+    );
 
     conn.execute("BEGIN").unwrap();
     // Uncommitted closest row: ANN must stream the live view, not the stale cache.
@@ -245,15 +250,14 @@ fn rollback_keeps_cache_intact() {
     let _ = conn
         .execute("SELECT id FROM t ORDER BY v <-> '[1.0, 0.0, 0.0]'::VECTOR(3) LIMIT 1")
         .unwrap();
-    assert_eq!(db.sql_cache_len(), 1);
+    assert!(conn.ann_cache_status("t", "v").unwrap().is_some());
 
     conn.execute("BEGIN").unwrap();
     conn.execute("INSERT INTO t VALUES (99, '[0.5, 0.5, 0.0]'::VECTOR(3))")
         .unwrap();
     conn.execute("ROLLBACK").unwrap();
-    assert_eq!(
-        db.sql_cache_len(),
-        1,
+    assert!(
+        conn.ann_cache_status("t", "v").unwrap().is_some(),
         "rolled-back DML must not invalidate the cache"
     );
 }
@@ -269,15 +273,14 @@ fn explicit_commit_invalidates_cache() {
     let _ = conn
         .execute("SELECT id FROM t ORDER BY v <-> '[1.0, 0.0, 0.0]'::VECTOR(3) LIMIT 1")
         .unwrap();
-    assert_eq!(db.sql_cache_len(), 1);
+    assert!(conn.ann_cache_status("t", "v").unwrap().is_some());
 
     conn.execute("BEGIN").unwrap();
     conn.execute("INSERT INTO t VALUES (99, '[1.0, 0.0, 0.0]'::VECTOR(3))")
         .unwrap();
     conn.execute("COMMIT").unwrap();
-    assert_eq!(
-        db.sql_cache_len(),
-        0,
+    assert!(
+        conn.ann_cache_status("t", "v").unwrap().is_none(),
         "explicit COMMIT after DML must evict the ANN cache"
     );
 }

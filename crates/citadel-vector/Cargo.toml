@@ -27,3 +27,5 @@ rand = { workspace = true }
 zeroize = { workspace = true }
 byteorder = "1.5"
 memmap2 = { workspace = true }
+blake3 = { workspace = true }
+rustc-hash = { workspace = true }

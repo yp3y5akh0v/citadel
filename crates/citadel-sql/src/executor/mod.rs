@@ -1,6 +1,7 @@
 //! SQL executor: DDL and DML operations.
 
 mod aggregate;
+pub(crate) mod ann_persist;
 mod ann_topk;
 pub(crate) mod compile;
 mod correlated;
@@ -17,6 +18,10 @@ pub(crate) mod triggers;
 mod view;
 mod window;
 pub(crate) mod write;
+pub use ann_persist::AnnSegmentInfo;
+pub(crate) use ann_topk::ann_dml_gen_key;
+pub use ann_topk::AnnIndexSource;
+pub(crate) use ann_topk::{ann_cache_status, persist_ann_index};
 pub use compile::{compile, CompiledPlan};
 use cte::*;
 use ddl::*;
