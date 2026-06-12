@@ -1,14 +1,14 @@
 +++
 title = "Introducing Citadel"
 date = 2026-06-07
-description = "An embedded database that encrypts every page, with a memory engine for AI agents."
+description = "An embedded database that encrypts every page, with a built-in memory engine."
 authors = ["Yuriy Peysakhov"]
 
 [taxonomies]
 tags = ["announcement"]
 +++
 
-Citadel is an embedded database. Every page is encrypted before it reaches disk, so the file is always ciphertext - there is no unencrypted mode. It also includes a memory engine for AI agents, on the same encrypted storage.
+Citadel is an embedded database. Every page is encrypted before it reaches disk, so the file is always ciphertext - there is no unencrypted mode. It also includes a memory engine on the same encrypted storage.
 
 ## Why encryption first
 
@@ -34,9 +34,9 @@ Most databases keep a write-ahead log for crash recovery. Citadel does not. Chan
 
 Citadel beats SQLite on all 50 head-to-head benchmarks, even with encryption on every page. The numbers are in the <a href="https://github.com/yp3y5akh0v/citadel#benchmarks" target="_blank" rel="noopener">README</a>.
 
-## Memory for AI agents
+## The memory engine
 
-Agents keep a lot of long-lived, private context, and you do not want that in plaintext. Citadel's memory layer covers:
+Apps and agents keep a lot of long-lived, private context, and you do not want that in plaintext. Citadel's memory layer covers:
 
 - **Typed memory** - `citadel-mem` stores **atoms** in **regions**, linked by typed **edges**. They are stored and encrypted like normal rows.
 - **Vector recall** - a `VECTOR(N)` column with a filtered ANN index from <a href="https://github.com/yp3y5akh0v/prism" target="_blank" rel="noopener">PRISM</a>. Recall mixes vector distance, keyword match, and recency, with an optional reranker.

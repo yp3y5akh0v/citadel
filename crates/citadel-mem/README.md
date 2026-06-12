@@ -1,6 +1,6 @@
 # citadeldb-mem
 
-Encrypted-first agent-memory engine, built on the
+Encrypted-first memory engine, built on the
 [Citadel](https://github.com/yp3y5akh0v/citadel) encrypted embedded database. Stores memory as
 regions of typed atoms connected by typed edges, retrieves through a hybrid pipeline (vector
 ANN + BM25 keyword + cross-encoder reranker), and **forgets by destroying keys** -

@@ -7,7 +7,7 @@ reads through Citadel's encrypted page storage, so the index is encrypted at res
 other page.
 
 This crate is part of the Citadel workspace. For SQL vector queries depend on the main
-[`citadeldb`](https://crates.io/crates/citadeldb) crate; for agent memory see
+[`citadeldb`](https://crates.io/crates/citadeldb) crate; for the memory engine see
 [`citadeldb-mem`](https://crates.io/crates/citadeldb-mem).
 
 ## License

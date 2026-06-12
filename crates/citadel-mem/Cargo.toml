@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords = ["agent-memory", "ai", "embeddings", "vector-search", "encrypted-memory"]
 categories = ["database-implementations", "artificial-intelligence", "cryptography", "data-structures", "caching"]
-description = "Encrypted-first agent memory engine for Citadel"
+description = "Encrypted-first memory engine for Citadel"
 readme = "README.md"
 
 [lib]

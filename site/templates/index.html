@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
-{% block title %}Citadel - Encrypted-first embedded database and agent-memory engine{% endblock %}
-{% block description %}Encrypted-first embedded database and agent-memory engine. Every page AES-256-CTR + HMAC-SHA256. Wins all {{ config.extra.benchmarks }} head-to-head benchmarks against unencrypted SQLite, with vector recall, an MCP server, and cryptographic forgetting.{% endblock %}
+{% block title %}Citadel - Encrypted-first embedded database and memory engine{% endblock %}
+{% block description %}Encrypted-first embedded database and memory engine. Every page AES-256-CTR + HMAC-SHA256. Wins all {{ config.extra.benchmarks }} head-to-head benchmarks against unencrypted SQLite, with vector recall, an MCP server, and cryptographic forgetting.{% endblock %}
 
 {% block content %}
 {% set base = config.base_url %}
@@ -9,9 +9,9 @@
 <section class="hero shell">
   <div class="hero-inner">
     <div>
-      <h1>Encrypted-first embedded database and agent memory, <span class="ac">faster than unencrypted SQLite.</span></h1>
+      <h1>Encrypted-first embedded database and memory engine, <span class="ac">faster than unencrypted SQLite.</span></h1>
       <p class="lede">
-        Every page is encrypted and authenticated before it touches disk. A full SQL engine that wins all {{ config.extra.benchmarks }} head-to-head benchmarks against SQLite - and, on the same encrypted pages, an agent-memory engine with vector recall, an MCP server, and cryptographic forgetting.
+        Every page is encrypted and authenticated before it touches disk. A full SQL engine that wins all {{ config.extra.benchmarks }} head-to-head benchmarks against SQLite - and, on the same encrypted pages, a memory engine with vector recall, an MCP server, and cryptographic forgetting.
       </p>
       <div class="hero-cta">
         <a class="btn" href="#install">Get started
@@ -75,7 +75,7 @@
   <div class="sec-head">
     <div class="eyebrow">One substrate, two faces</div>
     <h2>An encrypted file format that is both a database and a memory.</h2>
-    <p>The same AES-256-CTR + HMAC pages, copy-on-write B+ tree, and shadow-paging commit power both halves. Use the SQL engine, the agent-memory engine, or both in one file.</p>
+    <p>The same AES-256-CTR + HMAC pages, copy-on-write B+ tree, and shadow-paging commit power both halves. Use the SQL engine, the memory engine, or both in one file.</p>
   </div>
   <div class="pillars">
     <div class="pillar">
@@ -91,8 +91,8 @@
     </div>
     <div class="pillar">
       <div class="tag">citadeldb-vector / -mem / -ai / -mcp</div>
-      <h3>Agent memory engine</h3>
-      <p>Memory for AI agents that lives encrypted at rest. Typed atoms and edges, hybrid recall, and a Model Context Protocol server so Claude Desktop or any MCP client can read and write it.</p>
+      <h3>Memory engine</h3>
+      <p>Memory that lives encrypted at rest. Typed atoms and edges, hybrid recall, and a Model Context Protocol server so Claude Desktop or any MCP client can read and write it.</p>
       <ul>
         <li><code>VECTOR(N)</code> type with a <a class="ilink" href="https://github.com/yp3y5akh0v/prism" target="_blank" rel="noopener">PRISM</a>-backed filtered ANN index</li>
         <li>Hybrid recall: vector ANN + BM25 keyword + recency + optional cross-encoder reranker</li>
@@ -107,7 +107,7 @@
   <div class="sec-head">
     <div class="eyebrow">Features</div>
     <h2>A complete engine in a single file.</h2>
-    <p>Full SQL, real ACID, encrypted sync, and an agent-memory layer. Key hierarchy built around RFC&nbsp;3394, RFC&nbsp;5869, and a Rust-only crypto core.</p>
+    <p>Full SQL, real ACID, encrypted sync, and a memory engine. Key hierarchy built around RFC&nbsp;3394, RFC&nbsp;5869, and a Rust-only crypto core.</p>
   </div>
 
   <div class="features">
@@ -128,7 +128,7 @@
     </div>
     <div class="feat">
       <svg class="feat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="19" cy="18" r="2"/><path d="M7 7l3 3M17 7l-3 3M17 17l-3-3"/></svg>
-      <h3>Vector + agent memory</h3>
+      <h3>Vector + memory engine</h3>
       <p><code>VECTOR(N)</code> with a PRISM filtered ANN index, plus a memory engine of typed atoms with hybrid vector + keyword recall.</p>
     </div>
     <div class="feat">
@@ -341,8 +341,8 @@
 
 <section class="block shell" id="memory">
   <div class="sec-head">
-    <div class="eyebrow">Agent memory</div>
-    <h2>Encrypted memory for AI agents.</h2>
+    <div class="eyebrow">Memory engine</div>
+    <h2>Encrypted memory engine.</h2>
     <p>citadel-mem stores memory as typed <b>atoms</b> grouped into <b>regions</b> and connected by typed <b>edges</b>. Recall blends vector similarity, keyword scoring, and recency; forgetting destroys keys, not just rows.</p>
   </div>
 
@@ -418,7 +418,7 @@
       "command": "citadel-mcp",
       "args": [
         "--db", "memory.citadel",
-        "--region", "agent",
+        "--region", "default",
         "--embedder", "bge-small"
       ],
       "env": { "CITADEL_KEY": "your-passphrase" }
@@ -426,7 +426,7 @@
   }
 }{% endraw %}</pre>
       </div>
-      <p class="bench-note">Recall hits carry provenance, per-hit integrity verdicts, and <code>memory://atom/{id}</code> resource links. <code>mem_forget</code> returns an erasure receipt.</p>
+      <p class="bench-note">One-time setup: <code>citadel-mcp pull bge-small</code> downloads the embedder (models are never fetched automatically; omit <code>--embedder</code> for keyword-only recall). Recall hits carry provenance, per-hit integrity verdicts, and <code>memory://atom/{id}</code> resource links. <code>mem_forget</code> returns an erasure receipt.</p>
     </div>
   </div>
 </section>
