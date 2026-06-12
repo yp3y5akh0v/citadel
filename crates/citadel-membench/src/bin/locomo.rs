@@ -9,6 +9,9 @@
 //! Dataset path: argv[1] or CITADEL_LOCOMO_DATASET. Env knobs:
 //!   CITADEL_LOCOMO_READER_MODEL=m     answer-generation model (default gpt-4o-mini)
 //!   CITADEL_LOCOMO_JUDGE_MODEL=m      scoring model (default gpt-4o-mini)
+//!   CITADEL_LOCOMO_TOP_K=n            memories retrieved per question (default 50)
+//!   CITADEL_LOCOMO_READER_ORDER       chrono|relevance prompt order (default relevance)
+//!   CITADEL_LOCOMO_NEIGHBOR_RADIUS=n  adjacent turns around each hit (default 0 = off)
 //!   CITADEL_LOCOMO_RERANK_STRATEGY    replace|rrf (default rrf)
 //!   CITADEL_LOCOMO_READER_CONCURRENCY reader calls in flight (default 3)
 //!   CITADEL_LOCOMO_JUDGE_CONCURRENCY  judge calls in flight (default 12, mini)
@@ -34,8 +37,8 @@ use citadel_mem::{
     RerankStrategy, Reranker,
 };
 use citadel_membench::{
-    aggregate, ingest_sample, provenance, run_sample_observed, BenchConfig, Category,
-    QuestionResult, Sample,
+    aggregate, ingest_sample, provenance, run_sample_observed, turn_content, BenchConfig, Category,
+    QuestionResult, ReaderOrder, Sample,
 };
 use rustc_hash::FxHashMap;
 
@@ -50,7 +53,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .or_else(|| std::env::var("CITADEL_LOCOMO_DATASET").ok())
         .ok_or("dataset path required: argv[1] or CITADEL_LOCOMO_DATASET")?;
 
-    let config = BenchConfig::default();
+    let config = bench_config_from_env();
     let (mut samples, dataset_sha256) = citadel_membench::load_with_hash(&dataset_path)?;
 
     if let Ok(raw) = std::env::var("CITADEL_LOCOMO_MAX_SAMPLES") {
@@ -209,7 +212,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Arc::clone(&embedder),
             reader.as_ref(),
             judge.as_ref(),
-            config.top_k,
+            config,
             &pacer,
             &mut |r| prog.observe(r, &conv_id, live_trace.as_mut()),
         )?;
@@ -322,6 +325,35 @@ impl LiveProgress {
     }
 }
 
+/// Build the run config from env overrides over [`BenchConfig::default`]:
+/// CITADEL_LOCOMO_TOP_K, CITADEL_LOCOMO_READER_ORDER, CITADEL_LOCOMO_NEIGHBOR_RADIUS.
+fn bench_config_from_env() -> BenchConfig {
+    let d = BenchConfig::default();
+    let reader_order = match std::env::var("CITADEL_LOCOMO_READER_ORDER")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "chrono" => ReaderOrder::Chrono,
+        "relevance" => ReaderOrder::Relevance,
+        _ => d.reader_order,
+    };
+    BenchConfig {
+        top_k: env_usize("CITADEL_LOCOMO_TOP_K", 1, d.top_k),
+        reader_order,
+        neighbor_radius: env_usize("CITADEL_LOCOMO_NEIGHBOR_RADIUS", 0, d.neighbor_radius),
+    }
+}
+
+/// Read `key` as a `usize >= min`, else `default`.
+fn env_usize(key: &str, min: usize, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= min)
+        .unwrap_or(default)
+}
+
 /// Parse `CITADEL_LOCOMO_RERANK_STRATEGY` (replace|rrf, default rrf) into a strategy.
 fn rerank_strategy_from_env() -> RerankStrategy {
     match std::env::var("CITADEL_LOCOMO_RERANK_STRATEGY")
@@ -334,12 +366,15 @@ fn rerank_strategy_from_env() -> RerankStrategy {
     }
 }
 
-/// Token-free evidence recall@k, computed four ways to localize the lossy layer:
-///   A: exact cosine over raw bge (the embedder ceiling).
+/// Token-free evidence recall@k, measured per layer to localize the lossy stage:
+///   A: exact cosine over the indexed text (the embedder ceiling; embeds exactly
+///      what ingest indexes via `turn_content`).
 ///   B: semantic-only recall (citadel-vector PRISM).
-///   C: default fusion recall (+keyword/recency/score).
-///   D: fusion + cross-encoder reranker (the order the reader sees).
-/// Deltas localize the fault: low A = representation; A>>B = vector; B>>C = fusion.
+///   C: default fusion via recall (wall-clock recency, ~uniform for dated data).
+///   C-asof: default fusion graded as of the conversation's end (live recency).
+///   D / D-asof: fusion + cross-encoder reranker (the order the reader sees).
+/// Each cell reports ANY-evidence recall (some gold turn in top-k) and ALL-evidence
+/// recall (every gold turn in top-k - the true multi-hop ceiling).
 fn run_retrieval_diag(
     eng: &mut MemoryEngine,
     samples: &[Sample],
@@ -347,20 +382,28 @@ fn run_retrieval_diag(
 ) -> Result<(), Box<dyn Error>> {
     const KS: [usize; 3] = [10, 30, 50];
     const MAX_K: usize = 50;
-    // D is only populated when a reranker dir is set; its name reflects the strategy.
+    // D rows are only populated when a reranker dir is set; names pin the strategy.
     let rr_dir = std::env::var("CITADEL_RERANKER_DIR").ok();
-    let d_name = match &rr_dir {
-        Some(_) => format!(
-            "D: fusion + reranker {:?} (the order the reader sees)",
-            rerank_strategy_from_env()
+    let (d_name, d_asof_name) = match &rr_dir {
+        Some(_) => {
+            let strategy = rerank_strategy_from_env();
+            (
+                format!("D: fusion + reranker {strategy:?} (the order the reader sees)"),
+                format!("D-asof: fusion as of conversation end + reranker {strategy:?}"),
+            )
+        }
+        None => (
+            "D: (skipped; set CITADEL_RERANKER_DIR to measure)".to_string(),
+            "D-asof: (skipped; set CITADEL_RERANKER_DIR to measure)".to_string(),
         ),
-        None => "D: (skipped; set CITADEL_RERANKER_DIR to measure)".to_string(),
     };
     let mode_names = [
-        "A: exact-cosine (bge ceiling, no citadel)".to_string(),
+        "A: exact-cosine over the indexed text (embedder ceiling)".to_string(),
         "B: semantic-only via recall (citadel-vector PRISM)".to_string(),
         "C: default fusion via recall (citadel-mem)".to_string(),
+        "C-asof: default fusion as of conversation end".to_string(),
         d_name,
+        d_asof_name,
     ];
     let labels = ["multi_hop", "temporal", "open_domain", "single_hop"];
     let semantic_only = FusionWeights {
@@ -370,22 +413,22 @@ fn run_retrieval_diag(
         importance: 0.0,
     };
 
-    // Per mode: category label -> ([hit@KS[0], hit@KS[1], hit@KS[2]], measured_count).
-    let mut acc: Vec<BTreeMap<&str, ([usize; 3], usize)>> =
-        mode_names.iter().map(|_| BTreeMap::new()).collect();
+    let mut acc: Vec<BTreeMap<&str, Tally>> = mode_names.iter().map(|_| BTreeMap::new()).collect();
 
-    // Pass 1: A/B/C, with NO reranker attached (so C is pure fusion).
+    // Pass 1: A/B/C/C-asof, with NO reranker attached (so C is pure fusion).
     for s in samples {
         citadel_membench::create_bench_region(eng, &s.sample_id, Arc::clone(&embedder))?;
         ingest_sample(eng, &s.sample_id, s)?;
+        let as_of = s.as_of_micros();
 
-        // Embed every turn once for the exact-cosine ground truth (mode A).
-        let turn_texts: Vec<&str> = s.turns.iter().map(|t| t.text.as_str()).collect();
-        let turn_embs = embedder.embed(&turn_texts)?;
+        // Embed each turn's INDEXED text once for the exact-cosine ceiling (mode A).
+        let turn_texts: Vec<String> = s.turns.iter().map(turn_content).collect();
+        let turn_refs: Vec<&str> = turn_texts.iter().map(String::as_str).collect();
+        let turn_embs = embedder.embed(&turn_refs)?;
         let turn_dia: Vec<&str> = s.turns.iter().map(|t| t.dia_id.as_str()).collect();
 
         // Embed every scored question ONCE in a single batch (GPU-efficient), then reuse
-        // the vector across A/B/C via by_embedding so no recall re-embeds the query.
+        // the vector across modes via by_embedding so no recall re-embeds the query.
         let scored_qa: Vec<_> =
             s.qa.iter()
                 .filter(|qa| qa.category != Category::Adversarial && !qa.evidence.is_empty())
@@ -397,7 +440,7 @@ fn run_retrieval_diag(
             let label = qa.category.label();
             let q_emb = &q_embs[qi];
 
-            // A: exact cosine over raw bge embeddings (no citadel-vector/mem).
+            // A: exact cosine over the same embeddings the index holds.
             let mut scored: Vec<(f32, &str)> = turn_embs
                 .iter()
                 .zip(&turn_dia)
@@ -417,19 +460,25 @@ fn run_retrieval_diag(
             record(&mut acc[1], label, &hit_dia_ids(&b), &qa.evidence, KS);
 
             // C: default fusion (reuse the embedding; text drives the keyword signal).
-            let c = eng.recall(
-                &s.sample_id,
-                RecallQuery::by_embedding(q_emb.clone(), MAX_K).with_text(qa.question.as_str()),
-            )?;
+            let c_query =
+                RecallQuery::by_embedding(q_emb.clone(), MAX_K).with_text(qa.question.as_str());
+            let c = eng.recall(&s.sample_id, c_query.clone())?;
             record(&mut acc[2], label, &hit_dia_ids(&c), &qa.evidence, KS);
+
+            // C-asof: identical query graded as of the conversation's end.
+            if let Some(t) = as_of {
+                let ca = eng.recall(&s.sample_id, c_query.with_as_of(t))?;
+                record(&mut acc[3], label, &hit_dia_ids(&ca), &qa.evidence, KS);
+            }
         }
     }
 
-    // Pass 2 (mode D): attach the reranker and re-recall, isolating rerank from fusion.
+    // Pass 2 (D rows): attach the reranker and re-recall, isolating rerank from fusion.
     if let Some(dir) = &rr_dir {
         let ce = CrossEncoder::ms_marco_minilm_l6(dir)?;
         eng.set_reranker(Arc::new(ce), rerank_strategy_from_env());
         for s in samples {
+            let as_of = s.as_of_micros();
             let scored_qa: Vec<_> =
                 s.qa.iter()
                     .filter(|qa| qa.category != Category::Adversarial && !qa.evidence.is_empty())
@@ -437,60 +486,51 @@ fn run_retrieval_diag(
             let q_texts: Vec<&str> = scored_qa.iter().map(|qa| qa.question.as_str()).collect();
             let q_embs = embedder.embed(&q_texts)?;
             for (qi, &qa) in scored_qa.iter().enumerate() {
-                let d = eng.recall(
-                    &s.sample_id,
-                    RecallQuery::by_embedding(q_embs[qi].clone(), MAX_K)
-                        .with_text(qa.question.as_str()),
-                )?;
+                let d_query = RecallQuery::by_embedding(q_embs[qi].clone(), MAX_K)
+                    .with_text(qa.question.as_str());
+                let d = eng.recall(&s.sample_id, d_query.clone())?;
                 record(
-                    &mut acc[3],
+                    &mut acc[4],
                     qa.category.label(),
                     &hit_dia_ids(&d),
                     &qa.evidence,
                     KS,
                 );
+                if let Some(t) = as_of {
+                    let da = eng.recall(&s.sample_id, d_query.with_as_of(t))?;
+                    record(
+                        &mut acc[5],
+                        qa.category.label(),
+                        &hit_dia_ids(&da),
+                        &qa.evidence,
+                        KS,
+                    );
+                }
             }
         }
     }
 
     eprintln!(
-        "\n=== layered retrieval diagnostic: evidence recall@{}/{}/{} (pinpoints the lossy layer) ===",
+        "\n=== layered retrieval diagnostic: evidence recall@{}/{}/{} as any%/all% ===",
         KS[0], KS[1], KS[2]
     );
     for (mi, name) in mode_names.iter().enumerate() {
-        if mi == 3 && rr_dir.is_none() {
+        if mi >= 4 && rr_dir.is_none() {
             continue;
         }
         eprintln!("\n[{name}]");
-        let mut tot = [0usize; 3];
-        let mut tot_n = 0usize;
+        let mut tot = Tally::default();
         for label in labels {
-            if let Some((h, n)) = acc[mi].get(label) {
-                eprintln!(
-                    "  {label:>12} (n={n}): @{}={:.1}%  @{}={:.1}%  @{}={:.1}%",
-                    KS[0],
-                    pct(h[0], *n),
-                    KS[1],
-                    pct(h[1], *n),
-                    KS[2],
-                    pct(h[2], *n)
-                );
-                for ki in 0..3 {
-                    tot[ki] += h[ki];
+            if let Some(t) = acc[mi].get(label) {
+                eprintln!("  {label:>12} (n={:>4}): {}", t.n, t.cells(KS));
+                for ki in 0..KS.len() {
+                    tot.any[ki] += t.any[ki];
+                    tot.all[ki] += t.all[ki];
                 }
-                tot_n += n;
+                tot.n += t.n;
             }
         }
-        eprintln!(
-            "  {:>12} (n={tot_n}): @{}={:.1}%  @{}={:.1}%  @{}={:.1}%",
-            "OVERALL",
-            KS[0],
-            pct(tot[0], tot_n),
-            KS[1],
-            pct(tot[1], tot_n),
-            KS[2],
-            pct(tot[2], tot_n)
-        );
+        eprintln!("  {:>12} (n={:>4}): {}", "OVERALL", tot.n, tot.cells(KS));
     }
     Ok(())
 }
@@ -512,6 +552,8 @@ fn run_db_dump(
     let (mut tot_turns, mut tot_ingested, mut tot_atoms) = (0usize, 0usize, 0usize);
     let (mut tot_caption, mut tot_query) = (0usize, 0usize);
 
+    let mut tot_event_exact = 0usize;
+
     // One region per conversation: dump every conversation's ingested atoms.
     for s in samples {
         citadel_membench::create_bench_region(eng, &s.sample_id, Arc::clone(&embedder))?;
@@ -520,11 +562,20 @@ fn run_db_dump(
 
         let with_caption = atoms.iter().filter(|a| a.text.contains(cap_marker)).count();
         let with_query = atoms.iter().filter(|a| a.text.contains(qry_marker)).count();
+        // Stored event time must equal the parsed session date, turn for turn
+        // (ingest returns ids in turn order, so the zip aligns them exactly).
+        let by_id: FxHashMap<_, _> = atoms.iter().map(|a| (a.id, a.created_at)).collect();
+        let event_exact = ids
+            .iter()
+            .zip(&s.turns)
+            .filter(|(id, t)| t.event_micros().is_some_and(|e| by_id.get(*id) == Some(&e)))
+            .count();
         tot_turns += s.turns.len();
         tot_ingested += ids.len();
         tot_atoms += atoms.len();
         tot_caption += with_caption;
         tot_query += with_query;
+        tot_event_exact += event_exact;
 
         eprintln!("\n=== DB dump: region {} ===", s.sample_id);
         eprintln!(
@@ -538,6 +589,10 @@ fn run_db_dump(
             atoms.len(),
             pct(with_caption, atoms.len()),
             pct(with_query, atoms.len())
+        );
+        eprintln!(
+            "event-time created_at exact for {event_exact}/{} turns",
+            s.turns.len()
         );
 
         // A compact aligned table (truncated), then full untruncated text below so the
@@ -593,7 +648,8 @@ fn run_db_dump(
     eprintln!("\n=== DB dump: all {} conversations ===", samples.len());
     eprintln!(
         "turns={tot_turns}  ingested={tot_ingested}  fetched={tot_atoms}  \
-         caption {tot_caption} ({:.0}%)  query {tot_query} ({:.0}%)",
+         caption {tot_caption} ({:.0}%)  query {tot_query} ({:.0}%)  \
+         event-time exact {tot_event_exact}/{tot_turns}",
         pct(tot_caption, tot_atoms),
         pct(tot_query, tot_atoms)
     );
@@ -631,7 +687,7 @@ fn run_erasure_demo(
 
     // PRISM over sealed content: a real turn must surface through decrypt-then-rank.
     let needle = &s.turns[s.turns.len() / 2];
-    let needle_text = format!("{}: {}", needle.speaker, needle.text);
+    let needle_text = turn_content(needle);
     let hits = eng.recall(region, RecallQuery::by_text(&needle_text, 3))?;
     let target = hits
         .first()
@@ -711,20 +767,55 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Record whether any gold evidence dia_id lands in the top-{KS} of `ranked`.
+/// ANY/ALL evidence hit counts at each cutoff, plus the question count.
+#[derive(Default)]
+struct Tally {
+    any: [usize; 3],
+    all: [usize; 3],
+    n: usize,
+}
+
+impl Tally {
+    /// One report row: `@k any%/all%` per cutoff.
+    fn cells(&self, ks: [usize; 3]) -> String {
+        ks.iter()
+            .enumerate()
+            .map(|(ki, k)| {
+                format!(
+                    "@{k} {:.1}/{:.1}",
+                    pct(self.any[ki], self.n),
+                    pct(self.all[ki], self.n)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    }
+}
+
+/// Record whether any / every gold evidence dia_id lands in the top-{KS} of `ranked`.
 fn record(
-    acc: &mut BTreeMap<&str, ([usize; 3], usize)>,
+    acc: &mut BTreeMap<&str, Tally>,
     label: &'static str,
     ranked: &[&str],
     evidence: &[String],
     ks: [usize; 3],
 ) {
-    let entry = acc.entry(label).or_insert(([0; 3], 0));
-    entry.1 += 1;
+    let entry = acc.entry(label).or_default();
+    entry.n += 1;
     for (ki, &k) in ks.iter().enumerate() {
         let top = &ranked[..k.min(ranked.len())];
-        if evidence.iter().any(|e| top.contains(&e.as_str())) {
-            entry.0[ki] += 1;
+        let mut hit_any = false;
+        let mut hit_all = true;
+        for e in evidence {
+            let present = top.contains(&e.as_str());
+            hit_any |= present;
+            hit_all &= present;
+        }
+        if hit_any {
+            entry.any[ki] += 1;
+        }
+        if hit_all {
+            entry.all[ki] += 1;
         }
     }
 }

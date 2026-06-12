@@ -120,7 +120,7 @@
           <div class="spec-row"><div class="k">Isolation</div><div class="v">Snapshot / CoW B+tree</div><div class="note">single-writer MVCC</div></div>
           <div class="spec-row"><div class="k">FFI surface</div><div class="v"><span class="ac">{{ config.extra.ffi_functions }}</span> C-ABI functions</div><div class="note">citadel-ffi</div></div>
           <div class="spec-row"><div class="k">MCP tools</div><div class="v"><span class="ac">{{ config.extra.mcp_tools }}</span> over stdio</div><div class="note">citadel-mcp</div></div>
-          <div class="spec-row"><div class="k">LoCoMo score</div><div class="v"><span class="ac">{{ config.extra.locomo }}%</span> (3-run mean)</div><div class="note">encrypted / vs 91.6% recall ceiling</div></div>
+          <div class="spec-row"><div class="k">LoCoMo score</div><div class="v"><span class="ac">{{ config.extra.locomo }}%</span> (3-run mean)</div><div class="note">encrypted / vs {{ config.extra.locomo_ceiling }}% recall ceiling</div></div>
         </div>
       </div>
     </div>

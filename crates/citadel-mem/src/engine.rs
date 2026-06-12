@@ -433,6 +433,7 @@ impl MemoryEngine {
         let payload = serde_json::to_string(&atom.payload)
             .map_err(|e| MemError::Invalid(format!("payload not serializable: {e}")))?;
         let expires = atom.expires_at.map(Value::Timestamp).unwrap_or(Value::Null);
+        let created = Value::Timestamp(atom.created_at.unwrap_or_else(now_micros));
         let immutable = i64::from(atom.immutable);
 
         let table = h.table;
@@ -456,6 +457,7 @@ impl MemoryEngine {
                     atom.score,
                     atom.confidence,
                     immutable,
+                    created,
                     expires,
                 )?;
             } else {
@@ -465,7 +467,7 @@ impl MemoryEngine {
                          (id, region_id, kind, embedding, payload, text_content, score, confidence, \
                           access_count, immutable, created_at, accessed_at, expires_at) \
                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, \
-                          CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $10)"
+                          $10, CURRENT_TIMESTAMP, $11)"
                     ),
                     &[
                         Value::Integer(id),
@@ -477,6 +479,7 @@ impl MemoryEngine {
                         Value::Real(atom.score as f64),
                         Value::Real(atom.confidence as f64),
                         Value::Integer(immutable),
+                        created,
                         expires,
                     ],
                 )?;
@@ -537,6 +540,7 @@ impl MemoryEngine {
                     atoms.iter().zip(&ids).zip(sealed_blobs).zip(&slots)
                 {
                     let expires = atom.expires_at.map(Value::Timestamp).unwrap_or(Value::Null);
+                    let created = Value::Timestamp(atom.created_at.unwrap_or_else(now_micros));
                     insert_sealed_atom(
                         c,
                         &table,
@@ -549,6 +553,7 @@ impl MemoryEngine {
                         atom.score,
                         atom.confidence,
                         i64::from(atom.immutable),
+                        created,
                         expires,
                     )?;
                 }
@@ -558,12 +563,13 @@ impl MemoryEngine {
                      (id, region_id, kind, embedding, payload, text_content, score, confidence, \
                       access_count, immutable, created_at, accessed_at, expires_at) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, \
-                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $10)"
+                      $10, CURRENT_TIMESTAMP, $11)"
                 );
                 for ((atom, vec), &id) in atoms.into_iter().zip(vecs).zip(&ids) {
                     let payload = serde_json::to_string(&atom.payload)
                         .map_err(|e| MemError::Invalid(format!("payload not serializable: {e}")))?;
                     let expires = atom.expires_at.map(Value::Timestamp).unwrap_or(Value::Null);
+                    let created = Value::Timestamp(atom.created_at.unwrap_or_else(now_micros));
                     c.execute_params(
                         &plaintext_sql,
                         &[
@@ -576,6 +582,7 @@ impl MemoryEngine {
                             Value::Real(atom.score as f64),
                             Value::Real(atom.confidence as f64),
                             Value::Integer(i64::from(atom.immutable)),
+                            created,
                             expires,
                         ],
                     )?;
@@ -621,7 +628,7 @@ impl MemoryEngine {
         let conn = Connection::open(&self.db)?;
         let qr = conn.query_params(
             &format!(
-                "SELECT id, kind, CAST(payload AS TEXT), text_content, score, immutable \
+                "SELECT id, kind, CAST(payload AS TEXT), text_content, score, immutable, created_at \
                  FROM {table} WHERE region_id = $1 AND kind = $2{extra} \
                  ORDER BY id LIMIT {limit}",
                 table = h.table
@@ -999,7 +1006,7 @@ impl MemoryEngine {
         let conn = Connection::open(&self.db)?;
         let qr = conn.query_params(
             &format!(
-                "SELECT id, kind, CAST(payload AS TEXT), text_content, score, immutable \
+                "SELECT id, kind, CAST(payload AS TEXT), text_content, score, immutable, created_at \
                  FROM {table} WHERE id = $1 AND region_id = $2",
                 table = h.table
             ),
@@ -1018,7 +1025,7 @@ impl MemoryEngine {
         let conn = Connection::open(&self.db)?;
         let qr = conn.query_params(
             &format!(
-                "SELECT id, kind, CAST(payload AS TEXT), text_content, score, immutable \
+                "SELECT id, kind, CAST(payload AS TEXT), text_content, score, immutable, created_at \
                  FROM {table} WHERE region_id = $1 AND kind = $2 ORDER BY id DESC LIMIT 1",
                 table = h.table
             ),
@@ -1189,17 +1196,18 @@ impl MemoryEngine {
             .collect::<Result<Vec<_>>>()?;
         let query_terms = query_keyword_terms(q.text.as_deref());
         assign_bm25_ranks(&mut cands, &query_terms);
+        let as_of = q.as_of_micros.unwrap_or_else(now_micros);
         let mut hits = match (&self.reranker, &q.text) {
             (Some(r), Some(text)) => fuse_rerank(
                 r.as_ref(),
                 text,
                 cands,
                 q.weights,
-                now_micros(),
+                as_of,
                 self.rerank_strategy,
                 q.k,
             )?,
-            _ => fuse_rank(cands, q.weights, now_micros(), q.k),
+            _ => fuse_rank(cands, q.weights, as_of, q.k),
         };
 
         if let Some(ge) = &q.graph_expand {
@@ -1963,17 +1971,18 @@ impl MemoryEngine {
 
         assign_bm25_ranks(&mut cands, &query_terms);
 
+        let as_of = q.as_of_micros.unwrap_or_else(now_micros);
         let mut hits = match (&self.reranker, &q.text) {
             (Some(r), Some(text)) => fuse_rerank(
                 r.as_ref(),
                 text,
                 cands,
                 q.weights,
-                now_micros(),
+                as_of,
                 self.rerank_strategy,
                 q.k,
             )?,
-            _ => fuse_rank(cands, q.weights, now_micros(), q.k),
+            _ => fuse_rank(cands, q.weights, as_of, q.k),
         };
 
         if let Some(ge) = &q.graph_expand {
@@ -2104,7 +2113,7 @@ impl MemoryEngine {
         let wrapped = self.db.atom_store_live_wrapped()?;
         let qr = conn.query_params(
             &format!(
-                "SELECT id, kind, sealed, score, immutable FROM {table} \
+                "SELECT id, kind, sealed, score, immutable, created_at FROM {table} \
                  WHERE region_id = $1 AND kind = $2 ORDER BY id LIMIT {EXACT_SCAN_LIMIT}",
                 table = h.table
             ),
@@ -2129,6 +2138,7 @@ impl MemoryEngine {
                 text,
                 distance: f32::MAX,
                 score: as_f32(&row[3]),
+                created_at: as_ts(&row[5]),
                 immutable: as_bool(&row[4]),
             });
             if out.len() >= limit {
@@ -2146,7 +2156,7 @@ impl MemoryEngine {
         let conn = Connection::open(&self.db)?;
         let qr = conn.query_params(
             &format!(
-                "SELECT id, kind, sealed, score, immutable, key_slot FROM {table} \
+                "SELECT id, kind, sealed, score, immutable, key_slot, created_at FROM {table} \
                  WHERE id = $1 AND region_id = $2",
                 table = h.table
             ),
@@ -2165,6 +2175,7 @@ impl MemoryEngine {
             text,
             distance: f32::MAX,
             score: as_f32(&row[3]),
+            created_at: as_ts(&row[6]),
             immutable: as_bool(&row[4]),
         }))
     }
@@ -2177,7 +2188,7 @@ impl MemoryEngine {
         let conn = Connection::open(&self.db)?;
         let qr = conn.query_params(
             &format!(
-                "SELECT id, kind, sealed, score, immutable, key_slot FROM {table} \
+                "SELECT id, kind, sealed, score, immutable, key_slot, created_at FROM {table} \
                  WHERE region_id = $1 AND kind = $2 ORDER BY id DESC LIMIT 1",
                 table = h.table
             ),
@@ -2196,6 +2207,7 @@ impl MemoryEngine {
             text,
             distance: f32::MAX,
             score: as_f32(&row[3]),
+            created_at: as_ts(&row[6]),
             immutable: as_bool(&row[4]),
         }))
     }
@@ -2371,6 +2383,7 @@ fn insert_sealed_atom(
     score: f32,
     confidence: f32,
     immutable: i64,
+    created: Value,
     expires: Value,
 ) -> Result<()> {
     c.execute_params(
@@ -2378,7 +2391,7 @@ fn insert_sealed_atom(
             "INSERT INTO {table} \
              (id, region_id, kind, sealed, key_slot, key_gen, score, confidence, access_count, \
               immutable, created_at, accessed_at, expires_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $10)"
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $10, CURRENT_TIMESTAMP, $11)"
         ),
         &[
             Value::Integer(id),
@@ -2390,6 +2403,7 @@ fn insert_sealed_atom(
             Value::Real(score as f64),
             Value::Real(confidence as f64),
             Value::Integer(immutable),
+            created,
             expires,
         ],
     )?;
@@ -3295,8 +3309,8 @@ fn expand_graph(
     }
     let (fparams, in_list) = graph_fetch_params(region_id, &depth_of);
     let fetch_sql = format!(
-        "SELECT id, kind, CAST(payload AS TEXT), text_content, immutable FROM {table} \
-         WHERE region_id = $1 AND id IN ({in_list})"
+        "SELECT id, kind, CAST(payload AS TEXT), text_content, immutable, created_at \
+         FROM {table} WHERE region_id = $1 AND id IN ({in_list})"
     );
     let fetched = conn.query_params(&fetch_sql, &fparams)?;
 
@@ -3313,6 +3327,7 @@ fn expand_graph(
                 text: opt_text(&row[3]),
                 distance: f32::MAX, // graph-reached, not distance-ranked
                 score: 1.0 / (depth as f32 + 1.0),
+                created_at: as_ts(&row[5]),
                 immutable: as_bool(&row[4]),
             },
         ));
@@ -3340,7 +3355,8 @@ fn expand_graph_sealed(
     }
     let (fparams, in_list) = graph_fetch_params(region_id, &depth_of);
     let fetch_sql = format!(
-        "SELECT id, kind, sealed, immutable FROM {table} WHERE region_id = $1 AND id IN ({in_list})"
+        "SELECT id, kind, sealed, immutable, created_at FROM {table} \
+         WHERE region_id = $1 AND id IN ({in_list})"
     );
     let fetched = conn.query_params(&fetch_sql, &fparams)?;
 
@@ -3361,6 +3377,7 @@ fn expand_graph_sealed(
                 text,
                 distance: f32::MAX,
                 score: 1.0 / (depth as f32 + 1.0),
+                created_at: as_ts(&row[4]),
                 immutable: as_bool(&row[3]),
             },
         ));
@@ -3394,9 +3411,9 @@ fn parse_candidate(row: &[Value]) -> Result<Candidate> {
     })
 }
 
-/// Columns: id, kind, payload(text), text_content, score, immutable.
+/// Columns: id, kind, payload(text), text_content, score, immutable, created_at.
 fn parse_fetched(row: &[Value]) -> Result<AtomHit> {
-    if row.len() < 6 {
+    if row.len() < 7 {
         return Err(MemError::Invalid("unexpected fetch row shape".into()));
     }
     Ok(AtomHit {
@@ -3406,6 +3423,7 @@ fn parse_fetched(row: &[Value]) -> Result<AtomHit> {
         text: opt_text(&row[3]),
         distance: f32::MAX,
         score: as_f32(&row[4]),
+        created_at: as_ts(&row[6]),
         immutable: as_bool(&row[5]),
     })
 }

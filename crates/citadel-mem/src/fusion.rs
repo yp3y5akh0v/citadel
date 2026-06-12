@@ -76,6 +76,7 @@ pub(crate) fn fuse_rank(
             payload: c.payload,
             distance: c.dist,
             score,
+            created_at: c.created_micros,
             immutable: c.immutable,
         })
         .collect();
@@ -174,6 +175,7 @@ pub(crate) fn fuse_rerank(
             payload: c.payload,
             distance: c.dist,
             score: s,
+            created_at: c.created_micros,
             immutable: c.immutable,
         })
         .collect();

@@ -13,6 +13,9 @@ pub struct AtomInput {
     pub payload: Json,
     pub score: f32,
     pub confidence: f32,
+    /// Event time (micros): when the remembered fact happened, vs the ingest wall
+    /// clock used when `None`. Drives the recency fusion signal and `Stale` eviction.
+    pub created_at: Option<i64>,
     pub expires_at: Option<i64>,
     /// Protected from eviction (except `PurgeRegion`).
     pub immutable: bool,
@@ -26,6 +29,7 @@ impl AtomInput {
             payload: Json::Null,
             score: 0.0,
             confidence: 1.0,
+            created_at: None,
             expires_at: None,
             immutable: false,
         }
@@ -43,6 +47,11 @@ impl AtomInput {
 
     pub fn with_confidence(mut self, confidence: f32) -> Self {
         self.confidence = confidence;
+        self
+    }
+
+    pub fn with_created_at(mut self, micros: i64) -> Self {
+        self.created_at = Some(micros);
         self
     }
 
@@ -169,6 +178,9 @@ pub struct RecallQuery {
     pub payload_filter: Option<Json>,
     pub k: usize,
     pub weights: FusionWeights,
+    /// Reference clock (micros) for the recency signal; `None` = wall clock. Lets a
+    /// caller rank event-time atoms as of a past moment. Does not filter expiry.
+    pub as_of_micros: Option<i64>,
     pub graph_expand: Option<GraphExpand>,
 }
 
@@ -181,6 +193,7 @@ impl RecallQuery {
             payload_filter: None,
             k,
             weights: FusionWeights::default(),
+            as_of_micros: None,
             graph_expand: None,
         }
     }
@@ -193,6 +206,7 @@ impl RecallQuery {
             payload_filter: None,
             k,
             weights: FusionWeights::default(),
+            as_of_micros: None,
             graph_expand: None,
         }
     }
@@ -209,6 +223,11 @@ impl RecallQuery {
 
     pub fn with_weights(mut self, weights: FusionWeights) -> Self {
         self.weights = weights;
+        self
+    }
+
+    pub fn with_as_of(mut self, micros: i64) -> Self {
+        self.as_of_micros = Some(micros);
         self
     }
 
@@ -234,6 +253,9 @@ pub struct AtomHit {
     pub payload: Json,
     pub distance: f32,
     pub score: f32,
+    /// Stored creation clock (micros): the event time when remembered with
+    /// [`AtomInput::with_created_at`], else the ingest wall clock.
+    pub created_at: i64,
     /// Protected from eviction and in-place payload edits.
     pub immutable: bool,
 }

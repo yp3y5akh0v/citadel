@@ -9,7 +9,7 @@ deletion. On encrypted regions every atom is sealed and HMAC-authenticated, and 
 re-verified off disk.
 
 On the LoCoMo long-term conversational-memory benchmark, on encrypted regions with a matched
-`gpt-4o-mini` reader and judge, it scores 84.1% (3-run mean) against a 91.6% retrieval ceiling.
+`gpt-4o-mini` reader and judge, it scores 85.8% (3-run mean) against a 94.4% retrieval ceiling.
 Full protocol, audit, and numbers:
 [citadel-membench](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-membench).
 

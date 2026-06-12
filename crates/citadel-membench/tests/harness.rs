@@ -10,7 +10,8 @@ use citadel_ai::{CompletionResponse, LlmError, Message};
 use citadel_mem::{Embedder, MemoryEngine, MockEmbedder};
 use citadel_membench::{
     aggregate, build_reader_prompt, ingest_sample, judge_correct, parse_root, provenance,
-    run_sample, run_sample_observed, BenchConfig, BenchError, Category, Pacer, QuestionResult,
+    reader_view, run_sample, run_sample_observed, turn_content, BenchConfig, BenchError, Category,
+    Pacer, QuestionResult, ReaderOrder, Turn,
 };
 use serde_json::{json, Value};
 
@@ -139,6 +140,85 @@ fn ingest_count_equals_turn_count() {
 }
 
 #[test]
+fn turn_content_folds_date_speaker_caption_and_query() {
+    let samples = parse_root(&fixture()).unwrap();
+    assert_eq!(
+        turn_content(&samples[0].turns[0]),
+        "[2pm on 1 Jan 2024] Alice: I adopted a dog named Rex."
+    );
+
+    let full = Turn {
+        session: 1,
+        date_time: "1:56 pm on 8 May, 2023".to_string(),
+        speaker: "Bob".to_string(),
+        dia_id: "D1:9".to_string(),
+        text: "Look at this.".to_string(),
+        blip_caption: "a red barn".to_string(),
+        query: "barn sunset".to_string(),
+    };
+    assert_eq!(
+        turn_content(&full),
+        "[1:56 pm on 8 May, 2023] Bob: Look at this. \
+         [shared a photo: a red barn] [image search: barn sunset]"
+    );
+
+    let undated = Turn {
+        date_time: String::new(),
+        ..full
+    };
+    assert_eq!(
+        turn_content(&undated),
+        "Bob: Look at this. [shared a photo: a red barn] [image search: barn sunset]"
+    );
+}
+
+#[test]
+fn reader_view_expands_neighbors_dedups_and_orders() {
+    let samples = parse_root(&fixture()).unwrap();
+    let s = &samples[0];
+    let (_dir, eng) = open_engine();
+    let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
+    eng.create_region(&s.sample_id, embedder).unwrap();
+    let ids = ingest_sample(&eng, &s.sample_id, s).unwrap();
+    let hit = |i: usize| eng.fetch_one(&s.sample_id, ids[i]).unwrap().unwrap();
+    let view_ids = |hits, config| {
+        reader_view(&eng, &s.sample_id, hits, config)
+            .unwrap()
+            .iter()
+            .map(|h| h.id)
+            .collect::<Vec<_>>()
+    };
+
+    // A middle hit pulls in its previous and next turns, in conversation order.
+    let chrono = BenchConfig {
+        reader_order: ReaderOrder::Chrono,
+        neighbor_radius: 1,
+        ..BenchConfig::default()
+    };
+    assert_eq!(
+        view_ids(vec![hit(2)], chrono),
+        vec![ids[1], ids[2], ids[3]],
+        "radius-1 chrono view around a middle turn"
+    );
+
+    // The first turn has no predecessor in the region: nothing fetched, no error.
+    assert_eq!(view_ids(vec![hit(0)], chrono), vec![ids[0], ids[1]]);
+
+    // Adjacent hits share neighbors exactly once.
+    assert_eq!(
+        view_ids(vec![hit(2), hit(1)], chrono),
+        vec![ids[0], ids[1], ids[2], ids[3]],
+        "overlapping windows dedup"
+    );
+
+    // The default (relevance order, no expansion) passes the hits through untouched.
+    assert_eq!(
+        view_ids(vec![hit(3), hit(1)], BenchConfig::default()),
+        vec![ids[3], ids[1]]
+    );
+}
+
+#[test]
 fn reader_prompt_contains_only_passed_hits_not_gold_or_evidence() {
     let samples = parse_root(&fixture()).unwrap();
     let s = &samples[0];
@@ -241,15 +321,7 @@ fn run_sample_is_token_free_end_to_end() {
     let reader = testing::scripted(repeat_text("an answer", s.qa.len()));
     let judge = testing::scripted(repeat_text("CORRECT", s.qa.len()));
 
-    let results = run_sample(
-        &eng,
-        s,
-        embedder,
-        &*reader,
-        &*judge,
-        BenchConfig::default().top_k,
-    )
-    .unwrap();
+    let results = run_sample(&eng, s, embedder, &*reader, &*judge, BenchConfig::default()).unwrap();
     assert_eq!(results.len(), s.qa.len());
 
     let report = aggregate(&results, prov());
@@ -296,15 +368,7 @@ fn run_sample_marks_empty_gold_scored_question_unscorable() {
     let reader = testing::scripted(repeat_text("golden retriever", 1));
     let judge = testing::scripted(repeat_text("CORRECT", 1));
 
-    let results = run_sample(
-        &eng,
-        s,
-        embedder,
-        &*reader,
-        &*judge,
-        BenchConfig::default().top_k,
-    )
-    .unwrap();
+    let results = run_sample(&eng, s, embedder, &*reader, &*judge, BenchConfig::default()).unwrap();
     assert_eq!(results.len(), 2);
     let report = aggregate(&results, prov());
     assert_eq!(
@@ -324,7 +388,7 @@ fn repeat_text(text: &str, n: usize) -> Vec<CompletionResponse> {
 fn observer_fires_once_per_question_and_error_aborts() {
     let samples = parse_root(&fixture()).unwrap();
     let s = &samples[0];
-    let top_k = BenchConfig::default().top_k;
+    let config = BenchConfig::default();
     let reader = testing::constant("golden retriever");
     let judge = testing::constant("CORRECT");
 
@@ -339,7 +403,7 @@ fn observer_fires_once_per_question_and_error_aborts() {
         embedder,
         &*reader,
         &*judge,
-        top_k,
+        config,
         &Pacer::unbounded(),
         &mut |_| {
             seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -364,7 +428,7 @@ fn observer_fires_once_per_question_and_error_aborts() {
         embedder2,
         &*reader,
         &*judge,
-        top_k,
+        config,
         &Pacer::unbounded(),
         &mut |_| Err(BenchError::Dataset("observer boom".into())),
     );
@@ -427,15 +491,7 @@ fn concurrent_questions_match_serial_byte_for_byte() {
         let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
         let reader = testing::constant("golden retriever");
         let judge = testing::constant("CORRECT");
-        run_sample(
-            &eng,
-            s,
-            embedder,
-            &*reader,
-            &*judge,
-            BenchConfig::default().top_k,
-        )
-        .unwrap()
+        run_sample(&eng, s, embedder, &*reader, &*judge, BenchConfig::default()).unwrap()
     };
 
     let serial = run("1");

@@ -8,10 +8,12 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use citadel_ai::{CompletionRequest, CompletionResponse, LLMClient, LlmError, Message, TokenUsage};
-use citadel_mem::{AtomHit, MemoryEngine, RecallQuery};
+use citadel_mem::{AtomHit, AtomId, MemoryEngine, RecallQuery};
+use rustc_hash::FxHashSet;
 
 use crate::error::Result;
 use crate::ratelimit::Pacer;
+use crate::{BenchConfig, ReaderOrder};
 
 /// Hard cap on reader/judge output so a runaway response cannot inflate cost.
 const MAX_TOKENS: u32 = 512;
@@ -160,9 +162,43 @@ fn log_retry(attempt: u32, delay_ms: u64, e: &LlmError, spent: Duration, budget:
     }
 }
 
+/// The memory list as the reader sees it: each hit expanded with its +/-`radius`
+/// adjacent turns, deduped, in the configured order. Ingest writes turns in
+/// conversation order, so ascending atom id IS chronological order; a neighbor id
+/// outside the region simply fetches nothing. Under `Relevance` order each hit is
+/// rendered as a chronological `[id-r ..= id+r]` snippet, snippets by hit rank.
+pub fn reader_view(
+    eng: &MemoryEngine,
+    region: &str,
+    hits: Vec<AtomHit>,
+    config: BenchConfig,
+) -> Result<Vec<AtomHit>> {
+    let radius = config.neighbor_radius as i64;
+    let mut seen: FxHashSet<AtomId> = FxHashSet::default();
+    let mut view: Vec<AtomHit> = Vec::with_capacity(hits.len() * (2 * radius as usize + 1));
+    for hit in hits {
+        for id in hit.id - radius..=hit.id + radius {
+            if !seen.insert(id) {
+                continue;
+            }
+            if id == hit.id {
+                view.push(hit.clone());
+            } else if let Some(neighbor) = eng.fetch_one(region, id)? {
+                view.push(neighbor);
+            }
+        }
+    }
+    if config.reader_order == ReaderOrder::Chrono {
+        view.sort_by_key(|h| h.id);
+    }
+    Ok(view)
+}
+
 /// Build the reader prompt from only the hits + question, with one category-blind
-/// system prompt (the gold category would be test-metadata leakage). Hits are shown
-/// in relevance order with a `[date | speaker]` prefix; the signature isolates gold.
+/// system prompt (the gold category would be test-metadata leakage). Hits are
+/// rendered verbatim in the order given (see [`reader_view`]); each turn's text
+/// already carries its `[date] speaker:` prefix from ingest. The signature
+/// isolates gold.
 pub fn build_reader_prompt(hits: &[AtomHit], question: &str) -> Vec<Message> {
     let system = "You answer the question using ONLY the provided memories. Each \
          memory is a line from a past conversation, prefixed with the date it was \
@@ -208,21 +244,7 @@ pub fn build_reader_prompt(hits: &[AtomHit], question: &str) -> Vec<Message> {
 
     let mut user = String::from("Memories:\n");
     for (rank, hit) in hits.iter().enumerate() {
-        let date = hit
-            .payload
-            .get("date_time")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let speaker = hit
-            .payload
-            .get("speaker")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        user.push_str(&format!(
-            "{}. [{date} | {speaker}] {}\n",
-            rank + 1,
-            hit.text
-        ));
+        user.push_str(&format!("{}. {}\n", rank + 1, hit.text));
     }
     user.push_str(&format!("\nQuestion: {question}"));
 
@@ -230,25 +252,31 @@ pub fn build_reader_prompt(hits: &[AtomHit], question: &str) -> Vec<Message> {
 }
 
 /// The reader's answer plus retrieval facts: latency, token usage, and the `dia_id`s
-/// surfaced into the top-k (the retrieval-gap-vs-reader-miss instrumentation).
+/// the reader actually saw (the retrieval-gap-vs-reader-miss instrumentation).
 pub struct AnswerOutcome {
     pub answer: String,
+    /// Recall plus neighbor-expansion latency: everything the memory system does
+    /// to assemble the reader's context.
     pub recall_micros: u128,
     pub usage: TokenUsage,
     pub retrieved: Vec<String>,
 }
 
-/// Recall the top-`k` memories, then ask the reader; the reader call is paced + retried.
+/// Recall the top-`config.top_k` memories, expand to the reader view, then ask the
+/// reader; the reader call is paced + retried. Recall keeps the default wall clock:
+/// grading recency as of the conversation's end was measured to HURT evidence
+/// recall (diag C-asof, -4.6 any@30), so no as-of is passed here.
 pub fn answer_question(
     reader: &dyn LLMClient,
     pacer: &Pacer,
     eng: &MemoryEngine,
     region: &str,
     question: &str,
-    k: usize,
+    config: BenchConfig,
 ) -> Result<AnswerOutcome> {
     let started = Instant::now();
-    let hits = eng.recall(region, RecallQuery::by_text(question, k))?;
+    let hits = eng.recall(region, RecallQuery::by_text(question, config.top_k))?;
+    let hits = reader_view(eng, region, hits, config)?;
     let recall_micros = started.elapsed().as_micros();
 
     let retrieved = hits
