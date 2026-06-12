@@ -16,7 +16,21 @@ fn backend(e: impl std::fmt::Display) -> EmbedError {
     EmbedError::Backend(e.to_string())
 }
 
-/// Rerank micro-batch size; pairs are length-sorted so padding tracks each chunk.
+/// Reject non-finite model output at the source; a NaN that reaches storage
+/// otherwise surfaces as a distant index/quantizer panic.
+fn ensure_finite(values: &[f32], model_id: &str) -> Result<(), EmbedError> {
+    if values.iter().all(|v| v.is_finite()) {
+        Ok(())
+    } else {
+        Err(EmbedError::Backend(format!(
+            "{model_id}: model produced a non-finite output"
+        )))
+    }
+}
+
+/// Rerank micro-batch size; pairs are length-sorted so padding tracks each
+/// chunk. Tight buckets beat wider batches: attention cost grows with the
+/// padded length squared.
 const MICRO_BATCH: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,7 +369,11 @@ impl Embedder for CandleEmbedder {
         let out = self
             .run(texts, self.passage_prefix.as_deref())
             .map_err(backend)?;
-        out.to_vec2::<f32>().map_err(backend)
+        let rows = out.to_vec2::<f32>().map_err(backend)?;
+        for row in &rows {
+            ensure_finite(row, &self.model_id)?;
+        }
+        Ok(rows)
     }
 
     fn embed_queries(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
@@ -365,7 +383,11 @@ impl Embedder for CandleEmbedder {
         let out = self
             .run(texts, self.query_prefix.as_deref())
             .map_err(backend)?;
-        out.to_vec2::<f32>().map_err(backend)
+        let rows = out.to_vec2::<f32>().map_err(backend)?;
+        for row in &rows {
+            ensure_finite(row, &self.model_id)?;
+        }
+        Ok(rows)
     }
 }
 
@@ -394,10 +416,6 @@ impl CrossEncoder {
         let hidden = config.hidden_size;
 
         let mut tokenizer = Tokenizer::from_bytes(tokenizer_json).map_err(backend)?;
-        tokenizer.with_padding(Some(PaddingParams {
-            strategy: PaddingStrategy::BatchLongest,
-            ..Default::default()
-        }));
         tokenizer
             .with_truncation(Some(TruncationParams {
                 max_length,
@@ -442,6 +460,8 @@ impl CrossEncoder {
 
     /// Score every `(query, passage)` pair: one relevance logit per passage.
     /// Length-bucketed micro-batches keep padding near each chunk's real length.
+    /// Tokenization stays sequential: `encode_batch`'s rayon fan-out contends
+    /// with concurrent recalls.
     fn run(&self, query: &str, passages: &[&str]) -> candle_core::Result<Vec<f32>> {
         let mut encodings = Vec::with_capacity(passages.len());
         for p in passages {
@@ -509,7 +529,9 @@ impl Reranker for CrossEncoder {
         if passages.is_empty() {
             return Ok(Vec::new());
         }
-        self.run(query, passages).map_err(backend)
+        let scores = self.run(query, passages).map_err(backend)?;
+        ensure_finite(&scores, &self.model_id)?;
+        Ok(scores)
     }
 }
 
@@ -779,10 +801,6 @@ mod tests {
             .unwrap();
         let mut tokenizer = Tokenizer::new(wp);
         tokenizer.with_pre_tokenizer(Some(Whitespace {}));
-        tokenizer.with_padding(Some(PaddingParams {
-            strategy: PaddingStrategy::BatchLongest,
-            ..Default::default()
-        }));
 
         let config = Config {
             vocab_size,
@@ -826,5 +844,73 @@ mod tests {
             "empty -> empty"
         );
         assert_eq!(ce.model_id(), "synthetic-ce");
+    }
+
+    #[test]
+    fn ensure_finite_rejects_nan_and_infinity() {
+        assert!(ensure_finite(&[0.0, 1.5, -2.0], "m").is_ok());
+        assert!(ensure_finite(&[0.0, f32::NAN], "m").is_err());
+        assert!(ensure_finite(&[f32::NEG_INFINITY], "m").is_err());
+    }
+
+    /// Mixed-length passages spanning many micro-batches: chunked-batch scores
+    /// must equal per-pair scores, mapped back to input order.
+    #[test]
+    fn rerank_chunked_batch_matches_per_pair_scores() {
+        let ce = synthetic_cross_encoder();
+        let words = ["hello", "world", "test", "foo"];
+        let mut passages = Vec::new();
+        for i in 0..600 {
+            let len = 1 + (i * 7) % 50;
+            let mut p = String::new();
+            for j in 0..len {
+                if j > 0 {
+                    p.push(' ');
+                }
+                p.push_str(words[(i + j) % words.len()]);
+            }
+            passages.push(p);
+        }
+        assert!(passages.len() > MICRO_BATCH, "must span multiple chunks");
+
+        let refs: Vec<&str> = passages.iter().map(String::as_str).collect();
+        let batched = ce.rerank("hello world", &refs).unwrap();
+        assert_eq!(batched.len(), refs.len(), "one score per passage");
+        for (i, &p) in refs.iter().enumerate() {
+            let solo = ce.rerank("hello world", &[p]).unwrap()[0];
+            assert!(
+                approx(batched[i], solo, 1e-4),
+                "passage {i}: batched={} solo={solo}",
+                batched[i]
+            );
+        }
+    }
+
+    /// Real-model integration (local-only; not run in CI). With `cuda-embed`
+    /// this exercises the GPU rerank path end to end:
+    ///   cargo test -p citadeldb-mem --features cuda-embed -- --ignored
+    #[test]
+    #[ignore = "needs CITADEL_RERANKER_DIR -> a local ms-marco-MiniLM-L-6-v2 directory"]
+    fn real_cross_encoder_is_finite_and_batch_consistent() {
+        let dir = std::env::var("CITADEL_RERANKER_DIR")
+            .expect("set CITADEL_RERANKER_DIR to a local ms-marco-MiniLM-L-6-v2 directory");
+        let ce = CrossEncoder::ms_marco_minilm_l6(dir).unwrap();
+        let passages: Vec<String> = (0..96)
+            .map(|i| {
+                let filler = " and we compared ticket prices for the jazz concert".repeat(i % 5);
+                format!("Turn {i}: we planned the trip to Boston{filler}.")
+            })
+            .collect();
+        let refs: Vec<&str> = passages.iter().map(String::as_str).collect();
+        let batched = ce.rerank("what trip did they plan?", &refs).unwrap();
+        assert_eq!(batched.len(), refs.len(), "one score per passage");
+        for (i, &p) in refs.iter().enumerate() {
+            let solo = ce.rerank("what trip did they plan?", &[p]).unwrap()[0];
+            assert!(
+                (batched[i] - solo).abs() < 0.05,
+                "passage {i}: batched={} solo={solo}",
+                batched[i]
+            );
+        }
     }
 }
