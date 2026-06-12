@@ -24,9 +24,9 @@ I will acknowledge your report within 5 business days and provide updates as the
 
 | Version | Supported           |
 |---------|---------------------|
-| 1.4.x   | Yes                 |
-| 1.3.x   | Critical fixes only |
-| < 1.3   | No                  |
+| 1.5.x   | Yes                 |
+| 1.4.x   | Critical fixes only |
+| < 1.4   | No                  |
 
 Critical = data loss, data exposure, cryptographic flaws, or memory-safety bugs. Upgrade to the latest minor before reporting issues in older releases.
 

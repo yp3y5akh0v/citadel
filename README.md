@@ -52,7 +52,7 @@ systems are in [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEA
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. C FFI (37 functions), WebAssembly bindings
-- **5,000+ tests** - Unit, integration, torture tests across 19 crates
+- **5,200+ tests** - Unit, integration, torture tests across 19 crates
 
 ## Benchmarks
 
