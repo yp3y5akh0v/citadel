@@ -24,6 +24,8 @@
 //!   CITADEL_LOCOMO_DRY_RUN=1          load + print dataset stats, then exit (no LLM/key)
 //!   CITADEL_LOCOMO_RETRIEVAL_DIAG=1   token-free layered evidence recall@k, then exit
 //!                             (needs bge, no key; pinpoints the lossy layer)
+//!   CITADEL_LOCOMO_PARAM_SWEEP=1      token-free sweep of fusion weight ratios and
+//!                             rerank strategies (RRF k / Replace), then exit
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -131,6 +133,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Token-free: does top-k recall surface the gold evidence turns? No key.
     if std::env::var("CITADEL_LOCOMO_RETRIEVAL_DIAG").is_ok() {
         return run_retrieval_diag(&mut eng, &samples, embedder);
+    }
+
+    // Token-free: sweep fusion-weight ratios and rerank strategies. No key.
+    if std::env::var("CITADEL_LOCOMO_PARAM_SWEEP").is_ok() {
+        return run_param_sweep(&mut eng, &samples, embedder);
     }
 
     // Behind-the-scenes encryption + erasure verification (token-free, no key).
@@ -362,7 +369,7 @@ fn rerank_strategy_from_env() -> RerankStrategy {
         .as_str()
     {
         "replace" => RerankStrategy::Replace,
-        _ => RerankStrategy::Rrf { k: 60.0 },
+        _ => RerankStrategy::default(),
     }
 }
 
@@ -427,14 +434,15 @@ fn run_retrieval_diag(
         let turn_embs = embedder.embed(&turn_refs)?;
         let turn_dia: Vec<&str> = s.turns.iter().map(|t| t.dia_id.as_str()).collect();
 
-        // Embed every scored question ONCE in a single batch (GPU-efficient), then reuse
-        // the vector across modes via by_embedding so no recall re-embeds the query.
+        // Embed every scored question ONCE in a single batch (GPU-efficient) on the
+        // QUERY side (asymmetric models prefix here), then reuse the vector across
+        // modes via by_embedding so no recall re-embeds the query.
         let scored_qa: Vec<_> =
             s.qa.iter()
                 .filter(|qa| qa.category != Category::Adversarial && !qa.evidence.is_empty())
                 .collect();
         let q_texts: Vec<&str> = scored_qa.iter().map(|qa| qa.question.as_str()).collect();
-        let q_embs = embedder.embed(&q_texts)?;
+        let q_embs = embedder.embed_queries(&q_texts)?;
 
         for (qi, &qa) in scored_qa.iter().enumerate() {
             let label = qa.category.label();
@@ -484,7 +492,7 @@ fn run_retrieval_diag(
                     .filter(|qa| qa.category != Category::Adversarial && !qa.evidence.is_empty())
                     .collect();
             let q_texts: Vec<&str> = scored_qa.iter().map(|qa| qa.question.as_str()).collect();
-            let q_embs = embedder.embed(&q_texts)?;
+            let q_embs = embedder.embed_queries(&q_texts)?;
             for (qi, &qa) in scored_qa.iter().enumerate() {
                 let d_query = RecallQuery::by_embedding(q_embs[qi].clone(), MAX_K)
                     .with_text(qa.question.as_str());
@@ -531,6 +539,126 @@ fn run_retrieval_diag(
             }
         }
         eprintln!("  {:>12} (n={:>4}): {}", "OVERALL", tot.n, tot.cells(KS));
+    }
+    Ok(())
+}
+
+/// One conversation's cached sweep inputs: region name plus per-question
+/// `(query embedding, question text, gold evidence)`.
+type SweepCase = (String, Vec<(Vec<f32>, String, Vec<String>)>);
+
+/// Recall every cached question under `w` and tally overall any/all evidence recall.
+fn sweep_combo(
+    eng: &MemoryEngine,
+    cases: &[SweepCase],
+    w: FusionWeights,
+    ks: [usize; 3],
+    max_k: usize,
+) -> Result<Tally, Box<dyn Error>> {
+    let mut t = Tally::default();
+    for (region, questions) in cases {
+        for (emb, question, evidence) in questions {
+            let hits = eng.recall(
+                region,
+                RecallQuery::by_embedding(emb.clone(), max_k)
+                    .with_text(question.as_str())
+                    .with_weights(w),
+            )?;
+            t.record(&hit_dia_ids(&hits), evidence, ks);
+        }
+    }
+    Ok(t)
+}
+
+/// Token-free retrieval parameter sweep. Phase 1 sweeps the semantic:keyword
+/// fusion ratio with no reranker (recency/importance carry no rank signal on
+/// this dataset, so the ratio IS the linear stage). Phase 2 crosses the two
+/// best ratios with RRF damping constants and Replace. Ingest and query
+/// embeddings are computed once and reused by every combo; combos are ranked
+/// by overall any@50.
+fn run_param_sweep(
+    eng: &mut MemoryEngine,
+    samples: &[Sample],
+    embedder: Arc<dyn Embedder>,
+) -> Result<(), Box<dyn Error>> {
+    const KS: [usize; 3] = [10, 30, 50];
+    const MAX_K: usize = 50;
+
+    let mut cases: Vec<SweepCase> = Vec::new();
+    for s in samples {
+        citadel_membench::create_bench_region(eng, &s.sample_id, Arc::clone(&embedder))?;
+        ingest_sample(eng, &s.sample_id, s)?;
+        let scored_qa: Vec<_> =
+            s.qa.iter()
+                .filter(|qa| qa.category != Category::Adversarial && !qa.evidence.is_empty())
+                .collect();
+        let q_texts: Vec<&str> = scored_qa.iter().map(|qa| qa.question.as_str()).collect();
+        let q_embs = embedder.embed_queries(&q_texts)?;
+        let questions = scored_qa
+            .iter()
+            .zip(q_embs)
+            .map(|(qa, e)| (e, qa.question.clone(), qa.evidence.clone()))
+            .collect();
+        cases.push((s.sample_id.clone(), questions));
+    }
+
+    // 0.62:0.38 is the shipped default (0.40:0.25 normalized); 1:0 is layer B.
+    let ratios: [(f32, f32); 8] = [
+        (1.0, 0.0),
+        (0.8, 0.2),
+        (0.7, 0.3),
+        (0.62, 0.38),
+        (0.5, 0.5),
+        (0.4, 0.6),
+        (0.3, 0.7),
+        (0.0, 1.0),
+    ];
+
+    eprintln!("\n=== sweep phase 1: semantic:keyword ratio, no reranker (any%/all%) ===");
+    let mut phase1: Vec<((f32, f32), Tally)> = Vec::new();
+    for &(sem, kw) in &ratios {
+        let w = FusionWeights {
+            semantic: sem,
+            keyword: kw,
+            recency: 0.0,
+            importance: 0.0,
+        };
+        let t = sweep_combo(eng, &cases, w, KS, MAX_K)?;
+        eprintln!(
+            "  sem {sem:.2} / kw {kw:.2} (n={:>4}): {}",
+            t.n,
+            t.cells(KS)
+        );
+        phase1.push(((sem, kw), t));
+    }
+
+    let Ok(rr_dir) = std::env::var("CITADEL_RERANKER_DIR") else {
+        eprintln!("\nphase 2 skipped: set CITADEL_RERANKER_DIR to sweep rerank strategies");
+        return Ok(());
+    };
+    let ce = Arc::new(CrossEncoder::ms_marco_minilm_l6(&rr_dir)?);
+    phase1.sort_by(|a, b| b.1.any[2].cmp(&a.1.any[2]));
+    let top: Vec<(f32, f32)> = phase1.iter().take(2).map(|(ratio, _)| *ratio).collect();
+
+    let strategies = [
+        RerankStrategy::Rrf { k: 20.0 },
+        RerankStrategy::Rrf { k: 60.0 },
+        RerankStrategy::Rrf { k: 100.0 },
+        RerankStrategy::Replace,
+    ];
+    eprintln!("\n=== sweep phase 2: rerank strategy over the two best ratios (any%/all%) ===");
+    for &(sem, kw) in &top {
+        let w = FusionWeights {
+            semantic: sem,
+            keyword: kw,
+            recency: 0.0,
+            importance: 0.0,
+        };
+        for &strategy in &strategies {
+            eng.set_reranker(ce.clone(), strategy);
+            let t = sweep_combo(eng, &cases, w, KS, MAX_K)?;
+            eprintln!("  sem {sem:.2} / kw {kw:.2}  {strategy:?}: {}", t.cells(KS));
+        }
     }
     Ok(())
 }
@@ -776,6 +904,27 @@ struct Tally {
 }
 
 impl Tally {
+    /// Count whether any / every gold evidence dia_id lands in the top-{ks}.
+    fn record(&mut self, ranked: &[&str], evidence: &[String], ks: [usize; 3]) {
+        self.n += 1;
+        for (ki, &k) in ks.iter().enumerate() {
+            let top = &ranked[..k.min(ranked.len())];
+            let mut hit_any = false;
+            let mut hit_all = true;
+            for e in evidence {
+                let present = top.contains(&e.as_str());
+                hit_any |= present;
+                hit_all &= present;
+            }
+            if hit_any {
+                self.any[ki] += 1;
+            }
+            if hit_all {
+                self.all[ki] += 1;
+            }
+        }
+    }
+
     /// One report row: `@k any%/all%` per cutoff.
     fn cells(&self, ks: [usize; 3]) -> String {
         ks.iter()
@@ -792,7 +941,7 @@ impl Tally {
     }
 }
 
-/// Record whether any / every gold evidence dia_id lands in the top-{KS} of `ranked`.
+/// Record into the per-category tally for `label`.
 fn record(
     acc: &mut BTreeMap<&str, Tally>,
     label: &'static str,
@@ -800,24 +949,7 @@ fn record(
     evidence: &[String],
     ks: [usize; 3],
 ) {
-    let entry = acc.entry(label).or_default();
-    entry.n += 1;
-    for (ki, &k) in ks.iter().enumerate() {
-        let top = &ranked[..k.min(ranked.len())];
-        let mut hit_any = false;
-        let mut hit_all = true;
-        for e in evidence {
-            let present = top.contains(&e.as_str());
-            hit_any |= present;
-            hit_all &= present;
-        }
-        if hit_any {
-            entry.any[ki] += 1;
-        }
-        if hit_all {
-            entry.all[ki] += 1;
-        }
-    }
+    acc.entry(label).or_default().record(ranked, evidence, ks);
 }
 
 fn hit_dia_ids(hits: &[AtomHit]) -> Vec<&str> {

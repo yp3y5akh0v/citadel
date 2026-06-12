@@ -78,8 +78,8 @@ pub struct FusionWeights {
 impl Default for FusionWeights {
     fn default() -> Self {
         Self {
-            semantic: 0.4,
-            keyword: 0.25,
+            semantic: 0.45,
+            keyword: 0.2,
             recency: 0.2,
             importance: 0.15,
         }
@@ -105,13 +105,13 @@ pub enum RerankStrategy {
     /// Cross-encoder logit replaces the fusion score (discards keyword/recency).
     Replace,
     /// Reciprocal Rank Fusion of cross-encoder and fusion ranks; `k` is the damping
-    /// constant (60 is standard).
+    /// constant (60 is the literature standard; lower trusts top ranks more).
     Rrf { k: f32 },
 }
 
 impl Default for RerankStrategy {
     fn default() -> Self {
-        Self::Rrf { k: 60.0 }
+        Self::Rrf { k: 20.0 }
     }
 }
 

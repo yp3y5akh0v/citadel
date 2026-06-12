@@ -1495,6 +1495,68 @@ fn created_at_override_stores_event_time_on_the_sealed_path() {
     );
 }
 
+/// Counts which embedding side each call lands on (vectors come from the mock).
+struct SideCountingEmbedder {
+    inner: MockEmbedder,
+    passages: std::sync::atomic::AtomicUsize,
+    queries: std::sync::atomic::AtomicUsize,
+}
+
+impl Embedder for SideCountingEmbedder {
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+
+    fn metric(&self) -> EmbeddingMetric {
+        self.inner.metric()
+    }
+
+    fn model_id(&self) -> &str {
+        "side-counting"
+    }
+
+    fn embed(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
+        self.passages.fetch_add(texts.len(), Ordering::Relaxed);
+        self.inner.embed(texts)
+    }
+
+    fn embed_queries(
+        &self,
+        texts: &[&str],
+    ) -> std::result::Result<Vec<Vec<f32>>, crate::EmbedError> {
+        self.queries.fetch_add(texts.len(), Ordering::Relaxed);
+        self.inner.embed(texts)
+    }
+}
+
+#[test]
+fn remember_embeds_passages_and_recall_embeds_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    let counter = Arc::new(SideCountingEmbedder {
+        inner: MockEmbedder::new(8),
+        passages: std::sync::atomic::AtomicUsize::new(0),
+        queries: std::sync::atomic::AtomicUsize::new(0),
+    });
+    eng.create_region("sides", counter.clone()).unwrap();
+
+    eng.remember("sides", AtomInput::new("note", "alpha"))
+        .unwrap();
+    eng.remember_batch("sides", vec![AtomInput::new("note", "beta")])
+        .unwrap();
+    assert_eq!(counter.passages.load(Ordering::Relaxed), 2);
+    assert_eq!(counter.queries.load(Ordering::Relaxed), 0);
+
+    eng.recall("sides", RecallQuery::by_text("alpha", 1))
+        .unwrap();
+    assert_eq!(
+        counter.queries.load(Ordering::Relaxed),
+        1,
+        "recall is query-side"
+    );
+    assert_eq!(counter.passages.load(Ordering::Relaxed), 2);
+}
+
 #[test]
 fn recall_as_of_re_grades_recency_against_the_reference_clock() {
     let dir = tempfile::tempdir().unwrap();
