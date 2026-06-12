@@ -21,9 +21,10 @@ use citadel_mem::{Embedder, FusionWeights, MemoryEngine};
 pub use dataset::{load, load_with_hash, parse_root, sha256_hex, Category, QaSample, Sample, Turn};
 pub use error::{BenchError, Result};
 pub use eval::{
-    answer_question, build_reader_prompt, judge_abstained, judge_correct, AnswerOutcome,
+    answer_question, build_reader_prompt, judge_abstained, judge_correct, reader_view,
+    AnswerOutcome,
 };
-pub use ingest::ingest_sample;
+pub use ingest::{ingest_sample, turn_content};
 pub use ratelimit::{Gate, Pacer};
 
 /// Published OpenAI USD per 1M tokens as `(input, output)`, keyed by model id. OpenAI
@@ -63,24 +64,56 @@ const KNOWN_FLAWS: &str = "De facto LLM-judge protocol, not the paper's token-F1
      the real bill). Ingestion is raw conversation turns plus \
      each shared photo's BLIP caption (LoCoMo substitutes the image with its \
      caption), not LLM-extracted facts, so head-to-head vendor comparison is \
-     apples-to-oranges. Under this raw-turn ingest the recency and importance \
-     fusion weights are inert (all turns share one ingest timestamp and carry no \
-     importance), so ranking is effectively semantic+keyword only; the recorded \
-     weights describe the engine default, not an active 4-signal blend. Headline \
+     apples-to-oranges. Turns carry their session date as event-time created_at, \
+     but recency is graded against the wall clock, where every session is equally \
+     ancient, so the recency weight contributes no rank signal (grading as of the \
+     conversation's end was measured to HURT evidence recall and is not used); the \
+     importance weight is likewise inert (raw turns carry no importance score). Headline \
      excludes the adversarial category; adversarial is a separate abstention metric.";
+
+/// Order in which retrieved memories are rendered for the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderOrder {
+    /// Conversation order (ascending atom id = ingest = chronological).
+    Chrono,
+    /// Fusion/reranker relevance order, best hit first.
+    Relevance,
+}
+
+impl ReaderOrder {
+    pub fn label(self) -> &'static str {
+        match self {
+            ReaderOrder::Chrono => "chrono",
+            ReaderOrder::Relevance => "relevance",
+        }
+    }
+}
 
 /// Knobs for a benchmark run.
 #[derive(Debug, Clone, Copy)]
 pub struct BenchConfig {
     /// Number of memories retrieved per question and shown to the reader.
     pub top_k: usize,
+    /// Presentation order of those memories in the reader prompt.
+    pub reader_order: ReaderOrder,
+    /// Adjacent turns rendered around each hit (0 disables expansion).
+    pub neighbor_radius: usize,
 }
 
 impl Default for BenchConfig {
     fn default() -> Self {
-        // 30, not 50: a wider window buys ~1-2 pts but invites the "top_k >= pool =
-        // retrieve-everything" criticism. 30 is the common, defensible value.
-        Self { top_k: 30 }
+        // All three values are measured, not assumed. top_k 50: the token-free diag
+        // found +2.7% reader-visible gold over 30 (D any@50 94.4 vs any@30 91.7) and
+        // the conv-26 dev split converts it (93.4% vs 92.8%); 50 is conservative for
+        // the field (Mem0's eval suite defaults to top-k 200). Relevance order and
+        // no neighbor expansion: the conv-26 2x2 scored relevance+r0 93.4% against
+        // chrono 92.1%, r1 90.8%, chrono+r1 86.2% - with dates already prefixed on
+        // every memory line, reordering and padding only dilute the reader.
+        Self {
+            top_k: 50,
+            reader_order: ReaderOrder::Relevance,
+            neighbor_radius: 0,
+        }
     }
 }
 
@@ -125,6 +158,10 @@ pub struct Provenance {
     /// Cross-encoder reranker model id ("none" if recall used fusion only).
     pub reranker_model: String,
     pub top_k: usize,
+    /// Presentation order of retrieved memories in the reader prompt.
+    pub reader_order: String,
+    /// Adjacent turns rendered around each hit (0 = none).
+    pub neighbor_radius: usize,
     pub temperature: f32,
     /// Retrieval fusion weights (citadel-mem defaults); recorded for reproducibility.
     pub fusion_semantic: f32,
@@ -193,7 +230,7 @@ pub fn run_sample(
     embedder: Arc<dyn Embedder>,
     reader: &dyn LLMClient,
     judge: &dyn LLMClient,
-    top_k: usize,
+    config: BenchConfig,
 ) -> Result<Vec<QuestionResult>> {
     run_sample_observed(
         eng,
@@ -201,7 +238,7 @@ pub fn run_sample(
         embedder,
         reader,
         judge,
-        top_k,
+        config,
         &Pacer::unbounded(),
         &mut |_| Ok(()),
     )
@@ -216,7 +253,7 @@ pub fn run_sample_observed(
     embedder: Arc<dyn Embedder>,
     reader: &dyn LLMClient,
     judge: &dyn LLMClient,
-    top_k: usize,
+    config: BenchConfig,
     pacer: &Pacer,
     on_result: &mut (dyn FnMut(&QuestionResult) -> Result<()> + Send),
 ) -> Result<Vec<QuestionResult>> {
@@ -273,7 +310,7 @@ pub fn run_sample_observed(
                         &sample.sample_id,
                         reader,
                         judge,
-                        top_k,
+                        config,
                         &sample.qa[i],
                         pacer,
                         rg,
@@ -336,7 +373,7 @@ fn process_one_question(
     region: &str,
     reader: &dyn LLMClient,
     judge: &dyn LLMClient,
-    top_k: usize,
+    config: BenchConfig,
     qa: &QaSample,
     pacer: &Pacer,
     reader_gate: &Gate,
@@ -363,7 +400,7 @@ fn process_one_question(
 
     let outcome = {
         let _permit = reader_gate.acquire();
-        answer_question(reader, pacer, eng, region, &qa.question, top_k)?
+        answer_question(reader, pacer, eng, region, &qa.question, config)?
     };
 
     // Scored -> correctness judge. Adversarial -> abstention judge, except
@@ -498,6 +535,8 @@ pub fn provenance(
         embedder_model: embedder_model.into(),
         reranker_model: "none".to_string(),
         top_k: config.top_k,
+        reader_order: config.reader_order.label().to_string(),
+        neighbor_radius: config.neighbor_radius,
         temperature: 0.0,
         fusion_semantic: w.semantic,
         fusion_keyword: w.keyword,

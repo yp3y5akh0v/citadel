@@ -1,6 +1,7 @@
 use super::*;
 use crate::embed::MockEmbedder;
 use crate::error::MemError;
+use crate::types::FusionWeights;
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
 use std::sync::Arc;
 
@@ -1408,6 +1409,146 @@ fn evolve_score_zero_age_no_access_is_unity() {
     );
 }
 
+fn atom_created_at(db: &Arc<Database>, table: &str, atom_id: AtomId) -> i64 {
+    let conn = citadel_sql::Connection::open(db).unwrap();
+    let qr = conn
+        .query_params(
+            &format!("SELECT created_at FROM {table} WHERE id = $1"),
+            &[citadel_sql::Value::Integer(atom_id)],
+        )
+        .unwrap();
+    match qr.rows[0][0] {
+        citadel_sql::Value::Timestamp(t) => t,
+        ref v => panic!("created_at is not a timestamp: {v:?}"),
+    }
+}
+
+#[test]
+fn created_at_override_stores_event_time_on_the_plaintext_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let eng = MemoryEngine::open(db.clone()).unwrap();
+    eng.create_region("ev-t", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, false);
+
+    let start = micros_now();
+    let event = start - 90 * 86_400 * 1_000_000;
+    let backdated = eng
+        .remember(
+            "ev-t",
+            AtomInput::new("note", "alpha").with_created_at(event),
+        )
+        .unwrap();
+    let fresh = eng
+        .remember("ev-t", AtomInput::new("note", "beta"))
+        .unwrap();
+    let batched = eng
+        .remember_batch(
+            "ev-t",
+            vec![AtomInput::new("note", "gamma").with_created_at(event + 1)],
+        )
+        .unwrap()[0];
+
+    assert_eq!(atom_created_at(&db, &table, backdated), event);
+    assert_eq!(atom_created_at(&db, &table, batched), event + 1);
+    assert!(
+        atom_created_at(&db, &table, fresh) >= start,
+        "no override falls back to the ingest clock"
+    );
+    let hit = eng.fetch_one("ev-t", backdated).unwrap().unwrap();
+    assert_eq!(
+        hit.created_at, event,
+        "fetch surfaces the stored event time"
+    );
+}
+
+#[test]
+fn created_at_override_stores_event_time_on_the_sealed_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(db.clone()).unwrap();
+    eng.create_encrypted_region("ev-s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+
+    let event = micros_now() - 90 * 86_400 * 1_000_000;
+    let single = eng
+        .remember(
+            "ev-s",
+            AtomInput::new("note", "alpha").with_created_at(event),
+        )
+        .unwrap();
+    let batched = eng
+        .remember_batch(
+            "ev-s",
+            vec![AtomInput::new("note", "beta").with_created_at(event + 1)],
+        )
+        .unwrap()[0];
+
+    assert_eq!(atom_created_at(&db, &table, single), event);
+    assert_eq!(atom_created_at(&db, &table, batched), event + 1);
+    let hit = eng.fetch_one("ev-s", single).unwrap().unwrap();
+    assert_eq!(
+        hit.created_at, event,
+        "sealed fetch surfaces the event time"
+    );
+}
+
+#[test]
+fn recall_as_of_re_grades_recency_against_the_reference_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("asof", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+
+    // Identical text, so semantic and keyword signals tie; only recency can split
+    // them. Both events sit far past the 30-day half-life relative to the wall
+    // clock (recency underflows to 0.0 for both), so the default clock resolves
+    // by the id tie-break, while an as-of near the newer event separates them.
+    let day = 86_400i64 * 1_000_000;
+    let old_event = micros_now() - 6_000 * day;
+    let new_event = old_event + 30 * day;
+    let a = eng
+        .remember(
+            "asof",
+            AtomInput::new("note", "alpha").with_created_at(old_event),
+        )
+        .unwrap();
+    let b = eng
+        .remember(
+            "asof",
+            AtomInput::new("note", "alpha").with_created_at(new_event),
+        )
+        .unwrap();
+
+    let recency_only = FusionWeights {
+        semantic: 0.0,
+        keyword: 0.0,
+        recency: 1.0,
+        importance: 0.0,
+    };
+    let ids = |hits: Vec<AtomHit>| hits.iter().map(|h| h.id).collect::<Vec<_>>();
+
+    let wall = eng
+        .recall(
+            "asof",
+            RecallQuery::by_text("alpha", 2).with_weights(recency_only),
+        )
+        .unwrap();
+    assert_eq!(ids(wall), vec![a, b], "wall clock: ancient tie, id order");
+
+    let asof = eng
+        .recall(
+            "asof",
+            RecallQuery::by_text("alpha", 2)
+                .with_weights(recency_only)
+                .with_as_of(new_event + day),
+        )
+        .unwrap();
+    assert_eq!(ids(asof), vec![b, a], "as-of ranks the newer event first");
+}
+
 #[test]
 fn evolve_links_nearest_neighbor_with_inverse_distance_weight() {
     let dir = tempfile::tempdir().unwrap();
@@ -1738,10 +1879,10 @@ fn parse_candidate_rejects_short_row() {
 
 #[test]
 fn parse_fetched_rejects_short_row() {
-    let row = vec![Value::Integer(1); 5];
+    let row = vec![Value::Integer(1); 6];
     assert!(
         matches!(parse_fetched(&row), Err(MemError::Invalid(ref m)) if m.contains("fetch row shape")),
-        "row of len 5 (< 6) must be rejected by the length guard, not a later type error"
+        "row of len 6 (< 7) must be rejected by the length guard, not a later type error"
     );
     let ok = vec![
         Value::Integer(1),
@@ -1750,8 +1891,9 @@ fn parse_fetched_rejects_short_row() {
         Value::Null,
         Value::Real(0.5),
         Value::Integer(1),
+        Value::Timestamp(0),
     ];
-    assert!(parse_fetched(&ok).is_ok(), "row of len 6 must parse");
+    assert!(parse_fetched(&ok).is_ok(), "row of len 7 must parse");
 }
 
 #[test]

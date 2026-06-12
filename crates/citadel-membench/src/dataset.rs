@@ -70,6 +70,15 @@ pub struct Turn {
     pub query: String,
 }
 
+impl Turn {
+    /// Event time in micros since the epoch (UTC-naive), parsed from the session's
+    /// `date_time` ("1:56 pm on 8 May, 2023" - every session in locomo10.json uses
+    /// this exact shape). `None` when the string deviates.
+    pub fn event_micros(&self) -> Option<i64> {
+        parse_locomo_datetime(&self.date_time)
+    }
+}
+
 /// One question/answer probe over a conversation.
 #[derive(Debug, Clone)]
 pub struct QaSample {
@@ -85,6 +94,20 @@ pub struct Sample {
     pub sample_id: String,
     pub turns: Vec<Turn>,
     pub qa: Vec<QaSample>,
+}
+
+impl Sample {
+    /// The recency reference clock for this conversation's questions: one day after
+    /// the last session (LoCoMo probes a finished conversation, so "now" is just
+    /// past its end, not the bench's wall clock). `None` if no session date parses.
+    pub fn as_of_micros(&self) -> Option<i64> {
+        const DAY_MICROS: i64 = 86_400 * 1_000_000;
+        self.turns
+            .iter()
+            .filter_map(Turn::event_micros)
+            .max()
+            .map(|t| t + DAY_MICROS)
+    }
 }
 
 /// Parse `locomo10.json` (a JSON array of samples) from `path`.
@@ -262,5 +285,124 @@ fn render_answer(v: Option<&Value>) -> String {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Null) | None => String::new(),
         Some(other) => other.to_string(),
+    }
+}
+
+/// Parse LoCoMo's `H:MM am|pm on D Month, YYYY` session stamp to epoch micros.
+/// Strict on purpose: a deviating string returns `None` rather than a guess.
+fn parse_locomo_datetime(s: &str) -> Option<i64> {
+    let (clock, date) = s.split_once(" on ")?;
+    let (hm, ampm) = clock.trim().rsplit_once(' ')?;
+    let (h, m) = hm.split_once(':')?;
+    let (h, m) = (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?);
+    if !(1..=12).contains(&h) || !(0..=59).contains(&m) {
+        return None;
+    }
+    let hour = match ampm {
+        "am" => h % 12,
+        "pm" => h % 12 + 12,
+        _ => return None,
+    };
+
+    let mut parts = date.trim().split([' ', ',']).filter(|t| !t.is_empty());
+    let day = parts.next()?.parse::<i64>().ok()?;
+    let month = month_number(parts.next()?)?;
+    let year = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some() || !(1..=days_in_month(year, month)).contains(&day) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some((((days * 24 + hour) * 60 + m) * 60) * 1_000_000)
+}
+
+/// Day count of `month` in `year` (proleptic Gregorian).
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 31,
+    }
+}
+
+fn month_number(name: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    MONTHS.iter().position(|&m| m == name).map(|i| i as i64 + 1)
+}
+
+/// Days since 1970-01-01 for a proleptic-Gregorian date (Hinnant's days_from_civil).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+#[cfg(test)]
+mod datetime_tests {
+    use super::parse_locomo_datetime;
+
+    #[test]
+    fn parses_the_locomo_session_stamp() {
+        // 2023-05-08T13:56:00Z = 1_683_554_160 epoch seconds.
+        assert_eq!(
+            parse_locomo_datetime("1:56 pm on 8 May, 2023"),
+            Some(1_683_554_160 * 1_000_000)
+        );
+        // 2023-06-27T10:37:00Z = 1_687_862_220.
+        assert_eq!(
+            parse_locomo_datetime("10:37 am on 27 June, 2023"),
+            Some(1_687_862_220 * 1_000_000)
+        );
+    }
+
+    #[test]
+    fn twelve_oclock_wraps_correctly() {
+        assert_eq!(
+            parse_locomo_datetime("12:00 am on 1 January, 1970"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_locomo_datetime("12:30 pm on 1 January, 1970"),
+            Some((12 * 3600 + 30 * 60) * 1_000_000)
+        );
+    }
+
+    #[test]
+    fn deviating_stamps_return_none() {
+        assert_eq!(parse_locomo_datetime(""), None);
+        assert_eq!(parse_locomo_datetime("2pm on 1 Jan 2024"), None);
+        assert_eq!(parse_locomo_datetime("13:56 pm on 8 May, 2023"), None);
+        assert_eq!(parse_locomo_datetime("1:56 pm on 8 Floreal, 2023"), None);
+        assert_eq!(parse_locomo_datetime("1:56 pm on 8 May, 2023 extra"), None);
+    }
+
+    #[test]
+    fn impossible_civil_dates_return_none_not_a_rollover() {
+        assert_eq!(parse_locomo_datetime("12:00 am on 31 February, 2023"), None);
+        assert_eq!(parse_locomo_datetime("12:00 am on 29 February, 2023"), None);
+        assert_eq!(parse_locomo_datetime("12:00 am on 31 April, 2023"), None);
+        // 2024 is a leap year: 29 February is real.
+        assert!(parse_locomo_datetime("12:00 am on 29 February, 2024").is_some());
     }
 }

@@ -10,17 +10,18 @@
   <a href="https://crates.io/crates/citadeldb"><img src="https://img.shields.io/crates/v/citadeldb" alt="crates.io"></a>
   <a href="https://www.npmjs.com/package/@citadeldb/wasm"><img src="https://img.shields.io/npm/v/@citadeldb/wasm" alt="npm"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml"><img src="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LoCoMo-85.8%25-success" alt="LoCoMo 85.8%"></a>
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Wins all 50 head-to-head benchmarks against unencrypted SQLite at equal cache budgets.
+Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Wins all 50 head-to-head benchmarks against unencrypted SQLite at equal cache budgets, and scores **85.8%** on the LoCoMo long-term-memory benchmark - on fully encrypted regions.
 
 ## Encrypted agent memory
 
 Citadel adds embedded agent-memory layers on top of the encrypted engine:
 
 - **[citadeldb-vector](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-vector)** - a `VECTOR(N)` SQL type, distance operators (`<->` L2, `<#>` inner, `<=>` cosine), and a [PRISM](https://github.com/yp3y5akh0v/prism)-backed filtered ANN index that reads through the encrypted page store.
-- **[citadeldb-mem](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mem)** - an agent-memory engine (regions, atoms, edges) with hybrid recall (vector + BM25 keyword + cross-encoder reranker) and **cryptographic forgetting**: an atom or region is erased by destroying its key, at whole-store, per-region, and per-atom granularity. On the LoCoMo long-term-memory benchmark it scores 84.1% (3-run mean) on encrypted regions - protocol and numbers in [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md).
+- **[citadeldb-mem](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mem)** - an agent-memory engine (regions, atoms, edges) with hybrid recall (vector + BM25 keyword + cross-encoder reranker) and **cryptographic forgetting**: an atom or region is erased by destroying its key, at whole-store, per-region, and per-atom granularity. On the LoCoMo long-term-memory benchmark it scores 85.8% (3-run mean) on encrypted regions - protocol and numbers in [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md).
 - **[citadeldb-ai](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-ai)** - an autonomous agent runtime (ReAct + Reflexion, tool registry, budget caps, pluggable LLM backends) that uses citadeldb-mem for persistence.
 - **[citadeldb-mcp](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mcp)** - a Model Context Protocol server exposing a Citadel memory region (encrypted by default) to any MCP client (Claude Desktop, IDEs) as recall/remember/link/evolve/forget/verify tools.
 
