@@ -19,8 +19,15 @@ pub trait Embedder: Send + Sync {
     fn dim(&self) -> usize;
     fn metric(&self) -> EmbeddingMetric;
     fn model_id(&self) -> &str;
-    /// Embed a batch of texts, one vector per input, each of length `dim()`.
+    /// Embed a batch of stored texts (the passage side), one vector per input,
+    /// each of length `dim()`.
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError>;
+    /// Embed a batch of search queries. Asymmetric retrieval models (E5's
+    /// `query: `/`passage: ` format) encode the two sides differently; symmetric
+    /// models keep the default, which is identical to [`embed`](Self::embed).
+    fn embed_queries(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.embed(texts)
+    }
 }
 
 /// Sync, bring-your-own reranker: scores `(query, passage)` pairs jointly (higher = better).

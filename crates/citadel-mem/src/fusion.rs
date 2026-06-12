@@ -123,7 +123,7 @@ pub(crate) fn fuse_rerank(
     }
     // Scoring every candidate is CPU-bound, so pre-trim to the top RERANK_POOL by
     // linear fusion; the dropped tail is the low-fusion, likely-irrelevant remainder.
-    const RERANK_POOL: usize = 128;
+    const RERANK_POOL: usize = 256;
     if cands.len() > RERANK_POOL {
         let pre = fusion_scores(&cands, w, now_micros);
         let mut idx: Vec<usize> = (0..cands.len()).collect();

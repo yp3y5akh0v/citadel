@@ -1134,7 +1134,7 @@ impl MemoryEngine {
                 let text = q.text.as_deref().ok_or_else(|| {
                     MemError::Invalid("recall requires either text or embedding".into())
                 })?;
-                embed_one(&*h.embedder, text)?
+                embed_query_one(&*h.embedder, text)?
             }
         };
         if qvec.len() != h.dim as usize {
@@ -3388,6 +3388,15 @@ fn expand_graph_sealed(
 fn embed_one(embedder: &dyn Embedder, text: &str) -> Result<Vec<f32>> {
     embedder
         .embed(&[text])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| MemError::Invalid("embedder returned no vector".into()))
+}
+
+/// Query-side embedding: asymmetric models (E5) encode queries differently.
+fn embed_query_one(embedder: &dyn Embedder, text: &str) -> Result<Vec<f32>> {
+    embedder
+        .embed_queries(&[text])?
         .into_iter()
         .next()
         .ok_or_else(|| MemError::Invalid("embedder returned no vector".into()))

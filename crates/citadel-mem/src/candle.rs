@@ -45,7 +45,9 @@ pub struct CandleConfig {
     pub pooling: Pooling,
     /// L2-normalize each output vector (required for cosine similarity).
     pub normalize: bool,
-    /// Text prepended to every input before encoding (e.g. E5's `"query: "`).
+    /// Prepended to stored texts before encoding (e.g. E5's `"passage: "`).
+    pub passage_prefix: Option<String>,
+    /// Prepended to search queries before encoding (e.g. E5's `"query: "`).
     pub query_prefix: Option<String>,
     pub max_length: usize,
 }
@@ -59,6 +61,7 @@ impl CandleConfig {
             metric: EmbeddingMetric::Cosine,
             pooling: Pooling::Cls,
             normalize: true,
+            passage_prefix: None,
             query_prefix: None,
             max_length: 512,
         }
@@ -88,12 +91,15 @@ impl CandleConfig {
             metric: EmbeddingMetric::Cosine,
             pooling: Pooling::Mean,
             normalize: true,
+            passage_prefix: None,
             query_prefix: None,
             max_length: 256,
         }
     }
 
-    /// `intfloat/e5-large-v2` (1024d, cosine, mean pooling; requires a `"query: "` prefix).
+    /// `intfloat/e5-large-v2` (1024d, cosine, mean pooling). E5 retrieval is
+    /// asymmetric: stored texts MUST carry `"passage: "` and queries `"query: "`,
+    /// or retrieval quality collapses (per the model card).
     pub fn e5_large() -> Self {
         Self {
             model_id: "e5-large-v2".into(),
@@ -101,6 +107,7 @@ impl CandleConfig {
             metric: EmbeddingMetric::Cosine,
             pooling: Pooling::Mean,
             normalize: true,
+            passage_prefix: Some("passage: ".into()),
             query_prefix: Some("query: ".into()),
             max_length: 512,
         }
@@ -117,6 +124,7 @@ impl CandleConfig {
             metric: EmbeddingMetric::Cosine,
             pooling: Pooling::Cls,
             normalize: true,
+            passage_prefix: None,
             query_prefix: None,
             max_length: 512,
         }
@@ -154,7 +162,8 @@ pub struct CandleEmbedder {
     metric: EmbeddingMetric,
     pooling: Pooling,
     normalize: bool,
-    prefix: Option<String>,
+    passage_prefix: Option<String>,
+    query_prefix: Option<String>,
     model_id: String,
 }
 
@@ -242,7 +251,8 @@ impl CandleEmbedder {
             metric: cfg.metric,
             pooling: cfg.pooling,
             normalize: cfg.normalize,
-            prefix: cfg.query_prefix,
+            passage_prefix: cfg.passage_prefix,
+            query_prefix: cfg.query_prefix,
             model_id: cfg.model_id,
         })
     }
@@ -286,8 +296,8 @@ impl CandleEmbedder {
         Self::from_dir(dir, CandleConfig::granite_r2())
     }
 
-    fn run(&self, texts: &[&str]) -> candle_core::Result<Tensor> {
-        let inputs: Vec<String> = match &self.prefix {
+    fn run(&self, texts: &[&str], prefix: Option<&str>) -> candle_core::Result<Tensor> {
+        let inputs: Vec<String> = match prefix {
             Some(p) => texts.iter().map(|t| format!("{p}{t}")).collect(),
             None => texts.iter().map(|t| t.to_string()).collect(),
         };
@@ -342,7 +352,19 @@ impl Embedder for CandleEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let out = self.run(texts).map_err(backend)?;
+        let out = self
+            .run(texts, self.passage_prefix.as_deref())
+            .map_err(backend)?;
+        out.to_vec2::<f32>().map_err(backend)
+    }
+
+    fn embed_queries(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let out = self
+            .run(texts, self.query_prefix.as_deref())
+            .map_err(backend)?;
         out.to_vec2::<f32>().map_err(backend)
     }
 }
@@ -573,6 +595,8 @@ mod tests {
             ("world".to_string(), 5),
             ("test".to_string(), 6),
             ("foo".to_string(), 7),
+            ("query".to_string(), 8),
+            ("passage".to_string(), 9),
         ];
         let vocab_size = vocab.len();
         let wp = WordPieceBuilder::new()
@@ -609,7 +633,8 @@ mod tests {
             metric: EmbeddingMetric::Cosine,
             pooling: Pooling::Mean,
             normalize: true,
-            prefix: None,
+            passage_prefix: None,
+            query_prefix: None,
             model_id: "synthetic".into(),
         }
     }
@@ -632,6 +657,30 @@ mod tests {
         assert_eq!(out, again, "deterministic for identical input");
 
         assert!(e.embed(&[]).unwrap().is_empty(), "empty batch -> empty");
+        assert!(e.embed_queries(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn asymmetric_prefixes_split_passage_and_query_encodings() {
+        let mut e = synthetic_embedder();
+        // Symmetric model: both sides encode identically.
+        assert_eq!(
+            e.embed(&["hello world"]).unwrap(),
+            e.embed_queries(&["hello world"]).unwrap()
+        );
+
+        // E5-style asymmetric prefixes: each side must equal the manually
+        // prefixed raw encoding, and the two sides must differ.
+        e.passage_prefix = Some("passage ".into());
+        e.query_prefix = Some("query ".into());
+        let passage = e.embed(&["hello world"]).unwrap();
+        let query = e.embed_queries(&["hello world"]).unwrap();
+        assert_ne!(passage, query, "prefixes must separate the two sides");
+
+        e.passage_prefix = None;
+        e.query_prefix = None;
+        assert_eq!(passage, e.embed(&["passage hello world"]).unwrap());
+        assert_eq!(query, e.embed(&["query hello world"]).unwrap());
     }
 
     #[test]
