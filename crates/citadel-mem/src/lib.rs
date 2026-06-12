@@ -1,4 +1,4 @@
-//! Encrypted-first agent memory engine: regions, atoms, edges, traces.
+//! Encrypted-first memory engine: regions, atoms, edges, traces.
 
 #[cfg(feature = "candle-embed")]
 pub mod candle;

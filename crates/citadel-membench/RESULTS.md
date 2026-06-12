@@ -1,8 +1,8 @@
 # citadel-mem on LoCoMo
 
 Results and a reproducible evaluation harness for citadel-mem on the LoCoMo
-long-term conversational memory benchmark. citadel-mem is an embedded agent-memory
-engine that is encrypted at rest and forgets by destroying keys; the benchmark runs
+long-term conversational memory benchmark. citadel-mem is an embedded memory engine
+that is encrypted at rest and forgets by destroying keys; the benchmark runs
 on encrypted regions (each conversation is a per-atom-sealed region), so every number
 below is produced on the encrypted storage path. Each number is regenerated from a
 SHA-256-pinned dataset with one command, and the report records the reader and judge
@@ -10,8 +10,8 @@ models, the prompts, a per-question audit, and the run's limitations.
 
 ## Headline: full 10-conversation LoCoMo (encrypted, reader and judge `gpt-4o-mini`)
 
-Reference configuration: encrypted regions, `bge-large-en-v1.5` embedder, top-50
-retrieval in relevance order, temperature 0, raw-turn plus photo-caption ingestion with
+Reference configuration (as shipped in v1.4.0): encrypted regions, `bge-large-en-v1.5`
+embedder, top-50 retrieval in relevance order, temperature 0, raw-turn plus photo-caption ingestion with
 each session's date prefixed into the indexed turn text (`[date] speaker: text`). Scored
 categories are multi-hop, temporal, open-domain, and single-hop; the adversarial
 (unanswerable) category is reported separately as an abstention metric.
@@ -35,24 +35,14 @@ All runs are at temperature 0. **recall@50 is identical across all three runs - 
 1450/1536 questions hit gold** - because retrieval is deterministic (the in-memory index
 is rebuilt the same way each time); only the reader/judge-dependent metrics vary. Cost is
 computed from the recorded token counts (~7.05M in / ~0.14M out per run) at gpt-4o-mini
-rates ($0.15 / $0.60 per M).
-
-### Prior configuration (top-30, undated turn text)
-
-The previously published configuration - identical pipeline, top-30 retrieval, no date
-prefix in the indexed text - scored 84.1% +/- 0.5% over three runs (84.5 / 84.2 / 83.6)
-against a 91.6% recall@30 ceiling, with 71.4% adversarial abstention at ~$0.83 per run.
-The +1.7 came from two measured changes (selected on the conv-26 dev split, Limitations):
-top-50 retrieval (+2.7 reader-visible gold; multi_hop converts most of it) and the date
-prefix (temporal retrieval). The trade-off is abstention: more retrieved content tempts
-the reader to answer unanswerable questions (66.9% vs 71.4%), and each run costs more
-(~$1.14 vs ~$0.83).
+rates ($0.15 / $0.60 per M). Later retrieval defaults measure the same accuracy within
+reader noise at a higher retrieval ceiling; every configuration and run is in Run
+history below.
 
 **Encryption is free at the retrieval layer.** Recall over an encrypted region decrypts
 the region into an ephemeral in-memory nearest-neighbor index whose plaintext vectors
 are zeroized when it is dropped, so the retrieval ceiling and end-to-end accuracy are
-identical to a plaintext store; the recall path costs ~240 ms at p95 on the full 10
-conversations (344 ms on a cold first build).
+identical to a plaintext store; per-configuration recall latencies are in Run history.
 
 ## How 85.8% compares (matched reader and judge)
 
@@ -80,6 +70,26 @@ agentic multi-query retrieval and are not on this scale. With gold evidence visi
 the reader for 94.4% of scored questions, 80% of the remaining misses are
 reader-bound (the gold was in the prompt), so a stronger reader, not better retrieval,
 is the next lever.
+
+## Run history
+
+Each row changes only what it lists, on top of the row above. Scored runs are the
+three independent full runs of that configuration.
+
+| Configuration | Runs | Mean +/- SD | recall@50 any/all | p95 recall | Cost/run |
+|---|---|---|---|---|---|
+| top-30, undated turn text | 84.5 / 84.2 / 83.6 | 84.1% +/- 0.5% | 91.6% any@30 | - | ~$0.83 |
+| v1.4.0: top-50, date-prefixed text | 86.2 / 85.6 / 85.5 | 85.8% +/- 0.4% | 94.4 / 85.2 | ~300 ms | ~$1.14 |
+| v1.5: fusion 0.45/0.20/0.20/0.15, RRF k=20, rerank pool 256 | 85.9 / 85.2 / 85.5 | 85.5% +/- 0.4% | 95.1 / 86.2 | ~580 ms | ~$1.13 |
+
+- v1.4.0's +1.7 over top-30 came from two measured changes (selected on the conv-26
+  dev split): top-50 retrieval and the date prefix. The trade-off is abstention
+  (66.9% vs 71.4%): more retrieved content tempts the reader to answer unanswerable
+  questions.
+- v1.5 raises the retrieval ceiling (+0.7/+1.0 any/all@50; multi-hop all@50 58.9% to
+  61.3%) without moving scored accuracy: the means differ by less than the
+  run-to-run flip noise (Self-audit), because 80% of remaining misses already have
+  complete gold evidence in the prompt. p95 rises with the doubled rerank pool.
 
 ## Cryptographic forgetting
 
@@ -109,18 +119,21 @@ reader-safe freed pages before commit.
 reader_model:      gpt-4o-mini
 judge_model:       gpt-4o-mini
 embedder_model:    bge-large-en-v1.5  (GPU)
-reranker_model:    ms-marco-MiniLM-L-6-v2  (RRF fusion, k = 60)
+reranker_model:    ms-marco-MiniLM-L-6-v2  (RRF fusion, k = 20)
 regions:           encrypted (per-atom sealed; per-atom/region cryptographic erasure)
 top_k:             50
 reader_order:      relevance
 neighbor_radius:   0
 temperature:       0.0
-fusion weights:    semantic 0.40, keyword 0.25, recency 0.20, importance 0.15
+fusion weights:    semantic 0.45, keyword 0.20, recency 0.20, importance 0.15
                    (keyword is BM25 over Unicode word tokens; recency and importance
                    contribute no rank signal here - see Limitations)
 dataset:           locomo10.json
 dataset_sha256:    79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4
 ```
+
+These are the current defaults; the headline (v1.4.0) runs recorded their own
+configuration, listed in Run history.
 
 ## How the harness stays reproducible
 
@@ -191,8 +204,8 @@ date-prefixed (`[date] speaker: text ...`), overall evidence recall is:
 |---|---|---|---|
 | A: exact cosine over the indexed text | 75.7/63.0 | 87.2/75.5 | 90.6/81.1 |
 | B: citadel vector recall (PRISM) | 75.7/63.0 | 87.2/75.5 | 90.6/81.1 |
-| C: + linear fusion (BM25 keyword) | 80.4/67.6 | 90.2/78.7 | 92.8/83.3 |
-| D: + cross-encoder reranker | 83.9/71.4 | 91.7/80.5 | 94.4/85.2 |
+| C: + linear fusion (BM25 keyword) | 80.7/67.8 | 89.8/78.8 | 92.6/83.5 |
+| D: + cross-encoder reranker | 84.8/72.3 | 92.3/81.3 | 95.1/86.2 |
 
 A and B are identical to the decimal at every cutoff: nearest-neighbor recall over
 the decrypted-into-memory index of an encrypted region loses nothing against
@@ -211,6 +224,12 @@ to hurt recall (-4.6 any@30) and is not used.
 but on the gold topic and reports how often it marks them correct, bounding judge
 lenience. On this probe the judge marked 0 of 40 correct (0.0% false-accept).
 
+Run-to-run noise decomposes by diffing the per-question audits of the three headline
+runs (identical retrieval): 1,004 of 1,986 answers differ textually between runs at
+temperature 0; 100 questions flip correct/incorrect (62 scored, 38 adversarial) - 88
+because the reader's answer changed, 12 because the judge flipped on an identical
+answer. The +/-0.4% band is entirely reader/judge-side; retrieval contributes none.
+
 ## Limitations
 
 - The metric is an LLM-judge protocol, not the LoCoMo paper's token-F1, so a number is
@@ -228,7 +247,8 @@ lenience. On this probe the judge marked 0 of 40 correct (0.0% false-accept).
   below 100%. The retrieval ceiling and per-question audit are in the report.
 - conv-26 is the development split on which the configuration (top-50, relevance order,
   no neighbor expansion, date-prefixed indexing) was selected; the full-run figures are
-  the reportable ones.
+  the reportable ones. The v1.5 retrieval defaults (fusion ratio, RRF k, rerank pool)
+  were likewise selected on the token-free diagnostic and the same dev split.
 - Top-50 retrieval trades abstention for accuracy: with more retrieved content the
   reader answers more unanswerable questions (abstention 66.9% vs 71.4% at top-30).
 - Three runs at temperature 0; the hosted reader and judge are not bit-deterministic, so

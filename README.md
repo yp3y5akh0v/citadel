@@ -4,7 +4,7 @@
 
 <h1 align="center">Citadel</h1>
 
-<p align="center">Encrypted-first embedded database and agent-memory engine. Outperforms unencrypted SQLite.</p>
+<p align="center">Encrypted-first embedded database and memory engine. Outperforms unencrypted SQLite.</p>
 
 <p align="center">
   <a href="https://crates.io/crates/citadeldb"><img src="https://img.shields.io/crates/v/citadeldb" alt="crates.io"></a>
@@ -16,14 +16,27 @@
 
 Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Wins all 50 head-to-head benchmarks against unencrypted SQLite at equal cache budgets, and scores **85.8%** on the LoCoMo long-term-memory benchmark - on fully encrypted regions.
 
-## Encrypted agent memory
+## Encrypted memory engine
 
-Citadel adds embedded agent-memory layers on top of the encrypted engine:
+The same encrypted pages that hold SQL tables also hold memory. Three crates make up
+the memory engine:
 
 - **[citadeldb-vector](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-vector)** - a `VECTOR(N)` SQL type, distance operators (`<->` L2, `<#>` inner, `<=>` cosine), and a [PRISM](https://github.com/yp3y5akh0v/prism)-backed filtered ANN index that reads through the encrypted page store.
-- **[citadeldb-mem](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mem)** - an agent-memory engine (regions, atoms, edges) with hybrid recall (vector + BM25 keyword + cross-encoder reranker) and **cryptographic forgetting**: an atom or region is erased by destroying its key, at whole-store, per-region, and per-atom granularity. On the LoCoMo long-term-memory benchmark it scores 85.8% (3-run mean) on encrypted regions - protocol and numbers in [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md).
-- **[citadeldb-ai](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-ai)** - an autonomous agent runtime (ReAct + Reflexion, tool registry, budget caps, pluggable LLM backends) that uses citadeldb-mem for persistence.
+- **[citadeldb-mem](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mem)** - the memory engine (regions, atoms, edges) with hybrid recall and **cryptographic forgetting**: an atom or region is erased by destroying its key, at whole-store, per-region, and per-atom granularity.
 - **[citadeldb-mcp](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mcp)** - a Model Context Protocol server exposing a Citadel memory region (encrypted by default) to any MCP client (Claude Desktop, IDEs) as recall/remember/link/evolve/forget/verify tools.
+
+### Zero-LLM memory path
+
+citadeldb-mem uses no LLM at ingest or retrieval: it stores raw conversation content
+and recalls with embeddings, BM25 keyword matching, and a cross-encoder reranker.
+Remembering costs zero tokens, recall is deterministic, and data stays encrypted at
+rest. The LoCoMo score above is measured on this path (3-run mean, `gpt-4o-mini`
+reader and judge); the protocol, per-question audit, and comparisons with published
+systems are in [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md).
+
+## Agent runtime
+
+- **[citadeldb-ai](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-ai)** - an autonomous agent runtime (ReAct + Reflexion, tool registry, budget caps, pluggable LLM backends) that uses citadeldb-mem for persistence.
 
 ## Features
 
@@ -39,7 +52,7 @@ Citadel adds embedded agent-memory layers on top of the encrypted engine:
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. C FFI (37 functions), WebAssembly bindings
-- **5,000+ tests** - Unit, integration, torture tests across 18 crates
+- **5,000+ tests** - Unit, integration, torture tests across 19 crates
 
 ## Benchmarks
 
@@ -316,30 +329,35 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 ## Architecture
 
 ```
-Agent memory layer:
-+----------------------+----------------------+
-|      citadel-ai      |     citadel-mcp      |  Agent runtime (ReAct + Reflexion) + MCP server
-+----------------------+----------------------+
-|                 citadel-mem                  |  Agent memory: regions, atoms, recall, erasure
+Agent layer:
 +---------------------------------------------+
-|               citadel-vector                 |  VECTOR(N) type + PRISM filtered ANN index
+|                 citadel-ai                  |  Agent runtime (ReAct + Reflexion)
++---------------------------------------------+
+
+Memory layer:
++---------------------------------------------+
+|                 citadel-mcp                 |  MCP server: memory tools for any MCP client
++---------------------------------------------+
+|                 citadel-mem                 |  Memory engine: regions, atoms, recall, erasure
++---------------------------------------------+
+|                citadel-vector               |  VECTOR(N) type + PRISM filtered ANN index
 +---------------------------------------------+
 
 Encrypted database engine:
 +-------------+---------------+---------------+
-| citadel-cli | citadel-ffi   | citadel-wasm  |  CLI, C FFI, WebAssembly
+| citadel-cli |  citadel-ffi  | citadel-wasm  |  CLI, C FFI, WebAssembly
 +-------------+---------------+---------------+
-|                 citadel-sql                  |  SQL parser, planner, executor
+|                 citadel-sql                 |  SQL parser, planner, executor
 +---------------------------------------------+
-|                  citadel                     |  Database API, builder, sync
-+--------------+--------------+---------------+
-|  citadel-txn | citadel-sync | citadel-crypto|  Transactions, replication, keys
-+--------------+--------------+---------------+
-|citadel-buffer|         citadel-page         |  Buffer pool (SIEVE), page codec
-+--------------+------------------------------+
-|              citadel-io                      |  File I/O, fsync, io_uring
+|                   citadel                   |  Database API, builder, sync
++-------------+--------------+----------------+
+| citadel-txn | citadel-sync | citadel-crypto |  Transactions, replication, keys
++-------------+--------------+----------------+
+|       citadel-buffer       |  citadel-page  |  Buffer pool (SIEVE), page codec
++----------------------------+----------------+
+|                 citadel-io                  |  File I/O, fsync, io_uring
 +---------------------------------------------+
-|              citadel-core                    |  Types, errors, constants
+|                 citadel-core                |  Types, errors, constants
 +---------------------------------------------+
 ```
 

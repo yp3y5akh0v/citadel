@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
 {% block title %}About - Citadel{% endblock %}
-{% block description %}Citadel is a single-author Rust workspace: an encrypted-first embedded database and agent-memory engine. {{ config.extra.crates }} crates, encryption as the load-bearing layer, reproducible benchmarks against SQLite.{% endblock %}
+{% block description %}Citadel is a single-author Rust workspace: an encrypted-first embedded database and memory engine. {{ config.extra.crates }} crates, encryption as the load-bearing layer, reproducible benchmarks against SQLite.{% endblock %}
 
 {% block content %}
 <main class="shell">
@@ -10,7 +10,7 @@
     <div>
       <div class="kicker">About / The project</div>
       <h1>A single-author Rust project that treats encryption as <em>load-bearing</em>.</h1>
-      <p class="sub">Not an option, not an extension, not a wrapper. A {{ config.extra.crates }}-crate Rust workspace: a full SQL engine, a key-value API, AES-256-CTR + HMAC encryption at the page level, shadow paging, an encrypted agent-memory engine, and a reproducible benchmark suite against SQLite.</p>
+      <p class="sub">Not an option, not an extension, not a wrapper. A {{ config.extra.crates }}-crate Rust workspace: a full SQL engine, a key-value API, AES-256-CTR + HMAC encryption at the page level, shadow paging, an encrypted memory engine, and a reproducible benchmark suite against SQLite.</p>
     </div>
     <aside class="card">
       <div class="row"><span class="k">version</span><span class="v"><span class="ac">v{{ config.extra.version }}</span> / stable</span></div>
@@ -52,7 +52,7 @@
             <div class="t-num">iv.</div>
             <div>
               <h3>Memory is encrypted the <span class="ac">same way</span>.</h3>
-              <p>The agent-memory engine, <code>citadel-mem</code>, stores vectors, atoms, and edges on the exact same encrypted pages. Forgetting is cryptographic: destroy an atom's or region's key and the ciphertext that remains is unrecoverable, with a verifiable erasure receipt.</p>
+              <p>The memory engine, <code>citadel-mem</code>, stores vectors, atoms, and edges on the exact same encrypted pages. Forgetting is cryptographic: destroy an atom's or region's key and the ciphertext that remains is unrecoverable, with a verifiable erasure receipt.</p>
             </div>
           </div>
           <div class="tenet">
@@ -72,7 +72,7 @@
       <div class="sec-index"><span class="num">02</span><span class="label">Repo shape</span></div>
       <div>
         <p style="margin:0 0 24px; color:var(--fg-2); font-size:14.5px; line-height:1.65; max-width:62ch;">
-          A Cargo workspace of {{ config.extra.crates }} crates, layered from the bytes on disk up to the SQL frontend, the agent-memory engine, and the bindings. Each crate has its own tests; {{ config.extra.tests }} in total, with 100% pass on <code>cargo test --workspace</code>. {{ config.extra.published }} crates publish to crates.io.
+          A Cargo workspace of {{ config.extra.crates }} crates, layered from the bytes on disk up to the SQL frontend, the memory engine, and the bindings. Each crate has its own tests; {{ config.extra.tests }} in total, with 100% pass on <code>cargo test --workspace</code>. {{ config.extra.published }} crates publish to crates.io.
         </p>
         <div class="crates">
           <div class="crate"><div class="name">citadel-core</div><div class="desc">Shared types, errors, constants.</div></div>
@@ -86,7 +86,7 @@
           <div class="crate"><div class="name">citadel-sql</div><div class="desc">Parser, planner, executor. JOINs, CTEs, triggers, JSON/JSONB, FTS.</div></div>
           <div class="crate"><div class="name">sql-json-path</div><div class="desc">SQL/JSON Path engine (forked from RisingWave Labs).</div></div>
           <div class="crate"><div class="name">citadel-vector</div><div class="desc">VECTOR(N) type and <a class="ilink" href="https://github.com/yp3y5akh0v/prism" target="_blank" rel="noopener">PRISM</a> filtered ANN index.</div></div>
-          <div class="crate"><div class="name">citadel-mem</div><div class="desc">Agent-memory engine: regions, atoms, edges, traces.</div></div>
+          <div class="crate"><div class="name">citadel-mem</div><div class="desc">Memory engine: regions, atoms, edges, traces.</div></div>
           <div class="crate"><div class="name">citadel-ai</div><div class="desc">Agent runtime: ReAct + Reflexion, budget caps.</div></div>
           <div class="crate"><div class="name">citadel-mcp</div><div class="desc">MCP server exposing memory as {{ config.extra.mcp_tools }} tools.</div></div>
           <div class="crate"><div class="name">citadel-cli</div><div class="desc">REPL with 26 dot-commands, tab completion.</div></div>

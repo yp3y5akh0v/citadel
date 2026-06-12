@@ -120,7 +120,7 @@ fn ann_metric(m: EmbeddingMetric) -> Metric {
     }
 }
 
-/// Encrypted-first agent memory engine over a shared [`Database`].
+/// Encrypted-first memory engine over a shared [`Database`].
 pub struct MemoryEngine {
     db: Arc<Database>,
     regions: Mutex<FxHashMap<String, RegionState>>,
