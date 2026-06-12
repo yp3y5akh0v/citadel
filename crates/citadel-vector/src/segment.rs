@@ -51,10 +51,11 @@ const TAG_ATTRS: u8 = 7;
 /// BLAKE3 of the canonical little-endian encoding of EVERY [`PrismConfig`]
 /// field, domain-separated. The storage header pins this; a binary whose
 /// active config differs must refuse the segment (the graph was built for a
-/// different search geometry).
+/// different search geometry). The domain string carries the search-geometry
+/// version: bump it whenever build or search semantics change shape.
 pub fn prism_config_hash(cfg: &PrismConfig) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(b"citadel-annseg-config-v1");
+    h.update(b"citadel-annseg-config-v2");
     for v in [
         cfg.m_local as u64,
         cfg.m_greedy as u64,
@@ -198,7 +199,11 @@ impl SegmentParts {
 
     /// Finish the index with vectors ALREADY PLACED in PRISM-internal order
     /// (`filled` = how many slots the loader filled; must be exactly `n`).
-    pub fn into_index(self, vectors: Vec<f32>, filled: usize) -> Result<AnnIndex, SegmentError> {
+    pub fn into_index(
+        self,
+        mut vectors: Vec<f32>,
+        filled: usize,
+    ) -> Result<AnnIndex, SegmentError> {
         if filled != self.n {
             return Err(SegmentError::RehydrationIncomplete {
                 expected: self.n,
@@ -210,6 +215,12 @@ impl SegmentParts {
                 expected: self.n * self.dim as usize,
                 got: vectors.len(),
             });
+        }
+        // Cosine stores are build-normalized; rehydrated row vectors are raw.
+        // Re-applying the same normalization keeps loaded-segment search
+        // bit-identical to the freshly built index.
+        if self.metric == Metric::Cosine {
+            crate::prism::distance::normalize_rows(&mut vectors, self.dim as usize);
         }
         let store = PointStore::from_parts(vectors, self.dim as usize, self.attrs);
         let prism = PrismIndex {
@@ -478,33 +489,34 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
-    /// A small index with two attribute cells, NON-monotonic row ids (so
-    /// id_map order != insertion order), and deterministic vectors.
-    fn build_fixture() -> AnnIndex {
-        let mut rows: Vec<(u64, Vec<f32>, Vec<u32>)> = Vec::new();
-        for i in 0..200u64 {
-            // Reverse-ish ids: external order differs from internal.
-            let id = 1000 - i * 3;
-            let v: Vec<f32> = (0..8).map(|d| ((i * 7 + d) % 23) as f32 * 0.5).collect();
-            rows.push((id, v, vec![(i % 2) as u32]));
-        }
-        AnnIndex::build_with_attrs(rows, 1, Metric::Cosine, 8).expect("build fixture")
+    /// Deterministic fixture rows: two attribute cells and NON-monotonic row
+    /// ids (so id_map order != insertion order). RAW vectors, exactly what a
+    /// table scan would yield.
+    fn fixture_rows() -> Vec<(u64, Vec<f32>, Vec<u32>)> {
+        (0..200u64)
+            .map(|i| {
+                // Reverse-ish ids: external order differs from internal.
+                let id = 1000 - i * 3;
+                let v: Vec<f32> = (0..8).map(|d| ((i * 7 + d) % 23) as f32 * 0.5).collect();
+                (id, v, vec![(i % 2) as u32])
+            })
+            .collect()
     }
 
-    /// Rehydrate exactly as the storage loader will: by the id_map PERMUTATION.
-    fn rehydrate(index: &AnnIndex, parts: &SegmentParts) -> (Vec<f32>, usize) {
+    fn build_fixture() -> AnnIndex {
+        AnnIndex::build_with_attrs(fixture_rows(), 1, Metric::Cosine, 8).expect("build fixture")
+    }
+
+    /// Rehydrate exactly as the storage loader will: RAW row vectors placed by
+    /// the id_map PERMUTATION (the index re-applies any build normalization).
+    fn rehydrate(rows: &[(u64, Vec<f32>, Vec<u32>)], parts: &SegmentParts) -> (Vec<f32>, usize) {
         let inv = parts.internal_of_row();
         let dim = parts.dim() as usize;
         let mut vectors = vec![0.0f32; parts.n() * dim];
         let mut filled = 0;
-        // Source the vectors from the ORIGINAL index's store, keyed by row id,
-        // simulating the table scan (arbitrary order: ascending row id).
-        let p = index.prism();
-        for internal in 0..parts.n() {
-            let row = index.id_map()[internal];
-            let slot = inv[&row] as usize;
-            let src = &p.store.vectors[internal * dim..(internal + 1) * dim];
-            vectors[slot * dim..(slot + 1) * dim].copy_from_slice(src);
+        for (row, v, _) in rows {
+            let slot = inv[row] as usize;
+            vectors[slot * dim..(slot + 1) * dim].copy_from_slice(v);
             filled += 1;
         }
         (vectors, filled)
@@ -516,7 +528,7 @@ mod tests {
         // dicts machinery, not just the graph.
         let index = build_fixture();
         let parts = decode(&encode(&index)).expect("decode");
-        let (vectors, filled) = rehydrate(&index, &parts);
+        let (vectors, filled) = rehydrate(&fixture_rows(), &parts);
         let loaded = parts.into_index(vectors, filled).expect("into_index");
         let query: Vec<f32> = (0..8).map(|d| d as f32 * 0.7).collect();
         for code in [0u32, 1] {
@@ -537,10 +549,10 @@ mod tests {
                     (i * 2 + 1, v, vec![0])
                 })
                 .collect();
-            let index = AnnIndex::build_with_attrs(rows, 1, metric, 4).expect("build");
+            let index = AnnIndex::build_with_attrs(rows.clone(), 1, metric, 4).expect("build");
             let parts = decode(&encode(&index)).expect("decode");
             assert_eq!(parts.metric(), metric, "metric tag survives");
-            let (vectors, filled) = rehydrate(&index, &parts);
+            let (vectors, filled) = rehydrate(&rows, &parts);
             let loaded = parts.into_index(vectors, filled).expect("into_index");
             let q = [1.0f32, -2.0, 3.0, 0.5];
             assert_eq!(index.search(&q, 5), loaded.search(&q, 5), "{metric:?}");
@@ -549,12 +561,12 @@ mod tests {
 
     #[test]
     fn single_row_index_roundtrips() {
+        let rows = vec![(42u64, vec![1.0f32, 2.0], vec![0u32])];
         let index =
-            AnnIndex::build_with_attrs(vec![(42, vec![1.0, 2.0], vec![0])], 1, Metric::L2, 2)
-                .expect("build single");
+            AnnIndex::build_with_attrs(rows.clone(), 1, Metric::L2, 2).expect("build single");
         let parts = decode(&encode(&index)).expect("decode");
         assert_eq!(parts.n(), 1);
-        let (vectors, filled) = rehydrate(&index, &parts);
+        let (vectors, filled) = rehydrate(&rows, &parts);
         let loaded = parts.into_index(vectors, filled).expect("into_index");
         assert_eq!(loaded.search(&[1.0, 2.0], 1), vec![(42, 0.0)]);
     }
@@ -611,7 +623,7 @@ mod tests {
         let index = build_fixture();
         let bytes = encode(&index);
         let parts = decode(&bytes).expect("decode");
-        let (vectors, filled) = rehydrate(&index, &parts);
+        let (vectors, filled) = rehydrate(&fixture_rows(), &parts);
         let loaded = parts.into_index(vectors, filled).expect("into_index");
 
         let query: Vec<f32> = (0..8).map(|d| d as f32 * 0.3).collect();

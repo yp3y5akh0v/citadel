@@ -284,3 +284,134 @@ fn filtered_index_survives_reopen() {
         assert_eq!(row.category, 2, "row {id} not category 2 after reopen");
     }
 }
+
+#[test]
+fn filtered_eq_real_literal_on_integer_column_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    seed(&conn, 300, 5);
+    let q = vec_for(7);
+
+    let int_ids = query_ids(
+        &conn,
+        &format!(
+            "SELECT id FROM t WHERE category = 2 ORDER BY v <-> {} LIMIT 10",
+            vec_literal(&q)
+        ),
+    );
+    let real_ids = query_ids(
+        &conn,
+        &format!(
+            "SELECT id FROM t WHERE category = 2.0 ORDER BY v <-> {} LIMIT 10",
+            vec_literal(&q)
+        ),
+    );
+    assert!(!int_ids.is_empty());
+    assert_eq!(int_ids, real_ids, "category = 2.0 must match category = 2");
+}
+
+#[test]
+fn filtered_eq_fractional_literal_matches_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    seed(&conn, 100, 5);
+    let q = vec_for(7);
+
+    let ids = query_ids(
+        &conn,
+        &format!(
+            "SELECT id FROM t WHERE category = 1.5 ORDER BY v <-> {} LIMIT 10",
+            vec_literal(&q)
+        ),
+    );
+    assert!(ids.is_empty(), "no integer category equals 1.5");
+}
+
+#[test]
+fn filtered_eq_null_returns_no_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    seed(&conn, 100, 5);
+    // Rows whose category IS NULL must not be returned by `= NULL`.
+    let v = vec_for(1001);
+    conn.execute(&format!(
+        "INSERT INTO t VALUES (1001, NULL, 0.5, {})",
+        vec_literal(&v)
+    ))
+    .unwrap();
+    let q = vec_for(7);
+
+    let ids = query_ids(
+        &conn,
+        &format!(
+            "SELECT id FROM t WHERE category = NULL ORDER BY v <-> {} LIMIT 10",
+            vec_literal(&q)
+        ),
+    );
+    assert!(ids.is_empty(), "category = NULL is never true in SQL");
+}
+
+#[test]
+fn filtered_in_mixed_numeric_literals_matches_both_arms() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    let rows = seed(&conn, 300, 5);
+    let q = vec_for(50);
+
+    // Brute-force top-20 across categories {1, 2}.
+    let mut both: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.category == 1 || r.category == 2)
+        .collect();
+    both.sort_by(|a, b| l2(&a.v, &q).partial_cmp(&l2(&b.v, &q)).unwrap());
+    let truth: Vec<i64> = both.iter().take(20).map(|r| r.id as i64).collect();
+
+    let ids = query_ids(
+        &conn,
+        &format!(
+            "SELECT id FROM t WHERE category IN (1, 2.0) ORDER BY v <-> {} LIMIT 20",
+            vec_literal(&q)
+        ),
+    );
+    assert_eq!(ids, truth, "IN (1, 2.0) must cover both categories");
+}
+
+#[test]
+fn filtered_eq_nocase_text_matches_across_cases() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, tag TEXT COLLATE NOCASE, v VECTOR(8))")
+        .unwrap();
+    let tags = ["Foo", "foo", "FOO", "bar", "fOo", "BAR"];
+    for i in 1..=60u64 {
+        let v = vec_for(i);
+        conn.execute(&format!(
+            "INSERT INTO s VALUES ({i}, '{}', {})",
+            tags[(i % 6) as usize],
+            vec_literal(&v)
+        ))
+        .unwrap();
+    }
+    conn.execute("CREATE INDEX ix_sv ON s USING ann (v) WITH (metric = 'l2', filters = 'tag')")
+        .unwrap();
+    let q = vec_for(3);
+
+    let ids = query_ids(
+        &conn,
+        &format!(
+            "SELECT id FROM s WHERE tag = 'fOO' ORDER BY v <-> {} LIMIT 60",
+            vec_literal(&q)
+        ),
+    );
+    // Every Foo-cased row (40 of 60) matches under NOCASE; no bar row does.
+    assert_eq!(ids.len(), 40, "NOCASE eq must match every casing of 'foo'");
+    for id in &ids {
+        assert_ne!(*id as u64 % 6, 3, "row {id} is 'bar'");
+        assert_ne!(*id as u64 % 6, 5, "row {id} is 'BAR'");
+    }
+}

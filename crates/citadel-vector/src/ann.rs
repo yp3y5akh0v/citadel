@@ -194,6 +194,10 @@ impl AnnIndex {
 
     /// Filtered search; `filter` dims index the `build_with_attrs` attributes
     /// (`Filter::none()` matches all).
+    ///
+    /// Distances use the same units as the SQL operators (`<->` = true L2,
+    /// `<#>` = -dot, `<=>` = 1-cos), so callers may mix them with exact-ranked
+    /// scores. PRISM reports squared L2 internally; converted here.
     pub fn search_filtered(
         &self,
         query: &[f32],
@@ -202,10 +206,14 @@ impl AnnIndex {
         filter: &Filter,
     ) -> Vec<(u64, f32)> {
         debug_assert_eq!(query.len(), self.dim as usize);
+        let sqrt_l2 = self.metric == Metric::L2;
         self.prism
             .search(query, filter, k, ef)
             .into_iter()
-            .map(|r| (self.id_map[r.id as usize], r.dist))
+            .map(|r| {
+                let dist = if sqrt_l2 { r.dist.sqrt() } else { r.dist };
+                (self.id_map[r.id as usize], dist)
+            })
             .collect()
     }
 

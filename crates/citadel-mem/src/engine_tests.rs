@@ -294,7 +294,7 @@ fn delete_atoms_removes_all_listed_ids_not_just_first() {
     );
 }
 
-// --- Per-region cryptographic erasure (crate-internal, reaches the key store) ---
+// The erasure tests live in-crate (not tests/) because they reach the key store.
 
 /// The headline adversary test: an adversary holding the passphrase (and thus the
 /// REK, key file, and full DB image) recovers a sealed atom BEFORE forget by reading
@@ -1289,6 +1289,35 @@ fn vec_distance_matches_sql_metrics() {
     let d = vec_distance(EmbeddingMetric::Cosine, &[3.0, 4.0], &[0.0, 0.0]);
     assert_eq!(d, f32::MAX);
     assert!(!d.is_nan());
+}
+
+/// `search_sealed_index` sorts AnnIndex distances together with `vec_distance`
+/// tail scores, so the two must agree unit-for-unit on every metric.
+#[test]
+fn ann_index_distances_match_vec_distance_for_all_metrics() {
+    let rows: Vec<(u64, Vec<f32>)> = vec![
+        (1, vec![1.0, 2.0, 3.0, 4.0]),
+        (2, vec![-3.0, 0.5, 2.0, -1.0]),
+        (3, vec![0.1, 0.2, 0.3, 0.4]),
+    ];
+    let q = [0.5f32, -1.0, 2.0, 0.25];
+    for m in [
+        EmbeddingMetric::L2,
+        EmbeddingMetric::InnerProduct,
+        EmbeddingMetric::Cosine,
+    ] {
+        let idx = AnnIndex::build(rows.clone(), ann_metric(m), 4).unwrap();
+        let hits = idx.search(&q, rows.len());
+        assert_eq!(hits.len(), rows.len());
+        for (rid, d) in hits {
+            let v = &rows.iter().find(|(id, _)| *id == rid).unwrap().1;
+            let exact = vec_distance(m, &q, v);
+            assert!(
+                (d - exact).abs() < 1e-4,
+                "{m:?} row {rid}: index dist {d} vs exact {exact}"
+            );
+        }
+    }
 }
 
 /// True if `needle` occurs as a contiguous window of `hay`.
