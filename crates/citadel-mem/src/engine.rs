@@ -741,10 +741,16 @@ impl MemoryEngine {
         let index = AnnIndex::build_with_attrs(triples, 1, ann_metric(h.metric), h.dim)
             .map_err(|e| MemError::Invalid(format!("sealed ANN build: {e}")))?;
 
-        // Inner plaintext: [fp 32][kind_codes][segment body]; zeroized after seal.
+        // Inner plaintext: [fp 32][config_hash 32][kind_codes][segment body];
+        // zeroized after seal.
         let body = citadel_vector::segment::encode(&index);
         let mut inner = Vec::with_capacity(body.len() + 256);
         inner.extend_from_slice(&fingerprint);
+        // Pin the PRISM config (incl. search-geometry version): a binary whose
+        // active config differs must refuse the segment and rebuild from rows.
+        inner.extend_from_slice(&citadel_vector::segment::prism_config_hash(
+            &AnnIndex::active_config(ann_metric(h.metric)),
+        ));
         inner.extend_from_slice(&(kind_codes.len() as u32).to_le_bytes());
         let mut kinds: Vec<(&String, &u32)> = kind_codes.iter().collect();
         kinds.sort_by_key(|&(_, code)| *code);
@@ -885,10 +891,17 @@ impl MemoryEngine {
             }
         };
         let parsed = parse_sealed_segment(&inner);
-        let Some((stored_fp, kind_codes, parts)) = parsed else {
+        let Some((stored_fp, stored_cfg, kind_codes, parts)) = parsed else {
             inner.zeroize();
             return heal(self, "inner parse/decode failed");
         };
+        let active_cfg = citadel_vector::segment::prism_config_hash(&AnnIndex::active_config(
+            ann_metric(h.metric),
+        ));
+        if stored_cfg != active_cfg {
+            inner.zeroize();
+            return heal(self, "prism config changed since the segment was built");
+        }
 
         // Rehydrate by decrypting live rows, placed by the id_map PERMUTATION;
         // the recall cache comes from the same decrypt pass for free.
@@ -2582,10 +2595,12 @@ fn sealed_fp_scan(
 }
 
 /// Parse the sealed segment's inner plaintext:
-/// `[fp 32][kind_count u32][(len u32, kind, code u32)*][segment body]`.
+/// `[fp 32][config_hash 32][kind_count u32][(len u32, kind, code u32)*][segment body]`.
+#[allow(clippy::type_complexity)]
 fn parse_sealed_segment(
     inner: &[u8],
 ) -> Option<(
+    [u8; 32],
     [u8; 32],
     FxHashMap<String, u32>,
     citadel_vector::segment::SegmentParts,
@@ -2598,6 +2613,7 @@ fn parse_sealed_segment(
         Some(s)
     };
     let fp: [u8; 32] = take(&mut at, 32)?.try_into().ok()?;
+    let cfg: [u8; 32] = take(&mut at, 32)?.try_into().ok()?;
     let count = u32::from_le_bytes(take(&mut at, 4)?.try_into().ok()?) as usize;
     let mut kind_codes = FxHashMap::default();
     for _ in 0..count {
@@ -2607,7 +2623,7 @@ fn parse_sealed_segment(
         kind_codes.insert(kind, code);
     }
     let parts = citadel_vector::segment::decode(&inner[at..]).ok()?;
-    Some((fp, kind_codes, parts))
+    Some((fp, cfg, kind_codes, parts))
 }
 
 fn annseg_meta_key(region_id: RegionId, field: &str) -> String {

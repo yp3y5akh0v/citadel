@@ -70,9 +70,9 @@ pub struct PrismIndex {
     pub local_graph: Graph,
     pub medoids: Vec<u32>,
     pub global_medoid: u32,
-    /// Reverse mapping: point_id → cell index.
+    /// Reverse mapping: point_id -> cell index.
     pub point_cell: Vec<u32>,
-    /// Maps internal ID → original ID.
+    /// Maps internal ID -> original ID.
     pub original_ids: Vec<u32>,
     /// Scalar-quantized vectors for distance computation.
     pub sq8: SQ8Store,
@@ -83,7 +83,7 @@ pub struct PrismIndex {
 
 impl PrismIndex {
     /// Build a PRISM index from a PointStore (Algorithm 2).
-    pub fn build(store: PointStore, config: PrismConfig) -> Self {
+    pub fn build(mut store: PointStore, config: PrismConfig) -> Self {
         let n = store.len;
         assert!(n > 0, "cannot build index from empty point store");
         assert!(
@@ -91,10 +91,23 @@ impl PrismIndex {
             "m_random must be >= 4 and even (Friedman model requires d >= 4)"
         );
 
+        // Cosine: normalize once at build so SQ8-L2 code distances are
+        // rank-equivalent to cosine (L2^2 = 2 - 2cos on unit vectors). The
+        // exact rerank is scale-invariant, so reported distances and segment
+        // rehydration from raw table rows are unaffected.
+        if config.metric == Metric::Cosine {
+            let dim = store.dim;
+            distance::normalize_rows(&mut store.vectors, dim);
+        }
+
         let tree = PartitionTree::build(&store);
         let (store, tree, original_ids) = reorder_by_cell(store, tree);
         let sq8 = SQ8Store::build(&store);
-        let binary = BinaryStore::build(&store);
+        let binary = if config.binary_rerank > 0 {
+            BinaryStore::build(&store)
+        } else {
+            BinaryStore::empty(store.dim)
+        };
 
         let mut point_cell = vec![0u32; n];
         for (ci, cell) in tree.cells.iter().enumerate() {
@@ -105,53 +118,31 @@ impl PrismIndex {
 
         // Local Vamana graphs within each cell
         let mut adj = AdjBuilder::new(n);
-        let t0 = std::time::Instant::now();
         build_local_edges(&store, &tree, &sq8, &config, &mut adj);
-        let local_edges = adj.total_edges();
-        eprintln!(
-            "  Local edges: {:.1}s, {} edges ({:.1}/node)",
-            t0.elapsed().as_secs_f64(),
-            local_edges,
-            local_edges as f64 / n as f64
-        );
 
-        let t0 = std::time::Instant::now();
         let medoids = compute_medoids(&store, &tree, config.metric);
-        eprintln!("  Medoids: {:.1}s", t0.elapsed().as_secs_f64());
 
         let local_graph = adj.snapshot();
 
-        // Greedy cross-partition edges (attribute-diverse selection)
-        let t0 = std::time::Instant::now();
-        build_greedy_cross_edges(
-            &store,
-            &tree,
-            &medoids,
-            &local_graph,
-            &sq8,
-            &point_cell,
-            &config,
-            &mut adj,
-        );
-        let cross_edges = adj.total_edges() - local_edges;
-        eprintln!(
-            "  Cross edges: {:.1}s, {} edges ({:.1}/node)",
-            t0.elapsed().as_secs_f64(),
-            cross_edges,
-            cross_edges as f64 / n as f64
-        );
+        // The global graph (cross edges + random overlay) is traversed only by
+        // REGIME_MID; when sigma_high <= sigma_low that regime is unreachable
+        // and the two most expensive construction phases would build dead edges.
+        if config.sigma_high > config.sigma_low {
+            // Greedy cross-partition edges (attribute-diverse selection)
+            build_greedy_cross_edges(
+                &store,
+                &tree,
+                &medoids,
+                &local_graph,
+                &sq8,
+                &point_cell,
+                &config,
+                &mut adj,
+            );
 
-        // Random regular overlay (Friedman permutation model)
-        let edges_before = adj.total_edges();
-        let t0 = std::time::Instant::now();
-        build_random_overlay(n, config.m_random, &mut adj);
-        let random_edges = adj.total_edges() - edges_before;
-        eprintln!(
-            "  Random overlay: {:.1}s, {} edges ({:.1}/node)",
-            t0.elapsed().as_secs_f64(),
-            random_edges,
-            random_edges as f64 / n as f64
-        );
+            // Random regular overlay (Friedman permutation model)
+            build_random_overlay(n, config.m_random, &mut adj);
+        }
 
         let graph = adj.build();
 
@@ -182,26 +173,22 @@ fn reorder_by_cell(
     let dim = store.dim;
     let k = store.k();
 
-    // Build new ordering: cell 0's points, then cell 1's, etc.
     let mut new_order: Vec<u32> = Vec::with_capacity(n);
     for cell in &tree.cells {
         new_order.extend_from_slice(&cell.point_ids);
     }
 
-    // old_to_new[old_id] = new_id
     let mut old_to_new = vec![0u32; n];
     for (new_id, &old_id) in new_order.iter().enumerate() {
         old_to_new[old_id as usize] = new_id as u32;
     }
 
-    // Reorder vectors
     let mut new_vectors = vec![0.0f32; n * dim];
     for (new_id, &old_id) in new_order.iter().enumerate() {
         let src = &store.vectors[old_id as usize * dim..(old_id as usize + 1) * dim];
         new_vectors[new_id * dim..(new_id + 1) * dim].copy_from_slice(src);
     }
 
-    // Reorder attributes
     let mut new_attrs = Vec::with_capacity(k);
     for j in 0..k {
         let mut attr_col = vec![0u32; n];
@@ -211,7 +198,6 @@ fn reorder_by_cell(
         new_attrs.push(attr_col);
     }
 
-    // Update tree cell point IDs to new IDs
     for cell in &mut tree.cells {
         for pid in &mut cell.point_ids {
             *pid = old_to_new[*pid as usize];
@@ -263,7 +249,7 @@ fn build_local_edges(
     }
 }
 
-/// Vamana construction within a single cell: SQ8 beam search + f32 pruning, two passes.
+/// Vamana construction within a single cell: code-space beam search + f32 pruning, two passes.
 fn build_vamana_cell(
     store: &PointStore,
     sq8: &SQ8Store,
@@ -277,7 +263,6 @@ fn build_vamana_cell(
     let beam = n.min(config.beam_width);
     let alpha = config.vamana_alpha;
 
-    // Random initial graph
     let actual_r = r.min(n - 1);
     let mut graph: Vec<Vec<usize>> = (0..n)
         .map(|i| {
@@ -292,7 +277,6 @@ fn build_vamana_cell(
         })
         .collect();
 
-    // Medoid as entry point
     let dim = store.dim;
     let mut centroid = vec![0.0f32; dim];
     for &p in pts {
@@ -318,9 +302,9 @@ fn build_vamana_cell(
         order.shuffle(rng);
 
         for &i in &order {
-            let search_results = vamana_search_sq8(sq8, pts, &graph, entry, pts[i], beam);
+            let search_results =
+                vamana_search_code(store, sq8, config.metric, pts, &graph, entry, pts[i], beam);
 
-            // Union search results with current neighbors
             let mut candidates = search_results;
             for &nb in &graph[i] {
                 if !candidates.contains(&nb) {
@@ -330,7 +314,6 @@ fn build_vamana_cell(
 
             graph[i] = robust_prune(store, pts, i, &candidates, alpha, r, config.metric);
 
-            // Reverse edges
             let new_neighbors: Vec<usize> = graph[i].clone();
             for &j in &new_neighbors {
                 if !graph[j].contains(&i) {
@@ -351,9 +334,27 @@ fn build_vamana_cell(
     }
 }
 
-/// SQ8 beam search within a cell's local graph. Returns visited local indices.
-fn vamana_search_sq8(
+/// Heap-ordered candidate distance between two stored points. L2 and
+/// (build-normalized) Cosine rank by SQ8 codes; InnerProduct cannot be ranked
+/// in code-space L2, so it uses the exact f32 metric via a total-order key.
+#[inline]
+fn build_cand_dist(store: &PointStore, sq8: &SQ8Store, metric: Metric, a: u32, b: u32) -> u32 {
+    match metric {
+        Metric::L2 | Metric::Cosine => distance::l2_sq8(sq8.code(a), sq8.code(b)),
+        Metric::InnerProduct => distance::ord_key(distance::distance(
+            store.vector(a),
+            store.vector(b),
+            Metric::InnerProduct,
+        )),
+    }
+}
+
+/// Code-space beam search within a cell's local graph. Returns visited local indices.
+#[allow(clippy::too_many_arguments)]
+fn vamana_search_code(
+    store: &PointStore,
     sq8: &SQ8Store,
+    metric: Metric,
     pts: &[u32],
     graph: &[Vec<usize>],
     entry: usize,
@@ -363,12 +364,11 @@ fn vamana_search_sq8(
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
-    let q_code = sq8.code(query_id);
     let mut visited = vec![false; pts.len()];
     let mut candidates: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
     let mut results: BinaryHeap<(u32, usize)> = BinaryHeap::new();
 
-    let d = distance::l2_sq8(q_code, sq8.code(pts[entry]));
+    let d = build_cand_dist(store, sq8, metric, query_id, pts[entry]);
     visited[entry] = true;
     candidates.push(Reverse((d, entry)));
     results.push((d, entry));
@@ -387,7 +387,7 @@ fn vamana_search_sq8(
                 continue;
             }
             visited[w] = true;
-            let wd = distance::l2_sq8(q_code, sq8.code(pts[w]));
+            let wd = build_cand_dist(store, sq8, metric, query_id, pts[w]);
             candidates.push(Reverse((wd, w)));
             results.push((wd, w));
             if results.len() > beam {
@@ -399,7 +399,7 @@ fn vamana_search_sq8(
     results.into_iter().map(|(_, idx)| idx).collect()
 }
 
-/// Robust prune: rejects c if dist(c, selected) < α·dist(p, c).
+/// Robust prune: rejects c if alpha * dist(c, selected) <= dist(p, c).
 fn robust_prune(
     store: &PointStore,
     pts: &[u32],
@@ -452,7 +452,9 @@ fn build_greedy_cross_edges(
     let t = config.t.min(k);
     let beam = config.beam_width;
     let subsets = t_subsets(k, t);
-    let use_sq8 = config.metric == Metric::L2;
+    // SQ8-L2 candidate ranking is rank-faithful for L2 and for Cosine (vectors
+    // are build-normalized); InnerProduct falls back to exact full-cell scans.
+    let use_sq8 = config.metric != Metric::InnerProduct;
 
     let point_edges: Vec<Vec<u32>> = (0..n as u32)
         .into_par_iter()
@@ -460,7 +462,6 @@ fn build_greedy_cross_edges(
             let p_cell_idx = point_cell[p_id as usize];
             let p_vec = store.vector(p_id);
 
-            // Rank cells by SQ8 medoid distance
             let p_code = sq8.code(p_id);
             let mut cell_dists: Vec<(usize, u32)> = tree
                 .cells
@@ -474,7 +475,6 @@ fn build_greedy_cross_edges(
                 .collect();
             cell_dists.sort_unstable_by_key(|&(_, d)| d);
 
-            // Beam search closest cells for candidates
             let mut all_cand_ids: Vec<u32> = Vec::with_capacity(beam);
             for &(ci, _) in &cell_dists {
                 let cell_size = tree.cells[ci].point_ids.len();
@@ -505,7 +505,6 @@ fn build_greedy_cross_edges(
                 }
             }
 
-            // F32 rerank
             let mut candidates: Vec<(u32, f32)> = all_cand_ids
                 .iter()
                 .map(|&id| {
@@ -702,7 +701,6 @@ pub(crate) fn build_random_overlay(n: usize, m_random: usize, adj: &mut AdjBuild
     let half = m_random / 2;
 
     for _ in 0..half {
-        // Random permutation
         let mut perm: Vec<u32> = (0..n as u32).collect();
         perm.shuffle(&mut rng);
         for (i, &j) in perm.iter().enumerate() {
@@ -723,7 +721,6 @@ fn compute_medoids(store: &PointStore, tree: &PartitionTree, metric: Metric) -> 
             if pts.len() == 1 {
                 return pts[0];
             }
-            // Compute centroid
             let mut centroid = vec![0.0f32; dim];
             for &p in pts {
                 let v = store.vector(p);
@@ -735,7 +732,6 @@ fn compute_medoids(store: &PointStore, tree: &PartitionTree, metric: Metric) -> 
             for c in &mut centroid {
                 *c *= inv_n;
             }
-            // Return point closest to centroid
             *pts.iter()
                 .min_by(|&&a, &&b| {
                     let da = distance::distance(&centroid, store.vector(a), metric);
@@ -779,7 +775,7 @@ mod tests {
     #[test]
     fn test_build_small() {
         let mut store = PointStore::new(2, 2);
-        // 4 points, 2 attributes with 2 values each → 4 cells
+        // 4 points, 2 attributes with 2 values each = 4 cells.
         store.push(&[0.0, 0.0], &[0, 0]);
         store.push(&[1.0, 0.0], &[0, 1]);
         store.push(&[0.0, 1.0], &[1, 0]);

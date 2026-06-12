@@ -48,12 +48,7 @@ impl BinaryStore {
         let dim = store.dim;
         let code_words = dim.div_ceil(64);
         let block_size = largest_pow2_factor(dim);
-
-        use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0x505249534D);
-        let signs: Vec<f32> = (0..dim)
-            .map(|_| if rng.gen_bool(0.5) { 1.0 } else { -1.0 })
-            .collect();
+        let signs = seeded_signs(dim);
 
         let mut codes = vec![0u64; n * code_words];
         codes
@@ -68,6 +63,19 @@ impl BinaryStore {
             code_words,
             signs,
             block_size,
+        }
+    }
+
+    /// A store with signs but no codes, for configs that never consult the
+    /// binary pre-filter (`binary_rerank == 0`). `encode_query` stays valid;
+    /// `code()` must not be reached (every caller is gated on the rerank
+    /// factor), so the per-point encoding pass and its memory are skipped.
+    pub fn empty(dim: usize) -> Self {
+        Self {
+            codes: Vec::new(),
+            code_words: dim.div_ceil(64),
+            signs: seeded_signs(dim),
+            block_size: largest_pow2_factor(dim),
         }
     }
 
@@ -90,6 +98,15 @@ impl BinaryStore {
         encode_vector(query, &self.signs, self.block_size, &mut code);
         code
     }
+}
+
+/// Seed-fixed random sign flips shared by build and query encoding.
+fn seeded_signs(dim: usize) -> Vec<f32> {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x505249534D);
+    (0..dim)
+        .map(|_| if rng.gen_bool(0.5) { 1.0 } else { -1.0 })
+        .collect()
 }
 
 /// Apply HD rotation (sign flip + WHT) and extract signs into packed u64 code.

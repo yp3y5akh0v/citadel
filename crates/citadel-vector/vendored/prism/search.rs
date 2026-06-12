@@ -112,6 +112,17 @@ impl PrismIndex {
     pub fn search(&self, query: &[f32], filter: &Filter, k: usize, ef: usize) -> Vec<SearchResult> {
         assert_eq!(query.len(), self.store.dim);
 
+        // Match the build-time Cosine normalization so code-space distances
+        // stay rank-faithful. Reported distances are unchanged (cosine is
+        // scale-invariant in both arguments).
+        let normalized;
+        let query = if self.config.metric == distance::Metric::Cosine {
+            normalized = distance::normalized(query);
+            normalized.as_slice()
+        } else {
+            query
+        };
+
         let cell_indices = self.tree.filter_cells(filter.constraints());
         let n_f = self.tree.count_points(&cell_indices);
         let sigma = n_f as f32 / self.store.len as f32;
@@ -121,6 +132,24 @@ impl PrismIndex {
             self.regime_mid(query, &cell_indices, k, ef)
         } else {
             self.regime_low(query, filter, &cell_indices, k)
+        }
+    }
+
+    /// Heap-ordered candidate distance from the query to point `p`. L2 and
+    /// (build-normalized) Cosine rank by SQ8 codes; InnerProduct cannot be
+    /// ranked in code-space L2, so it ranks by the exact f32 metric mapped to
+    /// a total-order key (mirrors the construct-side `use_sq8` gate).
+    #[inline]
+    fn cand_dist(&self, query: &[f32], q_code: &[u8], p: u32) -> u32 {
+        match self.config.metric {
+            distance::Metric::L2 | distance::Metric::Cosine => {
+                distance::l2_sq8(q_code, self.sq8.code(p))
+            }
+            distance::Metric::InnerProduct => distance::ord_key(distance::distance(
+                query,
+                self.store.vector(p),
+                distance::Metric::InnerProduct,
+            )),
         }
     }
 
@@ -138,11 +167,15 @@ impl PrismIndex {
         }
 
         let q_code = self.sq8.quantize_query(query);
-        let q_binary = self.binary.encode_query(query);
+        let q_binary = if self.config.binary_rerank > 0 {
+            self.binary.encode_query(query)
+        } else {
+            Vec::new()
+        };
         let mut merged: BinaryHeap<(u32, u32)> = BinaryHeap::new();
 
         if cell_indices.len() == self.tree.cells.len() {
-            // All cells match: binary pre-filter → SQ8 rerank over entire index.
+            // All cells match: binary pre-filter -> code-space rerank over entire index.
             let n = self.store.len as u32;
             let rerank_budget = self.config.binary_rerank * ef;
             if self.config.binary_rerank > 0 && (n as usize) > rerank_budget {
@@ -152,21 +185,21 @@ impl PrismIndex {
                     heap_insert_sq8(&mut binary_heap, hd, p, rerank_budget);
                 }
                 for (_, p) in binary_heap {
-                    let dist = distance::l2_sq8(&q_code, self.sq8.code(p));
+                    let dist = self.cand_dist(query, &q_code, p);
                     heap_insert_sq8(&mut merged, dist, p, ef);
                 }
             } else {
                 for p in 0..n {
-                    let dist = distance::l2_sq8(&q_code, self.sq8.code(p));
+                    let dist = self.cand_dist(query, &q_code, p);
                     heap_insert_sq8(&mut merged, dist, p, ef);
                 }
             }
         } else {
-            // Rank cells by SQ8 medoid distance
+            // Visit cells nearest-medoid-first so the ef heap tightens early.
             let mut ranked: Vec<(usize, u32)> = cell_indices
                 .iter()
                 .map(|&ci| {
-                    let d = distance::l2_sq8(&q_code, self.sq8.code(self.medoids[ci]));
+                    let d = self.cand_dist(query, &q_code, self.medoids[ci]);
                     (ci, d)
                 })
                 .collect();
@@ -175,14 +208,13 @@ impl PrismIndex {
             let scan_threshold = (ef * self.config.m_local).max(2000);
 
             for &(ci, _) in &ranked {
-                let cands = self.search_cell(&q_code, &q_binary, ci, ef, scan_threshold);
-                for (sq8_dist, id) in cands {
-                    heap_insert_sq8(&mut merged, sq8_dist, id, ef);
+                let cands = self.search_cell(query, &q_code, &q_binary, ci, ef, scan_threshold);
+                for (cand_dist, id) in cands {
+                    heap_insert_sq8(&mut merged, cand_dist, id, ef);
                 }
             }
         }
 
-        // F32 rerank → top-k
         let mut results: Vec<SearchResult> = merged
             .into_iter()
             .map(|(_, id)| SearchResult {
@@ -196,7 +228,7 @@ impl PrismIndex {
     }
 
     /// Bridge routing for medium selectivity. Traverses full graph, using
-    /// non-matching nodes as bridges when bridge score > τ. SQ8 traversal, f32 rerank.
+    /// non-matching nodes as bridges when bridge score > tau. SQ8 traversal, f32 rerank.
     fn regime_mid(
         &self,
         query: &[f32],
@@ -210,24 +242,22 @@ impl PrismIndex {
 
         let q_code = self.sq8.quantize_query(query);
 
-        // Cell compatibility lookup
         let n_cells = self.tree.cells.len();
         let mut cell_match = vec![false; n_cells];
         for &ci in compatible_cells {
             cell_match[ci] = true;
         }
 
-        // Entry: closest compatible medoid
         let (_, entry) = compatible_cells
             .iter()
             .map(|&ci| {
-                let d = distance::l2_sq8(&q_code, self.sq8.code(self.medoids[ci]));
+                let d = self.cand_dist(query, &q_code, self.medoids[ci]);
                 (d, self.medoids[ci])
             })
             .min_by_key(|&(d, _)| d)
             .unwrap();
 
-        let entry_dist = distance::l2_sq8(&q_code, self.sq8.code(entry));
+        let entry_dist = self.cand_dist(query, &q_code, entry);
 
         let mut visited = Bitset::new(self.store.len);
         visited.insert(entry);
@@ -242,7 +272,7 @@ impl PrismIndex {
         let mut bridges_used = 0usize;
         let epsilon_factor = ((1.0 + self.config.epsilon) * (1.0 + self.config.epsilon)) as f64;
 
-        // Bridge threshold τ = σ/(1+σ) where σ = selectivity
+        // Bridge threshold tau = sigma / (1 + sigma), sigma = selectivity.
         let n_f: usize = compatible_cells
             .iter()
             .map(|&ci| self.tree.cells[ci].point_ids.len())
@@ -251,7 +281,6 @@ impl PrismIndex {
         let tau = sigma / (1.0 + sigma);
 
         while let Some(Reverse((d, c))) = candidates.pop() {
-            // Early termination
             if results.len() >= ef {
                 if let Some(&(worst, _)) = results.peek() {
                     if (d as f64) > (worst as f64) * epsilon_factor {
@@ -264,7 +293,6 @@ impl PrismIndex {
                 break;
             }
 
-            // Explore neighbors
             let neighbors = self.graph.neighbors(c);
             let sq8_dim = self.store.dim;
 
@@ -277,15 +305,13 @@ impl PrismIndex {
             }
 
             for &w in &unvisited_buf {
-                let wd = distance::l2_sq8(&q_code, self.sq8.code(w));
+                let wd = self.cand_dist(query, &q_code, w);
                 let w_cell = self.point_cell[w as usize];
 
                 if cell_match[w_cell as usize] {
-                    // Matching node
                     heap_insert_sq8(&mut results, wd, w, ef);
                     candidates.push(Reverse((wd, w)));
                 } else {
-                    // Bridge routing
                     let w_neighbors = self.graph.neighbors(w);
                     if !w_neighbors.is_empty() {
                         let matching_unvisited = w_neighbors
@@ -297,7 +323,7 @@ impl PrismIndex {
                             .count();
                         let fraction = matching_unvisited as f32 / w_neighbors.len() as f32;
 
-                        // Bridge score: matching fraction × proximity
+                        // Bridge score: matching fraction x proximity.
                         let r = results.peek().map_or(1.0f32, |&(worst, _)| worst as f32);
                         let bridge_score = fraction / (1.0 + wd as f32 / r.max(1.0));
 
@@ -310,7 +336,6 @@ impl PrismIndex {
             }
         }
 
-        // F32 rerank → top-k
         let mut final_results: Vec<SearchResult> = results
             .into_iter()
             .map(|(_, id)| SearchResult {
@@ -323,14 +348,20 @@ impl PrismIndex {
         final_results
     }
 
-    /// SQ8 beam search within a cell's local graph. Returns (id, sq8_dist) pairs.
-    fn greedy_search_cell_sq8(&self, q_code: &[u8], cell_idx: usize, ef: usize) -> Vec<(u32, u32)> {
+    /// Code-space beam search within a cell's local graph. Returns (id, cand_dist) pairs.
+    fn greedy_search_cell_sq8(
+        &self,
+        query: &[f32],
+        q_code: &[u8],
+        cell_idx: usize,
+        ef: usize,
+    ) -> Vec<(u32, u32)> {
         let pts = &self.tree.cells[cell_idx].point_ids;
         let base = pts[0];
         let sq8_dim = self.store.dim;
 
         let entry = self.medoids[cell_idx];
-        let entry_dist = distance::l2_sq8(q_code, self.sq8.code(entry));
+        let entry_dist = self.cand_dist(query, q_code, entry);
 
         let mut visited = Bitset::new(pts.len());
         visited.insert(entry - base);
@@ -360,7 +391,7 @@ impl PrismIndex {
             }
 
             for &w in &unvisited {
-                let wd = distance::l2_sq8(q_code, self.sq8.code(w));
+                let wd = self.cand_dist(query, q_code, w);
                 if results.len() < ef {
                     candidates.push(Reverse((wd, w)));
                     results.push((wd, w));
@@ -381,7 +412,7 @@ impl PrismIndex {
             .collect()
     }
 
-    /// REGIME_LOW — brute-force within compatible cells for very selective filters.
+    /// REGIME_LOW: brute-force within compatible cells for very selective filters.
     fn regime_low(
         &self,
         query: &[f32],
@@ -413,7 +444,7 @@ impl PrismIndex {
         results
     }
 
-    /// MQCB (Multi-Query Cell Batching) — groups queries by target cell so
+    /// MQCB (Multi-Query Cell Batching): groups queries by target cell so
     /// cell data stays warm in L3 across queries. Cells processed in parallel,
     /// queries within each cell sequentially.
     pub fn batch_search(
@@ -428,19 +459,32 @@ impl PrismIndex {
         let n_cells = self.tree.cells.len();
         let scan_threshold = (ef * self.config.m_local).max(2000);
 
-        // Precompute query codes and matching cells
+        // Match the build-time Cosine normalization (see `search`).
+        let normalized;
+        let queries = if self.config.metric == distance::Metric::Cosine {
+            let mut buf = queries.to_vec();
+            distance::normalize_rows(&mut buf, dim);
+            normalized = buf;
+            normalized.as_slice()
+        } else {
+            queries
+        };
+
         let query_info: Vec<(Vec<u8>, Vec<u64>, Vec<usize>)> = (0..nq)
             .into_par_iter()
             .map(|qi| {
                 let q = &queries[qi * dim..(qi + 1) * dim];
                 let q_code = self.sq8.quantize_query(q);
-                let q_binary = self.binary.encode_query(q);
+                let q_binary = if self.config.binary_rerank > 0 {
+                    self.binary.encode_query(q)
+                } else {
+                    Vec::new()
+                };
                 let cells = self.tree.filter_cells(filters[qi].constraints());
                 (q_code, q_binary, cells)
             })
             .collect();
 
-        // Classify queries by regime
         let mut high_regime: Vec<usize> = Vec::with_capacity(nq);
         let mut mid_regime: Vec<usize> = Vec::new();
         let mut low_regime: Vec<usize> = Vec::new();
@@ -465,7 +509,6 @@ impl PrismIndex {
             }
         }
 
-        // Group HIGH-regime queries by cell for MQCB
         let mut cell_queries: Vec<Vec<usize>> = vec![Vec::new(); n_cells];
         for &qi in &high_regime {
             for &ci in &query_info[qi].2 {
@@ -473,7 +516,8 @@ impl PrismIndex {
             }
         }
 
-        // MQCB: cells in parallel, queries within each cell sequentially (cache warmth)
+        // Cells in parallel, queries within each cell sequentially: cell data
+        // stays warm in cache across queries.
         #[allow(clippy::type_complexity)]
         let cell_results: Vec<Vec<(usize, Vec<(u32, u32)>)>> = cell_queries
             .into_par_iter()
@@ -482,16 +526,16 @@ impl PrismIndex {
             .map(|(ci, qs)| {
                 qs.iter()
                     .map(|&qi| {
+                        let q = &queries[qi * dim..(qi + 1) * dim];
                         let q_code = &query_info[qi].0;
                         let q_binary = &query_info[qi].1;
-                        let cands = self.search_cell(q_code, q_binary, ci, ef, scan_threshold);
+                        let cands = self.search_cell(q, q_code, q_binary, ci, ef, scan_threshold);
                         (qi, cands)
                     })
                     .collect()
             })
             .collect();
 
-        // Merge cell results into per-query SQ8 heaps
         let mut query_heaps: Vec<BinaryHeap<(u32, u32)>> =
             (0..nq).map(|_| BinaryHeap::new()).collect();
         for cell_batch in cell_results {
@@ -502,10 +546,10 @@ impl PrismIndex {
             }
         }
 
-        // Unfiltered queries: binary pre-filter → SQ8 rerank
         let unfilt_heaps: Vec<(usize, BinaryHeap<(u32, u32)>)> = unfiltered
             .par_iter()
             .map(|&qi| {
+                let q = &queries[qi * dim..(qi + 1) * dim];
                 let q_code = &query_info[qi].0;
                 let q_binary = &query_info[qi].1;
                 let n = self.store.len as u32;
@@ -518,12 +562,12 @@ impl PrismIndex {
                         heap_insert_sq8(&mut binary_heap, hd, p, rerank_budget);
                     }
                     for (_, p) in binary_heap {
-                        let dist = distance::l2_sq8(q_code, self.sq8.code(p));
+                        let dist = self.cand_dist(q, q_code, p);
                         heap_insert_sq8(&mut heap, dist, p, ef);
                     }
                 } else {
                     for p in 0..n {
-                        let dist = distance::l2_sq8(q_code, self.sq8.code(p));
+                        let dist = self.cand_dist(q, q_code, p);
                         heap_insert_sq8(&mut heap, dist, p, ef);
                     }
                 }
@@ -534,7 +578,6 @@ impl PrismIndex {
             query_heaps[qi] = heap;
         }
 
-        // F32 rerank
         let mut all_results: Vec<Vec<SearchResult>> = query_heaps
             .into_par_iter()
             .enumerate()
@@ -556,7 +599,6 @@ impl PrismIndex {
             })
             .collect();
 
-        // MID-regime queries (bridge routing)
         if !mid_regime.is_empty() {
             let mid_results: Vec<(usize, Vec<SearchResult>)> = mid_regime
                 .par_iter()
@@ -572,7 +614,6 @@ impl PrismIndex {
             }
         }
 
-        // LOW-regime queries (brute-force)
         if !low_regime.is_empty() {
             let low_results: Vec<(usize, Vec<SearchResult>)> = low_regime
                 .par_iter()
@@ -590,10 +631,12 @@ impl PrismIndex {
         all_results
     }
 
-    /// Search a single cell. Small cells: SQ8 scan (with optional binary pre-filter).
-    /// Large cells: graph search with adaptive ef. Returns (sq8_dist, point_id) pairs.
+    /// Search a single cell. Small cells: code-space scan (with optional binary
+    /// pre-filter). Large cells: graph search with adaptive ef. Returns
+    /// (cand_dist, point_id) pairs.
     fn search_cell(
         &self,
+        query: &[f32],
         q_code: &[u8],
         q_binary: &[u64],
         cell_idx: usize,
@@ -608,7 +651,6 @@ impl PrismIndex {
             let rerank_budget = self.config.binary_rerank * ef;
 
             if self.config.binary_rerank > 0 && pts.len() > rerank_budget {
-                // Binary Hamming pre-filter → SQ8 rerank
                 let mut binary_heap: BinaryHeap<(u32, u32)> = BinaryHeap::new();
                 for i in 0..pts.len() {
                     let p = base + i as u32;
@@ -616,21 +658,20 @@ impl PrismIndex {
                     heap_insert_sq8(&mut binary_heap, hd, p, rerank_budget);
                 }
                 for (_, p) in binary_heap {
-                    let dist = distance::l2_sq8(q_code, self.sq8.code(p));
+                    let dist = self.cand_dist(query, q_code, p);
                     heap_insert_sq8(&mut heap, dist, p, ef);
                 }
             } else {
-                // Pure SQ8 scan (small cell or binary pre-filter disabled)
                 for i in 0..pts.len() {
                     let p = base + i as u32;
-                    let dist = distance::l2_sq8(q_code, self.sq8.code(p));
+                    let dist = self.cand_dist(query, q_code, p);
                     heap_insert_sq8(&mut heap, dist, p, ef);
                 }
             }
         } else {
-            // Adaptive ef: scale graph search budget for large cells
+            // Scale the graph-search budget with cell size, capped at 5x ef.
             let ef_cell = ef.max((pts.len() / 200).min(ef * 5));
-            let local = self.greedy_search_cell_sq8(q_code, cell_idx, ef_cell);
+            let local = self.greedy_search_cell_sq8(query, q_code, cell_idx, ef_cell);
             for (id, dist) in local {
                 heap_insert_sq8(&mut heap, dist, id, ef);
             }
@@ -643,6 +684,7 @@ impl PrismIndex {
 #[cfg(test)]
 mod tests {
     use super::super::construct::{PrismConfig, PrismIndex};
+    use super::super::distance;
     use super::super::filter::Filter;
     use super::super::point::PointStore;
 
@@ -732,9 +774,8 @@ mod tests {
 
     #[test]
     fn test_regime_mid_bridge_routing() {
-        // Build an index where mid-selectivity queries hit REGIME_MID.
-        // 20 attribute values × 100 points/value = 2000 points.
-        // sigma_high=0.10, each value is 5% selectivity → routes through MID.
+        // 20 attribute values x 100 points/value = 2000 points; sigma_high=0.10,
+        // each value is 5% selectivity, so single-value filters route to MID.
         let dim = 16;
         let n = 2000;
         let n_vals = 20;
@@ -757,7 +798,7 @@ mod tests {
         };
         let index = PrismIndex::build(store, config);
 
-        // Filter for value 0 → 100 out of 2000 points = 5% selectivity → MID regime
+        // Value 0 matches 100 of 2000 points = 5% selectivity = MID regime.
         let query: Vec<f32> = (0..dim).map(|d| (d as f32 * 0.3).sin()).collect();
         let filter = Filter::eq(0, 0);
         let k = 5;
@@ -776,7 +817,6 @@ mod tests {
 
     #[test]
     fn test_batch_search_mixed_regimes() {
-        // Test batch_search with queries spanning multiple regimes.
         let dim = 8;
         let n = 1000;
         let n_vals = 10;
@@ -801,9 +841,8 @@ mod tests {
         let ef = 20;
         let nq = 3;
 
-        // Query 0: unfiltered (sigma=1.0 → HIGH)
-        // Query 1: filter for value 0 (10% → MID regime)
-        // Query 2: filter for value 5 (10% → MID regime)
+        // Query 0: unfiltered (sigma=1.0, HIGH); queries 1 and 2: single-value
+        // filters (10% selectivity, MID).
         let queries: Vec<f32> = (0..nq)
             .flat_map(|qi| (0..dim).map(move |d| ((qi * dim + d) as f32 * 0.5).sin()))
             .collect();
@@ -821,9 +860,69 @@ mod tests {
     }
 
     #[test]
+    fn inner_product_candidates_survive_l2_blind_spot() {
+        // 59 decoys hug the query in L2 with tiny dot products; one high-norm
+        // point is the true IP winner but the L2-farthest point in the set. An
+        // SQ8-L2 candidate heap (ef < n) would evict it before the rerank.
+        let mut store = PointStore::new(2, 1);
+        for i in 0..59 {
+            let j = (i as f32) * 0.001;
+            store.push(&[0.5 + j, j], &[0]);
+        }
+        store.push(&[20.0, 0.0], &[0]);
+        let config = PrismConfig {
+            m_local: 4,
+            m_greedy: 2,
+            m_random: 4,
+            t: 1,
+            beam_width: 10,
+            metric: distance::Metric::InnerProduct,
+            binary_rerank: 0,
+            ..Default::default()
+        };
+        let index = PrismIndex::build(store, config);
+
+        let results = index.search(&[1.0, 0.0], &Filter::none(), 1, 8);
+        assert_eq!(results[0].id, 59, "true IP winner must reach the rerank");
+        assert!((results[0].dist - (-20.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn cosine_candidates_survive_unnormalized_inputs() {
+        // Unnormalized data: the best-angle point has a huge norm (L2-farthest
+        // from the raw query) and would be evicted from a raw SQ8-L2 candidate
+        // heap; build-time normalization keeps code distances angle-faithful.
+        let mut store = PointStore::new(2, 1);
+        for i in 0..59 {
+            let j = (i as f32) * 0.001;
+            store.push(&[j, 1.0 + j], &[0]);
+        }
+        store.push(&[50.0, 1.0], &[0]);
+        let config = PrismConfig {
+            m_local: 4,
+            m_greedy: 2,
+            m_random: 4,
+            t: 1,
+            beam_width: 10,
+            metric: distance::Metric::Cosine,
+            binary_rerank: 0,
+            ..Default::default()
+        };
+        let index = PrismIndex::build(store, config);
+
+        let results = index.search(&[3.0, 0.0], &Filter::none(), 1, 8);
+        assert_eq!(results[0].id, 59, "best-angle point must reach the rerank");
+        assert!(
+            results[0].dist < 0.01,
+            "dist {} is not ~1-cos",
+            results[0].dist
+        );
+    }
+
+    #[test]
     fn test_binary_prefilter_recall() {
-        // Compare binary pre-filter (binary_rerank=4) vs pure SQ8 (binary_rerank=0).
-        // Results should be comparable — binary pre-filter is an approximation.
+        // The binary pre-filter is an approximation; results stay valid and
+        // ordered, just not necessarily identical to the pure SQ8 path.
         let dim = 64;
         let n = 2000;
         let n_vals = 10;
@@ -835,7 +934,6 @@ mod tests {
             store.push(&vec, &[(i % n_vals) as u32]);
         }
 
-        // Build with binary_rerank=4 (pre-filter enabled)
         let config_binary = PrismConfig {
             m_local: 4,
             m_greedy: 2,
@@ -865,7 +963,6 @@ mod tests {
 
     #[test]
     fn test_binary_prefilter_batch() {
-        // Verify batch_search works with binary pre-filter enabled.
         let dim = 32;
         let n = 500;
         let n_vals = 5;

@@ -479,7 +479,7 @@ fn sealed_multi_chunk_segment_roundtrips() {
     let dir = tempfile::tempdir().unwrap();
     let eng = open_engine(dir.path(), true);
     eng.create_encrypted_region("vault", embedder()).unwrap();
-    let inputs: Vec<citadel_mem::AtomInput> = (0..16000)
+    let inputs: Vec<citadel_mem::AtomInput> = (0..40000)
         .map(|i| citadel_mem::AtomInput::new("fact", format!("padded note {i} {}", "x".repeat(40))))
         .collect();
     eng.remember_batch("vault", inputs).unwrap();

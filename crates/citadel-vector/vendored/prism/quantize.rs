@@ -79,14 +79,18 @@ impl SQ8Store {
 
         // Percentile-clipped quantization (p0.5..p99.5).
         let sample_n = n.min(10_000);
-        let step = (n / sample_n).max(1);
 
         let (mins, maxs) = if sample_n >= 200 {
             let mut mins = vec![0.0f32; dim];
             let mut maxs = vec![0.0f32; dim];
             for d in 0..dim {
+                // Spread ids across the full range (a floored stride covers
+                // only a prefix when n is not a multiple of sample_n).
                 let mut sample: Vec<f32> = (0..sample_n)
-                    .map(|s| store.vector(((s * step).min(n - 1)) as u32)[d])
+                    .map(|s| {
+                        let idx = ((s as u64 * n as u64) / sample_n as u64) as usize;
+                        store.vector(idx.min(n - 1) as u32)[d]
+                    })
                     .collect();
                 sample.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
                 let lo = sample_n / 200;
@@ -207,6 +211,30 @@ mod tests {
         let sq8 = SQ8Store::build(&store);
         assert_eq!(sq8.code(0), &[0, 0]);
         assert_eq!(sq8.code(1), &[255, 255]);
+    }
+
+    #[test]
+    fn test_sq8_sampling_covers_tail_when_n_not_multiple_of_sample() {
+        // n = 12,500 (> 10k sample cap, not a multiple of it): the first 10k
+        // points sit in [0, 1], the last 2.5k at 100.5. A prefix-only sample
+        // would estimate the range from the old points alone.
+        let n = 12_500;
+        let mut vectors = Vec::with_capacity(n);
+        for i in 0..n {
+            if i < 10_000 {
+                vectors.push((i % 100) as f32 / 100.0 + 0.25);
+            } else {
+                vectors.push(100.5);
+            }
+        }
+        let store = PointStore::from_parts(vectors, 1, vec![vec![0; n]]);
+        let sq8 = SQ8Store::build(&store);
+        assert!(
+            sq8.scales[0] > 0.3,
+            "scale {} must reflect the tail range ~[0,100], not the prefix [0,1]",
+            sq8.scales[0]
+        );
+        assert_eq!(sq8.code((n - 1) as u32)[0], 255);
     }
 
     #[test]

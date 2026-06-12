@@ -14,6 +14,7 @@ use rustc_hash::FxHashMap;
 
 use crate::encoding::{
     decode_column_raw, decode_pk_integer, encode_int_key_into, encode_key_value,
+    encode_key_value_collated_into,
 };
 use crate::error::{Result, SqlError};
 use crate::eval::{eval_expr, is_truthy, ColumnMap, EvalCtx};
@@ -280,13 +281,18 @@ impl AnnTopKPlan {
         stmt: &SelectStmt,
         table_schema: &TableSchema,
     ) -> Result<ExecutionResult> {
-        // Map values to codes; a value absent from the dictionary matches no row.
+        // Map values to codes via the same collation-canonical encoding the
+        // dictionary was built with; a value absent from it matches no row.
         let mut constraints: Vec<(usize, Vec<u32>)> = Vec::with_capacity(self.pushable.len());
         for (dim, values) in &self.pushable {
             let dict = &cached.dicts[*dim];
+            let coll = table_schema.columns[self.filter_cols[*dim] as usize].collation;
             let mut codes = Vec::with_capacity(values.len());
+            let mut canon = Vec::with_capacity(16);
             for v in values {
-                if let Some(&code) = dict.get(encode_key_value(v).as_slice()) {
+                canon.clear();
+                encode_key_value_collated_into(v, coll, &mut canon);
+                if let Some(&code) = dict.get(canon.as_slice()) {
                     codes.push(code);
                 }
             }
@@ -432,6 +438,15 @@ fn scan_rows(
         .iter()
         .map(|&c| extract_plan(c, table_schema, non_pk, enc_pos))
         .collect::<Result<_>>()?;
+    // Dictionary keys are COLLATION-CANONICAL so collation-equal stored values
+    // share one attr code (matching the eval path's equality); the fingerprint
+    // keeps raw encodings so content edits between collation-equal values are
+    // still detected.
+    let collations: Vec<Collation> = spec
+        .filter_cols
+        .iter()
+        .map(|&c| table_schema.columns[c as usize].collation)
+        .collect();
     let mut dicts: Vec<FxHashMap<Vec<u8>, u32>> = vec![FxHashMap::default(); num_attrs];
     let mut fp = ann_persist::FingerprintHasher::new(
         &table_schema.name,
@@ -456,10 +471,11 @@ fn scan_rows(
                 ))
             }
         };
-        let mut encoded_filters: Vec<Vec<u8>> = Vec::with_capacity(num_attrs);
+        let mut filter_vals: Vec<Value> = Vec::with_capacity(num_attrs);
         for ex in &extracts {
-            encoded_filters.push(encode_key_value(&ex.extract(key, value)?));
+            filter_vals.push(ex.extract(key, value)?);
         }
+        let encoded_filters: Vec<Vec<u8>> = filter_vals.iter().map(encode_key_value).collect();
         let vec_bytes: Vec<u8> = vector
             .as_deref()
             .unwrap_or(&[])
@@ -479,9 +495,11 @@ fn scan_rows(
         };
         let id = decode_pk_integer(key)? as u64;
         let mut codes: Vec<u32> = Vec::with_capacity(num_attrs);
-        for (j, encoded) in encoded_filters.into_iter().enumerate() {
+        for (j, v) in filter_vals.iter().enumerate() {
+            let mut canon = Vec::with_capacity(16);
+            encode_key_value_collated_into(v, collations[j], &mut canon);
             let next = dicts[j].len() as u32;
-            codes.push(*dicts[j].entry(encoded).or_insert(next));
+            codes.push(*dicts[j].entry(canon).or_insert(next));
         }
         rows.push((id, vector, codes));
         Ok(true)
@@ -986,37 +1004,85 @@ fn split_where(
     }
 }
 
+/// Outcome of coercing a pushdown literal to the filter column's stored type.
+enum Coerced {
+    /// Encodes exactly like a stored value; safe for the dictionary lookup.
+    Exact(Value),
+    /// Can never equal any stored value of this column (e.g. a fractional
+    /// literal vs INTEGER); contributes no codes.
+    NeverMatches,
+    /// Eval equality may diverge from encoded-byte equality (NULL three-valued
+    /// logic, cross-type comparisons, floats past 2^53); the whole leaf must
+    /// stay in the residual so the eval path decides.
+    Residual,
+}
+
+fn coerce_pushdown_literal(val: Value, col_type: DataType) -> Coerced {
+    // Past 2^53 the int<->f64 mapping is not 1:1, so encoded equality and
+    // numeric equality diverge.
+    const EXACT_F64_INT: f64 = 9_007_199_254_740_992.0;
+    if val.is_null() {
+        return Coerced::Residual;
+    }
+    if val.data_type() == col_type {
+        return Coerced::Exact(val);
+    }
+    match (val, col_type) {
+        (Value::Real(r), DataType::Integer) => {
+            if r.is_nan() || r.is_infinite() {
+                Coerced::NeverMatches
+            } else if r.abs() > EXACT_F64_INT {
+                Coerced::Residual
+            } else if r.fract() == 0.0 {
+                Coerced::Exact(Value::Integer(r as i64))
+            } else {
+                Coerced::NeverMatches
+            }
+        }
+        (Value::Integer(i), DataType::Real) => {
+            if i.unsigned_abs() <= EXACT_F64_INT as u64 {
+                Coerced::Exact(Value::Real(i as f64))
+            } else {
+                Coerced::Residual
+            }
+        }
+        _ => Coerced::Residual,
+    }
+}
+
 /// A leaf is pushable if it is `col = literal` or `col IN (literal, ...)` on a
-/// declared filter column with all-constant right-hand side.
+/// declared filter column whose constant right-hand side coerces exactly to
+/// the column's stored type. An empty value list means the leaf is provably
+/// unsatisfiable (the caller short-circuits to an empty result).
 fn classify_leaf(
     leaf: &Expr,
     filter_cols: &[u16],
     table_schema: &TableSchema,
 ) -> Option<(usize, Vec<Value>)> {
-    match leaf {
+    let (col_expr, rhs): (&Expr, Vec<&Expr>) = match leaf {
         Expr::BinaryOp {
             left,
             op: BinOp::Eq,
             right,
-        } => {
-            let dim = filter_dim(left, filter_cols, table_schema)?;
-            let val = eval_const_expr(right).ok()?;
-            Some((dim, vec![val]))
-        }
+        } => (left, vec![right.as_ref()]),
         Expr::InList {
             expr,
             list,
             negated: false,
-        } => {
-            let dim = filter_dim(expr, filter_cols, table_schema)?;
-            let mut vals = Vec::with_capacity(list.len());
-            for e in list {
-                vals.push(eval_const_expr(e).ok()?);
-            }
-            Some((dim, vals))
+        } => (expr, list.iter().collect()),
+        _ => return None,
+    };
+    let dim = filter_dim(col_expr, filter_cols, table_schema)?;
+    let col_type = table_schema.columns[filter_cols[dim] as usize].data_type;
+    let mut vals = Vec::with_capacity(rhs.len());
+    for e in rhs {
+        match coerce_pushdown_literal(eval_const_expr(e).ok()?, col_type) {
+            Coerced::Exact(v) => vals.push(v),
+            Coerced::NeverMatches => {}
+            Coerced::Residual => return None,
         }
-        _ => None,
     }
+    Some((dim, vals))
 }
 
 /// Resolve a column expression to its attribute-dim index (position in

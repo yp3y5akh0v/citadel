@@ -41,10 +41,13 @@ impl PartitionTree {
             groups.entry(key).or_default().push(i as u32);
         }
 
-        let cells: Vec<Cell> = groups
+        let mut cells: Vec<Cell> = groups
             .into_iter()
             .map(|(values, point_ids)| Cell { values, point_ids })
             .collect();
+        // HashMap iteration order is random per process; sort so identical
+        // data always builds identical (and byte-identical persisted) indexes.
+        cells.sort_unstable_by(|a, b| a.values.cmp(&b.values));
 
         Self {
             cells,
