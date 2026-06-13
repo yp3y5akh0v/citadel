@@ -26,6 +26,8 @@ pub(crate) struct OpenAiClient {
     /// Output-token-cap field: OpenAI wants `max_completion_tokens`, some
     /// compatible servers (Ollama) only honor `max_tokens`.
     max_tokens_field: &'static str,
+    /// Optional `reasoning_effort` (low|medium|high); omitted from the wire when `None`.
+    reasoning_effort: Option<String>,
     /// Whether to price usage from the pricing table (false for free/local).
     priced: bool,
     agent: Agent,
@@ -50,6 +52,7 @@ impl OpenAiClient {
             base_url: base_url.into(),
             api_key: api_key.into(),
             max_tokens_field: OPENAI_MAX_TOKENS_FIELD,
+            reasoning_effort: None,
             priced: true,
             agent: agent(&LlmTimeouts::default()),
         }
@@ -61,10 +64,18 @@ impl OpenAiClient {
         self
     }
 
-    /// Override the output-token-cap field for a compatible server (Ollama uses `max_tokens`).
-    #[cfg(feature = "ollama")]
+    /// Override the output-token-cap field for a compatible server (Ollama and
+    /// Gemini's OpenAI-compat layer use `max_tokens`, not `max_completion_tokens`).
+    #[cfg(any(feature = "ollama", feature = "gemini"))]
     pub(super) fn max_tokens_field(mut self, field: &'static str) -> Self {
         self.max_tokens_field = field;
+        self
+    }
+
+    /// Set `reasoning_effort` (low|medium|high) for backends that support it.
+    #[cfg(feature = "gemini")]
+    pub(super) fn reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        self.reasoning_effort = Some(effort.into());
         self
     }
 
@@ -78,7 +89,12 @@ impl OpenAiClient {
 
 impl LLMClient for OpenAiClient {
     fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        let body = to_wire(req, &self.model, self.max_tokens_field);
+        let body = to_wire(
+            req,
+            &self.model,
+            self.max_tokens_field,
+            self.reasoning_effort.as_deref(),
+        );
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let auth = format!("Bearer {}", self.api_key);
         let headers = [
@@ -102,7 +118,12 @@ impl LLMClient for OpenAiClient {
     }
 }
 
-fn to_wire(req: &CompletionRequest, model: &str, max_tokens_field: &str) -> Value {
+fn to_wire(
+    req: &CompletionRequest,
+    model: &str,
+    max_tokens_field: &str,
+    reasoning_effort: Option<&str>,
+) -> Value {
     let messages: Vec<Value> = req.messages.iter().map(message_to_wire).collect();
     let mut body = json!({ "model": model, "messages": messages });
     let obj = body.as_object_mut().expect("json object literal");
@@ -144,6 +165,9 @@ fn to_wire(req: &CompletionRequest, model: &str, max_tokens_field: &str) -> Valu
     }
     if !req.stop.is_empty() {
         obj.insert("stop".to_string(), json!(req.stop));
+    }
+    if let Some(effort) = reasoning_effort {
+        obj.insert("reasoning_effort".to_string(), json!(effort));
     }
     body
 }
@@ -364,7 +388,7 @@ mod tests {
                 description: "find".into(),
                 input_schema: json!({ "type": "object" }),
             }]);
-        let w = to_wire(&req, "gpt", OPENAI_MAX_TOKENS_FIELD);
+        let w = to_wire(&req, "gpt", OPENAI_MAX_TOKENS_FIELD, None);
         assert_eq!(w["messages"][0]["role"], json!("system"));
         assert_eq!(w["tools"][0]["type"], json!("function"));
         assert_eq!(
@@ -382,7 +406,7 @@ mod tests {
         };
         let with_tools =
             CompletionRequest::new(vec![Message::user("u")]).with_tools(vec![spec.clone()]);
-        let wire = |r: &CompletionRequest| to_wire(r, "gpt", OPENAI_MAX_TOKENS_FIELD);
+        let wire = |r: &CompletionRequest| to_wire(r, "gpt", OPENAI_MAX_TOKENS_FIELD, None);
         assert!(wire(&with_tools).get("tool_choice").is_none());
         assert_eq!(
             wire(&with_tools.clone().with_tool_choice(ToolChoice::Any))["tool_choice"],
@@ -407,7 +431,7 @@ mod tests {
                 arguments: json!({ "q": "rust" }),
             }],
         })]);
-        let w = to_wire(&req, "gpt", OPENAI_MAX_TOKENS_FIELD);
+        let w = to_wire(&req, "gpt", OPENAI_MAX_TOKENS_FIELD, None);
         let msg = &w["messages"][0];
         assert_eq!(
             msg["content"],
@@ -425,7 +449,7 @@ mod tests {
     #[test]
     fn tool_result_is_a_tool_role_with_call_id() {
         let req = CompletionRequest::new(vec![Message::tool("call_1", "result text")]);
-        let w = to_wire(&req, "gpt", OPENAI_MAX_TOKENS_FIELD);
+        let w = to_wire(&req, "gpt", OPENAI_MAX_TOKENS_FIELD, None);
         assert_eq!(w["messages"][0]["role"], json!("tool"));
         assert_eq!(w["messages"][0]["tool_call_id"], json!("call_1"));
     }
@@ -436,12 +460,26 @@ mod tests {
             max_tokens: Some(256),
             ..CompletionRequest::new(vec![Message::user("u")])
         };
-        let openai = to_wire(&req, "gpt", OPENAI_MAX_TOKENS_FIELD);
+        let openai = to_wire(&req, "gpt", OPENAI_MAX_TOKENS_FIELD, None);
         assert_eq!(openai["max_completion_tokens"], json!(256));
         assert!(openai.get("max_tokens").is_none());
-        let ollama = to_wire(&req, "llama", "max_tokens");
+        let ollama = to_wire(&req, "llama", "max_tokens", None);
         assert_eq!(ollama["max_tokens"], json!(256));
         assert!(ollama.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_is_emitted_only_when_set() {
+        let req = CompletionRequest {
+            max_tokens: Some(512),
+            ..CompletionRequest::new(vec![Message::user("q")])
+        };
+        let gemini = to_wire(&req, "gemini-3.5-flash", "max_tokens", Some("low"));
+        assert_eq!(gemini["reasoning_effort"], json!("low"));
+        assert_eq!(gemini["max_tokens"], json!(512));
+        assert!(gemini.get("max_completion_tokens").is_none());
+        let plain = to_wire(&req, "gpt", OPENAI_MAX_TOKENS_FIELD, None);
+        assert!(plain.get("reasoning_effort").is_none());
     }
 
     #[test]

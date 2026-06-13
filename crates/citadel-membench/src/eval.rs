@@ -15,8 +15,18 @@ use crate::error::Result;
 use crate::ratelimit::Pacer;
 use crate::{BenchConfig, ReaderOrder};
 
-/// Hard cap on reader/judge output so a runaway response cannot inflate cost.
-const MAX_TOKENS: u32 = 512;
+/// Default hard cap on reader/judge output so a runaway response cannot inflate cost.
+const DEFAULT_MAX_TOKENS: u32 = 512;
+
+/// Output-token cap, read fresh so CITADEL_LOCOMO_MAX_TOKENS can raise it for a
+/// reasoning reader whose thinking tokens would otherwise crowd out the answer.
+fn max_output_tokens() -> u32 {
+    std::env::var("CITADEL_LOCOMO_MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_MAX_TOKENS)
+}
 
 /// Retry budget for transient (429/5xx/transport) LLM failures. The wall-clock budget
 /// is the primary guard and is per-question-bounded: a call holds its role permit for
@@ -71,7 +81,8 @@ fn paced_complete(
 ) -> Result<CompletionResponse> {
     let cfg = RetryConfig::get();
     let model = client.model_id();
-    let cost = client.count_tokens(&req.messages) + req.max_tokens.unwrap_or(MAX_TOKENS) as usize;
+    let cost =
+        client.count_tokens(&req.messages) + req.max_tokens.unwrap_or(max_output_tokens()) as usize;
     let started = Instant::now();
     let mut attempt: u32 = 0;
     loop {
@@ -262,6 +273,35 @@ pub struct AnswerOutcome {
     pub retrieved: Vec<String>,
 }
 
+/// Read the assembled memories: render the prompt and ask the paced, retried reader.
+fn read_assembled(
+    reader: &dyn LLMClient,
+    pacer: &Pacer,
+    question: &str,
+    view: Vec<AtomHit>,
+    recall_micros: u128,
+) -> Result<AnswerOutcome> {
+    let retrieved = view
+        .iter()
+        .filter_map(|h| {
+            h.payload
+                .get("dia_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    let mut req = CompletionRequest::new(build_reader_prompt(&view, question));
+    req.temperature = Some(0.0);
+    req.max_tokens = Some(max_output_tokens());
+    let resp = paced_complete(pacer, reader, &req)?;
+    Ok(AnswerOutcome {
+        answer: resp.message.content,
+        recall_micros,
+        usage: resp.usage,
+        retrieved,
+    })
+}
+
 /// Recall the top-`config.top_k` memories, expand to the reader view, then ask the
 /// reader; the reader call is paced + retried. Recall keeps the default wall clock:
 /// grading recency as of the conversation's end was measured to HURT evidence
@@ -276,29 +316,9 @@ pub fn answer_question(
 ) -> Result<AnswerOutcome> {
     let started = Instant::now();
     let hits = eng.recall(region, RecallQuery::by_text(question, config.top_k))?;
-    let hits = reader_view(eng, region, hits, config)?;
+    let view = reader_view(eng, region, hits, config)?;
     let recall_micros = started.elapsed().as_micros();
-
-    let retrieved = hits
-        .iter()
-        .filter_map(|h| {
-            h.payload
-                .get("dia_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .collect();
-
-    let mut req = CompletionRequest::new(build_reader_prompt(&hits, question));
-    req.temperature = Some(0.0);
-    req.max_tokens = Some(MAX_TOKENS);
-    let resp = paced_complete(pacer, reader, &req)?;
-    Ok(AnswerOutcome {
-        answer: resp.message.content,
-        recall_micros,
-        usage: resp.usage,
-        retrieved,
-    })
+    read_assembled(reader, pacer, question, view, recall_micros)
 }
 
 /// LLM-as-judge correctness with Mem0's generous LoCoMo rubric (same topic = CORRECT,
@@ -359,7 +379,7 @@ fn complete_judge(
         Message::user(user.to_string()),
     ]);
     req.temperature = Some(0.0);
-    req.max_tokens = Some(MAX_TOKENS);
+    req.max_tokens = Some(max_output_tokens());
     paced_complete(pacer, judge, &req)
 }
 

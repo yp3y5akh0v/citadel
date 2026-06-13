@@ -27,16 +27,19 @@ pub use eval::{
 pub use ingest::{ingest_sample, turn_content};
 pub use ratelimit::{Gate, Pacer};
 
-/// Published OpenAI USD per 1M tokens as `(input, output)`, keyed by model id. OpenAI
-/// returns no `cost_usd`, so the bench estimates it from the recorded token counts at
-/// these rates; the real bill is lower when prompt-prefix caching applies. Reader and
-/// judge are each costed at their own model's rate. Unknown models fall back to
-/// gpt-4o-mini rates.
+/// Published provider USD per 1M tokens as `(input, output)`, keyed by model id. The
+/// OpenAI/Gemini APIs return no `cost_usd`, so the bench estimates it from the recorded
+/// token counts at these rates; the real bill is lower when prompt-prefix caching
+/// applies. Reader and judge are each costed at their own model's rate. Unknown models
+/// fall back to gpt-4o-mini rates.
 fn model_rate(model: &str) -> (f64, f64) {
     if model.starts_with("gpt-4o-mini") {
         (0.15, 0.60)
     } else if model.starts_with("gpt-4o") {
         (2.50, 10.00)
+    } else if model.starts_with("gemini") {
+        // Gemini 3.5 Flash list price (May 2026); other Gemini ids approximated here.
+        (1.50, 9.00)
     } else {
         (0.15, 0.60)
     }
@@ -102,13 +105,7 @@ pub struct BenchConfig {
 
 impl Default for BenchConfig {
     fn default() -> Self {
-        // All three values are measured, not assumed. top_k 50: the token-free diag
-        // found +2.7% reader-visible gold over 30 (D any@50 94.4 vs any@30 91.7) and
-        // the conv-26 dev split converts it (93.4% vs 92.8%); 50 is conservative for
-        // the field (Mem0's eval suite defaults to top-k 200). Relevance order and
-        // no neighbor expansion: the conv-26 2x2 scored relevance+r0 93.4% against
-        // chrono 92.1%, r1 90.8%, chrono+r1 86.2% - with dates already prefixed on
-        // every memory line, reordering and padding only dilute the reader.
+        // Measured defaults; selection rationale is in RESULTS.md.
         Self {
             top_k: 50,
             reader_order: ReaderOrder::Relevance,
@@ -135,6 +132,13 @@ pub struct QuestionResult {
     pub retrieved: Vec<String>,
     /// Gold evidence `dia_id`s (from the dataset); joined against `retrieved`.
     pub gold_evidence: Vec<String>,
+    /// Rendered text of each gold evidence turn, parallel to `gold_evidence`. Audit
+    /// only: never fed into recall/read, so a miss stays classifiable from the log.
+    /// An unknown gold id renders a `<no turn for ...>` marker.
+    pub gold_turn_texts: Vec<String>,
+    /// Whether each gold evidence turn reached the reader's view, parallel to
+    /// `gold_evidence`. Splits a miss into retrieval-gap (any false) vs reader-miss.
+    pub gold_in_view: Vec<bool>,
     /// Audit trail: question, gold, and the reader's predicted answer.
     pub question: String,
     pub gold: String,
@@ -262,6 +266,13 @@ pub fn run_sample_observed(
     create_bench_region(eng, &sample.sample_id, embedder)?;
     ingest_sample(eng, &sample.sample_id, sample)?;
 
+    // dia_id -> rendered turn text, built once for the per-question gold audit.
+    let gold_index: FxHashMap<&str, String> = sample
+        .turns
+        .iter()
+        .map(|t| (t.dia_id.as_str(), turn_content(t)))
+        .collect();
+
     // Reader and judge keep independent in-flight caps (Gates); `pacer` enforces
     // per-model TPM. Questions run on a fixed pool of OS threads, NOT rayon: each task
     // blocks (HTTP, gate waits) and recall() uses rayon internally, so a rayon pool
@@ -290,6 +301,7 @@ pub fn run_sample_observed(
     let err_slot: std::sync::Mutex<Option<BenchError>> = std::sync::Mutex::new(None);
     let (tx, rx) = std::sync::mpsc::channel::<(usize, QuestionResult)>();
     let (rg, jg) = (&reader_gate, &judge_gate);
+    let gi = &gold_index;
     let (next_r, failed_r, observed_r, err_r) = (&next, &failed, &observed, &err_slot);
 
     std::thread::scope(|scope| {
@@ -312,6 +324,7 @@ pub fn run_sample_observed(
                         judge,
                         config,
                         &sample.qa[i],
+                        gi,
                         pacer,
                         rg,
                         jg,
@@ -375,6 +388,7 @@ fn process_one_question(
     judge: &dyn LLMClient,
     config: BenchConfig,
     qa: &QaSample,
+    gold_index: &FxHashMap<&str, String>,
     pacer: &Pacer,
     reader_gate: &Gate,
     judge_gate: &Gate,
@@ -392,6 +406,8 @@ fn process_one_question(
             cost_usd: 0.0,
             retrieved: Vec::new(),
             gold_evidence: qa.evidence.clone(),
+            gold_turn_texts: resolve_gold_texts(&qa.evidence, gold_index),
+            gold_in_view: gold_in_view_flags(&qa.evidence, &[]),
             question: qa.question.clone(),
             gold: qa.gold.clone(),
             predicted: String::new(),
@@ -415,6 +431,10 @@ fn process_one_question(
             judge_correct(judge, pacer, &qa.question, &qa.gold, &outcome.answer)?
         }
     };
+
+    // Gold instrumentation computed before `outcome.retrieved` is moved into the result.
+    let gold_in_view = gold_in_view_flags(&qa.evidence, &outcome.retrieved);
+    let gold_turn_texts = resolve_gold_texts(&qa.evidence, gold_index);
 
     Ok(QuestionResult {
         category: qa.category,
@@ -440,6 +460,8 @@ fn process_one_question(
         ),
         retrieved: outcome.retrieved,
         gold_evidence: qa.evidence.clone(),
+        gold_turn_texts,
+        gold_in_view,
         question: qa.question.clone(),
         gold: qa.gold.clone(),
         predicted: outcome.answer,
@@ -558,6 +580,29 @@ fn ratio(num: usize, den: usize) -> f64 {
     }
 }
 
+/// Resolve each gold `dia_id` to its rendered turn text via `index`, parallel to
+/// `evidence`. An unknown id renders a `<no turn for ...>` marker rather than dropping.
+fn resolve_gold_texts(evidence: &[String], index: &FxHashMap<&str, String>) -> Vec<String> {
+    evidence
+        .iter()
+        .map(|d| {
+            index
+                .get(d.as_str())
+                .cloned()
+                .unwrap_or_else(|| format!("<no turn for {d}>"))
+        })
+        .collect()
+}
+
+/// Per-gold-id presence in the reader's view: `true` iff the gold `dia_id` is in
+/// `retrieved`. Parallel to `evidence`.
+fn gold_in_view_flags(evidence: &[String], retrieved: &[String]) -> Vec<bool> {
+    evidence
+        .iter()
+        .map(|d| retrieved.iter().any(|r| r == d))
+        .collect()
+}
+
 /// Nearest-rank p95 of `latencies` (sorted in place). Empty -> 0.
 fn p95(latencies: &mut [u128]) -> u128 {
     if latencies.is_empty() {
@@ -597,6 +642,12 @@ mod cost_tests {
     }
 
     #[test]
+    fn model_rate_prices_gemini_at_flash_list() {
+        assert_eq!(model_rate("gemini-3.5-flash"), (1.50, 9.00));
+        assert_eq!(model_rate("gemini-3-pro"), (1.50, 9.00));
+    }
+
+    #[test]
     fn token_cost_applies_the_models_published_rate() {
         // 1M input + 1M output at gpt-4o-mini = 0.15 + 0.60 = 0.75.
         assert!((token_cost("gpt-4o-mini", 1_000_000, 1_000_000) - 0.75).abs() < 1e-9);
@@ -625,5 +676,38 @@ mod cost_tests {
         assert!((reader - 4.50).abs() < 1e-9);
         assert!((judge - 0.12).abs() < 1e-9);
         assert!(((reader + judge) - 4.62).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod gold_instrumentation_tests {
+    use super::*;
+
+    fn index() -> FxHashMap<&'static str, String> {
+        let mut m = FxHashMap::default();
+        m.insert(
+            "D2:1",
+            "[3pm] Alice: Rex is a golden retriever.".to_string(),
+        );
+        m.insert("D2:2", "[3pm] Alice: I paid 1200.".to_string());
+        m
+    }
+
+    #[test]
+    fn resolve_gold_texts_maps_ids_and_marks_unknown() {
+        let idx = index();
+        let texts = resolve_gold_texts(&["D2:1".to_string(), "D9:9".to_string()], &idx);
+        assert_eq!(texts[0], "[3pm] Alice: Rex is a golden retriever.");
+        assert_eq!(texts[1], "<no turn for D9:9>");
+        assert_eq!(texts.len(), 2, "parallel to evidence, one row per id");
+    }
+
+    #[test]
+    fn gold_in_view_flags_are_per_id_membership() {
+        let evidence = vec!["D2:1".to_string(), "D2:2".to_string()];
+        let retrieved = vec!["D2:1".to_string(), "D1:1".to_string()];
+        assert_eq!(gold_in_view_flags(&evidence, &retrieved), vec![true, false]);
+        // No evidence -> no flags (no spurious row).
+        assert!(gold_in_view_flags(&[], &retrieved).is_empty());
     }
 }

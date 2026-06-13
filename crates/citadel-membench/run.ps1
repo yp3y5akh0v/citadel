@@ -13,11 +13,16 @@ param(
   [int]$MaxSamples = 0,                  # 0 = all; 1 = conv-26; 2 = first two
   [string]$Reader  = "gpt-4o-mini",
   [string]$Judge   = "gpt-4o-mini",
+  [string]$ReaderProvider = "openai",   # reader backend: openai | gemini | claude | ollama
+  [string]$ReasoningEffort = "",        # gemini reader only: low|medium|high ("" = model default)
+  [int]$MaxTokens = 0,                   # reader/judge output cap; 0 = default 512 (raise for a reasoning reader)
   [int]$ReaderConcurrency = 6,
   [int]$JudgeConcurrency  = 12,
   [int]$ReaderTpm = 400000,             # pace under the reader's TPM limit
+  [int]$NeighborRadius = 0,             # adjacent turns rendered around each hit (#3); 0 = off
   [string]$Dataset   = $env:CITADEL_LOCOMO_DATASET,
   [string]$KeyFile   = $env:OPENAI_KEY_FILE,
+  [string]$GeminiKeyFile = $env:GEMINI_KEY_FILE,
   [string]$BgeDir    = $env:CITADEL_BGE_SMALL_DIR,
   [string]$Embedder  = "",              # "" = bge-small; else bge-base|bge-large|e5-large (match -BgeDir)
   [string]$RerankDir = $env:CITADEL_RERANKER_DIR,
@@ -29,7 +34,7 @@ $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 $exe  = Join-Path $root "..\..\target\debug\locomo.exe"
 if (-not (Test-Path $exe)) {
-  throw "locomo.exe not found at $exe - build: cargo build -p citadeldb-membench --features openai,cuda-embed --bin locomo"
+  throw "locomo.exe not found at $exe - build: cargo build -p citadeldb-membench --features gemini,cuda-embed --bin locomo (gemini implies openai for the judge)"
 }
 
 # Required inputs come from a flag or its environment-variable default.
@@ -46,15 +51,28 @@ New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $env:CITADEL_BGE_SMALL_DIR        = $BgeDir
 $env:CITADEL_LOCOMO_EMBEDDER      = $Embedder
 $env:CITADEL_LOCOMO_RERANK_STRATEGY = "rrf"
+$env:CITADEL_LOCOMO_NEIGHBOR_RADIUS = "$NeighborRadius"
 $env:CITADEL_LOCOMO_ENCRYPTED     = $Encrypted
 if ($RerankDir) { $env:CITADEL_RERANKER_DIR = $RerankDir }
 
-# Key: use an already-set OPENAI_API_KEY, else read it from the key file. Never printed.
+# Judge always runs on gpt-4o-mini (OPENAI_API_KEY); the reader may use a different
+# backend. Use an already-set OPENAI_API_KEY, else read it from the key file. Never printed.
 if (-not $env:OPENAI_API_KEY) {
   if (-not $KeyFile)             { throw "No API key. Set `$env:OPENAI_API_KEY, or pass -KeyFile / set `$env:OPENAI_KEY_FILE." }
   if (-not (Test-Path $KeyFile)) { throw "Key file not found: $KeyFile" }
   $env:OPENAI_API_KEY = (Get-Content $KeyFile -Raw).Trim()
 }
+
+# Reader backend: default openai; "gemini" uses the OpenAI-compatible Gemini endpoint
+# with its OWN key, so the gpt-4o-mini judge keeps using OPENAI_API_KEY.
+$env:CITADEL_LOCOMO_READER_PROVIDER = $ReaderProvider
+if ($ReaderProvider -eq "gemini" -and -not $env:GEMINI_API_KEY) {
+  if (-not $GeminiKeyFile)             { throw "Gemini reader needs a key. Pass -GeminiKeyFile or set `$env:GEMINI_KEY_FILE." }
+  if (-not (Test-Path $GeminiKeyFile)) { throw "Gemini key file not found: $GeminiKeyFile" }
+  $env:GEMINI_API_KEY = (Get-Content $GeminiKeyFile -Raw).Trim()
+}
+if ($ReasoningEffort) { $env:CITADEL_GEMINI_REASONING_EFFORT = $ReasoningEffort }
+if ($MaxTokens -gt 0) { $env:CITADEL_LOCOMO_MAX_TOKENS = "$MaxTokens" }
 
 $env:CITADEL_LOCOMO_READER_MODEL = $Reader
 $env:CITADEL_LOCOMO_JUDGE_MODEL  = $Judge
@@ -72,7 +90,7 @@ if ($MaxSamples -gt 0) {
 $report = Join-Path $dir "report.json"
 $log    = Join-Path $dir "run.log"
 $embLabel = if ($Embedder) { $Embedder } else { "bge-small" }
-"run: $Label  reader=$Reader judge=$Judge maxSamples=$MaxSamples encrypted=$Encrypted embedder=$embLabel  started $(Get-Date -Format o)" | Set-Content $log
+"run: $Label  reader=$Reader ($ReaderProvider) judge=$Judge maxSamples=$MaxSamples encrypted=$Encrypted embedder=$embLabel  started $(Get-Date -Format o)" | Set-Content $log
 Write-Host "run dir: $dir"
 Write-Host "watch:   pwsh -File watch.ps1"
 
@@ -91,5 +109,10 @@ $code = $LASTEXITCODE
 "EXIT=$code  WALL_SEC=$([math]::Round(((Get-Date) - $t0).TotalSeconds))  finished $(Get-Date -Format o)" | Add-Content $log
 
 Remove-Item Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
+Remove-Item Env:\GEMINI_API_KEY -ErrorAction SilentlyContinue
+Remove-Item Env:\CITADEL_LOCOMO_READER_PROVIDER -ErrorAction SilentlyContinue
+Remove-Item Env:\CITADEL_GEMINI_REASONING_EFFORT -ErrorAction SilentlyContinue
+Remove-Item Env:\CITADEL_LOCOMO_MAX_TOKENS -ErrorAction SilentlyContinue
 Remove-Item Env:\CITADEL_LOCOMO_MAX_SAMPLES -ErrorAction SilentlyContinue
+Remove-Item Env:\CITADEL_LOCOMO_NEIGHBOR_RADIUS -ErrorAction SilentlyContinue
 Write-Host "done: EXIT=$code  ->  $dir"

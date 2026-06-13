@@ -8,9 +8,13 @@ cryptographic erasure at whole-store, per-region, and per-atom granularity, not 
 deletion. On encrypted regions every atom is sealed and HMAC-authenticated, and can be
 re-verified off disk.
 
-On the LoCoMo long-term conversational-memory benchmark, on encrypted regions with a matched
-`gpt-4o-mini` reader and judge, it scores 85.8% (3-run mean) against a 94.4% retrieval ceiling.
-Full protocol, audit, and numbers:
+It uses **no LLM** at ingest or retrieval - raw turns in, vector + keyword + reranker out -
+so remembering costs zero tokens and the conversation is never sent to an LLM to build or
+search the memory, unlike fact-extraction and graph-building memory systems. On the LoCoMo
+long-term conversational-memory benchmark, on encrypted regions with a matched `gpt-4o-mini`
+reader and judge, it scores 85.5% (3-run mean) against a 95.1% retrieval ceiling; with a
+`gemini-3.5-flash` reader the same encrypted retrieval scores 90.6%. Full protocol, audit,
+comparison, and numbers:
 [citadel-membench](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-membench).
 
 This crate is part of the Citadel workspace.
