@@ -21,7 +21,7 @@ use crate::llm::{CompletionRequest, CompletionResponse, LlmError, Message};
 pub mod testing;
 
 /// Provider names the factory recognizes (whether or not compiled in this build).
-const KNOWN_PROVIDERS: &[&str] = &["mock", "claude", "openai", "ollama"];
+const KNOWN_PROVIDERS: &[&str] = &["mock", "claude", "openai", "ollama", "gemini"];
 
 /// Select an [`LLMClient`] from the environment: `{prefix}_PROVIDER` and
 /// `{prefix}_MODEL`, each falling back to the given default. API keys are read
@@ -109,6 +109,23 @@ pub fn build_with_timeouts(
             };
             Ok(Arc::new(client.with_timeouts(timeouts)))
         }
+        #[cfg(feature = "gemini")]
+        "gemini" => {
+            // Own key so a Gemini reader can coexist with an `openai` judge; the
+            // compat layer wants `max_tokens`, and reasoning effort is optional.
+            const GEMINI_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
+            let key = require_key("GEMINI_API_KEY", "gemini")?;
+            let mut client =
+                crate::llm::openai::OpenAiClient::with_base_url(model, GEMINI_BASE, key)
+                    .max_tokens_field("max_tokens");
+            if let Ok(effort) = std::env::var("CITADEL_GEMINI_REASONING_EFFORT") {
+                let effort = effort.trim();
+                if !effort.is_empty() {
+                    client = client.reasoning_effort(effort);
+                }
+            }
+            Ok(Arc::new(client.with_timeouts(timeouts)))
+        }
         other => fallback(other),
     }
 }
@@ -173,7 +190,7 @@ fn not_compiled(provider: &str) -> String {
 }
 
 fn unknown_provider(provider: &str) -> String {
-    format!("unknown llm provider '{provider}' (valid: mock, claude, openai, ollama)")
+    format!("unknown llm provider '{provider}' (valid: mock, claude, openai, ollama, gemini)")
 }
 
 /// How a closure-built client counts tokens.

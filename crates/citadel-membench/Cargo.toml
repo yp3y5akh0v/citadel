@@ -38,6 +38,9 @@ citadel-ai = { workspace = true, features = ["test-util"] }
 openai = ["citadel-ai/openai"]
 claude = ["citadel-ai/claude"]
 ollama = ["citadel-ai/ollama"]
+# Gemini reader via its OpenAI-compatible endpoint; implies openai (the bin's
+# required-feature, and the gpt-4o-mini judge backend).
+gemini = ["openai", "citadel-ai/gemini"]
 candle-embed = ["citadel-mem/candle-embed"]
 # Run the embedder + cross-encoder on the GPU (CUDA); implies candle-embed. Needs the CUDA toolkit.
 cuda-embed = ["candle-embed", "citadel-mem/cuda-embed"]
