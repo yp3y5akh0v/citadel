@@ -42,6 +42,9 @@ claude = ["dep:ureq"]
 openai = ["dep:ureq"]
 # Ollama uses the OpenAI wire format, so it reuses that adapter.
 ollama = ["openai"]
+# Gemini via its OpenAI-compatible endpoint: reuses the OpenAI adapter with a
+# fixed base URL, the `max_tokens` field, and a configurable `reasoning_effort`.
+gemini = ["openai"]
 # Allowlisted file_read/file_write tools.
 file-tools = []
 # Allowlisted run_command tool; wait-timeout enforces the kill deadline.

@@ -5,8 +5,7 @@
 use std::sync::Arc;
 
 use citadel::{Argon2Profile, DatabaseBuilder};
-use citadel_ai::testing;
-use citadel_ai::{CompletionResponse, LlmError, Message};
+use citadel_ai::{testing, CompletionResponse, LlmError, Message};
 use citadel_mem::{Embedder, MemoryEngine, MockEmbedder};
 use citadel_membench::{
     aggregate, build_reader_prompt, ingest_sample, judge_correct, parse_root, provenance,
@@ -333,6 +332,41 @@ fn run_sample_is_token_free_end_to_end() {
 }
 
 #[test]
+fn run_sample_records_gold_turn_texts_and_in_view() {
+    // k=50 over the 5-turn fixture retrieves every turn, so each gold id is in view.
+    let samples = parse_root(&fixture()).unwrap();
+    let s = &samples[0];
+    let (_dir, eng) = open_engine();
+    let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
+    let reader = testing::scripted(repeat_text("an answer", s.qa.len()));
+    let judge = testing::scripted(repeat_text("CORRECT", s.qa.len()));
+
+    let results = run_sample(&eng, s, embedder, &*reader, &*judge, BenchConfig::default()).unwrap();
+
+    // Single-hop: one gold id (D2:1) -> its rendered turn text, present in view.
+    let single = &results[0];
+    assert_eq!(single.category, Category::SingleHop);
+    assert_eq!(single.gold_evidence, vec!["D2:1"]);
+    assert_eq!(
+        single.gold_turn_texts,
+        vec!["[3pm on 5 Jan 2024] Alice: Rex is a golden retriever."]
+    );
+    assert_eq!(single.gold_in_view, vec![true]);
+
+    // Temporal: two gold ids -> two parallel texts + flags.
+    let temporal = &results[2];
+    assert_eq!(temporal.category, Category::Temporal);
+    assert_eq!(temporal.gold_turn_texts.len(), 2);
+    assert_eq!(temporal.gold_in_view, vec![true, true]);
+
+    // Open-domain has empty evidence: both stay empty (no spurious rows).
+    let open = &results[3];
+    assert_eq!(open.category, Category::OpenDomain);
+    assert!(open.gold_turn_texts.is_empty());
+    assert!(open.gold_in_view.is_empty());
+}
+
+#[test]
 fn aggregate_separates_unscorable_from_accuracy() {
     let results = vec![
         res(Category::SingleHop, true),
@@ -535,6 +569,8 @@ fn res(category: Category, correct: bool) -> QuestionResult {
         cost_usd: 0.0,
         retrieved: Vec::new(),
         gold_evidence: Vec::new(),
+        gold_turn_texts: Vec::new(),
+        gold_in_view: Vec::new(),
         question: String::new(),
         gold: String::new(),
         predicted: String::new(),
@@ -553,6 +589,8 @@ fn unscorable(category: Category) -> QuestionResult {
         cost_usd: 0.0,
         retrieved: Vec::new(),
         gold_evidence: Vec::new(),
+        gold_turn_texts: Vec::new(),
+        gold_in_view: Vec::new(),
         question: String::new(),
         gold: String::new(),
         predicted: String::new(),

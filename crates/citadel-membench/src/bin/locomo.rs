@@ -304,6 +304,8 @@ impl LiveProgress {
                 "predicted": r.predicted,
                 "retrieved": r.retrieved,
                 "gold_evidence": r.gold_evidence,
+                "gold_turn_texts": r.gold_turn_texts,
+                "gold_in_view": r.gold_in_view,
             });
             writeln!(w, "{line}")?;
         }
