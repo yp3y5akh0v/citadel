@@ -43,7 +43,7 @@ Apps and agents keep a lot of long-lived, private context, and you do not want t
 - **MCP server** - `citadel-mcp` serves a memory region over MCP (JSON-RPC on stdio, 13 tools), so Claude Desktop or any MCP client can use it.
 - **Forgetting** - to delete data you destroy its key instead of overwriting it. This works per atom, per region, or for the whole store, and returns a receipt. The ciphertext left behind cannot be read.
 
-It scores {{ locomo() }}% on the LoCoMo memory benchmark, with everything encrypted.
+It uses no LLM to build or search memory - it stores raw turns and recalls with vectors, keywords, and a reranker - yet scores {{ locomo() }}% on the LoCoMo memory benchmark with everything encrypted. With a stronger Gemini 3.5 Flash reader the same encrypted retrieval reaches {{ locomo_gemini() }}%.
 
 ## What it supports
 
