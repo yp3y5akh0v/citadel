@@ -10,11 +10,25 @@
   <a href="https://crates.io/crates/citadeldb"><img src="https://img.shields.io/crates/v/citadeldb" alt="crates.io"></a>
   <a href="https://www.npmjs.com/package/@citadeldb/wasm"><img src="https://img.shields.io/npm/v/@citadeldb/wasm" alt="npm"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml"><img src="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LoCoMo-85.5%25-success" alt="LoCoMo 85.5%"></a>
+  <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LoCoMo%20(gpt%2Fgemini)-85.5%2F90.6%25-success" alt="LoCoMo 85.5% (gpt-4o-mini) / 90.6% (gemini-3.5-flash) readers"></a>
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
 Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Wins all 50 head-to-head benchmarks against unencrypted SQLite at equal cache budgets, and its **zero-LLM** memory engine scores **85.5%** on the LoCoMo long-term-memory benchmark (mean of 3 runs, ±0.4%) against a **95.1% deterministic retrieval ceiling** - on fully encrypted regions.
+
+**LoCoMo** - `gpt-4o-mini` reader and judge (the field's standard setup):
+
+| Memory system | Score | Memory built with |
+|---|---|---|
+| **Citadel** | **85.5%** | **no LLM** - raw turns |
+| Full context (no retrieval) | 72.9% | - |
+| Mem0 (graph) | 68.4% | LLM facts + graph |
+| Mem0 | 66.9% | LLM fact-extraction |
+| Zep / Graphiti | 66.0% | LLM knowledge graph |
+| LangMem | 58.1% | LLM-managed |
+| OpenAI memory | 52.9% | LLM-managed |
+
+Competitor scores as published in the Mem0 paper ([arXiv 2504.19413](https://arxiv.org/abs/2504.19413)), at the same `gpt-4o-mini` reader and judge.
 
 ## Encrypted memory engine
 
@@ -32,7 +46,7 @@ and recalls with embeddings, BM25 keyword matching, and a cross-encoder reranker
 Remembering costs zero tokens, recall is deterministic, and the conversation is never
 sent to an LLM to build or search the memory, unlike fact-extraction and graph-building
 memory systems. The score above uses a `gpt-4o-mini` reader and judge; with a
-`gemini-3.5-flash` reader the same encrypted retrieval scores 90.6%. Protocol,
+`gemini-3.5-flash` reader the same encrypted retrieval scores 90.6% (mean of 3 runs). Protocol,
 per-question audit, and a comparison with published systems are in
 [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md).
 

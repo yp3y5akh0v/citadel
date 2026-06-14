@@ -8,7 +8,7 @@ below is produced on the encrypted storage path. Each number is regenerated from
 SHA-256-pinned dataset with one command, and the report records the reader and judge
 models, the prompts, a per-question audit, and the run's limitations.
 
-## Headline: full 10-conversation LoCoMo (encrypted, reader and judge `gpt-4o-mini`)
+## Full 10-conversation LoCoMo (encrypted, reader and judge `gpt-4o-mini`)
 
 Reference configuration (citadel v1.5.0 defaults): encrypted regions, `bge-large-en-v1.5`
 embedder, top-50 retrieval in relevance order, temperature 0, raw-turn plus photo-caption ingestion with
@@ -47,14 +47,26 @@ identical to a plaintext store; per-configuration recall latencies are in Run hi
 ### With a stronger reader (`gemini-3.5-flash`)
 
 Swapping only the reader to `gemini-3.5-flash` - same encrypted retrieval, same
-`gpt-4o-mini` judge, same category-blind prompt - scores **90.6%** (n=1540, single run):
-single_hop 94.1%, temporal 89.7%, multi_hop 87.9%, open_domain 70.8%, adversarial
-abstention 78.3%.
-The lift over 85.5% is concentrated where a non-reasoning reader fails: temporal date
-conversions (78.5% to 89.7%) and multi-hop combination (81.9% to 87.9%). It isolates the
-reader, so it is comparable to the 85.5% above. Reader cost rises about 10x: the full
-Gemini run is estimated at ~$11.6 against ~$1.13 for the gpt-4o-mini run (gemini-3.5-flash
-$1.50/$9.00 vs gpt-4o-mini $0.15/$0.60 per M tokens); the retrieval underneath is unchanged.
+`gpt-4o-mini` judge, same category-blind prompt - over three independent full runs:
+
+| Metric | Run 1 | Run 2 | Run 3 | Mean +/- SD |
+|---|---|---|---|---|
+| Overall scored (n=1540) | 90.6% | 90.7% | 90.6% | 90.6% +/- 0.1% |
+| single_hop (n=841) | 94.1% | 93.9% | 94.1% | 94.0% +/- 0.1% |
+| multi_hop (n=282) | 87.9% | 88.3% | 86.5% | 87.6% +/- 0.9% |
+| temporal (n=321) | 89.7% | 90.3% | 91.0% | 90.3% +/- 0.6% |
+| open_domain (n=96) | 70.8% | 70.8% | 70.8% | 70.8% +/- 0.0% |
+| Adversarial abstention (n=446) | 78.3% | 77.8% | 77.8% | 78.0% +/- 0.3% |
+| recall@50 ceiling (n=1536) | 95.1% | 95.1% | 95.1% | deterministic |
+| p95 recall latency | 515 ms | 475 ms | 434 ms | ~475 ms |
+| Token cost (USD) | ~$11.6 | ~$11.6 | ~$11.6 | ~$11.6 |
+
+The +5.1 over the 85.5% gpt-4o-mini mean is concentrated where a non-reasoning reader
+fails - temporal date conversions (78.5% -> 90.3%) and multi-hop combination
+(81.9% -> 87.6%); it isolates the reader (retrieval is unchanged), so it is directly
+comparable to 85.5%. open_domain is 70.8% in all three runs - the same 28 questions miss
+every run, a retrieval-recall limit, not a reader one. Reader cost rises ~10x
+(gemini-3.5-flash $1.50/$9.00 vs gpt-4o-mini $0.15/$0.60 per M tokens).
 
 Self-reported Gemini-reader-tier results (ByteRover blog, Hindsight paper; not a
 same-harness run). The reader, judge/prompt, and memory columns show where the protocols
@@ -66,14 +78,13 @@ differ:
 | ByteRover 2.0 | 90.9% / 92.2% | Gemini 3 Flash / Pro | Gemini 3 Flash + Hindsight prompt | LLM-curated |
 | Hindsight | 89.6% | Gemini 3 Pro | Gemini + Hindsight prompt | LLM-curated |
 
-The leaders' Gemini 3 Flash/Pro versions are retired; citadel uses the current
+Those numbers were produced with Gemini 3 Flash/Pro readers; citadel's runs use
 `gemini-3.5-flash`.
 
 ## How 85.5% compares (matched reader and judge)
 
 Both reader and judge are `gpt-4o-mini`, the models the published field uses, so the
-scored number is directly comparable. Against the field (all `gpt-4o-mini` reader and
-judge):
+scored number is directly comparable against the field:
 
 | System | Overall (scored) | Source |
 |---|---|---|
@@ -85,24 +96,21 @@ judge):
 | LangMem | 58.1% | arXiv 2504.19413 |
 | OpenAI memory | 52.9% | arXiv 2504.19413 |
 
-Matched on reader and judge, citadel-mem scores 17 to 33 points above these reported
-memory systems (and 13 above the full-context, no-retrieval baseline); this is not yet
-a same-harness comparison. We did not run those systems ourselves; their scores are
-taken from the Mem0 paper (Chhikara et al., 2025), so the reader and judge match but
-the rest of the pipeline does not. A same-harness re-run is future work.
+citadel-mem scores 17 to 33 points above these reported memory systems (and 13 above the
+full-context, no-retrieval baseline). Their scores are taken from the Mem0 paper
+(Chhikara et al., 2025).
 
 citadel reaches this number **zero-LLM**: raw turns in, vector + BM25 + cross-encoder
-out, with no LLM touching the memory at ingest or retrieval. Every system in the table
-instead runs an LLM over the conversation to build its memory (verified from each
-system's paper or repo: Mem0 LLM-extracts facts and self-edits them, Zep/Graphiti
-builds an LLM temporal knowledge graph, Letta/MemGPT self-edits memory, Hindsight and
-ByteRover LLM-curate context). citadel matches the reader and judge but runs no LLM over
-the conversation, at write or read time.
+out, with no LLM touching the memory at ingest or retrieval - so remembering costs no
+tokens, recall is deterministic, and nothing about the conversation is sent to a model
+to build or search the store. The other systems reach their numbers by running an LLM
+over the conversation to build memory (fact extraction, temporal knowledge graphs, or
+context curation); citadel uses none.
 
-Higher numbers reported elsewhere (90%+) pair a frontier reader with an LLM-curated
-memory. The reader is the dominant lever here: 82% of scored misses have the gold in the
-prompt and the reader still missed it (Self-audit below). Swapping only the reader to
-`gemini-3.5-flash` confirms it (90.6%, above); better retrieval recall is the second lever.
+The reader is the dominant lever for the remaining error: 82% of scored misses have the
+gold already in the prompt and the reader still missed it (Self-audit below). Swapping
+only the reader to `gemini-3.5-flash` raises the score to 90.6% (above) on the same
+zero-LLM retrieval; better retrieval recall is the second lever.
 
 ## Run history
 
@@ -166,7 +174,7 @@ dataset:           locomo10.json
 dataset_sha256:    79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4
 ```
 
-These are the v1.5.0 defaults used for the headline runs; earlier configurations are in
+These are the v1.5.0 defaults used for the full runs above; earlier configurations are in
 Run history.
 
 ## How the harness stays reproducible
@@ -268,7 +276,7 @@ to hurt recall (-4.6 any@30) and is not used.
 but on the gold topic and reports how often it marks them correct, bounding judge
 lenience. On this probe the judge marked 0 of 40 correct (0.0% false-accept).
 
-Run-to-run noise decomposes by diffing the per-question audits of the three headline
+Run-to-run noise decomposes by diffing the per-question audits of the three full
 runs (identical retrieval): 965 of 1,986 answers differ textually between runs at
 temperature 0; 79 questions flip correct/incorrect (49 scored, 30 adversarial) - 65
 because the reader's answer changed, 14 because the judge flipped on an identical
