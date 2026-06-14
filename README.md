@@ -10,7 +10,7 @@
   <a href="https://crates.io/crates/citadeldb"><img src="https://img.shields.io/crates/v/citadeldb" alt="crates.io"></a>
   <a href="https://www.npmjs.com/package/@citadeldb/wasm"><img src="https://img.shields.io/npm/v/@citadeldb/wasm" alt="npm"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml"><img src="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LoCoMo%20(gpt%2Fgemini)-85.5%2F90.6%25-success" alt="LoCoMo 85.5% (gpt-4o-mini) / 90.6% (gemini-3.5-flash) readers"></a>
+  <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LoCoMo%20(gpt--4o--mini%2Fgemini--flash)-85.5%2F90.6%25-success" alt="LoCoMo 85.5% (gpt-4o-mini) / 90.6% (gemini-3.5-flash) readers"></a>
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
