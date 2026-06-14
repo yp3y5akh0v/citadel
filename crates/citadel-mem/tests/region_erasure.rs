@@ -144,7 +144,7 @@ fn encrypted_recall_ranks_correctly_and_deterministically() {
     let exact = "apple banana cherry date";
     let texts = [
         exact,
-        "apple banana cherry kiwi",
+        "apple banana cherry melon",
         "apple lemon mango pear",
         "olive grape fig plum",
     ];
