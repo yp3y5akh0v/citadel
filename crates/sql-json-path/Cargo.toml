@@ -1,6 +1,6 @@
 [package]
 name = "citadeldb-sql-json-path"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 description = "Vendored SQL/JSON Path implementation for Citadel. Forked from sql-json-path (RisingWave Labs, Apache-2.0)."
 license = "Apache-2.0"
