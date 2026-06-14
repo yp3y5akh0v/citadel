@@ -373,7 +373,7 @@ Encrypted database engine:
 +----------------------------+----------------+
 |                 citadel-io                  |  File I/O, fsync, io_uring
 +---------------------------------------------+
-|                 citadel-core                |  Types, errors, constants
+|                citadel-core                 |  Types, errors, constants
 +---------------------------------------------+
 ```
 
