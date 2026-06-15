@@ -11,7 +11,7 @@ keywords = ["mcp", "ai", "agent", "memory", "llm"]
 categories = ["artificial-intelligence", "database", "cryptography"]
 description = "Model Context Protocol (MCP) server exposing Citadel encrypted memory as tools"
 readme = "README.md"
-# autobins off so src/bin/mcp_tests.rs stays a test module, not a second binary.
+# autobins off: only the explicit [[bin]] below is built (no auto-discovery).
 autobins = false
 
 [lib]

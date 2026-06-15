@@ -86,7 +86,7 @@
         <li>SQL: FULL OUTER &amp; LATERAL joins, recursive CTEs, window functions, triggers, materialized views</li>
         <li>JSON / JSONB with 14 PostgreSQL operators, GIN indexes, full-text search</li>
         <li>Key-value API and SQL share one transaction</li>
-        <li>P2P encrypted sync over Noise; CLI, C FFI, and WebAssembly bindings</li>
+        <li>P2P encrypted sync over Noise; Python, CLI, C FFI, and WebAssembly bindings</li>
       </ul>
     </div>
     <div class="pillar">
@@ -154,7 +154,7 @@
     <div class="feat">
       <svg class="feat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="18" height="12" rx="1"/><path d="M8 20h8M12 16v4"/></svg>
       <h3>Cross-platform bindings</h3>
-      <p>Windows, Linux, macOS. C FFI ({{ config.extra.ffi_functions }} functions) and WebAssembly from one Rust core. Tamper-evident HMAC-chained audit log.</p>
+      <p>Windows, Linux, macOS. Python, C FFI ({{ config.extra.ffi_functions }} functions), and WebAssembly from one Rust core. Tamper-evident HMAC-chained audit log.</p>
     </div>
   </div>
 </section>
@@ -181,6 +181,7 @@
         <button class="qs-tab active" data-tab="rust">Rust</button>
         <button class="qs-tab" data-tab="sql">SQL</button>
         <button class="qs-tab" data-tab="kv">Key-Value</button>
+        <button class="qs-tab" data-tab="python">Python</button>
         <button class="qs-tab" data-tab="wasm">WebAssembly</button>
         <button class="qs-tab" data-tab="c">C / FFI</button>
       </div>
@@ -468,6 +469,7 @@
     <div class="arch-stack">
       <div class="arch-row multi">
         <div><span class="crate">citadel-cli</span><span class="desc">interactive shell</span></div>
+        <div><span class="crate">citadel-python</span><span class="desc">Python wheel</span></div>
         <div><span class="crate">citadel-ffi</span><span class="desc">{{ config.extra.ffi_functions }} C-ABI functions</span></div>
         <div><span class="crate">citadel-wasm</span><span class="desc">browser builds</span></div>
       </div>
@@ -750,13 +752,18 @@
 <section class="block shell" id="bindings">
   <div class="sec-head">
     <div class="eyebrow">Distribution</div>
-    <h2>Rust, C, WebAssembly, and a CLI.</h2>
+    <h2>Rust, Python, C, WebAssembly, and a CLI.</h2>
   </div>
   <div class="bindings">
     <div class="binding">
       <div class="top"><h4>Rust</h4><span class="ver">crates.io / citadeldb</span></div>
       <p>The reference API. Builder-style open, typed transactions, no hidden allocation. {{ config.extra.published }} crates published.</p>
       <div class="inst"><span class="prompt">$</span> cargo add citadeldb citadeldb-sql</div>
+    </div>
+    <div class="binding">
+      <div class="top"><h4>Python</h4><span class="ver">PyPI / citadeldb</span></div>
+      <p>The full engine in one wheel: encrypted SQL, vector search, the memory engine, and the MCP server. Typed, with numpy vectors.</p>
+      <div class="inst"><span class="prompt">$</span> pip install citadeldb</div>
     </div>
     <div class="binding">
       <div class="top"><h4>C / C++</h4><span class="ver">cbindgen / citadel.h</span></div>

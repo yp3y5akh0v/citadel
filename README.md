@@ -9,6 +9,7 @@
 <p align="center">
   <a href="https://crates.io/crates/citadeldb"><img src="https://img.shields.io/crates/v/citadeldb" alt="crates.io"></a>
   <a href="https://www.npmjs.com/package/@citadeldb/wasm"><img src="https://img.shields.io/npm/v/@citadeldb/wasm" alt="npm"></a>
+  <a href="https://pypi.org/project/citadeldb/"><img src="https://img.shields.io/pypi/v/citadeldb" alt="PyPI"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml"><img src="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LoCoMo%20(gpt--4o--mini%2Fgemini--flash)-85.5%2F90.6%25-success" alt="LoCoMo 85.5% (gpt-4o-mini) / 90.6% (gemini-3.5-flash) readers"></a>
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
@@ -67,8 +68,8 @@ per-question audit, and a comparison with published systems are in
 - **Audit log** - HMAC-SHA256 chained, tamper-evident
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
-- **Cross-platform** - Windows, Linux, macOS. C FFI (37 functions), WebAssembly bindings
-- **5,200+ tests** - Unit, integration, torture tests across 19 crates
+- **Cross-platform** - Windows, Linux, macOS. Python, C FFI (37 functions), and WebAssembly bindings
+- **5,200+ tests** - Unit, integration, torture tests across 20 crates
 
 ## Benchmarks
 
@@ -360,9 +361,11 @@ Memory layer:
 +---------------------------------------------+
 
 Encrypted database engine:
-+-------------+---------------+---------------+
-| citadel-cli |  citadel-ffi  | citadel-wasm  |  CLI, C FFI, WebAssembly
-+-------------+---------------+---------------+
++----------------------+----------------------+
+|      citadel-cli     |    citadel-python    |  CLI, Python wheel
++----------------------+----------------------+
+|      citadel-ffi     |     citadel-wasm     |  C FFI, WebAssembly
++----------------------+----------------------+
 |                 citadel-sql                 |  SQL parser, planner, executor
 +---------------------------------------------+
 |                   citadel                   |  Database API, builder, sync
@@ -437,6 +440,24 @@ db.put(new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6]));
 ```
 
 Build: `wasm-pack build crates/citadel-wasm --target web`
+
+### Python
+
+One importable wheel with the full engine (SQL, vectors, memory, agent runtime) and bundled type stubs.
+
+```
+pip install citadeldb
+```
+
+```python
+import citadeldb
+
+db = citadeldb.connect("my.db", key="secret", create=True)
+db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+db.execute("INSERT INTO t VALUES (1, 'Alice')")
+db.query("SELECT * FROM t").to_dicts()
+# [{'id': 1, 'name': 'Alice'}]
+```
 
 ## Building
 

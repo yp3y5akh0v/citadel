@@ -59,10 +59,12 @@ pub trait Completer {
 pub trait ProposalOperator: Send + Sync {
     /// Propose zero or more candidates this round (empty = a barren round, valid).
     /// LLM operators drive the model through `llm`; non-LLM operators ignore it.
+    /// `llm` is an OWNED one-shot channel (not a borrow) so it can be handed across
+    /// a language boundary; the controller still traces and budgets every call.
     fn propose(
         &self,
         ctx: &ProposalContext<'_>,
-        llm: &mut dyn Completer,
+        llm: Box<dyn Completer>,
     ) -> Result<Vec<Candidate>, ProposeError>;
 }
 
@@ -263,7 +265,7 @@ impl ProposalOperator for LlmProposer {
     fn propose(
         &self,
         ctx: &ProposalContext<'_>,
-        llm: &mut dyn Completer,
+        mut llm: Box<dyn Completer>,
     ) -> Result<Vec<Candidate>, ProposeError> {
         let resp = llm.complete(&self.build_request(ctx))?;
         Ok(parse_candidates(&resp.message))
@@ -305,9 +307,8 @@ mod tests {
         let goal = Goal::new("produce a candidate satisfying the constraints");
         let lib = PromptLibrary::default();
         let system = lib.resolve(PromptId::Proposer);
-        let mut llm = OneShot(reply);
         LlmProposer::new()
-            .propose(&ctx_for(&goal, &system), &mut llm)
+            .propose(&ctx_for(&goal, &system), Box::new(OneShot(reply)))
             .unwrap()
     }
 

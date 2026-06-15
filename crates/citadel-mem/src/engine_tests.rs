@@ -131,7 +131,7 @@ fn supersedes_edges_reject_cycles() {
 #[test]
 fn reranker_reorders_recall_results() {
     let dir = tempfile::tempdir().unwrap();
-    let mut eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
     eng.create_region("rr", Arc::new(MockEmbedder::new(8)))
         .unwrap();
     eng.remember("rr", AtomInput::new("turn", "alpha beta gamma delta"))
@@ -1992,7 +1992,7 @@ fn as_ts_coerces_integer() {
 #[test]
 fn recall_fusion_arm_uses_reranker_replace_scores() {
     let dir = tempfile::tempdir().unwrap();
-    let mut eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
     eng.create_region("fa", Arc::new(MockEmbedder::new(8)))
         .unwrap();
     eng.remember("fa", AtomInput::new("turn", "alpha beta gamma"))
@@ -2019,7 +2019,7 @@ fn recall_fusion_arm_uses_reranker_replace_scores() {
 #[test]
 fn recall_sealed_fusion_arm_uses_reranker_replace_scores() {
     let dir = tempfile::tempdir().unwrap();
-    let mut eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
     eng.create_encrypted_region("fas", Arc::new(MockEmbedder::new(8)))
         .unwrap();
     eng.remember("fas", AtomInput::new("turn", "alpha beta gamma"))
@@ -2046,7 +2046,7 @@ fn recall_sealed_fusion_arm_uses_reranker_replace_scores() {
 #[test]
 fn set_reranker_changes_recall_score_from_fusion() {
     let dir = tempfile::tempdir().unwrap();
-    let mut eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
     eng.create_region("sr", Arc::new(MockEmbedder::new(8)))
         .unwrap();
     eng.remember("sr", AtomInput::new("turn", "alpha beta gamma"))

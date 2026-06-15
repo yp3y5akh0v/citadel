@@ -1,0 +1,62 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "citadeldb"
+description = "Encrypted-first embedded database, memory engine, and agent runtime for Python"
+readme = "python/README.md"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "Yuriy Peysakhov" }]
+keywords = [
+    "database",
+    "encryption",
+    "sql",
+    "vector-search",
+    "ann",
+    "embedded-database",
+    "memory",
+    "agent",
+    "llm",
+    "cryptography",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Typing :: Typed",
+]
+dynamic = ["version"]
+dependencies = ["numpy>=1.16"]
+
+[project.urls]
+Homepage = "https://citadeldb.dev"
+Documentation = "https://citadeldb.dev"
+Repository = "https://github.com/yp3y5akh0v/citadel"
+Issues = "https://github.com/yp3y5akh0v/citadel/issues"
+Changelog = "https://github.com/yp3y5akh0v/citadel/releases"
+
+[project.scripts]
+citadeldb = "citadeldb._cli:main"
+citadeldb-mcp = "citadeldb.mcp:main"
+
+[tool.maturin]
+manifest-path = "crates/citadel-python/Cargo.toml"
+python-source = "python"
+module-name = "citadeldb._core"
+features = ["pyo3/extension-module"]

@@ -6,6 +6,8 @@
 //! gated on structural provenance to the immutable goal, recorded RECORD-BEFORE-ABORT
 //! into the BLAKE3 chain. Sync, single-agent, no tokio.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -293,7 +295,7 @@ impl Agent {
     /// Build a fresh per-run context borrowing the agent's components.
     fn new_ctx(&self, prompt: String) -> Ctx<'_> {
         Ctx {
-            llm: &*self.llm,
+            llm: Arc::clone(&self.llm),
             graph: &self.graph,
             tools: &self.tools,
             budget: &self.budget,
@@ -317,9 +319,45 @@ impl Agent {
     }
 }
 
+/// Call the backend, retrying transient errors with bounded backoff; skips a
+/// backoff that would cross the wall-clock deadline. Shared by the cognition loop
+/// and the discovery proposal channel so every call retries identically.
+fn retry_complete(
+    llm: &dyn LLMClient,
+    policy: RetryPolicy,
+    started: Instant,
+    max_wall_secs: u64,
+    req: &CompletionRequest,
+) -> Result<CompletionResponse, LlmError> {
+    let mut attempt = 1;
+    loop {
+        match llm.complete(req) {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                if attempt >= policy.attempts.max(1) || !e.is_retryable() {
+                    return Err(e);
+                }
+                let delay = policy.delay_ms(attempt, e.retry_after_secs());
+                if would_exceed_wall(started, max_wall_secs, delay) {
+                    return Err(e);
+                }
+                backoff_sleep(delay);
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Whether sleeping `delay_ms` would reach the wall-clock cap. Rounds up to whole
+/// seconds so a sub-second backoff cannot slip past the second-granular guard.
+fn would_exceed_wall(started: Instant, max_wall_secs: u64, delay_ms: u64) -> bool {
+    let delay_secs = delay_ms.saturating_add(999) / 1_000;
+    started.elapsed().as_secs().saturating_add(delay_secs) >= max_wall_secs
+}
+
 /// Per-run state plus borrowed handles to the agent's components.
 struct Ctx<'a> {
-    llm: &'a dyn LLMClient,
+    llm: Arc<dyn LLMClient>,
     graph: &'a BeliefGraph,
     tools: &'a ToolRegistry,
     budget: &'a AgentBudget,
@@ -421,32 +459,13 @@ impl Ctx<'_> {
     /// Call the backend, retrying transient errors with bounded backoff (only the
     /// successful response is traced). Backoff is skipped if it would cross the deadline.
     fn call_with_retry(&self, req: &CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        let policy = self.config.retry;
-        let mut attempt = 1;
-        loop {
-            match self.llm.complete(req) {
-                Ok(resp) => return Ok(resp),
-                Err(e) => {
-                    if attempt >= policy.attempts.max(1) || !e.is_retryable() {
-                        return Err(e);
-                    }
-                    let delay = policy.delay_ms(attempt, e.retry_after_secs());
-                    if self.would_exceed_wall(delay) {
-                        return Err(e);
-                    }
-                    backoff_sleep(delay);
-                    attempt += 1;
-                }
-            }
-        }
-    }
-
-    /// Whether sleeping `delay_ms` would reach the wall-clock cap. Rounds up to whole
-    /// seconds so a sub-second backoff cannot slip past the second-granular guard.
-    fn would_exceed_wall(&self, delay_ms: u64) -> bool {
-        let delay_secs = delay_ms.saturating_add(999) / 1_000;
-        let elapsed = self.started.elapsed().as_secs();
-        elapsed.saturating_add(delay_secs) >= self.budget.max_wall_secs
+        retry_complete(
+            &*self.llm,
+            self.config.retry,
+            self.started,
+            self.budget.max_wall_secs,
+            req,
+        )
     }
 
     fn plan(&mut self) -> AgentResult<CognitionState> {
@@ -1304,26 +1323,9 @@ struct ReplyDigest {
 /// Enough of the reply text to show WHAT failed to parse, without dumping it.
 const REPLY_DIGEST_HEAD_CHARS: usize = 200;
 
-/// Adapts a [`Ctx`] into a [`Completer`] for the proposer: routes each call through
-/// the same traced, budgeted, replayable path as the cognition loop.
-struct CtxCompleter<'c, 'a> {
-    ctx: &'c mut Ctx<'a>,
-    prompt: &'c ResolvedPrompt,
-    last_reply: &'c mut Option<ReplyDigest>,
-}
-
-impl Completer for CtxCompleter<'_, '_> {
-    fn complete(&mut self, req: &CompletionRequest) -> Result<CompletionResponse, ProposeError> {
-        // The proposal operator OWNS its request's sampling: its explore/exploit
-        // temperature schedule (or its deliberate omission, for models that
-        // deprecate the parameter) must pass through untouched. The agent's
-        // deterministic default applies only to its own control calls.
-        let req = req.clone();
-        let resp = self.ctx.call_with_retry(&req).map_err(ProposeError::Llm)?;
-        self.ctx
-            .accrue_and_record(&req, &resp, self.prompt)
-            .map_err(|e| ProposeError::Failed(e.to_string()))?;
-        *self.last_reply = Some(ReplyDigest {
+impl ReplyDigest {
+    fn of(resp: &CompletionResponse) -> Self {
+        Self {
             head: resp
                 .message
                 .content
@@ -1332,6 +1334,57 @@ impl Completer for CtxCompleter<'_, '_> {
                 .collect(),
             tool_calls: resp.message.tool_calls.len(),
             finish_reason: resp.finish_reason,
+        }
+    }
+}
+
+/// One buffered proposal LLM call; the controller drains these after `propose` to
+/// accrue budget and record the replay trace.
+struct RecordedCall {
+    req: CompletionRequest,
+    resp: CompletionResponse,
+}
+
+/// The OWNED one-shot LLM channel handed to a proposal operator. It runs each call
+/// through the same retry path as the cognition loop and BUFFERS every
+/// (request, response) into a shared log; the controller drains the log after
+/// `propose` to accrue budget and record the trace. Decoupled from `Ctx` (the
+/// controller no longer completes inline) so the channel is `'static` and can be
+/// wrapped for another language runtime. Single-threaded by
+/// construction (`Rc`/`RefCell`), matching the sequential discovery loop.
+struct OwnedChannel {
+    llm: Arc<dyn LLMClient>,
+    retry: RetryPolicy,
+    started: Instant,
+    max_wall_secs: u64,
+    cost_capped: bool,
+    log: Rc<RefCell<Vec<RecordedCall>>>,
+}
+
+impl Completer for OwnedChannel {
+    fn complete(&mut self, req: &CompletionRequest) -> Result<CompletionResponse, ProposeError> {
+        // The proposal operator OWNS its request's sampling (its explore/exploit
+        // temperature schedule, or its deliberate omission) - pass it untouched.
+        let resp = retry_complete(
+            &*self.llm,
+            self.retry,
+            self.started,
+            self.max_wall_secs,
+            req,
+        )
+        .map_err(ProposeError::Llm)?;
+        // Fail closed PER CALL (as accrue_and_record does): an unpriced response
+        // cannot be cost-capped, so a multi-call operator stops on the first one.
+        if self.cost_capped && resp.usage.cost_usd.is_none() {
+            return Err(ProposeError::Failed(format!(
+                "max_cost_usd is set but model '{}' returned an unpriced response; \
+                 add the model to llm pricing or unset the cost cap",
+                self.llm.model_id()
+            )));
+        }
+        self.log.borrow_mut().push(RecordedCall {
+            req: req.clone(),
+            resp: resp.clone(),
         });
         Ok(resp)
     }
@@ -1402,21 +1455,32 @@ impl Ctx<'_> {
                 .collect();
 
             self.usage.proposals += 1;
-            let mut last_reply: Option<ReplyDigest> = None;
+            let log: Rc<RefCell<Vec<RecordedCall>>> = Rc::new(RefCell::new(Vec::new()));
             let candidates = {
                 let pctx = ProposalContext {
                     goal: &dgoal.goal,
                     elites: &elites,
                     system: &system,
                 };
-                let mut completer = CtxCompleter {
-                    ctx: self,
-                    prompt: &system,
-                    last_reply: &mut last_reply,
+                let channel = OwnedChannel {
+                    llm: Arc::clone(&self.llm),
+                    retry: self.config.retry,
+                    started: self.started,
+                    max_wall_secs: self.budget.max_wall_secs,
+                    cost_capped: self.budget.max_cost_usd.is_some(),
+                    log: Rc::clone(&log),
                 };
-                op.propose(&pctx, &mut completer)
+                op.propose(&pctx, Box::new(channel))
             }
             .map_err(|e| AgentError::Other(format!("proposer: {e}")))?;
+            // Drain the buffered calls: accrue budget + record the replay trace (the
+            // accounting the controller used to do inline), then summarize the last reply.
+            let calls: Vec<RecordedCall> = log.borrow_mut().drain(..).collect();
+            let mut last_reply: Option<ReplyDigest> = None;
+            for call in &calls {
+                self.accrue_and_record(&call.req, &call.resp, &system)?;
+                last_reply = Some(ReplyDigest::of(&call.resp));
+            }
 
             // Barren rounds are LOUD: a $-burning structural failure (every reply
             // unparseable) must be visible per round, not after the budget dies.

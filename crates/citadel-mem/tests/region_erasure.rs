@@ -590,7 +590,7 @@ fn grow_under_load_reopen_and_recycle() {
 fn encrypted_recall_with_kinds_filter_and_reranker() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(open_enc_db(&dir.path().join("m.db"), b"pw", true).unwrap());
-    let mut eng = MemoryEngine::open(db).unwrap();
+    let eng = MemoryEngine::open(db).unwrap();
     eng.create_encrypted_region("r", embedder()).unwrap();
     eng.remember(
         "r",

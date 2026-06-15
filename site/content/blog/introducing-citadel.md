@@ -51,6 +51,6 @@ It uses no LLM to build or search memory - it stores raw turns and recalls with 
 - **Vectors and memory** - `VECTOR(N)` with a PRISM ANN index, the `citadel-mem` atom/edge store, and the `citadel-mcp` server.
 - **Transactions** - ACID with snapshot isolation and concurrent readers.
 - **Sync** - encrypted peer-to-peer diffing over the Noise protocol.
-- **Bindings** - Rust, WebAssembly, a C API, and a CLI.
+- **Bindings** - Rust, Python, WebAssembly, a C API, and a CLI.
 
 Citadel is a Rust workspace with thousands of tests, all in one encrypted file. Try it in the [playground](@/demo/_index.md), or read the <a href="https://github.com/yp3y5akh0v/citadel" target="_blank" rel="noopener">source</a>.

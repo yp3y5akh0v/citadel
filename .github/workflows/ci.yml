@@ -66,6 +66,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      # citadeldb-python is a pyo3 cdylib member; its test harness links libpython.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.name }}
@@ -94,5 +98,34 @@ jobs:
           cargo clippy -p citadeldb-mcp --all-targets --no-default-features -- -D warnings
           cargo clippy -p citadeldb-mcp --all-targets --no-default-features --features candle-embed -- -D warnings
           cargo test -p citadeldb-mcp --no-default-features
+      - name: clippy citadel-python candle-embed surface (the lean wheel never builds it)
+        run: cargo clippy -p citadeldb-python --all-targets --features candle-embed -- -D warnings
       - name: wasm32 compiles with features gated away to mock-only
         run: cargo build -p citadeldb-ai --target wasm32-unknown-unknown --features claude,openai,ollama
+
+  # Build the wheel, run pytest, and type-check the stubs/facades.
+  python:
+    needs: [fmt, clippy]
+    runs-on: ubuntu-latest
+    name: python bindings
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tooling
+        run: pip install maturin pytest numpy mypy
+      - name: Build the wheel
+        run: maturin build --profile dev --out dist
+      - name: Install the wheel
+        run: pip install --no-index --find-links dist citadeldb
+      - name: pytest
+        run: pytest python/tests -q
+      - name: mypy (stubs + facades)
+        run: mypy -p citadeldb
+        env:
+          MYPYPATH: python
