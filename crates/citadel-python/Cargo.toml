@@ -1,0 +1,47 @@
+[package]
+name = "citadeldb-python"
+version.workspace = true
+edition.workspace = true
+# rust-numpy 0.29 needs a higher floor than the workspace's 1.75.
+rust-version = "1.83"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Python bindings for the Citadel encrypted database"
+publish = false
+
+[lib]
+name = "citadel_python"
+# cdylib: the importable extension (maturin renames it to citadeldb._core).
+crate-type = ["cdylib"]
+
+[dependencies]
+citadel = { workspace = true }
+citadel-sql = { workspace = true }
+citadel-vector = { workspace = true }
+citadel-mem = { workspace = true }
+# All providers + file/command tools (ureq, no tokio): in the default wheel.
+citadel-ai = { workspace = true, features = [
+    "claude",
+    "openai",
+    "ollama",
+    "gemini",
+    "file-tools",
+    "command-tool",
+] }
+citadel-cli = { workspace = true }
+# MCP server (no tokio); its candle-embed+hub default is off in the workspace dep.
+citadel-mcp = { workspace = true }
+# extension-module is set by maturin, not here (so cargo can find an interpreter).
+# numpy needs the full pyo3 API: no abi3, so per-Python-version wheels.
+pyo3 = { version = "0.29" }
+numpy = "0.29"
+self_cell = "1"
+serde_json = { workspace = true }
+
+[features]
+# Opt-in in-process Candle embedder; the default wheel stays lean (BYO embeddings).
+candle-embed = ["citadel-mem/candle-embed", "citadel-mcp/hub"]
+# Candle on an NVIDIA GPU (CUDA toolkit needed at build time).
+cuda-embed = ["candle-embed", "citadel-mem/cuda-embed", "citadel-mcp/cuda-embed"]

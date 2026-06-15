@@ -181,6 +181,15 @@ wtx.<span class="fn">create_table</span>(<span class="s">b"sessions"</span>)?;
 wtx.<span class="fn">table_insert</span>(<span class="s">b"sessions"</span>, <span class="s">b"token-abc"</span>, <span class="s">b"user-42"</span>)?;
 wtx.<span class="fn">commit</span>()?;`,
     },
+    python: {
+      file: 'app.py',
+      code: `<span class="k">import</span> citadeldb
+
+<span class="k">with</span> citadeldb.<span class="fn">connect</span>(<span class="s">"my.db"</span>, key=<span class="s">"secret"</span>, create=<span class="k">True</span>) <span class="k">as</span> db:
+    db.<span class="fn">execute</span>(<span class="s">"CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);"</span>)
+    db.<span class="fn">execute</span>(<span class="s">"INSERT INTO users VALUES (1, 'Alice');"</span>)
+    rows = db.<span class="fn">query</span>(<span class="s">"SELECT * FROM users;"</span>).rows  <span class="c"># [(1, 'Alice')]</span>`,
+    },
     wasm: {
       file: 'main.js',
       code: `<span class="k">import</span> { <span class="t">CitadelDb</span> } <span class="k">from</span> <span class="s">"@citadeldb/wasm"</span>;

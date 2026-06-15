@@ -72,7 +72,7 @@
       <div class="sec-index"><span class="num">02</span><span class="label">Repo shape</span></div>
       <div>
         <p style="margin:0 0 24px; color:var(--fg-2); font-size:14.5px; line-height:1.65; max-width:62ch;">
-          A Cargo workspace of {{ config.extra.crates }} crates, layered from the bytes on disk up to the SQL frontend, the memory engine, and the bindings. Each crate has its own tests; {{ config.extra.tests }} in total, with 100% pass on <code>cargo test --workspace</code>. {{ config.extra.published }} crates publish to crates.io.
+          A Cargo workspace of {{ config.extra.crates }} crates, layered from the bytes on disk up to the SQL frontend, the memory engine, and the bindings. Each crate has its own tests; {{ config.extra.tests }} in total, with 100% pass on <code>cargo test --workspace</code>. {{ config.extra.published }} crates publish to crates.io, plus a <code>citadeldb</code> wheel to PyPI.
         </p>
         <div class="crates">
           <div class="crate"><div class="name">citadel-core</div><div class="desc">Shared types, errors, constants.</div></div>
@@ -92,6 +92,7 @@
           <div class="crate"><div class="name">citadel-cli</div><div class="desc">REPL with 26 dot-commands, tab completion.</div></div>
           <div class="crate"><div class="name">citadel-ffi</div><div class="desc">{{ config.extra.ffi_functions }} C-ABI functions. cbindgen header.</div></div>
           <div class="crate"><div class="name">citadel-wasm</div><div class="desc">WebAssembly build. <code>@citadeldb/wasm</code> on npm.</div></div>
+          <div class="crate"><div class="name">citadel-python</div><div class="desc">PyO3 bindings. <code>citadeldb</code> wheel on PyPI.</div></div>
           <div class="crate"><div class="name">citadel-membench</div><div class="desc">LoCoMo long-memory benchmark harness.</div></div>
           <div class="crate"><div class="name">citadel-swe</div><div class="desc">Mini-SWE agent benchmark harness.</div></div>
         </div>
@@ -148,7 +149,7 @@
           </div>
           <div class="audit-row">
             <div class="cat">targets</div>
-            <div class="claim">Rust on crates.io, WebAssembly on npm, C ABI via <code>citadel-ffi</code>, and the <code>citadel</code> CLI. There is no Python binding yet.</div>
+            <div class="claim">Rust on crates.io, Python on PyPI, WebAssembly on npm, C ABI via <code>citadel-ffi</code>, and the <code>citadel</code> CLI.</div>
           </div>
           <div class="audit-row">
             <div class="cat">playground</div>
@@ -175,7 +176,7 @@
           </div>
         </div>
         <p style="margin:22px 0 0; color:var(--fg-3); font-size:13.5px; line-height:1.65; max-width:62ch;">
-          Citadel is a one-person project. If you want to contribute, the crate boundaries in section 02 are a decent map of where help is welcome: parser extensions, new code paths in <code>citadel-crypto</code>, recall tuning in <code>citadel-mem</code>, and language bindings on top of <code>citadel-ffi</code> are all fair game.
+          Citadel is a one-person project. If you want to contribute, the crate list in section 02 is a good map of where help is welcome - each crate is a self-contained area: parser extensions in <code>citadel-sql</code>, new code paths in <code>citadel-crypto</code>, recall tuning in <code>citadel-mem</code>, and more language bindings.
         </p>
       </div>
     </div>

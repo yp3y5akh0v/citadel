@@ -124,9 +124,11 @@ fn ann_metric(m: EmbeddingMetric) -> Metric {
 pub struct MemoryEngine {
     db: Arc<Database>,
     regions: Mutex<FxHashMap<String, RegionState>>,
-    /// Optional cross-encoder applied in `recall` before truncation; `None` = fusion.
-    reranker: Option<Arc<dyn Reranker>>,
-    rerank_strategy: RerankStrategy,
+    /// Optional cross-encoder + strategy applied in `recall` before truncation;
+    /// `None` = linear fusion. Behind a lock so `set_reranker` works through the
+    /// shared `Arc<MemoryEngine>`; recall snapshots it, never holding the guard
+    /// across the (possibly Python, possibly re-entrant) reranker callback.
+    reranker: RwLock<Option<(Arc<dyn Reranker>, RerankStrategy)>>,
 }
 
 const BOOTSTRAP_SQL: &str = "\
@@ -175,8 +177,7 @@ impl MemoryEngine {
         let engine = Self {
             db,
             regions: Mutex::new(FxHashMap::default()),
-            reranker: None,
-            rerank_strategy: RerankStrategy::default(),
+            reranker: RwLock::new(None),
         };
         if engine.db.region_keys_enabled() && engine.db.region_store_path().exists() {
             engine.reconcile_region_store()?;
@@ -271,9 +272,13 @@ impl MemoryEngine {
     }
 
     /// Attach a cross-encoder reranker for later `recall`s, combined per `strategy`.
-    pub fn set_reranker(&mut self, reranker: Arc<dyn Reranker>, strategy: RerankStrategy) {
-        self.reranker = Some(reranker);
-        self.rerank_strategy = strategy;
+    pub fn set_reranker(&self, reranker: Arc<dyn Reranker>, strategy: RerankStrategy) {
+        *self.reranker.write().unwrap() = Some((reranker, strategy));
+    }
+
+    /// Detach any reranker so subsequent `recall`s use linear fusion only.
+    pub fn clear_reranker(&self) {
+        *self.reranker.write().unwrap() = None;
     }
 
     /// Get-or-create a plaintext region bound to `embedder` (must match dim/metric/model).
@@ -1197,16 +1202,14 @@ impl MemoryEngine {
         let query_terms = query_keyword_terms(q.text.as_deref());
         assign_bm25_ranks(&mut cands, &query_terms);
         let as_of = q.as_of_micros.unwrap_or_else(now_micros);
-        let mut hits = match (&self.reranker, &q.text) {
-            (Some(r), Some(text)) => fuse_rerank(
-                r.as_ref(),
-                text,
-                cands,
-                q.weights,
-                as_of,
-                self.rerank_strategy,
-                q.k,
-            )?,
+        // Snapshot the reranker out of the lock: a BYO Python reranker callback may
+        // re-enter `set_reranker` or drop the GIL, so the guard must not be held
+        // across `fuse_rerank`. The Arc clone is a refcount bump; strategy is Copy.
+        let reranker = self.reranker.read().unwrap().clone();
+        let mut hits = match (reranker.as_ref(), &q.text) {
+            (Some((r, strategy)), Some(text)) => {
+                fuse_rerank(r.as_ref(), text, cands, q.weights, as_of, *strategy, q.k)?
+            }
             _ => fuse_rank(cands, q.weights, as_of, q.k),
         };
 
@@ -1972,16 +1975,14 @@ impl MemoryEngine {
         assign_bm25_ranks(&mut cands, &query_terms);
 
         let as_of = q.as_of_micros.unwrap_or_else(now_micros);
-        let mut hits = match (&self.reranker, &q.text) {
-            (Some(r), Some(text)) => fuse_rerank(
-                r.as_ref(),
-                text,
-                cands,
-                q.weights,
-                as_of,
-                self.rerank_strategy,
-                q.k,
-            )?,
+        // Snapshot the reranker out of the lock: a BYO Python reranker callback may
+        // re-enter `set_reranker` or drop the GIL, so the guard must not be held
+        // across `fuse_rerank`. The Arc clone is a refcount bump; strategy is Copy.
+        let reranker = self.reranker.read().unwrap().clone();
+        let mut hits = match (reranker.as_ref(), &q.text) {
+            (Some((r, strategy)), Some(text)) => {
+                fuse_rerank(r.as_ref(), text, cands, q.weights, as_of, *strategy, q.k)?
+            }
             _ => fuse_rank(cands, q.weights, as_of, q.k),
         };
 

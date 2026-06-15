@@ -8,3 +8,8 @@ site/public/
 site/static/wasm/*.wasm
 site/static/wasm/*.js
 /notes/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+/dist/

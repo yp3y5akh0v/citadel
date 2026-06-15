@@ -147,7 +147,7 @@ pub fn run_interactive(
                     buf.push_str(&line);
                     buf.push(' ');
 
-                    if has_complete_statement(&buf) {
+                    if crate::has_complete_statement(&buf) {
                         let sql = buf.trim().to_string();
                         execute_sql(&conn, &db, &sql, &mut settings);
                         buf.clear();
@@ -236,7 +236,7 @@ fn execute_batch_sql(conn: &Connection<'_>, db: &Database, content: &str, settin
 
         buf.push_str(line);
         buf.push(' ');
-        if has_complete_statement(&buf) {
+        if crate::has_complete_statement(&buf) {
             let sql = buf.trim();
             if !sql.is_empty() {
                 match conn.execute(sql) {
@@ -254,26 +254,6 @@ fn execute_batch_sql(conn: &Connection<'_>, db: &Database, content: &str, settin
             buf.clear();
         }
     }
-}
-
-fn has_complete_statement(s: &str) -> bool {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-
-    for ch in trimmed.chars() {
-        match ch {
-            '\'' if !in_double_quote => in_single_quote = !in_single_quote,
-            '"' if !in_single_quote => in_double_quote = !in_double_quote,
-            _ => {}
-        }
-    }
-
-    !in_single_quote && !in_double_quote && trimmed.ends_with(';')
 }
 
 fn history_file_path() -> Option<PathBuf> {
