@@ -65,6 +65,11 @@ jobs:
     name: test (${{ matrix.name }})
     steps:
       - uses: actions/checkout@v5
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
       - uses: dtolnay/rust-toolchain@stable
       # citadeldb-python is a pyo3 cdylib member; its test harness links libpython.
       - uses: actions/setup-python@v5
