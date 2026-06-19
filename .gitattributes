@@ -1,2 +1,4 @@
 # cbindgen-generated; pinned to LF.
 crates/citadel-ffi/citadel.h text eol=lf
+# cargo-generated; pinned to LF.
+Cargo.lock text eol=lf
