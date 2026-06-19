@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use citadel_mem::{
     AtomHit, AtomId, AtomInput, EdgeKind, EvictionPolicy, EvictionReport, FusionWeights,
-    MemoryEngine, RecallQuery,
+    GraphExpand, MemoryEngine, RecallQuery,
 };
 
 use crate::verify::CheckerAttestation;
@@ -118,6 +118,34 @@ pub struct VerifiedExport {
 }
 
 pub type GraphResult<T> = Result<T, GraphError>;
+
+/// Configured retrieval policy for the agent's always-on context recall.
+///
+/// Code-chosen, not LLM-chosen, so per-step recall stays deterministic and
+/// deployments can tune fusion/graph traversal without inline hyperparameters.
+#[derive(Debug, Clone)]
+pub struct RecallContextConfig {
+    /// Fusion weights for the seed recall. Defaults keep recency disabled for replay
+    /// stability while preserving semantic, keyword, and native importance signals.
+    pub weights: FusionWeights,
+    /// Optional graph expansion applied to seed hits. Defaults off until a deployment
+    /// measures that its graph topology adds signal. The memory engine's configured
+    /// reranker, if any, still runs inside `MemoryEngine::recall`.
+    pub graph_expand: Option<GraphExpand>,
+}
+
+impl Default for RecallContextConfig {
+    fn default() -> Self {
+        let weights = FusionWeights {
+            recency: 0.0,
+            ..FusionWeights::default()
+        };
+        Self {
+            weights,
+            graph_expand: None,
+        }
+    }
+}
 
 /// How [`BeliefGraph::evict_traces`] selects `llm_trace` atoms to forget. Traces
 /// are immutable, so this is a deliberate force-delete (never the audit/self-model).
@@ -606,7 +634,10 @@ impl BeliefGraph {
     pub fn add_hypothesis(&self, hyp: &Hypothesis, refines_goal: AtomId) -> GraphResult<AtomId> {
         let id = self.mem.remember(
             &self.region,
-            AtomInput::new("hypothesis", &hyp.summary).with_payload(hyp.to_json()),
+            AtomInput::new("hypothesis", &hyp.summary)
+                .with_payload(hyp.to_json())
+                .with_score(hyp.confidence)
+                .with_confidence(hyp.confidence),
         )?;
         self.mem.link(id, refines_goal, EdgeKind::Refines, 1.0)?;
         Ok(id)
@@ -626,7 +657,10 @@ impl BeliefGraph {
     pub fn add_reflection(&self, refl: &Reflection, about: AtomId) -> GraphResult<AtomId> {
         let id = self.mem.remember(
             &self.region,
-            AtomInput::new("reflection", &refl.insight).with_payload(refl.to_json()),
+            AtomInput::new("reflection", &refl.insight)
+                .with_payload(refl.to_json())
+                .with_score(refl.confidence)
+                .with_confidence(refl.confidence),
         )?;
         self.mem.link(id, about, EdgeKind::DerivedFrom, 1.0)?;
         Ok(id)
@@ -638,7 +672,9 @@ impl BeliefGraph {
     pub fn add_candidate(&self, artifact: &str, score: f64) -> GraphResult<AtomId> {
         let id = self.mem.remember(
             &self.region,
-            AtomInput::new(CANDIDATE_KIND, artifact).with_payload(json!({ "score": score })),
+            AtomInput::new(CANDIDATE_KIND, artifact)
+                .with_payload(json!({ "score": score }))
+                .with_score(score as f32),
         )?;
         Ok(id)
     }
@@ -672,6 +708,7 @@ impl BeliefGraph {
             &self.region,
             AtomInput::new(kind.as_str(), &candidate.text)
                 .with_payload(payload)
+                .with_score(score as f32)
                 .with_confidence(1.0)
                 .immutable(),
         )?;
@@ -1199,21 +1236,31 @@ impl BeliefGraph {
         Ok(out)
     }
 
-    /// Semantically recall the `k` most relevant atoms, restricted to narrative kinds
-    /// (evidence/fact/reflection) so trace/audit never leak into a prompt. Recency
-    /// weight is 0, so results depend only on (query, region state) - replay-stable.
+    /// Semantically recall the `k` most relevant atoms using the default context
+    /// retrieval policy.
     pub fn recall_relevant(&self, query: &str, k: usize) -> GraphResult<Vec<AtomHit>> {
-        let weights = FusionWeights {
-            recency: 0.0,
-            ..FusionWeights::default()
-        };
-        let q = RecallQuery::by_text(query, k)
+        self.recall_relevant_with(query, k, &RecallContextConfig::default())
+    }
+
+    /// Semantically recall the `k` most relevant atoms, restricted to narrative kinds
+    /// (evidence/fact/reflection) so trace/audit never seed prompt context. Recency is
+    /// controlled by `config`; the default keeps it at 0 for replay stability.
+    pub fn recall_relevant_with(
+        &self,
+        query: &str,
+        k: usize,
+        config: &RecallContextConfig,
+    ) -> GraphResult<Vec<AtomHit>> {
+        let mut q = RecallQuery::by_text(query, k)
             .with_kinds(vec![
                 "evidence".to_string(),
                 "fact".to_string(),
                 "reflection".to_string(),
             ])
-            .with_weights(weights);
+            .with_weights(config.weights);
+        if let Some(expand) = &config.graph_expand {
+            q = q.with_graph_expand(expand.clone());
+        }
         Ok(self.mem.recall(&self.region, q)?)
     }
 
@@ -1569,6 +1616,79 @@ mod tests {
         assert_eq!(refl_edges[0].dst_id, goal);
 
         assert_eq!(g.get_goal(goal).unwrap().unwrap().prompt, "solve X");
+    }
+
+    #[test]
+    fn graph_writes_native_memory_scores_when_available() {
+        let (_d, g) = graph();
+        let goal = g.add_goal(&Goal::new("score native fields")).unwrap();
+        let hyp = g
+            .add_hypothesis(
+                &Hypothesis {
+                    summary: "ranked hypothesis".into(),
+                    confidence: 0.6,
+                },
+                goal,
+            )
+            .unwrap();
+        let refl = g
+            .add_reflection(
+                &Reflection {
+                    insight: "ranked reflection".into(),
+                    confidence: 0.8,
+                },
+                goal,
+            )
+            .unwrap();
+        let cand = g.add_candidate("ranked candidate", 0.7).unwrap();
+        let verified = g
+            .add_verified_artifact(
+                cand,
+                VerifiedKind::Lemma,
+                CheckerAttestation {
+                    checker_id: "checker".into(),
+                    checker_version: "1".into(),
+                },
+                0.9,
+            )
+            .unwrap();
+
+        assert_eq!(g.mem.fetch_one("agent", hyp).unwrap().unwrap().score, 0.6);
+        assert_eq!(g.mem.fetch_one("agent", refl).unwrap().unwrap().score, 0.8);
+        assert_eq!(g.mem.fetch_one("agent", cand).unwrap().unwrap().score, 0.7);
+        assert_eq!(
+            g.mem.fetch_one("agent", verified).unwrap().unwrap().score,
+            0.9
+        );
+    }
+
+    #[test]
+    fn recall_relevant_uses_configured_graph_expansion() {
+        let (_d, g) = graph();
+        let parent = g
+            .mem
+            .remember("agent", AtomInput::new("fact", "parent context anchor"))
+            .unwrap();
+        let child = g
+            .mem
+            .remember("agent", AtomInput::new("evidence", "needle leaf context"))
+            .unwrap();
+        g.mem
+            .link(child, parent, EdgeKind::DerivedFrom, 1.0)
+            .unwrap();
+
+        let cfg = RecallContextConfig {
+            weights: FusionWeights::semantic_only(),
+            graph_expand: Some(GraphExpand::new(1, vec![EdgeKind::DerivedFrom])),
+        };
+        let hits = g
+            .recall_relevant_with("needle leaf context", 1, &cfg)
+            .unwrap();
+        assert!(hits.iter().any(|h| h.id == child), "seed hit missing");
+        assert!(
+            hits.iter().any(|h| h.id == parent),
+            "configured graph expansion should include the parent atom: {hits:?}"
+        );
     }
 
     #[test]

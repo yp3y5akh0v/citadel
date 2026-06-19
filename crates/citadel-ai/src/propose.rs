@@ -24,6 +24,14 @@ pub struct Candidate {
     pub rationale: String,
 }
 
+/// A candidate the verifier rejected, with the checker's reason - the input to
+/// [`ProposalOperator::repair`] so an LLM operator can feed the error back.
+#[derive(Debug, Clone)]
+pub struct RejectedCandidate {
+    pub artifact: Value,
+    pub reason: String,
+}
+
 /// An elite-archive entry offered to the operator as a mutation parent.
 #[derive(Debug, Clone)]
 pub struct Elite {
@@ -66,6 +74,19 @@ pub trait ProposalOperator: Send + Sync {
         ctx: &ProposalContext<'_>,
         llm: Box<dyn Completer>,
     ) -> Result<Vec<Candidate>, ProposeError>;
+
+    /// Repair a rejected candidate by re-prompting with the checker's reason, so the
+    /// model fixes its own error (error-feedback search). Default: no repair (an empty
+    /// result ends the attempt). LLM operators override this; the controller traces
+    /// and budgets the repair call exactly like a proposal.
+    fn repair(
+        &self,
+        _ctx: &ProposalContext<'_>,
+        _failed: &RejectedCandidate,
+        _llm: Box<dyn Completer>,
+    ) -> Result<Vec<Candidate>, ProposeError> {
+        Ok(Vec::new())
+    }
 }
 
 /// A [`ProposalOperator`] that asks a model (via the injected [`Completer`]) for
@@ -139,7 +160,7 @@ impl LlmProposer {
     fn build_request(&self, ctx: &ProposalContext<'_>) -> CompletionRequest {
         let best: Vec<&Value> = ctx.elites.iter().map(|e| &e.artifact).collect();
         let best = serde_json::to_string(&best).unwrap_or_else(|_| "[]".to_string());
-        let mut req = if self.plain_json {
+        let req = if self.plain_json {
             // The verification delegation is load-bearing for adaptive-thinking
             // models: without it the model re-implements the external checker
             // inside its billed, invisible reasoning and can emit no text at all.
@@ -162,6 +183,13 @@ impl LlmProposer {
                 .with_tools(vec![self.propose_tool()])
                 .with_tool_choice(ToolChoice::Any)
         };
+        self.finalize(req)
+    }
+
+    /// Apply the proposer's mode (plain-JSON schema + capped effort), token budget, and
+    /// sampling temperature to a built request. Shared by `build_request` and
+    /// `build_repair_request` so output shape and sampling stay identical.
+    fn finalize(&self, mut req: CompletionRequest) -> CompletionRequest {
         if self.plain_json {
             // Cap reasoning + force a schema-valid block; object root is the
             // canonical structured-output shape (the prompt names "candidates").
@@ -181,6 +209,38 @@ impl LlmProposer {
         req.max_tokens = self.max_tokens;
         req.temperature = Some(self.temperature);
         req
+    }
+
+    /// Re-prompt the model to fix a checker-rejected candidate (error-feedback search):
+    /// the failed artifact and reason go in, a corrected candidate comes out. Mirrors
+    /// `build_request`'s envelope so tool / plain-JSON mode and sampling match.
+    fn build_repair_request(
+        &self,
+        ctx: &ProposalContext<'_>,
+        failed: &RejectedCandidate,
+    ) -> CompletionRequest {
+        let artifact = serde_json::to_string(&failed.artifact).unwrap_or_else(|_| "{}".to_string());
+        let req = if self.plain_json {
+            let user = format!(
+                "Goal: {}\nThis candidate was REJECTED by the checker:\n{artifact}\n\
+                 Rejection reason: {}\nFix the specific error and immediately output corrected \
+                 candidate objects in the required JSON schema. Do NOT re-verify your fix - the \
+                 external checker re-validates every candidate.",
+                ctx.goal.prompt, failed.reason
+            );
+            CompletionRequest::new(vec![ctx.system.as_system(), Message::user(user)])
+        } else {
+            let user = format!(
+                "Goal: {}\nThis candidate was REJECTED by the checker:\n{artifact}\n\
+                 Rejection reason: {}\nFix the specific error and call the propose tool once with \
+                 a corrected candidate.",
+                ctx.goal.prompt, failed.reason
+            );
+            CompletionRequest::new(vec![ctx.system.as_system(), Message::user(user)])
+                .with_tools(vec![self.propose_tool()])
+                .with_tool_choice(ToolChoice::Any)
+        };
+        self.finalize(req)
     }
 }
 
@@ -270,6 +330,16 @@ impl ProposalOperator for LlmProposer {
         let resp = llm.complete(&self.build_request(ctx))?;
         Ok(parse_candidates(&resp.message))
     }
+
+    fn repair(
+        &self,
+        ctx: &ProposalContext<'_>,
+        failed: &RejectedCandidate,
+        mut llm: Box<dyn Completer>,
+    ) -> Result<Vec<Candidate>, ProposeError> {
+        let resp = llm.complete(&self.build_repair_request(ctx, failed))?;
+        Ok(parse_candidates(&resp.message))
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +380,33 @@ mod tests {
         LlmProposer::new()
             .propose(&ctx_for(&goal, &system), Box::new(OneShot(reply)))
             .unwrap()
+    }
+
+    fn repair_with(failed: RejectedCandidate, reply: CompletionResponse) -> Vec<Candidate> {
+        let goal = Goal::new("produce a candidate satisfying the constraints");
+        let lib = PromptLibrary::default();
+        let system = lib.resolve(PromptId::Proposer);
+        LlmProposer::new()
+            .repair(&ctx_for(&goal, &system), &failed, Box::new(OneShot(reply)))
+            .unwrap()
+    }
+
+    #[test]
+    fn repair_reprompts_and_parses_the_corrected_candidate() {
+        let failed = RejectedCandidate {
+            artifact: serde_json::json!({ "values": [[1, 1]] }),
+            reason: "checker: needs at least two distinct rows".to_string(),
+        };
+        let cands = repair_with(
+            failed,
+            CompletionResponse::tool_calls(vec![ToolCall {
+                id: "r".into(),
+                name: "propose".into(),
+                arguments: serde_json::json!({ "values": [[1, 1], [2, 1]] }),
+            }]),
+        );
+        assert_eq!(cands.len(), 1, "the model's fix is parsed like a proposal");
+        assert_eq!(cands[0].artifact["values"].as_array().unwrap().len(), 2);
     }
 
     #[test]
