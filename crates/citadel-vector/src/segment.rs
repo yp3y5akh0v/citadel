@@ -47,6 +47,7 @@ const TAG_BINARY: u8 = 4;
 const TAG_TREE: u8 = 5;
 const TAG_IDS: u8 = 6;
 const TAG_ATTRS: u8 = 7;
+const TAG_VECTORS: u8 = 8;
 
 /// BLAKE3 of the canonical little-endian encoding of EVERY [`PrismConfig`]
 /// field, domain-separated. The storage header pins this; a binary whose
@@ -148,6 +149,11 @@ pub fn encode(index: &AnnIndex) -> Vec<u8> {
             push_slice_u32(b, col);
         }
     });
+    // The f32 vectors in PRISM slot order, so a cold load is a bulk read, not a rescan.
+    section(&mut out, TAG_VECTORS, |b| {
+        push_u64(b, p.store.dim as u64);
+        push_slice_f32(b, &p.store.vectors);
+    });
     out
 }
 
@@ -168,6 +174,7 @@ pub struct SegmentParts {
     original_ids: Vec<u32>,
     id_map: Vec<u64>,
     attrs: Vec<Vec<u32>>,
+    vectors: Vec<f32>,
     n: usize,
 }
 
@@ -188,7 +195,7 @@ impl SegmentParts {
         &self.id_map
     }
 
-    /// `row_id -> PRISM-internal slot`: the PERMUTATION rehydration must use.
+    /// `row_id -> PRISM-internal slot`: the PERMUTATION the rehydration loader uses.
     pub fn internal_of_row(&self) -> FxHashMap<u64, u32> {
         self.id_map
             .iter()
@@ -197,8 +204,26 @@ impl SegmentParts {
             .collect()
     }
 
-    /// Finish the index with vectors ALREADY PLACED in PRISM-internal order
-    /// (`filled` = how many slots the loader filled; must be exactly `n`).
+    /// Assemble the index from vectors ALREADY in PRISM-internal slot order.
+    fn build(self, vectors: Vec<f32>) -> AnnIndex {
+        let store = PointStore::from_parts(vectors, self.dim as usize, self.attrs);
+        let prism = PrismIndex {
+            store,
+            tree: self.tree,
+            graph: self.graph,
+            local_graph: self.local_graph,
+            medoids: self.medoids,
+            global_medoid: self.global_medoid,
+            point_cell: self.point_cell,
+            original_ids: self.original_ids,
+            sq8: self.sq8,
+            binary: self.binary,
+            config: AnnIndex::active_config(self.metric),
+        };
+        AnnIndex::from_parts(prism, self.id_map, self.snapshot_max, self.metric, self.dim)
+    }
+
+    /// Build the index from externally-rehydrated vectors (id_map order); the sealed-load path.
     pub fn into_index(
         self,
         mut vectors: Vec<f32>,
@@ -216,33 +241,16 @@ impl SegmentParts {
                 got: vectors.len(),
             });
         }
-        // Cosine stores are build-normalized; rehydrated row vectors are raw.
-        // Re-applying the same normalization keeps loaded-segment search
-        // bit-identical to the freshly built index.
         if self.metric == Metric::Cosine {
             crate::prism::distance::normalize_rows(&mut vectors, self.dim as usize);
         }
-        let store = PointStore::from_parts(vectors, self.dim as usize, self.attrs);
-        let prism = PrismIndex {
-            store,
-            tree: self.tree,
-            graph: self.graph,
-            local_graph: self.local_graph,
-            medoids: self.medoids,
-            global_medoid: self.global_medoid,
-            point_cell: self.point_cell,
-            original_ids: self.original_ids,
-            sq8: self.sq8,
-            binary: self.binary,
-            config: AnnIndex::active_config(self.metric),
-        };
-        Ok(AnnIndex::from_parts(
-            prism,
-            self.id_map,
-            self.snapshot_max,
-            self.metric,
-            self.dim,
-        ))
+        Ok(self.build(vectors))
+    }
+
+    /// Build the index from the segment's embedded build-form vectors - the fast cold-load path.
+    pub fn into_index_embedded(mut self) -> AnnIndex {
+        let vectors = std::mem::take(&mut self.vectors);
+        self.build(vectors)
     }
 }
 
@@ -317,6 +325,17 @@ pub fn decode(bytes: &[u8]) -> Result<SegmentParts, SegmentError> {
         attrs.push(col);
     }
 
+    let v = r.section(TAG_VECTORS, "vectors")?;
+    let mut vr = Reader { buf: v, at: 0 };
+    let vdim = vr.u64("vectors")? as usize;
+    let vectors = vr.slice_f32("vectors")?;
+    if vdim != dim as usize || vectors.len() != n * dim as usize {
+        return Err(SegmentError::VectorLen {
+            expected: n * dim as usize,
+            got: vectors.len(),
+        });
+    }
+
     if id_map.len() != n || original_ids.len() != n || point_cell.len() != n {
         return Err(SegmentError::Inconsistent("id arrays disagree on n"));
     }
@@ -335,6 +354,7 @@ pub fn decode(bytes: &[u8]) -> Result<SegmentParts, SegmentError> {
         original_ids,
         id_map,
         attrs,
+        vectors,
         n,
     })
 }
@@ -635,6 +655,22 @@ mod tests {
     }
 
     #[test]
+    fn embedded_load_answers_like_the_original() {
+        // into_index_embedded (the fast path) must rebuild a search-identical index.
+        let index = build_fixture();
+        let parts = decode(&encode(&index)).expect("decode");
+        let loaded = parts.into_index_embedded();
+        let query: Vec<f32> = (0..8).map(|d| d as f32 * 0.3).collect();
+        assert_eq!(
+            index.search(&query, 10),
+            loaded.search(&query, 10),
+            "embedded-vector load must answer EXACTLY like the original"
+        );
+        assert_eq!(index.snapshot_max, loaded.snapshot_max);
+        assert_eq!(index.id_map(), loaded.id_map());
+    }
+
+    #[test]
     fn every_section_corruption_is_refused() {
         let index = build_fixture();
         let bytes = encode(&index);
@@ -647,7 +683,7 @@ mod tests {
             payload_spots.push(at + 9 + len / 2);
             at += 1 + 8 + len + 32;
         }
-        assert_eq!(payload_spots.len(), 7, "all seven sections present");
+        assert_eq!(payload_spots.len(), 8, "all eight sections present");
         for spot in payload_spots {
             let mut corrupt = bytes.clone();
             corrupt[spot] ^= 0xFF;

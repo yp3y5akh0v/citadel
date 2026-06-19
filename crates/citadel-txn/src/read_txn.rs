@@ -78,6 +78,11 @@ impl<'db> ReadTxn<'db> {
         self.snapshot.tree_entries
     }
 
+    /// The table's catalog root in this txn (a lookup, no scan); a version stamp.
+    pub fn table_root_page(&self, table: &[u8]) -> Result<Option<PageId>> {
+        self.manager.table_root(table)
+    }
+
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.search_tree(self.snapshot.tree_root, key)
     }
