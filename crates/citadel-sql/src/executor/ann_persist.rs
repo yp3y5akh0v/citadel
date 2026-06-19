@@ -20,7 +20,7 @@ use rustc_hash::FxHashMap;
 use crate::error::{Result, SqlError};
 
 /// Bump on ANY layout change of the header or the segment body.
-pub const ANNSEG_FORMAT_VERSION: u16 = 1;
+pub const ANNSEG_FORMAT_VERSION: u16 = 2;
 
 const MAGIC: &[u8; 7] = b"ANNSEG\0";
 
@@ -53,6 +53,8 @@ pub struct SegmentHeader {
     /// (NULL vectors are unindexed), exactly via the fingerprint scan.
     pub n: u64,
     pub snapshot_max: u64,
+    /// The table's catalog root at persist - a differing live root means stale (CoW gate).
+    pub table_root: u64,
     /// The indexed column and the filter columns, IN ATTRIBUTE ORDER - an
     /// index re-created over different columns must be refused explicitly,
     /// never discovered via fingerprint luck.
@@ -78,6 +80,7 @@ impl SegmentHeader {
         b.push(self.metric_tag);
         b.extend_from_slice(&self.n.to_le_bytes());
         b.extend_from_slice(&self.snapshot_max.to_le_bytes());
+        b.extend_from_slice(&self.table_root.to_le_bytes());
         b.extend_from_slice(&self.col_idx.to_le_bytes());
         b.extend_from_slice(&(self.filter_cols.len() as u32).to_le_bytes());
         for &c in &self.filter_cols {
@@ -130,6 +133,7 @@ impl SegmentHeader {
         let metric_tag = take(1)?[0];
         let n = u64::from_le_bytes(take(8)?.try_into().unwrap());
         let snapshot_max = u64::from_le_bytes(take(8)?.try_into().unwrap());
+        let table_root = u64::from_le_bytes(take(8)?.try_into().unwrap());
         let col_idx = u32::from_le_bytes(take(4)?.try_into().unwrap());
         let fc_len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
         let mut filter_cols = Vec::with_capacity(fc_len);
@@ -164,6 +168,7 @@ impl SegmentHeader {
             metric_tag,
             n,
             snapshot_max,
+            table_root,
             col_idx,
             filter_cols,
             dicts,
@@ -278,6 +283,7 @@ mod tests {
             metric_tag: 2,
             n: 311_592,
             snapshot_max: 99,
+            table_root: 1234,
             col_idx: 3,
             filter_cols: vec![1, 2],
             dicts: vec![

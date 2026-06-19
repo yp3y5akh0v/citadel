@@ -317,9 +317,9 @@ fn tampered_header_is_refused() {
 }
 
 #[test]
-fn resurrected_stale_segment_is_refused_by_the_fingerprint() {
-    // The Layer B case: a segment that survives a table change through a
-    // channel the transactional purge cannot see (here: raw-KV resurrection).
+fn resurrected_stale_segment_is_refused_by_the_root_stamp() {
+    // A raw-KV-resurrected segment (bypassing the transactional purge) is still caught
+    // on cold load: the DELETE moved the table's root, so root != the stamp.
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let conn = Connection::open(&db).unwrap();
@@ -359,10 +359,7 @@ fn resurrected_stale_segment_is_refused_by_the_fingerprint() {
     );
     match status(&conn, "t") {
         Some(AnnIndexSource::Built { refusal: Some(r) }) => {
-            assert!(
-                r.contains("stale") || r.contains("fingerprint"),
-                "reason: {r}"
-            );
+            assert!(r.contains("stale"), "reason: {r}");
         }
         other => panic!("expected Built with a staleness refusal, got {other:?}"),
     }

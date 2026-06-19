@@ -176,6 +176,11 @@ impl<'db> WriteTxn<'db> {
         self.tree.entry_count
     }
 
+    /// The table's catalog root in its committed view (a lookup, no scan); a version stamp.
+    pub fn table_root_page(&self, table: &[u8]) -> Result<Option<PageId>> {
+        self.manager.table_root(table)
+    }
+
     pub fn pending_free_count(&self) -> usize {
         self.alloc.freed_count()
     }
