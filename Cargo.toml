@@ -21,6 +21,28 @@ members = [
     "citadel-cli",
     "crates/citadel-python",
 ]
+# Excludes citadel-python; it needs a Python interpreter at build.
+default-members = [
+    "crates/citadel-core",
+    "crates/citadel-crypto",
+    "crates/citadel-io",
+    "crates/citadel-page",
+    "crates/citadel-buffer",
+    "crates/citadel-txn",
+    "crates/citadel-sql",
+    "crates/citadel-sync",
+    "crates/citadel-ffi",
+    "crates/citadel-wasm",
+    "crates/sql-json-path",
+    "crates/citadel-vector",
+    "crates/citadel-mem",
+    "crates/citadel-ai",
+    "crates/citadel-mcp",
+    "crates/citadel-membench",
+    "crates/citadel-swe",
+    "citadel",
+    "citadel-cli",
+]
 resolver = "2"
 
 [workspace.package]
