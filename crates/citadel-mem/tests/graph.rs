@@ -124,3 +124,37 @@ fn graph_expand_respects_edge_kind_filter() {
     assert!(ids.contains(&a));
     assert!(!ids.contains(&b), "causes edge must not be followed");
 }
+
+#[test]
+fn graph_expand_respects_atom_kind_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let seed = eng
+        .remember("r", AtomInput::new("fact", "alpha unique seed"))
+        .unwrap();
+    let allowed = eng
+        .remember("r", AtomInput::new("fact", "allowed fact neighbor"))
+        .unwrap();
+    let blocked = eng
+        .remember("r", AtomInput::new("audit", "blocked audit neighbor"))
+        .unwrap();
+    eng.link(seed, allowed, EdgeKind::DerivedFrom, 1.0).unwrap();
+    eng.link(seed, blocked, EdgeKind::DerivedFrom, 1.0).unwrap();
+
+    let hits = eng
+        .recall(
+            "r",
+            RecallQuery::by_text("alpha unique seed", 1)
+                .with_kinds(vec!["fact".to_string()])
+                .with_graph_expand(GraphExpand::new(1, vec![EdgeKind::DerivedFrom])),
+        )
+        .unwrap();
+    let ids: Vec<i64> = hits.iter().map(|h| h.id).collect();
+
+    assert!(ids.contains(&seed), "seed fact present");
+    assert!(ids.contains(&allowed), "allowed fact neighbor present");
+    assert!(
+        !ids.contains(&blocked),
+        "graph-expanded audit atom must honor the query kind filter"
+    );
+}

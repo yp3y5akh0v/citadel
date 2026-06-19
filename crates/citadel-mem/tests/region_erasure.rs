@@ -256,6 +256,43 @@ fn sealed_read_paths_are_functional() {
 }
 
 #[test]
+fn sealed_graph_expand_respects_atom_kind_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(open_enc_db(&dir.path().join("m.db"), b"pw", true).unwrap());
+    let eng = MemoryEngine::open(db).unwrap();
+    eng.create_encrypted_region("r", embedder()).unwrap();
+
+    let seed = eng
+        .remember("r", AtomInput::new("fact", "alpha unique seed"))
+        .unwrap();
+    let allowed = eng
+        .remember("r", AtomInput::new("fact", "allowed fact neighbor"))
+        .unwrap();
+    let blocked = eng
+        .remember("r", AtomInput::new("audit", "blocked audit neighbor"))
+        .unwrap();
+    eng.link(seed, allowed, EdgeKind::DerivedFrom, 1.0).unwrap();
+    eng.link(seed, blocked, EdgeKind::DerivedFrom, 1.0).unwrap();
+
+    let hits = eng
+        .recall(
+            "r",
+            RecallQuery::by_text("alpha unique seed", 1)
+                .with_kinds(vec!["fact".to_string()])
+                .with_graph_expand(GraphExpand::new(1, vec![EdgeKind::DerivedFrom])),
+        )
+        .unwrap();
+    let ids: Vec<i64> = hits.iter().map(|h| h.id).collect();
+
+    assert!(ids.contains(&seed), "seed fact present");
+    assert!(ids.contains(&allowed), "allowed fact neighbor present");
+    assert!(
+        !ids.contains(&blocked),
+        "graph-expanded sealed audit atom must honor the query kind filter"
+    );
+}
+
+#[test]
 fn update_atom_payload_reseals() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(open_enc_db(&dir.path().join("m.db"), b"pw", true).unwrap());

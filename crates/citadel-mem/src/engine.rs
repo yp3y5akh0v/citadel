@@ -24,8 +24,7 @@ use crate::types::{
 };
 use citadel::SlotState;
 
-/// Upper bound on rows scanned for encrypted decrypt-then-rank operations (no ANN/FTS
-/// index can operate over ciphertext). Mirrors the plaintext recall exact-scan cap.
+/// Row cap for encrypted decrypt-then-rank; no ANN/FTS index runs over ciphertext.
 const EXACT_SCAN_LIMIT: usize = 4096;
 
 /// Over-fetch ANN candidates by this factor before fusion re-ranking + filtering.
@@ -44,15 +43,12 @@ struct RegionState {
     dim: u16,
     metric: EmbeddingMetric,
     embedder: Arc<dyn Embedder>,
-    /// `Some` for an encrypted region: the region's atom-wrap key (derived from the
-    /// random RCK). Each atom is sealed under its own random key (ACK) whose sole
-    /// wrapped copy lives in the atom key store; this key wraps/unwraps those ACKs.
+    /// `Some` for encrypted regions: wraps/unwraps each atom's ACK; derived from the RCK.
     atom_wrap: Option<Arc<AtomWrapKey>>,
     /// Ephemeral in-RAM ANN index over decrypted vectors for sealed recall (lazy).
     ann: Arc<RwLock<Option<SealedAnn>>>,
-    /// Highest atom id ever assigned to this region (DB max at attach, bumped by
-    /// remember). Sealed recall reads this to detect post-snapshot inserts instead of
-    /// running a `MAX(id)` table scan on every call.
+    /// Highest atom id in this region; sealed recall reads it to detect post-snapshot
+    /// inserts without a per-call `MAX(id)` scan.
     max_id: Arc<AtomicI64>,
 }
 
@@ -68,31 +64,24 @@ struct RegionHandle {
     max_id: Arc<AtomicI64>,
 }
 
-/// Ephemeral, per-region in-RAM PRISM index over DECRYPTED vectors, built lazily on the
-/// first sealed recall. The plaintext vectors are zeroized when the index drops (see
-/// `PointStore`'s `Drop`), so they never outlive the region key.
+/// Ephemeral per-region in-RAM PRISM index over decrypted vectors, built lazily on
+/// first sealed recall; vectors zeroized on drop so they never outlive the region key.
 ///
-/// The GRAPH (not the vectors) may be persisted as a sealed segment: the
-/// segment ciphertext lives under its own random key held in the ERASABLE atom
-/// key store, so destroying that one slot crypto-erases every on-disk
-/// derivative (SQ8 codes are near-lossless embedding reconstructions - they
-/// must never outlive erasure any more than the atoms themselves).
+/// The graph may persist as a sealed segment under its own erasable atom-store key;
+/// destroying that slot crypto-erases the on-disk SQ8 codes (embedding-derived residue).
 struct SealedAnn {
     index: AnnIndex,
     /// Atom `kind` -> PRISM attribute code, so a kind-filtered recall maps to a `Filter`.
     kind_codes: FxHashMap<String, u32>,
-    /// Everything recall needs to rank a candidate, captured during the single index build
-    /// so the hot path reads it from RAM instead of re-fetching every candidate row (a
-    /// 400-element `WHERE id IN (...)` per recall) and re-decrypting on every call.
-    /// Plaintext, so zeroized on drop alongside the index vectors (never outlives the key).
+    /// Per-candidate rank inputs captured at index build, so the hot path avoids re-fetching
+    /// and re-decrypting each row. Plaintext; zeroized on drop alongside the index vectors.
     cached: FxHashMap<AtomId, CachedAtom>,
     /// Whether this index came from the persisted sealed segment or a scan build.
     source: AnnIndexSource,
 }
 
-/// The per-atom fields a sealed recall needs to build a `Candidate`, decrypted once at
-/// index build. `score`/`created`/`immutable` are immutable post-insert (or refreshed on
-/// the next index rebuild), so caching them is consistent with caching `text`/`payload`.
+/// Per-atom fields a sealed recall needs to build a `Candidate`, decrypted once at index
+/// build; refreshed on the next rebuild after any change.
 struct CachedAtom {
     kind: String,
     text: String,
@@ -111,7 +100,7 @@ impl Drop for SealedAnn {
     }
 }
 
-/// Map the memory metric to PRISM's distance metric (1:1).
+/// Map the memory metric to PRISM's distance metric.
 fn ann_metric(m: EmbeddingMetric) -> Metric {
     match m {
         EmbeddingMetric::Cosine => Metric::Cosine,
@@ -124,10 +113,9 @@ fn ann_metric(m: EmbeddingMetric) -> Metric {
 pub struct MemoryEngine {
     db: Arc<Database>,
     regions: Mutex<FxHashMap<String, RegionState>>,
-    /// Optional cross-encoder + strategy applied in `recall` before truncation;
-    /// `None` = linear fusion. Behind a lock so `set_reranker` works through the
-    /// shared `Arc<MemoryEngine>`; recall snapshots it, never holding the guard
-    /// across the (possibly Python, possibly re-entrant) reranker callback.
+    /// Optional cross-encoder + strategy applied in `recall` before truncation; `None` =
+    /// linear fusion. Locked for `set_reranker`; recall snapshots it before the callback to
+    /// avoid holding the guard across a re-entrant reranker.
     reranker: RwLock<Option<(Arc<dyn Reranker>, RerankStrategy)>>,
 }
 
@@ -188,7 +176,7 @@ impl MemoryEngine {
         Ok(engine)
     }
 
-    /// Reclaim slots left LIVE by an interrupted create (key written, row never committed).
+    /// Reclaim slots left live by an interrupted create (key written, row never committed).
     fn reconcile_region_store(&self) -> Result<()> {
         let live = self.db.region_store_live_owners()?;
         if live.is_empty() {
@@ -213,8 +201,8 @@ impl MemoryEngine {
         Ok(())
     }
 
-    /// Reclaim atom key slots left LIVE by an interrupted insert (key fsync'd, row never
-    /// committed): tombstone any LIVE slot not referenced by a committed atom row.
+    /// Reclaim atom key slots left live by an interrupted insert: tombstone any live slot
+    /// not referenced by a committed atom row.
     fn reconcile_atom_store(&self) -> Result<()> {
         let live = self.db.atom_store_live_owners()?;
         if live.is_empty() {
@@ -240,9 +228,8 @@ impl MemoryEngine {
                 valid.insert((as_int(&r[1])? as u32, as_int(&r[0])? as u64));
             }
         }
-        // Persisted sealed-segment keys are row-less BY DESIGN (a pseudo-atom
-        // id owns the slot; the ciphertext lives in a hidden chunk tree): the
-        // meta rows are their committed reference.
+        // Sealed-segment keys are row-less: a pseudo-atom id owns the slot, the meta rows
+        // are their committed reference.
         let qr = conn.query_params(
             "SELECT key, value FROM memory_meta WHERE key LIKE 'annseg_%'",
             &[],
@@ -339,8 +326,7 @@ impl MemoryEngine {
             ),
         };
 
-        // Seed the in-memory max id once (DB max for this region, 0 if the table is
-        // absent), so sealed recall never needs a per-call `MAX(id)` scan.
+        // Seed the in-memory max id once so sealed recall needs no per-call `MAX(id)` scan.
         let init_max = sealed_max_id(&conn, &atoms_table(dim, metric, atom_wrap.is_some()), id)?;
         self.regions.lock().unwrap().insert(
             key,
@@ -359,10 +345,8 @@ impl MemoryEngine {
 
     /// Drop a region and all its atoms and incident edges. No-op if absent.
     ///
-    /// For an encrypted region this is cryptographic erasure: the region's content
-    /// key is destroyed in the sidecar store (overwrite-in-place + fsync + read-back)
-    /// BEFORE any row is deleted, so a crash in between still leaves the content
-    /// permanently undecryptable rather than recoverable.
+    /// Encrypted: the region key is destroyed (overwrite + fsync + read-back) before any
+    /// row delete, so a crash in between leaves the content permanently undecryptable.
     pub fn drop_region(&self, name: &str) -> Result<()> {
         let key = name.to_ascii_lowercase();
         let conn = Connection::open(&self.db)?;
@@ -372,7 +356,7 @@ impl MemoryEngine {
         };
         let atoms = atoms_table(row.dim, row.metric, row.encrypted);
 
-        // Destroy the key and drop the atom-wrap cache BEFORE deleting rows (commit-point ordering).
+        // Destroy the key and drop the atom-wrap cache before deleting rows (commit-point order).
         if row.encrypted {
             let slot = row.rsk_slot.ok_or_else(|| {
                 MemError::Invalid(format!(
@@ -384,8 +368,7 @@ impl MemoryEngine {
         }
         self.regions.lock().unwrap().remove(&key);
 
-        // Reclaim the region's atom key slots (RCK already destroyed, so these are dead) so
-        // a dropped region doesn't leak them.
+        // Reclaim the region's atom key slots (RCK already destroyed, so these are dead).
         if row.encrypted && conn.table_schema(&atoms).is_some() {
             let qr = conn.query_params(
                 &format!("SELECT id, key_slot FROM {atoms} WHERE region_id = $1"),
@@ -530,7 +513,7 @@ impl MemoryEngine {
             let ids: Vec<AtomId> = (0..n as i64).map(|o| start + o).collect();
 
             if let Some(atom_wrap) = &h.atom_wrap {
-                // Seal all atoms, persist their wrapped ACKs with ONE fsync before the rows commit.
+                // Seal all atoms, persist their wrapped ACKs with one fsync before the rows commit.
                 let mut sealed_blobs: Vec<Vec<u8>> = Vec::with_capacity(n);
                 let mut key_items: Vec<(u64, [u8; WRAPPED_KEY_SIZE])> = Vec::with_capacity(n);
                 for ((atom, vec), &id) in atoms.iter().zip(&vecs).zip(&ids) {
@@ -603,8 +586,8 @@ impl MemoryEngine {
 
     /// Fetch atoms of `kind` (optional JSONB `@>` filter) via the `(region_id, kind)` index.
     ///
-    /// For an encrypted region this decrypts rows in id order and considers only the
-    /// first `EXACT_SCAN_LIMIT` (4096) atoms of the kind (no index runs over ciphertext).
+    /// Encrypted regions decrypt rows in id order and cover only the first
+    /// `EXACT_SCAN_LIMIT` (4096) atoms of the kind; no index runs over ciphertext.
     pub fn fetch(
         &self,
         region: &str,
@@ -643,12 +626,9 @@ impl MemoryEngine {
         qr.rows.iter().map(|row| parse_fetched(row)).collect()
     }
 
-    /// Count atoms of `kind` without materializing them - manifest verification
-    /// over a large reference corpus must not pay a full fetch. `kind` is a SQL
-    /// column in both region flavors, so no decryption is involved; in a sealed
-    /// region a crypto-erased atom still has a row but its key is gone, so the
-    /// count includes only atoms whose key is live (uncapped - this is a count,
-    /// not the `EXACT_SCAN_LIMIT`-bounded decrypting fetch).
+    /// Count atoms of `kind` without materializing them. `kind` is a plaintext column in
+    /// both flavors, so no decryption; a sealed region counts only atoms whose key is live
+    /// (uncapped, unlike the `EXACT_SCAN_LIMIT`-bounded decrypting fetch).
     pub fn count(&self, region: &str, kind: &str) -> Result<u64> {
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
@@ -685,14 +665,10 @@ impl MemoryEngine {
         }
     }
 
-    /// Freeze the region's ANN index into a persisted segment: subsequent cold
-    /// attaches LOAD it in seconds instead of paying the PRISM rebuild, with
-    /// the load-time scan re-proving freshness by content. Plaintext regions
-    /// persist through the SQL layer (`Connection::persist_ann_index`). SEALED
-    /// regions persist the segment as ONE ciphertext under a random key held
-    /// in the erasable atom key store: destroying that slot crypto-erases all
-    /// on-disk derivatives of the region's embeddings, preserving per-atom
-    /// erasure semantics end to end.
+    /// Freeze the region's ANN index into a persisted segment so a cold attach loads it
+    /// instead of rebuilding. Plaintext regions persist through the SQL layer; sealed
+    /// regions seal the segment as one ciphertext under a random key in the erasable atom
+    /// key store, so destroying that slot crypto-erases every on-disk embedding derivative.
     pub fn persist_ann_index(&self, region: &str) -> Result<AnnSegmentInfo> {
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
@@ -703,10 +679,9 @@ impl MemoryEngine {
         Ok(conn.persist_ann_index(&h.table, "embedding")?)
     }
 
-    /// The identity of the ANN index currently serving this region's recalls:
-    /// `Loaded {{ segment_b3 }}` (the persisted segment) or `Built` (a scan
-    /// rebuild, with the segment-refusal reason if one was rejected). `None`
-    /// when nothing is cached/built yet.
+    /// Which ANN index serves this region's recalls: `Loaded { segment_b3 }` (persisted
+    /// segment) or `Built` (scan rebuild, carrying the refusal reason if a segment was
+    /// rejected); `None` if nothing is built yet.
     pub fn ann_cache_status(&self, region: &str) -> Result<Option<AnnIndexSource>> {
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
@@ -719,13 +694,12 @@ impl MemoryEngine {
             .map(|(source, _)| source))
     }
 
-    /// Persist a SEALED region's ANN graph: scan + decrypt (computing the
-    /// liveness-aware fingerprint), pay the PRISM build once, encode the
-    /// segment, and seal it under a fresh random segment key whose ONLY copy
-    /// lives in the erasable atom key store under a pseudo-atom id. Chunks go
-    /// to the hidden `__annseg_{table}` tree, which every SQL mutation of the
-    /// region already drops transactionally; the key slot is retired by the
-    /// engine's own invalidation sites and healed at load.
+    /// Persist a sealed region's ANN graph: scan, decrypt (computing the liveness-aware
+    /// fingerprint), build the PRISM index, encode, and seal it under a fresh segment key
+    /// whose only copy lives in the erasable atom key store under a pseudo-atom id. Chunks
+    /// go to the hidden `__annseg_{table}` tree that every SQL mutation drops
+    /// transactionally; the key slot is retired by the engine's invalidation sites and
+    /// healed at load.
     fn persist_sealed_segment(&self, h: &RegionHandle) -> Result<AnnSegmentInfo> {
         use zeroize::Zeroize;
         let atom_wrap = h.atom_wrap.as_ref().expect("sealed persist");
@@ -773,10 +747,9 @@ impl MemoryEngine {
         }
         inner.extend_from_slice(&body);
 
-        // Seal under a fresh segment key; the pseudo-atom id binds the AAD and
-        // owns the erasable key-store slot.
-        // The pseudo-atom id comes from the SAME sequence as real atoms, so the
-        // segment's key-store slot can never collide with an atom's.
+        // Seal under a fresh segment key; the pseudo-atom id binds the AAD and owns the
+        // erasable key-store slot. It comes from the same sequence as real atoms, so the
+        // segment's slot can never collide with an atom's.
         let pseudo_id = with_write_txn(&conn, |c| next_id(c, "next_atom_id"))?;
         use rand::RngCore;
         let mut sk = [0u8; citadel_core::KEY_SIZE];
@@ -787,8 +760,8 @@ impl MemoryEngine {
         sk.zeroize();
         inner.zeroize();
 
-        // Retire any previous segment FIRST (old key must not survive as
-        // decryptable residue), then key-before-data like atoms.
+        // Retire any previous segment first (old key must not survive as decryptable
+        // residue), then key-before-data like atoms.
         self.retire_sealed_segment(h, &conn)?;
         let (slot, gen) = self
             .db
@@ -824,13 +797,11 @@ impl MemoryEngine {
         })
     }
 
-    /// Try to serve the sealed region's persisted segment: unwrap the segment
-    /// key from its erasable slot, decrypt, decode, and rehydrate vectors (and
-    /// the recall cache) by decrypting the live rows - whose liveness-aware
-    /// fingerprint must match the one sealed inside the segment. ANY failure
-    /// heals (retires the orphan key) and falls back to the scan build, with
-    /// the refusal reason carried in `Err(Some(reason))` so the rebuilt index
-    /// stays queryable about WHY the segment was not used.
+    /// Try to serve the sealed region's persisted segment: unwrap the segment key from its
+    /// erasable slot, decrypt, decode, and rehydrate vectors and the recall cache from the
+    /// live rows, whose liveness-aware fingerprint must match the one sealed in the segment.
+    /// Any failure heals (retires the orphan key) and falls back to the scan build, carrying
+    /// the refusal reason in `Err(Some(reason))`.
     #[allow(clippy::type_complexity)]
     fn try_load_sealed_segment(
         &self,
@@ -915,8 +886,8 @@ impl MemoryEngine {
             return heal(self, "prism config changed since the segment was built");
         }
 
-        // Rehydrate by decrypting live rows, placed by the id_map PERMUTATION;
-        // the recall cache comes from the same decrypt pass for free.
+        // Rehydrate by decrypting live rows, placed by the id_map permutation; the recall
+        // cache comes from the same decrypt pass.
         let wrapped = self.db.atom_store_live_wrapped()?;
         let slot_of = parts.internal_of_row();
         let dim = h.dim as usize;
@@ -953,8 +924,8 @@ impl MemoryEngine {
         )?;
         if unknown || live_fp != stored_fp || filled != parts.n() {
             inner.zeroize();
-            // Stale (liveness or content moved): expected after forgets that
-            // bypassed explicit retirement - rebuild honestly.
+            // Stale (liveness or content moved): expected after forgets that bypassed
+            // explicit retirement.
             return heal(
                 self,
                 &format!(
@@ -981,9 +952,9 @@ impl MemoryEngine {
         }))
     }
 
-    /// Destroy the sealed segment's key slot (crypto-erasing all on-disk
-    /// segment residue), delete ITS OWN chunk keys (other regions may share
-    /// the tree), and clear the meta rows. Safe when nothing is persisted.
+    /// Destroy the sealed segment's key slot (crypto-erasing all on-disk residue), delete
+    /// its own chunk keys (other regions may share the tree), and clear the meta rows. Safe
+    /// when nothing is persisted.
     fn retire_sealed_segment(&self, h: &RegionHandle, conn: &Connection<'_>) -> Result<()> {
         let Some((slot, _gen, pseudo_id)) = read_annseg_meta(conn, h.id)? else {
             return Ok(());
@@ -1122,10 +1093,10 @@ impl MemoryEngine {
 
     /// Hybrid recall: ANN retrieval then fusion re-ranking; returns the top `q.k` atoms.
     ///
-    /// Encrypted regions cannot use the ANN/FTS indexes (they operate on ciphertext),
-    /// so recall decrypts the first `EXACT_SCAN_LIMIT` (4096) atoms by id and ranks
-    /// them in Rust; the keyword signal is an in-Rust term overlap (not SQL `ts_rank`).
-    /// Regions with more than 4096 atoms are not fully covered on the sealed path.
+    /// Encrypted regions cannot use the ANN/FTS indexes (they run on ciphertext), so recall
+    /// decrypts the first `EXACT_SCAN_LIMIT` (4096) atoms by id and ranks them in Rust; the
+    /// keyword signal is in-Rust BM25, not SQL `ts_rank`. Regions over 4096 atoms are not
+    /// fully covered on the sealed path.
     pub fn recall(&self, region: &str, q: RecallQuery) -> Result<Vec<AtomHit>> {
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
@@ -1164,8 +1135,8 @@ impl MemoryEngine {
         // $1 = query vector (reused in SELECT + ORDER BY), $2 = region_id.
         let mut params: Vec<Value> = vec![Value::Vector(qvec.into()), Value::Integer(h.id)];
 
-        // Keyword rank is computed in Rust via the language-agnostic BM25 primitive
-        // (assign_bm25_ranks) shared with the sealed path - no SQL FTS, no language config.
+        // Keyword rank uses the in-Rust BM25 primitive (assign_bm25_ranks) shared with the
+        // sealed path; no SQL FTS, no language config.
         let mut where_parts = vec!["region_id = $2".to_string()];
         if !q.kinds.is_empty() {
             let mut ph = Vec::with_capacity(q.kinds.len());
@@ -1202,9 +1173,8 @@ impl MemoryEngine {
         let query_terms = query_keyword_terms(q.text.as_deref());
         assign_bm25_ranks(&mut cands, &query_terms);
         let as_of = q.as_of_micros.unwrap_or_else(now_micros);
-        // Snapshot the reranker out of the lock: a BYO Python reranker callback may
-        // re-enter `set_reranker` or drop the GIL, so the guard must not be held
-        // across `fuse_rerank`. The Arc clone is a refcount bump; strategy is Copy.
+        // Snapshot the reranker out of the lock: a BYO Python reranker may re-enter
+        // `set_reranker` or drop the GIL, so the guard must not be held across `fuse_rerank`.
         let reranker = self.reranker.read().unwrap().clone();
         let mut hits = match (reranker.as_ref(), &q.text) {
             (Some((r, strategy)), Some(text)) => {
@@ -1216,7 +1186,12 @@ impl MemoryEngine {
         if let Some(ge) = &q.graph_expand {
             let seeds: Vec<AtomId> = hits.iter().map(|h| h.id).collect();
             let present: FxHashSet<AtomId> = seeds.iter().copied().collect();
-            let mut expanded = expand_graph(&conn, &table, h.id, &seeds, ge)?;
+            let scope = GraphFetchScope {
+                table: &table,
+                region_id: h.id,
+                kind_allowlist: &q.kinds,
+            };
+            let mut expanded = expand_graph(&conn, scope, &seeds, ge)?;
             expanded.retain(|e| !present.contains(&e.id));
             hits.extend(expanded);
         }
@@ -1319,10 +1294,9 @@ impl MemoryEngine {
 
     /// Remove atoms matching `policy` and their edges; spares `immutable` except `PurgeRegion`.
     ///
-    /// On encrypted regions, `PredicateMatch` is exhaustive (it pages through every
-    /// atom, decrypting to test the payload); the other policies act on plaintext
-    /// metadata columns of the sealed table. Evicted atoms are cryptographically erased:
-    /// each atom's key is destroyed before its row is deleted.
+    /// Encrypted regions: `PredicateMatch` pages through every atom, decrypting to test the
+    /// payload; other policies act on the sealed table's plaintext metadata columns. Evicted
+    /// atoms are crypto-erased - each atom's key is destroyed before its row is deleted.
     pub fn evict(&self, region: &str, policy: EvictionPolicy) -> Result<EvictionReport> {
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
@@ -1392,9 +1366,9 @@ impl MemoryEngine {
             .join(", ");
         let conn = Connection::open(&self.db)?;
 
-        // Encrypted path: destroy each atom's key (commit point) BEFORE the row delete, so a
-        // crash in between still leaves the content permanently undecryptable. Plaintext path:
-        // there is no key to destroy - the row delete below is the whole operation.
+        // Encrypted path: destroy each atom's key (commit point) before the row delete, so a
+        // crash in between leaves the content permanently undecryptable. Plaintext path has
+        // no key to destroy; the row delete below is the whole operation.
         let slots_erased = if h.atom_wrap.is_some() {
             let qr = conn.query_params(
                 &format!(
@@ -1452,12 +1426,11 @@ impl MemoryEngine {
         Ok((rows_deleted, slots_erased))
     }
 
-    /// Delete atoms. For an encrypted region this is per-atom cryptographic erasure: each
-    /// atom's key is destroyed in the atom key store (overwrite-in-place + fsync +
-    /// read-back) BEFORE its row is deleted, so a crash in between still leaves that
-    /// atom's content permanently undecryptable. Sibling atoms and the region are intact.
-    /// Privileged: ignores the `immutable` flag. [`forget_atoms`](Self::forget_atoms) is
-    /// the model-safe variant with a verifiable receipt.
+    /// Delete atoms. Encrypted regions get per-atom cryptographic erasure: each atom's key is
+    /// destroyed (overwrite-in-place + fsync + read-back) before its row is deleted, so a
+    /// crash in between leaves that atom's content permanently undecryptable; sibling atoms
+    /// and the region are intact. Privileged: ignores `immutable`.
+    /// [`forget_atoms`](Self::forget_atoms) is the model-safe variant with a receipt.
     pub fn delete_atoms(&self, region: &str, ids: &[AtomId]) -> Result<EvictionReport> {
         if ids.is_empty() {
             return Ok(EvictionReport { removed: 0 });
@@ -1540,11 +1513,11 @@ impl MemoryEngine {
         self.delete_atoms(region, &[id]).map(|_| ())
     }
 
-    /// Re-authenticate atoms by id, returning one [`AtomAttestation`] per requested id (in
-    /// order). Reads each atom's sealed bytes FRESH from disk - never the in-RAM recall cache -
-    /// and recomputes the HMAC bound to the atom id, so a verdict reflects on-disk truth and
-    /// catches tampering (a flipped ciphertext byte) or a blob replayed from another row. Never
-    /// aborts on a bad atom; every id gets a verdict.
+    /// Re-authenticate atoms by id, returning one [`AtomAttestation`] per requested id in
+    /// order. Reads each atom's sealed bytes fresh from disk (not the in-RAM recall cache) and
+    /// recomputes the HMAC bound to the atom id, so a verdict reflects on-disk truth and
+    /// catches tampering (a flipped ciphertext byte) or a blob replayed from another row.
+    /// Never aborts on a bad atom; every id gets a verdict.
     pub fn verify_atoms(&self, region: &str, ids: &[AtomId]) -> Result<Vec<AtomAttestation>> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -1806,9 +1779,9 @@ impl MemoryEngine {
 
 /// Encrypted-region paths: sealed writes, decrypt-then-rank reads, and key lifecycle.
 impl MemoryEngine {
-    /// Attach an existing encrypted region: read its LIVE slot, unwrap the RCK, and
-    /// derive the atom-wrap key. Yields [`MemError::RegionForgotten`] if the slot was
-    /// tombstoned or its generation no longer matches the region row.
+    /// Attach an existing encrypted region: read its live slot, unwrap the RCK, and derive
+    /// the atom-wrap key. Yields [`MemError::RegionForgotten`] if the slot was tombstoned or
+    /// its generation no longer matches the region row.
     fn attach_region_key(&self, name: &str, row: &RegionRow) -> Result<Arc<AtomWrapKey>> {
         let slot = row
             .rsk_slot
@@ -1827,8 +1800,8 @@ impl MemoryEngine {
         Ok(Arc::new(atom_wrap))
     }
 
-    /// Create a new encrypted region: generate a random RCK, wrap it, persist the
-    /// LIVE slot (fsync'd) before inserting the region row, and return the atom-wrap key.
+    /// Create a new encrypted region: generate a random RCK, wrap it, persist the live slot
+    /// (fsync'd) before inserting the region row, and return the atom-wrap key.
     fn insert_encrypted_region(
         &self,
         conn: &Connection<'_>,
@@ -1846,8 +1819,8 @@ impl MemoryEngine {
         rand::thread_rng().fill_bytes(&mut rck);
         let wrapped = self.db.wrap_region_key(&rck)?;
 
-        // Persist the wrapped key (fsync'd) BEFORE inserting the row, so a committed
-        // region row always references a durable key.
+        // Persist the wrapped key (fsync'd) before inserting the row, so a committed region
+        // row always references a durable key.
         let (slot, gen) = self.db.region_store_allocate_write(id as u64, &wrapped)?;
 
         with_write_txn(conn, |c| {
@@ -1874,10 +1847,9 @@ impl MemoryEngine {
         Ok((id, Some(Arc::new(atom_wrap))))
     }
 
-    /// ANN recall over an encrypted region using an ephemeral in-RAM PRISM index built
-    /// from the region's DECRYPTED vectors (no ANN/FTS index can run over ciphertext).
-    /// The index is cached per region and its plaintext vectors are zeroized on drop,
-    /// so they never outlive the region key.
+    /// ANN recall over an encrypted region using an ephemeral in-RAM PRISM index built from
+    /// the region's decrypted vectors (no ANN/FTS index runs over ciphertext). Cached per
+    /// region; its plaintext vectors are zeroized on drop so they never outlive the region key.
     fn recall_sealed(
         &self,
         h: &RegionHandle,
@@ -1896,11 +1868,10 @@ impl MemoryEngine {
             return Ok(Vec::new());
         }
 
-        // Build candidates from the per-region cache captured at the single index build, so
-        // the hot path touches neither SQL nor decryption nor the key store. Every cached
-        // atom is live and current: any delete or payload/score change resets the index
-        // (`h.ann = None`), forcing a rebuild that drops the stale entry. Only post-snapshot
-        // tail atoms (cache miss) fall through to a small SQL fetch + decrypt below.
+        // Build candidates from the per-region cache captured at index build, so the hot path
+        // touches neither SQL nor decryption nor the key store. Every cached atom is live (any
+        // delete or payload/score change resets the index, forcing a rebuild); only
+        // post-snapshot tail atoms (cache miss) fall through to the SQL fetch + decrypt below.
         let query_terms = query_keyword_terms(q.text.as_deref());
         let mut cands: Vec<Candidate> = Vec::with_capacity(ranked.len());
         let mut misses: Vec<(AtomId, f32)> = Vec::new();
@@ -1975,9 +1946,8 @@ impl MemoryEngine {
         assign_bm25_ranks(&mut cands, &query_terms);
 
         let as_of = q.as_of_micros.unwrap_or_else(now_micros);
-        // Snapshot the reranker out of the lock: a BYO Python reranker callback may
-        // re-enter `set_reranker` or drop the GIL, so the guard must not be held
-        // across `fuse_rerank`. The Arc clone is a refcount bump; strategy is Copy.
+        // Snapshot the reranker out of the lock: a BYO Python reranker may re-enter
+        // `set_reranker` or drop the GIL, so the guard must not be held across `fuse_rerank`.
         let reranker = self.reranker.read().unwrap().clone();
         let mut hits = match (reranker.as_ref(), &q.text) {
             (Some((r, strategy)), Some(text)) => {
@@ -1990,8 +1960,12 @@ impl MemoryEngine {
             let seeds: Vec<AtomId> = hits.iter().map(|h| h.id).collect();
             let present: FxHashSet<AtomId> = seeds.iter().copied().collect();
             let wrapped = self.db.atom_store_live_wrapped()?;
-            let mut expanded =
-                expand_graph_sealed(&conn, table, atom_wrap, &wrapped, h.id, &seeds, ge)?;
+            let scope = GraphFetchScope {
+                table,
+                region_id: h.id,
+                kind_allowlist: &q.kinds,
+            };
+            let mut expanded = expand_graph_sealed(&conn, atom_wrap, &wrapped, scope, &seeds, ge)?;
             expanded.retain(|e| !present.contains(&e.id));
             hits.extend(expanded);
         }
@@ -2026,9 +2000,8 @@ impl MemoryEngine {
             }
         }
 
-        // Slow path: load the persisted sealed segment if one verifies, else
-        // rebuild from a decrypt scan - under the write lock, re-checking in
-        // case another writer won.
+        // Slow path: load the persisted sealed segment if one verifies, else rebuild from a
+        // decrypt scan - under the write lock, re-checking in case another writer won.
         {
             let mut guard = h.ann.write().unwrap();
             let need_full = guard
@@ -2242,7 +2215,7 @@ impl MemoryEngine {
                     "atom {atom_id} not found, or immutable, in region '{key}'"
                 )));
             };
-            // Re-seal under the SAME ACK (the atom's key is unchanged; only its payload).
+            // Re-seal under the same ACK (the atom's key is unchanged; only its payload).
             let wrapped = self.db.atom_store_slot(as_int(&row[1])? as u32)?.wrapped;
             let mut ack = atom_wrap.unwrap_atom_key(&wrapped)?;
             let seal_keys = derive_seal_keys(&ack);
@@ -2263,9 +2236,9 @@ impl MemoryEngine {
         })
     }
 
-    /// Ids of non-immutable sealed atoms whose payload `@>`-contains `predicate`.
-    /// EXHAUSTIVE: forgetting must not silently under-delete, so this pages through
-    /// every atom by id (unlike the bounded read paths) until the region is drained.
+    /// Ids of non-immutable sealed atoms whose payload `@>`-contains `predicate`. Exhaustive:
+    /// forgetting must not silently under-delete, so this pages through every atom by id
+    /// (unlike the bounded read paths) until the region is drained.
     fn evict_predicate_sealed_ids(
         &self,
         h: &RegionHandle,
@@ -2540,27 +2513,24 @@ fn sealed_max_id(conn: &Connection<'_>, table: &str, region_id: RegionId) -> Res
 /// only bounds per-value buffers).
 const SEALED_SEG_CHUNK: usize = 1024 * 1024;
 
-/// The hidden chunk tree for ONE sealed region's segment. PER-REGION (the
-/// region is the sealed lifecycle unit; regions sharing an atoms table must
-/// not destroy each other's segments) and deliberately NOT the SQL layer's
-/// `__annseg_{table}` name: sealed staleness is owned by the engine's explicit
-/// retirement at every mutation site, with the liveness-aware fingerprint
-/// refusing - at load - anything that changed through a channel the engine
-/// does not own.
+/// Hidden chunk tree for one sealed region's segment. Per-region (the region is the sealed
+/// lifecycle unit; regions sharing an atoms table must not destroy each other's segments) and
+/// deliberately not the SQL layer's `__annseg_{table}` name: sealed staleness is owned by the
+/// engine's retirement at every mutation site, with the liveness-aware fingerprint refusing,
+/// at load, anything changed through a channel the engine does not own.
 fn sealed_segment_table(table: &str, region_id: RegionId) -> String {
     format!("__annseg_r{region_id}__{table}")
 }
 
-/// One LIVE sealed row delivered to a scan consumer:
-/// `(id, kind, sealed_bytes, score, created_micros, immutable)`. Returning
-/// `false` stops delivery (the fingerprint still covers the remaining rows).
+/// One live sealed row delivered to a scan consumer:
+/// `(id, kind, sealed_bytes, score, created_micros, immutable)`. Returning `false` stops
+/// delivery (the fingerprint still covers the remaining rows).
 type SealedRowFn<'a> = dyn FnMut(AtomId, &str, &[u8], f32, i64, bool) -> Result<bool> + 'a;
 
-/// The liveness-aware content fingerprint of a sealed region, computed by ONE
-/// deterministic scan (ORDER BY id): every row contributes its id, its sealed
-/// ciphertext (length-framed), and its key-liveness bit - so both row content
-/// changes AND crypto-erasures (which flip liveness without touching rows)
-/// invalidate a persisted segment.
+/// Liveness-aware content fingerprint of a sealed region from one deterministic scan (ORDER
+/// BY id): every row contributes its id, its sealed ciphertext (length-framed), and its
+/// key-liveness bit, so both row-content changes and crypto-erasures (which flip liveness
+/// without touching rows) invalidate a persisted segment.
 fn sealed_fp_scan(
     conn: &Connection<'_>,
     h: &RegionHandle,
@@ -2797,7 +2767,7 @@ fn query_keyword_terms(text: Option<&str>) -> Vec<String> {
 
 /// Set each candidate's `text_rank` to its Okapi BM25 score for `query_terms`, with the
 /// candidate pool itself as the corpus. Language-agnostic: IDF down-weights terms common
-/// across the pool (stopword-like in ANY language), so no stoplist or stemmer is needed.
+/// across the pool (stopword-like in any language), so no stoplist or stemmer is needed.
 /// Shared keyword primitive for the plaintext and sealed recall paths.
 fn assign_bm25_ranks(cands: &mut [Candidate], query_terms: &[String]) {
     if query_terms.is_empty() || cands.is_empty() {
@@ -3278,26 +3248,43 @@ fn order_graph_hits(mut hits: Vec<(usize, AtomHit)>) -> Vec<AtomHit> {
     hits.into_iter().map(|(_, h)| h).collect()
 }
 
-/// In-clause placeholders `$2..` for `depth_of`'s ids, plus the `[region_id, ids..]`
-/// param vector (`$1` = region_id).
-fn graph_fetch_params(
+#[derive(Clone, Copy)]
+struct GraphFetchScope<'a> {
+    table: &'a str,
     region_id: RegionId,
+    kind_allowlist: &'a [String],
+}
+
+/// In-clause placeholders `$2..` for `depth_of`'s ids, plus the `[region_id, ids..]`
+/// param vector (`$1` = region_id). If present, `kind_allowlist` applies to graph-
+/// expanded atoms just like it applies to the initial recall seeds.
+fn graph_fetch_params(
+    scope: GraphFetchScope<'_>,
     depth_of: &FxHashMap<AtomId, usize>,
-) -> (Vec<Value>, String) {
-    let mut fparams: Vec<Value> = vec![Value::Integer(region_id)];
+) -> (Vec<Value>, String, String) {
+    let mut fparams: Vec<Value> = vec![Value::Integer(scope.region_id)];
     let mut fph = Vec::with_capacity(depth_of.len());
     for &id in depth_of.keys() {
         fparams.push(Value::Integer(id));
         fph.push(format!("${}", fparams.len()));
     }
-    (fparams, fph.join(", "))
+    let kind_clause = if scope.kind_allowlist.is_empty() {
+        String::new()
+    } else {
+        let mut ph = Vec::with_capacity(scope.kind_allowlist.len());
+        for kind in scope.kind_allowlist {
+            fparams.push(Value::Text(kind.clone().into()));
+            ph.push(format!("${}", fparams.len()));
+        }
+        format!(" AND kind IN ({})", ph.join(", "))
+    };
+    (fparams, fph.join(", "), kind_clause)
 }
 
 /// Walk `memory_edges` from `seeds` up to `ge.depth` hops; reachable atoms, nearest first.
 fn expand_graph(
     conn: &Connection<'_>,
-    table: &str,
-    region_id: RegionId,
+    scope: GraphFetchScope<'_>,
     seeds: &[AtomId],
     ge: &GraphExpand,
 ) -> Result<Vec<AtomHit>> {
@@ -3308,10 +3295,11 @@ fn expand_graph(
     if depth_of.is_empty() {
         return Ok(Vec::new());
     }
-    let (fparams, in_list) = graph_fetch_params(region_id, &depth_of);
+    let (fparams, in_list, kind_clause) = graph_fetch_params(scope, &depth_of);
+    let table = scope.table;
     let fetch_sql = format!(
         "SELECT id, kind, CAST(payload AS TEXT), text_content, immutable, created_at \
-         FROM {table} WHERE region_id = $1 AND id IN ({in_list})"
+         FROM {table} WHERE region_id = $1 AND id IN ({in_list}){kind_clause}"
     );
     let fetched = conn.query_params(&fetch_sql, &fparams)?;
 
@@ -3340,10 +3328,9 @@ fn expand_graph(
 /// reachable atoms' sealed content.
 fn expand_graph_sealed(
     conn: &Connection<'_>,
-    table: &str,
     atom_wrap: &AtomWrapKey,
     wrapped: &FxHashMap<u64, [u8; WRAPPED_KEY_SIZE]>,
-    region_id: RegionId,
+    scope: GraphFetchScope<'_>,
     seeds: &[AtomId],
     ge: &GraphExpand,
 ) -> Result<Vec<AtomHit>> {
@@ -3354,10 +3341,11 @@ fn expand_graph_sealed(
     if depth_of.is_empty() {
         return Ok(Vec::new());
     }
-    let (fparams, in_list) = graph_fetch_params(region_id, &depth_of);
+    let (fparams, in_list, kind_clause) = graph_fetch_params(scope, &depth_of);
+    let table = scope.table;
     let fetch_sql = format!(
         "SELECT id, kind, sealed, immutable, created_at FROM {table} \
-         WHERE region_id = $1 AND id IN ({in_list})"
+         WHERE region_id = $1 AND id IN ({in_list}){kind_clause}"
     );
     let fetched = conn.query_params(&fetch_sql, &fparams)?;
 
