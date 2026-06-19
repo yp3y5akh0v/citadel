@@ -7,6 +7,7 @@
 //! into the BLAKE3 chain. Sync, single-agent, no tokio.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -19,17 +20,20 @@ use citadel_mem::{AtomId, MemError};
 
 use crate::budget::{AgentBudget, BudgetExceeded, BudgetUsage};
 use crate::graph::{
-    BeliefGraph, CoInstantiationCheck, Evidence, Goal, GoalStatus, GraphError, Reflection,
-    SelfModel, Task, TaskStatus, Verdict, VerifiedKind, CANDIDATE_KIND,
+    BeliefGraph, CoInstantiationCheck, Evidence, Goal, GoalStatus, GraphError, RecallContextConfig,
+    Reflection, SelfModel, Task, TaskStatus, Verdict, VerifiedKind, CANDIDATE_KIND,
 };
 use crate::llm::{
     request_hash, AssistantMessage, CompletionRequest, CompletionResponse, FinishReason, LLMClient,
     LlmError, Message, TokenUsage, ToolCall, ToolChoice, ToolSpec,
 };
 use crate::prompts::{PromptId, PromptLibrary, ResolvedPrompt};
-use crate::propose::{Completer, Elite, ProposalContext, ProposalOperator, ProposeError};
+use crate::propose::{
+    Candidate, Completer, Elite, ProposalContext, ProposalOperator, ProposeError, RejectedCandidate,
+};
 use crate::tools::{
-    structural_constraints_ok, ExecPolicy, FsPolicy, Tool, ToolError, ToolPermissions, ToolRegistry,
+    is_known_memory_mutation, structural_constraints_ok, ExecPolicy, FsPolicy, Tool, ToolError,
+    ToolPermissions, ToolRegistry,
 };
 use crate::verify::{CheckerAttestation, Verifier, VerifyKind, VerifyRequest};
 
@@ -101,21 +105,20 @@ pub enum TerminatedBy {
     BudgetExceeded(BudgetExceeded),
 }
 
-/// Bounded backoff for a transient LLM error; capped under the wall-clock budget.
+/// Capped, jittered backoff for a transient LLM error. No attempt cap: a transient
+/// retries until the run's wall-clock budget (see `retry_complete`); a permanent
+/// error never retries.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
-    /// Total attempts including the first (1 disables retry).
-    pub attempts: u32,
     /// Base backoff, doubled each subsequent attempt.
     pub base_ms: u64,
-    /// Ceiling on any single backoff.
+    /// Ceiling on any single backoff (a server `Retry-After` may still exceed it).
     pub max_ms: u64,
 }
 
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
-            attempts: 3,
             base_ms: 200,
             max_ms: 2_000,
         }
@@ -123,14 +126,31 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// Backoff before retry `attempt` (1-based): exponential from `base_ms`,
-    /// raised to a server `Retry-After` when that is longer, capped at `max_ms`.
+    /// Backoff before retry `attempt` (1-based): capped exponential from `base_ms`,
+    /// then equal jitter (half fixed + half random) so the delay grows without
+    /// synchronizing or busy-looping at zero. A server `Retry-After` is a hard floor
+    /// and may exceed `max_ms`. Equal jitter, not full jitter: a single sequential
+    /// client needs only the non-zero floor, not fleet load-spreading.
     fn delay_ms(&self, attempt: u32, retry_after_secs: Option<u64>) -> u64 {
         let shift = (attempt.saturating_sub(1)).min(16);
-        let exp = self.base_ms.saturating_mul(1u64 << shift);
+        let exp = self.base_ms.saturating_mul(1u64 << shift).min(self.max_ms);
+        let jittered = exp / 2 + jitter(exp / 2 + 1);
         let server = retry_after_secs.unwrap_or(0).saturating_mul(1_000);
-        exp.max(server).min(self.max_ms)
+        jittered.max(server)
     }
+}
+
+/// A uniform sample in `[0, bound)` from the wall clock's sub-second nanos. Timing
+/// only, so it decorrelates backoff without perturbing the seed-pinned search
+/// (replay determinism is over candidates, not sleep length).
+fn jitter(bound: u64) -> u64 {
+    if bound <= 1 {
+        return 0;
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 % bound)
+        .unwrap_or(0)
 }
 
 /// Sleep `ms`. No-op on wasm (no blocking sleep; retryable HTTP backends absent).
@@ -150,12 +170,16 @@ pub struct AgentConfig {
     pub max_react_steps: u32,
     /// Prior atoms recall injects per subtask; 0 disables. Recency-free = replay-stable.
     pub recall_context_k: usize,
+    /// Configured retrieval controls for the always-on recall injected per subtask.
+    pub recall_context: RecallContextConfig,
     pub retry: RetryPolicy,
     pub verifier: Option<Arc<dyn Verifier>>,
     /// Versioned, overridable prompts for the loop's LLM call sites.
     pub prompt_library: Arc<PromptLibrary>,
     /// Discovery candidate generator; required only by run_discovery.
     pub proposal_operator: Option<Arc<dyn ProposalOperator>>,
+    /// Max error-feedback repair re-prompts per rejected discovery candidate (0 disables).
+    pub max_repairs: u32,
     /// Sampling temperature for control calls; 0.0 keeps them deterministic.
     pub temperature: f32,
 }
@@ -168,10 +192,12 @@ impl Default for AgentConfig {
             max_tool_attempts: 3,
             max_react_steps: 6,
             recall_context_k: 5,
+            recall_context: RecallContextConfig::default(),
             retry: RetryPolicy::default(),
             verifier: None,
             prompt_library: Arc::new(PromptLibrary::default()),
             proposal_operator: None,
+            max_repairs: 2,
             temperature: 0.0,
         }
     }
@@ -319,9 +345,11 @@ impl Agent {
     }
 }
 
-/// Call the backend, retrying transient errors with bounded backoff; skips a
-/// backoff that would cross the wall-clock deadline. Shared by the cognition loop
-/// and the discovery proposal channel so every call retries identically.
+/// Call the backend, retrying a transient error with capped, jittered backoff until
+/// the wall-clock deadline, so a network outage does not abort a long run. A
+/// permanent error (auth/malformed) fails fast. The wall-clock budget is the only
+/// bound; this single layer serves the cognition loop and the discovery proposal
+/// channel.
 fn retry_complete(
     llm: &dyn LLMClient,
     policy: RetryPolicy,
@@ -329,20 +357,22 @@ fn retry_complete(
     max_wall_secs: u64,
     req: &CompletionRequest,
 ) -> Result<CompletionResponse, LlmError> {
-    let mut attempt = 1;
+    let mut attempt = 1u32;
     loop {
         match llm.complete(req) {
             Ok(resp) => return Ok(resp),
             Err(e) => {
-                if attempt >= policy.attempts.max(1) || !e.is_retryable() {
+                // Permanent errors never succeed; only transient ones are worth waiting on.
+                if !e.is_retryable() {
                     return Err(e);
                 }
                 let delay = policy.delay_ms(attempt, e.retry_after_secs());
+                // The wall-clock budget, not an attempt count, ends a retry.
                 if would_exceed_wall(started, max_wall_secs, delay) {
                     return Err(e);
                 }
                 backoff_sleep(delay);
-                attempt += 1;
+                attempt = attempt.saturating_add(1);
             }
         }
     }
@@ -466,6 +496,45 @@ impl Ctx<'_> {
             self.budget.max_wall_secs,
             req,
         )
+    }
+
+    /// Run one repair call through a fresh budgeted/traced channel (same accrual as
+    /// the proposal path), returning the operator's fixes. A transient LLM failure
+    /// yields no fix; a hard error aborts. Operators without repair support no-op.
+    fn repair_candidate(
+        &mut self,
+        op: &Arc<dyn ProposalOperator>,
+        failed: &RejectedCandidate,
+        system: &ResolvedPrompt,
+        elites: &[Elite],
+        dgoal: &DiscoveryGoal,
+    ) -> AgentResult<Vec<Candidate>> {
+        let log: Rc<RefCell<Vec<RecordedCall>>> = Rc::new(RefCell::new(Vec::new()));
+        let fixes = {
+            let pctx = ProposalContext {
+                goal: &dgoal.goal,
+                elites,
+                system,
+            };
+            let channel = OwnedChannel {
+                llm: Arc::clone(&self.llm),
+                retry: self.config.retry,
+                started: self.started,
+                max_wall_secs: self.budget.max_wall_secs,
+                cost_capped: self.budget.max_cost_usd.is_some(),
+                log: Rc::clone(&log),
+            };
+            match op.repair(&pctx, failed, Box::new(channel)) {
+                Ok(fixes) => fixes,
+                Err(ProposeError::Llm(e)) if e.is_retryable() => Vec::new(),
+                Err(e) => return Err(AgentError::Other(format!("repair: {e}"))),
+            }
+        };
+        let calls: Vec<RecordedCall> = log.borrow_mut().drain(..).collect();
+        for call in &calls {
+            self.accrue_and_record(&call.req, &call.resp, system)?;
+        }
+        Ok(fixes)
     }
 
     fn plan(&mut self) -> AgentResult<CognitionState> {
@@ -661,7 +730,11 @@ impl Ctx<'_> {
         // disables). Recency-free, so it does not perturb replay.
         let k = self.config.recall_context_k;
         if k > 0 {
-            let recalled = self.graph.recall_relevant(&task.description, k)?;
+            let recalled = self.graph.recall_relevant_with(
+                &task.description,
+                k,
+                &self.config.recall_context,
+            )?;
             if !recalled.is_empty() {
                 user.push_str("Relevant context:\n");
                 for hit in &recalled {
@@ -728,10 +801,10 @@ impl Ctx<'_> {
     }
 
     /// Whether a tool may cause a non-idempotent side effect (so it must not retry):
-    /// `mem_remember`, or a declared filesystem write path / exec policy. Reads the
-    /// tool's own [`ToolPermissions`], so any write/exec tool is covered.
+    /// known memory mutations, or a declared filesystem write path / exec policy.
+    /// Reads the tool's own [`ToolPermissions`], so any write/exec tool is covered.
     fn is_mutating_tool(&self, name: &str) -> bool {
-        if name == "mem_remember" {
+        if is_known_memory_mutation(name) {
             return true;
         }
         match self.tools.permissions(name) {
@@ -1456,6 +1529,11 @@ impl Ctx<'_> {
 
             self.usage.proposals += 1;
             let log: Rc<RefCell<Vec<RecordedCall>>> = Rc::new(RefCell::new(Vec::new()));
+            // retry_complete waits out a transient proposer error until the wall-clock
+            // budget, so a blip never reaches here. A retryable error that does reach
+            // here (an outage past the wall budget, or one returned directly) folds into
+            // the idle path and the next budget check ends the run. Non-retryable is fatal.
+            let mut unreachable: Option<String> = None;
             let candidates = {
                 let pctx = ProposalContext {
                     goal: &dgoal.goal,
@@ -1470,9 +1548,15 @@ impl Ctx<'_> {
                     cost_capped: self.budget.max_cost_usd.is_some(),
                     log: Rc::clone(&log),
                 };
-                op.propose(&pctx, Box::new(channel))
-            }
-            .map_err(|e| AgentError::Other(format!("proposer: {e}")))?;
+                match op.propose(&pctx, Box::new(channel)) {
+                    Ok(candidates) => candidates,
+                    Err(ProposeError::Llm(e)) if e.is_retryable() => {
+                        unreachable = Some(e.to_string());
+                        Vec::new()
+                    }
+                    Err(e) => return Err(AgentError::Other(format!("proposer: {e}"))),
+                }
+            };
             // Drain the buffered calls: accrue budget + record the replay trace (the
             // accounting the controller used to do inline), then summarize the last reply.
             let calls: Vec<RecordedCall> = log.borrow_mut().drain(..).collect();
@@ -1487,20 +1571,32 @@ impl Ctx<'_> {
             if candidates.is_empty() {
                 barren_rounds += 1;
                 let round = self.usage.proposals;
-                match &last_reply {
-                    Some(r) => eprintln!(
+                match (&unreachable, &last_reply) {
+                    (Some(err), _) => eprintln!(
+                        "[discovery] round {round}: proposer LLM unreachable \
+                         (transient: {err}); idle round, continuing"
+                    ),
+                    (None, Some(r)) => eprintln!(
                         "[discovery] barren round {round}: 0 candidates \
                          (finish={:?}, tool_calls={}, text head: {:?})",
                         r.finish_reason, r.tool_calls, r.head
                     ),
-                    None => eprintln!(
+                    (None, None) => eprintln!(
                         "[discovery] barren round {round}: operator yielded 0 \
                          candidates without an LLM reply"
                     ),
                 }
             }
             let mut improved = false;
-            for cand in candidates {
+            // FIFO worklist: fresh candidates keep proposed order (mint bars are
+            // arrival-ordered); a rejected candidate is re-proposed with the kernel error
+            // and its fix re-enters with one less repair. No-op for operators without
+            // repair support.
+            let mut work: VecDeque<(Candidate, u32)> = candidates
+                .into_iter()
+                .map(|c| (c, self.config.max_repairs))
+                .collect();
+            while let Some((cand, repairs_left)) = work.pop_front() {
                 // Check before increment so max_checker_calls = N permits exactly
                 // N calls; flush first so no earned mint is dropped.
                 self.usage.wall_secs = self.started.elapsed().as_secs();
@@ -1540,8 +1636,20 @@ impl Ctx<'_> {
                     sample_reject_reason = Some(scored.reason.clone());
                 }
                 // Skip invalid, below-floor, or (per ScoredOutcome's contract)
-                // non-finite scores - never archive or rank them.
+                // non-finite scores - never archive or rank them. Error-feedback: hand
+                // the rejection back to the operator for a bounded fix.
                 if !scored.satisfied || !scored.score.is_finite() {
+                    if repairs_left > 0 {
+                        let rejected = RejectedCandidate {
+                            artifact: cand.artifact.clone(),
+                            reason: scored.reason.clone(),
+                        };
+                        let fixes =
+                            self.repair_candidate(&op, &rejected, &system, &elites, &dgoal)?;
+                        for fix in fixes {
+                            work.push_back((fix, repairs_left - 1));
+                        }
+                    }
                     continue;
                 }
                 let atom = self.graph.add_candidate(&artifact, scored.score)?;
@@ -1587,6 +1695,16 @@ impl Ctx<'_> {
 
             // Barren rounds count as idle, so a broken proposer dies after max_idle_rounds.
             idle = if improved { 0 } else { idle + 1 };
+            // Per-round heartbeat: the LLM call and kernel checks are otherwise silent.
+            eprintln!(
+                "[discovery] round {}: valid {}, minted {}, best {:.3}, idle {}/{}",
+                self.usage.proposals,
+                valid_candidates,
+                minted.len(),
+                best_score,
+                idle,
+                dgoal.max_idle_rounds
+            );
             // Converge after max_idle_rounds, but only with a real best (else Incomplete).
             if !improved && idle >= dgoal.max_idle_rounds {
                 break 'search if best_score.is_finite() {
@@ -1698,6 +1816,19 @@ fn flush_mints(
             let atom =
                 graph.add_verified_artifact(p.atom, dgoal.kind, attestation.clone(), p.score)?;
             ledger.minted.push(atom);
+            // Log the certified statement so mints are inspectable from the run log.
+            let stmt = serde_json::from_str::<Value>(&p.artifact)
+                .ok()
+                .and_then(|v| {
+                    v.get("statement")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| p.artifact.clone());
+            eprintln!(
+                "[discovery] minted {atom:?} (score {score:.3}): {stmt}",
+                score = p.score
+            );
             terminal_minted |= p.terminal;
             if ledger
                 .best_verified
@@ -1897,10 +2028,9 @@ mod tests {
         )
     }
 
-    fn fast_retry(attempts: u32) -> AgentConfig {
+    fn fast_retry() -> AgentConfig {
         AgentConfig {
             retry: RetryPolicy {
-                attempts,
                 base_ms: 0,
                 max_ms: 0,
             },
@@ -1925,26 +2055,37 @@ mod tests {
     }
 
     #[test]
-    fn retry_backoff_is_exponential_capped_and_honors_retry_after() {
+    fn retry_backoff_is_capped_jittered_and_honors_retry_after() {
         let p = RetryPolicy {
-            attempts: 5,
             base_ms: 100,
             max_ms: 1_000,
         };
-        assert_eq!(p.delay_ms(1, None), 100);
-        assert_eq!(p.delay_ms(2, None), 200);
-        assert_eq!(p.delay_ms(3, None), 400);
-        assert_eq!(p.delay_ms(10, None), 1_000, "capped at max_ms");
+        // Equal jitter: every delay lands in [cap/2, cap] of the capped exponential.
+        for (attempt, lo, hi) in [(1u32, 50u64, 100u64), (2, 100, 200), (3, 200, 400)] {
+            for _ in 0..64 {
+                let d = p.delay_ms(attempt, None);
+                assert!(
+                    (lo..=hi).contains(&d),
+                    "attempt {attempt}: {d} not in [{lo},{hi}]"
+                );
+            }
+        }
+        // The exponential is capped at max_ms before jitter, so attempt 10 -> [500, 1000].
+        for _ in 0..64 {
+            let d = p.delay_ms(10, None);
+            assert!((500..=1_000).contains(&d), "capped: {d}");
+        }
+        // A 2s Retry-After is a hard floor - honored even above max_ms.
         assert_eq!(
             p.delay_ms(1, Some(2)),
-            1_000,
-            "a 2s Retry-After is raised then capped at max_ms"
+            2_000,
+            "Retry-After is respected even when it exceeds max_ms"
         );
     }
 
     #[test]
     fn retryable_error_is_retried_until_success() {
-        let (_d, agent) = agent_with_llm(flaky(2, 503).client(), fast_retry(3));
+        let (_d, agent) = agent_with_llm(flaky(2, 503).client(), fast_retry());
         assert!(
             agent.run("do it").is_ok(),
             "a transient error must not abort the run when retries cover it"
@@ -1954,22 +2095,26 @@ mod tests {
     #[test]
     fn non_retryable_error_is_not_retried() {
         let flaky = flaky(1, 400);
-        let (_d, agent) = agent_with_llm(flaky.client(), fast_retry(5));
+        let (_d, agent) = agent_with_llm(flaky.client(), fast_retry());
         let err = agent.run("do it").unwrap_err();
         assert!(matches!(err, AgentError::Llm(_)), "a 4xx propagates");
         assert_eq!(flaky.calls(), 1, "a terminal error is not retried");
     }
 
     #[test]
-    fn retries_are_exhausted_then_error() {
-        let flaky = flaky(10, 503);
-        let (_d, agent) = agent_with_llm(flaky.client(), fast_retry(3));
-        let err = agent.run("do it").unwrap_err();
-        assert!(matches!(err, AgentError::Llm(_)));
+    fn a_transient_retries_past_the_old_attempt_cap_until_success() {
+        // No attempt cap: a transient retries until it succeeds (here after 5
+        // failures, past the old cap of 3), bounded only by wall-clock.
+        let flaky = flaky(5, 503);
+        let (_d, agent) = agent_with_llm(flaky.client(), fast_retry());
+        assert!(
+            agent.run("do it").is_ok(),
+            "a persistent-but-recovering transient retries until success"
+        );
         assert_eq!(
             flaky.calls(),
-            3,
-            "first attempt plus two retries, then give up"
+            6,
+            "5 transient failures, then success on the 6th"
         );
     }
 

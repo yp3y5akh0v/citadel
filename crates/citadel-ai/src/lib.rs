@@ -16,8 +16,8 @@ pub use agent::{
 pub use budget::{AgentBudget, BudgetExceeded, BudgetUsage};
 pub use graph::{
     BeliefGraph, ChainReport, CoInstantiationCheck, Evidence, Goal, GoalStatus, GoalStatusRecord,
-    GraphError, GraphResult, Hypothesis, Reflection, SelfModel, Task, TaskStatus,
-    TraceEvictionPolicy, Verdict, VerifiedExport, VerifiedKind,
+    GraphError, GraphResult, Hypothesis, RecallContextConfig, Reflection, SelfModel, Task,
+    TaskStatus, TraceEvictionPolicy, Verdict, VerifiedExport, VerifiedKind,
 };
 // Only door to an LLMClient; no concrete client re-exported.
 pub use llm::factory;
@@ -35,7 +35,7 @@ pub use llm::{
 pub use prompts::{Prompt, PromptId, PromptLibrary, PromptSource, ResolvedPrompt};
 pub use propose::{
     parse_artifacts, Candidate, Completer, Elite, LlmProposer, ProposalContext, ProposalOperator,
-    ProposeError,
+    ProposeError, RejectedCandidate,
 };
 #[cfg(all(feature = "command-tool", not(target_arch = "wasm32")))]
 pub use tools::RunCommandTool;

@@ -8,10 +8,11 @@ use std::sync::Arc;
 use citadel::{Argon2Profile, DatabaseBuilder};
 use citadel_ai::testing;
 use citadel_ai::{
-    Agent, AgentBudget, AgentConfig, BeliefGraph, Candidate, CheckerAttestation, Completer,
-    CompletionRequest, CompletionResponse, DiscoveryGoal, Goal, Message, ProposalContext,
-    ProposalOperator, ProposeError, ScoredOutcome, TerminatedBy, ToolRegistry, VerifiedKind,
-    Verifier, VerifyError, VerifyOutcome, VerifyRequest,
+    Agent, AgentBudget, AgentConfig, AgentResult, BeliefGraph, Candidate, CheckerAttestation,
+    Completer, CompletionRequest, CompletionResponse, DiscoveryGoal, DiscoveryReport, Goal,
+    LlmError, Message, ProposalContext, ProposalOperator, ProposeError, RejectedCandidate,
+    ScoredOutcome, TerminatedBy, ToolRegistry, VerifiedKind, Verifier, VerifyError, VerifyOutcome,
+    VerifyRequest,
 };
 use citadel_mem::{MemoryEngine, MockEmbedder};
 use serde_json::json;
@@ -358,5 +359,207 @@ fn discovery_cost_cap_fails_closed_on_the_first_unpriced_call() {
         calls.load(Ordering::Relaxed),
         1,
         "the operator stopped on the first call; the second never ran"
+    );
+}
+
+/// Run a discovery campaign with `proposer` and the always-accepting verifier to
+/// convergence, returning the raw result so a test can assert success OR failure.
+fn run_with_proposer<P: ProposalOperator + 'static>(
+    proposer: P,
+    max_idle_rounds: u32,
+) -> AgentResult<DiscoveryReport> {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseBuilder::new(dir.path().join("m.db"))
+        .passphrase(b"transient-proposer")
+        .argon2_profile(Argon2Profile::Iot)
+        .create()
+        .unwrap();
+    let eng = Arc::new(MemoryEngine::open(Arc::new(db)).unwrap());
+    eng.create_region("agent", Arc::new(MockEmbedder::new(64)))
+        .unwrap();
+    let graph = BeliefGraph::new(eng, "agent");
+    let config = AgentConfig {
+        verifier: Some(Arc::new(MockVerifier { score: 5.0 })),
+        proposal_operator: Some(Arc::new(proposer)),
+        ..Default::default()
+    };
+    let agent = Agent::new(
+        testing::scripted(vec![]),
+        graph,
+        ToolRegistry::new(),
+        AgentBudget::default(),
+        config,
+    );
+    agent.run_discovery(DiscoveryGoal {
+        goal: Goal::new("transient-failure handling"),
+        kind: VerifiedKind::Construction,
+        baseline_score: 0.0,
+        archive_width: 8,
+        max_idle_rounds,
+        max_mints: 4,
+    })
+}
+
+#[test]
+fn transient_proposer_llm_failure_is_idle_not_fatal() {
+    // An operator that returns a retryable error directly (its LLM channel exhausted).
+    // retry_complete already waits out a real transient, so reaching here means the
+    // proposer cannot produce; the run must not abort. Each such round folds into the
+    // idle path and a broken proposer converges to Incomplete (nothing minted) after
+    // max_idle_rounds.
+    struct UnreachableProposer;
+    impl ProposalOperator for UnreachableProposer {
+        fn propose(
+            &self,
+            _ctx: &ProposalContext<'_>,
+            _llm: Box<dyn Completer>,
+        ) -> Result<Vec<Candidate>, ProposeError> {
+            Err(ProposeError::Llm(LlmError::Transport(
+                "simulated outage".into(),
+            )))
+        }
+    }
+    let report =
+        run_with_proposer(UnreachableProposer, 2).expect("a transient failure is not fatal");
+    assert_eq!(report.terminated_by, TerminatedBy::Incomplete);
+    assert!(report.minted.is_empty());
+    assert_eq!(
+        report.barren_rounds, report.proposals,
+        "every unreachable round counts as idle/barren"
+    );
+    assert!(report.chain_valid);
+}
+
+#[test]
+fn non_retryable_proposer_error_stays_fatal() {
+    // A non-retryable proposer error (4xx / bad key) still aborts the run so real
+    // misconfiguration fails fast rather than spinning idle rounds.
+    struct UnauthorizedProposer;
+    impl ProposalOperator for UnauthorizedProposer {
+        fn propose(
+            &self,
+            _ctx: &ProposalContext<'_>,
+            _llm: Box<dyn Completer>,
+        ) -> Result<Vec<Candidate>, ProposeError> {
+            Err(ProposeError::Llm(LlmError::Http {
+                status: 401,
+                retry_after: None,
+                message: "invalid api key".into(),
+            }))
+        }
+    }
+    assert!(
+        run_with_proposer(UnauthorizedProposer, 2).is_err(),
+        "a non-retryable proposer error aborts the run"
+    );
+}
+
+#[test]
+fn loop_repairs_a_rejected_candidate_via_error_feedback() {
+    // The proposer first emits a candidate the verifier rejects; the loop hands the
+    // reason back through repair(), and the proposer's fix is accepted and mints -
+    // the end-to-end error-feedback path through the discovery loop.
+    struct RejectExactAcceptBy;
+    impl Verifier for RejectExactAcceptBy {
+        fn verify(&self, _req: &VerifyRequest<'_>) -> Result<VerifyOutcome, VerifyError> {
+            Ok(VerifyOutcome {
+                satisfied: true,
+                reason: "ok".into(),
+            })
+        }
+        fn score(&self, req: &VerifyRequest<'_>) -> Result<ScoredOutcome, VerifyError> {
+            let v: serde_json::Value = serde_json::from_str(&req.evidence[0].1)
+                .map_err(|e| VerifyError::Failed(e.to_string()))?;
+            let fixed = v["proof"].as_str() == Some("by rfl");
+            Ok(ScoredOutcome {
+                satisfied: fixed,
+                score: if fixed { 5.0 } else { 0.0 },
+                reason: if fixed {
+                    "ok".into()
+                } else {
+                    "kernel error: bare tactic without `by`".into()
+                },
+                cell: String::new(),
+                terminal: false,
+            })
+        }
+        fn attestation(&self) -> Option<CheckerAttestation> {
+            Some(CheckerAttestation::new("repair-mock", "1"))
+        }
+        fn cross_check(&self, _req: &VerifyRequest<'_>) -> Result<bool, VerifyError> {
+            Ok(true)
+        }
+    }
+    struct BadThenRepairGood;
+    impl ProposalOperator for BadThenRepairGood {
+        fn propose(
+            &self,
+            _ctx: &ProposalContext<'_>,
+            _llm: Box<dyn Completer>,
+        ) -> Result<Vec<Candidate>, ProposeError> {
+            Ok(vec![Candidate {
+                artifact: json!({ "statement": "theorem t : 1 = 1", "proof": "exact rfl" }),
+                parent: None,
+                rationale: "fresh".into(),
+            }])
+        }
+        fn repair(
+            &self,
+            _ctx: &ProposalContext<'_>,
+            failed: &RejectedCandidate,
+            _llm: Box<dyn Completer>,
+        ) -> Result<Vec<Candidate>, ProposeError> {
+            assert!(
+                failed.reason.contains("kernel error"),
+                "the kernel reason reaches repair: {}",
+                failed.reason
+            );
+            Ok(vec![Candidate {
+                artifact: json!({ "statement": "theorem t : 1 = 1", "proof": "by rfl" }),
+                parent: None,
+                rationale: "repair".into(),
+            }])
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseBuilder::new(dir.path().join("m.db"))
+        .passphrase(b"repair-loop")
+        .argon2_profile(Argon2Profile::Iot)
+        .create()
+        .unwrap();
+    let eng = Arc::new(MemoryEngine::open(Arc::new(db)).unwrap());
+    eng.create_region("agent", Arc::new(MockEmbedder::new(64)))
+        .unwrap();
+    let graph = BeliefGraph::new(eng, "agent");
+    let config = AgentConfig {
+        verifier: Some(Arc::new(RejectExactAcceptBy)),
+        proposal_operator: Some(Arc::new(BadThenRepairGood)),
+        ..Default::default()
+    };
+    let agent = Agent::new(
+        testing::scripted(vec![]),
+        graph,
+        ToolRegistry::new(),
+        AgentBudget::default(),
+        config,
+    );
+    let report = agent
+        .run_discovery(DiscoveryGoal {
+            goal: Goal::new("repair via error feedback"),
+            kind: VerifiedKind::Construction,
+            baseline_score: 0.0,
+            archive_width: 8,
+            max_idle_rounds: 1,
+            max_mints: 4,
+        })
+        .unwrap();
+    assert!(!report.minted.is_empty(), "the repaired candidate mints");
+    assert_eq!(
+        report
+            .best_artifact
+            .as_ref()
+            .and_then(|a| a["proof"].as_str()),
+        Some("by rfl"),
+        "the accepted artifact is the REPAIRED one, not the rejected bare tactic"
     );
 }
