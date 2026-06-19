@@ -189,12 +189,24 @@ def test_config_getters_and_setters():
     cfg = ag.AgentConfig()
     assert cfg.drift_bound == 5
     assert cfg.max_react_steps == 6
+    assert cfg.max_repairs == 2
     cfg.drift_bound = 9
     cfg.max_react_steps = 3
+    cfg.max_repairs = 5
     cfg.temperature = 0.5
     assert cfg.drift_bound == 9
     assert cfg.max_react_steps == 3
+    assert cfg.max_repairs == 5
     assert cfg.temperature == pytest.approx(0.5)
+
+
+def test_recall_context_config_methods():
+    cfg = ag.AgentConfig()
+    cfg.set_recall_context_weights(0.5, 0.25, 0.0, 0.25)
+    cfg.set_recall_context_graph_expand(1, ["derived_from"])
+    cfg.clear_recall_context_graph_expand()
+    with pytest.raises(ValueError):
+        cfg.set_recall_context_graph_expand(1, ["not_an_edge"])
 
 
 def test_budget_defaults_and_overrides():

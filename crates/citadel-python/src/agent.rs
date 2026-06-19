@@ -5,10 +5,10 @@ use std::sync::Arc;
 use citadel_ai::{
     Agent, AgentBudget, AgentConfig, AgentReport, BeliefGraph, BudgetExceeded, Candidate,
     Completer, DiscoveryGoal, DiscoveryReport, Elite, Goal, LlmProposer, PromptId, PromptLibrary,
-    ProposalContext, ProposalOperator, ProposeError, RetryPolicy, TerminatedBy, ToolRegistry,
-    VerifiedKind, Verifier,
+    ProposalContext, ProposalOperator, ProposeError, RecallContextConfig, RetryPolicy,
+    TerminatedBy, ToolRegistry, VerifiedKind, Verifier,
 };
-use citadel_mem::MemoryEngine;
+use citadel_mem::{EdgeKind, FusionWeights, GraphExpand, MemoryEngine};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -283,6 +283,22 @@ fn prompt_id(id: &str) -> PyResult<PromptId> {
     })
 }
 
+fn parse_recall_edge_kind(s: &str) -> PyResult<EdgeKind> {
+    match s.to_ascii_lowercase().as_str() {
+        "causes" => Ok(EdgeKind::Causes),
+        "contradicts" => Ok(EdgeKind::Contradicts),
+        "refines" => Ok(EdgeKind::Refines),
+        "precedes" => Ok(EdgeKind::Precedes),
+        "supersedes" => Ok(EdgeKind::Supersedes),
+        "derived_from" => Ok(EdgeKind::DerivedFrom),
+        "depends_on" => Ok(EdgeKind::DependsOn),
+        other => Err(PyValueError::new_err(format!(
+            "unknown edge kind '{other}' \
+             (causes|contradicts|refines|precedes|supersedes|derived_from|depends_on)"
+        ))),
+    }
+}
+
 /// Versioned overrides for the loop's LLM prompts; unset ids use the shipped defaults.
 #[pyclass(name = "PromptLibrary")]
 #[derive(Default)]
@@ -329,10 +345,12 @@ pub(crate) struct PyAgentConfig {
     max_tool_attempts: u32,
     max_react_steps: u32,
     recall_context_k: usize,
+    recall_context: RecallContextConfig,
     temperature: f32,
     retry: RetryPolicy,
     verifier: Option<Arc<dyn Verifier>>,
     proposal_operator: Option<Arc<dyn ProposalOperator>>,
+    max_repairs: u32,
     prompt_library: PromptLibrary,
 }
 
@@ -345,10 +363,12 @@ impl Default for PyAgentConfig {
             max_tool_attempts: c.max_tool_attempts,
             max_react_steps: c.max_react_steps,
             recall_context_k: c.recall_context_k,
+            recall_context: c.recall_context,
             temperature: c.temperature,
             retry: c.retry,
             verifier: c.verifier,
             proposal_operator: c.proposal_operator,
+            max_repairs: c.max_repairs,
             prompt_library: PromptLibrary::default(),
         }
     }
@@ -362,10 +382,12 @@ impl PyAgentConfig {
             max_tool_attempts: self.max_tool_attempts,
             max_react_steps: self.max_react_steps,
             recall_context_k: self.recall_context_k,
+            recall_context: self.recall_context.clone(),
             retry: self.retry,
             verifier: self.verifier.clone(),
             prompt_library: Arc::new(self.prompt_library.clone()),
             proposal_operator: self.proposal_operator.clone(),
+            max_repairs: self.max_repairs,
             temperature: self.temperature,
         }
     }
@@ -419,6 +441,16 @@ impl PyAgentConfig {
     }
 
     #[getter]
+    fn max_repairs(&self) -> u32 {
+        self.max_repairs
+    }
+
+    #[setter]
+    fn set_max_repairs(&mut self, value: u32) {
+        self.max_repairs = value;
+    }
+
+    #[getter]
     fn recall_context_k(&self) -> usize {
         self.recall_context_k
     }
@@ -426,6 +458,41 @@ impl PyAgentConfig {
     #[setter]
     fn set_recall_context_k(&mut self, value: usize) {
         self.recall_context_k = value;
+    }
+
+    /// Configure the always-on recall fusion weights used to inject context per subtask.
+    fn set_recall_context_weights(
+        &mut self,
+        semantic: f32,
+        keyword: f32,
+        recency: f32,
+        importance: f32,
+    ) {
+        self.recall_context.weights = FusionWeights {
+            semantic,
+            keyword,
+            recency,
+            importance,
+        };
+    }
+
+    /// Configure graph expansion for always-on context recall.
+    fn set_recall_context_graph_expand(
+        &mut self,
+        depth: usize,
+        edge_kinds: Vec<String>,
+    ) -> PyResult<()> {
+        let kinds = edge_kinds
+            .iter()
+            .map(|s| parse_recall_edge_kind(s))
+            .collect::<PyResult<Vec<_>>>()?;
+        self.recall_context.graph_expand = Some(GraphExpand::new(depth, kinds));
+        Ok(())
+    }
+
+    /// Disable graph expansion for always-on context recall.
+    fn clear_recall_context_graph_expand(&mut self) {
+        self.recall_context.graph_expand = None;
     }
 
     #[getter]
@@ -438,13 +505,10 @@ impl PyAgentConfig {
         self.temperature = value;
     }
 
-    /// Exponential backoff for transient tool/LLM failures.
-    fn set_retry(&mut self, attempts: u32, base_ms: u64, max_ms: u64) {
-        self.retry = RetryPolicy {
-            attempts,
-            base_ms,
-            max_ms,
-        };
+    /// Capped, jittered backoff for transient tool/LLM failures. Transient errors
+    /// retry until the wall-clock budget (no attempt cap); base/ceiling only tune it.
+    fn set_retry(&mut self, base_ms: u64, max_ms: u64) {
+        self.retry = RetryPolicy { base_ms, max_ms };
     }
 
     /// Set the deterministic verifier (a Python object implementing the verifier
