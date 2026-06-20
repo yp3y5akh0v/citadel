@@ -5,10 +5,10 @@ use std::sync::Arc;
 use citadel_ai::{
     Agent, AgentBudget, AgentConfig, AgentReport, BeliefGraph, BudgetExceeded, Candidate,
     Completer, DiscoveryGoal, DiscoveryReport, Elite, Goal, LlmProposer, PromptId, PromptLibrary,
-    ProposalContext, ProposalOperator, ProposeError, RecallContextConfig, RetryPolicy,
-    TerminatedBy, ToolRegistry, VerifiedKind, Verifier,
+    ProposalContext, ProposalOperator, ProposeError, RetryPolicy, TerminatedBy, ToolRegistry,
+    VerifiedKind, Verifier,
 };
-use citadel_mem::{EdgeKind, FusionWeights, GraphExpand, MemoryEngine};
+use citadel_mem::{EdgeKind, FusionWeights, GraphExpand, MemoryEngine, RecallProfile};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -345,7 +345,7 @@ pub(crate) struct PyAgentConfig {
     max_tool_attempts: u32,
     max_react_steps: u32,
     recall_context_k: usize,
-    recall_context: RecallContextConfig,
+    recall_context: RecallProfile,
     temperature: f32,
     retry: RetryPolicy,
     verifier: Option<Arc<dyn Verifier>>,

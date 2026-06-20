@@ -16,8 +16,8 @@ pub use agent::{
 pub use budget::{AgentBudget, BudgetExceeded, BudgetUsage};
 pub use graph::{
     BeliefGraph, ChainReport, CoInstantiationCheck, Evidence, Goal, GoalStatus, GoalStatusRecord,
-    GraphError, GraphResult, Hypothesis, RecallContextConfig, Reflection, SelfModel, Task,
-    TaskStatus, TraceEvictionPolicy, Verdict, VerifiedExport, VerifiedKind,
+    GraphError, GraphResult, Hypothesis, Reflection, SelfModel, Task, TaskStatus,
+    TraceEvictionPolicy, Verdict, VerifiedExport, VerifiedKind,
 };
 // Only door to an LLMClient; no concrete client re-exported.
 pub use llm::factory;

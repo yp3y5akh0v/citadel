@@ -8,7 +8,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use citadel_ai::{CompletionRequest, CompletionResponse, LLMClient, LlmError, Message, TokenUsage};
-use citadel_mem::{AtomHit, AtomId, MemoryEngine, RecallQuery};
+use citadel_mem::{AtomHit, AtomId, MemoryEngine, RecallProfile, RecallQuery};
 use rustc_hash::FxHashSet;
 
 use crate::error::Result;
@@ -303,8 +303,9 @@ fn read_assembled(
 }
 
 /// Recall the top-`config.top_k` memories, expand to the reader view, then ask the
-/// reader; the reader call is paced + retried. Recall keeps the default wall clock:
-/// grading recency as of the conversation's end was measured to HURT evidence
+/// reader; the reader call is paced + retried. Recall uses the canonical
+/// `RecallProfile::default` (the scored recipe). It keeps the default wall clock:
+/// grading recency as of the conversation's end was measured to hurt evidence
 /// recall (diag C-asof, -4.6 any@30), so no as-of is passed here.
 pub fn answer_question(
     reader: &dyn LLMClient,
@@ -315,7 +316,10 @@ pub fn answer_question(
     config: BenchConfig,
 ) -> Result<AnswerOutcome> {
     let started = Instant::now();
-    let hits = eng.recall(region, RecallQuery::by_text(question, config.top_k))?;
+    let hits = eng.recall(
+        region,
+        RecallProfile::default().apply(RecallQuery::by_text(question, config.top_k)),
+    )?;
     let view = reader_view(eng, region, hits, config)?;
     let recall_micros = started.elapsed().as_micros();
     read_assembled(reader, pacer, question, view, recall_micros)
