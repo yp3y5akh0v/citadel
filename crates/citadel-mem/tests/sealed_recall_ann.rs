@@ -123,6 +123,46 @@ fn excludes_deleted_atom() {
 }
 
 #[test]
+fn fetch_and_recall_cover_a_region_past_the_decrypt_page() {
+    // Exceeds the internal decrypt page size (4096): fetch must page, recall must index the
+    // whole region.
+    const N: usize = 4096 + 50;
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    eng.create_encrypted_region("r", embedder()).unwrap();
+
+    let needle = "distinctive tail needle past the scan window zzqq";
+    let mut atoms: Vec<AtomInput> = (0..N - 1)
+        .map(|i| AtomInput::new("turn", format!("filler chatter line {i}")))
+        .collect();
+    atoms.push(AtomInput::new("turn", needle)); // highest id, well past row 4096
+    eng.remember_batch("r", atoms).unwrap();
+
+    // limit past the page size: fetch pages and returns every atom.
+    let all = eng.fetch("r", "turn", None, 100_000).unwrap();
+    assert_eq!(
+        all.len(),
+        N,
+        "fetch pages past the 4096 window and returns every atom"
+    );
+    assert!(
+        all.iter().any(|h| h.text == needle),
+        "the tail atom past row 4096 is returned by fetch"
+    );
+
+    // a smaller limit returns exactly that many.
+    let few = eng.fetch("r", "turn", None, 10).unwrap();
+    assert_eq!(few.len(), 10, "fetch honors a small limit exactly");
+
+    // recall reaches an atom past the page boundary via the full-region index.
+    let hits = eng.recall("r", RecallQuery::by_text(needle, 3)).unwrap();
+    assert_eq!(
+        hits[0].text, needle,
+        "recall covers the whole encrypted region via the full in-RAM PRISM index"
+    );
+}
+
+#[test]
 fn encrypted_matches_plaintext_top_hit_over_larger_set() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
