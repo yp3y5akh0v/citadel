@@ -16,12 +16,12 @@ use std::time::Instant;
 use rustc_hash::FxHashMap;
 use serde_json::{json, Value};
 
-use citadel_mem::{AtomId, MemError};
+use citadel_mem::{AtomId, MemError, RecallProfile};
 
 use crate::budget::{AgentBudget, BudgetExceeded, BudgetUsage};
 use crate::graph::{
-    BeliefGraph, CoInstantiationCheck, Evidence, Goal, GoalStatus, GraphError, RecallContextConfig,
-    Reflection, SelfModel, Task, TaskStatus, Verdict, VerifiedKind, CANDIDATE_KIND,
+    BeliefGraph, CoInstantiationCheck, Evidence, Goal, GoalStatus, GraphError, Reflection,
+    SelfModel, Task, TaskStatus, Verdict, VerifiedKind, CANDIDATE_KIND,
 };
 use crate::llm::{
     request_hash, AssistantMessage, CompletionRequest, CompletionResponse, FinishReason, LLMClient,
@@ -170,8 +170,9 @@ pub struct AgentConfig {
     pub max_react_steps: u32,
     /// Prior atoms recall injects per subtask; 0 disables. Recency-free = replay-stable.
     pub recall_context_k: usize,
-    /// Configured retrieval controls for the always-on recall injected per subtask.
-    pub recall_context: RecallContextConfig,
+    /// Recall recipe for the always-on context injected per subtask. Defaults to the
+    /// agent-context profile (narrative kinds, recency-disabled for replay stability).
+    pub recall_context: RecallProfile,
     pub retry: RetryPolicy,
     pub verifier: Option<Arc<dyn Verifier>>,
     /// Versioned, overridable prompts for the loop's LLM call sites.
@@ -192,7 +193,7 @@ impl Default for AgentConfig {
             max_tool_attempts: 3,
             max_react_steps: 6,
             recall_context_k: 5,
-            recall_context: RecallContextConfig::default(),
+            recall_context: RecallProfile::agent_context(),
             retry: RetryPolicy::default(),
             verifier: None,
             prompt_library: Arc::new(PromptLibrary::default()),

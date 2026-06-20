@@ -6,6 +6,7 @@ pub mod embed;
 pub mod engine;
 pub mod error;
 mod fusion;
+pub mod profile;
 pub mod types;
 
 #[cfg(feature = "candle-embed")]
@@ -14,6 +15,7 @@ pub use citadel_sql::executor::{AnnIndexSource, AnnSegmentInfo};
 pub use embed::{EmbedError, Embedder, EmbeddingMetric, MockEmbedder, MockReranker, Reranker};
 pub use engine::{MemoryEngine, RegionId};
 pub use error::{MemError, Result};
+pub use profile::{RecallProfile, NARRATIVE_KINDS};
 pub use types::{
     AtomAttestation, AtomHit, AtomId, AtomInput, AttestVerdict, Edge, EdgeKind, ErasureReceipt,
     EvictionPolicy, EvictionReport, EvolutionReport, FusionWeights, GraphExpand, KindDigest,

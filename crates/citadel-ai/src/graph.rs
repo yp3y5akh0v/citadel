@@ -16,8 +16,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{json, Value};
 
 use citadel_mem::{
-    AtomHit, AtomId, AtomInput, EdgeKind, EvictionPolicy, EvictionReport, FusionWeights,
-    GraphExpand, MemoryEngine, RecallQuery,
+    AtomHit, AtomId, AtomInput, EdgeKind, EvictionPolicy, EvictionReport, MemoryEngine,
+    RecallProfile, RecallQuery,
 };
 
 use crate::verify::CheckerAttestation;
@@ -118,34 +118,6 @@ pub struct VerifiedExport {
 }
 
 pub type GraphResult<T> = Result<T, GraphError>;
-
-/// Configured retrieval policy for the agent's always-on context recall.
-///
-/// Code-chosen, not LLM-chosen, so per-step recall stays deterministic and
-/// deployments can tune fusion/graph traversal without inline hyperparameters.
-#[derive(Debug, Clone)]
-pub struct RecallContextConfig {
-    /// Fusion weights for the seed recall. Defaults keep recency disabled for replay
-    /// stability while preserving semantic, keyword, and native importance signals.
-    pub weights: FusionWeights,
-    /// Optional graph expansion applied to seed hits. Defaults off until a deployment
-    /// measures that its graph topology adds signal. The memory engine's configured
-    /// reranker, if any, still runs inside `MemoryEngine::recall`.
-    pub graph_expand: Option<GraphExpand>,
-}
-
-impl Default for RecallContextConfig {
-    fn default() -> Self {
-        let weights = FusionWeights {
-            recency: 0.0,
-            ..FusionWeights::default()
-        };
-        Self {
-            weights,
-            graph_expand: None,
-        }
-    }
-}
 
 /// How [`BeliefGraph::evict_traces`] selects `llm_trace` atoms to forget. Traces
 /// are immutable, so this is a deliberate force-delete (never the audit/self-model).
@@ -1236,31 +1208,21 @@ impl BeliefGraph {
         Ok(out)
     }
 
-    /// Semantically recall the `k` most relevant atoms using the default context
-    /// retrieval policy.
+    /// Semantically recall the `k` most relevant atoms using the agent-context
+    /// profile (narrative kinds, recency-disabled for replay stability).
     pub fn recall_relevant(&self, query: &str, k: usize) -> GraphResult<Vec<AtomHit>> {
-        self.recall_relevant_with(query, k, &RecallContextConfig::default())
+        self.recall_relevant_with(query, k, &RecallProfile::agent_context())
     }
 
-    /// Semantically recall the `k` most relevant atoms, restricted to narrative kinds
-    /// (evidence/fact/reflection) so trace/audit never seed prompt context. Recency is
-    /// controlled by `config`; the default keeps it at 0 for replay stability.
+    /// Recall the `k` most relevant atoms shaped by `profile`. The agent-context preset
+    /// keeps trace/audit out of context and disables recency for replay stability.
     pub fn recall_relevant_with(
         &self,
         query: &str,
         k: usize,
-        config: &RecallContextConfig,
+        profile: &RecallProfile,
     ) -> GraphResult<Vec<AtomHit>> {
-        let mut q = RecallQuery::by_text(query, k)
-            .with_kinds(vec![
-                "evidence".to_string(),
-                "fact".to_string(),
-                "reflection".to_string(),
-            ])
-            .with_weights(config.weights);
-        if let Some(expand) = &config.graph_expand {
-            q = q.with_graph_expand(expand.clone());
-        }
+        let q = profile.apply(RecallQuery::by_text(query, k));
         Ok(self.mem.recall(&self.region, q)?)
     }
 
@@ -1469,7 +1431,7 @@ fn now_micros() -> i64 {
 mod tests {
     use super::*;
     use citadel::{Argon2Profile, DatabaseBuilder};
-    use citadel_mem::MockEmbedder;
+    use citadel_mem::{GraphExpand, MockEmbedder};
 
     fn graph() -> (tempfile::TempDir, BeliefGraph) {
         let dir = tempfile::tempdir().unwrap();
@@ -1677,10 +1639,8 @@ mod tests {
             .link(child, parent, EdgeKind::DerivedFrom, 1.0)
             .unwrap();
 
-        let cfg = RecallContextConfig {
-            weights: FusionWeights::semantic_only(),
-            graph_expand: Some(GraphExpand::new(1, vec![EdgeKind::DerivedFrom])),
-        };
+        let mut cfg = RecallProfile::semantic_only();
+        cfg.graph_expand = Some(GraphExpand::new(1, vec![EdgeKind::DerivedFrom]));
         let hits = g
             .recall_relevant_with("needle leaf context", 1, &cfg)
             .unwrap();
