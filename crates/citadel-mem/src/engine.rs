@@ -24,7 +24,8 @@ use crate::types::{
 };
 use citadel::SlotState;
 
-/// Row cap for encrypted decrypt-then-rank; no ANN/FTS index runs over ciphertext.
+/// Page size for encrypted decrypt scans (sealed `fetch` + eviction); no ANN/FTS index runs
+/// over ciphertext, so those paths decrypt in id-ordered batches of this size.
 const EXACT_SCAN_LIMIT: usize = 4096;
 
 /// Over-fetch ANN candidates by this factor before fusion re-ranking + filtering.
@@ -33,6 +34,9 @@ const CAND_OVERFETCH: usize = 8;
 const MIN_CANDIDATES: usize = 64;
 /// Rebuild the whole sealed ANN index when the post-snapshot tail exceeds this many atoms.
 const REBUILD_TAIL_MAX: usize = 2048;
+/// Plaintext recall over-fetches at least this many ANN candidates before fusion re-ranking
+/// (the sealed path uses `CAND_OVERFETCH`/`MIN_CANDIDATES` instead).
+const MIN_OVERFETCH: usize = 4096;
 
 /// Stable identifier for a memory region (row id in `memory_regions`).
 pub type RegionId = i64;
@@ -584,10 +588,11 @@ impl MemoryEngine {
         Ok(ids)
     }
 
-    /// Fetch atoms of `kind` (optional JSONB `@>` filter) via the `(region_id, kind)` index.
+    /// Fetch up to `limit` atoms of `kind` (optional JSONB `@>` filter) via the
+    /// `(region_id, kind)` index.
     ///
-    /// Encrypted regions decrypt rows in id order and cover only the first
-    /// `EXACT_SCAN_LIMIT` (4096) atoms of the kind; no index runs over ciphertext.
+    /// Encrypted regions decrypt rows in id order, paging the decrypt so `limit` is honored
+    /// over the whole region; no content index runs over ciphertext.
     pub fn fetch(
         &self,
         region: &str,
@@ -627,8 +632,7 @@ impl MemoryEngine {
     }
 
     /// Count atoms of `kind` without materializing them. `kind` is a plaintext column in
-    /// both flavors, so no decryption; a sealed region counts only atoms whose key is live
-    /// (uncapped, unlike the `EXACT_SCAN_LIMIT`-bounded decrypting fetch).
+    /// both flavors, so no decryption; a sealed region counts only atoms whose key is live.
     pub fn count(&self, region: &str, kind: &str) -> Result<u64> {
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
@@ -1093,10 +1097,8 @@ impl MemoryEngine {
 
     /// Hybrid recall: ANN retrieval then fusion re-ranking; returns the top `q.k` atoms.
     ///
-    /// Encrypted regions cannot use the ANN/FTS indexes (they run on ciphertext), so recall
-    /// decrypts the first `EXACT_SCAN_LIMIT` (4096) atoms by id and ranks them in Rust; the
-    /// keyword signal is in-Rust BM25, not SQL `ts_rank`. Regions over 4096 atoms are not
-    /// fully covered on the sealed path.
+    /// Encrypted regions decrypt once into an in-RAM PRISM index over the whole region
+    /// (cached; post-snapshot tail exact-ranked); keyword is in-Rust BM25, not SQL `ts_rank`.
     pub fn recall(&self, region: &str, q: RecallQuery) -> Result<Vec<AtomHit>> {
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
@@ -1154,8 +1156,7 @@ impl MemoryEngine {
         }
 
         // Over-fetch trades query latency for better ranking of keyword/recency hits.
-        const EXACT_SCAN_LIMIT: usize = 4096;
-        let overfetch = q.k.saturating_mul(4).max(EXACT_SCAN_LIMIT);
+        let overfetch = q.k.saturating_mul(4).max(MIN_OVERFETCH);
         let sql = format!(
             "SELECT id, kind, CAST(payload AS TEXT), text_content, score, created_at, \
              embedding {distop} $1, 0.0, immutable \
@@ -1204,8 +1205,8 @@ impl MemoryEngine {
         with_write_txn(&conn, |c| link_edge(c, src, dst, kind, weight))
     }
 
-    /// Recompute neighbor edges and score. Encrypted regions ride the sealed scan
-    /// (`EXACT_SCAN_LIMIT`), not the ANN index, so far neighbors may be missed.
+    /// Recompute neighbor edges and score via recall; encrypted regions use the same
+    /// full-region sealed ANN index.
     pub fn evolve(
         &self,
         region: &str,
@@ -2085,37 +2086,54 @@ impl MemoryEngine {
             .expect("fetch_sealed on plaintext region");
         let conn = Connection::open(&self.db)?;
         let wrapped = self.db.atom_store_live_wrapped()?;
-        let qr = conn.query_params(
-            &format!(
-                "SELECT id, kind, sealed, score, immutable, created_at FROM {table} \
-                 WHERE region_id = $1 AND kind = $2 ORDER BY id LIMIT {EXACT_SCAN_LIMIT}",
-                table = h.table
-            ),
-            &[Value::Integer(h.id), Value::Text(kind.into())],
-        )?;
+        // Filtering runs after decryption, so page by id until `limit` is met or drained.
+        let sql = format!(
+            "SELECT id, kind, sealed, score, immutable, created_at FROM {table} \
+             WHERE region_id = $1 AND kind = $2 AND id > $3 ORDER BY id LIMIT {EXACT_SCAN_LIMIT}",
+            table = h.table
+        );
         let mut out = Vec::new();
-        for row in &qr.rows {
-            let id = as_int(&row[0])?;
-            let Some(w) = wrapped.get(&(id as u64)) else {
-                continue;
-            };
-            let (_emb, text, payload) = open_atom(atom_wrap, w, id, as_blob(&row[2])?)?;
-            if let Some(filter) = payload_filter {
-                if !json_contains(&payload, filter) {
+        let mut last_id: AtomId = i64::MIN;
+        'pages: loop {
+            let qr = conn.query_params(
+                &sql,
+                &[
+                    Value::Integer(h.id),
+                    Value::Text(kind.into()),
+                    Value::Integer(last_id),
+                ],
+            )?;
+            if qr.rows.is_empty() {
+                break;
+            }
+            let batch = qr.rows.len();
+            for row in &qr.rows {
+                let id = as_int(&row[0])?;
+                last_id = id;
+                let Some(w) = wrapped.get(&(id as u64)) else {
                     continue;
+                };
+                let (_emb, text, payload) = open_atom(atom_wrap, w, id, as_blob(&row[2])?)?;
+                if let Some(filter) = payload_filter {
+                    if !json_contains(&payload, filter) {
+                        continue;
+                    }
+                }
+                out.push(AtomHit {
+                    id,
+                    kind: as_text(&row[1])?.to_string(),
+                    payload,
+                    text,
+                    distance: f32::MAX,
+                    score: as_f32(&row[3]),
+                    created_at: as_ts(&row[5]),
+                    immutable: as_bool(&row[4]),
+                });
+                if out.len() >= limit {
+                    break 'pages;
                 }
             }
-            out.push(AtomHit {
-                id,
-                kind: as_text(&row[1])?.to_string(),
-                payload,
-                text,
-                distance: f32::MAX,
-                score: as_f32(&row[3]),
-                created_at: as_ts(&row[5]),
-                immutable: as_bool(&row[4]),
-            });
-            if out.len() >= limit {
+            if batch < EXACT_SCAN_LIMIT {
                 break;
             }
         }
