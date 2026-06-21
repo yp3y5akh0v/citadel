@@ -28,9 +28,8 @@ fn ensure_finite(values: &[f32], model_id: &str) -> Result<(), EmbedError> {
     }
 }
 
-/// Rerank micro-batch size; pairs are length-sorted so padding tracks each
-/// chunk. Tight buckets beat wider batches: attention cost grows with the
-/// padded length squared.
+/// Micro-batch size for length-bucketed encoding (embed + rerank); inputs are
+/// length-sorted so padding tracks each chunk (attention cost is ~length squared).
 const MICRO_BATCH: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,7 +185,10 @@ pub struct CandleEmbedder {
 fn select_device() -> Device {
     // cuda-embed was requested, so warn rather than silently drop to CPU.
     match Device::new_cuda(0) {
-        Ok(d) => d,
+        Ok(d) => {
+            eprintln!("[citadel-mem] cuda-embed: using CUDA GPU 0");
+            d
+        }
         Err(e) => {
             eprintln!("[citadel-mem] cuda-embed enabled but GPU init failed; using CPU: {e}");
             Device::Cpu
@@ -208,6 +210,11 @@ impl CandleEmbedder {
         cfg: CandleConfig,
     ) -> Result<Self, EmbedError> {
         let device = select_device();
+        // f32 GEMM via TF32 tensor cores (Ampere+); full f32 range. No-op on CPU.
+        if matches!(device, Device::Cuda(_)) {
+            candle_core::cuda::set_gemm_reduced_precision_f32(true);
+            eprintln!("[citadel-mem] cuda-embed: TF32 f32 GEMM enabled (tensor cores)");
+        }
 
         let mut tokenizer = Tokenizer::from_bytes(tokenizer_json).map_err(backend)?;
         let mut padding = PaddingParams {
@@ -310,42 +317,71 @@ impl CandleEmbedder {
         Self::from_dir(dir, CandleConfig::granite_r2())
     }
 
-    fn run(&self, texts: &[&str], prefix: Option<&str>) -> candle_core::Result<Tensor> {
-        let inputs: Vec<String> = match prefix {
-            Some(p) => texts.iter().map(|t| format!("{p}{t}")).collect(),
-            None => texts.iter().map(|t| t.to_string()).collect(),
-        };
-        let encodings = self
-            .tokenizer
-            .encode_batch(inputs, true)
-            .map_err(candle_core::Error::wrap)?;
-
-        let bsz = encodings.len();
-        let seq = encodings[0].get_ids().len();
-        let mut ids = Vec::with_capacity(bsz * seq);
-        let mut type_ids = Vec::with_capacity(bsz * seq);
-        let mut mask = Vec::with_capacity(bsz * seq);
-        for enc in &encodings {
-            ids.extend_from_slice(enc.get_ids());
-            type_ids.extend_from_slice(enc.get_type_ids());
-            mask.extend(enc.get_attention_mask().iter().map(|&m| m as f32));
+    /// Embed each text (rows in input order), length-bucketed so padding tracks each
+    /// chunk; masked padding keeps outputs identical to a single batch. Encoding stays
+    /// sequential to avoid rayon contention with concurrent recalls.
+    fn run(&self, texts: &[&str], prefix: Option<&str>) -> candle_core::Result<Vec<Vec<f32>>> {
+        let mut encodings = Vec::with_capacity(texts.len());
+        for t in texts {
+            let input = match prefix {
+                Some(p) => format!("{p}{t}"),
+                None => (*t).to_string(),
+            };
+            encodings.push(
+                self.tokenizer
+                    .encode(input, true)
+                    .map_err(candle_core::Error::wrap)?,
+            );
         }
 
-        let input_ids = Tensor::from_vec(ids, (bsz, seq), &self.device)?;
-        let type_ids = Tensor::from_vec(type_ids, (bsz, seq), &self.device)?;
-        let attn = Tensor::from_vec(mask, (bsz, seq), &self.device)?;
+        let mut order: Vec<usize> = (0..encodings.len()).collect();
+        order.sort_by_key(|&i| encodings[i].get_ids().len());
 
-        let hidden = self.model.forward(&input_ids, &type_ids, &attn)?;
-        let pooled = match self.pooling {
-            Pooling::Cls => cls_pool(&hidden)?,
-            Pooling::Mean => masked_mean_pool(&hidden, &attn)?,
-        };
-        let out = if self.normalize {
-            l2_normalize(&pooled)?
-        } else {
-            pooled
-        };
-        out.contiguous()
+        let mut rows: Vec<Vec<f32>> = vec![Vec::new(); encodings.len()];
+        for chunk in order.chunks(MICRO_BATCH) {
+            let seq = chunk
+                .iter()
+                .map(|&i| encodings[i].get_ids().len())
+                .max()
+                .unwrap_or(0);
+            let bsz = chunk.len();
+            let mut ids = Vec::with_capacity(bsz * seq);
+            let mut type_ids = Vec::with_capacity(bsz * seq);
+            let mut mask = Vec::with_capacity(bsz * seq);
+            for &i in chunk {
+                let enc = &encodings[i];
+                let mut row_ids = enc.get_ids().to_vec();
+                row_ids.resize(seq, 0);
+                ids.extend_from_slice(&row_ids);
+                let mut row_types = enc.get_type_ids().to_vec();
+                row_types.resize(seq, 0);
+                type_ids.extend_from_slice(&row_types);
+                let mut row_mask: Vec<f32> =
+                    enc.get_attention_mask().iter().map(|&m| m as f32).collect();
+                row_mask.resize(seq, 0.0);
+                mask.extend_from_slice(&row_mask);
+            }
+
+            let input_ids = Tensor::from_vec(ids, (bsz, seq), &self.device)?;
+            let type_ids = Tensor::from_vec(type_ids, (bsz, seq), &self.device)?;
+            let attn = Tensor::from_vec(mask, (bsz, seq), &self.device)?;
+
+            let hidden = self.model.forward(&input_ids, &type_ids, &attn)?;
+            let pooled = match self.pooling {
+                Pooling::Cls => cls_pool(&hidden)?,
+                Pooling::Mean => masked_mean_pool(&hidden, &attn)?,
+            };
+            let out = if self.normalize {
+                l2_normalize(&pooled)?
+            } else {
+                pooled
+            };
+            let chunk_rows = out.contiguous()?.to_vec2::<f32>()?;
+            for (pos, &i) in chunk.iter().enumerate() {
+                rows[i].clone_from(&chunk_rows[pos]);
+            }
+        }
+        Ok(rows)
     }
 }
 
@@ -366,10 +402,9 @@ impl Embedder for CandleEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let out = self
+        let rows = self
             .run(texts, self.passage_prefix.as_deref())
             .map_err(backend)?;
-        let rows = out.to_vec2::<f32>().map_err(backend)?;
         for row in &rows {
             ensure_finite(row, &self.model_id)?;
         }
@@ -380,10 +415,9 @@ impl Embedder for CandleEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let out = self
+        let rows = self
             .run(texts, self.query_prefix.as_deref())
             .map_err(backend)?;
-        let rows = out.to_vec2::<f32>().map_err(backend)?;
         for row in &rows {
             ensure_finite(row, &self.model_id)?;
         }
