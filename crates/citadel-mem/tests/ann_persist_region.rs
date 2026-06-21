@@ -92,8 +92,8 @@ fn plaintext_region_persists_and_reloads_with_identical_recall() {
         other => panic!("expected Loaded, got {other:?}"),
     }
 
-    // New atoms invalidate the segment transactionally; recall stays correct
-    // and the status reports the honest rebuild.
+    // A new atom is a pure append: the loaded segment is retained and the fresh
+    // atom is served by the tail merge, not a rebuild on every write.
     let new_id = eng
         .remember(
             "corpus",
@@ -107,10 +107,13 @@ fn plaintext_region_persists_and_reloads_with_identical_recall() {
         .map(|h| h.id)
         .collect();
     assert!(fresh.contains(&new_id), "post-persist atom is recallable");
-    assert!(matches!(
-        eng.ann_cache_status("corpus").unwrap(),
-        Some(AnnIndexSource::Built { .. })
-    ));
+    assert!(
+        matches!(
+            eng.ann_cache_status("corpus").unwrap(),
+            Some(AnnIndexSource::Loaded { .. })
+        ),
+        "an append retains the loaded segment (served via tail merge), not a rebuild"
+    );
 }
 
 #[test]

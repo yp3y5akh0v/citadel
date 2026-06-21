@@ -32,8 +32,6 @@ const EXACT_SCAN_LIMIT: usize = 4096;
 const CAND_OVERFETCH: usize = 8;
 /// Always evaluate at least this many ANN candidates (small-k recall stability).
 const MIN_CANDIDATES: usize = 64;
-/// Rebuild the whole sealed ANN index when the post-snapshot tail exceeds this many atoms.
-const REBUILD_TAIL_MAX: usize = 2048;
 /// Plaintext recall over-fetches at least this many ANN candidates before fusion re-ranking
 /// (the sealed path uses `CAND_OVERFETCH`/`MIN_CANDIDATES` instead).
 const MIN_OVERFETCH: usize = 4096;
@@ -311,7 +309,8 @@ impl MemoryEngine {
         }
 
         let conn = Connection::open(&self.db)?;
-        let (id, atom_wrap) = match self.load_region_row(&conn, &key)? {
+        // A fresh region has no atoms (max id 0); only a re-attach needs the MAX(id) scan.
+        let (id, atom_wrap, init_max) = match self.load_region_row(&conn, &key)? {
             Some(existing) => {
                 existing.verify_matches(&key, dim, metric, &model_id, encrypted)?;
                 let atom_wrap = if encrypted {
@@ -319,19 +318,22 @@ impl MemoryEngine {
                 } else {
                     None
                 };
-                (existing.id, atom_wrap)
+                let table = atoms_table(dim, metric, atom_wrap.is_some());
+                let max = sealed_max_id(&conn, &table, existing.id)?;
+                (existing.id, atom_wrap, max)
             }
             None if encrypted => {
-                self.insert_encrypted_region(&conn, &key, dim, metric, &model_id)?
+                let (id, wrap) =
+                    self.insert_encrypted_region(&conn, &key, dim, metric, &model_id)?;
+                (id, wrap, 0)
             }
             None => (
                 self.insert_region(&conn, &key, dim, metric, &model_id)?,
                 None,
+                0,
             ),
         };
 
-        // Seed the in-memory max id once so sealed recall needs no per-call `MAX(id)` scan.
-        let init_max = sealed_max_id(&conn, &atoms_table(dim, metric, atom_wrap.is_some()), id)?;
         self.regions.lock().unwrap().insert(
             key,
             RegionState {
@@ -2301,9 +2303,7 @@ impl MemoryEngine {
 
 /// Cached index needs a rebuild: post-snapshot tail exceeds the cap or 1/4 of indexed atoms.
 fn sealed_index_stale(sa: &SealedAnn, max_id: i64) -> bool {
-    let snap = sa.index.snapshot_max as i64;
-    let tail = (max_id - snap).max(0) as usize;
-    tail > REBUILD_TAIL_MAX || tail > sa.index.indexed_len() / 4
+    sa.index.tail_is_stale(max_id.max(0) as u64)
 }
 
 /// Top `cand_k` `(atom_id, distance)` from the cached index, plus exact-ranked atoms

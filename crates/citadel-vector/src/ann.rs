@@ -5,6 +5,9 @@ use crate::prism::{Filter, Metric, PointStore, PrismConfig, PrismIndex};
 /// Request `k * OVER_FETCH` candidates to offset PRISM recall below 1.0.
 pub const OVER_FETCH: usize = 4;
 
+/// Post-snapshot tail past this many rows rebuilds instead of brute-force merging.
+pub const REBUILD_TAIL_MAX: usize = 2048;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AnnError {
     #[error("ANN build requires at least one row")]
@@ -220,6 +223,12 @@ impl AnnIndex {
     /// Number of indexed rows.
     pub fn indexed_len(&self) -> usize {
         self.id_map.len()
+    }
+
+    /// Post-snapshot tail exceeds the rebuild cap or a quarter of the indexed set.
+    pub fn tail_is_stale(&self, live_max: u64) -> bool {
+        let tail = live_max.saturating_sub(self.snapshot_max) as usize;
+        tail > REBUILD_TAIL_MAX || tail > self.indexed_len() / 4
     }
 }
 

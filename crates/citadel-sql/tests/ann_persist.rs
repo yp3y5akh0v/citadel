@@ -142,11 +142,14 @@ fn every_dml_path_purges_the_segment_in_its_own_commit() {
                 other => panic!("{what}: expected Built after DML, got {other:?}"),
             }
         }
-        // The DML commit also stamped the table's last-DML generation marker.
-        assert!(
-            db.sql_cache_get::<u64>("ann_dml_gen:t").is_some(),
-            "{what}: marker stamped at commit"
-        );
+        // A mutation stamps the last-DML marker; the pure append (id 100 > max 40)
+        // is retained for the tail merge, so it purges the segment but not the marker.
+        let stamped = db.sql_cache_get::<u64>("ann_dml_gen:t").is_some();
+        if *what == "insert" {
+            assert!(!stamped, "{what}: a pure append is retained, not marked");
+        } else {
+            assert!(stamped, "{what}: marker stamped at commit");
+        }
     }
 }
 

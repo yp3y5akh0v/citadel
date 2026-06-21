@@ -138,7 +138,7 @@ fn order_by_distance_works_without_ann_index() {
 }
 
 #[test]
-fn insert_after_index_build_invalidates_cache() {
+fn insert_after_index_build_is_served_by_tail_merge() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let conn = Connection::open(&db).unwrap();
@@ -154,11 +154,12 @@ fn insert_after_index_build_invalidates_cache() {
         "cache should be populated"
     );
 
+    // A pure append (99 > seeded max) is retained, then served by the tail merge.
     conn.execute("INSERT INTO t VALUES (99, '[1.0, 0.0, 0.0]'::VECTOR(3))")
         .unwrap();
     assert!(
-        conn.ann_cache_status("t", "v").unwrap().is_none(),
-        "auto-commit INSERT should evict the stale ANN cache"
+        conn.ann_cache_status("t", "v").unwrap().is_some(),
+        "auto-commit append should retain the ANN cache for the tail merge"
     );
 
     let qr = match conn
@@ -178,7 +179,7 @@ fn insert_after_index_build_invalidates_cache() {
         .collect();
     assert!(
         ids.contains(&99),
-        "rebuilt cache must include the post-INSERT row (got {ids:?})"
+        "tail merge must surface the post-INSERT row (got {ids:?})"
     );
 }
 
@@ -263,7 +264,7 @@ fn rollback_keeps_cache_intact() {
 }
 
 #[test]
-fn explicit_commit_invalidates_cache() {
+fn explicit_commit_append_is_retained_for_tail_merge() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let conn = Connection::open(&db).unwrap();
@@ -280,8 +281,29 @@ fn explicit_commit_invalidates_cache() {
         .unwrap();
     conn.execute("COMMIT").unwrap();
     assert!(
-        conn.ann_cache_status("t", "v").unwrap().is_none(),
-        "explicit COMMIT after DML must evict the ANN cache"
+        conn.ann_cache_status("t", "v").unwrap().is_some(),
+        "a committed pure append is retained (served by the tail merge), not evicted"
+    );
+
+    // The retained cache must still surface the appended row via the tail merge.
+    let qr = match conn
+        .execute("SELECT id FROM t ORDER BY v <-> '[1.0, 0.0, 0.0]'::VECTOR(3) LIMIT 2")
+        .unwrap()
+    {
+        ExecutionResult::Query(qr) => qr,
+        _ => panic!(),
+    };
+    let ids: Vec<i64> = qr
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(i) => *i,
+            _ => panic!(),
+        })
+        .collect();
+    assert!(
+        ids.contains(&99),
+        "appended row must be visible (got {ids:?})"
     );
 }
 

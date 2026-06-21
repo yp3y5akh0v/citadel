@@ -69,9 +69,18 @@ pub struct SchemaManager {
     /// when the Connection opens; all Connections to the same DB share entries.
     /// Tests created via `empty()` get their own isolated cache.
     pub sql_caches: SqlCacheHandle,
-    /// Tables modified by DML since the last commit/rollback. Drained on
-    /// commit to invalidate dependent shared caches (e.g. ANN indexes).
+    /// Tables mutated (UPDATE/DELETE/upsert/DDL) since the last commit; their
+    /// shared caches are hard-invalidated on commit.
     dml_dirty_tables: std::cell::RefCell<FxHashSet<String>>,
+    /// Tables touched only by pure appends, mapped to the min inserted pk; an
+    /// append above the index snapshot tail-merges instead of hard-invalidating.
+    dml_append_tables: std::cell::RefCell<FxHashMap<String, i64>>,
+}
+
+/// DML since the last commit, classified for cache invalidation.
+pub struct DmlDirty {
+    pub mutating: Vec<String>,
+    pub appends: Vec<(String, i64)>,
 }
 
 #[derive(Clone)]
@@ -94,27 +103,43 @@ impl SchemaManager {
             generation: 0,
             sql_caches: Arc::new(Mutex::new(FxHashMap::default())),
             dml_dirty_tables: std::cell::RefCell::new(FxHashSet::default()),
+            dml_append_tables: std::cell::RefCell::new(FxHashMap::default()),
         }
     }
 
-    /// Mark a table as modified by DML. Caller should normalize the name
-    /// (lowercase) so dedup works correctly.
+    /// Mark a table mutated (UPDATE/DELETE/upsert/DDL); supersedes a pending append.
     pub fn mark_dml(&self, table_name: &str) {
-        self.dml_dirty_tables
-            .borrow_mut()
-            .insert(table_name.to_ascii_lowercase());
+        let lower = table_name.to_ascii_lowercase();
+        self.dml_append_tables.borrow_mut().remove(&lower);
+        self.dml_dirty_tables.borrow_mut().insert(lower);
     }
 
-    /// Take the set of tables modified since the last drain. Returns an empty
-    /// vec if no DML has run since the last commit/rollback.
-    pub fn drain_dml_dirty(&self) -> Vec<String> {
-        self.dml_dirty_tables.borrow_mut().drain().collect()
+    /// Mark a pure append with the smallest inserted pk; no-op if already mutating.
+    pub fn mark_dml_append(&self, table_name: &str, min_pk: i64) {
+        let lower = table_name.to_ascii_lowercase();
+        if self.dml_dirty_tables.borrow().contains(&lower) {
+            return;
+        }
+        self.dml_append_tables
+            .borrow_mut()
+            .entry(lower)
+            .and_modify(|m| *m = (*m).min(min_pk))
+            .or_insert(min_pk);
+    }
+
+    /// Take the touched tables, classified into mutating vs pure-append.
+    pub fn drain_dml_dirty(&self) -> DmlDirty {
+        DmlDirty {
+            mutating: self.dml_dirty_tables.borrow_mut().drain().collect(),
+            appends: self.dml_append_tables.borrow_mut().drain().collect(),
+        }
     }
 
     /// Forget pending DML markers without invalidating downstream caches.
     /// Used on rollback (uncommitted writes leave no caches stale).
     pub fn clear_dml_dirty(&self) {
         self.dml_dirty_tables.borrow_mut().clear();
+        self.dml_append_tables.borrow_mut().clear();
     }
 
     pub fn register_temp_alias(&mut self, user_name: &str, prefixed_name: String) {
@@ -260,6 +285,7 @@ impl SchemaManager {
             generation: 0,
             sql_caches: db.sql_cache_handle(),
             dml_dirty_tables: std::cell::RefCell::new(FxHashSet::default()),
+            dml_append_tables: std::cell::RefCell::new(FxHashMap::default()),
         };
         system_tables::register_builtins(&mut mgr);
         Ok(mgr)
