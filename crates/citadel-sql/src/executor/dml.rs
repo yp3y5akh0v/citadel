@@ -19,6 +19,36 @@ use super::compile::CompiledPlan;
 use super::helpers::*;
 use super::CteContext;
 
+/// Classify an INSERT for cache invalidation: a pure append (single-INTEGER pk,
+/// no conflict) stays append-retainable; anything else hard-invalidates.
+fn mark_insert_dml(
+    schema: &SchemaManager,
+    table_name: &str,
+    on_conflict: bool,
+    single_int_pk: bool,
+    min_inserted_pk: Option<i64>,
+    rows_written: u64,
+) {
+    if on_conflict {
+        schema.mark_dml(table_name);
+    } else if single_int_pk {
+        if let Some(m) = min_inserted_pk {
+            schema.mark_dml_append(table_name, m);
+        }
+    } else if rows_written > 0 {
+        schema.mark_dml(table_name);
+    }
+}
+
+/// Single INTEGER pk - the only shape an ANN plan indexes (and append-retains).
+fn is_single_int_pk(table_schema: &TableSchema) -> bool {
+    table_schema.primary_key_columns.len() == 1
+        && matches!(
+            table_schema.columns[table_schema.primary_key_columns[0] as usize].data_type,
+            DataType::Integer
+        )
+}
+
 pub(super) fn exec_insert(
     db: &Database,
     schema: &SchemaManager,
@@ -61,7 +91,6 @@ pub(super) fn exec_insert(
     let table_schema = schema
         .get(&lower_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
-    schema.mark_dml(&table_schema.name);
 
     let insert_columns = if stmt.columns.is_empty() {
         table_schema
@@ -209,6 +238,10 @@ pub(super) fn exec_insert(
             &[],
         )?;
     }
+
+    let plain_insert = compiled_conflict.is_none();
+    let single_int_pk = is_single_int_pk(table_schema);
+    let mut min_inserted_pk: Option<i64> = None;
 
     for idx in 0..total {
         for v in row.iter_mut() {
@@ -365,6 +398,11 @@ pub(super) fn exec_insert(
             pk_values[j] = std::mem::replace(&mut row[i], Value::Null);
         }
         encode_composite_key_into(&pk_values, &mut key_buf);
+        if plain_insert && single_int_pk {
+            if let Value::Integer(id) = &pk_values[0] {
+                min_inserted_pk = Some(min_inserted_pk.map_or(*id, |m| m.min(*id)));
+            }
+        }
 
         for (j, &i) in non_pk.iter().enumerate() {
             let col = &table_schema.columns[i];
@@ -552,6 +590,15 @@ pub(super) fn exec_insert(
             &stmt_new_rows,
         )?;
     }
+
+    mark_insert_dml(
+        schema,
+        &table_schema.name,
+        !plain_insert,
+        single_int_pk,
+        min_inserted_pk,
+        count,
+    );
 
     if let (Some(returning_cols), Some(rows)) = (stmt.returning.as_ref(), returning_rows) {
         let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
@@ -1421,7 +1468,6 @@ fn exec_insert_in_txn_impl(
     let table_schema = schema
         .get(&stmt.table)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
-    schema.mark_dml(&table_schema.name);
     super::ann_persist::purge_segment(wtx, &table_schema.name)?;
 
     let default_columns;
@@ -1590,6 +1636,10 @@ fn exec_insert_in_txn_impl(
     let mut count: u64 = 0;
     let mut returning_rows: Option<Vec<super::helpers::ReturningRow>> =
         stmt.returning.as_ref().map(|_| Vec::new());
+
+    let plain_insert = compiled_conflict.is_none();
+    let single_int_pk = is_single_int_pk(table_schema);
+    let mut min_inserted_pk: Option<i64> = None;
 
     let values = match &stmt.source {
         InsertSource::Values(rows) => Some(rows.as_slice()),
@@ -1889,6 +1939,11 @@ fn exec_insert_in_txn_impl(
             },
             false => encode_composite_key_into(&bufs.pk_values, &mut bufs.key_buf),
         }
+        if plain_insert && single_int_pk {
+            if let Value::Integer(id) = &bufs.pk_values[0] {
+                min_inserted_pk = Some(min_inserted_pk.map_or(*id, |m| m.min(*id)));
+            }
+        }
 
         for &slot in dropped {
             bufs.value_values[slot as usize] = Value::Null;
@@ -2078,6 +2133,15 @@ fn exec_insert_in_txn_impl(
             }
         }
     }
+
+    mark_insert_dml(
+        schema,
+        &table_schema.name,
+        !plain_insert,
+        single_int_pk,
+        min_inserted_pk,
+        count,
+    );
 
     if let (Some(returning_cols), Some(rows)) = (stmt.returning.as_ref(), returning_rows) {
         if has_insert_statement_triggers_impl {

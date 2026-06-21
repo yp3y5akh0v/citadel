@@ -37,13 +37,26 @@ const DEFAULT_CACHE_CAPACITY: usize = 64;
 /// build-races-a-commit window that prefix eviction alone leaves open.
 fn invalidate_dml_caches(schema: &SchemaManager, db: &Database) {
     let gen = db.manager().commit_generation();
-    for table in schema.drain_dml_dirty() {
+    let hard_invalidate = |table: &str| {
         db.sql_cache_invalidate_prefix(&format!("ann:{table}:"));
         let marker: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(gen);
         schema
             .sql_caches
             .lock()
-            .insert(crate::executor::ann_dml_gen_key(&table), marker);
+            .insert(crate::executor::ann_dml_gen_key(table), marker);
+    };
+
+    let dirty = schema.drain_dml_dirty();
+    for table in &dirty.mutating {
+        hard_invalidate(table);
+    }
+    // A pure append keeps the cached index (recall tail-merges the new rows)
+    // unless it landed at/below an index snapshot.
+    for (table, min_pk) in &dirty.appends {
+        if crate::executor::ann_appends_safe(schema, table, *min_pk) {
+            continue;
+        }
+        hard_invalidate(table);
     }
 }
 

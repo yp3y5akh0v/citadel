@@ -30,10 +30,14 @@ use super::window::has_any_window_function;
 type StorageResult<T> = std::result::Result<T, citadel_core::Error>;
 type ScanRow<'a> = dyn FnMut(&[u8], &[u8]) -> Result<bool> + 'a;
 type RawScanRow<'a> = dyn FnMut(&[u8], &[u8]) -> StorageResult<bool> + 'a;
+/// Recall candidate: (distance in SQL operator units, row id, decoded row).
+type RankedRow = (f64, i64, Vec<Value>);
 
 /// Scan + point-get over a read or write txn, materializing overflow values.
 pub(super) trait AnnScan {
     fn ann_scan(&mut self, table: &[u8], f: &mut ScanRow<'_>) -> Result<()>;
+    /// Forward scan from `start_key` (inclusive); O(tail) for the tail merge.
+    fn ann_scan_from(&mut self, table: &[u8], start_key: &[u8], f: &mut ScanRow<'_>) -> Result<()>;
     fn ann_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>>;
     /// Commit generation this snapshot reflects; `None` when the view has uncommitted
     /// writes - such an index cannot enter the shared cache.
@@ -67,6 +71,10 @@ impl AnnScan for ReadTxn<'_> {
         bridge_scan(|cb| self.table_scan_from(table, b"", cb), f)
     }
 
+    fn ann_scan_from(&mut self, table: &[u8], start_key: &[u8], f: &mut ScanRow<'_>) -> Result<()> {
+        bridge_scan(|cb| self.table_scan_from(table, start_key, cb), f)
+    }
+
     fn ann_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.table_get(table, key).map_err(SqlError::Storage)
     }
@@ -86,6 +94,10 @@ impl AnnScan for ReadTxn<'_> {
 impl AnnScan for WriteTxn<'_> {
     fn ann_scan(&mut self, table: &[u8], f: &mut ScanRow<'_>) -> Result<()> {
         bridge_scan(|cb| self.table_scan_from(table, b"", cb), f)
+    }
+
+    fn ann_scan_from(&mut self, table: &[u8], start_key: &[u8], f: &mut ScanRow<'_>) -> Result<()> {
+        bridge_scan(|cb| self.table_scan_from(table, start_key, cb), f)
     }
 
     fn ann_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -155,6 +167,51 @@ fn topk_shape_ok(stmt: &SelectStmt) -> bool {
             .columns
             .iter()
             .any(|c| matches!(c, SelectColumn::Expr { expr, .. } if is_aggregate_expr(expr)))
+}
+
+/// A finished result, or a request to rebuild the cache (tail too long to merge).
+enum RunOutcome {
+    Done(ExecutionResult),
+    Rebuild,
+}
+
+/// Tail-row distance in SQL operator units; None for a zero vector under cosine.
+fn tail_distance(metric: AnnMetric, q: &[f32], v: &[f32]) -> Option<f64> {
+    let d = match metric {
+        AnnMetric::L2 => {
+            let mut sum = 0.0f64;
+            for (x, y) in q.iter().zip(v.iter()) {
+                let diff = (*x as f64) - (*y as f64);
+                sum += diff * diff;
+            }
+            sum.sqrt()
+        }
+        AnnMetric::Inner => {
+            let mut sum = 0.0f64;
+            for (x, y) in q.iter().zip(v.iter()) {
+                sum += (*x as f64) * (*y as f64);
+            }
+            -sum
+        }
+        AnnMetric::Cosine => {
+            let mut dot = 0.0f64;
+            let mut nq = 0.0f64;
+            let mut nv = 0.0f64;
+            for (x, y) in q.iter().zip(v.iter()) {
+                let xf = *x as f64;
+                let yf = *y as f64;
+                dot += xf * yf;
+                nq += xf * xf;
+                nv += yf * yf;
+            }
+            let denom = nq.sqrt() * nv.sqrt();
+            if denom == 0.0 {
+                return None;
+            }
+            1.0 - dot / denom
+        }
+    };
+    Some(d)
 }
 
 impl AnnTopKPlan {
@@ -277,23 +334,36 @@ impl AnnTopKPlan {
         table_schema: &TableSchema,
     ) -> Result<ExecutionResult> {
         let cache_key = cache_key(&table_schema.name, self.col_idx, self.metric);
-        // Empty table: nothing to build, ORDER BY ... LIMIT yields no rows.
-        let Some(cached) = self.load_or_build_index(rtx, schema, &cache_key, table_schema)? else {
-            return empty_result(table_schema, stmt);
-        };
-        self.run_query(rtx, &cached, stmt, table_schema)
+        // One rebuild at most; the rebuilt snapshot has an empty tail.
+        let mut force_rebuild = false;
+        loop {
+            if force_rebuild {
+                schema.sql_caches.lock().remove(&cache_key);
+            }
+            let Some(cached) = self.load_or_build_index(rtx, schema, &cache_key, table_schema)?
+            else {
+                return empty_result(table_schema, stmt);
+            };
+            match self.run_query(rtx, &cached, stmt, table_schema, !force_rebuild)? {
+                RunOutcome::Done(result) => return Ok(result),
+                RunOutcome::Rebuild => force_rebuild = true,
+            }
+        }
     }
 
-    /// Search the index, apply filters and the residual recheck, then page and project.
+    /// Merge index hits with the brute-forced tail; `Rebuild` when the tail is too long.
     fn run_query(
         &self,
         txn: &mut dyn AnnScan,
         cached: &CachedAnnIndex,
         stmt: &SelectStmt,
         table_schema: &TableSchema,
-    ) -> Result<ExecutionResult> {
-        // Map values to codes via the dict's collation-canonical encoding; an absent value matches nothing.
+        allow_rebuild: bool,
+    ) -> Result<RunOutcome> {
+        // A filter value absent from the dict matches no indexed row, but a fresh
+        // tail row still might, so skip only the index search (not the tail).
         let mut constraints: Vec<(usize, Vec<u32>)> = Vec::with_capacity(self.pushable.len());
+        let mut index_unsat = false;
         for (dim, values) in &self.pushable {
             let dict = &cached.dicts[*dim];
             let coll = table_schema.columns[self.filter_cols[*dim] as usize].collation;
@@ -307,18 +377,31 @@ impl AnnTopKPlan {
                 }
             }
             if codes.is_empty() {
-                return empty_result(table_schema, stmt);
+                index_unsat = true;
             }
             constraints.push((*dim, codes));
         }
-        let filter = if constraints.is_empty() {
-            Filter::none()
-        } else {
-            Filter::new(constraints)
-        };
 
         let want = self.k.saturating_add(self.offset).max(1);
-        let mut rows = self.collect_survivors(txn, &cached.index, &filter, table_schema, want)?;
+        let mut merged: Vec<RankedRow> = if index_unsat {
+            Vec::new()
+        } else {
+            let filter = if constraints.is_empty() {
+                Filter::none()
+            } else {
+                Filter::new(constraints)
+            };
+            self.collect_survivors(txn, &cached.index, &filter, table_schema, want)?
+        };
+
+        match self.collect_tail(txn, &cached.index, table_schema, allow_rebuild)? {
+            Some(tail) => merged.extend(tail),
+            None => return Ok(RunOutcome::Rebuild),
+        }
+
+        // Global distance order; ties broken by id for determinism.
+        merged.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let mut rows: Vec<Vec<Value>> = merged.into_iter().map(|(_, _, row)| row).collect();
 
         if self.offset >= rows.len() {
             rows.clear();
@@ -328,15 +411,13 @@ impl AnnTopKPlan {
         rows.truncate(self.k);
 
         let (col_names, projected) = project_rows(&table_schema.columns, &stmt.columns, rows)?;
-        Ok(ExecutionResult::Query(QueryResult {
+        Ok(RunOutcome::Done(ExecutionResult::Query(QueryResult {
             columns: col_names,
             rows: projected,
-        }))
+        })))
     }
 
-    /// Search the index (with `filter` pushed in) and recheck the residual
-    /// predicate on decoded rows, over-fetching until `want` rows survive or the
-    /// index is exhausted. Distance order is preserved.
+    /// Index hits passing the residual recheck, over-fetched until `want` survive.
     fn collect_survivors(
         &self,
         txn: &mut dyn AnnScan,
@@ -344,7 +425,7 @@ impl AnnTopKPlan {
         filter: &Filter,
         table_schema: &TableSchema,
         want: usize,
-    ) -> Result<Vec<Vec<Value>>> {
+    ) -> Result<Vec<RankedRow>> {
         let col_map = ColumnMap::new(&table_schema.columns);
         let max_target = index.indexed_len().max(1);
         let mut key_buf: Vec<u8> = Vec::with_capacity(10);
@@ -352,8 +433,8 @@ impl AnnTopKPlan {
         loop {
             target = target.min(max_target);
             let hits = index.search_filtered_default_ef(&self.query_vec, target, filter);
-            let mut survivors: Vec<Vec<Value>> = Vec::with_capacity(want);
-            for (id, _dist) in &hits {
+            let mut survivors: Vec<RankedRow> = Vec::with_capacity(want);
+            for (id, dist) in &hits {
                 encode_int_key_into(*id as i64, &mut key_buf);
                 let Some(row_bytes) = txn.ann_get(table_schema.name.as_bytes(), &key_buf)? else {
                     continue;
@@ -367,7 +448,7 @@ impl AnnTopKPlan {
                     }
                 };
                 if keep {
-                    survivors.push(row);
+                    survivors.push((*dist as f64, *id as i64, row));
                     if survivors.len() >= want {
                         break;
                     }
@@ -379,6 +460,90 @@ impl AnnTopKPlan {
             }
             target = target.saturating_mul(2);
         }
+    }
+
+    /// Exact-rank rows appended past the snapshot; `None` when the tail is too long.
+    fn collect_tail(
+        &self,
+        txn: &mut dyn AnnScan,
+        index: &AnnIndex,
+        table_schema: &TableSchema,
+        allow_rebuild: bool,
+    ) -> Result<Option<Vec<RankedRow>>> {
+        let snapshot_max = index.snapshot_max;
+        // Negative pks (snapshot_max reads negative as i64) make the pk>snapshot_max
+        // boundary unsound; those tables hard-invalidate on append, so the tail is empty.
+        let first_tail_pk = match (snapshot_max as i64).checked_add(1) {
+            Some(pk) if (snapshot_max as i64) >= 0 => pk,
+            _ => return Ok(Some(Vec::new())),
+        };
+        let mut start_key: Vec<u8> = Vec::with_capacity(10);
+        encode_int_key_into(first_tail_pk, &mut start_key);
+
+        let col_map = ColumnMap::new(&table_schema.columns);
+        let mut out: Vec<RankedRow> = Vec::new();
+        let mut seen: u64 = 0;
+        let mut over_threshold = false;
+
+        txn.ann_scan_from(
+            table_schema.name.as_bytes(),
+            &start_key,
+            &mut |key, value| {
+                seen += 1;
+                if allow_rebuild && index.tail_is_stale(snapshot_max.saturating_add(seen)) {
+                    over_threshold = true;
+                    return Ok(false);
+                }
+                let row = decode_full_row(table_schema, key, value)?;
+                if !self.tail_passes_pushable(&row, table_schema) {
+                    return Ok(true);
+                }
+                if let Some(expr) = &self.residual {
+                    let ctx = EvalCtx::new(&col_map, &row);
+                    if !is_truthy(&eval_expr(expr, &ctx)?) {
+                        return Ok(true);
+                    }
+                }
+                let dist = match &row[self.col_idx] {
+                    Value::Vector(v) => match tail_distance(self.metric, &self.query_vec, v) {
+                        Some(d) => d,
+                        None => return Ok(true), // undefined distance (zero vector under cosine)
+                    },
+                    Value::Null => return Ok(true), // null vectors are unindexable
+                    _ => {
+                        return Err(SqlError::InvalidValue(
+                            "ANN column produced non-vector value".into(),
+                        ))
+                    }
+                };
+                out.push((dist, decode_pk_integer(key)?, row));
+                Ok(true)
+            },
+        )?;
+
+        if over_threshold {
+            return Ok(None);
+        }
+        Ok(Some(out))
+    }
+
+    /// Pushable conjuncts checked on decoded tail values (the tail has no PRISM codes).
+    fn tail_passes_pushable(&self, row: &[Value], table_schema: &TableSchema) -> bool {
+        for (dim, values) in &self.pushable {
+            let col = self.filter_cols[*dim] as usize;
+            let coll = table_schema.columns[col].collation;
+            let mut canon_row = Vec::with_capacity(16);
+            encode_key_value_collated_into(&row[col], coll, &mut canon_row);
+            let matched = values.iter().any(|v| {
+                let mut canon_v = Vec::with_capacity(16);
+                encode_key_value_collated_into(v, coll, &mut canon_v);
+                canon_v == canon_row
+            });
+            if !matched {
+                return false;
+            }
+        }
+        true
     }
 
     fn load_or_build_index(
@@ -517,6 +682,22 @@ fn scan_rows(
     })
 }
 
+/// Count a full O(N) rebuild; thrash tests assert this stays 0 on pure appends.
+#[cfg(test)]
+fn note_ann_rebuild() {
+    ANN_REBUILD_COUNT.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+thread_local! {
+    static ANN_REBUILD_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn take_ann_rebuilds() -> u64 {
+    ANN_REBUILD_COUNT.with(|c| c.replace(0))
+}
+
 /// Build the index from a scan; `None` if there are no indexable rows.
 fn build_index(
     txn: &mut dyn AnnScan,
@@ -536,6 +717,8 @@ fn build_index(
         spec.dim,
     )
     .map_err(|e| SqlError::InvalidValue(format!("ANN build failed: {e}")))?;
+    #[cfg(test)]
+    note_ann_rebuild();
     Ok(Some(CachedAnnIndex {
         index,
         dicts: outcome.dicts,
@@ -1198,6 +1381,25 @@ pub(crate) fn ann_dml_gen_key(table_name: &str) -> String {
     format!("ann_dml_gen:{table_name}")
 }
 
+/// Whether a pure append (smallest pk `min_pk`) can keep `table`'s cached ANN
+/// indexes: false if any has negative pks or `min_pk <= snapshot_max` (a gap-fill).
+pub(crate) fn ann_appends_safe(schema: &SchemaManager, table: &str, min_pk: i64) -> bool {
+    let prefix = format!("ann:{}:", table.to_ascii_lowercase());
+    let guard = schema.sql_caches.lock();
+    for (key, val) in guard.iter() {
+        if !key.starts_with(&prefix) {
+            continue;
+        }
+        if let Some(cached) = val.downcast_ref::<CachedAnnIndex>() {
+            let snap = cached.index.snapshot_max as i64;
+            if snap < 0 || min_pk <= snap {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Read the marker under an already-held cache lock.
 fn marker_gen_locked(
     entries: &FxHashMap<String, Arc<dyn Any + Send + Sync>>,
@@ -1248,5 +1450,264 @@ fn ann_metric_to_prism(m: AnnMetric) -> Metric {
         AnnMetric::L2 => Metric::L2,
         AnnMetric::Inner => Metric::InnerProduct,
         AnnMetric::Cosine => Metric::Cosine,
+    }
+}
+
+#[cfg(test)]
+mod thrash_tests {
+    use super::take_ann_rebuilds;
+    use crate::{Connection, ExecutionResult, Value};
+    use citadel::{Argon2Profile, DatabaseBuilder};
+
+    const DIM: usize = 8;
+
+    fn vec_for(i: u64) -> Vec<f32> {
+        (0..DIM)
+            .map(|d| {
+                let x = (i.wrapping_mul(2654435761).wrapping_add(d as u64 * 40503) % 1000) as f32;
+                x / 1000.0
+            })
+            .collect()
+    }
+
+    fn vec_literal(v: &[f32]) -> String {
+        let parts: Vec<String> = v.iter().map(|x| format!("{x}")).collect();
+        format!("'[{}]'::VECTOR({})", parts.join(", "), DIM)
+    }
+
+    fn recall_ids(conn: &Connection<'_>, qvec: &[f32], k: usize) -> Vec<i64> {
+        let sql = format!(
+            "SELECT id FROM t WHERE category = 0 ORDER BY v <-> {} LIMIT {k}",
+            vec_literal(qvec)
+        );
+        match conn.execute(&sql).unwrap() {
+            ExecutionResult::Query(qr) => qr
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Value::Integer(i) => *i,
+                    other => panic!("expected Integer id, got {other:?}"),
+                })
+                .collect(),
+            _ => panic!("expected query result"),
+        }
+    }
+
+    /// Interleaved append+recall must tail-merge, not rebuild per recall (thrash).
+    #[test]
+    fn interleaved_append_recall_does_not_thrash() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseBuilder::new(dir.path().join("test.db"))
+            .passphrase(b"test-passphrase")
+            .argon2_profile(Argon2Profile::Iot)
+            .create()
+            .unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, score REAL, v VECTOR(8))",
+        )
+        .unwrap();
+        // category 0 for everything so the pushable filter keeps all rows.
+        let base = 200u64;
+        for i in 1..=base {
+            conn.execute(&format!(
+                "INSERT INTO t VALUES ({i}, 0, 1.0, {})",
+                vec_literal(&vec_for(i))
+            ))
+            .unwrap();
+        }
+        conn.execute(
+            "CREATE INDEX ix_v ON t USING ann (v) WITH (metric = 'l2', filters = 'category')",
+        )
+        .unwrap();
+
+        // Warm: first recall builds/loads + caches.
+        let _ = recall_ids(&conn, &vec_for(7), 5);
+        let _ = take_ann_rebuilds(); // reset after warm-up
+
+        // Each append is a unique off-grid vector, queried exactly -> it's the nearest.
+        let appends = 10u64;
+        let mut total_rebuilds = 0u64;
+        for j in 0..appends {
+            let new_id = base + 1 + j;
+            let qvec = vec![0.50005f32 + (j as f32) * 0.0001; DIM];
+            conn.execute(&format!(
+                "INSERT INTO t VALUES ({new_id}, 0, 1.0, {})",
+                vec_literal(&qvec)
+            ))
+            .unwrap();
+            let ids = recall_ids(&conn, &qvec, 5);
+            total_rebuilds += take_ann_rebuilds();
+            assert_eq!(
+                ids.first().copied(),
+                Some(new_id as i64),
+                "freshly appended exact-match row must rank #0 (I1 fresh-visibility)"
+            );
+        }
+        assert_eq!(
+            total_rebuilds, 0,
+            "appends must not trigger PRISM rebuilds (got {total_rebuilds} over {appends} recalls = thrash)"
+        );
+    }
+
+    fn fresh_db(dir: &std::path::Path) -> citadel::Database {
+        DatabaseBuilder::new(dir.join("t.db"))
+            .passphrase(b"test-passphrase")
+            .argon2_profile(Argon2Profile::Iot)
+            .create()
+            .unwrap()
+    }
+
+    fn setup(conn: &Connection<'_>) {
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, category INTEGER, score REAL, v VECTOR(8))",
+        )
+        .unwrap();
+    }
+
+    fn insert(conn: &Connection<'_>, id: u64, v: &[f32]) {
+        conn.execute(&format!(
+            "INSERT INTO t VALUES ({id}, 0, 1.0, {})",
+            vec_literal(v)
+        ))
+        .unwrap();
+    }
+
+    fn build_index(conn: &Connection<'_>) {
+        conn.execute(
+            "CREATE INDEX ix_v ON t USING ann (v) WITH (metric = 'l2', filters = 'category')",
+        )
+        .unwrap();
+    }
+
+    /// I2: an in-place vector UPDATE must hard-invalidate (new vector reflected).
+    #[test]
+    fn inplace_vector_update_is_reflected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        setup(&conn);
+        for i in 1..=200 {
+            insert(&conn, i, &vec_for(i));
+        }
+        build_index(&conn);
+        let qvec = vec![0.50007f32; DIM];
+        let _ = recall_ids(&conn, &vec_for(7), 5); // warm
+        let _ = take_ann_rebuilds();
+
+        conn.execute(&format!(
+            "UPDATE t SET v = {} WHERE id = 50",
+            vec_literal(&qvec)
+        ))
+        .unwrap();
+        let ids = recall_ids(&conn, &qvec, 5);
+        assert!(
+            take_ann_rebuilds() >= 1,
+            "an in-place vector UPDATE must invalidate the cached index"
+        );
+        assert_eq!(ids.first().copied(), Some(50), "updated row must rank #0");
+    }
+
+    /// A DELETE of an indexed row must hard-invalidate so the row stops appearing.
+    #[test]
+    fn delete_indexed_row_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        setup(&conn);
+        for i in 1..=200 {
+            insert(&conn, i, &vec_for(i));
+        }
+        build_index(&conn);
+        let q = vec_for(7);
+        let before = recall_ids(&conn, &q, 5);
+        assert_eq!(before.first().copied(), Some(7), "id 7 is the exact match");
+        let _ = take_ann_rebuilds();
+
+        conn.execute("DELETE FROM t WHERE id = 7").unwrap();
+        let after = recall_ids(&conn, &q, 5);
+        assert!(
+            take_ann_rebuilds() >= 1,
+            "a DELETE must invalidate the cached index"
+        );
+        assert!(
+            !after.contains(&7),
+            "deleted row must not appear: {after:?}"
+        );
+    }
+
+    /// I3: a gap-fill INSERT below the snapshot must hard-invalidate (tail misses it).
+    #[test]
+    fn gap_fill_below_snapshot_is_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        setup(&conn);
+        // Leave a gap at ids 51..=59; snapshot_max becomes 100.
+        for i in 1..=50 {
+            insert(&conn, i, &vec_for(i));
+        }
+        for i in 60..=100 {
+            insert(&conn, i, &vec_for(i));
+        }
+        build_index(&conn);
+        let _ = recall_ids(&conn, &vec_for(7), 5); // warm, snapshot_max = 100
+        let _ = take_ann_rebuilds();
+
+        let qvec = vec![0.50009f32; DIM];
+        insert(&conn, 55, &qvec); // gap-fill: 55 < snapshot_max
+        let ids = recall_ids(&conn, &qvec, 5);
+        assert!(
+            take_ann_rebuilds() >= 1,
+            "a gap-fill insert below snapshot must invalidate, not tail-merge"
+        );
+        assert_eq!(
+            ids.first().copied(),
+            Some(55),
+            "gap-fill row must be visible at rank #0: {ids:?}"
+        );
+    }
+
+    /// A tail past the threshold triggers exactly one rebuild on recall.
+    #[test]
+    fn long_tail_triggers_single_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        setup(&conn);
+        for i in 1..=40 {
+            insert(&conn, i, &vec_for(i));
+        }
+        build_index(&conn);
+        let _ = recall_ids(&conn, &vec_for(7), 5); // warm, snapshot_max = 40, indexed_len/4 = 10
+        let _ = take_ann_rebuilds();
+
+        // Append 15 rows (> indexed_len/4) with no recall between: all retained.
+        let qvec = vec![0.50011f32; DIM];
+        for i in 41..=55u64 {
+            let v = if i == 55 {
+                qvec.clone()
+            } else {
+                vec_for(i + 1000)
+            };
+            insert(&conn, i, &v);
+        }
+        assert_eq!(
+            take_ann_rebuilds(),
+            0,
+            "appends alone must not rebuild (retained for tail merge)"
+        );
+
+        let ids = recall_ids(&conn, &qvec, 5);
+        assert_eq!(
+            take_ann_rebuilds(),
+            1,
+            "a tail past the threshold must trigger exactly one rebuild on recall"
+        );
+        assert_eq!(
+            ids.first().copied(),
+            Some(55),
+            "post-rebuild result correct"
+        );
     }
 }
