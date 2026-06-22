@@ -495,6 +495,31 @@ impl PyAgentConfig {
         self.recall_context.graph_expand = None;
     }
 
+    /// Restrict always-on context recall to these atom kinds (empty = no filter).
+    fn set_recall_context_kinds(&mut self, kinds: Vec<String>) {
+        self.recall_context.kinds = kinds;
+    }
+
+    /// Grade always-on context recall as of this microsecond timestamp (None = now).
+    #[pyo3(signature = (micros=None))]
+    fn set_recall_context_as_of(&mut self, micros: Option<i64>) {
+        self.recall_context.as_of_micros = micros;
+    }
+
+    /// Restrict always-on context recall to atoms matching a JSONB filter (None = no filter).
+    #[pyo3(signature = (payload_filter=None))]
+    fn set_recall_context_payload_filter(
+        &mut self,
+        py: Python<'_>,
+        payload_filter: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        self.recall_context.payload_filter = match &payload_filter {
+            Some(p) => Some(py_to_json(py, p.bind(py))?),
+            None => None,
+        };
+        Ok(())
+    }
+
     #[getter]
     fn temperature(&self) -> f32 {
         self.temperature

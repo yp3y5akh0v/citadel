@@ -205,6 +205,11 @@ def test_recall_context_config_methods():
     cfg.set_recall_context_weights(0.5, 0.25, 0.0, 0.25)
     cfg.set_recall_context_graph_expand(1, ["derived_from"])
     cfg.clear_recall_context_graph_expand()
+    cfg.set_recall_context_kinds(["fact", "evidence"])
+    cfg.set_recall_context_as_of(1_700_000_000_000_000)
+    cfg.set_recall_context_as_of(None)  # None = no as-of pin
+    cfg.set_recall_context_payload_filter({"topic": "x"})
+    cfg.set_recall_context_payload_filter(None)  # None = no filter
     with pytest.raises(ValueError):
         cfg.set_recall_context_graph_expand(1, ["not_an_edge"])
 

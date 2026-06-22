@@ -205,6 +205,25 @@ def test_non_finite_vector_param_rejected():
         db.execute("INSERT INTO v VALUES (1, $1)", [np.array([1.0, np.nan, 3.0], dtype="float32")])
 
 
+def test_db_ann_persist_and_status():
+    import numpy as np
+
+    db = fresh()
+    db.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, emb VECTOR(3))")
+    db.execute("CREATE INDEX items_ann ON items USING ann (emb) WITH (metric = 'l2')")
+    for i in range(40):
+        v = np.array([i * 0.1, (40 - i) * 0.1, (i % 7) * 0.1], dtype="float32")
+        db.execute("INSERT INTO items VALUES ($1, $2)", [i, v])
+    db.query(  # build the ANN index before freezing it
+        "SELECT id FROM items ORDER BY emb <-> $1 LIMIT 3",
+        [np.array([1.0, 0.0, 0.0], dtype="float32")],
+    )
+    info = db.persist_ann_index("items", "emb")
+    assert isinstance(info["segment_b3"], bytes) and info["n"] == 40
+    status = db.ann_cache_status("items", "emb")
+    assert status is not None and status["source"] in ("loaded", "built")
+
+
 def test_connect_options_secure_delete_and_fips_kdf():
     path = os.path.join(tempfile.mkdtemp(), "opt.cdl")
     opts = citadeldb.DatabaseOptions(secure_delete=True, kdf="pbkdf2", pbkdf2_iterations=600000)
