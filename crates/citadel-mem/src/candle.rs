@@ -740,10 +740,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs CITADEL_BGE_SMALL_DIR pointing at a local bge-small-en-v1.5 dir"]
+    #[ignore = "needs CITADEL_EMBEDDER_DIR pointing at a local bge-small-en-v1.5 dir"]
     fn bge_small_loads_real_model_and_embeds_semantically() {
-        let dir = std::env::var("CITADEL_BGE_SMALL_DIR")
-            .expect("set CITADEL_BGE_SMALL_DIR to a local bge-small-en-v1.5 directory");
+        let dir = std::env::var("CITADEL_EMBEDDER_DIR")
+            .expect("set CITADEL_EMBEDDER_DIR to a local bge-small-en-v1.5 directory");
         let e = CandleEmbedder::bge_small(&dir).expect("load bge-small from dir");
         assert_eq!(e.dim(), 384, "bge-small-en-v1.5 is 384-dim");
 

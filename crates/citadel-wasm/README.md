@@ -1,6 +1,6 @@
 # @citadeldb/wasm
 
-WebAssembly bindings for [Citadel](https://github.com/yp3y5akh0v/citadel) - an encrypted-first embedded database engine that outperforms unencrypted SQLite.
+WebAssembly bindings for [Citadel](https://github.com/yp3y5akh0v/citadel), an encrypted-first embedded database engine.
 
 Every page is encrypted at rest with AES-256-CTR + HMAC-SHA256. Runs entirely in the browser or Node.js with no server required.
 
@@ -25,7 +25,7 @@ db.execute("INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob');");
 const result = db.query("SELECT * FROM users;");
 // { columns: ["id", "name"], rows: [[1, "Alice"], [2, "Bob"]] }
 
-// Multi-statement script — returns one outcome per statement
+// Multi-statement script - returns one outcome per statement
 const outcomes = db.run(`
     CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
     INSERT INTO posts VALUES (1, 'Hello'), (2, 'World');
@@ -78,7 +78,7 @@ db.free();
 
 **JSON / JSONB** - 14 PG operators (`->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, `#-`, `@?`, `@@`, `@?_tz`, `@@_tz`), 16 scalar functions (`jsonb_typeof`, `jsonb_extract_path`, `jsonb_set`, `jsonb_pretty`, `to_jsonb`, etc.), 4 aggregates (`json_agg`, `jsonb_agg`, `json_object_agg`, `jsonb_object_agg`), 5 set-returning functions (`jsonb_array_elements`, `jsonb_each`, `jsonb_object_keys`, etc.), `JSON_TABLE` / `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` with full SQL/JSON predicate path language (e.g. `$.items[*] ? (@.x > 5)`), GIN inverted indexes (`CREATE INDEX … USING gin`) for accelerated `@>` containment
 
-**Full-text search** - `tsvector` / `tsquery` types, `to_tsvector` / `to_tsquery` / `plainto_tsquery` / `phraseto_tsquery` / `websearch_to_tsquery` builders, `@@` match operator, `ts_rank` / `ts_rank_cd` ranking with weighted positions (A/B/C/D), `strip`, `setweight` (2- and 3-arg selective), `tsvector || tsvector`, prefix matching (`term:*`), phrase distance (`<N>`), inverted indexes via `CREATE INDEX … USING fts` for sub-millisecond search at scale
+**Full-text search** - `tsvector` / `tsquery` types, `to_tsvector` / `to_tsquery` / `plainto_tsquery` / `phraseto_tsquery` / `websearch_to_tsquery` builders, `@@` match operator, `ts_rank` / `ts_rank_cd` ranking with weighted positions (A/B/C/D), `strip`, `setweight` (2- and 3-arg selective), `tsvector || tsvector`, prefix matching (`term:*`), phrase distance (`<N>`), inverted indexes via `CREATE INDEX … USING fts`
 
 **Constraints** - PRIMARY KEY, NOT NULL, UNIQUE (column + table level, inline or `CREATE UNIQUE INDEX`), DEFAULT, CHECK (column + table level), FOREIGN KEY with full referential actions (`ON DELETE` / `ON UPDATE` `CASCADE` / `SET NULL` / `SET DEFAULT` / `RESTRICT` / `NO ACTION`)
 

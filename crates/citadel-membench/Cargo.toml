@@ -24,7 +24,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 rustc-hash = { workspace = true }
-rayon = { workspace = true }
 sha2 = { workspace = true }
 # A bin target cannot see dev-dependencies, so this is a normal dep (used by both).
 tempfile = "3"
@@ -45,7 +44,11 @@ candle-embed = ["citadel-mem/candle-embed"]
 # Run the embedder + cross-encoder on the GPU (CUDA); implies candle-embed. Needs the CUDA toolkit.
 cuda-embed = ["candle-embed", "citadel-mem/cuda-embed"]
 
-# The live runner needs openai + candle-embed; gating keeps default/CI builds network-free.
+# The live runners need openai + candle-embed; gating keeps default/CI builds network-free.
 [[bin]]
 name = "locomo"
+required-features = ["openai", "candle-embed"]
+
+[[bin]]
+name = "longmemeval"
 required-features = ["openai", "candle-embed"]

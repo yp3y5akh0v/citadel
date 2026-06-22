@@ -2,7 +2,7 @@
 //! gated behind `openai` + `candle-embed` so default/CI builds never compile it.
 //!
 //! Usage:
-//!   OPENAI_API_KEY=...  CITADEL_BGE_SMALL_DIR=/path/to/bge-small  \
+//!   OPENAI_API_KEY=...  CITADEL_EMBEDDER_DIR=/path/to/bge-small  \
 //!     cargo run -p citadeldb-membench --features openai,candle-embed \
 //!     --bin locomo -- path/to/locomo10.json
 //!
@@ -17,7 +17,8 @@
 //!   CITADEL_LOCOMO_JUDGE_CONCURRENCY  judge calls in flight (default 12, mini)
 //!   CITADEL_LOCOMO_CONCURRENCY=1      force TRUE serial (both caps -> 1); else legacy floor
 //!   CITADEL_LOCOMO_READER_TPM / CITADEL_LOCOMO_JUDGE_TPM  per-model token/min cap (30000 / 1000000)
-//!   CITADEL_LOCOMO_RETRY_MAX_ELAPSED_SECS  per-call retry wall-clock budget (default 240)
+//!   CITADEL_MEMBENCH_RETRY_MAX_ELAPSED_SECS  per-call retry wall-clock budget (default 240)
+//!   CITADEL_MEMBENCH_MAX_TOKENS      reader/judge output-token cap override (shared)
 //!   CITADEL_LOCOMO_MAX_SAMPLES=N      cap the run to the first N conversations
 //!   CITADEL_LOCOMO_LIVE_TRACE=path    stream one JSON line per scored question
 //!   CITADEL_LOCOMO_AUDIT_PATH=path    per-question audit JSON written at the end
@@ -78,7 +79,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Arc::new(citadel_mem::MockEmbedder::new(384))
     } else {
         let bge_dir =
-            std::env::var("CITADEL_BGE_SMALL_DIR").map_err(|_| "CITADEL_BGE_SMALL_DIR not set")?;
+            std::env::var("CITADEL_EMBEDDER_DIR").map_err(|_| "CITADEL_EMBEDDER_DIR not set")?;
         // CITADEL_LOCOMO_EMBEDDER selects the model (default bge-small); dim/layers come from
         // its config.json, and the choice is recorded in Provenance.
         let ce = match std::env::var("CITADEL_LOCOMO_EMBEDDER")
@@ -351,6 +352,7 @@ fn bench_config_from_env() -> BenchConfig {
         top_k: env_usize("CITADEL_LOCOMO_TOP_K", 1, d.top_k),
         reader_order,
         neighbor_radius: env_usize("CITADEL_LOCOMO_NEIGHBOR_RADIUS", 0, d.neighbor_radius),
+        ..d
     }
 }
 

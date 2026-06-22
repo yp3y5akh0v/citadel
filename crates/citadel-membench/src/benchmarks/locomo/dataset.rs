@@ -9,7 +9,9 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::error::{BenchError, Result};
+use crate::core::civil::{days_from_civil, days_in_month};
+use crate::core::error::{BenchError, Result};
+use crate::core::hash::sha256_hex;
 
 /// LoCoMo question category: 1=multi-hop, 2=temporal, 3=open-domain, 4=single-hop,
 /// 5=adversarial. Adversarial has no answerable gold and is excluded from the headline.
@@ -123,15 +125,6 @@ pub fn load_with_hash(path: impl AsRef<Path>) -> Result<(Vec<Sample>, String)> {
     let sha = sha256_hex(&bytes);
     let root: Value = serde_json::from_slice(&bytes)?;
     Ok((parse_root(&root)?, sha))
-}
-
-/// Lowercase-hex SHA-256 of `bytes`.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// Parse an already-decoded LoCoMo root array (shared by `load` and tests).
@@ -315,21 +308,6 @@ fn parse_locomo_datetime(s: &str) -> Option<i64> {
     Some((((days * 24 + hour) * 60 + m) * 60) * 1_000_000)
 }
 
-/// Day count of `month` in `year` (proleptic Gregorian).
-fn days_in_month(y: i64, m: i64) -> i64 {
-    match m {
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 31,
-    }
-}
-
 fn month_number(name: &str) -> Option<i64> {
     const MONTHS: [&str; 12] = [
         "January",
@@ -346,16 +324,6 @@ fn month_number(name: &str) -> Option<i64> {
         "December",
     ];
     MONTHS.iter().position(|&m| m == name).map(|i| i as i64 + 1)
-}
-
-/// Days since 1970-01-01 for a proleptic-Gregorian date (Hinnant's days_from_civil).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
 //! Token-free proof that semantic recall (citadel-vector ANN via a real bge-small
 //! embedder) surfaces a MEANING-relevant memory the word-overlap MockEmbedder misses.
 //!
-//! Ignored: needs a local bge-small-en-v1.5 dir in CITADEL_BGE_SMALL_DIR. Run:
-//!   CITADEL_BGE_SMALL_DIR=... cargo test -p citadeldb-ai --features candle-embed \
+//! Ignored: needs a local bge-small-en-v1.5 dir in CITADEL_EMBEDDER_DIR. Run:
+//!   CITADEL_EMBEDDER_DIR=... cargo test -p citadeldb-ai --features candle-embed \
 //!     --test recall_quality -- --ignored --nocapture
 #![cfg(feature = "candle-embed")]
 
@@ -47,10 +47,10 @@ fn ranked_recall(embedder: Arc<dyn Embedder>) -> Vec<(String, f32)> {
 }
 
 #[test]
-#[ignore = "needs CITADEL_BGE_SMALL_DIR (a local bge-small-en-v1.5 dir)"]
+#[ignore = "needs CITADEL_EMBEDDER_DIR (a local bge-small-en-v1.5 dir)"]
 fn semantic_recall_surfaces_meaning_that_word_overlap_misses() {
-    let dir = std::env::var("CITADEL_BGE_SMALL_DIR")
-        .expect("set CITADEL_BGE_SMALL_DIR to a local bge-small-en-v1.5 dir");
+    let dir = std::env::var("CITADEL_EMBEDDER_DIR")
+        .expect("set CITADEL_EMBEDDER_DIR to a local bge-small-en-v1.5 dir");
 
     let bge = ranked_recall(Arc::new(
         CandleEmbedder::bge_small(&dir).expect("load bge-small"),

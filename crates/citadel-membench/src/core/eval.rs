@@ -11,21 +11,22 @@ use citadel_ai::{CompletionRequest, CompletionResponse, LLMClient, LlmError, Mes
 use citadel_mem::{AtomHit, AtomId, MemoryEngine, RecallProfile, RecallQuery};
 use rustc_hash::FxHashSet;
 
-use crate::error::Result;
-use crate::ratelimit::Pacer;
+use crate::core::benchmark::Benchmark;
+use crate::core::error::Result;
+use crate::core::ratelimit::Pacer;
 use crate::{BenchConfig, ReaderOrder};
 
 /// Default hard cap on reader/judge output so a runaway response cannot inflate cost.
 const DEFAULT_MAX_TOKENS: u32 = 512;
 
-/// Output-token cap, read fresh so CITADEL_LOCOMO_MAX_TOKENS can raise it for a
-/// reasoning reader whose thinking tokens would otherwise crowd out the answer.
-fn max_output_tokens() -> u32 {
-    std::env::var("CITADEL_LOCOMO_MAX_TOKENS")
+/// Output-token cap: `CITADEL_MEMBENCH_MAX_TOKENS` overrides the caller's `default`
+/// (raise it for a reasoning/CoT reader whose thinking tokens would crowd out the answer).
+fn max_output_tokens(default: u32) -> u32 {
+    std::env::var("CITADEL_MEMBENCH_MAX_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(DEFAULT_MAX_TOKENS)
+        .unwrap_or(default)
 }
 
 /// Retry budget for transient (429/5xx/transport) LLM failures. The wall-clock budget
@@ -55,10 +56,10 @@ impl RetryConfig {
                 .unwrap_or(d)
         };
         Self {
-            max_elapsed: Duration::from_secs(g("CITADEL_LOCOMO_RETRY_MAX_ELAPSED_SECS", 240)),
-            max_attempts: g("CITADEL_LOCOMO_RETRY_MAX_ATTEMPTS", 12) as u32,
-            base_ms: g("CITADEL_LOCOMO_RETRY_BASE_MS", 500),
-            cap_ms: g("CITADEL_LOCOMO_RETRY_CAP_MS", 60_000),
+            max_elapsed: Duration::from_secs(g("CITADEL_MEMBENCH_RETRY_MAX_ELAPSED_SECS", 240)),
+            max_attempts: g("CITADEL_MEMBENCH_RETRY_MAX_ATTEMPTS", 12) as u32,
+            base_ms: g("CITADEL_MEMBENCH_RETRY_BASE_MS", 500),
+            cap_ms: g("CITADEL_MEMBENCH_RETRY_CAP_MS", 60_000),
         }
     }
 
@@ -81,8 +82,10 @@ fn paced_complete(
 ) -> Result<CompletionResponse> {
     let cfg = RetryConfig::get();
     let model = client.model_id();
-    let cost =
-        client.count_tokens(&req.messages) + req.max_tokens.unwrap_or(max_output_tokens()) as usize;
+    let cost = client.count_tokens(&req.messages)
+        + req
+            .max_tokens
+            .unwrap_or(max_output_tokens(DEFAULT_MAX_TOKENS)) as usize;
     let started = Instant::now();
     let mut attempt: u32 = 0;
     loop {
@@ -205,63 +208,6 @@ pub fn reader_view(
     Ok(view)
 }
 
-/// Build the reader prompt from only the hits + question, with one category-blind
-/// system prompt (the gold category would be test-metadata leakage). Hits are
-/// rendered verbatim in the order given (see [`reader_view`]); each turn's text
-/// already carries its `[date] speaker:` prefix from ingest. The signature
-/// isolates gold.
-pub fn build_reader_prompt(hits: &[AtomHit], question: &str) -> Vec<Message> {
-    let system = "You answer the question using ONLY the provided memories. Each \
-         memory is a line from a past conversation, prefixed with the date it was \
-         said and the speaker, and may end with a photo description in the form \
-         '[shared a photo: ...]' or '[image search: ...]' - treat those photo \
-         descriptions as valid evidence (e.g. for what a sign, poster, or painting \
-         shows or says). Carefully analyze all the memories and combine them across \
-         turns as needed.\n\
-         For questions about time, read the dates on the memories and convert \
-         relative references to specific dates: 'yesterday' means the day before \
-         that memory's date, 'last year' means the prior calendar year, etc.\n\
-         When the question asks whether something is likely or what someone would \
-         probably do/think/have ('would X likely ...', 'is X likely ...'), give \
-         your best-supported verdict (e.g. 'Yes' or 'Likely no') with a one-clause \
-         reason grounded in the memories, rather than declining. Likewise, state a \
-         fact that the memories clearly imply even if not worded identically (e.g. \
-         a 'single parent' who mentions a breakup is single).\n\
-         Answer the question whenever the memories support an answer - directly, by \
-         a clear single-step inference, or by combining several turns. Do NOT \
-         decline just because the answer is not stated word-for-word, because it \
-         must be inferred, or because it is spread across turns: a 'next month' said \
-         in May means June; 'discomfort with religious conservatives' supports 'not \
-         very religious'.\n\
-         Before answering, find the specific memory that states or clearly implies \
-         the fact for the EXACT person, object, or subject the question names, and \
-         answer with what that memory says. Attribute each fact to whoever the \
-         memory says it belongs to: if a memory gives a fact about one person or \
-         object, do not transfer it to a different person or object the question \
-         asks about, and conversely do answer for the person who genuinely owns the \
-         fact even if another person has a similar one. Do not add a \
-         plausible-sounding detail that no memory states; if the only basis would be \
-         a typical association rather than something a memory actually says for the \
-         named subject, treat it as unsupported. When a question lists or asks \
-         'what' things someone did or has, include every matching item the memories \
-         provide, not just one. If the question assumes something the memories \
-         contradict or never support (a fact, an action, or who did it), say so \
-         plainly and stop there rather than substituting a different person's or \
-         subject's fact.\n\
-         Only reply that the memories contain no such information when, after \
-         checking every memory, nothing states or implies an answer for the \
-         specific person or value asked about - not by lookup, inference, or \
-         combination. Answer concisely.";
-
-    let mut user = String::from("Memories:\n");
-    for (rank, hit) in hits.iter().enumerate() {
-        user.push_str(&format!("{}. {}\n", rank + 1, hit.text));
-    }
-    user.push_str(&format!("\nQuestion: {question}"));
-
-    vec![Message::system(system), Message::user(user)]
-}
-
 /// The reader's answer plus retrieval facts: latency, token usage, and the `dia_id`s
 /// the reader actually saw (the retrieval-gap-vs-reader-miss instrumentation).
 pub struct AnswerOutcome {
@@ -274,10 +220,20 @@ pub struct AnswerOutcome {
 }
 
 /// Read the assembled memories: render the prompt and ask the paced, retried reader.
+/// The question to answer and the date it was asked (the reader's current-date anchor;
+/// `date` is empty for benchmarks without one).
+#[derive(Debug, Clone, Copy)]
+pub struct Question<'a> {
+    pub text: &'a str,
+    pub date: &'a str,
+}
+
 fn read_assembled(
+    bench: &dyn Benchmark,
     reader: &dyn LLMClient,
     pacer: &Pacer,
-    question: &str,
+    q: Question,
+    reader_max_tokens: u32,
     view: Vec<AtomHit>,
     recall_micros: u128,
 ) -> Result<AnswerOutcome> {
@@ -285,14 +241,14 @@ fn read_assembled(
         .iter()
         .filter_map(|h| {
             h.payload
-                .get("dia_id")
+                .get(bench.gold_id_key())
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
         })
         .collect();
-    let mut req = CompletionRequest::new(build_reader_prompt(&view, question));
+    let mut req = CompletionRequest::new(bench.reader_prompt(&view, q.text, q.date));
     req.temperature = Some(0.0);
-    req.max_tokens = Some(max_output_tokens());
+    req.max_tokens = Some(max_output_tokens(reader_max_tokens));
     let resp = paced_complete(pacer, reader, &req)?;
     Ok(AnswerOutcome {
         answer: resp.message.content,
@@ -308,71 +264,33 @@ fn read_assembled(
 /// grading recency as of the conversation's end was measured to hurt evidence
 /// recall (diag C-asof, -4.6 any@30), so no as-of is passed here.
 pub fn answer_question(
+    bench: &dyn Benchmark,
     reader: &dyn LLMClient,
     pacer: &Pacer,
     eng: &MemoryEngine,
     region: &str,
-    question: &str,
+    q: Question,
     config: BenchConfig,
 ) -> Result<AnswerOutcome> {
     let started = Instant::now();
     let hits = eng.recall(
         region,
-        RecallProfile::default().apply(RecallQuery::by_text(question, config.top_k)),
+        RecallProfile::default().apply(RecallQuery::by_text(q.text, config.top_k)),
     )?;
     let view = reader_view(eng, region, hits, config)?;
     let recall_micros = started.elapsed().as_micros();
-    read_assembled(reader, pacer, question, view, recall_micros)
+    read_assembled(
+        bench,
+        reader,
+        pacer,
+        q,
+        config.reader_max_tokens,
+        view,
+        recall_micros,
+    )
 }
 
-/// LLM-as-judge correctness with Mem0's generous LoCoMo rubric (same topic = CORRECT,
-/// tolerant of length/phrasing/date-format), binary. Returns `(correct, judge_usage)`.
-pub fn judge_correct(
-    judge: &dyn LLMClient,
-    pacer: &Pacer,
-    question: &str,
-    gold: &str,
-    predicted: &str,
-) -> Result<(bool, TokenUsage)> {
-    let system = "Your task is to label an answer to a question as CORRECT or WRONG. \
-         You are given (1) a question one user asked about another user, (2) a gold \
-         (ground-truth) answer, and (3) a generated answer to score.\n\
-         The gold answer is usually concise and names the referenced topic. The \
-         generated answer may be much longer; be GENEROUS - as long as it touches on \
-         the same topic as the gold answer, count it CORRECT.\n\
-         For time-related questions the gold answer is a specific date/month/year. The \
-         generated answer may be longer or use relative references; be generous - if \
-         it refers to the same date or time period as the gold answer, count it \
-         CORRECT. Even if the format differs (e.g. May 7th vs 7 May), it is CORRECT if \
-         it is the same date.\n\
-         First give a one-sentence explanation of your reasoning, then on a final line \
-         output a JSON object with a single key \"label\" whose value is exactly \
-         CORRECT or WRONG, e.g. {\"label\": \"CORRECT\"}. Do not include both CORRECT \
-         and WRONG anywhere in your reply.";
-    let user = format!("Question: {question}\nGold answer: {gold}\nGenerated answer: {predicted}");
-    let resp = complete_judge(judge, pacer, system, &user)?;
-    let correct = judge_label(&resp.message.content);
-    Ok((correct, resp.usage))
-}
-
-/// Adversarial questions: did the reader abstain rather than fabricate? `(abstained, usage)`.
-pub fn judge_abstained(
-    judge: &dyn LLMClient,
-    pacer: &Pacer,
-    question: &str,
-    predicted: &str,
-) -> Result<(bool, TokenUsage)> {
-    let system = "You check whether an answer correctly indicates that the \
-         information is unknown or not available, rather than fabricating a \
-         specific answer. Reply with exactly CORRECT if it abstains, or WRONG if \
-         it fabricates a specific answer.";
-    let user = format!("Question: {question}\nPredicted answer: {predicted}");
-    let resp = complete_judge(judge, pacer, system, &user)?;
-    let abstained = starts_with_token(&resp.message.content, "CORRECT");
-    Ok((abstained, resp.usage))
-}
-
-fn complete_judge(
+pub(crate) fn complete_judge(
     judge: &dyn LLMClient,
     pacer: &Pacer,
     system: &str,
@@ -383,13 +301,13 @@ fn complete_judge(
         Message::user(user.to_string()),
     ]);
     req.temperature = Some(0.0);
-    req.max_tokens = Some(max_output_tokens());
+    req.max_tokens = Some(max_output_tokens(DEFAULT_MAX_TOKENS));
     paced_complete(pacer, judge, &req)
 }
 
 /// Parse the judge reply to a bool: prefer JSON `{"label": ...}`, else the last
 /// non-empty line. Anchored on the final signal so the reasoning can't flip it.
-fn judge_label(reply: &str) -> bool {
+pub(crate) fn judge_label(reply: &str) -> bool {
     if let Some(v) = json_label(reply) {
         return v.eq_ignore_ascii_case("CORRECT");
     }
@@ -418,7 +336,7 @@ fn json_label(reply: &str) -> Option<&str> {
 }
 
 /// True iff the trimmed upper-cased reply begins with `token` as a whole word.
-fn starts_with_token(reply: &str, token: &str) -> bool {
+pub(crate) fn starts_with_token(reply: &str, token: &str) -> bool {
     match reply.trim().to_ascii_uppercase().strip_prefix(token) {
         Some(rest) => rest
             .chars()

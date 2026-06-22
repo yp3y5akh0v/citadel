@@ -15,6 +15,17 @@ use rustc_hash::FxHashMap;
 /// Floor on every paced sleep so a tiny deficit cannot busy-spin the CPU.
 const MIN_SLEEP: Duration = Duration::from_millis(5);
 
+/// Default tokens/minute per model (OpenAI Tier-1): gpt-4o-mini/nano allow ~10x
+/// gpt-4o, so the pacer must not flat-cap them low. Override with the bin's *_TPM env.
+pub fn default_tpm_for_model(model: &str) -> u64 {
+    let m = model.to_ascii_lowercase();
+    if m.contains("mini") || m.contains("nano") {
+        2_000_000
+    } else {
+        200_000
+    }
+}
+
 /// Fair counting semaphore; a permit is held around one round-trip (incl. its retry
 /// backoff), so the count equals requests-in-flight for that role.
 pub struct Gate {
@@ -118,9 +129,9 @@ pub struct Pacer {
 
 impl Pacer {
     /// Build buckets for the reader and judge models. Equal ids collapse to one
-    /// shared bucket. `CITADEL_LOCOMO_TPM_BURST_FRAC` (default 1.0) scales capacity.
+    /// shared bucket. `CITADEL_MEMBENCH_TPM_BURST_FRAC` (default 1.0) scales capacity.
     pub fn new(reader_model: &str, reader_tpm: u64, judge_model: &str, judge_tpm: u64) -> Self {
-        let burst = std::env::var("CITADEL_LOCOMO_TPM_BURST_FRAC")
+        let burst = std::env::var("CITADEL_MEMBENCH_TPM_BURST_FRAC")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|f| *f > 0.0)
@@ -197,5 +208,12 @@ mod tests {
     fn same_model_reader_and_judge_share_one_bucket() {
         let p = Pacer::new("m", 1000, "m", 1000);
         assert_eq!(p.buckets.len(), 1, "equal model ids collapse to one bucket");
+    }
+
+    #[test]
+    fn default_tpm_gives_mini_more_than_full_models() {
+        assert_eq!(default_tpm_for_model("gpt-4o-mini"), 2_000_000);
+        assert_eq!(default_tpm_for_model("gpt-4o"), 200_000);
+        assert!(default_tpm_for_model("gpt-4o-mini") > default_tpm_for_model("gpt-4o"));
     }
 }

@@ -30,9 +30,9 @@ Each page on disk is 8,208 bytes: a 16-byte IV, 8,160 bytes of AES-256-CTR ciphe
 
 Most databases keep a write-ahead log for crash recovery. Citadel does not. Changed pages are written to new locations, and one byte flip switches to the new version. Recovery is immediate, and readers always see a consistent snapshot.
 
-## Faster than unencrypted SQLite
+## Benchmarks vs unencrypted SQLite
 
-Citadel beats SQLite on all 50 head-to-head benchmarks, even with encryption on every page. The numbers are in the <a href="https://github.com/yp3y5akh0v/citadel#benchmarks" target="_blank" rel="noopener">README</a>.
+Citadel is faster than SQLite on all 50 head-to-head benchmarks, with encryption on every page. The numbers are in the <a href="https://github.com/yp3y5akh0v/citadel#benchmarks" target="_blank" rel="noopener">README</a>.
 
 ## The memory engine
 
@@ -43,7 +43,7 @@ Apps and agents keep a lot of long-lived, private context, and you do not want t
 - **MCP server** - `citadel-mcp` serves a memory region over MCP (JSON-RPC on stdio, 13 tools), so Claude Desktop or any MCP client can use it.
 - **Forgetting** - to delete data you destroy its key instead of overwriting it. This works per atom, per region, or for the whole store, and returns a receipt. The ciphertext left behind cannot be read.
 
-It uses no LLM to build or search memory - it stores raw turns and recalls with vectors, keywords, and a reranker - yet scores {{ locomo() }}% on the LoCoMo memory benchmark with everything encrypted. With a stronger Gemini 3.5 Flash reader the same encrypted retrieval reaches {{ locomo_gemini() }}% (both 3-run means).
+It uses no LLM to build or search memory; it stores raw turns and recalls with vectors, keywords, and a reranker. It scores {{ locomo() }}% on the LoCoMo memory benchmark with everything encrypted. With a Gemini 3.5 Flash reader the same encrypted retrieval scores {{ locomo_gemini() }}% (both 3-run means). On the LongMemEval oracle benchmark it scores {{ longmemeval() }}% with a GPT-4o reader and {{ longmemeval_mini() }}% with GPT-4o-mini. The LongMemEval paper's GPT-4o oracle score is 87.0%.
 
 ## What it supports
 
@@ -53,4 +53,4 @@ It uses no LLM to build or search memory - it stores raw turns and recalls with 
 - **Sync** - encrypted peer-to-peer diffing over the Noise protocol.
 - **Bindings** - Rust, Python, WebAssembly, a C API, and a CLI.
 
-Citadel is a Rust workspace with thousands of tests, all in one encrypted file. Try it in the [playground](@/demo/_index.md), or read the <a href="https://github.com/yp3y5akh0v/citadel" target="_blank" rel="noopener">source</a>.
+Citadel is a Rust workspace with 5,200+ tests, and stores all data in one encrypted file. Try it in the [playground](@/demo/_index.md), or read the <a href="https://github.com/yp3y5akh0v/citadel" target="_blank" rel="noopener">source</a>.

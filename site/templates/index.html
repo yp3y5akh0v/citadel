@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
 {% block title %}Citadel - Encrypted-first embedded database and memory engine{% endblock %}
-{% block description %}Encrypted-first embedded database and memory engine. Every page AES-256-CTR + HMAC-SHA256. Wins all {{ config.extra.benchmarks }} head-to-head benchmarks against unencrypted SQLite, with vector recall, an MCP server, and cryptographic forgetting.{% endblock %}
+{% block description %}Encrypted-first embedded SQL database with a built-in memory engine. Every page AES-256-CTR + HMAC-SHA256. Faster than unencrypted SQLite across all {{ config.extra.benchmarks }} head-to-head benchmarks, with vector recall, an MCP server, and cryptographic forgetting.{% endblock %}
 
 {% block content %}
 {% set base = config.base_url %}
@@ -11,7 +11,7 @@
     <div>
       <h1>Encrypted-first embedded database and memory engine, <span class="ac">faster than unencrypted SQLite.</span></h1>
       <p class="lede">
-        Every page is encrypted and authenticated before it touches disk. A full SQL engine that wins all {{ config.extra.benchmarks }} head-to-head benchmarks against SQLite - and, on the same encrypted pages, a memory engine with vector recall, an MCP server, and cryptographic forgetting.
+        Every page is encrypted and authenticated before it touches disk. A full SQL engine that is faster than SQLite on all {{ config.extra.benchmarks }} head-to-head benchmarks, and on the same encrypted pages, a memory engine with vector recall, an MCP server, and cryptographic forgetting.
       </p>
       <div class="hero-cta">
         <a class="btn" href="#install">Get started
@@ -63,7 +63,7 @@
   <div class="proof">
     <div class="proof-label">// proven in</div>
     <div class="proof-items">
-      <span><b>{{ config.extra.benchmarks }}/{{ config.extra.benchmarks }}</b> wins vs SQLite</span>
+      <span><b>{{ config.extra.benchmarks }}/{{ config.extra.benchmarks }}</b> faster vs SQLite</span>
       <span><b>362&times;</b> on full&nbsp;outer&nbsp;join</span>
       <span><b>{{ config.extra.tests }}</b> tests, {{ config.extra.crates }} crates</span>
       <span><b>{{ config.extra.locomo }}%</b> LoCoMo score</span>
@@ -97,7 +97,7 @@
         <li><code>VECTOR(N)</code> type with a <a class="ilink" href="https://github.com/yp3y5akh0v/prism" target="_blank" rel="noopener">PRISM</a>-backed filtered ANN index</li>
         <li>Hybrid recall: vector ANN + BM25 keyword + recency + optional cross-encoder reranker</li>
         <li>Cryptographic forgetting: erase an atom or region by destroying its key</li>
-        <li>{{ config.extra.mcp_tools }}-tool MCP server; {{ config.extra.locomo }}% on the LoCoMo long-memory benchmark</li>
+        <li>{{ config.extra.mcp_tools }}-tool MCP server; {{ config.extra.locomo }}% on LoCoMo and {{ config.extra.longmemeval }}% on LongMemEval (oracle, gpt-4o)</li>
       </ul>
     </div>
   </div>
@@ -367,12 +367,12 @@
     </div>
     <div>
       <div class="bench-kpis cols-2" style="margin-bottom:0">
-        <div class="kpi"><div class="val"><em>{{ config.extra.locomo }}</em>%</div><div class="lab">LoCoMo score (3-run mean)</div></div>
-        <div class="kpi"><div class="val"><em>{{ config.extra.locomo_ceiling }}</em>%</div><div class="lab">retrieval ceiling</div></div>
+        <div class="kpi"><div class="val"><em>{{ config.extra.locomo }}</em>%</div><div class="lab">LoCoMo (gpt-4o-mini)</div></div>
+        <div class="kpi"><div class="val"><em>{{ config.extra.longmemeval }}</em>%</div><div class="lab">LongMemEval (gpt-4o, oracle)</div></div>
+        <div class="kpi"><div class="val"><em>{{ config.extra.locomo_ceiling }}</em>%</div><div class="lab">LoCoMo retrieval ceiling</div></div>
         <div class="kpi"><div class="val"><em>7</em></div><div class="lab">typed edge kinds</div></div>
-        <div class="kpi"><div class="val"><em>9</em></div><div class="lab">memory operations</div></div>
       </div>
-      <p class="bench-note">LoCoMo long-term conversational-memory benchmark, encrypted regions, gpt-4o-mini reader and judge - zero LLM at ingest or retrieval. {{ config.extra.locomo_gemini }}% (3-run mean) with a gemini-3.5-flash reader. Protocol and full numbers in <code>citadeldb-membench</code>.</p>
+      <p class="bench-note">Two long-term-memory benchmarks, each on its official prompt and judge. LoCoMo: encrypted regions, gpt-4o-mini reader and judge, zero LLM at ingest or retrieval ({{ config.extra.locomo_gemini }}% with a gemini-3.5-flash reader). LongMemEval oracle (a retrieval-complete reader ceiling): {{ config.extra.longmemeval }}% with a gpt-4o reader and {{ config.extra.longmemeval_mini }}% with gpt-4o-mini. The LongMemEval paper's gpt-4o oracle score is 87.0%. Protocol and full numbers in <code>citadeldb-membench</code>.</p>
     </div>
   </div>
 </section>
@@ -435,15 +435,15 @@
 <section class="block shell" id="benchmarks">
   <div class="sec-head">
     <div class="eyebrow">Benchmarks</div>
-    <h2>{{ config.extra.benchmarks }} of {{ config.extra.benchmarks }} head-to-head, won.</h2>
-    <p>Single-threaded, 100K rows, <code class="mono" style="color:var(--accent)">(id INTEGER PK, name TEXT, age INTEGER)</code>. Equal cache budgets (~32 MB). Ratio is SQLite / Citadel time; higher means Citadel wins by more. Geometric mean ~2.8&times;.</p>
+    <h2>Faster on all {{ config.extra.benchmarks }} head-to-head benchmarks.</h2>
+    <p>Single-threaded, 100K rows, <code class="mono" style="color:var(--accent)">(id INTEGER PK, name TEXT, age INTEGER)</code>. Equal cache budgets (~32 MB). Ratio is SQLite / Citadel time; higher means a larger Citadel speedup. Geometric mean ~2.8&times;.</p>
   </div>
 
   <div class="bench-kpis">
     <div class="kpi"><div class="val"><em>362&times;</em></div><div class="lab">full_outer_join</div></div>
     <div class="kpi"><div class="val"><em>318&times;</em></div><div class="lab">correlated_in</div></div>
     <div class="kpi"><div class="val"><em>144&times;</em></div><div class="lab">count</div></div>
-    <div class="kpi"><div class="val"><em>1.03&times;</em></div><div class="lab">slowest (still wins)</div></div>
+    <div class="kpi"><div class="val"><em>1.03&times;</em></div><div class="lab">slowest (still faster)</div></div>
   </div>
 
   <div class="bench-table" id="benchTable">

@@ -1,14 +1,8 @@
-//! LoCoMo long-term-conversational-memory benchmark for citadel-mem.
-//!
-//! Headline accuracy excludes the adversarial category (no answerable gold) and
-//! reports it separately as abstention. The reader sees only the top-k retrieved
-//! memories, never the transcript/gold/evidence (see [`eval::build_reader_prompt`]).
+//! Long-term-memory benchmark harness: a dataset-agnostic engine (`core`) driving
+//! pluggable benchmarks (`benchmarks::{locomo, longmemeval}`).
 
-pub mod dataset;
-pub mod error;
-pub mod eval;
-pub mod ingest;
-pub mod ratelimit;
+pub mod benchmarks;
+pub mod core;
 
 use std::sync::Arc;
 
@@ -18,14 +12,18 @@ use serde::Serialize;
 use citadel_ai::LLMClient;
 use citadel_mem::{Embedder, FusionWeights, MemoryEngine};
 
-pub use dataset::{load, load_with_hash, parse_root, sha256_hex, Category, QaSample, Sample, Turn};
-pub use error::{BenchError, Result};
-pub use eval::{
-    answer_question, build_reader_prompt, judge_abstained, judge_correct, reader_view,
-    AnswerOutcome,
+use crate::benchmarks::locomo::Locomo;
+use crate::core::benchmark::Benchmark;
+
+pub use benchmarks::locomo::dataset::{
+    load, load_with_hash, parse_root, Category, QaSample, Sample, Turn,
 };
-pub use ingest::{ingest_sample, turn_content};
-pub use ratelimit::{Gate, Pacer};
+pub use benchmarks::locomo::ingest::{ingest_sample, turn_content};
+pub use benchmarks::locomo::prompts::{build_reader_prompt, judge_abstained, judge_correct};
+pub use core::error::{BenchError, Result};
+pub use core::eval::{answer_question, reader_view, AnswerOutcome, Question};
+pub use core::hash::sha256_hex;
+pub use core::ratelimit::{default_tpm_for_model, Gate, Pacer};
 
 /// Published provider USD per 1M tokens as `(input, output)`, keyed by model id. The
 /// OpenAI/Gemini APIs return no `cost_usd`, so the bench estimates it from the recorded
@@ -51,28 +49,6 @@ fn token_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
     (f64::from(input_tokens) / 1_000_000.0) * rate_in
         + (f64::from(output_tokens) / 1_000_000.0) * rate_out
 }
-
-/// LoCoMo's documented weaknesses, surfaced in every report.
-const KNOWN_FLAWS: &str = "De facto LLM-judge protocol, not the paper's token-F1, \
-     so comparable only to runs using the same judge model. Reader and judge are \
-     separate, independently-selected models (reader and judge gpt-4o-mini, the \
-     reference setup); both are pinned in Provenance. The reader uses \
-     ONE category-blind answer prompt (the answerer never receives the gold \
-     question category), matching the Mem0/Zep single-prompt protocol. A 40-case \
-     adversarial probe of the judge measured 0% false-accept (judge-probe.ps1), so \
-     judge lenience appears low; LoCoMo answer keys nonetheless have ~6.4% errors \
-     (an independent audit found ~99 wrong gold answers), so the honest accuracy \
-     ceiling is ~93.6%, not 100%. Cost is computed from the recorded reader+judge \
-     tokens at each model's published rate (an upper bound: prompt caching lowers \
-     the real bill). Ingestion is raw conversation turns plus \
-     each shared photo's BLIP caption (LoCoMo substitutes the image with its \
-     caption), not LLM-extracted facts, so head-to-head vendor comparison is \
-     apples-to-oranges. Turns carry their session date as event-time created_at, \
-     but recency is graded against the wall clock, where every session is equally \
-     ancient, so the recency weight contributes no rank signal (grading as of the \
-     conversation's end was measured to HURT evidence recall and is not used); the \
-     importance weight is likewise inert (raw turns carry no importance score). Headline \
-     excludes the adversarial category; adversarial is a separate abstention metric.";
 
 /// Order in which retrieved memories are rendered for the reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +77,9 @@ pub struct BenchConfig {
     pub reader_order: ReaderOrder,
     /// Adjacent turns rendered around each hit (0 disables expansion).
     pub neighbor_radius: usize,
+    /// Reader output-token cap; raise for a chain-of-thought reader (env override:
+    /// `CITADEL_MEMBENCH_MAX_TOKENS`).
+    pub reader_max_tokens: u32,
 }
 
 impl Default for BenchConfig {
@@ -110,6 +89,7 @@ impl Default for BenchConfig {
             top_k: 50,
             reader_order: ReaderOrder::Relevance,
             neighbor_radius: 0,
+            reader_max_tokens: 512,
         }
     }
 }
@@ -414,22 +394,26 @@ fn process_one_question(
         });
     }
 
+    let bench = Locomo;
     let outcome = {
         let _permit = reader_gate.acquire();
-        answer_question(reader, pacer, eng, region, &qa.question, config)?
+        let q = Question {
+            text: &qa.question,
+            date: "",
+        };
+        answer_question(&bench, reader, pacer, eng, region, q, config)?
     };
 
-    // Scored -> correctness judge. Adversarial -> abstention judge, except
-    // false-premise adversarials with a real gold (graded for correctness).
     let (correct, judge_usage) = {
         let _permit = judge_gate.acquire();
-        if qa.category.is_scored() {
-            judge_correct(judge, pacer, &qa.question, &qa.gold, &outcome.answer)?
-        } else if qa.gold.trim().is_empty() {
-            judge_abstained(judge, pacer, &qa.question, &outcome.answer)?
-        } else {
-            judge_correct(judge, pacer, &qa.question, &qa.gold, &outcome.answer)?
-        }
+        bench.judge(
+            judge,
+            pacer,
+            qa.category.is_scored(),
+            &qa.question,
+            &qa.gold,
+            &outcome.answer,
+        )?
     };
 
     // Gold instrumentation computed before `outcome.retrieved` is moved into the result.
@@ -568,7 +552,7 @@ pub fn provenance(
         dataset_sha256: dataset_sha256.into(),
         cost_rate_input_usd_per_m: rate_in,
         cost_rate_output_usd_per_m: rate_out,
-        known_flaws: KNOWN_FLAWS.to_string(),
+        known_flaws: Locomo.known_flaws().to_string(),
     }
 }
 

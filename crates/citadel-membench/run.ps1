@@ -3,7 +3,7 @@
 # No machine-specific paths are committed: locations default to environment variables and
 # are overridable by flags. Set these once (or pass the matching flag):
 #   $env:CITADEL_LOCOMO_DATASET    the locomo10.json dataset      (-Dataset)
-#   $env:CITADEL_BGE_SMALL_DIR     the embedder model directory   (-BgeDir)
+#   $env:CITADEL_EMBEDDER_DIR     the embedder model directory   (-EmbedderDir)
 #   $env:CITADEL_RERANKER_DIR      the reranker model directory   (-RerankDir, optional)
 #   $env:OPENAI_API_KEY            the API key directly, or
 #   $env:OPENAI_KEY_FILE           a file holding the key         (-KeyFile); the key is never printed
@@ -23,8 +23,8 @@ param(
   [string]$Dataset   = $env:CITADEL_LOCOMO_DATASET,
   [string]$KeyFile   = $env:OPENAI_KEY_FILE,
   [string]$GeminiKeyFile = $env:GEMINI_KEY_FILE,
-  [string]$BgeDir    = $env:CITADEL_BGE_SMALL_DIR,
-  [string]$Embedder  = "",              # "" = bge-small; else bge-base|bge-large|e5-large (match -BgeDir)
+  [string]$EmbedderDir    = $env:CITADEL_EMBEDDER_DIR,
+  [string]$Embedder  = "",              # "" = bge-small; else bge-base|bge-large|e5-large (match -EmbedderDir)
   [string]$RerankDir = $env:CITADEL_RERANKER_DIR,
   [bool]$Encrypted   = $true,           # encrypted regions: per-atom sealed + crypto erasure
   [switch]$DumpDb                       # also write a free DB dump (mock embed, no key)
@@ -40,15 +40,15 @@ if (-not (Test-Path $exe)) {
 # Required inputs come from a flag or its environment-variable default.
 if (-not $Dataset)             { throw "No dataset. Pass -Dataset or set `$env:CITADEL_LOCOMO_DATASET." }
 if (-not (Test-Path $Dataset)) { throw "Dataset not found: $Dataset" }
-if (-not $BgeDir)              { throw "No embedder dir. Pass -BgeDir or set `$env:CITADEL_BGE_SMALL_DIR." }
-if (-not (Test-Path $BgeDir))  { throw "Embedder dir not found: $BgeDir" }
+if (-not $EmbedderDir)              { throw "No embedder dir. Pass -EmbedderDir or set `$env:CITADEL_EMBEDDER_DIR." }
+if (-not (Test-Path $EmbedderDir))  { throw "Embedder dir not found: $EmbedderDir" }
 
 $stamp = Get-Date -Format "yyyy-MM-dd_HHmm"
 $safeLabel = ($Label -replace '[^A-Za-z0-9._-]', '-')
 $dir = Join-Path $root "runs\${stamp}__${safeLabel}"
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 
-$env:CITADEL_BGE_SMALL_DIR        = $BgeDir
+$env:CITADEL_EMBEDDER_DIR        = $EmbedderDir
 $env:CITADEL_LOCOMO_EMBEDDER      = $Embedder
 $env:CITADEL_LOCOMO_RERANK_STRATEGY = "rrf"
 $env:CITADEL_LOCOMO_NEIGHBOR_RADIUS = "$NeighborRadius"
@@ -72,7 +72,7 @@ if ($ReaderProvider -eq "gemini" -and -not $env:GEMINI_API_KEY) {
   $env:GEMINI_API_KEY = (Get-Content $GeminiKeyFile -Raw).Trim()
 }
 if ($ReasoningEffort) { $env:CITADEL_GEMINI_REASONING_EFFORT = $ReasoningEffort }
-if ($MaxTokens -gt 0) { $env:CITADEL_LOCOMO_MAX_TOKENS = "$MaxTokens" }
+if ($MaxTokens -gt 0) { $env:CITADEL_MEMBENCH_MAX_TOKENS = "$MaxTokens" }
 
 $env:CITADEL_LOCOMO_READER_MODEL = $Reader
 $env:CITADEL_LOCOMO_JUDGE_MODEL  = $Judge
@@ -112,7 +112,7 @@ Remove-Item Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
 Remove-Item Env:\GEMINI_API_KEY -ErrorAction SilentlyContinue
 Remove-Item Env:\CITADEL_LOCOMO_READER_PROVIDER -ErrorAction SilentlyContinue
 Remove-Item Env:\CITADEL_GEMINI_REASONING_EFFORT -ErrorAction SilentlyContinue
-Remove-Item Env:\CITADEL_LOCOMO_MAX_TOKENS -ErrorAction SilentlyContinue
+Remove-Item Env:\CITADEL_MEMBENCH_MAX_TOKENS -ErrorAction SilentlyContinue
 Remove-Item Env:\CITADEL_LOCOMO_MAX_SAMPLES -ErrorAction SilentlyContinue
 Remove-Item Env:\CITADEL_LOCOMO_NEIGHBOR_RADIUS -ErrorAction SilentlyContinue
 Write-Host "done: EXIT=$code  ->  $dir"
