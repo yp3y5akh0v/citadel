@@ -1,12 +1,13 @@
-# citadel-mem on LoCoMo
+# citadel-mem benchmarks
 
-Results and a reproducible evaluation harness for citadel-mem on the LoCoMo
-long-term conversational memory benchmark. citadel-mem is an embedded memory engine
-that is encrypted at rest and forgets by destroying keys; the benchmark runs
-on encrypted regions (each conversation is a per-atom-sealed region), so every number
-below is produced on the encrypted storage path. Each number is regenerated from a
-SHA-256-pinned dataset with one command, and the report records the reader and judge
-models, the prompts, a per-question audit, and the run's limitations.
+Results and a reproducible evaluation harness for citadel-mem on two long-term
+memory benchmarks: LoCoMo (below) and LongMemEval (oracle split, in its own section
+further down). citadel-mem is an embedded memory engine that is encrypted at rest and
+forgets by destroying keys; the LoCoMo numbers run on encrypted regions (each
+conversation is a per-atom-sealed region), so every LoCoMo figure is on the encrypted
+storage path. Each number is regenerated from a SHA-256-pinned dataset with one
+command, and the report records the reader and judge models, the prompts, a
+per-question audit, and the run's limitations.
 
 ## Full 10-conversation LoCoMo (encrypted, reader and judge `gpt-4o-mini`)
 
@@ -39,7 +40,7 @@ computed from the recorded token counts (~7.0M in / ~0.13M out per run) at gpt-4
 rates ($0.15 / $0.60 per M). The prior v1.4.0 configuration scored the same accuracy
 within reader noise at a lower retrieval ceiling (94.4%); both are in Run history below.
 
-**Encryption is free at the retrieval layer.** Recall over an encrypted region decrypts
+Encryption adds no retrieval-layer overhead. Recall over an encrypted region decrypts
 the region into an ephemeral in-memory nearest-neighbor index whose plaintext vectors
 are zeroized when it is dropped, so the retrieval ceiling and end-to-end accuracy are
 identical to a plaintext store; per-configuration recall latencies are in Run history.
@@ -61,9 +62,9 @@ Swapping only the reader to `gemini-3.5-flash` - same encrypted retrieval, same
 | p95 recall latency | 515 ms | 475 ms | 434 ms | ~475 ms |
 | Token cost (USD) | ~$11.6 | ~$11.6 | ~$11.6 | ~$11.6 |
 
-The +5.1 over the 85.5% gpt-4o-mini mean is concentrated where a non-reasoning reader
-fails - temporal date conversions (78.5% -> 90.3%) and multi-hop combination
-(81.9% -> 87.6%); it isolates the reader (retrieval is unchanged), so it is directly
+The +5.1 over the 85.5% gpt-4o-mini mean is concentrated in temporal date conversions
+(78.5% -> 90.3%) and multi-hop combination (81.9% -> 87.6%); retrieval is unchanged, so
+the comparison isolates the reader and is directly
 comparable to 85.5%. open_domain is 70.8% in all three runs - the same 28 questions miss
 every run, a retrieval-recall limit, not a reader one. Reader cost rises ~10x
 (gemini-3.5-flash $1.50/$9.00 vs gpt-4o-mini $0.15/$0.60 per M tokens).
@@ -96,21 +97,50 @@ scored number is directly comparable against the field:
 | LangMem | 58.1% | arXiv 2504.19413 |
 | OpenAI memory | 52.9% | arXiv 2504.19413 |
 
-citadel-mem scores 17 to 33 points above these reported memory systems (and 13 above the
-full-context, no-retrieval baseline). Their scores are taken from the Mem0 paper
+The 85.5% mean is 17 to 33 points higher than these reported memory systems, and 13 points
+above the full-context, no-retrieval baseline. Their scores are taken from the Mem0 paper
 (Chhikara et al., 2025).
 
-citadel reaches this number **zero-LLM**: raw turns in, vector + BM25 + cross-encoder
-out, with no LLM touching the memory at ingest or retrieval - so remembering costs no
-tokens, recall is deterministic, and nothing about the conversation is sent to a model
-to build or search the store. The other systems reach their numbers by running an LLM
+This number uses a zero-LLM memory path: raw turns in, vector + BM25 + cross-encoder
+out, with no LLM touching the memory at ingest or retrieval, so ingestion costs no
+tokens, recall is deterministic, and no conversation content is sent to a model
+to build or search the store. The other systems run an LLM
 over the conversation to build memory (fact extraction, temporal knowledge graphs, or
-context curation); citadel uses none.
+context curation).
 
-The reader is the dominant lever for the remaining error: 82% of scored misses have the
-gold already in the prompt and the reader still missed it (Self-audit below). Swapping
+82% of scored misses have the gold already in the prompt and the reader still missed it
+(Self-audit below), so reader quality dominates the remaining error. Swapping
 only the reader to `gemini-3.5-flash` raises the score to 90.6% (above) on the same
-zero-LLM retrieval; better retrieval recall is the second lever.
+zero-LLM retrieval; retrieval recall accounts for the rest.
+
+## LongMemEval (oracle split)
+
+[LongMemEval](https://arxiv.org/abs/2410.10813) measures long-term memory over many
+chat sessions across six question types. The oracle split places only the evidence
+sessions in the haystack, so it measures the reader ceiling on citadel's retrieved
+memory, not retrieval against distractors. The reader prompt replicates the official
+`run_generation.py` CoT template (generic, category-blind, history sorted by date,
+current date supplied); scoring uses the official `gpt-4o-2024-08-06` judge. 500 questions.
+
+| Reader | Overall | Task-averaged | Abstention |
+|---|---|---|---|
+| gpt-4o | 90.6% | 89.3% | 80.0% |
+| gpt-4o-mini | 82.2% | 83.0% | 70.0% |
+
+Per-type (gpt-4o / gpt-4o-mini): single-session-user 100 / 97.1, single-session-assistant
+98.2 / 96.4, temporal-reasoning 91.0 / 78.9, knowledge-update 88.5 / 79.5, multi-session
+88.0 / 75.9, single-session-preference 70.0 / 70.0.
+
+The gpt-4o reader (90.6%) exceeds the LongMemEval paper's own gpt-4o oracle score (0.870);
+the gpt-4o-mini reader (82.2%) exceeds the paper's gpt-4o-mini oracle (0.744). The
+gpt-4o-mini to gpt-4o jump is concentrated in the reasoning-heavy types (temporal +12.1,
+multi-session +12.1, knowledge-update +9.0), so those types are reader-bound, not
+retrieval-bound: at oracle scale the token-free retrieval diagnostic recalls every answer
+session by rank 10 and every evidence turn by rank 50. Oracle is a reader-ceiling upper
+bound; the full-haystack split is the run that stresses retrieval against distractors.
+
+Reproduce: see [RUNBOOK.md](RUNBOOK.md). The retrieval diagnostic
+(`CITADEL_LONGMEMEVAL_RETRIEVAL_DIAG=1`) is token-free and needs no API key.
 
 ## Run history
 
@@ -209,7 +239,7 @@ prints it):
 
 ```powershell
 pwsh -File run.ps1 -Label full-enc-mini -Reader gpt-4o-mini -Judge gpt-4o-mini `
-  -Embedder bge-large -BgeDir C:\path\to\bge-large-en-v1.5
+  -Embedder bge-large -EmbedderDir C:\path\to\bge-large-en-v1.5
 ```
 
 The 90.6% Gemini-reader variant uses the same harness, built with
@@ -219,7 +249,7 @@ unchanged):
 ```powershell
 pwsh -File run.ps1 -Label full-gemini-reader -ReaderProvider gemini -Reader gemini-3.5-flash `
   -ReasoningEffort low -MaxTokens 2048 -GeminiKeyFile C:\path\to\gemini-key.txt `
-  -Embedder bge-large -BgeDir C:\path\to\bge-large-en-v1.5
+  -Embedder bge-large -EmbedderDir C:\path\to\bge-large-en-v1.5
 ```
 
 Token-free retrieval diagnostic (no key, no spend) - prints the layered any/all
@@ -227,7 +257,7 @@ evidence recall (A / B / C / C-asof / D / D-asof):
 
 ```bash
 CITADEL_LOCOMO_ENCRYPTED=true CITADEL_LOCOMO_RETRIEVAL_DIAG=1 CITADEL_LOCOMO_EMBEDDER=bge-large \
-  CITADEL_BGE_SMALL_DIR=/path/to/bge-large-en-v1.5 \
+  CITADEL_EMBEDDER_DIR=/path/to/bge-large-en-v1.5 \
   CITADEL_RERANKER_DIR=/path/to/ms-marco-MiniLM-L-6-v2 \
   ./target/debug/locomo locomo10.json
 ```

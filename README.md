@@ -4,7 +4,7 @@
 
 <h1 align="center">Citadel</h1>
 
-<p align="center">Encrypted-first embedded database and memory engine. Outperforms unencrypted SQLite.</p>
+<p align="center">Encrypted-first embedded SQL database with a built-in memory engine.</p>
 
 <p align="center">
   <a href="https://crates.io/crates/citadeldb"><img src="https://badgen.net/crates/v/citadeldb" alt="crates.io"></a>
@@ -12,10 +12,11 @@
   <a href="https://pypi.org/project/citadeldb/"><img src="https://img.shields.io/pypi/v/citadeldb" alt="PyPI"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml"><img src="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LoCoMo%20(gpt--4o--mini%2Fgemini--flash)-85.5%2F90.6%25-success" alt="LoCoMo 85.5% (gpt-4o-mini) / 90.6% (gemini-3.5-flash) readers"></a>
+  <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LongMemEval%20oracle%20(gpt--4o)-90.6%25-success" alt="LongMemEval oracle 90.6% (gpt-4o reader)"></a>
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Every page is encrypted and authenticated before it hits disk. The database file is always opaque. Wins all 50 head-to-head benchmarks against unencrypted SQLite at equal cache budgets, and its **zero-LLM** memory engine scores **85.5%** on the LoCoMo long-term-memory benchmark (mean of 3 runs, ±0.4%) against a **95.1% deterministic retrieval ceiling** - on fully encrypted regions.
+Citadel is an embedded SQL database that encrypts and authenticates every page with AES-256-CTR and HMAC-SHA256 before it is written, so the database file is always opaque. The same encrypted pages hold SQL tables and a zero-LLM memory engine that recalls over encrypted regions. The tables below report its results against unencrypted SQLite across 50 head-to-head benchmarks and on the LoCoMo and LongMemEval long-term-memory benchmarks.
 
 **LoCoMo** - `gpt-4o-mini` reader and judge (the field's standard setup):
 
@@ -31,6 +32,15 @@ Every page is encrypted and authenticated before it hits disk. The database file
 
 Competitor scores as published in the Mem0 paper ([arXiv 2504.19413](https://arxiv.org/abs/2504.19413)), at the same `gpt-4o-mini` reader and judge.
 
+**LongMemEval** ([arXiv 2410.10813](https://arxiv.org/abs/2410.10813)) oracle split, official CoT prompt and `gpt-4o-2024-08-06` judge:
+
+| Reader | Overall | Task-averaged |
+|---|---|---|
+| gpt-4o | 90.6% | 89.3% |
+| gpt-4o-mini | 82.2% | 83.0% |
+
+Oracle = retrieval-complete (the evidence sessions are in context), so this measures the reader ceiling on Citadel's retrieved memory. The gpt-4o reader exceeds the LongMemEval paper's own gpt-4o oracle score (0.870). Protocol and per-question audit in [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md).
+
 ## Encrypted memory engine
 
 The same encrypted pages that hold SQL tables also hold memory. Three crates make up
@@ -45,8 +55,7 @@ the memory engine:
 citadeldb-mem uses no LLM at ingest or retrieval: it stores raw conversation content
 and recalls with embeddings, BM25 keyword matching, and a cross-encoder reranker.
 Remembering costs zero tokens, recall is deterministic, and the conversation is never
-sent to an LLM to build or search the memory, unlike fact-extraction and graph-building
-memory systems. The score above uses a `gpt-4o-mini` reader and judge; with a
+sent to an LLM to build or search the memory. The score above uses a `gpt-4o-mini` reader and judge; with a
 `gemini-3.5-flash` reader the same encrypted retrieval scores 90.6% (mean of 3 runs). Protocol,
 per-question audit, and a comparison with published systems are in
 [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md).
@@ -58,7 +67,7 @@ per-question audit, and a comparison with published systems are in
 ## Features
 
 - **Encrypted at rest** - AES-256-CTR + HMAC-SHA256 per page, verified before decryption
-- **SQL** - JOINs (INNER, LEFT, RIGHT, CROSS, FULL OUTER, LATERAL), subqueries, CTEs (recursive + WITH-DML), UNION/INTERSECT/EXCEPT, window functions, views, materialized views (with `REFRESH [CONCURRENTLY]`), triggers (BEFORE/AFTER/INSTEAD OF × ROW/STATEMENT, transition tables, WHEN, UPDATE OF, ENABLE/DISABLE), TEMP tables (per-connection in-memory), aggregates, indexes (partial, COLLATE, GIN, FTS, expression, CONCURRENTLY), constraints, generated columns (STORED + VIRTUAL), STRICT tables, COLLATE (BINARY/NOCASE/RTRIM), `BEGIN READ ONLY` transactions (mutations rejected), `ANY` / `ALL` quantified comparisons, `ARRAY` type, JSON/JSONB types with 14 PG operators (`->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, `#-`, `@?`, `@@`, `@?_tz`, `@@_tz`), `JSON_TABLE` / `JSON_EXISTS` / `JSON_VALUE` / `JSON_QUERY` + SQL/JSON predicate path language, 16 JSON scalar functions + 4 JSONB aggregates, set-returning JSON functions (`jsonb_array_elements`, `jsonb_each`, `jsonb_object_keys`), full-text search (FTS) with `tsvector`/`tsquery` types, `@@` match operator, ranking (`ts_rank`, `ts_rank_cd`), `strip`, `setweight` (2- and 3-arg), `tsvector || tsvector`, inverted FTS indexes (`CREATE INDEX … USING fts`), system catalog (`information_schema.*` incl. `triggers`, `pg_timezone_names`, `pg_timezone_abbrevs`, `pg_matviews`), ALTER TABLE, TRUNCATE, UPSERT (`ON CONFLICT`), RETURNING (with `OLD/NEW`), full FK actions (CASCADE / SET NULL / SET DEFAULT / RESTRICT), prepared statements with snapshot-tagged plan caching
+- **SQL** - JOINs, subqueries, CTEs (recursive + WITH-DML), UNION/INTERSECT/EXCEPT, window functions, views, materialized views, triggers, TEMP tables, generated columns (STORED + VIRTUAL), constraints, full FK actions, UPSERT, RETURNING, JSON/JSONB (14 Postgres operators + SQL/JSON path language), full-text search, prepared statements with plan caching, and a queryable system catalog. Full list under [SQL](#sql)
 - **ACID** - Copy-on-Write B+ tree, shadow paging, no WAL. Snapshot isolation with concurrent readers
 - **P2P sync** - Merkle-based table diffing over Noise-encrypted channels with PSK auth
 - **CLI** - SQL shell with tab completion, syntax highlighting, dot-commands (.backup, .verify, .rekey, .sync, .dump, ...)
@@ -130,7 +139,7 @@ select_gen_virtual     17.0 us        17.7 us        1.04x
 fk_cascade             86.5 us        89.4 us        1.03x
 ```
 
-50 head-to-head benchmarks. Citadel wins all 50. Geometric mean speedup: ~2.8x.
+50 head-to-head benchmarks. Citadel is faster on all 50. Geometric mean speedup: ~2.8x.
 
 ### Citadel-only (no direct SQLite equivalent)
 
@@ -221,7 +230,7 @@ Citadel-only benchmarks:
 - **date_arith** - `SELECT COUNT(*) FROM events WHERE ts + INTERVAL '1 day' > TIMESTAMP '2024-06-01 00:00:00'`
 - **date_sort** - `SELECT id FROM events ORDER BY ts LIMIT 100`
 - **json_gin** - `SELECT id FROM users WHERE data @> '{"role":"admin"}'::jsonb` with vs without `CREATE INDEX ... USING gin (data)`
-- **fts_index** - `SELECT id FROM docs WHERE body @@ to_tsquery('...')` with vs without `CREATE INDEX … USING fts (body)` (`body` is a `TSVECTOR` column)
+- **fts_index** - `SELECT id FROM docs WHERE body @@ to_tsquery('...')` with vs without `CREATE INDEX ... USING fts (body)` (`body` is a `TSVECTOR` column)
 
 SQLite config: `journal_mode=OFF, synchronous=OFF, cache_size=8192` (~32 MB).
 Citadel config: `SyncMode::Off, cache_size=4096` (~32 MB).
@@ -305,23 +314,23 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 **Types** - INTEGER, REAL, TEXT, BLOB, BOOLEAN, DATE, TIME, TIMESTAMP (WITH TIME ZONE), INTERVAL, JSON, JSONB, TSVECTOR, TSQUERY, ARRAY
 
-**Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS, FULL OUTER, LATERAL), subqueries (scalar, IN, EXISTS, correlated), CTEs (`WITH` / `WITH RECURSIVE` / WITH-DML: `WITH x AS (INSERT/UPDATE/DELETE … [RETURNING *]) SELECT …`), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, `ANY` / `ALL` (subquery + array forms), GROUP BY/HAVING, ORDER BY, LIMIT/OFFSET
+**Clauses** - JOINs (INNER, LEFT, RIGHT, CROSS, FULL OUTER, LATERAL), subqueries (scalar, IN, EXISTS, correlated), CTEs (`WITH` / `WITH RECURSIVE` / WITH-DML: `WITH x AS (INSERT/UPDATE/DELETE ... [RETURNING *]) SELECT ...`), UNION/INTERSECT/EXCEPT [ALL], CASE, BETWEEN, LIKE, DISTINCT, `ANY` / `ALL` (subquery + array forms), GROUP BY/HAVING, ORDER BY, LIMIT/OFFSET
 
 **Window functions** - ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, SUM/COUNT/AVG/MIN/MAX OVER with PARTITION BY, ORDER BY, ROWS/RANGE frames
 
 **Views** - CREATE/DROP VIEW, OR REPLACE, IF NOT EXISTS/IF EXISTS, column aliases, nested views
 
-**Materialized views** - `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name AS SELECT …`, `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name` (`CONCURRENTLY` does a diff-merge — DELETE removed rows, UPDATE changed rows, INSERT new rows — instead of TRUNCATE+repopulate), `DROP MATERIALIZED VIEW [CASCADE]`, full backing-table semantics (indexes, joins, planner sees a real table), `pg_matviews` introspection
+**Materialized views** - `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name AS SELECT ...`, `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name` (`CONCURRENTLY` does a diff-merge - DELETE removed rows, UPDATE changed rows, INSERT new rows - instead of TRUNCATE+repopulate), `DROP MATERIALIZED VIEW [CASCADE]`, full backing-table semantics (indexes, joins, planner sees a real table), `pg_matviews` introspection
 
-**Triggers** - `CREATE TRIGGER name {BEFORE|AFTER|INSTEAD OF} {INSERT|UPDATE [OF cols]|DELETE} ON table FOR EACH {ROW|STATEMENT} [REFERENCING NEW TABLE AS new_t OLD TABLE AS old_t] [WHEN (expr)] BEGIN ... END`. INSTEAD OF triggers make views writable. Transition tables work as virtual tables in trigger bodies. `ALTER TABLE … DISABLE/ENABLE TRIGGER [name|ALL]`. PG-faithful name-order firing. Introspection via `information_schema.triggers` and `SHOW TRIGGERS [ON table]`.
+**Triggers** - `CREATE TRIGGER name {BEFORE|AFTER|INSTEAD OF} {INSERT|UPDATE [OF cols]|DELETE} ON table FOR EACH {ROW|STATEMENT} [REFERENCING NEW TABLE AS new_t OLD TABLE AS old_t] [WHEN (expr)] BEGIN ... END`. INSTEAD OF triggers make views writable. Transition tables work as virtual tables in trigger bodies. `ALTER TABLE ... DISABLE/ENABLE TRIGGER [name|ALL]`. PG-faithful name-order firing. Introspection via `information_schema.triggers` and `SHOW TRIGGERS [ON table]`.
 
-**TEMP tables** - `CREATE TEMP TABLE …` lives in a per-connection in-memory database, dropped on disconnect. Full DDL/DML/index/constraint/trigger parity with persistent tables.
+**TEMP tables** - `CREATE TEMP TABLE ...` lives in a per-connection in-memory database, dropped on disconnect. Full DDL/DML/index/constraint/trigger parity with persistent tables.
 
 **Functions** - COUNT, SUM, AVG, MIN, MAX, LENGTH, UPPER, LOWER, SUBSTR/SUBSTRING, TRIM/LTRIM/RTRIM, REPLACE, INSTR, CONCAT, HEX, ABS, ROUND, CEIL/CEILING, FLOOR, SIGN, SQRT, RANDOM, COALESCE, NULLIF, CAST, TYPEOF, IIF
 
 **Date/Time Functions** - NOW, CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME, LOCALTIMESTAMP, LOCALTIME, CLOCK_TIMESTAMP, EXTRACT, DATE_PART, DATE_TRUNC, DATE_BIN, AGE, MAKE_DATE, MAKE_TIME, MAKE_TIMESTAMP, MAKE_INTERVAL, JUSTIFY_DAYS, JUSTIFY_HOURS, JUSTIFY_INTERVAL, ISFINITE, DATE, TIME, DATETIME, STRFTIME, JULIANDAY, UNIXEPOCH, TIMEDIFF, AT TIME ZONE. Supports `INTERVAL '1 year 2 months'`, `DATE '2024-01-15'`, `TIMESTAMP '2024-01-15 12:30:00Z'`, `infinity`/`-infinity` sentinels, BC dates, full IANA zone parsing (jiff), PG-normalized INTERVAL comparison.
 
-**Full-text search** - `tsvector` / `tsquery` types, `to_tsvector` / `to_tsquery` / `plainto_tsquery` / `phraseto_tsquery` / `websearch_to_tsquery` builders, `@@` match operator, `ts_rank` / `ts_rank_cd` ranking with weighted positions (A/B/C/D), prefix matching (`term:*`), phrase distance (`<N>`), inverted indexes via `CREATE INDEX … USING fts` for ~400× speedup over sequential scan
+**Full-text search** - `tsvector` / `tsquery` types, `to_tsvector` / `to_tsquery` / `plainto_tsquery` / `phraseto_tsquery` / `websearch_to_tsquery` builders, `@@` match operator, `ts_rank` / `ts_rank_cd` ranking with weighted positions (A/B/C/D), prefix matching (`term:*`), phrase distance (`<N>`), inverted indexes via `CREATE INDEX ... USING fts` for ~400x speedup over sequential scan
 
 **System catalog** - `information_schema.tables`, `information_schema.columns`, `information_schema.key_column_usage`, `information_schema.table_constraints`, `information_schema.triggers`, `pg_timezone_names`, `pg_timezone_abbrevs`, `pg_matviews` (virtual tables, queryable). `SHOW TRIGGERS [ON table]` and `SHOW MATERIALIZED VIEWS` shorthands for the corresponding catalog queries.
 
@@ -329,7 +338,7 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 **Multi-statement scripts** - `Connection::execute_script(sql)` runs `;`-separated statements in one call, returning per-statement outcomes with partial-success preserved. WASM: `db.run(sql)` returns `[{type, ...}, ...]`.
 
-**UPSERT** - `INSERT ... ON CONFLICT (cols) DO NOTHING` / `DO UPDATE SET col = excluded.col ... WHERE ...` and `ON CONFLICT ON CONSTRAINT idx_name`. `excluded.*` refers to the proposed row; bare `col` refers to the existing row. Single-descent storage primitive: on the canonical `DO UPDATE SET counter = counter + 1` pattern, Citadel is ~2× faster than SQLite.
+**UPSERT** - `INSERT ... ON CONFLICT (cols) DO NOTHING` / `DO UPDATE SET col = excluded.col ... WHERE ...` and `ON CONFLICT ON CONSTRAINT idx_name`. `excluded.*` refers to the proposed row; bare `col` refers to the existing row. Single-descent storage primitive: on the canonical `DO UPDATE SET counter = counter + 1` pattern, Citadel is ~2x faster than SQLite.
 
 ## Security
 

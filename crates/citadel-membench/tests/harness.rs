@@ -475,10 +475,10 @@ fn observer_fires_once_per_question_and_error_aborts() {
 fn paced_complete_rides_out_a_429_storm() {
     // Tiny backoff so 40 retries finish fast; config is read fresh per call so these
     // overrides apply. MAX_ELAPSED is a hard ceiling against a hang.
-    std::env::set_var("CITADEL_LOCOMO_RETRY_BASE_MS", "1");
-    std::env::set_var("CITADEL_LOCOMO_RETRY_CAP_MS", "2");
-    std::env::set_var("CITADEL_LOCOMO_RETRY_MAX_ELAPSED_SECS", "30");
-    std::env::set_var("CITADEL_LOCOMO_RETRY_MAX_ATTEMPTS", "100");
+    std::env::set_var("CITADEL_MEMBENCH_RETRY_BASE_MS", "1");
+    std::env::set_var("CITADEL_MEMBENCH_RETRY_CAP_MS", "2");
+    std::env::set_var("CITADEL_MEMBENCH_RETRY_MAX_ELAPSED_SECS", "30");
+    std::env::set_var("CITADEL_MEMBENCH_RETRY_MAX_ATTEMPTS", "100");
 
     // 40 consecutive 429s then success; the body carries a "try again in" phrase
     // so the Retry-After body-parse path is exercised.
@@ -492,10 +492,10 @@ fn paced_complete_rides_out_a_429_storm() {
     let pacer = citadel_membench::Pacer::unbounded();
     let res = judge_correct(&*client, &pacer, "q", "gold", "pred");
 
-    std::env::remove_var("CITADEL_LOCOMO_RETRY_BASE_MS");
-    std::env::remove_var("CITADEL_LOCOMO_RETRY_CAP_MS");
-    std::env::remove_var("CITADEL_LOCOMO_RETRY_MAX_ELAPSED_SECS");
-    std::env::remove_var("CITADEL_LOCOMO_RETRY_MAX_ATTEMPTS");
+    std::env::remove_var("CITADEL_MEMBENCH_RETRY_BASE_MS");
+    std::env::remove_var("CITADEL_MEMBENCH_RETRY_CAP_MS");
+    std::env::remove_var("CITADEL_MEMBENCH_RETRY_MAX_ELAPSED_SECS");
+    std::env::remove_var("CITADEL_MEMBENCH_RETRY_MAX_ATTEMPTS");
 
     let (correct, _) = res.expect("a 40-deep 429 storm must be ridden out, not fatal");
     assert!(correct, "the eventual CORRECT response is returned");

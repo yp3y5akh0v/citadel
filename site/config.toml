@@ -1,6 +1,6 @@
 base_url = "https://citadeldb.dev"
 title = "Citadel"
-description = "Encrypted-first embedded database and memory engine that outperforms unencrypted SQLite"
+description = "Encrypted-first embedded SQL database with a built-in memory engine"
 compile_sass = true
 build_search_index = false
 generate_feeds = true
@@ -24,6 +24,8 @@ tests = "5,200+"
 locomo = "85.5"
 locomo_gemini = "90.6"
 locomo_ceiling = "95.1"
+longmemeval = "90.6"
+longmemeval_mini = "82.2"
 benchmarks = 50
 mcp_tools = 13
 ffi_functions = 37

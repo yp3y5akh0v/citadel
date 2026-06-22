@@ -660,7 +660,6 @@ dependencies = [
  "citadeldb",
  "citadeldb-ai",
  "citadeldb-mem",
- "rayon",
  "rustc-hash",
  "serde",
  "serde_json",

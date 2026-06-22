@@ -3,8 +3,9 @@
 use citadel_mem::{AtomId, AtomInput, MemoryEngine};
 use serde_json::json;
 
-use crate::dataset::{Sample, Turn};
-use crate::error::Result;
+use crate::core::error::Result;
+
+use super::dataset::{Sample, Turn};
 
 /// The exact text indexed for one turn, shared with the retrieval diagnostic so
 /// measurements embed what the engine embeds. The session date and speaker are
