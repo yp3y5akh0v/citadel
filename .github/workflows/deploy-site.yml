@@ -9,6 +9,7 @@ on:
       - '.github/FUNDING.yml'
       - 'README.md'
       - 'crates/*/README.md'
+      - 'scripts/**'
   workflow_dispatch:
 
 permissions:
