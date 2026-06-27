@@ -135,6 +135,10 @@ impl SchemaManager {
         }
     }
 
+    pub fn has_dml_dirty(&self) -> bool {
+        !self.dml_dirty_tables.borrow().is_empty() || !self.dml_append_tables.borrow().is_empty()
+    }
+
     /// Forget pending DML markers without invalidating downstream caches.
     /// Used on rollback (uncommitted writes leave no caches stale).
     pub fn clear_dml_dirty(&self) {

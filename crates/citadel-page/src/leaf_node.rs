@@ -190,6 +190,42 @@ pub fn insert_direct(page: &mut Page, key: &[u8], val_type: ValueType, value: &[
     false
 }
 
+pub fn replace_at(
+    page: &mut Page,
+    idx: u16,
+    key: &[u8],
+    val_type: ValueType,
+    value: &[u8],
+) -> bool {
+    if update_value_in_place(page, idx, val_type, value) {
+        return true;
+    }
+
+    let old_size = get_cell_size(page, idx);
+    page.delete_cell_at(idx, old_size);
+    let total = LEAF_CELL_FIXED + key.len() + value.len();
+    if page
+        .insert_cell_direct(idx, total, |slot| {
+            write_cell_into(slot, key, val_type, value)
+        })
+        .is_some()
+    {
+        return true;
+    }
+
+    let cell_len_with_ptr = total + 2;
+    if (page.free_space() as usize) >= cell_len_with_ptr {
+        compact_page(page);
+        return page
+            .insert_cell_direct(idx, total, |slot| {
+                write_cell_into(slot, key, val_type, value)
+            })
+            .is_some();
+    }
+
+    false
+}
+
 /// Insert key-value at sorted position. Returns false if not enough space.
 pub fn insert(page: &mut Page, key: &[u8], val_type: ValueType, value: &[u8]) -> bool {
     let pos = match search(page, key) {

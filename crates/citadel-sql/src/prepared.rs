@@ -113,18 +113,8 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
 
     /// Execute and return a stepping `Rows<'_>` iterator.
     pub fn query(&self, params: &[Value]) -> Result<Rows<'_>> {
-        if params.len() != self.param_count {
-            return Err(SqlError::ParameterCountMismatch {
-                expected: self.param_count,
-                got: params.len(),
-            });
-        }
-        if self.conn.inner.borrow().schema.generation() == self.schema_gen {
-            if let Some(plan) = &self.compiled {
-                if let Some(stream) = try_stream_via_plan(self, plan.as_ref(), params) {
-                    return Ok(Rows::streaming(stream));
-                }
-            }
+        if let Some(stream) = self.stream_fast_path(params)? {
+            return Ok(Rows::streaming(stream));
         }
         let (columns, rows) = match self.run(params)? {
             ExecutionResult::Query(qr) => (qr.columns, qr.rows),
@@ -137,6 +127,14 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
 
     /// Execute and return the fully-materialized `QueryResult`.
     pub fn query_collect(&self, params: &[Value]) -> Result<QueryResult> {
+        if let Some(mut stream) = self.stream_fast_path(params)? {
+            let columns = stream.columns().to_vec();
+            let mut rows = Vec::new();
+            while let Some(row) = stream.next_row()? {
+                rows.push(row);
+            }
+            return Ok(QueryResult { columns, rows });
+        }
         match self.run(params)? {
             ExecutionResult::Query(qr) => Ok(qr),
             ExecutionResult::RowsAffected(n) => Ok(QueryResult {
@@ -164,23 +162,29 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
 
     /// True if the query returns at least one row (DML returns `n > 0`).
     pub fn exists(&self, params: &[Value]) -> Result<bool> {
+        if let Some(mut stream) = self.stream_fast_path(params)? {
+            return Ok(stream.next_row()?.is_some());
+        }
+        match self.run(params)? {
+            ExecutionResult::Query(qr) => Ok(!qr.rows.is_empty()),
+            ExecutionResult::RowsAffected(n) => Ok(n > 0),
+            ExecutionResult::Ok => Ok(false),
+        }
+    }
+
+    fn stream_fast_path(&self, params: &[Value]) -> Result<Option<Box<dyn RowSourceIter + 'db>>> {
         if params.len() != self.param_count {
             return Err(SqlError::ParameterCountMismatch {
                 expected: self.param_count,
                 got: params.len(),
             });
         }
-        if self.conn.inner.borrow().schema.generation() == self.schema_gen {
-            if let Some(plan) = &self.compiled {
-                if let Some(mut stream) = try_stream_via_plan(self, plan.as_ref(), params) {
-                    return Ok(stream.next_row()?.is_some());
-                }
-            }
+        if self.conn.inner.borrow().schema.generation() != self.schema_gen {
+            return Ok(None);
         }
-        match self.run(params)? {
-            ExecutionResult::Query(qr) => Ok(!qr.rows.is_empty()),
-            ExecutionResult::RowsAffected(n) => Ok(n > 0),
-            ExecutionResult::Ok => Ok(false),
+        match &self.compiled {
+            Some(plan) => Ok(try_stream_via_plan(self, plan.as_ref(), params)),
+            None => Ok(None),
         }
     }
 

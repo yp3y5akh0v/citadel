@@ -8,6 +8,7 @@ use citadel_page::leaf_node::OverflowRef;
 use citadel_page::overflow;
 use citadel_page::page::Page;
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 use citadel_buffer::allocator::{AllocCheckpoint, PageAllocator};
 use citadel_buffer::btree::{self, BTree, UpsertAction, UpsertOutcome};
@@ -69,7 +70,7 @@ pub struct WriteTxn<'a> {
     manager: &'a TxnManager,
     base_txn_id: TxnId,
     txn_id: TxnId,
-    old_slot: CommitSlot,
+    old_slot: Arc<CommitSlot>,
     pages: FxHashMap<PageId, Page>,
     tree: BTree,
     alloc: PageAllocator,
@@ -100,7 +101,7 @@ impl<'db> WriteTxn<'db> {
     pub(crate) fn new(
         manager: &'db TxnManager,
         txn_id: TxnId,
-        snapshot: CommitSlot,
+        snapshot: Arc<CommitSlot>,
         tree: BTree,
         alloc: PageAllocator,
         deferred_free: Vec<PageId>,

@@ -49,3 +49,7 @@ mimalloc = { workspace = true }
 [[bench]]
 name = "h2h_bench"
 harness = false
+
+[[bench]]
+name = "batch_bench"
+harness = false

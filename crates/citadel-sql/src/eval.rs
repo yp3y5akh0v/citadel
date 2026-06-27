@@ -236,6 +236,99 @@ pub fn resolve_scoped_param(n: usize) -> Result<Value> {
     })
 }
 
+pub(crate) enum CompiledExpr<'a> {
+    Const(Value),
+    Slot(usize),
+    Param(usize),
+    BinaryOp {
+        left: Box<CompiledExpr<'a>>,
+        op: BinOp,
+        right: Box<CompiledExpr<'a>>,
+        collation: Option<crate::types::Collation>,
+    },
+    UnaryOp {
+        op: UnaryOp,
+        operand: Box<CompiledExpr<'a>>,
+    },
+    IsNull(Box<CompiledExpr<'a>>),
+    IsNotNull(Box<CompiledExpr<'a>>),
+    Dynamic(&'a Expr),
+}
+
+impl<'a> CompiledExpr<'a> {
+    pub(crate) fn compile(expr: &'a Expr, col_map: &ColumnMap) -> Self {
+        match expr {
+            Expr::Literal(v) => CompiledExpr::Const(v.clone()),
+            Expr::Parameter(n) => CompiledExpr::Param(*n),
+            Expr::Column(name) => match col_map.resolve(name) {
+                Ok(idx) => CompiledExpr::Slot(idx),
+                Err(_) => CompiledExpr::Dynamic(expr),
+            },
+            Expr::IsNull(e) => CompiledExpr::IsNull(Box::new(Self::compile(e, col_map))),
+            Expr::IsNotNull(e) => CompiledExpr::IsNotNull(Box::new(Self::compile(e, col_map))),
+            Expr::UnaryOp { op, expr: e } => CompiledExpr::UnaryOp {
+                op: *op,
+                operand: Box::new(Self::compile(e, col_map)),
+            },
+            Expr::BinaryOp { left, op, right } => CompiledExpr::BinaryOp {
+                collation: compile_collation(left, right, col_map),
+                left: Box::new(Self::compile(left, col_map)),
+                op: *op,
+                right: Box::new(Self::compile(right, col_map)),
+            },
+            _ => CompiledExpr::Dynamic(expr),
+        }
+    }
+
+    pub(crate) fn eval(&self, ctx: &EvalCtx) -> Result<Value> {
+        match self {
+            CompiledExpr::Const(v) => Ok(v.clone()),
+            CompiledExpr::Slot(i) => Ok(ctx.row[*i].clone()),
+            CompiledExpr::Param(n) => resolve_parameter(*n, ctx.params),
+            CompiledExpr::IsNull(e) => Ok(Value::Boolean(e.eval(ctx)?.is_null())),
+            CompiledExpr::IsNotNull(e) => Ok(Value::Boolean(!e.eval(ctx)?.is_null())),
+            CompiledExpr::UnaryOp { op, operand } => {
+                let val = operand.eval(ctx)?;
+                eval_unary_op(*op, &val)
+            }
+            CompiledExpr::BinaryOp {
+                left,
+                op,
+                right,
+                collation,
+            } => {
+                let lval = left.eval(ctx)?;
+                let rval = right.eval(ctx)?;
+                if let Some(coll) = collation {
+                    if let Some(b) = eval_text_compare(&lval, *op, &rval, *coll) {
+                        return Ok(Value::Boolean(b));
+                    }
+                }
+                eval_binary_op(&lval, *op, &rval)
+            }
+            CompiledExpr::Dynamic(e) => eval_expr(e, ctx),
+        }
+    }
+}
+
+fn compile_collation(
+    left: &Expr,
+    right: &Expr,
+    col_map: &ColumnMap,
+) -> Option<crate::types::Collation> {
+    let needs_check = col_map.has_non_binary_collation()
+        || matches!(left, Expr::Collate { .. })
+        || matches!(right, Expr::Collate { .. });
+    if !needs_check {
+        return None;
+    }
+    let coll = collation_of(left)
+        .or_else(|| collation_of(right))
+        .or_else(|| column_collation(left, col_map))
+        .or_else(|| column_collation(right, col_map))?;
+    (coll != crate::types::Collation::Binary).then_some(coll)
+}
+
 pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
     match expr {
         Expr::Literal(v) => Ok(v.clone()),
@@ -294,7 +387,8 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
                 let coll = collation_of(left)
                     .or_else(|| collation_of(right))
                     .or_else(|| {
-                        column_collation(left, ctx).or_else(|| column_collation(right, ctx))
+                        column_collation(left, ctx.col_map)
+                            .or_else(|| column_collation(right, ctx.col_map))
                     });
                 if let Some(c) = coll {
                     if c != crate::types::Collation::Binary {
@@ -541,18 +635,13 @@ fn collation_of(expr: &Expr) -> Option<crate::types::Collation> {
     }
 }
 
-fn column_collation(expr: &Expr, ctx: &EvalCtx<'_>) -> Option<crate::types::Collation> {
+fn column_collation(expr: &Expr, col_map: &ColumnMap) -> Option<crate::types::Collation> {
     match expr {
-        Expr::Column(name) => ctx
-            .col_map
-            .resolve(name)
-            .ok()
-            .map(|i| ctx.col_map.collation_at(i)),
-        Expr::QualifiedColumn { table, column } => ctx
-            .col_map
+        Expr::Column(name) => col_map.resolve(name).ok().map(|i| col_map.collation_at(i)),
+        Expr::QualifiedColumn { table, column } => col_map
             .resolve_qualified(table, column)
             .ok()
-            .map(|i| ctx.col_map.collation_at(i)),
+            .map(|i| col_map.collation_at(i)),
         _ => None,
     }
 }

@@ -6,7 +6,7 @@ use crate::encoding::{
     encode_composite_key, row_non_pk_count, RawColumn,
 };
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap, EvalCtx};
+use crate::eval::{eval_expr, is_truthy, referenced_columns, ColumnMap, CompiledExpr, EvalCtx};
 use crate::parser::*;
 use crate::planner::{self, ScanPlan};
 use crate::types::*;
@@ -100,9 +100,10 @@ fn scan_step(
     schema: &TableSchema,
     key: &[u8],
     value: &[u8],
-    where_clause: Option<&Expr>,
+    compiled: Option<&CompiledExpr>,
     simple_pred: Option<&SimplePredicate>,
     between_pred: Option<&BetweenPredicate>,
+    jsonb_pred: Option<&JsonbContainsPredicate>,
     col_map: Option<&ColumnMap>,
     partial_ctx: Option<&PartialDecodeCtx>,
 ) -> Result<Option<Vec<Value>>> {
@@ -120,18 +121,25 @@ fn scan_step(
             Ok(None)
         };
     }
-    match (where_clause, col_map, partial_ctx) {
-        (Some(expr), Some(map), Some(pctx)) => {
+    if let Some(pred) = jsonb_pred {
+        return if pred.matches_raw(key, value)? {
+            Ok(Some(decode_full_row(schema, key, value)?))
+        } else {
+            Ok(None)
+        };
+    }
+    match (compiled, col_map, partial_ctx) {
+        (Some(pred), Some(map), Some(pctx)) => {
             let partial = pctx.decode(key, value)?;
-            if is_truthy(&eval_expr(expr, &EvalCtx::new(map, &partial))?) {
+            if is_truthy(&pred.eval(&EvalCtx::new(map, &partial))?) {
                 Ok(Some(pctx.complete(partial, key, value)?))
             } else {
                 Ok(None)
             }
         }
-        (Some(expr), Some(map), None) => {
+        (Some(pred), Some(map), None) => {
             let row = decode_full_row(schema, key, value)?;
-            if is_truthy(&eval_expr(expr, &EvalCtx::new(map, &row))?) {
+            if is_truthy(&pred.eval(&EvalCtx::new(map, &row))?) {
                 Ok(Some(row))
             } else {
                 Ok(None)
@@ -173,8 +181,17 @@ pub(super) fn collect_rows_with_read(
             } else {
                 None
             };
-            let needs_generic_eval =
-                where_clause.is_some() && simple_pred.is_none() && between_pred.is_none();
+            let jsonb_pred = if simple_pred.is_none() && between_pred.is_none() {
+                where_clause
+                    .as_ref()
+                    .and_then(|expr| try_jsonb_contains_predicate(expr, table_schema))
+            } else {
+                None
+            };
+            let needs_generic_eval = where_clause.is_some()
+                && simple_pred.is_none()
+                && between_pred.is_none()
+                && jsonb_pred.is_none();
 
             let col_map = if needs_generic_eval {
                 Some(ColumnMap::new(columns))
@@ -193,6 +210,10 @@ pub(super) fn collect_rows_with_read(
             } else {
                 None
             };
+            let compiled = match (col_map.as_ref(), where_clause.as_ref()) {
+                (Some(cm), Some(expr)) => Some(CompiledExpr::compile(expr, cm)),
+                _ => None,
+            };
 
             let entry_count = rtx.table_entry_count(lower_name.as_bytes()).unwrap_or(0) as usize;
             let capacity = if where_clause.is_some() {
@@ -208,9 +229,10 @@ pub(super) fn collect_rows_with_read(
                     table_schema,
                     key,
                     value,
-                    where_clause.as_ref(),
+                    compiled.as_ref(),
                     simple_pred.as_ref(),
                     between_pred.as_ref(),
+                    jsonb_pred.as_ref(),
                     col_map.as_ref(),
                     partial_ctx.as_ref(),
                 );
@@ -1302,6 +1324,57 @@ pub(super) fn try_simple_predicate(expr: &Expr, schema: &TableSchema) -> Option<
             default_val,
         })
     }
+}
+
+pub(super) struct JsonbContainsPredicate {
+    nonpk_idx: usize,
+    literal: std::sync::Arc<[u8]>,
+}
+
+impl JsonbContainsPredicate {
+    pub(super) fn matches_raw(&self, _key: &[u8], value: &[u8]) -> Result<bool> {
+        if self.nonpk_idx >= row_non_pk_count(value) {
+            return Ok(false);
+        }
+        match decode_column_raw(value, self.nonpk_idx)? {
+            RawColumn::Jsonb(bytes) => crate::json::jsonb_contains_bytes(bytes, &self.literal),
+            _ => Ok(false),
+        }
+    }
+}
+
+pub(super) fn try_jsonb_contains_predicate(
+    expr: &Expr,
+    schema: &TableSchema,
+) -> Option<JsonbContainsPredicate> {
+    let (col_name, lit_expr) = match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinOp::JsonContains,
+            right,
+        } => match left.as_ref() {
+            Expr::Column(name) => (name.as_str(), right.as_ref()),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let col_idx = schema.column_index(col_name)?;
+    if schema.columns[col_idx].data_type != DataType::Jsonb {
+        return None;
+    }
+    if matches!(
+        schema.columns[col_idx].generated_kind,
+        Some(crate::parser::GeneratedKind::Virtual)
+    ) {
+        return None;
+    }
+    let nonpk_order = schema.non_pk_indices().iter().position(|&i| i == col_idx)?;
+    let nonpk_idx = schema.encoding_positions()[nonpk_order] as usize;
+    let literal = match eval_const_expr(lit_expr).ok()? {
+        Value::Jsonb(b) => b,
+        _ => return None,
+    };
+    Some(JsonbContainsPredicate { nonpk_idx, literal })
 }
 
 /// Fold `col ± lit <cmp> lit` → `col <cmp> (lit ∓ lit)` at plan time. Returns `None`

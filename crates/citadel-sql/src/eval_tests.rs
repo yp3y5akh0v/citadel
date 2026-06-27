@@ -516,3 +516,79 @@ fn all_gt_threshold() {
         Value::Boolean(true)
     );
 }
+
+fn lit(v: Value) -> Expr {
+    Expr::Literal(v)
+}
+
+fn col_ref(name: &str) -> Expr {
+    Expr::Column(name.into())
+}
+
+fn binop(left: Expr, op: BinOp, right: Expr) -> Expr {
+    Expr::BinaryOp {
+        left: Box::new(left),
+        op,
+        right: Box::new(right),
+    }
+}
+
+#[test]
+fn compiled_expr_matches_interpreter() {
+    let cols = test_columns();
+    let cm = ColumnMap::new(&cols);
+    let row = test_row();
+    let params = vec![Value::Integer(95), Value::Text("Alice".into())];
+
+    let cases: Vec<Expr> = vec![
+        lit(Value::Integer(42)),
+        col_ref("id"),
+        col_ref("name"),
+        Expr::Parameter(1),
+        binop(col_ref("id"), BinOp::Eq, lit(Value::Integer(1))),
+        binop(col_ref("score"), BinOp::Gt, lit(Value::Real(90.0))),
+        binop(col_ref("score"), BinOp::Lt, lit(Value::Real(90.0))),
+        binop(col_ref("name"), BinOp::Eq, lit(Value::Text("Bob".into()))),
+        binop(col_ref("id"), BinOp::Add, lit(Value::Integer(10))),
+        binop(
+            binop(col_ref("id"), BinOp::Eq, lit(Value::Integer(1))),
+            BinOp::And,
+            binop(col_ref("score"), BinOp::Gt, lit(Value::Real(90.0))),
+        ),
+        binop(
+            binop(col_ref("id"), BinOp::Eq, lit(Value::Integer(9))),
+            BinOp::Or,
+            binop(col_ref("active"), BinOp::Eq, lit(Value::Boolean(true))),
+        ),
+        Expr::UnaryOp {
+            op: UnaryOp::Not,
+            expr: Box::new(col_ref("active")),
+        },
+        Expr::UnaryOp {
+            op: UnaryOp::Neg,
+            expr: Box::new(col_ref("id")),
+        },
+        Expr::IsNull(Box::new(col_ref("name"))),
+        Expr::IsNotNull(Box::new(col_ref("score"))),
+        binop(lit(Value::Null), BinOp::Eq, lit(Value::Integer(1))),
+        binop(col_ref("score"), BinOp::Gt, Expr::Parameter(1)),
+        Expr::Between {
+            expr: Box::new(col_ref("score")),
+            low: Box::new(lit(Value::Real(0.0))),
+            high: Box::new(lit(Value::Real(100.0))),
+            negated: false,
+        },
+        col_ref("nonexistent"),
+    ];
+
+    for (i, expr) in cases.iter().enumerate() {
+        let ctx = EvalCtx::with_params(&cm, &row, &params);
+        let interp = eval_expr(expr, &ctx);
+        let compiled = CompiledExpr::compile(expr, &cm).eval(&ctx);
+        match (interp, compiled) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "value mismatch at case {i}"),
+            (Err(_), Err(_)) => {}
+            (a, b) => panic!("ok/err divergence at case {i}: interp={a:?} compiled={b:?}"),
+        }
+    }
+}
