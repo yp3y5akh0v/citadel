@@ -41,7 +41,7 @@ impl PageLoader for ReadPages<'_> {
 pub struct ReadTxn<'a> {
     manager: &'a TxnManager,
     txn_id: TxnId,
-    snapshot: CommitSlot,
+    snapshot: Arc<CommitSlot>,
     commit_generation: u64,
     page_cache: FxHashMap<PageId, Arc<Page>>,
 }
@@ -50,7 +50,7 @@ impl<'db> ReadTxn<'db> {
     pub(crate) fn new(
         manager: &'db TxnManager,
         txn_id: TxnId,
-        snapshot: CommitSlot,
+        snapshot: Arc<CommitSlot>,
         commit_generation: u64,
     ) -> Self {
         Self {
@@ -226,9 +226,10 @@ impl<'db> ReadTxn<'db> {
         loop {
             view.ensure_loaded(cursor.leaf_page_id())?;
             let leaf_page = view
-                .get_page(&cursor.leaf_page_id())
-                .ok_or(Error::PageOutOfBounds(cursor.leaf_page_id()))?
-                .clone();
+                .cache
+                .get(&cursor.leaf_page_id())
+                .map(Arc::clone)
+                .ok_or(Error::PageOutOfBounds(cursor.leaf_page_id()))?;
             let n = leaf_page.num_cells();
             let mut idx = cursor.cell_index();
             while idx < n {

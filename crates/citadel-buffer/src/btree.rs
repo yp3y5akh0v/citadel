@@ -854,7 +854,7 @@ impl BTree {
         F: FnMut(&[u8]) -> std::result::Result<UpsertAction, E>,
         E: From<Error>,
     {
-        let action = {
+        let found = {
             let page = pages.get(&leaf_id).unwrap();
             match leaf_node::search(page, key) {
                 Ok(idx) => {
@@ -862,21 +862,21 @@ impl BTree {
                     if matches!(cell.val_type, ValueType::Tombstone) {
                         None
                     } else {
-                        Some(f(cell.value)?)
+                        Some((idx, f(cell.value)?))
                     }
                 }
                 Err(_) => None,
             }
         };
 
-        if let Some(act) = action {
+        if let Some((idx, act)) = found {
             match act {
                 UpsertAction::Skip => return Ok(UpsertOutcome::Skipped),
                 UpsertAction::Replace(new_bytes) => {
                     let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
                     let leaf_ok = {
                         let page = pages.get_mut(&new_leaf_id).unwrap();
-                        leaf_node::insert_direct(page, key, val_type, &new_bytes)
+                        leaf_node::replace_at(page, idx, key, val_type, &new_bytes)
                     };
                     if leaf_ok {
                         if new_leaf_id != leaf_id {

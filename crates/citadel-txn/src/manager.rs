@@ -46,7 +46,7 @@ pub struct TxnManager {
 
 struct ManagerState {
     active_slot: usize,
-    current_slot: CommitSlot,
+    current_slot: Arc<CommitSlot>,
     cached_god_byte: u8,
     cached_file_size: u64,
     reader_table: BTreeMap<TxnId, usize>,
@@ -91,7 +91,7 @@ impl TxnManager {
             write_active: AtomicBool::new(false),
             state: Mutex::new(ManagerState {
                 active_slot,
-                current_slot: slot,
+                current_slot: Arc::new(slot),
                 cached_god_byte: active_slot as u8 & GOD_BIT_ACTIVE_SLOT,
                 cached_file_size: file_size,
                 reader_table: BTreeMap::new(),
@@ -196,7 +196,7 @@ impl TxnManager {
             write_active: AtomicBool::new(false),
             state: Mutex::new(ManagerState {
                 active_slot: 0,
-                current_slot: slot,
+                current_slot: Arc::new(slot),
                 cached_god_byte: 0,
                 cached_file_size: file_size,
                 reader_table: BTreeMap::new(),
@@ -570,7 +570,7 @@ impl TxnManager {
         {
             let mut state = self.state.lock();
             state.active_slot = inactive_slot_idx;
-            state.current_slot = new_slot;
+            state.current_slot = Arc::new(new_slot);
             state.cached_god_byte = new_god_byte;
             state.cached_file_size = new_file_size;
             state.deferred_free = old_chain_pages;
@@ -614,7 +614,7 @@ impl TxnManager {
     }
 
     pub fn current_slot(&self) -> CommitSlot {
-        self.state.lock().current_slot.clone()
+        self.state.lock().current_slot.as_ref().clone()
     }
 
     pub fn reader_count(&self) -> usize {

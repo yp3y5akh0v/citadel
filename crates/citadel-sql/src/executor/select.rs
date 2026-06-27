@@ -4012,23 +4012,32 @@ impl CompiledPlan for CompiledSelect {
         }
         let lower = sel.from.to_ascii_lowercase();
         let table_schema = schema.get(&lower)?.clone();
-        let projection = build_projection(&sel.columns, &table_schema.columns)?;
+        let proj = build_stream_proj(&sel.columns, &table_schema)?;
         let columns = projection_column_names(&sel.columns, &table_schema.columns);
         let rtx = db.begin_read();
         let iter = rtx.into_table_scan_iter(lower.as_bytes(), b"").ok()?;
         Some(Box::new(StreamingSelect {
             iter,
             table_schema: Arc::new(table_schema),
-            projection,
+            proj,
             columns,
         }))
     }
 }
 
+enum StreamProj {
+    Identity,
+    Columns(Vec<usize>),
+    Exprs {
+        col_map: ColumnMap,
+        exprs: Vec<Expr>,
+    },
+}
+
 struct StreamingSelect<'db> {
     iter: citadel_txn::TableIter<citadel_txn::read_txn::OwnedReadTxnAdapter<'db>>,
     table_schema: Arc<TableSchema>,
-    projection: Vec<usize>,
+    proj: StreamProj,
     columns: Vec<String>,
 }
 
@@ -4037,7 +4046,18 @@ impl<'db> super::compile::RowSourceIter for StreamingSelect<'db> {
         match self.iter.next().map_err(SqlError::Storage)? {
             Some((key, value)) => {
                 let full = decode_full_row(&self.table_schema, key, value)?;
-                let out: Vec<Value> = self.projection.iter().map(|&i| full[i].clone()).collect();
+                let out = match &self.proj {
+                    StreamProj::Identity => full,
+                    StreamProj::Columns(idxs) => idxs.iter().map(|&i| full[i].clone()).collect(),
+                    StreamProj::Exprs { col_map, exprs } => {
+                        let ctx = EvalCtx::new(col_map, &full);
+                        let mut out = Vec::with_capacity(exprs.len());
+                        for e in exprs {
+                            out.push(eval_expr(e, &ctx)?);
+                        }
+                        out
+                    }
+                };
                 Ok(Some(out))
             }
             None => Ok(None),
@@ -4077,6 +4097,69 @@ fn build_projection(select_cols: &[SelectColumn], columns: &[ColumnDef]) -> Opti
         }
     }
     Some(out)
+}
+
+fn build_stream_proj(select_cols: &[SelectColumn], schema: &TableSchema) -> Option<StreamProj> {
+    if let Some(idxs) = build_projection(select_cols, &schema.columns) {
+        let identity =
+            idxs.len() == schema.columns.len() && idxs.iter().enumerate().all(|(i, &p)| i == p);
+        return Some(if identity {
+            StreamProj::Identity
+        } else {
+            StreamProj::Columns(idxs)
+        });
+    }
+    let exprs = build_expr_projection(select_cols)?;
+    Some(StreamProj::Exprs {
+        col_map: ColumnMap::new(&schema.columns),
+        exprs,
+    })
+}
+
+fn build_expr_projection(select_cols: &[SelectColumn]) -> Option<Vec<Expr>> {
+    let mut out = Vec::with_capacity(select_cols.len());
+    for col in select_cols {
+        match col {
+            SelectColumn::Expr { expr, .. } if is_streamable_scalar(expr) => out.push(expr.clone()),
+            _ => return None,
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn is_streamable_scalar(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Column(_) | Expr::QualifiedColumn { .. } => true,
+        Expr::BinaryOp { left, op, right } => {
+            !matches!(op, BinOp::JsonPathExistsTz | BinOp::JsonPathMatchTz)
+                && is_streamable_scalar(left)
+                && is_streamable_scalar(right)
+        }
+        Expr::UnaryOp { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
+            is_streamable_scalar(expr)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => is_streamable_scalar(expr) && is_streamable_scalar(low) && is_streamable_scalar(high),
+        Expr::Coalesce(args) => args.iter().all(is_streamable_scalar),
+        Expr::InList { expr, list, .. } => {
+            is_streamable_scalar(expr) && list.iter().all(is_streamable_scalar)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand.as_ref().map_or(true, |e| is_streamable_scalar(e))
+                && conditions
+                    .iter()
+                    .all(|(c, r)| is_streamable_scalar(c) && is_streamable_scalar(r))
+                && else_result
+                    .as_ref()
+                    .map_or(true, |e| is_streamable_scalar(e))
+        }
+        _ => false,
+    }
 }
 
 fn projection_column_names(select_cols: &[SelectColumn], columns: &[ColumnDef]) -> Vec<String> {

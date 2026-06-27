@@ -36,6 +36,9 @@ const DEFAULT_CACHE_CAPACITY: usize = 64;
 /// predates the marker is refused at lookup AND at insert, closing the
 /// build-races-a-commit window that prefix eviction alone leaves open.
 fn invalidate_dml_caches(schema: &SchemaManager, db: &Database) {
+    if !schema.has_dml_dirty() {
+        return;
+    }
     let gen = db.manager().commit_generation();
     let hard_invalidate = |table: &str| {
         db.sql_cache_invalidate_prefix(&format!("ann:{table}:"));
@@ -165,6 +168,18 @@ fn stmt_mutates(stmt: &Statement) -> bool {
         }
     }
     false
+}
+
+fn is_txn_control(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Begin { .. }
+            | Statement::Commit
+            | Statement::Rollback
+            | Statement::Savepoint(_)
+            | Statement::ReleaseSavepoint(_)
+            | Statement::RollbackTo(_)
+    )
 }
 
 fn select_query_has_dml(sq: &SelectQuery) -> bool {
@@ -496,6 +511,10 @@ impl<'a> Connection<'a> {
         }
     }
 
+    pub fn execute_batch(&self, sql: &str) -> Result<Vec<ExecutionResult>> {
+        self.inner.borrow_mut().execute_batch_impl(self.db, sql)
+    }
+
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
         self.query_params(sql, &[])
     }
@@ -642,6 +661,75 @@ impl<'a> ConnectionInner<'a> {
             }
         }
         self.execute_params_impl(db, sql, &[])
+    }
+
+    fn execute_batch_impl(&mut self, db: &'a Database, sql: &str) -> Result<Vec<ExecutionResult>> {
+        if self.active_txn.is_active() {
+            return Err(SqlError::TransactionAlreadyActive);
+        }
+        let stmts = parser::parse_sql_multi(sql)?;
+        if stmts.iter().any(is_txn_control) {
+            return Err(SqlError::Unsupported(
+                "transaction-control statements are not allowed in execute_batch".into(),
+            ));
+        }
+
+        let wtx = db.begin_write().map_err(SqlError::Storage)?;
+        let ts = crate::datetime::txn_or_clock_micros();
+        self.active_txn = ActiveTxn::Write(wtx);
+        self.txn_start_ts = Some(ts);
+        crate::datetime::set_txn_clock(Some(ts));
+
+        let mut results = Vec::with_capacity(stmts.len());
+        for stmt in &stmts {
+            match self.dispatch(db, stmt, &[]) {
+                Ok(r) => results.push(r),
+                Err(e) => {
+                    self.abort_active_txn(db);
+                    return Err(e);
+                }
+            }
+        }
+
+        let commit = match self.active_txn.take() {
+            ActiveTxn::Write(mut wtx) => {
+                match crate::executor::helpers::drain_deferred_fk_checks(&mut wtx) {
+                    Ok(()) => wtx.commit().map_err(SqlError::Storage),
+                    Err(e) => {
+                        wtx.abort();
+                        Err(e)
+                    }
+                }
+            }
+            _ => Err(SqlError::NoActiveTransaction),
+        };
+        self.reset_txn_state();
+        match commit {
+            Ok(()) => {
+                invalidate_dml_caches(&self.schema, db);
+                Ok(results)
+            }
+            Err(e) => {
+                self.schema = SchemaManager::load(db)?;
+                Err(e)
+            }
+        }
+    }
+
+    fn reset_txn_state(&mut self) {
+        self.clear_savepoint_state();
+        self.txn_start_ts = None;
+        crate::datetime::set_txn_clock(None);
+    }
+
+    fn abort_active_txn(&mut self, db: &'a Database) {
+        if let ActiveTxn::Write(wtx) = self.active_txn.take() {
+            wtx.abort();
+        }
+        if let Ok(fresh) = SchemaManager::load(db) {
+            self.schema = fresh;
+        }
+        self.reset_txn_state();
     }
 
     fn execute_params_impl(
@@ -865,9 +953,7 @@ impl<'a> ConnectionInner<'a> {
                     }
                     ActiveTxn::Read(_rtx) => {}
                 }
-                self.clear_savepoint_state();
-                self.txn_start_ts = None;
-                crate::datetime::set_txn_clock(None);
+                self.reset_txn_state();
                 Ok(ExecutionResult::Ok)
             }
             Statement::Rollback => {
@@ -879,9 +965,7 @@ impl<'a> ConnectionInner<'a> {
                     }
                     ActiveTxn::Read(_rtx) => {}
                 }
-                self.clear_savepoint_state();
-                self.txn_start_ts = None;
-                crate::datetime::set_txn_clock(None);
+                self.reset_txn_state();
                 Ok(ExecutionResult::Ok)
             }
             Statement::Savepoint(name) => self.do_savepoint(name),
@@ -1072,5 +1156,137 @@ impl<'a> Drop for Connection<'a> {
             }
             let _ = wtx.commit();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use citadel::{Argon2Profile, DatabaseBuilder};
+
+    fn fresh_db(dir: &std::path::Path) -> citadel::Database {
+        DatabaseBuilder::new(dir.join("t.db"))
+            .passphrase(b"test-passphrase")
+            .argon2_profile(Argon2Profile::Iot)
+            .create()
+            .unwrap()
+    }
+
+    #[test]
+    fn execute_batch_commits_all_statements() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+            .unwrap();
+
+        let results = conn
+            .execute_batch(
+                "INSERT INTO t VALUES (1, 10); \
+                 INSERT INTO t VALUES (2, 20); \
+                 UPDATE t SET n = n + 1 WHERE id = 1;",
+            )
+            .unwrap();
+        assert_eq!(results.len(), 3);
+
+        let qr = conn.query("SELECT id, n FROM t ORDER BY id").unwrap();
+        assert_eq!(qr.rows.len(), 2);
+        assert_eq!(qr.rows[0], vec![Value::Integer(1), Value::Integer(11)]);
+        assert_eq!(qr.rows[1], vec![Value::Integer(2), Value::Integer(20)]);
+    }
+
+    #[test]
+    fn execute_batch_rolls_back_whole_batch_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+
+        let res =
+            conn.execute_batch("INSERT INTO t VALUES (2, 20); INSERT INTO t VALUES (1, 999);");
+        assert!(res.is_err());
+
+        let qr = conn.query("SELECT id, n FROM t ORDER BY id").unwrap();
+        assert_eq!(qr.rows.len(), 1);
+        assert_eq!(qr.rows[0], vec![Value::Integer(1), Value::Integer(100)]);
+
+        conn.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+        assert!(!conn.in_transaction());
+    }
+
+    #[test]
+    fn execute_batch_rejects_txn_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        assert!(conn
+            .execute_batch("INSERT INTO t VALUES (1); COMMIT;")
+            .is_err());
+        assert!(!conn.in_transaction());
+    }
+
+    #[test]
+    fn execute_batch_rejected_inside_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        assert!(conn.execute_batch("INSERT INTO t VALUES (1);").is_err());
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn streamed_expression_projection_correct() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO t VALUES (1, 10); INSERT INTO t VALUES (2, 20); INSERT INTO t VALUES (3, 30);",
+        )
+        .unwrap();
+        let stmt = conn.prepare("SELECT id + 1, n * 2 FROM t").unwrap();
+        let qr = stmt.query_collect(&[]).unwrap();
+        assert_eq!(qr.rows.len(), 3);
+        assert_eq!(qr.rows[0], vec![Value::Integer(2), Value::Integer(20)]);
+        assert_eq!(qr.rows[1], vec![Value::Integer(3), Value::Integer(40)]);
+        assert_eq!(qr.rows[2], vec![Value::Integer(4), Value::Integer(60)]);
+    }
+
+    #[test]
+    fn jsonb_contains_raw_predicate_correct() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, data JSONB)")
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO u VALUES (1, '{\"role\":\"admin\",\"x\":1}'); \
+             INSERT INTO u VALUES (2, '{\"role\":\"user\"}'); \
+             INSERT INTO u VALUES (3, NULL); \
+             INSERT INTO u VALUES (4, '{\"role\":\"admin\"}');",
+        )
+        .unwrap();
+        let stmt = conn
+            .prepare("SELECT id FROM u WHERE data @> '{\"role\":\"admin\"}'::jsonb")
+            .unwrap();
+        let qr = stmt.query_collect(&[]).unwrap();
+        let mut ids: Vec<i64> = qr
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                _ => -1,
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 4]);
     }
 }
