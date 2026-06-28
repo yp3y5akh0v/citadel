@@ -7,7 +7,7 @@ use citadel_txn::write_txn::WriteTxn;
 use crate::error::Result;
 use crate::parser::Statement;
 use crate::schema::SchemaManager;
-use crate::types::{ExecutionResult, Value};
+use crate::types::{ExecutionResult, QueryResult, Value};
 
 pub enum ActiveTxnRef<'a, 'db: 'a> {
     None,
@@ -37,6 +37,17 @@ pub trait CompiledPlan: Send + Sync {
         None
     }
 
+    /// Zero-copy materialized collect; `None` if the plan cannot fast-collect.
+    fn try_collect(
+        &self,
+        _db: &Database,
+        _schema: &SchemaManager,
+        _stmt: &Statement,
+        _params: &[Value],
+    ) -> Option<Result<QueryResult>> {
+        None
+    }
+
     /// `false` when `execute` reads `params` directly without `resolve_scoped_param`,
     /// letting the caller skip `with_scoped_params`.
     fn uses_scoped_params(&self) -> bool {
@@ -55,6 +66,10 @@ pub trait CompiledPlan: Send + Sync {
 pub trait RowSourceIter {
     fn next_row(&mut self) -> Result<Option<Vec<Value>>>;
     fn columns(&self) -> &[String];
+    /// Upper bound on remaining rows, for output pre-sizing. 0 = unknown.
+    fn size_hint(&self) -> usize {
+        0
+    }
 }
 
 pub fn compile(schema: &SchemaManager, stmt: &Statement) -> Option<Arc<dyn CompiledPlan>> {

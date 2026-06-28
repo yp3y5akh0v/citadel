@@ -8,6 +8,7 @@ use citadel_page::leaf_node::OverflowRef;
 use citadel_page::overflow;
 use citadel_page::page::Page;
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use citadel_buffer::allocator::{AllocCheckpoint, PageAllocator};
@@ -211,7 +212,7 @@ impl<'db> WriteTxn<'db> {
             self.txn_id,
             key,
             val_type,
-            &val_payload,
+            val_payload.as_ref(),
         )
     }
 
@@ -492,8 +493,26 @@ impl<'db> WriteTxn<'db> {
     }
 
     pub fn table_insert(&mut self, table: &[u8], key: &[u8], value: &[u8]) -> Result<bool> {
+        self.table_insert_impl(table, key, value, true)
+    }
+
+    /// Insert into an index tree, skipping FK-cache invalidation (never an FK parent).
+    pub fn table_insert_index(&mut self, table: &[u8], key: &[u8], value: &[u8]) -> Result<bool> {
+        self.table_insert_impl(table, key, value, false)
+    }
+
+    #[inline]
+    fn table_insert_impl(
+        &mut self,
+        table: &[u8],
+        key: &[u8],
+        value: &[u8],
+        invalidate_fk: bool,
+    ) -> Result<bool> {
         Self::validate_key_value(key, value)?;
-        self.invalidate_fk_cache_for(table);
+        if invalidate_fk {
+            self.invalidate_fk_cache_for(table);
+        }
         self.ensure_table(table)?;
         let (val_type, val_payload) = self.stage_value(value);
         let tree = self.named_trees.get_mut(table).unwrap();
@@ -505,7 +524,7 @@ impl<'db> WriteTxn<'db> {
             self.txn_id,
             key,
             val_type,
-            &val_payload,
+            val_payload.as_ref(),
         )
     }
 
@@ -519,7 +538,7 @@ impl<'db> WriteTxn<'db> {
         Self::validate_key_value(key, value)?;
         self.invalidate_fk_cache_for(table);
         let (val_type, val_payload) = self.stage_value(value);
-        let val_bytes = val_payload.as_slice();
+        let val_bytes = val_payload.as_ref();
         let inserted = self.insert_if_absent_staged(table, key, val_type, val_bytes)?;
         if !inserted && val_type == ValueType::Overflow {
             let oref = OverflowRef::from_bytes(val_bytes);
@@ -632,7 +651,7 @@ impl<'db> WriteTxn<'db> {
             self.ensure_table(table)?;
         }
         let (val_type, val_payload) = self.stage_value(value);
-        let val_bytes = val_payload.as_slice();
+        let val_bytes = val_payload.as_ref();
 
         let Self {
             named_trees,
@@ -942,11 +961,10 @@ impl<'db> WriteTxn<'db> {
         Ok(())
     }
 
-    /// Stage a value for insertion: inline if ≤ MAX_INLINE_VALUE_SIZE, otherwise
-    /// spill to an overflow chain and return the 8-byte OverflowRef payload.
-    fn stage_value(&mut self, value: &[u8]) -> (ValueType, Vec<u8>) {
+    /// Stage a value: borrow inline (the tree copies it anyway), own the overflow ref.
+    fn stage_value<'v>(&mut self, value: &'v [u8]) -> (ValueType, Cow<'v, [u8]>) {
         if value.len() <= MAX_INLINE_VALUE_SIZE {
-            return (ValueType::Inline, value.to_vec());
+            return (ValueType::Inline, Cow::Borrowed(value));
         }
         let txn_id = self.txn_id;
         let alloc = &mut self.alloc;
@@ -963,7 +981,7 @@ impl<'db> WriteTxn<'db> {
             first_page: first,
             total_len: value.len() as u32,
         };
-        (ValueType::Overflow, oref.to_bytes().to_vec())
+        (ValueType::Overflow, Cow::Owned(oref.to_bytes().to_vec()))
     }
 
     fn ensure_catalog(&mut self) -> Result<()> {

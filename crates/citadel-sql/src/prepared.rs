@@ -127,9 +127,12 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
 
     /// Execute and return the fully-materialized `QueryResult`.
     pub fn query_collect(&self, params: &[Value]) -> Result<QueryResult> {
+        if let Some(qr) = self.collect_fast_path(params)? {
+            return Ok(qr);
+        }
         if let Some(mut stream) = self.stream_fast_path(params)? {
             let columns = stream.columns().to_vec();
-            let mut rows = Vec::new();
+            let mut rows = Vec::with_capacity(stream.size_hint());
             while let Some(row) = stream.next_row()? {
                 rows.push(row);
             }
@@ -184,6 +187,26 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
         }
         match &self.compiled {
             Some(plan) => Ok(try_stream_via_plan(self, plan.as_ref(), params)),
+            None => Ok(None),
+        }
+    }
+
+    /// Zero-copy collect for full scans; `None` falls through to the slower paths.
+    fn collect_fast_path(&self, params: &[Value]) -> Result<Option<QueryResult>> {
+        if params.len() != self.param_count {
+            return Err(SqlError::ParameterCountMismatch {
+                expected: self.param_count,
+                got: params.len(),
+            });
+        }
+        let inner = self.conn.inner.borrow();
+        if inner.schema.generation() != self.schema_gen || inner.active_txn_is_some() {
+            return Ok(None);
+        }
+        match &self.compiled {
+            Some(plan) => plan
+                .try_collect(self.conn.db, &inner.schema, &self.ast, params)
+                .transpose(),
             None => Ok(None),
         }
     }

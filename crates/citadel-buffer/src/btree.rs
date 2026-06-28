@@ -316,7 +316,7 @@ impl BTree {
                 };
                 let ok = {
                     let page = pages.get_mut(&cow_id).unwrap();
-                    leaf_node::insert_direct(page, key, val_type, value)
+                    leaf_node::insert_append_direct(page, key, val_type, value)
                 };
                 if ok {
                     if cow_id != cached_leaf {
@@ -481,7 +481,7 @@ impl BTree {
                 };
                 let ok = {
                     let page = pages.get_mut(&cow_id).unwrap();
-                    leaf_node::insert_direct(page, key, val_type, value)
+                    leaf_node::insert_append_direct(page, key, val_type, value)
                 };
                 if ok {
                     if cow_id != cached_leaf {
@@ -624,7 +624,7 @@ impl BTree {
                 };
                 let ok = {
                     let page = pages.get_mut(&cow_id).unwrap();
-                    leaf_node::insert_direct(page, key, val_type, value)
+                    leaf_node::insert_append_direct(page, key, val_type, value)
                 };
                 if ok {
                     if cow_id != cached_leaf {
@@ -784,7 +784,7 @@ impl BTree {
                 };
                 let ok = {
                     let page = pages.get_mut(&cow_id).unwrap();
-                    leaf_node::insert_direct(page, key, val_type, default_value)
+                    leaf_node::insert_append_direct(page, key, val_type, default_value)
                 };
                 if ok {
                     if cow_id != cached_leaf {

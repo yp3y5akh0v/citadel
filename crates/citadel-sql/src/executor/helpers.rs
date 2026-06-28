@@ -1189,21 +1189,43 @@ pub(super) fn encode_index_key_into_with_schema(
     buf: &mut Vec<u8>,
 ) {
     buf.clear();
+    // Encode straight from `row` (no Vec<Value>); byte-identical to the Expr path.
+    if idx.is_pure_column_index() {
+        let mut any_null = false;
+        for (i, key) in idx.keys.iter().enumerate() {
+            let crate::types::IndexKey::Column { idx: col_idx, .. } = key else {
+                unreachable!("is_pure_column_index guarantees Column keys")
+            };
+            let value = &row[*col_idx as usize];
+            any_null |= idx.unique && value.is_null();
+            encode_index_key_component(value, idx.collation_at(i), buf);
+        }
+        if !idx.unique || any_null {
+            for v in pk_values {
+                crate::encoding::encode_key_value_into(v, buf);
+            }
+        }
+        return;
+    }
     let key_values = materialize_index_key_values(idx, row, schema);
     let any_null = idx.unique && key_values.iter().any(|v| v.is_null());
     let include_pk = !idx.unique || any_null;
     for (i, value) in key_values.iter().enumerate() {
-        let coll = idx.collation_at(i);
-        if coll == crate::types::Collation::Binary {
-            crate::encoding::encode_key_value_into(value, buf);
-        } else {
-            crate::encoding::encode_key_value_collated_into(value, coll, buf);
-        }
+        encode_index_key_component(value, idx.collation_at(i), buf);
     }
     if include_pk {
         for v in pk_values {
             crate::encoding::encode_key_value_into(v, buf);
         }
+    }
+}
+
+#[inline]
+fn encode_index_key_component(value: &Value, coll: crate::types::Collation, buf: &mut Vec<u8>) {
+    if coll == crate::types::Collation::Binary {
+        crate::encoding::encode_key_value_into(value, buf);
+    } else {
+        crate::encoding::encode_key_value_collated_into(value, coll, buf);
     }
 }
 
@@ -1290,7 +1312,7 @@ pub(super) fn insert_index_entries(
                 let value = encode_index_value(idx, row, pk_values);
 
                 let is_new = wtx
-                    .table_insert(&table_buf, &key_buf, &value)
+                    .table_insert_index(&table_buf, &key_buf, &value)
                     .map_err(SqlError::Storage)?;
 
                 if idx.unique && !is_new {
@@ -1689,9 +1711,11 @@ pub(super) fn cascade_after_parent_delete(
         }
         for &(child_table, fk) in &child_fks {
             let child_schema = schema.get(child_table).unwrap();
-            let Some(cascading_idx) = find_cascading_idx(child_schema, fk) else {
-                continue;
-            };
+            let cascading_idx = find_cascading_idx(child_schema, fk).ok_or_else(|| {
+                SqlError::ForeignKeyViolation(format!(
+                    "no index backs the foreign key on '{child_table}' referencing '{cur_table}'"
+                ))
+            })?;
             let mut hits: Vec<FkChildHit> = Vec::new();
             for parent_pk_key in &cur_pks {
                 scan_fk_index_keys(wtx, child_schema, cascading_idx, parent_pk_key, &mut hits)?;
@@ -1709,8 +1733,12 @@ pub(super) fn cascade_after_parent_delete(
                 }
                 crate::parser::ReferentialAction::Cascade => {
                     delete_cascade_hits(wtx, schema, child_schema, cascading_idx, &hits)?;
-                    let pk_keys: Vec<Vec<u8>> = hits.into_iter().map(|h| h.into_pk_key()).collect();
-                    worklist.push((child_table.to_string(), pk_keys));
+                    // Skip the pk-key build for a leaf child that can't cascade on.
+                    if !schema.child_fks_for(child_table).is_empty() {
+                        let pk_keys: Vec<Vec<u8>> =
+                            hits.into_iter().map(|h| h.into_pk_key()).collect();
+                        worklist.push((child_table.to_string(), pk_keys));
+                    }
                 }
                 crate::parser::ReferentialAction::SetNull => {
                     let rows = fetch_child_rows(wtx, child_schema, &hits)?;

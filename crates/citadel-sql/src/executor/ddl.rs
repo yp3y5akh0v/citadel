@@ -948,6 +948,30 @@ pub(super) fn exec_create_index(
     Ok(ExecutionResult::Ok)
 }
 
+/// Refuse to drop the last index backing an FK (the cascade scan needs it).
+fn ensure_drop_index_keeps_fk_backing(table_schema: &TableSchema, idx_lower: &str) -> Result<()> {
+    let Some(dropped) = table_schema.index_by_name(idx_lower) else {
+        return Ok(());
+    };
+    let dropped_cols = dropped.columns_vec();
+    for fk in &table_schema.foreign_keys {
+        if dropped_cols != fk.columns {
+            continue;
+        }
+        let other_covers = table_schema
+            .indices
+            .iter()
+            .any(|i| i.name != idx_lower && i.columns_vec() == fk.columns);
+        if !other_covers {
+            return Err(SqlError::Unsupported(format!(
+                "cannot drop index '{}': required to enforce a foreign key on '{}'",
+                idx_lower, table_schema.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn exec_drop_index(
     db: &Database,
     schema: &mut SchemaManager,
@@ -965,6 +989,7 @@ pub(super) fn exec_drop_index(
         }
     };
 
+    ensure_drop_index_keeps_fk_backing(schema.get(&table_name).unwrap(), &lower_idx)?;
     let idx_table = TableSchema::index_table_name(&table_name, &lower_idx);
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
@@ -1074,6 +1099,7 @@ pub(super) fn exec_drop_index_in_txn(
         }
     };
 
+    ensure_drop_index_keeps_fk_backing(schema.get(&table_name).unwrap(), &lower_idx)?;
     let idx_table = TableSchema::index_table_name(&table_name, &lower_idx);
     wtx.drop_table(&idx_table).map_err(SqlError::Storage)?;
 

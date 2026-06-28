@@ -498,41 +498,53 @@ pub fn encode_row_into(values: &[Value], buf: &mut Vec<u8>) {
     }
 }
 
-pub struct IntRowTemplate {
+/// A physical slot: NULL, a runtime-filled integer hole, or a frozen constant.
+pub enum TemplateSlot {
+    Null,
+    IntHole,
+    Const(Value),
+}
+
+pub struct RowTemplate {
     pub template: Vec<u8>,
+    /// `(slot, byte offset)` of each integer hole the runtime fills.
     pub slot_offsets: Vec<(usize, usize)>,
 }
 
-pub fn build_int_row_template(phys_count: usize, null_slots: &[usize]) -> IntRowTemplate {
+pub fn build_row_template(phys_count: usize, slots: &[TemplateSlot]) -> RowTemplate {
     let bitmap_bytes = phys_count.div_ceil(8);
     let mut template = Vec::with_capacity(2 + bitmap_bytes + phys_count * 9);
     let header = (phys_count as u16) | V2_FLAG;
     template.extend_from_slice(&header.to_le_bytes());
     let bitmap_start = template.len();
     template.resize(bitmap_start + bitmap_bytes, 0);
-    for &i in null_slots {
-        template[bitmap_start + i / 8] |= 1 << (i % 8);
-    }
-    let mut slot_offsets = Vec::with_capacity(phys_count.saturating_sub(null_slots.len()));
-    for slot in 0..phys_count {
-        if null_slots.contains(&slot) {
-            continue;
+    let mut slot_offsets = Vec::new();
+    let set_null = |template: &mut [u8], slot: usize| {
+        template[bitmap_start + slot / 8] |= 1 << (slot % 8);
+    };
+    for (slot, kind) in slots.iter().enumerate() {
+        match kind {
+            TemplateSlot::Null => set_null(&mut template, slot),
+            TemplateSlot::IntHole => {
+                template.push(DataType::Integer.type_tag());
+                let value_offset = template.len();
+                template.extend_from_slice(&[0u8; 8]);
+                slot_offsets.push((slot, value_offset));
+            }
+            TemplateSlot::Const(v) if v.is_null() => set_null(&mut template, slot),
+            TemplateSlot::Const(v) => encode_cell_v2(v, &mut template),
         }
-        template.push(DataType::Integer.type_tag());
-        let value_offset = template.len();
-        template.extend_from_slice(&[0u8; 8]);
-        slot_offsets.push((slot, value_offset));
     }
-    IntRowTemplate {
+    RowTemplate {
         template,
         slot_offsets,
     }
 }
 
-/// Caller must guarantee every non-NULL `values[slot]` is `Value::Integer`.
+/// Caller must guarantee every `values[slot]` for an integer hole is `Value::Integer`.
 #[inline]
-pub fn encode_int_row_with_template(
-    tmpl: &IntRowTemplate,
+pub fn encode_row_with_template(
+    tmpl: &RowTemplate,
     values: &[Value],
     buf: &mut Vec<u8>,
 ) -> Result<()> {

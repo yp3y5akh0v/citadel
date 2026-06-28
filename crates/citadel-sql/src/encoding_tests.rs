@@ -522,9 +522,18 @@ fn int_row_template_matches_generic_encoder() {
         let mut generic = Vec::new();
         encode_row_into(&values, &mut generic);
 
-        let tmpl = build_int_row_template(phys_count, &null_slots);
+        let slots: Vec<TemplateSlot> = (0..phys_count)
+            .map(|s| {
+                if null_slots.contains(&s) {
+                    TemplateSlot::Null
+                } else {
+                    TemplateSlot::IntHole
+                }
+            })
+            .collect();
+        let tmpl = build_row_template(phys_count, &slots);
         let mut specialized = Vec::new();
-        encode_int_row_with_template(&tmpl, &values, &mut specialized).unwrap();
+        encode_row_with_template(&tmpl, &values, &mut specialized).unwrap();
 
         assert_eq!(
             specialized, generic,
