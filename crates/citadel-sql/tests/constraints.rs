@@ -1374,3 +1374,34 @@ fn fk_actions_persist_across_reopen() {
     assert_rows_affected(conn.execute("DELETE FROM parent WHERE id = 1").unwrap(), 1);
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM child"), 0);
 }
+
+#[test]
+fn drop_index_backing_fk_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, p INTEGER, \
+         FOREIGN KEY (p) REFERENCES parent(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+
+    // A second index also covers the FK column, so the auto-index is droppable.
+    conn.execute("CREATE INDEX idx_p ON child (p)").unwrap();
+    assert_ok(conn.execute("DROP INDEX __fk_child_0").unwrap());
+
+    // idx_p is now the sole index backing the FK; dropping it must be rejected.
+    let err = conn.execute("DROP INDEX idx_p").unwrap_err();
+    assert!(
+        matches!(err, SqlError::Unsupported(_)),
+        "expected Unsupported, got {err:?}"
+    );
+
+    // The cascade still works because a backing index survived.
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 1)").unwrap();
+    assert_rows_affected(conn.execute("DELETE FROM parent WHERE id = 1").unwrap(), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM child"), 0);
+}

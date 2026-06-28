@@ -1422,6 +1422,13 @@ impl TableSchema {
         !self.check_constraints.is_empty() || self.columns.iter().any(|c| c.check_expr.is_some())
     }
 
+    /// Only an ANN index owns a persisted segment; non-ANN tables skip the purge.
+    pub fn has_ann_index(&self) -> bool {
+        self.indices
+            .iter()
+            .any(|ix| matches!(ix.kind, IndexKind::Inverted(InvertedKind::Ann { .. })))
+    }
+
     /// Physical position -> logical column index. `usize::MAX` for dropped slots.
     pub fn decode_col_mapping(&self) -> &[usize] {
         &self.decode_mapping_cache

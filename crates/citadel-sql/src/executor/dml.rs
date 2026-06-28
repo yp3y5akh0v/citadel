@@ -19,6 +19,34 @@ use super::compile::CompiledPlan;
 use super::helpers::*;
 use super::CteContext;
 
+/// (before-insert, after-insert, after-update) row-trigger presence, hoisted once.
+fn row_insert_trigger_flags(schema: &SchemaManager, table_name: &str) -> (bool, bool, bool) {
+    use crate::parser::{TriggerEvent, TriggerGranularity, TriggerTiming};
+    let triggers = schema.triggers_for(table_name);
+    let row =
+        |t: &crate::types::TriggerDef| t.enabled && t.granularity == TriggerGranularity::ForEachRow;
+    let ev = |t: &crate::types::TriggerDef, update: bool| {
+        t.events.iter().any(|e| {
+            if update {
+                matches!(e, TriggerEvent::Update(_))
+            } else {
+                matches!(e, TriggerEvent::Insert)
+            }
+        })
+    };
+    (
+        triggers
+            .iter()
+            .any(|t| row(t) && t.timing == TriggerTiming::Before && ev(t, false)),
+        triggers
+            .iter()
+            .any(|t| row(t) && t.timing == TriggerTiming::After && ev(t, false)),
+        triggers
+            .iter()
+            .any(|t| row(t) && t.timing == TriggerTiming::After && ev(t, true)),
+    )
+}
+
 /// Classify an INSERT for cache invalidation: a pure append (single-INTEGER pk,
 /// no conflict) stays append-retainable; anything else hard-invalidates.
 fn mark_insert_dml(
@@ -242,6 +270,8 @@ pub(super) fn exec_insert(
     let plain_insert = compiled_conflict.is_none();
     let single_int_pk = is_single_int_pk(table_schema);
     let mut min_inserted_pk: Option<i64> = None;
+    let (has_before_insert_triggers, has_after_insert_triggers, has_after_update_triggers) =
+        row_insert_trigger_flags(schema, &table_schema.name);
 
     for idx in 0..total {
         for v in row.iter_mut() {
@@ -373,14 +403,6 @@ pub(super) fn exec_insert(
             None
         };
 
-        let has_before_insert_triggers = schema.triggers_for(&table_schema.name).iter().any(|t| {
-            t.enabled
-                && t.timing == crate::parser::TriggerTiming::Before
-                && t.granularity == crate::parser::TriggerGranularity::ForEachRow
-                && t.events
-                    .iter()
-                    .any(|e| matches!(e, crate::parser::TriggerEvent::Insert))
-        });
         if has_before_insert_triggers {
             super::triggers::fire_row_triggers(
                 &mut wtx,
@@ -439,15 +461,6 @@ pub(super) fn exec_insert(
                 if !is_new {
                     return Err(SqlError::DuplicateKey);
                 }
-                let has_after_insert_triggers =
-                    schema.triggers_for(&table_schema.name).iter().any(|t| {
-                        t.enabled
-                            && t.timing == crate::parser::TriggerTiming::After
-                            && t.granularity == crate::parser::TriggerGranularity::ForEachRow
-                            && t.events
-                                .iter()
-                                .any(|e| matches!(e, crate::parser::TriggerEvent::Insert))
-                    });
                 if !table_schema.indices.is_empty() || has_after_insert_triggers {
                     for (j, &i) in pk_indices.iter().enumerate() {
                         row[i] = pk_values[j].clone();
@@ -512,16 +525,6 @@ pub(super) fn exec_insert(
                         if let Some(r) = row_for_stmt_trigger.clone() {
                             stmt_new_rows.push(r);
                         }
-                        let has_after_insert_triggers =
-                            schema.triggers_for(&table_schema.name).iter().any(|t| {
-                                t.enabled
-                                    && t.timing == crate::parser::TriggerTiming::After
-                                    && t.granularity
-                                        == crate::parser::TriggerGranularity::ForEachRow
-                                    && t.events
-                                        .iter()
-                                        .any(|e| matches!(e, crate::parser::TriggerEvent::Insert))
-                            });
                         if has_after_insert_triggers {
                             super::triggers::fire_row_triggers(
                                 &mut wtx,
@@ -540,16 +543,6 @@ pub(super) fn exec_insert(
                         if let Some(buf) = returning_rows.as_mut() {
                             buf.push((Some(old.clone()), Some(new.clone())));
                         }
-                        let has_after_update_triggers =
-                            schema.triggers_for(&table_schema.name).iter().any(|t| {
-                                t.enabled
-                                    && t.timing == crate::parser::TriggerTiming::After
-                                    && t.granularity
-                                        == crate::parser::TriggerGranularity::ForEachRow
-                                    && t.events.iter().any(|e| {
-                                        matches!(e, crate::parser::TriggerEvent::Update(_))
-                                    })
-                            });
                         if has_after_update_triggers {
                             let changed_cols: Vec<String> = match oc_ref {
                                 CompiledOnConflict::DoUpdate { assignments, .. } => assignments
@@ -1468,7 +1461,9 @@ fn exec_insert_in_txn_impl(
     let table_schema = schema
         .get(&stmt.table)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
-    super::ann_persist::purge_segment(wtx, &table_schema.name)?;
+    if table_schema.has_ann_index() {
+        super::ann_persist::purge_segment(wtx, &table_schema.name)?;
+    }
 
     let default_columns;
     let insert_columns: &[String] = if stmt.columns.is_empty() {
@@ -1689,6 +1684,9 @@ fn exec_insert_in_txn_impl(
         )?;
     }
 
+    let (has_before_insert_triggers, has_after_insert_triggers, has_after_update_triggers) =
+        row_insert_trigger_flags(schema, &table_schema.name);
+
     let skip_row_clear = cache.is_some_and(|c| c.row_fully_overwritten);
     for idx in 0..total {
         if !skip_row_clear {
@@ -1908,14 +1906,6 @@ fn exec_insert_in_txn_impl(
             None
         };
 
-        let has_before_insert_triggers = schema.triggers_for(&table_schema.name).iter().any(|t| {
-            t.enabled
-                && t.timing == crate::parser::TriggerTiming::Before
-                && t.granularity == crate::parser::TriggerGranularity::ForEachRow
-                && t.events
-                    .iter()
-                    .any(|e| matches!(e, crate::parser::TriggerEvent::Insert))
-        });
         if has_before_insert_triggers {
             super::triggers::fire_row_triggers(
                 wtx,
@@ -1962,7 +1952,7 @@ fn exec_insert_in_txn_impl(
             }
         }
         match cache.and_then(|c| c.row_encoder.as_ref()) {
-            Some(tmpl) => crate::encoding::encode_int_row_with_template(
+            Some(tmpl) => crate::encoding::encode_row_with_template(
                 tmpl,
                 &bufs.value_values,
                 &mut bufs.value_buf,
@@ -1991,15 +1981,6 @@ fn exec_insert_in_txn_impl(
                 if !is_new {
                     return Err(SqlError::DuplicateKey);
                 }
-                let has_after_insert_triggers =
-                    schema.triggers_for(&table_schema.name).iter().any(|t| {
-                        t.enabled
-                            && t.timing == crate::parser::TriggerTiming::After
-                            && t.granularity == crate::parser::TriggerGranularity::ForEachRow
-                            && t.events
-                                .iter()
-                                .any(|e| matches!(e, crate::parser::TriggerEvent::Insert))
-                    });
                 if has_indices || has_after_insert_triggers {
                     for (j, &i) in pk_indices.iter().enumerate() {
                         bufs.row[i] = bufs.pk_values[j].clone();
@@ -2068,16 +2049,6 @@ fn exec_insert_in_txn_impl(
                         if let Some(r) = row_for_stmt_trigger_impl.clone() {
                             stmt_new_rows_impl.push(r);
                         }
-                        let has_after_insert_triggers =
-                            schema.triggers_for(&table_schema.name).iter().any(|t| {
-                                t.enabled
-                                    && t.timing == crate::parser::TriggerTiming::After
-                                    && t.granularity
-                                        == crate::parser::TriggerGranularity::ForEachRow
-                                    && t.events
-                                        .iter()
-                                        .any(|e| matches!(e, crate::parser::TriggerEvent::Insert))
-                            });
                         if has_after_insert_triggers {
                             super::triggers::fire_row_triggers(
                                 wtx,
@@ -2096,16 +2067,6 @@ fn exec_insert_in_txn_impl(
                         if let Some(buf) = returning_rows.as_mut() {
                             buf.push((Some(old.clone()), Some(new.clone())));
                         }
-                        let has_after_update_triggers =
-                            schema.triggers_for(&table_schema.name).iter().any(|t| {
-                                t.enabled
-                                    && t.timing == crate::parser::TriggerTiming::After
-                                    && t.granularity
-                                        == crate::parser::TriggerGranularity::ForEachRow
-                                    && t.events.iter().any(|e| {
-                                        matches!(e, crate::parser::TriggerEvent::Update(_))
-                                    })
-                            });
                         if has_after_update_triggers {
                             let changed_cols: Vec<String> = match oc_ref {
                                 CompiledOnConflict::DoUpdate { assignments, .. } => assignments
@@ -2202,7 +2163,7 @@ struct InsertCache {
     not_null_indices: Vec<u16>,
     bind_plan: Option<Vec<BindAction>>,
     row_fully_overwritten: bool,
-    row_encoder: Option<crate::encoding::IntRowTemplate>,
+    row_encoder: Option<crate::encoding::RowTemplate>,
     is_trivial_fast: bool,
     trivial_fast_program: Option<TrivialFastProgram>,
     needs_scoped_params: bool,
@@ -2227,6 +2188,30 @@ struct TrivialFastProgram {
     ops: Vec<WriteOp>,
     pk_param: u8,
     not_null_param_indices: Vec<u8>,
+    fk_checks: Vec<FkCheckSpec>,
+    index_inserts: Vec<IndexInsertSpec>,
+    on_dup: DupPolicy,
+}
+
+/// PK-duplicate policy: plain INSERT errors; `ON CONFLICT DO NOTHING` skips.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DupPolicy {
+    Error,
+    Skip,
+}
+
+/// A foreign-key existence check encodable straight from bound params.
+#[derive(Clone)]
+struct FkCheckSpec {
+    foreign_table: Vec<u8>,
+    col_params: Vec<u8>,
+}
+
+/// A pure-column non-unique secondary index insert encodable from bound params.
+#[derive(Clone)]
+struct IndexInsertSpec {
+    table: Vec<u8>,
+    key_params: Vec<(u8, crate::types::Collation)>,
 }
 
 #[derive(Clone)]
@@ -2258,18 +2243,65 @@ enum WriteOp {
 
 fn build_trivial_fast_program(
     bind_plan: &[BindAction],
-    row_encoder: &crate::encoding::IntRowTemplate,
+    phys_count: usize,
     non_virtual_pairs: &[(usize, usize)],
     generated_col_positions: &[usize],
     generated_fast_evals: &[FastGenEval],
-    pk_indices: &[usize],
-    columns: &[crate::types::ColumnDef],
+    ts: &TableSchema,
+    on_conflict: Option<&CompiledOnConflict>,
 ) -> Option<TrivialFastProgram> {
-    let pk_col = pk_indices[0];
+    let columns = &ts.columns;
+    let pk_col = ts.pk_indices()[0];
+
+    // Only DO NOTHING on a PK arbiter can skip dupes; any other shape bails.
+    let on_dup = match on_conflict {
+        None => DupPolicy::Error,
+        Some(CompiledOnConflict::DoNothing { target })
+            if matches!(target, None | Some(ConflictKind::PrimaryKey))
+                && ts.indices.is_empty()
+                && ts.foreign_keys.is_empty() =>
+        {
+            DupPolicy::Skip
+        }
+        _ => return None,
+    };
+
+    let mut col_to_bind: rustc_hash::FxHashMap<usize, &BindAction> = Default::default();
+    for action in bind_plan {
+        let col = match action {
+            BindAction::Param { col_idx, .. } | BindAction::Literal { col_idx, .. } => *col_idx,
+        };
+        col_to_bind.insert(col, action);
+    }
+
+    // Freeze literals into the template; int params/generated cols stay holes.
+    let mut slots: Vec<crate::encoding::TemplateSlot> = (0..phys_count)
+        .map(|_| crate::encoding::TemplateSlot::Null)
+        .collect();
+    for &(col, slot) in non_virtual_pairs {
+        slots[slot] = match col_to_bind.get(&col) {
+            Some(BindAction::Literal { value, .. }) => {
+                crate::encoding::TemplateSlot::Const(value.clone())
+            }
+            Some(BindAction::Param { target, .. }) => {
+                if *target != DataType::Integer {
+                    return None;
+                }
+                crate::encoding::TemplateSlot::IntHole
+            }
+            None => {
+                if columns[col].data_type != DataType::Integer {
+                    return None;
+                }
+                crate::encoding::TemplateSlot::IntHole
+            }
+        };
+    }
+    let tmpl = crate::encoding::build_row_template(phys_count, &slots);
     let col_to_slot: rustc_hash::FxHashMap<usize, usize> =
         non_virtual_pairs.iter().copied().collect();
     let slot_to_off: rustc_hash::FxHashMap<usize, usize> =
-        row_encoder.slot_offsets.iter().copied().collect();
+        tmpl.slot_offsets.iter().copied().collect();
 
     let mut col_to_param: rustc_hash::FxHashMap<usize, u8> = Default::default();
     let mut col_to_lit_int: rustc_hash::FxHashMap<usize, i64> = Default::default();
@@ -2300,18 +2332,15 @@ fn build_trivial_fast_program(
                     }
                 }
             }
-            BindAction::Literal { value, col_idx } => match value {
-                Value::Integer(v) => {
-                    col_to_lit_int.insert(*col_idx, *v);
-                    if *col_idx == pk_col {
-                        return None;
-                    }
-                    let slot = *col_to_slot.get(col_idx)?;
-                    let off = u32::try_from(*slot_to_off.get(&slot)?).ok()?;
-                    ops.push(WriteOp::LiteralI64 { value: *v, off });
+            // Already in the template; record ints only for generated-col refs.
+            BindAction::Literal { value, col_idx } => {
+                if *col_idx == pk_col {
+                    return None;
                 }
-                _ => return None,
-            },
+                if let Value::Integer(v) = value {
+                    col_to_lit_int.insert(*col_idx, *v);
+                }
+            }
         }
     }
 
@@ -2415,11 +2444,54 @@ fn build_trivial_fast_program(
         }
     }
 
+    let mut fk_checks: Vec<FkCheckSpec> = Vec::with_capacity(ts.foreign_keys.len());
+    for fk in &ts.foreign_keys {
+        if fk.deferrable && fk.initially_deferred {
+            return None;
+        }
+        let mut col_params = Vec::with_capacity(fk.columns.len());
+        for &c in &fk.columns {
+            col_params.push(col_to_param.get(&(c as usize)).copied()?);
+        }
+        fk_checks.push(FkCheckSpec {
+            foreign_table: fk.foreign_table.as_bytes().to_vec(),
+            col_params,
+        });
+    }
+
+    let mut index_inserts: Vec<IndexInsertSpec> = Vec::with_capacity(ts.indices.len());
+    for idx in &ts.indices {
+        if idx.unique
+            || !idx.is_pure_column_index()
+            || idx.predicate_expr.is_some()
+            || idx.predicate_sql.is_some()
+        {
+            return None;
+        }
+        let mut key_params = Vec::with_capacity(idx.keys.len());
+        for (i, key) in idx.keys.iter().enumerate() {
+            let crate::types::IndexKey::Column { idx: col_idx, .. } = key else {
+                return None;
+            };
+            key_params.push((
+                col_to_param.get(&(*col_idx as usize)).copied()?,
+                idx.collation_at(i),
+            ));
+        }
+        index_inserts.push(IndexInsertSpec {
+            table: TableSchema::index_table_name(&ts.name, &idx.name),
+            key_params,
+        });
+    }
+
     Some(TrivialFastProgram {
-        template: row_encoder.template.clone(),
+        template: tmpl.template,
         ops,
         pk_param,
         not_null_param_indices,
+        fk_checks,
+        index_inserts,
+        on_dup,
     })
 }
 
@@ -3353,12 +3425,54 @@ fn exec_insert_trivial_fast(
         }
     }
 
+    for fk in &prog.fk_checks {
+        if fk.col_params.iter().any(|&p| params[p as usize].is_null()) {
+            continue;
+        }
+        bufs.fk_key_buf.clear();
+        for &p in &fk.col_params {
+            crate::encoding::encode_key_value_into(&params[p as usize], &mut bufs.fk_key_buf);
+        }
+        if !wtx.fk_check_cached(&fk.foreign_table, &bufs.fk_key_buf) {
+            let found = wtx
+                .table_get(&fk.foreign_table, &bufs.fk_key_buf)
+                .map_err(SqlError::Storage)?;
+            if found.is_none() {
+                return Err(SqlError::ForeignKeyViolation(
+                    String::from_utf8_lossy(&fk.foreign_table).into_owned(),
+                ));
+            }
+            wtx.mark_fk_verified(&fk.foreign_table, &bufs.fk_key_buf);
+        }
+    }
+
     let is_new = wtx
-        .table_insert(table_lower.as_bytes(), &bufs.key_buf, &bufs.value_buf)
+        .table_insert_if_absent(table_lower.as_bytes(), &bufs.key_buf, &bufs.value_buf)
         .map_err(SqlError::Storage)?;
     if !is_new {
-        return Err(SqlError::DuplicateKey);
+        return match prog.on_dup {
+            DupPolicy::Error => Err(SqlError::DuplicateKey),
+            DupPolicy::Skip => Ok(ExecutionResult::RowsAffected(0)),
+        };
     }
+
+    for idx in &prog.index_inserts {
+        bufs.fk_key_buf.clear();
+        for &(p, coll) in &idx.key_params {
+            crate::encoding::encode_key_value_collated_into(
+                &params[p as usize],
+                coll,
+                &mut bufs.fk_key_buf,
+            );
+        }
+        crate::encoding::encode_key_value_into(
+            &params[prog.pk_param as usize],
+            &mut bufs.fk_key_buf,
+        );
+        wtx.table_insert_index(&idx.table, &bufs.fk_key_buf, &[])
+            .map_err(SqlError::Storage)?;
+    }
+
     Ok(ExecutionResult::RowsAffected(1))
 }
 
@@ -3483,8 +3597,6 @@ impl CompiledInsert {
                 }
                 bind_plan.is_some() && covered.len() == ts.columns.len()
             };
-            let has_fks = !ts.foreign_keys.is_empty();
-            let has_indices = !ts.indices.is_empty();
             let mut non_virtual_pairs: Vec<(usize, usize)> = Vec::new();
             let mut null_value_slots: Vec<usize> =
                 dropped_non_pk_slots.iter().map(|&s| s as usize).collect();
@@ -3512,33 +3624,32 @@ impl CompiledInsert {
                     }
                 });
                 if all_int_or_null {
-                    let mut null_slots: Vec<usize> =
-                        dropped_non_pk_slots.iter().map(|&s| s as usize).collect();
+                    let mut slots: Vec<crate::encoding::TemplateSlot> = (0..phys_count)
+                        .map(|_| crate::encoding::TemplateSlot::IntHole)
+                        .collect();
+                    for &s in &dropped_non_pk_slots {
+                        slots[s as usize] = crate::encoding::TemplateSlot::Null;
+                    }
                     for (j, &i) in non_pk_indices.iter().enumerate() {
                         if matches!(
                             ts.columns[i].generated_kind,
                             Some(crate::parser::GeneratedKind::Virtual)
                         ) {
-                            null_slots.push(encoding_positions[j] as usize);
+                            slots[encoding_positions[j] as usize] =
+                                crate::encoding::TemplateSlot::Null;
                         }
                     }
-                    Some(crate::encoding::build_int_row_template(
-                        phys_count,
-                        &null_slots,
-                    ))
+                    Some(crate::encoding::build_row_template(phys_count, &slots))
                 } else {
                     None
                 }
             };
+            // build_trivial_fast_program rejects any shape it can't compile.
             let is_trivial_fast_eligible = !insert_has_subquery(stmt)
                 && !ts.columns.iter().any(|c| c.default_expr.is_some())
                 && !ts.has_checks()
-                && !has_fks
-                && !has_indices
-                && stmt.on_conflict.is_none()
                 && stmt.returning.is_none()
                 && bind_plan.is_some()
-                && row_encoder.is_some()
                 && row_fully_overwritten
                 && single_int_pk
                 && generated_fast_evals
@@ -3547,12 +3658,12 @@ impl CompiledInsert {
             let trivial_fast_program = if is_trivial_fast_eligible {
                 build_trivial_fast_program(
                     bind_plan.as_ref().unwrap(),
-                    row_encoder.as_ref().unwrap(),
+                    phys_count,
                     &non_virtual_pairs,
                     &generated_col_positions,
                     &generated_fast_evals,
-                    &pk_indices,
-                    &ts.columns,
+                    ts,
+                    on_conflict.as_deref(),
                 )
             } else {
                 None

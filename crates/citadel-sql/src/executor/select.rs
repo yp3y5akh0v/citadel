@@ -3991,37 +3991,29 @@ impl CompiledPlan for CompiledSelect {
         stmt: &Statement,
         _params: &[Value],
     ) -> Option<Box<dyn super::compile::RowSourceIter + 'db>> {
-        let sq = match stmt {
-            Statement::Select(s) => s,
-            _ => return None,
-        };
-        let sel = match &sq.body {
-            QueryBody::Select(s) => s,
-            _ => return None,
-        };
-        if sel.where_clause.is_some()
-            || !sel.order_by.is_empty()
-            || sel.limit.is_some()
-            || sel.offset.is_some()
-            || !sel.joins.is_empty()
-            || !sel.group_by.is_empty()
-            || sel.having.is_some()
-            || sel.distinct
-        {
-            return None;
-        }
-        let lower = sel.from.to_ascii_lowercase();
-        let table_schema = schema.get(&lower)?.clone();
-        let proj = build_stream_proj(&sel.columns, &table_schema)?;
-        let columns = projection_column_names(&sel.columns, &table_schema.columns);
-        let rtx = db.begin_read();
+        let (lower, table_schema, proj, columns) = stream_scan_setup(schema, stmt)?;
+        let mut rtx = db.begin_read();
+        let row_count = rtx.table_entry_count(lower.as_bytes()).unwrap_or(0) as usize;
         let iter = rtx.into_table_scan_iter(lower.as_bytes(), b"").ok()?;
         Some(Box::new(StreamingSelect {
             iter,
             table_schema: Arc::new(table_schema),
             proj,
             columns,
+            scratch: Vec::new(),
+            row_count,
         }))
+    }
+
+    fn try_collect(
+        &self,
+        db: &Database,
+        schema: &SchemaManager,
+        stmt: &Statement,
+        _params: &[Value],
+    ) -> Option<Result<QueryResult>> {
+        let (lower, table_schema, proj, columns) = stream_scan_setup(schema, stmt)?;
+        Some(collect_scan(db, &lower, &table_schema, &proj, columns))
     }
 }
 
@@ -4039,34 +4031,122 @@ struct StreamingSelect<'db> {
     table_schema: Arc<TableSchema>,
     proj: StreamProj,
     columns: Vec<String>,
+    /// Reused decode buffer for projections that build a separate output row.
+    scratch: Vec<Value>,
+    row_count: usize,
 }
 
 impl<'db> super::compile::RowSourceIter for StreamingSelect<'db> {
     fn next_row(&mut self) -> Result<Option<Vec<Value>>> {
-        match self.iter.next().map_err(SqlError::Storage)? {
-            Some((key, value)) => {
-                let full = decode_full_row(&self.table_schema, key, value)?;
-                let out = match &self.proj {
-                    StreamProj::Identity => full,
-                    StreamProj::Columns(idxs) => idxs.iter().map(|&i| full[i].clone()).collect(),
-                    StreamProj::Exprs { col_map, exprs } => {
-                        let ctx = EvalCtx::new(col_map, &full);
-                        let mut out = Vec::with_capacity(exprs.len());
-                        for e in exprs {
-                            out.push(eval_expr(e, &ctx)?);
-                        }
-                        out
-                    }
-                };
-                Ok(Some(out))
-            }
-            None => Ok(None),
-        }
+        let Some((key, value)) = self.iter.next().map_err(SqlError::Storage)? else {
+            return Ok(None);
+        };
+        Ok(Some(decode_and_project(
+            &self.proj,
+            &self.table_schema,
+            key,
+            value,
+            &mut self.scratch,
+        )?))
     }
 
     fn columns(&self) -> &[String] {
         &self.columns
     }
+
+    fn size_hint(&self) -> usize {
+        self.row_count
+    }
+}
+
+/// Decode `(key, value)` and project; `scratch` is reused by Columns/Exprs only.
+fn decode_and_project(
+    proj: &StreamProj,
+    schema: &TableSchema,
+    key: &[u8],
+    value: &[u8],
+    scratch: &mut Vec<Value>,
+) -> Result<Vec<Value>> {
+    match proj {
+        StreamProj::Identity => decode_full_row(schema, key, value),
+        StreamProj::Columns(idxs) => {
+            decode_full_row_into(schema, key, value, scratch)?;
+            Ok(idxs.iter().map(|&i| scratch[i].clone()).collect())
+        }
+        StreamProj::Exprs { col_map, exprs } => {
+            decode_full_row_into(schema, key, value, scratch)?;
+            let ctx = EvalCtx::new(col_map, scratch);
+            let mut out = Vec::with_capacity(exprs.len());
+            for e in exprs {
+                out.push(eval_expr(e, &ctx)?);
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Shared setup for the stream/collect fast paths (single-table SELECT, no clauses).
+fn stream_scan_setup(
+    schema: &SchemaManager,
+    stmt: &Statement,
+) -> Option<(String, TableSchema, StreamProj, Vec<String>)> {
+    let sq = match stmt {
+        Statement::Select(s) => s,
+        _ => return None,
+    };
+    let sel = match &sq.body {
+        QueryBody::Select(s) => s,
+        _ => return None,
+    };
+    if sel.where_clause.is_some()
+        || !sel.order_by.is_empty()
+        || sel.limit.is_some()
+        || sel.offset.is_some()
+        || !sel.joins.is_empty()
+        || !sel.group_by.is_empty()
+        || sel.having.is_some()
+        || sel.distinct
+    {
+        return None;
+    }
+    let lower = sel.from.to_ascii_lowercase();
+    let table_schema = schema.get(&lower)?.clone();
+    let proj = build_stream_proj(&sel.columns, &table_schema)?;
+    let columns = projection_column_names(&sel.columns, &table_schema.columns);
+    Some((lower, table_schema, proj, columns))
+}
+
+/// Materialize a full scan off borrowed page cells (no per-row key/value copy).
+fn collect_scan(
+    db: &Database,
+    table_lower: &str,
+    table_schema: &TableSchema,
+    proj: &StreamProj,
+    columns: Vec<String>,
+) -> Result<QueryResult> {
+    let mut rtx = db.begin_read();
+    let row_count = rtx.table_entry_count(table_lower.as_bytes()).unwrap_or(0) as usize;
+    let mut rows = Vec::with_capacity(row_count);
+    let mut scratch: Vec<Value> = Vec::new();
+    let mut err: Option<SqlError> = None;
+    rtx.table_scan_raw(
+        table_lower.as_bytes(),
+        |key, value| match decode_and_project(proj, table_schema, key, value, &mut scratch) {
+            Ok(row) => {
+                rows.push(row);
+                true
+            }
+            Err(e) => {
+                err = Some(e);
+                false
+            }
+        },
+    )
+    .map_err(SqlError::Storage)?;
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok(QueryResult { columns, rows })
 }
 
 fn build_projection(select_cols: &[SelectColumn], columns: &[ColumnDef]) -> Option<Vec<usize>> {

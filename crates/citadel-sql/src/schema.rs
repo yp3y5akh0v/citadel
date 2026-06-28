@@ -11,6 +11,9 @@ use crate::error::{Result, SqlError};
 use crate::system_tables::{self, VirtualTable};
 use crate::types::{ForeignKeySchemaEntry, TableSchema, ViewDef};
 
+/// Reverse FK index (parent -> [(child table, fk idx)]), tagged with its generation.
+type FkChildrenCache = std::cell::RefCell<Option<(u64, FxHashMap<String, Vec<(String, usize)>>)>>;
+
 const SCHEMA_TABLE: &[u8] = b"_schema";
 const VIEWS_TABLE: &[u8] = b"_views";
 const TRIGGERS_TABLE: &[u8] = b"_triggers";
@@ -75,6 +78,8 @@ pub struct SchemaManager {
     /// Tables touched only by pure appends, mapped to the min inserted pk; an
     /// append above the index snapshot tail-merges instead of hard-invalidating.
     dml_append_tables: std::cell::RefCell<FxHashMap<String, i64>>,
+    /// Reverse FK index, rebuilt lazily whenever the schema generation changes.
+    fk_children_cache: FkChildrenCache,
 }
 
 /// DML since the last commit, classified for cache invalidation.
@@ -104,6 +109,7 @@ impl SchemaManager {
             sql_caches: Arc::new(Mutex::new(FxHashMap::default())),
             dml_dirty_tables: std::cell::RefCell::new(FxHashSet::default()),
             dml_append_tables: std::cell::RefCell::new(FxHashMap::default()),
+            fk_children_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -290,6 +296,7 @@ impl SchemaManager {
             sql_caches: db.sql_cache_handle(),
             dml_dirty_tables: std::cell::RefCell::new(FxHashSet::default()),
             dml_append_tables: std::cell::RefCell::new(FxHashMap::default()),
+            fk_children_cache: std::cell::RefCell::new(None),
         };
         system_tables::register_builtins(&mut mgr);
         Ok(mgr)
@@ -420,8 +427,15 @@ impl SchemaManager {
     }
 
     pub fn triggers_for(&self, target: &str) -> &[crate::types::TriggerDef] {
+        if self.triggers.is_empty() {
+            return &[];
+        }
+        // Keys are stored lowercased; skip the alloc when target already is.
+        if !target.bytes().any(|b| b.is_ascii_uppercase()) {
+            return self.triggers.get(target).map_or(&[], |v| v.as_slice());
+        }
         let key = target.to_ascii_lowercase();
-        self.triggers.get(&key).map(|v| v.as_slice()).unwrap_or(&[])
+        self.triggers.get(&key).map_or(&[], |v| v.as_slice())
     }
 
     pub fn all_triggers(&self) -> impl Iterator<Item = &crate::types::TriggerDef> + '_ {
@@ -620,16 +634,38 @@ impl SchemaManager {
     }
 
     pub fn child_fks_for(&self, parent: &str) -> Vec<(&str, &ForeignKeySchemaEntry)> {
-        self.tables
+        self.ensure_fk_children_cache();
+        let cache = self.fk_children_cache.borrow();
+        let Some((_, map)) = cache.as_ref() else {
+            return Vec::new();
+        };
+        let Some(children) = map.get(parent) else {
+            return Vec::new();
+        };
+        children
             .iter()
-            .flat_map(|(name, schema)| {
-                schema
-                    .foreign_keys
-                    .iter()
-                    .filter(|fk| fk.foreign_table == parent)
-                    .map(move |fk| (name.as_str(), fk))
+            .map(|(child, fk_idx)| {
+                let schema = self.tables.get(child).expect("cached child table exists");
+                (schema.name.as_str(), &schema.foreign_keys[*fk_idx])
             })
             .collect()
+    }
+
+    /// Rebuild the reverse FK index iff it is stale for the current generation.
+    fn ensure_fk_children_cache(&self) {
+        if matches!(self.fk_children_cache.borrow().as_ref(), Some((g, _)) if *g == self.generation)
+        {
+            return;
+        }
+        let mut map: FxHashMap<String, Vec<(String, usize)>> = FxHashMap::default();
+        for (child_name, schema) in &self.tables {
+            for (fk_idx, fk) in schema.foreign_keys.iter().enumerate() {
+                map.entry(fk.foreign_table.clone())
+                    .or_default()
+                    .push((child_name.clone(), fk_idx));
+            }
+        }
+        *self.fk_children_cache.borrow_mut() = Some((self.generation, map));
     }
 
     pub fn save_schema(
