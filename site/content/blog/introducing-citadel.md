@@ -32,7 +32,7 @@ Most databases keep a write-ahead log for crash recovery. Citadel does not. Chan
 
 ## Benchmarks vs unencrypted SQLite
 
-Citadel is faster than SQLite on all 50 head-to-head benchmarks, with encryption on every page. The numbers are in the <a href="https://github.com/yp3y5akh0v/citadel#benchmarks" target="_blank" rel="noopener">README</a>.
+Citadel is faster than SQLite on all {{ benchmarks() }} head-to-head benchmarks, with encryption on every page. The numbers are in the <a href="https://github.com/yp3y5akh0v/citadel#benchmarks" target="_blank" rel="noopener">README</a>.
 
 ## The memory engine
 

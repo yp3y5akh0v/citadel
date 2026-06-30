@@ -16,7 +16,7 @@
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Citadel is an embedded SQL database that encrypts and authenticates every page with AES-256-CTR and HMAC-SHA256 before it is written, so the database file is always opaque. The same encrypted pages hold SQL tables and a zero-LLM memory engine that recalls over encrypted regions. The tables below report its results against unencrypted SQLite across 50 head-to-head benchmarks and on the LoCoMo and LongMemEval long-term-memory benchmarks.
+Citadel is an embedded SQL database that encrypts and authenticates every page with AES-256-CTR and HMAC-SHA256 before it is written, so the database file is always opaque. The same encrypted pages hold SQL tables and a zero-LLM memory engine that recalls over encrypted regions. The tables below report its results against unencrypted SQLite across 54 head-to-head benchmarks and on the LoCoMo and LongMemEval long-term-memory benchmarks.
 
 **LoCoMo** - `gpt-4o-mini` reader and judge (the field's standard setup):
 
@@ -82,77 +82,81 @@ per-question audit, and a comparison with published systems are in
 
 ## Benchmarks
 
-Single-threaded on 100K rows, schema `(id INTEGER PK, name TEXT, age INTEGER)`. Ratio = SQLite / Citadel time.
+Single-threaded, durability off (pure engine overhead). Most benchmarks run on 100K rows of `(id INTEGER PK, name TEXT, age INTEGER)`; per-benchmark queries and schemas are in Methodology. Ratio = SQLite / Citadel time (higher is faster).
 
 ```
 Benchmark              Citadel        SQLite         Ratio
 ----------------------------------------------------------
-full_outer_join        61.9 us        22.4 ms        362x
-correlated_in          5.95 ms        1.89 s         318x
-count                  148 ns         21.3 us        144x
-correlated_scalar      300 us         20.2 ms        67x
-point                  930 ns         12.7 us        14x
-fts_rank               4.91 ms        40.2 ms        8.2x
-group_by               1.35 ms        9.79 ms        7.2x
-cte                    1.24 ms        5.78 ms        4.7x
-union                  28.9 us        136 us         4.7x
-view_point             3.08 us        12.8 us        4.2x
-truncate               18.9 us        58.3 us        3.1x
-partial_index_point    4.59 us        13.1 us        2.85x
-upsert_returning       60.8 us        167 us         2.75x
-insert_returning       63.7 us        167 us         2.62x
-fts_match              3.02 ms        7.37 ms        2.44x
-window_agg             33.2 ms        77.5 ms        2.33x
-jsonb_contains         11.7 ms        27.1 ms        2.32x
-fts_phrase             4.29 ms        9.17 ms        2.14x
-savepoint_create       329 ns         696 ns         2.12x
-sort                   1.29 ms        2.53 ms        1.96x
-view_filter            877 us         1.71 ms        1.95x
-upsert_counter         27.5 us        53.1 us        1.93x
-delete_returning       90.7 us        175 us         1.93x
-filter                 943 us         1.80 ms        1.91x
-insert_select          613 us         1.12 ms        1.83x
-json_extract           17.2 ms        31.0 ms        1.80x
-join                   50.5 us        89.2 us        1.77x
-window_rank            68.1 ms        119.5 ms       1.76x
-delete                 44.9 us        71.0 us        1.58x
-recursive_cte          75.7 us        117.9 us       1.56x
-update                 18.0 us        27.8 us        1.54x
-savepoint_nested       236 us         361 us         1.53x
-upsert_dedup           21.3 us        32.4 us        1.52x
-correlated_exists      4.64 ms        6.61 ms        1.43x
-with_dml               76.9 us        108 us         1.40x
-distinct               2.83 ms        3.80 ms        1.34x
-fk_cascade_delete_only 59.7 us        77.4 us        1.30x
-update_returning       113 us         146 us         1.29x
-insert                 39.2 us        50.5 us        1.29x
-savepoint_rollback     1.75 ms        2.20 ms        1.26x
-sort_nocase            2.53 ms        3.02 ms        1.19x
-insert_gen_virtual     47.0 us        54.5 us        1.16x
-sum                    1.60 ms        1.83 ms        1.14x
-insert_gen_stored      50.0 us        56.7 us        1.13x
-upsert_all_new         45.0 us        51.0 us        1.13x
-update_gen_propagate   42.8 us        47.5 us        1.11x
-upsert_mixed           52.3 us        57.6 us        1.10x
-scan                   7.31 ms        7.69 ms        1.05x
-select_gen_virtual     17.0 us        17.7 us        1.04x
-fk_cascade             86.5 us        89.4 us        1.03x
+correlated_in          6.52 ms        1.97 s         302x
+full_outer_join        70.6 us        20.6 ms        292x
+correlated_scalar      324 us         19.2 ms        59x
+count                  605 ns         21.0 us        35x
+point                  1.12 us        12.5 us        11x
+fts_rank               4.85 ms        41.8 ms        8.6x
+group_by               1.38 ms        10.3 ms        7.5x
+union                  27.6 us        148 us         5.3x
+cte                    1.30 ms        6.10 ms        4.7x
+jsonb_contains         5.63 ms        26.2 ms        4.6x
+view_point             3.29 us        12.3 us        3.7x
+truncate               20.6 us        56.7 us        2.75x
+window_agg             28.8 ms        76.1 ms        2.65x
+fts_match              2.87 ms        7.54 ms        2.63x
+upsert_dedup           12.4 us        32.3 us        2.61x
+json_extract           12.2 ms        31.3 ms        2.57x
+partial_index_point    4.78 us        12.2 us        2.54x
+insert_returning       70.9 us        172 us         2.42x
+fts_phrase             4.04 ms        9.05 ms        2.24x
+upsert_returning       79.2 us        174 us         2.19x
+window_rank            60.6 ms        127 ms         2.09x
+savepoint_create       345 ns         716 ns         2.08x
+sort                   1.34 ms        2.67 ms        1.99x
+filter                 973 us         1.87 ms        1.92x
+view_filter            980 us         1.81 ms        1.85x
+scan                   5.03 ms        9.33 ms        1.85x
+savepoint_nested       188 us         348 us         1.85x
+savepoint_rollback     1.25 ms        2.26 ms        1.80x
+insert_select          553 us         936 us         1.69x
+join                   59.6 us        95.3 us        1.60x
+update                 18.6 us        29.2 us        1.56x
+insert                 33.1 us        51.3 us        1.55x
+upsert_all_new         32.5 us        50.2 us        1.55x
+upsert_counter         36.3 us        55.0 us        1.51x
+wide_proj_full         4.69 ms        7.06 ms        1.51x
+wide_proj_pk           315 us         462 us         1.46x
+delete_returning       120 us         172 us         1.44x
+recursive_cte          86.7 us        123 us         1.42x
+delete                 52.0 us        73.5 us        1.41x
+correlated_exists      5.02 ms        6.87 ms        1.37x
+distinct               2.84 ms        3.86 ms        1.36x
+fk_cascade_delete_only 59.8 us        77.5 us        1.30x
+with_dml               82.0 us        105 us         1.28x
+wide_proj_3col         943 us         1.20 ms        1.27x
+sum                    1.55 ms        1.93 ms        1.24x
+wide_proj_2col         510 us         623 us         1.22x
+sort_nocase            2.72 ms        3.30 ms        1.21x
+insert_gen_virtual     45.8 us        54.2 us        1.19x
+upsert_mixed           50.7 us        57.8 us        1.14x
+select_gen_virtual     15.9 us        17.8 us        1.12x
+insert_gen_stored      49.8 us        55.3 us        1.11x
+fk_cascade             80.7 us        87.5 us        1.09x
+update_gen_propagate   43.9 us        45.5 us        1.03x
+update_returning       146 us         148 us         1.01x
 ```
 
-50 head-to-head benchmarks. Citadel is faster on all 50. Geometric mean speedup: ~2.8x.
+54 head-to-head benchmarks. Citadel is faster on all 54. Geometric mean speedup: ~2.6x.
 
 ### Citadel-only (no direct SQLite equivalent)
 
 ```
 Benchmark           Citadel
 -------------------------------
-date_extract        13.6 ms
-date_groupby        9.54 ms
-json_table          8.07 ms
-lateral             2.65 ms
-date_arith          1.74 ms
-date_range_scan     1.71 ms
-date_sort           1.46 ms
+date_groupby        19.2 ms
+date_extract        14.4 ms
+json_table          9.46 ms
+lateral             2.76 ms
+date_range_scan     1.80 ms
+date_arith          1.73 ms
+date_sort           1.43 ms
 ```
 
 ### Index speedups (citadel-internal)
@@ -160,8 +164,8 @@ date_sort           1.46 ms
 ```
 Benchmark              Without index    With index     Speedup
 ---------------------------------------------------------------
-json_gin               11.2 ms          36.4 us        308x
-fts_index              1.29 s           3.14 ms        412x
+json_gin               5.63 ms          36.9 us        153x
+fts_index              1.35 s           2.85 ms        475x
 ```
 
 <details>
@@ -183,12 +187,12 @@ H2H benchmarks:
 - **upsert_returning** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1 RETURNING c`
 - **view_filter** - `SELECT * FROM v WHERE age = 42`
 - **filter** - `SELECT * FROM t WHERE age = 42`
-- **window_agg** - `SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING)`
+- **window_agg** - `SELECT SUM(age) OVER (ORDER BY id ROWS 50 PRECEDING) FROM t`
 - **jsonb_contains** - `SELECT id FROM users WHERE data @> '{"role":"admin"}'::jsonb`
 - **savepoint_create** - `BEGIN; SAVEPOINT sp; RELEASE sp; COMMIT`
 - **sort** - `SELECT * FROM t ORDER BY age LIMIT 10`
 - **upsert_counter** - `INSERT ... ON CONFLICT (id) DO UPDATE SET c = c + 1`
-- **window_rank** - `ROW_NUMBER() OVER (PARTITION BY age ORDER BY id)`
+- **window_rank** - `SELECT ROW_NUMBER() OVER (PARTITION BY age ORDER BY id) FROM t`
 - **delete_returning** - `DELETE ... WHERE id = ? RETURNING id, val`
 - **upsert_dedup** - `INSERT ... ON CONFLICT (id) DO NOTHING`
 - **json_extract** - `SELECT data ->> 'name' FROM users`
@@ -203,6 +207,10 @@ H2H benchmarks:
 - **update_returning** - `UPDATE t SET c = c + ? WHERE id = ? RETURNING c`
 - **insert** - `INSERT INTO t (id, val) VALUES (?, ?)`
 - **scan** - `SELECT * FROM t`
+- **wide_proj_pk** - `SELECT id FROM wide` (24-column table: 3 INT keys, 8 INT, 12 TEXT; 10K rows)
+- **wide_proj_2col** - `SELECT id, k1 FROM wide`
+- **wide_proj_3col** - `SELECT id, k1, t1 FROM wide`
+- **wide_proj_full** - `SELECT * FROM wide`
 - **sort_nocase** - `SELECT name FROM t ORDER BY name COLLATE NOCASE LIMIT 10`
 - **sum** - `SELECT SUM(age) FROM t`
 - **insert_gen_virtual** - `INSERT INTO t (id, a, b) VALUES (?, ?, ?)`
@@ -214,7 +222,7 @@ H2H benchmarks:
 - **recursive_cte** - `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 1000) SELECT SUM(x) FROM seq`
 - **insert_gen_stored** - `INSERT INTO t (id, a, b) VALUES (?, ?, ?)`
 - **fk_cascade** - `DELETE FROM parent WHERE id = ?`
-- **fk_cascade_delete_only** - `DELETE FROM parent WHERE id = ?` without index on child
+- **fk_cascade_delete_only** - `DELETE FROM parent WHERE id = ?` (no index on child)
 - **join** - `SELECT a.id, b.data FROM a INNER JOIN b ON a.id = b.a_id`
 - **fts_match** - `SELECT id FROM docs WHERE body @@ to_tsquery('rust & database')`
 - **fts_phrase** - `SELECT id FROM docs WHERE body @@ phraseto_tsquery('rust database')`
@@ -229,12 +237,14 @@ Citadel-only benchmarks:
 - **date_range_scan** - `SELECT COUNT(*) FROM events WHERE d BETWEEN DATE '2024-02-01' AND DATE '2024-03-31'`
 - **date_arith** - `SELECT COUNT(*) FROM events WHERE ts + INTERVAL '1 day' > TIMESTAMP '2024-06-01 00:00:00'`
 - **date_sort** - `SELECT id FROM events ORDER BY ts LIMIT 100`
-- **json_gin** - `SELECT id FROM users WHERE data @> '{"role":"admin"}'::jsonb` with vs without `CREATE INDEX ... USING gin (data)`
-- **fts_index** - `SELECT id FROM docs WHERE body @@ to_tsquery('...')` with vs without `CREATE INDEX ... USING fts (body)` (`body` is a `TSVECTOR` column)
+
+Index speedups (same query, with vs without the index):
+
+- **json_gin** - `SELECT id FROM users WHERE data @> '{"role":"admin"}'::jsonb`; index `CREATE INDEX ... USING gin (data)`
+- **fts_index** - `SELECT id FROM docs WHERE body @@ to_tsquery(...)`; index `CREATE INDEX ... USING fts (body)` (`body` is a `TSVECTOR` column)
 
 SQLite config: `journal_mode=OFF, synchronous=OFF, cache_size=8192` (~32 MB).
 Citadel config: `SyncMode::Off, cache_size=4096` (~32 MB).
-Both run with durability disabled to measure pure engine overhead, not disk I/O.
 
 Reproduce with `cargo bench -p citadeldb-sql --bench h2h_bench`
 
@@ -330,7 +340,7 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 **Date/Time Functions** - NOW, CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME, LOCALTIMESTAMP, LOCALTIME, CLOCK_TIMESTAMP, EXTRACT, DATE_PART, DATE_TRUNC, DATE_BIN, AGE, MAKE_DATE, MAKE_TIME, MAKE_TIMESTAMP, MAKE_INTERVAL, JUSTIFY_DAYS, JUSTIFY_HOURS, JUSTIFY_INTERVAL, ISFINITE, DATE, TIME, DATETIME, STRFTIME, JULIANDAY, UNIXEPOCH, TIMEDIFF, AT TIME ZONE. Supports `INTERVAL '1 year 2 months'`, `DATE '2024-01-15'`, `TIMESTAMP '2024-01-15 12:30:00Z'`, `infinity`/`-infinity` sentinels, BC dates, full IANA zone parsing (jiff), PG-normalized INTERVAL comparison.
 
-**Full-text search** - `tsvector` / `tsquery` types, `to_tsvector` / `to_tsquery` / `plainto_tsquery` / `phraseto_tsquery` / `websearch_to_tsquery` builders, `@@` match operator, `ts_rank` / `ts_rank_cd` ranking with weighted positions (A/B/C/D), prefix matching (`term:*`), phrase distance (`<N>`), inverted indexes via `CREATE INDEX ... USING fts` for ~400x speedup over sequential scan
+**Full-text search** - `tsvector` / `tsquery` types, `to_tsvector` / `to_tsquery` / `plainto_tsquery` / `phraseto_tsquery` / `websearch_to_tsquery` builders, `@@` match operator, `ts_rank` / `ts_rank_cd` ranking with weighted positions (A/B/C/D), prefix matching (`term:*`), phrase distance (`<N>`), inverted indexes via `CREATE INDEX ... USING fts` for ~475x speedup over sequential scan
 
 **System catalog** - `information_schema.tables`, `information_schema.columns`, `information_schema.key_column_usage`, `information_schema.table_constraints`, `information_schema.triggers`, `pg_timezone_names`, `pg_timezone_abbrevs`, `pg_matviews` (virtual tables, queryable). `SHOW TRIGGERS [ON table]` and `SHOW MATERIALIZED VIEWS` shorthands for the corresponding catalog queries.
 
@@ -338,7 +348,7 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 **Multi-statement scripts** - `Connection::execute_script(sql)` runs `;`-separated statements in one call, returning per-statement outcomes with partial-success preserved. WASM: `db.run(sql)` returns `[{type, ...}, ...]`.
 
-**UPSERT** - `INSERT ... ON CONFLICT (cols) DO NOTHING` / `DO UPDATE SET col = excluded.col ... WHERE ...` and `ON CONFLICT ON CONSTRAINT idx_name`. `excluded.*` refers to the proposed row; bare `col` refers to the existing row. Single-descent storage primitive: on the canonical `DO UPDATE SET counter = counter + 1` pattern, Citadel is ~2x faster than SQLite.
+**UPSERT** - `INSERT ... ON CONFLICT (cols) DO NOTHING` / `DO UPDATE SET col = excluded.col ... WHERE ...` and `ON CONFLICT ON CONSTRAINT idx_name`. `excluded.*` refers to the proposed row; bare `col` refers to the existing row. Single-descent storage primitive: on the canonical `DO UPDATE SET counter = counter + 1` pattern, Citadel is ~1.5x faster than SQLite.
 
 ## Security
 
