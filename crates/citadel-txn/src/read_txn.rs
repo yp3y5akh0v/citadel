@@ -1,7 +1,7 @@
 //! Read transaction: MVCC snapshot isolation. RAII reader registration.
 
 use rustc_hash::FxHashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use citadel_core::types::{PageId, PageType, TxnId, ValueType};
 use citadel_core::{Error, Result};
@@ -35,6 +35,22 @@ impl PageLoader for ReadPages<'_> {
         }
         Ok(())
     }
+}
+
+/// A table's leaf pages in left-to-right order; cacheable across reads at one commit gen.
+pub type LeafPages = Vec<Arc<Page>>;
+
+/// Cache form of [`LeafPages`]: weak handles, so caching does not pin pages in the pool.
+pub type LeafPagesWeak = Vec<Weak<Page>>;
+
+/// Downgrade live leaves to their cacheable weak form.
+pub fn downgrade_leaves(leaves: &[Arc<Page>]) -> LeafPagesWeak {
+    leaves.iter().map(Arc::downgrade).collect()
+}
+
+/// Upgrade cached weak leaves to live handles; `None` if any was evicted (caller rebuilds).
+pub fn upgrade_leaves(weak: &[Weak<Page>]) -> Option<LeafPages> {
+    weak.iter().map(Weak::upgrade).collect()
 }
 
 /// Read-only transaction with snapshot isolation.
@@ -295,15 +311,21 @@ impl<'db> ReadTxn<'db> {
         Ok(crate::scan_iter::TableIter::new(adapter, cursor))
     }
 
-    /// Full table scan via direct leaf iteration. Callback returns `false` to stop.
-    pub fn table_scan_raw<F>(&mut self, table: &[u8], mut f: F) -> Result<()>
-    where
-        F: FnMut(&[u8], &[u8]) -> bool,
-    {
+    /// Collect a table's leaf pages left-to-right (the DFS prelude of a full scan), so a
+    /// caller can cache them and skip this walk on repeated scans at the same commit gen.
+    pub fn collect_table_leaves(&mut self, table: &[u8]) -> Result<LeafPages> {
         let desc = self.lookup_table(table)?;
         let mut leaves = Vec::new();
         self.load_and_collect_leaves(desc.root_page, &mut leaves)?;
-        for page in &leaves {
+        Ok(leaves)
+    }
+
+    /// Iterate the cells of `leaves` (materializing overflow). Callback returns `false` to stop.
+    pub fn scan_leaves<F>(&mut self, leaves: &[Arc<Page>], mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> bool,
+    {
+        for page in leaves {
             let n = page.num_cells();
             for i in 0..n {
                 let cell = leaf_node::read_cell(page, i);
@@ -330,6 +352,15 @@ impl<'db> ReadTxn<'db> {
             }
         }
         Ok(())
+    }
+
+    /// Full table scan via direct leaf iteration. Callback returns `false` to stop.
+    pub fn table_scan_raw<F>(&mut self, table: &[u8], f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> bool,
+    {
+        let leaves = self.collect_table_leaves(table)?;
+        self.scan_leaves(&leaves, f)
     }
 
     /// DFS pass that loads each page into the cache and collects leaves in left-to-right order.

@@ -55,6 +55,7 @@ pub mod upsert_mixed;
 pub mod upsert_returning;
 pub mod view_filter;
 pub mod view_point;
+pub mod wide_proj;
 pub mod window_agg;
 pub mod window_rank;
 pub mod with_dml;

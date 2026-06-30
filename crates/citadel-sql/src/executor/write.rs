@@ -216,7 +216,7 @@ fn resolve_int_param(n: usize) -> Option<i64> {
 
 fn compute_gen_col_targets(
     table_schema: &TableSchema,
-    _set_target_schema_indices: &[usize],
+    set_target_schema_indices: &[usize],
     pk_indices: &[usize],
 ) -> (Vec<GenColPatch>, Vec<(usize, usize)>) {
     let stored_gen_cols: Vec<&ColumnDef> = table_schema
@@ -262,7 +262,12 @@ fn compute_gen_col_targets(
 
     let mut gen_eval_decode_cols: Vec<(usize, usize)> = Vec::new();
     for &schema_idx in &needed_indices {
-        if pk_indices.contains(&schema_idx) {
+        // Single-column UPDATE: the set-target's new value is live in partial_row, skip re-decode.
+        // Multi-column SET re-decodes (RHS evaluates against the original, unmutated row).
+        if pk_indices.contains(&schema_idx)
+            || (set_target_schema_indices.len() == 1
+                && set_target_schema_indices.contains(&schema_idx))
+        {
             continue;
         }
         if let Some(nonpk_order) = non_pk.iter().position(|&i| i == schema_idx) {
@@ -748,6 +753,9 @@ fn exec_update_compiled(
                             *off = usize::MAX;
                         }
                     }
+                    if fast.targets.len() == 1 {
+                        bufs.partial_row[target.schema_idx] = coerced;
+                    }
                 }
                 apply_gen_col_patches_slice(
                     value,
@@ -1032,6 +1040,9 @@ pub(super) fn exec_update(
                             patch_row_column(value, target.phys_idx, &coerced, &mut patch_buf)?;
                             value[..patch_buf.len()].copy_from_slice(&patch_buf);
                         }
+                        if targets.len() == 1 {
+                            partial_row[target.schema_idx] = coerced;
+                        }
                     }
                     apply_gen_col_patches_slice(
                         value,
@@ -1145,6 +1156,9 @@ pub(super) fn exec_update(
                 if !patch_column_in_place(raw_value, target.phys_idx, &coerced)? {
                     patch_row_column(raw_value, target.phys_idx, &coerced, &mut patch_buf)?;
                     std::mem::swap(raw_value, &mut patch_buf);
+                }
+                if targets.len() == 1 {
+                    partial_row[target.schema_idx] = coerced;
                 }
             }
             apply_gen_col_patches_vec(
@@ -2247,6 +2261,9 @@ fn exec_update_in_txn_compiled(
                         patch_row_column(value, target.phys_idx, &coerced, patch_buf)?;
                         value[..patch_buf.len()].copy_from_slice(patch_buf);
                     }
+                    if targets.len() == 1 {
+                        partial_row[target.schema_idx] = coerced;
+                    }
                 }
                 apply_gen_col_patches_slice(
                     value,
@@ -2291,6 +2308,9 @@ fn exec_update_in_txn_compiled(
             if !patch_column_in_place(&mut raw_value, target.phys_idx, &coerced)? {
                 patch_row_column(&raw_value, target.phys_idx, &coerced, patch_buf)?;
                 std::mem::swap(&mut raw_value, patch_buf);
+            }
+            if targets.len() == 1 {
+                partial_row[target.schema_idx] = coerced;
             }
         }
         apply_gen_col_patches_vec(
@@ -2386,6 +2406,9 @@ fn exec_update_in_txn_compiled(
                 patch_row_column(raw_value, target.phys_idx, &coerced, patch_buf)?;
                 std::mem::swap(raw_value, patch_buf);
             }
+            if targets.len() == 1 {
+                partial_row[target.schema_idx] = coerced;
+            }
         }
         apply_gen_col_patches_vec(
             raw_value,
@@ -2443,6 +2466,9 @@ fn exec_pk_lookup_update(
         if !patch_column_in_place(&mut raw_value, target.phys_idx, &coerced)? {
             patch_row_column(&raw_value, target.phys_idx, &coerced, patch_buf)?;
             std::mem::swap(&mut raw_value, patch_buf);
+        }
+        if targets.len() == 1 {
+            partial_row[target.schema_idx] = coerced;
         }
     }
     apply_gen_col_patches_vec(

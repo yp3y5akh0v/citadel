@@ -218,6 +218,52 @@ fn update_multiple_base_cols_recomputes() {
 }
 
 #[test]
+fn single_set_recomputes_stored_from_mixed_deps() {
+    // Single-target UPDATE fast path: the stored gen depends on the SET column (taken live
+    // from partial_row, not re-decoded) AND a non-set column (which must still be decoded).
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER, \
+         s INTEGER GENERATED ALWAYS AS (a + c) STORED)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t (id, a, c) VALUES (1, 1, 100)")
+        .unwrap();
+    conn.execute("UPDATE t SET a = 5 WHERE id = 1").unwrap();
+    let qr = query(&conn, "SELECT a, c, s FROM t");
+    assert_eq!(
+        qr.rows[0],
+        vec![Value::Integer(5), Value::Integer(100), Value::Integer(105)]
+    );
+}
+
+#[test]
+fn prepared_txn_update_recomputes_stored_from_assigned_col() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, \
+         d INTEGER GENERATED ALWAYS AS (a * 2 + 1) STORED)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t (id, a) VALUES (1, 3)").unwrap();
+
+    let stmt = conn
+        .prepare("UPDATE t SET a = a + $1 WHERE id = $2")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    stmt.execute(&[Value::Integer(4), Value::Integer(1)])
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let qr = query(&conn, "SELECT a, d FROM t WHERE id = 1");
+    assert_eq!(qr.rows[0], vec![Value::Integer(7), Value::Integer(15)]);
+}
+
+#[test]
 fn insert_into_generated_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
@@ -527,4 +573,35 @@ fn group_by_virtual() {
     assert_eq!(qr.rows[1][1], Value::Integer(2));
     assert_eq!(qr.rows[2][0], Value::Integer(2));
     assert_eq!(qr.rows[2][1], Value::Integer(1));
+}
+
+#[test]
+fn virtual_add_overflow_errors_not_wraps() {
+    // The checked fast virtual evaluator must error on overflow, never wrap (matching
+    // generic eval). Covers both the clause-free and filtered-virtual read paths.
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, \
+         s INTEGER GENERATED ALWAYS AS (a + b) VIRTUAL)",
+    )
+    .unwrap();
+    conn.execute(&format!(
+        "INSERT INTO t (id, a, b) VALUES (1, {}, 1)",
+        i64::MAX
+    ))
+    .unwrap();
+
+    let err = conn.query("SELECT s FROM t").unwrap_err();
+    assert!(
+        matches!(err, SqlError::IntegerOverflow),
+        "clause-free: {err:?}"
+    );
+
+    let err = conn.query("SELECT id FROM t WHERE s > 0").unwrap_err();
+    assert!(
+        matches!(err, SqlError::IntegerOverflow),
+        "filtered: {err:?}"
+    );
 }

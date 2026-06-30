@@ -1410,3 +1410,104 @@ fn add_column_nullable_with_where_null_check() {
     assert_eq!(qr.rows.len(), 1);
     assert_eq!(qr.rows[0][0], Value::Integer(3));
 }
+
+fn as_int(v: &Value) -> i64 {
+    match v {
+        Value::Integer(i) => *i,
+        other => panic!("expected Integer, got {other:?}"),
+    }
+}
+
+#[test]
+fn projected_scan_after_nontrailing_drop_column() {
+    // Regression: a non-trailing DROP COLUMN left surviving columns at physical slots past
+    // the live count, panicking the projected-scan decoder out-of-bounds.
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER, d TEXT)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10, 20, 30, 'x')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 11, 21, 31, 'y')")
+        .unwrap();
+
+    // Non-trailing non-PK drop: surviving c, d now sit at physical slots > live count.
+    assert_ok(conn.execute("ALTER TABLE t DROP COLUMN b").unwrap());
+
+    let r = conn
+        .prepare("SELECT a, c FROM t")
+        .unwrap()
+        .query_collect(&[])
+        .unwrap();
+    let mut got: Vec<(i64, i64)> = r
+        .rows
+        .iter()
+        .map(|row| (as_int(&row[0]), as_int(&row[1])))
+        .collect();
+    got.sort();
+    assert_eq!(got, vec![(10, 30), (11, 31)]);
+
+    let r = conn
+        .prepare("SELECT a, d FROM t")
+        .unwrap()
+        .query_collect(&[])
+        .unwrap();
+    let mut got: Vec<(i64, String)> = r
+        .rows
+        .iter()
+        .map(|row| {
+            let s = match &row[1] {
+                Value::Text(s) => s.to_string(),
+                v => panic!("d: {v:?}"),
+            };
+            (as_int(&row[0]), s)
+        })
+        .collect();
+    got.sort();
+    assert_eq!(got, vec![(10, "x".to_string()), (11, "y".to_string())]);
+
+    let r = conn
+        .prepare("SELECT id FROM t")
+        .unwrap()
+        .query_collect(&[])
+        .unwrap();
+    assert_eq!(r.rows.len(), 2);
+    let r = conn.query("SELECT * FROM t").unwrap();
+    assert_eq!(r.rows[0].len(), 4);
+}
+
+#[test]
+fn projected_fastlane_fires_after_trailing_drop() {
+    // The static-offset fast lane must still fire correctly when the dropped slot is
+    // after every projected target, so offsets are unaffected.
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10, 20, 30)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 11, 21, 31)")
+        .unwrap();
+
+    assert_ok(conn.execute("ALTER TABLE t DROP COLUMN c").unwrap());
+
+    // a, b are fixed-width and precede the dropped slot -> fast lane resolves offsets.
+    let r = conn
+        .prepare("SELECT a, b FROM t")
+        .unwrap()
+        .query_collect(&[])
+        .unwrap();
+    let mut got: Vec<(i64, i64)> = r
+        .rows
+        .iter()
+        .map(|row| (as_int(&row[0]), as_int(&row[1])))
+        .collect();
+    got.sort();
+    assert_eq!(got, vec![(10, 20), (11, 21)]);
+}

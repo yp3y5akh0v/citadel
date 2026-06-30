@@ -749,6 +749,130 @@ fn prepare_streaming_projection() {
 }
 
 #[test]
+fn prepare_streaming_projection_orderings() {
+    // Exercises ProjectedDecoder's three paths: monotonic push (pk first, ascending),
+    // monotonic with the offset plan declining (variable col before target -> index
+    // fallback), and non-monotonic (pk not first -> index path, output order preserved).
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
+    let by = |rows: &mut Vec<Vec<Value>>, key: usize| {
+        rows.sort_by_key(|r| match &r[key] {
+            Value::Integer(i) => *i,
+            _ => -1,
+        });
+    };
+
+    let mut rows = expect_query(
+        &conn.prepare("SELECT id, name, age FROM users").unwrap(),
+        &[],
+    );
+    by(&mut rows, 0);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Text("Alice".into()),
+                Value::Integer(30)
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Text("Bob".into()),
+                Value::Integer(25)
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Text("Carol".into()),
+                Value::Integer(35)
+            ],
+        ]
+    );
+
+    // `name` (TEXT, variable) precedes `age`, so the offset plan declines -> index path.
+    let mut rows = expect_query(&conn.prepare("SELECT id, age FROM users").unwrap(), &[]);
+    by(&mut rows, 0);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(30)],
+            vec![Value::Integer(2), Value::Integer(25)],
+            vec![Value::Integer(3), Value::Integer(35)],
+        ]
+    );
+
+    let mut rows = expect_query(&conn.prepare("SELECT name, id FROM users").unwrap(), &[]);
+    by(&mut rows, 1);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Text("Alice".into()), Value::Integer(1)],
+            vec![Value::Text("Bob".into()), Value::Integer(2)],
+            vec![Value::Text("Carol".into()), Value::Integer(3)],
+        ]
+    );
+
+    let mut rows = expect_query(
+        &conn.prepare("SELECT age, id, name FROM users").unwrap(),
+        &[],
+    );
+    by(&mut rows, 1);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(30),
+                Value::Integer(1),
+                Value::Text("Alice".into())
+            ],
+            vec![
+                Value::Integer(25),
+                Value::Integer(2),
+                Value::Text("Bob".into())
+            ],
+            vec![
+                Value::Integer(35),
+                Value::Integer(3),
+                Value::Text("Carol".into())
+            ],
+        ]
+    );
+}
+
+#[test]
+fn prepare_scan_leaf_cache_invalidates_on_write() {
+    // The streaming scan caches the table's leaf pages keyed by commit generation. A write
+    // must bump the generation and invalidate, so a re-executed prepared scan sees new data
+    // rather than stale cached leaves.
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_users(&conn);
+
+    let scan = conn.prepare("SELECT id FROM users").unwrap();
+    assert_eq!(scan.query_collect(&[]).unwrap().rows.len(), 3);
+
+    conn.execute("INSERT INTO users (id, name, age) VALUES (4, 'Dave', 40)")
+        .unwrap();
+    assert_eq!(scan.query_collect(&[]).unwrap().rows.len(), 4);
+
+    conn.execute("DELETE FROM users WHERE id = 1").unwrap();
+    let r = scan.query_collect(&[]).unwrap();
+    assert_eq!(r.rows.len(), 3);
+    let mut ids: Vec<i64> = r
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            Value::Integer(i) => *i,
+            v => panic!("id: {v:?}"),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![2, 3, 4]);
+}
+
+#[test]
 fn prepare_exists_short_circuits_via_stream() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());

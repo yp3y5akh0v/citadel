@@ -10,6 +10,7 @@ criterion_group!(
     h2h::count::bench,
     h2h::point::bench,
     h2h::scan::bench,
+    h2h::wide_proj::bench,
     h2h::filter::bench,
     h2h::sort::bench,
     h2h::sort_nocase::bench,

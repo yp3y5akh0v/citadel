@@ -830,42 +830,41 @@ pub(crate) fn fixed_width_size(type_tag: u8) -> Option<usize> {
     }
 }
 
+/// Resolve a cell's `(data_len, body_pos)` from its tag. Variable-width cells carry a
+/// u32 length prefix; V2 fixed-width cells omit it.
+#[inline]
+fn cell_extent(
+    data: &[u8],
+    type_tag: u8,
+    after_tag: usize,
+    version: RowVersion,
+) -> Result<(usize, usize)> {
+    let fixed = match version {
+        RowVersion::V2 => fixed_width_size(type_tag),
+        RowVersion::V1 => None,
+    };
+    if let Some(n) = fixed {
+        return Ok((n, after_tag));
+    }
+    if after_tag + 4 > data.len() {
+        return Err(SqlError::InvalidValue("truncated column data".into()));
+    }
+    let len = u32::from_le_bytes([
+        data[after_tag],
+        data[after_tag + 1],
+        data[after_tag + 2],
+        data[after_tag + 3],
+    ]) as usize;
+    Ok((len, after_tag + 4))
+}
+
 #[inline]
 fn read_cell(data: &[u8], pos: usize, version: RowVersion) -> Result<(u8, &[u8], usize)> {
     if pos >= data.len() {
         return Err(SqlError::InvalidValue("truncated column data".into()));
     }
     let type_tag = data[pos];
-    let after_tag = pos + 1;
-    let (data_len, body_pos) = match version {
-        RowVersion::V2 => match fixed_width_size(type_tag) {
-            Some(n) => (n, after_tag),
-            None => {
-                if after_tag + 4 > data.len() {
-                    return Err(SqlError::InvalidValue("truncated column data".into()));
-                }
-                let len = u32::from_le_bytes([
-                    data[after_tag],
-                    data[after_tag + 1],
-                    data[after_tag + 2],
-                    data[after_tag + 3],
-                ]) as usize;
-                (len, after_tag + 4)
-            }
-        },
-        RowVersion::V1 => {
-            if after_tag + 4 > data.len() {
-                return Err(SqlError::InvalidValue("truncated column data".into()));
-            }
-            let len = u32::from_le_bytes([
-                data[after_tag],
-                data[after_tag + 1],
-                data[after_tag + 2],
-                data[after_tag + 3],
-            ]) as usize;
-            (len, after_tag + 4)
-        }
-    };
+    let (data_len, body_pos) = cell_extent(data, type_tag, pos + 1, version)?;
     if body_pos + data_len > data.len() {
         return Err(SqlError::InvalidValue("truncated column value".into()));
     }
@@ -876,10 +875,15 @@ fn read_cell(data: &[u8], pos: usize, version: RowVersion) -> Result<(u8, &[u8],
     ))
 }
 
+/// Next cell position by offset; the body is left unsliced (the next read validates it).
 #[inline]
 fn skip_cell(data: &[u8], pos: usize, version: RowVersion) -> Result<usize> {
-    let (_, _, next) = read_cell(data, pos, version)?;
-    Ok(next)
+    if pos >= data.len() {
+        return Err(SqlError::InvalidValue("truncated column data".into()));
+    }
+    let type_tag = data[pos];
+    let (data_len, body_pos) = cell_extent(data, type_tag, pos + 1, version)?;
+    Ok(body_pos + data_len)
 }
 
 fn copy_cell_to_v2(
@@ -936,6 +940,25 @@ pub fn decode_row(data: &[u8]) -> Result<Vec<Value>> {
     }
 
     Ok(values)
+}
+
+/// Push non-PK cells onto `out` in physical order. `Ok(false)` if stored count != `expected`.
+/// Sound only when physical order == logical order (no dropped slots).
+pub(crate) fn decode_row_push(data: &[u8], expected: usize, out: &mut Vec<Value>) -> Result<bool> {
+    let (version, col_count, bitmap, mut pos) = parse_row_header(data)?;
+    if col_count != expected {
+        return Ok(false);
+    }
+    for col in 0..col_count {
+        if bitmap[col / 8] & (1 << (col % 8)) != 0 {
+            out.push(Value::Null);
+        } else {
+            let (type_tag, body, next) = read_cell(data, pos, version)?;
+            out.push(decode_value(type_tag, body)?);
+            pos = next;
+        }
+    }
+    Ok(true)
 }
 
 /// Returns the number of non-PK columns stored in a row value blob.
@@ -1048,6 +1071,130 @@ pub fn decode_columns_into(
     }
 
     Ok(())
+}
+
+struct OffsetTarget {
+    cell_pos: usize,
+    tag: u8,
+    fixed_width: Option<usize>,
+    out_pos: usize,
+}
+
+/// Reads projected non-PK columns from a V2 row by static byte offset. Built only when
+/// every column before the last target is fixed-width, so offsets are constant.
+pub(crate) struct ProjectedOffsetPlan {
+    expected_header: u16,
+    body_start: usize,
+    nonnull_mask: Vec<u8>,
+    targets: Vec<OffsetTarget>,
+}
+
+impl ProjectedOffsetPlan {
+    /// `targets` = `(physical_index, out_position)`. `None` if a variable-width column
+    /// precedes the last target.
+    pub(crate) fn build(phys_tags: &[u8], targets: &[(usize, usize)]) -> Option<Self> {
+        if targets.is_empty() {
+            return None;
+        }
+        let max_t = targets.iter().map(|&(p, _)| p).max()?;
+        let mut offsets = Vec::with_capacity(max_t + 1);
+        let mut acc = 0usize;
+        for (i, &tag) in phys_tags.iter().enumerate().take(max_t + 1) {
+            offsets.push(acc);
+            if i < max_t {
+                acc += 1 + fixed_width_size(tag)?;
+            }
+        }
+        let mut out_targets = Vec::with_capacity(targets.len());
+        for &(p, out_pos) in targets {
+            let tag = phys_tags[p];
+            out_targets.push(OffsetTarget {
+                cell_pos: offsets[p],
+                tag,
+                fixed_width: fixed_width_size(tag),
+                out_pos,
+            });
+        }
+        let phys_count = phys_tags.len();
+        let bitmap_bytes = phys_count.div_ceil(8);
+        let mut nonnull_mask = vec![0u8; bitmap_bytes];
+        for bit in 0..=max_t {
+            nonnull_mask[bit / 8] |= 1 << (bit % 8);
+        }
+        Some(Self {
+            expected_header: V2_FLAG | (phys_count as u16),
+            body_start: 2 + bitmap_bytes,
+            nonnull_mask,
+            targets: out_targets,
+        })
+    }
+
+    /// True when `data` matches the plan's V2 header and has no NULL in the static prefix.
+    #[inline]
+    fn layout_ok(&self, data: &[u8]) -> bool {
+        if data.len() < self.body_start
+            || u16::from_le_bytes([data[0], data[1]]) != self.expected_header
+        {
+            return false;
+        }
+        self.nonnull_mask
+            .iter()
+            .enumerate()
+            .all(|(i, &m)| data[2 + i] & m == 0)
+    }
+
+    /// Decode one target by static offset. `Ok(None)` = tag/bounds mismatch (fall back).
+    #[inline]
+    fn read_target(&self, data: &[u8], t: &OffsetTarget) -> Result<Option<Value>> {
+        let pos = self.body_start + t.cell_pos;
+        if data.get(pos) != Some(&t.tag) {
+            return Ok(None);
+        }
+        let after_tag = pos + 1;
+        let (len, body_pos) = match t.fixed_width {
+            Some(n) => (n, after_tag),
+            None => match data.get(after_tag..after_tag + 4) {
+                Some(lb) => (
+                    u32::from_le_bytes(lb.try_into().unwrap()) as usize,
+                    after_tag + 4,
+                ),
+                None => return Ok(None),
+            },
+        };
+        match data.get(body_pos..body_pos + len) {
+            Some(body) => Ok(Some(decode_value(t.tag, body)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Decode planned columns by index into `row`. `Ok(false)` = layout mismatch (fall back).
+    pub(crate) fn decode_into(&self, data: &[u8], row: &mut [Value]) -> Result<bool> {
+        if !self.layout_ok(data) {
+            return Ok(false);
+        }
+        for t in &self.targets {
+            match self.read_target(data, t)? {
+                Some(v) => row[t.out_pos] = v,
+                None => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Push planned columns onto `out` (monotonic projection only). `Ok(false)` = layout
+    /// mismatch; `out` may be left partially pushed and must be discarded by the caller.
+    pub(crate) fn decode_push(&self, data: &[u8], out: &mut Vec<Value>) -> Result<bool> {
+        if !self.layout_ok(data) {
+            return Ok(false);
+        }
+        for t in &self.targets {
+            match self.read_target(data, t)? {
+                Some(v) => out.push(v),
+                None => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1264,6 +1411,9 @@ pub fn patch_column_in_place(data: &mut [u8], target: usize, new_val: &Value) ->
             pos = skip_cell(data, pos, version)?;
         }
     }
+    if pos >= data.len() {
+        return Err(SqlError::InvalidValue("truncated column data".into()));
+    }
     let type_tag = data[pos];
     let (old_data_len, val_start) = match version {
         RowVersion::V2 => match fixed_width_size(type_tag) {
@@ -1448,11 +1598,8 @@ pub fn decode_pk_integer(key: &[u8]) -> Result<i64> {
     if key.is_empty() || key[0] != TAG_INTEGER {
         return Err(SqlError::InvalidValue("not an integer key".into()));
     }
-    let (val, _) = decode_integer(&key[1..])?;
-    match val {
-        Value::Integer(i) => Ok(i),
-        _ => unreachable!(),
-    }
+    let (val, _) = decode_signed_varint(&key[1..])?;
+    Ok(val)
 }
 
 #[cfg(test)]

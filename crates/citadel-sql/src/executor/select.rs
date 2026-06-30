@@ -203,7 +203,6 @@ pub(super) fn exec_select_with_read(
             group_by: stmt.group_by.clone(),
             having: stmt.having.clone(),
         };
-        // Handle correlated scalar in SELECT
         let mut ext_cols = table_schema.columns.clone();
         let clean_stmt = handle_correlated_select_with_read(
             rtx,
@@ -2597,7 +2596,6 @@ fn try_streaming_distinct_with_read(
     let enc_pos = table_schema.encoding_positions();
     let num_pk_cols = table_schema.primary_key_columns.len();
 
-    // Resolve each SELECT column to a RawAggTarget
     let mut targets: Vec<RawAggTarget> = Vec::new();
     let mut col_names: Vec<String> = Vec::new();
 
@@ -3839,11 +3837,16 @@ pub(super) fn process_select(
     }))
 }
 
+/// Scanned table's leaf pages cached across re-executions, keyed by commit generation, so
+/// repeated prepared scans skip the per-scan leaf-collection DFS + buffer-pool locks.
+type LeafScanCache = parking_lot::RwLock<Option<(u64, citadel_txn::read_txn::LeafPagesWeak)>>;
+
 pub struct CompiledSelect {
     join_plan: Option<Arc<JoinPlanStatic>>,
     join_cache: Option<parking_lot::RwLock<Option<Arc<CachedJoin>>>>,
     compound_plan: Option<Arc<CompoundPlanStatic>>,
     compound_cache: Option<parking_lot::RwLock<Option<Arc<CachedCompound>>>>,
+    leaf_cache: LeafScanCache,
 }
 
 struct JoinPlanStatic {
@@ -3899,6 +3902,7 @@ impl CompiledSelect {
                 join_cache: None,
                 compound_plan,
                 compound_cache,
+                leaf_cache: parking_lot::RwLock::new(None),
             });
         }
 
@@ -3934,6 +3938,7 @@ impl CompiledSelect {
             join_cache,
             compound_plan: None,
             compound_cache: None,
+            leaf_cache: parking_lot::RwLock::new(None),
         })
     }
 }
@@ -4013,16 +4018,36 @@ impl CompiledPlan for CompiledSelect {
         _params: &[Value],
     ) -> Option<Result<QueryResult>> {
         let (lower, table_schema, proj, columns) = stream_scan_setup(schema, stmt)?;
-        Some(collect_scan(db, &lower, &table_schema, &proj, columns))
+        Some(collect_scan(
+            db,
+            &lower,
+            &table_schema,
+            &proj,
+            columns,
+            &self.leaf_cache,
+        ))
     }
 }
 
 enum StreamProj {
-    Identity,
-    Columns(Vec<usize>),
+    Identity {
+        /// Push-build the full row; precomputed eligibility.
+        full_push: bool,
+    },
+    Columns {
+        idxs: Vec<usize>,
+        /// Compact path: decodes straight into the output row, no scratch.
+        proj_decoder: Option<ProjectedDecoder>,
+        /// Fallback partial decode; None when all columns are needed.
+        ctx: Option<PartialDecodeCtx>,
+        /// idxs has no repeats, so projected values can be moved out.
+        unique: bool,
+    },
     Exprs {
         col_map: ColumnMap,
         exprs: Vec<Expr>,
+        /// Decodes only the referenced columns; None when all are needed.
+        ctx: Option<PartialDecodeCtx>,
     },
 }
 
@@ -4068,17 +4093,49 @@ fn decode_and_project(
     scratch: &mut Vec<Value>,
 ) -> Result<Vec<Value>> {
     match proj {
-        StreamProj::Identity => decode_full_row(schema, key, value),
-        StreamProj::Columns(idxs) => {
-            decode_full_row_into(schema, key, value, scratch)?;
-            Ok(idxs.iter().map(|&i| scratch[i].clone()).collect())
+        StreamProj::Identity { full_push } => {
+            if *full_push {
+                if let Some(row) = decode_full_row_push(schema, key, value)? {
+                    return Ok(row);
+                }
+            }
+            decode_full_row(schema, key, value)
         }
-        StreamProj::Exprs { col_map, exprs } => {
-            decode_full_row_into(schema, key, value, scratch)?;
-            let ctx = EvalCtx::new(col_map, scratch);
+        StreamProj::Columns {
+            idxs,
+            proj_decoder,
+            ctx,
+            unique,
+        } => {
+            if let Some(pd) = proj_decoder {
+                return pd.decode(key, value);
+            }
+            match ctx {
+                Some(c) => c.decode_into(key, value, scratch)?,
+                None => decode_full_row_into(schema, key, value, scratch)?,
+            }
+            if *unique {
+                Ok(idxs
+                    .iter()
+                    .map(|&i| std::mem::take(&mut scratch[i]))
+                    .collect())
+            } else {
+                Ok(idxs.iter().map(|&i| scratch[i].clone()).collect())
+            }
+        }
+        StreamProj::Exprs {
+            col_map,
+            exprs,
+            ctx,
+        } => {
+            match ctx {
+                Some(c) => c.decode_into(key, value, scratch)?,
+                None => decode_full_row_into(schema, key, value, scratch)?,
+            }
+            let ectx = EvalCtx::new(col_map, scratch);
             let mut out = Vec::with_capacity(exprs.len());
             for e in exprs {
-                out.push(eval_expr(e, &ctx)?);
+                out.push(eval_expr(e, &ectx)?);
             }
             Ok(out)
         }
@@ -4123,15 +4180,35 @@ fn collect_scan(
     table_schema: &TableSchema,
     proj: &StreamProj,
     columns: Vec<String>,
+    leaf_cache: &LeafScanCache,
 ) -> Result<QueryResult> {
     let mut rtx = db.begin_read();
+    let gen = rtx.commit_generation();
     let row_count = rtx.table_entry_count(table_lower.as_bytes()).unwrap_or(0) as usize;
+
+    // A write bumps the gen and invalidates; DDL recompiles the plan upstream.
+    let cached = match &*leaf_cache.read() {
+        Some((cached_gen, weak)) if *cached_gen == gen => {
+            citadel_txn::read_txn::upgrade_leaves(weak)
+        }
+        _ => None,
+    };
+    let leaves = match cached {
+        Some(l) => l,
+        None => {
+            let l = rtx
+                .collect_table_leaves(table_lower.as_bytes())
+                .map_err(SqlError::Storage)?;
+            *leaf_cache.write() = Some((gen, citadel_txn::read_txn::downgrade_leaves(&l)));
+            l
+        }
+    };
+
     let mut rows = Vec::with_capacity(row_count);
     let mut scratch: Vec<Value> = Vec::new();
     let mut err: Option<SqlError> = None;
-    rtx.table_scan_raw(
-        table_lower.as_bytes(),
-        |key, value| match decode_and_project(proj, table_schema, key, value, &mut scratch) {
+    rtx.scan_leaves(&leaves, |key, value| {
+        match decode_and_project(proj, table_schema, key, value, &mut scratch) {
             Ok(row) => {
                 rows.push(row);
                 true
@@ -4140,8 +4217,8 @@ fn collect_scan(
                 err = Some(e);
                 false
             }
-        },
-    )
+        }
+    })
     .map_err(SqlError::Storage)?;
     if let Some(e) = err {
         return Err(e);
@@ -4183,16 +4260,44 @@ fn build_stream_proj(select_cols: &[SelectColumn], schema: &TableSchema) -> Opti
     if let Some(idxs) = build_projection(select_cols, &schema.columns) {
         let identity =
             idxs.len() == schema.columns.len() && idxs.iter().enumerate().all(|(i, &p)| i == p);
-        return Some(if identity {
-            StreamProj::Identity
-        } else {
-            StreamProj::Columns(idxs)
+        if identity {
+            return Some(StreamProj::Identity {
+                full_push: full_row_push_eligible(schema),
+            });
+        }
+        let mut needed = idxs.clone();
+        needed.sort_unstable();
+        needed.dedup();
+        let unique = needed.len() == idxs.len();
+        let proj_decoder = unique
+            .then(|| ProjectedDecoder::try_new(schema, &idxs))
+            .flatten();
+        let ctx = proj_decoder
+            .is_none()
+            .then(|| {
+                (needed.len() < schema.columns.len())
+                    .then(|| PartialDecodeCtx::new(schema, &needed))
+            })
+            .flatten();
+        return Some(StreamProj::Columns {
+            idxs,
+            proj_decoder,
+            ctx,
+            unique,
         });
     }
     let exprs = build_expr_projection(select_cols)?;
+    let mut needed: Vec<usize> = Vec::new();
+    for e in &exprs {
+        needed.extend(referenced_columns(e, &schema.columns));
+    }
+    needed.sort_unstable();
+    needed.dedup();
+    let ctx = (needed.len() < schema.columns.len()).then(|| PartialDecodeCtx::new(schema, &needed));
     Some(StreamProj::Exprs {
         col_map: ColumnMap::new(&schema.columns),
         exprs,
+        ctx,
     })
 }
 
