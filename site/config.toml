@@ -26,6 +26,6 @@ locomo_gemini = "90.6"
 locomo_ceiling = "95.1"
 longmemeval = "90.6"
 longmemeval_mini = "82.2"
-benchmarks = 50
+benchmarks = 54
 mcp_tools = 13
 ffi_functions = 37
