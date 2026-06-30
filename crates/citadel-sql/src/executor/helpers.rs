@@ -1,6 +1,7 @@
 use crate::encoding::{
-    decode_columns, decode_columns_into, decode_composite_key, decode_key_value, decode_pk_into,
-    decode_row_into, encode_composite_key, row_non_pk_count,
+    decode_columns, decode_columns_into, decode_composite_key, decode_key_value, decode_pk_integer,
+    decode_pk_into, decode_row_into, decode_row_push, encode_composite_key, row_non_pk_count,
+    ProjectedOffsetPlan,
 };
 use crate::error::{Result, SqlError};
 use crate::eval::{eval_expr, is_truthy, ColumnMap, EvalCtx};
@@ -152,6 +153,41 @@ pub(super) fn eval_fast_gen(
     }
 }
 
+/// Checked variant of [`eval_fast_gen`]: integer overflow returns `IntegerOverflow` (never
+/// wraps); non-integer/NULL operands fall back to `eval_expr`, so results are byte-identical.
+pub(super) fn eval_fast_gen_checked(
+    fast: &FastGenEval,
+    expr: &Expr,
+    partial_row: &[Value],
+    col_map: &ColumnMap,
+) -> Result<Value> {
+    match fast {
+        FastGenEval::IntColMulAdd {
+            col_schema_idx,
+            mul,
+            add,
+        } => match partial_row[*col_schema_idx] {
+            Value::Integer(v) => v
+                .checked_mul(*mul)
+                .and_then(|p| p.checked_add(*add))
+                .map(Value::Integer)
+                .ok_or(SqlError::IntegerOverflow),
+            _ => eval_expr(expr, &EvalCtx::new(col_map, partial_row)),
+        },
+        FastGenEval::IntColAddCol {
+            left_idx,
+            right_idx,
+        } => match (&partial_row[*left_idx], &partial_row[*right_idx]) {
+            (Value::Integer(a), Value::Integer(b)) => a
+                .checked_add(*b)
+                .map(Value::Integer)
+                .ok_or(SqlError::IntegerOverflow),
+            _ => eval_expr(expr, &EvalCtx::new(col_map, partial_row)),
+        },
+        FastGenEval::None => eval_expr(expr, &EvalCtx::new(col_map, partial_row)),
+    }
+}
+
 pub(super) struct PartialDecodeCtx {
     pk_positions: Vec<(usize, usize)>,
     nonpk_targets: Vec<usize>,
@@ -163,8 +199,10 @@ pub(super) struct PartialDecodeCtx {
     remaining_nonpk_schema: Vec<usize>,
     nonpk_defaults: Vec<(usize, usize, Value)>,
     remaining_defaults: Vec<(usize, usize, Value)>,
-    virtuals_to_eval: Vec<(usize, Expr, DataType, bool)>,
+    virtuals_to_eval: Vec<(usize, Expr, DataType, bool, FastGenEval)>,
     col_map: ColumnMap,
+    /// Columns this ctx writes; the only ones a reused buffer must clear.
+    reset_cols: Vec<usize>,
 }
 
 impl PartialDecodeCtx {
@@ -267,15 +305,16 @@ impl PartialDecodeCtx {
                     c.generated_kind,
                     Some(crate::parser::GeneratedKind::Virtual)
                 ) {
-                    virtuals_to_eval.push((
-                        col,
-                        c.generated_expr.as_ref().unwrap().clone(),
-                        c.data_type,
-                        c.nullable,
-                    ));
+                    let expr = c.generated_expr.as_ref().unwrap();
+                    let fast = detect_fast_gen_eval(expr, schema);
+                    virtuals_to_eval.push((col, expr.clone(), c.data_type, c.nullable, fast));
                 }
             }
         }
+
+        let mut reset_cols = expanded_needed;
+        reset_cols.sort_unstable();
+        reset_cols.dedup();
 
         Self {
             pk_positions,
@@ -290,12 +329,13 @@ impl PartialDecodeCtx {
             remaining_defaults,
             virtuals_to_eval,
             col_map: ColumnMap::new(&schema.columns),
+            reset_cols,
         }
     }
 
     fn materialize_virtuals(&self, row: &mut [Value]) -> Result<()> {
-        for (pos, expr, dt, nullable) in &self.virtuals_to_eval {
-            let val = eval_expr(expr, &EvalCtx::new(&self.col_map, row))?;
+        for (pos, expr, dt, nullable, fast) in &self.virtuals_to_eval {
+            let val = eval_fast_gen_checked(fast, expr, row, &self.col_map)?;
             row[*pos] = if val.is_null() {
                 if !*nullable {
                     return Err(SqlError::InvalidValue(format!(
@@ -315,7 +355,21 @@ impl PartialDecodeCtx {
     }
 
     pub(super) fn decode(&self, key: &[u8], value: &[u8]) -> Result<Vec<Value>> {
-        let mut row = vec![Value::Null; self.num_cols];
+        let mut row = Vec::new();
+        self.decode_into(key, value, &mut row)?;
+        Ok(row)
+    }
+
+    /// Decode the needed columns into a reused `row` buffer; others stay NULL.
+    pub(super) fn decode_into(&self, key: &[u8], value: &[u8], row: &mut Vec<Value>) -> Result<()> {
+        if row.len() != self.num_cols {
+            row.clear();
+            row.resize(self.num_cols, Value::Null);
+        } else {
+            for &p in &self.reset_cols {
+                row[p] = Value::Null;
+            }
+        }
 
         if self.pk_positions.len() == 1 && self.num_pk_cols == 1 {
             let (_, schema_col) = self.pk_positions[0];
@@ -329,7 +383,7 @@ impl PartialDecodeCtx {
         }
 
         if !self.nonpk_targets.is_empty() {
-            decode_columns_into(value, &self.nonpk_targets, &self.nonpk_schema, &mut row)?;
+            decode_columns_into(value, &self.nonpk_targets, &self.nonpk_schema, row)?;
         }
 
         if !self.nonpk_defaults.is_empty() {
@@ -342,10 +396,10 @@ impl PartialDecodeCtx {
         }
 
         if !self.virtuals_to_eval.is_empty() {
-            self.materialize_virtuals(&mut row)?;
+            self.materialize_virtuals(row)?;
         }
 
-        Ok(row)
+        Ok(())
     }
 
     pub(super) fn complete(
@@ -378,6 +432,110 @@ impl PartialDecodeCtx {
     }
 }
 
+/// Decodes a projection straight into a right-sized output row. Built only for the common
+/// shape (single-column PK, no VIRTUAL or defaulted columns); other shapes fall back.
+pub(super) struct ProjectedDecoder {
+    single_pk_out: Option<usize>,
+    pk_is_integer: bool,
+    nonpk_targets: Vec<usize>,
+    nonpk_out: Vec<usize>,
+    offset_plan: Option<ProjectedOffsetPlan>,
+    /// pk at output 0 then non-PK in ascending output==physical order, so the row builds by push.
+    monotonic: bool,
+    arity: usize,
+}
+
+impl ProjectedDecoder {
+    pub(super) fn try_new(schema: &TableSchema, idxs: &[usize]) -> Option<Self> {
+        if schema.primary_key_columns.len() != 1 {
+            return None;
+        }
+        let pk_col = schema.primary_key_columns[0] as usize;
+        let non_pk = schema.non_pk_indices();
+        let enc_pos = schema.encoding_positions();
+        let mut single_pk_out = None;
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for (out_pos, &col) in idxs.iter().enumerate() {
+            let c = &schema.columns[col];
+            if matches!(
+                c.generated_kind,
+                Some(crate::parser::GeneratedKind::Virtual)
+            ) {
+                return None;
+            }
+            if col == pk_col {
+                single_pk_out = Some(out_pos);
+                continue;
+            }
+            if c.default_expr.is_some() {
+                return None;
+            }
+            let nonpk_order = non_pk.iter().position(|&i| i == col)?;
+            pairs.push((enc_pos[nonpk_order] as usize, out_pos));
+        }
+        pairs.sort_by_key(|&(t, _)| t);
+        // Sized by physical slot count, not live: enc_pos holds physical slots that exceed
+        // the live count after a non-trailing DROP COLUMN (dropped slots stay tag 0 -> decline).
+        let mut phys_tags = vec![0u8; schema.physical_non_pk_count()];
+        for (k, &schema_col) in non_pk.iter().enumerate() {
+            phys_tags[enc_pos[k] as usize] = schema.columns[schema_col].data_type.type_tag();
+        }
+        let offset_plan = ProjectedOffsetPlan::build(&phys_tags, &pairs);
+        let monotonic =
+            single_pk_out == Some(0) && pairs.iter().enumerate().all(|(i, &(_, o))| o == i + 1);
+        Some(Self {
+            single_pk_out,
+            pk_is_integer: matches!(schema.columns[pk_col].data_type, DataType::Integer),
+            nonpk_targets: pairs.iter().map(|&(t, _)| t).collect(),
+            nonpk_out: pairs.iter().map(|&(_, o)| o).collect(),
+            offset_plan,
+            monotonic,
+            arity: idxs.len(),
+        })
+    }
+
+    pub(super) fn decode(&self, key: &[u8], value: &[u8]) -> Result<Vec<Value>> {
+        if self.monotonic {
+            match &self.offset_plan {
+                Some(plan) => {
+                    let mut out = Vec::with_capacity(self.arity);
+                    out.push(self.decode_pk(key)?);
+                    if plan.decode_push(value, &mut out)? {
+                        return Ok(out);
+                    }
+                    // Layout mismatch: discard the partial push, fall to the index path.
+                }
+                None if self.nonpk_targets.is_empty() => {
+                    return Ok(vec![self.decode_pk(key)?]);
+                }
+                None => {}
+            }
+        }
+        let mut out = vec![Value::Null; self.arity];
+        if let Some(j) = self.single_pk_out {
+            out[j] = self.decode_pk(key)?;
+        }
+        if !self.nonpk_targets.is_empty() {
+            if let Some(plan) = &self.offset_plan {
+                if plan.decode_into(value, &mut out)? {
+                    return Ok(out);
+                }
+            }
+            decode_columns_into(value, &self.nonpk_targets, &self.nonpk_out, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    #[inline]
+    fn decode_pk(&self, key: &[u8]) -> Result<Value> {
+        if self.pk_is_integer {
+            Ok(Value::Integer(decode_pk_integer(key)?))
+        } else {
+            Ok(decode_key_value(key)?.0)
+        }
+    }
+}
+
 pub(crate) fn decode_full_row(
     schema: &TableSchema,
     key: &[u8],
@@ -386,6 +544,31 @@ pub(crate) fn decode_full_row(
     let mut row = Vec::with_capacity(schema.columns.len());
     decode_full_row_into(schema, key, value, &mut row)?;
     Ok(row)
+}
+
+/// True when a full row can be push-built (single PK at logical 0, no virtual columns,
+/// no dropped slots).
+pub(crate) fn full_row_push_eligible(schema: &TableSchema) -> bool {
+    schema.primary_key_columns.len() == 1
+        && schema.primary_key_columns[0] == 0
+        && !schema.has_virtual_columns()
+        && schema.dropped_non_pk_slots().is_empty()
+}
+
+/// Push-build a full `SELECT *` row (pk then each physical cell). Caller gates on
+/// `full_row_push_eligible`. `None` when stored count != live schema (pre-column-add row).
+pub(crate) fn decode_full_row_push(
+    schema: &TableSchema,
+    key: &[u8],
+    value: &[u8],
+) -> Result<Option<Vec<Value>>> {
+    let mut row = Vec::with_capacity(schema.columns.len());
+    row.push(decode_key_value(key)?.0);
+    if decode_row_push(value, schema.columns.len() - 1, &mut row)? {
+        Ok(Some(row))
+    } else {
+        Ok(None)
+    }
 }
 
 #[inline]
@@ -1229,7 +1412,7 @@ fn encode_index_key_component(value: &Value, coll: crate::types::Collation, buf:
     }
 }
 
-/// Expression eval errors (or missing schema) materialize as `Value::Null` — PG semantics.
+/// Expression eval errors (or missing schema) materialize as `Value::Null` - PG semantics.
 pub(super) fn materialize_index_key_values(
     idx: &IndexDef,
     row: &[Value],
@@ -1592,7 +1775,7 @@ pub(super) fn index_columns_changed(idx: &IndexDef, old_row: &[Value], new_row: 
         .any(|col_idx| old_row[col_idx as usize] != new_row[col_idx as usize])
 }
 
-/// NULL or eval errors → false (treated as predicate-false).
+/// NULL or eval errors -> false (treated as predicate-false).
 pub(super) fn row_matches_partial(idx: &IndexDef, row: &[Value], col_map: &ColumnMap) -> bool {
     let Some(expr) = idx.predicate_expr.as_ref() else {
         return true;

@@ -136,3 +136,52 @@ pub fn citadel_date_table(conn: &Connection) {
     }
     conn.execute("COMMIT").unwrap();
 }
+
+pub const WIDE_ROWS: i64 = 10_000;
+
+const WIDE_CREATE: &str = "CREATE TABLE wide (\
+    id INTEGER NOT NULL PRIMARY KEY, k1 INTEGER, k2 INTEGER, k3 INTEGER, \
+    n1 INTEGER, n2 INTEGER, n3 INTEGER, n4 INTEGER, n5 INTEGER, n6 INTEGER, n7 INTEGER, n8 INTEGER, \
+    t1 TEXT, t2 TEXT, t3 TEXT, t4 TEXT, t5 TEXT, t6 TEXT, \
+    t7 TEXT, t8 TEXT, t9 TEXT, t10 TEXT, t11 TEXT, t12 TEXT)";
+
+const WIDE_PAD: &str = "the_quick_brown_fox_jumps_over_the_lazy_dog_0123456789_padding";
+
+fn wide_insert_sql(i: i64) -> String {
+    format!(
+        "INSERT INTO wide VALUES ({i}, {k1}, {k2}, {k3}, \
+         {n1}, {n2}, {n3}, {n4}, {n5}, {n6}, {n7}, {n8}, \
+         't1_{i}_{p}', 't2_{i}_{p}', 't3_{i}_{p}', 't4_{i}_{p}', 't5_{i}_{p}', 't6_{i}_{p}', \
+         't7_{i}_{p}', 't8_{i}_{p}', 't9_{i}_{p}', 't10_{i}_{p}', 't11_{i}_{p}', 't12_{i}_{p}')",
+        k1 = i % 1000,
+        k2 = i % 100,
+        k3 = i % 10,
+        n1 = i % 50,
+        n2 = (i + 1) % 50,
+        n3 = (i + 2) % 50,
+        n4 = (i + 3) % 50,
+        n5 = (i + 4) % 50,
+        n6 = (i + 5) % 50,
+        n7 = (i + 6) % 50,
+        n8 = (i + 7) % 50,
+        p = WIDE_PAD,
+    )
+}
+
+pub fn citadel_wide(conn: &Connection) {
+    conn.execute(WIDE_CREATE).unwrap();
+    conn.execute("BEGIN").unwrap();
+    for i in 0..WIDE_ROWS {
+        conn.execute(&wide_insert_sql(i)).unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+}
+
+pub fn sqlite_wide(conn: &rusqlite::Connection) {
+    conn.execute(WIDE_CREATE, []).unwrap();
+    conn.execute_batch("BEGIN").unwrap();
+    for i in 0..WIDE_ROWS {
+        conn.execute(&wide_insert_sql(i), []).unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
+}
