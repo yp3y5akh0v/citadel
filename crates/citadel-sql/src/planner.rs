@@ -632,6 +632,18 @@ fn conjunct_proves_not_null(expr: &Expr, col: &str) -> bool {
     }
 }
 
+/// Fold a probe value the way index keys are folded at write time
+/// (`encode_key_value_collated_into`), so probe bytes match stored key bytes.
+fn fold_probe_value(value: Value, coll: crate::types::Collation) -> Value {
+    match (&value, coll) {
+        (Value::Text(s), crate::types::Collation::NoCase) => Value::Text(s.to_ascii_lowercase()),
+        (Value::Text(s), crate::types::Collation::Rtrim) => {
+            Value::Text(s.trim_end_matches(' ').into())
+        }
+        _ => value,
+    }
+}
+
 fn try_index_scan(
     schema: &TableSchema,
     idx: &IndexDef,
@@ -646,7 +658,13 @@ fn try_index_scan(
         return None;
     }
     let idx_columns = idx.columns_vec();
-    for &col_idx in &idx_columns {
+    for (pos, &col_idx) in idx_columns.iter().enumerate() {
+        // Keys are stored folded by the component collation; usable only when
+        // it matches the column's comparison collation, probes fold to match.
+        let coll = idx.collation_at(pos);
+        if coll != schema.columns[col_idx as usize].collation {
+            break;
+        }
         let mut found_eq = false;
         for (i, pred) in predicates.iter().enumerate() {
             if used.contains(&i) {
@@ -654,7 +672,7 @@ fn try_index_scan(
             }
             if let Some(sp) = pred {
                 if sp.col_idx == col_idx as usize && sp.op == BinOp::Eq {
-                    equality_values.push(sp.value.clone());
+                    equality_values.push(fold_probe_value(sp.value.clone(), coll));
                     used.push(i);
                     found_eq = true;
                     break;
@@ -668,7 +686,7 @@ fn try_index_scan(
                 }
                 if let Some(sp) = pred {
                     if sp.col_idx == col_idx as usize && is_range_op(sp.op) {
-                        range_conds.push((sp.op, sp.value.clone()));
+                        range_conds.push((sp.op, fold_probe_value(sp.value.clone(), coll)));
                         used.push(i);
                     }
                 }
