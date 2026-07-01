@@ -12,6 +12,7 @@ mod explain;
 pub(crate) mod helpers;
 mod join;
 pub(crate) mod matviews;
+mod result_cache;
 mod scan;
 mod select;
 pub(crate) mod triggers;

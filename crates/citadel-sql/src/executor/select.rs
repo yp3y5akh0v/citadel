@@ -4098,6 +4098,10 @@ pub struct CompiledSelect {
     compound_plan: Option<Arc<CompoundPlanStatic>>,
     compound_cache: Option<parking_lot::RwLock<Option<Arc<CachedCompound>>>>,
     leaf_cache: LeafScanCache,
+    /// `Some` iff the statement is deterministic and read-only
+    /// (`result_cache::is_result_cacheable`); memoizes the materialized
+    /// result keyed by (commit generation, params).
+    result_cache: Option<super::result_cache::ResultCacheSlot>,
 }
 
 struct JoinPlanStatic {
@@ -4129,10 +4133,31 @@ struct CachedCompound {
     branch_rows: Vec<Vec<Vec<Value>>>,
 }
 
+/// A plan object whose only job is carrying the result-cache slot; every
+/// execution routes through the generic executors.
+fn cache_carrier(
+    result_cache: Option<super::result_cache::ResultCacheSlot>,
+) -> Option<CompiledSelect> {
+    result_cache.map(|rc| CompiledSelect {
+        join_plan: None,
+        join_cache: None,
+        compound_plan: None,
+        compound_cache: None,
+        leaf_cache: parking_lot::RwLock::new(None),
+        result_cache: Some(rc),
+    })
+}
+
 impl CompiledSelect {
     pub fn try_compile(schema: &SchemaManager, sq: &SelectQuery) -> Option<Self> {
+        let result_cache = if super::result_cache::is_result_cacheable(schema, sq) {
+            Some(super::result_cache::ResultCacheSlot::new())
+        } else {
+            None
+        };
+
         if sq.recursive || !sq.ctes.is_empty() {
-            return None;
+            return cache_carrier(result_cache);
         }
 
         let (compound_plan, compound_cache) = match &sq.body {
@@ -4140,7 +4165,7 @@ impl CompiledSelect {
                 if let Some(plan) = build_compound_plan_static(schema, comp) {
                     (Some(Arc::new(plan)), Some(parking_lot::RwLock::new(None)))
                 } else {
-                    return None;
+                    return cache_carrier(result_cache);
                 }
             }
             QueryBody::Select(_) => (None, None),
@@ -4154,6 +4179,7 @@ impl CompiledSelect {
                 compound_plan,
                 compound_cache,
                 leaf_cache: parking_lot::RwLock::new(None),
+                result_cache,
             });
         }
 
@@ -4173,7 +4199,7 @@ impl CompiledSelect {
                 .as_ref()
                 .is_some_and(crate::parser::has_subquery)
         {
-            return None;
+            return cache_carrier(result_cache);
         }
 
         let (join_plan, join_cache) = if sel.joins.is_empty() {
@@ -4190,7 +4216,41 @@ impl CompiledSelect {
             compound_plan: None,
             compound_cache: None,
             leaf_cache: parking_lot::RwLock::new(None),
+            result_cache,
         })
+    }
+
+    /// Serve or fill the result memo against one read snapshot: the lookup
+    /// generation and the executing transaction are the same snapshot, so a
+    /// stored result is exactly what re-execution at that generation returns.
+    fn execute_cached_read(
+        &self,
+        schema: &SchemaManager,
+        sq: &SelectQuery,
+        params: &[Value],
+        slot: &super::result_cache::ResultCacheSlot,
+        rtx: &mut ReadTxn<'_>,
+    ) -> Result<ExecutionResult> {
+        let gen = rtx.commit_generation();
+        if let Some(qr) = slot.lookup(gen, params) {
+            return Ok(ExecutionResult::Query(qr));
+        }
+        let result = if let (Some(plan), Some(cache)) = (&self.compound_plan, &self.compound_cache)
+        {
+            execute_cached_compound_with_read(rtx, plan, cache)?
+        } else if let (Some(plan), Some(cache)) = (&self.join_plan, &self.join_cache) {
+            let sel = match &sq.body {
+                QueryBody::Select(s) => s,
+                _ => unreachable!("cached join plan implies a plain select body"),
+            };
+            execute_cached_join_with_read(rtx, plan, cache, sel)?
+        } else {
+            exec_select_query_with_read(rtx, schema, sq)?
+        };
+        if let ExecutionResult::Query(ref qr) = result {
+            slot.store(gen, params, qr);
+        }
+        Ok(result)
     }
 }
 
@@ -4200,7 +4260,7 @@ impl CompiledPlan for CompiledSelect {
         db: &Database,
         schema: &SchemaManager,
         stmt: &Statement,
-        _params: &[Value],
+        params: &[Value],
         txn: super::compile::ActiveTxnRef<'_, '_>,
     ) -> Result<ExecutionResult> {
         let sq = match stmt {
@@ -4215,6 +4275,18 @@ impl CompiledPlan for CompiledSelect {
         use super::compile::ActiveTxnRef;
 
         if matches!(txn, ActiveTxnRef::None | ActiveTxnRef::Read(_)) {
+            // Never serve under ActiveTxnRef::Write: read-your-writes.
+            if let Some(slot) = &self.result_cache {
+                return match txn {
+                    ActiveTxnRef::Read(rtx) => {
+                        self.execute_cached_read(schema, sq, params, slot, rtx)
+                    }
+                    _ => {
+                        let mut rtx = db.begin_read();
+                        self.execute_cached_read(schema, sq, params, slot, &mut rtx)
+                    }
+                };
+            }
             if let (Some(plan), Some(cache)) = (&self.compound_plan, &self.compound_cache) {
                 return match txn {
                     ActiveTxnRef::Read(rtx) => execute_cached_compound_with_read(rtx, plan, cache),
@@ -4277,6 +4349,11 @@ impl CompiledPlan for CompiledSelect {
             columns,
             &self.leaf_cache,
         ))
+    }
+
+    fn needs_txn_clock(&self) -> bool {
+        // Cacheable statements are volatile-free: the clock is never read.
+        self.result_cache.is_none()
     }
 }
 
@@ -4402,6 +4479,11 @@ fn stream_scan_setup(
         Statement::Select(s) => s,
         _ => return None,
     };
+    // Cache-carrier plans compile for CTE/derived-FROM shapes too; this scan
+    // path must only ever see a plain base-table select.
+    if sq.recursive || !sq.ctes.is_empty() {
+        return None;
+    }
     let sel = match &sq.body {
         QueryBody::Select(s) => s,
         _ => return None,
@@ -4414,6 +4496,9 @@ fn stream_scan_setup(
         || !sel.group_by.is_empty()
         || sel.having.is_some()
         || sel.distinct
+        || sel.from_subquery.is_some()
+        || sel.from_args.is_some()
+        || sel.from_json_table.is_some()
     {
         return None;
     }
