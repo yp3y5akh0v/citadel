@@ -1712,6 +1712,14 @@ impl StreamAggPlan {
                         Some(idx) => idx,
                         None => return Ok(None),
                     };
+                    // Virtual generated columns are stored as NULL placeholders;
+                    // the raw-bytes scan cannot compute them.
+                    if matches!(
+                        table_schema.columns[col_idx].generated_kind,
+                        Some(crate::parser::GeneratedKind::Virtual)
+                    ) {
+                        return Ok(None);
+                    }
                     match func.as_str() {
                         "COUNT" => ops.push((StreamAgg::Count(col_idx), name)),
                         "SUM" => ops.push((StreamAgg::Sum(col_idx), name)),
@@ -2330,6 +2338,14 @@ impl TopKScanPlan {
             Some(idx) => idx,
             None => return Ok(None),
         };
+        // Virtual generated columns are stored as NULL placeholders; the
+        // raw-bytes scan cannot compute them.
+        if matches!(
+            schema.columns[col_idx].generated_kind,
+            Some(crate::parser::GeneratedKind::Virtual)
+        ) {
+            return Ok(None);
+        }
         let collation = explicit_coll.unwrap_or_else(|| schema.columns[col_idx].collation);
 
         let non_pk = schema.non_pk_indices();

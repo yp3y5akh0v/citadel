@@ -605,3 +605,74 @@ fn virtual_add_overflow_errors_not_wraps() {
         "filtered: {err:?}"
     );
 }
+
+#[test]
+fn stream_aggregates_over_virtual_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, \
+         g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t (id, a) VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+
+    let qr = conn.query("SELECT SUM(g) FROM t").unwrap();
+    assert_eq!(qr.rows[0][0], Value::Integer(120));
+    let qr = conn
+        .query("SELECT MIN(g), MAX(g), COUNT(g) FROM t")
+        .unwrap();
+    assert_eq!(
+        qr.rows[0],
+        vec![Value::Integer(20), Value::Integer(60), Value::Integer(3)]
+    );
+}
+
+#[test]
+fn group_by_over_virtual_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, \
+         g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t (id, a) VALUES (1, 10), (2, 10), (3, 30)")
+        .unwrap();
+
+    let qr = conn
+        .query("SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g")
+        .unwrap();
+    assert_eq!(
+        qr.rows,
+        vec![
+            vec![Value::Integer(20), Value::Integer(2)],
+            vec![Value::Integer(60), Value::Integer(1)],
+        ]
+    );
+}
+
+#[test]
+fn order_by_virtual_column_with_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, \
+         g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t (id, a) VALUES (1, 30), (2, 10), (3, 20)")
+        .unwrap();
+
+    let qr = conn
+        .query("SELECT id FROM t ORDER BY g DESC LIMIT 2")
+        .unwrap();
+    assert_eq!(
+        qr.rows,
+        vec![vec![Value::Integer(1)], vec![Value::Integer(3)]]
+    );
+}
