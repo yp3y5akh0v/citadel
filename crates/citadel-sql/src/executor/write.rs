@@ -69,6 +69,7 @@ struct CompiledFastPath {
     range_bounds_i64: Option<Vec<(BinOp, i64)>>,
     gen_targets: Vec<GenColPatch>,
     gen_extra_cols: Vec<(usize, usize)>,
+    rhs_extra_cols: Vec<(usize, usize)>,
     pk_lookup_fast: Option<PkLookupFast>,
 }
 
@@ -214,18 +215,153 @@ fn resolve_int_param(n: usize) -> Option<i64> {
     }
 }
 
+/// Bare-column refs of a SET expression; false = refs not provably decodable
+/// from the stored row (qualified/subquery forms), take the interpreted path.
+/// No wildcard arm on purpose: new Expr variants must be classified here.
+fn fast_lane_column_refs(expr: &Expr, out: &mut Vec<String>) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::TypedNullRecord(_) => true,
+        Expr::Column(name) => {
+            out.push(name.to_ascii_lowercase());
+            true
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            fast_lane_column_refs(left, out) && fast_lane_column_refs(right, out)
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } | Expr::Collate { expr, .. } => {
+            fast_lane_column_refs(expr, out)
+        }
+        Expr::IsNull(e) | Expr::IsNotNull(e) => fast_lane_column_refs(e, out),
+        Expr::Function { args, distinct, .. } => {
+            !*distinct && args.iter().all(|a| fast_lane_column_refs(a, out))
+        }
+        Expr::InList { expr, list, .. } => {
+            fast_lane_column_refs(expr, out) && list.iter().all(|e| fast_lane_column_refs(e, out))
+        }
+        Expr::InSet { expr, .. } => fast_lane_column_refs(expr, out),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            fast_lane_column_refs(expr, out)
+                && fast_lane_column_refs(low, out)
+                && fast_lane_column_refs(high, out)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            fast_lane_column_refs(expr, out)
+                && fast_lane_column_refs(pattern, out)
+                && match escape {
+                    Some(e) => fast_lane_column_refs(e, out),
+                    None => true,
+                }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            (match operand {
+                Some(o) => fast_lane_column_refs(o, out),
+                None => true,
+            }) && conditions
+                .iter()
+                .all(|(c, r)| fast_lane_column_refs(c, out) && fast_lane_column_refs(r, out))
+                && (match else_result {
+                    Some(e) => fast_lane_column_refs(e, out),
+                    None => true,
+                })
+        }
+        Expr::Coalesce(items) | Expr::ArrayLiteral(items) => {
+            items.iter().all(|e| fast_lane_column_refs(e, out))
+        }
+        Expr::QualifiedColumn { .. }
+        | Expr::CountStar
+        | Expr::InSubquery { .. }
+        | Expr::Exists { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::WindowFunction { .. }
+        | Expr::Quantified { .. } => false,
+    }
+}
+
+/// (schema_idx, phys_idx) decode pairs for `names`, minus pk and `skip_targets`.
+/// None = unresolvable or virtual (stored as a NULL placeholder): interpreted path.
+fn resolve_extra_decode_cols(
+    table_schema: &TableSchema,
+    names: &[String],
+    skip_targets: &[usize],
+    pk_indices: &[usize],
+) -> Option<Vec<(usize, usize)>> {
+    let non_pk = table_schema.non_pk_indices();
+    let enc_pos = table_schema.encoding_positions();
+    let mut extras: Vec<(usize, usize)> = Vec::new();
+    for name in names {
+        let schema_idx = table_schema.column_index(name)?;
+        if pk_indices.contains(&schema_idx)
+            || skip_targets.contains(&schema_idx)
+            || extras.iter().any(|&(si, _)| si == schema_idx)
+        {
+            continue;
+        }
+        if matches!(
+            table_schema.columns[schema_idx].generated_kind,
+            Some(crate::parser::GeneratedKind::Virtual)
+        ) {
+            return None;
+        }
+        let nonpk_order = non_pk.iter().position(|&i| i == schema_idx)?;
+        extras.push((schema_idx, enc_pos[nonpk_order] as usize));
+    }
+    Some(extras)
+}
+
+/// SET-referenced columns that are neither pk nor targets; None = interpreted path.
+fn compute_rhs_extra_cols(
+    table_schema: &TableSchema,
+    assignments: &[(String, Expr)],
+    set_target_schema_indices: &[usize],
+    pk_indices: &[usize],
+) -> Option<Vec<(usize, usize)>> {
+    let mut names: Vec<String> = Vec::new();
+    for (_, expr) in assignments {
+        if !fast_lane_column_refs(expr, &mut names) {
+            return None;
+        }
+    }
+    resolve_extra_decode_cols(table_schema, &names, set_target_schema_indices, pk_indices)
+}
+
+fn decode_cols_into(
+    value: &[u8],
+    cols: &[(usize, usize)],
+    partial_row: &mut [Value],
+) -> Result<()> {
+    for &(schema_idx, phys_idx) in cols {
+        partial_row[schema_idx] = decode_column_raw(value, phys_idx)?.to_value();
+    }
+    Ok(())
+}
+
+/// Gen-col patches plus the (schema_idx, phys_idx) columns their exprs read.
+type GenColPlan = (Vec<GenColPatch>, Vec<(usize, usize)>);
+
+/// None when a generated expr's refs aren't provably decodable: interpreted path.
 fn compute_gen_col_targets(
     table_schema: &TableSchema,
     set_target_schema_indices: &[usize],
     pk_indices: &[usize],
-) -> (Vec<GenColPatch>, Vec<(usize, usize)>) {
+) -> Option<GenColPlan> {
     let stored_gen_cols: Vec<&ColumnDef> = table_schema
         .columns
         .iter()
         .filter(|c| matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored)))
         .collect();
     if stored_gen_cols.is_empty() {
-        return (Vec::new(), Vec::new());
+        return Some((Vec::new(), Vec::new()));
     }
 
     let non_pk = table_schema.non_pk_indices();
@@ -233,9 +369,9 @@ fn compute_gen_col_targets(
     let mut gen_targets = Vec::with_capacity(stored_gen_cols.len());
     for c in &stored_gen_cols {
         let schema_idx = c.position as usize;
-        let nonpk_order = non_pk.iter().position(|&i| i == schema_idx).unwrap();
+        let nonpk_order = non_pk.iter().position(|&i| i == schema_idx)?;
         let phys_idx = enc_pos[nonpk_order] as usize;
-        let expr = c.generated_expr.clone().unwrap();
+        let expr = c.generated_expr.clone()?;
         let fast_eval = detect_fast_gen_eval(&expr, table_schema);
         gen_targets.push(GenColPatch {
             schema_idx,
@@ -248,35 +384,22 @@ fn compute_gen_col_targets(
 
     let mut needed_names: Vec<String> = Vec::new();
     for gp in &gen_targets {
-        super::ddl::collect_column_refs(&gp.expr, &mut needed_names);
-    }
-
-    let mut needed_indices: Vec<usize> = Vec::new();
-    for name in &needed_names {
-        if let Some(idx) = table_schema.column_index(name) {
-            if !needed_indices.contains(&idx) {
-                needed_indices.push(idx);
-            }
+        if !fast_lane_column_refs(&gp.expr, &mut needed_names) {
+            return None;
         }
     }
 
-    let mut gen_eval_decode_cols: Vec<(usize, usize)> = Vec::new();
-    for &schema_idx in &needed_indices {
-        // Single-column UPDATE: the set-target's new value is live in partial_row, skip re-decode.
-        // Multi-column SET re-decodes (RHS evaluates against the original, unmutated row).
-        if pk_indices.contains(&schema_idx)
-            || (set_target_schema_indices.len() == 1
-                && set_target_schema_indices.contains(&schema_idx))
-        {
-            continue;
-        }
-        if let Some(nonpk_order) = non_pk.iter().position(|&i| i == schema_idx) {
-            let phys_idx = enc_pos[nonpk_order] as usize;
-            gen_eval_decode_cols.push((schema_idx, phys_idx));
-        }
-    }
+    // Single-column UPDATE: the set-target's new value is live in partial_row, skip re-decode.
+    // Multi-column SET re-decodes targets (from the already-patched row bytes = new values).
+    let skip_targets: &[usize] = if set_target_schema_indices.len() == 1 {
+        set_target_schema_indices
+    } else {
+        &[]
+    };
+    let gen_eval_decode_cols =
+        resolve_extra_decode_cols(table_schema, &needed_names, skip_targets, pk_indices)?;
 
-    (gen_targets, gen_eval_decode_cols)
+    Some((gen_targets, gen_eval_decode_cols))
 }
 
 enum RangeStatus {
@@ -369,9 +492,7 @@ fn apply_gen_col_patches_slice(
     if gen_targets.is_empty() {
         return Ok(());
     }
-    for &(schema_idx, phys_idx) in gen_extra_cols {
-        partial_row[schema_idx] = decode_column_raw(value, phys_idx)?.to_value();
-    }
+    decode_cols_into(value, gen_extra_cols, partial_row)?;
     for gp in gen_targets {
         let raw = eval_fast_gen(&gp.fast_eval, &gp.expr, partial_row, col_map)?;
         let coerced = coerce_gen_value(raw, &gp.col)?;
@@ -395,9 +516,7 @@ fn apply_gen_col_patches_vec(
     if gen_targets.is_empty() {
         return Ok(());
     }
-    for &(schema_idx, phys_idx) in gen_extra_cols {
-        partial_row[schema_idx] = decode_column_raw(value, phys_idx)?.to_value();
-    }
+    decode_cols_into(value, gen_extra_cols, partial_row)?;
     for gp in gen_targets {
         let raw = eval_fast_gen(&gp.fast_eval, &gp.expr, partial_row, col_map)?;
         let coerced = coerce_gen_value(raw, &gp.col)?;
@@ -495,13 +614,14 @@ fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Comp
     let has_fk = !table_schema.foreign_keys.is_empty();
     let has_indices = !table_schema.indices.is_empty();
     let has_child_fk = !schema.child_fks_for(&table_name_lower).is_empty();
-    let can_fast_path = !pk_changed_by_set
+    let fast_eligible = !pk_changed_by_set
         && !has_fk
         && !has_indices
         && !has_child_fk
-        && !table_schema.has_checks();
+        && !table_schema.has_checks()
+        && !super::triggers::has_update_triggers(schema, &table_schema.name);
 
-    let fast = if can_fast_path {
+    let fast = if fast_eligible {
         let non_pk = table_schema.non_pk_indices();
         let enc_pos = table_schema.encoding_positions();
         let num_pk_cols = table_schema.primary_key_columns.len();
@@ -560,23 +680,32 @@ fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Comp
         };
 
         let set_target_indices: Vec<usize> = targets.iter().map(|t| t.schema_idx).collect();
-        let (gen_targets, gen_extra_cols) =
-            compute_gen_col_targets(table_schema, &set_target_indices, pk_indices);
+        let gen = compute_gen_col_targets(table_schema, &set_target_indices, pk_indices);
+        let rhs = compute_rhs_extra_cols(
+            table_schema,
+            &stmt.assignments,
+            &set_target_indices,
+            pk_indices,
+        );
         let pk_lookup_fast = detect_pk_lookup_fast(&stmt.where_clause, table_schema);
 
-        Some(CompiledFastPath {
-            num_pk_cols,
-            num_columns: table_schema.columns.len(),
-            single_int_pk,
-            targets,
-            scan_plan: plan,
-            pk_idx_cache: pk_indices.to_vec(),
-            col_map: ColumnMap::new(&table_schema.columns),
-            range_bounds_i64,
-            gen_targets,
-            gen_extra_cols,
-            pk_lookup_fast,
-        })
+        match (gen, rhs) {
+            (Some((gen_targets, gen_extra_cols)), Some(rhs_extra_cols)) => Some(CompiledFastPath {
+                num_pk_cols,
+                num_columns: table_schema.columns.len(),
+                single_int_pk,
+                targets,
+                scan_plan: plan,
+                pk_idx_cache: pk_indices.to_vec(),
+                col_map: ColumnMap::new(&table_schema.columns),
+                range_bounds_i64,
+                gen_targets,
+                gen_extra_cols,
+                rhs_extra_cols,
+                pk_lookup_fast,
+            }),
+            _ => None,
+        }
     } else {
         None
     };
@@ -586,7 +715,7 @@ fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Comp
         is_view: false,
         has_correlated_where: false,
         has_subquery: false,
-        can_fast_path,
+        can_fast_path: fast.is_some(),
         fast,
     })
 }
@@ -676,6 +805,7 @@ fn exec_update_compiled(
                     bufs.partial_row[target.schema_idx] = raw.to_value();
                     bufs.offsets[i] = off;
                 }
+                decode_cols_into(value, &fast.rhs_extra_cols, &mut bufs.partial_row)?;
                 for (i, target) in fast.targets.iter().enumerate() {
                     let generic_eval = || {
                         eval_expr(
@@ -901,22 +1031,18 @@ pub(super) fn exec_update(
         .any(|c| matches!(c.generated_kind, Some(crate::parser::GeneratedKind::Stored)));
     // Fast paths skip the trigger-firing site at the slow path's tail. Gate on
     // "no UPDATE triggers" so AFTER UPDATE row triggers always run.
-    let has_update_triggers = schema.triggers_for(&table_schema.name).iter().any(|t| {
-        t.enabled
-            && (t.timing == crate::parser::TriggerTiming::After
-                || t.timing == crate::parser::TriggerTiming::Before)
-            && t.events
-                .iter()
-                .any(|e| matches!(e, crate::parser::TriggerEvent::Update(_)))
-    });
-    if !pk_changed_by_set
-        && !has_fk
-        && !has_indices
-        && !has_child_fk
-        && !has_update_triggers
-        && !table_schema.has_checks()
-        && stmt.returning.is_none()
-    {
+    let has_update_triggers = super::triggers::has_update_triggers(schema, &table_schema.name);
+    'fast: {
+        if pk_changed_by_set
+            || has_fk
+            || has_indices
+            || has_child_fk
+            || has_update_triggers
+            || table_schema.has_checks()
+            || stmt.returning.is_some()
+        {
+            break 'fast;
+        }
         let non_pk = table_schema.non_pk_indices();
         let enc_pos = table_schema.encoding_positions();
         let num_pk_cols = table_schema.primary_key_columns.len();
@@ -956,8 +1082,18 @@ pub(super) fn exec_update(
 
         let pk_indices_vec = table_schema.pk_indices().to_vec();
         let set_target_indices: Vec<usize> = targets.iter().map(|t| t.schema_idx).collect();
-        let (gen_targets, gen_extra_cols) =
-            compute_gen_col_targets(table_schema, &set_target_indices, &pk_indices_vec);
+        let (gen_targets, gen_extra_cols, rhs_extra_cols) = match (
+            compute_gen_col_targets(table_schema, &set_target_indices, &pk_indices_vec),
+            compute_rhs_extra_cols(
+                table_schema,
+                &stmt.assignments,
+                &set_target_indices,
+                &pk_indices_vec,
+            ),
+        ) {
+            (Some((g, ge)), Some(r)) => (g, ge, r),
+            _ => break 'fast,
+        };
 
         let set_cols: Vec<ColumnDef> = targets.iter().map(|t| t.col.clone()).collect();
         let gen_cols: Vec<ColumnDef> = gen_targets.iter().map(|g| g.col.clone()).collect();
@@ -1019,6 +1155,7 @@ pub(super) fn exec_update(
                         partial_row[target.schema_idx] =
                             decode_column_raw(value, target.phys_idx)?.to_value();
                     }
+                    decode_cols_into(value, &rhs_extra_cols, &mut partial_row)?;
                     for target in &targets {
                         let new_val =
                             eval_expr(&target.expr, &EvalCtx::new(&col_map, &partial_row))?;
@@ -1137,6 +1274,7 @@ pub(super) fn exec_update(
                 partial_row[target.schema_idx] =
                     decode_column_raw(raw_value, target.phys_idx)?.to_value();
             }
+            decode_cols_into(raw_value, &rhs_extra_cols, &mut partial_row)?;
             for target in &targets {
                 let new_val = eval_expr(&target.expr, &EvalCtx::new(&col_map, &partial_row))?;
                 let coerced = if new_val.is_null() {
@@ -2174,6 +2312,7 @@ fn exec_update_in_txn_compiled(
     let targets = &fast.targets;
     let gen_targets = &fast.gen_targets;
     let gen_extra_cols = &fast.gen_extra_cols;
+    let rhs_extra_cols = &fast.rhs_extra_cols;
 
     bufs.partial_row.clear();
     bufs.partial_row.resize(fast.num_columns, Value::Null);
@@ -2192,6 +2331,7 @@ fn exec_update_in_txn_compiled(
             targets,
             gen_targets,
             gen_extra_cols,
+            rhs_extra_cols,
             bufs,
         );
     }
@@ -2254,6 +2394,7 @@ fn exec_update_in_txn_compiled(
                     partial_row[target.schema_idx] =
                         decode_column_raw(value, target.phys_idx)?.to_value();
                 }
+                decode_cols_into(value, rhs_extra_cols, partial_row)?;
                 for target in targets {
                     let new_val = compiled_target_eval(target, partial_row, col_map)?;
                     let coerced = coerce_gen_value(new_val, &target.col)?;
@@ -2444,6 +2585,7 @@ fn exec_pk_lookup_update(
     targets: &[CompiledTarget],
     gen_targets: &[GenColPatch],
     gen_extra_cols: &[(usize, usize)],
+    rhs_extra_cols: &[(usize, usize)],
     bufs: &mut UpdateBufs,
 ) -> Result<ExecutionResult> {
     let key = encode_composite_key(std::slice::from_ref(pk_value));
@@ -2460,6 +2602,7 @@ fn exec_pk_lookup_update(
     for target in targets {
         partial_row[target.schema_idx] = decode_column_raw(&raw_value, target.phys_idx)?.to_value();
     }
+    decode_cols_into(&raw_value, rhs_extra_cols, partial_row)?;
     for target in targets {
         let new_val = compiled_target_eval(target, partial_row, col_map)?;
         let coerced = coerce_gen_value(new_val, &target.col)?;
@@ -2546,6 +2689,7 @@ fn try_fast_update_in_txn(
         || has_child_fk
         || table_schema.has_checks()
         || stmt.returning.is_some()
+        || super::triggers::has_update_triggers(schema, &table_schema.name)
     {
         return Ok(None);
     }
@@ -2589,8 +2733,18 @@ fn try_fast_update_in_txn(
 
     let pk_idx_cache = table_schema.pk_indices().to_vec();
     let set_target_indices: Vec<usize> = targets.iter().map(|t| t.schema_idx).collect();
-    let (gen_targets, gen_extra_cols) =
-        compute_gen_col_targets(table_schema, &set_target_indices, &pk_idx_cache);
+    let (gen_targets, gen_extra_cols, rhs_extra_cols) = match (
+        compute_gen_col_targets(table_schema, &set_target_indices, &pk_idx_cache),
+        compute_rhs_extra_cols(
+            table_schema,
+            &stmt.assignments,
+            &set_target_indices,
+            &pk_idx_cache,
+        ),
+    ) {
+        (Some((g, ge)), Some(r)) => (g, ge, r),
+        _ => return Ok(None),
+    };
 
     let set_cols: Vec<ColumnDef> = targets.iter().map(|t| t.col.clone()).collect();
     let gen_cols: Vec<ColumnDef> = gen_targets.iter().map(|g| g.col.clone()).collect();
@@ -2649,13 +2803,16 @@ fn try_fast_update_in_txn(
                     partial_row[target.schema_idx] =
                         decode_column_raw(value, target.phys_idx)?.to_value();
                 }
+                decode_cols_into(value, &rhs_extra_cols, &mut partial_row)?;
                 for target in &targets {
                     let new_val = eval_expr(&target.expr, &EvalCtx::new(col_map, &partial_row))?;
                     let coerced = coerce_gen_value(new_val, &target.col)?;
-                    partial_row[target.schema_idx] = coerced.clone();
                     if !patch_column_in_place(value, target.phys_idx, &coerced)? {
                         patch_row_column(value, target.phys_idx, &coerced, &mut patch_buf)?;
                         value[..patch_buf.len()].copy_from_slice(&patch_buf);
+                    }
+                    if targets.len() == 1 {
+                        partial_row[target.schema_idx] = coerced;
                     }
                 }
                 apply_gen_col_patches_slice(
@@ -2743,13 +2900,16 @@ fn try_fast_update_in_txn(
             partial_row[target.schema_idx] =
                 decode_column_raw(raw_value, target.phys_idx)?.to_value();
         }
+        decode_cols_into(raw_value, &rhs_extra_cols, &mut partial_row)?;
         for target in &targets {
             let new_val = eval_expr(&target.expr, &EvalCtx::new(col_map, &partial_row))?;
             let coerced = coerce_gen_value(new_val, &target.col)?;
-            partial_row[target.schema_idx] = coerced.clone();
             if !patch_column_in_place(raw_value, target.phys_idx, &coerced)? {
                 patch_row_column(raw_value, target.phys_idx, &coerced, &mut patch_buf)?;
                 std::mem::swap(raw_value, &mut patch_buf);
+            }
+            if targets.len() == 1 {
+                partial_row[target.schema_idx] = coerced;
             }
         }
         apply_gen_col_patches_vec(

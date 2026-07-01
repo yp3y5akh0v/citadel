@@ -2056,3 +2056,95 @@ fn alter_table_disable_unknown_trigger_errors() {
             || err.to_string().to_lowercase().contains("trigger")
     );
 }
+
+fn setup_fast_lane_tables(conn: &Connection) {
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, v INTEGER NOT NULL)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit (id INTEGER NOT NULL PRIMARY KEY, tag TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+}
+
+fn audit_count(conn: &Connection) -> Value {
+    conn.query("SELECT COUNT(*) FROM audit").unwrap().rows[0][0].clone()
+}
+
+#[test]
+fn after_insert_trigger_fires_on_prepared_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_fast_lane_tables(&conn);
+    conn.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW \
+         BEGIN INSERT INTO audit VALUES (NEW.id, 'ins'); END",
+    )
+    .unwrap();
+
+    // All-parameter single-int-pk insert inside a txn: the trivial-fast lane shape.
+    let stmt = conn.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    stmt.execute(&[Value::Integer(3), Value::Integer(30)])
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(audit_count(&conn), Value::Integer(1));
+}
+
+#[test]
+fn after_update_trigger_fires_on_prepared_pk_update_in_txn() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_fast_lane_tables(&conn);
+    conn.execute(
+        "CREATE TRIGGER trg AFTER UPDATE ON t FOR EACH ROW \
+         BEGIN INSERT INTO audit VALUES (NEW.id, 'upd'); END",
+    )
+    .unwrap();
+
+    let stmt = conn
+        .prepare("UPDATE t SET v = v + 1 WHERE id = $1")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    assert_eq!(stmt.execute(&[Value::Integer(1)]).unwrap(), 1);
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(audit_count(&conn), Value::Integer(1));
+}
+
+#[test]
+fn after_update_trigger_fires_on_plain_update_in_txn() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_fast_lane_tables(&conn);
+    conn.execute(
+        "CREATE TRIGGER trg AFTER UPDATE ON t FOR EACH ROW \
+         BEGIN INSERT INTO audit VALUES (NEW.id, 'upd'); END",
+    )
+    .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("UPDATE t SET v = v + 1 WHERE id = 1").unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(audit_count(&conn), Value::Integer(1));
+}
+
+#[test]
+fn after_update_trigger_fires_on_prepared_range_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_fast_lane_tables(&conn);
+    conn.execute(
+        "CREATE TRIGGER trg AFTER UPDATE ON t FOR EACH ROW \
+         BEGIN INSERT INTO audit VALUES (NEW.id, 'upd'); END",
+    )
+    .unwrap();
+
+    let stmt = conn
+        .prepare("UPDATE t SET v = v + 1 WHERE id >= 1 AND id <= 2")
+        .unwrap();
+    assert_eq!(stmt.execute(&[]).unwrap(), 2);
+    assert_eq!(audit_count(&conn), Value::Integer(2));
+}

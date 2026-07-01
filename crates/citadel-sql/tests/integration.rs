@@ -462,6 +462,157 @@ fn update_set_evaluates_against_original_row() {
     assert_eq!(qr.rows[0][1], Value::Integer(10)); // b was 20, now has a's original value
 }
 
+fn setup_ab(conn: &Connection<'_>, not_null: bool) {
+    let cols = if not_null {
+        "a INTEGER NOT NULL, b INTEGER NOT NULL"
+    } else {
+        "a INTEGER, b INTEGER"
+    };
+    conn.execute(&format!(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, {cols})"
+    ))
+    .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 5, 20)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 6, 30)").unwrap();
+}
+
+fn ab_rows(conn: &Connection<'_>) -> Vec<Vec<Value>> {
+    conn.query("SELECT a, b FROM t ORDER BY id").unwrap().rows
+}
+
+#[test]
+fn update_rhs_reads_non_target_column_pk_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_ab(&conn, false);
+
+    assert_rows_affected(
+        conn.execute("UPDATE t SET a = b + 1 WHERE id = 1").unwrap(),
+        1,
+    );
+    assert_eq!(
+        ab_rows(&conn)[0],
+        vec![Value::Integer(21), Value::Integer(20)]
+    );
+}
+
+#[test]
+fn update_rhs_reads_non_target_column_pk_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    // NOT NULL fixed-width columns route through the in-place range patch lane.
+    setup_ab(&conn, true);
+
+    assert_rows_affected(
+        conn.execute("UPDATE t SET a = b + 1 WHERE id >= 1 AND id <= 2")
+            .unwrap(),
+        2,
+    );
+    let rows = ab_rows(&conn);
+    assert_eq!(rows[0], vec![Value::Integer(21), Value::Integer(20)]);
+    assert_eq!(rows[1], vec![Value::Integer(31), Value::Integer(30)]);
+}
+
+#[test]
+fn update_rhs_reads_non_target_column_in_txn() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_ab(&conn, false);
+
+    conn.execute("BEGIN").unwrap();
+    assert_rows_affected(
+        conn.execute("UPDATE t SET a = b + 1 WHERE id = 1").unwrap(),
+        1,
+    );
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        ab_rows(&conn)[0],
+        vec![Value::Integer(21), Value::Integer(20)]
+    );
+}
+
+#[test]
+fn update_rhs_reads_non_target_column_in_txn_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_ab(&conn, true);
+
+    conn.execute("BEGIN").unwrap();
+    assert_rows_affected(
+        conn.execute("UPDATE t SET a = b + 1 WHERE id >= 1 AND id <= 2")
+            .unwrap(),
+        2,
+    );
+    conn.execute("COMMIT").unwrap();
+    let rows = ab_rows(&conn);
+    assert_eq!(rows[0], vec![Value::Integer(21), Value::Integer(20)]);
+    assert_eq!(rows[1], vec![Value::Integer(31), Value::Integer(30)]);
+}
+
+#[test]
+fn update_rhs_reads_non_target_column_prepared_in_txn() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_ab(&conn, false);
+
+    let stmt = conn
+        .prepare("UPDATE t SET a = b + $1 WHERE id = $2")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    assert_eq!(
+        stmt.execute(&[Value::Integer(1), Value::Integer(1)])
+            .unwrap(),
+        1
+    );
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        ab_rows(&conn)[0],
+        vec![Value::Integer(21), Value::Integer(20)]
+    );
+}
+
+#[test]
+fn update_rhs_reads_non_target_column_prepared_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_ab(&conn, true);
+
+    let stmt = conn
+        .prepare("UPDATE t SET a = b + 1 WHERE id >= 1 AND id <= 2")
+        .unwrap();
+    assert_eq!(stmt.execute(&[]).unwrap(), 2);
+    let rows = ab_rows(&conn);
+    assert_eq!(rows[0], vec![Value::Integer(21), Value::Integer(20)]);
+    assert_eq!(rows[1], vec![Value::Integer(31), Value::Integer(30)]);
+}
+
+#[test]
+fn update_multi_target_swap_in_txn() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_ab(&conn, false);
+
+    conn.execute("BEGIN").unwrap();
+    assert_rows_affected(
+        conn.execute("UPDATE t SET a = b, b = a WHERE id = 1")
+            .unwrap(),
+        1,
+    );
+    conn.execute("COMMIT").unwrap();
+    // Both RHS evaluate against the original row: a and b swap.
+    assert_eq!(
+        ab_rows(&conn)[0],
+        vec![Value::Integer(20), Value::Integer(5)]
+    );
+}
+
 #[test]
 fn update_no_matches() {
     let dir = tempfile::tempdir().unwrap();
