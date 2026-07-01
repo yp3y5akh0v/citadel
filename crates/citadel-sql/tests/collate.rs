@@ -162,3 +162,64 @@ fn create_table_with_column_collate_persists() {
     let qr = conn.query("SELECT id FROM t WHERE name = 'alice'").unwrap();
     assert_eq!(qr.rows.len(), 1);
 }
+
+#[test]
+fn nocase_column_index_equality_probe_matches_all_cases() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)")
+        .unwrap();
+    conn.execute("CREATE INDEX p_name ON p (name)").unwrap();
+    conn.execute("INSERT INTO p VALUES (1, 'alice'), (2, 'Bob'), (3, 'CAROL')")
+        .unwrap();
+
+    for (probe, expected) in [("ALICE", 1i64), ("alice", 1), ("bob", 2), ("Carol", 3)] {
+        let qr = conn
+            .query(&format!("SELECT id FROM p WHERE name = '{probe}'"))
+            .unwrap();
+        assert_eq!(
+            qr.rows,
+            vec![vec![Value::Integer(expected)]],
+            "probe {probe:?} against the NOCASE index"
+        );
+    }
+}
+
+#[test]
+fn nocase_column_index_range_probe_folds_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)")
+        .unwrap();
+    conn.execute("CREATE INDEX p_name ON p (name)").unwrap();
+    conn.execute("INSERT INTO p VALUES (1, 'apple'), (2, 'Banana'), (3, 'CHERRY')")
+        .unwrap();
+
+    // NOCASE range: 'B' <= name <= 'c' covers Banana and CHERRY case-insensitively.
+    let qr = conn
+        .query("SELECT id FROM p WHERE name >= 'B' AND name <= 'cz' ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        qr.rows,
+        vec![vec![Value::Integer(2)], vec![Value::Integer(3)]]
+    );
+}
+
+#[test]
+fn rtrim_column_index_equality_probe_folds() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, name TEXT COLLATE RTRIM)")
+        .unwrap();
+    conn.execute("CREATE INDEX p_name ON p (name)").unwrap();
+    conn.execute("INSERT INTO p VALUES (1, 'x  '), (2, 'y')")
+        .unwrap();
+
+    let qr = conn.query("SELECT id FROM p WHERE name = 'x'").unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Integer(1)]]);
+    let qr = conn.query("SELECT id FROM p WHERE name = 'y   '").unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Integer(2)]]);
+}
