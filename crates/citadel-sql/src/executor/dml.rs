@@ -3652,6 +3652,7 @@ impl CompiledInsert {
                 && bind_plan.is_some()
                 && row_fully_overwritten
                 && single_int_pk
+                && !super::triggers::has_insert_triggers(schema, &ts.name)
                 && generated_fast_evals
                     .iter()
                     .all(|fe| !matches!(fe, FastGenEval::None));
