@@ -519,19 +519,10 @@ fn reject_non_deterministic(sq: &SelectQuery) -> Result<()> {
     fn walk_expr(expr: &Expr) -> Result<()> {
         match expr {
             Expr::Function { name, args, .. } => {
-                let lower = name.to_ascii_lowercase();
-                if matches!(
-                    lower.as_str(),
-                    "now"
-                        | "random"
-                        | "current_timestamp"
-                        | "current_date"
-                        | "current_time"
-                        | "localtimestamp"
-                        | "localtime"
-                ) {
+                if crate::eval::is_volatile_function_expr(&name.to_ascii_uppercase(), args) {
                     return Err(SqlError::Unsupported(format!(
-                        "non-deterministic function '{lower}' in matview definition"
+                        "non-deterministic function '{}' in matview definition",
+                        name.to_ascii_lowercase()
                     )));
                 }
                 for a in args {

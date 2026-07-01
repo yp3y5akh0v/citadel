@@ -1605,19 +1605,7 @@ fn reject_volatile_in_generated(expr: &Expr) -> Result<()> {
         match e {
             Expr::Function { name, args, .. } => {
                 let upper = name.to_ascii_uppercase();
-                if matches!(
-                    upper.as_str(),
-                    "RANDOM"
-                        | "NOW"
-                        | "CURRENT_TIMESTAMP"
-                        | "CURRENT_DATE"
-                        | "CURRENT_TIME"
-                        | "CLOCK_TIMESTAMP"
-                        | "STATEMENT_TIMESTAMP"
-                        | "TRANSACTION_TIMESTAMP"
-                        | "LOCALTIMESTAMP"
-                        | "LOCALTIME"
-                ) {
+                if crate::eval::is_volatile_function_expr(&upper, args) {
                     return Err(SqlError::Unsupported(format!(
                         "volatile function {name}() not allowed in GENERATED expression"
                     )));
@@ -2192,10 +2180,10 @@ fn validate_partial_index_predicate(expr: &Expr) -> Result<()> {
             Expr::WindowFunction { .. } => bad = Some("window functions"),
             Expr::Parameter(_) => bad = Some("bound parameters"),
             Expr::QualifiedColumn { .. } => bad = Some("cross-table references"),
-            Expr::Function { name, .. } => {
+            Expr::Function { name, args, .. } => {
                 if is_aggregate_function(name) {
                     bad = Some("aggregates");
-                } else if !is_immutable_function(name) {
+                } else if crate::eval::is_volatile_function_expr(&name.to_ascii_uppercase(), args) {
                     bad = Some("non-deterministic functions");
                 }
             }
@@ -2214,20 +2202,6 @@ fn is_aggregate_function(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "count" | "sum" | "avg" | "min" | "max" | "total" | "group_concat" | "string_agg"
-    )
-}
-
-fn is_immutable_function(name: &str) -> bool {
-    !matches!(
-        name.to_ascii_lowercase().as_str(),
-        "now"
-            | "current_timestamp"
-            | "current_date"
-            | "current_time"
-            | "localtimestamp"
-            | "localtime"
-            | "random"
-            | "rand"
     )
 }
 

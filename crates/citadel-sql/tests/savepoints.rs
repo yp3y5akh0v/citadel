@@ -1384,3 +1384,30 @@ fn real_complex_error_recovery_flow() {
     assert_eq!(qr.rows[1][0], Value::Text("B".into()));
     assert_eq!(qr.rows[1][1], Value::Integer(10));
 }
+
+#[test]
+fn rollback_to_savepoint_invalidates_plans_compiled_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN b INTEGER").unwrap();
+    // Compiled while `b` exists; the generation counter is at G+1.
+    let sel = conn.prepare("SELECT b FROM t WHERE id = 1").unwrap();
+    conn.execute("ROLLBACK TO s").unwrap();
+    // Different DDL: without monotonic generations this lands on G+1 again
+    // and the stale plan above would falsely revalidate.
+    conn.execute("ALTER TABLE t ADD COLUMN c TEXT").unwrap();
+    let result = sel.query_collect(&[]);
+    conn.execute("COMMIT").unwrap();
+
+    assert!(
+        matches!(result, Err(SqlError::ColumnNotFound(ref c)) if c == "b"),
+        "recompile must see that b no longer exists, got {result:?}"
+    );
+}
