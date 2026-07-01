@@ -21,6 +21,8 @@ citadel-buffer = { workspace = true }
 citadel-txn = { workspace = true }
 citadel = { workspace = true }
 citadel-vector = { workspace = true }
+# Parallel dispatch is cfg-gated in code; already transitive via citadel-vector.
+rayon = { workspace = true }
 blake3 = { workspace = true }
 sqlparser = { workspace = true }
 thiserror = { workspace = true }

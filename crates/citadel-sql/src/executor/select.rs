@@ -273,10 +273,18 @@ pub(super) fn exec_select_with_read(
         let mut states: Vec<AggState> = plan.ops.iter().map(|(op, _)| AggState::new(op)).collect();
         let mut scan_err: Option<SqlError> = None;
         if stmt.where_clause.is_none() {
-            rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
-                plan.feed_row_raw(key, value, &mut states, &mut scan_err)
-            })
-            .map_err(SqlError::Storage)?;
+            let leaves = rtx
+                .collect_table_leaves(lower_name.as_bytes())
+                .map_err(SqlError::Storage)?;
+            match try_parallel_stream_agg(rtx, &plan, &leaves)? {
+                Some(merged) => states = merged,
+                None => {
+                    rtx.scan_leaves(&leaves, |key, value| {
+                        plan.feed_row_raw(key, value, &mut states, &mut scan_err)
+                    })
+                    .map_err(SqlError::Storage)?;
+                }
+            }
         } else {
             let col_map = ColumnMap::new(&table_schema.columns);
             rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
@@ -1370,6 +1378,80 @@ impl AggState {
         }
     }
 
+    /// Fold `other` (a later shard in leaf order) into `self`. Only gate-admitted
+    /// states reach here: counts, integer Sum (wrapping add is associative), and
+    /// Min/Max over non-REAL (strict compare keeps the earlier value on ties).
+    pub(super) fn merge(&mut self, other: AggState) {
+        match (self, other) {
+            (AggState::CountStar(a), AggState::CountStar(b)) => *a += b,
+            (AggState::Count(a), AggState::Count(b)) => *a += b,
+            (
+                AggState::Sum {
+                    int_sum,
+                    real_sum,
+                    has_real,
+                    all_null,
+                    interval_months,
+                    interval_days,
+                    interval_micros,
+                    is_interval,
+                },
+                AggState::Sum {
+                    int_sum: b_int,
+                    real_sum: b_real,
+                    has_real: b_has_real,
+                    all_null: b_all_null,
+                    interval_months: b_months,
+                    interval_days: b_days,
+                    interval_micros: b_micros,
+                    is_interval: b_is_interval,
+                },
+            ) => {
+                // Total over every variant field; only the integer fields are
+                // reachable under the gate.
+                *int_sum += b_int;
+                *real_sum += b_real;
+                *has_real |= b_has_real;
+                *all_null &= b_all_null;
+                *interval_months = interval_months.saturating_add(b_months);
+                *interval_days = interval_days.saturating_add(b_days);
+                *interval_micros = interval_micros.saturating_add(b_micros);
+                *is_interval |= b_is_interval;
+            }
+            (AggState::Min(a), AggState::Min(b)) => {
+                if let Some(bv) = b {
+                    *a = Some(match a.take() {
+                        None => bv,
+                        Some(av) => {
+                            if bv < av {
+                                bv
+                            } else {
+                                av
+                            }
+                        }
+                    });
+                }
+            }
+            (AggState::Max(a), AggState::Max(b)) => {
+                if let Some(bv) = b {
+                    *a = Some(match a.take() {
+                        None => bv,
+                        Some(av) => {
+                            if bv > av {
+                                bv
+                            } else {
+                                av
+                            }
+                        }
+                    });
+                }
+            }
+            // Avg is order-sensitive f64 accumulation, excluded by the gate;
+            // mismatched pairs cannot occur (shards build from the same ops).
+            _ => unreachable!("merge on non-parallel aggregate state"),
+        }
+    }
+
     pub(super) fn feed_val(&mut self, val: &Value) -> Result<()> {
         match self {
             AggState::CountStar(c) => {
@@ -1664,6 +1746,171 @@ pub(super) struct StreamAggPlan {
     nonpk_agg_defaults: Vec<Option<Value>>,
     /// When `Some`, evaluates WHERE on raw column bytes without decoding the row.
     fast_pred: Option<FastPredicate>,
+    /// Every aggregate is order-insensitive (see `AggState::merge`), so the
+    /// no-WHERE scan may fan leaves across shards.
+    parallel_ok: bool,
+}
+
+/// The borrowed pieces of a [`StreamAggPlan`] that raw-row feeding needs;
+/// shard tasks capture this instead of the whole plan.
+#[derive(Clone, Copy)]
+pub(super) struct RawFeed<'a> {
+    raw_targets: &'a [RawAggTarget],
+    num_pk_cols: usize,
+    nonpk_agg_defaults: &'a [Option<Value>],
+}
+
+impl RawFeed<'_> {
+    pub(super) fn feed(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        states: &mut [AggState],
+        scan_err: &mut Option<SqlError>,
+    ) -> bool {
+        for (i, target) in self.raw_targets.iter().enumerate() {
+            let raw = match target {
+                RawAggTarget::CountStar => {
+                    if let Err(e) = states[i].feed_raw(&RawColumn::Null) {
+                        *scan_err = Some(e);
+                        return false;
+                    }
+                    continue;
+                }
+                RawAggTarget::Pk(pk_pos) => {
+                    if self.num_pk_cols == 1 && *pk_pos == 0 {
+                        match decode_pk_integer(key) {
+                            Ok(v) => RawColumn::Integer(v),
+                            Err(e) => {
+                                *scan_err = Some(e);
+                                return false;
+                            }
+                        }
+                    } else {
+                        match decode_composite_key(key, self.num_pk_cols) {
+                            Ok(pk) => RawColumn::Integer(match &pk[*pk_pos] {
+                                Value::Integer(i) => *i,
+                                _ => {
+                                    *scan_err =
+                                        Some(SqlError::InvalidValue("PK not integer".into()));
+                                    return false;
+                                }
+                            }),
+                            Err(e) => {
+                                *scan_err = Some(e);
+                                return false;
+                            }
+                        }
+                    }
+                }
+                RawAggTarget::NonPk(idx) => {
+                    let stored = row_non_pk_count(value);
+                    if *idx >= stored {
+                        if let Some(ref default) = self.nonpk_agg_defaults[i] {
+                            if let Err(e) = states[i].feed_val(default) {
+                                *scan_err = Some(e);
+                                return false;
+                            }
+                        } else if let Err(e) = states[i].feed_raw(&RawColumn::Null) {
+                            *scan_err = Some(e);
+                            return false;
+                        }
+                        continue;
+                    }
+                    match decode_column_raw(value, *idx) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            *scan_err = Some(e);
+                            return false;
+                        }
+                    }
+                }
+            };
+            if let Err(e) = states[i].feed_raw(&raw) {
+                *scan_err = Some(e);
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Leaves per rayon shard: large enough to amortize task overhead, small
+/// enough to balance across cores.
+const LEAVES_PER_SHARD: usize = 32;
+/// Below this many leaves the serial scan wins.
+const MIN_PARALLEL_LEAVES: usize = 256;
+
+/// Fan a no-WHERE streaming aggregation across rayon shards when the plan's
+/// ops are order-insensitive and the table is large enough to pay for it.
+/// `Ok(None)` means "run the serial scan".
+#[cfg(not(target_arch = "wasm32"))]
+fn try_parallel_stream_agg(
+    rtx: &ReadTxn<'_>,
+    plan: &StreamAggPlan,
+    leaves: &citadel_txn::read_txn::LeafPages,
+) -> Result<Option<Vec<AggState>>> {
+    if !plan.parallel_ok || leaves.len() < MIN_PARALLEL_LEAVES || rayon::current_num_threads() < 2 {
+        return Ok(None);
+    }
+    parallel_stream_agg_sharded(rtx, plan, leaves, LEAVES_PER_SHARD).map(Some)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn try_parallel_stream_agg(
+    _rtx: &ReadTxn<'_>,
+    _plan: &StreamAggPlan,
+    _leaves: &citadel_txn::read_txn::LeafPages,
+) -> Result<Option<Vec<AggState>>> {
+    Ok(None)
+}
+
+/// Scan leaf chunks concurrently (each through its own shard scanner tied to
+/// `rtx`'s snapshot) and fold the per-shard states in leaf order. Exposed with
+/// an explicit shard size so tests can exercise multi-shard merging on small
+/// tables; production dispatch goes through `try_parallel_stream_agg`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn parallel_stream_agg_sharded(
+    rtx: &ReadTxn<'_>,
+    plan: &StreamAggPlan,
+    leaves: &citadel_txn::read_txn::LeafPages,
+    leaves_per_shard: usize,
+) -> Result<Vec<AggState>> {
+    use rayon::prelude::*;
+
+    let feed = plan.raw_feed();
+    let ops = &plan.ops;
+    let shard_states: Vec<Result<Vec<AggState>>> = leaves
+        .par_chunks(leaves_per_shard.max(1))
+        .map(|chunk| {
+            let mut scanner = rtx.shard_scanner();
+            let mut states: Vec<AggState> = ops.iter().map(|(op, _)| AggState::new(op)).collect();
+            let mut scan_err: Option<SqlError> = None;
+            scanner
+                .scan_leaves(chunk, |key, value| {
+                    feed.feed(key, value, &mut states, &mut scan_err)
+                })
+                .map_err(SqlError::Storage)?;
+            match scan_err {
+                Some(e) => Err(e),
+                None => Ok(states),
+            }
+        })
+        .collect();
+
+    let mut merged: Option<Vec<AggState>> = None;
+    for shard in shard_states {
+        let shard = shard?;
+        match &mut merged {
+            None => merged = Some(shard),
+            Some(acc) => {
+                for (a, b) in acc.iter_mut().zip(shard) {
+                    a.merge(b);
+                }
+            }
+        }
+    }
+    Ok(merged.expect("at least one shard"))
 }
 
 pub(super) enum FastPredicate {
@@ -1815,6 +2062,48 @@ impl StreamAggPlan {
             None
         };
 
+        // Shard-mergeable ops only (see AggState::merge): AVG and REAL fold
+        // order-sensitively (f64, NaN compares Equal), INTERVAL saturates.
+        // Defaults fed for pre-ALTER rows join the fold: same bounds apply.
+        let parallel_ok = ops
+            .iter()
+            .zip(&nonpk_agg_defaults)
+            .all(|((op, _), default)| {
+                let default_ok = matches!(
+                    default,
+                    None | Some(
+                        Value::Null
+                            | Value::Integer(_)
+                            | Value::Text(_)
+                            | Value::Blob(_)
+                            | Value::Boolean(_)
+                            | Value::Time(_)
+                            | Value::Date(_)
+                            | Value::Timestamp(_)
+                    )
+                );
+                match op {
+                    StreamAgg::CountStar | StreamAgg::Count(_) => true,
+                    StreamAgg::Sum(idx) => {
+                        table_schema.columns[*idx].data_type == DataType::Integer
+                            && matches!(default, None | Some(Value::Null | Value::Integer(_)))
+                    }
+                    StreamAgg::Min(idx) | StreamAgg::Max(idx) => {
+                        matches!(
+                            table_schema.columns[*idx].data_type,
+                            DataType::Integer
+                                | DataType::Text
+                                | DataType::Blob
+                                | DataType::Boolean
+                                | DataType::Time
+                                | DataType::Date
+                                | DataType::Timestamp
+                        ) && default_ok
+                    }
+                    StreamAgg::Avg(_) => false,
+                }
+            });
+
         Ok(Some(Self {
             ops,
             partial_ctx,
@@ -1822,6 +2111,7 @@ impl StreamAggPlan {
             num_pk_cols,
             nonpk_agg_defaults,
             fast_pred,
+            parallel_ok,
         }))
     }
 
@@ -1899,6 +2189,14 @@ impl StreamAggPlan {
         true
     }
 
+    pub(super) fn raw_feed(&self) -> RawFeed<'_> {
+        RawFeed {
+            raw_targets: &self.raw_targets,
+            num_pk_cols: self.num_pk_cols,
+            nonpk_agg_defaults: &self.nonpk_agg_defaults,
+        }
+    }
+
     pub(super) fn feed_row_raw(
         &self,
         key: &[u8],
@@ -1906,70 +2204,7 @@ impl StreamAggPlan {
         states: &mut [AggState],
         scan_err: &mut Option<SqlError>,
     ) -> bool {
-        for (i, target) in self.raw_targets.iter().enumerate() {
-            let raw = match target {
-                RawAggTarget::CountStar => {
-                    if let Err(e) = states[i].feed_raw(&RawColumn::Null) {
-                        *scan_err = Some(e);
-                        return false;
-                    }
-                    continue;
-                }
-                RawAggTarget::Pk(pk_pos) => {
-                    if self.num_pk_cols == 1 && *pk_pos == 0 {
-                        match decode_pk_integer(key) {
-                            Ok(v) => RawColumn::Integer(v),
-                            Err(e) => {
-                                *scan_err = Some(e);
-                                return false;
-                            }
-                        }
-                    } else {
-                        match decode_composite_key(key, self.num_pk_cols) {
-                            Ok(pk) => RawColumn::Integer(match &pk[*pk_pos] {
-                                Value::Integer(i) => *i,
-                                _ => {
-                                    *scan_err =
-                                        Some(SqlError::InvalidValue("PK not integer".into()));
-                                    return false;
-                                }
-                            }),
-                            Err(e) => {
-                                *scan_err = Some(e);
-                                return false;
-                            }
-                        }
-                    }
-                }
-                RawAggTarget::NonPk(idx) => {
-                    let stored = row_non_pk_count(value);
-                    if *idx >= stored {
-                        if let Some(ref default) = self.nonpk_agg_defaults[i] {
-                            if let Err(e) = states[i].feed_val(default) {
-                                *scan_err = Some(e);
-                                return false;
-                            }
-                        } else if let Err(e) = states[i].feed_raw(&RawColumn::Null) {
-                            *scan_err = Some(e);
-                            return false;
-                        }
-                        continue;
-                    }
-                    match decode_column_raw(value, *idx) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            *scan_err = Some(e);
-                            return false;
-                        }
-                    }
-                }
-            };
-            if let Err(e) = states[i].feed_raw(&raw) {
-                *scan_err = Some(e);
-                return false;
-            }
-        }
-        true
+        self.raw_feed().feed(key, value, states, scan_err)
     }
 
     pub(super) fn finish(self, states: Vec<AggState>) -> ExecutionResult {
