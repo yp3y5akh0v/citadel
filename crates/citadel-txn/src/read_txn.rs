@@ -37,6 +37,61 @@ impl PageLoader for ReadPages<'_> {
     }
 }
 
+/// Cell iteration over a leaf slice (materializing overflow through `view`).
+/// Callback returns `false` to stop.
+fn scan_leaf_cells<F>(view: &mut ReadPages<'_>, leaves: &[Arc<Page>], mut f: F) -> Result<()>
+where
+    F: FnMut(&[u8], &[u8]) -> bool,
+{
+    for page in leaves {
+        let n = page.num_cells();
+        for i in 0..n {
+            let cell = leaf_node::read_cell(page, i);
+            match cell.val_type {
+                ValueType::Tombstone => continue,
+                ValueType::Inline => {
+                    if !f(cell.key, cell.value) {
+                        return Ok(());
+                    }
+                }
+                ValueType::Overflow => {
+                    let oref = OverflowRef::from_bytes(cell.value);
+                    let key_owned = cell.key.to_vec();
+                    let materialized = overflow_io::read_chain_value(view, &oref)?;
+                    if !f(&key_owned, &materialized) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Leaf-slice scanner detached from the transaction's page cache so shards
+/// can run concurrently, borrow-tied to the registered read txn. Touches
+/// exactly the pages the serial [`ReadTxn::scan_leaves`] would; overflow
+/// chains are read through the manager into a shard-local cache.
+pub struct LeafShardScanner<'t> {
+    manager: &'t TxnManager,
+    cache: FxHashMap<PageId, Arc<Page>>,
+}
+
+impl LeafShardScanner<'_> {
+    /// Iterate the cells of `leaves` (materializing overflow). Callback
+    /// returns `false` to stop.
+    pub fn scan_leaves<F>(&mut self, leaves: &[Arc<Page>], f: F) -> Result<()>
+    where
+        F: FnMut(&[u8], &[u8]) -> bool,
+    {
+        let mut view = ReadPages {
+            cache: &mut self.cache,
+            manager: self.manager,
+        };
+        scan_leaf_cells(&mut view, leaves, f)
+    }
+}
+
 /// A table's leaf pages in left-to-right order; cacheable across reads at one commit gen.
 pub type LeafPages = Vec<Arc<Page>>;
 
@@ -321,37 +376,24 @@ impl<'db> ReadTxn<'db> {
     }
 
     /// Iterate the cells of `leaves` (materializing overflow). Callback returns `false` to stop.
-    pub fn scan_leaves<F>(&mut self, leaves: &[Arc<Page>], mut f: F) -> Result<()>
+    pub fn scan_leaves<F>(&mut self, leaves: &[Arc<Page>], f: F) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> bool,
     {
-        for page in leaves {
-            let n = page.num_cells();
-            for i in 0..n {
-                let cell = leaf_node::read_cell(page, i);
-                match cell.val_type {
-                    ValueType::Tombstone => continue,
-                    ValueType::Inline => {
-                        if !f(cell.key, cell.value) {
-                            return Ok(());
-                        }
-                    }
-                    ValueType::Overflow => {
-                        let oref = OverflowRef::from_bytes(cell.value);
-                        let key_owned = cell.key.to_vec();
-                        let mut view = ReadPages {
-                            cache: &mut self.page_cache,
-                            manager: self.manager,
-                        };
-                        let materialized = overflow_io::read_chain_value(&mut view, &oref)?;
-                        if !f(&key_owned, &materialized) {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
+        let mut view = ReadPages {
+            cache: &mut self.page_cache,
+            manager: self.manager,
+        };
+        scan_leaf_cells(&mut view, leaves, f)
+    }
+
+    /// A scanner for parallel leaf iteration, borrow-tied to this txn so the
+    /// snapshot registration outlives every shard using it.
+    pub fn shard_scanner(&self) -> LeafShardScanner<'_> {
+        LeafShardScanner {
+            manager: self.manager,
+            cache: FxHashMap::default(),
         }
-        Ok(())
     }
 
     /// Full table scan via direct leaf iteration. Callback returns `false` to stop.

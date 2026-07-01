@@ -712,6 +712,7 @@ dependencies = [
  "mimalloc",
  "parking_lot",
  "rand 0.8.6",
+ "rayon",
  "rusqlite",
  "rustc-hash",
  "serde_json",
