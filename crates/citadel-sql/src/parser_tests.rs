@@ -1056,6 +1056,62 @@ fn create_index_predicate_rejects_random() {
 }
 
 #[test]
+fn create_index_predicate_rejects_clock_timestamp() {
+    let err = parse_sql("CREATE INDEX i ON t (c) WHERE ts > clock_timestamp()").unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("non-deterministic")));
+}
+
+#[test]
+fn create_index_predicate_rejects_one_arg_age() {
+    let err = parse_sql("CREATE INDEX i ON t (c) WHERE age(ts) > 100").unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("non-deterministic")));
+}
+
+#[test]
+fn create_index_predicate_accepts_two_arg_age() {
+    assert!(parse_sql("CREATE INDEX i ON t (c) WHERE age(a, b) > 100").is_ok());
+}
+
+#[test]
+fn create_index_predicate_rejects_date_now_literal() {
+    let err = parse_sql("CREATE INDEX i ON t (c) WHERE ts > date('now')").unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("non-deterministic")));
+}
+
+#[test]
+fn create_index_predicate_accepts_date_of_column() {
+    assert!(parse_sql("CREATE INDEX i ON t (c) WHERE date(ts) > '2020-01-01'").is_ok());
+}
+
+#[test]
+fn generated_rejects_date_now_literal() {
+    let err = parse_sql(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT GENERATED ALWAYS AS (date('now')) STORED)",
+    )
+    .unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("volatile")));
+}
+
+#[test]
+fn generated_rejects_one_arg_age() {
+    let err = parse_sql(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, ts TIMESTAMP, \
+         g INTERVAL GENERATED ALWAYS AS (age(ts)) STORED)",
+    )
+    .unwrap_err();
+    assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("volatile")));
+}
+
+#[test]
+fn generated_accepts_date_of_column() {
+    assert!(parse_sql(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, ts TIMESTAMP, \
+         g DATE GENERATED ALWAYS AS (date(ts)) STORED)",
+    )
+    .is_ok());
+}
+
+#[test]
 fn create_index_predicate_rejects_aggregate() {
     let err = parse_sql("CREATE INDEX i ON t (c) WHERE c > sum(c)").unwrap_err();
     assert!(matches!(err, SqlError::Unsupported(msg) if msg.contains("aggregates")));

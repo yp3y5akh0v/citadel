@@ -726,7 +726,8 @@ impl<'a> ConnectionInner<'a> {
         if let ActiveTxn::Write(wtx) = self.active_txn.take() {
             wtx.abort();
         }
-        if let Ok(fresh) = SchemaManager::load(db) {
+        if let Ok(mut fresh) = SchemaManager::load(db) {
+            fresh.bump_generation_past(self.schema.generation());
             self.schema = fresh;
         }
         self.reset_txn_state();
@@ -961,7 +962,9 @@ impl<'a> ConnectionInner<'a> {
                     ActiveTxn::None => return Err(SqlError::NoActiveTransaction),
                     ActiveTxn::Write(wtx) => {
                         wtx.abort();
-                        self.schema = SchemaManager::load(db)?;
+                        let mut fresh = SchemaManager::load(db)?;
+                        fresh.bump_generation_past(self.schema.generation());
+                        self.schema = fresh;
                     }
                     ActiveTxn::Read(_rtx) => {}
                 }

@@ -113,3 +113,35 @@ fn generation_bumps_on_register_remove_and_toggle() {
     let g3 = s.generation();
     assert!(g3 > g2);
 }
+
+#[test]
+fn restore_snapshot_never_rewinds_generation() {
+    let mut s = SchemaManager::empty();
+    let snap = s.save_snapshot();
+    s.register_trigger(sample_trigger("t1", "users"));
+    let before_restore = s.generation();
+    s.restore_snapshot(snap);
+    assert!(s.generation() > before_restore);
+}
+
+#[test]
+fn restore_snapshot_without_changes_keeps_generation() {
+    // The counter must not move here, or every DML-only savepoint rollback
+    // would recompile all prepared statements.
+    let mut s = SchemaManager::empty();
+    let snap = s.save_snapshot();
+    let gen = s.generation();
+    s.restore_snapshot(snap);
+    assert_eq!(s.generation(), gen);
+}
+
+#[test]
+fn bump_generation_past_is_strictly_greater() {
+    let mut s = SchemaManager::empty();
+    let base = s.generation();
+    s.bump_generation_past(base + 100);
+    assert!(s.generation() > base + 100);
+    let cur = s.generation();
+    s.bump_generation_past(0);
+    assert_eq!(s.generation(), cur);
+}

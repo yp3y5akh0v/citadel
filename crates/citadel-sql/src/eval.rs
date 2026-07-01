@@ -1722,6 +1722,44 @@ fn parse_vector_literal(s: &str, expected_dim: u16) -> Result<std::sync::Arc<[f3
     Ok(std::sync::Arc::from(out.into_boxed_slice()))
 }
 
+/// Scalar functions whose result can differ across statements for identical
+/// arguments (wall clock, RNG, tzdb). Single source of truth for volatility;
+/// any function added to `eval_scalar_function` MUST be classified here.
+pub(crate) fn is_volatile_function(name_upper: &str, argc: usize) -> bool {
+    match name_upper {
+        "RANDOM"
+        | "RAND"
+        | "NOW"
+        | "CURRENT_TIMESTAMP"
+        | "LOCALTIMESTAMP"
+        | "CURRENT_DATE"
+        | "CURRENT_TIME"
+        | "LOCALTIME"
+        | "CLOCK_TIMESTAMP"
+        | "STATEMENT_TIMESTAMP"
+        | "TRANSACTION_TIMESTAMP"
+        | "AT_TIMEZONE" => true,
+        // 1-arg AGE measures from the current clock; 2-arg AGE is pure.
+        "AGE" => argc == 1,
+        _ => false,
+    }
+}
+
+/// Name volatility plus the DATE/TIME/DATETIME clock forms (zero-arg or a
+/// literal 'now'). A non-literal arg can reach 'now' via TEXT data at runtime;
+/// callers needing that guarantee must exclude those shapes themselves.
+pub(crate) fn is_volatile_function_expr(name_upper: &str, args: &[Expr]) -> bool {
+    if is_volatile_function(name_upper, args.len()) {
+        return true;
+    }
+    matches!(name_upper, "DATE" | "TIME" | "DATETIME")
+        && match args.first() {
+            None => true,
+            Some(Expr::Literal(Value::Text(s))) => s.trim().eq_ignore_ascii_case("now"),
+            Some(_) => false,
+        }
+}
+
 fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Value> {
     let evaluated: Vec<Value> = args
         .iter()

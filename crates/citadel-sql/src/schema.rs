@@ -705,9 +705,22 @@ impl SchemaManager {
     }
 
     pub fn restore_snapshot(&mut self, snap: SchemaSnapshot) {
+        // Equal generations prove nothing changed since the snapshot: restore
+        // is a no-op and plans stay valid. Otherwise never rewind - a plan
+        // compiled after the snapshot must not revalidate against it.
+        if self.generation != snap.generation {
+            self.generation = self.generation.max(snap.generation) + 1;
+        }
         self.tables = snap.tables;
         self.views = snap.views;
-        self.generation = snap.generation;
+    }
+
+    /// Advance the generation strictly past `prior` so plans compiled against
+    /// a predecessor manager can never revalidate against this one.
+    pub fn bump_generation_past(&mut self, prior: u64) {
+        if self.generation <= prior {
+            self.generation = prior + 1;
+        }
     }
 }
 

@@ -224,6 +224,19 @@ fn create_matview_rejects_current_timestamp() {
 }
 
 #[test]
+fn create_matview_rejects_clock_timestamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let err = conn
+        .execute("CREATE MATERIALIZED VIEW mv AS SELECT id, CLOCK_TIMESTAMP() AS t FROM src")
+        .unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("non-deterministic"));
+}
+
+#[test]
 fn create_matview_rejects_random() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
