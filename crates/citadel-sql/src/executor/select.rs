@@ -4443,6 +4443,8 @@ struct JoinPlanStatic {
     table_schemas: Vec<Arc<TableSchema>>,
     needed_per_table: Vec<Vec<usize>>,
     output_combined: Option<Vec<usize>>,
+    /// Per join step: (equi_pairs, is_pure_equi), fixed by the statement.
+    step_equi: Vec<(Vec<(usize, usize)>, bool)>,
 }
 
 struct CachedJoin {
@@ -5085,11 +5087,26 @@ fn build_join_plan_static(schema: &SchemaManager, sel: &SelectStmt) -> Option<Jo
     }
 
     let needed_plan = super::join::compute_join_needed_columns(sel, &all_refs)?;
+    let mut combined_cols = super::join::build_joined_columns(&all_refs[..1]);
+    let mut step_equi = Vec::with_capacity(sel.joins.len());
+    for (ji, join) in sel.joins.iter().enumerate() {
+        super::join::extend_joined_columns(&mut combined_cols, &all_refs[ji + 1]);
+        let outer_col_count: usize = all_refs[..ji + 1]
+            .iter()
+            .map(|(_, s)| s.columns.len())
+            .sum();
+        step_equi.push(super::join::compute_equi_join_meta(
+            join,
+            &combined_cols,
+            outer_col_count,
+        ));
+    }
     Some(JoinPlanStatic {
         table_lowers,
         table_schemas,
         needed_per_table: needed_plan.per_table,
         output_combined: Some(needed_plan.output_combined),
+        step_equi,
     })
 }
 
@@ -5168,8 +5185,7 @@ fn execute_cached_join_with_read(
             None
         };
 
-        let (equi_pairs, is_pure_equi) =
-            super::join::compute_equi_join_meta(join, &combined_cols, outer_col_count);
+        let (equi_pairs, is_pure_equi) = &plan.step_equi[ji];
 
         outer_rows = super::join::exec_join_step_borrowed(
             outer_rows,
@@ -5180,8 +5196,8 @@ fn execute_cached_join_with_read(
             inner_col_count,
             cur_outer_pk_col,
             proj.as_ref(),
-            &equi_pairs,
-            is_pure_equi,
+            equi_pairs,
+            *is_pure_equi,
         );
         cur_outer_pk_col = None;
     }
