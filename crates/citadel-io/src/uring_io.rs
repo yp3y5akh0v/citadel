@@ -208,6 +208,43 @@ impl PageIO for UringPageIO {
         Ok(())
     }
 
+    fn write_pages_ref(&self, pages: &[(u64, &[u8; PAGE_SIZE])]) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+
+        let max_end = pages
+            .iter()
+            .map(|(offset, _)| offset + PAGE_SIZE as u64)
+            .max()
+            .unwrap();
+        if max_end > self.file_size()? {
+            self.truncate(max_end)?;
+        }
+
+        let mut ring = self.ring.lock();
+        let sq_cap = ring.submission().capacity();
+        let batch_size = sq_cap.saturating_sub(1).max(1);
+
+        for chunk in pages.chunks(batch_size) {
+            for (i, (offset, buf)) in chunk.iter().enumerate() {
+                let sqe = opcode::Write::new(types::Fd(self.fd), buf.as_ptr(), PAGE_SIZE as u32)
+                    .offset(*offset)
+                    .build()
+                    .user_data(i as u64);
+
+                unsafe {
+                    ring.submission().push(&sqe).map_err(|_| sq_full_err())?;
+                }
+            }
+
+            ring.submit_and_wait(chunk.len())?;
+            Self::drain_cqes(&mut ring, chunk.len())?;
+        }
+
+        Ok(())
+    }
+
     fn flush_pages(&self, pages: &[(u64, [u8; PAGE_SIZE])]) -> Result<()> {
         self.write_pages(pages)?;
         self.fsync()

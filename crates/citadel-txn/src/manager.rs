@@ -42,7 +42,12 @@ pub struct TxnManager {
     hmac_state: page_cipher::HmacState,
     /// When true, freed pages past all readers are zero-filled on commit (secure delete).
     secure_delete: AtomicBool,
+    /// Reusable encrypt output buffer, capped at COMMIT_ARENA_PAGES pages.
+    commit_arena: Mutex<Vec<u8>>,
 }
+
+/// Commit encrypt/write chunk size; bounds arena retention and transient memory.
+const COMMIT_ARENA_PAGES: usize = 64;
 
 struct ManagerState {
     active_slot: usize,
@@ -103,6 +108,7 @@ impl TxnManager {
             sync_mode,
             hmac_state: page_cipher::HmacState::new(&mac_key, epoch),
             secure_delete: AtomicBool::new(false),
+            commit_arena: Mutex::new(Vec::new()),
         })
     }
 
@@ -208,6 +214,7 @@ impl TxnManager {
             sync_mode,
             hmac_state: page_cipher::HmacState::new(&mac_key, epoch),
             secure_delete: AtomicBool::new(false),
+            commit_arena: Mutex::new(Vec::new()),
         })
     }
 
@@ -427,59 +434,48 @@ impl TxnManager {
         }
 
         let hmac_state = &self.hmac_state;
-        #[cfg(feature = "parallel")]
-        {
-            let encrypt_one = |&(offset, page_id): &(u64, PageId)| -> (u64, [u8; PAGE_SIZE]) {
-                let page = &pages[&page_id];
-                let mut encrypted = [0u8; PAGE_SIZE];
-                page_cipher::encrypt_page_with_hmac(
-                    &self.dek,
-                    hmac_state,
-                    page_id,
-                    page.as_bytes(),
-                    &mut encrypted,
-                );
-                (offset, encrypted)
-            };
-            use rayon::prelude::*;
-            let encrypted_pages: Vec<(u64, [u8; PAGE_SIZE])> =
-                dirty_page_info.par_iter().map(encrypt_one).collect();
-            if !encrypted_pages.is_empty() {
-                self.io.write_pages(&encrypted_pages)?;
+        if !dirty_page_info.is_empty() {
+            // encrypt_page_with_hmac overwrites every output byte: no re-zeroing.
+            let mut arena = self.commit_arena.lock();
+            let arena_len = COMMIT_ARENA_PAGES.min(dirty_page_info.len()) * PAGE_SIZE;
+            if arena.len() < arena_len {
+                arena.resize(arena_len, 0);
             }
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            if dirty_page_info.len() <= 1 {
-                let mut encrypted = [0u8; PAGE_SIZE];
-                for &(offset, page_id) in &dirty_page_info {
+            for chunk in dirty_page_info.chunks(COMMIT_ARENA_PAGES) {
+                let bufs = &mut arena[..chunk.len() * PAGE_SIZE];
+                let encrypt_one = |(dst, &(_, page_id)): (&mut [u8], &(u64, PageId))| {
                     let page = &pages[&page_id];
                     page_cipher::encrypt_page_with_hmac(
                         &self.dek,
                         hmac_state,
                         page_id,
                         page.as_bytes(),
-                        &mut encrypted,
+                        dst.try_into().expect("arena chunk is PAGE_SIZE"),
                     );
-                    self.io.write_page(offset, &encrypted)?;
+                };
+                #[cfg(feature = "parallel")]
+                {
+                    use rayon::prelude::*;
+                    bufs.par_chunks_exact_mut(PAGE_SIZE)
+                        .zip(chunk.par_iter())
+                        .for_each(encrypt_one);
                 }
-            } else {
-                let encrypted_pages: Vec<(u64, [u8; PAGE_SIZE])> = dirty_page_info
-                    .iter()
-                    .map(|&(offset, page_id)| {
-                        let page = &pages[&page_id];
-                        let mut encrypted = [0u8; PAGE_SIZE];
-                        page_cipher::encrypt_page_with_hmac(
-                            &self.dek,
-                            hmac_state,
-                            page_id,
-                            page.as_bytes(),
-                            &mut encrypted,
-                        );
-                        (offset, encrypted)
-                    })
-                    .collect();
-                self.io.write_pages(&encrypted_pages)?;
+                #[cfg(not(feature = "parallel"))]
+                bufs.chunks_exact_mut(PAGE_SIZE)
+                    .zip(chunk.iter())
+                    .for_each(encrypt_one);
+
+                if let [(offset, _)] = chunk {
+                    let buf: &[u8; PAGE_SIZE] = (&arena[..PAGE_SIZE]).try_into().unwrap();
+                    self.io.write_page(*offset, buf)?;
+                } else {
+                    let refs: Vec<(u64, &[u8; PAGE_SIZE])> = chunk
+                        .iter()
+                        .zip(arena.chunks_exact(PAGE_SIZE))
+                        .map(|(&(offset, _), buf)| (offset, buf.try_into().unwrap()))
+                        .collect();
+                    self.io.write_pages_ref(&refs)?;
+                }
             }
         }
 
