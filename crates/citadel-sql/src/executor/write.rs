@@ -830,6 +830,7 @@ fn exec_update_compiled(
     if let crate::planner::ScanPlan::PkRangeScan {
         ref start_key,
         ref range_conds,
+        full_cover: true,
         ..
     } = fast.scan_plan
     {
@@ -1191,6 +1192,7 @@ pub(super) fn exec_update(
             crate::planner::ScanPlan::PkRangeScan {
                 start_key,
                 range_conds,
+                full_cover: true,
                 ..
             },
         ) = (patch_safe, &plan)
@@ -1282,7 +1284,7 @@ pub(super) fn exec_update(
         let mut kv_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         {
             match &plan {
-                crate::planner::ScanPlan::PkLookup { pk_values } => {
+                crate::planner::ScanPlan::PkLookup { pk_values, .. } => {
                     let key = crate::encoding::encode_composite_key(pk_values);
                     if let Some(value) = wtx
                         .table_get(lower_name.as_bytes(), &key)
@@ -1337,7 +1339,7 @@ pub(super) fn exec_update(
         let mut patched: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(kv_pairs.len());
 
         for (key, raw_value) in &mut kv_pairs {
-            if matches!(plan, crate::planner::ScanPlan::SeqScan) {
+            if !plan.covers_where() {
                 if let Some(ref w) = stmt.where_clause {
                     let row = decode_full_row(table_schema, key, raw_value)?;
                     if !eval_expr(w, &EvalCtx::new(col_map, &row)).is_ok_and(|v| is_truthy(&v)) {
@@ -2466,6 +2468,7 @@ fn exec_update_in_txn_compiled(
         crate::planner::ScanPlan::PkRangeScan {
             start_key,
             range_conds,
+            full_cover: true,
             ..
         },
     ) = (patch_safe, &plan)
@@ -2535,7 +2538,11 @@ fn exec_update_in_txn_compiled(
         return Ok(ExecutionResult::RowsAffected(count));
     }
 
-    if let crate::planner::ScanPlan::PkLookup { pk_values } = &plan {
+    if let crate::planner::ScanPlan::PkLookup {
+        pk_values,
+        full_cover: true,
+    } = &plan
+    {
         let key = encode_composite_key(pk_values);
         let mut raw_value = match wtx
             .table_get(compiled.table_name_lower.as_bytes(), &key)
@@ -2635,7 +2642,7 @@ fn exec_update_in_txn_compiled(
     let patch_buf = &mut bufs.patch_buf;
 
     for (key, raw_value) in bufs.kv_pairs.iter_mut() {
-        if matches!(plan, crate::planner::ScanPlan::SeqScan) {
+        if !plan.covers_where() {
             if let Some(ref w) = stmt.where_clause {
                 let row = decode_full_row(table_schema, key, raw_value)?;
                 if !eval_expr(w, &EvalCtx::new(col_map, &row)).is_ok_and(|v| is_truthy(&v)) {
@@ -2884,6 +2891,7 @@ fn try_fast_update_in_txn(
         crate::planner::ScanPlan::PkRangeScan {
             start_key,
             range_conds,
+            full_cover: true,
             ..
         },
     ) = (patch_safe, &plan)
@@ -2960,7 +2968,7 @@ fn try_fast_update_in_txn(
 
     let mut kv_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     match &plan {
-        crate::planner::ScanPlan::PkLookup { pk_values } => {
+        crate::planner::ScanPlan::PkLookup { pk_values, .. } => {
             let key = encode_composite_key(pk_values);
             if let Some(value) = wtx
                 .table_get(lower_name.as_bytes(), &key)
@@ -3009,7 +3017,7 @@ fn try_fast_update_in_txn(
     let mut patched: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(kv_pairs.len());
 
     for (key, raw_value) in &mut kv_pairs {
-        if matches!(plan, crate::planner::ScanPlan::SeqScan) {
+        if !plan.covers_where() {
             if let Some(ref w) = stmt.where_clause {
                 let row = decode_full_row(table_schema, key, raw_value)?;
                 if !eval_expr(w, &EvalCtx::new(col_map, &row)).is_ok_and(|v| is_truthy(&v)) {

@@ -249,7 +249,7 @@ pub(super) fn collect_rows_with_read(
             Ok((rows, where_clause.is_some()))
         }
 
-        ScanPlan::PkLookup { pk_values } => {
+        ScanPlan::PkLookup { pk_values, .. } => {
             let key = encode_composite_key(&pk_values);
             match rtx
                 .table_get(lower_name.as_bytes(), &key)
@@ -275,6 +275,7 @@ pub(super) fn collect_rows_with_read(
             ref start_key,
             ref range_conds,
             num_pk_cols,
+            ..
         } => {
             let mut rows = Vec::new();
             let mut scan_err: Option<SqlError> = None;
@@ -551,7 +552,7 @@ pub(super) fn collect_rows_write(
             Ok((rows, where_clause.is_some()))
         }
 
-        ScanPlan::PkLookup { pk_values } => {
+        ScanPlan::PkLookup { pk_values, .. } => {
             let key = encode_composite_key(&pk_values);
             match wtx
                 .table_get(lower_name.as_bytes(), &key)
@@ -577,6 +578,7 @@ pub(super) fn collect_rows_write(
             ref start_key,
             ref range_conds,
             num_pk_cols,
+            ..
         } => {
             let mut rows = Vec::new();
             let mut scan_err: Option<SqlError> = None;
@@ -725,7 +727,7 @@ pub(super) fn collect_keyed_rows_with_read(
             Ok(rows)
         }
 
-        ScanPlan::PkLookup { pk_values } => {
+        ScanPlan::PkLookup { pk_values, .. } => {
             let key = encode_composite_key(&pk_values);
             match rtx
                 .table_get(lower_name.as_bytes(), &key)
@@ -743,6 +745,7 @@ pub(super) fn collect_keyed_rows_with_read(
             ref start_key,
             ref range_conds,
             num_pk_cols,
+            ..
         } => {
             let mut rows = Vec::new();
             let mut scan_err: Option<SqlError> = None;
@@ -864,7 +867,7 @@ pub(super) fn collect_keyed_rows_write(
             Ok(rows)
         }
 
-        ScanPlan::PkLookup { pk_values } => {
+        ScanPlan::PkLookup { pk_values, .. } => {
             let key = encode_composite_key(&pk_values);
             match wtx
                 .table_get(lower_name.as_bytes(), &key)
@@ -882,6 +885,7 @@ pub(super) fn collect_keyed_rows_write(
             ref start_key,
             ref range_conds,
             num_pk_cols,
+            ..
         } => {
             let mut rows = Vec::new();
             let mut scan_err: Option<SqlError> = None;

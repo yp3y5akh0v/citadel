@@ -73,11 +73,17 @@ pub enum ScanPlan {
     SeqScan,
     PkLookup {
         pk_values: Vec<Value>,
+        /// True when the pk equalities are the ENTIRE predicate. PkLookup is
+        /// otherwise a superset prefilter: consumers must re-apply the WHERE.
+        full_cover: bool,
     },
     PkRangeScan {
         start_key: Vec<u8>,
         range_conds: Vec<(BinOp, Value)>,
         num_pk_cols: usize,
+        /// True when the range conds are the ENTIRE predicate. PkRangeScan is
+        /// otherwise a superset prefilter: consumers must re-apply the WHERE.
+        full_cover: bool,
     },
     IndexScan {
         index_name: String,
@@ -226,6 +232,18 @@ fn flatten_between(expr: &Expr, schema: &TableSchema, out: &mut Vec<SimplePredic
     }
 }
 
+impl ScanPlan {
+    /// True when the plan consumed the entire WHERE. Every other plan yields
+    /// a row superset: consumers must re-apply the predicate per row.
+    pub fn covers_where(&self) -> bool {
+        match self {
+            ScanPlan::PkLookup { full_cover, .. } => *full_cover,
+            ScanPlan::PkRangeScan { full_cover, .. } => *full_cover,
+            _ => false,
+        }
+    }
+}
+
 pub fn plan_select(schema: &TableSchema, where_clause: &Option<Expr>) -> ScanPlan {
     plan_select_inner(schema, where_clause, false)
 }
@@ -271,7 +289,11 @@ fn plan_select_inner(
         .collect();
     flatten_between(where_expr, schema, &mut range_preds);
 
-    if let Some(plan) = try_pk_range_scan(schema, &range_preds) {
+    if let Some(plan) = try_pk_range_scan(
+        schema,
+        &range_preds,
+        pk_range_full_cover(schema, &predicates, &simple),
+    ) {
         return plan;
     }
 
@@ -454,7 +476,11 @@ fn collect_required(
     }
 }
 
-fn try_pk_range_scan(schema: &TableSchema, range_preds: &[SimplePredicate]) -> Option<ScanPlan> {
+fn try_pk_range_scan(
+    schema: &TableSchema,
+    range_preds: &[SimplePredicate],
+    full_cover: bool,
+) -> Option<ScanPlan> {
     if schema.primary_key_columns.len() != 1 {
         return None; // Only single-column PK for now
     }
@@ -477,6 +503,26 @@ fn try_pk_range_scan(schema: &TableSchema, range_preds: &[SimplePredicate]) -> O
         start_key,
         range_conds: conds,
         num_pk_cols: 1,
+        full_cover,
+    })
+}
+
+/// True when every WHERE conjunct is a pk range or literal pk BETWEEN.
+fn pk_range_full_cover(
+    schema: &TableSchema,
+    predicates: &[&Expr],
+    simple: &[Option<SimplePredicate>],
+) -> bool {
+    let [pk_col] = schema.primary_key_columns[..] else {
+        return false;
+    };
+    let pk_col = pk_col as usize;
+    predicates.iter().zip(simple).all(|(raw, s)| match s {
+        Some(p) => p.col_idx == pk_col && is_range_op(p.op),
+        None => matches!(raw, Expr::Between { expr: col_expr, low, high, negated: false }
+            if resolve_column_name(col_expr).and_then(|n| schema.column_index(n)) == Some(pk_col)
+                && resolve_literal(low).is_some()
+                && resolve_literal(high).is_some()),
     })
 }
 
@@ -498,7 +544,16 @@ fn try_pk_lookup(schema: &TableSchema, predicates: &[Option<SimplePredicate>]) -
 
     if pk_values.iter().all(|v| v.is_some()) {
         let values: Vec<Value> = pk_values.into_iter().map(|v| v.unwrap()).collect();
-        Some(ScanPlan::PkLookup { pk_values: values })
+        // A duplicated pk col would leave another unfilled and return None.
+        let full_cover = predicates.len() == pk_cols.len()
+            && predicates.iter().all(|s| {
+                s.as_ref()
+                    .is_some_and(|p| p.op == BinOp::Eq && pk_cols.contains(&(p.col_idx as u16)))
+            });
+        Some(ScanPlan::PkLookup {
+            pk_values: values,
+            full_cover,
+        })
     } else {
         None
     }
@@ -726,7 +781,7 @@ pub fn describe_plan(plan: &ScanPlan, table_schema: &TableSchema) -> String {
     match plan {
         ScanPlan::SeqScan => String::new(),
 
-        ScanPlan::PkLookup { pk_values } => {
+        ScanPlan::PkLookup { pk_values, .. } => {
             let pk_cols: Vec<&str> = table_schema
                 .primary_key_columns
                 .iter()
