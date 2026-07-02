@@ -15,6 +15,8 @@ criterion_group!(
     h2h::sort::bench,
     h2h::sort_nocase::bench,
     h2h::join::bench,
+    h2h::join_param::bench,
+    h2h::covered_scan::bench,
     h2h::sum::bench,
     h2h::group_by::bench,
     h2h::insert::bench,
