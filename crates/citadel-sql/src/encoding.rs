@@ -286,6 +286,21 @@ pub fn decode_key_value(data: &[u8]) -> Result<(Value, usize)> {
             }
             Ok((Value::Array(std::sync::Arc::new(elems)), n + 1))
         }
+        TAG_VECTOR => {
+            let (inner, n) = decode_null_escaped(&data[1..])?;
+            if inner.len() < 2 {
+                return Err(SqlError::InvalidValue("truncated vector key".into()));
+            }
+            let dim = u16::from_le_bytes([inner[0], inner[1]]) as usize;
+            if inner.len() != 2 + dim * 4 {
+                return Err(SqlError::InvalidValue("truncated vector key".into()));
+            }
+            let elems: Vec<f32> = inner[2..]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            Ok((Value::Vector(std::sync::Arc::from(elems)), n + 1))
+        }
         tag => Err(SqlError::InvalidValue(format!("unknown key tag: {tag:#x}"))),
     }
 }
