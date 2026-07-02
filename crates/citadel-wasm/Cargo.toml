@@ -12,7 +12,7 @@ keywords = ["database", "encryption", "wasm", "webassembly", "sql"]
 categories = ["wasm", "database-implementations", "cryptography"]
 
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = ["--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-sign-ext", "--enable-mutable-globals"]
+wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-sign-ext", "--enable-mutable-globals", "--strip-producers"]
 
 [lib]
 name = "citadel_wasm"
