@@ -190,3 +190,102 @@ fn point_select_drop_column_recompiles() {
         vec![vec![Value::Integer(10)]]
     );
 }
+
+#[test]
+fn scan_lane_non_pk_filter_varying_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER, s TEXT)")
+        .unwrap();
+    for id in 1..=8 {
+        conn.execute(&format!("INSERT INTO t VALUES ({id}, {}, 's{id}')", id % 3))
+            .unwrap();
+    }
+
+    let stmt = conn.prepare("SELECT id FROM t WHERE val = $1").unwrap();
+    let ids = |v: i64| -> Vec<i64> {
+        stmt.query_collect(&[Value::Integer(v)])
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                _ => unreachable!(),
+            })
+            .collect()
+    };
+    assert_eq!(ids(0), vec![3, 6]);
+    assert_eq!(ids(1), vec![1, 4, 7]);
+    assert_eq!(ids(2), vec![2, 5, 8]);
+    assert_eq!(ids(9), Vec::<i64>::new());
+}
+
+#[test]
+fn scan_lane_indexed_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_val ON t (val)").unwrap();
+    for id in 1..=6 {
+        conn.execute(&format!("INSERT INTO t VALUES ({id}, {})", id % 2))
+            .unwrap();
+    }
+
+    let stmt = conn.prepare("SELECT id FROM t WHERE val = $1").unwrap();
+    let qr = stmt.query_collect(&[Value::Integer(1)]).unwrap();
+    assert_eq!(qr.rows.len(), 3);
+    conn.execute("INSERT INTO t VALUES (7, 1)").unwrap();
+    let qr = stmt.query_collect(&[Value::Integer(1)]).unwrap();
+    assert_eq!(qr.rows.len(), 4);
+}
+
+#[test]
+fn scan_lane_mixed_range_and_residual() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    for id in 1..=10 {
+        conn.execute(&format!("INSERT INTO t VALUES ({id}, {})", id * 10))
+            .unwrap();
+    }
+
+    let stmt = conn
+        .prepare("SELECT id FROM t WHERE id >= $1 AND v < $2")
+        .unwrap();
+    let qr = stmt
+        .query_collect(&[Value::Integer(4), Value::Integer(80)])
+        .unwrap();
+    assert_eq!(
+        qr.rows,
+        vec![
+            vec![Value::Integer(4)],
+            vec![Value::Integer(5)],
+            vec![Value::Integer(6)],
+            vec![Value::Integer(7)],
+        ]
+    );
+}
+
+#[test]
+fn scan_lane_read_your_writes_in_txn() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 5), (2, 5)").unwrap();
+
+    let stmt = conn.prepare("SELECT id FROM t WHERE val = $1").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 5)").unwrap();
+    let qr = stmt.query_collect(&[Value::Integer(5)]).unwrap();
+    assert_eq!(qr.rows.len(), 3);
+    conn.execute("ROLLBACK").unwrap();
+    let qr = stmt.query_collect(&[Value::Integer(5)]).unwrap();
+    assert_eq!(qr.rows.len(), 2);
+}
