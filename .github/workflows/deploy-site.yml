@@ -39,7 +39,7 @@ jobs:
 
       - name: Build WASM
         run: |
-          wasm-pack build crates/citadel-wasm --target web --release
+          bash scripts/publish-wasm.sh
           mkdir -p site/static/wasm
           cp crates/citadel-wasm/pkg/citadel_wasm_bg.wasm site/static/wasm/
           cp crates/citadel-wasm/pkg/citadel_wasm.js site/static/wasm/
