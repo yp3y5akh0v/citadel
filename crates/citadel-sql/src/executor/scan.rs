@@ -13,6 +13,20 @@ use crate::types::*;
 
 use super::helpers::*;
 
+/// Seek key for the tightest lower range bound; BelowLower re-checks keep
+/// correctness when bounds conflict.
+fn index_scan_start(prefix: &[u8], range_conds: &[(BinOp, Value)]) -> Option<Vec<u8>> {
+    range_conds
+        .iter()
+        .filter(|(op, _)| matches!(op, BinOp::Gt | BinOp::GtEq))
+        .map(|(_, v)| {
+            let mut k = prefix.to_vec();
+            crate::encoding::encode_key_value_into(v, &mut k);
+            k
+        })
+        .max()
+}
+
 /// Check PK range conditions. Returns: 0 = match, 1 = below lower (skip), 2 = above upper (stop).
 pub(super) fn check_pk_range(pk_val: &Value, range_conds: &[(BinOp, Value)]) -> u8 {
     for (op, bound) in range_conds {
@@ -332,8 +346,10 @@ pub(super) fn collect_rows_with_read(
             let mut pk_keys: Vec<Vec<u8>> = Vec::new();
 
             {
+                let start = index_scan_start(&prefix, &range_conds);
+                let start: &[u8] = start.as_deref().unwrap_or(&prefix);
                 let mut scan_err: Option<SqlError> = None;
-                rtx.table_scan_from_fast(&idx_table, &prefix, |key, value| {
+                rtx.table_scan_from_fast(&idx_table, start, |key, value| {
                     if !key.starts_with(&prefix) {
                         return Ok(false);
                     }
@@ -635,8 +651,10 @@ pub(super) fn collect_rows_write(
             let mut pk_keys: Vec<Vec<u8>> = Vec::new();
 
             {
+                let start = index_scan_start(&prefix, &range_conds);
+                let start: &[u8] = start.as_deref().unwrap_or(&prefix);
                 let mut scan_err: Option<SqlError> = None;
-                wtx.table_scan_from(&idx_table, &prefix, |key, value| {
+                wtx.table_scan_from(&idx_table, start, |key, value| {
                     if !key.starts_with(&prefix) {
                         return Ok(false);
                     }
@@ -791,8 +809,10 @@ pub(super) fn collect_keyed_rows_with_read(
             let num_index_cols = index_columns.len();
             let mut pk_keys: Vec<Vec<u8>> = Vec::new();
             {
+                let start = index_scan_start(&prefix, &range_conds);
+                let start: &[u8] = start.as_deref().unwrap_or(&prefix);
                 let mut scan_err: Option<SqlError> = None;
-                rtx.table_scan_from_fast(&idx_table, &prefix, |key, value| {
+                rtx.table_scan_from_fast(&idx_table, start, |key, value| {
                     if !key.starts_with(&prefix) {
                         return Ok(false);
                     }
@@ -932,8 +952,10 @@ pub(super) fn collect_keyed_rows_write(
             let mut pk_keys: Vec<Vec<u8>> = Vec::new();
 
             {
+                let start = index_scan_start(&prefix, &range_conds);
+                let start: &[u8] = start.as_deref().unwrap_or(&prefix);
                 let mut scan_err: Option<SqlError> = None;
-                wtx.table_scan_from(&idx_table, &prefix, |key, value| {
+                wtx.table_scan_from(&idx_table, start, |key, value| {
                     if !key.starts_with(&prefix) {
                         return Ok(false);
                     }
