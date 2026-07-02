@@ -637,7 +637,10 @@ impl CompiledPlan for CompiledUpdate {
 
 fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<CompiledUpdate> {
     let user_name = stmt.table.to_ascii_lowercase();
-    let is_view = schema.get_view(&user_name).is_some();
+    // Matview names resolve to their backing table; only the interpreted
+    // path raises the modification error.
+    let is_view =
+        schema.get_view(&user_name).is_some() || schema.get_matview(&user_name).is_some();
     if is_view {
         return Ok(CompiledUpdate {
             table_name_lower: user_name,
@@ -3101,6 +3104,12 @@ pub(super) fn exec_update_in_txn(
         }
         return Err(SqlError::CannotModifyView(stmt.table.clone()));
     }
+    if schema.get_matview(&user_name).is_some() {
+        return Err(SqlError::CannotModifyView(format!(
+            "materialized view '{}' is read-only — use REFRESH MATERIALIZED VIEW",
+            stmt.table
+        )));
+    }
     let table_schema = schema
         .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
@@ -3601,6 +3610,12 @@ pub(super) fn exec_delete_in_txn(
             return exec_instead_of_view_delete_in_txn(wtx, schema, &user_name, &aliases, stmt);
         }
         return Err(SqlError::CannotModifyView(stmt.table.clone()));
+    }
+    if schema.get_matview(&user_name).is_some() {
+        return Err(SqlError::CannotModifyView(format!(
+            "materialized view '{}' is read-only — use REFRESH MATERIALIZED VIEW",
+            stmt.table
+        )));
     }
     let table_schema = schema
         .get(&user_name)

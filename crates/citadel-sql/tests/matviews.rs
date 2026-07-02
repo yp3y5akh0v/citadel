@@ -1460,3 +1460,59 @@ fn refresh_and_with_no_data_in_same_script() {
         .unwrap();
     assert_eq!(qr.rows[0][0], Value::Boolean(true));
 }
+
+#[test]
+fn prepared_update_matview_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO src VALUES (1, 10)").unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT id, v FROM src")
+        .unwrap();
+    let stmt = conn.prepare("UPDATE mv SET v = 99 WHERE id = 1").unwrap();
+    let err = stmt.execute(&[]).unwrap_err();
+    assert!(matches!(err, SqlError::CannotModifyView(_)));
+    conn.execute("BEGIN").unwrap();
+    let err = stmt.execute(&[]).unwrap_err();
+    assert!(matches!(err, SqlError::CannotModifyView(_)));
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn prepared_insert_matview_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT id, v FROM src")
+        .unwrap();
+    let stmt = conn.prepare("INSERT INTO mv VALUES ($1, $2)").unwrap();
+    let err = stmt
+        .execute(&[Value::Integer(1), Value::Integer(2)])
+        .unwrap_err();
+    assert!(matches!(err, SqlError::CannotModifyView(_)));
+    conn.execute("BEGIN").unwrap();
+    let err = stmt
+        .execute(&[Value::Integer(1), Value::Integer(2)])
+        .unwrap_err();
+    assert!(matches!(err, SqlError::CannotModifyView(_)));
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn prepared_delete_matview_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO src VALUES (1, 10)").unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT id, v FROM src")
+        .unwrap();
+    let stmt = conn.prepare("DELETE FROM mv WHERE id = $1").unwrap();
+    let err = stmt.execute(&[Value::Integer(1)]).unwrap_err();
+    assert!(matches!(err, SqlError::CannotModifyView(_)));
+}
