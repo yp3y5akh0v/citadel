@@ -1,7 +1,7 @@
 //! Transaction manager: single-writer MVCC with shadow-paging commit.
 
 use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -499,14 +499,14 @@ impl TxnManager {
                 )
             })
             .collect();
-        let loaded_hashes: Vec<u32> = loaded_tree_meta
-            .keys()
-            .map(|name| file_manager::table_name_hash(name))
-            .collect();
-        let current_hashes: std::collections::HashSet<u32> =
-            named_table_entries.iter().map(|e| e.0).collect();
+        let mut known_hashes: FxHashSet<u32> = named_table_entries.iter().map(|e| e.0).collect();
+        known_hashes.extend(
+            loaded_tree_meta
+                .keys()
+                .map(|name| file_manager::table_name_hash(name)),
+        );
         for &(hash, count, root, depth) in &old_slot.named_table_entries {
-            if !loaded_hashes.contains(&hash) && !current_hashes.contains(&hash) {
+            if !known_hashes.contains(&hash) {
                 named_table_entries.push((hash, count, root, depth));
             }
         }
