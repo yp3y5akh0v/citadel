@@ -4102,7 +4102,12 @@ pub struct CompiledSelect {
     /// (`result_cache::is_result_cacheable`); memoizes the materialized
     /// result keyed by (commit generation, params).
     result_cache: Option<super::result_cache::ResultCacheSlot>,
-    point: Option<PkPointPlan>,
+    lane: Option<CompiledSelectLane>,
+}
+
+enum CompiledSelectLane {
+    Point(PkPointPlan),
+    Scan(SimpleScanPlan),
 }
 
 /// Full-pk-equality SELECT compiled to a table_get; key values re-resolve per execute.
@@ -4113,6 +4118,14 @@ struct PkPointPlan {
     columns: Vec<String>,
     where_expr: Expr,
     pk_sources: Vec<PointSource>,
+}
+
+/// Single-table WHERE-only SELECT; planning still runs per execute.
+struct SimpleScanPlan {
+    table_schema: TableSchema,
+    proj: StreamProj,
+    columns: Vec<String>,
+    where_expr: Option<Expr>,
 }
 
 enum PointSource {
@@ -4179,7 +4192,7 @@ fn collect_pk_eq_conjuncts(
     true
 }
 
-fn build_pk_point_plan(schema: &SchemaManager, sel: &SelectStmt) -> Option<PkPointPlan> {
+fn build_select_lane(schema: &SchemaManager, sel: &SelectStmt) -> Option<CompiledSelectLane> {
     if !sel.joins.is_empty()
         || !sel.group_by.is_empty()
         || sel.having.is_some()
@@ -4205,18 +4218,69 @@ fn build_pk_point_plan(schema: &SchemaManager, sel: &SelectStmt) -> Option<PkPoi
     if table_schema.has_virtual_columns() {
         return None;
     }
+    // The no-WHERE shape is already served by the leaf-cached collect_scan.
     let where_expr = sel.where_clause.as_ref()?;
-    let pk_sources = detect_pk_point_sources(where_expr, table_schema)?;
     let proj = build_stream_proj(&sel.columns, table_schema)?;
     let columns = projection_column_names(&sel.columns, &table_schema.columns);
-    Some(PkPointPlan {
-        table_lower: table_schema.name.clone(),
+    if let Some(pk_sources) = detect_pk_point_sources(where_expr, table_schema) {
+        return Some(CompiledSelectLane::Point(PkPointPlan {
+            table_lower: table_schema.name.clone(),
+            table_schema: table_schema.clone(),
+            proj,
+            columns,
+            where_expr: where_expr.clone(),
+            pk_sources,
+        }));
+    }
+    Some(CompiledSelectLane::Scan(SimpleScanPlan {
         table_schema: table_schema.clone(),
         proj,
         columns,
-        where_expr: where_expr.clone(),
-        pk_sources,
-    })
+        where_expr: Some(where_expr.clone()),
+    }))
+}
+
+impl CompiledSelectLane {
+    fn run(&self, rtx: &mut ReadTxn<'_>) -> Result<QueryResult> {
+        match self {
+            CompiledSelectLane::Point(p) => p.run(rtx),
+            CompiledSelectLane::Scan(s) => s.run(rtx),
+        }
+    }
+}
+
+impl SimpleScanPlan {
+    fn run(&self, rtx: &mut ReadTxn<'_>) -> Result<QueryResult> {
+        let (rows, filtered) =
+            super::scan::collect_rows_with_read(rtx, &self.table_schema, &self.where_expr, None)?;
+        let col_map = self.table_schema.column_map();
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            if !filtered {
+                if let Some(w) = &self.where_expr {
+                    if !eval_expr(w, &EvalCtx::new(col_map, row)).is_ok_and(|v| is_truthy(&v)) {
+                        continue;
+                    }
+                }
+            }
+            out.push(self.project(col_map, row)?);
+        }
+        Ok(QueryResult {
+            columns: self.columns.clone(),
+            rows: out,
+        })
+    }
+
+    fn project(&self, col_map: &ColumnMap, row: &[Value]) -> Result<Vec<Value>> {
+        match &self.proj {
+            StreamProj::Identity { .. } => Ok(row.to_vec()),
+            StreamProj::Columns { idxs, .. } => Ok(idxs.iter().map(|&i| row[i].clone()).collect()),
+            StreamProj::Exprs { exprs, .. } => {
+                let ectx = EvalCtx::new(col_map, row);
+                exprs.iter().map(|e| eval_expr(e, &ectx)).collect()
+            }
+        }
+    }
 }
 
 impl PkPointPlan {
@@ -4300,7 +4364,7 @@ fn cache_carrier(
         compound_cache: None,
         leaf_cache: parking_lot::RwLock::new(None),
         result_cache: Some(rc),
-        point: None,
+        lane: None,
     })
 }
 
@@ -4336,7 +4400,7 @@ impl CompiledSelect {
                 compound_cache,
                 leaf_cache: parking_lot::RwLock::new(None),
                 result_cache,
-                point: None,
+                lane: None,
             });
         }
 
@@ -4366,8 +4430,8 @@ impl CompiledSelect {
         } else {
             (None, None)
         };
-        let point = if sel.joins.is_empty() {
-            build_pk_point_plan(schema, sel)
+        let lane = if sel.joins.is_empty() {
+            build_select_lane(schema, sel)
         } else {
             None
         };
@@ -4379,7 +4443,7 @@ impl CompiledSelect {
             compound_cache: None,
             leaf_cache: parking_lot::RwLock::new(None),
             result_cache,
-            point,
+            lane,
         })
     }
 
@@ -4398,8 +4462,8 @@ impl CompiledSelect {
         if let Some(qr) = slot.lookup(gen, params) {
             return Ok(ExecutionResult::Query(qr));
         }
-        if let Some(point) = &self.point {
-            let qr = point.run(rtx)?;
+        if let Some(lane) = &self.lane {
+            let qr = lane.run(rtx)?;
             slot.store(gen, params, &qr);
             return Ok(ExecutionResult::Query(qr));
         }
@@ -4455,10 +4519,10 @@ impl CompiledPlan for CompiledSelect {
                     }
                 };
             }
-            if let Some(point) = &self.point {
+            if let Some(lane) = &self.lane {
                 let qr = match txn {
-                    ActiveTxnRef::Read(rtx) => point.run(rtx)?,
-                    _ => point.run(&mut db.begin_read())?,
+                    ActiveTxnRef::Read(rtx) => lane.run(rtx)?,
+                    _ => lane.run(&mut db.begin_read())?,
                 };
                 return Ok(ExecutionResult::Query(qr));
             }
