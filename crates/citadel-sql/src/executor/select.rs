@@ -2551,6 +2551,7 @@ impl StreamGroupByPlan {
 pub(super) struct TopKScanPlan {
     sort_target: RawAggTarget,
     num_pk_cols: usize,
+    pk_is_int: bool,
     descending: bool,
     nulls_first: bool,
     keep: usize,
@@ -2631,6 +2632,9 @@ impl TopKScanPlan {
         Ok(Some(Self {
             sort_target,
             num_pk_cols: schema.primary_key_columns.len(),
+            pk_is_int: schema.primary_key_columns.len() == 1
+                && schema.columns[schema.primary_key_columns[0] as usize].data_type
+                    == DataType::Integer,
             descending: ob.descending,
             nulls_first: ob.nulls_first.unwrap_or(!ob.descending),
             keep,
@@ -2723,7 +2727,7 @@ impl TopKScanPlan {
         scan(&mut |key, value| {
             let sort_key: Value = match &self.sort_target {
                 RawAggTarget::Pk(pk_pos) => {
-                    if self.num_pk_cols == 1 && *pk_pos == 0 {
+                    if self.pk_is_int && *pk_pos == 0 {
                         match decode_pk_integer(key) {
                             Ok(v) => Value::Integer(v),
                             Err(e) => {
