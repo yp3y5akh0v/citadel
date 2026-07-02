@@ -101,6 +101,17 @@ pub(super) fn try_covered_index_collect_read(
     let col_map = table_schema.column_map();
     let start = index_scan_start(prefix, range_conds);
     let start: &[u8] = start.as_deref().unwrap_or(prefix);
+    // Output slots per stream position: index components then pk columns.
+    let stream_slots: Option<Vec<Vec<usize>>> = emit_direct.map(|order| {
+        let mut slots = vec![Vec::new(); num_index_cols + num_pk_cols];
+        for (out_i, ci) in order.iter().enumerate() {
+            match pk_cols.iter().position(|&pc| pc as usize == *ci) {
+                Some(p) => slots[num_index_cols + p].push(out_i),
+                None => slots[comp_of[ci]].push(out_i),
+            }
+        }
+        slots
+    });
     let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut scan_err: Option<SqlError> = None;
     rtx.table_scan_from_fast(idx_table, start, |key, value| {
@@ -117,6 +128,49 @@ pub(super) fn try_covered_index_collect_read(
             }
         }
         let built = (|| -> Result<Vec<Value>> {
+            if let (Some(slots), Some(order)) = (&stream_slots, emit_direct) {
+                // One pass over the key/value bytes straight into the output.
+                let mut out = vec![Value::Null; order.len()];
+                let mut pos = 0;
+                for slot in &slots[..num_index_cols] {
+                    if slot.is_empty() {
+                        pos += crate::encoding::skip_key_value(&key[pos..])?;
+                    } else {
+                        let (v, n) = decode_key_value(&key[pos..])?;
+                        pos += n;
+                        match slot.as_slice() {
+                            [oi] => out[*oi] = v,
+                            many => {
+                                for &oi in many {
+                                    out[oi] = v.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+                let (pk_stream, mut ppos) = if *is_unique && !value.is_empty() {
+                    (value, 0)
+                } else {
+                    (key, pos)
+                };
+                for slot in &slots[num_index_cols..] {
+                    if slot.is_empty() {
+                        ppos += crate::encoding::skip_key_value(&pk_stream[ppos..])?;
+                    } else {
+                        let (v, n) = decode_key_value(&pk_stream[ppos..])?;
+                        ppos += n;
+                        match slot.as_slice() {
+                            [oi] => out[*oi] = v,
+                            many => {
+                                for &oi in many {
+                                    out[oi] = v.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+                return Ok(out);
+            }
             let (mut comps, pk_vals) = if *is_unique && !value.is_empty() {
                 (
                     decode_composite_key(key, num_index_cols)?,
@@ -127,17 +181,6 @@ pub(super) fn try_covered_index_collect_read(
                 let pk_vals = all.split_off(num_index_cols);
                 (all, pk_vals)
             };
-            if let Some(order) = emit_direct {
-                return Ok(order
-                    .iter()
-                    .map(
-                        |ci| match pk_cols.iter().position(|&pc| pc as usize == *ci) {
-                            Some(i) => pk_vals[i].clone(),
-                            None => comps[comp_of[ci]].clone(),
-                        },
-                    )
-                    .collect());
-            }
             let mut row = vec![Value::Null; ncols];
             for (&ci, &pos) in &comp_of {
                 row[ci] = std::mem::replace(&mut comps[pos], Value::Null);

@@ -372,6 +372,41 @@ fn decode_real(data: &[u8]) -> Result<(Value, usize)> {
 }
 
 /// Decode null-escaped bytes. Returns (decoded bytes, bytes consumed including terminator).
+/// Byte length of one encoded key component, decoding nothing.
+pub(crate) fn skip_key_value(data: &[u8]) -> Result<usize> {
+    if data.is_empty() {
+        return Err(SqlError::InvalidValue("empty key data".into()));
+    }
+    match data[0] {
+        TAG_NULL => Ok(1),
+        TAG_BOOLEAN => Ok(2),
+        TAG_INTEGER => decode_integer(&data[1..]).map(|(_, n)| n + 1),
+        TAG_REAL => decode_real(&data[1..]).map(|(_, n)| n + 1),
+        TAG_TIME | TAG_DATE | TAG_TIMESTAMP => decode_signed_varint(&data[1..]).map(|(_, n)| n + 1),
+        TAG_INTERVAL => Ok(17),
+        // Every remaining tag wraps a null-escaped payload.
+        _ => skip_null_escaped(&data[1..]).map(|n| n + 1),
+    }
+}
+
+fn skip_null_escaped(data: &[u8]) -> Result<usize> {
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0x00 {
+            if i + 1 < data.len() && data[i + 1] == 0xFF {
+                i += 2;
+            } else {
+                return Ok(i + 1);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Err(SqlError::InvalidValue(
+        "unterminated null-escaped string".into(),
+    ))
+}
+
 fn decode_null_escaped(data: &[u8]) -> Result<(Vec<u8>, usize)> {
     let mut result = Vec::new();
     let mut i = 0;
