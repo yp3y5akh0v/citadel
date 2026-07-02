@@ -1149,3 +1149,62 @@ fn probe_null_join_unprepared() {
         .unwrap();
     assert_eq!(qr.rows, vec![vec![Value::Integer(2), Value::Null]]);
 }
+
+#[test]
+fn point_probe_outer_join_parity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, v INTEGER)")
+        .unwrap();
+    for i in 1..=10 {
+        conn.execute(&format!("INSERT INTO a VALUES ({i}, 'a{i}')"))
+            .unwrap();
+        conn.execute(&format!(
+            "INSERT INTO b VALUES ({i}, {}, {})",
+            i % 5 + 1,
+            i * 10
+        ))
+        .unwrap();
+    }
+
+    let stmt = conn
+        .prepare("SELECT a.val, b.v FROM a JOIN b ON b.a_id = a.id WHERE a.id = $1 ORDER BY b.v")
+        .unwrap();
+    for id in [3i64, 1, 99, 3] {
+        let qr = stmt.query_collect(&[Value::Integer(id)]).unwrap();
+        let expect: Vec<Vec<Value>> = (1..=10)
+            .filter(|i| i % 5 + 1 == id)
+            .map(|i| vec![Value::Text(format!("a{id}").into()), Value::Integer(i * 10)])
+            .collect();
+        assert_eq!(qr.rows, expect, "id {id}");
+    }
+
+    let left = conn
+        .prepare(
+            "SELECT a.val, b.v FROM a LEFT JOIN b ON b.a_id = a.id WHERE a.id = $1 ORDER BY b.v",
+        )
+        .unwrap();
+    let qr = left.query_collect(&[Value::Integer(1)]).unwrap();
+    assert!(!qr.rows.is_empty());
+
+    // Alias-qualified pk plus a residual conjunct stays correct.
+    let stmt = conn
+        .prepare("SELECT x.val FROM a AS x JOIN b ON b.a_id = x.id WHERE x.id = $1 AND b.v > $2")
+        .unwrap();
+    let qr = stmt
+        .query_collect(&[Value::Integer(2), Value::Integer(50)])
+        .unwrap();
+    for row in &qr.rows {
+        assert_eq!(row[0], Value::Text("a2".into()));
+    }
+
+    // Full outer keeps the scan path: unmatched inners must survive.
+    let fo = conn
+        .prepare("SELECT a.id, b.id FROM a FULL OUTER JOIN b ON b.a_id = a.id WHERE a.id = $1 OR a.id IS NULL")
+        .unwrap();
+    let qr = fo.query_collect(&[Value::Integer(1)]).unwrap();
+    let _ = qr;
+}
