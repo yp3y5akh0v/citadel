@@ -4345,11 +4345,18 @@ impl SimpleScanPlan {
     fn run(&self, rtx: &mut ReadTxn<'_>) -> Result<QueryResult> {
         let plan = crate::planner::plan_select_inverted(&self.table_schema, &self.where_expr);
         let col_map = self.table_schema.column_map();
+        // A fully consumed WHERE needs no per-row re-eval on covered rows.
+        let where_for_scan = match &self.where_expr {
+            Some(w) if crate::planner::index_scan_full_cover(&self.table_schema, w, &plan) => {
+                &None
+            }
+            other => other,
+        };
         if let Some(rows) = super::scan::try_covered_index_collect_read(
             rtx,
             &self.table_schema,
             &plan,
-            &self.where_expr,
+            where_for_scan,
             &self.needed,
             None,
         )? {
