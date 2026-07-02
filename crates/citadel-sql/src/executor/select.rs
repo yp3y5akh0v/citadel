@@ -4350,6 +4350,10 @@ impl SimpleScanPlan {
             Some(w) if crate::planner::index_scan_full_cover(&self.table_schema, w, &plan) => &None,
             other => other,
         };
+        let emit_direct = match &self.proj {
+            StreamProj::Columns { idxs, .. } => Some(idxs.as_slice()),
+            _ => None,
+        };
         if let Some(rows) = super::scan::try_covered_index_collect_read(
             rtx,
             &self.table_schema,
@@ -4357,7 +4361,15 @@ impl SimpleScanPlan {
             where_for_scan,
             &self.needed,
             None,
+            emit_direct,
         )? {
+            // Direct emission is already projected; residual paths are not.
+            if emit_direct.is_some() && where_for_scan.is_none() {
+                return Ok(QueryResult {
+                    columns: self.columns.clone(),
+                    rows,
+                });
+            }
             let mut out = Vec::with_capacity(rows.len());
             for row in &rows {
                 out.push(self.project(col_map, row)?);
