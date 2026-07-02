@@ -136,6 +136,79 @@ pub(super) fn try_covered_index_collect_read(
     Ok(Some(rows))
 }
 
+/// Count index entries in bounds without decoding rows. Callers must prove
+/// the WHERE is fully consumed (`index_scan_full_cover`); NULL range
+/// components are skipped because NULL never satisfies a comparison.
+pub(super) fn covered_index_count_read(
+    rtx: &mut ReadTxn<'_>,
+    table_schema: &TableSchema,
+    plan: &ScanPlan,
+) -> Result<Option<u64>> {
+    let ScanPlan::IndexScan {
+        index_name,
+        idx_table,
+        prefix,
+        num_prefix_cols,
+        range_conds,
+        index_columns,
+        ..
+    } = plan
+    else {
+        return Ok(None);
+    };
+    let Some(idx) = table_schema.indices.iter().find(|i| &i.name == index_name) else {
+        return Ok(None);
+    };
+    if idx.kind != IndexKind::BTree {
+        return Ok(None);
+    }
+    let num_index_cols = index_columns.len();
+    let start = index_scan_start(prefix, range_conds);
+    let start: &[u8] = start.as_deref().unwrap_or(prefix);
+    let mut count = 0u64;
+    let mut scan_err: Option<SqlError> = None;
+    rtx.table_scan_from_fast(idx_table, start, |key, _value| {
+        if !key.starts_with(prefix) {
+            return Ok(false);
+        }
+        match check_range_conditions(key, *num_prefix_cols, range_conds, num_index_cols) {
+            Ok(RangeCheck::ExceedsUpper) => return Ok(false),
+            Ok(RangeCheck::BelowLower) => return Ok(true),
+            Ok(RangeCheck::Match) => {}
+            Err(e) => {
+                scan_err = Some(e);
+                return Ok(false);
+            }
+        }
+        if !range_conds.is_empty() {
+            match decode_nth_key_component(key, *num_prefix_cols) {
+                Ok(Value::Null) => return Ok(true),
+                Ok(_) => {}
+                Err(e) => {
+                    scan_err = Some(e);
+                    return Ok(false);
+                }
+            }
+        }
+        count += 1;
+        Ok(true)
+    })
+    .map_err(SqlError::Storage)?;
+    if let Some(e) = scan_err {
+        return Err(e);
+    }
+    Ok(Some(count))
+}
+
+fn decode_nth_key_component(key: &[u8], n: usize) -> Result<Value> {
+    let mut pos = 0;
+    for _ in 0..n {
+        let (_, len) = decode_key_value(&key[pos..])?;
+        pos += len;
+    }
+    Ok(decode_key_value(&key[pos..])?.0)
+}
+
 /// Check PK range conditions. Returns: 0 = match, 1 = below lower (skip), 2 = above upper (stop).
 pub(super) fn check_pk_range(pk_val: &Value, range_conds: &[(BinOp, Value)]) -> u8 {
     for (op, bound) in range_conds {
