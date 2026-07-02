@@ -141,6 +141,21 @@ pub(super) fn hash_key(row: &[Value], col_indices: &[usize]) -> Vec<Value> {
     col_indices.iter().map(|&i| row[i].clone()).collect()
 }
 
+/// SQL `=` never matches NULL: rows with a NULL key stay out of probe maps.
+fn insert_probe_row(
+    map: &mut FxHashMap<Vec<Value>, Vec<usize>>,
+    idx: usize,
+    inner: &[Value],
+    inner_key_cols: &[usize],
+) {
+    if inner_key_cols.iter().any(|&c| inner[c].is_null()) {
+        return;
+    }
+    map.entry(hash_key(inner, inner_key_cols))
+        .or_default()
+        .push(idx);
+}
+
 pub(super) fn count_conjuncts(expr: &Expr) -> usize {
     match expr {
         Expr::BinaryOp {
@@ -583,10 +598,7 @@ pub(super) fn exec_join_step(
 
     let mut inner_map: FxHashMap<Vec<Value>, Vec<usize>> = FxHashMap::default();
     for (idx, inner) in inner_rows.iter().enumerate() {
-        inner_map
-            .entry(hash_key(inner, &inner_key_cols))
-            .or_default()
-            .push(idx);
+        insert_probe_row(&mut inner_map, idx, inner, &inner_key_cols);
     }
 
     let cap = effective_proj.map_or(outer_col_count + inner_col_count, |p| p.slots.len());
