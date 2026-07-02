@@ -4,6 +4,7 @@ tab_width = 4
 documentation_style = "doxy"
 style = "both"
 cpp_compat = true
+after_includes = "\n#ifndef CITADEL_API\n#define CITADEL_API\n#endif"
 
 [defines]
 "feature = io-uring" = "CITADEL_IO_URING"

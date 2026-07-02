@@ -6,6 +6,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#ifndef CITADEL_API
+#define CITADEL_API
+#endif
+
 /**
  * Error codes returned by all citadel_* functions.
  */
