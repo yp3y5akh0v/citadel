@@ -94,6 +94,14 @@ impl JsCitadelDb {
         self.inner.delete(key).map_err(|e| JsValue::from_str(&e))
     }
 
+    /// Create a named key-value table. Errors if it already exists.
+    #[wasm_bindgen(js_name = "createTable")]
+    pub fn create_table(&self, table: &str) -> Result<(), JsValue> {
+        self.inner
+            .create_table(table)
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
     /// Put a key-value pair into a named table.
     #[wasm_bindgen(js_name = "tablePut")]
     pub fn table_put(&self, table: &str, key: &[u8], value: &[u8]) -> Result<(), JsValue> {
