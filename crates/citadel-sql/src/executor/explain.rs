@@ -234,12 +234,11 @@ pub(super) fn explain_select_cte(
 
     if stmt.joins.is_empty() {
         let plan = planner::plan_select(from_schema, &stmt.where_clause);
-        lines.push(format_scan_line(
-            &lower_from,
-            &stmt.from_alias,
-            &plan,
-            from_schema,
-        ));
+        let mut line = format_scan_line(&lower_from, &stmt.from_alias, &plan, from_schema);
+        if super::select::select_would_cover(schema, stmt) {
+            line.push_str(" COVERING");
+        }
+        lines.push(line);
     } else {
         let from_plan = planner::plan_select(from_schema, &None);
         lines.push(format_scan_line(
