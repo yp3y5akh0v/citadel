@@ -919,3 +919,22 @@ fn prepare_query_dml_yields_empty_rows() {
     let check = conn.query("SELECT name FROM users WHERE id = 9").unwrap();
     assert_eq!(check.rows[0][0], Value::Text("Inserted".into()));
 }
+
+#[test]
+fn prepared_insert_null_param_in_txn() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, v INTEGER)")
+        .unwrap();
+
+    let stmt = conn.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    stmt.execute(&[Value::Integer(1), Value::Null]).unwrap();
+    stmt.execute(&[Value::Integer(2), Value::Integer(7)])
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let qr = conn.query("SELECT v FROM t ORDER BY id").unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Null], vec![Value::Integer(7)]]);
+}
