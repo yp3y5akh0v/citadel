@@ -256,3 +256,74 @@ fn partial_index_not_served_covered() {
     let qr = stmt.query_collect(&[Value::Integer(5)]).unwrap();
     assert_eq!(qr.rows, vec![vec![Value::Integer(1)]]);
 }
+
+#[test]
+fn covered_count_matches_base_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_val ON t (val)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 5), (2, 5), (3, 6), (4, NULL)")
+        .unwrap();
+
+    let stmt = conn
+        .prepare("SELECT COUNT(*) FROM t WHERE val = $1")
+        .unwrap();
+    let qr = stmt.query_collect(&[Value::Integer(5)]).unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Integer(2)]]);
+
+    let stmt = conn
+        .prepare("SELECT COUNT(*) FROM t WHERE val >= $1")
+        .unwrap();
+    let qr = stmt.query_collect(&[Value::Integer(5)]).unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Integer(3)]]);
+
+    let stmt = conn
+        .prepare("SELECT COUNT(*) FROM t WHERE val < $1")
+        .unwrap();
+    let qr = stmt.query_collect(&[Value::Integer(7)]).unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Integer(3)]]);
+}
+
+#[test]
+fn covered_count_residual_and_error_parity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, k INTEGER, x INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_k ON t (k)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1, 0), (2, 2, 1)")
+        .unwrap();
+
+    let qr = conn
+        .query("SELECT COUNT(*) FROM t WHERE k >= 1 AND x = 1")
+        .unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Integer(1)]]);
+
+    let err = conn
+        .query("SELECT COUNT(*) FROM t WHERE k >= 1 AND 1 / (k - 1) = 0")
+        .unwrap_err();
+    let _ = err;
+}
+
+#[test]
+fn covered_count_dup_eq_conjunct_stays_correct() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, k INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_k ON t (k)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1), (2, 2)").unwrap();
+
+    let qr = conn
+        .query("SELECT COUNT(*) FROM t WHERE k = 1 AND k = 2")
+        .unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Integer(0)]]);
+
+    let qr = conn.query("SELECT COUNT(*) FROM t WHERE k = NULL").unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Integer(0)]]);
+}

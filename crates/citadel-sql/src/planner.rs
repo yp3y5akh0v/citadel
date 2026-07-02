@@ -507,6 +507,46 @@ fn try_pk_range_scan(
     })
 }
 
+/// True when an IndexScan's prefix+range conds consume the ENTIRE predicate,
+/// each prefix column exactly once and no NULL bounds (NULL never matches).
+pub fn index_scan_full_cover(schema: &TableSchema, where_expr: &Expr, plan: &ScanPlan) -> bool {
+    let ScanPlan::IndexScan {
+        num_prefix_cols,
+        range_conds,
+        index_columns,
+        ..
+    } = plan
+    else {
+        return false;
+    };
+    let prefix_cols = &index_columns[..*num_prefix_cols];
+    let range_col = index_columns.get(*num_prefix_cols);
+    let mut eq_cols: Vec<u16> = Vec::with_capacity(*num_prefix_cols);
+    let mut range_seen = 0usize;
+    for c in flatten_and(where_expr) {
+        let Some(p) = extract_simple_predicate(c, schema) else {
+            return false;
+        };
+        if p.value.is_null() {
+            return false;
+        }
+        let col = p.col_idx as u16;
+        if p.op == BinOp::Eq && prefix_cols.contains(&col) {
+            if eq_cols.contains(&col) {
+                return false;
+            }
+            eq_cols.push(col);
+            continue;
+        }
+        if is_range_op(p.op) && range_col == Some(&col) {
+            range_seen += 1;
+            continue;
+        }
+        return false;
+    }
+    eq_cols.len() == *num_prefix_cols && range_seen == range_conds.len()
+}
+
 /// True when every WHERE conjunct is a pk range or literal pk BETWEEN.
 fn pk_range_full_cover(
     schema: &TableSchema,

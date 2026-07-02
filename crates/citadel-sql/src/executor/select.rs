@@ -285,7 +285,26 @@ pub(super) fn exec_select_with_read(
                     .map_err(SqlError::Storage)?;
                 }
             }
-        } else {
+        } else if let Some(w) = &stmt.where_clause {
+            if plan
+                .ops
+                .iter()
+                .all(|(op, _)| matches!(op, StreamAgg::CountStar))
+            {
+                let scan_plan = crate::planner::plan_select(table_schema, &stmt.where_clause);
+                if crate::planner::index_scan_full_cover(table_schema, w, &scan_plan) {
+                    if let Some(n) =
+                        super::scan::covered_index_count_read(rtx, table_schema, &scan_plan)?
+                    {
+                        let states: Vec<AggState> = plan
+                            .ops
+                            .iter()
+                            .map(|_| AggState::CountStar(n as i64))
+                            .collect();
+                        return Ok(plan.finish(states));
+                    }
+                }
+            }
             let col_map = table_schema.column_map();
             rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
                 plan.feed_row(
