@@ -4445,6 +4445,63 @@ struct JoinPlanStatic {
     output_combined: Option<Vec<usize>>,
     /// Per join step: (equi_pairs, is_pure_equi), fixed by the statement.
     step_equi: Vec<(Vec<(usize, usize)>, bool)>,
+    /// Full-pk-eq WHERE on the outer table: fetch one row instead of a scan.
+    outer_point: Option<Vec<PointSource>>,
+}
+
+/// Pk-eq sources for the outer table; other conjuncts stay post-join filtered.
+fn detect_outer_point_sources(
+    where_expr: &Expr,
+    outer_ref: &str,
+    outer_schema: &TableSchema,
+    unqualified_is_ambiguous: &dyn Fn(&str) -> bool,
+) -> Option<Vec<PointSource>> {
+    let pk_cols = &outer_schema.primary_key_columns;
+    if pk_cols.is_empty() {
+        return None;
+    }
+    let pk_pos = |e: &Expr| -> Option<usize> {
+        let name = match e {
+            Expr::Column(n) if !unqualified_is_ambiguous(n) => n,
+            Expr::QualifiedColumn { table, column } if table.eq_ignore_ascii_case(outer_ref) => {
+                column
+            }
+            _ => return None,
+        };
+        let idx = outer_schema.column_index(name)? as u16;
+        pk_cols.iter().position(|&c| c == idx)
+    };
+    let source = |e: &Expr| match e {
+        Expr::Literal(v) => Some(PointSource::Literal(v.clone())),
+        Expr::Parameter(n) => Some(PointSource::Param(*n)),
+        _ => None,
+    };
+    let mut sources: Vec<Option<PointSource>> = (0..pk_cols.len()).map(|_| None).collect();
+    let mut stack = vec![where_expr];
+    while let Some(e) = stack.pop() {
+        let Expr::BinaryOp { left, op, right } = e else {
+            continue;
+        };
+        if *op == BinOp::And {
+            stack.push(left);
+            stack.push(right);
+            continue;
+        }
+        if *op != BinOp::Eq {
+            continue;
+        }
+        let (pos, src) = if let (Some(p), Some(s)) = (pk_pos(left), source(right)) {
+            (p, s)
+        } else if let (Some(p), Some(s)) = (pk_pos(right), source(left)) {
+            (p, s)
+        } else {
+            continue;
+        };
+        if sources[pos].is_none() {
+            sources[pos] = Some(src);
+        }
+    }
+    sources.into_iter().collect()
 }
 
 struct CachedJoin {
@@ -5114,12 +5171,28 @@ fn build_join_plan_static(schema: &SchemaManager, sel: &SelectStmt) -> Option<Jo
             outer_col_count,
         ));
     }
+    // Outer prefilter commutes with preserved-outer joins only.
+    let outer_point = if sel.joins.iter().all(|j| {
+        matches!(
+            j.join_type,
+            JoinType::Inner | JoinType::Cross | JoinType::Left
+        )
+    }) && !from_schema.has_virtual_columns()
+    {
+        let ambiguous = |name: &str| inner_schemas.iter().any(|s| s.column_index(name).is_some());
+        sel.where_clause
+            .as_ref()
+            .and_then(|w| detect_outer_point_sources(w, &all_refs[0].0, &from_schema, &ambiguous))
+    } else {
+        None
+    };
     Some(JoinPlanStatic {
         table_lowers,
         table_schemas,
         needed_per_table: needed_plan.per_table,
         output_combined: Some(needed_plan.output_combined),
         step_equi,
+        outer_point,
     })
 }
 
@@ -5166,8 +5239,25 @@ fn execute_cached_join_with_read(
     };
 
     let outer_schema = &plan.table_schemas[0];
-    let mut outer_rows =
-        super::join::collect_rows_partial(rtx, outer_schema, &plan.needed_per_table[0])?;
+    let mut outer_rows = if let Some(sources) = &plan.outer_point {
+        let mut pk_values = Vec::with_capacity(sources.len());
+        for s in sources {
+            pk_values.push(match s {
+                PointSource::Literal(v) => v.clone(),
+                PointSource::Param(n) => crate::eval::resolve_scoped_param(*n)?,
+            });
+        }
+        let key = crate::encoding::encode_composite_key(&pk_values);
+        match rtx
+            .table_get(outer_schema.name.as_bytes(), &key)
+            .map_err(SqlError::Storage)?
+        {
+            Some(value) => vec![decode_full_row(outer_schema, &key, &value)?],
+            None => Vec::new(),
+        }
+    } else {
+        super::join::collect_rows_partial(rtx, outer_schema, &plan.needed_per_table[0])?
+    };
 
     let mut cur_outer_pk_col: Option<usize> = if outer_schema.primary_key_columns.len() == 1 {
         Some(outer_schema.primary_key_columns[0] as usize)
