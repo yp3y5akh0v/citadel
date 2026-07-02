@@ -19,7 +19,112 @@
 Citadel is a local-first encrypted memory engine for AI agents, built on an embedded SQL/vector database.
 It stores raw conversations without LLM-based ingest, recalls with hybrid retrieval, and supports cryptographic forgetting by destroying keys.
 
-The tables below report its results against unencrypted SQLite across 58 head-to-head benchmarks and on the LoCoMo and LongMemEval long-term-memory benchmarks.
+## Quick Start
+
+Install for Python with `pip install citadeldb` or the browser with `npm install @citadeldb/wasm`, or try it with no install in the [live playground](https://citadeldb.dev/demo/). Each Rust example below lists the crates it uses.
+
+### Memory
+
+Uses the `citadeldb` and `citadeldb-mem` crates (enable `citadeldb-mem`'s `candle-embed` feature). `bge_large` loads a local BGE-large model; other presets (`bge_small`, `e5_large`, ...) or a custom `Embedder` work too.
+
+```rust
+use std::sync::Arc;
+use citadel::DatabaseBuilder;
+use citadel_mem::{AtomInput, CandleEmbedder, MemoryEngine, RecallQuery};
+
+// Encrypted store (per-atom keys enable cryptographic forgetting)
+let db = DatabaseBuilder::new("memory.db")
+    .passphrase(b"secret")
+    .enable_region_keys(true)
+    .create()?;
+let mem = MemoryEngine::open(Arc::new(db))?;
+
+// Local embedding model
+let embedder = Arc::new(CandleEmbedder::bge_large("/path/to/model")?);
+mem.create_encrypted_region("chat", embedder)?;
+
+// Remember raw turns (no LLM)
+mem.remember("chat", AtomInput::new("fact", "Alice's cat is named Mochi"))?;
+let berlin = mem.remember("chat", AtomInput::new("fact", "Alice lives in Berlin"))?;
+
+// Recall by relevance
+for hit in mem.recall("chat", RecallQuery::by_text("where does Alice live?", 5))? {
+    println!("{:.3}  {}", hit.score, hit.text);
+}
+
+// Cryptographic forgetting: destroy the atom's key
+mem.forget_atom("chat", berlin)?;
+```
+
+### SQL and key-value
+
+Uses the `citadeldb` and `citadeldb-sql` crates.
+
+```rust
+use citadel::DatabaseBuilder;
+use citadel_sql::Connection;
+
+let db = DatabaseBuilder::new("my.db")
+    .passphrase(b"secret")
+    .create()?;
+
+let conn = Connection::open(&db)?;
+conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")?;
+conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice');")?;
+let result = conn.query("SELECT * FROM users;")?;
+
+// Key-value API
+let mut wtx = db.begin_write()?;
+wtx.insert(b"key", b"value")?;
+wtx.commit()?;
+
+let mut rtx = db.begin_read();
+assert_eq!(rtx.get(b"key")?.unwrap(), b"value");
+
+// Named tables
+let mut wtx = db.begin_write()?;
+wtx.create_table(b"sessions")?;
+wtx.table_insert(b"sessions", b"token-abc", b"user-42")?;
+wtx.commit()?;
+
+// In-memory (no file I/O - useful for testing and WASM)
+let mem_db = DatabaseBuilder::new("")
+    .passphrase(b"secret")
+    .create_in_memory()?;
+```
+
+### CLI
+
+```bash
+citadel --create my.db
+
+citadel> CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+citadel> INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob');
+citadel> SELECT * FROM users;
++----+-------+
+| id | name  |
++----+-------+
+|  1 | Alice |
+|  2 | Bob   |
++----+-------+
+
+citadel> .backup mydb.bak
+citadel> .verify
+citadel> .stats
+citadel> .audit verify
+citadel> .rekey
+citadel> .compact clean.db
+citadel> .dump users
+
+# P2P sync
+citadel> .keygen
+citadel> .listen 4248 <KEY>              # Terminal A
+citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
+```
+
+## Memory benchmarks
+
+Citadel is scored on the LoCoMo and LongMemEval long-term-memory benchmarks. Execution speed against unencrypted SQLite across 58 head-to-head benchmarks is under [Speed benchmarks](#speed-benchmarks).
 
 **LoCoMo** - `gpt-4o-mini` reader and judge (the field's standard setup):
 
@@ -83,7 +188,7 @@ per-question audit, and a comparison with published systems are in
 - **Cross-platform** - Windows, Linux, macOS. Python, C FFI (37 functions), and WebAssembly bindings
 - **5,000+ tests** - Unit, integration, torture tests across 20 crates
 
-## Benchmarks
+## Speed benchmarks
 
 Single-threaded, durability off (pure engine overhead). Most benchmarks run on 100K rows of `(id INTEGER PK, name TEXT, age INTEGER)`; per-benchmark queries and schemas are in Methodology. Ratio = SQLite / Citadel time (higher is faster). Two-run medians.
 
@@ -280,72 +385,6 @@ Reproduce with `cargo bench -p citadeldb-sql --bench h2h_bench`
 
 </details>
 
-## Quick Start
-
-### Library
-
-```rust
-use citadel::DatabaseBuilder;
-use citadel_sql::Connection;
-
-let db = DatabaseBuilder::new("my.db")
-    .passphrase(b"secret")
-    .create()?;
-
-let mut conn = Connection::open(&db)?;
-conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")?;
-conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice');")?;
-let result = conn.query("SELECT * FROM users;")?;
-
-// Key-value API
-let mut wtx = db.begin_write()?;
-wtx.insert(b"key", b"value")?;
-wtx.commit()?;
-
-let mut rtx = db.begin_read();
-assert_eq!(rtx.get(b"key")?.unwrap(), b"value");
-
-// Named tables
-let mut wtx = db.begin_write()?;
-wtx.create_table(b"sessions")?;
-wtx.table_insert(b"sessions", b"token-abc", b"user-42")?;
-wtx.commit()?;
-
-// In-memory (no file I/O - useful for testing and WASM)
-let mem_db = DatabaseBuilder::new("")
-    .passphrase(b"secret")
-    .create_in_memory()?;
-```
-
-### CLI
-
-```bash
-citadel --create my.db
-
-citadel> CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
-citadel> INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob');
-citadel> SELECT * FROM users;
-+----+-------+
-| id | name  |
-+----+-------+
-|  1 | Alice |
-|  2 | Bob   |
-+----+-------+
-
-citadel> .backup mydb.bak
-citadel> .verify
-citadel> .stats
-citadel> .audit verify
-citadel> .rekey
-citadel> .compact clean.db
-citadel> .dump users
-
-# P2P sync
-citadel> .keygen
-citadel> .listen 4248 <KEY>              # Terminal A
-citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
-```
-
 ## SQL
 
 **Statements** - CREATE/DROP TABLE (incl. `TEMP`), ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE, DISABLE/ENABLE TRIGGER), CREATE/DROP INDEX (incl. partial `WHERE`, expression keys, `CONCURRENTLY`), CREATE/DROP VIEW, CREATE/DROP MATERIALIZED VIEW (with `REFRESH [CONCURRENTLY]`), CREATE/DROP TRIGGER (BEFORE/AFTER/INSTEAD OF, FOR EACH ROW/STATEMENT, `REFERENCING NEW/OLD TABLE`, `WHEN`, `UPDATE OF cols`), INSERT (VALUES, SELECT, ON CONFLICT DO NOTHING/DO UPDATE, ON CONSTRAINT), SELECT, UPDATE, DELETE, TRUNCATE TABLE, RETURNING (with `OLD`/`NEW`), BEGIN [READ ONLY | READ WRITE]/COMMIT/ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO, SET TIME ZONE, EXPLAIN, REFRESH MATERIALIZED VIEW
@@ -458,11 +497,11 @@ Static or dynamic library with auto-generated `citadel.h` (cbindgen). All 37 fun
 #include "citadel.h"
 
 CitadelDb *db = NULL;
-citadel_create("my.db", "secret", 6, &db);
+citadel_create("my.db", (const uint8_t*)"secret", 6, NULL, &db);
 
 CitadelWriteTxn *wtx = NULL;
 citadel_write_begin(db, &wtx);
-citadel_write_put(wtx, (const uint8_t*)"key", 3, (const uint8_t*)"val", 3);
+citadel_write_put(wtx, (const uint8_t*)"key", 3, (const uint8_t*)"val", 3, NULL);
 citadel_write_commit(wtx);
 
 CitadelSqlConn *conn = NULL;
