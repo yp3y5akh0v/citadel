@@ -5,10 +5,11 @@ const { join } = require("path");
 const root = execSync("git rev-parse --show-toplevel", { encoding: "utf8" }).trim();
 const pkg = join(root, "crates", "citadel-wasm", "pkg");
 
-// Build wasm package
+// Build wasm package. Size opt level is scoped here so native builds keep speed.
 execSync("wasm-pack build crates/citadel-wasm --target web --release --scope citadeldb", {
   cwd: root,
   stdio: "inherit",
+  env: { ...process.env, CARGO_PROFILE_RELEASE_OPT_LEVEL: "z" },
 });
 
 // Patch generated package.json
