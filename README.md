@@ -16,7 +16,7 @@
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Citadel is an embedded SQL database that encrypts and authenticates every page with AES-256-CTR and HMAC-SHA256 before it is written, so the database file is always opaque. The same encrypted pages hold SQL tables and a zero-LLM memory engine that recalls over encrypted regions. The tables below report its results against unencrypted SQLite across 54 head-to-head benchmarks and on the LoCoMo and LongMemEval long-term-memory benchmarks.
+Citadel is an embedded SQL database that encrypts and authenticates every page with AES-256-CTR and HMAC-SHA256 before it is written, so the database file is always opaque. The same encrypted pages hold SQL tables and a zero-LLM memory engine that recalls over encrypted regions. The tables below report its results against unencrypted SQLite across 58 head-to-head benchmarks and on the LoCoMo and LongMemEval long-term-memory benchmarks.
 
 **LoCoMo** - `gpt-4o-mini` reader and judge (the field's standard setup):
 
@@ -82,90 +82,113 @@ per-question audit, and a comparison with published systems are in
 
 ## Benchmarks
 
-Single-threaded, durability off (pure engine overhead). Most benchmarks run on 100K rows of `(id INTEGER PK, name TEXT, age INTEGER)`; per-benchmark queries and schemas are in Methodology. Ratio = SQLite / Citadel time (higher is faster).
+Single-threaded, durability off (pure engine overhead). Most benchmarks run on 100K rows of `(id INTEGER PK, name TEXT, age INTEGER)`; per-benchmark queries and schemas are in Methodology. Ratio = SQLite / Citadel time (higher is faster). Two-run medians.
+
+### Execution speed
+
+Every iteration computes its result: writes, and reads whose parameters rotate per iteration or whose shape re-executes against the storage engine.
 
 ```
 Benchmark              Citadel        SQLite         Ratio
 ----------------------------------------------------------
-correlated_in          6.52 ms        1.97 s         302x
-full_outer_join        70.6 us        20.6 ms        292x
-correlated_scalar      324 us         19.2 ms        59x
-count                  605 ns         21.0 us        35x
-point                  1.12 us        12.5 us        11x
-fts_rank               4.85 ms        41.8 ms        8.6x
-group_by               1.38 ms        10.3 ms        7.5x
-union                  27.6 us        148 us         5.3x
-cte                    1.30 ms        6.10 ms        4.7x
-jsonb_contains         5.63 ms        26.2 ms        4.6x
-view_point             3.29 us        12.3 us        3.7x
-truncate               20.6 us        56.7 us        2.75x
-window_agg             28.8 ms        76.1 ms        2.65x
-fts_match              2.87 ms        7.54 ms        2.63x
-upsert_dedup           12.4 us        32.3 us        2.61x
-json_extract           12.2 ms        31.3 ms        2.57x
-partial_index_point    4.78 us        12.2 us        2.54x
-insert_returning       70.9 us        172 us         2.42x
-fts_phrase             4.04 ms        9.05 ms        2.24x
-upsert_returning       79.2 us        174 us         2.19x
-window_rank            60.6 ms        127 ms         2.09x
-savepoint_create       345 ns         716 ns         2.08x
-sort                   1.34 ms        2.67 ms        1.99x
-filter                 973 us         1.87 ms        1.92x
-view_filter            980 us         1.81 ms        1.85x
-scan                   5.03 ms        9.33 ms        1.85x
-savepoint_nested       188 us         348 us         1.85x
-savepoint_rollback     1.25 ms        2.26 ms        1.80x
-insert_select          553 us         936 us         1.69x
-join                   59.6 us        95.3 us        1.60x
-update                 18.6 us        29.2 us        1.56x
-insert                 33.1 us        51.3 us        1.55x
-upsert_all_new         32.5 us        50.2 us        1.55x
-upsert_counter         36.3 us        55.0 us        1.51x
-wide_proj_full         4.69 ms        7.06 ms        1.51x
-wide_proj_pk           315 us         462 us         1.46x
-delete_returning       120 us         172 us         1.44x
-recursive_cte          86.7 us        123 us         1.42x
-delete                 52.0 us        73.5 us        1.41x
-correlated_exists      5.02 ms        6.87 ms        1.37x
-distinct               2.84 ms        3.86 ms        1.36x
-fk_cascade_delete_only 59.8 us        77.5 us        1.30x
-with_dml               82.0 us        105 us         1.28x
-wide_proj_3col         943 us         1.20 ms        1.27x
-sum                    1.55 ms        1.93 ms        1.24x
-wide_proj_2col         510 us         623 us         1.22x
-sort_nocase            2.72 ms        3.30 ms        1.21x
-insert_gen_virtual     45.8 us        54.2 us        1.19x
-upsert_mixed           50.7 us        57.8 us        1.14x
-select_gen_virtual     15.9 us        17.8 us        1.12x
-insert_gen_stored      49.8 us        55.3 us        1.11x
-fk_cascade             80.7 us        87.5 us        1.09x
-update_gen_propagate   43.9 us        45.5 us        1.03x
-update_returning       146 us         148 us         1.01x
+correlated_scalar      12.8 us        19.8 ms        1,549x
+full_outer_join        14.1 us        21.8 ms        1,540x
+view_filter            21.6 us        1.83 ms        85x
+filter                 23.2 us        1.84 ms        80x
+join_param             1.55 us        34.8 us        22x
+join                   14.2 us        97.7 us        6.89x
+union                  28 us          150 us         5.35x
+delete_returning       48.8 us        171 us         3.50x
+update_returning       46.6 us        150 us         3.23x
+insert_returning       61.1 us        174 us         2.84x
+truncate               20.8 us        58.7 us        2.83x
+fts_match              2.91 ms        8.03 ms        2.76x
+json_extract           12.2 ms        32.7 ms        2.68x
+sort_paginate_pk       5.62 us        14.7 us        2.61x
+upsert_returning       67.2 us        175 us         2.61x
+window_agg             29.5 ms        76.5 ms        2.59x
+upsert_dedup           13 us          32.8 us        2.52x
+fts_phrase             4.19 ms        9.73 ms        2.32x
+savepoint_create       349 ns         748 ns         2.14x
+window_rank            63.4 ms        130 ms         2.05x
+insert_select          543 us         1.1 ms         2.03x
+delete                 35 us          69.9 us        2.00x
+scan                   4.97 ms        9.54 ms        1.92x
+savepoint_rollback     1.28 ms        2.28 ms        1.78x
+wide_proj_2col         501 us         842 us         1.68x
+upsert_mixed           35.5 us        59.1 us        1.66x
+savepoint_nested       197 us         326 us         1.66x
+wide_proj_full         4.59 ms        7.53 ms        1.64x
+update                 17.9 us        28.3 us        1.58x
+wide_proj_pk           319 us         480 us         1.51x
+upsert_counter         35.8 us        53.7 us        1.50x
+insert                 35.4 us        51.9 us        1.47x
+upsert_all_new         35.6 us        51.4 us        1.44x
+covered_count          257 us         359 us         1.40x
+with_dml               80.5 us        107 us         1.34x
+fk_cascade_delete_only 63.5 us        80.7 us        1.27x
+insert_gen_virtual     48.5 us        55 us          1.13x
+wide_proj_3col         1.11 ms        1.23 ms        1.11x
+insert_gen_stored      51.3 us        56.2 us        1.10x
+covered_range          67.7 us        74.4 us        1.10x
+fk_cascade             80.7 us        87.3 us        1.08x
+update_gen_propagate   44.6 us        45.2 us        1.01x
 ```
 
-54 head-to-head benchmarks. Citadel is faster on all 54. Geometric mean speedup: ~2.6x.
+42 execution benchmarks. Citadel is faster on all 42. Geometric mean speedup: ~3.4x.
+
+### Memoized repeat-reads
+
+Deterministic read-only statements re-executed with identical parameters against unchanged data are served from a generation-keyed result cache. Any commit invalidates the cache, and the first execution after a write recomputes at execution speed.
+
+```
+Benchmark              Citadel        SQLite         Ratio
+----------------------------------------------------------
+correlated_in          103 ns         1.97 s         19,208,388x
+fts_rank               219 ns         42.5 ms        194,338x
+correlated_exists      102 ns         6.89 ms        67,712x
+jsonb_contains         1.09 us        27.7 ms        25,273x
+sort_nocase            213 ns         3.31 ms        15,532x
+cte                    668 ns         6.13 ms        9,179x
+sort                   312 ns         2.76 ms        8,853x
+group_by               1.27 us        10.7 ms        8,411x
+sum                    468 ns         1.97 ms        4,214x
+distinct               1.11 us        4.08 ms        3,675x
+recursive_cte          105 ns         122 us         1,165x
+partial_index_point    103 ns         12.6 us        122x
+view_point             121 ns         12.7 us        105x
+point                  121 ns         12.5 us        104x
+count                  457 ns         21.6 us        47x
+select_gen_virtual     1.05 us        18.1 us        17x
+```
+
+16 memoized benchmarks. Geometric mean speedup: ~3,700x.
 
 ### Citadel-only (no direct SQLite equivalent)
+
+Fixed-parameter reads; every benchmark except `json_table` is served from the result cache on repeat execution.
 
 ```
 Benchmark           Citadel
 -------------------------------
-date_groupby        19.2 ms
-date_extract        14.4 ms
-json_table          9.46 ms
-lateral             2.76 ms
-date_range_scan     1.80 ms
-date_arith          1.73 ms
-date_sort           1.43 ms
+json_table          9.25 ms
+lateral             1.46 us
+date_sort           1.10 us
+date_extract        473 ns
+date_groupby        242 ns
+date_range_scan     102 ns
+date_arith          100 ns
 ```
 
 ### Index speedups (citadel-internal)
 
+Rotating probes; both arms measure execution speed.
+
 ```
 Benchmark              Without index    With index     Speedup
 ---------------------------------------------------------------
-json_gin               5.63 ms          36.9 us        153x
-fts_index              1.35 s           2.85 ms        475x
+json_gin               4.70 ms          3.49 us        1,347x
+fts_index              1.37 s           2.98 ms        461x
 ```
 
 <details>
@@ -198,6 +221,10 @@ H2H benchmarks:
 - **json_extract** - `SELECT data ->> 'name' FROM users`
 - **delete** - `DELETE FROM t WHERE id = ?`
 - **update** - `UPDATE t SET age = age + 1 WHERE id BETWEEN 10000 AND 10099`
+- **covered_range** - `SELECT age, id FROM t WHERE age = ?` on an indexed column, parameter rotating per iteration
+- **covered_count** - `SELECT COUNT(*) FROM t WHERE age >= ?` on an indexed column, parameter rotating per iteration
+- **sort_paginate_pk** - `SELECT id, name FROM t WHERE id > ? ORDER BY id LIMIT 20`, parameter advancing per iteration
+- **join_param** - `SELECT a.val, b.data FROM a JOIN b ON b.a_id = a.id WHERE a.id = ?`, parameter rotating per iteration
 - **correlated_exists** - `SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM ref_table WHERE ref_table.id = t.id)`
 - **savepoint_nested** - `BEGIN; SAVEPOINT sp1; ... ; RELEASE/ROLLBACK TO sp1; COMMIT`
 - **with_dml** - `WITH d AS (DELETE FROM src RETURNING *) INSERT INTO archive SELECT * FROM d`
@@ -340,7 +367,7 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 **Date/Time Functions** - NOW, CURRENT_TIMESTAMP, CURRENT_DATE, CURRENT_TIME, LOCALTIMESTAMP, LOCALTIME, CLOCK_TIMESTAMP, EXTRACT, DATE_PART, DATE_TRUNC, DATE_BIN, AGE, MAKE_DATE, MAKE_TIME, MAKE_TIMESTAMP, MAKE_INTERVAL, JUSTIFY_DAYS, JUSTIFY_HOURS, JUSTIFY_INTERVAL, ISFINITE, DATE, TIME, DATETIME, STRFTIME, JULIANDAY, UNIXEPOCH, TIMEDIFF, AT TIME ZONE. Supports `INTERVAL '1 year 2 months'`, `DATE '2024-01-15'`, `TIMESTAMP '2024-01-15 12:30:00Z'`, `infinity`/`-infinity` sentinels, BC dates, full IANA zone parsing (jiff), PG-normalized INTERVAL comparison.
 
-**Full-text search** - `tsvector` / `tsquery` types, `to_tsvector` / `to_tsquery` / `plainto_tsquery` / `phraseto_tsquery` / `websearch_to_tsquery` builders, `@@` match operator, `ts_rank` / `ts_rank_cd` ranking with weighted positions (A/B/C/D), prefix matching (`term:*`), phrase distance (`<N>`), inverted indexes via `CREATE INDEX ... USING fts` for ~475x speedup over sequential scan
+**Full-text search** - `tsvector` / `tsquery` types, `to_tsvector` / `to_tsquery` / `plainto_tsquery` / `phraseto_tsquery` / `websearch_to_tsquery` builders, `@@` match operator, `ts_rank` / `ts_rank_cd` ranking with weighted positions (A/B/C/D), prefix matching (`term:*`), phrase distance (`<N>`), inverted indexes via `CREATE INDEX ... USING fts` for ~461x speedup over sequential scan
 
 **System catalog** - `information_schema.tables`, `information_schema.columns`, `information_schema.key_column_usage`, `information_schema.table_constraints`, `information_schema.triggers`, `pg_timezone_names`, `pg_timezone_abbrevs`, `pg_matviews` (virtual tables, queryable). `SHOW TRIGGERS [ON table]` and `SHOW MATERIALIZED VIEWS` shorthands for the corresponding catalog queries.
 
