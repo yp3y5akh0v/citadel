@@ -2171,11 +2171,29 @@ struct TrivialFastProgram {
     on_dup: DupPolicy,
 }
 
-/// PK-duplicate policy: plain INSERT errors; `ON CONFLICT DO NOTHING` skips.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// PK-dup policy: Error = plain INSERT, Skip = DO NOTHING, Patch = DO UPDATE.
+#[derive(Clone)]
 enum DupPolicy {
     Error,
     Skip,
+    Patch(Vec<DoUpdateFastPath>),
+}
+
+impl TrivialFastProgram {
+    /// NULL params change the row's cell layout; those rows take the cached lane.
+    fn binds(&self, params: &[Value]) -> bool {
+        !params[self.pk_param as usize].is_null()
+            && self.ops.iter().all(|op| match op {
+                WriteOp::ParamI64 { param_idx, .. } => !params[*param_idx as usize].is_null(),
+                WriteOp::GenAddParamsI64 {
+                    a_param, b_param, ..
+                } => !params[*a_param as usize].is_null() && !params[*b_param as usize].is_null(),
+                WriteOp::GenMulAddParamI64 { param_idx, .. } => {
+                    !params[*param_idx as usize].is_null()
+                }
+                WriteOp::LiteralI64 { .. } => true,
+            })
+    }
 }
 
 /// A foreign-key existence check encodable straight from bound params.
@@ -2231,7 +2249,7 @@ fn build_trivial_fast_program(
     let columns = &ts.columns;
     let pk_col = ts.pk_indices()[0];
 
-    // Only DO NOTHING on a PK arbiter can skip dupes; any other shape bails.
+    // PK-arbiter shapes on index/FK-free tables only; anything else bails.
     let on_dup = match on_conflict {
         None => DupPolicy::Error,
         Some(CompiledOnConflict::DoNothing { target })
@@ -2240,6 +2258,14 @@ fn build_trivial_fast_program(
                 && ts.foreign_keys.is_empty() =>
         {
             DupPolicy::Skip
+        }
+        Some(CompiledOnConflict::DoUpdate {
+            target: ConflictKind::PrimaryKey,
+            where_clause: None,
+            fast_paths: Some(fps),
+            ..
+        }) if ts.indices.is_empty() && ts.foreign_keys.is_empty() && !ts.has_checks() => {
+            DupPolicy::Patch(fps.clone())
         }
         _ => return None,
     };
@@ -3424,13 +3450,27 @@ fn exec_insert_trivial_fast(
         }
     }
 
+    if let DupPolicy::Patch(fps) = &prog.on_dup {
+        let outcome = wtx.table_upsert_with::<_, SqlError>(
+            table_lower.as_bytes(),
+            &bufs.key_buf,
+            &bufs.value_buf,
+            |old_bytes| apply_fast_path_patch(old_bytes, fps),
+        )?;
+        return Ok(match outcome {
+            UpsertOutcome::Inserted | UpsertOutcome::Updated => ExecutionResult::RowsAffected(1),
+            UpsertOutcome::Skipped => ExecutionResult::RowsAffected(0),
+        });
+    }
+
     let is_new = wtx
         .table_insert_if_absent(table_lower.as_bytes(), &bufs.key_buf, &bufs.value_buf)
         .map_err(SqlError::Storage)?;
     if !is_new {
-        return match prog.on_dup {
+        return match &prog.on_dup {
             DupPolicy::Error => Err(SqlError::DuplicateKey),
             DupPolicy::Skip => Ok(ExecutionResult::RowsAffected(0)),
+            DupPolicy::Patch(_) => unreachable!("handled above"),
         };
     }
 
@@ -3626,6 +3666,9 @@ impl CompiledInsert {
                 && row_fully_overwritten
                 && single_int_pk
                 && !super::triggers::has_insert_triggers(schema, &ts.name)
+                // A DO UPDATE dup hit fires UPDATE row triggers on the slow path.
+                && (stmt.on_conflict.is_none()
+                    || !super::triggers::has_update_triggers(schema, &ts.name))
                 && generated_fast_evals
                     .iter()
                     .all(|fe| !matches!(fe, FastGenEval::None));
@@ -3711,9 +3754,23 @@ impl CompiledPlan for CompiledInsert {
                 "cannot execute mutating statement inside a read-only transaction".into(),
             )),
             ActiveTxnRef::Write(outer) => match self.cached.as_ref() {
-                Some(c) if c.is_trivial_fast => with_insert_scratch(|bufs| {
-                    exec_insert_trivial_fast(outer, &self.table_lower, c, bufs, params)
-                }),
+                Some(c)
+                    if c.is_trivial_fast
+                        && c.trivial_fast_program
+                            .as_ref()
+                            .is_some_and(|p| p.binds(params)) =>
+                {
+                    // Patch mutates existing rows: mark like every DO UPDATE path.
+                    if matches!(
+                        c.trivial_fast_program.as_ref().map(|p| &p.on_dup),
+                        Some(DupPolicy::Patch(_))
+                    ) {
+                        schema.mark_dml(&self.table_lower);
+                    }
+                    with_insert_scratch(|bufs| {
+                        exec_insert_trivial_fast(outer, &self.table_lower, c, bufs, params)
+                    })
+                }
                 Some(c) => exec_insert_in_txn_cached(outer, schema, ins, params, c),
                 None => exec_insert_in_txn(outer, schema, ins, params),
             },

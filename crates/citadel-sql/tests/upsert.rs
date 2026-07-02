@@ -824,3 +824,123 @@ fn multi_row_error_mid_batch_rolls_back() {
     let qr = query(&conn, "SELECT COUNT(*) FROM t");
     assert_eq!(qr.rows[0][0], Value::Integer(0));
 }
+
+#[test]
+fn prepared_counter_upsert_in_txn_patches_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, c INTEGER)")
+        .unwrap();
+
+    let stmt = conn
+        .prepare("INSERT INTO t VALUES ($1, 1) ON CONFLICT(id) DO UPDATE SET c = c + 1")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for id in [1, 2, 1, 1, 2] {
+        assert_eq!(stmt.execute(&[Value::Integer(id)]).unwrap(), 1);
+    }
+    conn.execute("COMMIT").unwrap();
+
+    let qr = query(&conn, "SELECT id, c FROM t ORDER BY id");
+    assert_eq!(
+        qr.rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(3)],
+            vec![Value::Integer(2), Value::Integer(2)],
+        ]
+    );
+}
+
+#[test]
+fn counter_upsert_matches_indexed_table_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    // plain = Patch-eligible; indexed = heavy lane. Results must agree.
+    conn.execute("CREATE TABLE plain (id INTEGER NOT NULL PRIMARY KEY, c INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE indexed (id INTEGER NOT NULL PRIMARY KEY, c INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX indexed_c ON indexed (c)")
+        .unwrap();
+
+    for table in ["plain", "indexed"] {
+        let stmt = conn
+            .prepare(&format!(
+                "INSERT INTO {table} VALUES ($1, $2) ON CONFLICT(id) DO UPDATE SET c = c + 5"
+            ))
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        // Row 2 starts NULL: NULL + 5 stays NULL on both lanes.
+        for (id, c) in [
+            (1, Value::Integer(10)),
+            (2, Value::Null),
+            (1, Value::Integer(0)),
+            (2, Value::Null),
+        ] {
+            stmt.execute(&[Value::Integer(id), c]).unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    }
+
+    let plain = query(&conn, "SELECT id, c FROM plain ORDER BY id");
+    let indexed = query(&conn, "SELECT id, c FROM indexed ORDER BY id");
+    assert_eq!(plain.rows, indexed.rows);
+    assert_eq!(
+        plain.rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(15)],
+            vec![Value::Integer(2), Value::Null],
+        ]
+    );
+}
+
+#[test]
+fn counter_upsert_with_update_trigger_fires() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, c INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit (id INTEGER NOT NULL PRIMARY KEY, tag TEXT)")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER trg AFTER UPDATE ON t FOR EACH ROW \
+         BEGIN INSERT INTO audit VALUES (NEW.c, 'upd'); END",
+    )
+    .unwrap();
+
+    let stmt = conn
+        .prepare("INSERT INTO t VALUES ($1, 1) ON CONFLICT(id) DO UPDATE SET c = c + 1")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    stmt.execute(&[Value::Integer(1)]).unwrap();
+    stmt.execute(&[Value::Integer(1)]).unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let qr = query(&conn, "SELECT COUNT(*) FROM audit");
+    assert_eq!(qr.rows, vec![vec![Value::Integer(1)]]);
+}
+
+#[test]
+fn counter_upsert_savepoint_rollback_restores_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, c INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    let stmt = conn
+        .prepare("INSERT INTO t VALUES ($1, 1) ON CONFLICT(id) DO UPDATE SET c = c + 1")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT s").unwrap();
+    stmt.execute(&[Value::Integer(1)]).unwrap();
+    conn.execute("ROLLBACK TO s").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let qr = query(&conn, "SELECT c FROM t WHERE id = 1");
+    assert_eq!(qr.rows, vec![vec![Value::Integer(10)]]);
+}
