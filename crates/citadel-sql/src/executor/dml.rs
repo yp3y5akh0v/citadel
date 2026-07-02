@@ -2165,7 +2165,6 @@ struct TrivialFastProgram {
     template: Vec<u8>,
     ops: Vec<WriteOp>,
     pk_param: u8,
-    not_null_param_indices: Vec<u8>,
     fk_checks: Vec<FkCheckSpec>,
     index_inserts: Vec<IndexInsertSpec>,
     on_dup: DupPolicy,
@@ -2177,23 +2176,6 @@ enum DupPolicy {
     Error,
     Skip,
     Patch(Vec<DoUpdateFastPath>),
-}
-
-impl TrivialFastProgram {
-    /// NULL params change the row's cell layout; those rows take the cached lane.
-    fn binds(&self, params: &[Value]) -> bool {
-        !params[self.pk_param as usize].is_null()
-            && self.ops.iter().all(|op| match op {
-                WriteOp::ParamI64 { param_idx, .. } => !params[*param_idx as usize].is_null(),
-                WriteOp::GenAddParamsI64 {
-                    a_param, b_param, ..
-                } => !params[*a_param as usize].is_null() && !params[*b_param as usize].is_null(),
-                WriteOp::GenMulAddParamI64 { param_idx, .. } => {
-                    !params[*param_idx as usize].is_null()
-                }
-                WriteOp::LiteralI64 { .. } => true,
-            })
-    }
 }
 
 /// A foreign-key existence check encodable straight from bound params.
@@ -2224,16 +2206,12 @@ enum WriteOp {
         a_param: u8,
         b_param: u8,
         off: u32,
-        bitmap_byte_off: u32,
-        bitmap_bit_mask: u8,
     },
     GenMulAddParamI64 {
         param_idx: u8,
         mul: i64,
         add: i64,
         off: u32,
-        bitmap_byte_off: u32,
-        bitmap_bit_mask: u8,
     },
 }
 
@@ -2353,8 +2331,6 @@ fn build_trivial_fast_program(
     for (i, &gen_pos) in generated_col_positions.iter().enumerate() {
         let gen_slot = *col_to_slot.get(&gen_pos)?;
         let gen_off = u32::try_from(*slot_to_off.get(&gen_slot)?).ok()?;
-        let bitmap_byte_off = u32::try_from(2 + gen_slot / 8).ok()?;
-        let bitmap_bit_mask: u8 = 1u8 << (gen_slot % 8);
         let gen_col_nullable = columns[gen_pos].nullable;
 
         match &generated_fast_evals[i] {
@@ -2376,8 +2352,6 @@ fn build_trivial_fast_program(
                             a_param: ap,
                             b_param: bp,
                             off: gen_off,
-                            bitmap_byte_off,
-                            bitmap_bit_mask,
                         });
                     }
                     (Some(p), None) => {
@@ -2390,8 +2364,6 @@ fn build_trivial_fast_program(
                             mul: 1,
                             add: lit,
                             off: gen_off,
-                            bitmap_byte_off,
-                            bitmap_bit_mask,
                         });
                     }
                     (None, Some(p)) => {
@@ -2404,8 +2376,6 @@ fn build_trivial_fast_program(
                             mul: 1,
                             add: lit,
                             off: gen_off,
-                            bitmap_byte_off,
-                            bitmap_bit_mask,
                         });
                     }
                     (None, None) => {
@@ -2432,8 +2402,6 @@ fn build_trivial_fast_program(
                         mul: *mul,
                         add: *add,
                         off: gen_off,
-                        bitmap_byte_off,
-                        bitmap_bit_mask,
                     });
                 } else if let Some(lit) = col_to_lit_int.get(col_schema_idx).copied() {
                     ops.push(WriteOp::LiteralI64 {
@@ -2492,7 +2460,6 @@ fn build_trivial_fast_program(
         template: tmpl.template,
         ops,
         pk_param,
-        not_null_param_indices,
         fk_checks,
         index_inserts,
         on_dup,
@@ -3349,27 +3316,23 @@ fn compile_on_conflict(oc: &OnConflictClause, ts: &TableSchema) -> Result<Compil
     }
 }
 
-/// Caller MUST check `cache.is_trivial_fast` first.
+/// Caller MUST check `cache.is_trivial_fast` first. `Ok(None)` = a NULL
+/// param changes the row's cell layout; the caller runs the cached lane.
 fn exec_insert_trivial_fast(
     wtx: &mut WriteTxn<'_>,
     table_lower: &str,
     cache: &InsertCache,
     bufs: &mut InsertBufs,
     params: &[Value],
-) -> Result<ExecutionResult> {
+) -> Result<Option<ExecutionResult>> {
     let prog = cache
         .trivial_fast_program
         .as_ref()
         .expect("trivial fast: program");
 
-    for &p in &prog.not_null_param_indices {
-        if params[p as usize].is_null() {
-            return Err(SqlError::NotNullViolation(format!("param@{p}")));
-        }
-    }
-
     match &params[prog.pk_param as usize] {
         Value::Integer(v) => crate::encoding::encode_int_key_into(*v, &mut bufs.key_buf),
+        Value::Null => return Ok(None),
         _ => return Err(SqlError::InvalidValue("non-integer PK in fast path".into())),
     }
 
@@ -3383,6 +3346,7 @@ fn exec_insert_trivial_fast(
                     let off = *off as usize;
                     bufs.value_buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
                 }
+                Value::Null => return Ok(None),
                 other => {
                     return Err(SqlError::TypeMismatch {
                         expected: "Integer".into(),
@@ -3398,33 +3362,25 @@ fn exec_insert_trivial_fast(
                 a_param,
                 b_param,
                 off,
-                bitmap_byte_off,
-                bitmap_bit_mask,
             } => match (&params[*a_param as usize], &params[*b_param as usize]) {
                 (Value::Integer(a), Value::Integer(b)) => {
                     let off = *off as usize;
                     bufs.value_buf[off..off + 8].copy_from_slice(&a.wrapping_add(*b).to_le_bytes());
                 }
-                _ => {
-                    bufs.value_buf[*bitmap_byte_off as usize] |= *bitmap_bit_mask;
-                }
+                _ => return Ok(None),
             },
             WriteOp::GenMulAddParamI64 {
                 param_idx,
                 mul,
                 add,
                 off,
-                bitmap_byte_off,
-                bitmap_bit_mask,
             } => match &params[*param_idx as usize] {
                 Value::Integer(v) => {
                     let r = v.wrapping_mul(*mul).wrapping_add(*add);
                     let off = *off as usize;
                     bufs.value_buf[off..off + 8].copy_from_slice(&r.to_le_bytes());
                 }
-                _ => {
-                    bufs.value_buf[*bitmap_byte_off as usize] |= *bitmap_bit_mask;
-                }
+                _ => return Ok(None),
             },
         }
     }
@@ -3457,10 +3413,10 @@ fn exec_insert_trivial_fast(
             &bufs.value_buf,
             |old_bytes| apply_fast_path_patch(old_bytes, fps),
         )?;
-        return Ok(match outcome {
+        return Ok(Some(match outcome {
             UpsertOutcome::Inserted | UpsertOutcome::Updated => ExecutionResult::RowsAffected(1),
             UpsertOutcome::Skipped => ExecutionResult::RowsAffected(0),
-        });
+        }));
     }
 
     let is_new = wtx
@@ -3469,7 +3425,7 @@ fn exec_insert_trivial_fast(
     if !is_new {
         return match &prog.on_dup {
             DupPolicy::Error => Err(SqlError::DuplicateKey),
-            DupPolicy::Skip => Ok(ExecutionResult::RowsAffected(0)),
+            DupPolicy::Skip => Ok(Some(ExecutionResult::RowsAffected(0))),
             DupPolicy::Patch(_) => unreachable!("handled above"),
         };
     }
@@ -3491,7 +3447,7 @@ fn exec_insert_trivial_fast(
             .map_err(SqlError::Storage)?;
     }
 
-    Ok(ExecutionResult::RowsAffected(1))
+    Ok(Some(ExecutionResult::RowsAffected(1)))
 }
 
 fn build_bind_plan(
@@ -3754,12 +3710,7 @@ impl CompiledPlan for CompiledInsert {
                 "cannot execute mutating statement inside a read-only transaction".into(),
             )),
             ActiveTxnRef::Write(outer) => match self.cached.as_ref() {
-                Some(c)
-                    if c.is_trivial_fast
-                        && c.trivial_fast_program
-                            .as_ref()
-                            .is_some_and(|p| p.binds(params)) =>
-                {
+                Some(c) if c.is_trivial_fast => {
                     // Patch mutates existing rows: mark like every DO UPDATE path.
                     if matches!(
                         c.trivial_fast_program.as_ref().map(|p| &p.on_dup),
@@ -3767,9 +3718,12 @@ impl CompiledPlan for CompiledInsert {
                     ) {
                         schema.mark_dml(&self.table_lower);
                     }
-                    with_insert_scratch(|bufs| {
+                    match with_insert_scratch(|bufs| {
                         exec_insert_trivial_fast(outer, &self.table_lower, c, bufs, params)
-                    })
+                    })? {
+                        Some(r) => Ok(r),
+                        None => exec_insert_in_txn_cached(outer, schema, ins, params, c),
+                    }
                 }
                 Some(c) => exec_insert_in_txn_cached(outer, schema, ins, params, c),
                 None => exec_insert_in_txn(outer, schema, ins, params),
