@@ -1,3 +1,6 @@
+// Host-side stress suite: threads and OS files have no wasm equivalent.
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread;
