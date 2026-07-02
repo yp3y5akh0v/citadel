@@ -1394,3 +1394,106 @@ fn distinct_boolean_dedup() {
     assert_eq!(qr.rows[0][0], Value::Boolean(false));
     assert_eq!(qr.rows[1][0], Value::Boolean(true));
 }
+
+#[test]
+fn prepared_range_update_reapplies_residual_where() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER, c INTEGER)")
+        .unwrap();
+    for id in 1..=6 {
+        conn.execute(&format!("INSERT INTO t VALUES ({id}, {}, 0)", id % 2))
+            .unwrap();
+    }
+
+    let stmt = conn
+        .prepare("UPDATE t SET c = 1 WHERE id >= $1 AND val = 1")
+        .unwrap();
+    stmt.execute(&[Value::Integer(1)]).unwrap();
+    let qr = conn
+        .query("SELECT id FROM t WHERE c = 1 ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        qr.rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(3)],
+            vec![Value::Integer(5)],
+        ]
+    );
+
+    conn.execute("UPDATE t SET c = 0").unwrap();
+    conn.execute("BEGIN").unwrap();
+    stmt.execute(&[Value::Integer(1)]).unwrap();
+    conn.execute("COMMIT").unwrap();
+    let qr = conn
+        .query("SELECT id FROM t WHERE c = 1 ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        qr.rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(3)],
+            vec![Value::Integer(5)],
+        ]
+    );
+}
+
+#[test]
+fn range_update_with_residual_where_unprepared() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER, c INTEGER)")
+        .unwrap();
+    for id in 1..=6 {
+        conn.execute(&format!("INSERT INTO t VALUES ({id}, {}, 0)", id % 2))
+            .unwrap();
+    }
+    conn.execute("UPDATE t SET c = 1 WHERE id >= 1 AND val = 1")
+        .unwrap();
+    let qr = conn
+        .query("SELECT id FROM t WHERE c = 1 ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        qr.rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(3)],
+            vec![Value::Integer(5)],
+        ]
+    );
+}
+
+#[test]
+fn pk_lookup_update_reapplies_residual_where() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER, c INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1, 0), (2, 0, 0)")
+        .unwrap();
+
+    conn.execute("UPDATE t SET c = 1 WHERE id = 2 AND val = 1")
+        .unwrap();
+    let qr = conn.query("SELECT c FROM t WHERE id = 2").unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Integer(0)]]);
+
+    let stmt = conn
+        .prepare("UPDATE t SET c = 1 WHERE id = $1 AND val = 1")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    stmt.execute(&[Value::Integer(2)]).unwrap();
+    stmt.execute(&[Value::Integer(1)]).unwrap();
+    conn.execute("COMMIT").unwrap();
+    let qr = conn.query("SELECT id, c FROM t ORDER BY id").unwrap();
+    assert_eq!(
+        qr.rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(1)],
+            vec![Value::Integer(2), Value::Integer(0)],
+        ]
+    );
+}

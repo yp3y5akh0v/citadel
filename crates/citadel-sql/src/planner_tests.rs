@@ -81,8 +81,12 @@ fn pk_equality_is_pk_lookup() {
     });
     let plan = plan_select(&schema, &where_clause);
     match plan {
-        ScanPlan::PkLookup { pk_values } => {
+        ScanPlan::PkLookup {
+            pk_values,
+            full_cover,
+        } => {
             assert_eq!(pk_values, vec![Value::Integer(42)]);
+            assert!(full_cover);
         }
         other => panic!("expected PkLookup, got {other:?}"),
     }
