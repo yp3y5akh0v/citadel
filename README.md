@@ -78,7 +78,7 @@ per-question audit, and a comparison with published systems are in
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. Python, C FFI (37 functions), and WebAssembly bindings
-- **5,200+ tests** - Unit, integration, torture tests across 20 crates
+- **5,000+ tests** - Unit, integration, torture tests across 20 crates
 
 ## Benchmarks
 
@@ -139,7 +139,7 @@ update_gen_propagate   44.6 us        45.2 us        1.01x
 
 ### Memoized repeat-reads
 
-Deterministic read-only statements re-executed with identical parameters against unchanged data are served from a generation-keyed result cache. Any commit invalidates the cache, and the first execution after a write recomputes at execution speed.
+Deterministic read-only statements re-executed with identical parameters against unchanged data are served from a generation-keyed result cache. Any commit invalidates the cache, and the first execution after a write recomputes at execution speed. SQLite has no result cache and re-executes every query.
 
 ```
 Benchmark              Citadel        SQLite         Ratio

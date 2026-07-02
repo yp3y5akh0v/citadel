@@ -436,7 +436,7 @@
   <div class="sec-head">
     <div class="eyebrow">Benchmarks</div>
     <h2>Faster on all {{ config.extra.benchmarks }} head-to-head benchmarks.</h2>
-    <p>Single-threaded, 100K rows, <code class="mono" style="color:var(--accent)">(id INTEGER PK, name TEXT, age INTEGER)</code>. Equal cache budgets (~32 MB). Ratio is SQLite / Citadel time; higher means a larger Citadel speedup. Two-run medians, two regimes: execution speed (every iteration computes its result; geometric mean ~3.4&times;) and memoized repeat-reads (identical parameters against unchanged data, served from a generation-keyed result cache that any commit invalidates).</p>
+    <p>Single-threaded, 100K rows, <code class="mono" style="color:var(--accent)">(id INTEGER PK, name TEXT, age INTEGER)</code>. Equal cache budgets (~32 MB). Ratio is SQLite / Citadel time; higher means a larger Citadel speedup. Two-run medians, two regimes: execution speed (every iteration computes its result; geometric mean ~3.4&times;) and memoized repeat-reads (identical parameters against unchanged data, served from a generation-keyed result cache that any commit invalidates; SQLite has no result cache and re-executes every query).</p>
   </div>
 
   <div class="bench-kpis">
