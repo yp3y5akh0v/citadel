@@ -1574,21 +1574,28 @@ pub(super) fn exec_update(
         }
     }
 
-    let stmt_changed_cols: Vec<String> = stmt.assignments.iter().map(|(c, _)| c.clone()).collect();
-    let stmt_old_rows: Vec<Vec<Value>> = changes.iter().map(|c| c.old_row.clone()).collect();
-    let stmt_new_rows: Vec<Vec<Value>> = changes.iter().map(|c| c.new_row.clone()).collect();
-    super::triggers::fire_statement_triggers(
-        &mut wtx,
-        schema,
-        &table_schema.name,
-        crate::parser::TriggerTiming::Before,
-        super::triggers::FireEvent::Update {
-            changed_columns: &stmt_changed_cols,
-        },
-        &table_schema.columns,
-        &stmt_old_rows,
-        &stmt_new_rows,
-    )?;
+    let fire_stmt_update =
+        super::triggers::has_statement_update_triggers(schema, &table_schema.name);
+    let mut stmt_changed_cols: Vec<String> = Vec::new();
+    let mut stmt_old_rows: Vec<Vec<Value>> = Vec::new();
+    let mut stmt_new_rows: Vec<Vec<Value>> = Vec::new();
+    if fire_stmt_update {
+        stmt_changed_cols = stmt.assignments.iter().map(|(c, _)| c.clone()).collect();
+        stmt_old_rows = changes.iter().map(|c| c.old_row.clone()).collect();
+        stmt_new_rows = changes.iter().map(|c| c.new_row.clone()).collect();
+        super::triggers::fire_statement_triggers(
+            &mut wtx,
+            schema,
+            &table_schema.name,
+            crate::parser::TriggerTiming::Before,
+            super::triggers::FireEvent::Update {
+                changed_columns: &stmt_changed_cols,
+            },
+            &table_schema.columns,
+            &stmt_old_rows,
+            &stmt_new_rows,
+        )?;
+    }
 
     let col_map_partial = any_partial_index(table_schema).then(|| table_schema.column_map());
 
@@ -1741,18 +1748,20 @@ pub(super) fn exec_update(
         }
     }
 
-    super::triggers::fire_statement_triggers(
-        &mut wtx,
-        schema,
-        &table_schema.name,
-        crate::parser::TriggerTiming::After,
-        super::triggers::FireEvent::Update {
-            changed_columns: &stmt_changed_cols,
-        },
-        &table_schema.columns,
-        &stmt_old_rows,
-        &stmt_new_rows,
-    )?;
+    if fire_stmt_update {
+        super::triggers::fire_statement_triggers(
+            &mut wtx,
+            schema,
+            &table_schema.name,
+            crate::parser::TriggerTiming::After,
+            super::triggers::FireEvent::Update {
+                changed_columns: &stmt_changed_cols,
+            },
+            &table_schema.columns,
+            &stmt_old_rows,
+            &stmt_new_rows,
+        )?;
+    }
 
     if let Some(returning_cols) = stmt.returning.as_ref() {
         let rows: Vec<super::helpers::ReturningRow> = changes
@@ -1956,18 +1965,22 @@ pub(super) fn exec_delete(
         }
     }
 
-    let old_rows_for_stmt: Vec<Vec<Value>> =
-        rows_to_delete.iter().map(|(_, r)| r.clone()).collect();
-    super::triggers::fire_statement_triggers(
-        &mut wtx,
-        schema,
-        &table_schema.name,
-        crate::parser::TriggerTiming::Before,
-        super::triggers::FireEvent::Delete,
-        &table_schema.columns,
-        &old_rows_for_stmt,
-        &[],
-    )?;
+    let fire_stmt_delete =
+        super::triggers::has_statement_delete_triggers(schema, &table_schema.name);
+    let mut old_rows_for_stmt: Vec<Vec<Value>> = Vec::new();
+    if fire_stmt_delete {
+        old_rows_for_stmt = rows_to_delete.iter().map(|(_, r)| r.clone()).collect();
+        super::triggers::fire_statement_triggers(
+            &mut wtx,
+            schema,
+            &table_schema.name,
+            crate::parser::TriggerTiming::Before,
+            super::triggers::FireEvent::Delete,
+            &table_schema.columns,
+            &old_rows_for_stmt,
+            &[],
+        )?;
+    }
 
     for (key, row) in &rows_to_delete {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
@@ -2011,16 +2024,18 @@ pub(super) fn exec_delete(
         }
     }
 
-    super::triggers::fire_statement_triggers(
-        &mut wtx,
-        schema,
-        &table_schema.name,
-        crate::parser::TriggerTiming::After,
-        super::triggers::FireEvent::Delete,
-        &table_schema.columns,
-        &old_rows_for_stmt,
-        &[],
-    )?;
+    if fire_stmt_delete {
+        super::triggers::fire_statement_triggers(
+            &mut wtx,
+            schema,
+            &table_schema.name,
+            crate::parser::TriggerTiming::After,
+            super::triggers::FireEvent::Delete,
+            &table_schema.columns,
+            &old_rows_for_stmt,
+            &[],
+        )?;
+    }
 
     if let Some(returning_cols) = stmt.returning.as_ref() {
         let rows: Vec<super::helpers::ReturningRow> = rows_to_delete
@@ -3220,22 +3235,28 @@ pub(super) fn exec_update_in_txn(
         })
         .cloned()
         .collect();
-    let stmt_changed_cols_in_txn: Vec<String> =
-        stmt.assignments.iter().map(|(c, _)| c.clone()).collect();
-    let stmt_old_rows_in_txn: Vec<Vec<Value>> = changes.iter().map(|c| c.old_row.clone()).collect();
-    let stmt_new_rows_in_txn: Vec<Vec<Value>> = changes.iter().map(|c| c.new_row.clone()).collect();
-    super::triggers::fire_statement_triggers(
-        wtx,
-        schema,
-        &table_schema.name,
-        crate::parser::TriggerTiming::Before,
-        super::triggers::FireEvent::Update {
-            changed_columns: &stmt_changed_cols_in_txn,
-        },
-        &table_schema.columns,
-        &stmt_old_rows_in_txn,
-        &stmt_new_rows_in_txn,
-    )?;
+    let fire_stmt_update =
+        super::triggers::has_statement_update_triggers(schema, &table_schema.name);
+    let mut stmt_changed_cols_in_txn: Vec<String> = Vec::new();
+    let mut stmt_old_rows_in_txn: Vec<Vec<Value>> = Vec::new();
+    let mut stmt_new_rows_in_txn: Vec<Vec<Value>> = Vec::new();
+    if fire_stmt_update {
+        stmt_changed_cols_in_txn = stmt.assignments.iter().map(|(c, _)| c.clone()).collect();
+        stmt_old_rows_in_txn = changes.iter().map(|c| c.old_row.clone()).collect();
+        stmt_new_rows_in_txn = changes.iter().map(|c| c.new_row.clone()).collect();
+        super::triggers::fire_statement_triggers(
+            wtx,
+            schema,
+            &table_schema.name,
+            crate::parser::TriggerTiming::Before,
+            super::triggers::FireEvent::Update {
+                changed_columns: &stmt_changed_cols_in_txn,
+            },
+            &table_schema.columns,
+            &stmt_old_rows_in_txn,
+            &stmt_new_rows_in_txn,
+        )?;
+    }
 
     if !before_update_triggers_in_txn.is_empty() {
         let changed_cols: Vec<String> = stmt.assignments.iter().map(|(c, _)| c.clone()).collect();
@@ -3406,18 +3427,20 @@ pub(super) fn exec_update_in_txn(
         }
     }
 
-    super::triggers::fire_statement_triggers(
-        wtx,
-        schema,
-        &table_schema.name,
-        crate::parser::TriggerTiming::After,
-        super::triggers::FireEvent::Update {
-            changed_columns: &stmt_changed_cols_in_txn,
-        },
-        &table_schema.columns,
-        &stmt_old_rows_in_txn,
-        &stmt_new_rows_in_txn,
-    )?;
+    if fire_stmt_update {
+        super::triggers::fire_statement_triggers(
+            wtx,
+            schema,
+            &table_schema.name,
+            crate::parser::TriggerTiming::After,
+            super::triggers::FireEvent::Update {
+                changed_columns: &stmt_changed_cols_in_txn,
+            },
+            &table_schema.columns,
+            &stmt_old_rows_in_txn,
+            &stmt_new_rows_in_txn,
+        )?;
+    }
 
     if let Some(returning_cols) = stmt.returning.as_ref() {
         let rows: Vec<super::helpers::ReturningRow> = changes
@@ -3540,18 +3563,22 @@ pub(super) fn exec_delete_in_txn(
         }
     }
 
-    let stmt_old_rows_in_txn: Vec<Vec<Value>> =
-        rows_to_delete.iter().map(|(_, r)| r.clone()).collect();
-    super::triggers::fire_statement_triggers(
-        wtx,
-        schema,
-        &table_schema.name,
-        crate::parser::TriggerTiming::Before,
-        super::triggers::FireEvent::Delete,
-        &table_schema.columns,
-        &stmt_old_rows_in_txn,
-        &[],
-    )?;
+    let fire_stmt_delete =
+        super::triggers::has_statement_delete_triggers(schema, &table_schema.name);
+    let mut stmt_old_rows_in_txn: Vec<Vec<Value>> = Vec::new();
+    if fire_stmt_delete {
+        stmt_old_rows_in_txn = rows_to_delete.iter().map(|(_, r)| r.clone()).collect();
+        super::triggers::fire_statement_triggers(
+            wtx,
+            schema,
+            &table_schema.name,
+            crate::parser::TriggerTiming::Before,
+            super::triggers::FireEvent::Delete,
+            &table_schema.columns,
+            &stmt_old_rows_in_txn,
+            &[],
+        )?;
+    }
 
     for (key, row) in &rows_to_delete {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
@@ -3595,16 +3622,18 @@ pub(super) fn exec_delete_in_txn(
         }
     }
 
-    super::triggers::fire_statement_triggers(
-        wtx,
-        schema,
-        &table_schema.name,
-        crate::parser::TriggerTiming::After,
-        super::triggers::FireEvent::Delete,
-        &table_schema.columns,
-        &stmt_old_rows_in_txn,
-        &[],
-    )?;
+    if fire_stmt_delete {
+        super::triggers::fire_statement_triggers(
+            wtx,
+            schema,
+            &table_schema.name,
+            crate::parser::TriggerTiming::After,
+            super::triggers::FireEvent::Delete,
+            &table_schema.columns,
+            &stmt_old_rows_in_txn,
+            &[],
+        )?;
+    }
 
     if let Some(returning_cols) = stmt.returning.as_ref() {
         let rows: Vec<super::helpers::ReturningRow> = rows_to_delete
