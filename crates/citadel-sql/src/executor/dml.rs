@@ -1452,6 +1452,12 @@ fn exec_insert_in_txn_impl(
         }
         return Err(SqlError::CannotModifyView(stmt.table.clone()));
     }
+    if schema.get_matview(&view_lookup_key).is_some() {
+        return Err(SqlError::CannotModifyView(format!(
+            "materialized view '{}' is read-only — use REFRESH MATERIALIZED VIEW",
+            stmt.table
+        )));
+    }
 
     let table_schema = schema
         .get(&stmt.table)
@@ -3494,7 +3500,11 @@ fn build_bind_plan(
 impl CompiledInsert {
     pub fn try_compile(schema: &SchemaManager, stmt: &InsertStmt) -> Option<Self> {
         let lower = stmt.table.to_ascii_lowercase();
-        let cached = if let Some(ts) = schema.get(&lower) {
+        // Matview names resolve to their backing table; only the interpreted
+        // path raises the modification error.
+        let cached = if schema.get_matview(&lower).is_some() {
+            None
+        } else if let Some(ts) = schema.get(&lower) {
             let insert_columns: Vec<&str> = if stmt.columns.is_empty() {
                 ts.columns.iter().map(|c| c.name.as_str()).collect()
             } else {
