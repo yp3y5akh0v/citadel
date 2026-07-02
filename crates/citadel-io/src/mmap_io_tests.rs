@@ -135,3 +135,21 @@ fn write_commit_meta_works() {
     io.read_at(100, &mut slot).unwrap();
     assert_eq!(slot, [0xAB; 64]);
 }
+
+#[test]
+fn write_pages_ref_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = open_new_file(&dir, "test.db");
+    let io = MmapPageIO::try_new(file).unwrap();
+
+    let a = [0x11u8; PAGE_SIZE];
+    let b = [0x22u8; PAGE_SIZE];
+    io.write_pages_ref(&[(0, &a), (PAGE_SIZE as u64 * 3, &b)])
+        .unwrap();
+
+    let mut got = [0u8; PAGE_SIZE];
+    io.read_page(0, &mut got).unwrap();
+    assert_eq!(got, a);
+    io.read_page(PAGE_SIZE as u64 * 3, &mut got).unwrap();
+    assert_eq!(got, b);
+}

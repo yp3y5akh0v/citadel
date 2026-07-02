@@ -33,6 +33,13 @@ pub trait PageIO: Send + Sync {
         Ok(())
     }
 
+    fn write_pages_ref(&self, pages: &[(u64, &[u8; PAGE_SIZE])]) -> Result<()> {
+        for &(offset, buf) in pages {
+            self.write_page(offset, buf)?;
+        }
+        Ok(())
+    }
+
     fn flush_pages(&self, pages: &[(u64, [u8; PAGE_SIZE])]) -> Result<()> {
         self.write_pages(pages)?;
         self.fsync()

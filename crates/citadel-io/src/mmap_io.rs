@@ -127,6 +127,24 @@ impl PageIO for MmapPageIO {
         Ok(())
     }
 
+    fn write_pages_ref(&self, pages: &[(u64, &[u8; PAGE_SIZE])]) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let max_end = pages
+            .iter()
+            .map(|(o, _)| o + PAGE_SIZE as u64)
+            .max()
+            .unwrap();
+        self.ensure_mapped(max_end)?;
+        let mut inner = self.inner.write();
+        for &(offset, buf) in pages {
+            let start = offset as usize;
+            inner.mmap[start..start + PAGE_SIZE].copy_from_slice(buf);
+        }
+        Ok(())
+    }
+
     fn fsync(&self) -> Result<()> {
         let inner = self.inner.read();
         inner.mmap.flush()?;
