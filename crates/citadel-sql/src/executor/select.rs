@@ -4261,6 +4261,26 @@ fn collect_pk_eq_conjuncts(
     true
 }
 
+/// Inverted-index operators have specialized ladder paths the lane lacks.
+fn where_has_inverted_op(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            matches!(op, BinOp::JsonContains | BinOp::JsonPathMatch)
+                || where_has_inverted_op(left)
+                || where_has_inverted_op(right)
+        }
+        Expr::UnaryOp { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
+            where_has_inverted_op(expr)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            where_has_inverted_op(expr) || where_has_inverted_op(low) || where_has_inverted_op(high)
+        }
+        _ => false,
+    }
+}
+
 fn build_select_lane(schema: &SchemaManager, sel: &SelectStmt) -> Option<CompiledSelectLane> {
     if !sel.joins.is_empty()
         || !sel.group_by.is_empty()
@@ -4272,6 +4292,7 @@ fn build_select_lane(schema: &SchemaManager, sel: &SelectStmt) -> Option<Compile
         || sel.from_subquery.is_some()
         || sel.from_args.is_some()
         || sel.from_json_table.is_some()
+        || sel.where_clause.as_ref().is_some_and(where_has_inverted_op)
     {
         return None;
     }
