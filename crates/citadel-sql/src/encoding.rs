@@ -541,13 +541,21 @@ pub fn build_row_template(phys_count: usize, slots: &[TemplateSlot]) -> RowTempl
     }
 }
 
-/// Caller must guarantee every `values[slot]` for an integer hole is `Value::Integer`.
 #[inline]
 pub fn encode_row_with_template(
     tmpl: &RowTemplate,
     values: &[Value],
     buf: &mut Vec<u8>,
 ) -> Result<()> {
+    // NULL in an int hole removes its cell: take the generic encoder.
+    if tmpl
+        .slot_offsets
+        .iter()
+        .any(|&(slot, _)| values[slot].is_null())
+    {
+        encode_row_into(values, buf);
+        return Ok(());
+    }
     buf.clear();
     buf.extend_from_slice(&tmpl.template);
     for &(slot, off) in &tmpl.slot_offsets {
