@@ -1419,6 +1419,7 @@ impl AggState {
     /// Fold `other` (a later shard in leaf order) into `self`. Only gate-admitted
     /// states reach here: counts, integer Sum (wrapping add is associative), and
     /// Min/Max over non-REAL (strict compare keeps the earlier value on ties).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn merge(&mut self, other: AggState) {
         match (self, other) {
             (AggState::CountStar(a), AggState::CountStar(b)) => *a += b,
@@ -1786,6 +1787,7 @@ pub(super) struct StreamAggPlan {
     fast_pred: Option<FastPredicate>,
     /// Every aggregate is order-insensitive (see `AggState::merge`), so the
     /// no-WHERE scan may fan leaves across shards.
+    #[cfg(not(target_arch = "wasm32"))]
     parallel_ok: bool,
 }
 
@@ -1875,8 +1877,10 @@ impl RawFeed<'_> {
 
 /// Leaves per rayon shard: large enough to amortize task overhead, small
 /// enough to balance across cores.
+#[cfg(not(target_arch = "wasm32"))]
 const LEAVES_PER_SHARD: usize = 32;
 /// Below this many leaves the serial scan wins.
+#[cfg(not(target_arch = "wasm32"))]
 const MIN_PARALLEL_LEAVES: usize = 256;
 
 /// Fan a no-WHERE streaming aggregation across rayon shards when the plan's
@@ -2103,6 +2107,7 @@ impl StreamAggPlan {
         // Shard-mergeable ops only (see AggState::merge): AVG and REAL fold
         // order-sensitively (f64, NaN compares Equal), INTERVAL saturates.
         // Defaults fed for pre-ALTER rows join the fold: same bounds apply.
+        #[cfg(not(target_arch = "wasm32"))]
         let parallel_ok = ops
             .iter()
             .zip(&nonpk_agg_defaults)
@@ -2149,6 +2154,7 @@ impl StreamAggPlan {
             num_pk_cols,
             nonpk_agg_defaults,
             fast_pred,
+            #[cfg(not(target_arch = "wasm32"))]
             parallel_ok,
         }))
     }
