@@ -374,3 +374,216 @@ fn execute_does_not_drop_returning_rows() {
         .unwrap();
     assert_eq!(rows_affected(result), 1);
 }
+
+fn setup_fast_lane(conn: &Connection) {
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, c INTEGER, note TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b')")
+        .unwrap();
+}
+
+#[test]
+fn prepared_pk_update_returning_in_txn() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_fast_lane(&conn);
+
+    let stmt = conn
+        .prepare("UPDATE t SET c = c + $1 WHERE id = $2 RETURNING c")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for (add, id, expect) in [(5, 1, 15), (5, 1, 20), (7, 2, 27)] {
+        let qr = stmt
+            .query_collect(&[Value::Integer(add), Value::Integer(id)])
+            .unwrap();
+        assert_eq!(qr.columns, vec!["c".to_string()]);
+        assert_eq!(qr.rows, vec![vec![Value::Integer(expect)]]);
+    }
+    conn.execute("COMMIT").unwrap();
+    let qr = query(&conn, "SELECT c FROM t ORDER BY id");
+    assert_eq!(
+        qr.rows,
+        vec![vec![Value::Integer(20)], vec![Value::Integer(27)]]
+    );
+}
+
+#[test]
+fn prepared_pk_update_returning_alias_and_non_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_fast_lane(&conn);
+
+    let stmt = conn
+        .prepare("UPDATE t SET c = c + 1 WHERE id = $1 RETURNING c AS newc, id, note")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let qr = stmt.query_collect(&[Value::Integer(1)]).unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        qr.columns,
+        vec!["newc".to_string(), "id".to_string(), "note".to_string()]
+    );
+    assert_eq!(
+        qr.rows,
+        vec![vec![
+            Value::Integer(11),
+            Value::Integer(1),
+            Value::Text("a".into())
+        ]]
+    );
+}
+
+#[test]
+fn prepared_multi_target_update_returning_reads_new_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, b INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10, 20)").unwrap();
+
+    // Multi-target RETURNING must read the patched row bytes.
+    let stmt = conn
+        .prepare("UPDATE t SET a = $1, b = $2 WHERE id = $3 RETURNING a, b")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let qr = stmt
+        .query_collect(&[Value::Integer(100), Value::Integer(200), Value::Integer(1)])
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        qr.rows,
+        vec![vec![Value::Integer(100), Value::Integer(200)]]
+    );
+}
+
+#[test]
+fn prepared_pk_update_returning_zero_match_keeps_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_fast_lane(&conn);
+
+    let stmt = conn
+        .prepare("UPDATE t SET c = c + 1 WHERE id = $1 RETURNING c")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let qr = stmt.query_collect(&[Value::Integer(999)]).unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(qr.columns, vec!["c".to_string()]);
+    assert!(qr.rows.is_empty());
+}
+
+#[test]
+fn prepared_pk_update_returning_star() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_fast_lane(&conn);
+
+    let stmt = conn
+        .prepare("UPDATE t SET c = c + 1 WHERE id = $1 RETURNING *")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let qr = stmt.query_collect(&[Value::Integer(2)]).unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        qr.columns,
+        vec!["id".to_string(), "c".to_string(), "note".to_string()]
+    );
+    assert_eq!(
+        qr.rows,
+        vec![vec![
+            Value::Integer(2),
+            Value::Integer(21),
+            Value::Text("b".into())
+        ]]
+    );
+}
+
+#[test]
+fn prepared_pk_update_returning_old_new_falls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    setup_fast_lane(&conn);
+
+    let stmt = conn
+        .prepare("UPDATE t SET c = c + 1 WHERE id = $1 RETURNING old.c, new.c")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let qr = stmt.query_collect(&[Value::Integer(1)]).unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Integer(10), Value::Integer(11)]]);
+}
+
+#[test]
+fn prepared_pk_update_returning_stored_generated() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, \
+         g INTEGER GENERATED ALWAYS AS (a * 2) STORED)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t (id, a) VALUES (1, 5)").unwrap();
+
+    let stmt = conn
+        .prepare("UPDATE t SET a = $1 WHERE id = $2 RETURNING a, g")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let qr = stmt
+        .query_collect(&[Value::Integer(9), Value::Integer(1)])
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Integer(9), Value::Integer(18)]]);
+}
+
+#[test]
+fn prepared_pk_update_returning_virtual_generated_falls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, \
+         g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t (id, a) VALUES (1, 5)").unwrap();
+
+    let stmt = conn
+        .prepare("UPDATE t SET a = $1 WHERE id = $2 RETURNING g")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let qr = stmt
+        .query_collect(&[Value::Integer(9), Value::Integer(1)])
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Integer(18)]]);
+}
+
+#[test]
+fn autocommit_update_returning_virtual_generated_is_recomputed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, \
+         g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t (id, a) VALUES (1, 5)").unwrap();
+
+    let result = conn
+        .execute("UPDATE t SET a = 9 WHERE id = 1 RETURNING g")
+        .unwrap();
+    match result {
+        ExecutionResult::Query(qr) => {
+            assert_eq!(qr.rows, vec![vec![Value::Integer(18)]]);
+        }
+        other => panic!("expected query result, got {other:?}"),
+    }
+}

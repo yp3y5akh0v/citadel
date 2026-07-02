@@ -71,6 +71,7 @@ struct CompiledFastPath {
     gen_extra_cols: Vec<(usize, usize)>,
     rhs_extra_cols: Vec<(usize, usize)>,
     pk_lookup_fast: Option<PkLookupFast>,
+    returning_fast: Option<ReturningFast>,
 }
 
 #[derive(Clone)]
@@ -82,6 +83,14 @@ enum PkLookupSource {
 #[derive(Clone)]
 struct PkLookupFast {
     source: PkLookupSource,
+}
+
+/// Plain-column RETURNING for the pk-lookup lane; other shapes interpret.
+struct ReturningFast {
+    col_names: Vec<String>,
+    out_idx: Vec<usize>,
+    /// Columns decoded from the post-patch row bytes (new values).
+    extra_decode: Vec<(usize, usize)>,
 }
 
 #[derive(Clone)]
@@ -344,6 +353,65 @@ fn decode_cols_into(
         partial_row[schema_idx] = decode_column_raw(value, phys_idx)?.to_value();
     }
     Ok(())
+}
+
+/// `live` = columns already holding new values in partial_row post-patch.
+fn compile_returning_fast(
+    table_schema: &TableSchema,
+    returning: &[SelectColumn],
+    live: impl Fn(usize) -> bool,
+) -> Option<ReturningFast> {
+    let virtual_col = |idx: usize| {
+        matches!(
+            table_schema.columns[idx].generated_kind,
+            Some(crate::parser::GeneratedKind::Virtual)
+        )
+    };
+    let mut col_names = Vec::new();
+    let mut out_idx = Vec::new();
+    for sel in returning {
+        match sel {
+            SelectColumn::Expr {
+                expr: Expr::Column(name),
+                alias,
+            } => {
+                let idx = table_schema.column_index(name)?;
+                if virtual_col(idx) {
+                    return None;
+                }
+                // Naming parity with project_returning.
+                col_names.push(alias.clone().unwrap_or_else(|| name.clone()));
+                out_idx.push(idx);
+            }
+            SelectColumn::AllColumns => {
+                for c in &table_schema.columns {
+                    if virtual_col(c.position as usize) {
+                        return None;
+                    }
+                    col_names.push(c.name.clone());
+                    out_idx.push(c.position as usize);
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    let non_pk = table_schema.non_pk_indices();
+    let enc_pos = table_schema.encoding_positions();
+    let mut extra_decode: Vec<(usize, usize)> = Vec::new();
+    for &idx in &out_idx {
+        if live(idx) || extra_decode.iter().any(|&(si, _)| si == idx) {
+            continue;
+        }
+        let nonpk_order = non_pk.iter().position(|&i| i == idx)?;
+        extra_decode.push((idx, enc_pos[nonpk_order] as usize));
+    }
+
+    Some(ReturningFast {
+        col_names,
+        out_idx,
+        extra_decode,
+    })
 }
 
 /// Gen-col patches plus the (schema_idx, phys_idx) columns their exprs read.
@@ -690,20 +758,34 @@ fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Comp
         let pk_lookup_fast = detect_pk_lookup_fast(&stmt.where_clause, table_schema);
 
         match (gen, rhs) {
-            (Some((gen_targets, gen_extra_cols)), Some(rhs_extra_cols)) => Some(CompiledFastPath {
-                num_pk_cols,
-                num_columns: table_schema.columns.len(),
-                single_int_pk,
-                targets,
-                scan_plan: plan,
-                pk_idx_cache: pk_indices.to_vec(),
-                col_map: ColumnMap::new(&table_schema.columns),
-                range_bounds_i64,
-                gen_targets,
-                gen_extra_cols,
-                rhs_extra_cols,
-                pk_lookup_fast,
-            }),
+            (Some((gen_targets, gen_extra_cols)), Some(rhs_extra_cols)) => {
+                let returning_fast = stmt.returning.as_ref().and_then(|r| {
+                    // Post-patch: pk, single-target value, gen targets, extras.
+                    let live = |idx: usize| {
+                        pk_indices.contains(&idx)
+                            || (targets.len() == 1 && targets[0].schema_idx == idx)
+                            || gen_targets.iter().any(|g| g.schema_idx == idx)
+                            || rhs_extra_cols.iter().any(|&(si, _)| si == idx)
+                            || gen_extra_cols.iter().any(|&(si, _)| si == idx)
+                    };
+                    compile_returning_fast(table_schema, r, live)
+                });
+                Some(CompiledFastPath {
+                    num_pk_cols,
+                    num_columns: table_schema.columns.len(),
+                    single_int_pk,
+                    targets,
+                    scan_plan: plan,
+                    pk_idx_cache: pk_indices.to_vec(),
+                    col_map: ColumnMap::new(&table_schema.columns),
+                    range_bounds_i64,
+                    gen_targets,
+                    gen_extra_cols,
+                    rhs_extra_cols,
+                    pk_lookup_fast,
+                    returning_fast,
+                })
+            }
             _ => None,
         }
     } else {
@@ -2328,9 +2410,14 @@ fn exec_update_in_txn_compiled(
         .get(&compiled.table_name_lower)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
 
-    if stmt.returning.is_some() {
-        return exec_update_in_txn(wtx, schema, stmt);
-    }
+    let ret_fast = if stmt.returning.is_some() {
+        match fast.returning_fast.as_ref() {
+            Some(rf) => Some(rf),
+            None => return exec_update_in_txn(wtx, schema, stmt),
+        }
+    } else {
+        None
+    };
 
     let single_int_pk = fast.single_int_pk;
     let num_pk_cols = fast.num_pk_cols;
@@ -2353,14 +2440,15 @@ fn exec_update_in_txn_compiled(
             wtx,
             &compiled.table_name_lower,
             &pk_value,
-            pk_idx_cache,
-            col_map,
-            targets,
-            gen_targets,
-            gen_extra_cols,
-            rhs_extra_cols,
+            fast,
+            ret_fast,
             bufs,
         );
+    }
+
+    // Only the pk-lookup lane produces RETURNING rows; other plans fall back.
+    if ret_fast.is_some() {
+        return exec_update_in_txn(wtx, schema, stmt);
     }
 
     let plan = crate::planner::plan_select(table_schema, &stmt.where_clause);
@@ -2602,34 +2690,39 @@ fn exec_update_in_txn_compiled(
     Ok(ExecutionResult::RowsAffected(bufs.patched.len() as u64))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn exec_pk_lookup_update(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     table_name_lower: &str,
     pk_value: &Value,
-    pk_idx_cache: &[usize],
-    col_map: &ColumnMap,
-    targets: &[CompiledTarget],
-    gen_targets: &[GenColPatch],
-    gen_extra_cols: &[(usize, usize)],
-    rhs_extra_cols: &[(usize, usize)],
+    fast: &CompiledFastPath,
+    ret_fast: Option<&ReturningFast>,
     bufs: &mut UpdateBufs,
 ) -> Result<ExecutionResult> {
+    let targets = &fast.targets;
+    let col_map = &fast.col_map;
     let key = encode_composite_key(std::slice::from_ref(pk_value));
     let mut raw_value = match wtx
         .table_get(table_name_lower.as_bytes(), &key)
         .map_err(SqlError::Storage)?
     {
         Some(v) => v,
-        None => return Ok(ExecutionResult::RowsAffected(0)),
+        None => {
+            return Ok(match ret_fast {
+                Some(rf) => ExecutionResult::Query(QueryResult {
+                    columns: rf.col_names.clone(),
+                    rows: Vec::new(),
+                }),
+                None => ExecutionResult::RowsAffected(0),
+            })
+        }
     };
     let partial_row = &mut bufs.partial_row;
     let patch_buf = &mut bufs.patch_buf;
-    partial_row[pk_idx_cache[0]] = pk_value.clone();
+    partial_row[fast.pk_idx_cache[0]] = pk_value.clone();
     for target in targets {
         partial_row[target.schema_idx] = decode_column_raw(&raw_value, target.phys_idx)?.to_value();
     }
-    decode_cols_into(&raw_value, rhs_extra_cols, partial_row)?;
+    decode_cols_into(&raw_value, &fast.rhs_extra_cols, partial_row)?;
     for target in targets {
         let new_val = compiled_target_eval(target, partial_row, col_map)?;
         let coerced = coerce_gen_value(new_val, &target.col)?;
@@ -2644,13 +2737,22 @@ fn exec_pk_lookup_update(
     apply_gen_col_patches_vec(
         &mut raw_value,
         partial_row,
-        gen_targets,
-        gen_extra_cols,
+        &fast.gen_targets,
+        &fast.gen_extra_cols,
         col_map,
         patch_buf,
     )?;
     wtx.table_insert(table_name_lower.as_bytes(), &key, &raw_value)
         .map_err(SqlError::Storage)?;
+    if let Some(rf) = ret_fast {
+        // Post-patch bytes hold the new values RETURNING reports.
+        decode_cols_into(&raw_value, &rf.extra_decode, partial_row)?;
+        let row: Vec<Value> = rf.out_idx.iter().map(|&i| partial_row[i].clone()).collect();
+        return Ok(ExecutionResult::Query(QueryResult {
+            columns: rf.col_names.clone(),
+            rows: vec![row],
+        }));
+    }
     Ok(ExecutionResult::RowsAffected(1))
 }
 
