@@ -235,85 +235,93 @@ db.<span class="fn">run</span>(<span class="s">"INSERT INTO t (id, name) VALUES 
 })();
 
 (() => {
-  const table = document.getElementById('benchTable');
-  if (!table) return;
-  const BENCH = [
-    ['correlated_in', '6.52 ms', '1.97 s', 302],
-    ['full_outer_join', '70.6 µs', '20.6 ms', 292],
-    ['correlated_scalar', '324 µs', '19.2 ms', 59],
-    ['count', '605 ns', '21.0 µs', 35],
-    ['point', '1.12 µs', '12.5 µs', 11],
-    ['fts_rank', '4.85 ms', '41.8 ms', 8.6],
-    ['group_by', '1.38 ms', '10.3 ms', 7.5],
-    ['union', '27.6 µs', '148 µs', 5.3],
-    ['cte', '1.30 ms', '6.10 ms', 4.7],
-    ['jsonb_contains', '5.63 ms', '26.2 ms', 4.6],
-    ['view_point', '3.29 µs', '12.3 µs', 3.7],
-    ['truncate', '20.6 µs', '56.7 µs', 2.75],
-    ['window_agg', '28.8 ms', '76.1 ms', 2.65],
-    ['fts_match', '2.87 ms', '7.54 ms', 2.63],
-    ['upsert_dedup', '12.4 µs', '32.3 µs', 2.61],
-    ['json_extract', '12.2 ms', '31.3 ms', 2.57],
-    ['partial_index_point', '4.78 µs', '12.2 µs', 2.54],
-    ['insert_returning', '70.9 µs', '172 µs', 2.42],
-    ['fts_phrase', '4.04 ms', '9.05 ms', 2.24],
-    ['upsert_returning', '79.2 µs', '174 µs', 2.19],
-    ['window_rank', '60.6 ms', '127 ms', 2.09],
-    ['savepoint_create', '345 ns', '716 ns', 2.08],
-    ['sort', '1.34 ms', '2.67 ms', 1.99],
-    ['filter', '973 µs', '1.87 ms', 1.92],
-    ['view_filter', '980 µs', '1.81 ms', 1.85],
-    ['scan', '5.03 ms', '9.33 ms', 1.85],
-    ['savepoint_nested', '188 µs', '348 µs', 1.85],
-    ['savepoint_rollback', '1.25 ms', '2.26 ms', 1.80],
-    ['insert_select', '553 µs', '936 µs', 1.69],
-    ['join', '59.6 µs', '95.3 µs', 1.60],
-    ['update', '18.6 µs', '29.2 µs', 1.56],
-    ['insert', '33.1 µs', '51.3 µs', 1.55],
-    ['upsert_all_new', '32.5 µs', '50.2 µs', 1.55],
-    ['upsert_counter', '36.3 µs', '55.0 µs', 1.51],
-    ['wide_proj_full', '4.69 ms', '7.06 ms', 1.51],
-    ['wide_proj_pk', '315 µs', '462 µs', 1.46],
-    ['delete_returning', '120 µs', '172 µs', 1.44],
-    ['recursive_cte', '86.7 µs', '123 µs', 1.42],
-    ['delete', '52.0 µs', '73.5 µs', 1.41],
-    ['correlated_exists', '5.02 ms', '6.87 ms', 1.37],
-    ['distinct', '2.84 ms', '3.86 ms', 1.36],
-    ['fk_cascade_delete_only', '59.8 µs', '77.5 µs', 1.30],
-    ['with_dml', '82.0 µs', '105 µs', 1.28],
-    ['wide_proj_3col', '943 µs', '1.20 ms', 1.27],
-    ['sum', '1.55 ms', '1.93 ms', 1.24],
-    ['wide_proj_2col', '510 µs', '623 µs', 1.22],
-    ['sort_nocase', '2.72 ms', '3.30 ms', 1.21],
-    ['insert_gen_virtual', '45.8 µs', '54.2 µs', 1.19],
-    ['upsert_mixed', '50.7 µs', '57.8 µs', 1.14],
-    ['select_gen_virtual', '15.9 µs', '17.8 µs', 1.12],
-    ['insert_gen_stored', '49.8 µs', '55.3 µs', 1.11],
-    ['fk_cascade', '80.7 µs', '87.5 µs', 1.09],
-    ['update_gen_propagate', '43.9 µs', '45.5 µs', 1.03],
-    ['update_returning', '146 µs', '148 µs', 1.01],
+  const BENCH_EXEC = [
+    ['correlated_scalar', '12.8 µs', '19.8 ms', 1549],
+    ['full_outer_join', '14.1 µs', '21.8 ms', 1540],
+    ['view_filter', '21.6 µs', '1.83 ms', 85],
+    ['filter', '23.2 µs', '1.84 ms', 80],
+    ['join_param', '1.55 µs', '34.8 µs', 22],
+    ['join', '14.2 µs', '97.7 µs', 6.89],
+    ['union', '28.0 µs', '150 µs', 5.35],
+    ['delete_returning', '48.8 µs', '171 µs', 3.50],
+    ['update_returning', '46.6 µs', '150 µs', 3.23],
+    ['insert_returning', '61.1 µs', '174 µs', 2.84],
+    ['truncate', '20.8 µs', '58.7 µs', 2.83],
+    ['fts_match', '2.91 ms', '8.03 ms', 2.76],
+    ['json_extract', '12.2 ms', '32.7 ms', 2.68],
+    ['sort_paginate_pk', '5.62 µs', '14.7 µs', 2.61],
+    ['upsert_returning', '67.2 µs', '175 µs', 2.61],
+    ['window_agg', '29.5 ms', '76.5 ms', 2.59],
+    ['upsert_dedup', '13.0 µs', '32.8 µs', 2.52],
+    ['fts_phrase', '4.19 ms', '9.73 ms', 2.32],
+    ['savepoint_create', '349 ns', '748 ns', 2.14],
+    ['window_rank', '63.4 ms', '130 ms', 2.05],
+    ['insert_select', '543 µs', '1.10 ms', 2.03],
+    ['delete', '35.0 µs', '69.9 µs', 2.00],
+    ['scan', '4.97 ms', '9.54 ms', 1.92],
+    ['savepoint_rollback', '1.28 ms', '2.28 ms', 1.78],
+    ['wide_proj_2col', '501 µs', '842 µs', 1.68],
+    ['upsert_mixed', '35.5 µs', '59.1 µs', 1.66],
+    ['savepoint_nested', '197 µs', '326 µs', 1.66],
+    ['wide_proj_full', '4.59 ms', '7.53 ms', 1.64],
+    ['update', '17.9 µs', '28.3 µs', 1.58],
+    ['wide_proj_pk', '319 µs', '480 µs', 1.51],
+    ['upsert_counter', '35.8 µs', '53.7 µs', 1.50],
+    ['insert', '35.4 µs', '51.9 µs', 1.47],
+    ['upsert_all_new', '35.6 µs', '51.4 µs', 1.44],
+    ['covered_count', '257 µs', '359 µs', 1.40],
+    ['with_dml', '80.5 µs', '107 µs', 1.34],
+    ['fk_cascade_delete_only', '63.5 µs', '80.7 µs', 1.27],
+    ['insert_gen_virtual', '48.5 µs', '55.0 µs', 1.13],
+    ['wide_proj_3col', '1.11 ms', '1.23 ms', 1.11],
+    ['covered_range', '68.2 µs', '74.8 µs', 1.10],
+    ['insert_gen_stored', '51.3 µs', '56.2 µs', 1.10],
+    ['fk_cascade', '80.7 µs', '87.3 µs', 1.08],
+    ['update_gen_propagate', '44.6 µs', '45.2 µs', 1.01],
   ];
-  BENCH.forEach(([name, c, s, r]) => {
-    const logR = Math.log10(r) / Math.log10(302);
-    const w = Math.max(6, logR * 100);
-    const row = document.createElement('div');
-    row.className = 'row';
-    row.innerHTML = `
-      <div class="name mono">${name}</div>
-      <div class="bar-wrap"><div class="bar"><i data-w="${w.toFixed(1)}%"></i></div></div>
-      <div class="num">${c}</div>
-      <div class="num">${s}</div>
-      <div class="ratio">${r.toFixed(r < 10 ? 2 : 0)}×</div>`;
-    table.appendChild(row);
-  });
-  const barEls = table.querySelectorAll('.bar i');
-  const obs = new IntersectionObserver((e) => {
-    if (e[0].isIntersecting) {
-      barEls.forEach((b, i) => setTimeout(() => b.style.width = b.dataset.w, 40 * i));
-      obs.disconnect();
-    }
-  }, { threshold: 0.15 });
-  obs.observe(table);
+  const BENCH_MEMO = [
+    ['correlated_in', '103 ns', '1.97 s', 19208388],
+    ['fts_rank', '219 ns', '42.5 ms', 194338],
+    ['correlated_exists', '102 ns', '6.89 ms', 67712],
+    ['jsonb_contains', '1.09 µs', '27.7 ms', 25273],
+    ['sort_nocase', '213 ns', '3.31 ms', 15532],
+    ['cte', '668 ns', '6.13 ms', 9179],
+    ['sort', '312 ns', '2.76 ms', 8853],
+    ['group_by', '1.27 µs', '10.7 ms', 8411],
+    ['sum', '468 ns', '1.97 ms', 4214],
+    ['distinct', '1.11 µs', '4.08 ms', 3675],
+    ['recursive_cte', '105 ns', '122 µs', 1165],
+    ['partial_index_point', '103 ns', '12.6 µs', 122],
+    ['view_point', '121 ns', '12.7 µs', 105],
+    ['point', '121 ns', '12.5 µs', 104],
+    ['count', '457 ns', '21.6 µs', 47],
+    ['select_gen_virtual', '1.05 µs', '18.1 µs', 17],
+  ];
+  const fmtRatio = (r) => {
+    if (r >= 1000) return r.toLocaleString('en-US') + '×';
+    return r.toFixed(r < 10 ? 2 : 0) + '×';
+  };
+  const renderBench = (id, data) => {
+    const table = document.getElementById(id);
+    if (!table) return;
+    const maxLog = Math.log10(data[0][3]);
+    const frag = document.createDocumentFragment();
+    data.forEach(([name, c, s, r]) => {
+      const w = Math.max(6, (Math.log10(r) / maxLog) * 100);
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `
+        <div class="name mono">${name}</div>
+        <div class="bar-wrap"><div class="bar"><i style="width:${w.toFixed(1)}%"></i></div></div>
+        <div class="num">${c}</div>
+        <div class="num">${s}</div>
+        <div class="ratio">${fmtRatio(r)}</div>`;
+      frag.appendChild(row);
+    });
+    table.appendChild(frag);
+  };
+  renderBench('benchTable', BENCH_EXEC);
+  renderBench('memoTable', BENCH_MEMO);
 })();
 
 (() => {

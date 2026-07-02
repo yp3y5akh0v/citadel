@@ -521,13 +521,16 @@ section.block { padding-top: 64px; padding-bottom: 64px; }
 .kpi .val em { font-style: normal; background: linear-gradient(180deg, var(--accent-2) 0%, var(--accent) 100%); -webkit-background-clip: text; background-clip: text; color: transparent; }
 .kpi .lab { font-size: 12.5px; color: var(--fg-3); margin-top: 6px; font-family: var(--f-mono); }
 
+.bench-sub { font-family: var(--f-mono); font-size: 13px; font-weight: 500; letter-spacing: 0.04em; text-transform: uppercase; color: var(--fg-3); margin: 34px 0 12px; }
 .bench-table { width: 100%; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; font-family: var(--f-mono); font-size: 13px; }
 .bench-table .row { display: grid; grid-template-columns: 220px 1fr 120px 110px 110px; align-items: center; padding: 11px 18px; border-top: 1px solid var(--line); transition: background .2s; }
 .bench-table .row:not(.h):hover { background: var(--bg-2); }
 .bench-table .row.h { background: var(--bg-2); color: var(--fg-3); font-size: 11.5px; border-top: none; letter-spacing: 0.02em; }
 .bench-table .name { color: var(--fg); }
 .bench-table .bar { height: 10px; background: var(--bg-3); border-radius: 3px; position: relative; overflow: hidden; }
-.bench-table .bar i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent-3) 0%, var(--accent) 60%, var(--accent-2) 100%); border-radius: 3px; width: 0; box-shadow: 0 0 10px rgba(95,185,234,0.3); transition: width 1.1s cubic-bezier(.2,.8,.2,1); }
+.bench-table .bar i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent-3) 0%, var(--accent) 60%, var(--accent-2) 100%); border-radius: 3px; box-shadow: 0 0 10px rgba(95,185,234,0.3); transform-origin: left; animation: bar-in 0.45s cubic-bezier(.2,.8,.2,1) backwards; }
+@keyframes bar-in { from { transform: scaleX(0); } }
+@media (prefers-reduced-motion: reduce) { .bench-table .bar i { animation: none; } }
 .bench-table .num { text-align: right; color: var(--fg-2); }
 .bench-table .ratio { text-align: right; color: var(--accent); font-weight: 500; }
 .bench-note { margin-top: 12px; font-size: 12.5px; color: var(--fg-3); font-family: var(--f-mono); }
