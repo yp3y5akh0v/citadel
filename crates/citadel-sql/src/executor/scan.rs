@@ -177,28 +177,25 @@ pub(super) fn covered_index_count_read(
     if idx.kind != IndexKind::BTree {
         return Ok(None);
     }
-    let num_index_cols = index_columns.len();
+    let has_range_col = *num_prefix_cols < index_columns.len();
     let start = index_scan_start(prefix, range_conds);
     let start: &[u8] = start.as_deref().unwrap_or(prefix);
     let mut count = 0u64;
     let mut scan_err: Option<SqlError> = None;
+    // Prefix bytes are equality-checked by starts_with: only the range
+    // component needs one decode for bounds plus the NULL skip.
     rtx.table_scan_from_fast(idx_table, start, |key, _value| {
         if !key.starts_with(prefix) {
             return Ok(false);
         }
-        match check_range_conditions(key, *num_prefix_cols, range_conds, num_index_cols) {
-            Ok(RangeCheck::ExceedsUpper) => return Ok(false),
-            Ok(RangeCheck::BelowLower) => return Ok(true),
-            Ok(RangeCheck::Match) => {}
-            Err(e) => {
-                scan_err = Some(e);
-                return Ok(false);
-            }
-        }
-        if !range_conds.is_empty() {
+        if !range_conds.is_empty() && has_range_col {
             match decode_nth_key_component(key, *num_prefix_cols) {
                 Ok(Value::Null) => return Ok(true),
-                Ok(_) => {}
+                Ok(v) => match check_pk_range(&v, range_conds) {
+                    2 => return Ok(false),
+                    1 => return Ok(true),
+                    _ => {}
+                },
                 Err(e) => {
                     scan_err = Some(e);
                     return Ok(false);
