@@ -53,14 +53,24 @@ pub fn bench(c: &mut Criterion) {
         .execute("CREATE INDEX idx_data ON users USING gin (data)")
         .unwrap();
 
-    let q = "SELECT id FROM users WHERE data @> '{\"role\":\"admin\"}'::jsonb";
+    // Rotating probes keep the single-slot result memo cold: execution speed.
+    let q = "SELECT id FROM users WHERE data @> $1::jsonb";
     let stmt_seq = conn_seq.prepare(q).unwrap();
     let stmt_gin = conn_gin.prepare(q).unwrap();
+    let probe = |i: i64| citadel_sql::Value::Text(format!("{{\"id\":{}}}", i % ROWS).into());
+    let mut si = 0i64;
     g.bench_function(BenchmarkId::new("seq_scan", ""), |b| {
-        b.iter(|| stmt_seq.query_collect(&[]).unwrap());
+        b.iter(|| {
+            si += 1;
+            stmt_seq.query_collect(&[probe(si)]).unwrap()
+        });
     });
+    let mut gi = 0i64;
     g.bench_function(BenchmarkId::new("gin_index", ""), |b| {
-        b.iter(|| stmt_gin.query_collect(&[]).unwrap());
+        b.iter(|| {
+            gi += 1;
+            stmt_gin.query_collect(&[probe(gi)]).unwrap()
+        });
     });
     g.finish();
 }
