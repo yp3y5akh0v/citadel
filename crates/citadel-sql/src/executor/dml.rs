@@ -508,7 +508,8 @@ pub(super) fn exec_insert(
                     &pk_values,
                     oc_ref,
                     row_col_map.unwrap(),
-                    stmt.returning.is_some(),
+                    // Trigger dispatch needs the Updated outcome's rows too.
+                    stmt.returning.is_some() || has_after_update_triggers,
                 )?;
                 match outcome {
                     InsertRowOutcome::Inserted => {
@@ -2015,7 +2016,8 @@ fn exec_insert_in_txn_impl(
                     &bufs.pk_values,
                     oc_ref,
                     row_col_map.unwrap(),
-                    stmt.returning.is_some(),
+                    // Trigger dispatch needs the Updated outcome's rows too.
+                    stmt.returning.is_some() || has_after_update_triggers,
                 )?;
                 match outcome {
                     InsertRowOutcome::Inserted => {
