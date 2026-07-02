@@ -627,6 +627,11 @@ pub(super) fn stmt_has_subquery(stmt: &SelectStmt) -> bool {
             return true;
         }
     }
+    for gb in &stmt.group_by {
+        if has_subquery(gb) {
+            return true;
+        }
+    }
     for join in &stmt.joins {
         if let Some(ref on_expr) = join.on_clause {
             if has_subquery(on_expr) {

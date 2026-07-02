@@ -685,3 +685,25 @@ fn raw_column_array_decodes() {
     assert!(matches!(raw, RawColumn::Array(_)));
     assert_eq!(raw.to_value(), v);
 }
+
+#[test]
+fn vector_key_round_trips() {
+    let mut buf = Vec::new();
+    let v = Value::Vector(std::sync::Arc::from(vec![1.5f32, -2.25, 0.0]));
+    encode_key_value_into(&v, &mut buf);
+    let (decoded, n) = decode_key_value(&buf).unwrap();
+    assert_eq!(n, buf.len());
+    match decoded {
+        Value::Vector(d) => assert_eq!(&d[..], &[1.5f32, -2.25, 0.0]),
+        other => panic!("expected vector, got {other:?}"),
+    }
+}
+
+#[test]
+fn composite_key_with_vector_component() {
+    let mut buf = Vec::new();
+    encode_key_value_into(&Value::Vector(std::sync::Arc::from(vec![3.0f32])), &mut buf);
+    encode_key_value_into(&Value::Integer(42), &mut buf);
+    let vals = decode_composite_key(&buf, 2).unwrap();
+    assert_eq!(vals[1], Value::Integer(42));
+}
