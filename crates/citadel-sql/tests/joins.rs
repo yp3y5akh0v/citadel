@@ -1045,3 +1045,107 @@ fn full_outer_join_explain_string() {
         "expected FULL OUTER JOIN in plan: {plan:?}"
     );
 }
+
+#[test]
+fn cached_join_probe_reuse_with_rotating_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, bid INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, tag TEXT)")
+        .unwrap();
+    for i in 1..=20 {
+        conn.execute(&format!("INSERT INTO b VALUES ({i}, 't{i}')"))
+            .unwrap();
+        conn.execute(&format!("INSERT INTO a VALUES ({i}, {})", 21 - i))
+            .unwrap();
+    }
+
+    let stmt = conn
+        .prepare("SELECT a.id, b.tag FROM a JOIN b ON a.bid = b.id WHERE a.id = $1")
+        .unwrap();
+    for id in [3i64, 17, 3, 9] {
+        let qr = stmt.query_collect(&[Value::Integer(id)]).unwrap();
+        assert_eq!(
+            qr.rows,
+            vec![vec![
+                Value::Integer(id),
+                Value::Text(format!("t{}", 21 - id).into()),
+            ]],
+            "id {id}"
+        );
+    }
+}
+
+#[test]
+fn cached_join_sees_inner_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, bid INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO a VALUES (1, 10)").unwrap();
+    conn.execute("INSERT INTO b VALUES (10, 100)").unwrap();
+
+    let stmt = conn
+        .prepare("SELECT b.v FROM a JOIN b ON a.bid = b.id")
+        .unwrap();
+    assert_eq!(
+        stmt.query_collect(&[]).unwrap().rows,
+        vec![vec![Value::Integer(100)]]
+    );
+    conn.execute("UPDATE b SET v = 200 WHERE id = 10").unwrap();
+    assert_eq!(
+        stmt.query_collect(&[]).unwrap().rows,
+        vec![vec![Value::Integer(200)]]
+    );
+    conn.execute("INSERT INTO b VALUES (11, 1)").unwrap();
+    conn.execute("INSERT INTO a VALUES (2, 11)").unwrap();
+    assert_eq!(stmt.query_collect(&[]).unwrap().rows.len(), 2);
+}
+
+#[test]
+fn cached_join_text_keys_and_nulls() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO a VALUES (1, 'x'), (2, NULL), (3, 'y')")
+        .unwrap();
+    conn.execute("INSERT INTO b VALUES (1, 'x', 10), (2, NULL, 20), (3, 'z', 30)")
+        .unwrap();
+
+    let stmt = conn
+        .prepare("SELECT a.id, b.v FROM a LEFT JOIN b ON a.k = b.k ORDER BY a.id")
+        .unwrap();
+    let expect = vec![
+        vec![Value::Integer(1), Value::Integer(10)],
+        vec![Value::Integer(2), Value::Null],
+        vec![Value::Integer(3), Value::Null],
+    ];
+    assert_eq!(stmt.query_collect(&[]).unwrap().rows, expect);
+    assert_eq!(stmt.query_collect(&[]).unwrap().rows, expect);
+}
+
+#[test]
+fn probe_null_join_unprepared() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE pa (id INTEGER PRIMARY KEY, k TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE pb (id INTEGER PRIMARY KEY, k TEXT, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO pa VALUES (2, NULL)").unwrap();
+    conn.execute("INSERT INTO pb VALUES (2, NULL, 20)").unwrap();
+    let qr = conn
+        .query("SELECT pa.id, pb.v FROM pa LEFT JOIN pb ON pa.k = pb.k")
+        .unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Integer(2), Value::Null]]);
+}
