@@ -4,7 +4,7 @@ use crate::error::{Result, SqlError};
 use crate::types::{CompactString, DataType, Value};
 
 /// Type tags for order-preserving key encoding.
-const TAG_NULL: u8 = 0x00;
+pub(crate) const TAG_NULL: u8 = 0x00;
 const TAG_BLOB: u8 = 0x01;
 const TAG_TEXT: u8 = 0x02;
 const TAG_BOOLEAN: u8 = 0x03;

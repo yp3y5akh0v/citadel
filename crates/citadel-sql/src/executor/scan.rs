@@ -180,24 +180,49 @@ pub(super) fn covered_index_count_read(
     let has_range_col = *num_prefix_cols < index_columns.len();
     let start = index_scan_start(prefix, range_conds);
     let start: &[u8] = start.as_deref().unwrap_or(prefix);
+    // Key encoding is order-preserving and prefix-free: bounds compare as
+    // raw component bytes, so the loop never decodes.
+    let enc = |v: &Value| {
+        let mut b = Vec::new();
+        crate::encoding::encode_key_value_into(v, &mut b);
+        b
+    };
+    let strict_lower: Option<Vec<u8>> = range_conds
+        .iter()
+        .filter(|(op, _)| matches!(op, BinOp::Gt))
+        .map(|(_, v)| enc(v))
+        .max();
+    let uppers: Vec<(Vec<u8>, bool)> = range_conds
+        .iter()
+        .filter_map(|(op, v)| match op {
+            BinOp::Lt => Some((enc(v), false)),
+            BinOp::LtEq => Some((enc(v), true)),
+            _ => None,
+        })
+        .collect();
+    let check_bounds = !range_conds.is_empty() && has_range_col;
     let mut count = 0u64;
-    let mut scan_err: Option<SqlError> = None;
-    // Prefix bytes are equality-checked by starts_with: only the range
-    // component needs one decode for bounds plus the NULL skip.
     rtx.table_scan_from_fast(idx_table, start, |key, _value| {
         if !key.starts_with(prefix) {
             return Ok(false);
         }
-        if !range_conds.is_empty() && has_range_col {
-            match decode_nth_key_component(key, *num_prefix_cols) {
-                Ok(Value::Null) => return Ok(true),
-                Ok(v) => match check_pk_range(&v, range_conds) {
-                    2 => return Ok(false),
-                    1 => return Ok(true),
-                    _ => {}
-                },
-                Err(e) => {
-                    scan_err = Some(e);
+        if check_bounds {
+            let rest = &key[prefix.len()..];
+            // NULL never satisfies a comparison; it sorts below every bound.
+            if rest.first() == Some(&crate::encoding::TAG_NULL) {
+                return Ok(true);
+            }
+            if let Some(lb) = &strict_lower {
+                if rest.starts_with(lb) {
+                    return Ok(true);
+                }
+            }
+            for (ub, inclusive) in &uppers {
+                if rest.starts_with(ub.as_slice()) {
+                    if !*inclusive {
+                        return Ok(false);
+                    }
+                } else if rest > ub.as_slice() {
                     return Ok(false);
                 }
             }
@@ -206,19 +231,7 @@ pub(super) fn covered_index_count_read(
         Ok(true)
     })
     .map_err(SqlError::Storage)?;
-    if let Some(e) = scan_err {
-        return Err(e);
-    }
     Ok(Some(count))
-}
-
-fn decode_nth_key_component(key: &[u8], n: usize) -> Result<Value> {
-    let mut pos = 0;
-    for _ in 0..n {
-        let (_, len) = decode_key_value(&key[pos..])?;
-        pos += len;
-    }
-    Ok(decode_key_value(&key[pos..])?.0)
 }
 
 /// Check PK range conditions. Returns: 0 = match, 1 = below lower (skip), 2 = above upper (stop).
