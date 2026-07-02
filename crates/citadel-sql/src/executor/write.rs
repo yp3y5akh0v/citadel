@@ -635,12 +635,360 @@ impl CompiledPlan for CompiledUpdate {
     }
 }
 
+pub struct CompiledDelete {
+    table_name_lower: String,
+    is_view: bool,
+    has_correlated_where: bool,
+    has_subquery: bool,
+    fast: Option<CompiledDeleteFast>,
+}
+
+struct CompiledDeleteFast {
+    single_int_pk: bool,
+    num_columns: usize,
+    pk_idx: usize,
+    shape: DeleteShape,
+    returning_fast: Option<ReturningFast>,
+}
+
+enum DeleteShape {
+    PkLookup(PkLookupFast),
+    PkRange(Vec<(BinOp, PkLookupSource)>),
+}
+
+/// Every conjunct must be a pk range op with a Literal/Parameter bound; the
+/// lane consumes the WHERE in full (never a planner superset prefilter).
+fn detect_pk_range_fast(
+    where_clause: &Option<Expr>,
+    table_schema: &TableSchema,
+) -> Option<Vec<(BinOp, PkLookupSource)>> {
+    let pk = &table_schema.primary_key_columns;
+    if pk.len() != 1 {
+        return None;
+    }
+    let pk_name = table_schema.columns[pk[0] as usize]
+        .name
+        .to_ascii_lowercase();
+    let mut out = Vec::new();
+    collect_pk_range_conjuncts(where_clause.as_ref()?, &pk_name, &mut out).then_some(out)
+}
+
+fn collect_pk_range_conjuncts(
+    expr: &Expr,
+    pk_name: &str,
+    out: &mut Vec<(BinOp, PkLookupSource)>,
+) -> bool {
+    let (left, op, right) = match expr {
+        Expr::BinaryOp { left, op, right } => (left.as_ref(), *op, right.as_ref()),
+        _ => return false,
+    };
+    if op == BinOp::And {
+        return collect_pk_range_conjuncts(left, pk_name, out)
+            && collect_pk_range_conjuncts(right, pk_name, out);
+    }
+    let flipped = match op {
+        BinOp::Lt => BinOp::Gt,
+        BinOp::LtEq => BinOp::GtEq,
+        BinOp::Gt => BinOp::Lt,
+        BinOp::GtEq => BinOp::LtEq,
+        _ => return false,
+    };
+    let col_matches = |e: &Expr| match e {
+        Expr::Column(name) => name.eq_ignore_ascii_case(pk_name),
+        Expr::QualifiedColumn { column, .. } => column.eq_ignore_ascii_case(pk_name),
+        _ => false,
+    };
+    let source = |e: &Expr| match e {
+        Expr::Literal(v) => Some(PkLookupSource::Literal(v.clone())),
+        Expr::Parameter(n) => Some(PkLookupSource::Parameter(*n)),
+        _ => None,
+    };
+    let pushed = if col_matches(left) {
+        source(right).map(|s| (op, s))
+    } else if col_matches(right) {
+        source(left).map(|s| (flipped, s))
+    } else {
+        None
+    };
+    match pushed {
+        Some(cond) => {
+            out.push(cond);
+            true
+        }
+        None => false,
+    }
+}
+
+impl CompiledDelete {
+    pub fn try_compile(schema: &SchemaManager, stmt: &DeleteStmt) -> Option<Self> {
+        let user_name = stmt.table.to_ascii_lowercase();
+        // Matview names resolve to their backing table; only the interpreted
+        // path raises the modification error.
+        if schema.get_view(&user_name).is_some() || schema.get_matview(&user_name).is_some() {
+            return Some(Self {
+                table_name_lower: user_name,
+                is_view: true,
+                has_correlated_where: false,
+                has_subquery: false,
+                fast: None,
+            });
+        }
+        let table_schema = schema.get(&user_name)?;
+        // Storage name (post-TEMP-alias resolution); used by wtx.table_* calls.
+        let table_name_lower = table_schema.name.clone();
+
+        let corr_ctx = CorrelationCtx {
+            outer_schema: table_schema,
+            outer_alias: None,
+        };
+        let has_correlated = has_correlated_where(&stmt.where_clause, &corr_ctx, schema);
+        let has_sub = super::dml::delete_has_subquery(stmt);
+
+        // No-WHERE keeps the truncate fast path in the interpreted executors.
+        let fast_eligible = !has_correlated
+            && !has_sub
+            && stmt.where_clause.is_some()
+            && table_schema.indices.is_empty()
+            && schema.child_fks_for(&table_name_lower).is_empty()
+            && !super::triggers::has_delete_triggers(schema, &table_schema.name);
+
+        let fast = if fast_eligible {
+            let pk_indices = table_schema.pk_indices();
+            let single_int_pk = table_schema.primary_key_columns.len() == 1
+                && table_schema.columns[table_schema.primary_key_columns[0] as usize].data_type
+                    == DataType::Integer;
+            let shape = if let Some(pk) = detect_pk_lookup_fast(&stmt.where_clause, table_schema) {
+                Some(DeleteShape::PkLookup(pk))
+            } else {
+                detect_pk_range_fast(&stmt.where_clause, table_schema).map(DeleteShape::PkRange)
+            };
+            shape.map(|shape| {
+                let returning_fast = match (&shape, stmt.returning.as_ref()) {
+                    (DeleteShape::PkLookup(_), Some(r)) => {
+                        compile_returning_fast(table_schema, r, |idx| pk_indices.contains(&idx))
+                    }
+                    _ => None,
+                };
+                CompiledDeleteFast {
+                    single_int_pk,
+                    num_columns: table_schema.columns.len(),
+                    pk_idx: pk_indices[0],
+                    shape,
+                    returning_fast,
+                }
+            })
+        } else {
+            None
+        };
+
+        Some(Self {
+            table_name_lower,
+            is_view: false,
+            has_correlated_where: has_correlated,
+            has_subquery: has_sub,
+            fast,
+        })
+    }
+
+    fn run_fast(
+        &self,
+        wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+        fast: &CompiledDeleteFast,
+        bufs: &mut UpdateBufs,
+        empty_query_on_zero_match: bool,
+    ) -> Result<ExecutionResult> {
+        match &fast.shape {
+            DeleteShape::PkLookup(pk) => {
+                let pk_value = match &pk.source {
+                    PkLookupSource::Literal(v) => v.clone(),
+                    PkLookupSource::Parameter(n) => crate::eval::resolve_scoped_param(*n)?,
+                };
+                exec_pk_lookup_delete(
+                    wtx,
+                    &self.table_name_lower,
+                    &pk_value,
+                    fast,
+                    bufs,
+                    empty_query_on_zero_match,
+                )
+            }
+            DeleteShape::PkRange(bounds) => exec_pk_range_delete(
+                wtx,
+                &self.table_name_lower,
+                bounds,
+                fast.single_int_pk,
+                bufs,
+            ),
+        }
+    }
+}
+
+impl CompiledPlan for CompiledDelete {
+    fn execute(
+        &self,
+        db: &Database,
+        schema: &SchemaManager,
+        stmt: &Statement,
+        _params: &[Value],
+        txn: super::compile::ActiveTxnRef<'_, '_>,
+    ) -> Result<ExecutionResult> {
+        let del = match stmt {
+            Statement::Delete(d) => d,
+            _ => {
+                return Err(SqlError::Unsupported(
+                    "CompiledDelete received non-DELETE statement".into(),
+                ))
+            }
+        };
+        let fast = match &self.fast {
+            Some(f)
+                if !self.is_view
+                    && !self.has_correlated_where
+                    && !self.has_subquery
+                    // Only the pk-lookup lane produces RETURNING rows.
+                    && (del.returning.is_none() || f.returning_fast.is_some()) =>
+            {
+                Some(f)
+            }
+            _ => None,
+        };
+        use super::compile::ActiveTxnRef;
+        match txn {
+            ActiveTxnRef::None => {
+                let Some(fast) = fast else {
+                    return exec_delete(db, schema, del);
+                };
+                let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+                // No segment purge: this lane compiles only for index-free tables.
+                schema.mark_dml(&self.table_name_lower);
+                let result = with_update_scratch(|bufs| self.run_fast(&mut wtx, fast, bufs, true))?;
+                super::helpers::drain_deferred_fk_checks(&mut wtx)?;
+                wtx.commit().map_err(SqlError::Storage)?;
+                Ok(result)
+            }
+            ActiveTxnRef::Read(_) => Err(SqlError::Unsupported(
+                "cannot execute mutating statement inside a read-only transaction".into(),
+            )),
+            ActiveTxnRef::Write(outer) => {
+                let Some(fast) = fast else {
+                    return exec_delete_in_txn(outer, schema, del);
+                };
+                // No mark_dml: index-free at compile generation, like the
+                // compiled UPDATE in-txn lane; fallbacks mark on their own.
+                with_update_scratch(|bufs| self.run_fast(outer, fast, bufs, false))
+            }
+        }
+    }
+}
+
+fn exec_pk_lookup_delete(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    table_name_lower: &str,
+    pk_value: &Value,
+    fast: &CompiledDeleteFast,
+    bufs: &mut UpdateBufs,
+    empty_query_on_zero_match: bool,
+) -> Result<ExecutionResult> {
+    let key = crate::encoding::encode_composite_key(std::slice::from_ref(pk_value));
+    let Some(rf) = fast.returning_fast.as_ref() else {
+        let deleted = wtx
+            .table_delete(table_name_lower.as_bytes(), &key)
+            .map_err(SqlError::Storage)?;
+        return Ok(ExecutionResult::RowsAffected(u64::from(deleted)));
+    };
+    let Some(bytes) = wtx
+        .table_get(table_name_lower.as_bytes(), &key)
+        .map_err(SqlError::Storage)?
+    else {
+        // Zero-match RETURNING shape differs per path; pinned by tests.
+        return Ok(if empty_query_on_zero_match {
+            ExecutionResult::Query(QueryResult {
+                columns: rf.col_names.clone(),
+                rows: Vec::new(),
+            })
+        } else {
+            ExecutionResult::RowsAffected(0)
+        });
+    };
+    bufs.partial_row.clear();
+    bufs.partial_row.resize(fast.num_columns, Value::Null);
+    bufs.partial_row[fast.pk_idx] = pk_value.clone();
+    decode_cols_into(&bytes, &rf.extra_decode, &mut bufs.partial_row)?;
+    let row: Vec<Value> = rf
+        .out_idx
+        .iter()
+        .map(|&i| bufs.partial_row[i].clone())
+        .collect();
+    wtx.table_delete(table_name_lower.as_bytes(), &key)
+        .map_err(SqlError::Storage)?;
+    Ok(ExecutionResult::Query(QueryResult {
+        columns: rf.col_names.clone(),
+        rows: vec![row],
+    }))
+}
+
+fn exec_pk_range_delete(
+    wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
+    table_name_lower: &str,
+    bounds: &[(BinOp, PkLookupSource)],
+    single_int_pk: bool,
+    bufs: &mut UpdateBufs,
+) -> Result<ExecutionResult> {
+    let range_conds: Vec<(BinOp, Value)> = bounds
+        .iter()
+        .map(|(op, s)| {
+            Ok((
+                *op,
+                match s {
+                    PkLookupSource::Literal(v) => v.clone(),
+                    PkLookupSource::Parameter(n) => crate::eval::resolve_scoped_param(*n)?,
+                },
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let start_key = range_conds
+        .iter()
+        .filter(|(op, _)| matches!(op, BinOp::GtEq | BinOp::Gt))
+        .map(|(_, v)| crate::encoding::encode_composite_key(std::slice::from_ref(v)))
+        .min()
+        .unwrap_or_default();
+
+    bufs.kv_pairs.clear();
+    let mut scan_err: Option<SqlError> = None;
+    wtx.table_scan_from(
+        table_name_lower.as_bytes(),
+        &start_key,
+        |key, _value| match range_in_bounds(key, single_int_pk, 1, &range_conds, &mut scan_err) {
+            RangeStatus::Stop | RangeStatus::Err => Ok(false),
+            RangeStatus::Skip => Ok(true),
+            RangeStatus::Hit => {
+                bufs.kv_pairs.push((key.to_vec(), Vec::new()));
+                Ok(true)
+            }
+        },
+    )
+    .map_err(SqlError::Storage)?;
+    if let Some(e) = scan_err {
+        return Err(e);
+    }
+
+    let mut count = 0u64;
+    for (key, _) in &bufs.kv_pairs {
+        if wtx
+            .table_delete(table_name_lower.as_bytes(), key)
+            .map_err(SqlError::Storage)?
+        {
+            count += 1;
+        }
+    }
+    Ok(ExecutionResult::RowsAffected(count))
+}
+
 fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<CompiledUpdate> {
     let user_name = stmt.table.to_ascii_lowercase();
     // Matview names resolve to their backing table; only the interpreted
     // path raises the modification error.
-    let is_view =
-        schema.get_view(&user_name).is_some() || schema.get_matview(&user_name).is_some();
+    let is_view = schema.get_view(&user_name).is_some() || schema.get_matview(&user_name).is_some();
     if is_view {
         return Ok(CompiledUpdate {
             table_name_lower: user_name,
@@ -1975,14 +2323,7 @@ pub(super) fn exec_delete(
     }
 
     // Fast TRUNCATE path skips per-row firing; gate on no DELETE triggers (ROW + STATEMENT).
-    let has_delete_triggers = schema.triggers_for(&table_schema.name).iter().any(|t| {
-        t.enabled
-            && (t.timing == crate::parser::TriggerTiming::After
-                || t.timing == crate::parser::TriggerTiming::Before)
-            && t.events
-                .iter()
-                .any(|e| matches!(e, crate::parser::TriggerEvent::Delete))
-    });
+    let has_delete_triggers = super::triggers::has_delete_triggers(schema, &table_schema.name);
     if stmt.where_clause.is_none()
         && schema.child_fks_for(&lower_name).is_empty()
         && stmt.returning.is_none()
@@ -3626,14 +3967,8 @@ pub(super) fn exec_delete_in_txn(
     }
     let lower_name = table_schema.name.clone();
 
-    let has_delete_triggers_in_txn = schema.triggers_for(&table_schema.name).iter().any(|t| {
-        t.enabled
-            && (t.timing == crate::parser::TriggerTiming::After
-                || t.timing == crate::parser::TriggerTiming::Before)
-            && t.events
-                .iter()
-                .any(|e| matches!(e, crate::parser::TriggerEvent::Delete))
-    });
+    let has_delete_triggers_in_txn =
+        super::triggers::has_delete_triggers(schema, &table_schema.name);
     if stmt.where_clause.is_none()
         && schema.child_fks_for(&user_name).is_empty()
         && stmt.returning.is_none()

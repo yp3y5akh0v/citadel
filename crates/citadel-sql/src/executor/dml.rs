@@ -3749,47 +3749,6 @@ impl CompiledPlan for CompiledInsert {
     }
 }
 
-pub struct CompiledDelete {
-    table_lower: String,
-}
-
-impl CompiledDelete {
-    pub fn try_compile(schema: &SchemaManager, stmt: &DeleteStmt) -> Option<Self> {
-        let lower = stmt.table.to_ascii_lowercase();
-        schema.get(&lower)?;
-        Some(Self { table_lower: lower })
-    }
-}
-
-impl CompiledPlan for CompiledDelete {
-    fn execute(
-        &self,
-        db: &Database,
-        schema: &SchemaManager,
-        stmt: &Statement,
-        _params: &[Value],
-        txn: super::compile::ActiveTxnRef<'_, '_>,
-    ) -> Result<ExecutionResult> {
-        let del = match stmt {
-            Statement::Delete(d) => d,
-            _ => {
-                return Err(SqlError::Unsupported(
-                    "CompiledDelete received non-DELETE statement".into(),
-                ))
-            }
-        };
-        let _ = &self.table_lower;
-        use super::compile::ActiveTxnRef;
-        match txn {
-            ActiveTxnRef::None => super::write::exec_delete(db, schema, del),
-            ActiveTxnRef::Read(_) => Err(SqlError::Unsupported(
-                "cannot execute mutating statement inside a read-only transaction".into(),
-            )),
-            ActiveTxnRef::Write(outer) => super::write::exec_delete_in_txn(outer, schema, del),
-        }
-    }
-}
-
 fn exec_instead_of_view_insert_auto(
     db: &Database,
     schema: &SchemaManager,
