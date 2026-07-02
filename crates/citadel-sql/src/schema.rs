@@ -26,6 +26,15 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Borrow already-lowercase names (the common hot-path case), allocate otherwise.
+fn lower_cow(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    }
+}
+
 fn transition_table_lookup(name_lower: &str) -> Option<String> {
     TRANSITION_TABLES.with(|cell| {
         let stack = cell.borrow();
@@ -115,22 +124,29 @@ impl SchemaManager {
 
     /// Mark a table mutated (UPDATE/DELETE/upsert/DDL); supersedes a pending append.
     pub fn mark_dml(&self, table_name: &str) {
-        let lower = table_name.to_ascii_lowercase();
-        self.dml_append_tables.borrow_mut().remove(&lower);
-        self.dml_dirty_tables.borrow_mut().insert(lower);
+        let key = lower_cow(table_name);
+        // Dirty implies no pending append (mark_dml_append checks dirty first;
+        // this fn removes the append entry before inserting dirty).
+        if self.dml_dirty_tables.borrow().contains(key.as_ref()) {
+            return;
+        }
+        self.dml_append_tables.borrow_mut().remove(key.as_ref());
+        self.dml_dirty_tables.borrow_mut().insert(key.into_owned());
     }
 
     /// Mark a pure append with the smallest inserted pk; no-op if already mutating.
     pub fn mark_dml_append(&self, table_name: &str, min_pk: i64) {
-        let lower = table_name.to_ascii_lowercase();
-        if self.dml_dirty_tables.borrow().contains(&lower) {
+        let key = lower_cow(table_name);
+        if self.dml_dirty_tables.borrow().contains(key.as_ref()) {
             return;
         }
-        self.dml_append_tables
-            .borrow_mut()
-            .entry(lower)
-            .and_modify(|m| *m = (*m).min(min_pk))
-            .or_insert(min_pk);
+        let mut appends = self.dml_append_tables.borrow_mut();
+        match appends.get_mut(key.as_ref()) {
+            Some(m) => *m = (*m).min(min_pk),
+            None => {
+                appends.insert(key.into_owned(), min_pk);
+            }
+        }
     }
 
     /// Take the touched tables, classified into mutating vs pure-append.
@@ -312,8 +328,17 @@ impl SchemaManager {
     }
 
     pub fn get(&self, name: &str) -> Option<&TableSchema> {
-        let lower = name.to_ascii_lowercase();
-        if let Some(prefixed) = transition_table_lookup(&lower) {
+        // Hot callers pass pre-lowered names; those skip the String alloc.
+        if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.get_lower(&name.to_ascii_lowercase())
+        } else {
+            self.get_lower(name)
+        }
+    }
+
+    /// Resolution precedence: transition > matview > temp alias > base table.
+    fn get_lower(&self, lower: &str) -> Option<&TableSchema> {
+        if let Some(prefixed) = transition_table_lookup(lower) {
             if let Some(s) = self.tables.get(&prefixed) {
                 return Some(s);
             }
@@ -321,20 +346,18 @@ impl SchemaManager {
                 return Some(leaked);
             }
         }
-        if let Some(mv) = self.matviews.get(&lower) {
-            return self.tables.get(&mv.backing_table);
+        if !self.matviews.is_empty() {
+            if let Some(mv) = self.matviews.get(lower) {
+                return self.tables.get(&mv.backing_table);
+            }
         }
-        if let Some(prefixed) = self.temp_aliases.get(&lower) {
-            return self.tables.get(prefixed);
+        if !self.temp_aliases.is_empty() {
+            if let Some(prefixed) = self.temp_aliases.get(lower) {
+                return self.tables.get(prefixed);
+            }
         }
-        if let Some(s) = self.tables.get(name) {
-            return Some(s);
-        }
-        if name.bytes().any(|b| b.is_ascii_uppercase()) {
-            self.tables.get(&lower)
-        } else {
-            None
-        }
+        // Table keys are registered lowercase; one canonical probe suffices.
+        self.tables.get(lower)
     }
 
     pub fn register_transition_schema(&self, storage_name: String, schema: TableSchema) {
@@ -349,24 +372,18 @@ impl SchemaManager {
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        let lower = name.to_ascii_lowercase();
-        if transition_table_lookup(&lower).is_some() {
-            return true;
-        }
-        if self.matviews.contains_key(&lower) {
-            return true;
-        }
-        if self.temp_aliases.contains_key(&lower) {
-            return true;
-        }
-        if self.tables.contains_key(name) {
-            return true;
-        }
         if name.bytes().any(|b| b.is_ascii_uppercase()) {
-            self.tables.contains_key(&lower)
+            self.contains_lower(&name.to_ascii_lowercase())
         } else {
-            false
+            self.contains_lower(name)
         }
+    }
+
+    fn contains_lower(&self, lower: &str) -> bool {
+        transition_table_lookup(lower).is_some()
+            || (!self.matviews.is_empty() && self.matviews.contains_key(lower))
+            || (!self.temp_aliases.is_empty() && self.temp_aliases.contains_key(lower))
+            || self.tables.contains_key(lower)
     }
 
     pub fn generation(&self) -> u64 {

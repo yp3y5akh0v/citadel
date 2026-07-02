@@ -113,8 +113,11 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
 
     /// Execute and return a stepping `Rows<'_>` iterator.
     pub fn query(&self, params: &[Value]) -> Result<Rows<'_>> {
-        if let Some(stream) = self.stream_fast_path(params)? {
-            return Ok(Rows::streaming(stream));
+        // Fast paths are SELECT-only; run() re-checks arity identically first.
+        if self.readonly {
+            if let Some(stream) = self.stream_fast_path(params)? {
+                return Ok(Rows::streaming(stream));
+            }
         }
         let (columns, rows) = match self.run(params)? {
             ExecutionResult::Query(qr) => (qr.columns, qr.rows),
@@ -127,16 +130,18 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
 
     /// Execute and return the fully-materialized `QueryResult`.
     pub fn query_collect(&self, params: &[Value]) -> Result<QueryResult> {
-        if let Some(qr) = self.collect_fast_path(params)? {
-            return Ok(qr);
-        }
-        if let Some(mut stream) = self.stream_fast_path(params)? {
-            let columns = stream.columns().to_vec();
-            let mut rows = Vec::with_capacity(stream.size_hint());
-            while let Some(row) = stream.next_row()? {
-                rows.push(row);
+        if self.readonly {
+            if let Some(qr) = self.collect_fast_path(params)? {
+                return Ok(qr);
             }
-            return Ok(QueryResult { columns, rows });
+            if let Some(mut stream) = self.stream_fast_path(params)? {
+                let columns = stream.columns().to_vec();
+                let mut rows = Vec::with_capacity(stream.size_hint());
+                while let Some(row) = stream.next_row()? {
+                    rows.push(row);
+                }
+                return Ok(QueryResult { columns, rows });
+            }
         }
         match self.run(params)? {
             ExecutionResult::Query(qr) => Ok(qr),
@@ -165,8 +170,10 @@ impl<'c, 'db> PreparedStatement<'c, 'db> {
 
     /// True if the query returns at least one row (DML returns `n > 0`).
     pub fn exists(&self, params: &[Value]) -> Result<bool> {
-        if let Some(mut stream) = self.stream_fast_path(params)? {
-            return Ok(stream.next_row()?.is_some());
+        if self.readonly {
+            if let Some(mut stream) = self.stream_fast_path(params)? {
+                return Ok(stream.next_row()?.is_some());
+            }
         }
         match self.run(params)? {
             ExecutionResult::Query(qr) => Ok(!qr.rows.is_empty()),

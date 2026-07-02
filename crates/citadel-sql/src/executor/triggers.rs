@@ -55,6 +55,25 @@ pub(super) fn has_insert_triggers(schema: &SchemaManager, table: &str) -> bool {
     })
 }
 
+/// Kind-only check: the `UPDATE OF` column intersection happens at fire time.
+pub(super) fn has_statement_update_triggers(schema: &SchemaManager, table: &str) -> bool {
+    schema.triggers_for(table).iter().any(|t| {
+        t.enabled
+            && t.granularity == TriggerGranularity::ForEachStatement
+            && t.events
+                .iter()
+                .any(|e| matches!(e, TriggerEvent::Update(_)))
+    })
+}
+
+pub(super) fn has_statement_delete_triggers(schema: &SchemaManager, table: &str) -> bool {
+    schema.triggers_for(table).iter().any(|t| {
+        t.enabled
+            && t.granularity == TriggerGranularity::ForEachStatement
+            && t.events.iter().any(|e| matches!(e, TriggerEvent::Delete))
+    })
+}
+
 pub(super) fn exec_create_trigger(
     db: &Database,
     schema: &mut SchemaManager,
