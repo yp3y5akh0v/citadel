@@ -4450,6 +4450,19 @@ struct JoinPlanStatic {
 struct CachedJoin {
     cached_gen: u64,
     inner_per_table: Vec<Vec<Vec<Value>>>,
+    probes: Vec<super::join::ProbeIndex>,
+}
+
+/// Retention cap for the per-generation join cache (values, not bytes).
+const JOIN_CACHE_MAX_CELLS: usize = 262_144;
+
+impl CachedJoin {
+    fn cell_count(&self) -> usize {
+        self.inner_per_table
+            .iter()
+            .map(|rows| rows.len() * rows.first().map_or(0, Vec::len))
+            .sum()
+    }
 }
 
 struct CompoundPlanStatic {
@@ -5134,11 +5147,19 @@ fn execute_cached_join_with_read(
             Some(c) if c.cached_gen == snapshot_gen => Arc::clone(c),
             _ => {
                 let inner = build_inner_data(rtx, plan)?;
+                let probes = inner
+                    .iter()
+                    .zip(&plan.step_equi)
+                    .map(|(rows, (pairs, pure))| super::join::build_probe_index(rows, pairs, *pure))
+                    .collect();
                 let arc = Arc::new(CachedJoin {
                     cached_gen: snapshot_gen,
                     inner_per_table: inner,
+                    probes,
                 });
-                *slot = Some(Arc::clone(&arc));
+                if arc.cell_count() <= JOIN_CACHE_MAX_CELLS {
+                    *slot = Some(Arc::clone(&arc));
+                }
                 arc
             }
         }
@@ -5198,6 +5219,7 @@ fn execute_cached_join_with_read(
             proj.as_ref(),
             equi_pairs,
             *is_pure_equi,
+            Some(&cached.probes[ji]),
         );
         cur_outer_pk_col = None;
     }

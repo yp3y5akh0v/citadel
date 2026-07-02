@@ -1417,6 +1417,43 @@ pub(super) fn try_integer_join_borrowed(
         }
     }
 
+    Ok(integer_join_with_map(
+        outer_rows,
+        join_type,
+        &IntJoinCtx {
+            inner_rows,
+            inner_map: &inner_map,
+            outer_key_col,
+            outer_col_count,
+            inner_col_count,
+            projection,
+        },
+    ))
+}
+
+pub(super) struct IntJoinCtx<'a> {
+    inner_rows: &'a [Vec<Value>],
+    inner_map: &'a FxHashMap<i64, Vec<usize>>,
+    outer_key_col: usize,
+    outer_col_count: usize,
+    inner_col_count: usize,
+    projection: Option<&'a CombineProjection>,
+}
+
+fn integer_join_with_map(
+    outer_rows: Vec<Vec<Value>>,
+    join_type: &JoinType,
+    ctx: &IntJoinCtx<'_>,
+) -> Vec<Vec<Value>> {
+    let IntJoinCtx {
+        inner_rows,
+        inner_map,
+        outer_key_col,
+        outer_col_count,
+        inner_col_count,
+        projection,
+    } = *ctx;
+    let cap = projection.map_or(outer_col_count + inner_col_count, |p| p.slots.len());
     let mut result = Vec::with_capacity(inner_rows.len());
 
     match join_type {
@@ -1531,7 +1568,50 @@ pub(super) fn try_integer_join_borrowed(
         }
     }
 
-    Ok(result)
+    result
+}
+
+/// Probe side of a pure-equi join step, cached per commit generation.
+pub(super) enum ProbeIndex {
+    Int(FxHashMap<i64, Vec<usize>>),
+    Generic(FxHashMap<Vec<Value>, Vec<usize>>),
+    None,
+}
+
+pub(super) fn build_probe_index(
+    inner_rows: &[Vec<Value>],
+    equi_pairs: &[(usize, usize)],
+    is_pure_equi: bool,
+) -> ProbeIndex {
+    if !is_pure_equi || equi_pairs.is_empty() {
+        return ProbeIndex::None;
+    }
+    if equi_pairs.len() == 1 {
+        // Int-lane parity: NULL keys skipped, any non-integer key disqualifies.
+        let (_, inner_key_col) = equi_pairs[0];
+        let mut map: FxHashMap<i64, Vec<usize>> =
+            FxHashMap::with_capacity_and_hasher(inner_rows.len(), Default::default());
+        let mut all_int = true;
+        for (idx, inner) in inner_rows.iter().enumerate() {
+            match &inner[inner_key_col] {
+                Value::Integer(k) => map.entry(*k).or_default().push(idx),
+                Value::Null => {}
+                _ => {
+                    all_int = false;
+                    break;
+                }
+            }
+        }
+        if all_int {
+            return ProbeIndex::Int(map);
+        }
+    }
+    let inner_key_cols: Vec<usize> = equi_pairs.iter().map(|&(_, i)| i).collect();
+    let mut map: FxHashMap<Vec<Value>, Vec<usize>> = FxHashMap::default();
+    for (idx, inner) in inner_rows.iter().enumerate() {
+        insert_probe_row(&mut map, idx, inner, &inner_key_cols);
+    }
+    ProbeIndex::Generic(map)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1546,11 +1626,26 @@ pub(super) fn exec_join_step_borrowed(
     projection: Option<&CombineProjection>,
     equi_pairs: &[(usize, usize)],
     is_pure_equi: bool,
+    probe: Option<&ProbeIndex>,
 ) -> Vec<Vec<Value>> {
     let effective_proj = if is_pure_equi { projection } else { None };
 
     if equi_pairs.len() == 1 && is_pure_equi {
         let (outer_key_col, inner_key_col) = equi_pairs[0];
+        if let Some(ProbeIndex::Int(map)) = probe {
+            return integer_join_with_map(
+                outer_rows,
+                &join.join_type,
+                &IntJoinCtx {
+                    inner_rows,
+                    inner_map: map,
+                    outer_key_col,
+                    outer_col_count,
+                    inner_col_count,
+                    projection: effective_proj,
+                },
+            );
+        }
         let outer_is_sorted = outer_pk_col == Some(outer_key_col);
         match try_integer_join_borrowed(
             outer_rows,
@@ -1571,13 +1666,18 @@ pub(super) fn exec_join_step_borrowed(
     let outer_key_cols: Vec<usize> = equi_pairs.iter().map(|&(o, _)| o).collect();
     let inner_key_cols: Vec<usize> = equi_pairs.iter().map(|&(_, i)| i).collect();
 
-    let mut inner_map: FxHashMap<Vec<Value>, Vec<usize>> = FxHashMap::default();
-    for (idx, inner) in inner_rows.iter().enumerate() {
-        inner_map
-            .entry(hash_key(inner, &inner_key_cols))
-            .or_default()
-            .push(idx);
-    }
+    let built_map;
+    let inner_map: &FxHashMap<Vec<Value>, Vec<usize>> = match probe {
+        Some(ProbeIndex::Generic(map)) => map,
+        _ => {
+            let mut map: FxHashMap<Vec<Value>, Vec<usize>> = FxHashMap::default();
+            for (idx, inner) in inner_rows.iter().enumerate() {
+                insert_probe_row(&mut map, idx, inner, &inner_key_cols);
+            }
+            built_map = map;
+            &built_map
+        }
+    };
 
     let cap = effective_proj.map_or(outer_col_count + inner_col_count, |p| p.slots.len());
     let mut result = Vec::new();
