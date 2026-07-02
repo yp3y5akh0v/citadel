@@ -195,7 +195,9 @@ pub(super) fn exec_insert(
     // DML invalidates the table's persisted ANN segment in the SAME txn
     // (rollback restores it; commit makes table-changed-but-segment-survives
     // unrepresentable for this path).
-    super::ann_persist::purge_segment(&mut wtx, &table_schema.name)?;
+    if table_schema.has_ann_index() {
+        super::ann_persist::purge_segment(&mut wtx, &table_schema.name)?;
+    }
     let mut count: u64 = 0;
     let mut returning_rows: Option<Vec<super::helpers::ReturningRow>> =
         stmt.returning.as_ref().map(|_| Vec::new());

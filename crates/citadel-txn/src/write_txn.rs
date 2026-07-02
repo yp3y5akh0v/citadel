@@ -429,7 +429,9 @@ impl<'db> WriteTxn<'db> {
     }
 
     pub fn drop_table(&mut self, name: &[u8]) -> Result<()> {
-        self.fk_check_cache.clear();
+        // Cache keys are parent-table names: only the dropped table's entry
+        // can go stale.
+        self.invalidate_fk_cache_for(name);
         self.ensure_table(name)?;
         self.ensure_catalog()?;
 

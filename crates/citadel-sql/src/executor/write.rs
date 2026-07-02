@@ -741,9 +741,9 @@ fn exec_update_compiled(
 
     let fast = compiled.fast.as_ref().unwrap();
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    // Mark + purge the persisted segment in the same txn, like every DML path.
+    // No segment purge: this lane compiles only for index-free tables, so an
+    // ANN segment cannot exist.
     schema.mark_dml(&compiled.table_name_lower);
-    super::ann_persist::purge_segment(&mut wtx, &compiled.table_name_lower)?;
 
     if let crate::planner::ScanPlan::PkRangeScan {
         ref start_key,
@@ -1099,8 +1099,9 @@ pub(super) fn exec_update(
         let gen_cols: Vec<ColumnDef> = gen_targets.iter().map(|g| g.col.clone()).collect();
         let patch_safe = pk_range_patch_safe(&set_cols, &gen_cols);
 
+        // No segment purge: this lane requires an index-free table, so an ANN
+        // segment cannot exist.
         let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-        super::ann_persist::purge_segment(&mut wtx, &lower_name)?;
 
         // `value: &mut [u8]` can't grow; nullable/variable-width fall through.
         if let (
@@ -1477,7 +1478,9 @@ pub(super) fn exec_update(
     }
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    super::ann_persist::purge_segment(&mut wtx, &lower_name)?;
+    if table_schema.has_ann_index() {
+        super::ann_persist::purge_segment(&mut wtx, &lower_name)?;
+    }
 
     if !table_schema.foreign_keys.is_empty() {
         for c in &changes {
@@ -1864,7 +1867,9 @@ pub(super) fn exec_delete(
 
     let col_map = table_schema.column_map();
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-    super::ann_persist::purge_segment(&mut wtx, &lower_name)?;
+    if table_schema.has_ann_index() {
+        super::ann_persist::purge_segment(&mut wtx, &lower_name)?;
+    }
 
     // Fast TRUNCATE path skips per-row firing; gate on no DELETE triggers (ROW + STATEMENT).
     let has_delete_triggers = schema.triggers_for(&table_schema.name).iter().any(|t| {
@@ -2968,7 +2973,9 @@ pub(super) fn exec_update_in_txn(
         .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
     schema.mark_dml(&table_schema.name);
-    super::ann_persist::purge_segment(wtx, &table_schema.name)?;
+    if table_schema.has_ann_index() {
+        super::ann_persist::purge_segment(wtx, &table_schema.name)?;
+    }
     let lower_name = table_schema.name.clone();
     let strict = table_schema.is_strict();
 
@@ -3452,7 +3459,9 @@ pub(super) fn exec_delete_in_txn(
         .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
     schema.mark_dml(&table_schema.name);
-    super::ann_persist::purge_segment(wtx, &table_schema.name)?;
+    if table_schema.has_ann_index() {
+        super::ann_persist::purge_segment(wtx, &table_schema.name)?;
+    }
     let lower_name = table_schema.name.clone();
 
     let has_delete_triggers_in_txn = schema.triggers_for(&table_schema.name).iter().any(|t| {
