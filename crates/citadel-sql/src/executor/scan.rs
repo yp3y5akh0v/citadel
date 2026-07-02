@@ -70,6 +70,7 @@ pub(super) fn try_covered_index_collect_read(
     where_clause: &Option<Expr>,
     needed: &[usize],
     limit: Option<usize>,
+    emit_direct: Option<&[usize]>,
 ) -> Result<Option<Vec<Vec<Value>>>> {
     let Some(comp_of) = covered_index_components(table_schema, plan, needed) else {
         return Ok(None);
@@ -87,6 +88,12 @@ pub(super) fn try_covered_index_collect_read(
         return Ok(None);
     };
     let pk_cols = &table_schema.primary_key_columns;
+    // Direct emission has no full-width row for a residual re-eval.
+    let emit_direct = if where_clause.is_none() {
+        emit_direct
+    } else {
+        None
+    };
 
     let num_index_cols = index_columns.len();
     let num_pk_cols = pk_cols.len();
@@ -110,8 +117,7 @@ pub(super) fn try_covered_index_collect_read(
             }
         }
         let built = (|| -> Result<Vec<Value>> {
-            let mut row = vec![Value::Null; ncols];
-            let (comps, pk_vals) = if *is_unique && !value.is_empty() {
+            let (mut comps, pk_vals) = if *is_unique && !value.is_empty() {
                 (
                     decode_composite_key(key, num_index_cols)?,
                     decode_composite_key(value, num_pk_cols)?,
@@ -121,8 +127,20 @@ pub(super) fn try_covered_index_collect_read(
                 let pk_vals = all.split_off(num_index_cols);
                 (all, pk_vals)
             };
+            if let Some(order) = emit_direct {
+                return Ok(order
+                    .iter()
+                    .map(
+                        |ci| match pk_cols.iter().position(|&pc| pc as usize == *ci) {
+                            Some(i) => pk_vals[i].clone(),
+                            None => comps[comp_of[ci]].clone(),
+                        },
+                    )
+                    .collect());
+            }
+            let mut row = vec![Value::Null; ncols];
             for (&ci, &pos) in &comp_of {
-                row[ci] = comps[pos].clone();
+                row[ci] = std::mem::replace(&mut comps[pos], Value::Null);
             }
             for (i, &pc) in pk_cols.iter().enumerate() {
                 row[pc as usize] = pk_vals[i].clone();
