@@ -4,7 +4,7 @@
 
 <h1 align="center">Citadel</h1>
 
-<p align="center">Encrypted-first embedded SQL database with a built-in memory engine.</p>
+<p align="center">Local-first encrypted memory for AI agents. Zero-LLM ingest, SQL/vector search, MCP, and cryptographic forgetting.</p>
 
 <p align="center">
   <a href="https://crates.io/crates/citadeldb"><img src="https://badgen.net/crates/v/citadeldb" alt="crates.io"></a>
@@ -16,7 +16,10 @@
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Citadel is an embedded SQL database that encrypts and authenticates every page with AES-256-CTR and HMAC-SHA256 before it is written, so the database file is always opaque. The same encrypted pages hold SQL tables and a zero-LLM memory engine that recalls over encrypted regions. The tables below report its results against unencrypted SQLite across 58 head-to-head benchmarks and on the LoCoMo and LongMemEval long-term-memory benchmarks.
+Citadel is a local-first encrypted memory engine for AI agents, built on an embedded SQL/vector database.
+It stores raw conversations without LLM-based ingest, recalls with hybrid retrieval, and supports cryptographic forgetting by destroying keys.
+
+The tables below report its results against unencrypted SQLite across 58 head-to-head benchmarks and on the LoCoMo and LongMemEval long-term-memory benchmarks.
 
 **LoCoMo** - `gpt-4o-mini` reader and judge (the field's standard setup):
 
