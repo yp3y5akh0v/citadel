@@ -2728,7 +2728,7 @@ pub(super) fn exec_select_in_txn(
         });
     }
 
-    let scan_limit = compute_scan_limit(stmt);
+    let scan_limit = compute_scan_limit(stmt, table_schema);
     let (rows, predicate_applied) =
         collect_rows_write(wtx, table_schema, &stmt.where_clause, scan_limit)?;
     super::process_select(&table_schema.columns, rows, stmt, predicate_applied)

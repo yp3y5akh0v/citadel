@@ -27,8 +27,7 @@ fn index_scan_start(prefix: &[u8], range_conds: &[(BinOp, Value)]) -> Option<Vec
         .max()
 }
 
-/// Column index -> key-component position when the plan's index can serve
-/// every needed column losslessly (Binary components or pk columns).
+/// Column index -> key-component position when the index covers every need.
 pub(super) fn covered_index_components(
     table_schema: &TableSchema,
     plan: &ScanPlan,
@@ -154,9 +153,7 @@ pub(super) fn try_covered_index_collect_read(
     Ok(Some(rows))
 }
 
-/// Count index entries in bounds without decoding rows. Callers must prove
-/// the WHERE is fully consumed (`index_scan_full_cover`); NULL range
-/// components are skipped because NULL never satisfies a comparison.
+/// Entry count in bounds; caller proves full cover, NULL components skip.
 pub(super) fn covered_index_count_read(
     rtx: &mut ReadTxn<'_>,
     table_schema: &TableSchema,

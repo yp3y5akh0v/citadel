@@ -289,3 +289,59 @@ fn scan_lane_read_your_writes_in_txn() {
     let qr = stmt.query_collect(&[Value::Integer(5)]).unwrap();
     assert_eq!(qr.rows.len(), 2);
 }
+
+#[test]
+fn pk_order_pagination_parity() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    for id in 1..=50 {
+        conn.execute(&format!("INSERT INTO t VALUES ({id}, {})", id * 2))
+            .unwrap();
+    }
+
+    let keyset = conn
+        .prepare("SELECT id FROM t WHERE id > $1 ORDER BY id LIMIT 5")
+        .unwrap();
+    for after in [0i64, 10, 45, 49] {
+        let qr = keyset.query_collect(&[Value::Integer(after)]).unwrap();
+        let expect: Vec<Vec<Value>> = (after + 1..=50)
+            .take(5)
+            .map(|id| vec![Value::Integer(id)])
+            .collect();
+        assert_eq!(qr.rows, expect, "after {after}");
+    }
+
+    let qr = conn
+        .query("SELECT id FROM t ORDER BY id LIMIT 5 OFFSET 20")
+        .unwrap();
+    let expect: Vec<Vec<Value>> = (21..=25).map(|id| vec![Value::Integer(id)]).collect();
+    assert_eq!(qr.rows, expect);
+
+    let qr = conn
+        .query("SELECT id FROM t ORDER BY id DESC LIMIT 3")
+        .unwrap();
+    let expect: Vec<Vec<Value>> = (48..=50).rev().map(|id| vec![Value::Integer(id)]).collect();
+    assert_eq!(qr.rows, expect);
+}
+
+#[test]
+fn text_pk_nocase_order_not_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (name TEXT NOT NULL COLLATE NOCASE PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES ('b'), ('A'), ('C')")
+        .unwrap();
+
+    let qr = conn
+        .query("SELECT name FROM t ORDER BY name LIMIT 2")
+        .unwrap();
+    assert_eq!(
+        qr.rows,
+        vec![vec![Value::Text("A".into())], vec![Value::Text("b".into())],]
+    );
+}
