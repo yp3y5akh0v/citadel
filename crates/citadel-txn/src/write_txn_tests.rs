@@ -652,3 +652,19 @@ fn shrink_overwrite_default_tree_frees_overflow_chain() {
     );
     assert_eq!(wtx.get(b"k").unwrap(), Some(b"small".to_vec()));
 }
+
+#[test]
+fn drop_table_invalidates_only_its_fk_cache_entry() {
+    let mgr = create_test_manager();
+
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.create_table(b"parent_a").unwrap();
+    wtx.create_table(b"parent_b").unwrap();
+    wtx.mark_fk_verified(b"parent_a", b"k1");
+    wtx.mark_fk_verified(b"parent_b", b"k2");
+
+    wtx.drop_table(b"parent_b").unwrap();
+    assert!(wtx.fk_check_cached(b"parent_a", b"k1"));
+    assert!(!wtx.fk_check_cached(b"parent_b", b"k2"));
+    wtx.commit().unwrap();
+}
