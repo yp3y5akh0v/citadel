@@ -27,6 +27,115 @@ fn index_scan_start(prefix: &[u8], range_conds: &[(BinOp, Value)]) -> Option<Vec
         .max()
 }
 
+/// Index-only row service; only Binary components and pk columns reconstruct.
+pub(super) fn try_covered_index_collect_read(
+    rtx: &mut ReadTxn<'_>,
+    table_schema: &TableSchema,
+    plan: &ScanPlan,
+    where_clause: &Option<Expr>,
+    needed: &[usize],
+    limit: Option<usize>,
+) -> Result<Option<Vec<Vec<Value>>>> {
+    let ScanPlan::IndexScan {
+        index_name,
+        idx_table,
+        prefix,
+        num_prefix_cols,
+        range_conds,
+        is_unique,
+        index_columns,
+    } = plan
+    else {
+        return Ok(None);
+    };
+    let Some(idx) = table_schema.indices.iter().find(|i| &i.name == index_name) else {
+        return Ok(None);
+    };
+    if idx.predicate_expr.is_some() || idx.kind != IndexKind::BTree {
+        return Ok(None);
+    }
+    let mut comp_of: rustc_hash::FxHashMap<usize, usize> = Default::default();
+    for (pos, key) in idx.keys.iter().enumerate() {
+        if let IndexKey::Column {
+            idx: ci,
+            collate: Collation::Binary,
+        } = key
+        {
+            comp_of.insert(*ci as usize, pos);
+        }
+    }
+    let pk_cols = &table_schema.primary_key_columns;
+    for &n in needed {
+        if !pk_cols.iter().any(|&c| c as usize == n) && !comp_of.contains_key(&n) {
+            return Ok(None);
+        }
+    }
+
+    let num_index_cols = index_columns.len();
+    let num_pk_cols = pk_cols.len();
+    let ncols = table_schema.columns.len();
+    let col_map = table_schema.column_map();
+    let start = index_scan_start(prefix, range_conds);
+    let start: &[u8] = start.as_deref().unwrap_or(prefix);
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    let mut scan_err: Option<SqlError> = None;
+    rtx.table_scan_from_fast(idx_table, start, |key, value| {
+        if !key.starts_with(prefix) {
+            return Ok(false);
+        }
+        match check_range_conditions(key, *num_prefix_cols, range_conds, num_index_cols) {
+            Ok(RangeCheck::ExceedsUpper) => return Ok(false),
+            Ok(RangeCheck::BelowLower) => return Ok(true),
+            Ok(RangeCheck::Match) => {}
+            Err(e) => {
+                scan_err = Some(e);
+                return Ok(false);
+            }
+        }
+        let built = (|| -> Result<Vec<Value>> {
+            let mut row = vec![Value::Null; ncols];
+            let (comps, pk_vals) = if *is_unique && !value.is_empty() {
+                (
+                    decode_composite_key(key, num_index_cols)?,
+                    decode_composite_key(value, num_pk_cols)?,
+                )
+            } else {
+                let mut all = decode_composite_key(key, num_index_cols + num_pk_cols)?;
+                let pk_vals = all.split_off(num_index_cols);
+                (all, pk_vals)
+            };
+            for (&ci, &pos) in &comp_of {
+                row[ci] = comps[pos].clone();
+            }
+            for (i, &pc) in pk_cols.iter().enumerate() {
+                row[pc as usize] = pk_vals[i].clone();
+            }
+            Ok(row)
+        })();
+        let row = match built {
+            Ok(r) => r,
+            Err(e) => {
+                scan_err = Some(e);
+                return Ok(false);
+            }
+        };
+        // Row-mode parity: residual WHERE eval errors drop the row.
+        if let Some(expr) = where_clause {
+            match eval_expr(expr, &EvalCtx::new(col_map, &row)) {
+                Ok(v) if is_truthy(&v) => {}
+                _ => return Ok(true),
+            }
+        }
+        rows.push(row);
+        Ok(limit.map_or(true, |n| rows.len() < n))
+    })
+    .map_err(SqlError::Storage)?;
+    if let Some(e) = scan_err {
+        return Err(e);
+    }
+    Ok(Some(rows))
+}
+
 /// Check PK range conditions. Returns: 0 = match, 1 = below lower (skip), 2 = above upper (stop).
 pub(super) fn check_pk_range(pk_val: &Value, range_conds: &[(BinOp, Value)]) -> u8 {
     for (op, bound) in range_conds {
@@ -180,6 +289,16 @@ pub(super) fn collect_rows_with_read(
     limit: Option<usize>,
 ) -> Result<(Vec<Vec<Value>>, bool)> {
     let plan = planner::plan_select_inverted(table_schema, where_clause);
+    collect_rows_with_read_planned(rtx, table_schema, where_clause, limit, plan)
+}
+
+pub(super) fn collect_rows_with_read_planned(
+    rtx: &mut ReadTxn<'_>,
+    table_schema: &TableSchema,
+    where_clause: &Option<Expr>,
+    limit: Option<usize>,
+    plan: ScanPlan,
+) -> Result<(Vec<Vec<Value>>, bool)> {
     let lower_name = &table_schema.name;
     let columns = &table_schema.columns;
 

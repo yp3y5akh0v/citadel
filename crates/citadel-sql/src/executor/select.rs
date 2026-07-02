@@ -4126,6 +4126,8 @@ struct SimpleScanPlan {
     proj: StreamProj,
     columns: Vec<String>,
     where_expr: Option<Expr>,
+    /// Schema columns the projection and WHERE read; the covered-index gate.
+    needed: Vec<usize>,
 }
 
 enum PointSource {
@@ -4232,11 +4234,23 @@ fn build_select_lane(schema: &SchemaManager, sel: &SelectStmt) -> Option<Compile
             pk_sources,
         }));
     }
+    let mut needed: Vec<usize> = match &proj {
+        StreamProj::Identity { .. } => (0..table_schema.columns.len()).collect(),
+        StreamProj::Columns { idxs, .. } => idxs.clone(),
+        StreamProj::Exprs { exprs, .. } => exprs
+            .iter()
+            .flat_map(|e| referenced_columns(e, &table_schema.columns))
+            .collect(),
+    };
+    needed.extend(referenced_columns(where_expr, &table_schema.columns));
+    needed.sort_unstable();
+    needed.dedup();
     Some(CompiledSelectLane::Scan(SimpleScanPlan {
         table_schema: table_schema.clone(),
         proj,
         columns,
         where_expr: Some(where_expr.clone()),
+        needed,
     }))
 }
 
@@ -4251,9 +4265,32 @@ impl CompiledSelectLane {
 
 impl SimpleScanPlan {
     fn run(&self, rtx: &mut ReadTxn<'_>) -> Result<QueryResult> {
-        let (rows, filtered) =
-            super::scan::collect_rows_with_read(rtx, &self.table_schema, &self.where_expr, None)?;
+        let plan = crate::planner::plan_select_inverted(&self.table_schema, &self.where_expr);
         let col_map = self.table_schema.column_map();
+        if let Some(rows) = super::scan::try_covered_index_collect_read(
+            rtx,
+            &self.table_schema,
+            &plan,
+            &self.where_expr,
+            &self.needed,
+            None,
+        )? {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in &rows {
+                out.push(self.project(col_map, row)?);
+            }
+            return Ok(QueryResult {
+                columns: self.columns.clone(),
+                rows: out,
+            });
+        }
+        let (rows, filtered) = super::scan::collect_rows_with_read_planned(
+            rtx,
+            &self.table_schema,
+            &self.where_expr,
+            None,
+            plan,
+        )?;
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             if !filtered {
