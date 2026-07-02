@@ -55,6 +55,16 @@ pub(super) fn has_insert_triggers(schema: &SchemaManager, table: &str) -> bool {
     })
 }
 
+/// True if any enabled BEFORE/AFTER trigger (row- or statement-level) fires
+/// on DELETE for `table`. Fast lanes must bail so the firing path runs.
+pub(super) fn has_delete_triggers(schema: &SchemaManager, table: &str) -> bool {
+    schema.triggers_for(table).iter().any(|t| {
+        t.enabled
+            && (t.timing == TriggerTiming::After || t.timing == TriggerTiming::Before)
+            && t.events.iter().any(|e| matches!(e, TriggerEvent::Delete))
+    })
+}
+
 /// Kind-only check: the `UPDATE OF` column intersection happens at fire time.
 pub(super) fn has_statement_update_triggers(schema: &SchemaManager, table: &str) -> bool {
     schema.triggers_for(table).iter().any(|t| {

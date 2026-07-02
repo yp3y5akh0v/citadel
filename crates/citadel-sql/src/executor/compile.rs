@@ -82,7 +82,7 @@ pub fn compile(schema: &SchemaManager, stmt: &Statement) -> Option<Arc<dyn Compi
             .ok()
             .flatten()
             .map(|c| Arc::new(c) as Arc<dyn CompiledPlan>),
-        Statement::Delete(del) => super::dml::CompiledDelete::try_compile(schema, del)
+        Statement::Delete(del) => super::write::CompiledDelete::try_compile(schema, del)
             .map(|c| Arc::new(c) as Arc<dyn CompiledPlan>),
         _ => None,
     }
