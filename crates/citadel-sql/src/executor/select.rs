@@ -358,7 +358,7 @@ pub(super) fn exec_select_with_read(
         return Ok(result);
     }
 
-    let scan_limit = compute_scan_limit(stmt);
+    let scan_limit = compute_scan_limit(stmt, table_schema);
     let (rows, predicate_applied) =
         collect_rows_with_read(rtx, table_schema, &stmt.where_clause, scan_limit)?;
     process_select(&table_schema.columns, rows, stmt, predicate_applied)
@@ -1274,12 +1274,12 @@ fn try_inverted_index_only_with_read(
     })))
 }
 
-pub(super) fn compute_scan_limit(stmt: &SelectStmt) -> Option<usize> {
-    if !stmt.order_by.is_empty()
-        || !stmt.group_by.is_empty()
-        || stmt.distinct
-        || stmt.having.is_some()
-    {
+pub(super) fn compute_scan_limit(stmt: &SelectStmt, table_schema: &TableSchema) -> Option<usize> {
+    if !stmt.group_by.is_empty() || stmt.distinct || stmt.having.is_some() {
+        return None;
+    }
+    // Pk-prefix ASC order matches tree order; index-order arms ignore the limit.
+    if !stmt.order_by.is_empty() && !order_by_is_pk_prefix_asc(stmt, table_schema) {
         return None;
     }
     if has_any_window_function(stmt) {
@@ -1301,6 +1301,25 @@ pub(super) fn compute_scan_limit(stmt: &SelectStmt) -> Option<usize> {
         .unwrap_or(0)
         .max(0) as usize;
     Some(limit_val.saturating_add(offset_val))
+}
+
+fn order_by_is_pk_prefix_asc(stmt: &SelectStmt, table_schema: &TableSchema) -> bool {
+    let [ob] = &stmt.order_by[..] else {
+        return false;
+    };
+    if ob.descending {
+        return false;
+    }
+    let Expr::Column(name) = &ob.expr else {
+        return false;
+    };
+    let Some(&pk0) = table_schema.primary_key_columns.first() else {
+        return false;
+    };
+    let Some(idx) = table_schema.column_index(name) else {
+        return false;
+    };
+    idx as u16 == pk0 && table_schema.columns[idx].collation == Collation::Binary
 }
 
 pub(super) fn try_count_star_shortcut(
@@ -2721,6 +2740,23 @@ impl TopKScanPlan {
         }
 
         let k = self.keep;
+        // Primary-tree order == output order: keep the first k, skip the heap.
+        if matches!(self.sort_target, RawAggTarget::Pk(0))
+            && !self.descending
+            && self.collation == crate::types::Collation::Binary
+        {
+            let mut firsts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(k);
+            scan(&mut |key, value| {
+                firsts.push((key.to_vec(), value.to_vec()));
+                firsts.len() < k
+            })
+            .map_err(SqlError::Storage)?;
+            let mut rows: Vec<Vec<Value>> = Vec::with_capacity(firsts.len());
+            for (key, value) in &firsts {
+                rows.push(decode_full_row(schema, key, value)?);
+            }
+            return finish_topk(schema, stmt, rows);
+        }
         let mut heap: BinaryHeap<CandWrapper> = BinaryHeap::with_capacity(k + 1);
         let mut scan_err: Option<SqlError> = None;
 
@@ -2828,25 +2864,33 @@ impl TopKScanPlan {
             rows.push(decode_full_row(schema, &w.c.raw_key, &w.c.raw_value)?);
         }
 
-        if let Some(ref offset_expr) = stmt.offset {
-            let offset = eval_const_int(offset_expr)?.max(0) as usize;
-            if offset < rows.len() {
-                rows = rows.split_off(offset);
-            } else {
-                rows.clear();
-            }
-        }
-        if let Some(ref limit_expr) = stmt.limit {
-            let limit = eval_const_int(limit_expr)?.max(0) as usize;
-            rows.truncate(limit);
-        }
-
-        let (col_names, projected) = project_rows(&schema.columns, &stmt.columns, rows)?;
-        Ok(ExecutionResult::Query(QueryResult {
-            columns: col_names,
-            rows: projected,
-        }))
+        finish_topk(schema, stmt, rows)
     }
+}
+
+fn finish_topk(
+    schema: &TableSchema,
+    stmt: &SelectStmt,
+    mut rows: Vec<Vec<Value>>,
+) -> Result<ExecutionResult> {
+    if let Some(ref offset_expr) = stmt.offset {
+        let offset = eval_const_int(offset_expr)?.max(0) as usize;
+        if offset < rows.len() {
+            rows = rows.split_off(offset);
+        } else {
+            rows.clear();
+        }
+    }
+    if let Some(ref limit_expr) = stmt.limit {
+        let limit = eval_const_int(limit_expr)?.max(0) as usize;
+        rows.truncate(limit);
+    }
+
+    let (col_names, projected) = project_rows(&schema.columns, &stmt.columns, rows)?;
+    Ok(ExecutionResult::Query(QueryResult {
+        columns: col_names,
+        rows: projected,
+    }))
 }
 
 /// Streaming DISTINCT: extract only needed columns from raw scan, dedup inline.

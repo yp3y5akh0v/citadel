@@ -38,6 +38,17 @@ fn i(n: i64) -> Value {
     Value::Integer(n)
 }
 
+fn scan_limit_schema() -> crate::types::TableSchema {
+    crate::types::TableSchema::new(
+        "t".into(),
+        cols(&[("id", DataType::Integer), ("x", DataType::Integer)]),
+        vec![0],
+        vec![],
+        vec![],
+        vec![],
+    )
+}
+
 fn empty_select(from: &str) -> SelectStmt {
     SelectStmt {
         columns: vec![SelectColumn::AllColumns],
@@ -60,14 +71,14 @@ fn empty_select(from: &str) -> SelectStmt {
 #[test]
 fn compute_scan_limit_none_when_no_limit() {
     let s = empty_select("t");
-    assert_eq!(compute_scan_limit(&s), None);
+    assert_eq!(compute_scan_limit(&s, &scan_limit_schema()), None);
 }
 
 #[test]
 fn compute_scan_limit_simple_limit() {
     let mut s = empty_select("t");
     s.limit = Some(Expr::Literal(i(10)));
-    assert_eq!(compute_scan_limit(&s), Some(10));
+    assert_eq!(compute_scan_limit(&s, &scan_limit_schema()), Some(10));
 }
 
 #[test]
@@ -75,7 +86,7 @@ fn compute_scan_limit_with_offset_adds() {
     let mut s = empty_select("t");
     s.limit = Some(Expr::Literal(i(5)));
     s.offset = Some(Expr::Literal(i(3)));
-    assert_eq!(compute_scan_limit(&s), Some(8));
+    assert_eq!(compute_scan_limit(&s, &scan_limit_schema()), Some(8));
 }
 
 #[test]
@@ -88,7 +99,7 @@ fn compute_scan_limit_none_with_order_by() {
         descending: false,
         nulls_first: None,
     }];
-    assert_eq!(compute_scan_limit(&s), None);
+    assert_eq!(compute_scan_limit(&s, &scan_limit_schema()), None);
 }
 
 #[test]
@@ -96,7 +107,7 @@ fn compute_scan_limit_none_with_group_by() {
     let mut s = empty_select("t");
     s.limit = Some(Expr::Literal(i(10)));
     s.group_by = vec![Expr::Column("x".into())];
-    assert_eq!(compute_scan_limit(&s), None);
+    assert_eq!(compute_scan_limit(&s, &scan_limit_schema()), None);
 }
 
 #[test]
@@ -104,7 +115,7 @@ fn compute_scan_limit_none_with_distinct() {
     let mut s = empty_select("t");
     s.limit = Some(Expr::Literal(i(10)));
     s.distinct = true;
-    assert_eq!(compute_scan_limit(&s), None);
+    assert_eq!(compute_scan_limit(&s, &scan_limit_schema()), None);
 }
 
 #[test]
@@ -394,4 +405,21 @@ mod parallel {
         assert!(!ok("SELECT SUM(iv) FROM t"));
         assert!(!ok("SELECT MIN(iv) FROM t"));
     }
+}
+
+#[test]
+fn compute_scan_limit_allows_pk_asc_order() {
+    use crate::parser::OrderByItem;
+    let mut s = empty_select("t");
+    s.limit = Some(Expr::Literal(i(10)));
+    s.offset = Some(Expr::Literal(i(5)));
+    s.order_by = vec![OrderByItem {
+        expr: Expr::Column("id".into()),
+        descending: false,
+        nulls_first: None,
+    }];
+    assert_eq!(compute_scan_limit(&s, &scan_limit_schema()), Some(15));
+
+    s.order_by[0].descending = true;
+    assert_eq!(compute_scan_limit(&s, &scan_limit_schema()), None);
 }
