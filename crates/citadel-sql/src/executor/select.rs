@@ -4102,6 +4102,161 @@ pub struct CompiledSelect {
     /// (`result_cache::is_result_cacheable`); memoizes the materialized
     /// result keyed by (commit generation, params).
     result_cache: Option<super::result_cache::ResultCacheSlot>,
+    point: Option<PkPointPlan>,
+}
+
+/// Full-pk-equality SELECT compiled to a table_get; key values re-resolve per execute.
+struct PkPointPlan {
+    table_lower: String,
+    table_schema: TableSchema,
+    proj: StreamProj,
+    columns: Vec<String>,
+    where_expr: Expr,
+    pk_sources: Vec<PointSource>,
+}
+
+enum PointSource {
+    Literal(Value),
+    Param(usize),
+}
+
+/// Every conjunct must be `pk_col = Literal|Parameter`, each pk col once.
+fn detect_pk_point_sources(
+    where_expr: &Expr,
+    table_schema: &TableSchema,
+) -> Option<Vec<PointSource>> {
+    let pk_cols = &table_schema.primary_key_columns;
+    if pk_cols.is_empty() {
+        return None;
+    }
+    let mut sources: Vec<Option<PointSource>> = (0..pk_cols.len()).map(|_| None).collect();
+    if !collect_pk_eq_conjuncts(where_expr, table_schema, &mut sources) {
+        return None;
+    }
+    sources.into_iter().collect()
+}
+
+fn collect_pk_eq_conjuncts(
+    expr: &Expr,
+    table_schema: &TableSchema,
+    sources: &mut [Option<PointSource>],
+) -> bool {
+    let Expr::BinaryOp { left, op, right } = expr else {
+        return false;
+    };
+    if *op == BinOp::And {
+        return collect_pk_eq_conjuncts(left, table_schema, sources)
+            && collect_pk_eq_conjuncts(right, table_schema, sources);
+    }
+    if *op != BinOp::Eq {
+        return false;
+    }
+    // Bare columns only: qualifier validity is the generic path's concern.
+    let pk_pos = |e: &Expr| {
+        let Expr::Column(name) = e else { return None };
+        let idx = table_schema.column_index(name)? as u16;
+        table_schema
+            .primary_key_columns
+            .iter()
+            .position(|&c| c == idx)
+    };
+    let source = |e: &Expr| match e {
+        Expr::Literal(v) => Some(PointSource::Literal(v.clone())),
+        Expr::Parameter(n) => Some(PointSource::Param(*n)),
+        _ => None,
+    };
+    let (pos, src) = if let (Some(p), Some(s)) = (pk_pos(left), source(right)) {
+        (p, s)
+    } else if let (Some(p), Some(s)) = (pk_pos(right), source(left)) {
+        (p, s)
+    } else {
+        return false;
+    };
+    if sources[pos].is_some() {
+        return false;
+    }
+    sources[pos] = Some(src);
+    true
+}
+
+fn build_pk_point_plan(schema: &SchemaManager, sel: &SelectStmt) -> Option<PkPointPlan> {
+    if !sel.joins.is_empty()
+        || !sel.group_by.is_empty()
+        || sel.having.is_some()
+        || !sel.order_by.is_empty()
+        || sel.limit.is_some()
+        || sel.offset.is_some()
+        || sel.distinct
+        || sel.from_subquery.is_some()
+        || sel.from_args.is_some()
+        || sel.from_json_table.is_some()
+    {
+        return None;
+    }
+    let lower = sel.from.to_ascii_lowercase();
+    if schema.get_view(&lower).is_some()
+        || schema.get_matview(&lower).is_some()
+        || schema.get_virtual(&lower).is_some()
+    {
+        return None;
+    }
+    let table_schema = schema.get(&lower)?;
+    // Virtual columns are stored as NULL placeholders the raw decode keeps.
+    if table_schema.has_virtual_columns() {
+        return None;
+    }
+    let where_expr = sel.where_clause.as_ref()?;
+    let pk_sources = detect_pk_point_sources(where_expr, table_schema)?;
+    let proj = build_stream_proj(&sel.columns, table_schema)?;
+    let columns = projection_column_names(&sel.columns, &table_schema.columns);
+    Some(PkPointPlan {
+        table_lower: table_schema.name.clone(),
+        table_schema: table_schema.clone(),
+        proj,
+        columns,
+        where_expr: where_expr.clone(),
+        pk_sources,
+    })
+}
+
+impl PkPointPlan {
+    fn run(&self, rtx: &mut ReadTxn<'_>) -> Result<QueryResult> {
+        let mut pk_values = Vec::with_capacity(self.pk_sources.len());
+        for s in &self.pk_sources {
+            pk_values.push(match s {
+                PointSource::Literal(v) => v.clone(),
+                PointSource::Param(n) => crate::eval::resolve_scoped_param(*n)?,
+            });
+        }
+        let key = crate::encoding::encode_composite_key(&pk_values);
+        let rows = match rtx
+            .table_get(self.table_lower.as_bytes(), &key)
+            .map_err(SqlError::Storage)?
+        {
+            Some(value) => {
+                let row = decode_full_row(&self.table_schema, &key, &value)?;
+                let col_map = self.table_schema.column_map();
+                match eval_expr(&self.where_expr, &EvalCtx::new(col_map, &row)) {
+                    Ok(v) if is_truthy(&v) => {
+                        let mut scratch: Vec<Value> = Vec::new();
+                        vec![decode_and_project(
+                            &self.proj,
+                            &self.table_schema,
+                            &key,
+                            &value,
+                            &mut scratch,
+                        )?]
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        };
+        Ok(QueryResult {
+            columns: self.columns.clone(),
+            rows,
+        })
+    }
 }
 
 struct JoinPlanStatic {
@@ -4145,6 +4300,7 @@ fn cache_carrier(
         compound_cache: None,
         leaf_cache: parking_lot::RwLock::new(None),
         result_cache: Some(rc),
+        point: None,
     })
 }
 
@@ -4180,6 +4336,7 @@ impl CompiledSelect {
                 compound_cache,
                 leaf_cache: parking_lot::RwLock::new(None),
                 result_cache,
+                point: None,
             });
         }
 
@@ -4209,6 +4366,11 @@ impl CompiledSelect {
         } else {
             (None, None)
         };
+        let point = if sel.joins.is_empty() {
+            build_pk_point_plan(schema, sel)
+        } else {
+            None
+        };
 
         Some(Self {
             join_plan,
@@ -4217,6 +4379,7 @@ impl CompiledSelect {
             compound_cache: None,
             leaf_cache: parking_lot::RwLock::new(None),
             result_cache,
+            point,
         })
     }
 
@@ -4233,6 +4396,11 @@ impl CompiledSelect {
     ) -> Result<ExecutionResult> {
         let gen = rtx.commit_generation();
         if let Some(qr) = slot.lookup(gen, params) {
+            return Ok(ExecutionResult::Query(qr));
+        }
+        if let Some(point) = &self.point {
+            let qr = point.run(rtx)?;
+            slot.store(gen, params, &qr);
             return Ok(ExecutionResult::Query(qr));
         }
         let result = if let (Some(plan), Some(cache)) = (&self.compound_plan, &self.compound_cache)
@@ -4286,6 +4454,13 @@ impl CompiledPlan for CompiledSelect {
                         self.execute_cached_read(schema, sq, params, slot, &mut rtx)
                     }
                 };
+            }
+            if let Some(point) = &self.point {
+                let qr = match txn {
+                    ActiveTxnRef::Read(rtx) => point.run(rtx)?,
+                    _ => point.run(&mut db.begin_read())?,
+                };
+                return Ok(ExecutionResult::Query(qr));
             }
             if let (Some(plan), Some(cache)) = (&self.compound_plan, &self.compound_cache) {
                 return match txn {
