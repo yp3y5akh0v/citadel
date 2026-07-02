@@ -42,6 +42,7 @@ db.put(new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6]));
 const value = db.get(new Uint8Array([1, 2, 3]));
 
 // Named tables
+db.createTable("sessions");
 db.tablePut("sessions", new Uint8Array([1]), new Uint8Array([2]));
 
 // Stats
@@ -64,6 +65,7 @@ db.free();
 | `put(key, value)` | Insert into default table |
 | `get(key)` | Get from default table |
 | `delete(key)` | Delete from default table |
+| `createTable(table)` | Create a named table |
 | `tablePut(table, key, value)` | Insert into named table |
 | `tableGet(table, key)` | Get from named table |
 | `tableDelete(table, key)` | Delete from named table |

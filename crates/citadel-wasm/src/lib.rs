@@ -130,6 +130,15 @@ impl CitadelDb {
         Ok(existed)
     }
 
+    /// Create a named key-value table. Errors if it already exists.
+    pub fn create_table(&self, table: &str) -> Result<(), String> {
+        let mut wtx = self.db().begin_write().map_err(|e| format!("{e}"))?;
+        wtx.create_table(table.as_bytes())
+            .map_err(|e| format!("{e}"))?;
+        wtx.commit().map_err(|e| format!("{e}"))?;
+        Ok(())
+    }
+
     /// Put a key-value pair into a named table.
     pub fn table_put(&self, table: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
         let mut wtx = self.db().begin_write().map_err(|e| format!("{e}"))?;
