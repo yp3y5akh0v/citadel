@@ -1814,28 +1814,59 @@ pub(super) fn partial_idx_update_actions(
     (del, ins)
 }
 
-pub(super) struct FkChildHit {
-    pub fk_idx_key: Vec<u8>,
+/// Child-row hits from an FK index scan; all key bytes share one arena.
+#[derive(Default)]
+pub(super) struct FkChildHits {
+    arena: Vec<u8>,
+    hits: Vec<FkChildHit>,
+}
+
+struct FkChildHit {
+    key: (u32, u32),
     pk_key_repr: PkKeyRepr,
 }
 
 enum PkKeyRepr {
     Suffix(u32),
-    Owned(Vec<u8>),
+    Owned((u32, u32)),
 }
 
-impl FkChildHit {
-    pub fn pk_key(&self) -> &[u8] {
-        match &self.pk_key_repr {
-            PkKeyRepr::Suffix(off) => &self.fk_idx_key[*off as usize..],
-            PkKeyRepr::Owned(v) => v,
-        }
+impl FkChildHits {
+    pub fn clear(&mut self) {
+        self.arena.clear();
+        self.hits.clear();
     }
 
-    pub fn into_pk_key(self) -> Vec<u8> {
-        match self.pk_key_repr {
-            PkKeyRepr::Suffix(off) => self.fk_idx_key[off as usize..].to_vec(),
-            PkKeyRepr::Owned(v) => v,
+    pub fn is_empty(&self) -> bool {
+        self.hits.is_empty()
+    }
+
+    fn push(&mut self, key: &[u8], owned_pk: Option<&[u8]>, suffix: u32) {
+        let key_off = self.arena.len() as u32;
+        self.arena.extend_from_slice(key);
+        let pk_key_repr = match owned_pk {
+            Some(pk) => {
+                let off = self.arena.len() as u32;
+                self.arena.extend_from_slice(pk);
+                PkKeyRepr::Owned((off, pk.len() as u32))
+            }
+            None => PkKeyRepr::Suffix(suffix),
+        };
+        self.hits.push(FkChildHit {
+            key: (key_off, key.len() as u32),
+            pk_key_repr,
+        });
+    }
+
+    fn fk_idx_key(&self, hit: &FkChildHit) -> &[u8] {
+        let (off, len) = hit.key;
+        &self.arena[off as usize..(off + len) as usize]
+    }
+
+    fn pk_key(&self, hit: &FkChildHit) -> &[u8] {
+        match hit.pk_key_repr {
+            PkKeyRepr::Suffix(s) => &self.fk_idx_key(hit)[s as usize..],
+            PkKeyRepr::Owned((off, len)) => &self.arena[off as usize..(off + len) as usize],
         }
     }
 }
@@ -1855,7 +1886,7 @@ pub(super) fn scan_fk_index_keys(
     child_schema: &TableSchema,
     cascading_idx: &IndexDef,
     parent_pk_key: &[u8],
-    out: &mut Vec<FkChildHit>,
+    out: &mut FkChildHits,
 ) -> Result<()> {
     let idx_table = TableSchema::index_table_name(&child_schema.name, &cascading_idx.name);
     let unique_no_null = cascading_idx.unique;
@@ -1864,15 +1895,8 @@ pub(super) fn scan_fk_index_keys(
         if !key.starts_with(parent_pk_key) {
             return Ok(false);
         }
-        let pk_key_repr = if unique_no_null && !value.is_empty() {
-            PkKeyRepr::Owned(value.to_vec())
-        } else {
-            PkKeyRepr::Suffix(parent_pk_len)
-        };
-        out.push(FkChildHit {
-            fk_idx_key: key.to_vec(),
-            pk_key_repr,
-        });
+        let owned_pk = (unique_no_null && !value.is_empty()).then_some(value);
+        out.push(key, owned_pk, parent_pk_len);
         Ok(true)
     })
     .map_err(SqlError::Storage)
@@ -1886,6 +1910,7 @@ pub(super) fn cascade_after_parent_delete(
 ) -> Result<()> {
     let mut worklist: Vec<(String, Vec<Vec<u8>>)> =
         vec![(parent_table.to_string(), deleted_pk_keys.to_vec())];
+    let mut hits = FkChildHits::default();
 
     while let Some((cur_table, cur_pks)) = worklist.pop() {
         let child_fks = schema.child_fks_for(&cur_table);
@@ -1899,7 +1924,7 @@ pub(super) fn cascade_after_parent_delete(
                     "no index backs the foreign key on '{child_table}' referencing '{cur_table}'"
                 ))
             })?;
-            let mut hits: Vec<FkChildHit> = Vec::new();
+            hits.clear();
             for parent_pk_key in &cur_pks {
                 scan_fk_index_keys(wtx, child_schema, cascading_idx, parent_pk_key, &mut hits)?;
             }
@@ -1919,7 +1944,7 @@ pub(super) fn cascade_after_parent_delete(
                     // Skip the pk-key build for a leaf child that can't cascade on.
                     if !schema.child_fks_for(child_table).is_empty() {
                         let pk_keys: Vec<Vec<u8>> =
-                            hits.into_iter().map(|h| h.into_pk_key()).collect();
+                            hits.hits.iter().map(|h| hits.pk_key(h).to_vec()).collect();
                         worklist.push((child_table.to_string(), pk_keys));
                     }
                 }
@@ -1943,7 +1968,7 @@ fn delete_cascade_hits(
     schema: &crate::schema::SchemaManager,
     child_schema: &TableSchema,
     cascading_idx: &IndexDef,
-    hits: &[FkChildHit],
+    hits: &FkChildHits,
 ) -> Result<()> {
     let child_table = child_schema.name.as_str();
     let cascading_idx_table = TableSchema::index_table_name(child_table, &cascading_idx.name);
@@ -1964,10 +1989,10 @@ fn delete_cascade_hits(
     });
 
     if other_indices.is_empty() && !has_after_delete_triggers {
-        for hit in hits {
-            wtx.table_delete(&cascading_idx_table, &hit.fk_idx_key)
+        for hit in &hits.hits {
+            wtx.table_delete(&cascading_idx_table, hits.fk_idx_key(hit))
                 .map_err(SqlError::Storage)?;
-            wtx.table_delete(child_table.as_bytes(), hit.pk_key())
+            wtx.table_delete(child_table.as_bytes(), hits.pk_key(hit))
                 .map_err(SqlError::Storage)?;
         }
     } else {
@@ -1980,8 +2005,8 @@ fn delete_cascade_hits(
             .collect();
         let mut pk_values_buf: Vec<Value> = Vec::with_capacity(pk_indices.len());
         let mut idx_key_buf: Vec<u8> = Vec::new();
-        for ((pk_key, row), hit) in rows.iter().zip(hits) {
-            wtx.table_delete(&cascading_idx_table, &hit.fk_idx_key)
+        for ((pk_key, row), hit) in rows.iter().zip(&hits.hits) {
+            wtx.table_delete(&cascading_idx_table, hits.fk_idx_key(hit))
                 .map_err(SqlError::Storage)?;
             pk_values_buf.clear();
             pk_values_buf.extend(pk_indices.iter().map(|&j| row[j].clone()));
@@ -2023,11 +2048,11 @@ fn delete_cascade_hits(
 fn fetch_child_rows(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     child_schema: &TableSchema,
-    hits: &[FkChildHit],
+    hits: &FkChildHits,
 ) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
-    let mut rows = Vec::with_capacity(hits.len());
-    for hit in hits {
-        let pk = hit.pk_key();
+    let mut rows = Vec::with_capacity(hits.hits.len());
+    for hit in &hits.hits {
+        let pk = hits.pk_key(hit);
         if let Some(value_bytes) = wtx
             .table_get(child_schema.name.as_bytes(), pk)
             .map_err(SqlError::Storage)?
@@ -2139,6 +2164,7 @@ pub(super) fn cascade_after_parent_update(
     if child_fks.is_empty() {
         return Ok(());
     }
+    let mut hits = FkChildHits::default();
 
     for &(child_table, fk) in &child_fks {
         let child_schema = schema.get(child_table).unwrap();
@@ -2157,7 +2183,7 @@ pub(super) fn cascade_after_parent_update(
             if !changed {
                 continue;
             }
-            let mut hits: Vec<FkChildHit> = Vec::new();
+            hits.clear();
             scan_fk_index_keys(wtx, child_schema, cascading_idx, old_pk_key, &mut hits)?;
             if hits.is_empty() {
                 continue;
