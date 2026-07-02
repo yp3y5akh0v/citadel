@@ -1766,8 +1766,15 @@ pub(super) fn exec_update(
     if let Some(returning_cols) = stmt.returning.as_ref() {
         let rows: Vec<super::helpers::ReturningRow> = changes
             .iter()
-            .map(|c| (Some(c.old_row.clone()), Some(c.new_row.clone())))
-            .collect();
+            .map(|c| {
+                let mut new_row = c.new_row.clone();
+                // Virtual columns in new_row still hold pre-update values.
+                if table_schema.has_virtual_columns() {
+                    super::helpers::materialize_virtual(table_schema, &mut new_row)?;
+                }
+                Ok((Some(c.old_row.clone()), Some(new_row)))
+            })
+            .collect::<Result<_>>()?;
         let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
         super::helpers::drain_deferred_fk_checks(&mut wtx)?;
         wtx.commit().map_err(SqlError::Storage)?;
@@ -3445,8 +3452,15 @@ pub(super) fn exec_update_in_txn(
     if let Some(returning_cols) = stmt.returning.as_ref() {
         let rows: Vec<super::helpers::ReturningRow> = changes
             .iter()
-            .map(|c| (Some(c.old_row.clone()), Some(c.new_row.clone())))
-            .collect();
+            .map(|c| {
+                let mut new_row = c.new_row.clone();
+                // Virtual columns in new_row still hold pre-update values.
+                if table_schema.has_virtual_columns() {
+                    super::helpers::materialize_virtual(table_schema, &mut new_row)?;
+                }
+                Ok((Some(c.old_row.clone()), Some(new_row)))
+            })
+            .collect::<Result<_>>()?;
         let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
         return Ok(ExecutionResult::Query(qr));
     }
