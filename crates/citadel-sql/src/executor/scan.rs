@@ -193,11 +193,7 @@ pub(super) fn collect_rows_with_read(
                 && between_pred.is_none()
                 && jsonb_pred.is_none();
 
-            let col_map = if needs_generic_eval {
-                Some(ColumnMap::new(columns))
-            } else {
-                None
-            };
+            let col_map = needs_generic_eval.then(|| table_schema.column_map());
             let partial_ctx = if needs_generic_eval {
                 where_clause.as_ref().and_then(|expr| {
                     let needed = referenced_columns(expr, columns);
@@ -210,7 +206,7 @@ pub(super) fn collect_rows_with_read(
             } else {
                 None
             };
-            let compiled = match (col_map.as_ref(), where_clause.as_ref()) {
+            let compiled = match (col_map, where_clause.as_ref()) {
                 (Some(cm), Some(expr)) => Some(CompiledExpr::compile(expr, cm)),
                 _ => None,
             };
@@ -233,7 +229,7 @@ pub(super) fn collect_rows_with_read(
                     simple_pred.as_ref(),
                     between_pred.as_ref(),
                     jsonb_pred.as_ref(),
-                    col_map.as_ref(),
+                    col_map,
                     partial_ctx.as_ref(),
                 );
                 match step {
@@ -262,8 +258,8 @@ pub(super) fn collect_rows_with_read(
                 Some(value) => {
                     let row = decode_full_row(table_schema, &key, &value)?;
                     if let Some(ref expr) = where_clause {
-                        let col_map = ColumnMap::new(columns);
-                        match eval_expr(expr, &EvalCtx::new(&col_map, &row)) {
+                        let col_map = table_schema.column_map();
+                        match eval_expr(expr, &EvalCtx::new(col_map, &row)) {
                             Ok(val) if is_truthy(&val) => Ok((vec![row], true)),
                             _ => Ok((vec![], true)),
                         }
@@ -282,7 +278,7 @@ pub(super) fn collect_rows_with_read(
         } => {
             let mut rows = Vec::new();
             let mut scan_err: Option<SqlError> = None;
-            let col_map = ColumnMap::new(columns);
+            let col_map = table_schema.column_map();
             rtx.table_scan_from(lower_name.as_bytes(), start_key, |key, value| {
                 let pk_vals = match decode_composite_key(key, num_pk_cols) {
                     Ok(v) => v,
@@ -299,7 +295,7 @@ pub(super) fn collect_rows_with_read(
                 match decode_full_row(table_schema, key, value) {
                     Ok(row) => {
                         let keep = match &where_clause {
-                            Some(expr) => eval_expr(expr, &EvalCtx::new(&col_map, &row))
+                            Some(expr) => eval_expr(expr, &EvalCtx::new(col_map, &row))
                                 .is_ok_and(|v| is_truthy(&v)),
                             None => true,
                         };
@@ -366,7 +362,7 @@ pub(super) fn collect_rows_with_read(
             }
 
             let mut rows = Vec::new();
-            let col_map = ColumnMap::new(columns);
+            let col_map = table_schema.column_map();
             for pk_key in &pk_keys {
                 if let Some(value) = rtx
                     .table_get(lower_name.as_bytes(), pk_key)
@@ -374,7 +370,7 @@ pub(super) fn collect_rows_with_read(
                 {
                     let row = decode_full_row(table_schema, pk_key, &value)?;
                     if let Some(ref expr) = where_clause {
-                        match eval_expr(expr, &EvalCtx::new(&col_map, &row)) {
+                        match eval_expr(expr, &EvalCtx::new(col_map, &row)) {
                             Ok(val) if is_truthy(&val) => rows.push(row),
                             _ => {}
                         }
@@ -395,7 +391,7 @@ pub(super) fn collect_rows_with_read(
         } => {
             let candidate_pks = inverted_intersect_candidates(rtx, &idx_table, &probe_entries)?;
             let mut rows = Vec::new();
-            let col_map = ColumnMap::new(columns);
+            let col_map = table_schema.column_map();
             for pk_key in &candidate_pks {
                 if let Some(value) = rtx
                     .table_get(lower_name.as_bytes(), pk_key)
@@ -406,7 +402,7 @@ pub(super) fn collect_rows_with_read(
                         rows.push(row);
                         continue;
                     }
-                    match eval_expr(&recheck_expr, &EvalCtx::new(&col_map, &row)) {
+                    match eval_expr(&recheck_expr, &EvalCtx::new(col_map, &row)) {
                         Ok(val) if is_truthy(&val) => rows.push(row),
                         _ => {}
                     }
@@ -509,7 +505,7 @@ pub(super) fn collect_rows_write(
             let mut rows = Vec::new();
             let mut scan_err: Option<SqlError> = None;
 
-            let col_map = ColumnMap::new(columns);
+            let col_map = table_schema.column_map();
             let partial_ctx = where_clause.as_ref().and_then(|expr| {
                 let needed = referenced_columns(expr, columns);
                 if needed.len() < columns.len() {
@@ -522,7 +518,7 @@ pub(super) fn collect_rows_write(
             wtx.table_scan_from(lower_name.as_bytes(), b"", |key, value| {
                 match (&where_clause, &partial_ctx) {
                     (Some(expr), Some(ctx)) => match ctx.decode(key, value) {
-                        Ok(partial) => match eval_expr(expr, &EvalCtx::new(&col_map, &partial)) {
+                        Ok(partial) => match eval_expr(expr, &EvalCtx::new(col_map, &partial)) {
                             Ok(val) if is_truthy(&val) => match ctx.complete(partial, key, value) {
                                 Ok(row) => rows.push(row),
                                 Err(e) => scan_err = Some(e),
@@ -533,7 +529,7 @@ pub(super) fn collect_rows_write(
                         Err(e) => scan_err = Some(e),
                     },
                     (Some(expr), None) => match decode_full_row(table_schema, key, value) {
-                        Ok(row) => match eval_expr(expr, &EvalCtx::new(&col_map, &row)) {
+                        Ok(row) => match eval_expr(expr, &EvalCtx::new(col_map, &row)) {
                             Ok(val) if is_truthy(&val) => rows.push(row),
                             Err(e) => scan_err = Some(e),
                             _ => {}
@@ -564,8 +560,8 @@ pub(super) fn collect_rows_write(
                 Some(value) => {
                     let row = decode_full_row(table_schema, &key, &value)?;
                     if let Some(ref expr) = where_clause {
-                        let col_map = ColumnMap::new(columns);
-                        match eval_expr(expr, &EvalCtx::new(&col_map, &row)) {
+                        let col_map = table_schema.column_map();
+                        match eval_expr(expr, &EvalCtx::new(col_map, &row)) {
                             Ok(val) if is_truthy(&val) => Ok((vec![row], true)),
                             _ => Ok((vec![], true)),
                         }
@@ -584,7 +580,7 @@ pub(super) fn collect_rows_write(
         } => {
             let mut rows = Vec::new();
             let mut scan_err: Option<SqlError> = None;
-            let col_map = ColumnMap::new(columns);
+            let col_map = table_schema.column_map();
             wtx.table_scan_from(lower_name.as_bytes(), start_key, |key, value| {
                 let pk_vals = match decode_composite_key(key, num_pk_cols) {
                     Ok(v) => v,
@@ -601,7 +597,7 @@ pub(super) fn collect_rows_write(
                 match decode_full_row(table_schema, key, value) {
                     Ok(row) => {
                         let keep = match &where_clause {
-                            Some(expr) => eval_expr(expr, &EvalCtx::new(&col_map, &row))
+                            Some(expr) => eval_expr(expr, &EvalCtx::new(col_map, &row))
                                 .is_ok_and(|v| is_truthy(&v)),
                             None => true,
                         };
@@ -668,7 +664,7 @@ pub(super) fn collect_rows_write(
             }
 
             let mut rows = Vec::new();
-            let col_map = ColumnMap::new(columns);
+            let col_map = table_schema.column_map();
             for pk_key in &pk_keys {
                 if let Some(value) = wtx
                     .table_get(lower_name.as_bytes(), pk_key)
@@ -676,7 +672,7 @@ pub(super) fn collect_rows_write(
                 {
                     let row = decode_full_row(table_schema, pk_key, &value)?;
                     if let Some(ref expr) = where_clause {
-                        match eval_expr(expr, &EvalCtx::new(&col_map, &row)) {
+                        match eval_expr(expr, &EvalCtx::new(col_map, &row)) {
                             Ok(val) if is_truthy(&val) => rows.push(row),
                             _ => {}
                         }

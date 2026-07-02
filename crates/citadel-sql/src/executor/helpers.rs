@@ -613,7 +613,7 @@ pub(crate) fn decode_full_row_into(
 /// Caller must ensure all non-virtual columns in `row` are already populated.
 #[inline]
 pub(crate) fn materialize_virtual(schema: &TableSchema, row: &mut [Value]) -> Result<()> {
-    let col_map = ColumnMap::new(&schema.columns);
+    let col_map = schema.column_map();
     for col in &schema.columns {
         if matches!(
             col.generated_kind,
@@ -621,7 +621,7 @@ pub(crate) fn materialize_virtual(schema: &TableSchema, row: &mut [Value]) -> Re
         ) {
             let val = eval_expr(
                 col.generated_expr.as_ref().unwrap(),
-                &EvalCtx::new(&col_map, row),
+                &EvalCtx::new(col_map, row),
             )?;
             let pos = col.position as usize;
             row[pos] = if val.is_null() {
@@ -1147,7 +1147,7 @@ pub(super) fn project_returning(
     rows: &[ReturningRow],
 ) -> Result<QueryResult> {
     let columns = &table_schema.columns;
-    let col_map = ColumnMap::new(columns);
+    let col_map = table_schema.column_map();
 
     let mut col_names = Vec::new();
     for sel_col in returning {
@@ -1165,7 +1165,7 @@ pub(super) fn project_returning(
     let mut out_rows = Vec::with_capacity(rows.len());
     for (old, new) in rows {
         let default_row: &[Value] = new.as_deref().or(old.as_deref()).unwrap_or(&[]);
-        let ctx = EvalCtx::with_old_new(&col_map, default_row, old.as_deref(), new.as_deref());
+        let ctx = EvalCtx::with_old_new(col_map, default_row, old.as_deref(), new.as_deref());
 
         let mut out = Vec::with_capacity(col_names.len());
         for sel_col in returning {

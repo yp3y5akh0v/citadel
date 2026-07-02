@@ -972,8 +972,8 @@ pub(super) fn exec_update(
             handle_correlated_where_read(db, schema, &select_stmt, &corr_ctx, &mut rows)?;
 
         if let Some(ref w) = remaining {
-            let col_map = ColumnMap::new(&table_schema.columns);
-            rows.retain(|row| match eval_expr(w, &EvalCtx::new(&col_map, row)) {
+            let col_map = table_schema.column_map();
+            rows.retain(|row| match eval_expr(w, &EvalCtx::new(col_map, row)) {
                 Ok(val) => is_truthy(&val),
                 Err(_) => false,
             });
@@ -1013,7 +1013,7 @@ pub(super) fn exec_update(
         stmt
     };
 
-    let col_map = ColumnMap::new(&table_schema.columns);
+    let col_map = table_schema.column_map();
     let pk_indices = table_schema.pk_indices();
 
     let pk_changed_by_set = stmt.assignments.iter().any(|(col_name, _)| {
@@ -1158,7 +1158,7 @@ pub(super) fn exec_update(
                     decode_cols_into(value, &rhs_extra_cols, &mut partial_row)?;
                     for target in &targets {
                         let new_val =
-                            eval_expr(&target.expr, &EvalCtx::new(&col_map, &partial_row))?;
+                            eval_expr(&target.expr, &EvalCtx::new(col_map, &partial_row))?;
                         let coerced = if new_val.is_null() {
                             if !target.col.nullable {
                                 return Err(SqlError::NotNullViolation(target.col.name.clone()));
@@ -1186,7 +1186,7 @@ pub(super) fn exec_update(
                         &mut partial_row,
                         &gen_targets,
                         &gen_extra_cols,
-                        &col_map,
+                        col_map,
                         &mut patch_buf,
                     )?;
                     Ok(Some(true))
@@ -1257,7 +1257,7 @@ pub(super) fn exec_update(
             if matches!(plan, crate::planner::ScanPlan::SeqScan) {
                 if let Some(ref w) = stmt.where_clause {
                     let row = decode_full_row(table_schema, key, raw_value)?;
-                    if !eval_expr(w, &EvalCtx::new(&col_map, &row)).is_ok_and(|v| is_truthy(&v)) {
+                    if !eval_expr(w, &EvalCtx::new(col_map, &row)).is_ok_and(|v| is_truthy(&v)) {
                         continue;
                     }
                 }
@@ -1276,7 +1276,7 @@ pub(super) fn exec_update(
             }
             decode_cols_into(raw_value, &rhs_extra_cols, &mut partial_row)?;
             for target in &targets {
-                let new_val = eval_expr(&target.expr, &EvalCtx::new(&col_map, &partial_row))?;
+                let new_val = eval_expr(&target.expr, &EvalCtx::new(col_map, &partial_row))?;
                 let coerced = if new_val.is_null() {
                     if !target.col.nullable {
                         return Err(SqlError::NotNullViolation(target.col.name.clone()));
@@ -1304,7 +1304,7 @@ pub(super) fn exec_update(
                 &mut partial_row,
                 &gen_targets,
                 &gen_extra_cols,
-                &col_map,
+                col_map,
                 &mut patch_buf,
             )?;
             patched.push((std::mem::take(key), std::mem::take(raw_value)));
@@ -1329,7 +1329,7 @@ pub(super) fn exec_update(
         .into_iter()
         .filter(|(_, row)| match &stmt.where_clause {
             Some(where_expr) => {
-                eval_expr(where_expr, &EvalCtx::new(&col_map, row)).is_ok_and(|v| is_truthy(&v))
+                eval_expr(where_expr, &EvalCtx::new(col_map, row)).is_ok_and(|v| is_truthy(&v))
             }
             None => true,
         })
@@ -1380,7 +1380,7 @@ pub(super) fn exec_update(
             if col.generated_kind.is_some() {
                 return Err(SqlError::CannotUpdateGeneratedColumn(col.name.clone()));
             }
-            let new_val = eval_expr(expr, &EvalCtx::new(&col_map, row))?;
+            let new_val = eval_expr(expr, &EvalCtx::new(col_map, row))?;
 
             let coerced = if new_val.is_null() {
                 if !col.nullable {
@@ -1401,7 +1401,7 @@ pub(super) fn exec_update(
         for col in &stored_gen_cols {
             let val = eval_expr(
                 col.generated_expr.as_ref().unwrap(),
-                &EvalCtx::new(&col_map, &new_row),
+                &EvalCtx::new(col_map, &new_row),
             )?;
             let pos = col.position as usize;
             new_row[pos] = if val.is_null() {
@@ -1422,7 +1422,7 @@ pub(super) fn exec_update(
         if table_schema.has_checks() {
             for col in &table_schema.columns {
                 if let Some(ref check) = col.check_expr {
-                    let result = eval_expr(check, &EvalCtx::new(&col_map, &new_row))?;
+                    let result = eval_expr(check, &EvalCtx::new(col_map, &new_row))?;
                     if !is_truthy(&result) && !result.is_null() {
                         let name = col.check_name.as_deref().unwrap_or(&col.name);
                         return Err(SqlError::CheckViolation(name.to_string()));
@@ -1430,7 +1430,7 @@ pub(super) fn exec_update(
                 }
             }
             for tc in &table_schema.check_constraints {
-                let result = eval_expr(&tc.expr, &EvalCtx::new(&col_map, &new_row))?;
+                let result = eval_expr(&tc.expr, &EvalCtx::new(col_map, &new_row))?;
                 if !is_truthy(&result) && !result.is_null() {
                     let name = tc.name.as_deref().unwrap_or(&tc.sql);
                     return Err(SqlError::CheckViolation(name.to_string()));
@@ -1822,8 +1822,8 @@ pub(super) fn exec_delete(
             handle_correlated_where_read(db, schema, &select_stmt, &corr_ctx, &mut rows)?;
 
         if let Some(ref w) = remaining {
-            let col_map = ColumnMap::new(&table_schema.columns);
-            rows.retain(|row| match eval_expr(w, &EvalCtx::new(&col_map, row)) {
+            let col_map = table_schema.column_map();
+            rows.retain(|row| match eval_expr(w, &EvalCtx::new(col_map, row)) {
                 Ok(val) => is_truthy(&val),
                 Err(_) => false,
             });
@@ -1862,7 +1862,7 @@ pub(super) fn exec_delete(
         stmt
     };
 
-    let col_map = ColumnMap::new(&table_schema.columns);
+    let col_map = table_schema.column_map();
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     super::ann_persist::purge_segment(&mut wtx, &lower_name)?;
 
@@ -1896,7 +1896,7 @@ pub(super) fn exec_delete(
     let rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
         .into_iter()
         .filter(|(_, row)| match &stmt.where_clause {
-            Some(where_expr) => match eval_expr(where_expr, &EvalCtx::new(&col_map, row)) {
+            Some(where_expr) => match eval_expr(where_expr, &EvalCtx::new(col_map, row)) {
                 Ok(val) => is_truthy(&val),
                 Err(_) => false,
             },
@@ -2235,13 +2235,13 @@ pub(super) fn exec_select_in_txn(
             })
             .map_err(SqlError::Storage)?;
         } else {
-            let col_map = ColumnMap::new(&table_schema.columns);
+            let col_map = table_schema.column_map();
             wtx.table_scan_from(lower_name.as_bytes(), b"", |key, value| {
                 Ok(plan.feed_row(
                     key,
                     value,
                     table_schema,
-                    &col_map,
+                    col_map,
                     &stmt.where_clause,
                     &mut states,
                     &mut scan_err,
@@ -2972,9 +2972,9 @@ pub(super) fn exec_update_in_txn(
     let lower_name = table_schema.name.clone();
     let strict = table_schema.is_strict();
 
-    let col_map = ColumnMap::new(&table_schema.columns);
+    let col_map = table_schema.column_map();
 
-    if let Some(result) = try_fast_update_in_txn(wtx, schema, stmt, table_schema, &col_map)? {
+    if let Some(result) = try_fast_update_in_txn(wtx, schema, stmt, table_schema, col_map)? {
         return Ok(result);
     }
 
@@ -2982,7 +2982,7 @@ pub(super) fn exec_update_in_txn(
     let matching_rows: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
         .into_iter()
         .filter(|(_, row)| match &stmt.where_clause {
-            Some(where_expr) => match eval_expr(where_expr, &EvalCtx::new(&col_map, row)) {
+            Some(where_expr) => match eval_expr(where_expr, &EvalCtx::new(col_map, row)) {
                 Ok(val) => is_truthy(&val),
                 Err(_) => false,
             },
@@ -3034,7 +3034,7 @@ pub(super) fn exec_update_in_txn(
             if col.generated_kind.is_some() {
                 return Err(SqlError::CannotUpdateGeneratedColumn(col.name.clone()));
             }
-            let new_val = eval_expr(expr, &EvalCtx::new(&col_map, row))?;
+            let new_val = eval_expr(expr, &EvalCtx::new(col_map, row))?;
 
             let coerced = if new_val.is_null() {
                 if !col.nullable {
@@ -3058,7 +3058,7 @@ pub(super) fn exec_update_in_txn(
         for col in &stored_gen_cols {
             let val = eval_expr(
                 col.generated_expr.as_ref().unwrap(),
-                &EvalCtx::new(&col_map, &new_row),
+                &EvalCtx::new(col_map, &new_row),
             )?;
             let pos = col.position as usize;
             new_row[pos] = if val.is_null() {
@@ -3079,7 +3079,7 @@ pub(super) fn exec_update_in_txn(
         if table_schema.has_checks() {
             for col in &table_schema.columns {
                 if let Some(ref check) = col.check_expr {
-                    let result = eval_expr(check, &EvalCtx::new(&col_map, &new_row))?;
+                    let result = eval_expr(check, &EvalCtx::new(col_map, &new_row))?;
                     if !is_truthy(&result) && !result.is_null() {
                         let name = col.check_name.as_deref().unwrap_or(&col.name);
                         return Err(SqlError::CheckViolation(name.to_string()));
@@ -3087,7 +3087,7 @@ pub(super) fn exec_update_in_txn(
                 }
             }
             for tc in &table_schema.check_constraints {
-                let result = eval_expr(&tc.expr, &EvalCtx::new(&col_map, &new_row))?;
+                let result = eval_expr(&tc.expr, &EvalCtx::new(col_map, &new_row))?;
                 if !is_truthy(&result) && !result.is_null() {
                     let name = tc.name.as_deref().unwrap_or(&tc.sql);
                     return Err(SqlError::CheckViolation(name.to_string()));
@@ -3478,12 +3478,12 @@ pub(super) fn exec_delete_in_txn(
         return Ok(ExecutionResult::RowsAffected(count));
     }
 
-    let col_map = ColumnMap::new(&table_schema.columns);
+    let col_map = table_schema.column_map();
     let all_candidates = collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?;
     let rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
         .into_iter()
         .filter(|(_, row)| match &stmt.where_clause {
-            Some(where_expr) => match eval_expr(where_expr, &EvalCtx::new(&col_map, row)) {
+            Some(where_expr) => match eval_expr(where_expr, &EvalCtx::new(col_map, row)) {
                 Ok(val) => is_truthy(&val),
                 Err(_) => false,
             },
