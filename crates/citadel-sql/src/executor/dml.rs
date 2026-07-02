@@ -166,16 +166,8 @@ pub(super) fn exec_insert(
 
     let has_checks = table_schema.has_checks();
     let strict = table_schema.is_strict();
-    let row_col_map_for_gen = if !generated_cols.is_empty() {
-        Some(ColumnMap::new(&table_schema.columns))
-    } else {
-        None
-    };
-    let check_col_map = if has_checks {
-        Some(ColumnMap::new(&table_schema.columns))
-    } else {
-        None
-    };
+    let row_col_map_for_gen = (!generated_cols.is_empty()).then(|| table_schema.column_map());
+    let check_col_map = has_checks.then(|| table_schema.column_map());
 
     let select_rows = match &stmt.source {
         InsertSource::Select(sq) => {
@@ -197,7 +189,7 @@ pub(super) fn exec_insert(
 
     let row_col_map = compiled_conflict
         .as_ref()
-        .map(|_| ColumnMap::new(&table_schema.columns));
+        .map(|_| table_schema.column_map());
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     // DML invalidates the table's persisted ANN segment in the SAME txn
@@ -325,7 +317,7 @@ pub(super) fn exec_insert(
             }
         }
 
-        if let Some(ref gen_map) = row_col_map_for_gen {
+        if let Some(gen_map) = row_col_map_for_gen {
             for &(pos, gen_expr) in &generated_cols {
                 let val = eval_expr(gen_expr, &EvalCtx::new(gen_map, &row))?;
                 let col = &table_schema.columns[pos];
@@ -343,7 +335,7 @@ pub(super) fn exec_insert(
             }
         }
 
-        if let Some(ref col_map) = check_col_map {
+        if let Some(col_map) = check_col_map {
             for col in &table_schema.columns {
                 if let Some(ref check) = col.check_expr {
                     let result = eval_expr(check, &EvalCtx::new(col_map, &row))?;
@@ -513,7 +505,7 @@ pub(super) fn exec_insert(
                     &row,
                     &pk_values,
                     oc_ref,
-                    row_col_map.as_ref().unwrap(),
+                    row_col_map.unwrap(),
                     stmt.returning.is_some(),
                 )?;
                 match outcome {
@@ -1522,18 +1514,7 @@ fn exec_insert_in_txn_impl(
             .collect();
     }
     let has_gen_cols = !cached_gen_positions.is_empty() || !generated_cols_uncached.is_empty();
-    let row_col_map_for_gen_owned: Option<ColumnMap> = if !has_gen_cols || cache.is_some() {
-        None
-    } else {
-        Some(ColumnMap::new(&table_schema.columns))
-    };
-    let row_col_map_for_gen: Option<&ColumnMap> = if !has_gen_cols {
-        None
-    } else if let Some(c) = cache {
-        c.row_col_map.as_ref()
-    } else {
-        row_col_map_for_gen_owned.as_ref()
-    };
+    let row_col_map_for_gen: Option<&ColumnMap> = has_gen_cols.then(|| table_schema.column_map());
 
     let any_defaults = match cache {
         Some(c) => c.any_defaults,
@@ -1560,7 +1541,7 @@ fn exec_insert_in_txn_impl(
         None => table_schema.has_checks(),
     };
     let check_col_map = if has_checks {
-        Some(ColumnMap::new(&table_schema.columns))
+        Some(table_schema.column_map())
     } else {
         None
     };
@@ -1604,15 +1585,9 @@ fn exec_insert_in_txn_impl(
         (_, None) => None,
     };
 
-    let row_col_map_owned: Option<ColumnMap> =
-        if compiled_conflict.is_some() && cache.and_then(|c| c.row_col_map.as_ref()).is_none() {
-            Some(ColumnMap::new(&table_schema.columns))
-        } else {
-            None
-        };
-    let row_col_map: Option<&ColumnMap> = cache
-        .and_then(|c| c.row_col_map.as_ref())
-        .or(row_col_map_owned.as_ref());
+    let row_col_map: Option<&ColumnMap> = compiled_conflict
+        .is_some()
+        .then(|| table_schema.column_map());
 
     let select_rows = match &stmt.source {
         InsertSource::Select(sq) => {
@@ -1846,7 +1821,7 @@ fn exec_insert_in_txn_impl(
             }
         }
 
-        if let Some(ref col_map) = check_col_map {
+        if let Some(col_map) = check_col_map {
             for col in &table_schema.columns {
                 if let Some(ref check) = col.check_expr {
                     let result = eval_expr(check, &EvalCtx::new(col_map, &bufs.row))?;
@@ -2151,7 +2126,6 @@ struct InsertCache {
     any_defaults: bool,
     has_checks: bool,
     on_conflict: Option<Arc<CompiledOnConflict>>,
-    row_col_map: Option<ColumnMap>,
     generated_col_positions: Vec<usize>,
     generated_fast_evals: Vec<FastGenEval>,
     pk_indices: Vec<usize>,
@@ -3559,11 +3533,6 @@ impl CompiledInsert {
                     detect_fast_gen_eval(ts.columns[pos].generated_expr.as_ref().unwrap(), ts)
                 })
                 .collect();
-            let row_col_map = if on_conflict.is_some() || !generated_col_positions.is_empty() {
-                Some(ColumnMap::new(&ts.columns))
-            } else {
-                None
-            };
             let pk_indices: Vec<usize> = ts.pk_indices().to_vec();
             let non_pk_indices: Vec<usize> = ts.non_pk_indices().to_vec();
             let encoding_positions: Vec<u16> = ts.encoding_positions().to_vec();
@@ -3686,7 +3655,6 @@ impl CompiledInsert {
                 any_defaults,
                 has_checks,
                 on_conflict,
-                row_col_map,
                 generated_col_positions,
                 generated_fast_evals,
                 pk_indices,

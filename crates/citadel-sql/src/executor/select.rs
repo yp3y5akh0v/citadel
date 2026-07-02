@@ -286,13 +286,13 @@ pub(super) fn exec_select_with_read(
                 }
             }
         } else {
-            let col_map = ColumnMap::new(&table_schema.columns);
+            let col_map = table_schema.column_map();
             rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
                 plan.feed_row(
                     key,
                     value,
                     table_schema,
-                    &col_map,
+                    col_map,
                     &stmt.where_clause,
                     &mut states,
                     &mut scan_err,
@@ -1933,7 +1933,7 @@ impl StreamAggPlan {
             return Ok(None);
         }
 
-        let col_map = ColumnMap::new(&table_schema.columns);
+        let col_map = table_schema.column_map();
         let mut ops: Vec<(StreamAgg, String)> = Vec::new();
         for sel_col in &stmt.columns {
             let (expr, alias) = match sel_col {
@@ -1955,7 +1955,7 @@ impl StreamAggPlan {
                         return Ok(None);
                     }
                     let func = func_name.to_ascii_uppercase();
-                    let col_idx = match resolve_simple_col(&args[0], &col_map) {
+                    let col_idx = match resolve_simple_col(&args[0], col_map) {
                         Some(idx) => idx,
                         None => return Ok(None),
                     };
@@ -2260,7 +2260,7 @@ impl StreamGroupByPlan {
         }
         let where_pred = where_pred.flatten();
 
-        let col_map = ColumnMap::new(&schema.columns);
+        let col_map = schema.column_map();
 
         let group_col_idx = match &stmt.group_by[0] {
             Expr::Column(name) => col_map.resolve(name).ok(),
@@ -2302,7 +2302,7 @@ impl StreamGroupByPlan {
                 .unwrap_or(&expr_display_name(expr))
                 .to_string();
 
-            if let Some(idx) = resolve_simple_col(expr, &col_map) {
+            if let Some(idx) = resolve_simple_col(expr, col_map) {
                 if idx == group_col_idx {
                     output.push((GroupByOutputCol::GroupKey, name));
                     continue;
@@ -2325,7 +2325,7 @@ impl StreamGroupByPlan {
                         return Ok(None);
                     }
                     let func = func_name.to_ascii_uppercase();
-                    let col_idx = match resolve_simple_col(&args[0], &col_map) {
+                    let col_idx = match resolve_simple_col(&args[0], col_map) {
                         Some(idx) => idx,
                         None => return Ok(None),
                     };
@@ -2564,12 +2564,12 @@ impl TopKScanPlan {
         }
 
         let ob = &stmt.order_by[0];
-        let col_map = ColumnMap::new(&schema.columns);
+        let col_map = schema.column_map();
         let (sort_expr, explicit_coll): (&Expr, Option<crate::types::Collation>) = match &ob.expr {
             Expr::Collate { expr: e, collation } => (e.as_ref(), Some(*collation)),
             other => (other, None),
         };
-        let col_idx = match resolve_simple_col(sort_expr, &col_map) {
+        let col_idx = match resolve_simple_col(sort_expr, col_map) {
             Some(idx) => idx,
             None => return Ok(None),
         };
@@ -2842,7 +2842,7 @@ fn try_streaming_distinct_with_read(
         return Ok(None);
     }
 
-    let col_map = ColumnMap::new(&table_schema.columns);
+    let col_map = table_schema.column_map();
     let non_pk = table_schema.non_pk_indices();
     let enc_pos = table_schema.encoding_positions();
     let num_pk_cols = table_schema.primary_key_columns.len();
@@ -2859,7 +2859,7 @@ fn try_streaming_distinct_with_read(
             .as_deref()
             .unwrap_or(&expr_display_name(expr))
             .to_string();
-        let col_idx = match resolve_simple_col(expr, &col_map) {
+        let col_idx = match resolve_simple_col(expr, col_map) {
             Some(idx) => idx,
             None => return Ok(None),
         };
