@@ -327,3 +327,25 @@ fn covered_count_dup_eq_conjunct_stays_correct() {
     let qr = conn.query("SELECT COUNT(*) FROM t WHERE k = NULL").unwrap();
     assert_eq!(qr.rows, vec![vec![Value::Integer(0)]]);
 }
+
+#[test]
+fn explain_marks_covering_scans() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, val INTEGER, extra TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_val ON t (val)").unwrap();
+
+    let qr = conn
+        .query("EXPLAIN SELECT id FROM t WHERE val = 5")
+        .unwrap();
+    let text = format!("{:?}", qr.rows);
+    assert!(text.contains("COVERING"), "expected marker in {text}");
+
+    let qr = conn
+        .query("EXPLAIN SELECT extra FROM t WHERE val = 5")
+        .unwrap();
+    let text = format!("{:?}", qr.rows);
+    assert!(!text.contains("COVERING"), "unexpected marker in {text}");
+}

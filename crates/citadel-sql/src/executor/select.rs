@@ -4282,6 +4282,17 @@ impl CompiledSelectLane {
     }
 }
 
+/// EXPLAIN marker: true when the scan lane would serve this select covered.
+pub(super) fn select_would_cover(schema: &SchemaManager, sel: &SelectStmt) -> bool {
+    match build_select_lane(schema, sel) {
+        Some(CompiledSelectLane::Scan(s)) => {
+            let plan = crate::planner::plan_select_inverted(&s.table_schema, &s.where_expr);
+            super::scan::covered_index_components(&s.table_schema, &plan, &s.needed).is_some()
+        }
+        _ => false,
+    }
+}
+
 impl SimpleScanPlan {
     fn run(&self, rtx: &mut ReadTxn<'_>) -> Result<QueryResult> {
         let plan = crate::planner::plan_select_inverted(&self.table_schema, &self.where_expr);

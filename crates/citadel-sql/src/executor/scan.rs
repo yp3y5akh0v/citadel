@@ -27,32 +27,22 @@ fn index_scan_start(prefix: &[u8], range_conds: &[(BinOp, Value)]) -> Option<Vec
         .max()
 }
 
-/// Index-only row service; only Binary components and pk columns reconstruct.
-pub(super) fn try_covered_index_collect_read(
-    rtx: &mut ReadTxn<'_>,
+/// Column index -> key-component position when the plan's index can serve
+/// every needed column losslessly (Binary components or pk columns).
+pub(super) fn covered_index_components(
     table_schema: &TableSchema,
     plan: &ScanPlan,
-    where_clause: &Option<Expr>,
     needed: &[usize],
-    limit: Option<usize>,
-) -> Result<Option<Vec<Vec<Value>>>> {
-    let ScanPlan::IndexScan {
-        index_name,
-        idx_table,
-        prefix,
-        num_prefix_cols,
-        range_conds,
-        is_unique,
-        index_columns,
-    } = plan
-    else {
-        return Ok(None);
+) -> Option<rustc_hash::FxHashMap<usize, usize>> {
+    let ScanPlan::IndexScan { index_name, .. } = plan else {
+        return None;
     };
-    let Some(idx) = table_schema.indices.iter().find(|i| &i.name == index_name) else {
-        return Ok(None);
-    };
+    let idx = table_schema
+        .indices
+        .iter()
+        .find(|i| &i.name == index_name)?;
     if idx.predicate_expr.is_some() || idx.kind != IndexKind::BTree {
-        return Ok(None);
+        return None;
     }
     let mut comp_of: rustc_hash::FxHashMap<usize, usize> = Default::default();
     for (pos, key) in idx.keys.iter().enumerate() {
@@ -67,9 +57,37 @@ pub(super) fn try_covered_index_collect_read(
     let pk_cols = &table_schema.primary_key_columns;
     for &n in needed {
         if !pk_cols.iter().any(|&c| c as usize == n) && !comp_of.contains_key(&n) {
-            return Ok(None);
+            return None;
         }
     }
+    Some(comp_of)
+}
+
+/// Index-only row service; only Binary components and pk columns reconstruct.
+pub(super) fn try_covered_index_collect_read(
+    rtx: &mut ReadTxn<'_>,
+    table_schema: &TableSchema,
+    plan: &ScanPlan,
+    where_clause: &Option<Expr>,
+    needed: &[usize],
+    limit: Option<usize>,
+) -> Result<Option<Vec<Vec<Value>>>> {
+    let Some(comp_of) = covered_index_components(table_schema, plan, needed) else {
+        return Ok(None);
+    };
+    let ScanPlan::IndexScan {
+        idx_table,
+        prefix,
+        num_prefix_cols,
+        range_conds,
+        is_unique,
+        index_columns,
+        ..
+    } = plan
+    else {
+        return Ok(None);
+    };
+    let pk_cols = &table_schema.primary_key_columns;
 
     let num_index_cols = index_columns.len();
     let num_pk_cols = pk_cols.len();
