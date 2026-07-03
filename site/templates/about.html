@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
 {% block title %}About - Citadel{% endblock %}
-{% block description %}Citadel is a single-author Rust workspace: an encrypted-first embedded database and memory engine. {{ config.extra.crates }} crates, encryption as the load-bearing layer, reproducible benchmarks against SQLite.{% endblock %}
+{% block description %}Citadel is a single-author Rust workspace: a local-first encrypted AI memory engine for agents, on an embedded SQL/vector database. {{ config.extra.crates }} crates, encryption as the load-bearing layer, cryptographic forgetting, reproducible benchmarks.{% endblock %}
 
 {% block content %}
 <main class="shell">
@@ -10,7 +10,7 @@
     <div>
       <div class="kicker">About / The project</div>
       <h1>A single-author Rust project that treats encryption as <em>load-bearing</em>.</h1>
-      <p class="sub">Not an option, not an extension, not a wrapper. A {{ config.extra.crates }}-crate Rust workspace: a full SQL engine, a key-value API, AES-256-CTR + HMAC encryption at the page level, shadow paging, an encrypted memory engine, and a reproducible benchmark suite against SQLite.</p>
+      <p class="sub">Not an option, not an extension, not a wrapper. A {{ config.extra.crates }}-crate Rust workspace: an encrypted memory engine with cryptographic forgetting, hybrid vector recall, and an MCP server - built on a full SQL engine with AES-256-CTR + HMAC page encryption, shadow paging, and a reproducible benchmark suite.</p>
     </div>
     <aside class="card">
       <div class="row"><span class="k">version</span><span class="v"><span class="ac">v{{ config.extra.version }}</span> / stable</span></div>

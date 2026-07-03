@@ -1,6 +1,6 @@
 base_url = "https://citadeldb.dev"
 title = "Citadel"
-description = "Encrypted-first embedded SQL database with a built-in memory engine"
+description = "Local-first encrypted AI memory engine for agents, on an embedded SQL/vector database with zero-LLM ingest, MCP, and cryptographic forgetting"
 compile_sass = true
 build_search_index = false
 generate_feeds = true

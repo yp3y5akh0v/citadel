@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
-{% block title %}Citadel - Encrypted-first embedded database and memory engine{% endblock %}
-{% block description %}Encrypted-first embedded SQL database with a built-in memory engine. Every page AES-256-CTR + HMAC-SHA256. Faster than unencrypted SQLite across all {{ config.extra.benchmarks }} head-to-head benchmarks, with vector recall, an MCP server, and cryptographic forgetting.{% endblock %}
+{% block title %}Citadel - Local-first encrypted memory for AI agents{% endblock %}
+{% block description %}Local-first encrypted AI memory for agents: store, recall with hybrid vector search, and cryptographically forget by destroying keys. Zero-LLM ingest, an MCP server, and no API keys - all on an embedded encrypted SQL/vector database, so your data stays on your machine.{% endblock %}
 
 {% block content %}
 {% set base = config.base_url %}
@@ -9,9 +9,9 @@
 <section class="hero shell">
   <div class="hero-inner">
     <div>
-      <h1>Encrypted-first embedded database and memory engine, <span class="ac">faster than unencrypted SQLite.</span></h1>
+      <h1>Local-first <span class="ac">encrypted memory</span> for AI agents.</h1>
       <p class="lede">
-        Every page is encrypted and authenticated before it touches disk. A full SQL engine that is faster than SQLite on all {{ config.extra.benchmarks }} head-to-head benchmarks, and on the same encrypted pages, a memory engine with vector recall, an MCP server, and cryptographic forgetting.
+        Store an agent's memory on-device, recall it with hybrid vector search, and erase it by destroying its key, with a verifiable erasure receipt. Zero-LLM ingest and an MCP server, all on one encrypted SQL/vector file. No API keys; your data stays on your machine.
       </p>
       <div class="hero-cta">
         <a class="btn" href="#install">Get started
@@ -28,7 +28,7 @@
       </div>
       <div class="install" id="install">
         <span class="prompt">$</span>
-        <code id="installCmd">cargo add citadeldb citadeldb-sql</code>
+        <code id="installCmd">cargo add citadeldb citadeldb-mem</code>
         <button id="copyInstall" aria-label="copy">copy</button>
       </div>
     </div>
@@ -63,10 +63,10 @@
   <div class="proof">
     <div class="proof-label">// proven in</div>
     <div class="proof-items">
-      <span><b>{{ config.extra.benchmarks }}/{{ config.extra.benchmarks }}</b> faster vs SQLite</span>
-      <span><b>1,540&times;</b> on full&nbsp;outer&nbsp;join</span>
-      <span><b>{{ config.extra.tests }}</b> tests, {{ config.extra.crates }} crates</span>
       <span><b>{{ config.extra.locomo }}%</b> LoCoMo score</span>
+      <span><b>{{ config.extra.locomo_ceiling }}%</b> recall ceiling</span>
+      <span><b>{{ config.extra.tests }}</b> tests, {{ config.extra.crates }} crates</span>
+      <span><b>{{ config.extra.benchmarks }}/{{ config.extra.benchmarks }}</b> faster vs SQLite</span>
     </div>
   </div>
 </div>
@@ -74,21 +74,10 @@
 <section class="block shell">
   <div class="sec-head">
     <div class="eyebrow">One substrate, two faces</div>
-    <h2>An encrypted file format that is both a database and a memory.</h2>
-    <p>The same AES-256-CTR + HMAC pages, copy-on-write B+ tree, and shadow-paging commit power both halves. Use the SQL engine, the memory engine, or both in one file.</p>
+    <h2>An encrypted file that is both an agent memory and a database.</h2>
+    <p>The same AES-256-CTR + HMAC pages, copy-on-write B+ tree, and shadow-paging commit power both halves. Use the memory engine, the SQL engine, or both in one file.</p>
   </div>
   <div class="pillars">
-    <div class="pillar">
-      <div class="tag">citadeldb / citadeldb-sql</div>
-      <h3>Encrypted database</h3>
-      <p>A complete embedded SQL + key-value engine. ACID without a WAL, snapshot isolation, and a single self-contained file - faster than unencrypted SQLite at equal cache budgets.</p>
-      <ul>
-        <li>SQL: FULL OUTER &amp; LATERAL joins, recursive CTEs, window functions, triggers, materialized views</li>
-        <li>JSON / JSONB with 14 PostgreSQL operators, GIN indexes, full-text search</li>
-        <li>Key-value API and SQL share one transaction</li>
-        <li>P2P encrypted sync over Noise; Python, CLI, C FFI, and WebAssembly bindings</li>
-      </ul>
-    </div>
     <div class="pillar">
       <div class="tag">citadeldb-vector / -mem / -ai / -mcp</div>
       <h3>Memory engine</h3>
@@ -98,6 +87,17 @@
         <li>Hybrid recall: vector ANN + BM25 keyword + recency + optional cross-encoder reranker</li>
         <li>Cryptographic forgetting: erase an atom or region by destroying its key</li>
         <li>{{ config.extra.mcp_tools }}-tool MCP server; {{ config.extra.locomo }}% on LoCoMo and {{ config.extra.longmemeval }}% on LongMemEval (oracle, gpt-4o)</li>
+      </ul>
+    </div>
+    <div class="pillar">
+      <div class="tag">citadeldb / citadeldb-sql</div>
+      <h3>Encrypted database</h3>
+      <p>A complete embedded SQL + key-value engine. ACID without a WAL, snapshot isolation, and a single self-contained file - faster than unencrypted SQLite at equal cache budgets.</p>
+      <ul>
+        <li>SQL: FULL OUTER &amp; LATERAL joins, recursive CTEs, window functions, triggers, materialized views</li>
+        <li>JSON / JSONB with 14 PostgreSQL operators, GIN indexes, full-text search</li>
+        <li>Key-value API and SQL share one transaction</li>
+        <li>P2P encrypted sync over Noise; Python, CLI, C FFI, and WebAssembly bindings</li>
       </ul>
     </div>
   </div>
