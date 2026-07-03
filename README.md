@@ -9,7 +9,9 @@
 <p align="center">
   <a href="https://crates.io/crates/citadeldb"><img src="https://badgen.net/crates/v/citadeldb" alt="crates.io"></a>
   <a href="https://www.npmjs.com/package/@citadeldb/wasm"><img src="https://img.shields.io/npm/v/@citadeldb/wasm" alt="npm"></a>
-  <a href="https://pypi.org/project/citadeldb/"><img src="https://img.shields.io/pypi/v/citadeldb" alt="PyPI"></a>
+  <a href="https://pypi.org/project/citadeldb/"><img src="https://img.shields.io/pypi/v/citadeldb?label=pypi%20citadeldb" alt="PyPI citadeldb"></a>
+  <a href="https://pypi.org/project/citadeldb-mcp/"><img src="https://img.shields.io/pypi/v/citadeldb-mcp?label=pypi%20citadeldb-mcp" alt="PyPI citadeldb-mcp"></a>
+  <a href="https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mcp"><img src="https://img.shields.io/badge/MCP-dev.citadeldb%2Fmcp-blue" alt="MCP registry: dev.citadeldb/mcp"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml"><img src="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LoCoMo%20(gpt--4o--mini%2Fgemini--flash)-85.5%2F90.6%25-success" alt="LoCoMo 85.5% (gpt-4o-mini) / 90.6% (gemini-3.5-flash) readers"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LongMemEval%20oracle%20(gpt--4o)-90.6%25-success" alt="LongMemEval oracle 90.6% (gpt-4o reader)"></a>
@@ -124,9 +126,10 @@ citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 
 ### MCP
 
-Serve an encrypted memory region to Claude Desktop or any MCP client. Run with no install
-via `uvx citadeldb-mcp`, or install it with `pip install citadeldb-mcp` or
-`cargo install citadeldb-mcp`, then add it to `claude_desktop_config.json`:
+Serve an encrypted memory region to Claude Desktop or any MCP client. `citadeldb-mcp` is
+published to PyPI and listed in the official [MCP registry](https://registry.modelcontextprotocol.io/v0/servers?search=dev.citadeldb/mcp)
+as `dev.citadeldb/mcp`. Run it with no install via `uvx citadeldb-mcp`, or
+`pip install citadeldb-mcp` / `cargo install citadeldb-mcp`, then add it to `claude_desktop_config.json`:
 
 ```json
 {
