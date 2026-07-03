@@ -6,8 +6,8 @@ further down). citadel-mem is an embedded memory engine that is encrypted at res
 forgets by destroying keys; the LoCoMo numbers run on encrypted regions (each
 conversation is a per-atom-sealed region), so every LoCoMo figure is on the encrypted
 storage path. Each number is regenerated from a SHA-256-pinned dataset with one
-command, and the report records the reader and judge models, the prompts, a
-per-question audit, and the run's limitations.
+command, and each run writes a report locally recording the reader and judge models, the
+prompts, a per-question audit, and the run's limitations.
 
 ## Full 10-conversation LoCoMo (encrypted, reader and judge `gpt-4o-mini`)
 
@@ -326,7 +326,7 @@ answer. The +/-0.4% band is entirely reader/judge-side; retrieval contributes no
 - Cryptographic erasure removes content, not the page-encrypted metadata and edge
   topology, the physical NAND on wear-leveled media, or copies in pre-forget backups.
 - LoCoMo gold labels contain errors (the harness lists candidates), putting a ceiling
-  below 100%. The retrieval ceiling and per-question audit are in the report.
+  below 100%. The retrieval ceiling and per-question audit are in each run's local report.
 - conv-26 is the development split on which the configuration (top-50, relevance order,
   no neighbor expansion, date-prefixed indexing) was selected; the full-run figures are
   the reportable ones. The v1.5 retrieval defaults (fusion ratio, RRF k, rerank pool)

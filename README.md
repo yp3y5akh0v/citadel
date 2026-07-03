@@ -171,7 +171,7 @@ Competitor scores as published in the Mem0 paper ([arXiv 2504.19413](https://arx
 | gpt-4o | 90.6% | 89.3% |
 | gpt-4o-mini | 82.2% | 83.0% |
 
-Oracle = retrieval-complete (the evidence sessions are in context), so this measures the reader ceiling on Citadel's retrieved memory. The gpt-4o reader exceeds the LongMemEval paper's own gpt-4o oracle score (0.870). Protocol and per-question audit in [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md).
+Oracle = retrieval-complete (the evidence sessions are in context), so this measures the reader ceiling on Citadel's retrieved memory. The gpt-4o reader exceeds the LongMemEval paper's own gpt-4o oracle score (0.870). Protocol and methodology in [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md).
 
 ## Encrypted memory engine
 
@@ -188,8 +188,8 @@ citadeldb-mem uses no LLM at ingest or retrieval: it stores raw conversation con
 and recalls with embeddings, BM25 keyword matching, and a cross-encoder reranker.
 Remembering costs zero tokens, recall is deterministic, and the conversation is never
 sent to an LLM to build or search the memory. The score above uses a `gpt-4o-mini` reader and judge; with a
-`gemini-3.5-flash` reader the same encrypted retrieval scores 90.6% (mean of 3 runs). Protocol,
-per-question audit, and a comparison with published systems are in
+`gemini-3.5-flash` reader the same encrypted retrieval scores 90.6% (mean of 3 runs). Protocol
+and a comparison with published systems are in
 [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md).
 
 ## Agent runtime
