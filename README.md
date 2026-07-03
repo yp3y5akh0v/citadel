@@ -122,6 +122,27 @@ citadel> .listen 4248 <KEY>              # Terminal A
 citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 ```
 
+### MCP
+
+Serve an encrypted memory region to Claude Desktop or any MCP client. Run with no install
+via `uvx citadeldb-mcp`, or install it with `pip install citadeldb-mcp` or
+`cargo install citadeldb-mcp`, then add it to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "citadel": {
+      "command": "citadeldb-mcp",
+      "args": ["--db", "memory.cdl", "--embedder", "bge-large"],
+      "env": { "CITADEL_KEY": "your-passphrase" }
+    }
+  }
+}
+```
+
+Omit `--embedder` for keyword-only recall, or run `citadeldb-mcp pull bge-large` first for
+semantic recall.
+
 ## Memory benchmarks
 
 Citadel is scored on the LoCoMo and LongMemEval long-term-memory benchmarks. Execution speed against unencrypted SQLite across 58 head-to-head benchmarks is under [Speed benchmarks](#speed-benchmarks).

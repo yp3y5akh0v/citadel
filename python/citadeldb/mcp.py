@@ -1,4 +1,9 @@
-"""MCP server: expose a citadel memory region as MCP tools over JSON-RPC stdio."""
+"""MCP server: expose a citadel memory region as MCP tools over JSON-RPC stdio.
+
+This wheel is built without the Candle embedder, so the MCP server here is
+keyword-only; use the standalone ``citadeldb-mcp`` package (``uvx citadeldb-mcp``)
+for semantic recall. The memory API accepts your own embeddings in either build.
+"""
 
 import sys
 

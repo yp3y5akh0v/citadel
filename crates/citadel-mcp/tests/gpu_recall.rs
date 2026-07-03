@@ -33,7 +33,7 @@ fn bge_large_semantic_recall() {
         "\n",
     );
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_citadel-mcp"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_citadeldb-mcp"))
         .args([
             "--db",
             db.to_str().unwrap(),
@@ -49,17 +49,17 @@ fn bge_large_semantic_recall() {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn citadel-mcp");
+        .expect("spawn citadeldb-mcp");
     child
         .stdin
         .take()
         .unwrap()
         .write_all(requests.as_bytes())
         .unwrap();
-    let out = child.wait_with_output().expect("wait for citadel-mcp");
+    let out = child.wait_with_output().expect("wait for citadeldb-mcp");
     assert!(
         out.status.success(),
-        "citadel-mcp exited with {:?}",
+        "citadeldb-mcp exited with {:?}",
         out.status
     );
 

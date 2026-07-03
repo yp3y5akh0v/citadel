@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "citadeldb-mcp"
+description = "Model Context Protocol server for Citadel: encrypted memory as MCP tools"
+readme = "../../crates/citadel-mcp/README.md"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+authors = [{ name = "Yuriy Peysakhov" }]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://citadeldb.dev"
+Repository = "https://github.com/yp3y5akh0v/citadel"
+
+[tool.maturin]
+manifest-path = "../../crates/citadel-mcp/Cargo.toml"
+bindings = "bin"

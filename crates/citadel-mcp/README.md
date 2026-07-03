@@ -1,5 +1,7 @@
 # citadeldb-mcp
 
+mcp-name: dev.citadeldb/mcp
+
 Model Context Protocol (MCP) server for the
 [Citadel](https://github.com/yp3y5akh0v/citadel) encrypted memory engine. Gives any MCP client
 (Claude Desktop, an IDE, an agent) persistent, encrypted memory.
@@ -8,6 +10,32 @@ Memory lives in a local [`citadeldb-mem`](https://crates.io/crates/citadeldb-mem
 AES-256 encrypted at rest, per-atom sealed and HMAC-authenticated, recalled through a hybrid
 vector + keyword + recency + importance fusion over a [PRISM](https://github.com/yp3y5akh0v/prism) approximate nearest-neighbor index,
 connected by a typed edge graph, and forgotten by **destroying keys** (cryptographic erasure).
+
+## Install
+
+Run it with no install:
+
+```sh
+uvx citadeldb-mcp --db memory.cdl
+```
+
+Or install the command with `pip install citadeldb-mcp` or `cargo install citadeldb-mcp`,
+then wire it into Claude Desktop (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "citadel": {
+      "command": "citadeldb-mcp",
+      "args": ["--db", "memory.cdl", "--embedder", "bge-large"],
+      "env": { "CITADEL_KEY": "your-passphrase" }
+    }
+  }
+}
+```
+
+Omit `--embedder` for keyword-only recall, or run `citadeldb-mcp pull bge-large` first for
+semantic recall (models are never downloaded automatically; see below).
 
 Tools (over a synchronous, hand-rolled JSON-RPC 2.0 stdio transport):
 
@@ -24,7 +52,7 @@ Tools (over a synchronous, hand-rolled JSON-RPC 2.0 stdio transport):
 - `mem_evict` - selective forgetting by policy (cryptographic erasure on encrypted regions)
 - `mem_forget` - forget atoms by id and return a verifiable **erasure receipt** (cryptographic erasure on encrypted regions; skips immutable atoms unless forced)
 
-The `citadel-mcp` binary reads the passphrase from `CITADEL_KEY` and serves one region
+The `citadeldb-mcp` binary reads the passphrase from `CITADEL_KEY` and serves one region
 (encrypted by default); only protocol messages go to stdout, diagnostics to stderr.
 
 Recall is keyword-only (a mock embedder) until you opt into a real semantic model. The
@@ -32,8 +60,8 @@ Recall is keyword-only (a mock embedder) until you opt into a real semantic mode
 explicit request, never automatically:
 
 ```sh
-citadel-mcp pull bge-small                       # one-time download to ~/.citadel/models
-citadel-mcp --db memory.cdl --embedder bge-small
+citadeldb-mcp pull bge-large                       # one-time download to ~/.citadel/models
+citadeldb-mcp --db memory.cdl --embedder bge-large
 ```
 
 Pull names: `bge-small`, `bge-base`, `bge-large`, `minilm`, `e5-large`. Or point `--model-dir`
@@ -43,8 +71,8 @@ run the model on an NVIDIA GPU.
 For better recall ordering, add a cross-encoder reranker (off by default, also explicit):
 
 ```sh
-citadel-mcp pull ms-marco-minilm
-citadel-mcp --db memory.cdl --embedder bge-small --reranker ms-marco-minilm
+citadeldb-mcp pull ms-marco-minilm
+citadeldb-mcp --db memory.cdl --embedder bge-large --reranker ms-marco-minilm
 ```
 
 This crate is part of the Citadel workspace.

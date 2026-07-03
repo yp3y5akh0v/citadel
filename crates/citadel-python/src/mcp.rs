@@ -9,7 +9,7 @@ pub(crate) fn mcp_main(py: Python<'_>, argv: Vec<String>) -> i32 {
     match py.detach(|| citadel_mcp::run(&argv)) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("citadel-mcp: {e}");
+            eprintln!("citadeldb-mcp: {e}");
             1
         }
     }

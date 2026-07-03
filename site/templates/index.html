@@ -381,7 +381,7 @@
   <div class="sec-head">
     <div class="eyebrow">Model Context Protocol</div>
     <h2>Plug encrypted memory into Claude Desktop.</h2>
-    <p>citadel-mcp serves one memory region over MCP (JSON-RPC 2.0 on stdio) with {{ config.extra.mcp_tools }} tools. Encrypted by default, with per-atom sealing and cryptographic erasure. Any MCP client - Claude Desktop, an IDE - can read and write it.</p>
+    <p>citadeldb-mcp exposes a memory region as {{ config.extra.mcp_tools }} MCP tools over JSON-RPC 2.0 on stdio, so Claude Desktop, an IDE, or any other MCP client can read and write it directly.</p>
   </div>
 
   <div class="qs">
@@ -416,18 +416,17 @@
         <pre class="code">{% raw %}{
   "mcpServers": {
     "citadel": {
-      "command": "citadel-mcp",
+      "command": "citadeldb-mcp",
       "args": [
-        "--db", "memory.citadel",
-        "--region", "default",
-        "--embedder", "bge-small"
+        "--db", "memory.cdl",
+        "--embedder", "bge-large"
       ],
       "env": { "CITADEL_KEY": "your-passphrase" }
     }
   }
 }{% endraw %}</pre>
       </div>
-      <p class="bench-note">One-time setup: <code>citadel-mcp pull bge-small</code> downloads the embedder (models are never fetched automatically; omit <code>--embedder</code> for keyword-only recall). Recall hits carry provenance, per-hit integrity verdicts, and <code>memory://atom/{id}</code> resource links. <code>mem_forget</code> returns an erasure receipt.</p>
+      <p class="bench-note">One-time setup: <code>citadeldb-mcp pull bge-large</code> downloads the embedder (models are never fetched automatically; omit <code>--embedder</code> for keyword-only recall). Recall hits carry provenance, per-hit integrity verdicts, and <code>memory://atom/{id}</code> resource links.</p>
     </div>
   </div>
 </section>

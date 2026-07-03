@@ -18,7 +18,7 @@ autobins = false
 name = "citadel_mcp"
 
 [[bin]]
-name = "citadel-mcp"
+name = "citadeldb-mcp"
 path = "src/bin/mcp.rs"
 
 [dependencies]
@@ -38,7 +38,7 @@ tempfile = "3"
 default = ["candle-embed", "hub"]
 # CPU Candle embedders (BGE / MiniLM / E5).
 candle-embed = ["citadel-mem/candle-embed"]
-# On-demand model download for `citadel-mcp pull`.
+# On-demand model download for `citadeldb-mcp pull`.
 hub = ["candle-embed", "dep:ureq"]
 # GPU (CUDA) embeddings; needs the CUDA toolkit.
 cuda-embed = ["candle-embed", "citadel-mem/cuda-embed"]

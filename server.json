@@ -1,0 +1,35 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "dev.citadeldb/mcp",
+  "title": "Citadel",
+  "description": "Encrypted-first embedded database with vector search and agent memory, exposed as MCP tools",
+  "version": "1.11.0",
+  "repository": { "url": "https://github.com/yp3y5akh0v/citadel", "source": "github" },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "citadeldb-mcp",
+      "version": "1.11.0",
+      "runtimeHint": "uvx",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "CITADEL_KEY",
+          "description": "Passphrase that derives the AES-256 key encrypting the database region",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "named",
+          "name": "--db",
+          "description": "Path to the Citadel database/region file",
+          "isRequired": true,
+          "format": "filepath"
+        }
+      ]
+    }
+  ]
+}

@@ -69,7 +69,7 @@ pub fn serve_with_config(config: &ServeConfig) -> Result<(), String> {
     }
 
     eprintln!(
-        "citadel-mcp: serving region '{}' ({}, embedder={}) from {} (MCP stdio)",
+        "citadeldb-mcp: serving region '{}' ({}, embedder={}) from {} (MCP stdio)",
         config.region,
         if config.encrypted {
             "encrypted"
@@ -84,7 +84,7 @@ pub fn serve_with_config(config: &ServeConfig) -> Result<(), String> {
         use citadel_mem::RerankStrategy;
         let reranker = build_reranker(name, config)?;
         mem.set_reranker(reranker, RerankStrategy::default());
-        eprintln!("citadel-mcp: reranker={name} (rrf)");
+        eprintln!("citadeldb-mcp: reranker={name} (rrf)");
     }
     crate::serve_stdio(Arc::new(mem), &config.region).map_err(|e| format!("serve: {e}"))
 }
@@ -186,8 +186,8 @@ fn build_embedder(config: &ServeConfig) -> Result<Arc<dyn Embedder>, String> {
     match config.embedder.as_str() {
         "mock" => {
             eprintln!(
-                "citadel-mcp: WARNING mock embedder - keyword-only recall, not semantic. \
-                 For semantic recall run `citadel-mcp pull bge-small`, then restart with \
+                "citadeldb-mcp: WARNING mock embedder - keyword-only recall, not semantic. \
+                 For semantic recall run `citadeldb-mcp pull bge-small`, then restart with \
                  --embedder bge-small (or pass --model-dir to a local model)."
             );
             Ok(Arc::new(MockEmbedder::new(EMBED_DIM)))
@@ -245,7 +245,7 @@ fn build_real_embedder(name: &str, config: &ServeConfig) -> Result<Arc<dyn Embed
             let cached = resolve_models_dir(config.models_dir.as_deref())?.join(name);
             if !cached.join("model.safetensors").exists() {
                 return Err(format!(
-                    "embedder '{name}' is not downloaded - run `citadel-mcp pull {name}` first, \
+                    "embedder '{name}' is not downloaded - run `citadeldb-mcp pull {name}` first, \
                      or pass --model-dir <dir> to a local model"
                 ));
             }
@@ -293,7 +293,7 @@ fn build_reranker(
             let cached = resolve_models_dir(config.models_dir.as_deref())?.join(name);
             if !cached.join("model.safetensors").exists() {
                 return Err(format!(
-                    "reranker '{name}' is not downloaded - run `citadel-mcp pull {name}` first, \
+                    "reranker '{name}' is not downloaded - run `citadeldb-mcp pull {name}` first, \
                      or pass --reranker-dir <dir> to a local model"
                 ));
             }
@@ -360,13 +360,13 @@ pub fn pull_model(name: &str, models_dir: Option<&str>) -> Result<(), String> {
         .ok_or_else(|| unknown_pullable(name))?;
     let dest = resolve_models_dir(models_dir)?.join(name);
     download_model(repo, &dest)?;
-    eprintln!("citadel-mcp: pulled '{name}' to {}", dest.display());
+    eprintln!("citadeldb-mcp: pulled '{name}' to {}", dest.display());
     let flag = if reranker_spec(name).is_some() {
         "--reranker"
     } else {
         "--embedder"
     };
-    eprintln!("citadel-mcp: serve it with `{flag} {name}`");
+    eprintln!("citadeldb-mcp: serve it with `{flag} {name}`");
     Ok(())
 }
 
@@ -384,7 +384,7 @@ fn hub_url(repo: &str, file: &str) -> String {
 #[cfg(feature = "hub")]
 fn download_model(repo: &str, dest: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
-    eprintln!("citadel-mcp: pulling '{repo}' from huggingface.co");
+    eprintln!("citadeldb-mcp: pulling '{repo}' from huggingface.co");
     for file in MODEL_FILES {
         download_file(&hub_url(repo, file), &dest.join(file))?;
     }

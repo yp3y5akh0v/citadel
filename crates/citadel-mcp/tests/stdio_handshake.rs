@@ -1,4 +1,4 @@
-//! End-to-end integration test: spawn the real `citadel-mcp` binary and drive a
+//! End-to-end integration test: spawn the real `citadeldb-mcp` binary and drive a
 //! JSON-RPC session over stdio. Exercises the live `serve_stdio` IO loop, the CLI,
 //! and the encrypted-by-default region with the mock embedder (so it runs in CI).
 
@@ -7,13 +7,13 @@ use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
-/// Spawn `citadel-mcp` on a throwaway encrypted DB, feed `requests` (newline-delimited
+/// Spawn `citadeldb-mcp` on a throwaway encrypted DB, feed `requests` (newline-delimited
 /// JSON-RPC), and return the parsed response lines. Dropping stdin sends EOF, which
 /// ends the server's loop cleanly.
 fn run_session(requests: &str) -> Vec<Value> {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("mcp.cdl");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_citadel-mcp"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_citadeldb-mcp"))
         // Pin the mock embedder explicitly: the test must never hit the network,
         // regardless of the binary's default embedder.
         .args([
@@ -29,17 +29,17 @@ fn run_session(requests: &str) -> Vec<Value> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn citadel-mcp");
+        .expect("spawn citadeldb-mcp");
     child
         .stdin
         .take()
         .unwrap()
         .write_all(requests.as_bytes())
         .unwrap();
-    let out = child.wait_with_output().expect("wait for citadel-mcp");
+    let out = child.wait_with_output().expect("wait for citadeldb-mcp");
     assert!(
         out.status.success(),
-        "citadel-mcp exited with {:?}",
+        "citadeldb-mcp exited with {:?}",
         out.status
     );
     String::from_utf8(out.stdout)

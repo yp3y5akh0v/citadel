@@ -1,0 +1,112 @@
+name: Release MCP
+
+# Standalone citadeldb-mcp wheels (maturin bin bindings: the real citadel-mcp binary, no
+# pyo3). One wheel per platform covers every Python version, so unlike release-python.yml
+# there is no per-Python-version matrix dimension anywhere in this workflow.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: wheels (${{ matrix.platform.target }} on ${{ matrix.platform.runner }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { runner: ubuntu-latest, target: x86_64, manylinux: auto }
+          - { runner: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
+          - { runner: macos-15-intel, target: x86_64, manylinux: "" }
+          - { runner: macos-latest, target: aarch64, manylinux: "" }
+          - { runner: windows-latest, target: x64, manylinux: "" }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: packaging/citadeldb-mcp
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux }}
+          args: --release --out dist --find-interpreter
+          sccache: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.runner }}-${{ matrix.platform.target }}
+          path: packaging/citadeldb-mcp/dist
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: packaging/citadeldb-mcp
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: packaging/citadeldb-mcp/dist
+
+  test:
+    name: test (${{ matrix.os }})
+    needs: wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15-intel, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - name: Install and smoke-test the wheel
+        shell: bash
+        run: |
+          python -m pip install --no-index --find-links dist citadeldb-mcp
+          set +e
+          citadeldb-mcp --db test.cdl > out.txt 2>&1
+          code=$?
+          set -e
+          cat out.txt
+          # Missing CITADEL_KEY is the expected failure; anything else is a real bug.
+          test "$code" -eq 1
+          grep -q "set CITADEL_KEY" out.txt
+
+  publish:
+    name: Publish to PyPI
+    needs: [wheels, sdist, test]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    # Trusted Publishing (OIDC): needs its own PyPI publisher entry for citadeldb-mcp
+    # (a new project name), scoped to this workflow file + the pypi environment.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

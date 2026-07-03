@@ -1,4 +1,4 @@
-//! `citadel-mcp`: a stdio MCP server exposing a citadel memory region as tools.
+//! `citadeldb-mcp`: a stdio MCP server exposing a citadel memory region as tools.
 //!
 //! An MCP client (e.g. Claude Desktop) spawns this binary and talks JSON-RPC
 //! over stdin/stdout. The database passphrase is read from `CITADEL_KEY`.
@@ -12,8 +12,8 @@
 //! are fetched only on explicit request - never automatically:
 //!
 //! ```text
-//! citadel-mcp pull bge-small                 # one-time download to ~/.citadel/models
-//! citadel-mcp --db memory.cdl --embedder bge-small
+//! citadeldb-mcp pull bge-large                 # one-time download to ~/.citadel/models
+//! citadeldb-mcp --db memory.cdl --embedder bge-large
 //! ```
 //!
 //! Or bring your own local model with `--model-dir <dir>` (fully offline); a
@@ -23,8 +23,8 @@
 //! Claude Desktop config (claude_desktop_config.json):
 //! ```json
 //! { "mcpServers": { "citadel": {
-//!     "command": "citadel-mcp",
-//!     "args": ["--db", "/path/memory.cdl", "--region", "default", "--embedder", "bge-small"],
+//!     "command": "citadeldb-mcp",
+//!     "args": ["--db", "/path/memory.cdl", "--region", "default", "--embedder", "bge-large"],
 //!     "env": { "CITADEL_KEY": "<passphrase>" } } } }
 //! ```
 
@@ -35,7 +35,7 @@ fn main() -> ExitCode {
     match citadel_mcp::run(&argv) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("citadel-mcp: {e}");
+            eprintln!("citadeldb-mcp: {e}");
             ExitCode::FAILURE
         }
     }
