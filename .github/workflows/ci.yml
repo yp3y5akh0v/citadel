@@ -9,6 +9,7 @@ on:
       - 'scripts/**'
       - 'LICENSE-*'
       - '.github/FUNDING.yml'
+      - 'server.json'
   pull_request:
     branches: [master]
     paths-ignore:
@@ -17,6 +18,7 @@ on:
       - 'scripts/**'
       - 'LICENSE-*'
       - '.github/FUNDING.yml'
+      - 'server.json'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
