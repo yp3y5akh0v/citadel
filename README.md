@@ -573,7 +573,7 @@ db.query("SELECT * FROM t").to_dicts()
 
 ## Building
 
-Rust 1.75+.
+Rust 1.80+.
 
 ```bash
 git clone https://github.com/yp3y5akh0v/citadel.git

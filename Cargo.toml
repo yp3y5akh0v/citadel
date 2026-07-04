@@ -48,7 +48,7 @@ resolver = "2"
 [workspace.package]
 version = "1.11.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 authors = ["Yuriy Peysakhov"]
 repository = "https://github.com/yp3y5akh0v/citadel"
@@ -90,6 +90,7 @@ base64 = "0.22"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 blake3 = "1"
 rustc-hash = "2.1"
+prism-ann = "0.2"
 
 thiserror = "2.0"
 

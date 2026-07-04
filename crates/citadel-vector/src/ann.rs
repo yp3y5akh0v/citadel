@@ -1,4 +1,4 @@
-//! In-memory ANN index wrapping the vendored PRISM engine.
+//! In-memory ANN index wrapping the PRISM engine.
 
 use crate::prism::{Filter, Metric, PointStore, PrismConfig, PrismIndex};
 

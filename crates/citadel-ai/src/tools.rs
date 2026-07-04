@@ -1258,8 +1258,8 @@ pub use fs_tools::{FileReadTool, FileWriteTool, ListDirTool};
 ///     token). `args` may be a JSON array or a whitespace-split string; both yield
 ///     verbatim argv tokens, neither can re-introduce a shell.
 ///   - PROGRAM ALLOWLIST (basename): no path separator, no `..`, no `.bat`/`.cmd`/
-///     `.com`/script wrapper (sidesteps the Windows BatBadBut CVE-2024-24576, unfixed
-///     before Rust 1.77.2 > our 1.75 MSRV), and in the configured set; empty = deny-all.
+///     `.com`/script wrapper (Windows `.bat`/`.cmd` re-expose the BatBadBut
+///     CVE-2024-24576 through cmd.exe), and in the configured set; empty = deny-all.
 ///   - WORKING DIR canonicalized at construction; only the START dir (a child can `cd`,
 ///     open absolute paths, or fork) - weak confinement, not a jail.
 ///   - OUTPUT CAP per stream via drain threads (no full-pipe block); `truncated: true`.

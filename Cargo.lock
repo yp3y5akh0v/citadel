@@ -796,18 +796,15 @@ name = "citadeldb-vector"
 version = "1.11.0"
 dependencies = [
  "blake3",
- "byteorder",
  "citadeldb-buffer",
  "citadeldb-core",
  "citadeldb-crypto",
  "citadeldb-page",
  "citadeldb-txn",
- "memmap2",
+ "prism-ann",
  "rand 0.8.6",
- "rayon",
  "rustc-hash",
  "thiserror 2.0.18",
- "zeroize",
 ]
 
 [[package]]
@@ -2838,6 +2835,19 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn",
+]
+
+[[package]]
+name = "prism-ann"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c79e210695f60f5ea4eb2e8e77faca147bae77a8317c31baa01ba8343071a3f"
+dependencies = [
+ "byteorder",
+ "memmap2",
+ "rand 0.8.6",
+ "rayon",
+ "zeroize",
 ]
 
 [[package]]

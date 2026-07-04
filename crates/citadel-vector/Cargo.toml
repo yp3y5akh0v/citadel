@@ -21,11 +21,8 @@ citadel-crypto = { workspace = true }
 citadel-page = { workspace = true }
 citadel-buffer = { workspace = true }
 citadel-txn = { workspace = true }
-rayon = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
-zeroize = { workspace = true }
-byteorder = "1.5"
-memmap2 = { workspace = true }
 blake3 = { workspace = true }
 rustc-hash = { workspace = true }
+prism-ann = { workspace = true }
