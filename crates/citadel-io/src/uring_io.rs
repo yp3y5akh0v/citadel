@@ -18,7 +18,7 @@ pub struct UringPageIO {
 impl UringPageIO {
     /// Try to create an io_uring-backed I/O instance.
     ///
-    /// Returns `None` if io_uring is unavailable (old kernel, restricted container).
+    /// `None` if io_uring is unavailable (old kernel, restricted container).
     /// The caller should fall back to `MmapPageIO`.
     pub fn try_new(file: File) -> Option<Self> {
         let fd = file.into_raw_fd();
@@ -46,7 +46,10 @@ impl UringPageIO {
         }
     }
 
-    fn drain_cqes(ring: &mut IoUring, expected: usize) -> Result<()> {
+    /// Drain `expected` completions, requiring each to have transferred
+    /// exactly `expected_len` bytes - a short (torn) write must fail the
+    /// batch just like the single-op paths reject `n < len`.
+    fn drain_cqes(ring: &mut IoUring, expected: usize, expected_len: usize) -> Result<()> {
         let mut completed = 0;
         while completed < expected {
             let result = ring.completion().next().map(|cqe| cqe.result());
@@ -54,6 +57,13 @@ impl UringPageIO {
                 if r < 0 {
                     while ring.completion().next().is_some() {}
                     return Err(Error::Io(io::Error::from_raw_os_error(-r)));
+                }
+                if (r as usize) < expected_len {
+                    while ring.completion().next().is_some() {}
+                    return Err(Error::Io(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "short write",
+                    )));
                 }
                 completed += 1;
             }
@@ -202,7 +212,7 @@ impl PageIO for UringPageIO {
             }
 
             ring.submit_and_wait(chunk.len())?;
-            Self::drain_cqes(&mut ring, chunk.len())?;
+            Self::drain_cqes(&mut ring, chunk.len(), PAGE_SIZE)?;
         }
 
         Ok(())
@@ -239,7 +249,7 @@ impl PageIO for UringPageIO {
             }
 
             ring.submit_and_wait(chunk.len())?;
-            Self::drain_cqes(&mut ring, chunk.len())?;
+            Self::drain_cqes(&mut ring, chunk.len(), PAGE_SIZE)?;
         }
 
         Ok(())

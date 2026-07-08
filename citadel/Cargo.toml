@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 keywords = ["encrypted-database", "embedded-database", "encryption", "database", "key-management"]
 categories = ["database-implementations", "database", "cryptography"]
-description = "Citadel: encrypted-first embedded SQL database with a built-in memory engine"
+description = "Citadel: encrypted-first embedded SQL/vector database, the foundation of the Citadel memory engine for AI agents"
 readme = "../README.md"
 
 [lib]

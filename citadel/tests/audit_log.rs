@@ -465,6 +465,84 @@ fn audit_rotation_deletes_old_files() {
 }
 
 #[test]
+fn audit_verify_chain_valid_after_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let pass = b"pass";
+    let config = AuditConfig {
+        enabled: true,
+        max_file_size: 200,
+        max_rotated_files: 2,
+    };
+
+    let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
+        .passphrase(pass)
+        .kdf_algorithm(KdfAlgorithm::Pbkdf2HmacSha256)
+        .pbkdf2_iterations(600_000)
+        .cache_size(64)
+        .audit_config(config)
+        .create()
+        .unwrap();
+
+    for _ in 0..10 {
+        db.integrity_check().unwrap();
+    }
+    drop(db);
+
+    let rotated_1 = dir.path().join("test.citadel.citadel-audit.1");
+    assert!(rotated_1.exists());
+
+    let ap = audit_path(dir.path());
+    let entries = read_audit_log(&ap).unwrap();
+    assert!(!entries.is_empty());
+
+    let audit_key = get_audit_key(dir.path(), pass);
+    let result = verify_audit_log(&ap, &audit_key).unwrap();
+    assert!(result.chain_valid);
+    assert_eq!(result.entries_verified, entries.len() as u64);
+    assert!(result.chain_break_at.is_none());
+
+    let rotated_result = verify_audit_log(&rotated_1, &audit_key).unwrap();
+    assert!(rotated_result.chain_valid);
+}
+
+#[test]
+fn audit_torn_trailing_record_truncated_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let pass = b"pass";
+
+    let db = create_test_db(dir.path(), pass);
+    drop(db);
+
+    let ap = audit_path(dir.path());
+    let entries_before = read_audit_log(&ap).unwrap();
+
+    // Simulate a torn write: crash after log() wrote only the entry magic.
+    let mut data = std::fs::read(&ap).unwrap();
+    data.extend_from_slice(&0x454E_5452u32.to_le_bytes());
+    std::fs::write(&ap, &data).unwrap();
+
+    let db = open_test_db(dir.path(), pass);
+    drop(db);
+
+    // The DatabaseOpened/DatabaseClosed entries appended after the torn
+    // record must be visible and the chain must verify end to end.
+    let entries = read_audit_log(&ap).unwrap();
+    assert_eq!(entries.len(), entries_before.len() + 2);
+    for i in 1..entries.len() {
+        assert_eq!(entries[i].sequence_no, entries[i - 1].sequence_no + 1);
+    }
+    assert_eq!(
+        entries[entries_before.len()].event_type,
+        AuditEventType::DatabaseOpened
+    );
+
+    let audit_key = get_audit_key(dir.path(), pass);
+    let result = verify_audit_log(&ap, &audit_key).unwrap();
+    assert!(result.chain_valid);
+    assert_eq!(result.entries_verified, entries.len() as u64);
+}
+
+#[test]
 fn audit_log_path_method() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_test_db(dir.path(), b"pass");
@@ -614,7 +692,8 @@ fn scenario_truncation_detected_by_count() {
     assert!(result.chain_valid);
     assert_eq!(result.entries_verified, (original_count - 1) as u64);
 
-    // Header entry_count still reflects original total - mismatch reveals truncation
+    // Header entry_count still reflects original total - mismatch reveals
+    // truncation
     let header_data = std::fs::read(&ap).unwrap();
     let header_count = u64::from_le_bytes(header_data[24..32].try_into().unwrap());
     assert_ne!(header_count as usize, entries_after.len());
@@ -741,14 +820,16 @@ fn scenario_corrupted_entry_recovery_via_sentinel() {
     data[offset + 7] = 0x7F;
     std::fs::write(&ap, &data).unwrap();
 
-    let strict_entries = read_audit_log(&ap).unwrap();
-    assert_eq!(strict_entries.len(), 2);
+    // read_audit_log resyncs past the damaged record like the writer does,
+    // so every intact entry stays visible; only the corrupted one is lost.
+    let entries_after = read_audit_log(&ap).unwrap();
+    assert_eq!(entries_after.len(), total - 1);
 
     let scan = scan_corrupted_audit_log(&ap).unwrap();
-    assert!(scan.entries.len() > strict_entries.len());
+    assert_eq!(scan.entries.len(), entries_after.len());
     assert!(!scan.corruption_offsets.is_empty());
 
-    let recovered_seq_nos: Vec<u64> = scan.entries.iter().map(|e| e.sequence_no).collect();
+    let recovered_seq_nos: Vec<u64> = entries_after.iter().map(|e| e.sequence_no).collect();
     assert!(recovered_seq_nos.contains(&1));
     assert!(recovered_seq_nos.contains(&2));
     let recovered_past_gap = recovered_seq_nos.iter().filter(|&&s| s >= 4).count();
@@ -808,14 +889,17 @@ fn scenario_zeroed_magic_recovery() {
     data[offset + 3] = 0;
     std::fs::write(&ap, &data).unwrap();
 
-    let strict = read_audit_log(&ap).unwrap();
-    assert_eq!(strict.len(), 1);
+    // The zeroed-magic record is lost, but read_audit_log resyncs and keeps
+    // every other entry visible, matching the scanner's recovery.
+    let entries_after = read_audit_log(&ap).unwrap();
+    assert_eq!(entries_after.len(), total - 1);
 
     let scan = scan_corrupted_audit_log(&ap).unwrap();
-    assert!(scan.entries.len() > strict.len());
+    assert_eq!(scan.entries.len(), entries_after.len());
     assert!(!scan.corruption_offsets.is_empty());
 
-    let recovered_seq: Vec<u64> = scan.entries.iter().map(|e| e.sequence_no).collect();
+    let recovered_seq: Vec<u64> = entries_after.iter().map(|e| e.sequence_no).collect();
+    assert!(recovered_seq.contains(&1));
     for seq in 3..=total as u64 {
         assert!(
             recovered_seq.contains(&seq),

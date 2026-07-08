@@ -1,5 +1,5 @@
-//! LongMemEval runner: ingest each question's haystack, answer it, collect predictions.
-//! Emit-only; the official Python scorer grades the JSONL.
+//! LongMemEval runner: ingest each question's haystack, answer it, collect
+//! predictions. Emit-only; the official Python scorer grades the JSONL.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,12 +18,14 @@ use crate::BenchConfig;
 pub struct LmevalConfig {
     pub bench: BenchConfig,
     pub encrypted: bool,
+    /// Reopened persisted DB: re-attach regions and skip ingest.
+    pub reuse: bool,
     pub reader_concurrency: usize,
 }
 
-/// Ingest + answer every sample, returning `(question_id, hypothesis)` in sample order.
-/// `on_emit(index, question_id, hypothesis)` fires per answer in completion order (for a
-/// live trace); an error from it aborts the run.
+/// Ingest + answer every sample, returning `(question_id, hypothesis)` in
+/// sample order. `on_emit` fires per answer in completion order (live trace);
+/// an error from it aborts the run.
 pub fn run(
     eng: &MemoryEngine,
     samples: &[LmSample],
@@ -33,8 +35,9 @@ pub fn run(
     cfg: &LmevalConfig,
     on_emit: &mut (dyn FnMut(usize, &str, &str) -> Result<()> + Send),
 ) -> Result<Vec<(String, String)>> {
-    // Region names are case-folded by the engine, so a duplicate (case-insensitive)
-    // question_id would merge two haystacks; fail loud rather than contaminate.
+    // Region names are case-folded by the engine, so a duplicate
+    // (case-insensitive) question_id would merge two haystacks; fail loud
+    // rather than contaminate.
     let mut seen = rustc_hash::FxHashSet::default();
     for s in samples {
         if !seen.insert(s.question_id.to_ascii_lowercase()) {
@@ -45,8 +48,9 @@ pub fn run(
         }
     }
 
-    // Phase 1: ingest each question's private haystack into its own region. Writes are
-    // single-writer, so this stays sequential; questions then fan out as reads.
+    // Phase 1: ingest each question's private haystack into its own region.
+    // Writes are single-writer, so this stays sequential; questions then fan
+    // out as reads.
     let t_ingest = Instant::now();
     let n = samples.len();
     for (i, s) in samples.iter().enumerate() {
@@ -55,17 +59,22 @@ pub fn run(
         } else {
             eng.create_region(&s.question_id, Arc::clone(&embedder))?;
         }
-        ingest::ingest_sample(eng, &s.question_id, s)?;
+        if !cfg.reuse {
+            ingest::ingest_sample(eng, &s.question_id, s)?;
+        }
         if (i + 1) % 25 == 0 || i + 1 == n {
-            eprintln!("  ingested {}/{n}", i + 1);
+            let verb = if cfg.reuse { "re-attached" } else { "ingested" };
+            eprintln!("  {verb} {}/{n}", i + 1);
         }
     }
     eprintln!(
-        "  phase 1 (ingest {n}) {:.1}s",
+        "  phase 1 ({} {n}) {:.1}s",
+        if cfg.reuse { "re-attach" } else { "ingest" },
         t_ingest.elapsed().as_secs_f64()
     );
 
-    // Phase 2: answer each question concurrently; results returned in sample order.
+    // Phase 2: answer each question concurrently; results returned in sample
+    // order.
     let t_answer = Instant::now();
     let bench = LongMemEval;
     let total = samples.len();

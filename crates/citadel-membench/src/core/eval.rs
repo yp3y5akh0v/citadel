@@ -1,7 +1,8 @@
 //! Reader and judge: turn retrieved memories into an answer, then score it.
 //!
-//! Isolation invariant: the reader sees only the top-k hits + the question, never
-//! the transcript/gold/evidence. The judge sees the gold; the reader never does.
+//! Isolation invariant: the reader sees only the top-k hits + the question,
+//! never the transcript/gold/evidence. The judge sees the gold, the reader
+//! never does.
 
 use std::sync::OnceLock;
 use std::thread::sleep;
@@ -11,16 +12,19 @@ use citadel_ai::{CompletionRequest, CompletionResponse, LLMClient, LlmError, Mes
 use citadel_mem::{AtomHit, AtomId, MemoryEngine, RecallProfile, RecallQuery};
 use rustc_hash::FxHashSet;
 
+use crate::core::agentic;
 use crate::core::benchmark::Benchmark;
 use crate::core::error::Result;
 use crate::core::ratelimit::Pacer;
 use crate::{BenchConfig, ReaderOrder};
 
-/// Default hard cap on reader/judge output so a runaway response cannot inflate cost.
+/// Default hard cap on reader/judge output so a runaway response cannot inflate
+/// cost.
 const DEFAULT_MAX_TOKENS: u32 = 512;
 
-/// Output-token cap: `CITADEL_MEMBENCH_MAX_TOKENS` overrides the caller's `default`
-/// (raise it for a reasoning/CoT reader whose thinking tokens would crowd out the answer).
+/// Output-token cap: `CITADEL_MEMBENCH_MAX_TOKENS` overrides the caller's
+/// `default` (raise it for a reasoning/CoT reader whose thinking tokens would
+/// crowd out the answer).
 fn max_output_tokens(default: u32) -> u32 {
     std::env::var("CITADEL_MEMBENCH_MAX_TOKENS")
         .ok()
@@ -29,10 +33,10 @@ fn max_output_tokens(default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-/// Retry budget for transient (429/5xx/transport) LLM failures. The wall-clock budget
-/// is the primary guard and is per-question-bounded: a call holds its role permit for
-/// the whole retry loop, so an unbounded budget would let one stuck question hog a
-/// slot. Terminal errors (other 4xx, malformed body) are not retried.
+/// Retry budget for transient (429/5xx/transport) LLM failures. The wall-clock
+/// budget is the primary, per-question guard: a call holds its role permit for
+/// the whole retry loop, so an unbounded budget would let one stuck question
+/// hog a slot. Terminal errors are not retried.
 #[derive(Debug, Clone, Copy)]
 struct RetryConfig {
     max_elapsed: Duration,
@@ -42,8 +46,9 @@ struct RetryConfig {
 }
 
 impl RetryConfig {
-    /// Read fresh each call (cheap). NOT cached: a process-global `OnceLock` froze the
-    /// first test's config, silently ignoring per-run budget overrides.
+    /// Read fresh each call (cheap). NOT cached: a process-global `OnceLock`
+    /// froze the first test's config, silently ignoring per-run budget
+    /// overrides.
     fn get() -> Self {
         Self::from_env()
     }
@@ -63,8 +68,9 @@ impl RetryConfig {
         }
     }
 
-    /// Capped exponential backoff jittered into `[exp, 1.5*exp]`, then floored to the
-    /// server's `Retry-After` (`server_ms`, the only value allowed past `cap_ms`).
+    /// Capped exponential backoff jittered into `[exp, 1.5*exp]`, then floored
+    /// to the server's `Retry-After` (`server_ms`, the only value allowed past
+    /// `cap_ms`).
     fn delay_ms(&self, attempt: u32, server_ms: Option<u64>, jitter01: f64) -> u64 {
         let shift = attempt.saturating_sub(1).min(16);
         let exp = self.base_ms.saturating_mul(1u64 << shift).min(self.cap_ms);
@@ -74,7 +80,8 @@ impl RetryConfig {
 }
 
 /// Complete via the per-model [`Pacer`], retrying transient failures with a
-/// wall-clock-bounded backoff; a residual 429 backs the whole pool off together.
+/// wall-clock-bounded backoff; a residual 429 backs the whole pool off
+/// together.
 fn paced_complete(
     pacer: &Pacer,
     client: &dyn LLMClient,
@@ -114,8 +121,8 @@ fn paced_complete(
     }
 }
 
-/// Server's requested wait in MILLISECONDS: the `Retry-After` header (x1000) or the
-/// "try again in Xs/Xms" body hint (which keeps sub-second precision).
+/// Server's requested wait in milliseconds: the `Retry-After` header (x1000) or
+/// the "try again in Xs/Xms" body hint (which keeps sub-second precision).
 fn server_retry_after_ms(e: &LlmError) -> Option<u64> {
     match e {
         LlmError::Http { message, .. } => parse_retry_after_body_ms(message).or_else(|| match e {
@@ -129,7 +136,7 @@ fn server_retry_after_ms(e: &LlmError) -> Option<u64> {
     }
 }
 
-/// Wait in MILLISECONDS from a "try again in 3.46s" / "334ms" body (sub-second precise).
+/// Wait in ms from a "try again in 3.46s" / "334ms" body (sub-second precise).
 fn parse_retry_after_body_ms(msg: &str) -> Option<u64> {
     let lower = msg.to_ascii_lowercase();
     let after = lower[lower.find("try again in")? + "try again in".len()..].trim_start();
@@ -147,8 +154,8 @@ fn parse_retry_after_body_ms(msg: &str) -> Option<u64> {
     Some(ms.ceil().max(1.0) as u64)
 }
 
-/// Deterministic-per-thread jitter in `[0, 1)` (std-only splitmix64), seeded with
-/// monotonic entropy so concurrent workers desynchronize their backoffs.
+/// Deterministic-per-thread jitter in `[0, 1)` (std-only splitmix64), seeded
+/// with monotonic entropy so concurrent workers desynchronize their backoffs.
 fn jitter01(attempt: u32) -> f64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -176,11 +183,10 @@ fn log_retry(attempt: u32, delay_ms: u64, e: &LlmError, spent: Duration, budget:
     }
 }
 
-/// The memory list as the reader sees it: each hit expanded with its +/-`radius`
+/// The memory list as the reader sees it: each hit expanded with +/-`radius`
 /// adjacent turns, deduped, in the configured order. Ingest writes turns in
-/// conversation order, so ascending atom id IS chronological order; a neighbor id
-/// outside the region simply fetches nothing. Under `Relevance` order each hit is
-/// rendered as a chronological `[id-r ..= id+r]` snippet, snippets by hit rank.
+/// conversation order, so ascending atom id is chronological; under
+/// `Relevance` each hit renders as a `[id-r ..= id+r]` snippet by hit rank.
 pub fn reader_view(
     eng: &MemoryEngine,
     region: &str,
@@ -208,20 +214,21 @@ pub fn reader_view(
     Ok(view)
 }
 
-/// The reader's answer plus retrieval facts: latency, token usage, and the `dia_id`s
-/// the reader actually saw (the retrieval-gap-vs-reader-miss instrumentation).
+/// The reader's answer plus retrieval facts: latency, token usage, and the
+/// `dia_id`s the reader actually saw (the retrieval-gap-vs-reader-miss
+/// instrumentation).
 pub struct AnswerOutcome {
     pub answer: String,
-    /// Recall plus neighbor-expansion latency: everything the memory system does
-    /// to assemble the reader's context.
+    /// Recall plus neighbor-expansion latency: everything the memory system
+    /// does to assemble the reader's context.
     pub recall_micros: u128,
     pub usage: TokenUsage,
     pub retrieved: Vec<String>,
 }
 
-/// Read the assembled memories: render the prompt and ask the paced, retried reader.
-/// The question to answer and the date it was asked (the reader's current-date anchor;
-/// `date` is empty for benchmarks without one).
+/// Read the assembled memories: render the prompt and ask the paced, retried
+/// reader. The question to answer and the date it was asked (the reader's
+/// current-date anchor; `date` is empty for benchmarks without one).
 #[derive(Debug, Clone, Copy)]
 pub struct Question<'a> {
     pub text: &'a str,
@@ -258,11 +265,10 @@ fn read_assembled(
     })
 }
 
-/// Recall the top-`config.top_k` memories, expand to the reader view, then ask the
-/// reader; the reader call is paced + retried. Recall uses the canonical
-/// `RecallProfile::default` (the scored recipe). It keeps the default wall clock:
-/// grading recency as of the conversation's end was measured to hurt evidence
-/// recall (diag C-asof, -4.6 any@30), so no as-of is passed here.
+/// Recall the top-`config.top_k` memories, expand to the reader view, then ask
+/// the reader (paced + retried). Uses `RecallProfile::default`. No as-of is
+/// passed: grading recency as of the conversation's end measured worse
+/// (diag C-asof, -4.6 any@30).
 pub fn answer_question(
     bench: &dyn Benchmark,
     reader: &dyn LLMClient,
@@ -279,6 +285,30 @@ pub fn answer_question(
     )?;
     let view = reader_view(eng, region, hits, config)?;
     let recall_micros = started.elapsed().as_micros();
+    if config.agentic && agentic::is_aggregation_question(q.text) {
+        match answer_aggregation(bench, reader, pacer, q, config.reader_max_tokens, &view)? {
+            Aggregation::Answered(outcome) => {
+                return Ok(AnswerOutcome {
+                    recall_micros,
+                    ..outcome
+                })
+            }
+            // Unusable extraction: fall back, but keep its spend on the ledger.
+            Aggregation::FellBack(spent) => {
+                let mut out = read_assembled(
+                    bench,
+                    reader,
+                    pacer,
+                    q,
+                    config.reader_max_tokens,
+                    view,
+                    recall_micros,
+                )?;
+                add_usage(&mut out.usage, &spent);
+                return Ok(out);
+            }
+        }
+    }
     read_assembled(
         bench,
         reader,
@@ -288,6 +318,70 @@ pub fn answer_question(
         view,
         recall_micros,
     )
+}
+
+/// Outcome of the agentic attempt: an answer, or a fallback carrying the tokens
+/// the discarded extraction call already spent.
+enum Aggregation {
+    Answered(AnswerOutcome),
+    FellBack(TokenUsage),
+}
+
+/// Accumulate `b` into `a` (tokens add; cost adds when both sides price it).
+fn add_usage(a: &mut TokenUsage, b: &TokenUsage) {
+    a.input_tokens += b.input_tokens;
+    a.output_tokens += b.output_tokens;
+    a.cost_usd = match (a.cost_usd, b.cost_usd) {
+        (Some(x), Some(y)) => Some(x + y),
+        (x, y) => x.or(y),
+    };
+}
+
+/// Two-pass agentic read: extract -> dedup/sort/count in code -> answer from
+/// the list. `None` (unparseable) falls back to the single-prompt path. Same
+/// retrieval/view/isolation as [`read_assembled`]: reader sees only the
+/// retrieved memories and the question, never gold.
+fn answer_aggregation(
+    bench: &dyn Benchmark,
+    reader: &dyn LLMClient,
+    pacer: &Pacer,
+    q: Question,
+    reader_max_tokens: u32,
+    view: &[AtomHit],
+) -> Result<Aggregation> {
+    let mut extract = CompletionRequest::new(agentic::extraction_messages(view, q.text, q.date));
+    extract.temperature = Some(0.0);
+    extract.max_tokens = Some(max_output_tokens(reader_max_tokens));
+    let extracted = paced_complete(pacer, reader, &extract)?;
+    let Some(items) = agentic::parse_items(&extracted.message.content) else {
+        return Ok(Aggregation::FellBack(extracted.usage));
+    };
+    let items = agentic::dedup_and_sort(items);
+
+    let mut messages = bench.reader_prompt(view, q.text, q.date);
+    messages.push(agentic::anchor_message(&items));
+    let mut answer = CompletionRequest::new(messages);
+    answer.temperature = Some(0.0);
+    answer.max_tokens = Some(max_output_tokens(reader_max_tokens));
+    let resp = paced_complete(pacer, reader, &answer)?;
+
+    let retrieved = view
+        .iter()
+        .filter_map(|h| {
+            h.payload
+                .get(bench.gold_id_key())
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    let mut usage = extracted.usage;
+    add_usage(&mut usage, &resp.usage);
+    Ok(Aggregation::Answered(AnswerOutcome {
+        answer: resp.message.content,
+        recall_micros: 0,
+        usage,
+        retrieved,
+    }))
 }
 
 pub(crate) fn complete_judge(
@@ -318,7 +412,7 @@ pub(crate) fn judge_label(reply: &str) -> bool {
         .find(|l| !l.is_empty())
         .unwrap_or("");
     let up = last.to_ascii_uppercase();
-    // The label appearing LAST wins (the prompt forbids emitting both).
+    // The label appearing last wins (the prompt forbids emitting both).
     match (up.rfind("WRONG"), up.rfind("CORRECT")) {
         (Some(w), Some(c)) => c > w,
         (Some(_), None) => false,

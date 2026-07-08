@@ -16,5 +16,7 @@ pub enum BenchError {
     #[error(transparent)]
     Mem(#[from] MemError),
     #[error(transparent)]
+    Db(#[from] citadel::Error),
+    #[error(transparent)]
     Llm(#[from] LlmError),
 }

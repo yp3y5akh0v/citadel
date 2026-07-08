@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
-{% block title %}Citadel - Local-first encrypted memory for AI agents{% endblock %}
-{% block description %}Local-first encrypted AI memory for agents: store, recall with hybrid vector search, and cryptographically forget by destroying keys. Zero-LLM ingest, an MCP server, and no API keys - all on an embedded encrypted SQL/vector database, so your data stays on your machine.{% endblock %}
+{% block title %}Citadel - Local-first encrypted memory engine for AI agents{% endblock %}
+{% block description %}Local-first encrypted memory engine for AI agents: store, recall with hybrid vector search, and cryptographically forget by destroying keys. Zero-LLM ingest, an MCP server, and no API keys - all on an embedded encrypted SQL/vector database, so your data stays on your machine.{% endblock %}
 
 {% block content %}
 {% set base = config.base_url %}
@@ -86,7 +86,7 @@
         <li><code>VECTOR(N)</code> type with a <a class="ilink" href="https://github.com/yp3y5akh0v/prism" target="_blank" rel="noopener">PRISM</a>-backed filtered ANN index</li>
         <li>Hybrid recall: vector ANN + BM25 keyword + recency + optional cross-encoder reranker</li>
         <li>Cryptographic forgetting: erase an atom or region by destroying its key</li>
-        <li>{{ config.extra.mcp_tools }}-tool MCP server; {{ config.extra.locomo }}% on LoCoMo and {{ config.extra.longmemeval }}% on LongMemEval (oracle, gpt-4o)</li>
+        <li>{{ config.extra.mcp_tools }}-tool MCP server; {{ config.extra.locomo }}% on LoCoMo and {{ config.extra.longmemeval }}% on LongMemEval-S (gpt-4o)</li>
       </ul>
     </div>
     <div class="pillar">
@@ -363,16 +363,16 @@
     <div class="arch-copy">
       <p><b style="color:var(--fg)">Hybrid fusion recall.</b> A query over-fetches ANN candidates, then scores each on normalized semantic distance, BM25 keyword overlap, recency (30-day half-life), and importance. An optional cross-encoder reranker (replace or reciprocal-rank-fusion) sharpens the top results, and a graph walk pulls in linked neighbors.</p>
       <p><b style="color:var(--fg)">Forgetting that is real.</b> On encrypted regions every atom is sealed under its own key, wrapped by a per-region key. <code>forget</code> and <code>evict</code> destroy those keys and return an erasure receipt; the ciphertext that remains is unrecoverable. Re-verify any atom off disk: authentic, tampered, or key-erased.</p>
-      <p><b style="color:var(--fg)">Bring your own embedder.</b> A keyword-only mock for tests, or Candle models (BGE small/base/large, MiniLM, E5-large) and a cross-encoder reranker, pulled on demand. CUDA optional.</p>
+      <p><b style="color:var(--fg)">Bring your own embedder.</b> A keyword-only mock for tests, or Candle models (E5-large, MiniLM, BGE small/base/large) and a cross-encoder reranker, pulled on demand. CUDA optional.</p>
     </div>
     <div>
       <div class="bench-kpis cols-2" style="margin-bottom:0">
         <div class="kpi"><div class="val"><em>{{ config.extra.locomo }}</em>%</div><div class="lab">LoCoMo (gpt-4o-mini)</div></div>
-        <div class="kpi"><div class="val"><em>{{ config.extra.longmemeval }}</em>%</div><div class="lab">LongMemEval (gpt-4o, oracle)</div></div>
+        <div class="kpi"><div class="val"><em>{{ config.extra.longmemeval }}</em>%</div><div class="lab">LongMemEval-S (gpt-4o)</div></div>
         <div class="kpi"><div class="val"><em>{{ config.extra.locomo_ceiling }}</em>%</div><div class="lab">LoCoMo retrieval ceiling</div></div>
         <div class="kpi"><div class="val"><em>7</em></div><div class="lab">typed edge kinds</div></div>
       </div>
-      <p class="bench-note">Two long-term-memory benchmarks, each on its official prompt and judge. LoCoMo: encrypted regions, gpt-4o-mini reader and judge, zero LLM at ingest or retrieval ({{ config.extra.locomo_gemini }}% with a gemini-3.5-flash reader). LongMemEval oracle (a retrieval-complete reader ceiling): {{ config.extra.longmemeval }}% with a gpt-4o reader and {{ config.extra.longmemeval_mini }}% with gpt-4o-mini. The LongMemEval paper's gpt-4o oracle score is 87.0%. Protocol and full numbers in <code>citadeldb-membench</code>.</p>
+      <p class="bench-note">Two long-term-memory benchmarks, each on its official prompt and judge. LoCoMo: encrypted regions, gpt-4o-mini reader and judge, zero LLM at ingest or retrieval. LongMemEval-S (full-haystack, ~40-50 sessions/question): {{ config.extra.longmemeval }}% with a gpt-4o reader and the official gpt-4o judge. Protocol and full numbers in <code>citadeldb-membench</code>.</p>
     </div>
   </div>
 </section>
@@ -419,14 +419,15 @@
       "command": "citadeldb-mcp",
       "args": [
         "--db", "memory.cdl",
-        "--embedder", "bge-large"
+        "--embedder", "e5-large",
+        "--reranker", "ms-marco-minilm"
       ],
       "env": { "CITADEL_KEY": "your-passphrase" }
     }
   }
 }{% endraw %}</pre>
       </div>
-      <p class="bench-note">One-time setup: <code>citadeldb-mcp pull bge-large</code> downloads the embedder (models are never fetched automatically; omit <code>--embedder</code> for keyword-only recall). Recall hits carry provenance, per-hit integrity verdicts, and <code>memory://atom/{id}</code> resource links.</p>
+      <p class="bench-note">One-time setup: <code>citadeldb-mcp pull e5-large</code> and <code>pull ms-marco-minilm</code> download the embedder and reranker (the best-recall config; models are never fetched automatically - omit both for keyword-only recall). Recall hits carry provenance, per-hit integrity verdicts, and <code>memory://atom/{id}</code> resource links.</p>
     </div>
   </div>
 </section>

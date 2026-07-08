@@ -1,7 +1,7 @@
 use citadel_txn::manager::TxnManager;
 
 use crate::apply::{apply_patch, apply_patch_to_table, ApplyResult};
-use crate::diff::{merkle_diff, MerkleHash, TreeReader};
+use crate::diff::{merkle_diff, MerkleHash, TreeReader, UNKNOWN_HASH};
 use crate::local_reader::LocalTreeReader;
 use crate::node_id::NodeId;
 use crate::patch::SyncPatch;
@@ -160,7 +160,8 @@ impl SyncSession {
             }
         };
 
-        let in_sync = local_hash == remote_hash;
+        // Two Off-mode endpoints both present UNKNOWN_HASH while divergent.
+        let in_sync = local_hash == remote_hash && local_hash != UNKNOWN_HASH;
 
         transport.send(&SyncMessage::HelloAck {
             node_id: self.config.node_id,
@@ -339,7 +340,11 @@ impl SyncSession {
                 .map(|t| t.root_hash)
                 .unwrap_or([0u8; citadel_core::MERKLE_HASH_SIZE]);
 
-            if local_hash == remote_hash && local_root.is_valid() && remote_root.is_valid() {
+            if local_hash == remote_hash
+                && local_hash != UNKNOWN_HASH
+                && local_root.is_valid()
+                && remote_root.is_valid()
+            {
                 continue;
             }
 
@@ -558,7 +563,7 @@ impl SyncSession {
         let local_reader = LocalTreeReader::new(manager);
         let (_, local_hash) = local_reader.root_info().map_err(SyncError::Database)?;
 
-        if local_hash == remote_hash {
+        if local_hash == remote_hash && local_hash != UNKNOWN_HASH {
             return Ok(ApplyResult::empty());
         }
 

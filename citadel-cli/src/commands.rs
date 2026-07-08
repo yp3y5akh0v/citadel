@@ -93,6 +93,11 @@ const DOT_COMMANDS: &[DotCommand] = &[
         description: "Run integrity check",
     },
     DotCommand {
+        name: ".upgrade",
+        args: "",
+        description: "Upgrade the file to the authenticated slot format (one-way)",
+    },
+    DotCommand {
         name: ".audit",
         args: "[verify]",
         description: "Show or verify audit log",
@@ -221,6 +226,10 @@ pub fn execute_dot_command(
         }
         ".verify" => {
             cmd_verify(db, out);
+            Action::Continue
+        }
+        ".upgrade" => {
+            cmd_upgrade(db, out);
             Action::Continue
         }
         ".audit" => {
@@ -472,6 +481,35 @@ fn cmd_compact(args: &[&str], db: &Database, out: &mut dyn Write) {
         }
     } else {
         let _ = writeln!(out, "Usage: .compact PATH");
+    }
+}
+
+fn cmd_upgrade(db: &Database, out: &mut dyn Write) {
+    match db.upgrade_format() {
+        Ok(report) => {
+            let _ = writeln!(out, "Tables refreshed: {}", report.tables_refreshed);
+            let _ = writeln!(
+                out,
+                "Commit slots: {}",
+                if report.slots_flagged {
+                    "sealed V1, header flag set"
+                } else {
+                    "resealed, flag pending"
+                }
+            );
+            let _ = writeln!(
+                out,
+                "Audit log: {}",
+                if report.audit_upgraded {
+                    "upgraded to v2"
+                } else {
+                    "already current (or disabled)"
+                }
+            );
+        }
+        Err(e) => {
+            let _ = writeln!(out, "Error: {e}");
+        }
     }
 }
 

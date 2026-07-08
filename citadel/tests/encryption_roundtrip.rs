@@ -143,15 +143,20 @@ fn file_header_and_recovery() {
     let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = [0xAAu8; MAC_SIZE];
-    let header = FileHeader::new(0x42, dek_id);
+    let mac_key = [0x11u8; MAC_KEY_SIZE];
+    let mut header = FileHeader::new(0x42, dek_id);
+    // New-format headers are flagged V1-only; seal like TxnManager::create.
+    for slot in &mut header.slots {
+        slot.seal(&mac_key);
+    }
     write_file_header(&io, &header).unwrap();
     io.fsync().unwrap();
 
-    let (slot_idx, slot) = recover(&io).unwrap();
+    let (slot_idx, slot) = recover(&io, &mac_key).unwrap();
     assert_eq!(slot_idx, 0);
     assert_eq!(slot.txn_id, TxnId(0));
 
-    let new_slot = CommitSlot {
+    let mut new_slot = CommitSlot {
         txn_id: TxnId(1),
         tree_root: PageId(0),
         tree_depth: 1,
@@ -162,17 +167,17 @@ fn file_header_and_recovery() {
         pending_free_root: PageId::INVALID,
         encryption_epoch: 1,
         dek_id,
-        checksum: 0,
         merkle_root: [0u8; citadel_core::MERKLE_HASH_SIZE],
-        named_table_entries: Vec::new(),
+        ..Default::default()
     };
+    new_slot.seal(&mac_key);
 
     write_commit_slot(&io, 1, &new_slot).unwrap(); // write to inactive slot 1
     io.fsync().unwrap();
     write_god_byte(&io, GOD_BIT_ACTIVE_SLOT).unwrap(); // flip to slot 1
     io.fsync().unwrap();
 
-    let (slot_idx, slot) = recover(&io).unwrap();
+    let (slot_idx, slot) = recover(&io, &mac_key).unwrap();
     assert_eq!(slot_idx, 1);
     assert_eq!(slot.txn_id, TxnId(1));
     assert_eq!(slot.tree_entries, 100);
@@ -193,12 +198,18 @@ fn recovery_rejects_tree_root_at_high_water_mark() {
     let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = [0xBBu8; MAC_SIZE];
-    let header = FileHeader::new(0x99, dek_id);
+    let mac_key = [0x22u8; MAC_KEY_SIZE];
+    // New files are flagged at birth, so both header slots must be sealed V1
+    // (the real create path does the same) or recover() reports a downgrade.
+    let mut header = FileHeader::new(0x99, dek_id);
+    for slot in &mut header.slots {
+        slot.seal(&mac_key);
+    }
     write_file_header(&io, &header).unwrap();
     io.fsync().unwrap();
 
     // HWM is one past highest allocated, so tree_root == HWM is out of bounds
-    let slot = CommitSlot {
+    let mut slot = CommitSlot {
         txn_id: TxnId(1),
         tree_root: PageId(5),
         tree_depth: 1,
@@ -209,15 +220,15 @@ fn recovery_rejects_tree_root_at_high_water_mark() {
         pending_free_root: PageId::INVALID,
         encryption_epoch: 1,
         dek_id,
-        checksum: 0,
         merkle_root: [0u8; citadel_core::MERKLE_HASH_SIZE],
-        named_table_entries: Vec::new(),
+        ..Default::default()
     };
+    slot.seal(&mac_key);
 
     write_commit_slot(&io, 0, &slot).unwrap();
     io.fsync().unwrap();
 
-    let result = recover(&io);
+    let result = recover(&io, &mac_key);
     assert!(
         matches!(result, Err(Error::PageOutOfBounds(PageId(5)))),
         "tree_root == high_water_mark should be rejected, got: {result:?}"
@@ -239,12 +250,18 @@ fn recovery_rejects_pending_free_at_high_water_mark() {
     let io = MmapPageIO::try_new(file).unwrap();
 
     let dek_id = [0xCCu8; MAC_SIZE];
-    let header = FileHeader::new(0xAA, dek_id);
+    let mac_key = [0x33u8; MAC_KEY_SIZE];
+    // See recovery_rejects_tree_root_at_high_water_mark: both header slots
+    // must be sealed V1 on a birth-flagged file.
+    let mut header = FileHeader::new(0xAA, dek_id);
+    for slot in &mut header.slots {
+        slot.seal(&mac_key);
+    }
     write_file_header(&io, &header).unwrap();
     io.fsync().unwrap();
 
     // pending_free_root == high_water_mark is invalid
-    let slot = CommitSlot {
+    let mut slot = CommitSlot {
         txn_id: TxnId(1),
         tree_root: PageId(1),
         tree_depth: 1,
@@ -255,15 +272,15 @@ fn recovery_rejects_pending_free_at_high_water_mark() {
         pending_free_root: PageId(8),
         encryption_epoch: 1,
         dek_id,
-        checksum: 0,
         merkle_root: [0u8; citadel_core::MERKLE_HASH_SIZE],
-        named_table_entries: Vec::new(),
+        ..Default::default()
     };
+    slot.seal(&mac_key);
 
     write_commit_slot(&io, 0, &slot).unwrap();
     io.fsync().unwrap();
 
-    let result = recover(&io);
+    let result = recover(&io, &mac_key);
     assert!(
         matches!(result, Err(Error::PageOutOfBounds(PageId(8)))),
         "pending_free_root == high_water_mark should be rejected, got: {result:?}"

@@ -190,3 +190,93 @@ fn summarize_rolls_up_per_kind() {
     let event = summary.kinds.iter().find(|k| k.kind == "event").unwrap();
     assert_eq!(event.count, 1);
 }
+
+/// TTL contract: a lapsed `expires_at` hides the atom from recall/fetch/count,
+/// and `EvictionPolicy::Expired` physically deletes it; an unexpired TTL
+/// changes nothing.
+#[test]
+fn expired_ttl_hides_then_evicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let now = 1_700_000_000_000_000i64;
+    eng.remember(
+        "r",
+        AtomInput::new("fact", "lapsed secret").with_expires_at(now - 1),
+    )
+    .unwrap();
+    let live = eng
+        .remember(
+            "r",
+            AtomInput::new("fact", "future secret").with_expires_at(i64::MAX),
+        )
+        .unwrap();
+    eng.remember("r", AtomInput::new("fact", "eternal note"))
+        .unwrap();
+
+    let hits = eng.recall("r", RecallQuery::by_text("secret", 10)).unwrap();
+    assert!(
+        hits.iter().all(|h| h.text != "lapsed secret"),
+        "expired atom is not recallable"
+    );
+    assert!(hits.iter().any(|h| h.id == live), "unexpired TTL recalls");
+    assert_eq!(eng.count("r", "fact").unwrap(), 2, "count skips expired");
+    assert_eq!(
+        eng.fetch("r", "fact", None, 10).unwrap().len(),
+        2,
+        "fetch skips expired"
+    );
+
+    let report = eng.evict("r", EvictionPolicy::Expired).unwrap();
+    assert_eq!(report.removed, 1, "only the lapsed atom is deleted");
+}
+
+/// Lru evicts the cold atom, not the recently-recalled hot one; Stale spares
+/// atoms that were read this engine-lifetime.
+#[test]
+fn lru_and_stale_honour_in_process_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let hot = eng
+        .remember("r", AtomInput::new("fact", "the hot topic everyone asks"))
+        .unwrap();
+    let _cold = eng
+        .remember("r", AtomInput::new("fact", "a cold forgotten trivia"))
+        .unwrap();
+
+    // Recall the hot atom so in-process stats mark it accessed.
+    let hits = eng
+        .recall("r", RecallQuery::by_text("the hot topic everyone asks", 1))
+        .unwrap();
+    assert_eq!(hits[0].id, hot);
+
+    // Stale (cutoff = far future) targets only the never-accessed cold atom.
+    let report = eng
+        .evict(
+            "r",
+            EvictionPolicy::Stale {
+                older_than_micros: -3_600_000_000,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.removed, 1, "hot atom spared by Stale");
+    assert!(eng.fetch_one("r", hot).unwrap().is_some());
+
+    // Refill and check Lru keeps the recalled half.
+    let cold2 = eng
+        .remember("r", AtomInput::new("fact", "another cold entry"))
+        .unwrap();
+    eng.recall("r", RecallQuery::by_text("the hot topic everyone asks", 1))
+        .unwrap();
+    let report = eng
+        .evict("r", EvictionPolicy::Lru { keep_fraction: 0.5 })
+        .unwrap();
+    assert_eq!(report.removed, 1);
+    assert!(
+        eng.fetch_one("r", hot).unwrap().is_some(),
+        "hot atom survives Lru"
+    );
+    assert!(
+        eng.fetch_one("r", cold2).unwrap().is_none(),
+        "cold atom evicted by Lru"
+    );
+}

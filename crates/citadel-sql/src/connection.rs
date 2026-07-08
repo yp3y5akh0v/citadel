@@ -33,7 +33,7 @@ const DEFAULT_CACHE_CAPACITY: usize = 64;
 
 /// On commit, evict shared caches (e.g. ANN indexes) for DML-touched tables,
 /// and stamp each table's last-DML generation marker: an index whose snapshot
-/// predates the marker is refused at lookup AND at insert, closing the
+/// predates the marker is refused at lookup and at insert, closing the
 /// build-races-a-commit window that prefix eviction alone leaves open.
 fn invalidate_dml_caches(schema: &SchemaManager, db: &Database) {
     if !schema.has_dml_dirty() {
@@ -388,8 +388,8 @@ struct SavepointSnapshot {
     schema_snap: SchemaSnapshot,
 }
 
-/// Active transaction held by a Connection. `None` outside BEGIN/COMMIT; `Write` for normal
-/// BEGIN (or BEGIN READ WRITE); `Read` for BEGIN READ ONLY.
+/// Active transaction held by a Connection. `None` outside BEGIN/COMMIT;
+/// `Write` for normal BEGIN (or BEGIN READ WRITE); `Read` for BEGIN READ ONLY.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ActiveTxn<'a> {
     None,
@@ -422,11 +422,11 @@ pub(crate) struct ConnectionInner<'a> {
     pub(crate) schema: SchemaManager,
     active_txn: ActiveTxn<'a>,
     savepoint_stack: Vec<SavepointEntry>,
-    in_place_saved: Option<bool>,
     pub(crate) stmt_cache: LruCache<String, CacheEntry>,
     txn_start_ts: Option<i64>,
     session_timezone: String,
-    /// Namespaces TEMP tables as `__temp_<id>_<name>`. Cleaned up on Connection drop.
+    /// Namespaces TEMP tables as `__temp_<id>_<name>`. Cleaned up on Connection
+    /// drop.
     temp_id: u64,
     temp_table_names: Vec<String>,
 }
@@ -447,7 +447,6 @@ impl<'a> Connection<'a> {
                 schema,
                 active_txn: ActiveTxn::None,
                 savepoint_stack: Vec::new(),
-                in_place_saved: None,
                 stmt_cache,
                 txn_start_ts: None,
                 session_timezone: "UTC".to_string(),
@@ -457,17 +456,19 @@ impl<'a> Connection<'a> {
         })
     }
 
-    /// Txn-start UTC µs inside BEGIN/COMMIT, else `None`.
+    /// Txn-start UTC micros inside BEGIN/COMMIT, else `None`.
     pub fn txn_start_ts(&self) -> Option<i64> {
         self.inner.borrow().txn_start_ts
     }
 
-    /// Returns the session time-zone (IANA name or fixed offset). Default `"UTC"`.
+    /// Returns the session time-zone (IANA name or fixed offset). Default
+    /// `"UTC"`.
     pub fn session_timezone(&self) -> String {
         self.inner.borrow().session_timezone.clone()
     }
 
-    /// Set the session time-zone. Accepts IANA names, ISO-8601 offsets, `"UTC"`, `"Z"`.
+    /// Set the session time-zone. Accepts IANA names, ISO-8601 offsets,
+    /// `"UTC"`, `"Z"`.
     pub fn set_session_timezone(&self, tz: &str) -> Result<()> {
         self.inner.borrow_mut().set_session_timezone_impl(tz)
     }
@@ -570,7 +571,7 @@ impl<'a> Connection<'a> {
 
     /// Freeze the ANN index for `table.column` into a persisted segment: one
     /// write txn scans, builds, serializes, and commits atomically; subsequent
-    /// cold attaches LOAD it (seconds) instead of rebuilding (minutes), with
+    /// cold attaches load it (seconds) instead of rebuilding (minutes), with
     /// the load-time scan re-proving freshness by content. The single writer
     /// lock is held for the whole build - an offline/builder operation.
     /// Refused inside an explicit transaction (it owns its own txn), and for
@@ -1043,18 +1044,11 @@ impl<'a> ConnectionInner<'a> {
 
     fn clear_savepoint_state(&mut self) {
         self.savepoint_stack.clear();
-        self.in_place_saved = None;
     }
 
     fn do_savepoint(&mut self, name: &str) -> Result<ExecutionResult> {
-        let wtx = self
-            .active_txn
-            .as_write_mut()
-            .ok_or(SqlError::NoActiveTransaction)?;
-
-        if self.savepoint_stack.is_empty() {
-            self.in_place_saved = Some(wtx.in_place());
-            wtx.set_in_place(false);
+        if self.active_txn.as_write_mut().is_none() {
+            return Err(SqlError::NoActiveTransaction);
         }
 
         self.savepoint_stack.push(SavepointEntry {
@@ -1106,14 +1100,6 @@ impl<'a> ConnectionInner<'a> {
             .rposition(|e| e.name == name)
             .ok_or_else(|| SqlError::SavepointNotFound(name.to_string()))?;
         self.savepoint_stack.truncate(idx);
-
-        if self.savepoint_stack.is_empty() {
-            if let (Some(wtx), Some(original)) =
-                (self.active_txn.as_write_mut(), self.in_place_saved.take())
-            {
-                wtx.set_in_place(original);
-            }
-        }
 
         Ok(ExecutionResult::Ok)
     }

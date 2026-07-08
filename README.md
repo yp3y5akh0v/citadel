@@ -4,7 +4,7 @@
 
 <h1 align="center">Citadel</h1>
 
-<p align="center">Local-first encrypted memory for AI agents. Zero-LLM ingest, SQL/vector search, MCP, and cryptographic forgetting.</p>
+<p align="center">Local-first encrypted memory engine for AI agents, built on an embedded SQL/vector database with zero-LLM ingest, MCP, and cryptographic forgetting.</p>
 
 <p align="center">
   <a href="https://crates.io/crates/citadeldb"><img src="https://badgen.net/crates/v/citadeldb" alt="crates.io"></a>
@@ -13,26 +13,21 @@
   <a href="https://pypi.org/project/citadeldb-mcp/"><img src="https://img.shields.io/pypi/v/citadeldb-mcp?label=pypi%20citadeldb-mcp" alt="PyPI citadeldb-mcp"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mcp"><img src="https://img.shields.io/badge/MCP-dev.citadeldb%2Fmcp-blue" alt="MCP registry: dev.citadeldb/mcp"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml"><img src="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LoCoMo%20(gpt--4o--mini%2Fgemini--flash)-85.5%2F90.6%25-success" alt="LoCoMo 85.5% (gpt-4o-mini) / 90.6% (gemini-3.5-flash) readers"></a>
-  <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LongMemEval%20oracle%20(gpt--4o)-90.6%25-success" alt="LongMemEval oracle 90.6% (gpt-4o reader)"></a>
+  <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LoCoMo%20(gpt--4o--mini)-85.7%25-success" alt="LoCoMo 85.7% (gpt-4o-mini)"></a>
+  <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LongMemEval--S%20(gpt--4o)-86.2%25-success" alt="LongMemEval-S 86.2% (gpt-4o reader)"></a>
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
 </p>
 
-Citadel is a local-first encrypted memory engine for AI agents, built on an embedded SQL/vector database.
-It stores raw conversations without LLM-based ingest, recalls with hybrid retrieval, and supports cryptographic forgetting by destroying keys.
-
 ## Quick Start
-
-Install for Python with `pip install citadeldb` or the browser with `npm install @citadeldb/wasm`, or try it with no install in the [live playground](https://citadeldb.dev/demo/). Each Rust example below lists the crates it uses.
 
 ### Memory
 
-Uses the `citadeldb` and `citadeldb-mem` crates (enable `citadeldb-mem`'s `candle-embed` feature). `bge_large` loads a local BGE-large model; other presets (`bge_small`, `e5_large`, ...) or a custom `Embedder` work too.
+Uses the `citadeldb` and `citadeldb-mem` crates (enable `citadeldb-mem`'s `candle-embed` feature). `e5_large` loads the recommended local embedder, and adding a `CrossEncoder` reranker gives the best recall (the benchmark config). Other presets (`bge_large`, `bge_small`, ...) or a custom `Embedder` work too.
 
 ```rust
 use std::sync::Arc;
 use citadel::DatabaseBuilder;
-use citadel_mem::{AtomInput, CandleEmbedder, MemoryEngine, RecallQuery};
+use citadel_mem::{AtomInput, CandleEmbedder, CrossEncoder, MemoryEngine, RecallQuery, RerankStrategy};
 
 // Encrypted store (per-atom keys enable cryptographic forgetting)
 let db = DatabaseBuilder::new("memory.db")
@@ -41,9 +36,13 @@ let db = DatabaseBuilder::new("memory.db")
     .create()?;
 let mem = MemoryEngine::open(Arc::new(db))?;
 
-// Local embedding model
-let embedder = Arc::new(CandleEmbedder::bge_large("/path/to/model")?);
+// Local embedder (e5-large) + cross-encoder reranker = the best-recall setup
+let embedder = Arc::new(CandleEmbedder::e5_large("/path/to/e5-large")?);
 mem.create_encrypted_region("chat", embedder)?;
+mem.set_reranker(
+    Arc::new(CrossEncoder::ms_marco_minilm_l6("/path/to/ms-marco-minilm")?),
+    RerankStrategy::default(),
+);
 
 // Remember raw turns (no LLM)
 mem.remember("chat", AtomInput::new("fact", "Alice's cat is named Mochi"))?;
@@ -60,7 +59,7 @@ mem.forget_atom("chat", berlin)?;
 
 ### SQL and key-value
 
-Uses the `citadeldb` and `citadeldb-sql` crates.
+Uses the `citadeldb` and `citadeldb-sql` crates - or try SQL with no install in the [live playground](https://citadeldb.dev/demo/).
 
 ```rust
 use citadel::DatabaseBuilder;
@@ -112,6 +111,7 @@ citadel> SELECT * FROM users;
 
 citadel> .backup mydb.bak
 citadel> .verify
+citadel> .upgrade
 citadel> .stats
 citadel> .audit verify
 citadel> .rekey
@@ -136,15 +136,15 @@ as `dev.citadeldb/mcp`. Run it with no install via `uvx citadeldb-mcp`, or
   "mcpServers": {
     "citadel": {
       "command": "citadeldb-mcp",
-      "args": ["--db", "memory.cdl", "--embedder", "bge-large"],
+      "args": ["--db", "memory.cdl", "--embedder", "e5-large", "--reranker", "ms-marco-minilm"],
       "env": { "CITADEL_KEY": "your-passphrase" }
     }
   }
 }
 ```
 
-Omit `--embedder` for keyword-only recall, or run `citadeldb-mcp pull bge-large` first for
-semantic recall.
+For the best recall (the benchmark config), `pull e5-large` + `pull ms-marco-minilm` first,
+then use `--embedder e5-large --reranker ms-marco-minilm`. Omit both for instant keyword-only recall.
 
 ## Memory benchmarks
 
@@ -154,7 +154,7 @@ Citadel is scored on the LoCoMo and LongMemEval long-term-memory benchmarks. Exe
 
 | Memory system | Score | Memory built with |
 |---|---|---|
-| **Citadel** | **85.5%** | **no LLM** - raw turns |
+| **Citadel** | **85.7%** | **no LLM** - raw turns |
 | Full context (no retrieval) | 72.9% | - |
 | Mem0 (graph) | 68.4% | LLM facts + graph |
 | Mem0 | 66.9% | LLM fact-extraction |
@@ -164,14 +164,15 @@ Citadel is scored on the LoCoMo and LongMemEval long-term-memory benchmarks. Exe
 
 Competitor scores as published in the Mem0 paper ([arXiv 2504.19413](https://arxiv.org/abs/2504.19413)), at the same `gpt-4o-mini` reader and judge.
 
-**LongMemEval** ([arXiv 2410.10813](https://arxiv.org/abs/2410.10813)) oracle split, official CoT prompt and `gpt-4o-2024-08-06` judge:
+**LongMemEval_S** ([arXiv 2410.10813](https://arxiv.org/abs/2410.10813)) full-haystack split (~40-50 sessions/question), gpt-4o reader, official CoT prompt and `gpt-4o-2024-08-06` judge:
 
-| Reader | Overall | Task-averaged |
-|---|---|---|
-| gpt-4o | 90.6% | 89.3% |
-| gpt-4o-mini | 82.2% | 83.0% |
+| Metric | Score |
+|---|---|
+| Overall | 86.2% |
+| Task-averaged | 86.8% |
+| Abstention | 80.0% |
 
-Oracle = retrieval-complete (the evidence sessions are in context), so this measures the reader ceiling on Citadel's retrieved memory. The gpt-4o reader exceeds the LongMemEval paper's own gpt-4o oracle score (0.870). Protocol and methodology in [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md).
+Full-haystack stresses retrieval against distractors (not the oracle reader ceiling). Protocol and per-type results in [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md).
 
 ## Encrypted memory engine
 
@@ -187,9 +188,9 @@ the memory engine:
 citadeldb-mem uses no LLM at ingest or retrieval: it stores raw conversation content
 and recalls with embeddings, BM25 keyword matching, and a cross-encoder reranker.
 Remembering costs zero tokens, recall is deterministic, and the conversation is never
-sent to an LLM to build or search the memory. The score above uses a `gpt-4o-mini` reader and judge; with a
-`gemini-3.5-flash` reader the same encrypted retrieval scores 90.6% (mean of 3 runs). Protocol
-and a comparison with published systems are in
+sent to an LLM to build or search the memory. The readers and judges above are separate
+LLMs - gpt-4o-mini for LoCoMo, gpt-4o for LongMemEval. Protocol and a comparison with
+published systems are in
 [citadel-membench](https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md).
 
 ## Agent runtime
@@ -201,8 +202,9 @@ and a comparison with published systems are in
 - **Encrypted at rest** - AES-256-CTR + HMAC-SHA256 per page, verified before decryption
 - **SQL** - JOINs, subqueries, CTEs (recursive + WITH-DML), UNION/INTERSECT/EXCEPT, window functions, views, materialized views, triggers, TEMP tables, generated columns (STORED + VIRTUAL), constraints, full FK actions, UPSERT, RETURNING, JSON/JSONB (14 Postgres operators + SQL/JSON path language), full-text search, prepared statements with plan caching, and a queryable system catalog. Full list under [SQL](#sql)
 - **ACID** - Copy-on-Write B+ tree, shadow paging, no WAL. Snapshot isolation with concurrent readers
+- **Authenticated commit slots** - the commit metadata (table roots, catalog) carries its own HMAC; older files migrate one-way via `.upgrade`
 - **P2P sync** - Merkle-based table diffing over Noise-encrypted channels with PSK auth
-- **CLI** - SQL shell with tab completion, syntax highlighting, dot-commands (.backup, .verify, .rekey, .sync, .dump, ...)
+- **CLI** - SQL shell with tab completion, syntax highlighting, 27 dot-commands (.backup, .verify, .upgrade, .rekey, .sync, .dump, ...)
 - **3-tier key hierarchy** - Passphrase -> Argon2id -> Master Key -> AES-KW -> REK -> HKDF -> DEK + MAC
 - **Cryptographic forgetting** - Erase data by destroying its key, not by overwriting: whole-store, and per-region / per-atom via [citadeldb-mem](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mem). A forgotten region or atom is unrecoverable
 - **FIPS 140-3** - PBKDF2-HMAC-SHA256 + AES-256-CTR when compliance requires it
@@ -474,9 +476,9 @@ Memory layer:
 
 Encrypted database engine:
 +----------------------+----------------------+
-|      citadel-cli     |    citadel-python    |  CLI, Python wheel
+|     citadel-cli      |    citadel-python    |  CLI, Python wheel
 +----------------------+----------------------+
-|      citadel-ffi     |     citadel-wasm     |  C FFI, WebAssembly
+|     citadel-ffi      |     citadel-wasm     |  C FFI, WebAssembly
 +----------------------+----------------------+
 |                 citadel-sql                 |  SQL parser, planner, executor
 +---------------------------------------------+
@@ -511,6 +513,14 @@ Shadow paging with a god byte - one byte selects the active commit slot. Atomic 
 3. Update the inactive commit slot
 4. Flip the god byte
 
+### Integrity Boundary
+
+What the at-rest integrity machinery does and does not guarantee against an attacker with file access:
+
+- **Per-page HMAC** binds `(epoch, page_id, IV, ciphertext)`. Any modification of a page's bytes is detected before decryption. It does **not** bind the commit generation: a page image validly written in the past for the same `(page_id, epoch)` verifies forever.
+- **Commit slots** are keyed-MAC'd (truncated HMAC-SHA256 over the whole slot) when the named-table entries fit the authenticated layout; files written by pre-1.13 versions carry only a keyless checksum over part of the slot and are still accepted, so slot authentication is corruption detection and a tampering bar, not a hard guarantee - an attacker can re-encode a slot in the legacy format.
+- **Rollback to an older genuine state** (an earlier file snapshot, or an old slot plus its old pages) passes every check by construction and cannot be detected from the file alone. Deployments that need freshness must keep an external anchor - e.g. record the latest commit's `txn_id` and Merkle root outside the attacker's reach and compare after opening.
+
 ## Language Bindings
 
 ### C / C++
@@ -537,6 +547,8 @@ citadel_close(db);
 ```
 
 ### WebAssembly
+
+Install with `npm install @citadeldb/wasm`.
 
 ```js
 import { CitadelDb } from "@citadeldb/wasm";

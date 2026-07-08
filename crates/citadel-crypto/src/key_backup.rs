@@ -127,7 +127,8 @@ fn compute_backup_mac(mac_key: &[u8; KEY_SIZE], data: &[u8]) -> [u8; MAC_SIZE] {
     out
 }
 
-/// Create a key backup, wrapping the REK under a BEK derived from `backup_passphrase`.
+/// Create a key backup, wrapping the REK under a BEK derived from
+/// `backup_passphrase`.
 #[allow(clippy::too_many_arguments)]
 pub fn create_key_backup(
     rek: &[u8; KEY_SIZE],
@@ -142,7 +143,7 @@ pub fn create_key_backup(
 ) -> citadel_core::Result<[u8; KEY_BACKUP_SIZE]> {
     let backup_salt = crate::kdf::generate_salt();
 
-    let mut bek = derive_mk(
+    let bek = derive_mk(
         kdf_algorithm,
         backup_passphrase,
         &backup_salt,
@@ -168,7 +169,6 @@ pub fn create_key_backup(
         hmac: [0u8; MAC_SIZE],
     };
     backup.update_hmac(&bek);
-    bek.zeroize();
 
     Ok(backup.serialize())
 }
@@ -180,7 +180,7 @@ pub fn restore_rek_from_backup(
 ) -> citadel_core::Result<RestoreResult> {
     let backup = KeyBackup::deserialize(backup_data)?;
 
-    let mut bek = derive_mk(
+    let bek = derive_mk(
         backup.kdf_algorithm,
         backup_passphrase,
         &backup.backup_salt,
@@ -191,14 +191,13 @@ pub fn restore_rek_from_backup(
 
     backup.verify_hmac(&bek)?;
 
-    let mut rek =
+    let rek =
         unwrap_rek(&bek, &backup.wrapped_rek).map_err(|_| citadel_core::Error::BadPassphrase)?;
-    bek.zeroize();
 
     let keys = derive_keys_from_rek(&rek);
 
-    let result = RestoreResult {
-        rek,
+    Ok(RestoreResult {
+        rek: *rek,
         keys,
         file_id: backup.file_id,
         cipher_id: backup.cipher_id,
@@ -207,10 +206,7 @@ pub fn restore_rek_from_backup(
         kdf_param2: backup.kdf_param2,
         kdf_param3: backup.kdf_param3,
         epoch: backup.epoch,
-    };
-    rek.zeroize();
-
-    Ok(result)
+    })
 }
 
 pub struct RestoreResult {

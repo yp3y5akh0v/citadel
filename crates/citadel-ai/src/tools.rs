@@ -1,9 +1,9 @@
 //! Tool registry, the `Tool` trait, and the built-in memory tools.
 //!
-//! Each tool declares a JSON-Schema [`ToolSpec`] and [`ToolPermissions`] (least-
-//! privilege). `mem_recall`/`mem_remember` need no network/fs/process. The opt-in
-//! `file-tools`/`command-tool` carry the teeth, each enforcing its allowlist inside
-//! `call`; [`structural_constraints_ok`] is post-dispatch defense-in-depth.
+//! Each tool declares a JSON-Schema [`ToolSpec`] and least-privilege
+//! [`ToolPermissions`]. The opt-in `file-tools`/`command-tool` carry the teeth,
+//! each enforcing its allowlist inside `call`; [`structural_constraints_ok`] is
+//! post-dispatch defense-in-depth.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,8 +44,9 @@ pub enum FsPolicy {
     },
 }
 
-/// What programs a tool may spawn. Default `None`: no subprocesses. `RunCommandTool`
-/// declares `AllowPrograms` so the read-only gate can forbid it (a run is a mutation).
+/// What programs a tool may spawn. Default `None`: no subprocesses.
+/// `RunCommandTool` declares `AllowPrograms` so the read-only gate can forbid
+/// it (a run is a mutation).
 #[derive(Debug, Clone, Default)]
 pub enum ExecPolicy {
     #[default]
@@ -105,17 +106,18 @@ impl ToolRegistry {
         self.tools.keys().map(String::as_str).collect()
     }
 
-    /// The declared permissions of a registered tool, or `None` if not registered.
+    /// The declared permissions of a registered tool, or `None` if not
+    /// registered.
     pub fn permissions(&self, name: &str) -> Option<ToolPermissions> {
         self.tools.get(name).map(|t| t.permissions())
     }
 
-    /// Run the named tool, or `Unknown` if unregistered. Arguments pass RAW; the tool
-    /// validates and coerces them.
+    /// Run the named tool, or `Unknown` if unregistered. Arguments pass raw;
+    /// the tool validates and coerces them.
     ///
-    /// Structured-arg coercion is PER-TOOL by design: `run_command.args` is the only
-    /// structured argument any tool declares and needs tool-specific handling. Lift a
-    /// shared pass here only when a SECOND tool declares a top-level array/object arg.
+    /// Structured-arg coercion is per-tool: `run_command.args` is the only
+    /// structured argument any tool declares. Lift a shared pass here only when
+    /// a second tool declares a top-level array/object arg.
     pub fn dispatch(&self, call: &ToolCall) -> Result<String, ToolError> {
         let tool = self
             .tools
@@ -233,10 +235,9 @@ pub(crate) fn is_known_memory_mutation(name: &str) -> bool {
     name == "mem_remember"
 }
 
-/// Deterministic structural constraint check: every dispatched call must be a
-/// registered tool, satisfy an "only use ..." whitelist parsed from `constraints`,
-/// and honor a read-only rule (no memory writes, no fs-write/exec tool). Phrases it
-/// can't map fall through to the `Verifier`/critic (heuristic by design).
+/// Deterministic constraint check: every call must be a registered tool,
+/// satisfy an "only use ..." allowlist from `constraints`, and honor a
+/// read-only rule. Unmappable phrases fall through to the `Verifier`/critic.
 pub(crate) fn structural_constraints_ok(
     reg: &ToolRegistry,
     constraints: &[String],
@@ -355,7 +356,8 @@ impl Tool for MemRecallTool {
         let provenance = opt_bool_arg(args, "provenance", false, "mem_recall")?;
         let attest = opt_bool_arg(args, "attest", false, "mem_recall")?;
 
-        // Agent-context recipe (recency off, narrative guard); `kinds` overrides it.
+        // Agent-context recipe (recency off, narrative guard); `kinds`
+        // overrides it.
         let mut q = RecallProfile::agent_context().apply(RecallQuery::by_text(query, k));
         if !kinds.is_empty() {
             q = q.with_kinds(kinds);
@@ -503,17 +505,14 @@ impl Tool for MemRememberTool {
     }
 }
 
-/// Opt-in, native-only file tools (`file-tools` feature): read/write within an
-/// allowlist of canonical roots.
+/// Opt-in file tools (`file-tools`): read/write within allowlisted canonical
+/// roots.
 ///
-/// Security: each tool enforces its allowlist at call time - the SOLE preventive
-/// control (`structural_constraints_ok` runs post-dispatch, audit/drift only).
-/// Paths are canonicalized (symlinks resolved) BEFORE a path-COMPONENT containment
-/// check, defeating the CVE-2025-53109/53110 symlink-escape class and the `/root` vs
-/// `/root-sibling` prefix trick; canonicalizing both sides also makes containment
-/// correct on case-insensitive filesystems. NOT an OS sandbox (a TOCTOU window
-/// exists - use a container). A path may be absolute or relative to a root; the
-/// canonicalize+containment gate always decides, so relatives never widen access.
+/// Security: each tool enforces its allowlist at call time (the sole preventive
+/// control; `structural_constraints_ok` is post-dispatch audit only). Paths are
+/// canonicalized before a path-component containment check, closing the
+/// CVE-2025-53109/53110 symlink-escape class and the `/root` vs `/root-sibling`
+/// prefix trick. NOT an OS sandbox (a TOCTOU window exists - use a container).
 #[cfg(all(feature = "file-tools", not(target_arch = "wasm32")))]
 mod fs_tools {
     use std::fs;
@@ -526,8 +525,8 @@ mod fs_tools {
     /// Largest file `file_read` returns, to bound a single tool result.
     const MAX_READ_BYTES: u64 = 1 << 20;
 
-    /// Canonicalize each allowed root once; an unresolvable root is a loud error
-    /// (no silent deny-all). Empty input = deny-all by construction.
+    /// Canonicalize each allowed root once; an unresolvable root is a loud
+    /// error (no silent deny-all). Empty input = deny-all by construction.
     fn canonical_roots(
         roots: impl IntoIterator<Item = PathBuf>,
         tool: &str,
@@ -558,8 +557,9 @@ mod fs_tools {
             .unwrap_or_else(|| "an allowed directory".into())
     }
 
-    /// Absolute candidates for `req`: absolute as-is; relative joined against each
-    /// root in order. Containment is checked per candidate, so relatives never widen.
+    /// Absolute candidates for `req`: absolute as-is; relative joined against
+    /// each root in order. Containment is checked per candidate, so relatives
+    /// never widen.
     fn candidates(req: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
         if req.is_absolute() {
             vec![req.to_path_buf()]
@@ -568,8 +568,8 @@ mod fs_tools {
         }
     }
 
-    /// Reject a path that names no file (empty or only `.`/`..`), fail-closed before
-    /// any filesystem access.
+    /// Reject a path that names no file (empty or only `.`/`..`), fail-closed
+    /// before any filesystem access.
     fn require_named(req: &Path, tool: &str) -> Result<(), ToolError> {
         if req.components().any(|c| matches!(c, Component::Normal(_))) {
             Ok(())
@@ -581,8 +581,8 @@ mod fs_tools {
         }
     }
 
-    /// No candidate resolved inside the roots: "outside allowed roots" if one resolved
-    /// out, else name the roots to guide a corrected path.
+    /// No candidate resolved inside the roots: "outside allowed roots" if one
+    /// resolved out, else name the roots to guide a corrected path.
     fn not_contained(
         tool: &str,
         req: &Path,
@@ -605,8 +605,8 @@ mod fs_tools {
         }
     }
 
-    /// Resolve a read target: canonicalize each candidate (symlinks + `..` collapse)
-    /// and return the first whose real path is contained.
+    /// Resolve a read target: canonicalize each candidate (symlinks + `..`
+    /// collapse) and return the first whose real path is contained.
     fn resolve_read(req: &Path, roots: &[PathBuf]) -> Result<PathBuf, ToolError> {
         require_named(req, "file_read")?;
         let mut resolved_outside = false;
@@ -620,9 +620,9 @@ mod fs_tools {
         Err(not_contained("file_read", req, roots, resolved_outside))
     }
 
-    /// Resolve a write target (leaf may not exist): canonicalize the PARENT and
-    /// re-append the Normal leaf; an existing symlink leaf is resolved so its real
-    /// target is containment-checked. First candidate inside the roots wins.
+    /// Resolve a write target (leaf may not exist): canonicalize the parent and
+    /// re-append the leaf; a symlink leaf is resolved so its real target is
+    /// containment-checked. First candidate inside the roots wins.
     fn resolve_write(req: &Path, roots: &[PathBuf]) -> Result<PathBuf, ToolError> {
         require_named(req, "file_write")?;
         let Some(Component::Normal(leaf)) = req.components().next_back() else {
@@ -705,8 +705,9 @@ mod fs_tools {
                 tool: "file_read".into(),
                 reason: format!("stat: {e}"),
             })?;
-            // A directory reports len 0 (slipping past the cap) and then read_to_string
-            // fails with a misleading "access denied"; reject it clearly instead.
+            // A directory reports len 0 (slipping past the cap) and then
+            // read_to_string fails with a misleading "access denied"; reject it
+            // clearly instead.
             if md.is_dir() {
                 return Err(ToolError::BadArgs {
                     tool: "file_read".into(),
@@ -774,7 +775,8 @@ mod fs_tools {
 
         fn call(&self, args: &Value) -> Result<String, ToolError> {
             let path = resolve_write(Path::new(str_arg(args, "path", "file_write")?), &self.roots)?;
-            // Block overwriting an existing directory (false for a not-yet-created file).
+            // Block overwriting an existing directory (false for a
+            // not-yet-created file).
             if path.is_dir() {
                 return Err(ToolError::BadArgs {
                     tool: "file_write".into(),
@@ -796,9 +798,9 @@ mod fs_tools {
     }
 
     /// Lists one directory level inside the allowlisted roots (name + is_dir),
-    /// reusing file_read's canonicalize+containment gate. Uses `DirEntry::file_type`,
-    /// which does NOT follow symlinks/junctions, so a reparse point reports is_dir=false
-    /// and is never traversed (entry.metadata would leak out-of-root targets).
+    /// reusing file_read's gate. `DirEntry::file_type` does not follow
+    /// symlinks, so a reparse point reports is_dir=false and is never traversed
+    /// (entry.metadata would leak out-of-root targets).
     pub struct ListDirTool {
         roots: Vec<PathBuf>,
     }
@@ -844,16 +846,16 @@ mod fs_tools {
         }
 
         fn call(&self, args: &Value) -> Result<String, ToolError> {
-            // Optional arg, read like the other tools' optional args (str_arg would
-            // hard-error on a missing key, which "required: []" forbids).
+            // Optional arg, read like the other tools' optional args (str_arg
+            // would hard-error on a missing key, which "required: []" forbids).
             let raw = args
                 .get("path")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .unwrap_or("");
-            // require_named rejects ""/"."/"..", so listing the root must resolve to
-            // the primary canonical root directly (trivially contained). first()
-            // guards the empty-roots case - indexing roots[0] would be a new panic.
+            // require_named rejects ""/"."/"..", so listing the root resolves
+            // to the primary canonical root directly. first() guards the
+            // empty-roots case (indexing roots[0] would panic).
             let dir = if raw.is_empty() || raw == "." {
                 self.roots
                     .first()
@@ -886,8 +888,9 @@ mod fs_tools {
                     tool: "list_dir".into(),
                     reason: format!("entry: {e}"),
                 })?;
-                // file_type does NOT follow a symlink/junction; entry.metadata WOULD
-                // and could leak an out-of-root target, so it must never be used here.
+                // file_type does not follow a symlink/junction; entry.metadata
+                // would and could leak an out-of-root target, so it must never
+                // be used here.
                 let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                 entries.push((entry.file_name().to_string_lossy().into_owned(), is_dir));
             }
@@ -967,8 +970,9 @@ mod fs_tools {
 
         #[test]
         fn relative_path_resolves_within_root() {
-            // A path relative to the allowed root now resolves (instead of being
-            // bounced), so the agent can use the natural "src/lib.rs" form.
+            // A path relative to the allowed root now resolves (instead of
+            // being bounced), so the agent can use the natural "src/lib.rs"
+            // form.
             let dir = tempfile::tempdir().unwrap();
             let root = std::fs::canonicalize(dir.path()).unwrap();
             std::fs::create_dir(root.join("src")).unwrap();
@@ -993,13 +997,14 @@ mod fs_tools {
 
         #[test]
         fn relative_escape_denied() {
-            // A relative path that climbs out of the root is still rejected: the
-            // canonicalize + containment gate runs after the root join, so the
-            // relative form can never widen the sandbox.
+            // A relative path that climbs out of the root is still rejected:
+            // the canonicalize + containment gate runs after the root join, so
+            // the relative form can never widen the sandbox.
             let allowed = tempfile::tempdir().unwrap();
             let outside = tempfile::tempdir().unwrap();
             write_file(&outside.path().join("secret.txt"), "s");
-            // Reach the sibling tempdir by a relative path out of the allowed root.
+            // Reach the sibling tempdir by a relative path out of the allowed
+            // root.
             let escape = Path::new("..")
                 .join(outside.path().file_name().unwrap())
                 .join("secret.txt");
@@ -1037,7 +1042,8 @@ mod fs_tools {
 
         #[test]
         fn read_or_write_directory_rejected() {
-            // A directory target gets a clear error, not the OS's "access denied".
+            // A directory target gets a clear error, not the OS's "access
+            // denied".
             let dir = tempfile::tempdir().unwrap();
             std::fs::create_dir(dir.path().join("sub")).unwrap();
             let reader = FileReadTool::new([dir.path().to_path_buf()]).unwrap();
@@ -1065,7 +1071,8 @@ mod fs_tools {
             write_file(&outside.path().join("secret.txt"), "s");
 
             let lister = ListDirTool::new([root.clone()]).unwrap();
-            // The root lists via an omitted path and via ".", with is_dir per entry.
+            // The root lists via an omitted path and via ".", with is_dir per
+            // entry.
             for args in [json!({}), json!({ "path": "." })] {
                 let v: Value = serde_json::from_str(&lister.call(&args).unwrap()).unwrap();
                 let entries = v["entries"].as_array().unwrap();
@@ -1099,7 +1106,8 @@ mod fs_tools {
 
         #[test]
         fn list_dir_empty_roots_no_panic() {
-            // The "."/root default must not index roots[0] when there are no roots.
+            // The "."/root default must not index roots[0] when there are no
+            // roots.
             let lister = ListDirTool::new(std::iter::empty()).unwrap();
             assert!(lister.call(&json!({})).is_err());
             assert!(lister.call(&json!({ "path": "." })).is_err());
@@ -1195,7 +1203,8 @@ mod fs_tools {
             let err = reader
                 .call(&json!({ "path": link.to_str().unwrap() }))
                 .unwrap_err();
-            // Denied by containment after resolving the symlink - NOT a missing-file error.
+            // Denied by containment after resolving the symlink, not a
+            // missing-file error.
             assert!(format!("{err}").contains("outside allowed roots"));
         }
 
@@ -1205,7 +1214,7 @@ mod fs_tools {
             use std::os::unix::fs::symlink;
             let allowed = tempfile::tempdir().unwrap();
             let outside = tempfile::tempdir().unwrap();
-            // EXISTING out-of-root target so the deny is by containment, not a
+            // Existing out-of-root target so the deny is by containment, not a
             // dangling-symlink canonicalize error (guards the symlink branch).
             write_file(&outside.path().join("target.txt"), "orig");
             let link = allowed.path().join("evil.txt");
@@ -1247,30 +1256,24 @@ mod fs_tools {
 #[cfg(all(feature = "file-tools", not(target_arch = "wasm32")))]
 pub use fs_tools::{FileReadTool, FileWriteTool, ListDirTool};
 
-/// Opt-in, native-only command/test-runner tool (`command-tool` feature): runs one
-/// allowlisted program in a fixed canonical working dir, captures capped output, and
-/// kills the child past a deadline.
+/// Opt-in command/test-runner tool (`command-tool`): runs one allowlisted
+/// program in a fixed working dir, captures capped output, kills past a
+/// deadline.
 ///
-/// Security, enforced in `call()` before every spawn (the SOLE preventive control;
-/// `structural_constraints_ok` runs post-dispatch):
-///   - ARG-VECTOR, NEVER A SHELL: `Command::new(prog).args(vec)`, no `sh -c`, so the
-///     CWE-78 shell-injection class is structurally gone (`; rm -rf /` is a literal
-///     token). `args` may be a JSON array or a whitespace-split string; both yield
-///     verbatim argv tokens, neither can re-introduce a shell.
-///   - PROGRAM ALLOWLIST (basename): no path separator, no `..`, no `.bat`/`.cmd`/
-///     `.com`/script wrapper (Windows `.bat`/`.cmd` re-expose the BatBadBut
-///     CVE-2024-24576 through cmd.exe), and in the configured set; empty = deny-all.
-///   - WORKING DIR canonicalized at construction; only the START dir (a child can `cd`,
-///     open absolute paths, or fork) - weak confinement, not a jail.
-///   - OUTPUT CAP per stream via drain threads (no full-pipe block); `truncated: true`.
-///   - TIMEOUT via `wait-timeout`, then kill+reap. `timed_out` is the authoritative kill
-///     flag, NOT `exit_code == null` (a Windows kill yields a non-null code).
-///   - SECRET STRIP: the child inherits the real env (the toolchain needs it), minus
-///     every secret-NAMED var (`is_secret_env_name`) - best-effort defense, not a boundary.
+/// Security, enforced in `call()` before every spawn (the sole preventive
+/// control; `structural_constraints_ok` is post-dispatch):
+///   - Arg-vector, never a shell: `Command::args(vec)`, no `sh -c`, so CWE-78
+///     shell injection is structurally gone (`; rm -rf /` is a literal token).
+///   - Program allowlist (basename): no separator, no `..`, no `.bat`/`.cmd`
+///     wrapper (BatBadBut CVE-2024-24576); empty = deny-all.
+///   - Working dir is the start dir only, not a jail (a child can `cd`/fork).
+///   - Output capped per stream; timeout via `wait-timeout` then kill+reap
+///     (`timed_out` is authoritative; a Windows kill yields a non-null code).
+///   - Secret strip: real env minus secret-named vars - best-effort.
 ///
-/// A non-zero exit is NOT an error (a failing test is a valid observation); only
-/// spawn/timeout/policy failures are `ToolError`. NOT an OS sandbox (no network/syscall
-/// isolation, TOCTOU) - real isolation is the operator's container.
+/// A non-zero exit is not an error; only spawn/timeout/policy failures are
+/// `ToolError`. NOT an OS sandbox (no network/syscall isolation) - use a
+/// container.
 #[cfg(all(feature = "command-tool", not(target_arch = "wasm32")))]
 mod cmd_tools {
     use std::io::Read;
@@ -1289,20 +1292,21 @@ mod cmd_tools {
     /// Largest amount captured per stream; the rest is drained and discarded.
     const MAX_OUTPUT_BYTES: usize = 1 << 20;
 
-    /// After the child resolves, how long to wait for the drain threads' buffered
-    /// output - so `call` always returns within `timeout + DRAIN_GRACE` even if a
-    /// forked grandchild holds a pipe open (killing it is the container's job).
+    /// Grace to collect drained output after the child exits, so `call`
+    /// returns within `timeout + DRAIN_GRACE` even if a forked grandchild
+    /// holds a pipe open.
     const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-    /// Windows script/batch wrappers that run THROUGH `cmd.exe` and re-expose the
-    /// BatBadBut CVE-2024-24576 argv injection on pre-1.77.2 std; refused by extension.
+    /// Windows script/batch wrappers that run through `cmd.exe` and re-expose
+    /// the BatBadBut CVE-2024-24576 argv injection on pre-1.77.2 std; refused
+    /// by extension.
     const BLOCKED_EXTS: &[&str] = &[
         ".bat", ".cmd", ".com", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh",
     ];
 
-    /// A program name must be a bare basename: non-empty, no path separator, no `..`,
-    /// no whitespace/control char (a trailing space/dot would slip a `cmd.exe `-style
-    /// name past the extension check, since Windows strips them), and not a wrapper.
+    /// A program name must be a bare basename: non-empty, no separator, no
+    /// `..`, no whitespace/control (a trailing space/dot would slip a name past
+    /// the extension check, since Windows strips them), and not a wrapper.
     fn is_rejected_program(p: &str) -> bool {
         if p.is_empty() || p.contains('/') || p.contains('\\') || p.contains("..") {
             return true;
@@ -1318,8 +1322,9 @@ mod cmd_tools {
         BLOCKED_EXTS.iter().any(|ext| lower.ends_with(ext))
     }
 
-    /// Whether an env var NAME looks like a secret, so the child never inherits it.
-    /// Name-based (not value), OS-agnostic; best-effort defense, not a guarantee.
+    /// Whether an env var name looks like a secret, so the child never inherits
+    /// it. Name-based (not value), OS-agnostic; best-effort defense, not a
+    /// guarantee.
     fn is_secret_env_name(name: &str) -> bool {
         let n = name.to_ascii_uppercase();
         const EXACT: &[&str] = &[
@@ -1344,8 +1349,9 @@ mod cmd_tools {
         EXACT.contains(&n.as_str()) || NEEDLES.iter().any(|&needle| n.contains(needle))
     }
 
-    /// Read a child pipe to EOF, keeping at most `cap` bytes (keep reading past it so
-    /// the child never blocks). Returns the bytes and whether it exceeded `cap`.
+    /// Read a child pipe to EOF, keeping at most `cap` bytes (keep reading past
+    /// it so the child never blocks). Returns the bytes and whether it exceeded
+    /// `cap`.
     fn drain_capped<R: Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
@@ -1370,7 +1376,8 @@ mod cmd_tools {
         (buf, truncated)
     }
 
-    /// Runs one allowlisted program in a fixed working directory with a deadline.
+    /// Runs one allowlisted program in a fixed working directory with a
+    /// deadline.
     #[derive(Debug)]
     pub struct RunCommandTool {
         allowed: Vec<String>,
@@ -1479,12 +1486,11 @@ mod cmd_tools {
                 });
             }
 
-            // `args` is the argument VECTOR, never a shell line. All accepted shapes
-            // produce LITERAL argv tokens via `Command::args` (no `sh -c`): a JSON
-            // array, a stringified JSON array ("[\"test\"]", parsed not split), or a
-            // plain string (whitespace-split). No quote/glob/metachar handling, so
-            // "; rm -rf /" becomes harmless literal tokens. Coercing (vs rejecting)
-            // lets the agent run its verifying `cargo test`.
+            // `args` is the argument vector, never a shell line: every shape
+            // (JSON array, stringified JSON array, or whitespace-split string)
+            // yields literal argv tokens via `Command::args`, so "; rm -rf /"
+            // is harmless. Coercing rather than rejecting lets the agent run
+            // its verifying `cargo test`.
             let arg_vec = match args.get("args") {
                 None | Some(Value::Null) => Vec::new(),
                 Some(Value::Array(items)) => {
@@ -1505,15 +1511,15 @@ mod cmd_tools {
                     v
                 }
                 Some(Value::String(s)) => {
-                    // A string is either a STRINGIFIED JSON array ("[\"test\"]", the
-                    // common LLM mistake) or a whitespace token list ("test --release").
-                    // Parse the former, split the latter; both yield literal argv tokens.
+                    // A string is either a stringified JSON array (parse it)
+                    // or a whitespace token list (split it); both yield literal
+                    // argv tokens.
                     let trimmed = s.trim();
                     match serde_json::from_str::<Vec<String>>(trimmed) {
                         Ok(parsed) => parsed,
-                        // Looks like a JSON array but doesn't parse: splitting would
-                        // yield garbage like `["test",`. Reject with guidance - a plain
-                        // arg never starts with '['.
+                        // Looks like a JSON array but doesn't parse: splitting
+                        // would yield garbage like `["test",`. Reject with
+                        // guidance - a plain arg never starts with '['.
                         Err(_) if trimmed.starts_with('[') => {
                             return Err(ToolError::BadArgs {
                                 tool: "run_command".into(),
@@ -1536,9 +1542,9 @@ mod cmd_tools {
                 }
             };
 
-            // Inherit the real env so the toolchain self-locates, then env_remove the
-            // secret-NAMED vars (is_secret_env_name) + CARGO_TARGET_DIR (isolate the
-            // child target dir). env_clear + an allowlist starved MSVC linking.
+            // Inherit the real env so the toolchain self-locates, then remove
+            // secret-named vars and CARGO_TARGET_DIR (env_clear + an allowlist
+            // starved MSVC linking).
             let mut cmd = Command::new(program);
             cmd.args(&arg_vec)
                 .current_dir(&self.workdir)
@@ -1556,9 +1562,9 @@ mod cmd_tools {
                 reason: format!("spawn {program}: {e}"),
             })?;
 
-            // Drain both pipes concurrently so the child never blocks (`.output()`
-            // would block to EOF and ignore the timeout). Channel, not a blocking join,
-            // so a forked grandchild holding a pipe can't make `call` hang past the deadline.
+            // Drain both pipes concurrently so the child never blocks
+            // (`.output()` blocks to EOF, ignoring the timeout); via a channel,
+            // not a join, so a grandchild holding a pipe can't hang `call`.
             let cap = self.cap;
             let (tx, rx) = mpsc::channel::<(usize, Vec<u8>, bool)>();
             let mut expected = 0usize;
@@ -1580,8 +1586,9 @@ mod cmd_tools {
             }
             drop(tx);
 
-            // Resolve within the deadline. On timeout OR wait error, kill+reap so no
-            // zombie/orphan is left on any path (std's Child::drop neither kills nor waits).
+            // Resolve within the deadline. On timeout OR wait error, kill+reap
+            // so no zombie/orphan is left on any path (std's Child::drop
+            // neither kills nor waits).
             let (exit_code, timed_out, wait_failed) = match child.wait_timeout(self.timeout) {
                 Ok(Some(st)) => (st.code(), false, false),
                 Ok(None) => {
@@ -1596,7 +1603,8 @@ mod cmd_tools {
                 }
             };
 
-            // Collect whatever the drain threads captured, bounded by DRAIN_GRACE.
+            // Collect whatever the drain threads captured, bounded by
+            // DRAIN_GRACE.
             let mut streams: [(Vec<u8>, bool); 2] = [(Vec::new(), false), (Vec::new(), false)];
             let mut got = 0usize;
             let grace_deadline = Instant::now() + DRAIN_GRACE;
@@ -1621,8 +1629,9 @@ mod cmd_tools {
                 });
             }
 
-            // `exit_code` is null only on a Unix signal-kill (a Windows kill reports a
-            // non-null code), so `timed_out` is the authoritative kill flag.
+            // `exit_code` is null only on a Unix signal-kill (a Windows kill
+            // reports a non-null code), so `timed_out` is the authoritative
+            // kill flag.
             Ok(json!({
                 "exit_code": exit_code,
                 "stdout": String::from_utf8_lossy(&streams[0].0).into_owned(),
@@ -1661,7 +1670,8 @@ mod cmd_tools {
         }
         #[cfg(windows)]
         mod plat {
-            // ping.exe is on PATH, arg-vector pure, and waits ~1s between echoes.
+            // ping.exe is on PATH, arg-vector pure, and waits ~1s between
+            // echoes.
             pub const PRINT: &str = "ping";
             pub fn print_args(_s: &str) -> Vec<String> {
                 vec!["-n".into(), "1".into(), "127.0.0.1".into()]
@@ -1713,12 +1723,14 @@ mod cmd_tools {
             let err = t.call(&json!({"program": "git"})).unwrap_err();
             let msg = format!("{err}");
             assert!(msg.contains("not in allowlist"));
-            // The denial surfaces the allowlist so the agent stops guessing programs.
+            // The denial surfaces the allowlist so the agent stops guessing
+            // programs.
             assert!(msg.contains("cargo"), "should list allowlist: {msg}");
         }
 
-        // A bare string `args` is split on whitespace into literal argv tokens and
-        // runs exactly like the equivalent array, for a model that sends a string.
+        // A bare string `args` is split on whitespace into literal argv tokens
+        // and runs exactly like the equivalent array, for a model that sends a
+        // string.
         #[test]
         fn string_args_split_on_whitespace_and_run() {
             let dir = tempfile::tempdir().unwrap();
@@ -1739,9 +1751,8 @@ mod cmd_tools {
             assert!(!v["stdout"].as_str().unwrap().is_empty());
         }
 
-        // A STRINGIFIED JSON array like "[\"test\"]" must be PARSED back to its
-        // elements, NOT whitespace-split into garbage tokens like `["test",`
-        // (which fed cargo `cargo '["test",'` -> "no such command"). Tokens stay
+        // A stringified JSON array like "[\"test\"]" must be parsed back to its
+        // elements, not split into garbage tokens like `["test",`. Tokens stay
         // literal argv either way.
         #[test]
         fn stringified_json_array_args_are_parsed_not_split() {
@@ -1781,9 +1792,9 @@ mod cmd_tools {
             }
         }
 
-        // A string that LOOKS like a JSON array but is MALFORMED is rejected with
-        // guidance, NOT whitespace-split into garbage tokens like `["test",` that
-        // cargo would read as a bogus subcommand.
+        // A string that looks like a JSON array but is malformed is rejected
+        // with guidance, not whitespace-split into garbage tokens like
+        // `["test",` that cargo would read as a bogus subcommand.
         #[test]
         fn malformed_json_array_string_args_rejected_with_guidance() {
             let dir = tempfile::tempdir().unwrap();
@@ -1795,12 +1806,9 @@ mod cmd_tools {
             assert!(msg.contains("malformed JSON array"), "{msg}");
         }
 
-        // SECURITY: a string with shell metacharacters is NOT a shell line. Each
-        // whitespace token is passed verbatim to the allowlisted program; there is
-        // no `sh -c`, so `;` and `rm` are just literal argv tokens handed to
-        // `echo`/`ping`, never a command split. The string runs WITHOUT error
-        // precisely because nothing interprets the metacharacters (CWE-78 stays
-        // structurally closed).
+        // SECURITY: shell metacharacters are not a shell line. Each token goes
+        // verbatim to the allowlisted program; with no `sh -c`, `;` and `rm`
+        // are literal argv tokens, never a command split (CWE-78 stays closed).
         #[test]
         fn string_args_metacharacters_are_literal_tokens_not_shell() {
             let dir = tempfile::tempdir().unwrap();
@@ -1870,9 +1878,9 @@ mod cmd_tools {
         fn non_basename_program_rejected() {
             let dir = tempfile::tempdir().unwrap();
             let t = tool(&["cargo"], dir.path(), Duration::from_secs(5));
-            // Includes the BatBadBut bypass vectors: trailing space and trailing
-            // dot (Windows strips both before resolving the file), embedded
-            // whitespace, and the wider script/wrapper extension set.
+            // Includes the BatBadBut bypass vectors: trailing space and
+            // trailing dot (Windows strips both before resolving the file),
+            // embedded whitespace, and the wider script/wrapper extension set.
             for bad in [
                 "../evil",
                 "/usr/bin/sh",
@@ -1944,10 +1952,10 @@ mod cmd_tools {
             assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
         }
 
-        // Regression: a child that exits immediately but backgrounds a long-lived
-        // grandchild inheriting stdout keeps the pipe open. A blocking drain join
-        // would hang until the grandchild dies (~5s); the bounded collection must
-        // return within ~DRAIN_GRACE regardless.
+        // Regression: a child that exits but backgrounds a grandchild
+        // inheriting stdout keeps the pipe open. A blocking drain join would
+        // hang until it dies; the bounded collection returns within
+        // ~DRAIN_GRACE.
         #[cfg(unix)]
         #[test]
         fn surviving_grandchild_does_not_hang_call() {
@@ -1961,7 +1969,8 @@ mod cmd_tools {
             let v = parse(&out);
             assert_eq!(v["exit_code"], json!(0), "got {out}");
             assert_eq!(v["timed_out"], json!(false));
-            // Bounded by DRAIN_GRACE (2s) + slack, NOT the grandchild's lifetime.
+            // Bounded by DRAIN_GRACE (2s) + slack, not the grandchild's
+            // lifetime.
             assert!(elapsed < Duration::from_secs(4), "call hung: {elapsed:?}");
         }
 
@@ -2129,7 +2138,8 @@ mod tests {
             .unwrap();
         let tool = MemRecallTool::new(Arc::clone(&eng), "r");
 
-        // Default recall applies the narrative guard, so the audit atom is hidden.
+        // Default recall applies the narrative guard, so the audit atom is
+        // hidden.
         let out = tool
             .call(&json!({"query": "project audit entry", "k": 10}))
             .unwrap();
@@ -2143,7 +2153,8 @@ mod tests {
             "audit atom must not leak through the narrative guard: {out}"
         );
 
-        // Explicit kinds replace the guard (not union): audit in, narrative out.
+        // Explicit kinds replace the guard (not union): audit in, narrative
+        // out.
         let overridden = tool
             .call(&json!({"query": "project audit entry", "k": 10, "kinds": ["audit"]}))
             .unwrap();
@@ -2171,7 +2182,7 @@ mod tests {
                 "score": 0.75,
                 "confidence": 0.5,
                 "created_at": 1234,
-                "expires_at": 9999,
+                "expires_at": 4_102_444_800_000_000i64,
                 "immutable": true
             }))
             .unwrap();
@@ -2194,14 +2205,15 @@ mod tests {
         let parent = eng
             .remember(
                 "r",
-                AtomInput::new("fact", "root provenance atom").with_payload(json!({"tag": "root"})),
+                AtomInput::new("fact", "root provenance atom")
+                    .with_payload(json!({"tag": "root", "lineage": "demo"})),
             )
             .unwrap();
         let child = eng
             .remember(
                 "r",
                 AtomInput::new("evidence", "leaf searchable atom")
-                    .with_payload(json!({"tag": "leaf"}))
+                    .with_payload(json!({"tag": "leaf", "lineage": "demo"}))
                     .with_score(0.9),
             )
             .unwrap();
@@ -2213,7 +2225,7 @@ mod tests {
                 "query": "leaf searchable",
                 "k": 1,
                 "kinds": ["evidence", "fact"],
-                "payload_filter": {"tag": "leaf"},
+                "payload_filter": {"lineage": "demo"},
                 "graph_depth": 1,
                 "graph_edge_kinds": ["derived_from"],
                 "provenance": true,

@@ -1,31 +1,35 @@
-//! Live LoCoMo runner. Requires a real OpenAI key and a local BGE-small model;
-//! gated behind `openai` + `candle-embed` so default/CI builds never compile it.
+//! Live LoCoMo runner. Requires a real OpenAI key and a local embedder
+//! (e5-large); gated behind `openai` + `candle-embed` so CI never compiles it.
 //!
 //! Usage:
-//!   OPENAI_API_KEY=...  CITADEL_EMBEDDER_DIR=/path/to/bge-small  \
+//!   OPENAI_API_KEY=...  CITADEL_EMBEDDER_DIR=/path/to/e5-large  \
 //!     cargo run -p citadeldb-membench --features openai,candle-embed \
 //!     --bin locomo -- path/to/locomo10.json
 //!
 //! Dataset path: argv[1] or CITADEL_LOCOMO_DATASET. Env knobs:
-//!   CITADEL_LOCOMO_READER_MODEL=m     answer-generation model (default gpt-4o-mini)
+//!   CITADEL_LOCOMO_READER_MODEL=m     answer model (default gpt-4o-mini)
 //!   CITADEL_LOCOMO_JUDGE_MODEL=m      scoring model (default gpt-4o-mini)
-//!   CITADEL_LOCOMO_TOP_K=n            memories retrieved per question (default 50)
-//!   CITADEL_LOCOMO_READER_ORDER       chrono|relevance prompt order (default relevance)
-//!   CITADEL_LOCOMO_NEIGHBOR_RADIUS=n  adjacent turns around each hit (default 0 = off)
+//!   CITADEL_LOCOMO_TOP_K=n            memories per question (default 50)
+//!   CITADEL_LOCOMO_READER_ORDER       chrono|relevance prompt order (def rel)
+//!   CITADEL_LOCOMO_NEIGHBOR_RADIUS=n  adjacent turns per hit (default 0)
+//!   CITADEL_LOCOMO_AGENTIC=1          agentic reader for aggregation Qs
 //!   CITADEL_LOCOMO_RERANK_STRATEGY    replace|rrf (default rrf)
 //!   CITADEL_LOCOMO_READER_CONCURRENCY reader calls in flight (default 3)
 //!   CITADEL_LOCOMO_JUDGE_CONCURRENCY  judge calls in flight (default 12, mini)
-//!   CITADEL_LOCOMO_CONCURRENCY=1      force TRUE serial (both caps -> 1); else legacy floor
-//!   CITADEL_LOCOMO_READER_TPM / CITADEL_LOCOMO_JUDGE_TPM  per-model token/min cap (30000 / 1000000)
-//!   CITADEL_MEMBENCH_RETRY_MAX_ELAPSED_SECS  per-call retry wall-clock budget (default 240)
-//!   CITADEL_MEMBENCH_MAX_TOKENS      reader/judge output-token cap override (shared)
-//!   CITADEL_LOCOMO_MAX_SAMPLES=N      cap the run to the first N conversations
-//!   CITADEL_LOCOMO_LIVE_TRACE=path    stream one JSON line per scored question
-//!   CITADEL_LOCOMO_AUDIT_PATH=path    per-question audit JSON written at the end
-//!   CITADEL_LOCOMO_DRY_RUN=1          load + print dataset stats, then exit (no LLM/key)
-//!   CITADEL_LOCOMO_RETRIEVAL_DIAG=1   token-free layered evidence recall@k, then exit
-//!                             (needs bge, no key; pinpoints the lossy layer)
-//!   CITADEL_LOCOMO_PARAM_SWEEP=1      token-free sweep of fusion weight ratios and
+//!   CITADEL_LOCOMO_CONCURRENCY=1      force TRUE serial (both caps -> 1)
+//!   CITADEL_LOCOMO_READER_TPM / _JUDGE_TPM  per-model token/min cap
+//!                             (30000 / 1000000)
+//!   CITADEL_MEMBENCH_RETRY_MAX_ELAPSED_SECS  per-call retry budget (def 240)
+//!   CITADEL_MEMBENCH_MAX_TOKENS      output-token cap override (shared)
+//!   CITADEL_LOCOMO_MAX_SAMPLES=N      cap to the first N conversations
+//!   CITADEL_LOCOMO_LIVE_TRACE=path    stream one JSON line per question
+//!   CITADEL_LOCOMO_AUDIT_PATH=path    per-question audit JSON at the end
+//!   CITADEL_LOCOMO_DB_PATH=path       persist + reuse the encrypted DB
+//!                             (skip ingest; ENCRYPTED must match the build)
+//!   CITADEL_LOCOMO_DRY_RUN=1          load + print dataset stats, then exit
+//!   CITADEL_LOCOMO_RETRIEVAL_DIAG=1   token-free layered recall@k, then exit
+//!                             (needs embedder, no key; finds the lossy layer)
+//!   CITADEL_LOCOMO_PARAM_SWEEP=1      token-free fusion-ratio sweep and
 //!                             rerank strategies (RRF k / Replace), then exit
 
 use std::collections::BTreeMap;
@@ -33,7 +37,6 @@ use std::error::Error;
 use std::io::Write;
 use std::sync::Arc;
 
-use citadel::{Argon2Profile, DatabaseBuilder};
 use citadel_ai::LLMClient;
 use citadel_mem::{
     AtomHit, CandleEmbedder, CrossEncoder, Embedder, FusionWeights, MemoryEngine, RecallQuery,
@@ -45,8 +48,9 @@ use citadel_membench::{
 };
 use rustc_hash::FxHashMap;
 
-/// Reader generates answers, judge scores them (distinct roles, may differ). Override
-/// via CITADEL_LOCOMO_READER_MODEL / CITADEL_LOCOMO_JUDGE_MODEL; both are pinned in Provenance.
+/// Reader generates answers, judge scores them (distinct roles, may differ).
+/// Override via CITADEL_LOCOMO_READER_MODEL / CITADEL_LOCOMO_JUDGE_MODEL; both
+/// are pinned in Provenance.
 const DEFAULT_READER_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_JUDGE_MODEL: &str = "gpt-4o-mini";
 
@@ -73,58 +77,67 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    // CITADEL_LOCOMO_MOCK_EMBED uses a deterministic embedder: fine for the DB dump
-    // (embedder-independent), NOT for the diag or full run (need real bge semantics).
+    // CITADEL_LOCOMO_MOCK_EMBED uses a deterministic embedder: fine for the DB
+    // dump (embedder-independent), not for the diag or full run (need real
+    // embedder semantics).
     let embedder: Arc<dyn Embedder> = if std::env::var("CITADEL_LOCOMO_MOCK_EMBED").is_ok() {
         Arc::new(citadel_mem::MockEmbedder::new(384))
     } else {
-        let bge_dir =
+        let model_dir =
             std::env::var("CITADEL_EMBEDDER_DIR").map_err(|_| "CITADEL_EMBEDDER_DIR not set")?;
-        // CITADEL_LOCOMO_EMBEDDER selects the model (default bge-small); dim/layers come from
-        // its config.json, and the choice is recorded in Provenance.
+        // CITADEL_LOCOMO_EMBEDDER selects the model (default e5-large);
+        // dim/layers come from its config.json, and the choice is recorded in
+        // Provenance.
         let ce = match std::env::var("CITADEL_LOCOMO_EMBEDDER")
             .unwrap_or_default()
             .as_str()
         {
-            "bge-base" => CandleEmbedder::bge_base(&bge_dir)?,
-            "bge-large" => CandleEmbedder::bge_large(&bge_dir)?,
-            "e5-large" => CandleEmbedder::e5_large(&bge_dir)?,
-            "granite-r2" => CandleEmbedder::granite_r2(&bge_dir)?,
-            _ => CandleEmbedder::bge_small(&bge_dir)?,
+            "bge-base" => CandleEmbedder::bge_base(&model_dir)?,
+            "bge-large" => CandleEmbedder::bge_large(&model_dir)?,
+            "e5-large" => CandleEmbedder::e5_large(&model_dir)?,
+            "e5-large-v2" => CandleEmbedder::e5_large_v2(&model_dir)?,
+            "granite-r2" => CandleEmbedder::granite_r2(&model_dir)?,
+            "arctic" => CandleEmbedder::arctic(&model_dir)?,
+            "modernbert-embed" => CandleEmbedder::modernbert_embed(&model_dir)?,
+            _ => CandleEmbedder::e5_large(&model_dir)?,
         };
         Arc::new(ce)
     };
 
-    // CITADEL_LOCOMO_ENCRYPTED seals atoms per-key and enables per-atom/region erasure.
-    // CITADEL_LOCOMO_DB_PATH persists the (encrypted) DB for table/sidecar inspection; else temp.
+    // CITADEL_LOCOMO_ENCRYPTED seals atoms per-key (enables erasure).
+    // CITADEL_LOCOMO_DB_PATH persists + reuses the DB (ENCRYPTED must match).
     let encrypted = citadel_membench::encrypted_regions()
         || std::env::var("CITADEL_LOCOMO_ERASURE_DEMO").is_ok();
-    let db_path = std::env::var("CITADEL_LOCOMO_DB_PATH").ok();
-    if let Some(p) = &db_path {
-        if std::path::Path::new(p).exists() {
-            return Err(
-                format!("CITADEL_LOCOMO_DB_PATH exists: {p} (remove it for a fresh run)").into(),
-            );
-        }
-    }
-    let tmp = if db_path.is_none() {
-        Some(tempfile::tempdir()?)
+    let bench_db = citadel_membench::open_bench_db("CITADEL_LOCOMO_DB_PATH", encrypted)?;
+    let db = Arc::clone(&bench_db.db);
+    if bench_db.reuse {
+        eprintln!(
+            "db: reuse {} (encrypted_regions={encrypted}) - skipping ingest",
+            bench_db.path.display()
+        );
     } else {
-        None
-    };
-    let db_file = match &db_path {
-        Some(p) => std::path::PathBuf::from(p),
-        None => tmp.as_ref().unwrap().path().join("membench.cdl"),
-    };
-    let mut builder = DatabaseBuilder::new(&db_file)
-        .passphrase(b"membench")
-        .argon2_profile(Argon2Profile::Iot);
-    if encrypted {
-        builder = builder.enable_region_keys(true);
+        eprintln!(
+            "db: {} (encrypted_regions={encrypted})",
+            bench_db.path.display()
+        );
     }
-    let db = Arc::new(builder.create()?);
-    eprintln!("db: {} (encrypted_regions={encrypted})", db_file.display());
     let mut eng = MemoryEngine::open(db.clone())?;
+
+    // The token-free build-and-inspect modes rebuild a throwaway DB; reusing a
+    // persisted one would double-ingest. LoCoMo is seconds to rebuild, so
+    // require a fresh DB for them.
+    if bench_db.reuse
+        && (std::env::var("CITADEL_LOCOMO_DUMP_DB").is_ok()
+            || std::env::var("CITADEL_LOCOMO_RETRIEVAL_DIAG").is_ok()
+            || std::env::var("CITADEL_LOCOMO_PARAM_SWEEP").is_ok()
+            || std::env::var("CITADEL_LOCOMO_ERASURE_DEMO").is_ok())
+    {
+        return Err(
+            "CITADEL_LOCOMO_DB_PATH reuse supports only the scored run; unset it \
+                    (or point to a new path) for dump/diag/sweep/erasure modes"
+                .into(),
+        );
+    }
 
     // Inspect what is actually stored: ingest one conversation, dump its atoms.
     if std::env::var("CITADEL_LOCOMO_DUMP_DB").is_ok() {
@@ -146,8 +159,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         return run_erasure_demo(&eng, db, &samples, embedder);
     }
 
-    // Optional cross-encoder reranker re-orders the candidate pool before the reader's
-    // top-k. CITADEL_LOCOMO_RERANK_STRATEGY=replace|rrf (default rrf blends cross-encoder + fusion).
+    // Optional cross-encoder reranker re-orders the candidate pool before the
+    // reader's top-k. CITADEL_LOCOMO_RERANK_STRATEGY=replace|rrf (default rrf
+    // blends cross-encoder + fusion).
     let reranker_model = match std::env::var("CITADEL_RERANKER_DIR") {
         Ok(rr_dir) => {
             let ce = CrossEncoder::ms_marco_minilm_l6(&rr_dir)?;
@@ -163,8 +177,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    // Reader/judge selected via the shared citadel-ai backend factory: CITADEL_LOCOMO_READER_*
-    // / CITADEL_LOCOMO_JUDGE_* (default openai; OPENAI_API_KEY is read inside the factory).
+    // Reader/judge selected via the shared citadel-ai backend factory:
+    // CITADEL_LOCOMO_READER_* / CITADEL_LOCOMO_JUDGE_* (default openai;
+    // OPENAI_API_KEY is read inside the factory).
     let reader: Arc<dyn LLMClient> =
         citadel_ai::factory::from_env("CITADEL_LOCOMO_READER", "openai", DEFAULT_READER_MODEL)
             .map_err(|e| format!("reader LLM: {e}"))?;
@@ -182,8 +197,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     eprintln!("reader: {reader_model}  judge: {judge_model}");
 
-    // Per-model TPM pacing keeps submissions under the OpenAI limit so a burst can't
-    // trigger a 429 storm. Override via CITADEL_LOCOMO_READER_TPM / CITADEL_LOCOMO_JUDGE_TPM.
+    // Per-model TPM pacing keeps submissions under the OpenAI limit so a burst
+    // can't trigger a 429 storm. Override via CITADEL_LOCOMO_READER_TPM /
+    // CITADEL_LOCOMO_JUDGE_TPM.
     const DEFAULT_READER_TPM: u64 = 30_000;
     const DEFAULT_JUDGE_TPM: u64 = 1_000_000;
     let reader_tpm = std::env::var("CITADEL_LOCOMO_READER_TPM")
@@ -196,8 +212,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(DEFAULT_JUDGE_TPM);
     let pacer = citadel_membench::Pacer::new(&reader_model, reader_tpm, &judge_model, judge_tpm);
 
-    // CITADEL_LOCOMO_LIVE_TRACE=path writes one JSON line per question (a plain File, so each
-    // writeln is a direct, tailable syscall).
+    // CITADEL_LOCOMO_LIVE_TRACE=path writes one JSON line per question (a plain
+    // File, so each writeln is a direct, tailable syscall).
     let mut live_trace = std::env::var("CITADEL_LOCOMO_LIVE_TRACE")
         .ok()
         .map(std::fs::File::create)
@@ -221,6 +237,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             reader.as_ref(),
             judge.as_ref(),
             config,
+            bench_db.reuse,
             &pacer,
             &mut |r| prog.observe(r, &conv_id, live_trace.as_mut()),
         )?;
@@ -238,7 +255,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     prov.reranker_model = reranker_model;
     let report = aggregate(&results, prov);
 
-    // Per-question audit trail (question, gold, predicted, verdict) for spot-checking.
+    // Per-question audit trail (question, gold, predicted, verdict) for
+    // spot-checking.
     if let Ok(path) = std::env::var("CITADEL_LOCOMO_AUDIT_PATH") {
         std::fs::write(&path, serde_json::to_string_pretty(&results)?)?;
         eprintln!(
@@ -252,8 +270,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Live running tally (per-category correct/total), printed and optionally streamed
-/// to a JSONL trace as each question scores.
+/// Live running tally (per-category correct/total), printed and optionally
+/// streamed to a JSONL trace as each question scores.
 struct LiveProgress {
     total: usize,
     done: usize,
@@ -336,7 +354,8 @@ impl LiveProgress {
 }
 
 /// Build the run config from env overrides over [`BenchConfig::default`]:
-/// CITADEL_LOCOMO_TOP_K, CITADEL_LOCOMO_READER_ORDER, CITADEL_LOCOMO_NEIGHBOR_RADIUS.
+/// CITADEL_LOCOMO_TOP_K, CITADEL_LOCOMO_READER_ORDER,
+/// CITADEL_LOCOMO_NEIGHBOR_RADIUS.
 fn bench_config_from_env() -> BenchConfig {
     let d = BenchConfig::default();
     let reader_order = match std::env::var("CITADEL_LOCOMO_READER_ORDER")
@@ -352,6 +371,7 @@ fn bench_config_from_env() -> BenchConfig {
         top_k: env_usize("CITADEL_LOCOMO_TOP_K", 1, d.top_k),
         reader_order,
         neighbor_radius: env_usize("CITADEL_LOCOMO_NEIGHBOR_RADIUS", 0, d.neighbor_radius),
+        agentic: std::env::var("CITADEL_LOCOMO_AGENTIC").is_ok(),
         ..d
     }
 }
@@ -365,7 +385,8 @@ fn env_usize(key: &str, min: usize, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Parse `CITADEL_LOCOMO_RERANK_STRATEGY` (replace|rrf, default rrf) into a strategy.
+/// Parse `CITADEL_LOCOMO_RERANK_STRATEGY` (replace|rrf, default rrf) into a
+/// strategy.
 fn rerank_strategy_from_env() -> RerankStrategy {
     match std::env::var("CITADEL_LOCOMO_RERANK_STRATEGY")
         .unwrap_or_default()
@@ -377,15 +398,11 @@ fn rerank_strategy_from_env() -> RerankStrategy {
     }
 }
 
-/// Token-free evidence recall@k, measured per layer to localize the lossy stage:
-///   A: exact cosine over the indexed text (the embedder ceiling; embeds exactly
-///      what ingest indexes via `turn_content`).
-///   B: semantic-only recall (citadel-vector PRISM).
-///   C: default fusion via recall (wall-clock recency, ~uniform for dated data).
-///   C-asof: default fusion graded as of the conversation's end (live recency).
-///   D / D-asof: fusion + cross-encoder reranker (the order the reader sees).
-/// Each cell reports ANY-evidence recall (some gold turn in top-k) and ALL-evidence
-/// recall (every gold turn in top-k - the true multi-hop ceiling).
+/// Token-free evidence recall@k per layer, to localize the lossy stage: A exact
+/// cosine (embedder ceiling), B semantic-only PRISM, C default fusion,
+/// C-asof fusion graded at conversation end, D/D-asof + cross-encoder reranker.
+/// Each cell reports any-evidence and all-evidence recall (the multi-hop
+/// ceiling).
 fn run_retrieval_diag(
     eng: &mut MemoryEngine,
     samples: &[Sample],
@@ -393,7 +410,8 @@ fn run_retrieval_diag(
 ) -> Result<(), Box<dyn Error>> {
     const KS: [usize; 3] = [10, 30, 50];
     const MAX_K: usize = 50;
-    // D rows are only populated when a reranker dir is set; names pin the strategy.
+    // D rows are only populated when a reranker dir is set; names pin the
+    // strategy.
     let rr_dir = std::env::var("CITADEL_RERANKER_DIR").ok();
     let (d_name, d_asof_name) = match &rr_dir {
         Some(_) => {
@@ -432,15 +450,16 @@ fn run_retrieval_diag(
         ingest_sample(eng, &s.sample_id, s)?;
         let as_of = s.as_of_micros();
 
-        // Embed each turn's INDEXED text once for the exact-cosine ceiling (mode A).
+        // Embed each turn's indexed text once for the exact-cosine ceiling
+        // (mode A).
         let turn_texts: Vec<String> = s.turns.iter().map(turn_content).collect();
         let turn_refs: Vec<&str> = turn_texts.iter().map(String::as_str).collect();
         let turn_embs = embedder.embed(&turn_refs)?;
         let turn_dia: Vec<&str> = s.turns.iter().map(|t| t.dia_id.as_str()).collect();
 
-        // Embed every scored question ONCE in a single batch (GPU-efficient) on the
-        // QUERY side (asymmetric models prefix here), then reuse the vector across
-        // modes via by_embedding so no recall re-embeds the query.
+        // Embed every scored question once in a single batch (GPU-efficient) on
+        // the query side (asymmetric models prefix here), then reuse the vector
+        // across modes via by_embedding so no recall re-embeds the query.
         let scored_qa: Vec<_> =
             s.qa.iter()
                 .filter(|qa| qa.category != Category::Adversarial && !qa.evidence.is_empty())
@@ -462,7 +481,8 @@ fn run_retrieval_diag(
             let a_ranked: Vec<&str> = scored.iter().map(|(_, d)| *d).collect();
             record(&mut acc[0], label, &a_ranked, &qa.evidence, KS);
 
-            // B: semantic-only through recall (reuse the embedding; keyword inert here).
+            // B: semantic-only recall (reuse the embedding; keyword inert
+            // here).
             let b = eng.recall(
                 &s.sample_id,
                 RecallQuery::by_embedding(q_emb.clone(), MAX_K)
@@ -471,7 +491,8 @@ fn run_retrieval_diag(
             )?;
             record(&mut acc[1], label, &hit_dia_ids(&b), &qa.evidence, KS);
 
-            // C: default fusion (reuse the embedding; text drives the keyword signal).
+            // C: default fusion (reuse the embedding; text drives the keyword
+            // signal).
             let c_query =
                 RecallQuery::by_embedding(q_emb.clone(), MAX_K).with_text(qa.question.as_str());
             let c = eng.recall(&s.sample_id, c_query.clone())?;
@@ -485,7 +506,8 @@ fn run_retrieval_diag(
         }
     }
 
-    // Pass 2 (D rows): attach the reranker and re-recall, isolating rerank from fusion.
+    // Pass 2 (D rows): attach the reranker and re-recall, isolating rerank from
+    // fusion.
     if let Some(dir) = &rr_dir {
         let ce = CrossEncoder::ms_marco_minilm_l6(dir)?;
         eng.set_reranker(Arc::new(ce), rerank_strategy_from_env());
@@ -551,7 +573,8 @@ fn run_retrieval_diag(
 /// `(query embedding, question text, gold evidence)`.
 type SweepCase = (String, Vec<(Vec<f32>, String, Vec<String>)>);
 
-/// Recall every cached question under `w` and tally overall any/all evidence recall.
+/// Recall every cached question under `w` and tally overall any/all evidence
+/// recall.
 fn sweep_combo(
     eng: &MemoryEngine,
     cases: &[SweepCase],
@@ -574,12 +597,10 @@ fn sweep_combo(
     Ok(t)
 }
 
-/// Token-free retrieval parameter sweep. Phase 1 sweeps the semantic:keyword
-/// fusion ratio with no reranker (recency/importance carry no rank signal on
-/// this dataset, so the ratio IS the linear stage). Phase 2 crosses the two
-/// best ratios with RRF damping constants and Replace. Ingest and query
-/// embeddings are computed once and reused by every combo; combos are ranked
-/// by overall any@50.
+/// Token-free retrieval parameter sweep: phase 1 sweeps the semantic:keyword
+/// ratio with no reranker (the ratio is the whole linear stage here), phase 2
+/// crosses the two best ratios with RRF constants and Replace. Embeddings
+/// computed once and reused; combos ranked by overall any@50.
 fn run_param_sweep(
     eng: &mut MemoryEngine,
     samples: &[Sample],
@@ -667,8 +688,8 @@ fn run_param_sweep(
     Ok(())
 }
 
-/// Inspect stored atoms: ingest each conversation and print the raw rows, to verify
-/// what the DB actually holds (text + caption/query markers).
+/// Inspect stored atoms: ingest each conversation and print the raw rows, to
+/// verify what the DB actually holds (text + caption/query markers).
 fn run_db_dump(
     eng: &MemoryEngine,
     samples: &[Sample],
@@ -678,7 +699,8 @@ fn run_db_dump(
         return Err("no samples to dump".into());
     }
 
-    // Markers confirming ingest folded the caption + image-search query into the text.
+    // Markers confirming ingest folded the caption + image-search query into
+    // the text.
     let cap_marker = "[shared a photo:";
     let qry_marker = "[image search:";
     let (mut tot_turns, mut tot_ingested, mut tot_atoms) = (0usize, 0usize, 0usize);
@@ -727,8 +749,8 @@ fn run_db_dump(
             s.turns.len()
         );
 
-        // A compact aligned table (truncated), then full untruncated text below so the
-        // caption/query markers are visible.
+        // A compact aligned table (truncated), then full untruncated text below
+        // so the caption/query markers are visible.
         let show = atoms.len().min(15);
         eprintln!("\nfirst {show} stored atoms:");
         eprintln!(
@@ -766,7 +788,8 @@ fn run_db_dump(
             );
         }
 
-        // Full text of the first 5 caption/query atoms, so the markers are fully visible.
+        // Full text of the first 5 caption/query atoms, so the markers are
+        // fully visible.
         eprintln!("\nfull text of first atoms carrying a caption or query marker:");
         for a in atoms
             .iter()
@@ -788,10 +811,10 @@ fn run_db_dump(
     Ok(())
 }
 
-/// Token-free encryption + erasure verification on one real conversation: ingest into
-/// an ENCRYPTED region (per-atom sealed), prove PRISM-over-sealed recall, then exercise
-/// per-atom (`forget_atom`) and per-region (`drop_region`) erasure, printing the on-disk
-/// key-store sidecar bytes before/after each so the destruction is visible.
+/// Token-free encryption + erasure demo on one conversation: ingest into an
+/// encrypted region, prove PRISM-over-sealed recall, then exercise
+/// `forget_atom`/`drop_region`, printing the key-store sidecar bytes
+/// before/after so the destruction is visible.
 fn run_erasure_demo(
     eng: &MemoryEngine,
     db: Arc<citadel::Database>,
@@ -817,7 +840,8 @@ fn run_erasure_demo(
         len(&region_sidecar)
     );
 
-    // PRISM over sealed content: a real turn must surface through decrypt-then-rank.
+    // PRISM over sealed content: a real turn must surface through
+    // decrypt-then-rank.
     let needle = &s.turns[s.turns.len() / 2];
     let needle_text = turn_content(needle);
     let hits = eng.recall(region, RecallQuery::by_text(&needle_text, 3))?;
@@ -832,7 +856,8 @@ fn run_erasure_demo(
         truncate(&hits[0].text, 50)
     );
 
-    // Per-atom erasure: forget the top hit, show recall drops it + the ACK slot changes.
+    // Per-atom erasure: forget the top hit, show recall drops it + the ACK slot
+    // changes.
     let before = bytes(&atom_sidecar);
     eprintln!(
         "\n[per-atom erasure] forgetting atom {target} (present_before={})",
@@ -858,7 +883,8 @@ fn run_erasure_demo(
         );
     }
 
-    // Per-region erasure: drop the region, show recall empties + the RCK slot changes.
+    // Per-region erasure: drop the region, show recall empties + the RCK slot
+    // changes.
     let rbefore = bytes(&region_sidecar);
     eng.drop_region(region)?;
     let rafter = bytes(&region_sidecar);
@@ -899,7 +925,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// ANY/ALL evidence hit counts at each cutoff, plus the question count.
+/// any/all evidence hit counts at each cutoff, plus the question count.
 #[derive(Default)]
 struct Tally {
     any: [usize; 3],

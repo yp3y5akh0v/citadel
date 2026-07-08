@@ -13,8 +13,6 @@ pub struct PageAllocator {
     /// All page IDs allocated this txn (in allocation order). Used to bound
     /// O(allocated) page-cache cleanup on ROLLBACK TO SAVEPOINT.
     allocated_this_txn: Vec<PageId>,
-    /// In-place CoW mode (SyncMode::Off + no readers): reuse page IDs.
-    in_place: bool,
 }
 
 impl PageAllocator {
@@ -24,16 +22,7 @@ impl PageAllocator {
             ready_to_use: Vec::new(),
             freed_this_txn: Vec::new(),
             allocated_this_txn: Vec::new(),
-            in_place: false,
         }
-    }
-
-    pub fn set_in_place(&mut self, enabled: bool) {
-        self.in_place = enabled;
-    }
-
-    pub fn in_place(&self) -> bool {
-        self.in_place
     }
 
     /// Prefers reusing reclaimed pages over incrementing the high water mark.
@@ -70,6 +59,12 @@ impl PageAllocator {
         self.ready_to_use.extend(pages);
     }
 
+    /// Drain the unconsumed reclaimed pages so the caller can carry them over
+    /// to the next transaction instead of leaking them.
+    pub fn take_ready_to_use(&mut self) -> Vec<PageId> {
+        std::mem::take(&mut self.ready_to_use)
+    }
+
     pub fn commit(&mut self) -> Vec<PageId> {
         self.allocated_this_txn.clear();
         std::mem::take(&mut self.freed_this_txn)
@@ -94,7 +89,6 @@ impl PageAllocator {
             ready_to_use: self.ready_to_use.clone(),
             freed_this_txn_len: self.freed_this_txn.len(),
             allocated_this_txn_len: self.allocated_this_txn.len(),
-            in_place: self.in_place,
         }
     }
 
@@ -103,7 +97,6 @@ impl PageAllocator {
         self.ready_to_use = cp.ready_to_use;
         self.freed_this_txn.truncate(cp.freed_this_txn_len);
         self.allocated_this_txn.truncate(cp.allocated_this_txn_len);
-        self.in_place = cp.in_place;
     }
 
     pub fn allocated_since(&self, checkpoint_len: usize) -> &[PageId] {
@@ -117,7 +110,6 @@ pub struct AllocCheckpoint {
     ready_to_use: Vec<PageId>,
     freed_this_txn_len: usize,
     allocated_this_txn_len: usize,
-    in_place: bool,
 }
 
 impl AllocCheckpoint {

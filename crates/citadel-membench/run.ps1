@@ -7,7 +7,7 @@
 #   $env:CITADEL_RERANKER_DIR      the reranker model directory   (-RerankDir, optional)
 #   $env:OPENAI_API_KEY            the API key directly, or
 #   $env:OPENAI_KEY_FILE           a file holding the key         (-KeyFile); the key is never printed
-#   pwsh -File run.ps1 -Label live2 -MaxSamples 2 -Embedder bge-large
+#   pwsh -File run.ps1 -Label live2 -MaxSamples 2 -Embedder e5-large
 param(
   [Parameter(Mandatory = $true)] [string]$Label,
   [int]$MaxSamples = 0,                  # 0 = all; 1 = conv-26; 2 = first two
@@ -24,7 +24,7 @@ param(
   [string]$KeyFile   = $env:OPENAI_KEY_FILE,
   [string]$GeminiKeyFile = $env:GEMINI_KEY_FILE,
   [string]$EmbedderDir    = $env:CITADEL_EMBEDDER_DIR,
-  [string]$Embedder  = "",              # "" = bge-small; else bge-base|bge-large|e5-large (match -EmbedderDir)
+  [string]$Embedder  = "",              # "" = e5-large (default); else bge-large|bge-base|bge-small|e5-large-v2 (match -EmbedderDir)
   [string]$RerankDir = $env:CITADEL_RERANKER_DIR,
   [bool]$Encrypted   = $true,           # encrypted regions: per-atom sealed + crypto erasure
   [switch]$DumpDb                       # also write a free DB dump (mock embed, no key)
@@ -32,9 +32,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
-$exe  = Join-Path $root "..\..\target\debug\locomo.exe"
+$exe  = Join-Path $root "..\..\target\release\locomo.exe"   # prefer the optimized build
+if (-not (Test-Path $exe)) { $exe = Join-Path $root "..\..\target\debug\locomo.exe" }
 if (-not (Test-Path $exe)) {
-  throw "locomo.exe not found at $exe - build: cargo build -p citadeldb-membench --features gemini,cuda-embed --bin locomo (gemini implies openai for the judge)"
+  throw "locomo.exe not found (release or debug) - build: cargo build --release -p citadeldb-membench --features openai,cuda-embed --bin locomo"
 }
 
 # Required inputs come from a flag or its environment-variable default.
@@ -89,7 +90,7 @@ if ($MaxSamples -gt 0) {
 
 $report = Join-Path $dir "report.json"
 $log    = Join-Path $dir "run.log"
-$embLabel = if ($Embedder) { $Embedder } else { "bge-small" }
+$embLabel = if ($Embedder) { $Embedder } else { "e5-large" }
 "run: $Label  reader=$Reader ($ReaderProvider) judge=$Judge maxSamples=$MaxSamples encrypted=$Encrypted embedder=$embLabel  started $(Get-Date -Format o)" | Set-Content $log
 Write-Host "run dir: $dir"
 Write-Host "watch:   pwsh -File watch.ps1"

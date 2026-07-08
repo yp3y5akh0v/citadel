@@ -1,6 +1,6 @@
 base_url = "https://citadeldb.dev"
 title = "Citadel"
-description = "Local-first encrypted AI memory engine for agents, on an embedded SQL/vector database with zero-LLM ingest, MCP, and cryptographic forgetting"
+description = "Local-first encrypted memory engine for AI agents, built on an embedded SQL/vector database with zero-LLM ingest, MCP, and cryptographic forgetting"
 compile_sass = true
 build_search_index = false
 generate_feeds = true
@@ -17,15 +17,13 @@ name = "tags"
 [extra]
 author = "Yuriy Peysakhov"
 github = "https://github.com/yp3y5akh0v/citadel"
-version = "1.12.0"
+version = "1.13.0"
 crates = 20
 published = 15
 tests = "5,000+"
-locomo = "85.5"
-locomo_gemini = "90.6"
-locomo_ceiling = "95.1"
-longmemeval = "90.6"
-longmemeval_mini = "82.2"
+locomo = "85.7"
+locomo_ceiling = "94.5"
+longmemeval = "86.2"
 benchmarks = 58
 mcp_tools = 13
 ffi_functions = 37

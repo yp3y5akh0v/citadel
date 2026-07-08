@@ -45,6 +45,17 @@ fn write_and_sync_creates_file() {
     assert_eq!(data, b"hello");
 }
 
+// Callers (database create/backup/compact) rely on this to persist new
+// directory entries; pin that it stays public and succeeds on a real path.
+#[test]
+fn fsync_directory_succeeds_for_new_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.dat");
+
+    fs::write(&path, b"data").unwrap();
+    fsync_directory(&path).unwrap();
+}
+
 #[test]
 fn atomic_write_empty_data() {
     let dir = tempfile::tempdir().unwrap();
@@ -66,6 +77,55 @@ fn atomic_write_large_data() {
 
     let data = fs::read(&path).unwrap();
     assert_eq!(data, large);
+}
+
+#[test]
+fn copy_and_sync_replicates_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.dat");
+    let dest = dir.path().join("dest.dat");
+    fs::write(&src, b"key material").unwrap();
+
+    copy_and_sync(&src, &dest).unwrap();
+
+    assert_eq!(fs::read(&dest).unwrap(), b"key material");
+}
+
+#[test]
+fn copy_and_sync_missing_source_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("missing.dat");
+    let dest = dir.path().join("dest.dat");
+
+    assert!(copy_and_sync(&src, &dest).is_err());
+    assert!(!dest.exists());
+}
+
+/// A chmod-protected (read-only) source must still back up - fs::copy would
+/// clone the read-only bit onto the destination and fail the fsync reopen -
+/// and the destination must end up with the source's restrictive
+/// permissions, not umask defaults.
+#[test]
+fn copy_and_sync_copies_readonly_source_and_preserves_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.dat");
+    let dest = dir.path().join("dest.dat");
+    fs::write(&src, b"protected key material").unwrap();
+    let orig = fs::metadata(&src).unwrap().permissions();
+    let mut readonly = orig.clone();
+    readonly.set_readonly(true);
+    fs::set_permissions(&src, readonly).unwrap();
+
+    copy_and_sync(&src, &dest).unwrap();
+
+    assert_eq!(fs::read(&dest).unwrap(), b"protected key material");
+    assert!(
+        fs::metadata(&dest).unwrap().permissions().readonly(),
+        "destination must inherit the source's restrictive permissions"
+    );
+
+    fs::set_permissions(&src, orig.clone()).unwrap();
+    fs::set_permissions(&dest, orig).unwrap();
 }
 
 // The region-erasure guarantee rests on these primitives never truncating or
@@ -96,7 +156,8 @@ fn overwrite_in_place_preserves_surrounding_bytes_and_length() {
 fn overwrite_in_place_on_missing_file_errors() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("missing.dat");
-    // Uses .open() not .create(), so a missing file must error (never silently create).
+    // Uses .open() not .create(), so a missing file must error (never silently
+    // create).
     assert!(overwrite_in_place(&path, 0, &[1, 2, 3]).is_err());
 }
 

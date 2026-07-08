@@ -1,7 +1,7 @@
 # citadel-mem benchmarks
 
 Results and a reproducible evaluation harness for citadel-mem on two long-term
-memory benchmarks: LoCoMo (below) and LongMemEval (oracle split, in its own section
+memory benchmarks: LoCoMo (below) and LongMemEval_S (full-haystack, in its own section
 further down). citadel-mem is an embedded memory engine that is encrypted at rest and
 forgets by destroying keys; the LoCoMo numbers run on encrypted regions (each
 conversation is a per-atom-sealed region), so every LoCoMo figure is on the encrypted
@@ -11,85 +11,72 @@ prompts, a per-question audit, and the run's limitations.
 
 ## Full 10-conversation LoCoMo (encrypted, reader and judge `gpt-4o-mini`)
 
-Reference configuration (citadel v1.5.0 defaults): encrypted regions, `bge-large-en-v1.5`
-embedder, top-50 retrieval in relevance order, temperature 0, raw-turn plus photo-caption ingestion with
+Reference configuration (citadel defaults): encrypted regions, `e5-large` (v1) embedder +
+`ms-marco-minilm` cross-encoder reranker, top-50 retrieval in relevance order,
+temperature 0, raw-turn plus photo-caption ingestion with
 each session's date prefixed into the indexed turn text (`[date] speaker: text`). Scored
 categories are multi-hop, temporal, open-domain, and single-hop; the adversarial
 (unanswerable) category is reported separately as an abstention metric.
 
-Three independent full runs (n=1540 scored questions each); the Mean +/- SD column is the
-sample mean and standard deviation across the three. The Run 1-3 columns show the full
-run-to-run range; the spread is hosted-model (gpt-4o-mini) nondeterminism, not the engine.
+Three independent full runs (n=1540 scored questions each), measured 2026-07-09; the
+Mean +/- SD column is the sample mean and standard deviation across the three. The Run
+1-3 columns show the full run-to-run range; the spread is hosted-model (gpt-4o-mini)
+nondeterminism, not the engine.
 
 | Metric | Run 1 | Run 2 | Run 3 | Mean +/- SD |
 |---|---|---|---|---|
-| Overall scored (n=1540) | 85.9% | 85.2% | 85.5% | 85.5% +/- 0.4% |
-| single_hop (n=841) | 92.0% | 91.7% | 92.0% | 91.9% +/- 0.2% |
-| multi_hop (n=282) | 82.6% | 81.2% | 81.9% | 81.9% +/- 0.7% |
-| temporal (n=321) | 78.8% | 78.5% | 78.2% | 78.5% +/- 0.3% |
-| open_domain (n=96) | 65.6% | 62.5% | 62.5% | 63.5% +/- 1.8% |
-| Adversarial abstention (n=446) | 67.7% | 67.0% | 66.8% | 67.2% +/- 0.5% |
-| recall@50 ceiling (n=1536) | 95.1% | 95.1% | 95.1% | deterministic |
-| p95 recall latency | 572 ms | 563 ms | 585 ms | ~570 ms |
-| Token cost (USD) | ~$1.13 | ~$1.13 | ~$1.13 | ~$1.13 |
+| Overall scored (n=1540) | 85.5% | 85.4% | 86.0% | 85.7% +/- 0.3% |
+| single_hop (n=841) | 91.9% | 91.8% | 92.6% | 92.1% +/- 0.5% |
+| multi_hop (n=282) | 81.2% | 81.2% | 81.6% | 81.3% +/- 0.2% |
+| temporal (n=321) | 78.8% | 78.2% | 79.1% | 78.7% +/- 0.5% |
+| open_domain (n=96) | 64.6% | 65.6% | 64.6% | 64.9% +/- 0.6% |
+| Adversarial abstention (n=446) | 67.0% | 66.6% | 67.3% | 67.0% +/- 0.3% |
+| p95 recall latency | 1.0 s | 0.6 s | 2.2 s | host-load bound |
+| Token cost (USD) | ~$1.12 | ~$1.12 | ~$1.12 | ~$1.12 |
 
-All runs are at temperature 0. **recall@50 is identical across all three runs - the same
-1461/1536 questions hit gold** - because retrieval is deterministic (the in-memory index
-is rebuilt the same way each time); only the reader/judge-dependent metrics vary. Cost is
-computed from the recorded token counts (~7.0M in / ~0.13M out per run) at gpt-4o-mini
-rates ($0.15 / $0.60 per M). The prior v1.4.0 configuration scored the same accuracy
-within reader noise at a lower retrieval ceiling (94.4%); both are in Run history below.
+All runs are at temperature 0; retrieval is deterministic (the in-memory index is rebuilt
+the same way each time), so only the reader/judge-dependent metrics vary run to run. Cost is
+computed from the recorded token counts (~6.9M in / ~0.14M out per run) at gpt-4o-mini rates
+($0.15 / $0.60 per M). This triple ran under concurrent desktop load, which bounds the p95
+recall latency; an idle-machine triple on bit-identical retrieval measured p95 447-516 ms.
+
+A prior triple measured 2026-07-04 scored 86.3% / 86.1% / 85.6% (86.0% +/- 0.3%) on
+retrieval bit-identical to these runs (the same ordered top-50 for all 1,986 questions);
+the shift is hosted reader/judge variance - cross-date verdict-flip rates equal the
+within-date rates.
+
+**Embedder.** The default is `e5-large` (v1). Retrieval is reader-bound, so the embedder is a
+within-noise choice; on this benchmark `e5-large` matches or slightly beats the alternatives
+(85.7% vs 85.5% for `bge-large` over 3 runs each, same reranker + fusion). Deterministic
+retrieval recall (recall@50, hybrid fusion, no reranker) across the encoders we evaluated:
+
+| Embedder | recall@50 |
+|---|---|
+| **e5-large (v1)** | **92.7** |
+| bge-large-en-v1.5 | 92.8 |
+| mxbai-embed-large-v1 | 92.3 |
+| snowflake-arctic-embed-l | 92.2 |
+| e5-large-v2 | 91.8 |
+| modernbert-embed-base | 91.8 |
+| granite-embedding-english-r2 | 89.6 |
+
+The top encoders sit within ~1 point on raw recall; the cross-encoder reranker (see the layers
+below) then lifts the final recall@50 to 94.5%. `bge-large` and the others remain selectable
+`--embedder` options.
 
 Encryption adds no retrieval-layer overhead. Recall over an encrypted region decrypts
 the region into an ephemeral in-memory nearest-neighbor index whose plaintext vectors
 are zeroized when it is dropped, so the retrieval ceiling and end-to-end accuracy are
-identical to a plaintext store; per-configuration recall latencies are in Run history.
+identical to a plaintext store.
 
-### With a stronger reader (`gemini-3.5-flash`)
-
-Swapping only the reader to `gemini-3.5-flash` - same encrypted retrieval, same
-`gpt-4o-mini` judge, same category-blind prompt - over three independent full runs:
-
-| Metric | Run 1 | Run 2 | Run 3 | Mean +/- SD |
-|---|---|---|---|---|
-| Overall scored (n=1540) | 90.6% | 90.7% | 90.6% | 90.6% +/- 0.1% |
-| single_hop (n=841) | 94.1% | 93.9% | 94.1% | 94.0% +/- 0.1% |
-| multi_hop (n=282) | 87.9% | 88.3% | 86.5% | 87.6% +/- 0.9% |
-| temporal (n=321) | 89.7% | 90.3% | 91.0% | 90.3% +/- 0.6% |
-| open_domain (n=96) | 70.8% | 70.8% | 70.8% | 70.8% +/- 0.0% |
-| Adversarial abstention (n=446) | 78.3% | 77.8% | 77.8% | 78.0% +/- 0.3% |
-| recall@50 ceiling (n=1536) | 95.1% | 95.1% | 95.1% | deterministic |
-| p95 recall latency | 515 ms | 475 ms | 434 ms | ~475 ms |
-| Token cost (USD) | ~$11.6 | ~$11.6 | ~$11.6 | ~$11.6 |
-
-The +5.1 over the 85.5% gpt-4o-mini mean is concentrated in temporal date conversions
-(78.5% -> 90.3%) and multi-hop combination (81.9% -> 87.6%); retrieval is unchanged, so
-the comparison isolates the reader and is directly
-comparable to 85.5%. open_domain is 70.8% in all three runs - the same 28 questions miss
-every run, a retrieval-recall limit, not a reader one. Reader cost rises ~10x
-(gemini-3.5-flash $1.50/$9.00 vs gpt-4o-mini $0.15/$0.60 per M tokens).
-
-Self-reported Gemini-reader-tier results (ByteRover blog, Hindsight paper; not a
-same-harness run). The reader, judge/prompt, and memory columns show where the protocols
-differ:
-
-| System | LoCoMo overall | Reader | Judge + prompt | Memory build |
-|---|---|---|---|---|
-| **citadel-mem (encrypted)** | **90.6%** | gemini-3.5-flash | gpt-4o-mini, citadel prompt | zero-LLM (raw turns) |
-| ByteRover 2.0 | 90.9% / 92.2% | Gemini 3 Flash / Pro | Gemini 3 Flash + Hindsight prompt | LLM-curated |
-| Hindsight | 89.6% | Gemini 3 Pro | Gemini + Hindsight prompt | LLM-curated |
-
-Those numbers were produced with Gemini 3 Flash/Pro readers; citadel's runs use
-`gemini-3.5-flash`.
-
-## How 85.5% compares (matched reader and judge)
+## How 85.7% compares (matched reader and judge)
 
 Both reader and judge are `gpt-4o-mini`, the models the published field uses, so the
 scored number is directly comparable against the field:
 
 | System | Overall (scored) | Source |
 |---|---|---|
-| **citadel-mem (encrypted)** | **85.5%** (3-run mean) | this work |
+| **citadel-mem (encrypted)** | **85.7%** (3-run mean) | this work |
 | Full-context, no retrieval | 72.9% | arXiv 2504.19413 |
 | Mem0 (graph) | 68.4% | arXiv 2504.19413 |
 | Mem0 | 66.9% | arXiv 2504.19413 |
@@ -97,7 +84,7 @@ scored number is directly comparable against the field:
 | LangMem | 58.1% | arXiv 2504.19413 |
 | OpenAI memory | 52.9% | arXiv 2504.19413 |
 
-The 85.5% mean is 17 to 33 points higher than these reported memory systems, and 13 points
+The 85.7% mean is 17 to 33 points higher than these reported memory systems, and 13 points
 above the full-context, no-retrieval baseline. Their scores are taken from the Mem0 paper
 (Chhikara et al., 2025).
 
@@ -108,60 +95,28 @@ to build or search the store. The other systems run an LLM
 over the conversation to build memory (fact extraction, temporal knowledge graphs, or
 context curation).
 
-82% of scored misses have the gold already in the prompt and the reader still missed it
-(Self-audit below), so reader quality dominates the remaining error. Swapping
-only the reader to `gemini-3.5-flash` raises the score to 90.6% (above) on the same
-zero-LLM retrieval; retrieval recall accounts for the rest.
+79% of scored misses have the gold already in the prompt and the reader still missed it
+(Self-audit below), so reader quality dominates the remaining error.
 
-## LongMemEval (oracle split)
+## LongMemEval_S (full-haystack)
 
-[LongMemEval](https://arxiv.org/abs/2410.10813) measures long-term memory over many
-chat sessions across six question types. The oracle split places only the evidence
-sessions in the haystack, so it measures the reader ceiling on citadel's retrieved
-memory, not retrieval against distractors. The reader prompt replicates the official
-`run_generation.py` CoT template (generic, category-blind, history sorted by date,
-current date supplied); scoring uses the official `gpt-4o-2024-08-06` judge. 500 questions.
+[LongMemEval](https://arxiv.org/abs/2410.10813) tests long-term memory over many chat sessions
+across six question types. `longmemeval_s` is the full-haystack split: ~40-50 sessions per
+question (~115k tokens), so retrieval runs against distractors. Config: 500 questions, encrypted
+regions, `e5-large` embedder + `ms-marco-minilm` reranker, gpt-4o reader, official CoT prompt
+(session-grouped history), official `gpt-4o-2024-08-06` judge.
 
-| Reader | Overall | Task-averaged | Abstention |
-|---|---|---|---|
-| gpt-4o | 90.6% | 89.3% | 80.0% |
-| gpt-4o-mini | 82.2% | 83.0% | 70.0% |
+| Metric | Score |
+|---|---|
+| Overall | 86.2% |
+| Task-averaged | 86.8% |
+| Abstention (n=30) | 80.0% |
 
-Per-type (gpt-4o / gpt-4o-mini): single-session-user 100 / 97.1, single-session-assistant
-98.2 / 96.4, temporal-reasoning 91.0 / 78.9, knowledge-update 88.5 / 79.5, multi-session
-88.0 / 75.9, single-session-preference 70.0 / 70.0.
+Per-type: single-session-assistant 100.0%, single-session-user 98.6%, knowledge-update 92.3%,
+temporal-reasoning 84.2%, multi-session 75.9%, single-session-preference 70.0%.
+Single-run numbers; run-to-run reader/judge variance is about +/-2 points.
 
-The gpt-4o reader (90.6%) exceeds the LongMemEval paper's own gpt-4o oracle score (0.870);
-the gpt-4o-mini reader (82.2%) exceeds the paper's gpt-4o-mini oracle (0.744). The
-gpt-4o-mini to gpt-4o jump is concentrated in the reasoning-heavy types (temporal +12.1,
-multi-session +12.1, knowledge-update +9.0), so those types are reader-bound, not
-retrieval-bound: at oracle scale the token-free retrieval diagnostic recalls every answer
-session by rank 10 and every evidence turn by rank 50. Oracle is a reader-ceiling upper
-bound; the full-haystack split is the run that stresses retrieval against distractors.
-
-Reproduce: see [RUNBOOK.md](RUNBOOK.md). The retrieval diagnostic
-(`CITADEL_LONGMEMEVAL_RETRIEVAL_DIAG=1`) is token-free and needs no API key.
-
-## Run history
-
-Each row changes only what it lists, on top of the row above. Scored runs are the
-three independent full runs of that configuration.
-
-| Configuration | Runs | Min / mean / max | recall@50 any/all | p95 recall | Cost/run |
-|---|---|---|---|---|---|
-| top-30, undated turn text | 84.5 / 84.2 / 83.6 | 83.6 / 84.1 / 84.5 | 91.6% any@30 | - | ~$0.83 |
-| v1.4.0 (prior): top-50, date-prefixed text | 86.2 / 85.6 / 85.5 | 85.5 / 85.8 / 86.2 | 94.4 / 85.2 | ~300 ms | ~$1.14 |
-| v1.5.0 (current): fusion 0.45/0.20/0.20/0.15, RRF k=20, rerank pool 256 | 85.9 / 85.2 / 85.5 | 85.2 / 85.5 / 85.9 | 95.1 / 86.2 | ~570 ms | ~$1.13 |
-
-- v1.4.0's +1.7 over top-30 came from two measured changes (selected on the conv-26
-  dev split): top-50 retrieval and the date prefix. The trade-off is abstention
-  (66.9% vs 71.4%): more retrieved content tempts the reader to answer unanswerable
-  questions.
-- v1.5.0 raises the retrieval ceiling (94.4% to 95.1% any@50, 85.2% to 86.2% all@50;
-  multi-hop all@50 reaches 61.3%) without moving scored accuracy: the v1.5.0 and v1.4.0
-  means differ by less than the run-to-run flip noise (Self-audit), because 82% of
-  remaining misses already have complete gold evidence in the prompt. p95 rises with
-  the doubled rerank pool.
+Reproduce: see [RUNBOOK.md](RUNBOOK.md).
 
 ## Cryptographic forgetting
 
@@ -190,7 +145,7 @@ reader-safe freed pages before commit.
 ```
 reader_model:      gpt-4o-mini
 judge_model:       gpt-4o-mini
-embedder_model:    bge-large-en-v1.5  (GPU)
+embedder_model:    e5-large  (GPU)
 reranker_model:    ms-marco-MiniLM-L-6-v2  (RRF fusion, k = 20)
 regions:           encrypted (per-atom sealed; per-atom/region cryptographic erasure)
 top_k:             50
@@ -204,8 +159,7 @@ dataset:           locomo10.json
 dataset_sha256:    79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4
 ```
 
-These are the v1.5.0 defaults used for the full runs above; earlier configurations are in
-Run history.
+These are the defaults used for the full runs above.
 
 ## How the harness stays reproducible
 
@@ -215,7 +169,7 @@ Run history.
   selectable models, both recorded in the report.
 - The reader uses one fixed prompt built from only the retrieved turns and the
   question; it never receives the question's category, and sees the top-k retrieved
-  turns (50 by default; the 84.1% runs used 30), not the full conversation.
+  turns (50 by default), not the full conversation.
 - Serial and concurrent runs score identically (the harness adds no nondeterminism);
   `CITADEL_LOCOMO_CONCURRENCY=1` forces a serial path. Concurrency changes wall-clock time, not
   the score.
@@ -225,7 +179,7 @@ Run history.
 ## Reproduce
 
 Prerequisites (one-time): the LoCoMo dataset `locomo10.json` (verify the SHA-256 above);
-embedder weights `bge-large-en-v1.5`; reranker weights `ms-marco-MiniLM-L-6-v2`; an
+embedder weights `e5-large` (`intfloat/e5-large`); reranker weights `ms-marco-MiniLM-L-6-v2`; an
 OpenAI API key.
 
 Build (GPU embedder; use `candle-embed` instead of `cuda-embed` for CPU):
@@ -239,25 +193,15 @@ prints it):
 
 ```powershell
 pwsh -File run.ps1 -Label full-enc-mini -Reader gpt-4o-mini -Judge gpt-4o-mini `
-  -Embedder bge-large -EmbedderDir C:\path\to\bge-large-en-v1.5
-```
-
-The 90.6% Gemini-reader variant uses the same harness, built with
-`--features gemini,cuda-embed`, swapping only the reader (the gpt-4o-mini judge is
-unchanged):
-
-```powershell
-pwsh -File run.ps1 -Label full-gemini-reader -ReaderProvider gemini -Reader gemini-3.5-flash `
-  -ReasoningEffort low -MaxTokens 2048 -GeminiKeyFile C:\path\to\gemini-key.txt `
-  -Embedder bge-large -EmbedderDir C:\path\to\bge-large-en-v1.5
+  -Embedder e5-large -EmbedderDir C:\path\to\e5-large
 ```
 
 Token-free retrieval diagnostic (no key, no spend) - prints the layered any/all
 evidence recall (A / B / C / C-asof / D / D-asof):
 
 ```bash
-CITADEL_LOCOMO_ENCRYPTED=true CITADEL_LOCOMO_RETRIEVAL_DIAG=1 CITADEL_LOCOMO_EMBEDDER=bge-large \
-  CITADEL_EMBEDDER_DIR=/path/to/bge-large-en-v1.5 \
+CITADEL_LOCOMO_ENCRYPTED=true CITADEL_LOCOMO_RETRIEVAL_DIAG=1 CITADEL_LOCOMO_EMBEDDER=e5-large \
+  CITADEL_EMBEDDER_DIR=/path/to/e5-large \
   CITADEL_RERANKER_DIR=/path/to/ms-marco-MiniLM-L-6-v2 \
   ./target/debug/locomo locomo10.json
 ```
@@ -268,12 +212,12 @@ CITADEL_LOCOMO_ENCRYPTED=true CITADEL_LOCOMO_RETRIEVAL_DIAG=1 CITADEL_LOCOMO_EMB
 split of every scored miss into a retrieval gap (gold evidence not retrieved, not
 reader-fixable) versus a reader miss (gold retrieved, answer still wrong).
 
-Across the full run (Run 1), recall@50 = 95.1% (1461/1536); the denominator is 1536
+Across the full run (Run 1), recall@50 = 94.5% (1451/1536); the denominator is 1536
 rather than 1540 because four scored questions list no gold-evidence turns and are
-excluded from the recall computation. Of 217 scored misses, 40 are retrieval gaps and
-177 are reader misses - 82% of the remaining error is reader-bound. By category:
-single_hop 67 (15 gap, 52 reader), temporal 68 (10 gap, 58 reader), multi_hop 49 (6
-gap, 43 reader), open_domain 33 (9 gap, 24 reader). Some reader misses are LoCoMo
+excluded from the recall computation. Of 223 scored misses, 46 are retrieval gaps and
+177 are reader misses - 79% of the remaining error is reader-bound. By category:
+single_hop 68 (18 gap, 50 reader), temporal 68 (10 gap, 58 reader), multi_hop 53 (8
+gap, 45 reader), open_domain 34 (10 gap, 24 reader). Some reader misses are LoCoMo
 gold-key errors (the gold turn is attributed to the wrong speaker); the audit flags
 candidates by a speaker-mismatch heuristic.
 
@@ -284,10 +228,10 @@ date-prefixed (`[date] speaker: text ...`), overall evidence recall is:
 
 | Layer | @10 | @30 | @50 |
 |---|---|---|---|
-| A: exact cosine over the indexed text | 75.7/63.0 | 87.2/75.5 | 90.6/81.1 |
-| B: citadel vector recall (PRISM) | 75.7/63.0 | 87.2/75.5 | 90.6/81.1 |
-| C: + linear fusion (BM25 keyword) | 80.7/67.8 | 89.8/78.8 | 92.6/83.5 |
-| D: + cross-encoder reranker | 84.8/72.3 | 92.3/81.3 | 95.1/86.2 |
+| A: exact cosine over the indexed text | 78.9/66.1 | 88.3/77.3 | 91.1/81.8 |
+| B: citadel vector recall (PRISM) | 78.9/66.1 | 88.3/77.3 | 91.1/81.8 |
+| C: + linear fusion (BM25 keyword) | 81.6/69.1 | 90.6/79.8 | 92.8/83.3 |
+| D: + cross-encoder reranker | 84.2/71.8 | 92.1/81.5 | 94.5/85.2 |
 
 A and B are identical to the decimal at every cutoff: nearest-neighbor recall over
 the decrypted-into-memory index of an encrypted region loses nothing against
@@ -297,20 +241,22 @@ ceiling"; that diagnostic embedded the raw turn text while the index held
 speaker-and-caption-enriched text - an instrumentation artifact, not a ceiling.)
 Fusion and the reranker add recall on top of the exact vector layer because they
 merge non-vector signals. The all column bounds multi-hop: even exact retrieval
-surfaces every gold turn for only 58.9% of multi-hop questions at k=50, so the
+surfaces every gold turn for only 57.1% of multi-hop questions at k=50, so the
 remaining multi-hop gap needs multi-query retrieval, not better ranking. Grading
 recency as of the conversation's end (the diag's C-asof/D-asof rows) was measured
-to hurt recall (-4.6 any@30) and is not used.
+to hurt recall (-4.3 any@30) and is not used.
 
 `judge-probe.ps1` feeds the judge a fixed 40-item set of answers that are factually wrong
 but on the gold topic and reports how often it marks them correct, bounding judge
 lenience. On this probe the judge marked 0 of 40 correct (0.0% false-accept).
 
 Run-to-run noise decomposes by diffing the per-question audits of the three full
-runs (identical retrieval): 965 of 1,986 answers differ textually between runs at
-temperature 0; 79 questions flip correct/incorrect (49 scored, 30 adversarial) - 65
-because the reader's answer changed, 14 because the judge flipped on an identical
-answer. The +/-0.4% band is entirely reader/judge-side; retrieval contributes none.
+runs (identical retrieval): 909 of 1,986 answers differ textually between runs at
+temperature 0; 78 questions flip correct/incorrect (52 scored, 26 adversarial) - 66
+because the reader's answer changed, 12 because the judge flipped on an identical
+answer. The judge-side flips concentrate in temporal golds of the form "the week
+before [date]", where an answer naming the anchor date sits on the accept/reject
+boundary. The +/-0.3% band is entirely reader/judge-side; retrieval contributes none.
 
 ## Limitations
 
@@ -318,28 +264,25 @@ answer. The +/-0.4% band is entirely reader/judge-side; retrieval contributes no
   comparable only to runs using the same judge model.
 - Ingestion is raw conversation turns plus each shared photo's caption, not LLM-extracted
   facts. Accuracy is therefore not directly comparable with fact-extraction systems.
-- Turns carry their session date as event-time `created_at`, but recency is graded
-  against the wall clock, where every session is equally ancient, so the recency weight
-  contributes no rank signal (grading as of the conversation's end was measured to hurt
-  recall and is not used); the importance weight is inert (raw turns carry none).
-  Ranking is effectively semantic plus BM25 keyword.
-- Cryptographic erasure removes content, not the page-encrypted metadata and edge
-  topology, the physical NAND on wear-leveled media, or copies in pre-forget backups.
+- On this benchmark the recency and importance fusion weights contribute no rank signal
+  (all sessions are equally old versus the wall clock, and raw turns carry no importance),
+  so ranking is effectively semantic plus BM25 keyword.
 - LoCoMo gold labels contain errors (the harness lists candidates), putting a ceiling
   below 100%. The retrieval ceiling and per-question audit are in each run's local report.
 - conv-26 is the development split on which the configuration (top-50, relevance order,
   no neighbor expansion, date-prefixed indexing) was selected; the full-run figures are
-  the reportable ones. The v1.5 retrieval defaults (fusion ratio, RRF k, rerank pool)
+  the reportable ones. The retrieval defaults (fusion ratio, RRF k, rerank pool)
   were likewise selected on the token-free diagnostic and the same dev split.
 - Top-50 retrieval trades abstention for accuracy: with more retrieved content the
-  reader answers more unanswerable questions (abstention 67.2% vs 71.4% at top-30).
+  reader answers more unanswerable questions (abstention 67.0%).
 - Three runs at temperature 0; the hosted reader and judge are not bit-deterministic, so
-  scored accuracy varies run-to-run (85.5% +/- 0.4%). Retrieval is deterministic, so
-  recall@50 is identical (95.1%, the same 1461/1536 questions) across all three.
+  scored accuracy varies run-to-run (85.7% +/- 0.3%; a 2026-07-04 triple on bit-identical
+  retrieval measured 86.0% +/- 0.3%). Retrieval is deterministic, so recall@50 is
+  identical (94.5%, the same 1451/1536 questions) across all runs.
 
 ## Prompts
 
 The reader prompt is one fixed, category-blind system prompt in
-`src/eval.rs::build_reader_prompt`. The judge prompts are in `src/eval.rs::judge_correct`
-(answerable questions) and `judge_abstained` (adversarial abstention). They are committed
-in source and reproduced in the report.
+`src/benchmarks/locomo/prompts.rs::build_reader_prompt`. The judge prompts are in the same
+file: `judge_correct` (answerable questions) and `judge_abstained` (adversarial abstention).
+They are committed in source and reproduced in the report.

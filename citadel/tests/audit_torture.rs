@@ -266,7 +266,8 @@ fn torture_false_positive_magic_in_detail_data() {
     let pass = b"pass";
 
     let db = create_test_db(dir.path(), pass);
-    // Use backup to generate entries with path detail containing arbitrary bytes
+    // Use backup to generate entries with path detail containing arbitrary
+    // bytes
     let backup_path = dir.path().join("ENTR-test.citadel");
     db.backup(&backup_path).unwrap();
     db.integrity_check().unwrap();
@@ -346,7 +347,8 @@ fn torture_invalid_event_type_skipped() {
 
     // Corrupt entry 3's event_type to 0xFF (invalid)
     let (off, _) = offsets[2];
-    // event_type at: magic(4) + entry_len(4) + timestamp(8) + seq_no(8) = offset + 24
+    // event_type at: magic(4) + entry_len(4) + timestamp(8) + seq_no(8) =
+    // offset + 24
     data[off + 24] = 0xFF;
     data[off + 25] = 0xFF;
     std::fs::write(&ap, &data).unwrap();
@@ -376,7 +378,7 @@ fn torture_invalid_detail_len_skipped() {
 
     // Corrupt entry 4's detail_len to a huge value
     let (off, _) = offsets[3];
-    // detail_len at: magic(4) + entry_len(4) + timestamp(8) + seq_no(8) + event_type(2) = offset + 26
+    // detail_len offset = magic(4)+len(4)+ts(8)+seq(8)+event(2) = 26.
     data[off + 26] = 0xFF;
     data[off + 27] = 0xFF;
     std::fs::write(&ap, &data).unwrap();
@@ -731,12 +733,14 @@ fn torture_single_entry_corrupted() {
     data[67] = 0;
     std::fs::write(&ap, &data).unwrap();
 
-    let strict = read_audit_log(&ap).unwrap();
-    assert_eq!(strict.len(), 0);
+    // The first entry's magic is destroyed; read_audit_log resyncs and
+    // still surfaces every later entry, matching the scanner.
+    let after = read_audit_log(&ap).unwrap();
+    assert_eq!(after.len(), entries.len() - 1);
 
     let scan = scan_corrupted_audit_log(&ap).unwrap();
     assert!(!scan.corruption_offsets.is_empty());
-    assert!(!scan.entries.is_empty());
+    assert_eq!(scan.entries.len(), after.len());
 }
 
 #[test]
@@ -965,10 +969,12 @@ fn torture_entry_len_off_by_one_too_large() {
     data[off + 4..off + 8].copy_from_slice(&bad_len.to_le_bytes());
     std::fs::write(&ap, &data).unwrap();
 
-    let strict = read_audit_log(&ap).unwrap();
-    assert_eq!(strict.len(), 2);
+    // read_audit_log resyncs past the poisoned length like the scanner.
+    let after = read_audit_log(&ap).unwrap();
+    assert_eq!(after.len(), total - 1);
 
     let scan = scan_corrupted_audit_log(&ap).unwrap();
+    assert_eq!(scan.entries.len(), after.len());
     let seq_nos: Vec<u64> = scan.entries.iter().map(|e| e.sequence_no).collect();
     assert!(seq_nos.contains(&1));
     assert!(seq_nos.contains(&2));
@@ -997,10 +1003,12 @@ fn torture_entry_len_off_by_one_too_small() {
     data[off + 4..off + 8].copy_from_slice(&bad_len.to_le_bytes());
     std::fs::write(&ap, &data).unwrap();
 
-    let strict = read_audit_log(&ap).unwrap();
-    assert!(strict.len() <= 3);
+    // read_audit_log resyncs past the poisoned length like the scanner.
+    let after = read_audit_log(&ap).unwrap();
+    assert_eq!(after.len(), total - 1);
 
     let scan = scan_corrupted_audit_log(&ap).unwrap();
+    assert_eq!(scan.entries.len(), after.len());
     let seq_nos: Vec<u64> = scan.entries.iter().map(|e| e.sequence_no).collect();
     for seq in 4..=total as u64 {
         assert!(
@@ -1068,12 +1076,16 @@ fn torture_scan_and_verify_coherent_after_gap() {
     let scan_seqs: Vec<u64> = scan.entries.iter().map(|e| e.sequence_no).collect();
     assert!(!scan_seqs.contains(&4));
 
-    let strict = read_audit_log(&ap).unwrap();
-    assert_eq!(strict.len(), 3);
+    // read matches the scanner's recovery; verify reports the gap as a
+    // chain break instead of a clean prefix (records after garbage are
+    // never a silently valid chain).
+    let after = read_audit_log(&ap).unwrap();
+    assert_eq!(after.len(), total - 1);
 
     let result = verify_audit_log(&ap, &key).unwrap();
-    assert!(result.chain_valid);
+    assert!(!result.chain_valid, "a mid-file gap is a broken chain");
     assert_eq!(result.entries_verified, 3);
+    assert_eq!(result.chain_break_at, Some(4));
 
     let header_data = std::fs::read(&ap).unwrap();
     let header_count = u64::from_le_bytes(header_data[24..32].try_into().unwrap());
@@ -1268,20 +1280,21 @@ fn torture_entry_len_extends_to_eof() {
     data[off + 4..off + 8].copy_from_slice(&bad_len.to_le_bytes());
     std::fs::write(&ap, &data).unwrap();
 
-    // Sequential read stops or reads a bogus mega-entry
-    let strict = read_audit_log(&ap).unwrap();
-    assert!(
-        strict.len() <= 3,
-        "should stop at or before the corrupted entry"
-    );
+    // The mega-length fails the internal consistency check
+    // (entry_len == 56 + detail_len), so read resyncs and recovers the
+    // remaining entries instead of swallowing them into a phantom.
+    let after = read_audit_log(&ap).unwrap();
+    assert_eq!(after.len(), total - 1);
 
-    // Scan: the corrupt entry's structural validation (event_type/detail_len)
-    // should fail, causing scan to skip it and recover entries 4+
+    // Scan agrees: the corrupt entry is skipped, everything else recovered.
     let scan = scan_corrupted_audit_log(&ap).unwrap();
+    assert_eq!(scan.entries.len(), after.len());
     let seq_nos: Vec<u64> = scan.entries.iter().map(|e| e.sequence_no).collect();
-    // Entries before corruption must be present
     assert!(seq_nos.contains(&1));
     assert!(seq_nos.contains(&2));
+    for seq in 4..=total as u64 {
+        assert!(seq_nos.contains(&seq), "entry {seq} should be recovered");
+    }
 }
 
 /// Overwrite a region with repeated magic bytes (no valid entry structure).
@@ -1336,7 +1349,7 @@ fn torture_repeated_magic_bytes_no_phantom() {
 }
 
 /// Bit-flip in every byte position of a single entry. For each flip,
-/// verify scan still recovers all OTHER entries.
+/// verify scan still recovers all other entries.
 #[test]
 fn torture_single_bit_flip_every_position() {
     let dir = tempfile::tempdir().unwrap();

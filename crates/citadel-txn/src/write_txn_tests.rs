@@ -67,7 +67,6 @@ fn abort_discards_changes() {
 fn snapshot_and_restore_main_tree() {
     let mgr = create_test_manager();
     let mut wtx = mgr.begin_write().unwrap();
-    wtx.set_in_place(false);
 
     wtx.insert(b"a", b"1").unwrap();
     wtx.insert(b"b", b"2").unwrap();
@@ -95,7 +94,6 @@ fn snapshot_and_restore_main_tree() {
 fn snapshot_reusable_across_multiple_restores() {
     let mgr = create_test_manager();
     let mut wtx = mgr.begin_write().unwrap();
-    wtx.set_in_place(false);
 
     wtx.insert(b"base", b"v").unwrap();
     let snap = wtx.begin_savepoint();
@@ -113,7 +111,6 @@ fn snapshot_reusable_across_multiple_restores() {
 fn snapshot_restores_named_tables() {
     let mgr = create_test_manager();
     let mut wtx = mgr.begin_write().unwrap();
-    wtx.set_in_place(false);
 
     wtx.create_table(b"t1").unwrap();
     wtx.table_insert(b"t1", b"k1", b"v1").unwrap();
@@ -135,7 +132,6 @@ fn snapshot_restores_named_tables() {
 fn snapshot_drops_post_snapshot_pages() {
     let mgr = create_test_manager();
     let mut wtx = mgr.begin_write().unwrap();
-    wtx.set_in_place(false);
 
     for i in 0..20u32 {
         let k = format!("k{i:03}");
@@ -162,7 +158,6 @@ fn snapshot_drops_post_snapshot_pages() {
 fn nested_savepoints_rollback_inner() {
     let mgr = create_test_manager();
     let mut wtx = mgr.begin_write().unwrap();
-    wtx.set_in_place(false);
 
     wtx.insert(b"a", b"1").unwrap();
     let outer = wtx.begin_savepoint();
@@ -178,17 +173,6 @@ fn nested_savepoints_rollback_inner() {
     wtx.restore_snapshot(outer);
     assert_eq!(wtx.get(b"a").unwrap(), Some(b"1".to_vec()));
     assert_eq!(wtx.get(b"b").unwrap(), None);
-}
-
-#[test]
-fn in_place_toggle_helpers() {
-    let mgr = create_test_manager();
-    let mut wtx = mgr.begin_write().unwrap();
-    let original = wtx.in_place();
-    wtx.set_in_place(!original);
-    assert_eq!(wtx.in_place(), !original);
-    wtx.set_in_place(original);
-    assert_eq!(wtx.in_place(), original);
 }
 
 #[test]
@@ -651,6 +635,187 @@ fn shrink_overwrite_default_tree_frees_overflow_chain() {
         "expected overflow chain pages to be freed (before={before}, after={after})"
     );
     assert_eq!(wtx.get(b"k").unwrap(), Some(b"small".to_vec()));
+}
+
+#[test]
+fn update_sorted_grows_rows_into_overflow_without_loss() {
+    let mgr = create_test_manager();
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.create_table(b"t").unwrap();
+    for i in 0..60u32 {
+        let key = format!("k{i:02}");
+        wtx.table_insert(b"t", key.as_bytes(), &[b'a'; 120])
+            .unwrap();
+    }
+    let big3k = vec![b'x'; 3000];
+    let big10k = vec![b'y'; 10_000];
+    let pairs: Vec<(&[u8], &[u8])> = vec![
+        (b"k05".as_slice(), big3k.as_slice()),
+        (b"k07".as_slice(), big10k.as_slice()),
+    ];
+    assert_eq!(wtx.table_update_sorted(b"t", &pairs).unwrap(), 2);
+    assert_eq!(wtx.table_get(b"t", b"k05").unwrap(), Some(big3k.clone()));
+    assert_eq!(wtx.table_get(b"t", b"k07").unwrap(), Some(big10k.clone()));
+    assert_eq!(wtx.table_entry_count(b"t").unwrap(), 60);
+    wtx.commit().unwrap();
+
+    let mut rtx = mgr.begin_read();
+    assert_eq!(rtx.table_get(b"t", b"k05").unwrap(), Some(big3k));
+    assert_eq!(rtx.table_get(b"t", b"k07").unwrap(), Some(big10k));
+}
+
+#[test]
+fn update_sorted_shrink_frees_replaced_overflow_chain() {
+    let mgr = create_test_manager();
+    let big = vec![0xAB; MAX_INLINE_VALUE_SIZE * 4 + 17];
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.create_table(b"t").unwrap();
+    wtx.table_insert(b"t", b"k", &big).unwrap();
+
+    let before = wtx.pending_free_count();
+    let pairs: Vec<(&[u8], &[u8])> = vec![(b"k".as_slice(), b"small".as_slice())];
+    assert_eq!(wtx.table_update_sorted(b"t", &pairs).unwrap(), 1);
+    let after = wtx.pending_free_count();
+
+    assert!(
+        after > before,
+        "replaced overflow chain must be freed (before={before}, after={after})"
+    );
+    assert_eq!(wtx.table_get(b"t", b"k").unwrap(), Some(b"small".to_vec()));
+}
+
+#[test]
+fn update_sorted_absent_key_frees_staged_chain() {
+    let mgr = create_test_manager();
+    let big = vec![0xCD; MAX_INLINE_VALUE_SIZE * 3 + 9];
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.create_table(b"t").unwrap();
+    wtx.table_insert(b"t", b"k1", b"v1").unwrap();
+
+    // The absent key's value is staged to an overflow chain before the tree
+    // walk; the skipped pair must release it instead of orphaning the pages.
+    let before = wtx.pending_free_count();
+    let pairs: Vec<(&[u8], &[u8])> = vec![
+        (b"absent".as_slice(), big.as_slice()),
+        (b"k1".as_slice(), b"v2".as_slice()),
+    ];
+    assert_eq!(wtx.table_update_sorted(b"t", &pairs).unwrap(), 1);
+    let after = wtx.pending_free_count();
+
+    assert!(
+        after > before,
+        "staged chain of the skipped pair must be freed (before={before}, after={after})"
+    );
+    assert_eq!(wtx.table_get(b"t", b"k1").unwrap(), Some(b"v2".to_vec()));
+    assert_eq!(wtx.table_get(b"t", b"absent").unwrap(), None);
+}
+
+#[test]
+fn insert_or_fetch_existing_overflow_value_is_materialized() {
+    let mgr = create_test_manager();
+    let big = vec![b'z'; MAX_INLINE_VALUE_SIZE * 2 + 5];
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.create_table(b"t").unwrap();
+    wtx.table_insert(b"t", b"k", &big).unwrap();
+
+    // Inline incoming value: the full existing row must come back, not the ref.
+    match wtx.table_insert_or_fetch(b"t", b"k", b"new").unwrap() {
+        InsertOutcome::Existed(bytes) => assert_eq!(bytes, big),
+        _ => panic!("expected Existed"),
+    }
+
+    // Overflow incoming value: its staged chain is dropped, existing returned.
+    let incoming = vec![b'w'; MAX_INLINE_VALUE_SIZE + 100];
+    let before = wtx.pending_free_count();
+    match wtx.table_insert_or_fetch(b"t", b"k", &incoming).unwrap() {
+        InsertOutcome::Existed(bytes) => assert_eq!(bytes, big),
+        _ => panic!("expected Existed"),
+    }
+    assert!(wtx.pending_free_count() > before);
+    assert_eq!(wtx.table_get(b"t", b"k").unwrap(), Some(big));
+}
+
+#[test]
+fn upsert_with_materializes_overflow_and_stages_replacement() {
+    let mgr = create_test_manager();
+    let big = vec![b'o'; 5000];
+    let replacement = vec![b'r'; 9000];
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.create_table(b"t").unwrap();
+    wtx.table_insert(b"t", b"k", &big).unwrap();
+
+    let before = wtx.pending_free_count();
+    let out = wtx
+        .table_upsert_with::<_, citadel_core::Error>(b"t", b"k", b"default", |old| {
+            assert_eq!(
+                old,
+                big.as_slice(),
+                "callback must see the materialized row"
+            );
+            Ok(UpsertAction::Replace(replacement.clone()))
+        })
+        .unwrap();
+    assert!(matches!(out, UpsertOutcome::Updated));
+    assert!(
+        wtx.pending_free_count() > before,
+        "old overflow chain must be freed"
+    );
+    assert_eq!(wtx.table_get(b"t", b"k").unwrap(), Some(replacement));
+}
+
+#[test]
+fn upsert_with_oversized_default_value_is_staged() {
+    let mgr = create_test_manager();
+    let big_default = vec![b'd'; 9000];
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.create_table(b"t").unwrap();
+    // Previously panicked in split_leaf_with_insert: the unstaged 9000-byte
+    // cell can never fit a page.
+    let out = wtx
+        .table_upsert_with::<_, citadel_core::Error>(b"t", b"k", &big_default, |_| {
+            Ok(UpsertAction::Skip)
+        })
+        .unwrap();
+    assert!(matches!(out, UpsertOutcome::Inserted));
+    assert_eq!(wtx.table_get(b"t", b"k").unwrap(), Some(big_default));
+}
+
+#[test]
+fn update_range_materializes_overflow_rows_for_callback() {
+    let mgr = create_test_manager();
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.create_table(b"t").unwrap();
+    // Alternate inline and overflow rows under the same range.
+    let big = vec![b'q'; 3000];
+    let small = vec![b's'; 100];
+    for i in 0..6u8 {
+        let v = if i % 2 == 0 { &big } else { &small };
+        wtx.table_insert(b"t", &[i], v).unwrap();
+    }
+
+    let before = wtx.pending_free_count();
+    let count = wtx
+        .table_update_range::<_, citadel_core::Error>(b"t", &[0u8], |key, value| {
+            let expected = if key[0] % 2 == 0 { 3000 } else { 100 };
+            assert_eq!(value.len(), expected, "callback must see the full row");
+            value[0] = b'P';
+            Ok(Some(true))
+        })
+        .unwrap();
+    assert_eq!(count, 6);
+    assert!(
+        wtx.pending_free_count() > before,
+        "rewritten overflow chains must free the old ones"
+    );
+    for i in 0..6u8 {
+        let mut expected = if i % 2 == 0 {
+            big.clone()
+        } else {
+            small.clone()
+        };
+        expected[0] = b'P';
+        assert_eq!(wtx.table_get(b"t", &[i]).unwrap(), Some(expected));
+    }
 }
 
 #[test]

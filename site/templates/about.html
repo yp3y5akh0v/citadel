@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
 {% block title %}About - Citadel{% endblock %}
-{% block description %}Citadel is a single-author Rust workspace: a local-first encrypted AI memory engine for agents, on an embedded SQL/vector database. {{ config.extra.crates }} crates, encryption as the load-bearing layer, cryptographic forgetting, reproducible benchmarks.{% endblock %}
+{% block description %}Citadel is a single-author Rust workspace: a local-first encrypted memory engine for AI agents, built on an embedded SQL/vector database. {{ config.extra.crates }} crates, encryption as the load-bearing layer, cryptographic forgetting, reproducible benchmarks.{% endblock %}
 
 {% block content %}
 <main class="shell">
@@ -122,7 +122,7 @@
           <div class="spec-row"><div class="k">FFI surface</div><div class="v"><span class="ac">{{ config.extra.ffi_functions }}</span> C-ABI functions</div><div class="note">citadel-ffi</div></div>
           <div class="spec-row"><div class="k">MCP tools</div><div class="v"><span class="ac">{{ config.extra.mcp_tools }}</span> over stdio</div><div class="note">citadel-mcp</div></div>
           <div class="spec-row"><div class="k">LoCoMo score</div><div class="v"><span class="ac">{{ config.extra.locomo }}%</span> (3-run mean)</div><div class="note">encrypted / {{ config.extra.locomo_ceiling }}% recall ceiling</div></div>
-          <div class="spec-row"><div class="k">LongMemEval</div><div class="v"><span class="ac">{{ config.extra.longmemeval }}%</span> (gpt-4o, oracle)</div><div class="note">{{ config.extra.longmemeval_mini }}% gpt-4o-mini / paper's gpt-4o oracle 87.0%</div></div>
+          <div class="spec-row"><div class="k">LongMemEval-S</div><div class="v"><span class="ac">{{ config.extra.longmemeval }}%</span> (gpt-4o, full-haystack)</div><div class="note">retrieval against ~40-50 sessions/question</div></div>
         </div>
       </div>
     </div>
@@ -146,7 +146,7 @@
           </div>
           <div class="audit-row">
             <div class="cat">memory</div>
-            <div class="claim"><code>citadel-mem</code> stores regions of typed atoms and edges with hybrid recall and cryptographic erasure; <code>citadel-mcp</code> serves it over the Model Context Protocol; the {{ config.extra.locomo }}% LoCoMo and {{ config.extra.longmemeval }}% LongMemEval (oracle) scores are measured by <code>citadel-membench</code>.</div>
+            <div class="claim"><code>citadel-mem</code> stores regions of typed atoms and edges with hybrid recall and cryptographic erasure; <code>citadel-mcp</code> serves it over the Model Context Protocol; the {{ config.extra.locomo }}% LoCoMo and {{ config.extra.longmemeval }}% LongMemEval-S scores are measured by <code>citadel-membench</code>.</div>
           </div>
           <div class="audit-row">
             <div class="cat">targets</div>

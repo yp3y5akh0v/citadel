@@ -2,7 +2,7 @@ use citadel_core::{Result, PAGE_SIZE};
 
 /// Trait for page-level I/O operations.
 ///
-/// All operations work with on-disk page format (8208 bytes = IV + ciphertext + MAC).
+/// Operations use the on-disk page format (8208B = IV + ciphertext + MAC).
 /// The offset parameter is the byte offset in the file.
 pub trait PageIO: Send + Sync {
     /// Read a page from disk at the given byte offset.
@@ -45,6 +45,10 @@ pub trait PageIO: Send + Sync {
         self.fsync()
     }
 
+    /// Publish a commit's metadata (SyncMode::Off path). The slot bytes must
+    /// land before the god byte: a crash between the two then leaves the god
+    /// byte selecting the previous commit, not a stale two-generations-old
+    /// slot.
     fn write_commit_meta(
         &self,
         god_offset: u64,
@@ -52,7 +56,11 @@ pub trait PageIO: Send + Sync {
         slot_offset: u64,
         slot_buf: &[u8],
     ) -> Result<()> {
-        self.write_at(god_offset, &[god_byte])?;
-        self.write_at(slot_offset, slot_buf)
+        self.write_at(slot_offset, slot_buf)?;
+        self.write_at(god_offset, &[god_byte])
     }
 }
+
+#[cfg(test)]
+#[path = "traits_tests.rs"]
+mod tests;

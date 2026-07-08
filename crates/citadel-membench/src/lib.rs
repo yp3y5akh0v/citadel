@@ -1,5 +1,5 @@
-//! Long-term-memory benchmark harness: a dataset-agnostic engine (`core`) driving
-//! pluggable benchmarks (`benchmarks::{locomo, longmemeval}`).
+//! Long-term-memory benchmark harness: a dataset-agnostic engine (`core`)
+//! driving pluggable benchmarks (`benchmarks::{locomo, longmemeval}`).
 
 pub mod benchmarks;
 pub mod core;
@@ -20,23 +20,24 @@ pub use benchmarks::locomo::dataset::{
 };
 pub use benchmarks::locomo::ingest::{ingest_sample, turn_content};
 pub use benchmarks::locomo::prompts::{build_reader_prompt, judge_abstained, judge_correct};
+pub use core::db::{open_bench_db, BenchDb};
 pub use core::error::{BenchError, Result};
 pub use core::eval::{answer_question, reader_view, AnswerOutcome, Question};
 pub use core::hash::sha256_hex;
 pub use core::ratelimit::{default_tpm_for_model, Gate, Pacer};
 
-/// Published provider USD per 1M tokens as `(input, output)`, keyed by model id. The
-/// OpenAI/Gemini APIs return no `cost_usd`, so the bench estimates it from the recorded
-/// token counts at these rates; the real bill is lower when prompt-prefix caching
-/// applies. Reader and judge are each costed at their own model's rate. Unknown models
-/// fall back to gpt-4o-mini rates.
+/// Published USD per 1M tokens as `(input, output)`, keyed by model id: the
+/// APIs return no `cost_usd`, so the bench estimates from token counts (real
+/// bill is lower with prompt caching). Unknown models fall back to
+/// gpt-4o-mini.
 fn model_rate(model: &str) -> (f64, f64) {
     if model.starts_with("gpt-4o-mini") {
         (0.15, 0.60)
     } else if model.starts_with("gpt-4o") {
         (2.50, 10.00)
     } else if model.starts_with("gemini") {
-        // Gemini 3.5 Flash list price (May 2026); other Gemini ids approximated here.
+        // Gemini 3.5 Flash list price (May 2026); other Gemini ids approximated
+        // here.
         (1.50, 9.00)
     } else {
         (0.15, 0.60)
@@ -77,9 +78,13 @@ pub struct BenchConfig {
     pub reader_order: ReaderOrder,
     /// Adjacent turns rendered around each hit (0 disables expansion).
     pub neighbor_radius: usize,
-    /// Reader output-token cap; raise for a chain-of-thought reader (env override:
-    /// `CITADEL_MEMBENCH_MAX_TOKENS`).
+    /// Reader output-token cap; raise for a chain-of-thought reader (env
+    /// override: `CITADEL_MEMBENCH_MAX_TOKENS`).
     pub reader_max_tokens: u32,
+    /// Agentic reader: aggregation-shaped questions (detected from the question
+    /// text only) run extract -> code dedup/count/sort -> answer-from-list. A
+    /// separate labeled number; recall is untouched.
+    pub agentic: bool,
 }
 
 impl Default for BenchConfig {
@@ -90,6 +95,7 @@ impl Default for BenchConfig {
             reader_order: ReaderOrder::Relevance,
             neighbor_radius: 0,
             reader_max_tokens: 512,
+            agentic: false,
         }
     }
 }
@@ -98,26 +104,29 @@ impl Default for BenchConfig {
 #[derive(Debug, Clone, Serialize)]
 pub struct QuestionResult {
     pub category: Category,
-    /// Unscorable (empty gold key) -> excluded from accuracy. Always true for adversarial.
+    /// Unscorable (empty gold key) is excluded; adversarial is always scorable.
     pub scorable: bool,
-    /// For scored categories: judged correct. For adversarial: judged abstained.
+    /// For scored categories: judged correct. For adversarial: judged
+    /// abstained.
     pub correct: bool,
     pub recall_micros: u128,
     pub input_tokens: u32,
     pub output_tokens: u32,
-    /// Estimated USD for this question: reader + judge tokens, each at its model's rate.
+    /// Estimated USD: reader + judge tokens, each at its model's rate.
     pub cost_usd: f64,
-    /// `dia_id`s retrieved into the reader's top-k; vs `gold_evidence` this splits a
-    /// miss into reader-failure (gold retrieved) vs retrieval-gap (gold absent).
+    /// `dia_id`s retrieved into the reader's top-k; vs `gold_evidence` this
+    /// splits a miss into reader-failure (gold retrieved) vs retrieval-gap
+    /// (gold absent).
     pub retrieved: Vec<String>,
     /// Gold evidence `dia_id`s (from the dataset); joined against `retrieved`.
     pub gold_evidence: Vec<String>,
-    /// Rendered text of each gold evidence turn, parallel to `gold_evidence`. Audit
-    /// only: never fed into recall/read, so a miss stays classifiable from the log.
-    /// An unknown gold id renders a `<no turn for ...>` marker.
+    /// Rendered text of each gold evidence turn, parallel to `gold_evidence`.
+    /// Audit only: never fed into recall/read, so a miss stays classifiable
+    /// from the log. An unknown gold id renders a `<no turn for ...>` marker.
     pub gold_turn_texts: Vec<String>,
     /// Whether each gold evidence turn reached the reader's view, parallel to
-    /// `gold_evidence`. Splits a miss into retrieval-gap (any false) vs reader-miss.
+    /// `gold_evidence`. Splits a miss into retrieval-gap (any false) vs
+    /// reader-miss.
     pub gold_in_view: Vec<bool>,
     /// Audit trail: question, gold, and the reader's predicted answer.
     pub question: String,
@@ -147,7 +156,8 @@ pub struct Provenance {
     /// Adjacent turns rendered around each hit (0 = none).
     pub neighbor_radius: usize,
     pub temperature: f32,
-    /// Retrieval fusion weights (citadel-mem defaults); recorded for reproducibility.
+    /// Retrieval fusion weights (citadel-mem defaults); recorded for
+    /// reproducibility.
     pub fusion_semantic: f32,
     pub fusion_keyword: f32,
     pub fusion_recency: f32,
@@ -155,8 +165,8 @@ pub struct Provenance {
     pub dataset_note: String,
     /// SHA-256 of the scored dataset file: pins the exact input.
     pub dataset_sha256: String,
-    /// The reader model's published per-1M rates; the bench costs reader and judge
-    /// each at its own model's rate (estimated, not billed).
+    /// The reader model's published per-1M rates; the bench costs reader and
+    /// judge each at its own model's rate (estimated, not billed).
     pub cost_rate_input_usd_per_m: f64,
     pub cost_rate_output_usd_per_m: f64,
     pub known_flaws: String,
@@ -167,14 +177,17 @@ pub struct Provenance {
 pub struct BenchReport {
     pub provenance: Provenance,
     pub per_category: FxHashMap<String, CategoryStats>,
-    /// Headline accuracy over the four scored categories (adversarial excluded).
+    /// Headline accuracy over the four scored categories (adversarial
+    /// excluded).
     pub overall_accuracy: f64,
     pub overall_total: usize,
     pub overall_correct: usize,
-    /// Secondary metric: fraction of adversarial questions the reader abstained on.
+    /// Secondary metric: fraction of adversarial questions the reader abstained
+    /// on.
     pub adversarial_abstention: f64,
     pub adversarial_total: usize,
-    /// Scored questions skipped for an empty/malformed gold key (not in accuracy).
+    /// Scored questions skipped for an empty/malformed gold key (not in
+    /// accuracy).
     pub unscorable_total: usize,
     pub recall_p95_micros: u128,
     pub total_input_tokens: u64,
@@ -182,17 +195,16 @@ pub struct BenchReport {
     pub estimated_cost_usd: f64,
 }
 
-/// Whether to use encrypted regions (per-atom sealed + crypto erasure). Env vars are
-/// strings, so `CITADEL_LOCOMO_ENCRYPTED` is parsed as a bool ("true"/"false", case-insensitive);
-/// unset = false.
+/// Whether to use encrypted regions (per-atom sealed + crypto erasure), from
+/// `CITADEL_LOCOMO_ENCRYPTED` ("true"/"false", case-insensitive; unset=false).
 pub fn encrypted_regions() -> bool {
     std::env::var("CITADEL_LOCOMO_ENCRYPTED")
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 
-/// Create the per-conversation region: encrypted (per-atom sealed + crypto erasure) when
-/// [`encrypted_regions`] is on, else the plaintext path used by the historical baselines.
+/// Create the per-conversation region: encrypted when [`encrypted_regions`] is
+/// on, else the plaintext path used by the historical baselines.
 pub fn create_bench_region(
     eng: &MemoryEngine,
     name: &str,
@@ -206,8 +218,8 @@ pub fn create_bench_region(
     Ok(())
 }
 
-/// Run one conversation end-to-end: ingest into a fresh region, then retrieve, read,
-/// and judge each question. Returns one result per question.
+/// Run one conversation end-to-end: ingest into a fresh region, then retrieve,
+/// read, and judge each question. Returns one result per question.
 pub fn run_sample(
     eng: &MemoryEngine,
     sample: &Sample,
@@ -223,13 +235,15 @@ pub fn run_sample(
         reader,
         judge,
         config,
+        false,
         &Pacer::unbounded(),
         &mut |_| Ok(()),
     )
 }
 
-/// Like [`run_sample`] but invokes `on_result` per question as it scores (for live
-/// tracing). Scoring is identical; an error from the callback aborts the run.
+/// Like [`run_sample`] but invokes `on_result` per question as it scores
+/// (live tracing); scoring is identical. `reuse = true` skips ingest and
+/// recalls from a reopened persisted DB.
 #[allow(clippy::too_many_arguments)]
 pub fn run_sample_observed(
     eng: &MemoryEngine,
@@ -238,13 +252,17 @@ pub fn run_sample_observed(
     reader: &dyn LLMClient,
     judge: &dyn LLMClient,
     config: BenchConfig,
+    reuse: bool,
     pacer: &Pacer,
     on_result: &mut (dyn FnMut(&QuestionResult) -> Result<()> + Send),
 ) -> Result<Vec<QuestionResult>> {
-    // One region per conversation (no cross-conversation retrieval). Ingest is the
-    // single-writer phase and must finish first; questions then fan out concurrently.
+    // One region per conversation. Ingest is the single-writer phase and must
+    // finish before questions fan out; a reused DB skips it (atoms already
+    // present).
     create_bench_region(eng, &sample.sample_id, embedder)?;
-    ingest_sample(eng, &sample.sample_id, sample)?;
+    if !reuse {
+        ingest_sample(eng, &sample.sample_id, sample)?;
+    }
 
     // dia_id -> rendered turn text, built once for the per-question gold audit.
     let gold_index: FxHashMap<&str, String> = sample
@@ -253,10 +271,10 @@ pub fn run_sample_observed(
         .map(|t| (t.dia_id.as_str(), turn_content(t)))
         .collect();
 
-    // Reader and judge keep independent in-flight caps (Gates); `pacer` enforces
-    // per-model TPM. Questions run on a fixed pool of OS threads, NOT rayon: each task
-    // blocks (HTTP, gate waits) and recall() uses rayon internally, so a rayon pool
-    // would nest and deadlock once workers park. CITADEL_LOCOMO_CONCURRENCY=1 = serial.
+    // Reader and judge keep independent in-flight caps; `pacer` enforces
+    // per-model TPM. Tasks run on OS threads, NOT rayon: each blocks (HTTP,
+    // gate waits) and recall() uses rayon internally, so nesting would
+    // deadlock. CITADEL_LOCOMO_CONCURRENCY=1 = serial.
     let legacy = std::env::var("CITADEL_LOCOMO_CONCURRENCY")
         .ok()
         .and_then(|s| s.parse::<usize>().ok());
@@ -271,9 +289,9 @@ pub fn run_sample_observed(
     let reader_gate = Gate::new(reader_n);
     let judge_gate = Gate::new(judge_n);
 
-    // The callback fires per question in completion order (mutex-serialized) for live
-    // tracing; results are returned in QUESTION order (by index), so the report stays
-    // byte-identical to a serial run. A worker error aborts the run.
+    // The callback fires in completion order (serialized) for live tracing;
+    // results return in question order, so the report is byte-identical to a
+    // serial run. A worker error aborts.
     let total = sample.qa.len();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let failed = std::sync::atomic::AtomicBool::new(false);
@@ -310,7 +328,8 @@ pub fn run_sample_observed(
                         jg,
                     ) {
                         Ok(r) => {
-                            // Run the observer under its lock, then send: never hold two locks at once.
+                            // Run the observer under its lock, then send: never
+                            // hold two locks at once.
                             let observe = (*observed_r.lock().expect("observer poisoned"))(&r);
                             match observe {
                                 Ok(()) => {
@@ -358,8 +377,9 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Score one question: recall -> read -> judge. Self-contained and order-independent
-/// (runs concurrently); the reader and judge calls each hold their own permit.
+/// Score one question: recall -> read -> judge. Self-contained and
+/// order-independent (runs concurrently); the reader and judge calls each hold
+/// their own permit.
 #[allow(clippy::too_many_arguments)]
 fn process_one_question(
     eng: &MemoryEngine,
@@ -373,8 +393,9 @@ fn process_one_question(
     reader_gate: &Gate,
     judge_gate: &Gate,
 ) -> Result<QuestionResult> {
-    // Empty gold on a scored question = malformed key: record unscorable (no LLM call)
-    // rather than grading it wrong. Returns before acquiring any gate/pacer.
+    // Empty gold on a scored question = malformed key: record unscorable (no
+    // LLM call) rather than grading it wrong. Returns before acquiring any
+    // gate/pacer.
     if qa.category.is_scored() && qa.gold.trim().is_empty() {
         return Ok(QuestionResult {
             category: qa.category,
@@ -416,7 +437,8 @@ fn process_one_question(
         )?
     };
 
-    // Gold instrumentation computed before `outcome.retrieved` is moved into the result.
+    // Gold instrumentation computed before `outcome.retrieved` is moved into
+    // the result.
     let gold_in_view = gold_in_view_flags(&qa.evidence, &outcome.retrieved);
     let gold_turn_texts = resolve_gold_texts(&qa.evidence, gold_index);
 
@@ -452,7 +474,8 @@ fn process_one_question(
     })
 }
 
-/// Roll per-question results into a [`BenchReport`] (overall = scored categories only).
+/// Roll per-question results into a [`BenchReport`] (overall = scored
+/// categories only).
 pub fn aggregate(results: &[QuestionResult], provenance: Provenance) -> BenchReport {
     let mut per_category: FxHashMap<String, CategoryStats> = FxHashMap::default();
     let mut overall_total = 0usize;
@@ -470,7 +493,8 @@ pub fn aggregate(results: &[QuestionResult], provenance: Provenance) -> BenchRep
         total_input_tokens += u64::from(r.input_tokens);
         total_output_tokens += u64::from(r.output_tokens);
         total_cost_usd += r.cost_usd;
-        // Unscorable questions skip recall (latency 0); excluding keeps p95 honest.
+        // Unscorable questions skip recall (latency 0); excluding keeps p95
+        // honest.
         if r.scorable {
             latencies.push(r.recall_micros);
         }
@@ -523,7 +547,8 @@ pub fn aggregate(results: &[QuestionResult], provenance: Provenance) -> BenchRep
     }
 }
 
-/// Build a [`Provenance`] block; fusion weights, cost rates, and known flaws pinned here.
+/// Build a [`Provenance`] block; fusion weights, cost rates, and known flaws
+/// pinned here.
 pub fn provenance(
     reader_model: impl Into<String>,
     judge_model: impl Into<String>,
@@ -564,8 +589,9 @@ fn ratio(num: usize, den: usize) -> f64 {
     }
 }
 
-/// Resolve each gold `dia_id` to its rendered turn text via `index`, parallel to
-/// `evidence`. An unknown id renders a `<no turn for ...>` marker rather than dropping.
+/// Resolve each gold `dia_id` to its rendered turn text via `index`, parallel
+/// to `evidence`. An unknown id renders a `<no turn for ...>` marker rather
+/// than dropping.
 fn resolve_gold_texts(evidence: &[String], index: &FxHashMap<&str, String>) -> Vec<String> {
     evidence
         .iter()
@@ -578,8 +604,8 @@ fn resolve_gold_texts(evidence: &[String], index: &FxHashMap<&str, String>) -> V
         .collect()
 }
 
-/// Per-gold-id presence in the reader's view: `true` iff the gold `dia_id` is in
-/// `retrieved`. Parallel to `evidence`.
+/// Per-gold-id presence in the reader's view: `true` iff the gold `dia_id` is
+/// in `retrieved`. Parallel to `evidence`.
 fn gold_in_view_flags(evidence: &[String], retrieved: &[String]) -> Vec<bool> {
     evidence
         .iter()
@@ -613,7 +639,8 @@ mod cost_tests {
 
     #[test]
     fn model_rate_mini_wins_over_the_gpt4o_prefix() {
-        // "gpt-4o-mini" also starts with "gpt-4o"; the mini branch must be checked first.
+        // "gpt-4o-mini" also starts with "gpt-4o"; the mini branch must be
+        // checked first.
         assert_eq!(model_rate("gpt-4o-mini"), (0.15, 0.60));
         assert_ne!(model_rate("gpt-4o-mini"), model_rate("gpt-4o"));
     }
@@ -641,7 +668,8 @@ mod cost_tests {
 
     #[test]
     fn token_cost_scales_input_and_output_independently() {
-        // 2M input + 0.5M output at gpt-4o-mini = 2*0.15 + 0.5*0.60 = 0.30 + 0.30 = 0.60.
+        // 2M input + 0.5M output at gpt-4o-mini = 2*0.15 + 0.5*0.60 = 0.30 +
+        // 0.30 = 0.60.
         assert!((token_cost("gpt-4o-mini", 2_000_000, 500_000) - 0.60).abs() < 1e-9);
     }
 
@@ -653,8 +681,8 @@ mod cost_tests {
 
     #[test]
     fn per_question_cost_bills_reader_and_judge_at_their_own_models() {
-        // As in process_one_question: a gpt-4o reader and gpt-4o-mini judge are each
-        // costed at their own model's rate, then summed.
+        // As in process_one_question: a gpt-4o reader and gpt-4o-mini judge are
+        // each costed at their own model's rate, then summed.
         let reader = token_cost("gpt-4o", 1_000_000, 200_000); // 2.50 + 0.2*10 = 4.50
         let judge = token_cost("gpt-4o-mini", 400_000, 100_000); // 0.4*0.15 + 0.1*0.60 = 0.12
         assert!((reader - 4.50).abs() < 1e-9);

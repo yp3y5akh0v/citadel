@@ -92,10 +92,12 @@ impl LeafShardScanner<'_> {
     }
 }
 
-/// A table's leaf pages in left-to-right order; cacheable across reads at one commit gen.
+/// A table's leaf pages in left-to-right order; cacheable across reads at one
+/// commit gen.
 pub type LeafPages = Vec<Arc<Page>>;
 
-/// Cache form of [`LeafPages`]: weak handles, so caching does not pin pages in the pool.
+/// Cache form of [`LeafPages`]: weak handles, so caching does not pin pages in
+/// the pool.
 pub type LeafPagesWeak = Vec<Weak<Page>>;
 
 /// Downgrade live leaves to their cacheable weak form.
@@ -103,7 +105,8 @@ pub fn downgrade_leaves(leaves: &[Arc<Page>]) -> LeafPagesWeak {
     leaves.iter().map(Arc::downgrade).collect()
 }
 
-/// Upgrade cached weak leaves to live handles; `None` if any was evicted (caller rebuilds).
+/// Upgrade cached weak leaves to live handles; `None` if any was evicted
+/// (caller rebuilds).
 pub fn upgrade_leaves(weak: &[Weak<Page>]) -> Option<LeafPages> {
     weak.iter().map(Weak::upgrade).collect()
 }
@@ -149,7 +152,8 @@ impl<'db> ReadTxn<'db> {
         self.snapshot.tree_entries
     }
 
-    /// The table's catalog root in this txn (a lookup, no scan); a version stamp.
+    /// The table's catalog root in this txn (a lookup, no scan); a version
+    /// stamp.
     pub fn table_root_page(&self, table: &[u8]) -> Result<Option<PageId>> {
         self.manager.table_root(table)
     }
@@ -366,8 +370,9 @@ impl<'db> ReadTxn<'db> {
         Ok(crate::scan_iter::TableIter::new(adapter, cursor))
     }
 
-    /// Collect a table's leaf pages left-to-right (the DFS prelude of a full scan), so a
-    /// caller can cache them and skip this walk on repeated scans at the same commit gen.
+    /// Collect a table's leaf pages left-to-right (the DFS prelude of a full
+    /// scan), so a caller can cache them and skip this walk on repeated scans
+    /// at the same commit gen.
     pub fn collect_table_leaves(&mut self, table: &[u8]) -> Result<LeafPages> {
         let desc = self.lookup_table(table)?;
         let mut leaves = Vec::new();
@@ -375,7 +380,8 @@ impl<'db> ReadTxn<'db> {
         Ok(leaves)
     }
 
-    /// Iterate the cells of `leaves` (materializing overflow). Callback returns `false` to stop.
+    /// Iterate the cells of `leaves` (materializing overflow). Callback returns
+    /// `false` to stop.
     pub fn scan_leaves<F>(&mut self, leaves: &[Arc<Page>], f: F) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> bool,
@@ -396,7 +402,8 @@ impl<'db> ReadTxn<'db> {
         }
     }
 
-    /// Full table scan via direct leaf iteration. Callback returns `false` to stop.
+    /// Full table scan via direct leaf iteration. Callback returns `false` to
+    /// stop.
     pub fn table_scan_raw<F>(&mut self, table: &[u8], f: F) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> bool,
@@ -405,7 +412,8 @@ impl<'db> ReadTxn<'db> {
         self.scan_leaves(&leaves, f)
     }
 
-    /// DFS pass that loads each page into the cache and collects leaves in left-to-right order.
+    /// DFS pass that loads each page into the cache and collects leaves in
+    /// left-to-right order.
     fn load_and_collect_leaves(
         &mut self,
         page_id: PageId,
@@ -566,7 +574,8 @@ impl<'db> ReadTxn<'db> {
 
 impl<'db> Drop for ReadTxn<'db> {
     fn drop(&mut self) {
-        self.manager.unregister_reader(self.txn_id);
+        // Registration is keyed by snapshot txn id (see begin_read).
+        self.manager.unregister_reader(self.snapshot.txn_id);
     }
 }
 

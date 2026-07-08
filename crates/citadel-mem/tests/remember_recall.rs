@@ -184,3 +184,57 @@ fn remember_batch_inserts_all_with_unique_ids() {
         "empty batch is a no-op"
     );
 }
+
+/// Reopening re-attaches every region from one grouped MAX snapshot; later
+/// writes and recall must see both old and new atoms in each region.
+#[test]
+fn reattach_multi_region_reopen_recalls_and_extends() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.db");
+    let db = Arc::new(
+        DatabaseBuilder::new(&path)
+            .passphrase(b"test-passphrase")
+            .argon2_profile(Argon2Profile::Iot)
+            .enable_region_keys(true)
+            .create()
+            .unwrap(),
+    );
+    let eng = MemoryEngine::open(db).unwrap();
+    for (name, n) in [("alpha", 3usize), ("beta", 1)] {
+        eng.create_encrypted_region(name, Arc::new(MockEmbedder::new(64)))
+            .unwrap();
+        let atoms = (0..n)
+            .map(|i| AtomInput::new("turn", format!("{name} note {i}")))
+            .collect();
+        eng.remember_batch(name, atoms).unwrap();
+    }
+    drop(eng);
+
+    let db = Arc::new(
+        DatabaseBuilder::new(&path)
+            .passphrase(b"test-passphrase")
+            .argon2_profile(Argon2Profile::Iot)
+            .enable_region_keys(true)
+            .open()
+            .unwrap(),
+    );
+    let eng = MemoryEngine::open(db).unwrap();
+    // Second attach is served by the snapshot built on the first.
+    eng.create_encrypted_region("alpha", Arc::new(MockEmbedder::new(64)))
+        .unwrap();
+    eng.create_encrypted_region("beta", Arc::new(MockEmbedder::new(64)))
+        .unwrap();
+
+    // A write after reattach must extend, not shadow: recall sees old + new
+    // atoms, proving init_max seeded correctly from the snapshot.
+    eng.remember("alpha", AtomInput::new("turn", "alpha note new"))
+        .unwrap();
+    let alpha = eng
+        .recall("alpha", RecallQuery::by_text("alpha note", 10))
+        .unwrap();
+    assert_eq!(alpha.len(), 4, "3 persisted + 1 new");
+    let beta = eng
+        .recall("beta", RecallQuery::by_text("beta note", 10))
+        .unwrap();
+    assert_eq!(beta.len(), 1, "persisted atom recalled after reattach");
+}

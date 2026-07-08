@@ -1,4 +1,5 @@
-//! Token-free LongMemEval runner test: inline fixture + MockEmbedder + constant reader.
+//! Token-free LongMemEval runner test: inline fixture + MockEmbedder + constant
+//! reader.
 
 use std::sync::Arc;
 
@@ -66,6 +67,7 @@ fn run_emits_one_hypothesis_per_question_in_order() {
     let cfg = LmevalConfig {
         bench: BenchConfig::default(),
         encrypted: false,
+        reuse: false,
         reader_concurrency: 2,
     };
 
@@ -89,4 +91,73 @@ fn run_emits_one_hypothesis_per_question_in_order() {
     assert_eq!(out[1].0, "q_second_abs");
     assert!(out.iter().all(|(_, hyp)| hyp == "an answer"));
     assert_eq!(emitted.len(), 2);
+}
+
+/// Agentic path end-to-end: an aggregation question runs extract -> code
+/// dedup/count -> answer (two reader calls); a non-aggregation question keeps
+/// the single-prompt path. Scripted responses assert the call sequence.
+#[test]
+fn agentic_routes_aggregation_and_falls_back_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let samples = dataset::parse_root(&json!([
+        {
+            "question_id": "q_count",
+            "question_type": "multi-session",
+            "question": "How many pets did I mention?",
+            "answer": "2",
+            "question_date": "2023/05/20 (Sat) 02:21",
+            "haystack_session_ids": ["answer_aaa_1"],
+            "haystack_dates": ["2023/05/01 (Mon) 09:00"],
+            "haystack_sessions": [
+                [{"role": "user", "content": "My dog Rex and my cat Mia are pals.", "has_answer": true}]
+            ],
+            "answer_session_ids": ["answer_aaa_1"]
+        },
+        {
+            "question_id": "q_plain",
+            "question_type": "single-session-user",
+            "question": "what pet did I mention?",
+            "answer": "Rex",
+            "question_date": "2023/05/20 (Sat) 02:21",
+            "haystack_session_ids": ["answer_bbb_1"],
+            "haystack_dates": ["2023/05/02 (Tue) 09:00"],
+            "haystack_sessions": [
+                [{"role": "user", "content": "My dog Rex is a golden retriever.", "has_answer": true}]
+            ],
+            "answer_session_ids": ["answer_bbb_1"]
+        }
+    ]))
+    .unwrap();
+    let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
+    // Serial (concurrency 1): q_count consumes the first two scripted responses
+    // (extraction JSON + final), q_plain the third (single-prompt).
+    let reader = testing::scripted(vec![
+        citadel_ai::CompletionResponse::text(
+            "[{\"item\":\"dog Rex\",\"date\":\"2023/05/01\"},{\"item\":\"cat Mia\",\"date\":\"2023/05/01\"}]",
+        ),
+        citadel_ai::CompletionResponse::text("You mentioned 2 pets."),
+        citadel_ai::CompletionResponse::text("Rex, a golden retriever."),
+    ]);
+    let cfg = LmevalConfig {
+        bench: BenchConfig {
+            agentic: true,
+            ..BenchConfig::default()
+        },
+        encrypted: false,
+        reuse: false,
+        reader_concurrency: 1,
+    };
+    let out = run(
+        &eng,
+        &samples,
+        embedder,
+        &*reader,
+        &Pacer::unbounded(),
+        &cfg,
+        &mut |_, _, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(out[0].1, "You mentioned 2 pets.", "agentic two-pass answer");
+    assert_eq!(out[1].1, "Rex, a golden retriever.", "single-prompt path");
 }

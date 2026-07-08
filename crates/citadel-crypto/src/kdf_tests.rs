@@ -107,6 +107,16 @@ fn salt_generation() {
 }
 
 #[test]
+fn derive_mk_returns_zeroizing_wrapper() {
+    // Regression: the derived MK must be wrapped in Zeroizing so it is wiped
+    // on drop on every caller exit path, not left on the stack.
+    let salt = [0x42u8; ARGON2_SALT_SIZE];
+    let mk: Zeroizing<[u8; KEY_SIZE]> =
+        derive_mk(KdfAlgorithm::Argon2id, b"test", &salt, 64, 1, 1).unwrap();
+    assert_ne!(*mk, [0u8; KEY_SIZE]);
+}
+
+#[test]
 fn master_key_zeroize_on_drop() {
     let key = [0xFFu8; KEY_SIZE];
     let mk = MasterKey::new(key);

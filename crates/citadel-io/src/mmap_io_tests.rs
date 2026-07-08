@@ -137,6 +137,82 @@ fn write_commit_meta_works() {
 }
 
 #[test]
+fn failed_remap_does_not_poison_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = open_new_file(&dir, "test.db");
+    let io = MmapPageIO::try_new(file).unwrap();
+
+    let page = [0x5Au8; PAGE_SIZE];
+    io.write_page(0, &page).unwrap();
+
+    // Absurd grow: set_len or map_mut must fail. Before the fix this left a
+    // 1-byte dummy mapping behind a stale size, so any later access panicked.
+    assert!(io.truncate(1 << 60).is_err());
+
+    // Accesses after the failed remap must return Err at worst, never panic,
+    // and file_size() must keep reporting the real on-disk length so no
+    // caller sizes a destructive set_len() from a lying zero.
+    assert!(io.file_size().unwrap() >= INITIAL_MAPPING_SIZE);
+    let mut read_buf = [0u8; PAGE_SIZE];
+    if io.read_page(0, &mut read_buf).is_ok() {
+        assert_eq!(read_buf, page);
+        io.write_page(PAGE_SIZE as u64, &page).unwrap();
+        io.read_page(PAGE_SIZE as u64, &mut read_buf).unwrap();
+        assert_eq!(read_buf, page);
+    }
+}
+
+#[test]
+fn degraded_mapping_reports_real_file_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = open_new_file(&dir, "test.db");
+    let io = MmapPageIO::try_new(file).unwrap();
+
+    let page = [0x3Cu8; PAGE_SIZE];
+    io.write_page(0, &page).unwrap();
+    io.fsync().unwrap();
+
+    // Simulate the worst remap_locked failure arm: both the grow and the
+    // recovery map failed, leaving the 1-byte dummy behind size = 0.
+    {
+        let mut inner = io.inner.write();
+        inner.mmap = MmapOptions::new().len(1).map_anon().unwrap();
+        inner.size = 0;
+    }
+
+    // The file still holds live data; file_size() must say so, or the next
+    // ensure_file_size would shrink the file over committed pages.
+    assert!(io.file_size().unwrap() >= INITIAL_MAPPING_SIZE);
+
+    // Reads fail their bounds check instead of panicking on the dummy map.
+    let mut read_buf = [0u8; PAGE_SIZE];
+    assert!(io.read_page(0, &mut read_buf).is_err());
+
+    // A later write remaps at the real file length and recovers the backend.
+    io.write_page(PAGE_SIZE as u64, &page).unwrap();
+    io.read_page(0, &mut read_buf).unwrap();
+    assert_eq!(read_buf, page);
+}
+
+#[test]
+fn shrink_then_read_past_end_errs() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = open_new_file(&dir, "test.db");
+    let io = MmapPageIO::try_new(file).unwrap();
+
+    let page = [0x77u8; PAGE_SIZE];
+    io.write_page(0, &page).unwrap();
+
+    io.truncate(PAGE_SIZE as u64).unwrap();
+    assert_eq!(io.file_size().unwrap(), PAGE_SIZE as u64);
+
+    let mut read_buf = [0u8; PAGE_SIZE];
+    io.read_page(0, &mut read_buf).unwrap();
+    assert_eq!(read_buf, page);
+    assert!(io.read_page(PAGE_SIZE as u64, &mut read_buf).is_err());
+}
+
+#[test]
 fn write_pages_ref_round_trips() {
     let dir = tempfile::tempdir().unwrap();
     let file = open_new_file(&dir, "test.db");

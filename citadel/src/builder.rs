@@ -89,6 +89,8 @@ impl DatabaseBuilder {
         self
     }
 
+    /// Buffer pool capacity in pages. Must be at least 1;
+    /// `create()`/`open()`/`create_in_memory()` reject 0 with an error.
     pub fn cache_size(mut self, pages: usize) -> Self {
         self.cache_size = pages;
         self
@@ -133,9 +135,10 @@ impl DatabaseBuilder {
         self
     }
 
-    /// Zero-fill freed B+ tree pages once they are past all readers, so a passphrase holder
-    /// with disk access cannot recover deleted-row residue from stale pages. Off by default
-    /// (a small write cost on delete-heavy workloads).
+    /// Zero-fill freed B+ tree pages once they are past all readers, so a
+    /// passphrase holder with disk access cannot recover deleted-row residue
+    /// from stale pages. Off by default (a small write cost on delete-heavy
+    /// workloads).
     pub fn enable_secure_delete(mut self, enable: bool) -> Self {
         self.secure_delete = enable;
         self
@@ -173,6 +176,18 @@ impl DatabaseBuilder {
         Box::new(MmapPageIO::try_new(file).expect("mmap init failed"))
     }
 
+    /// Reject a zero cache size up front: the buffer pool requires capacity
+    /// >= 1 and would otherwise panic deep inside the transaction manager.
+    fn validate_cache_size(&self) -> Result<()> {
+        if self.cache_size == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cache_size must be at least 1 page",
+            )));
+        }
+        Ok(())
+    }
+
     /// Resolve KDF parameters: (m_cost, t_cost, p_cost) for Argon2id,
     /// or (iterations, 0, 0) for PBKDF2.
     fn resolve_kdf_params(&self) -> (u32, u32, u32) {
@@ -185,7 +200,8 @@ impl DatabaseBuilder {
         }
     }
 
-    /// Validate configuration against FIPS constraints (when fips feature enabled).
+    /// Validate configuration against FIPS constraints (when fips feature
+    /// enabled).
     #[cfg(feature = "fips")]
     fn validate_fips(&self) -> Result<()> {
         if self.kdf_algorithm != KdfAlgorithm::Pbkdf2HmacSha256 {
@@ -220,7 +236,13 @@ impl DatabaseBuilder {
             let log = if audit_path.exists() {
                 audit::AuditLog::open_existing(&audit_path, file_id, audit_key, self.audit_config)?
             } else {
-                audit::AuditLog::create(&audit_path, file_id, audit_key, self.audit_config)?
+                audit::AuditLog::create(
+                    &audit_path,
+                    file_id,
+                    audit_key,
+                    self.audit_config,
+                    manager.slots_flagged(),
+                )?
             };
             Some(log)
         } else {
@@ -265,10 +287,15 @@ impl DatabaseBuilder {
     }
 
     /// Create a new database. Fails if the data file already exists.
+    ///
+    /// The data file is created (`create_new`) before the key file, so a
+    /// failed `create()` never clobbers an existing database's key file; a
+    /// crash between the two just leaves an empty data file to remove.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create(self) -> Result<Database> {
         #[cfg(feature = "fips")]
         self.validate_fips()?;
+        self.validate_cache_size()?;
 
         let passphrase = self
             .passphrase
@@ -280,15 +307,25 @@ impl DatabaseBuilder {
 
         let (kf, keys, region_keys) = self.create_keys(passphrase, file_id)?;
 
-        durable::write_and_sync(&key_path, &kf.serialize())?;
-
+        // Existence guard before the key file is written: create() on an
+        // existing database must not overwrite its key material.
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(&self.path)?;
 
-        file_lock::try_lock_exclusive(&file)?;
+        let init = file_lock::try_lock_exclusive(&file)
+            .and_then(|()| Ok(durable::fsync_directory(&self.path)?))
+            .and_then(|()| Ok(durable::write_and_sync(&key_path, &kf.serialize())?));
+        if let Err(e) = init {
+            // Best-effort: remove the just-created data file so a retried
+            // create() can succeed. Drop the handle first - Windows cannot
+            // delete a file with an open locked handle.
+            drop(file);
+            let _ = fs::remove_file(&self.path);
+            return Err(e);
+        }
 
         let dek_id = compute_dek_id(&keys.mac_key, &keys.dek);
         let io = Self::create_page_io(file);
@@ -329,9 +366,11 @@ impl DatabaseBuilder {
     pub fn create_in_memory(mut self) -> Result<Database> {
         #[cfg(feature = "fips")]
         self.validate_fips()?;
+        self.validate_cache_size()?;
 
-        // Per-region cryptographic erasure needs a durable overwrite-in-place sidecar,
-        // which an in-memory database cannot provide; reject the combination up front.
+        // Per-region cryptographic erasure needs a durable overwrite-in-place
+        // sidecar, which an in-memory database cannot provide; reject the
+        // combination up front.
         if self.enable_region_keys {
             return Err(Error::RegionKeysRequireFile);
         }
@@ -374,6 +413,8 @@ impl DatabaseBuilder {
     /// Open an existing database. Fails if the data file does not exist.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(self) -> Result<Database> {
+        self.validate_cache_size()?;
+
         let passphrase = self
             .passphrase
             .as_deref()
@@ -433,9 +474,9 @@ impl DatabaseBuilder {
         )
     }
 
-    /// Create a key file, deriving region wrap keys only when `enable_region_keys`
-    /// is set. Returns the wrap keys to retain (`Some`) or `None` so the plaintext
-    /// path holds no region key material.
+    /// Create a key file, deriving region wrap keys only when
+    /// `enable_region_keys` is set. Returns the wrap keys to retain (`Some`) or
+    /// `None` so the plaintext path holds no region key material.
     #[allow(clippy::type_complexity)]
     fn create_keys(
         &self,
@@ -472,7 +513,8 @@ impl DatabaseBuilder {
         }
     }
 
-    /// Open a key file, deriving region wrap keys only when `enable_region_keys`.
+    /// Open a key file, deriving region wrap keys only when
+    /// `enable_region_keys`.
     #[cfg(not(target_arch = "wasm32"))]
     #[allow(clippy::type_complexity)]
     fn open_keys(

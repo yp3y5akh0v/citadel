@@ -1,7 +1,7 @@
-//! Sealed-recall ANN coverage: the encrypted recall path builds an ephemeral in-RAM
-//! PRISM index over decrypted vectors, so it is correct over large regions, fresh
-//! after incremental writes, kind-filterable, and excludes deleted atoms - while
-//! matching the plaintext PRISM top hit.
+//! Sealed-recall ANN coverage: the encrypted recall path builds an ephemeral
+//! in-RAM PRISM index over decrypted vectors, so it is correct over large
+//! regions, fresh after incremental writes, kind-filterable, and excludes
+//! deleted atoms - while matching the plaintext PRISM top hit.
 
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
 use citadel_mem::{AtomInput, Embedder, MemoryEngine, MockEmbedder, RecallQuery};
@@ -61,7 +61,8 @@ fn sees_atoms_added_after_first_recall() {
         .recall("r", RecallQuery::by_text("seed line 0", 3))
         .unwrap();
 
-    // An atom inserted AFTER the snapshot must surface via the tail-delta exact scan.
+    // An atom inserted after the snapshot must surface via the tail-delta exact
+    // scan.
     let fresh = "freshly added distinctive memory token qwxz";
     eng.remember("r", AtomInput::new("fact", fresh)).unwrap();
     let hits = eng.recall("r", RecallQuery::by_text(fresh, 3)).unwrap();
@@ -124,8 +125,8 @@ fn excludes_deleted_atom() {
 
 #[test]
 fn fetch_and_recall_cover_a_region_past_the_decrypt_page() {
-    // Exceeds the internal decrypt page size (4096): fetch must page, recall must index the
-    // whole region.
+    // Exceeds the decrypt page size (4096): fetch must page, recall must
+    // index the whole region.
     const N: usize = 4096 + 50;
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());
@@ -196,4 +197,36 @@ fn encrypted_matches_plaintext_top_hit_over_larger_set() {
         plain[0].text, exact,
         "plaintext PRISM recall top hit is the exact match"
     );
+}
+
+/// A kind that did not exist when the index snapshot was built must still be
+/// found in the post-snapshot tail; an unknown kind code must not short-circuit
+/// recall to empty.
+#[test]
+fn kind_absent_from_index_snapshot_is_found_in_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    eng.create_encrypted_region("r", embedder()).unwrap();
+
+    let seed: Vec<AtomInput> = (0..20)
+        .map(|i| AtomInput::new("turn", format!("chatter line {i}")))
+        .collect();
+    eng.remember_batch("r", seed).unwrap();
+    // First recall builds the index snapshot with only kind "turn".
+    eng.recall("r", RecallQuery::by_text("chatter", 3)).unwrap();
+
+    // A brand-new kind lands in the post-snapshot tail.
+    eng.remember(
+        "r",
+        AtomInput::new("fact", "the sky is a deep shade of blue"),
+    )
+    .unwrap();
+    let hits = eng
+        .recall(
+            "r",
+            RecallQuery::by_text("deep shade of blue", 5).with_kinds(vec!["fact".into()]),
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1, "tail atom of a new kind must be recalled");
+    assert_eq!(hits[0].kind, "fact");
 }

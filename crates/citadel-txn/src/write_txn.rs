@@ -7,7 +7,7 @@ use citadel_page::branch_node;
 use citadel_page::leaf_node::OverflowRef;
 use citadel_page::overflow;
 use citadel_page::page::Page;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -28,15 +28,6 @@ thread_local! {
 pub enum InsertOutcome {
     Inserted,
     Existed(Vec<u8>),
-}
-
-impl From<Option<Vec<u8>>> for InsertOutcome {
-    fn from(v: Option<Vec<u8>>) -> Self {
-        match v {
-            None => InsertOutcome::Inserted,
-            Some(existing) => InsertOutcome::Existed(existing),
-        }
-    }
 }
 
 struct WritePages<'a> {
@@ -76,13 +67,15 @@ pub struct WriteTxn<'a> {
     tree: BTree,
     alloc: PageAllocator,
     committed: bool,
-    deferred_free: Vec<PageId>,
     named_trees: FxHashMap<Vec<u8>, BTree>,
     catalog: Option<BTree>,
     catalog_dirty: bool,
     loaded_tree_meta: FxHashMap<Vec<u8>, (PageId, u16)>,
     deferred_fk_checks: Vec<DeferredFkCheck>,
     fk_check_cache: FxHashMap<Vec<u8>, Vec<u8>>,
+    /// Set by refresh_all_catalog_descriptors: commit even when nothing
+    /// changed, so the inactive slot is rewritten (and resealed V1).
+    force_commit: bool,
 }
 
 #[derive(Clone)]
@@ -93,27 +86,23 @@ pub struct WriteTxnSnapshot {
     catalog: Option<BTree>,
     catalog_dirty: bool,
     loaded_tree_meta: FxHashMap<Vec<u8>, (PageId, u16)>,
-    deferred_free: Vec<PageId>,
     deferred_fk_checks_len: usize,
 }
 
 impl<'db> WriteTxn<'db> {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         manager: &'db TxnManager,
         txn_id: TxnId,
         snapshot: Arc<CommitSlot>,
         tree: BTree,
         alloc: PageAllocator,
-        deferred_free: Vec<PageId>,
         recycled_pages: Option<FxHashMap<PageId, Page>>,
-        recycle_safe: bool,
     ) -> Self {
+        // Recycling reuses only the map's allocation: entries are keyed by
+        // page ids that CoW retires every txn, so contents are always stale.
         let pages = match recycled_pages {
             Some(mut m) => {
-                if !(alloc.in_place() && recycle_safe) {
-                    m.clear();
-                }
+                m.clear();
                 m
             }
             None => FxHashMap::with_capacity_and_hasher(16, Default::default()),
@@ -127,13 +116,13 @@ impl<'db> WriteTxn<'db> {
             tree,
             alloc,
             committed: false,
-            deferred_free,
             named_trees: FxHashMap::default(),
             catalog: None,
             catalog_dirty: false,
             loaded_tree_meta: FxHashMap::default(),
             deferred_fk_checks: Vec::new(),
             fk_check_cache: FxHashMap::default(),
+            force_commit: false,
         }
     }
 
@@ -178,7 +167,8 @@ impl<'db> WriteTxn<'db> {
         self.tree.entry_count
     }
 
-    /// The table's catalog root in its committed view (a lookup, no scan); a version stamp.
+    /// The table's catalog root in its committed view (a lookup, no scan); a
+    /// version stamp.
     pub fn table_root_page(&self, table: &[u8]) -> Result<Option<PageId>> {
         self.manager.table_root(table)
     }
@@ -428,6 +418,21 @@ impl<'db> WriteTxn<'db> {
         Ok(())
     }
 
+    /// Format-upgrade primitive: rewrite every listed table's catalog
+    /// descriptor this commit so its entry sheds SLOT_ENTRY_STALE and the
+    /// slot can reseal V1. Dropping loaded_tree_meta forces the rewrite (the
+    /// rename trick); force_commit lets an unchanged pass still rewrite the
+    /// other physical slot.
+    pub fn refresh_all_catalog_descriptors(&mut self, names: &[Vec<u8>]) -> Result<()> {
+        for name in names {
+            self.ensure_table(name)?;
+            self.loaded_tree_meta.remove(name.as_slice());
+            self.catalog_dirty = true;
+        }
+        self.force_commit = true;
+        Ok(())
+    }
+
     pub fn drop_table(&mut self, name: &[u8]) -> Result<()> {
         // Cache keys are parent-table names: only the dropped table's entry
         // can go stale.
@@ -479,8 +484,11 @@ impl<'db> WriteTxn<'db> {
         let tree = self.named_trees.remove(old_name).unwrap();
         self.named_trees.insert(new_name.to_vec(), tree);
 
-        // Remove old meta so finalize_catalog writes the new name
-        self.loaded_tree_meta.remove(old_name);
+        // Keep the old name in loaded_tree_meta (like drop_table) so its hash
+        // reaches build_slot_entries' known set and the old slot entry is
+        // dropped; removing it would let ensure_table resurrect the old name
+        // as an alias. finalize_catalog still writes the new name (it iterates
+        // named_trees).
 
         let catalog_root = self.catalog.as_ref().unwrap().root;
         self.preload_path(catalog_root, old_name)?;
@@ -498,7 +506,8 @@ impl<'db> WriteTxn<'db> {
         self.table_insert_impl(table, key, value, true)
     }
 
-    /// Insert into an index tree, skipping FK-cache invalidation (never an FK parent).
+    /// Insert into an index tree, skipping FK-cache invalidation (never an FK
+    /// parent).
     pub fn table_insert_index(&mut self, table: &[u8], key: &[u8], value: &[u8]) -> Result<bool> {
         self.table_insert_impl(table, key, value, false)
     }
@@ -516,6 +525,12 @@ impl<'db> WriteTxn<'db> {
             self.invalidate_fk_cache_for(table);
         }
         self.ensure_table(table)?;
+        self.stage_and_insert(table, key, value)
+    }
+
+    /// Stage `value` and insert through the split-safe tree path, freeing any
+    /// replaced overflow chain. Table must already be ensured.
+    fn stage_and_insert(&mut self, table: &[u8], key: &[u8], value: &[u8]) -> Result<bool> {
         let (val_type, val_payload) = self.stage_value(value);
         let tree = self.named_trees.get_mut(table).unwrap();
         Self::insert_into_tree(
@@ -585,13 +600,15 @@ impl<'db> WriteTxn<'db> {
         )
     }
 
-    #[inline]
+    /// Upsert via callback. The existing value handed to `f` is fully
+    /// materialized (overflow chains included), and both the replacement and
+    /// `default_value` are staged, so values of any size are safe here.
     pub fn table_upsert_with<F, E>(
         &mut self,
         table: &[u8],
         key: &[u8],
         default_value: &[u8],
-        f: F,
+        mut f: F,
     ) -> std::result::Result<UpsertOutcome, E>
     where
         F: FnMut(&[u8]) -> std::result::Result<UpsertAction, E>,
@@ -599,46 +616,34 @@ impl<'db> WriteTxn<'db> {
     {
         Self::validate_key_value(key, default_value)?;
         self.invalidate_fk_cache_for(table);
+        self.ensure_table(table)?;
 
-        if !self.named_trees.contains_key(table) {
-            self.ensure_table(table)?;
-        }
-        let Self {
-            named_trees,
-            pages,
-            alloc,
-            manager,
-            txn_id,
-            ..
-        } = self;
-        let tree = named_trees.get_mut(table).unwrap();
-        let root = tree.root;
-        let manager = *manager;
-        let txn_id = *txn_id;
+        let root = self.named_trees[table].root;
+        let leaf_id = Self::descend_to_leaf(&mut self.pages, self.manager, root, key)?;
+        let existing = match BTree::search_at_leaf(&self.pages, leaf_id, key)? {
+            Some((ValueType::Tombstone, _)) => None,
+            Some((ValueType::Overflow, payload)) => {
+                let oref = OverflowRef::from_bytes(&payload);
+                Some(self.materialize_overflow(&oref)?)
+            }
+            Some((_, value)) => Some(value),
+            None => None,
+        };
 
-        if tree.lil_would_hit(pages, key) {
-            return tree.upsert_with(
-                pages,
-                alloc,
-                txn_id,
-                key,
-                ValueType::Inline,
-                default_value,
-                f,
-            );
+        match existing {
+            Some(old) => match f(&old)? {
+                UpsertAction::Skip => Ok(UpsertOutcome::Skipped),
+                UpsertAction::Replace(new_bytes) => {
+                    Self::validate_key_value(key, &new_bytes)?;
+                    self.stage_and_insert(table, key, &new_bytes)?;
+                    Ok(UpsertOutcome::Updated)
+                }
+            },
+            None => {
+                self.stage_and_insert(table, key, default_value)?;
+                Ok(UpsertOutcome::Inserted)
+            }
         }
-        let (path, leaf_id) = Self::walk_loading(pages, manager, root, key)?;
-        tree.upsert_with_at_leaf(
-            pages,
-            alloc,
-            txn_id,
-            key,
-            ValueType::Inline,
-            default_value,
-            path,
-            leaf_id,
-            f,
-        )
     }
 
     pub fn table_insert_or_fetch(
@@ -673,13 +678,22 @@ impl<'db> WriteTxn<'db> {
             Self::preload_path_raw(pages, manager, root, key)?;
         }
         let outcome = tree.insert_or_fetch(pages, alloc, txn_id, key, val_type, val_bytes)?;
-        let existed = outcome.is_some();
-        if existed && val_type == ValueType::Overflow {
+        if outcome.is_some() && val_type == ValueType::Overflow {
+            // Key already existed: drop the chain staged for the new value.
             let oref = OverflowRef::from_bytes(val_bytes);
             let mut view = WritePages { pages, manager };
             overflow_io::free_chain(&mut view, alloc, oref.first_page)?;
         }
-        Ok(InsertOutcome::from(outcome))
+        match outcome {
+            None => Ok(InsertOutcome::Inserted),
+            Some((ValueType::Overflow, payload)) => {
+                let oref = OverflowRef::from_bytes(&payload);
+                let mut view = WritePages { pages, manager };
+                let value = overflow_io::read_chain_value(&mut view, &oref)?;
+                Ok(InsertOutcome::Existed(value))
+            }
+            Some((_, value)) => Ok(InsertOutcome::Existed(value)),
+        }
     }
 
     /// Batch-update existing keys. Keys must be sorted.
@@ -689,6 +703,20 @@ impl<'db> WriteTxn<'db> {
         }
         self.invalidate_fk_cache_for(table);
         self.ensure_table(table)?;
+
+        // Stage every value first: anything above the inline threshold goes
+        // to an overflow chain, so each leaf cell stays page-sized.
+        let mut staged: Vec<(ValueType, Cow<'_, [u8]>)> = Vec::with_capacity(pairs.len());
+        for &(key, value) in pairs {
+            Self::validate_key_value(key, value)?;
+            staged.push(self.stage_value(value));
+        }
+        let staged_pairs: Vec<(&[u8], ValueType, &[u8])> = pairs
+            .iter()
+            .zip(staged.iter())
+            .map(|(&(key, _), (val_type, payload))| (key, *val_type, payload.as_ref()))
+            .collect();
+
         let Self {
             named_trees,
             pages,
@@ -698,11 +726,36 @@ impl<'db> WriteTxn<'db> {
             ..
         } = self;
         let tree = named_trees.get_mut(table).unwrap();
+        let manager = *manager;
         Self::descend_to_leaf(pages, manager, tree.root, pairs[0].0)?;
-        tree.update_sorted(pages, alloc, *txn_id, pairs)
+        let mut replaced_overflow = Vec::new();
+        let mut skipped = Vec::new();
+        let count = tree.update_sorted(
+            pages,
+            alloc,
+            *txn_id,
+            &staged_pairs,
+            &mut replaced_overflow,
+            &mut skipped,
+        )?;
+        for head in replaced_overflow {
+            let mut view = WritePages { pages, manager };
+            overflow_io::free_chain(&mut view, alloc, head)?;
+        }
+        // Chains staged for pairs update_sorted did not apply (absent or
+        // duplicate key) would otherwise orphan their pages.
+        for i in skipped {
+            if let (ValueType::Overflow, payload) = &staged[i] {
+                let oref = OverflowRef::from_bytes(payload);
+                let mut view = WritePages { pages, manager };
+                overflow_io::free_chain(&mut view, alloc, oref.first_page)?;
+            }
+        }
+        Ok(count)
     }
 
-    /// Fused scan + in-place patch from `start_key`. Callback: `Some(true)`=modified, `None`=stop.
+    /// Fused scan + in-place patch from `start_key`. Callback:
+    /// `Some(true)`=modified, `None`=stop.
     pub fn table_update_range<F, E>(
         &mut self,
         table: &[u8],
@@ -738,13 +791,13 @@ impl<'db> WriteTxn<'db> {
             let leaf_id = cursor.leaf_page_id();
             view.ensure_loaded(leaf_id)?;
 
-            {
+            let val_type = {
                 let page = view.pages.get(&leaf_id).unwrap();
-                let cell = citadel_page::leaf_node::read_cell(page, cursor.cell_index());
-                if cell.val_type == ValueType::Tombstone {
-                    cursor.next_lazy(&mut view)?;
-                    continue;
-                }
+                citadel_page::leaf_node::read_cell(page, cursor.cell_index()).val_type
+            };
+            if val_type == ValueType::Tombstone {
+                cursor.next_lazy(&mut view)?;
+                continue;
             }
 
             if cow_leaf != leaf_id {
@@ -763,6 +816,49 @@ impl<'db> WriteTxn<'db> {
                 cow_leaf = new_id;
             }
 
+            if val_type == ValueType::Overflow {
+                // The cell holds an 8-byte OverflowRef: materialize the chain
+                // into a scratch buffer for the callback, and on modification
+                // write a fresh chain and free the old one. The ref is
+                // overwritten in place, so cell indices are unaffected.
+                let (key, oref) = {
+                    let page = view.pages.get(&cow_leaf).unwrap();
+                    let cell = citadel_page::leaf_node::read_cell(page, cursor.cell_index());
+                    (cell.key.to_vec(), OverflowRef::from_bytes(cell.value))
+                };
+                let mut scratch = overflow_io::read_chain_value(&mut view, &oref)?;
+                match f(&key, &mut scratch)? {
+                    Some(true) => {
+                        let first = overflow::write_chain(
+                            &scratch,
+                            txn_id,
+                            || alloc.allocate(),
+                            |pid, page| {
+                                view.pages.insert(pid, page);
+                            },
+                        );
+                        let new_ref = OverflowRef {
+                            first_page: first,
+                            total_len: scratch.len() as u32,
+                        };
+                        let page = view.pages.get_mut(&cow_leaf).unwrap();
+                        let replaced = citadel_page::leaf_node::update_value_in_place(
+                            page,
+                            cursor.cell_index(),
+                            ValueType::Overflow,
+                            &new_ref.to_bytes(),
+                        );
+                        debug_assert!(replaced, "8-byte overflow ref must overwrite in place");
+                        overflow_io::free_chain(&mut view, alloc, oref.first_page)?;
+                        count += 1;
+                    }
+                    Some(false) => {}
+                    None => break,
+                }
+                cursor.next_lazy(&mut view)?;
+                continue;
+            }
+
             let page = view.pages.get_mut(&cow_leaf).unwrap();
             let ci = cursor.cell_index();
             let cell_off = page.cell_offset(ci) as usize;
@@ -774,7 +870,8 @@ impl<'db> WriteTxn<'db> {
             let key_start = cell_off + 6;
             let val_start = cell_off + 7 + key_len;
 
-            // Split borrow: key (immutable) and value (mutable) from non-overlapping regions
+            // Split borrow: key (immutable) and value (mutable) from
+            // non-overlapping regions
             let (before_val, from_val) = page.data.split_at_mut(val_start);
             let key = &before_val[key_start..key_start + key_len];
             let value = &mut from_val[..val_len];
@@ -839,7 +936,8 @@ impl<'db> WriteTxn<'db> {
         Ok(deleted)
     }
 
-    /// Drop all pages, reset to an empty leaf. Returns pre-truncation entry count.
+    /// Drop all pages, reset to an empty leaf. Returns pre-truncation entry
+    /// count.
     pub fn table_truncate(&mut self, table: &[u8]) -> Result<u64> {
         self.invalidate_fk_cache_for(table);
         self.ensure_table(table)?;
@@ -873,7 +971,7 @@ impl<'db> WriteTxn<'db> {
     }
 
     pub fn commit(mut self) -> Result<()> {
-        let catalog_root = self.finalize_catalog()?;
+        let (catalog_root, catalog_refreshed) = self.finalize_catalog()?;
         self.manager.commit_write(
             self.base_txn_id,
             self.txn_id,
@@ -881,10 +979,11 @@ impl<'db> WriteTxn<'db> {
             &mut self.alloc,
             &self.tree,
             &self.old_slot,
-            &self.deferred_free,
             catalog_root,
             &self.named_trees,
             &self.loaded_tree_meta,
+            &catalog_refreshed,
+            self.force_commit,
         )?;
         self.committed = true;
         Ok(())
@@ -914,7 +1013,6 @@ impl<'db> WriteTxn<'db> {
         self.catalog = snap.catalog;
         self.catalog_dirty = snap.catalog_dirty;
         self.loaded_tree_meta = snap.loaded_tree_meta;
-        self.deferred_free = snap.deferred_free;
         self.deferred_fk_checks
             .truncate(snap.deferred_fk_checks_len);
         self.fk_check_cache.clear();
@@ -929,18 +1027,8 @@ impl<'db> WriteTxn<'db> {
             catalog: self.catalog.clone(),
             catalog_dirty: self.catalog_dirty,
             loaded_tree_meta: self.loaded_tree_meta.clone(),
-            deferred_free: self.deferred_free.clone(),
             deferred_fk_checks_len: self.deferred_fk_checks.len(),
         }
-    }
-
-    /// Must be disabled while savepoints are live — in-place CoW defeats rollback.
-    pub fn set_in_place(&mut self, enabled: bool) {
-        self.alloc.set_in_place(enabled);
-    }
-
-    pub fn in_place(&self) -> bool {
-        self.alloc.in_place()
     }
 
     pub fn base_txn_id(&self) -> TxnId {
@@ -963,7 +1051,8 @@ impl<'db> WriteTxn<'db> {
         Ok(())
     }
 
-    /// Stage a value: borrow inline (the tree copies it anyway), own the overflow ref.
+    /// Stage a value: borrow inline (the tree copies it anyway), own the
+    /// overflow ref.
     fn stage_value<'v>(&mut self, value: &'v [u8]) -> (ValueType, Cow<'v, [u8]>) {
         if value.len() <= MAX_INLINE_VALUE_SIZE {
             return (ValueType::Inline, Cow::Borrowed(value));
@@ -1078,12 +1167,18 @@ impl<'db> WriteTxn<'db> {
         Ok(())
     }
 
-    fn finalize_catalog(&mut self) -> Result<PageId> {
+    /// Returns the new catalog root and the hashes whose descriptors were
+    /// written this commit; the manager marks every other moved/stale table's
+    /// slot entry SLOT_ENTRY_STALE so it survives serialize.
+    fn finalize_catalog(&mut self) -> Result<(PageId, FxHashSet<u32>)> {
+        use citadel_io::file_manager::table_name_hash;
+
         if !self.catalog_dirty && self.named_trees.is_empty() {
-            return Ok(self.old_slot.catalog_root);
+            return Ok((self.old_slot.catalog_root, FxHashSet::default()));
         }
 
-        // SyncMode::Off: skip catalog update if only roots changed (cached in slot)
+        // SyncMode::Off: skip catalog update if only roots changed (cached in
+        // slot)
         if !self.catalog_dirty && self.manager.sync_mode() == citadel_core::types::SyncMode::Off {
             let needs_catalog = self.named_trees.iter().any(|(name, tree)| {
                 match self.loaded_tree_meta.get(name.as_slice()) {
@@ -1091,8 +1186,12 @@ impl<'db> WriteTxn<'db> {
                     None => true, // new table
                 }
             });
-            if !needs_catalog {
-                return Ok(self.old_slot.catalog_root);
+            // The skip makes the slot the moved roots' only record, so it is
+            // legal only when the touched trees plus carried stale entries fit
+            // the V1 capacity (else a dropped entry's stale descriptor wins on
+            // reopen).
+            if !needs_catalog && self.slot_entries_fit() {
+                return Ok((self.old_slot.catalog_root, FxHashSet::default()));
             }
         }
 
@@ -1118,7 +1217,7 @@ impl<'db> WriteTxn<'db> {
             .collect();
 
         if structural_entries.is_empty() {
-            return Ok(self.catalog.as_ref().unwrap().root);
+            return Ok((self.catalog.as_ref().unwrap().root, FxHashSet::default()));
         }
 
         for (name, value) in &structural_entries {
@@ -1136,7 +1235,32 @@ impl<'db> WriteTxn<'db> {
             )?;
         }
 
-        Ok(self.catalog.as_ref().unwrap().root)
+        let refreshed = structural_entries
+            .iter()
+            .map(|(name, _)| table_name_hash(name))
+            .collect();
+        Ok((self.catalog.as_ref().unwrap().root, refreshed))
+    }
+
+    /// Whether the Off-mode catalog skip is legal: touched trees plus carried
+    /// stale entries must fit the V1 capacity (stale entries are never dropped
+    /// by serialize). Counting all touched trees as stale over-approximates,
+    /// so it can only refuse a skip early, never admit an unsafe one.
+    fn slot_entries_fit(&self) -> bool {
+        use citadel_io::file_manager::table_name_hash;
+        let known: rustc_hash::FxHashSet<u32> = self
+            .named_trees
+            .keys()
+            .chain(self.loaded_tree_meta.keys())
+            .map(|name| table_name_hash(name))
+            .collect();
+        let carried_stale = self
+            .old_slot
+            .named_table_entries
+            .iter()
+            .filter(|&&(hash, ..)| !known.contains(&hash) && self.old_slot.entry_is_stale(hash))
+            .count();
+        self.named_trees.len() + carried_stale <= citadel_core::SLOT_NAMED_MAX_ENTRIES_V1
     }
 
     fn free_tree_pages(&mut self, root: PageId) -> Result<()> {

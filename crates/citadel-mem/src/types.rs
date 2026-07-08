@@ -5,7 +5,8 @@ use serde_json::Value as Json;
 /// Stable identifier for a memory atom (globally unique across per-dim tables).
 pub type AtomId = i64;
 
-/// Input to [`remember`](crate::MemoryEngine::remember): `text` is embedded, `payload` stored as JSONB.
+/// Input to [`remember`](crate::MemoryEngine::remember): `text` is embedded,
+/// `payload` stored as JSONB.
 #[derive(Debug, Clone)]
 pub struct AtomInput {
     pub kind: String,
@@ -13,8 +14,9 @@ pub struct AtomInput {
     pub payload: Json,
     pub score: f32,
     pub confidence: f32,
-    /// Event time (micros): when the remembered fact happened, vs the ingest wall
-    /// clock used when `None`. Drives the recency fusion signal and `Stale` eviction.
+    /// Event time (micros): when the remembered fact happened, vs the ingest
+    /// wall clock used when `None`. Drives the recency fusion signal and
+    /// `Stale` eviction.
     pub created_at: Option<i64>,
     pub expires_at: Option<i64>,
     /// Protected from eviction (except `PurgeRegion`).
@@ -66,7 +68,8 @@ impl AtomInput {
     }
 }
 
-/// Recall fusion weights (need not sum to 1); each signal is normalized to [0,1] first.
+/// Recall fusion weights (need not sum to 1); each signal is normalized to
+/// [0,1] first.
 #[derive(Debug, Clone, Copy)]
 pub struct FusionWeights {
     pub semantic: f32,
@@ -102,10 +105,12 @@ impl FusionWeights {
 /// How a reranker combines with linear fusion.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RerankStrategy {
-    /// Cross-encoder logit replaces the fusion score (discards keyword/recency).
+    /// Cross-encoder logit replaces the fusion score (discards
+    /// keyword/recency).
     Replace,
-    /// Reciprocal Rank Fusion of cross-encoder and fusion ranks; `k` is the damping
-    /// constant (60 is the literature standard; lower trusts top ranks more).
+    /// Reciprocal Rank Fusion of cross-encoder and fusion ranks; `k` is the
+    /// damping constant (60 is the literature standard; lower trusts top ranks
+    /// more).
     Rrf { k: f32 },
 }
 
@@ -115,7 +120,8 @@ impl Default for RerankStrategy {
     }
 }
 
-/// Relationship between two atoms; `DependsOn`/`Supersedes` are acyclic, the rest may cycle.
+/// Relationship between two atoms; `DependsOn`/`Supersedes` acyclic, rest
+/// cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeKind {
     Causes,
@@ -156,7 +162,7 @@ pub struct Edge {
     pub evidence_ref: Option<Json>,
 }
 
-/// Recall graph expansion: from each seed, walk `memory_edges` up to `depth` hops over `kinds`.
+/// Recall graph expansion: walk `memory_edges` up to `depth` hops over `kinds`.
 #[derive(Debug, Clone)]
 pub struct GraphExpand {
     pub depth: usize,
@@ -169,7 +175,8 @@ impl GraphExpand {
     }
 }
 
-/// A recall request: provide `text` (embedded + keyword-ranked) or an `embedding`.
+/// A recall request: provide `text` (embedded + keyword-ranked) or an
+/// `embedding`.
 #[derive(Debug, Clone)]
 pub struct RecallQuery {
     pub text: Option<String>,
@@ -178,8 +185,9 @@ pub struct RecallQuery {
     pub payload_filter: Option<Json>,
     pub k: usize,
     pub weights: FusionWeights,
-    /// Reference clock (micros) for the recency signal; `None` = wall clock. Lets a
-    /// caller rank event-time atoms as of a past moment. Does not filter expiry.
+    /// Reference clock (micros) for the recency signal; `None` = wall clock.
+    /// Lets a caller rank event-time atoms as of a past moment. Does not filter
+    /// expiry.
     pub as_of_micros: Option<i64>,
     pub graph_expand: Option<GraphExpand>,
 }
@@ -236,8 +244,9 @@ impl RecallQuery {
         self
     }
 
-    /// Attach the query text to a [`by_embedding`](Self::by_embedding) query so the
-    /// keyword signal and cross-encoder reranker still run, without re-embedding.
+    /// Attach the query text to a [`by_embedding`](Self::by_embedding) query so
+    /// the keyword signal and cross-encoder reranker still run, without
+    /// re-embedding.
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
         self.text = Some(text.into());
         self
@@ -260,13 +269,21 @@ pub struct AtomHit {
     pub immutable: bool,
 }
 
-/// Selective-forgetting policy; `immutable` atoms survive all but `PurgeRegion`.
+/// Selective-forgetting policy; `immutable` survives all but `PurgeRegion`.
+///
+/// `Stale`/`Lru` recency combines the persisted insert-time floor with
+/// in-process read tracking (per engine); reads stay write-free, so access
+/// history is per-engine-lifetime, not durable across reopens.
 #[derive(Debug, Clone)]
 pub enum EvictionPolicy {
-    /// Never-accessed atoms older than `older_than_micros`.
+    /// Atoms older than `older_than_micros` that no read has touched.
     Stale { older_than_micros: i64 },
-    /// Drop least-recently-accessed atoms, keeping the top `keep_fraction` (0.0..=1.0).
+    /// Drop least-recently-accessed atoms, keeping the top `keep_fraction`
+    /// (0.0..=1.0).
     Lru { keep_fraction: f32 },
+    /// Atoms whose `expires_at` TTL has lapsed (physical delete; encrypted
+    /// regions get per-atom cryptographic erasure like every eviction).
+    Expired,
     /// Atoms below both score and confidence thresholds.
     LowScore {
         score_threshold: f32,
@@ -283,7 +300,7 @@ pub struct EvictionReport {
     pub removed: u64,
 }
 
-/// One per-atom key slot proven destroyed (Live -> Tombstone at `new_gen` = `old_gen` + 1).
+/// One key slot proven destroyed (Live -> Tombstone, `new_gen` = `old_gen`+1).
 #[derive(Debug, Clone)]
 pub struct SlotErasure {
     pub slot: u32,
@@ -300,14 +317,15 @@ pub const ERASURE_SCOPE_CAVEAT: &str =
      retain stale physical copies, and any external backup, replica, or escrowed key is out of \
      scope. Plaintext regions are logically deleted only, not cryptographically erased.";
 
-/// Result of [`forget_atoms`](crate::MemoryEngine::forget_atoms). On a plaintext region
-/// `cryptographic_erasure` is false (logical delete only).
+/// Result of [`forget_atoms`](crate::MemoryEngine::forget_atoms). On a
+/// plaintext region `cryptographic_erasure` is false (logical delete only).
 #[derive(Debug, Clone)]
 pub struct ErasureReceipt {
     /// True only on an encrypted region (else a logical row delete).
     pub cryptographic_erasure: bool,
     pub rows_deleted: u64,
-    /// Keys destroyed (`== slots_erased.len()`); may be fewer than ids requested.
+    /// Keys destroyed (`== slots_erased.len()`); may be fewer than ids
+    /// requested.
     pub erased_count: u64,
     pub slots_erased: Vec<SlotErasure>,
     /// Ids skipped as immutable (when `force` is false).
@@ -323,20 +341,21 @@ pub struct ErasureReceipt {
     pub scope_caveat: &'static str,
 }
 
-/// One atom's integrity verdict from [`verify_atoms`](crate::MemoryEngine::verify_atoms).
+/// One atom's integrity verdict from
+/// [`verify_atoms`](crate::MemoryEngine::verify_atoms).
 #[derive(Debug, Clone)]
 pub struct AtomAttestation {
     pub atom_id: AtomId,
     pub verdict: AttestVerdict,
-    /// Verdict came from an HMAC bound to the atom id (proves origin, not just integrity);
-    /// false for key-erased/missing/plaintext.
+    /// Verdict came from an HMAC bound to the atom id (proves origin, not just
+    /// integrity); false for key-erased/missing/plaintext.
     pub aad_bound: bool,
     /// Key slot and generation (encrypted regions only).
     pub key_slot: Option<u32>,
     pub key_gen: Option<u64>,
 }
 
-/// `Authentic` proves byte-integrity and origin-binding, NOT that the content is benign.
+/// `Authentic` proves byte-integrity and origin, NOT that content is benign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttestVerdict {
     /// Sealed bytes re-authenticated and bound to this id.

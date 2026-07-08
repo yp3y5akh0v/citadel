@@ -13,11 +13,23 @@ connected by a typed edge graph, and forgotten by **destroying keys** (cryptogra
 
 ## Install
 
-Run it with no install:
+Run it with no install (keyword-only recall - works immediately, no downloads):
 
 ```sh
 uvx citadeldb-mcp --db memory.cdl
 ```
+
+**For the best recall (recommended - this is the benchmark config):** pull the semantic
+embedder and the cross-encoder reranker once, then enable both:
+
+```sh
+uvx citadeldb-mcp pull e5-large
+uvx citadeldb-mcp pull ms-marco-minilm
+uvx citadeldb-mcp --db memory.cdl --embedder e5-large --reranker ms-marco-minilm
+```
+
+`e5-large` + `ms-marco-minilm` is the highest-recall setup and the exact config behind the
+memory benchmark numbers. Models are never downloaded automatically.
 
 Or install the command with `pip install citadeldb-mcp` or `cargo install citadeldb-mcp`,
 then wire it into Claude Desktop (`claude_desktop_config.json`):
@@ -27,15 +39,12 @@ then wire it into Claude Desktop (`claude_desktop_config.json`):
   "mcpServers": {
     "citadel": {
       "command": "citadeldb-mcp",
-      "args": ["--db", "memory.cdl", "--embedder", "bge-large"],
+      "args": ["--db", "memory.cdl", "--embedder", "e5-large", "--reranker", "ms-marco-minilm"],
       "env": { "CITADEL_KEY": "your-passphrase" }
     }
   }
 }
 ```
-
-Omit `--embedder` for keyword-only recall, or run `citadeldb-mcp pull bge-large` first for
-semantic recall (models are never downloaded automatically; see below).
 
 Tools (over a synchronous, hand-rolled JSON-RPC 2.0 stdio transport):
 
@@ -55,25 +64,15 @@ Tools (over a synchronous, hand-rolled JSON-RPC 2.0 stdio transport):
 The `citadeldb-mcp` binary reads the passphrase from `CITADEL_KEY` and serves one region
 (encrypted by default); only protocol messages go to stdout, diagnostics to stderr.
 
-Recall is keyword-only (a mock embedder) until you opt into a real semantic model. The
-(CPU) Candle embedder is compiled into the default build, but models are fetched only on
-explicit request, never automatically:
+Recall is keyword-only (a mock embedder) until you enable a semantic model. The (CPU) Candle
+embedder is compiled into the default build; models are fetched only on explicit `pull`,
+never automatically. `e5-large` + the `ms-marco-minilm` reranker (shown above) is the
+recommended, highest-recall setup.
 
-```sh
-citadeldb-mcp pull bge-large                       # one-time download to ~/.citadel/models
-citadeldb-mcp --db memory.cdl --embedder bge-large
-```
-
-Pull names: `bge-small`, `bge-base`, `bge-large`, `minilm`, `e5-large`. Or point `--model-dir`
-at a local model directory for a fully offline setup, and build with `--features cuda-embed` to
-run the model on an NVIDIA GPU.
-
-For better recall ordering, add a cross-encoder reranker (off by default, also explicit):
-
-```sh
-citadeldb-mcp pull ms-marco-minilm
-citadeldb-mcp --db memory.cdl --embedder bge-large --reranker ms-marco-minilm
-```
+Embedder pull names: `e5-large` (recommended), `e5-large-v2`, `bge-small`, `bge-base`,
+`bge-large`, `minilm`. Reranker: `ms-marco-minilm`. Or point `--model-dir` at a
+local model directory for a fully offline setup, and build with `--features cuda-embed` to run
+on an NVIDIA GPU.
 
 This crate is part of the Citadel workspace.
 

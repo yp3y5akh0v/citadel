@@ -71,7 +71,7 @@ fn plaintext_region_persists_and_reloads_with_identical_recall() {
     assert_eq!(info.n, 130, "all atoms of every kind are indexed");
     drop(eng);
 
-    // Cold attach: recall identical, served by the LOADED segment.
+    // Cold attach: recall identical, served by the loaded segment.
     let eng = open_engine(dir.path(), false);
     eng.create_region("corpus", embedder()).unwrap();
     assert!(
@@ -140,7 +140,7 @@ fn sealed_region_persists_and_reloads_with_identical_recall() {
     assert_eq!(info.n, 90);
     drop(eng);
 
-    // Cold attach: the first sealed recall LOADS the segment (no PRISM build)
+    // Cold attach: the first sealed recall loads the segment (no PRISM build)
     // and answers identically; the recall cache (text/payload) is rebuilt from
     // the same decrypt pass.
     let eng = open_engine(dir.path(), false);
@@ -335,7 +335,7 @@ fn sealed_second_persist_replaces_and_serves_the_new_segment() {
 #[test]
 fn sealed_chunk_loss_heals_and_next_persist_recovers() {
     // Crash-window shape: chunks gone (e.g. swept by the SQL purge) while the
-    // key slot + meta survive. The load must HEAL (retire the orphan key,
+    // key slot + meta survive. The load must heal (retire the orphan key,
     // carry the reason) and a later persist must work from scratch.
     let dir = tempfile::tempdir().unwrap();
     let db = DatabaseBuilder::new(dir.path().join("m.db"))
@@ -353,7 +353,7 @@ fn sealed_chunk_loss_heals_and_next_persist_recovers() {
     }
     eng.persist_ann_index("vault").unwrap();
 
-    // Drop ONLY the chunk tree via raw KV, leaving meta + key slot live.
+    // Drop only the chunk tree via raw KV, leaving meta + key slot live.
     {
         let mut wtx = db.begin_write().unwrap();
         wtx.drop_table(b"__annseg_r1__memory_atoms_d16_cosine_enc")
@@ -386,7 +386,7 @@ fn sealed_chunk_loss_heals_and_next_persist_recovers() {
 fn sealed_resurrected_ciphertext_is_useless_after_retirement() {
     // Crypto-erasure of the segment itself: save the ciphertext chunks AND the
     // meta rows, forget an atom (which retires = tombstones the segment key),
-    // resurrect both - the segment must be REFUSED (its key is dead), the
+    // resurrect both - the segment must be refused (its key is dead), the
     // forgotten atom must never resurface.
     let dir = tempfile::tempdir().unwrap();
     let db = DatabaseBuilder::new(dir.path().join("m.db"))
@@ -465,14 +465,32 @@ fn sealed_resurrected_ciphertext_is_useless_after_retirement() {
         .map(|h| h.id)
         .collect();
     assert!(!hits.contains(&victim), "forgotten atom stays forgotten");
+    // Open-time reconcile completes the retire against the resurrection: the
+    // restored chunks and meta are physically destroyed (the segment key is
+    // dead), so recall rebuilds cleanly from live atoms rather than merely
+    // refusing the ciphertext.
+    let conn = citadel_sql::Connection::open(&db).unwrap();
+    let leftover = match conn
+        .execute("SELECT key FROM memory_meta WHERE key LIKE 'annseg_%'")
+        .unwrap()
+    {
+        citadel_sql::ExecutionResult::Query(qr) => qr.rows.len(),
+        _ => panic!(),
+    };
+    assert_eq!(leftover, 0, "resurrected annseg meta is destroyed at open");
+    {
+        let mut rtx = db.begin_read();
+        let mut n = 0usize;
+        // A dropped table scans as absent/empty either way.
+        let _ = rtx.table_scan_from(seg_table, b"", &mut |_k: &[u8], _v: &[u8]| {
+            n += 1;
+            Ok(true)
+        });
+        assert_eq!(n, 0, "resurrected ciphertext chunks are destroyed at open");
+    }
     match eng.ann_cache_status("vault").unwrap() {
-        Some(AnnIndexSource::Built { refusal: Some(r) }) => {
-            assert!(
-                r.contains("slot") || r.contains("unwrap"),
-                "the dead key refuses the resurrected ciphertext: {r}"
-            );
-        }
-        other => panic!("expected a refused resurrection, got {other:?}"),
+        Some(AnnIndexSource::Built { refusal: None }) => {}
+        other => panic!("expected a clean rebuild over live atoms, got {other:?}"),
     }
 }
 
@@ -718,4 +736,37 @@ fn sealed_payload_update_retires_the_segment() {
         ),
         "payload update retires the persisted segment"
     );
+}
+
+/// Dropping an encrypted region retires its persisted segment: no annseg meta
+/// (and no resurrectable residue) survives the drop.
+#[test]
+fn drop_region_retires_persisted_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        DatabaseBuilder::new(dir.path().join("edge.db"))
+            .passphrase(b"pw")
+            .enable_region_keys(true)
+            .argon2_profile(Argon2Profile::Iot)
+            .create()
+            .unwrap(),
+    );
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("v", embedder()).unwrap();
+    for i in 0..5 {
+        eng.remember("v", AtomInput::new("fact", format!("m {i}")))
+            .unwrap();
+    }
+    eng.persist_ann_index("v").unwrap();
+    eng.drop_region("v").unwrap();
+
+    let conn = citadel_sql::Connection::open(&db).unwrap();
+    let leftover = match conn
+        .execute("SELECT key FROM memory_meta WHERE key LIKE 'annseg_%'")
+        .unwrap()
+    {
+        citadel_sql::ExecutionResult::Query(qr) => qr.rows.len(),
+        _ => panic!(),
+    };
+    assert_eq!(leftover, 0, "segment meta dies with its region");
 }

@@ -1,26 +1,29 @@
 use hmac::Hmac;
 use sha2::Sha256;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use citadel_core::types::KdfAlgorithm;
 use citadel_core::{Argon2Profile, ARGON2_SALT_SIZE, KEY_SIZE, PBKDF2_MIN_ITERATIONS};
 
 /// Derive a Master Key from a passphrase using Argon2id.
+///
+/// Returned in a [`Zeroizing`] wrapper so the MK is wiped on drop on every
+/// exit path of the caller.
 pub fn derive_mk_argon2id(
     passphrase: &[u8],
     salt: &[u8; ARGON2_SALT_SIZE],
     m_cost: u32,
     t_cost: u32,
     p_cost: u32,
-) -> citadel_core::Result<[u8; KEY_SIZE]> {
+) -> citadel_core::Result<Zeroizing<[u8; KEY_SIZE]>> {
     let params = argon2::Params::new(m_cost, t_cost, p_cost, Some(KEY_SIZE))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
 
     let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
-    let mut mk = [0u8; KEY_SIZE];
+    let mut mk = Zeroizing::new([0u8; KEY_SIZE]);
     argon2
-        .hash_password_into(passphrase, salt, &mut mk)
+        .hash_password_into(passphrase, salt, &mut *mk)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
 
     Ok(mk)
@@ -31,7 +34,7 @@ pub fn derive_mk_with_profile(
     passphrase: &[u8],
     salt: &[u8; ARGON2_SALT_SIZE],
     profile: Argon2Profile,
-) -> citadel_core::Result<[u8; KEY_SIZE]> {
+) -> citadel_core::Result<Zeroizing<[u8; KEY_SIZE]>> {
     derive_mk_argon2id(
         passphrase,
         salt,
@@ -46,7 +49,7 @@ pub fn derive_mk_pbkdf2(
     passphrase: &[u8],
     salt: &[u8; ARGON2_SALT_SIZE],
     iterations: u32,
-) -> citadel_core::Result<[u8; KEY_SIZE]> {
+) -> citadel_core::Result<Zeroizing<[u8; KEY_SIZE]>> {
     if iterations < PBKDF2_MIN_ITERATIONS {
         return Err(citadel_core::Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -56,8 +59,8 @@ pub fn derive_mk_pbkdf2(
             ),
         )));
     }
-    let mut mk = [0u8; KEY_SIZE];
-    pbkdf2::pbkdf2::<Hmac<Sha256>>(passphrase, salt, iterations, &mut mk)
+    let mut mk = Zeroizing::new([0u8; KEY_SIZE]);
+    pbkdf2::pbkdf2::<Hmac<Sha256>>(passphrase, salt, iterations, &mut *mk)
         .expect("PBKDF2 should not fail with valid parameters");
     Ok(mk)
 }
@@ -65,7 +68,7 @@ pub fn derive_mk_pbkdf2(
 /// Derive a Master Key using the algorithm stored in the key file.
 ///
 /// For Argon2id: `kdf_param1`=m_cost, `kdf_param2`=t_cost, `kdf_param3`=p_cost.
-/// For PBKDF2: `kdf_param1`=iterations, `kdf_param2` and `kdf_param3` are ignored.
+/// For PBKDF2: `kdf_param1`=iterations; `kdf_param2`/`kdf_param3` ignored.
 pub fn derive_mk(
     algorithm: KdfAlgorithm,
     passphrase: &[u8],
@@ -73,7 +76,7 @@ pub fn derive_mk(
     kdf_param1: u32,
     kdf_param2: u32,
     kdf_param3: u32,
-) -> citadel_core::Result<[u8; KEY_SIZE]> {
+) -> citadel_core::Result<Zeroizing<[u8; KEY_SIZE]>> {
     match algorithm {
         KdfAlgorithm::Argon2id => {
             derive_mk_argon2id(passphrase, salt, kdf_param1, kdf_param2, kdf_param3)

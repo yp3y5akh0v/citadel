@@ -25,8 +25,8 @@ impl Drop for DerivedKeys {
 
 /// Derive DEK and MAC_KEY from REK via HKDF-SHA256.
 ///
-/// DEK = HKDF-SHA256(ikm=REK, salt=zeros(32), info="citadel-dek-v1", len=32)
-/// MAC_KEY = HKDF-SHA256(ikm=REK, salt=zeros(32), info="citadel-mac-key-v1", len=32)
+/// DEK = HKDF-SHA256(ikm=REK, salt=zeros(32), info="citadel-dek-v1")
+/// MAC_KEY = HKDF-SHA256(ikm=REK, salt=zeros(32), info="citadel-mac-key-v1")
 pub fn derive_keys_from_rek(rek: &[u8; KEY_SIZE]) -> DerivedKeys {
     let salt = [0u8; 32];
 
@@ -54,7 +54,7 @@ pub fn derive_keys_from_rek(rek: &[u8; KEY_SIZE]) -> DerivedKeys {
 
 /// Derive the key file MAC key from the Master Key.
 ///
-/// mac_from_mk = HKDF-SHA256(ikm=MK, salt=zeros(32), info="citadel-keyfile-mac", len=32)
+/// HKDF-SHA256(ikm=MK, salt=zeros(32), info="citadel-keyfile-mac", len=32).
 pub fn derive_keyfile_mac_key(mk: &[u8; KEY_SIZE]) -> [u8; KEY_SIZE] {
     let salt = [0u8; 32];
     let hk = Hkdf::<Sha256>::new(Some(&salt), mk);
@@ -66,7 +66,7 @@ pub fn derive_keyfile_mac_key(mk: &[u8; KEY_SIZE]) -> [u8; KEY_SIZE] {
 
 /// Derive Master Key from KMS-provided raw bytes via HKDF.
 ///
-/// MK = HKDF-SHA256(ikm=kms_bytes, salt="citadel-v1", info="citadel-master-key", len=32)
+/// HKDF-SHA256(ikm=kms_bytes, salt="citadel-v1", info="citadel-master-key").
 pub fn derive_mk_from_kms(kms_bytes: &[u8]) -> [u8; KEY_SIZE] {
     let hk = Hkdf::<Sha256>::new(Some(HKDF_KMS_SALT), kms_bytes);
     let mut mk = [0u8; KEY_SIZE];
@@ -75,8 +75,9 @@ pub fn derive_mk_from_kms(kms_bytes: &[u8]) -> [u8; KEY_SIZE] {
     mk
 }
 
-/// HMAC key for region key-store integrity / torn-write detection, from the REK.
-/// This authenticates slot bytes; it does NOT protect RCK secrecy (AES-KW does).
+/// HMAC key for region key-store integrity / torn-write detection, from the
+/// REK. This authenticates slot bytes; it does NOT protect RCK secrecy (AES-KW
+/// does).
 pub fn derive_region_store_mac_key(rek: &[u8; KEY_SIZE]) -> [u8; KEY_SIZE] {
     let salt = [0u8; 32];
     let hk = Hkdf::<Sha256>::new(Some(&salt), rek);
@@ -101,18 +102,21 @@ impl Drop for RegionWrapKeys {
 }
 
 impl RegionWrapKeys {
-    /// Wrap a region's random content key (RCK) under the region KEK (AES-256-KW).
-    /// The 40-byte result is the SOLE copy of the RCK; destroying it erases the region.
+    /// Wrap a region's random content key (RCK) under the region KEK
+    /// (AES-256-KW). The 40-byte result is the sole copy of the RCK; destroying
+    /// it erases the region.
     pub fn wrap_region_key(&self, rck: &[u8; KEY_SIZE]) -> [u8; WRAPPED_KEY_SIZE] {
         crate::key_manager::wrap_rek(&self.kek, rck)
     }
 
-    /// Unwrap a region RCK. Fails (AES-KW integrity) if the slot was erased (zeroed).
+    /// Unwrap a region RCK. Fails (AES-KW integrity) if the slot was erased
+    /// (zeroed). The caller owns the returned RCK and is responsible for
+    /// zeroizing it.
     pub fn unwrap_region_key(
         &self,
         wrapped: &[u8; WRAPPED_KEY_SIZE],
     ) -> citadel_core::Result<[u8; KEY_SIZE]> {
-        crate::key_manager::unwrap_rek(&self.kek, wrapped)
+        Ok(*crate::key_manager::unwrap_rek(&self.kek, wrapped)?)
     }
 }
 
@@ -129,8 +133,9 @@ pub fn derive_region_wrap_keys(rek: &[u8; KEY_SIZE]) -> RegionWrapKeys {
     }
 }
 
-/// Content-sealing keys derived from a per-atom RANDOM content key (ACK). Because the
-/// ACK is random, destroying its sole wrapped copy makes these non-recomputable.
+/// Content-sealing keys derived from a per-atom random content key (ACK).
+/// Because the ACK is random, destroying its sole wrapped copy makes these
+/// non-recomputable.
 pub struct SealKeys {
     pub dek: [u8; KEY_SIZE],
     pub mac_key: [u8; MAC_KEY_SIZE],
@@ -143,9 +148,10 @@ impl Drop for SealKeys {
     }
 }
 
-/// dek = HKDF(ack, "citadel-rck-dek-v1"); mac_key = HKDF(ack, "citadel-rck-mac-v1"). The
-/// `-rck-` info strings are a historical wire-format constant (unchanged so existing
-/// sealed data stays readable); the input is the per-atom ACK.
+/// dek = HKDF(ack, "citadel-rck-dek-v1"); mac_key = HKDF(ack,
+/// "citadel-rck-mac-v1"). The `-rck-` info strings are a historical wire-format
+/// constant (unchanged so existing sealed data stays readable); the input is
+/// the per-atom ACK.
 pub fn derive_seal_keys(ack: &[u8; KEY_SIZE]) -> SealKeys {
     let salt = [0u8; 32];
 
@@ -175,22 +181,26 @@ impl Drop for AtomWrapKey {
 }
 
 impl AtomWrapKey {
-    /// Wrap an atom's random content key (ACK) under the region atom KEK (AES-256-KW).
-    /// The 40-byte result is the SOLE copy of the ACK; destroying it erases that atom.
+    /// Wrap an atom's random content key (ACK) under the region atom KEK
+    /// (AES-256-KW). The 40-byte result is the sole copy of the ACK; destroying
+    /// it erases that atom.
     pub fn wrap_atom_key(&self, ack: &[u8; KEY_SIZE]) -> [u8; WRAPPED_KEY_SIZE] {
         crate::key_manager::wrap_rek(&self.kek, ack)
     }
 
-    /// Unwrap an atom ACK. Fails (AES-KW integrity) if the slot was erased (zeroed).
+    /// Unwrap an atom ACK. Fails (AES-KW integrity) if the slot was erased
+    /// (zeroed). The caller owns the returned ACK and is responsible for
+    /// zeroizing it.
     pub fn unwrap_atom_key(
         &self,
         wrapped: &[u8; WRAPPED_KEY_SIZE],
     ) -> citadel_core::Result<[u8; KEY_SIZE]> {
-        crate::key_manager::unwrap_rek(&self.kek, wrapped)
+        Ok(*crate::key_manager::unwrap_rek(&self.kek, wrapped)?)
     }
 }
 
-/// Derive the per-region atom-wrap KEK from the region's random content key (RCK).
+/// Derive the per-region atom-wrap KEK from the region's random content key
+/// (RCK).
 pub fn derive_atom_wrap_key(rck: &[u8; KEY_SIZE]) -> AtomWrapKey {
     let salt = [0u8; 32];
     let hk = Hkdf::<Sha256>::new(Some(&salt), rck);

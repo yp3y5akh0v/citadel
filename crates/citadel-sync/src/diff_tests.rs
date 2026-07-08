@@ -68,3 +68,51 @@ fn page_digest_branch_has_children() {
     };
     assert_eq!(d.children.len(), 3);
 }
+
+struct SingleLeafReader {
+    hash: MerkleHash,
+    entry: DiffEntry,
+}
+
+impl TreeReader for SingleLeafReader {
+    fn root_info(&self) -> Result<(PageId, MerkleHash)> {
+        Ok((PageId(0), self.hash))
+    }
+
+    fn page_digest(&self, page_id: PageId) -> Result<PageDigest> {
+        Ok(PageDigest {
+            page_id,
+            page_type: PageType::Leaf,
+            merkle_hash: self.hash,
+            children: vec![],
+        })
+    }
+
+    fn leaf_entries(&self, _page_id: PageId) -> Result<Vec<DiffEntry>> {
+        Ok(vec![self.entry.clone()])
+    }
+}
+
+/// Regression: SyncMode::Off commits zero page hashes instead of recomputing
+/// them; two matching all-zero hashes mean "unknown", not "identical", so the
+/// diff must traverse and surface the divergent entries.
+#[test]
+fn zero_hashes_never_prune_subtrees() {
+    let entry = |val: &[u8]| DiffEntry {
+        key: b"k".to_vec(),
+        value: val.to_vec(),
+        val_type: 0,
+    };
+    let source = SingleLeafReader {
+        hash: [0u8; MERKLE_HASH_SIZE],
+        entry: entry(b"v2"),
+    };
+    let target = SingleLeafReader {
+        hash: [0u8; MERKLE_HASH_SIZE],
+        entry: entry(b"v1"),
+    };
+
+    let result = merkle_diff(&source, &target).unwrap();
+    assert_eq!(result.subtrees_skipped, 0);
+    assert_eq!(result.entries, vec![entry(b"v2")]);
+}

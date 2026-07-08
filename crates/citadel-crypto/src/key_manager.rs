@@ -2,7 +2,7 @@ use aes_kw::Kek;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use citadel_core::types::{CipherId, KdfAlgorithm};
 use citadel_core::{
@@ -140,13 +140,16 @@ pub fn wrap_rek(mk: &[u8; KEY_SIZE], rek: &[u8; KEY_SIZE]) -> [u8; WRAPPED_KEY_S
 }
 
 /// Unwrap a 40-byte wrapped REK using AES-256-KW. Produces 32 bytes.
+///
+/// Returned in a [`Zeroizing`] wrapper so the REK is wiped on drop on every
+/// exit path of the caller.
 pub fn unwrap_rek(
     mk: &[u8; KEY_SIZE],
     wrapped: &[u8; WRAPPED_KEY_SIZE],
-) -> citadel_core::Result<[u8; KEY_SIZE]> {
+) -> citadel_core::Result<Zeroizing<[u8; KEY_SIZE]>> {
     let kek = Kek::from(*mk);
-    let mut rek = [0u8; KEY_SIZE];
-    kek.unwrap(wrapped, &mut rek)
+    let mut rek = Zeroizing::new([0u8; KEY_SIZE]);
+    kek.unwrap(wrapped, &mut *rek)
         .map_err(|_| citadel_core::Error::KeyUnwrapFailed)?;
     Ok(rek)
 }
@@ -176,10 +179,10 @@ pub fn create_key_file(
     Ok((kf, keys))
 }
 
-/// Like [`create_key_file`] but also returns the region wrap keys used by citadel-mem
-/// for per-region cryptographic erasure. Derived from the REK before it is zeroized;
-/// callers that do not enable region keys use [`create_key_file`] so no region key
-/// material is held.
+/// Like [`create_key_file`] but also returns the region wrap keys used by
+/// citadel-mem for per-region cryptographic erasure. Derived from the REK
+/// before it is zeroized; callers that do not enable region keys use
+/// [`create_key_file`] so no region key material is held.
 pub fn create_key_file_with_region_keys(
     passphrase: &[u8],
     file_id: u64,
@@ -192,8 +195,8 @@ pub fn create_key_file_with_region_keys(
     use rand::RngCore;
 
     let salt = crate::kdf::generate_salt();
-    let mut rek = [0u8; KEY_SIZE];
-    rand::thread_rng().fill_bytes(&mut rek);
+    let mut rek = Zeroizing::new([0u8; KEY_SIZE]);
+    rand::thread_rng().fill_bytes(&mut *rek);
 
     let mk = derive_mk(kdf_algorithm, passphrase, &salt, m_cost, t_cost, p_cost)?;
 
@@ -219,8 +222,6 @@ pub fn create_key_file_with_region_keys(
         file_mac: [0u8; MAC_SIZE],
     };
     kf.update_mac(&mk);
-
-    rek.zeroize();
 
     Ok((kf, keys, region))
 }
@@ -260,12 +261,10 @@ pub fn open_key_file_with_region_keys(
 
     kf.verify_mac(&mk)?;
 
-    let mut rek =
-        unwrap_rek(&mk, &kf.wrapped_rek).map_err(|_| citadel_core::Error::BadPassphrase)?;
+    let rek = unwrap_rek(&mk, &kf.wrapped_rek).map_err(|_| citadel_core::Error::BadPassphrase)?;
 
     let keys = derive_keys_from_rek(&rek);
     let region = derive_region_wrap_keys(&rek);
-    rek.zeroize();
 
     Ok((kf, keys, region))
 }

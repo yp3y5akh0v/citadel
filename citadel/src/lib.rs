@@ -10,7 +10,7 @@ pub mod audit;
 // Public API
 pub use builder::DatabaseBuilder;
 pub use citadel_sync::SyncKey;
-pub use database::{Database, DbStats, SharedCache, SqlCacheHandle, SyncOutcome};
+pub use database::{Database, DbStats, SharedCache, SqlCacheHandle, SyncOutcome, UpgradeReport};
 pub use key_codec::{SlotRecord, SlotState};
 
 #[cfg(feature = "audit-log")]

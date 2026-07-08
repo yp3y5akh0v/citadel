@@ -6,36 +6,57 @@ End-to-end procedure for the LongMemEval benchmark. Path/credentials are placeho
 ## Prerequisites
 - An Ampere+ NVIDIA GPU for the fast path (the `cuda-embed` feature enables TF32 +
   length-bucketed embedding). CPU works via `candle-embed` but is much slower.
-- A local embedder model dir, e.g. `bge-large-en-v1.5` (`<EMBEDDER_DIR>`).
-- The LongMemEval oracle dataset `longmemeval_oracle.json` (`<DATASET>`).
+- A local embedder model dir, e.g. `e5-large` (`<EMBEDDER_DIR>`).
+- The LongMemEval dataset (`<DATASET>`): `longmemeval_s_cleaned.json` for the full-haystack
+  headline run, or `longmemeval_oracle.json` for the reader-ceiling.
 - The official LongMemEval repo cloned (`<LME_REPO>`) for scoring, and a Python venv
   with `openai backoff tqdm numpy` (`<PY>` = its python).
 - An OpenAI API key for the QA run + scoring (the diagnostic below needs neither).
 
 ## Build
-GPU: `cargo run -q -p citadeldb-membench --features openai,cuda-embed --bin longmemeval -- <DATASET>`
+Use `--release` for full runs (debug is fine for a small `CITADEL_LONGMEMEVAL_MAX_SAMPLES` smoke).
+GPU: `cargo run -q --release -p citadeldb-membench --features openai,cuda-embed --bin longmemeval -- <DATASET>`
 CPU: swap `cuda-embed` -> `candle-embed`.
 
 ## Env knobs (see the bin header for the full list)
 - `OPENAI_API_KEY` - load inline; never commit/echo.
 - `PYO3_PYTHON` - the real python.exe so cargo can build the pyo3 crates (clippy/build).
-- `CITADEL_EMBEDDER_DIR=<EMBEDDER_DIR>` - the embedder model dir (any bge/e5/granite dir).
-- `CITADEL_LONGMEMEVAL_EMBEDDER` - bge-large|bge-base|bge-small|e5-large|granite-r2 (default bge-small).
+- `CITADEL_EMBEDDER_DIR=<EMBEDDER_DIR>` - the embedder model dir (any e5/bge/granite dir).
+- `CITADEL_LONGMEMEVAL_EMBEDDER` - e5-large|e5-large-v2|bge-large|bge-base|bge-small|granite-r2 (default e5-large).
+- `CITADEL_RERANKER_DIR=<RERANKER_DIR>` - cross-encoder reranker dir (ms-marco-MiniLM-L-6-v2); the best-recall config, matching LoCoMo. Omit for embedder-only.
+- `CITADEL_LONGMEMEVAL_RERANK_STRATEGY` - replace|rrf (default rrf).
 - `CITADEL_LONGMEMEVAL_OUT` - prediction JSONL path.
 - `CITADEL_LONGMEMEVAL_READER_CONCURRENCY` - reader calls in flight.
 - `CITADEL_LONGMEMEVAL_READER_TPM` - per-model tokens/min (default is model-aware: gpt-4o-mini -> 2M, else 200k).
 - `CITADEL_LONGMEMEVAL_MAX_SAMPLES=N` - cap to the first N questions.
 - `CITADEL_LONGMEMEVAL_ENCRYPTED=true` - seal atoms per-region key (default plaintext).
+- `CITADEL_LONGMEMEVAL_DB_PATH=<PATH>.cdl` - persist the encrypted DB; a later run reopens + reuses it (skip the ~2h ingest). Keep `ENCRYPTED` identical between build and reuse.
 - `CITADEL_LONGMEMEVAL_RETRIEVAL_DIAG=1` - token-free recall@k diagnostic (no reader/key).
 - `CITADEL_MEMBENCH_MAX_TOKENS` - reader output cap OVERRIDE (LongMemEval defaults to 800 = CoT gen_length).
 
 ## QA run (the score)
 Set `OPENAI_API_KEY`, `PYO3_PYTHON`, `CITADEL_EMBEDDER_DIR=<EMBEDDER_DIR>`,
-`CITADEL_LONGMEMEVAL_EMBEDDER=bge-large`, `CITADEL_LONGMEMEVAL_OUT=<OUT>`,
-`CITADEL_LONGMEMEVAL_READER_CONCURRENCY=8`, then run the build command above.
+`CITADEL_LONGMEMEVAL_EMBEDDER=e5-large`, `CITADEL_RERANKER_DIR=<RERANKER_DIR>` (best recall),
+`CITADEL_LONGMEMEVAL_OUT=<OUT>`, `CITADEL_LONGMEMEVAL_READER_CONCURRENCY=8`, then run the build
+command above. For the full-haystack `longmemeval_s_cleaned.json` run, add
+`CITADEL_LONGMEMEVAL_READER_MODEL=gpt-4o`.
 Phase 1 ingests one region per question (`ingested N/500`); phase 2 runs the reader
 (`answered N/500`, where OpenAI charges happen) and writes the JSONL at the end.
 Reader defaults: gpt-4o-mini, the official CoT prompt, max_tokens 800.
+
+## Reuse a persisted DB (skip the ~2h ingest)
+Full-haystack ingest dominates wall-clock (~2h for `longmemeval_s_cleaned.json`; the work
+scales with turn count, ~493 turns/region). Set `CITADEL_LONGMEMEVAL_DB_PATH=<PATH>.cdl` to
+persist the encrypted DB and reuse it:
+- first run (path missing): builds + ingests once, then persists (reusable next run);
+- later runs (path present): reopen + re-attach every region and SKIP ingest (phase 1 prints
+  `re-attach`), recalling from the stored vectors (the ANN segment rebuilds on first recall).
+Only the reader re-runs, so prompt / `TOP_K` / reader sweeps drop to seconds. The retrieval
+diagnostic honours the same reuse. `ENCRYPTED` must match between the build run and every
+reuse run. The cache is the `.cdl` PLUS its sidecars - `.cdl.citadel-keys`, `.citadel-regions`,
+`.citadel-atomkeys`, `.citadel-audit` - copy or delete them as a set (a missing `.citadel-regions`
+fails re-attach with `RegionForgotten`). LoCoMo has the same `CITADEL_LOCOMO_DB_PATH` for its
+scored run (its token-free modes need a fresh DB).
 
 ## Score (official; Windows gotcha)
 The official scripts `open()` with the platform default encoding, which on Windows is
@@ -65,9 +86,3 @@ cargo clippy --workspace --all-targets -- -D warnings              # needs PYO3_
 cargo clippy -p citadeldb-membench --features openai,cuda-embed --all-targets -- -D warnings
 cargo test -p citadeldb-membench
 ```
-
-## Caveats to report with any number
-Oracle = retrieval-complete (a reader-ceiling upper bound, not end-to-end); always NAME
-the reader model (headline figures are reader-dependent). Paper references (arxiv
-2410.10813): gpt-4o oracle 0.870, gpt-4o-mini oracle 0.744. The full-haystack split is
-the run that stresses citadel's retrieval.

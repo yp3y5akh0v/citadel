@@ -158,3 +158,107 @@ fn graph_expand_respects_atom_kind_filter() {
         "graph-expanded audit atom must honor the query kind filter"
     );
 }
+
+/// A payload-filtered recall must stay filtered through graph expansion: an
+/// expanded neighbor whose payload fails the filter is excluded, exactly like a
+/// direct seed.
+#[test]
+fn graph_expansion_honours_payload_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    let seed = eng
+        .remember(
+            "r",
+            AtomInput::new("fact", "public seed note")
+                .with_payload(serde_json::json!({"visibility": "public"})),
+        )
+        .unwrap();
+    let public_nb = eng
+        .remember(
+            "r",
+            AtomInput::new("fact", "public neighbor")
+                .with_payload(serde_json::json!({"visibility": "public"})),
+        )
+        .unwrap();
+    let private_nb = eng
+        .remember(
+            "r",
+            AtomInput::new("fact", "private neighbor")
+                .with_payload(serde_json::json!({"visibility": "private"})),
+        )
+        .unwrap();
+    eng.link(seed, public_nb, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
+    eng.link(seed, private_nb, EdgeKind::DerivedFrom, 1.0)
+        .unwrap();
+
+    let hits = eng
+        .recall(
+            "r",
+            RecallQuery::by_text("public seed note", 1)
+                .with_payload_filter(serde_json::json!({"visibility": "public"}))
+                .with_graph_expand(GraphExpand::new(1, vec![EdgeKind::DerivedFrom])),
+        )
+        .unwrap();
+    let ids: Vec<i64> = hits.iter().map(|h| h.id).collect();
+    assert!(ids.contains(&seed), "filtered seed present");
+    assert!(ids.contains(&public_nb), "matching neighbor expanded");
+    assert!(
+        !ids.contains(&private_nb),
+        "expansion must not bypass the payload filter"
+    );
+}
+
+/// Sealed graph expansion honours the payload filter exactly like plaintext.
+#[test]
+fn sealed_graph_expansion_honours_payload_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        DatabaseBuilder::new(dir.path().join("edge.db"))
+            .passphrase(b"pw")
+            .enable_region_keys(true)
+            .argon2_profile(Argon2Profile::Iot)
+            .create()
+            .unwrap(),
+    );
+    let eng = MemoryEngine::open(db).unwrap();
+    eng.create_encrypted_region("v", Arc::new(MockEmbedder::new(64)))
+        .unwrap();
+    let seed = eng
+        .remember(
+            "v",
+            AtomInput::new("fact", "public seed")
+                .with_payload(serde_json::json!({"vis": "public"})),
+        )
+        .unwrap();
+    let pub_nb = eng
+        .remember(
+            "v",
+            AtomInput::new("fact", "public friend")
+                .with_payload(serde_json::json!({"vis": "public"})),
+        )
+        .unwrap();
+    let priv_nb = eng
+        .remember(
+            "v",
+            AtomInput::new("fact", "private friend")
+                .with_payload(serde_json::json!({"vis": "private"})),
+        )
+        .unwrap();
+    eng.link(seed, pub_nb, EdgeKind::DerivedFrom, 1.0).unwrap();
+    eng.link(seed, priv_nb, EdgeKind::DerivedFrom, 1.0).unwrap();
+
+    let ids: Vec<i64> = eng
+        .recall(
+            "v",
+            RecallQuery::by_text("public seed", 1)
+                .with_payload_filter(serde_json::json!({"vis": "public"}))
+                .with_graph_expand(GraphExpand::new(1, vec![EdgeKind::DerivedFrom])),
+        )
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    assert!(ids.contains(&pub_nb));
+    assert!(!ids.contains(&priv_nb), "sealed expansion filters payloads");
+}

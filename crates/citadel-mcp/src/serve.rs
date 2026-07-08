@@ -1,4 +1,5 @@
-//! Serve a citadel memory region over MCP: open db, attach region, run stdio loop.
+//! Serve a citadel memory region over MCP: open db, attach region, run stdio
+//! loop.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -37,8 +38,9 @@ impl Default for ServeConfig {
     }
 }
 
-/// Open (or create) the database, attach the region, and run the MCP stdio loop.
-/// The passphrase is read from `CITADEL_KEY`. Blocks until the client closes stdin.
+/// Open (or create) the database, attach the region, and run the MCP stdio
+/// loop. The passphrase is read from `CITADEL_KEY`. Blocks until the client
+/// closes stdin.
 pub fn serve_with_config(config: &ServeConfig) -> Result<(), String> {
     let key = std::env::var("CITADEL_KEY")
         .map_err(|_| "set CITADEL_KEY to the database passphrase".to_string())?;
@@ -46,7 +48,8 @@ pub fn serve_with_config(config: &ServeConfig) -> Result<(), String> {
     let mut builder = DatabaseBuilder::new(&config.db)
         .passphrase(key.as_bytes())
         .argon2_profile(Argon2Profile::Iot);
-    // Encrypted regions seal each atom under its own key; that needs region wrap keys.
+    // Encrypted regions seal each atom under its own key; that needs region
+    // wrap keys.
     if config.encrypted {
         builder = builder.enable_region_keys(true);
     }
@@ -171,7 +174,7 @@ fn run_pull(argv: &[String]) -> Result<(), String> {
     }
     let name = model.ok_or(
         "usage: pull \
-         <bge-small|bge-base|bge-large|minilm|e5-large|ms-marco-minilm> [--models-dir <dir>]",
+         <e5-large|e5-large-v2|bge-small|bge-base|bge-large|minilm|ms-marco-minilm> [--models-dir <dir>]",
     )?;
     pull_model(&name, models_dir.as_deref())
 }
@@ -181,14 +184,15 @@ fn run_pull(_argv: &[String]) -> Result<(), String> {
     Err("`pull` needs a build with --features hub (model download support)".to_string())
 }
 
-/// Build the `--embedder`; never downloads and never silently falls back to mock.
+/// Build the `--embedder`; never downloads and never silently falls back to
+/// mock.
 fn build_embedder(config: &ServeConfig) -> Result<Arc<dyn Embedder>, String> {
     match config.embedder.as_str() {
         "mock" => {
             eprintln!(
                 "citadeldb-mcp: WARNING mock embedder - keyword-only recall, not semantic. \
-                 For semantic recall run `citadeldb-mcp pull bge-small`, then restart with \
-                 --embedder bge-small (or pass --model-dir to a local model)."
+                 For semantic recall run `citadeldb-mcp pull e5-large`, then restart with \
+                 --embedder e5-large (or pass --model-dir to a local model)."
             );
             Ok(Arc::new(MockEmbedder::new(EMBED_DIM)))
         }
@@ -199,7 +203,9 @@ fn build_embedder(config: &ServeConfig) -> Result<Arc<dyn Embedder>, String> {
 /// Error for an `--embedder`/`pull` name that is not in the catalog.
 #[cfg(feature = "candle-embed")]
 fn unknown_embedder(name: &str) -> String {
-    format!("unknown embedder '{name}' (mock|bge-small|bge-base|bge-large|minilm|e5-large)")
+    format!(
+        "unknown embedder '{name}' (mock|e5-large|e5-large-v2|bge-small|bge-base|bge-large|minilm)"
+    )
 }
 
 /// Built-in model catalog: CLI name -> (preset config, HuggingFace repo id).
@@ -207,6 +213,8 @@ fn unknown_embedder(name: &str) -> String {
 fn model_spec(name: &str) -> Option<(citadel_mem::CandleConfig, &'static str)> {
     use citadel_mem::CandleConfig;
     Some(match name {
+        "e5-large" => (CandleConfig::e5_large(), "intfloat/e5-large"),
+        "e5-large-v2" => (CandleConfig::e5_large_v2(), "intfloat/e5-large-v2"),
         "bge-small" => (CandleConfig::bge_small(), "BAAI/bge-small-en-v1.5"),
         "bge-base" => (CandleConfig::bge_base(), "BAAI/bge-base-en-v1.5"),
         "bge-large" => (CandleConfig::bge_large(), "BAAI/bge-large-en-v1.5"),
@@ -214,7 +222,6 @@ fn model_spec(name: &str) -> Option<(citadel_mem::CandleConfig, &'static str)> {
             CandleConfig::minilm_l6(),
             "sentence-transformers/all-MiniLM-L6-v2",
         ),
-        "e5-large" => (CandleConfig::e5_large(), "intfloat/e5-large-v2"),
         _ => return None,
     })
 }
@@ -257,7 +264,8 @@ fn build_real_embedder(name: &str, config: &ServeConfig) -> Result<Arc<dyn Embed
     Ok(Arc::new(embedder))
 }
 
-/// Without `hub` there is no download cache, so a real model must come from `--model-dir`.
+/// Without `hub` there is no download cache, so a real model must come from
+/// `--model-dir`.
 #[cfg(all(feature = "candle-embed", not(feature = "hub")))]
 fn build_real_embedder(name: &str, config: &ServeConfig) -> Result<Arc<dyn Embedder>, String> {
     use citadel_mem::CandleEmbedder;
@@ -279,7 +287,8 @@ fn build_real_embedder(name: &str, _config: &ServeConfig) -> Result<Arc<dyn Embe
     ))
 }
 
-/// Load reranker `name` from `--reranker-dir` or the `pull` cache; never downloads.
+/// Load reranker `name` from `--reranker-dir` or the `pull` cache; never
+/// downloads.
 #[cfg(feature = "hub")]
 fn build_reranker(
     name: &str,
@@ -305,7 +314,8 @@ fn build_reranker(
     Ok(Arc::new(reranker))
 }
 
-/// Without `hub` there is no download cache, so a reranker must come from `--reranker-dir`.
+/// Without `hub` there is no download cache, so a reranker must come from
+/// `--reranker-dir`.
 #[cfg(all(feature = "candle-embed", not(feature = "hub")))]
 fn build_reranker(
     name: &str,
@@ -323,8 +333,8 @@ fn build_reranker(
     Ok(Arc::new(reranker))
 }
 
-/// Directory holding `pull`ed models: `--models-dir`, else `$CITADEL_MODELS_DIR`, else
-/// `<home>/.citadel/models`.
+/// Directory holding `pull`ed models: `--models-dir`, else
+/// `$CITADEL_MODELS_DIR`, else `<home>/.citadel/models`.
 #[cfg(feature = "hub")]
 fn resolve_models_dir(override_dir: Option<&str>) -> Result<std::path::PathBuf, String> {
     use std::path::PathBuf;
@@ -346,12 +356,13 @@ fn resolve_models_dir(override_dir: Option<&str>) -> Result<std::path::PathBuf, 
 #[cfg(feature = "hub")]
 fn unknown_pullable(name: &str) -> String {
     format!(
-        "unknown model '{name}' (embedders: bge-small|bge-base|bge-large|minilm|e5-large; \
+        "unknown model '{name}' (embedders: e5-large|e5-large-v2|bge-small|bge-base|bge-large|minilm; \
          rerankers: ms-marco-minilm)"
     )
 }
 
-/// Download a public model (embedder or reranker) into the cache; never implicit.
+/// Download a public model (embedder or reranker) into the cache; never
+/// implicit.
 #[cfg(feature = "hub")]
 pub fn pull_model(name: &str, models_dir: Option<&str>) -> Result<(), String> {
     let repo = model_spec(name)
@@ -391,7 +402,8 @@ fn download_model(repo: &str, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Stream URL to a `.partial` sibling, rename on success; no half-written files.
+/// Stream URL to a `.partial` sibling, rename on success; no half-written
+/// files.
 #[cfg(feature = "hub")]
 fn download_file(url: &str, target: &Path) -> Result<(), String> {
     use std::io::{Read, Write};

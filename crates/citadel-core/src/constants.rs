@@ -17,6 +17,11 @@ pub const CHECKSUM_SIZE: usize = 8; // xxHash64
 
 pub const FILE_HEADER_SIZE: usize = 512;
 pub const GOD_BYTE_OFFSET: usize = 20;
+// Header flags byte (previously zero padding, so pre-flag files read as 0).
+pub const HEADER_FLAGS_OFFSET: usize = 21;
+// One-way: set once both slots are V1, then recover() rejects legacy
+// (MAC-less) slots, closing the re-encode-as-legacy downgrade.
+pub const HEADER_FLAG_SLOTS_V1: u8 = 0x01;
 pub const FILE_ID_OFFSET: usize = 24;
 pub const COMMIT_SLOT_OFFSET: usize = 32;
 pub const COMMIT_SLOT_SIZE: usize = 240;
@@ -48,9 +53,10 @@ pub const HKDF_INFO_REGION_STORE_MAC: &[u8] = b"citadel-region-store-mac-v1";
 pub const HKDF_INFO_REGION_WRAP: &[u8] = b"citadel-region-wrap-v1";
 pub const HKDF_INFO_RCK_DEK: &[u8] = b"citadel-rck-dek-v1";
 pub const HKDF_INFO_RCK_MAC: &[u8] = b"citadel-rck-mac-v1";
-// Per-atom erasure: each atom's random content key (ACK) is AES-KW-wrapped under a KEK
-// derived from the region RCK and stored as the SOLE copy in the atom key store, so
-// destroying that slot erases one atom and destroying the RCK erases the whole region.
+// Per-atom erasure: each atom's random content key (ACK) is AES-KW-wrapped
+// under a KEK derived from the region RCK and stored as the sole copy in the
+// atom key store, so destroying that slot erases one atom and destroying the
+// RCK erases the whole region.
 pub const HKDF_INFO_ATOM_WRAP: &[u8] = b"citadel-atom-wrap-v1";
 pub const ATOM_STORE_MAGIC: u32 = 0x4154_4D53; // "ATMS"
 pub const ATOM_STORE_PREALLOC_SLOTS: u32 = 256; // initial capacity (grows append-only)
@@ -71,13 +77,18 @@ pub const MAX_VALUE_SIZE: usize = 1 << 30; // 1 GiB
 pub const PENDING_FREE_ENTRY_SIZE: usize = 12; // page_id(4) + freed_at_txn(8)
 pub const PENDING_FREE_ENTRIES_PER_PAGE: usize = USABLE_SIZE / PENDING_FREE_ENTRY_SIZE; // 674
 
-// Merkle hash: BLAKE3 truncated to 28 bytes (224 bits) to fit inline in the page header.
+// Merkle hash: BLAKE3 truncated to 28 bytes (224 bits) to fit inline in the
+// page header.
 pub const MERKLE_HASH_SIZE: usize = 28;
 pub const MERKLE_HASH_OFFSET: usize = 36; // page header offset [36..64]
 pub const SLOT_MERKLE_ROOT: usize = 84; // CommitSlot offset [84..112]
 
 pub const AUDIT_LOG_MAGIC: u32 = 0x4155_4454; // "AUDT"
-pub const AUDIT_LOG_VERSION: u32 = 1;
+
+// v1 (released): header bytes 32..64 are a vestigial tip, chain seeds from
+// zeros. v2: those bytes are a write-once chain seed. v1 files stay v1.
+pub const AUDIT_LOG_VERSION_LEGACY: u32 = 1;
+pub const AUDIT_LOG_VERSION: u32 = 2;
 pub const AUDIT_HEADER_SIZE: usize = 64;
 pub const AUDIT_ENTRY_MAGIC: u32 = 0x454E_5452; // "ENTR" - per-entry sentinel for scanning past corruption
 pub const HKDF_INFO_AUDIT_KEY: &[u8] = b"citadel-audit-key-v1";
@@ -102,6 +113,22 @@ pub const SLOT_NAMED_ENTRIES: usize = 112;
 pub const SLOT_NAMED_ENTRY_SIZE: usize = 18;
 pub const SLOT_NAMED_MAX_ENTRIES: usize =
     (COMMIT_SLOT_SIZE - SLOT_NAMED_ENTRIES - 2) / SLOT_NAMED_ENTRY_SIZE;
+
+// V1 (authenticated) slot tail: [222..224] a format marker, [224..240] a
+// truncated HMAC over [0..SLOT_MAC]. Legacy slots hold a 7th entry or zeros
+// there, so both pre-v1 forms stay distinguishable.
+pub const SLOT_FORMAT_MARKER: usize = 222;
+pub const SLOT_MARKER_V1: u16 = 0xC17A;
+pub const SLOT_MAC: usize = 224;
+pub const SLOT_MAC_SIZE: usize = COMMIT_SLOT_SIZE - SLOT_MAC;
+pub const SLOT_NAMED_MAX_ENTRIES_V1: usize =
+    (SLOT_FORMAT_MARKER - SLOT_NAMED_ENTRIES - 2) / SLOT_NAMED_ENTRY_SIZE;
+pub const SLOT_MAC_DOMAIN: &[u8] = b"citadel-slot-mac-v1";
+// High bit of an entry's count: marks it the sole record of its root (never
+// dropped on serialize). In count, not depth, so a downgrade reader treating
+// it as a statistic can't misread it as tree height. Wire-compatible: real
+// counts never reach 2^63 and old files never set it.
+pub const SLOT_ENTRY_STALE: u64 = 1 << 63;
 
 pub const GROWTH_CHUNK_1MB: u64 = 1024 * 1024;
 pub const GROWTH_CHUNK_4MB: u64 = 4 * 1024 * 1024;

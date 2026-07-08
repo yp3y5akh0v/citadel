@@ -102,7 +102,18 @@ fn wrap_unwrap_roundtrip() {
     assert_eq!(wrapped.len(), WRAPPED_KEY_SIZE);
 
     let unwrapped = unwrap_rek(&mk, &wrapped).unwrap();
-    assert_eq!(unwrapped, rek);
+    assert_eq!(*unwrapped, rek);
+}
+
+#[test]
+fn unwrap_rek_returns_zeroizing_wrapper() {
+    // Regression: unwrap_rek must hand back the REK inside Zeroizing so the
+    // secret is wiped on drop on every caller exit path, not left on the stack.
+    let mk = [0xAA; KEY_SIZE];
+    let rek = [0xBB; KEY_SIZE];
+    let wrapped = wrap_rek(&mk, &rek);
+    let unwrapped: Zeroizing<[u8; KEY_SIZE]> = unwrap_rek(&mk, &wrapped).unwrap();
+    assert_eq!(*unwrapped, rek);
 }
 
 #[test]

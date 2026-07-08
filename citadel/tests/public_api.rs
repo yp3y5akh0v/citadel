@@ -90,6 +90,49 @@ fn create_fails_if_exists() {
 }
 
 #[test]
+fn failed_create_preserves_existing_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+
+    {
+        let db = fast_builder(&db_path).create().unwrap();
+        let mut wtx = db.begin_write().unwrap();
+        wtx.insert(b"survivor", b"data").unwrap();
+        wtx.commit().unwrap();
+    }
+
+    // A second create() must fail without overwriting the existing key file;
+    // otherwise the database below becomes permanently undecryptable.
+    let result = fast_builder(&db_path).create();
+    assert!(result.is_err());
+
+    let db = fast_builder(&db_path).open().unwrap();
+    let mut rtx = db.begin_read();
+    assert_eq!(rtx.get(b"survivor").unwrap(), Some(b"data".to_vec()));
+}
+
+#[test]
+fn cache_size_zero_errors_instead_of_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+
+    let result = fast_builder(&db_path).cache_size(0).create();
+    assert!(result.is_err());
+    // The rejected create() must not leave a data file behind.
+    assert!(!db_path.exists());
+
+    let result = DatabaseBuilder::new(&db_path)
+        .passphrase(b"test-passphrase")
+        .cache_size(0)
+        .create_in_memory();
+    assert!(result.is_err());
+
+    fast_builder(&db_path).create().unwrap();
+    let result = fast_builder(&db_path).cache_size(0).open();
+    assert!(result.is_err());
+}
+
+#[test]
 fn open_fails_if_not_exists() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("nonexistent.db");
@@ -274,4 +317,34 @@ fn large_dataset_persistence() {
             );
         }
     }
+}
+
+/// upgrade_format on an already-current file is idempotent: slots stay
+/// flagged, the audit log stays v2, and data survives the forced commits.
+#[test]
+fn upgrade_format_on_current_file_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+
+    let db = fast_builder(&db_path).create().unwrap();
+    let mut wtx = db.begin_write().unwrap();
+    wtx.insert(b"hello", b"world").unwrap();
+    wtx.commit().unwrap();
+
+    let report = db.upgrade_format().unwrap();
+    assert!(report.slots_flagged, "new files are already flagged");
+    assert!(!report.audit_upgraded, "new audit logs are already v2");
+
+    let report = db.upgrade_format().unwrap();
+    assert!(report.slots_flagged);
+    assert!(!report.audit_upgraded);
+
+    let mut rtx = db.begin_read();
+    assert_eq!(rtx.get(b"hello").unwrap(), Some(b"world".to_vec()));
+    drop(rtx);
+    drop(db);
+
+    let db = fast_builder(&db_path).open().unwrap();
+    let mut rtx = db.begin_read();
+    assert_eq!(rtx.get(b"hello").unwrap(), Some(b"world".to_vec()));
 }

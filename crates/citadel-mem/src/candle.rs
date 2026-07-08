@@ -28,8 +28,8 @@ fn ensure_finite(values: &[f32], model_id: &str) -> Result<(), EmbedError> {
     }
 }
 
-/// Micro-batch size for length-bucketed encoding (embed + rerank); inputs are
-/// length-sorted so padding tracks each chunk (attention cost is ~length squared).
+/// Micro-batch size for length-bucketed encoding; inputs are length-sorted so
+/// padding tracks each chunk (attention cost is ~length squared).
 const MICRO_BATCH: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,16 +40,17 @@ pub enum Pooling {
     Mean,
 }
 
-/// The encoder architecture behind an embedding model - decides which config
-/// shape `config.json` parses as and which forward signature runs (BERT takes
-/// token-type ids; ModernBERT has none and builds rotary/local attention).
+/// Encoder architecture behind a model - selects the `config.json` shape and
+/// forward signature (BERT takes token-type ids; ModernBERT uses rotary/local
+/// attention instead).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
     Bert,
     ModernBert,
 }
 
-/// Settings for [`CandleEmbedder::from_dir`] (`dim` comes from the model config).
+/// Settings for [`CandleEmbedder::from_dir`] (`dim` comes from the model
+/// config).
 #[derive(Debug, Clone)]
 pub struct CandleConfig {
     pub model_id: String,
@@ -110,12 +111,12 @@ impl CandleConfig {
         }
     }
 
-    /// `intfloat/e5-large-v2` (1024d, cosine, mean pooling). E5 retrieval is
-    /// asymmetric: stored texts MUST carry `"passage: "` and queries `"query: "`,
-    /// or retrieval quality collapses (per the model card).
+    /// `intfloat/e5-large` (v1) - recommended (1024d, cosine, mean). E5 is
+    /// asymmetric: stored texts MUST carry `"passage: "` and queries
+    /// `"query: "`, or retrieval collapses.
     pub fn e5_large() -> Self {
         Self {
-            model_id: "e5-large-v2".into(),
+            model_id: "e5-large".into(),
             arch: Arch::Bert,
             metric: EmbeddingMetric::Cosine,
             pooling: Pooling::Mean,
@@ -126,10 +127,18 @@ impl CandleConfig {
         }
     }
 
-    /// `ibm-granite/granite-embedding-english-r2` (768d, cosine, CLS pooling, NO
-    /// prefixes - natively symmetric). ModernBERT backbone with a byte-BPE
-    /// tokenizer: 0% UNK on symbol-dense text (Lean statements), where the
-    /// BERT-vocab tier maps `∀ ∃ ≠` to `[UNK]` and collapses `=`/`≠`.
+    /// `intfloat/e5-large-v2` - the later retrain; weaker than v1 on our
+    /// retrieval, kept as a selectable option.
+    pub fn e5_large_v2() -> Self {
+        Self {
+            model_id: "e5-large-v2".into(),
+            ..Self::e5_large()
+        }
+    }
+
+    /// `ibm-granite/granite-embedding-english-r2` (768d, cosine, CLS, no
+    /// prefixes - symmetric). ModernBERT + byte-BPE tokenizer: 0% UNK on
+    /// symbol-dense text (Lean) where a BERT vocab maps math symbols to [UNK].
     pub fn granite_r2() -> Self {
         Self {
             model_id: "granite-embedding-english-r2".into(),
@@ -139,6 +148,36 @@ impl CandleConfig {
             normalize: true,
             passage_prefix: None,
             query_prefix: None,
+            max_length: 512,
+        }
+    }
+
+    /// `Snowflake/snowflake-arctic-embed-l` / `-m-v1.5` (BERT, CLS). Retrieval
+    /// needs the query instruction; documents carry no prefix.
+    pub fn arctic() -> Self {
+        Self {
+            model_id: "snowflake-arctic-embed".into(),
+            arch: Arch::Bert,
+            metric: EmbeddingMetric::Cosine,
+            pooling: Pooling::Cls,
+            normalize: true,
+            passage_prefix: None,
+            query_prefix: Some("Represent this sentence for searching relevant passages: ".into()),
+            max_length: 512,
+        }
+    }
+
+    /// `nomic-ai/modernbert-embed-base` (ModernBERT, mean pooling, asymmetric
+    /// `search_query:` / `search_document:` prefixes).
+    pub fn modernbert_embed() -> Self {
+        Self {
+            model_id: "modernbert-embed-base".into(),
+            arch: Arch::ModernBert,
+            metric: EmbeddingMetric::Cosine,
+            pooling: Pooling::Mean,
+            normalize: true,
+            passage_prefix: Some("search_document: ".into()),
+            query_prefix: Some("search_query: ".into()),
             max_length: 512,
         }
     }
@@ -180,7 +219,8 @@ pub struct CandleEmbedder {
     model_id: String,
 }
 
-/// Inference device: GPU 0 with `cuda-embed` (CPU fallback at runtime), else CPU.
+/// Inference device: GPU 0 with `cuda-embed` (CPU fallback at runtime), else
+/// CPU.
 #[cfg(feature = "cuda-embed")]
 fn select_device() -> Device {
     // cuda-embed was requested, so warn rather than silently drop to CPU.
@@ -210,7 +250,8 @@ impl CandleEmbedder {
         cfg: CandleConfig,
     ) -> Result<Self, EmbedError> {
         let device = select_device();
-        // f32 GEMM via TF32 tensor cores (Ampere+); full f32 range. No-op on CPU.
+        // f32 GEMM via TF32 tensor cores (Ampere+); full f32 range. No-op on
+        // CPU.
         if matches!(device, Device::Cuda(_)) {
             candle_core::cuda::set_gemm_reduced_precision_f32(true);
             eprintln!("[citadel-mem] cuda-embed: TF32 f32 GEMM enabled (tensor cores)");
@@ -234,15 +275,17 @@ impl CandleEmbedder {
             Arch::ModernBert => {
                 let config: ModernBertConfig =
                     serde_json::from_slice(config_json).map_err(backend)?;
-                // ModernBERT vocabs don't put [PAD] at id 0; take it from the config.
+                // ModernBERT vocabs don't put [PAD] at id 0; take it from the
+                // config.
                 padding.pad_id = config.pad_token_id;
                 if let Some(tok) = tokenizer.id_to_token(config.pad_token_id) {
                     padding.pad_token = tok;
                 }
                 let dim = config.hidden_size;
-                // Candle's loader addresses the backbone under a `model.` prefix
-                // (the ForMaskedLM layout); a bare ModernBertModel checkpoint
-                // (granite-r2) stores tensors unprefixed - strip it on lookup.
+                // Candle's loader addresses the backbone under a `model.`
+                // prefix (the ForMaskedLM layout); a bare ModernBertModel
+                // checkpoint (granite-r2) stores tensors unprefixed - strip it
+                // on lookup.
                 let vb = if vb.contains_tensor("model.embeddings.tok_embeddings.weight") {
                     vb
                 } else {
@@ -278,7 +321,8 @@ impl CandleEmbedder {
         })
     }
 
-    /// Load from a directory of `config.json` / `tokenizer.json` / `model.safetensors`.
+    /// Load from a directory of `config.json` / `tokenizer.json` /
+    /// `model.safetensors`.
     pub fn from_dir(dir: impl AsRef<Path>, cfg: CandleConfig) -> Result<Self, EmbedError> {
         let dir = dir.as_ref();
         let config = std::fs::read(dir.join("config.json")).map_err(backend)?;
@@ -307,9 +351,14 @@ impl CandleEmbedder {
         Self::from_dir(dir, CandleConfig::minilm_l6())
     }
 
-    /// `intfloat/e5-large-v2` from a directory.
+    /// `intfloat/e5-large` (the original v1) from a directory.
     pub fn e5_large(dir: impl AsRef<Path>) -> Result<Self, EmbedError> {
         Self::from_dir(dir, CandleConfig::e5_large())
+    }
+
+    /// `intfloat/e5-large-v2` from a directory.
+    pub fn e5_large_v2(dir: impl AsRef<Path>) -> Result<Self, EmbedError> {
+        Self::from_dir(dir, CandleConfig::e5_large_v2())
     }
 
     /// `ibm-granite/granite-embedding-english-r2` from a directory.
@@ -317,9 +366,20 @@ impl CandleEmbedder {
         Self::from_dir(dir, CandleConfig::granite_r2())
     }
 
-    /// Embed each text (rows in input order), length-bucketed so padding tracks each
-    /// chunk; masked padding keeps outputs identical to a single batch. Encoding stays
-    /// sequential to avoid rayon contention with concurrent recalls.
+    /// `Snowflake/snowflake-arctic-embed-l` / `-m-v1.5` from a directory.
+    pub fn arctic(dir: impl AsRef<Path>) -> Result<Self, EmbedError> {
+        Self::from_dir(dir, CandleConfig::arctic())
+    }
+
+    /// `nomic-ai/modernbert-embed-base` from a directory.
+    pub fn modernbert_embed(dir: impl AsRef<Path>) -> Result<Self, EmbedError> {
+        Self::from_dir(dir, CandleConfig::modernbert_embed())
+    }
+
+    /// Embed each text (rows in input order), length-bucketed so padding tracks
+    /// each chunk; masked padding keeps outputs identical to a single batch.
+    /// Encoding stays sequential to avoid rayon contention with concurrent
+    /// recalls.
     fn run(&self, texts: &[&str], prefix: Option<&str>) -> candle_core::Result<Vec<Vec<f32>>> {
         let mut encodings = Vec::with_capacity(texts.len());
         for t in texts {
@@ -437,7 +497,8 @@ pub struct CrossEncoder {
 }
 
 impl CrossEncoder {
-    /// Load from raw model bytes; `max_length` caps the `(query, passage)` token length.
+    /// Load from raw model bytes; `max_length` caps the `(query, passage)`
+    /// token length.
     pub fn from_bytes(
         config_json: &[u8],
         tokenizer_json: &[u8],
@@ -474,7 +535,8 @@ impl CrossEncoder {
         })
     }
 
-    /// Load from a directory of `config.json` / `tokenizer.json` / `model.safetensors`.
+    /// Load from a directory of `config.json` / `tokenizer.json` /
+    /// `model.safetensors`.
     pub fn from_dir(
         dir: impl AsRef<Path>,
         model_id: impl Into<String>,
@@ -487,15 +549,16 @@ impl CrossEncoder {
         Self::from_bytes(&config, &tokenizer, weights, model_id, max_length)
     }
 
-    /// `cross-encoder/ms-marco-MiniLM-L-6-v2` from a directory (1 logit, 512-token pairs).
+    /// `cross-encoder/ms-marco-MiniLM-L-6-v2` from a directory (1 logit,
+    /// 512-token pairs).
     pub fn ms_marco_minilm_l6(dir: impl AsRef<Path>) -> Result<Self, EmbedError> {
         Self::from_dir(dir, "ms-marco-MiniLM-L-6-v2", 512)
     }
 
     /// Score every `(query, passage)` pair: one relevance logit per passage.
-    /// Length-bucketed micro-batches keep padding near each chunk's real length.
-    /// Tokenization stays sequential: `encode_batch`'s rayon fan-out contends
-    /// with concurrent recalls.
+    /// Length-bucketed micro-batches keep padding near each chunk's real
+    /// length. Tokenization stays sequential: `encode_batch`'s rayon fan-out
+    /// contends with concurrent recalls.
     fn run(&self, query: &str, passages: &[&str]) -> candle_core::Result<Vec<f32>> {
         let mut encodings = Vec::with_capacity(passages.len());
         for p in passages {
@@ -506,8 +569,9 @@ impl CrossEncoder {
             );
         }
 
-        // Process short pairs together and long pairs together: sorting by token
-        // length keeps each micro-batch's padding near its real content length.
+        // Process short pairs together and long pairs together: sorting by
+        // token length keeps each micro-batch's padding near its real content
+        // length.
         let mut order: Vec<usize> = (0..encodings.len()).collect();
         order.sort_by_key(|&i| encodings[i].get_ids().len());
 
@@ -541,7 +605,8 @@ impl CrossEncoder {
             let attn = Tensor::from_vec(mask, (bsz, seq), &self.device)?;
 
             let hidden = self.model.forward(&input_ids, &type_ids, Some(&attn))?;
-            // narrow+squeeze is non-contiguous; candle's CUDA matmul needs contiguous.
+            // narrow+squeeze is non-contiguous; candle's CUDA matmul needs
+            // contiguous.
             let cls = hidden.narrow(1, 0, 1)?.squeeze(1)?.contiguous()?;
             let pooled = self.pooler.forward(&cls)?.tanh()?;
             let logits = self.classifier.forward(&pooled)?;
@@ -569,7 +634,8 @@ impl Reranker for CrossEncoder {
     }
 }
 
-/// Masked mean over tokens; denominator floored so all-padding rows don't divide by zero.
+/// Masked mean over tokens; denominator floored so all-padding rows don't
+/// divide by zero.
 fn masked_mean_pool(hidden: &Tensor, mask: &Tensor) -> candle_core::Result<Tensor> {
     let mask3 = mask.unsqueeze(2)?; // [b, seq, 1]
     let summed = hidden.broadcast_mul(&mask3)?.sum(1)?; // [b, h]
@@ -638,10 +704,12 @@ mod tests {
         assert!(approx(norm, 1.0, 1e-6));
     }
 
-    /// Tiny random-weight BERT + WordPiece tokenizer; runs the full path in CI offline.
+    /// Tiny random-weight BERT + WordPiece tokenizer; runs the full path in CI
+    /// offline.
     fn synthetic_embedder() -> CandleEmbedder {
         let device = Device::Cpu;
-        // WordPieceBuilder::vocab wants Into<AHashMap>; the array form avoids ahash.
+        // WordPieceBuilder::vocab wants Into<AHashMap>; the array form avoids
+        // ahash.
         let vocab = [
             ("[PAD]".to_string(), 0u32),
             ("[UNK]".to_string(), 1),
@@ -757,7 +825,8 @@ mod tests {
         assert_eq!(out.len(), 3);
         assert!(out.iter().all(|v| v.len() == 384));
 
-        // bge vectors are L2-normalized, so a dot product is the cosine similarity.
+        // bge vectors are L2-normalized, so a dot product is the cosine
+        // similarity.
         let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
         let related = cos(&out[0], &out[1]);
         let unrelated = cos(&out[0], &out[2]);
@@ -776,9 +845,9 @@ mod tests {
         assert_eq!(e.dim(), 768, "granite-embedding-english-r2 is 768-dim");
 
         // The property that disqualified the BERT-vocab tier: a negation-only
-        // difference must be VISIBLE at the input layer. With NFD+strip-accents
-        // WordPiece, `=` and `≠` tokenize identically and these two statements
-        // collapse; granite's byte-BPE must keep them apart.
+        // difference must be visible at the input layer. With NFD+strip-accents
+        // WordPiece, `=` and not-equal tokenize identically and these two
+        // statements collapse; granite's byte-BPE must keep them apart.
         let out = e
             .embed(&[
                 "\u{2200} (a b : \u{2115}), a + b = b + a",
@@ -799,11 +868,11 @@ mod tests {
         let renamed = cos(&out[0], &out[2]);
         let unrelated = cos(&out[0], &out[3]);
         eprintln!("GRANITE cos: negation={negation} alpha-renamed={renamed} unrelated={unrelated}");
-        // The negation may legitimately sit CLOSER than a rename (one character of
-        // surface difference vs four) - the vector tier is a recall widener and a
-        // recalled negation is refuted downstream by the kernel. What must hold:
-        // the pair is not INPUT-IDENTICAL (the BERT-vocab failure mode, cos ~1.0),
-        // and both restatements rank far above unrelated text.
+        // The negation may legitimately sit closer than a rename (one character
+        // of surface difference vs four) - the vector tier is a recall widener
+        // and a recalled negation is refuted downstream by the kernel. What
+        // must hold: the pair is not input-identical (the BERT-vocab failure
+        // mode, cos ~1.0), and both restatements rank far above unrelated text.
         assert!(
             negation < 0.999,
             "negation-only pair must not collapse to identity: {negation}"
@@ -814,7 +883,8 @@ mod tests {
         );
     }
 
-    /// Tiny random-weight cross-encoder; runs the full rerank path in CI offline.
+    /// Tiny random-weight cross-encoder; runs the full rerank path in CI
+    /// offline.
     fn synthetic_cross_encoder() -> CrossEncoder {
         let device = Device::Cpu;
         let vocab = [

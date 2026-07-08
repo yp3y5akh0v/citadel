@@ -13,7 +13,8 @@ use std::path::Path;
 /// Crash-safe: always leaves either old or new file, never partial.
 pub fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let temp_path = path.with_extension("tmp");
-    // `write_synced` closes before rename; Windows refuses to rename an open file.
+    // `write_synced` closes before rename; Windows refuses to rename an open
+    // file.
     write_synced(&temp_path, data)?;
     fs::rename(&temp_path, path)?;
     fsync_directory(path)?;
@@ -38,8 +39,10 @@ fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
     file.sync_data()
 }
 
-/// Fsync parent directory to durably record file creation/rename (Linux only).
-fn fsync_directory(file_path: &Path) -> std::io::Result<()> {
+/// Fsync `file_path`'s parent directory to durably record a file
+/// creation/rename (no-op on non-Unix, where directory handles can't be
+/// fsynced and the platforms persist directory metadata themselves).
+pub fn fsync_directory(file_path: &Path) -> std::io::Result<()> {
     let dir = file_path.parent().unwrap_or(Path::new("."));
 
     #[cfg(unix)]
@@ -56,11 +59,29 @@ fn fsync_directory(file_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Overwrite `bytes` at `offset` in an EXISTING file, in place, then fsync the data.
+/// Copy `src` to `dest`, fsync the content, then apply the source's
+/// permissions. Streams into a fresh writable file rather than `fs::copy`,
+/// which clones the source mode up front - that both fails the fsync reopen
+/// on a read-only key file and would leave a 0600 file world-readable under
+/// the umask. Callers still fsync the destination directory per batch.
+pub fn copy_and_sync(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let mut from = std::fs::File::open(src)?;
+    let perms = from.metadata()?.permissions();
+    let mut to = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dest)?;
+    std::io::copy(&mut from, &mut to)?;
+    to.sync_data()?;
+    fs::set_permissions(dest, perms)
+}
+
+/// Overwrite `bytes` at `offset` in place in an existing file, then fsync.
 ///
-/// Does NOT create, truncate, or rename - it reuses the same physical byte range.
-/// This is what cryptographic erasure of a key slot relies on: there is no temp file
-/// or rename that would orphan a prior copy of the bytes being destroyed.
+/// Does NOT create, truncate, or rename; reuses the same byte range. Key-slot
+/// crypto-erasure relies on this: no temp file or rename that would orphan a
+/// prior copy of the destroyed bytes.
 pub fn overwrite_in_place(path: &Path, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = OpenOptions::new().write(true).open(path)?;
     file.seek(SeekFrom::Start(offset))?;
@@ -68,8 +89,9 @@ pub fn overwrite_in_place(path: &Path, offset: u64, bytes: &[u8]) -> std::io::Re
     file.sync_data()
 }
 
-/// Overwrite several fixed byte ranges of an EXISTING file through one open handle, then
-/// fsync once: one durability barrier for the batch, not one per block. Durable on `Ok`.
+/// Overwrite several fixed byte ranges of an existing file through one open
+/// handle, then fsync once: one durability barrier for the batch, not one per
+/// block. Durable on `Ok`.
 pub fn write_blocks_synced<const N: usize>(
     path: &Path,
     blocks: &[(u64, [u8; N])],

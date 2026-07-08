@@ -297,8 +297,9 @@ fn fast_lane_column_refs(expr: &Expr, out: &mut Vec<String>) -> bool {
     }
 }
 
-/// (schema_idx, phys_idx) decode pairs for `names`, minus pk and `skip_targets`.
-/// None = unresolvable or virtual (stored as a NULL placeholder): interpreted path.
+/// (schema_idx, phys_idx) decode pairs for `names`, minus pk and
+/// `skip_targets`. None = unresolvable or virtual (stored as a NULL
+/// placeholder): interpreted path.
 fn resolve_extra_decode_cols(
     table_schema: &TableSchema,
     names: &[String],
@@ -328,7 +329,8 @@ fn resolve_extra_decode_cols(
     Some(extras)
 }
 
-/// SET-referenced columns that are neither pk nor targets; None = interpreted path.
+/// SET-referenced columns that are neither pk nor targets; None = interpreted
+/// path.
 fn compute_rhs_extra_cols(
     table_schema: &TableSchema,
     assignments: &[(String, Expr)],
@@ -417,7 +419,8 @@ fn compile_returning_fast(
 /// Gen-col patches plus the (schema_idx, phys_idx) columns their exprs read.
 type GenColPlan = (Vec<GenColPatch>, Vec<(usize, usize)>);
 
-/// None when a generated expr's refs aren't provably decodable: interpreted path.
+/// None when a generated expr's refs aren't provably decodable: interpreted
+/// path.
 fn compute_gen_col_targets(
     table_schema: &TableSchema,
     set_target_schema_indices: &[usize],
@@ -457,8 +460,9 @@ fn compute_gen_col_targets(
         }
     }
 
-    // Single-column UPDATE: the set-target's new value is live in partial_row, skip re-decode.
-    // Multi-column SET re-decodes targets (from the already-patched row bytes = new values).
+    // Single-column UPDATE: the set-target's new value is live in partial_row,
+    // skip re-decode. Multi-column SET re-decodes targets (from the
+    // already-patched row bytes = new values).
     let skip_targets: &[usize] = if set_target_schema_indices.len() == 1 {
         set_target_schema_indices
     } else {
@@ -859,7 +863,8 @@ impl CompiledPlan for CompiledDelete {
                     return exec_delete(db, schema, del);
                 };
                 let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
-                // No segment purge: this lane compiles only for index-free tables.
+                // No segment purge: this lane compiles only for index-free
+                // tables.
                 schema.mark_dml(&self.table_name_lower);
                 let result = with_update_scratch(|bufs| self.run_fast(&mut wtx, fast, bufs, true))?;
                 super::helpers::drain_deferred_fk_checks(&mut wtx)?;
@@ -1003,7 +1008,8 @@ fn compile_update_impl(schema: &SchemaManager, stmt: &UpdateStmt) -> Result<Comp
     let table_schema = schema
         .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
-    // Storage name (post-TEMP-alias resolution); used by wtx.table_* calls below.
+    // Storage name (post-TEMP-alias resolution); used by wtx.table_* calls
+    // below.
     let table_name_lower = table_schema.name.clone();
 
     let corr_ctx = CorrelationCtx {
@@ -1161,7 +1167,8 @@ fn exec_update_compiled(
     bufs: &mut UpdateBufs,
 ) -> Result<ExecutionResult> {
     if compiled.is_view {
-        // exec_update handles INSTEAD OF view dispatch (or returns CannotModifyView).
+        // exec_update handles INSTEAD OF view dispatch (or returns
+        // CannotModifyView).
         return exec_update(db, schema, stmt);
     }
     if compiled.has_correlated_where
@@ -1178,12 +1185,27 @@ fn exec_update_compiled(
     // ANN segment cannot exist.
     schema.mark_dml(&compiled.table_name_lower);
 
-    if let crate::planner::ScanPlan::PkRangeScan {
-        ref start_key,
-        ref range_conds,
-        full_cover: true,
-        ..
-    } = fast.scan_plan
+    // The range lane patches in place through a fixed-length buffer, so it is
+    // legal only when no target can change the row width; a growing value
+    // takes the delete+reinsert lane below.
+    let patch_safe = fast
+        .targets
+        .iter()
+        .all(|t| !t.col.nullable && is_fixed_width_type(t.col.data_type))
+        && fast
+            .gen_targets
+            .iter()
+            .all(|g| !g.col.nullable && is_fixed_width_type(g.col.data_type));
+
+    if let (
+        true,
+        crate::planner::ScanPlan::PkRangeScan {
+            start_key,
+            range_conds,
+            full_cover: true,
+            ..
+        },
+    ) = (patch_safe, &fast.scan_plan)
     {
         bufs.partial_row.clear();
         bufs.partial_row.resize(fast.num_columns, Value::Null);
@@ -1375,7 +1397,8 @@ pub(super) fn exec_update(
         .get(&user_name)
         .ok_or_else(|| SqlError::TableNotFound(stmt.table.clone()))?;
     schema.mark_dml(&table_schema.name);
-    // Use storage name (post-TEMP-alias resolution) for all wtx.* storage calls below.
+    // Use storage name (post-TEMP-alias resolution) for all wtx.* storage calls
+    // below.
     let lower_name = table_schema.name.clone();
     let strict = table_schema.is_strict();
 
@@ -2322,7 +2345,8 @@ pub(super) fn exec_delete(
         super::ann_persist::purge_segment(&mut wtx, &lower_name)?;
     }
 
-    // Fast TRUNCATE path skips per-row firing; gate on no DELETE triggers (ROW + STATEMENT).
+    // Fast TRUNCATE path skips per-row firing; gate on no DELETE triggers (ROW
+    // + STATEMENT).
     let has_delete_triggers = super::triggers::has_delete_triggers(schema, &table_schema.name);
     if stmt.where_clause.is_none()
         && schema.child_fks_for(&lower_name).is_empty()

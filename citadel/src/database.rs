@@ -39,6 +39,18 @@ pub struct DbStats {
     pub merkle_root: [u8; MERKLE_HASH_SIZE],
 }
 
+/// Outcome of [`Database::upgrade_format`].
+#[derive(Debug, Clone, Copy)]
+pub struct UpgradeReport {
+    /// Named tables whose catalog descriptors were rewritten (staleness
+    /// cleared).
+    pub tables_refreshed: usize,
+    /// Whether HEADER_FLAG_SLOTS_V1 is set (both commit slots sealed V1).
+    pub slots_flagged: bool,
+    /// Whether the audit log header was converted from v1 to v2 by this call.
+    pub audit_upgraded: bool,
+}
+
 /// An open Citadel database (`Send + Sync`).
 ///
 /// Exclusively locks the database file for its lifetime.
@@ -57,10 +69,16 @@ pub struct Database {
     /// `Some` only when the builder enabled region keys; derived from the REK
     /// and zeroized on drop. The raw REK is never retained here.
     region_keys: Option<RegionWrapKeys>,
-    /// Sidecar region key store (lazy); shared by every `MemoryEngine` over this db.
+    /// Sidecar region key store (lazy); shared by every `MemoryEngine` over
+    /// this db.
     region_store: Mutex<Option<RegionKeyStore>>,
     /// Sidecar per-atom key store (lazy); holds each atom's wrapped ACK.
     atom_store: Mutex<Option<AtomKeyStore>>,
+    /// Serializes multi-step key-lifecycle spans (allocate->commit, reconcile,
+    /// erase, persist) across handles, so reconcile can't tombstone a key an
+    /// in-flight write just allocated. Store calls are already internally
+    /// locked; this guards the spans between them.
+    key_lifecycle: Mutex<()>,
 }
 
 impl std::fmt::Debug for Database {
@@ -96,6 +114,7 @@ impl Database {
             region_keys,
             region_store: Mutex::new(None),
             atom_store: Mutex::new(None),
+            key_lifecycle: Mutex::new(()),
         }
     }
 
@@ -116,7 +135,14 @@ impl Database {
             region_keys,
             region_store: Mutex::new(None),
             atom_store: Mutex::new(None),
+            key_lifecycle: Mutex::new(()),
         }
+    }
+
+    /// Guard for a key-lifecycle span (see the field doc); never held while
+    /// running user callbacks.
+    pub fn key_lifecycle_lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.key_lifecycle.lock()
     }
 
     /// Fetch a typed entry from the shared SQL cache.
@@ -187,15 +213,16 @@ impl Database {
         self.file_id
     }
 
-    /// Whether per-region cryptographic erasure keys are available.
-    /// `true` only when the database was opened with `enable_region_keys(true)`.
+    /// Whether per-region cryptographic erasure keys are available. `true` only
+    /// when the database was opened with `enable_region_keys(true)`.
     pub fn region_keys_enabled(&self) -> bool {
         self.region_keys.is_some()
     }
 
-    /// Wrap a region's random content key (RCK) under the region KEK (AES-256-KW).
-    /// The 40-byte result is the sole copy of the RCK; citadel-mem stores it in the
-    /// sidecar key store and overwrites it in place to erase the region.
+    /// Wrap a region's random content key (RCK) under the region KEK
+    /// (AES-256-KW). The 40-byte result is the sole copy of the RCK;
+    /// citadel-mem stores it in the sidecar key store and overwrites it in
+    /// place to erase the region.
     pub fn wrap_region_key(&self, rck: &[u8; KEY_SIZE]) -> Result<[u8; WRAPPED_KEY_SIZE]> {
         self.region_keys
             .as_ref()
@@ -241,7 +268,8 @@ impl Database {
         f(guard.as_mut().expect("region store initialized above"))
     }
 
-    /// Allocate a slot and store the wrapped RCK (fsync'd); returns `(slot, gen)`.
+    /// Allocate a slot and store the wrapped RCK (fsync'd); returns `(slot,
+    /// gen)`.
     pub fn region_store_allocate_write(
         &self,
         region_id: u64,
@@ -269,8 +297,9 @@ impl Database {
         self.with_region_store(|s| s.live_owners())
     }
 
-    /// Path to the sidecar per-atom key store, `{key_path}` with the `citadel-atomkeys`
-    /// extension. Pure path math; the file only exists once an encrypted atom is written.
+    /// Path to the sidecar per-atom key store, `{key_path}` with the
+    /// `citadel-atomkeys` extension. Pure path math; the file only exists once
+    /// an encrypted atom is written.
     pub fn atom_store_path(&self) -> PathBuf {
         atom_store_path_for(&self.key_path)
     }
@@ -289,7 +318,8 @@ impl Database {
         f(guard.as_mut().expect("atom store initialized above"))
     }
 
-    /// Allocate a slot and store one atom's wrapped ACK (fsync'd); returns `(slot, gen)`.
+    /// Allocate a slot and store one atom's wrapped ACK (fsync'd); returns
+    /// `(slot, gen)`.
     pub fn atom_store_allocate_write(
         &self,
         atom_id: u64,
@@ -302,8 +332,8 @@ impl Database {
         })
     }
 
-    /// Allocate and durably write a batch of `(atom_id, wrapped)` ACKs with ONE fsync;
-    /// returns `(slot, gen)` per item in order.
+    /// Allocate and durably write a batch of `(atom_id, wrapped)` ACKs with one
+    /// fsync; returns `(slot, gen)` per item in order.
     pub fn atom_store_allocate_batch(
         &self,
         items: &[(u64, [u8; WRAPPED_KEY_SIZE])],
@@ -333,9 +363,9 @@ impl Database {
         self.with_atom_store(|s| s.tombstone(slot, atom_id))
     }
 
-    /// Erase a batch of atom key slots with two fsyncs total (not 2N). Items are `(slot, atom_id)`.
-    /// Returns the slots actually erased as `(slot, atom_id, old_gen, new_gen)`, confirmed
-    /// through the key store's read-back gate, for building a verifiable erasure receipt.
+    /// Erase a batch of key slots with two fsyncs total (not 2N); items are
+    /// `(slot, atom_id)`. Returns the erased `(slot, atom_id, old_gen,
+    /// new_gen)`, read-back confirmed, for a verifiable erasure receipt.
     pub fn atom_store_tombstone_batch(
         &self,
         items: &[(u32, u64)],
@@ -437,8 +467,12 @@ impl Database {
         self.manager.backup_to(&dest_io)?;
 
         let dest_key_path = resolve_key_path_for(dest_path);
-        fs::copy(&self.key_path, &dest_key_path)?;
+        durable::copy_and_sync(&self.key_path, &dest_key_path)?;
         self.copy_region_store_to(&dest_key_path)?;
+
+        // Persist the new directory entries (data, key, and sidecar files all
+        // live in dest_path's directory); file fsyncs alone don't cover them.
+        durable::fsync_directory(dest_path)?;
 
         #[cfg(feature = "audit-log")]
         self.log_audit_with_path(AuditEventType::BackupCreated, dest_path);
@@ -502,7 +536,7 @@ impl Database {
         Ok(())
     }
 
-    /// Restore a key file from an encrypted backup (static - no `Database` needed).
+    /// Restore a key file from an encrypted backup (static; no `Database`).
     ///
     /// Unwraps the REK using `backup_passphrase`, then creates a new key file
     /// protected by `new_db_passphrase`.
@@ -580,8 +614,12 @@ impl Database {
         self.manager.compact_to(&dest_io)?;
 
         let dest_key_path = resolve_key_path_for(dest_path);
-        fs::copy(&self.key_path, &dest_key_path)?;
+        durable::copy_and_sync(&self.key_path, &dest_key_path)?;
         self.copy_region_store_to(&dest_key_path)?;
+
+        // Persist the new directory entries (data, key, and sidecar files all
+        // live in dest_path's directory); file fsyncs alone don't cover them.
+        durable::fsync_directory(dest_path)?;
 
         #[cfg(feature = "audit-log")]
         self.log_audit_with_path(AuditEventType::CompactionPerformed, dest_path);
@@ -592,19 +630,19 @@ impl Database {
     /// Copy the sidecar region key store next to `dest_key_path`, if it exists.
     ///
     /// A backup/compaction must carry the wrapped region keys so encrypted
-    /// regions remain openable from the copy. Note: a backup taken while a
-    /// region is live retains a recoverable key; `forget` cannot reach it, so
-    /// backup retention is the operator's responsibility (see `region_store_path`).
+    /// regions remain openable from the copy. A backup taken while a region is
+    /// live retains a recoverable key that `forget` cannot reach, so backup
+    /// retention is the operator's job (see `region_store_path`).
     #[cfg(not(target_arch = "wasm32"))]
     fn copy_region_store_to(&self, dest_key_path: &Path) -> Result<()> {
         let src = self.region_store_path();
         if src.exists() {
             let dest = region_store_path_for(dest_key_path);
-            fs::copy(&src, &dest)?;
+            durable::copy_and_sync(&src, &dest)?;
         }
         let atom_src = self.atom_store_path();
         if atom_src.exists() {
-            fs::copy(&atom_src, atom_store_path_for(dest_key_path))?;
+            durable::copy_and_sync(&atom_src, &atom_store_path_for(dest_key_path))?;
         }
         Ok(())
     }
@@ -614,6 +652,44 @@ impl Database {
     #[doc(hidden)]
     pub fn manager(&self) -> &TxnManager {
         &self.manager
+    }
+
+    /// Convert a pre-v1 file to the protected format: reseal both slots V1
+    /// (for any table count), stamp the one-way HEADER_FLAG_SLOTS_V1, and
+    /// upgrade the audit header to v2. One-way (pre-v1 binaries can no longer
+    /// open it) and idempotent.
+    pub fn upgrade_format(&self) -> Result<UpgradeReport> {
+        let names: Vec<Vec<u8>> = self
+            .manager
+            .list_tables()?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+
+        // Each commit rewrites one physical slot. The first refresh clears
+        // all staleness; the second pass only needs a forced empty commit to
+        // reseal the other physical slot with the (now fresh) entries.
+        let mut txn = self.manager.begin_write()?;
+        txn.refresh_all_catalog_descriptors(&names)?;
+        txn.commit()?;
+        let mut txn = self.manager.begin_write()?;
+        txn.refresh_all_catalog_descriptors(&[])?;
+        txn.commit()?;
+        let slots_flagged = self.manager.mark_slots_v1()?;
+
+        #[cfg(feature = "audit-log")]
+        let audit_upgraded = match self.audit_log {
+            Some(ref mutex) => mutex.lock().upgrade_to_v2()?,
+            None => false,
+        };
+        #[cfg(not(feature = "audit-log"))]
+        let audit_upgraded = false;
+
+        Ok(UpgradeReport {
+            tables_refreshed: names.len(),
+            slots_flagged,
+            audit_upgraded,
+        })
     }
 
     /// Path to the audit log file, if audit logging is enabled.
@@ -768,13 +844,15 @@ fn resolve_key_path_for(data_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Sidecar region key store path: `key_path` with the `citadel-regions` extension,
-/// e.g. `mydb.citadel.citadel-keys` -> `mydb.citadel.citadel-regions`.
+/// Sidecar region key store path: `key_path` with the `citadel-regions`
+/// extension, e.g. `mydb.citadel.citadel-keys` ->
+/// `mydb.citadel.citadel-regions`.
 fn region_store_path_for(key_path: &Path) -> PathBuf {
     key_path.with_extension("citadel-regions")
 }
 
-/// Sidecar atom key store path: `key_path` with the `citadel-atomkeys` extension.
+/// Sidecar atom key store path: `key_path` with the `citadel-atomkeys`
+/// extension.
 fn atom_store_path_for(key_path: &Path) -> PathBuf {
     key_path.with_extension("citadel-atomkeys")
 }

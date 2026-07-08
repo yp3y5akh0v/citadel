@@ -1,30 +1,30 @@
-//! `citadeldb-mcp`: a stdio MCP server exposing a citadel memory region as tools.
+//! `citadeldb-mcp`: a stdio MCP server exposing a memory region as tools.
 //!
 //! An MCP client (e.g. Claude Desktop) spawns this binary and talks JSON-RPC
-//! over stdin/stdout. The database passphrase is read from `CITADEL_KEY`.
-//! Everything except MCP protocol messages is written to stderr.
+//! over stdin/stdout; the passphrase is `CITADEL_KEY`, non-protocol output
+//! goes to stderr. The region is encrypted by default (per-atom sealed + crypto
+//! erasure); pass `--region-mode plaintext` to opt out.
 //!
-//! The region is encrypted by default (per-atom sealed + cryptographic erasure);
-//! pass `--region-mode plaintext` to opt out.
-//!
-//! Recall is keyword-only (the `mock` embedder) until you opt into a real semantic
-//! model. The real (Candle) embedder is compiled into the default build, but models
-//! are fetched only on explicit request - never automatically:
+//! Recall is keyword-only (`mock` embedder) until you opt into a real model.
+//! The Candle embedder ships in the default build; models are fetched only on
+//! request, never automatically:
 //!
 //! ```text
-//! citadeldb-mcp pull bge-large                 # one-time download to ~/.citadel/models
-//! citadeldb-mcp --db memory.cdl --embedder bge-large
+//! citadeldb-mcp pull e5-large              # download to ~/.citadel/models
+//! citadeldb-mcp pull ms-marco-minilm       # cross-encoder reranker
+//! citadeldb-mcp --db memory.cdl --embedder e5-large --reranker ms-marco-minilm
 //! ```
 //!
-//! Or bring your own local model with `--model-dir <dir>` (fully offline); a
-//! `cuda-embed` build runs the model on an NVIDIA GPU. Optionally improve recall ordering
-//! with a cross-encoder reranker: `pull ms-marco-minilm` then `--reranker ms-marco-minilm`.
+//! `e5-large` + `ms-marco-minilm` is the highest-recall config. Or
+//! `--model-dir <dir>` for your own local model; a `cuda-embed` build uses an
+//! NVIDIA GPU.
 //!
 //! Claude Desktop config (claude_desktop_config.json):
 //! ```json
 //! { "mcpServers": { "citadel": {
 //!     "command": "citadeldb-mcp",
-//!     "args": ["--db", "/path/memory.cdl", "--region", "default", "--embedder", "bge-large"],
+//!     "args": ["--db", "/path/memory.cdl", "--region", "default",
+//!              "--embedder", "e5-large", "--reranker", "ms-marco-minilm"],
 //!     "env": { "CITADEL_KEY": "<passphrase>" } } } }
 //! ```
 

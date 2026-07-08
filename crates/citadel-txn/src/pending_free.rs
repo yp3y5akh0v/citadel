@@ -1,4 +1,5 @@
-//! Pending-free chain: tracks freed pages that can't be reused until no older readers exist.
+//! Pending-free chain: freed pages that can't be reused until no older reader
+//! exists.
 //!
 //! Format: linked list of PendingFree pages on disk.
 //! Each page contains an array of PendingFreeEntry structs.
@@ -8,7 +9,7 @@ use citadel_buffer::allocator::PageAllocator;
 use citadel_core::types::{PageId, PageType, TxnId};
 use citadel_core::{Error, Result, PAGE_HEADER_SIZE, PENDING_FREE_ENTRY_SIZE, USABLE_SIZE};
 use citadel_page::page::Page;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// A pending-free entry: a page that was freed at a specific transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,23 +52,26 @@ pub fn read_chain(pages: &FxHashMap<PageId, Page>, root: PageId) -> Result<Vec<P
     Ok(entries)
 }
 
-/// Write a new pending-free chain into the page map.
-/// Allocates new pages from the allocator (never reuses old chain pages).
+/// Number of chain pages needed to hold `entry_count` entries.
+fn chain_pages_needed(entry_count: usize) -> usize {
+    entry_count.div_ceil(MAX_ENTRIES_PER_PAGE)
+}
+
+/// Write a new pending-free chain into the page map using the given
+/// pre-allocated structure pages (never reuses old chain pages).
 /// Returns the root PageId of the new chain (PageId::INVALID if empty).
 pub fn write_chain(
     pages: &mut FxHashMap<PageId, Page>,
-    alloc: &mut PageAllocator,
     txn_id: TxnId,
     entries: &[PendingFreeEntry],
+    page_ids: &[PageId],
 ) -> PageId {
     if entries.is_empty() {
         return PageId::INVALID;
     }
 
-    let num_pages = entries.len().div_ceil(MAX_ENTRIES_PER_PAGE);
-
-    // Allocate all pages up front so `right_child` links can reference them.
-    let page_ids: Vec<PageId> = (0..num_pages).map(|_| alloc.allocate()).collect();
+    let num_pages = chain_pages_needed(entries.len());
+    debug_assert_eq!(num_pages, page_ids.len());
 
     let mut entry_idx = 0;
     for (i, &page_id) in page_ids.iter().enumerate() {
@@ -123,57 +127,96 @@ pub fn collect_chain_page_ids(
     Ok(ids)
 }
 
-/// Process the pending-free chain during commit.
+/// Commit-time inputs to [`process_chain`]. `loan_pool` must be the
+/// allocator's drained ready_to_use remainder: those pages were freed >= 2
+/// commits back, so overwriting them now cannot damage either recovery slot.
+pub struct ChainCommit<'a> {
+    pub txn_id: TxnId,
+    pub current_root: PageId,
+    pub freed_this_txn: &'a [PageId],
+    pub consumed: &'a FxHashSet<PageId>,
+    pub reclaim_horizon: TxnId,
+}
+
+/// Drop consumed entries, draw new structure pages from the loan first (CoW,
+/// never reusing old chain pages), and add this txn's frees plus the old
+/// chain pages as new entries. Entries stay listed until a commit records
+/// their consumption, so an abort/no-op/shutdown strands nothing.
 ///
-/// 1. Reads existing chain entries
-/// 2. Reclaims entries with freed_at_txn < oldest_active_reader
-/// 3. Adds freed_this_txn + deferred_free as new entries
-/// 4. Writes new chain (CoW - never reuses old chain pages)
-///
-/// Returns: (new_chain_root, reclaimed_page_ids, old_chain_page_ids)
-///
-/// The old_chain_page_ids should be added to deferred_free for the NEXT commit.
-/// The reclaimed_page_ids can be added to alloc.ready_to_use for future txns.
+/// Returns `(new_chain_root, available_entries)`; entries carry freed_at_txn
+/// so the caller can zero each page once for secure delete.
 pub fn process_chain(
     pages: &mut FxHashMap<PageId, Page>,
     alloc: &mut PageAllocator,
-    txn_id: TxnId,
-    current_root: PageId,
-    freed_this_txn: &[PageId],
-    deferred_free: &[PageId],
-    oldest_active_reader: TxnId,
-) -> Result<(PageId, Vec<PageId>, Vec<PageId>)> {
+    loan_pool: &mut Vec<PageId>,
+    commit: &ChainCommit<'_>,
+) -> Result<(PageId, Vec<PendingFreeEntry>)> {
+    let ChainCommit {
+        txn_id,
+        current_root,
+        freed_this_txn,
+        consumed,
+        reclaim_horizon,
+    } = *commit;
     let existing = read_chain(pages, current_root)?;
     let old_chain_pages = collect_chain_page_ids(pages, current_root)?;
 
-    let mut still_pending = Vec::new();
-    let mut reclaimed = Vec::new();
+    let mut surviving: Vec<PendingFreeEntry> = existing
+        .into_iter()
+        .filter(|entry| !consumed.contains(&entry.page_id))
+        .collect();
+    let new_count = old_chain_pages.len() + freed_this_txn.len();
 
-    for entry in existing {
-        if entry.freed_at_txn.as_u64() < oldest_active_reader.as_u64() {
-            reclaimed.push(entry.page_id);
-        } else {
-            still_pending.push(entry);
-        }
+    // Structure pages, loan pool first. Every loan page has exactly one
+    // surviving entry (it came from the chain and was not consumed by the
+    // txn body); taking it removes that entry.
+    let mut structure: Vec<PageId> = Vec::new();
+    let mut taken: FxHashMap<PageId, TxnId> = FxHashMap::default();
+    while structure.len() < chain_pages_needed(surviving.len() + new_count) {
+        let Some(page_id) = loan_pool.pop() else {
+            break;
+        };
+        let idx = surviving
+            .iter()
+            .position(|entry| entry.page_id == page_id)
+            .expect("loan page must have an unconsumed chain entry");
+        taken.insert(page_id, surviving.swap_remove(idx).freed_at_txn);
+        structure.push(page_id);
+    }
+    // Removing an entry can lower the page count below what was already
+    // taken; hand the overshoot back (at most one page).
+    while structure.len() > chain_pages_needed(surviving.len() + new_count) {
+        let page_id = structure.pop().unwrap();
+        surviving.push(PendingFreeEntry {
+            page_id,
+            freed_at_txn: taken.remove(&page_id).unwrap(),
+        });
+        loan_pool.push(page_id);
+    }
+    while structure.len() < chain_pages_needed(surviving.len() + new_count) {
+        structure.push(alloc.allocate());
     }
 
-    for &page_id in deferred_free {
-        still_pending.push(PendingFreeEntry {
+    // Reuse is safe iff freed_at <= horizon (see reclaim_horizon). A page
+    // freed at this txn is excluded: the previous slot still references it
+    // until the next commit rewrites its location.
+    let available = surviving
+        .iter()
+        .filter(|entry| entry.freed_at_txn.as_u64() <= reclaim_horizon.as_u64())
+        .copied()
+        .collect();
+
+    let mut entries = surviving;
+    for &page_id in old_chain_pages.iter().chain(freed_this_txn) {
+        entries.push(PendingFreeEntry {
             page_id,
             freed_at_txn: txn_id,
         });
     }
 
-    for &page_id in freed_this_txn {
-        still_pending.push(PendingFreeEntry {
-            page_id,
-            freed_at_txn: txn_id,
-        });
-    }
+    let new_root = write_chain(pages, txn_id, &entries, &structure);
 
-    let new_root = write_chain(pages, alloc, txn_id, &still_pending);
-
-    Ok((new_root, reclaimed, old_chain_pages))
+    Ok((new_root, available))
 }
 
 fn read_entry_count(page: &Page) -> usize {

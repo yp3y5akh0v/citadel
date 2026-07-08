@@ -337,3 +337,39 @@ fn sync_persists_across_reopen() {
     assert_eq!(collect_all(&db1), collect_all(&db2));
     assert_eq!(collect_all(&db2).len(), 30);
 }
+
+/// Regression (Off-mode zeroed Merkle roots compared equal): two divergent
+/// SyncMode::Off databases both present the unknown (all-zero) root hash, so
+/// the hash short-circuits must not declare them already in sync.
+#[test]
+fn off_mode_divergent_databases_still_sync() {
+    use citadel::SyncMode;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db1 = fast_builder(&dir.path().join("a.db"))
+        .sync_mode(SyncMode::Off)
+        .create()
+        .unwrap();
+    let db2 = fast_builder(&dir.path().join("b.db"))
+        .sync_mode(SyncMode::Off)
+        .create()
+        .unwrap();
+
+    insert_range(&db1, 0, 20);
+    insert_range(&db2, 100, 110);
+
+    let (init_outcome, resp_outcome) = sync_push(&db1, &db2);
+    assert!(
+        !init_outcome.already_in_sync && !resp_outcome.already_in_sync,
+        "divergent Off-mode databases must not short-circuit as in sync"
+    );
+
+    // Push merges the initiator's rows into the responder.
+    let data2 = collect_all(&db2);
+    for i in 0..20u32 {
+        assert!(
+            data2.contains_key(i.to_be_bytes().as_slice()),
+            "key {i} missing"
+        );
+    }
+}

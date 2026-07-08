@@ -6,6 +6,10 @@ use citadel_core::{Result, MERKLE_HASH_SIZE};
 /// 28-byte BLAKE3 Merkle hash.
 pub type MerkleHash = [u8; MERKLE_HASH_SIZE];
 
+/// SyncMode::Off commits zero Merkle hashes instead of recomputing them, so an
+/// all-zero hash means "unknown" and must never prune a subtree as identical.
+pub(crate) const UNKNOWN_HASH: MerkleHash = [0u8; MERKLE_HASH_SIZE];
+
 /// Digest of a single page - hash, type, and children.
 #[derive(Debug, Clone)]
 pub struct PageDigest {
@@ -48,7 +52,7 @@ impl DiffResult {
 /// Abstraction for reading tree structure during diff.
 ///
 /// For local databases, `LocalTreeReader` reads from `TxnManager` directly.
-/// For remote databases, the transport layer implements this via message exchange.
+/// For remote databases, the transport implements this via messages.
 pub trait TreeReader {
     /// Root page ID and its Merkle hash.
     fn root_info(&self) -> Result<(PageId, MerkleHash)>;
@@ -78,7 +82,7 @@ pub trait TreeReader {
 
 /// Compute the Merkle diff between two trees.
 ///
-/// Returns entries from `source` that are different from or missing in `target`.
+/// Entries in `source` that differ from or are missing in `target`.
 /// Walks both trees in parallel using BFS, skipping entire subtrees when
 /// Merkle hashes match.
 pub fn merkle_diff(source: &dyn TreeReader, target: &dyn TreeReader) -> Result<DiffResult> {
@@ -91,8 +95,8 @@ pub fn merkle_diff(source: &dyn TreeReader, target: &dyn TreeReader) -> Result<D
         subtrees_skipped: 0,
     };
 
-    // Roots match - databases are identical
-    if src_root_hash == tgt_root_hash {
+    // Roots match - databases are identical (unknown hashes always traverse)
+    if src_root_hash == tgt_root_hash && src_root_hash != UNKNOWN_HASH {
         return Ok(result);
     }
 
@@ -104,7 +108,9 @@ pub fn merkle_diff(source: &dyn TreeReader, target: &dyn TreeReader) -> Result<D
         let tgt_digest = target.page_digest(tgt_pid)?;
         result.pages_compared += 1;
 
-        if src_digest.merkle_hash == tgt_digest.merkle_hash {
+        if src_digest.merkle_hash == tgt_digest.merkle_hash
+            && src_digest.merkle_hash != UNKNOWN_HASH
+        {
             result.subtrees_skipped += 1;
             continue;
         }

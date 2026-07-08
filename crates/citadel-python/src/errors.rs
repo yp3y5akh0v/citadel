@@ -109,6 +109,8 @@ fn core_category(e: &CoreError) -> Category {
         CoreError::PageTampered(_)
         | CoreError::ChecksumMismatch(_)
         | CoreError::DatabaseCorrupted
+        | CoreError::SlotDowngradeDetected
+        | CoreError::LegacySlotWriteOnV1File
         | CoreError::CorruptOverflowChain(_)
         | CoreError::InvalidMagic { .. }
         | CoreError::RegionSealTampered
@@ -255,7 +257,8 @@ fn tool_category(e: &ToolError) -> Category {
     }
 }
 
-/// Maps a foreign engine error to a typed exception (local trait = orphan-rule).
+/// Maps a foreign engine error to a typed exception (local trait =
+/// orphan-rule).
 pub(crate) trait IntoPyErr {
     fn into_pyerr(self) -> PyErr;
 }
@@ -337,7 +340,8 @@ pub(crate) fn llm_build_err(msg: String) -> PyErr {
     LlmError::new_err(msg)
 }
 
-/// Raise a `ProgrammingError` for binding-side API misuse (not an engine error).
+/// Raise a `ProgrammingError` for binding-side API misuse (not an engine
+/// error).
 pub(crate) fn programming_err(msg: impl Into<String>) -> PyErr {
     ProgrammingError::new_err(msg.into())
 }

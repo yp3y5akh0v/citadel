@@ -42,25 +42,59 @@ impl MmapPageIO {
         if self.inner.read().size >= needed {
             return Ok(());
         }
-        self.remap_to(needed)
+        let file = self.file.lock();
+        let mut inner = self.inner.write();
+        if inner.size >= needed {
+            return Ok(());
+        }
+        // Never below the real file length: after a failed remap the tracked
+        // size can lag it, and set_len() under it would destroy data.
+        let target = needed.max(file.metadata()?.len());
+        Self::remap_locked(&file, &mut inner, target)
     }
 
     fn remap_to(&self, new_size: u64) -> Result<()> {
         let file = self.file.lock();
         let mut inner = self.inner.write();
+        Self::remap_locked(&file, &mut inner, new_size)
+    }
+
+    fn remap_locked(file: &File, inner: &mut MmapInner, new_size: u64) -> Result<()> {
         if inner.size == new_size {
             return Ok(());
         }
         let _ = inner.mmap.flush_async();
-        // Windows forbids set_len() while mapped — drop old mmap first.
+        // Windows forbids set_len() while mapped - drop old mmap first.
         let dummy = MmapOptions::new().len(1).map_anon()?;
         let old = std::mem::replace(&mut inner.mmap, dummy);
         drop(old);
-        file.set_len(new_size)?;
-        let new_mmap = unsafe { MmapOptions::new().len(new_size as usize).map_mut(&*file)? };
-        inner.mmap = new_mmap;
-        inner.size = new_size;
-        Ok(())
+        let mapped = file
+            .set_len(new_size)
+            .and_then(|()| unsafe { MmapOptions::new().len(new_size as usize).map_mut(file) });
+        match mapped {
+            Ok(mmap) => {
+                inner.mmap = mmap;
+                inner.size = new_size;
+                Ok(())
+            }
+            Err(e) => {
+                // Old mapping is gone; remap at the real length. If that too
+                // fails, size = 0 makes later accesses fail bounds checks
+                // rather than index the dummy map.
+                inner.size = 0;
+                if let Ok(len) = file.metadata().map(|m| m.len()) {
+                    if len > 0 {
+                        if let Ok(mmap) =
+                            unsafe { MmapOptions::new().len(len as usize).map_mut(file) }
+                        {
+                            inner.mmap = mmap;
+                            inner.size = len;
+                        }
+                    }
+                }
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -152,7 +186,11 @@ impl PageIO for MmapPageIO {
     }
 
     fn file_size(&self) -> Result<u64> {
-        Ok(self.inner.read().size)
+        // Real file length, not the tracked mapping size: after a failed
+        // remap the mapping can lag the file, and a sizing decision made from
+        // the smaller value could set_len() below live data.
+        let file = self.file.lock();
+        Ok(file.metadata()?.len())
     }
 
     fn truncate(&self, size: u64) -> Result<()> {
@@ -169,10 +207,13 @@ impl PageIO for MmapPageIO {
         let max_end = (god_offset + 1).max(slot_offset + slot_buf.len() as u64);
         self.ensure_mapped(max_end)?;
         let mut inner = self.inner.write();
-        inner.mmap[god_offset as usize] = god_byte;
+        // Slot before god byte: a crash between the two must leave the god
+        // byte selecting the previous commit, not a stale two-generations-old
+        // slot.
         let slot_start = slot_offset as usize;
         let slot_end = slot_start + slot_buf.len();
         inner.mmap[slot_start..slot_end].copy_from_slice(slot_buf);
+        inner.mmap[god_offset as usize] = god_byte;
         Ok(())
     }
 }

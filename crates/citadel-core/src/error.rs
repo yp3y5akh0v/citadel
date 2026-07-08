@@ -22,6 +22,12 @@ pub enum Error {
     #[error("database file is corrupted: both commit slots are invalid")]
     DatabaseCorrupted,
 
+    #[error("commit-slot downgrade detected: this file requires authenticated (V1) slots but holds a valid legacy slot; a pre-v1 binary or a rollback wrote to it - reopen with the binary that wrote it or restore from a trusted backup")]
+    SlotDowngradeDetected,
+
+    #[error("refusing to write an unauthenticated (legacy) commit slot into a V1-flagged file: stale named-table entries exceed the V1 slot capacity")]
+    LegacySlotWriteOnV1File,
+
     #[error("page checksum mismatch on page {0} (post-decrypt integrity failure)")]
     ChecksumMismatch(PageId),
 

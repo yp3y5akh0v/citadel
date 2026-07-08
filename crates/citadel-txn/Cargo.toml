@@ -24,6 +24,7 @@ citadel-buffer = { workspace = true }
 parking_lot = { workspace = true }
 blake3 = { workspace = true }
 rustc-hash = { workspace = true }
+zeroize = { workspace = true }
 rayon = { workspace = true, optional = true }
 
 [features]

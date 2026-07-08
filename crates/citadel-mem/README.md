@@ -11,9 +11,8 @@ It uses **no LLM** at ingest or retrieval - raw turns in, vector + keyword + rer
 so remembering costs zero tokens and the conversation is never sent to an LLM to build or
 search the memory. On the LoCoMo
 long-term conversational-memory benchmark, on encrypted regions with a matched `gpt-4o-mini`
-reader and judge, it scores 85.5% (3-run mean); the deterministic retrieval ceiling is 95.1%. With a
-`gemini-3.5-flash` reader the same encrypted retrieval scores 90.6%. On the LongMemEval oracle
-split it scores 90.6% with a `gpt-4o` reader and 82.2% with `gpt-4o-mini`. Full protocol, audit,
+reader and judge, it scores 85.7% (3-run mean); the deterministic retrieval ceiling is 94.5%. On the
+LongMemEval_S full-haystack split it scores 86.2% with a `gpt-4o` reader. Full protocol, audit,
 comparison, and numbers:
 [citadel-membench](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-membench).
 

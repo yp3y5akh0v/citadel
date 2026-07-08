@@ -1,4 +1,5 @@
-//! CoW B+ tree engine. Mutations clone pages; old pages go to pending-free list.
+//! CoW B+ tree engine. Mutations clone pages; old pages go to pending-free
+//! list.
 
 use crate::allocator::PageAllocator;
 use citadel_core::types::{PageId, PageType, TxnId, ValueType};
@@ -130,7 +131,8 @@ impl BTree {
         false
     }
 
-    /// Combined LIL check + insert. Returns `Some(was_new)` on hit, `None` on miss.
+    /// Combined LIL check + insert. Returns `Some(was_new)` on hit, `None` on
+    /// miss.
     pub fn try_lil_insert(
         &mut self,
         pages: &mut FxHashMap<PageId, Page>,
@@ -263,12 +265,6 @@ impl BTree {
         let leaf_empty = pages.get(&cow_id).unwrap().num_cells() == 0;
 
         if !leaf_empty || cached_path.is_empty() {
-            if alloc.in_place() && cow_id == cached_leaf {
-                self.entry_count -= 1;
-                self.clear_lil_caches();
-                self.last_delete = Some((cached_path, cow_id));
-                return Ok(Some((true, overflow_head)));
-            }
             if cow_id != cached_leaf {
                 self.root = propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id);
             }
@@ -297,7 +293,8 @@ impl BTree {
         val_type: ValueType,
         value: &[u8],
     ) -> Result<bool> {
-        // LIL cache: skip walk_to_leaf for sequential appends to the rightmost leaf.
+        // LIL cache: skip walk_to_leaf for sequential appends to the rightmost
+        // leaf.
         if let Some((mut cached_path, cached_leaf)) = self.last_insert.take() {
             let (hit, needs_cow) = {
                 let page = pages
@@ -389,24 +386,6 @@ impl BTree {
         };
 
         if leaf_ok {
-            if alloc.in_place() && new_leaf_id == leaf_id {
-                let mut is_rightmost = true;
-                for &(ancestor_id, child_idx) in path.iter().rev() {
-                    let page = pages.get(&ancestor_id).unwrap();
-                    if child_idx != page.num_cells() as usize {
-                        is_rightmost = false;
-                        break;
-                    }
-                }
-                if is_rightmost {
-                    self.last_delete = None;
-                    self.last_insert = Some((path, new_leaf_id));
-                }
-                if !key_exists {
-                    self.entry_count += 1;
-                }
-                return Ok((!key_exists, replaced_overflow));
-            }
             let mut child = new_leaf_id;
             let mut is_rightmost = true;
             let mut new_path = path;
@@ -454,6 +433,9 @@ impl BTree {
         Ok((!key_exists, replaced_overflow))
     }
 
+    /// Insert if absent; otherwise return the existing cell's `(val_type,
+    /// bytes)` so the caller can materialize overflow refs before exposing the
+    /// value.
     pub fn insert_or_fetch(
         &mut self,
         pages: &mut FxHashMap<PageId, Page>,
@@ -462,7 +444,7 @@ impl BTree {
         key: &[u8],
         val_type: ValueType,
         value: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<(ValueType, Vec<u8>)>> {
         if let Some((mut cached_path, cached_leaf)) = self.last_insert.take() {
             let (hit, needs_cow) = {
                 let page = pages
@@ -522,7 +504,7 @@ impl BTree {
                     if matches!(cell.val_type, ValueType::Tombstone) {
                         None
                     } else {
-                        Some(cell.value.to_vec())
+                        Some((cell.val_type, cell.value.to_vec()))
                     }
                 }
                 Err(_) => None,
@@ -539,22 +521,6 @@ impl BTree {
         };
 
         if leaf_ok {
-            if alloc.in_place() && new_leaf_id == leaf_id {
-                let mut is_rightmost = true;
-                for &(ancestor_id, child_idx) in path.iter().rev() {
-                    let page = pages.get(&ancestor_id).unwrap();
-                    if child_idx != page.num_cells() as usize {
-                        is_rightmost = false;
-                        break;
-                    }
-                }
-                if is_rightmost {
-                    self.last_delete = None;
-                    self.last_insert = Some((path, new_leaf_id));
-                }
-                self.entry_count += 1;
-                return Ok(None);
-            }
             let mut child = new_leaf_id;
             let mut is_rightmost = true;
             let mut new_path = path;
@@ -693,22 +659,6 @@ impl BTree {
         };
 
         if leaf_ok {
-            if alloc.in_place() && new_leaf_id == leaf_id {
-                let mut is_rightmost = true;
-                for &(ancestor_id, child_idx) in path.iter().rev() {
-                    let page = pages.get(&ancestor_id).unwrap();
-                    if child_idx != page.num_cells() as usize {
-                        is_rightmost = false;
-                        break;
-                    }
-                }
-                if is_rightmost {
-                    self.last_delete = None;
-                    self.last_insert = Some((path, new_leaf_id));
-                }
-                self.entry_count += 1;
-                return Ok(true);
-            }
             let mut child = new_leaf_id;
             let mut is_rightmost = true;
             let mut new_path = path;
@@ -750,245 +700,18 @@ impl BTree {
         Ok(true)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[inline]
-    pub fn upsert_with<F, E>(
-        &mut self,
-        pages: &mut FxHashMap<PageId, Page>,
-        alloc: &mut PageAllocator,
-        txn_id: TxnId,
-        key: &[u8],
-        val_type: ValueType,
-        default_value: &[u8],
-        f: F,
-    ) -> std::result::Result<UpsertOutcome, E>
-    where
-        F: FnMut(&[u8]) -> std::result::Result<UpsertAction, E>,
-        E: From<Error>,
-    {
-        if let Some((mut cached_path, cached_leaf)) = self.last_insert.take() {
-            let (hit, needs_cow) = {
-                let page = pages
-                    .get(&cached_leaf)
-                    .ok_or(Error::PageOutOfBounds(cached_leaf))?;
-                let n = page.num_cells();
-                let h = n > 0 && key > leaf_node::read_cell(page, n - 1).key;
-                let nc = page.txn_id() != txn_id;
-                (h, nc)
-            };
-            if hit {
-                let cow_id = if needs_cow {
-                    cow_page(pages, alloc, cached_leaf, txn_id)
-                } else {
-                    cached_leaf
-                };
-                let ok = {
-                    let page = pages.get_mut(&cow_id).unwrap();
-                    leaf_node::insert_append_direct(page, key, val_type, default_value)
-                };
-                if ok {
-                    if cow_id != cached_leaf {
-                        self.root =
-                            propagate_cow_up(pages, alloc, txn_id, &mut cached_path, cow_id);
-                    }
-                    self.entry_count += 1;
-                    self.last_delete = None;
-                    self.last_insert = Some((cached_path, cow_id));
-                    return Ok(UpsertOutcome::Inserted);
-                }
-                let (sep_key, right_id) = split_leaf_with_insert(
-                    pages,
-                    alloc,
-                    txn_id,
-                    cow_id,
-                    key,
-                    val_type,
-                    default_value,
-                );
-                self.root = propagate_split_up(
-                    pages,
-                    alloc,
-                    txn_id,
-                    &cached_path,
-                    cow_id,
-                    &sep_key,
-                    right_id,
-                    &mut self.depth,
-                );
-                self.clear_lil_caches();
-                self.entry_count += 1;
-                return Ok(UpsertOutcome::Inserted);
-            }
-            self.last_insert = Some((cached_path, cached_leaf));
-        }
-
-        let (path, leaf_id) = self.walk_to_leaf(pages, key)?;
-        self.upsert_with_at_leaf(
-            pages,
-            alloc,
-            txn_id,
-            key,
-            val_type,
-            default_value,
-            path,
-            leaf_id,
-            f,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[inline]
-    pub fn upsert_with_at_leaf<F, E>(
-        &mut self,
-        pages: &mut FxHashMap<PageId, Page>,
-        alloc: &mut PageAllocator,
-        txn_id: TxnId,
-        key: &[u8],
-        val_type: ValueType,
-        default_value: &[u8],
-        path: Vec<(PageId, usize)>,
-        leaf_id: PageId,
-        mut f: F,
-    ) -> std::result::Result<UpsertOutcome, E>
-    where
-        F: FnMut(&[u8]) -> std::result::Result<UpsertAction, E>,
-        E: From<Error>,
-    {
-        let found = {
-            let page = pages.get(&leaf_id).unwrap();
-            match leaf_node::search(page, key) {
-                Ok(idx) => {
-                    let cell = leaf_node::read_cell(page, idx);
-                    if matches!(cell.val_type, ValueType::Tombstone) {
-                        None
-                    } else {
-                        Some((idx, f(cell.value)?))
-                    }
-                }
-                Err(_) => None,
-            }
-        };
-
-        if let Some((idx, act)) = found {
-            match act {
-                UpsertAction::Skip => return Ok(UpsertOutcome::Skipped),
-                UpsertAction::Replace(new_bytes) => {
-                    let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
-                    let leaf_ok = {
-                        let page = pages.get_mut(&new_leaf_id).unwrap();
-                        leaf_node::replace_at(page, idx, key, val_type, &new_bytes)
-                    };
-                    if leaf_ok {
-                        if new_leaf_id != leaf_id {
-                            let mut new_path = path;
-                            self.root =
-                                propagate_cow_up(pages, alloc, txn_id, &mut new_path, new_leaf_id);
-                        }
-                        return Ok(UpsertOutcome::Updated);
-                    }
-                    self.clear_lil_caches();
-                    let (sep_key, right_id) = split_leaf_with_insert(
-                        pages,
-                        alloc,
-                        txn_id,
-                        new_leaf_id,
-                        key,
-                        val_type,
-                        &new_bytes,
-                    );
-                    self.root = propagate_split_up(
-                        pages,
-                        alloc,
-                        txn_id,
-                        &path,
-                        new_leaf_id,
-                        &sep_key,
-                        right_id,
-                        &mut self.depth,
-                    );
-                    return Ok(UpsertOutcome::Updated);
-                }
-            }
-        }
-
-        let new_leaf_id = cow_page(pages, alloc, leaf_id, txn_id);
-        let leaf_ok = {
-            let page = pages.get_mut(&new_leaf_id).unwrap();
-            leaf_node::insert_direct(page, key, val_type, default_value)
-        };
-
-        if leaf_ok {
-            if alloc.in_place() && new_leaf_id == leaf_id {
-                let mut is_rightmost = true;
-                for &(ancestor_id, child_idx) in path.iter().rev() {
-                    let page = pages.get(&ancestor_id).unwrap();
-                    if child_idx != page.num_cells() as usize {
-                        is_rightmost = false;
-                        break;
-                    }
-                }
-                if is_rightmost {
-                    self.last_delete = None;
-                    self.last_insert = Some((path, new_leaf_id));
-                }
-                self.entry_count += 1;
-                return Ok(UpsertOutcome::Inserted);
-            }
-            let mut child = new_leaf_id;
-            let mut is_rightmost = true;
-            let mut new_path = path;
-            for i in (0..new_path.len()).rev() {
-                let (ancestor_id, child_idx) = new_path[i];
-                let new_ancestor = cow_page(pages, alloc, ancestor_id, txn_id);
-                let page = pages.get_mut(&new_ancestor).unwrap();
-                update_branch_child(page, child_idx, child);
-                if child_idx != page.num_cells() as usize {
-                    is_rightmost = false;
-                }
-                new_path[i] = (new_ancestor, child_idx);
-                child = new_ancestor;
-            }
-            self.root = child;
-
-            if is_rightmost {
-                self.last_delete = None;
-                self.last_insert = Some((new_path, new_leaf_id));
-            }
-            self.entry_count += 1;
-            return Ok(UpsertOutcome::Inserted);
-        }
-
-        self.clear_lil_caches();
-        let (sep_key, right_id) = split_leaf_with_insert(
-            pages,
-            alloc,
-            txn_id,
-            new_leaf_id,
-            key,
-            val_type,
-            default_value,
-        );
-        self.root = propagate_split_up(
-            pages,
-            alloc,
-            txn_id,
-            &path,
-            new_leaf_id,
-            &sep_key,
-            right_id,
-            &mut self.depth,
-        );
-        self.entry_count += 1;
-        Ok(UpsertOutcome::Inserted)
-    }
-
-    /// Bulk-update existing keys. Keys must be sorted.
+    /// Bulk-update existing keys (sorted). Callers stage oversized values as
+    /// overflow chains and free the heads returned in `replaced_overflow`.
+    /// Absent/duplicate keys are skipped, their indices pushed to `skipped`
+    /// so the caller can release the staged chains that would else orphan.
     pub fn update_sorted(
         &mut self,
         pages: &mut FxHashMap<PageId, Page>,
         alloc: &mut PageAllocator,
         txn_id: TxnId,
-        pairs: &[(&[u8], &[u8])],
+        pairs: &[(&[u8], ValueType, &[u8])],
+        replaced_overflow: &mut Vec<PageId>,
+        skipped: &mut Vec<usize>,
     ) -> Result<u64> {
         if pairs.is_empty() {
             return Ok(0);
@@ -1003,9 +726,10 @@ impl BTree {
 
         let mut count: u64 = 0;
         let mut hint: u16 = 0;
+        let mut need_walk = false;
 
-        for &(key, value) in pairs {
-            let past_leaf = {
+        for (pair_idx, &(key, val_type, value)) in pairs.iter().enumerate() {
+            let past_leaf = need_walk || {
                 let page = pages.get(&cow_leaf).unwrap();
                 let n = page.num_cells();
                 n == 0 || key > leaf_node::read_cell(page, n - 1).key
@@ -1020,6 +744,7 @@ impl BTree {
                     self.root = propagate_cow_up(pages, alloc, txn_id, &mut path, cow_leaf);
                 }
                 hint = 0;
+                need_walk = false;
             }
 
             let page = pages.get(&cow_leaf).unwrap();
@@ -1041,11 +766,37 @@ impl BTree {
 
             if let Some(idx) = idx {
                 hint = idx + 1;
+                {
+                    let cell = leaf_node::read_cell(page, idx);
+                    if cell.val_type == ValueType::Overflow {
+                        replaced_overflow
+                            .push(leaf_node::OverflowRef::from_bytes(cell.value).first_page);
+                    }
+                }
                 let page = pages.get_mut(&cow_leaf).unwrap();
-                if !leaf_node::update_value_in_place(page, idx, ValueType::Inline, value) {
-                    leaf_node::insert_direct(page, key, ValueType::Inline, value);
+                if !leaf_node::replace_at(page, idx, key, val_type, value) {
+                    // The new cell doesn't fit even after compaction.
+                    // replace_at already removed the old cell, so the
+                    // split-insert restores the key (net-zero entry count).
+                    let (sep_key, right_id) = split_leaf_with_insert(
+                        pages, alloc, txn_id, cow_leaf, key, val_type, value,
+                    );
+                    self.root = propagate_split_up(
+                        pages,
+                        alloc,
+                        txn_id,
+                        &path,
+                        cow_leaf,
+                        &sep_key,
+                        right_id,
+                        &mut self.depth,
+                    );
+                    // Leaf contents and `path` are stale after the split.
+                    need_walk = true;
                 }
                 count += 1;
+            } else {
+                skipped.push(pair_idx);
             }
         }
 
@@ -1093,11 +844,6 @@ impl BTree {
         let leaf_empty = pages.get(&new_leaf_id).unwrap().num_cells() == 0;
 
         if !leaf_empty || path.is_empty() {
-            if alloc.in_place() && new_leaf_id == leaf_id {
-                self.entry_count -= 1;
-                self.last_delete = Some((path.clone(), new_leaf_id));
-                return Ok(true);
-            }
             self.root = propagate_cow_up(pages, alloc, txn_id, path, new_leaf_id);
             self.entry_count -= 1;
             self.last_delete = Some((path.clone(), new_leaf_id));
@@ -1137,20 +883,13 @@ impl BTree {
     }
 }
 
-/// CoW a page. No-op if already owned by this txn. In-place mode reuses page ID.
+/// CoW a page. No-op if already owned by this txn.
 pub fn cow_page(
     pages: &mut FxHashMap<PageId, Page>,
     alloc: &mut PageAllocator,
     old_id: PageId,
     txn_id: TxnId,
 ) -> PageId {
-    if alloc.in_place() {
-        let page = pages.get_mut(&old_id).unwrap();
-        if page.txn_id() != txn_id {
-            page.set_txn_id(txn_id);
-        }
-        return old_id;
-    }
     let mut new_page = {
         let page = pages.get(&old_id).unwrap();
         if page.txn_id() == txn_id {
@@ -1478,16 +1217,19 @@ fn propagate_remove_up(
                 let only_child = pages.get(&new_ancestor).unwrap().right_child();
                 alloc.free(new_ancestor);
                 pages.remove(&new_ancestor);
-                *depth -= 1;
+                // Only a root collapse shrinks global depth (a walk-capacity
+                // bound that must stay >= true height, hence >= 1).
+                *depth = (*depth).saturating_sub(1).max(1);
                 return only_child;
             }
             new_child = new_ancestor;
             need_remove_at_level = false;
         } else {
+            // Non-root branch drained: splice its only child up. Global depth
+            // unchanged - other subtrees keep the full height.
             let only_child = pages.get(&new_ancestor).unwrap().right_child();
             alloc.free(new_ancestor);
             pages.remove(&new_ancestor);
-            *depth -= 1;
 
             new_child = only_child;
             need_remove_at_level = false;
