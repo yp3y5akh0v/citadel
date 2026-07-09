@@ -9,6 +9,7 @@ on:
       - 'scripts/**'
       - 'LICENSE-*'
       - '.github/FUNDING.yml'
+      - '.github/*.png'
       - 'server.json'
   pull_request:
     branches: [master]
@@ -18,6 +19,7 @@ on:
       - 'scripts/**'
       - 'LICENSE-*'
       - '.github/FUNDING.yml'
+      - '.github/*.png'
       - 'server.json'
 
 concurrency:
