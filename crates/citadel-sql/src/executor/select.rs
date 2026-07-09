@@ -5141,13 +5141,11 @@ fn is_streamable_scalar(expr: &Expr) -> bool {
             conditions,
             else_result,
         } => {
-            operand.as_ref().map_or(true, |e| is_streamable_scalar(e))
+            operand.as_ref().is_none_or(|e| is_streamable_scalar(e))
                 && conditions
                     .iter()
                     .all(|(c, r)| is_streamable_scalar(c) && is_streamable_scalar(r))
-                && else_result
-                    .as_ref()
-                    .map_or(true, |e| is_streamable_scalar(e))
+                && else_result.as_ref().is_none_or(|e| is_streamable_scalar(e))
         }
         _ => false,
     }

@@ -177,9 +177,10 @@ pub(super) fn compute_equi_join_meta(
         .as_ref()
         .map(|on| extract_equi_join_keys(on, combined_cols, outer_col_count))
         .unwrap_or_default();
-    let is_pure_equi = join.on_clause.as_ref().map_or(true, |on| {
-        !equi_pairs.is_empty() && count_conjuncts(on) == equi_pairs.len()
-    });
+    let is_pure_equi = join
+        .on_clause
+        .as_ref()
+        .is_none_or(|on| !equi_pairs.is_empty() && count_conjuncts(on) == equi_pairs.len());
     (equi_pairs, is_pure_equi)
 }
 

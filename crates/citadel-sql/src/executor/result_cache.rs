@@ -245,7 +245,7 @@ fn cacheable_select(ctx: &mut WalkCtx<'_>, sel: &SelectStmt) -> bool {
             .is_none_or_cacheable(ctx, cacheable_expr)
 }
 
-/// `Option::map_or(true, ..)` with the walker context threaded through.
+/// `Option::is_none_or` with the walker context threaded through.
 trait OptionCacheable<T> {
     fn is_none_or_cacheable(
         &self,

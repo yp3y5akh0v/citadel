@@ -1831,10 +1831,7 @@ fn flush_mints(
                 score = p.score
             );
             terminal_minted |= p.terminal;
-            if ledger
-                .best_verified
-                .map_or(true, |(best, _)| p.score > best)
-            {
+            if ledger.best_verified.is_none_or(|(best, _)| p.score > best) {
                 *ledger.best_verified = Some((p.score, atom));
             }
         } else {

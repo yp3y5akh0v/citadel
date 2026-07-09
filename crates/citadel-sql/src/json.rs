@@ -2149,7 +2149,7 @@ pub fn fn_pretty(v: &Value) -> Result<Value> {
 }
 
 pub fn fn_build_object(args: &[Value], target: crate::types::DataType) -> Result<Value> {
-    if args.len() % 2 != 0 {
+    if !args.len().is_multiple_of(2) {
         return Err(SqlError::InvalidValue(
             "jsonb_build_object requires an even number of arguments".into(),
         ));

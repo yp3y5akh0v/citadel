@@ -205,7 +205,7 @@ pub(super) fn try_covered_index_collect_read(
             }
         }
         rows.push(row);
-        Ok(limit.map_or(true, |n| rows.len() < n))
+        Ok(limit.is_none_or(|n| rows.len() < n))
     })
     .map_err(SqlError::Storage)?;
     if let Some(e) = scan_err {
@@ -532,7 +532,7 @@ pub(super) fn collect_rows_with_read_planned(
                         return false;
                     }
                 }
-                limit.map_or(true, |n| rows.len() < n)
+                limit.is_none_or(|n| rows.len() < n)
             })
             .map_err(SqlError::Storage)?;
             if let Some(e) = scan_err {
@@ -601,7 +601,7 @@ pub(super) fn collect_rows_with_read_planned(
                         return Ok(false);
                     }
                 }
-                Ok(scan_err.is_none() && limit.map_or(true, |n| rows.len() < n))
+                Ok(scan_err.is_none() && limit.is_none_or(|n| rows.len() < n))
             })
             .map_err(SqlError::Storage)?;
             if let Some(e) = scan_err {
@@ -787,7 +787,7 @@ pub(super) fn collect_rows_write(
                         Ok(false) => {}
                         Err(e) => scan_err = Some(e),
                     }
-                    let keep_going = scan_err.is_none() && limit.map_or(true, |n| rows.len() < n);
+                    let keep_going = scan_err.is_none() && limit.is_none_or(|n| rows.len() < n);
                     Ok(keep_going)
                 })
                 .map_err(SqlError::Storage)?;
@@ -836,7 +836,7 @@ pub(super) fn collect_rows_write(
                         Err(e) => scan_err = Some(e),
                     },
                 }
-                let keep_going = scan_err.is_none() && limit.map_or(true, |n| rows.len() < n);
+                let keep_going = scan_err.is_none() && limit.is_none_or(|n| rows.len() < n);
                 Ok(keep_going)
             })
             .map_err(SqlError::Storage)?;
@@ -906,7 +906,7 @@ pub(super) fn collect_rows_write(
                         return Ok(false);
                     }
                 }
-                Ok(scan_err.is_none() && limit.map_or(true, |n| rows.len() < n))
+                Ok(scan_err.is_none() && limit.is_none_or(|n| rows.len() < n))
             })
             .map_err(SqlError::Storage)?;
             if let Some(e) = scan_err {

@@ -174,7 +174,7 @@ fn jitter01(attempt: u32) -> f64 {
 
 /// Log the first retry then every 16th, so a sustained storm stays readable.
 fn log_retry(attempt: u32, delay_ms: u64, e: &LlmError, spent: Duration, budget: Duration) {
-    if attempt == 1 || attempt % 16 == 0 {
+    if attempt == 1 || attempt.is_multiple_of(16) {
         eprintln!(
             "  retry {attempt} after {delay_ms}ms (transient: {e}; elapsed {}s/{}s)",
             spent.as_secs(),
@@ -435,7 +435,7 @@ pub(crate) fn starts_with_token(reply: &str, token: &str) -> bool {
         Some(rest) => rest
             .chars()
             .next()
-            .map_or(true, |c| !c.is_ascii_alphanumeric()),
+            .is_none_or(|c| !c.is_ascii_alphanumeric()),
         None => false,
     }
 }
