@@ -1541,7 +1541,6 @@ fn convert_column_def(
             sp::ColumnOption::Generated {
                 generation_expr,
                 generation_expr_mode,
-                sequence_options: _,
                 ..
             } => {
                 let Some(expr) = generation_expr else {

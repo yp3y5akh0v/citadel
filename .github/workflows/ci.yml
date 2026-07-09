@@ -29,20 +29,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
       - run: cargo fmt --all --check
 
   clippy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # The locked workspace must compile on the declared rust-version.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install MSRV toolchain
+        run: rustup toolchain install 1.88 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo +1.88 check --workspace --exclude citadeldb-python
 
   test:
     needs: [fmt, clippy]
@@ -74,7 +84,8 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           df -h /
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
       # citadeldb-python is a pyo3 cdylib member; its test harness links libpython.
       - uses: actions/setup-python@v5
         with:
@@ -91,10 +102,8 @@ jobs:
     name: citadel-ai backends
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-          components: clippy
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           key: ai-backends
@@ -119,7 +128,8 @@ jobs:
     name: python bindings
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           key: python

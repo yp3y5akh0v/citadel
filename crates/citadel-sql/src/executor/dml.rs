@@ -2414,13 +2414,12 @@ fn build_trivial_fast_program(
                         add: *add,
                         off: gen_off,
                     });
-                } else if let Some(lit) = col_to_lit_int.get(col_schema_idx).copied() {
+                } else {
+                    let lit = col_to_lit_int.get(col_schema_idx).copied()?;
                     ops.push(WriteOp::LiteralI64 {
                         value: lit.wrapping_mul(*mul).wrapping_add(*add),
                         off: gen_off,
                     });
-                } else {
-                    return None;
                 }
             }
             FastGenEval::None => return None,

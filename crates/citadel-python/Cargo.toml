@@ -2,8 +2,7 @@
 name = "citadeldb-python"
 version.workspace = true
 edition.workspace = true
-# rust-numpy 0.29 needs a higher floor than the workspace's 1.80.
-rust-version = "1.83"
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -1,0 +1,5 @@
+# Pinned so local checks match CI; upgrade by bumping `channel` and fixing new lints.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]

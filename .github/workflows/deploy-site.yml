@@ -27,9 +27,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
 
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked
@@ -58,6 +57,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     needs: build
+    timeout-minutes: 10
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
