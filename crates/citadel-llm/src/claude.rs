@@ -1,4 +1,4 @@
-//! Anthropic Messages API; wire: top-level system, tool_result turns, object input.
+//! Anthropic Messages API; wire: top-level system, tool_result blocks, object input.
 
 use serde_json::{json, Value};
 use ureq::Agent;
@@ -7,15 +7,17 @@ use super::http::{agent, estimate_tokens, post_json, LlmTimeouts};
 use super::pricing;
 use super::{
     AssistantMessage, ClientRequestIdentity, CompletionRequest, CompletionResponse, FinishReason,
-    LLMClient, LlmError, Message, TokenUsage, ToolCall, ToolChoice,
+    LLMClient, LlmError, Message, OutputSchemaSupport, TokenUsage, ToolCall, ToolChoice,
 };
 
 pub(super) const API_URL: &str = "https://api.anthropic.com/v1/messages";
 pub(super) const API_VERSION: &str = "2023-06-01";
 /// Anthropic requires `max_tokens`; used when the request leaves it unset.
 pub(super) const DEFAULT_MAX_TOKENS: u32 = 4096;
+pub(super) const MESSAGES_WIRE_REVISION: &str = "anthropic-messages-v2";
+pub(super) const STRUCTURED_OUTPUTS_REVISION: &str = "json-schema-output-config-v1";
 
-/// Calls api.anthropic.com; the API key stays in memory, never logged or persisted.
+/// Anthropic client; the API key is memory-only, never logged or persisted.
 pub(crate) struct ClaudeClient {
     model: String,
     api_key: String,
@@ -60,11 +62,16 @@ impl LLMClient for ClaudeClient {
             "claude",
             API_URL,
             &[
-                ("wire", "anthropic-messages-v1"),
+                ("wire", MESSAGES_WIRE_REVISION),
                 ("anthropic-version", API_VERSION),
                 ("default_max_tokens", &default_max_tokens),
+                ("structured_outputs", STRUCTURED_OUTPUTS_REVISION),
             ],
         )
+    }
+
+    fn output_schema_support(&self) -> OutputSchemaSupport {
+        OutputSchemaSupport::StrictJsonSchema
     }
 
     fn count_tokens(&self, messages: &[Message]) -> usize {
@@ -72,7 +79,7 @@ impl LLMClient for ClaudeClient {
     }
 }
 
-/// Opus 4.7+ and Fable 400 on non-default temperature/top_p/top_k; omit them there.
+/// Opus 4.7+ and Fable reject non-default temperature/top_p/top_k with a 400.
 fn rejects_sampling_params(model: &str) -> bool {
     if model.starts_with("claude-fable-") {
         return true;
@@ -149,7 +156,7 @@ fn to_wire(req: &CompletionRequest, model: &str) -> Value {
             })
             .collect();
         obj.insert("tools".to_string(), Value::Array(tools));
-        // Only meaningful alongside tools; Auto is the provider default (omit it).
+        // Meaningful only with tools; Auto is the provider default (omit it).
         match &req.tool_choice {
             ToolChoice::Auto => {}
             ToolChoice::Any => {
@@ -163,13 +170,12 @@ fn to_wire(req: &CompletionRequest, model: &str) -> Value {
             }
         }
     }
-    // Omit temperature for models that 400 on it (see rejects_sampling_params).
     if let Some(t) = req.temperature {
         if !rejects_sampling_params(model) {
             obj.insert("temperature".to_string(), json!(t));
         }
     }
-    // effort caps thinking; json_schema guarantees JSON text, not all-thinking.
+    // effort caps reasoning spend; json_schema forces text-first, not all-thinking.
     let mut output_config = serde_json::Map::new();
     if let Some(effort) = req.effort {
         output_config.insert("effort".to_string(), json!(effort.as_str()));
@@ -216,15 +222,17 @@ fn from_wire(resp: &Value, model: &str) -> Result<CompletionResponse, LlmError> 
     }
 
     let finish_reason = match resp.get("stop_reason").and_then(Value::as_str) {
-        Some("max_tokens") => FinishReason::Length,
+        Some("end_turn" | "stop_sequence") => FinishReason::Stop,
+        Some("max_tokens" | "model_context_window_exceeded") => FinishReason::Length,
         Some("tool_use") => FinishReason::ToolUse,
-        _ => FinishReason::Stop,
+        Some("refusal") => FinishReason::Refusal,
+        Some("pause_turn") | Some(_) | None => FinishReason::Error,
     };
 
     // All-thinking reply at the cap silently burns budget; fail loud.
     if finish_reason == FinishReason::Length && text.is_empty() && tool_calls.is_empty() {
         return Err(LlmError::Backend(format!(
-            "anthropic: hit max_tokens with no text or tool_use (skipped blocks: [{}]); \
+            "anthropic: hit an output limit with no text or tool_use (skipped blocks: [{}]); \
              raise max_tokens or cap reasoning via output_config effort",
             skipped.join(", ")
         )));
@@ -423,11 +431,41 @@ mod tests {
             from_wire(&base("max_tokens"), "m").unwrap().finish_reason,
             FinishReason::Length
         );
+        assert_eq!(
+            from_wire(&base("model_context_window_exceeded"), "m")
+                .unwrap()
+                .finish_reason,
+            FinishReason::Length
+        );
+        assert_eq!(
+            from_wire(&base("refusal"), "m").unwrap().finish_reason,
+            FinishReason::Refusal
+        );
+        assert_eq!(
+            from_wire(&base("pause_turn"), "m").unwrap().finish_reason,
+            FinishReason::Error
+        );
+        assert_eq!(
+            from_wire(&base("future_reason"), "m")
+                .unwrap()
+                .finish_reason,
+            FinishReason::Error
+        );
+        assert_eq!(
+            from_wire(&json!({ "content": [] }), "m")
+                .unwrap()
+                .finish_reason,
+            FinishReason::Error
+        );
     }
 
     #[test]
     fn output_config_carries_effort_and_json_schema_format() {
         use crate::Effort;
+        assert_eq!(
+            ClaudeClient::new("claude-fable-5", "secret").output_schema_support(),
+            OutputSchemaSupport::StrictJsonSchema
+        );
         let schema = json!({ "type": "array", "items": { "type": "object" } });
         let req = CompletionRequest {
             effort: Some(Effort::Low),
@@ -465,7 +503,7 @@ mod tests {
 
     #[test]
     fn from_wire_keeps_truncated_text_on_max_tokens() {
-        // Partial text at the cap is still a (Length-flagged) reply, not an error.
+        // Truncated text at the cap is still a Length reply, not an error.
         let resp = json!({
             "content": [{ "type": "text", "text": "[{\"points\":" }],
             "stop_reason": "max_tokens"

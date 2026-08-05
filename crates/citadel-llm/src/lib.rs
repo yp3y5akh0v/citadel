@@ -1,4 +1,4 @@
-//! Sync one-shot `LLMClient` trait and types; no tokio, rayon fans out at the loop.
+//! The `LLMClient` trait and its types; sync (no tokio) to match citadel.
 
 pub(crate) mod mock;
 
@@ -6,7 +6,7 @@ pub mod factory;
 #[cfg(any(test, feature = "test-util"))]
 pub use factory::testing;
 
-// HTTP backends are native-only (ureq is blocking std I/O); wasm builds mock only.
+// HTTP backends are native-only (ureq is blocking I/O); wasm builds mock only.
 #[cfg(all(not(target_arch = "wasm32"), feature = "claude"))]
 pub(crate) mod claude;
 #[cfg(all(
@@ -19,26 +19,37 @@ mod http;
     any(feature = "claude", feature = "openai")
 ))]
 pub use http::LlmTimeouts;
+mod limits;
 #[cfg(all(not(target_arch = "wasm32"), feature = "ollama"))]
 pub(crate) mod ollama;
 #[cfg(all(not(target_arch = "wasm32"), feature = "openai"))]
 pub(crate) mod openai;
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(feature = "claude", feature = "openai")
-))]
+mod openai_models;
 mod pricing;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+/// USD per million (input, output) tokens; `None` when unknown, never guessed.
+pub fn known_token_rates_usd_per_million(model_id: &str) -> Option<(f64, f64)> {
+    pricing::pricing_for(model_id).map(|rate| (rate.input_per_mtok, rate.output_per_mtok))
+}
+
+/// Published output-token ceiling; a lower cap silently truncates output.
+pub fn known_max_output_tokens(model_id: &str) -> Option<u32> {
+    limits::max_output_tokens(model_id)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
-    /// Non-HTTP/transport failure: mock exhaustion, replay miss, malformed body.
+    /// No faithful backend mapping; refused pre-dispatch, so no spend.
+    #[error("llm request unsupported: {0}")]
+    UnsupportedRequest(String),
+    /// Not HTTP or transport: mock exhaustion, replay miss, malformed body.
     #[error("llm backend error: {0}")]
     Backend(String),
-    /// A non-2xx HTTP status; `retry_after` is the `Retry-After` header in seconds.
+    /// Non-2xx provider status; `retry_after` is `Retry-After` in seconds.
     #[error("llm http {status}: {message}")]
     Http {
         status: u16,
@@ -51,13 +62,18 @@ pub enum LlmError {
 }
 
 impl LlmError {
-    /// Whether a retry might succeed: only 429/5xx/transport are transient.
+    /// True only for 429, 5xx, and transport errors; all else is terminal.
     pub fn is_retryable(&self) -> bool {
         match self {
             LlmError::Http { status, .. } => *status == 429 || (500..600).contains(status),
             LlmError::Transport(_) => true,
-            LlmError::Backend(_) => false,
+            LlmError::UnsupportedRequest(_) | LlmError::Backend(_) => false,
         }
+    }
+
+    /// Whether the client refused locally before any provider dispatch.
+    pub fn is_pre_dispatch(&self) -> bool {
+        matches!(self, LlmError::UnsupportedRequest(_))
     }
 
     /// The server-requested retry delay in seconds, if the error carried one.
@@ -78,7 +94,7 @@ pub enum Message {
     Tool {
         call_id: String,
         content: String,
-        /// True if the call failed; sets the wire error flag (Anthropic `is_error`).
+        /// True when the call failed; maps to Anthropic's `is_error` flag.
         is_error: bool,
     },
 }
@@ -106,7 +122,7 @@ pub struct AssistantMessage {
     pub tool_calls: Vec<ToolCall>,
 }
 
-/// A function-schema tool the model may call; `input_schema` is raw JSON Schema.
+/// A tool the model may call; `input_schema` is raw JSON Schema.
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
     pub name: String,
@@ -114,7 +130,7 @@ pub struct ToolSpec {
     pub input_schema: Value,
 }
 
-/// A model's tool request; raw `arguments`, unvalidated until `Tool::call`.
+/// A model's tool invocation; `arguments` is raw, unvalidated JSON.
 #[derive(Debug, Clone)]
 pub struct ToolCall {
     pub id: String,
@@ -122,7 +138,7 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
-/// How the model may use tools; per-backend `to_wire` map, part of the replay key.
+/// How the model may use offered tools; folded into the replay key.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ToolChoice {
     /// Model decides (the provider default when tools are present).
@@ -134,7 +150,7 @@ pub enum ToolChoice {
     Tool(String),
 }
 
-/// Reasoning cap (Anthropic `output_config.effort`); else a model may emit no text.
+/// Provider-neutral reasoning cap; unsupported profiles refuse, never drop it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effort {
     Low,
@@ -161,11 +177,13 @@ pub struct CompletionRequest {
     pub tool_choice: ToolChoice,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
-    /// Reasoning cap; 400s on models without `effort` (e.g. Sonnet/Haiku 4.5).
+    /// Reasoning cap; omitted from the wire when `None`, refused if unmappable.
     pub effort: Option<Effort>,
-    /// JSON Schema the reply must satisfy; first content block is valid JSON text.
+    /// Strict reply schema; guarantees JSON text or a pre-dispatch refusal.
     pub output_schema: Option<Value>,
     pub stop: Vec<String>,
+    /// Best-effort seed; seedless temp-0 flips ~9% of answers (A/B noise floor).
+    pub seed: Option<u64>,
 }
 
 impl CompletionRequest {
@@ -174,6 +192,12 @@ impl CompletionRequest {
             messages,
             ..Default::default()
         }
+    }
+
+    /// Pin the sampling seed (see [`CompletionRequest::seed`]).
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
     }
 
     pub fn with_tools(mut self, tools: Vec<ToolSpec>) -> Self {
@@ -193,15 +217,31 @@ pub enum FinishReason {
     Stop,
     Length,
     ToolUse,
+    /// Provider declined but billed; refusal text is in `message.content`.
+    Refusal,
+    /// Safety filter stopped the response; content and usage still returned.
+    ContentFilter,
     Error,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     /// Set by backends with known pricing; `None` for local models.
     pub cost_usd: Option<f64>,
+}
+
+impl TokenUsage {
+    /// Cost is a partial total when only one side is priced; track per call.
+    pub fn add(&mut self, other: &TokenUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cost_usd = match (self.cost_usd, other.cost_usd) {
+            (Some(x), Some(y)) => Some(x + y),
+            (x, y) => x.or(y),
+        };
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -211,7 +251,7 @@ pub struct CompletionResponse {
     pub finish_reason: FinishReason,
 }
 
-/// Non-secret transport/wire identity; closes same-model different-wire aliases.
+/// Non-secret provider/endpoint/wire identity; the model id is bound by callers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientRequestIdentity {
@@ -252,7 +292,7 @@ impl ClientRequestIdentity {
         }
     }
 
-    /// Identity for in-process clients; the canonical request is the only wire.
+    /// Identity for in-process clients whose only wire is the canonical request.
     pub fn in_process() -> Self {
         Self::from_config(
             "in-process",
@@ -312,23 +352,35 @@ impl CompletionResponse {
     }
 }
 
-/// One-shot completion backend; sync to match citadel's non-async core.
+/// Native enforcement available for [`CompletionRequest::output_schema`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputSchemaSupport {
+    Unsupported,
+    StrictJsonSchema,
+}
+
+/// One-shot sync completion backend; plug in via `Arc<dyn LLMClient>`.
 pub trait LLMClient: Send + Sync {
     fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, LlmError>;
 
     /// Identifies which model produced a response (for trace logs).
     fn model_id(&self) -> &str;
 
-    /// Effective wire identity; HTTP backends override from their exact config.
+    /// Non-secret wire identity; HTTP backends override the in-process default.
     fn request_identity(&self) -> ClientRequestIdentity {
         ClientRequestIdentity::in_process()
     }
 
-    /// Best-effort token count for pre-call budget checks; HTTP backends estimate.
+    /// Whether this profile enforces strict JSON Schema; default unsupported.
+    fn output_schema_support(&self) -> OutputSchemaSupport {
+        OutputSchemaSupport::Unsupported
+    }
+
+    /// Token count for pre-call budgeting; HTTP backends may approximate.
     fn count_tokens(&self, messages: &[Message]) -> usize;
 }
 
-/// Replay-key JSON: message order semantic, tools name-sorted, every field present.
+/// Deterministic replay-key encoding; message order semantic, tools name-sorted.
 pub fn canonical_json(req: &CompletionRequest) -> String {
     let mut tools: Vec<&ToolSpec> = req.tools.iter().collect();
     tools.sort_by(|a, b| a.name.cmp(&b.name));
@@ -455,6 +507,31 @@ mod canonical_tests {
     }
 
     #[test]
+    fn strict_output_schema_request_hash_is_frozen() {
+        let req = CompletionRequest {
+            output_schema: Some(json!({
+                "type": "object",
+                "properties": {
+                    "decision": { "type": "string", "enum": ["facts", "nothing_durable"] },
+                    "facts": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["decision", "facts"],
+                "additionalProperties": false
+            })),
+            max_tokens: Some(1500),
+            temperature: Some(0.0),
+            ..CompletionRequest::new(vec![
+                Message::system("extract durable facts"),
+                Message::user("session text"),
+            ])
+        };
+        assert_eq!(
+            request_hash("gpt-4o-mini-2024-07-18", &req),
+            "0c81c2092b7a67417f5c403f9c26fd1f7875746e68934bdfa5e14ebaa9c33f12"
+        );
+    }
+
+    #[test]
     fn tool_choice_is_part_of_the_key() {
         let base = || CompletionRequest::new(vec![Message::user("u")]).with_tools(vec![spec("t")]);
         assert_ne!(
@@ -488,6 +565,10 @@ mod error_tests {
         assert!(!http(401).is_retryable());
         assert!(LlmError::Transport("dns".into()).is_retryable());
         assert!(!LlmError::Backend("mock drained".into()).is_retryable());
+        let unsupported = LlmError::UnsupportedRequest("schema".into());
+        assert!(!unsupported.is_retryable());
+        assert!(unsupported.is_pre_dispatch());
+        assert!(!LlmError::Backend("malformed reply".into()).is_pre_dispatch());
     }
 
     #[test]
