@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use citadel_ai::factory;
-use citadel_ai::{
+use citadel_llm::factory;
+use citadel_llm::{
     AssistantMessage, CompletionRequest, CompletionResponse, Effort, FinishReason, LLMClient,
     LlmError, Message, TokenUsage, ToolCall, ToolChoice, ToolSpec,
 };
@@ -450,7 +450,7 @@ fn message_chars(m: &Message) -> usize {
 pub(crate) struct PyLlmHandle {
     pub(crate) inner: Arc<dyn LLMClient>,
     /// Present only for replay handles; exposes the cache-miss count.
-    replay: Option<factory::Replay>,
+    replay: Option<citadel_ai::Replay>,
 }
 
 #[pymethods]
@@ -491,7 +491,7 @@ impl PyLlmHandle {
     /// on a faithful replay. Errors if the graph has no traces.
     #[staticmethod]
     fn replay(graph: &PyBeliefGraph) -> PyResult<Self> {
-        let r = factory::replay_from_graph(graph.belief_graph()).map_err(to_pyerr)?;
+        let r = citadel_ai::replay_from_graph(graph.belief_graph()).map_err(to_pyerr)?;
         Ok(Self {
             inner: r.client(),
             replay: Some(r),

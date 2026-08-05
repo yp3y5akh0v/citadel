@@ -1,6 +1,6 @@
 //! LoCoMo reader prompt, judge rubrics, and documented flaws.
 
-use citadel_ai::{LLMClient, Message, TokenUsage};
+use citadel_llm::{LLMClient, Message, TokenUsage};
 use citadel_mem::AtomHit;
 
 use crate::core::error::Result;

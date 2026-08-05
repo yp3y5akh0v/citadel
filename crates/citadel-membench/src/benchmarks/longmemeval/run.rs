@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use citadel_ai::LLMClient;
+use citadel_llm::LLMClient;
 use citadel_mem::{Embedder, MemoryEngine};
 
 use super::dataset::LmSample;

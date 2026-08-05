@@ -1,11 +1,11 @@
 //! Token-free harness tests: no network, no real model files. Everything runs
 //! against an inline LoCoMo-shaped fixture, a `MockEmbedder`, and the
-//! `citadel_ai::testing` client toolkit.
+//! `citadel_llm::testing` client toolkit.
 
 use std::sync::Arc;
 
 use citadel::{Argon2Profile, DatabaseBuilder};
-use citadel_ai::{testing, CompletionResponse, LlmError, Message};
+use citadel_llm::{testing, CompletionResponse, LlmError, Message};
 use citadel_mem::{Embedder, MemoryEngine, MockEmbedder};
 use citadel_membench::{
     aggregate, build_reader_prompt, ingest_sample, judge_correct, parse_root, provenance,

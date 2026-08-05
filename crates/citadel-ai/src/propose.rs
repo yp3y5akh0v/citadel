@@ -10,11 +10,11 @@ use serde_json::{json, Value};
 use citadel_mem::AtomId;
 
 use crate::graph::Goal;
-use crate::llm::{
+use crate::prompts::ResolvedPrompt;
+use citadel_llm::{
     AssistantMessage, CompletionRequest, CompletionResponse, Effort, LlmError, Message, ToolChoice,
     ToolSpec,
 };
-use crate::prompts::ResolvedPrompt;
 
 /// A proposed-but-unchecked artifact + its mutation parent + the operator's rationale.
 #[derive(Debug, Clone)]
@@ -345,8 +345,8 @@ impl ProposalOperator for LlmProposer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{CompletionResponse, ToolCall};
     use crate::prompts::{PromptId, PromptLibrary};
+    use citadel_llm::{CompletionResponse, ToolCall};
 
     /// Build a `{"values":[[a,b],...]}` artifact string (local: no problem-specific dep).
     fn artifact_with(rows: &[(i64, i64)]) -> String {
@@ -539,7 +539,7 @@ mod tests {
             .with_artifact_schema(schema.clone())
             .with_plain_json()
             .build_request(&ctx_for(&goal, &system));
-        assert_eq!(req.effort, Some(crate::llm::Effort::Low));
+        assert_eq!(req.effort, Some(citadel_llm::Effort::Low));
         assert_eq!(
             req.output_schema,
             Some(serde_json::json!({

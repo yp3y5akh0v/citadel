@@ -17,7 +17,8 @@ name = "citadel_swe"
 
 # Harness lives in tests/, so deps are dev-only (file-tools + command-tool always on).
 [dev-dependencies]
-citadel-ai = { workspace = true, features = ["file-tools", "command-tool", "test-util"] }
+citadel-ai = { workspace = true, features = ["file-tools", "command-tool"] }
+citadel-llm = { workspace = true, features = ["test-util"] }
 citadel-mem = { workspace = true }
 citadel = { workspace = true }
 serde_json = { workspace = true }
@@ -26,9 +27,9 @@ tempfile = "3"
 [features]
 # `live` is the aggregate gate for the real-LLM bench + harness; each provider implies it.
 live = []
-claude = ["citadel-ai/claude", "live"]
-openai = ["citadel-ai/openai", "live"]
-ollama = ["citadel-ai/ollama", "live"]
+claude = ["citadel-llm/claude", "live"]
+openai = ["citadel-llm/openai", "live"]
+ollama = ["citadel-llm/ollama", "live"]
 candle-embed = ["citadel-mem/candle-embed"]
 # Run the embedder on the GPU (CUDA); implies candle-embed. Needs the CUDA toolkit.
 cuda-embed = ["candle-embed", "citadel-mem/cuda-embed"]

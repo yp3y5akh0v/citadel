@@ -18,6 +18,7 @@ name = "citadel_membench"
 
 [dependencies]
 citadel-mem = { workspace = true }
+citadel-llm = { workspace = true }
 citadel-ai = { workspace = true }
 citadel = { workspace = true }
 serde = { version = "1", features = ["derive"] }
@@ -31,15 +32,15 @@ tempfile = "3"
 [dev-dependencies]
 # Test/bench targets (tests/harness.rs) need the `testing` toolkit; the `locomo`
 # bin (a normal build) must NOT get test-util, keeping it out of the shipped path.
-citadel-ai = { workspace = true, features = ["test-util"] }
+citadel-llm = { workspace = true, features = ["test-util"] }
 
 [features]
-openai = ["citadel-ai/openai"]
-claude = ["citadel-ai/claude"]
-ollama = ["citadel-ai/ollama"]
+openai = ["citadel-llm/openai"]
+claude = ["citadel-llm/claude"]
+ollama = ["citadel-llm/ollama"]
 # Gemini reader via its OpenAI-compatible endpoint; implies openai (the bin's
 # required-feature, and the gpt-4o-mini judge backend).
-gemini = ["openai", "citadel-ai/gemini"]
+gemini = ["openai", "citadel-llm/gemini"]
 candle-embed = ["citadel-mem/candle-embed"]
 # Run the embedder + cross-encoder on the GPU (CUDA); implies candle-embed. Needs the CUDA toolkit.
 cuda-embed = ["candle-embed", "citadel-mem/cuda-embed"]

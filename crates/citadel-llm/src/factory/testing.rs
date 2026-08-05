@@ -1,13 +1,11 @@
-//! Test-only [`LLMClient`] builders: the single sanctioned way to get a fake
-//! client, so no test constructs a concrete client type directly. Always built
-//! (no feature gate) - the mock + closure adapter are pure.
+//! Test-only [`LLMClient`] fakes; ungated (pure); no test builds a concrete client.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{from_fn_with, TokenCount};
-use crate::llm::mock::MockClient;
-use crate::llm::{CompletionRequest, CompletionResponse, LLMClient};
+use crate::mock::MockClient;
+use crate::{CompletionRequest, CompletionResponse, LLMClient};
 
 /// Pops `responses` in order, then errors when drained (empty errors on first call).
 pub fn scripted(responses: Vec<CompletionResponse>) -> Arc<dyn LLMClient> {
@@ -30,13 +28,12 @@ pub fn constant(text: impl Into<String>) -> Arc<dyn LLMClient> {
 /// Every call returns a fresh error from `mk` (caller picks the flavor).
 pub fn error<E>(mk: E) -> Arc<dyn LLMClient>
 where
-    E: Fn() -> crate::llm::LlmError + Send + Sync + 'static,
+    E: Fn() -> crate::LlmError + Send + Sync + 'static,
 {
     from_fn_with("error", TokenCount::Constant(1), move |_req| Err(mk()))
 }
 
 /// Returns `Http { status, message }` for the first `fail` calls, then `then`.
-/// The returned [`Probe`] surfaces an atomic call counter for attempt assertions.
 pub fn http_storm(
     fail: u32,
     status: u16,
@@ -53,7 +50,7 @@ pub fn http_storm(
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok();
         if was_failing {
-            Err(crate::llm::LlmError::Http {
+            Err(crate::LlmError::Http {
                 status,
                 retry_after: None,
                 message: message.clone(),
@@ -84,8 +81,7 @@ impl Probe {
     }
 }
 
-/// Scripted (pops in order, errors when drained) AND records every request, so a
-/// test can assert what context each round was handed via [`Capture::requests`].
+/// Scripted (pops in order, errors when drained) and records every request.
 pub fn capturing(responses: Vec<CompletionResponse>) -> Capture {
     let inner = MockClient::scripted(responses);
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -116,7 +112,7 @@ impl Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{FinishReason, Message};
+    use crate::{FinishReason, Message};
 
     #[test]
     fn scripted_responses_are_returned_in_order_then_exhaust() {
@@ -182,7 +178,7 @@ mod tests {
 
     #[test]
     fn error_always_fails() {
-        let client = error(|| crate::llm::LlmError::Backend("boom".into()));
+        let client = error(|| crate::LlmError::Backend("boom".into()));
         assert!(client.complete(&CompletionRequest::default()).is_err());
     }
 }

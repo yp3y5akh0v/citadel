@@ -8,7 +8,9 @@ use std::sync::OnceLock;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use citadel_ai::{CompletionRequest, CompletionResponse, LLMClient, LlmError, Message, TokenUsage};
+use citadel_llm::{
+    CompletionRequest, CompletionResponse, LLMClient, LlmError, Message, TokenUsage,
+};
 use citadel_mem::{AtomHit, AtomId, MemoryEngine, RecallProfile, RecallQuery};
 use rustc_hash::FxHashSet;
 

@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use citadel_ai::testing;
-use citadel_ai::{AgentBudget, CompletionResponse, FileWriteTool, LLMClient, Tool};
+use citadel_ai::{AgentBudget, FileWriteTool, Tool};
 use citadel_ai::{AgentReport, TerminatedBy};
+use citadel_llm::testing;
+use citadel_llm::{CompletionResponse, LLMClient};
 
 use swe_harness::*;
 
@@ -230,7 +231,7 @@ fn live_swe_bench() {
     if std::env::var("CITADEL_SWE_LIVE").is_err() {
         return;
     }
-    let llm = citadel_ai::factory::from_env("CITADEL_SWE", "claude", "claude-sonnet-4-6")
+    let llm = citadel_llm::factory::from_env("CITADEL_SWE", "claude", "claude-sonnet-4-6")
         .unwrap_or_else(|e| panic!("{e}"));
     let model = llm.model_id().to_string();
     let min_rate: f64 = std::env::var("CITADEL_SWE_MIN_RATE")

@@ -1,5 +1,4 @@
-//! Ollama backend (native-only, `ollama` feature): the OpenAI adapter pointed at
-//! the local daemon, since Ollama's `/v1` is wire-identical to OpenAI.
+//! Ollama (native-only, `ollama` feature): OpenAI adapter, `/v1` is wire-identical.
 
 use super::http::LlmTimeouts;
 use super::openai::OpenAiClient;
@@ -52,14 +51,14 @@ impl LLMClient for OllamaClient {
 #[cfg(test)]
 mod tests {
     use super::OllamaClient;
-    use crate::llm::{CompletionRequest, FinishReason, LLMClient, Message};
+    use crate::{CompletionRequest, FinishReason, LLMClient, Message};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
 
     #[test]
     fn carries_model_tag() {
-        let c = crate::llm::factory::build("ollama", "llama3.2").unwrap();
+        let c = crate::factory::build("ollama", "llama3.2").unwrap();
         assert_eq!(c.model_id(), "llama3.2");
     }
 

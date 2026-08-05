@@ -9,7 +9,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 
-use citadel_ai::LLMClient;
+use citadel_llm::LLMClient;
 use citadel_mem::{Embedder, FusionWeights, MemoryEngine};
 
 use crate::benchmarks::locomo::Locomo;

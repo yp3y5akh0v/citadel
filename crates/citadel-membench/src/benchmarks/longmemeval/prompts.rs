@@ -1,7 +1,7 @@
 //! LongMemEval reader prompt and documented flaws (no Rust judge; scored
 //! externally).
 
-use citadel_ai::Message;
+use citadel_llm::Message;
 use citadel_mem::{AtomHit, AtomId};
 use rustc_hash::FxHashMap;
 

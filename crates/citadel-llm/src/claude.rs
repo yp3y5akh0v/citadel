@@ -1,8 +1,4 @@
-//! Anthropic Messages API backend (native-only, `claude` feature).
-//!
-//! The wire shape differs from OpenAI: the system prompt is a top-level field (not
-//! a role), tool results are `tool_result` blocks in a user turn, and tool-call
-//! `input` is a JSON object both ways (no string round-trip).
+//! Anthropic Messages API; wire: top-level system, tool_result turns, object input.
 
 use serde_json::{json, Value};
 use ureq::Agent;
@@ -19,8 +15,7 @@ pub(super) const API_VERSION: &str = "2023-06-01";
 /// Anthropic requires `max_tokens`; used when the request leaves it unset.
 pub(super) const DEFAULT_MAX_TOKENS: u32 = 4096;
 
-/// Calls api.anthropic.com. The API key is held only in memory and never
-/// logged or persisted.
+/// Calls api.anthropic.com; the API key stays in memory, never logged or persisted.
 pub(crate) struct ClaudeClient {
     model: String,
     api_key: String,
@@ -77,9 +72,7 @@ impl LLMClient for ClaudeClient {
     }
 }
 
-/// Opus 4.7+ and the Fable family reject any non-default `temperature`/`top_p`/
-/// `top_k` with a 400 ("`temperature` is deprecated for this model"); omit them
-/// for those models. Sonnet/Haiku/Opus<=4.6 accept temperature.
+/// Opus 4.7+ and Fable 400 on non-default temperature/top_p/top_k; omit them there.
 fn rejects_sampling_params(model: &str) -> bool {
     if model.starts_with("claude-fable-") {
         return true;
@@ -176,9 +169,7 @@ fn to_wire(req: &CompletionRequest, model: &str) -> Value {
             obj.insert("temperature".to_string(), json!(t));
         }
     }
-    // effort caps invisible reasoning spend; the json_schema format guarantees
-    // the first block is text with valid JSON (an adaptive-thinking model can
-    // otherwise burn the whole max_tokens budget thinking and emit no text).
+    // effort caps thinking; json_schema guarantees JSON text, not all-thinking.
     let mut output_config = serde_json::Map::new();
     if let Some(effort) = req.effort {
         output_config.insert("effort".to_string(), json!(effort.as_str()));
@@ -263,8 +254,7 @@ fn parse_usage(raw: Option<&Value>, model: &str) -> TokenUsage {
             .unwrap_or(0)
             .min(u64::from(u32::MAX)) as u32
     };
-    // input_tokens excludes cached tokens; sum them so budget accounting
-    // reflects the true input cost.
+    // input_tokens excludes cached tokens; sum them for true input cost.
     let input_tokens = field("input_tokens")
         .saturating_add(field("cache_read_input_tokens"))
         .saturating_add(field("cache_creation_input_tokens"));
@@ -280,7 +270,7 @@ fn parse_usage(raw: Option<&Value>, model: &str) -> TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::ToolSpec;
+    use crate::ToolSpec;
 
     fn spec() -> ToolSpec {
         ToolSpec {
@@ -437,7 +427,7 @@ mod tests {
 
     #[test]
     fn output_config_carries_effort_and_json_schema_format() {
-        use crate::llm::Effort;
+        use crate::Effort;
         let schema = json!({ "type": "array", "items": { "type": "object" } });
         let req = CompletionRequest {
             effort: Some(Effort::Low),

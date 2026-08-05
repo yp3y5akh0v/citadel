@@ -15,7 +15,7 @@ use citadel_mem::{
     AtomAttestation, AtomInput, EdgeKind, GraphExpand, MemoryEngine, RecallProfile, RecallQuery,
 };
 
-use crate::llm::{ToolCall, ToolSpec};
+use citadel_llm::{ToolCall, ToolSpec};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
@@ -908,8 +908,8 @@ mod fs_tools {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::llm::ToolCall;
         use crate::tools::{structural_constraints_ok, ToolRegistry};
+        use citadel_llm::ToolCall;
 
         fn write_file(path: &Path, body: &str) {
             std::fs::write(path, body).unwrap();
@@ -1648,8 +1648,8 @@ mod cmd_tools {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::llm::ToolCall;
         use crate::tools::{structural_constraints_ok, ToolRegistry};
+        use citadel_llm::ToolCall;
         use std::time::Instant;
 
         // No single benign program is present and arg-vector-pure on both Unix

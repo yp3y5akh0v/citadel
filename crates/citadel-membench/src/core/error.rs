@@ -1,6 +1,6 @@
 //! Error type for the LoCoMo benchmark harness.
 
-use citadel_ai::LlmError;
+use citadel_llm::LlmError;
 use citadel_mem::MemError;
 
 pub type Result<T> = std::result::Result<T, BenchError>;

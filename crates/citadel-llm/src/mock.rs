@@ -60,7 +60,7 @@ pub(crate) fn message_chars(m: &Message) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::llm::{CompletionResponse, FinishReason, ToolCall};
+    use crate::{CompletionResponse, FinishReason, ToolCall};
 
     #[test]
     fn tool_call_response_carries_calls() {

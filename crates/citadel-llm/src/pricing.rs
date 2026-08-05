@@ -1,8 +1,4 @@
-//! Per-model USD pricing for filling [`TokenUsage::cost_usd`].
-//!
-//! Rates are USD per 1M tokens, point-in-time (verified 2026-07). An unknown
-//! model returns `None` (no guessed price); only models with confident rates
-//! are listed.
+//! USD per 1M tokens for cost_usd; verified 2026-07, unknown ids `None` not guessed.
 
 use super::TokenUsage;
 
@@ -14,8 +10,7 @@ pub(super) struct ModelPricing {
     pub output_per_mtok: f64,
 }
 
-/// Known pricing for `model_id`, or `None` if there is no confident rate for it.
-/// Matched by family prefix so date-suffixed ids resolve.
+/// Pricing for `model_id` by family prefix (date-suffixed ids resolve), else `None`.
 pub(super) fn pricing_for(model_id: &str) -> Option<ModelPricing> {
     let (input_per_mtok, output_per_mtok) = if model_id.starts_with("claude-fable-5") {
         (10.0, 50.0)
