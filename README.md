@@ -152,17 +152,12 @@ Citadel is scored on the LoCoMo and LongMemEval long-term-memory benchmarks. Exe
 
 **LoCoMo** - `gpt-4o-mini` reader and judge (the field's standard setup):
 
-| Memory system | Score | Memory built with |
-|---|---|---|
-| **Citadel** | **85.7%** | **no LLM** - raw turns |
-| Full context (no retrieval) | 72.9% | - |
-| Mem0 (graph) | 68.4% | LLM facts + graph |
-| Mem0 | 66.9% | LLM fact-extraction |
-| Zep / Graphiti | 66.0% | LLM knowledge graph |
-| LangMem | 58.1% | LLM-managed |
-| OpenAI memory | 52.9% | LLM-managed |
+| Metric | Score |
+|---|---|
+| Overall | 85.7% |
+| Full context at the same reader (no retrieval) | 72.9% |
 
-Competitor scores as published in the Mem0 paper ([arXiv 2504.19413](https://arxiv.org/abs/2504.19413)), at the same `gpt-4o-mini` reader and judge.
+Memory is built with no LLM - raw turns only, indexed and recalled deterministically.
 
 **LongMemEval_S** ([arXiv 2410.10813](https://arxiv.org/abs/2410.10813)) full-haystack split (~40-50 sessions/question), gpt-4o reader, official CoT prompt and `gpt-4o-2024-08-06` judge:
 
@@ -195,6 +190,7 @@ published systems are in
 
 ## Agent runtime
 
+- **[citadeldb-llm](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-llm)** - the provider-neutral LLM client layer (Claude, OpenAI, Ollama, Gemini) behind one factory, with canonical request hashing and a non-secret client request identity.
 - **[citadeldb-ai](https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-ai)** - an autonomous agent runtime (ReAct + Reflexion, tool registry, budget caps, pluggable LLM backends) that uses citadeldb-mem for persistence.
 
 ## Features
