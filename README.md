@@ -15,7 +15,7 @@
   <a href="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml"><img src="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LoCoMo%20(gpt--4o--mini)-85.7%25-success" alt="LoCoMo 85.7% (gpt-4o-mini)"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LongMemEval--S%20(gpt--4o)-86.2%25-success" alt="LongMemEval-S 86.2% (gpt-4o reader)"></a>
-  <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
+  <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
 </p>
 
 ## Quick Start
@@ -603,4 +603,4 @@ cargo build --release
 
 ## License
 
-[MIT](https://github.com/yp3y5akh0v/citadel/blob/HEAD/LICENSE-MIT) OR [Apache-2.0](https://github.com/yp3y5akh0v/citadel/blob/HEAD/LICENSE-APACHE)
+[Apache-2.0](https://github.com/yp3y5akh0v/citadel/blob/HEAD/LICENSE-APACHE)

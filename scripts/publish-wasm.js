@@ -21,7 +21,6 @@ manifest.files = [
   "citadel_wasm.js",
   "citadel_wasm.d.ts",
   "LICENSE-APACHE",
-  "LICENSE-MIT",
 ];
 manifest.sideEffects = ["./citadel_wasm.js", "./snippets/*"];
 
@@ -29,7 +28,6 @@ writeFileSync(join(pkg, "package.json"), JSON.stringify(manifest, null, 2) + "\n
 
 // Copy license files
 copyFileSync(join(root, "LICENSE-APACHE"), join(pkg, "LICENSE-APACHE"));
-copyFileSync(join(root, "LICENSE-MIT"), join(pkg, "LICENSE-MIT"));
 
 console.log(`\nPackage ready at crates/citadel-wasm/pkg/`);
 console.log(`To publish: cd crates/citadel-wasm/pkg && npm publish --access public`);

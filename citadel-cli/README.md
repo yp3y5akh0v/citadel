@@ -24,4 +24,4 @@ Supports 27 dot-commands (`.backup`, `.verify`, `.upgrade`, `.stats`, `.sync`, `
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

@@ -12,4 +12,4 @@ This crate is part of the Citadel workspace. For SQL vector queries depend on th
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

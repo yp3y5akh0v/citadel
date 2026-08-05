@@ -7,7 +7,7 @@ name = "citadeldb-mcp"
 description = "Model Context Protocol server for Citadel: encrypted memory as MCP tools"
 readme = "../../crates/citadel-mcp/README.md"
 requires-python = ">=3.10"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 authors = [{ name = "Yuriy Peysakhov" }]
 dynamic = ["version"]
 
