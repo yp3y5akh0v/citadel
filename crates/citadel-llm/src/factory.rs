@@ -37,7 +37,10 @@ pub fn request_identity_from_env(
     default_model: &str,
 ) -> Result<(String, ClientRequestIdentity), String> {
     let (provider, model) = provider_model(prefix, default_provider, default_model);
-    Ok((model, request_identity_for_provider(&provider)?))
+    Ok((
+        model.clone(),
+        request_identity_for_provider(&provider, &model)?,
+    ))
 }
 
 /// [`from_env`] with explicit deadlines instead of `CITADEL_AI_LLM_TIMEOUT_SECS`.
@@ -92,8 +95,14 @@ pub fn build_with_timeouts(
         #[cfg(feature = "openai")]
         "openai" => {
             let key = require_key("OPENAI_API_KEY", "openai")?;
-            let client = crate::openai::OpenAiClient::with_base_url(model, openai_base_url(), key)
-                .identity_provider("openai");
+            let client = crate::openai::OpenAiClient::with_base_url(
+                model,
+                openai_base_url(),
+                key,
+                crate::OutputSchemaSupport::StrictJsonSchema,
+                crate::openai::request_effort_support_for_model(model),
+            )
+            .identity_provider("openai");
             Ok(Arc::new(client.with_timeouts(timeouts)))
         }
         #[cfg(feature = "ollama")]
@@ -105,10 +114,15 @@ pub fn build_with_timeouts(
         "gemini" => {
             // Compat layer wants `max_tokens`; own key so an openai judge coexists.
             let key = require_key("GEMINI_API_KEY", "gemini")?;
-            let mut client =
-                crate::openai::OpenAiClient::with_base_url(model, GEMINI_BASE_URL, key)
-                    .max_tokens_field("max_tokens")
-                    .identity_provider("gemini");
+            let mut client = crate::openai::OpenAiClient::with_base_url(
+                model,
+                GEMINI_BASE_URL,
+                key,
+                crate::OutputSchemaSupport::Unsupported,
+                crate::openai::RequestEffortSupport::Unsupported,
+            )
+            .max_tokens_field("max_tokens")
+            .identity_provider("gemini");
             if let Some(effort) = gemini_reasoning_effort() {
                 client = client.reasoning_effort(effort);
             }
@@ -136,7 +150,43 @@ fn gemini_reasoning_effort() -> Option<String> {
         .filter(|effort| !effort.is_empty())
 }
 
-fn request_identity_for_provider(provider: &str) -> Result<ClientRequestIdentity, String> {
+fn request_identity_for_provider(
+    provider: &str,
+    model: &str,
+) -> Result<ClientRequestIdentity, String> {
+    identity_from_parts(
+        provider,
+        model,
+        resolved_base_url(provider).as_deref(),
+        resolved_gemini_effort(provider).as_deref(),
+    )
+}
+
+fn resolved_base_url(provider: &str) -> Option<String> {
+    match provider {
+        #[cfg(feature = "openai")]
+        "openai" => Some(openai_base_url()),
+        #[cfg(feature = "ollama")]
+        "ollama" => Some(ollama_base_url()),
+        _ => None,
+    }
+}
+
+fn resolved_gemini_effort(provider: &str) -> Option<String> {
+    match provider {
+        #[cfg(feature = "gemini")]
+        "gemini" => gemini_reasoning_effort(),
+        _ => None,
+    }
+}
+
+fn identity_from_parts(
+    provider: &str,
+    model: &str,
+    base_url: Option<&str>,
+    gemini_effort: Option<&str>,
+) -> Result<ClientRequestIdentity, String> {
+    let _ = (model, base_url, gemini_effort);
     match provider {
         "mock" => Ok(ClientRequestIdentity::in_process()),
         #[cfg(feature = "claude")]
@@ -146,45 +196,46 @@ fn request_identity_for_provider(provider: &str) -> Result<ClientRequestIdentity
                 "claude",
                 crate::claude::API_URL,
                 &[
-                    ("wire", "anthropic-messages-v1"),
+                    ("wire", crate::claude::MESSAGES_WIRE_REVISION),
                     ("anthropic-version", crate::claude::API_VERSION),
                     ("default_max_tokens", &default_max_tokens),
+                    (
+                        "structured_outputs",
+                        crate::claude::STRUCTURED_OUTPUTS_REVISION,
+                    ),
                 ],
             ))
         }
         #[cfg(feature = "openai")]
-        "openai" => Ok(ClientRequestIdentity::from_config(
-            "openai",
-            &openai_base_url(),
-            &[
-                ("wire", "openai-chat-completions-v1"),
-                ("max_tokens_field", crate::openai::OPENAI_MAX_TOKENS_FIELD),
-                ("reasoning_effort", "<none>"),
-            ],
-        )),
-        #[cfg(feature = "ollama")]
-        "ollama" => Ok(ClientRequestIdentity::from_config(
-            "ollama",
-            &ollama_base_url(),
-            &[
-                ("wire", "openai-chat-completions-v1"),
-                ("max_tokens_field", "max_tokens"),
-                ("reasoning_effort", "<none>"),
-            ],
-        )),
-        #[cfg(feature = "gemini")]
-        "gemini" => {
-            let effort = gemini_reasoning_effort();
-            Ok(ClientRequestIdentity::from_config(
-                "gemini",
-                GEMINI_BASE_URL,
-                &[
-                    ("wire", "openai-chat-completions-v1"),
-                    ("max_tokens_field", "max_tokens"),
-                    ("reasoning_effort", effort.as_deref().unwrap_or("<none>")),
-                ],
+        "openai" => {
+            let request_effort = crate::openai::request_effort_support_for_model(model);
+            Ok(crate::openai::client_request_identity(
+                "openai",
+                base_url.ok_or("openai identity requires a resolved base URL")?,
+                crate::openai::OPENAI_MAX_TOKENS_FIELD,
+                None,
+                request_effort,
+                crate::OutputSchemaSupport::StrictJsonSchema,
             ))
         }
+        #[cfg(feature = "ollama")]
+        "ollama" => Ok(crate::openai::client_request_identity(
+            "ollama",
+            base_url.ok_or("ollama identity requires a resolved base URL")?,
+            "max_tokens",
+            None,
+            crate::openai::RequestEffortSupport::Unsupported,
+            crate::OutputSchemaSupport::Unsupported,
+        )),
+        #[cfg(feature = "gemini")]
+        "gemini" => Ok(crate::openai::client_request_identity(
+            "gemini",
+            GEMINI_BASE_URL,
+            "max_tokens",
+            gemini_effort,
+            crate::openai::RequestEffortSupport::Unsupported,
+            crate::OutputSchemaSupport::Unsupported,
+        )),
         p if KNOWN_PROVIDERS.contains(&p) => Err(not_compiled(p)),
         p => Err(unknown_provider(p)),
     }
@@ -446,7 +497,7 @@ mod tests {
                 Some("https://gateway.invalid/custom/v1/"),
             ),
         ]);
-        let expected = request_identity_for_provider("openai").unwrap();
+        let expected = request_identity_for_provider("openai", "same-model").unwrap();
         let client = build("openai", "same-model").unwrap();
         assert_eq!(expected, client.request_identity());
     }
@@ -456,7 +507,7 @@ mod tests {
     fn ollama_pure_identity_matches_built_custom_endpoint() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _env = EnvGuard::set(&[("OLLAMA_BASE_URL", Some("http://localhost:19999/custom/v1/"))]);
-        let expected = request_identity_for_provider("ollama").unwrap();
+        let expected = request_identity_for_provider("ollama", "same-model").unwrap();
         let client = build("ollama", "same-model").unwrap();
         assert_eq!(expected, client.request_identity());
     }
@@ -469,7 +520,7 @@ mod tests {
             ("GEMINI_API_KEY", Some("not-a-real-key")),
             ("CITADEL_GEMINI_REASONING_EFFORT", Some("low")),
         ]);
-        let expected = request_identity_for_provider("gemini").unwrap();
+        let expected = request_identity_for_provider("gemini", "same-model").unwrap();
         let client = build("gemini", "same-model").unwrap();
         assert_eq!(expected, client.request_identity());
     }
@@ -479,7 +530,7 @@ mod tests {
     fn claude_pure_identity_matches_built_client() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _env = EnvGuard::set(&[("ANTHROPIC_API_KEY", Some("not-a-real-key"))]);
-        let expected = request_identity_for_provider("claude").unwrap();
+        let expected = request_identity_for_provider("claude", "same-model").unwrap();
         let client = build("claude", "same-model").unwrap();
         assert_eq!(expected, client.request_identity());
     }

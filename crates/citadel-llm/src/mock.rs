@@ -11,7 +11,7 @@ pub(crate) struct MockClient {
 }
 
 impl MockClient {
-    /// Hands back `responses` one per `complete` call, then errors once drained.
+    /// Hands back `responses` one per `complete` call; errors once drained.
     pub(crate) fn scripted(responses: Vec<CompletionResponse>) -> Self {
         Self {
             scripted: Mutex::new(responses.into()),
@@ -60,7 +60,16 @@ pub(crate) fn message_chars(m: &Message) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::{CompletionResponse, FinishReason, ToolCall};
+    use super::MockClient;
+    use crate::{CompletionResponse, FinishReason, LLMClient, OutputSchemaSupport, ToolCall};
+
+    #[test]
+    fn custom_client_capabilities_default_to_unsupported() {
+        assert_eq!(
+            MockClient::replying("ok").output_schema_support(),
+            OutputSchemaSupport::Unsupported
+        );
+    }
 
     #[test]
     fn tool_call_response_carries_calls() {

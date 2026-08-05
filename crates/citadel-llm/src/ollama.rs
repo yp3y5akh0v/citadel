@@ -1,9 +1,10 @@
-//! Ollama (native-only, `ollama` feature): OpenAI adapter, `/v1` is wire-identical.
+//! Ollama backend (`ollama`, native-only): OpenAI adapter; `/v1` is wire-identical.
 
 use super::http::LlmTimeouts;
 use super::openai::OpenAiClient;
 use super::{
     ClientRequestIdentity, CompletionRequest, CompletionResponse, LLMClient, LlmError, Message,
+    OutputSchemaSupport,
 };
 
 pub(super) const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
@@ -16,14 +17,19 @@ impl OllamaClient {
     /// A specific Ollama `/v1` base: remote host, custom port, or test server.
     pub(crate) fn with_base_url(model: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
-            inner: OpenAiClient::with_base_url(model, base_url, "ollama")
-                .max_tokens_field("max_tokens")
-                .identity_provider("ollama")
-                .unpriced(),
+            inner: OpenAiClient::with_base_url(
+                model,
+                base_url,
+                "ollama",
+                OutputSchemaSupport::Unsupported,
+                super::openai::RequestEffortSupport::Unsupported,
+            )
+            .max_tokens_field("max_tokens")
+            .identity_provider("ollama")
+            .unpriced(),
         }
     }
 
-    /// Replace the default HTTP deadlines.
     pub(crate) fn with_timeouts(mut self, timeouts: LlmTimeouts) -> Self {
         self.inner = self.inner.with_timeouts(timeouts);
         self
@@ -41,6 +47,10 @@ impl LLMClient for OllamaClient {
 
     fn request_identity(&self) -> ClientRequestIdentity {
         self.inner.request_identity()
+    }
+
+    fn output_schema_support(&self) -> OutputSchemaSupport {
+        self.inner.output_schema_support()
     }
 
     fn count_tokens(&self, messages: &[Message]) -> usize {

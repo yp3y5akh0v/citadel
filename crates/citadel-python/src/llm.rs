@@ -138,6 +138,8 @@ fn finish_reason_str(f: FinishReason) -> &'static str {
         FinishReason::Stop => "stop",
         FinishReason::Length => "length",
         FinishReason::ToolUse => "tool_use",
+        FinishReason::Refusal => "refusal",
+        FinishReason::ContentFilter => "content_filter",
         FinishReason::Error => "error",
     }
 }
@@ -281,9 +283,12 @@ fn parse_finish_reason(s: &str) -> PyResult<FinishReason> {
         "stop" => Ok(FinishReason::Stop),
         "length" => Ok(FinishReason::Length),
         "tool_use" | "tooluse" => Ok(FinishReason::ToolUse),
+        "refusal" => Ok(FinishReason::Refusal),
+        "content_filter" | "contentfilter" => Ok(FinishReason::ContentFilter),
         "error" => Ok(FinishReason::Error),
         other => Err(PyValueError::new_err(format!(
-            "unknown finish_reason '{other}' (stop|length|tool_use|error)"
+            "unknown finish_reason '{other}' \
+             (stop|length|tool_use|refusal|content_filter|error)"
         ))),
     }
 }
@@ -358,6 +363,7 @@ pub(crate) fn request_from_py(obj: &Bound<'_, PyAny>) -> PyResult<CompletionRequ
             .map(|v| v.extract())
             .transpose()?
             .unwrap_or_default(),
+        seed: dict_item(&d, "seed")?.map(|v| v.extract()).transpose()?,
     })
 }
 
