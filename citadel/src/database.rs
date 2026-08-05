@@ -3,6 +3,7 @@ use std::fs;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use citadel_core::{Error, Result, KEY_FILE_SIZE, KEY_SIZE, MERKLE_HASH_SIZE, WRAPPED_KEY_SIZE};
@@ -22,6 +23,59 @@ use crate::atom_store::AtomKeyStore;
 use crate::audit::{AuditEventType, AuditLog};
 use crate::key_codec::SlotRecord;
 use crate::region_store::RegionKeyStore;
+
+/// Exclusive key-lifecycle capability over ONE database; always the outermost lock.
+#[must_use = "the capability releases the lifecycle span when dropped"]
+pub struct KeyLifecycleGuard<'a> {
+    db: &'a Database,
+    _span: parking_lot::MutexGuard<'a, ()>,
+}
+
+impl KeyLifecycleGuard<'_> {
+    /// Cryptographically erase region key `slot` (no-op if already erased).
+    pub fn region_store_tombstone(&self, slot: u32, region_id: u64) -> Result<()> {
+        self.db.with_region_store(|s| {
+            // Bump before and after: a cache built between them is never stamped current.
+            self.db.bump_cache_epoch();
+            let result = s.tombstone(slot, region_id);
+            self.db.bump_cache_epoch();
+            result
+        })
+    }
+
+    /// Cryptographically erase atom key `slot` (no-op if already erased).
+    pub fn atom_store_tombstone(&self, slot: u32, atom_id: u64) -> Result<()> {
+        self.db.with_atom_store(|s| {
+            // Armed before and after the attempt (see region_store_tombstone).
+            self.db.bump_cache_epoch();
+            let result = s.tombstone(slot, atom_id);
+            self.db.bump_cache_epoch();
+            result
+        })
+    }
+
+    /// Batch erase, two fsyncs; recycled slots skip so retries converge; returns receipts.
+    pub fn atom_store_tombstone_batch(
+        &self,
+        items: &[(u32, u64, u64)],
+    ) -> Result<Vec<(u32, u64, u64, u64)>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.db.with_atom_store(|s| {
+            // Armed before and after the attempt (see region_store_tombstone).
+            self.db.bump_cache_epoch();
+            let result = s.tombstone_batch(items);
+            self.db.bump_cache_epoch();
+            result
+        })
+    }
+
+    /// Finish torn batch erases; no epoch bump - only already-armed keys are touched.
+    pub fn normalize_atom_store_torn_erases(&self) -> Result<usize> {
+        self.db.with_atom_store(|s| s.normalize_torn_tombstones())
+    }
+}
 
 /// Type-erased cache of `Arc<T>` entries shared across connections to one DB.
 pub type SharedCache = Mutex<FxHashMap<String, Arc<dyn Any + Send + Sync>>>;
@@ -79,6 +133,11 @@ pub struct Database {
     /// in-flight write just allocated. Store calls are already internally
     /// locked; this guards the spans between them.
     key_lifecycle: Mutex<()>,
+    /// Bumped before key destruction and rewrites; caches refuse older-epoch plaintext.
+    cache_epoch: AtomicU64,
+    /// Test-only hook fired as a destruction wrapper reaches the acquisition boundary.
+    #[cfg(any(test, feature = "test-util"))]
+    destruction_acquire_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl std::fmt::Debug for Database {
@@ -115,6 +174,9 @@ impl Database {
             region_store: Mutex::new(None),
             atom_store: Mutex::new(None),
             key_lifecycle: Mutex::new(()),
+            cache_epoch: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            destruction_acquire_hook: Mutex::new(None),
         }
     }
 
@@ -136,13 +198,42 @@ impl Database {
             region_store: Mutex::new(None),
             atom_store: Mutex::new(None),
             key_lifecycle: Mutex::new(()),
+            cache_epoch: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-util"))]
+            destruction_acquire_hook: Mutex::new(None),
         }
     }
 
-    /// Guard for a key-lifecycle span (see the field doc); never held while
-    /// running user callbacks.
-    pub fn key_lifecycle_lock(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.key_lifecycle.lock()
+    /// Capability for a key-lifecycle span (see the field doc); never held in callbacks.
+    pub fn key_lifecycle_lock(&self) -> KeyLifecycleGuard<'_> {
+        KeyLifecycleGuard {
+            db: self,
+            _span: self.key_lifecycle.lock(),
+        }
+    }
+
+    /// Fires the test-only hook at the acquisition boundary; no-op unless armed.
+    fn fire_destruction_acquire_hook(&self) {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(hook) = self.destruction_acquire_hook.lock().as_ref() {
+            hook();
+        }
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn debug_set_destruction_acquire_hook(&self, hook: Option<Box<dyn Fn() + Send + Sync>>) {
+        *self.destruction_acquire_hook.lock() = hook;
+    }
+
+    /// Current invalidation epoch (see the field doc); caches refuse reads once it moves.
+    pub fn cache_epoch(&self) -> u64 {
+        self.cache_epoch.load(Ordering::Acquire)
+    }
+
+    /// Advance the epoch; key destruction bumps automatically, sealed writes explicitly.
+    pub fn bump_cache_epoch(&self) -> u64 {
+        self.cache_epoch.fetch_add(1, Ordering::Release) + 1
     }
 
     /// Fetch a typed entry from the shared SQL cache.
@@ -283,14 +374,25 @@ impl Database {
         self.with_region_store(|s| s.read_slot(slot))
     }
 
-    /// Cryptographically erase region key `slot` (no-op if already erased).
+    /// Cryptographically erase region key `slot` (no-op if erased); acquires the span.
     pub fn region_store_tombstone(&self, slot: u32, region_id: u64) -> Result<()> {
-        self.with_region_store(|s| s.tombstone(slot, region_id))
+        self.fire_destruction_acquire_hook();
+        self.key_lifecycle_lock()
+            .region_store_tombstone(slot, region_id)
     }
 
     /// `(slot, region_id)` for every LIVE region key slot.
     pub fn region_store_live_owners(&self) -> Result<Vec<(u32, u64)>> {
-        self.with_region_store(|s| s.live_owners())
+        Ok(self
+            .region_store_live_bindings()?
+            .into_iter()
+            .map(|(slot, owner, _)| (slot, owner))
+            .collect())
+    }
+
+    /// `(slot, region_id, gen)` per LIVE slot - the binding a reconciler matches.
+    pub fn region_store_live_bindings(&self) -> Result<Vec<(u32, u64, u64)>> {
+        self.with_region_store(|s| s.live_bindings())
     }
 
     /// Path to the sidecar per-atom key store, `{key_path}` with the
@@ -341,17 +443,23 @@ impl Database {
         self.with_atom_store(|s| s.read_slot(slot))
     }
 
-    /// Cryptographically erase atom key `slot` (no-op if already erased).
+    /// Cryptographically erase atom key `slot` (no-op if erased); acquires the span.
     pub fn atom_store_tombstone(&self, slot: u32, atom_id: u64) -> Result<()> {
-        self.with_atom_store(|s| s.tombstone(slot, atom_id))
+        self.fire_destruction_acquire_hook();
+        self.key_lifecycle_lock()
+            .atom_store_tombstone(slot, atom_id)
     }
 
-    /// Batch erase, two fsyncs; recycled slots skip so retries converge.
+    /// Batch erase, two fsyncs; recycled skips, returns receipts; acquires the span.
     pub fn atom_store_tombstone_batch(
         &self,
         items: &[(u32, u64, u64)],
     ) -> Result<Vec<(u32, u64, u64, u64)>> {
-        self.with_atom_store(|s| s.tombstone_batch(items))
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.fire_destruction_acquire_hook();
+        self.key_lifecycle_lock().atom_store_tombstone_batch(items)
     }
 
     /// Every LIVE atom key's `atom_id -> wrapped ACK`, in one whole-file pass.
@@ -361,7 +469,30 @@ impl Database {
 
     /// `(slot, atom_id)` for every LIVE atom key slot.
     pub fn atom_store_live_owners(&self) -> Result<Vec<(u32, u64)>> {
-        self.with_atom_store(|s| s.live_owners())
+        Ok(self
+            .atom_store_live_bindings()?
+            .into_iter()
+            .map(|(slot, owner, _)| (slot, owner))
+            .collect())
+    }
+
+    /// `(slot, atom_id, gen)` per LIVE slot - the binding a reconciler matches.
+    pub fn atom_store_live_bindings(&self) -> Result<Vec<(u32, u64, u64)>> {
+        self.with_atom_store(|s| s.live_bindings())
+    }
+
+    /// One-shot `tombstone_batch` failure before the sibling scrub - the torn window.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn debug_fail_next_atom_tombstone_batch_before_sibling(&self) {
+        crate::atom_store::fail_next_batch_before_sibling();
+    }
+
+    /// Both raw copies of atom key slot `slot` (A then B); `None` per MAC-invalid copy.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn debug_atom_slot_copies(&self, slot: u32) -> Result<[Option<SlotRecord>; 2]> {
+        self.with_atom_store(|s| s.slot_copies(slot))
     }
 
     /// Number of currently active readers.
@@ -633,6 +764,16 @@ impl Database {
     #[doc(hidden)]
     pub fn manager(&self) -> &TxnManager {
         &self.manager
+    }
+
+    /// Every named tree in the physical catalog (the SQL catalog lists only DDL tables).
+    pub fn table_names(&self) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .manager
+            .list_tables()?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
     }
 
     /// Convert a pre-v1 file to the protected format: reseal both slots V1

@@ -46,6 +46,7 @@ getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
 getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
+citadel = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 criterion = { workspace = true }
 mimalloc = { workspace = true }

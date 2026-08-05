@@ -20,7 +20,7 @@ use citadel_core::{
 use citadel_io::durable::{
     append_and_sync, overwrite_in_place, truncate_and_sync, write_and_sync, write_blocks_synced,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use zeroize::Zeroizing;
 
 use crate::key_codec::{
@@ -38,6 +38,18 @@ std::thread_local! {
     /// Fault-inject failure after durable LIVE bytes, before the slot returns.
     static FAIL_LIVE_READBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_BATCH_READBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(any(test, feature = "test-util"))]
+std::thread_local! {
+    /// Die between the two durable updates - the window the normalization sweep heals.
+    static FAIL_BATCH_BEFORE_SIBLING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm [`FAIL_BATCH_BEFORE_SIBLING`] for this thread's next batch erase.
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) fn fail_next_batch_before_sibling() {
+    FAIL_BATCH_BEFORE_SIBLING.with(|f| f.set(true));
 }
 
 fn build_header(mac_key: &[u8; KEY_SIZE], file_id: u64, slot_count: u32, gen: u64) -> [u8; BLOCK] {
@@ -230,17 +242,68 @@ impl AtomKeyStore {
         Ok(out)
     }
 
-    /// `(slot, atom_id)` for every LIVE atom key slot (one whole-file pass).
-    pub(crate) fn live_owners(&self) -> Result<Vec<(u32, u64)>> {
+    /// `(slot, atom_id, gen)` for every LIVE atom key slot (one whole-file pass).
+    pub(crate) fn live_bindings(&self) -> Result<Vec<(u32, u64, u64)>> {
         let bytes = std::fs::read(&self.path)?;
         let mut live = Vec::new();
         for i in 0..self.slot_count {
             let rec = view_from(&self.mac_key, &bytes, i)?.record;
             if rec.state == SlotState::Live {
-                live.push((i, rec.region_id));
+                live.push((i, rec.region_id, rec.gen));
             }
         }
         Ok(live)
+    }
+
+    /// The create_or_open torn-erase heal for handles that never reopen from disk.
+    pub(crate) fn normalize_torn_tombstones(&mut self) -> Result<usize> {
+        let bytes = std::fs::read(&self.path)?;
+        let free: FxHashSet<u32> = self.free.iter().copied().collect();
+        let mut repaired = 0;
+        for i in 0..self.slot_count {
+            let view = view_from(&self.mac_key, &bytes, i)?;
+            if view.record.state != SlotState::Tombstone {
+                continue;
+            }
+            let off = slot_offset(i, !view.authoritative_b) as usize;
+            let sib_clean = parse_slot_block(&self.mac_key, &bytes[off..off + BLOCK])
+                .is_some_and(|r| r.state == SlotState::Tombstone);
+            let stranded = !free.contains(&i);
+            if sib_clean && !stranded {
+                continue;
+            }
+            if !sib_clean {
+                self.scrub_stale_sibling(i, &view)?;
+            }
+            if stranded {
+                self.free.push(i);
+            }
+            repaired += 1;
+        }
+        Ok(repaired)
+    }
+
+    /// Push `slot` exactly once: a retried erase must never hand it to two allocations.
+    fn restore_free(&mut self, slot: u32) {
+        if !self.free.contains(&slot) {
+            self.free.push(slot);
+        }
+    }
+
+    /// Both raw copies of `slot` (A then B); `None` per MAC-invalid copy.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn slot_copies(&self, slot: u32) -> Result<[Option<SlotRecord>; 2]> {
+        if slot >= self.slot_count {
+            return Err(Error::RegionStoreCorrupt(format!(
+                "atom slot {slot} out of bounds"
+            )));
+        }
+        let a = parse_slot_block(
+            &self.mac_key,
+            &self.read_block_at(slot_offset(slot, false))?,
+        );
+        let b = parse_slot_block(&self.mac_key, &self.read_block_at(slot_offset(slot, true))?);
+        Ok([a, b])
     }
 
     /// Allocate one free slot, growing the store if the free list is empty.
@@ -286,7 +349,7 @@ impl AtomKeyStore {
         }
     }
 
-    /// Batch allocate and bind; reclaims every reservation on any failure.
+    /// Batch allocate and bind; any single-fsync write/read-back failure reclaims all.
     pub(crate) fn allocate_write_batch(
         &mut self,
         items: &[(u64, [u8; WRAPPED_KEY_SIZE])],
@@ -321,7 +384,7 @@ impl AtomKeyStore {
         }
     }
 
-    /// Reclaims a reserved slot; EMPTY is valid under the store lock.
+    /// Reclaims a reserved slot; EMPTY is valid under the store lock; scrubs key residue.
     fn abort_reserved_slot(&mut self, slot: u32, expected_atom_id: u64) -> Result<()> {
         let view = self.view(slot)?;
         match view.record.state {
@@ -486,7 +549,7 @@ impl AtomKeyStore {
         Ok(gens)
     }
 
-    /// Scrubs both copies to TOMBSTONE; a torn erase leaves the sibling keyed.
+    /// Scrubs the sibling to TOMBSTONE and confirms; a torn erase leaves it keyed.
     fn scrub_stale_sibling(&self, slot: u32, view: &SlotView) -> Result<()> {
         let off = slot_offset(slot, !view.authoritative_b);
         if let Some(r) = parse_slot_block(&self.mac_key, &self.read_block_at(off)?) {
@@ -516,8 +579,12 @@ impl AtomKeyStore {
     pub(crate) fn tombstone(&mut self, slot: u32, expected_atom_id: u64) -> Result<()> {
         let view = self.view(slot)?;
         match view.record.state {
-            // Already erased and free, but the sibling may still hold the key.
-            SlotState::Tombstone => return self.scrub_stale_sibling(slot, &view),
+            // A torn erase leaves the sibling keyed and the slot stranded; finish both.
+            SlotState::Tombstone => {
+                self.scrub_stale_sibling(slot, &view)?;
+                self.restore_free(slot);
+                return Ok(());
+            }
             SlotState::Empty => {
                 return Err(Error::RegionStoreCorrupt(format!(
                     "forget of atom slot {slot} which holds no live key"
@@ -560,7 +627,7 @@ impl AtomKeyStore {
         Ok(())
     }
 
-    /// Batch erase, two fsyncs; recycled slots skip, wrong generation fails loud.
+    /// Batch erase, two fsyncs; recycled skips, wrong gen fails loud, receipt per slot.
     pub(crate) fn tombstone_batch(
         &mut self,
         items: &[(u32, u64, u64)],
@@ -569,9 +636,9 @@ impl AtomKeyStore {
             return Ok(Vec::new());
         }
         let image = std::fs::read(&self.path)?;
-        let tomb_block = |gen: u64| {
+        let tomb_block = |mac_key: &[u8; KEY_SIZE], gen: u64| {
             build_slot_block(
-                &self.mac_key,
+                mac_key,
                 SlotState::Tombstone,
                 0,
                 gen,
@@ -586,9 +653,10 @@ impl AtomKeyStore {
         for &(slot, atom_id, expected_gen) in items {
             let view = view_from(&self.mac_key, &image, slot)?;
             match view.record.state {
-                // Already erased and free, but the sibling may still hold the key.
+                // A torn erase leaves the sibling keyed and the slot stranded; finish both.
                 SlotState::Tombstone => {
                     self.scrub_stale_sibling(slot, &view)?;
+                    self.restore_free(slot);
                     continue;
                 }
                 SlotState::Empty => {
@@ -609,7 +677,7 @@ impl AtomKeyStore {
                 )));
             }
             let new_gen = view.max_gen + 1;
-            let tomb = tomb_block(new_gen);
+            let tomb = tomb_block(&self.mac_key, new_gen);
             let live_off = slot_offset(slot, view.authoritative_b);
             live_writes.push((live_off, tomb));
             sibling_writes.push((slot_offset(slot, !view.authoritative_b), tomb));
@@ -631,6 +699,12 @@ impl AtomKeyStore {
                     )))
                 }
             }
+        }
+        #[cfg(any(test, feature = "test-util"))]
+        if FAIL_BATCH_BEFORE_SIBLING.with(std::cell::Cell::take) {
+            return Err(Error::RegionStoreCorrupt(
+                "injected tombstone_batch failure before the sibling scrub".into(),
+            ));
         }
         // Overwrite all sibling copies, one fsync; free the slots.
         write_blocks_synced(&self.path, &sibling_writes)?;
