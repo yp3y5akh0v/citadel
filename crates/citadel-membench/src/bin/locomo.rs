@@ -177,7 +177,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    // Reader/judge selected via the shared citadel-ai backend factory:
+    // Reader/judge selected via the shared citadel-llm backend factory:
     // CITADEL_LOCOMO_READER_* / CITADEL_LOCOMO_JUDGE_* (default openai;
     // OPENAI_API_KEY is read inside the factory).
     let reader: Arc<dyn LLMClient> =

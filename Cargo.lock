@@ -687,7 +687,6 @@ name = "citadeldb-membench"
 version = "1.13.0"
 dependencies = [
  "citadeldb",
- "citadeldb-ai",
  "citadeldb-llm",
  "citadeldb-mem",
  "rustc-hash",
