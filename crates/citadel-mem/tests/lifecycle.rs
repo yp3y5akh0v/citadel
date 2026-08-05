@@ -161,10 +161,10 @@ fn evolve_links_close_neighbors_and_sets_score() {
         .recall(
             "r",
             RecallQuery::by_text("red green blue", 1)
-                .with_graph_expand(GraphExpand::new(1, vec![EdgeKind::DerivedFrom])),
+                .with_graph_expand(GraphExpand::new(1, vec![EdgeKind::SimilarTo])),
         )
         .unwrap();
-    assert!(hits.len() >= 2, "seed + at least one derived neighbor");
+    assert!(hits.len() >= 2, "seed + at least one similar neighbor");
 }
 
 #[test]

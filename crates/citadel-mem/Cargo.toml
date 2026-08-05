@@ -28,6 +28,7 @@ zeroize = { workspace = true }
 blake3 = { workspace = true }
 rand = { workspace = true }
 rustc-hash = { workspace = true }
+sha2 = { workspace = true }
 unicode-segmentation = { workspace = true }
 # Optional pure-Rust embedding backend (Candle BERT); default build stays light.
 candle-core = { version = "0.10", optional = true }

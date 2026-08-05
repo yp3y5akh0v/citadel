@@ -2,8 +2,150 @@
 
 use serde_json::Value as Json;
 
+use crate::embed::EmbeddingMetric;
+
 /// Stable identifier for a memory atom (globally unique across per-dim tables).
 pub type AtomId = i64;
+
+/// Persisted identity fields; construction validates encrypted rows' live RSK.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRegionIdentity {
+    name: String,
+    encrypted: bool,
+    dim: u16,
+    metric: EmbeddingMetric,
+    model_id: String,
+}
+
+impl StoredRegionIdentity {
+    pub(crate) fn new(
+        name: String,
+        encrypted: bool,
+        dim: u16,
+        metric: EmbeddingMetric,
+        model_id: String,
+    ) -> Self {
+        Self {
+            name,
+            encrypted,
+            dim,
+            metric,
+            model_id,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn encrypted(&self) -> bool {
+        self.encrypted
+    }
+
+    pub fn dim(&self) -> u16 {
+        self.dim
+    }
+
+    pub fn metric(&self) -> EmbeddingMetric {
+        self.metric
+    }
+
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+}
+
+/// Content-free retrieval metadata; score keeps exact f32 bits (+0.0 vs -0.0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAtomRetrievalState {
+    atom_id: AtomId,
+    kind: String,
+    score_bits: u32,
+    expires_at: Option<i64>,
+}
+
+impl StoredAtomRetrievalState {
+    pub(crate) fn new(
+        atom_id: AtomId,
+        kind: String,
+        score_bits: u32,
+        expires_at: Option<i64>,
+    ) -> Self {
+        Self {
+            atom_id,
+            kind,
+            score_bits,
+            expires_at,
+        }
+    }
+
+    pub fn atom_id(&self) -> AtomId {
+        self.atom_id
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub fn score_bits(&self) -> u32 {
+        self.score_bits
+    }
+
+    pub fn expires_at(&self) -> Option<i64> {
+        self.expires_at
+    }
+}
+
+/// Canonical encoding identity; any encoding change requires a new schema string.
+pub const STORED_EMBEDDINGS_SCHEMA: &str = "citadel-mem-stored-embeddings-v1";
+
+/// Opaque SHA-256 proof of stored embeddings; raw vectors are never exposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEmbeddingsIdentity {
+    schema: &'static str,
+    region: String,
+    kind: String,
+    count: u64,
+    dim: u32,
+    sha256: String,
+}
+
+impl StoredEmbeddingsIdentity {
+    pub(crate) fn new(region: String, kind: String, count: u64, dim: u32, sha256: String) -> Self {
+        Self {
+            schema: STORED_EMBEDDINGS_SCHEMA,
+            region,
+            kind,
+            count,
+            dim,
+            sha256,
+        }
+    }
+
+    pub fn schema(&self) -> &'static str {
+        self.schema
+    }
+
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    pub fn dim(&self) -> u32 {
+        self.dim
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
 
 /// Input to [`remember`](crate::MemoryEngine::remember): `text` is embedded,
 /// `payload` stored as JSONB.
@@ -129,8 +271,11 @@ pub enum EdgeKind {
     Refines,
     Precedes,
     Supersedes,
+    /// True provenance: the src atom was derived from the dst atom.
     DerivedFrom,
     DependsOn,
+    /// Vector-neighbor similarity; distinct from DerivedFrom to keep provenance clean.
+    SimilarTo,
 }
 
 impl EdgeKind {
@@ -143,6 +288,7 @@ impl EdgeKind {
             EdgeKind::Supersedes => "supersedes",
             EdgeKind::DerivedFrom => "derived_from",
             EdgeKind::DependsOn => "depends_on",
+            EdgeKind::SimilarTo => "similar_to",
         }
     }
 
@@ -190,6 +336,8 @@ pub struct RecallQuery {
     /// expiry.
     pub as_of_micros: Option<i64>,
     pub graph_expand: Option<GraphExpand>,
+    /// Rank superseded atoms too; off by default so recall answers with current facts.
+    pub include_superseded: bool,
 }
 
 impl RecallQuery {
@@ -203,6 +351,7 @@ impl RecallQuery {
             weights: FusionWeights::default(),
             as_of_micros: None,
             graph_expand: None,
+            include_superseded: false,
         }
     }
 
@@ -216,7 +365,13 @@ impl RecallQuery {
             weights: FusionWeights::default(),
             as_of_micros: None,
             graph_expand: None,
+            include_superseded: false,
         }
+    }
+
+    pub fn with_superseded(mut self, include: bool) -> Self {
+        self.include_superseded = include;
+        self
     }
 
     pub fn with_kinds(mut self, kinds: Vec<String>) -> Self {
@@ -249,6 +404,88 @@ impl RecallQuery {
     /// re-embedding.
     pub fn with_text(mut self, text: impl Into<String>) -> Self {
         self.text = Some(text.into());
+        self
+    }
+}
+
+/// Multi-query recall: independent sub-queries, RRF merge, one optional rerank pass.
+#[derive(Debug, Clone)]
+pub struct MultiRecallQuery {
+    pub queries: Vec<RecallQuery>,
+    pub k: usize,
+    /// One cross-encoder pass over the merged pool; `None` keeps the pure RRF order.
+    pub rerank_query: Option<String>,
+    /// RRF damping constant (60 is the literature standard; lower trusts top ranks).
+    pub rrf_k: f32,
+}
+
+impl MultiRecallQuery {
+    pub fn new(queries: Vec<RecallQuery>, k: usize) -> Self {
+        Self {
+            queries,
+            k,
+            rerank_query: None,
+            rrf_k: 60.0,
+        }
+    }
+
+    pub fn with_rerank_query(mut self, text: impl Into<String>) -> Self {
+        self.rerank_query = Some(text.into());
+        self
+    }
+
+    pub fn with_rrf_k(mut self, k: f32) -> Self {
+        self.rrf_k = k;
+        self
+    }
+}
+
+/// Deterministic id-order listing; after_id resumes, [from, before) bounds time.
+#[derive(Debug, Clone)]
+pub struct FetchQuery {
+    /// `None` lists every kind.
+    pub kind: Option<String>,
+    pub payload_filter: Option<Json>,
+    pub after_id: Option<AtomId>,
+    pub created_from: Option<i64>,
+    pub created_before: Option<i64>,
+    pub limit: usize,
+}
+
+impl FetchQuery {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            kind: None,
+            payload_filter: None,
+            after_id: None,
+            created_from: None,
+            created_before: None,
+            limit,
+        }
+    }
+
+    pub fn with_kind(mut self, kind: impl Into<String>) -> Self {
+        self.kind = Some(kind.into());
+        self
+    }
+
+    pub fn with_payload_filter(mut self, filter: Json) -> Self {
+        self.payload_filter = Some(filter);
+        self
+    }
+
+    pub fn with_after_id(mut self, id: AtomId) -> Self {
+        self.after_id = Some(id);
+        self
+    }
+
+    pub fn with_created_from(mut self, micros: i64) -> Self {
+        self.created_from = Some(micros);
+        self
+    }
+
+    pub fn with_created_before(mut self, micros: i64) -> Self {
+        self.created_before = Some(micros);
         self
     }
 }
@@ -387,6 +624,13 @@ impl AttestVerdict {
 pub struct EvolutionReport {
     pub links_added: usize,
     pub score: f32,
+}
+
+/// Result of [`crate::MemoryEngine::remember_if_absent`]: id + whether it inserted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RememberOutcome {
+    pub id: AtomId,
+    pub inserted: bool,
 }
 
 /// Per-kind structural digest of a region's atoms.
