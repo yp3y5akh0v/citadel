@@ -52,8 +52,9 @@ fn parse_edge_kind(s: &str) -> PyResult<EdgeKind> {
         "supersedes" => Ok(EdgeKind::Supersedes),
         "derived_from" => Ok(EdgeKind::DerivedFrom),
         "depends_on" => Ok(EdgeKind::DependsOn),
+        "similar_to" => Ok(EdgeKind::SimilarTo),
         other => Err(PyValueError::new_err(format!(
-            "unknown edge kind '{other}' (causes|contradicts|refines|precedes|supersedes|derived_from|depends_on)"
+            "unknown edge kind '{other}' (causes|contradicts|refines|precedes|supersedes|derived_from|depends_on|similar_to)"
         ))),
     }
 }
@@ -888,7 +889,7 @@ impl PyMemory {
     }
 
     /// Link two atoms with a typed edge (causes/contradicts/refines/precedes/
-    /// supersedes/derived_from/depends_on).
+    /// supersedes/derived_from/depends_on/similar_to).
     #[pyo3(signature = (src, dst, kind, weight=1.0))]
     fn link(&self, src: i64, dst: i64, kind: &str, weight: f32) -> PyResult<()> {
         self.inner
@@ -981,7 +982,7 @@ impl PyMemory {
             .collect()
     }
 
-    /// Recompute an atom's neighbor links by ANN search; returns `{links_added, score}`.
+    /// Recompute an atom's `similar_to` links by ANN search; returns `{links_added, score}`.
     fn evolve(
         &self,
         py: Python<'_>,

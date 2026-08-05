@@ -292,9 +292,10 @@ fn parse_recall_edge_kind(s: &str) -> PyResult<EdgeKind> {
         "supersedes" => Ok(EdgeKind::Supersedes),
         "derived_from" => Ok(EdgeKind::DerivedFrom),
         "depends_on" => Ok(EdgeKind::DependsOn),
+        "similar_to" => Ok(EdgeKind::SimilarTo),
         other => Err(PyValueError::new_err(format!(
             "unknown edge kind '{other}' \
-             (causes|contradicts|refines|precedes|supersedes|derived_from|depends_on)"
+             (causes|contradicts|refines|precedes|supersedes|derived_from|depends_on|similar_to)"
         ))),
     }
 }
