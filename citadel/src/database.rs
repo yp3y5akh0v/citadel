@@ -275,11 +275,7 @@ impl Database {
         region_id: u64,
         wrapped: &[u8; WRAPPED_KEY_SIZE],
     ) -> Result<(u32, u64)> {
-        self.with_region_store(|s| {
-            let slot = s.allocate_slot()?;
-            let gen = s.write_live(slot, region_id, wrapped)?;
-            Ok((slot, gen))
-        })
+        self.with_region_store(|s| s.allocate_write(region_id, wrapped))
     }
 
     /// The authoritative record of region key `slot`.
@@ -325,11 +321,7 @@ impl Database {
         atom_id: u64,
         wrapped: &[u8; WRAPPED_KEY_SIZE],
     ) -> Result<(u32, u64)> {
-        self.with_atom_store(|s| {
-            let slot = s.allocate_slot()?;
-            let gen = s.write_live(slot, atom_id, wrapped)?;
-            Ok((slot, gen))
-        })
+        self.with_atom_store(|s| s.allocate_write(atom_id, wrapped))
     }
 
     /// Allocate and durably write a batch of `(atom_id, wrapped)` ACKs with one
@@ -341,16 +333,7 @@ impl Database {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        self.with_atom_store(|s| {
-            let slots = s.allocate_batch(items.len())?;
-            let writes: Vec<(u32, u64, [u8; WRAPPED_KEY_SIZE])> = slots
-                .iter()
-                .zip(items)
-                .map(|(&slot, (atom_id, wrapped))| (slot, *atom_id, *wrapped))
-                .collect();
-            let gens = s.write_live_batch(&writes)?;
-            Ok(slots.into_iter().zip(gens).collect())
-        })
+        self.with_atom_store(|s| s.allocate_write_batch(items))
     }
 
     /// The authoritative record of atom key `slot` (its wrapped ACK and state).
@@ -363,12 +346,10 @@ impl Database {
         self.with_atom_store(|s| s.tombstone(slot, atom_id))
     }
 
-    /// Erase a batch of key slots with two fsyncs total (not 2N); items are
-    /// `(slot, atom_id)`. Returns the erased `(slot, atom_id, old_gen,
-    /// new_gen)`, read-back confirmed, for a verifiable erasure receipt.
+    /// Batch erase, two fsyncs; recycled slots skip so retries converge.
     pub fn atom_store_tombstone_batch(
         &self,
-        items: &[(u32, u64)],
+        items: &[(u32, u64, u64)],
     ) -> Result<Vec<(u32, u64, u64, u64)>> {
         self.with_atom_store(|s| s.tombstone_batch(items))
     }
