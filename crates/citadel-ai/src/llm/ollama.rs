@@ -3,24 +3,23 @@
 
 use super::http::LlmTimeouts;
 use super::openai::OpenAiClient;
-use super::{CompletionRequest, CompletionResponse, LLMClient, LlmError, Message};
+use super::{
+    ClientRequestIdentity, CompletionRequest, CompletionResponse, LLMClient, LlmError, Message,
+};
 
-const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
+pub(super) const OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 
 pub(crate) struct OllamaClient {
     inner: OpenAiClient,
 }
 
 impl OllamaClient {
-    pub(crate) fn new(model: impl Into<String>) -> Self {
-        Self::with_base_url(model, OLLAMA_BASE_URL)
-    }
-
     /// A specific Ollama `/v1` base: remote host, custom port, or test server.
     pub(crate) fn with_base_url(model: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             inner: OpenAiClient::with_base_url(model, base_url, "ollama")
                 .max_tokens_field("max_tokens")
+                .identity_provider("ollama")
                 .unpriced(),
         }
     }
@@ -39,6 +38,10 @@ impl LLMClient for OllamaClient {
 
     fn model_id(&self) -> &str {
         self.inner.model_id()
+    }
+
+    fn request_identity(&self) -> ClientRequestIdentity {
+        self.inner.request_identity()
     }
 
     fn count_tokens(&self, messages: &[Message]) -> usize {

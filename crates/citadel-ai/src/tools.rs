@@ -212,6 +212,7 @@ fn edge_kind(s: &str) -> Result<EdgeKind, ToolError> {
         "supersedes" => EdgeKind::Supersedes,
         "derived_from" => EdgeKind::DerivedFrom,
         "depends_on" => EdgeKind::DependsOn,
+        "similar_to" => EdgeKind::SimilarTo,
         other => {
             return Err(ToolError::BadArgs {
                 tool: "mem_recall".into(),
@@ -335,7 +336,8 @@ impl Tool for MemRecallTool {
                                 "precedes",
                                 "supersedes",
                                 "derived_from",
-                                "depends_on"
+                                "depends_on",
+                                "similar_to"
                             ]
                         },
                         "description": "edge kinds to follow when graph_depth > 0; empty means all"

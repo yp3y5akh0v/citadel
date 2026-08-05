@@ -18,8 +18,10 @@ name = "citadel_ai"
 [dependencies]
 citadel-mem = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
+sha2 = { workspace = true }
 rustc-hash = { workspace = true }
 
 # Native-only: ureq does blocking std::net I/O (no wasm).

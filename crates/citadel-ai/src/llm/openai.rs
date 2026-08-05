@@ -1,7 +1,8 @@
 //! OpenAI Chat Completions backend (native-only, `openai` feature).
 //!
 //! Also serves any OpenAI-compatible endpoint via [`OpenAiClient::with_base_url`].
-//! Tool-call `arguments` are a JSON string on the wire; stringified out, parsed back in.
+//! Tool-call `arguments` are a JSON string on the wire; stringified out,
+//! parsed back in.
 
 use serde_json::{json, Value};
 use ureq::Agent;
@@ -9,13 +10,13 @@ use ureq::Agent;
 use super::http::{agent, estimate_tokens, post_json, LlmTimeouts};
 use super::pricing;
 use super::{
-    AssistantMessage, CompletionRequest, CompletionResponse, FinishReason, LLMClient, LlmError,
-    Message, TokenUsage, ToolCall, ToolChoice,
+    AssistantMessage, ClientRequestIdentity, CompletionRequest, CompletionResponse, FinishReason,
+    LLMClient, LlmError, Message, TokenUsage, ToolCall, ToolChoice,
 };
 
-const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+pub(super) const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// OpenAI's modern output-token cap field; `max_tokens` is deprecated there.
-const OPENAI_MAX_TOKENS_FIELD: &str = "max_completion_tokens";
+pub(super) const OPENAI_MAX_TOKENS_FIELD: &str = "max_completion_tokens";
 
 /// Calls an OpenAI-compatible `/chat/completions` endpoint. The API key is held
 /// only in memory and never logged or persisted.
@@ -26,19 +27,15 @@ pub(crate) struct OpenAiClient {
     /// Output-token-cap field: OpenAI wants `max_completion_tokens`, some
     /// compatible servers (Ollama) only honor `max_tokens`.
     max_tokens_field: &'static str,
-    /// Optional `reasoning_effort` (low|medium|high); omitted from the wire when `None`.
+    /// Optional reasoning_effort (low|medium|high); omitted from the wire when None.
     reasoning_effort: Option<String>,
+    identity_provider: &'static str,
     /// Whether to price usage from the pricing table (false for free/local).
     priced: bool,
     agent: Agent,
 }
 
 impl OpenAiClient {
-    /// A client for the official OpenAI API.
-    pub(crate) fn new(model: impl Into<String>, api_key: impl Into<String>) -> Self {
-        Self::with_base_url(model, DEFAULT_BASE_URL, api_key)
-    }
-
     /// A client for any OpenAI-compatible endpoint (Together, OpenRouter, a
     /// local Ollama `/v1`, ...). `base_url` is the path up to but excluding
     /// `/chat/completions`.
@@ -53,6 +50,7 @@ impl OpenAiClient {
             api_key: api_key.into(),
             max_tokens_field: OPENAI_MAX_TOKENS_FIELD,
             reasoning_effort: None,
+            identity_provider: "openai",
             priced: true,
             agent: agent(&LlmTimeouts::default()),
         }
@@ -79,6 +77,11 @@ impl OpenAiClient {
         self
     }
 
+    pub(super) fn identity_provider(mut self, provider: &'static str) -> Self {
+        self.identity_provider = provider;
+        self
+    }
+
     /// Report no cost (a free/local endpoint).
     #[cfg(feature = "ollama")]
     pub(super) fn unpriced(mut self) -> Self {
@@ -102,8 +105,7 @@ impl LLMClient for OpenAiClient {
             ("content-type", "application/json"),
         ];
         let resp = post_json(&self.agent, &url, &headers, &body)?;
-        // A forced tool_choice means a tool was mandatory here; pass that and the offered
-        // tool names so from_wire can recover a call a local model leaked into content.
+        // Pass forced tool_choice + names so from_wire can recover a leaked call.
         let forced_tool = !matches!(req.tool_choice, ToolChoice::Auto);
         let tool_names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
         from_wire(&resp, &self.model, self.priced, forced_tool, &tool_names)
@@ -111,6 +113,21 @@ impl LLMClient for OpenAiClient {
 
     fn model_id(&self) -> &str {
         &self.model
+    }
+
+    fn request_identity(&self) -> ClientRequestIdentity {
+        ClientRequestIdentity::from_config(
+            self.identity_provider,
+            &self.base_url,
+            &[
+                ("wire", "openai-chat-completions-v1"),
+                ("max_tokens_field", self.max_tokens_field),
+                (
+                    "reasoning_effort",
+                    self.reasoning_effort.as_deref().unwrap_or("<none>"),
+                ),
+            ],
+        )
     }
 
     fn count_tokens(&self, messages: &[Message]) -> usize {
@@ -315,9 +332,7 @@ fn parse_usage(raw: Option<&Value>, model: &str, priced: bool) -> TokenUsage {
     usage
 }
 
-/// Recover a tool call a local model emitted as a JSON object in `content` instead of the
-/// structured `tool_calls` array. Returns a call only when the content names a known tool,
-/// or - when exactly one tool was offered - a bare arguments object for it.
+/// Recover a tool call a local model leaked into content as a JSON object.
 fn recover_tool_call(content: &str, tool_names: &[&str]) -> Option<ToolCall> {
     let obj = extract_json_object(content)?;
     let recovered = |name: &str, arguments: Value| ToolCall {
@@ -335,15 +350,14 @@ fn recover_tool_call(content: &str, tool_names: &[&str]) -> Option<ToolCall> {
             recovered(name, args)
         });
     }
-    // No name wrapper: a call offering exactly one tool means the object is its arguments.
+    // One offered tool: a bare object is its arguments.
     match tool_names {
         &[only] if !obj.contains_key("tool_calls") => Some(recovered(only, Value::Object(obj))),
         _ => None,
     }
 }
 
-/// The first balanced top-level JSON object in `s` (string- and escape-aware), tolerating
-/// code fences, language tags, and surrounding prose. `None` if none parses.
+/// First balanced top-level JSON object, tolerating fences and prose.
 fn extract_json_object(s: &str) -> Option<serde_json::Map<String, Value>> {
     let start = s.find('{')?;
     let mut depth = 0u32;
@@ -508,7 +522,7 @@ mod tests {
         );
         assert_eq!(r.usage.input_tokens, 12);
         assert_eq!(r.usage.output_tokens, 4);
-        assert_eq!(r.usage.cost_usd, None, "gpt is not in the pricing table");
+        assert_eq!(r.usage.cost_usd, None, "bare 'gpt' has no confident rate");
     }
 
     #[test]
@@ -525,8 +539,7 @@ mod tests {
 
     #[test]
     fn recovers_forced_tool_call_leaked_into_fenced_content() {
-        // Ollama/small-model behavior: the call is a fenced JSON blob in content with an
-        // empty tool_calls array and finish_reason "stop". A forced tool recovers it.
+        // Ollama shape: fenced JSON in content, empty tool_calls; forced tool recovers.
         let resp = json!({
             "choices": [{
                 "message": { "content": "```json\n{\"name\": \"submit_plan\", \"parameters\": {\"goal\": {\"prompt\": \"fix\"}}}\n```" },
