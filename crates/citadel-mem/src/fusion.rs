@@ -1,12 +1,16 @@
 //! Multi-signal recall fusion: re-rank ANN candidates by a weighted blend of
 //! semantic distance, keyword rank, recency, and importance.
 
+use rustc_hash::FxHashMap;
 use serde_json::Value as Json;
 
 use crate::embed::{EmbedError, Reranker};
 use crate::types::{AtomHit, AtomId, FusionWeights, RerankStrategy};
 
 const RECENCY_HALF_LIFE_DAYS: f32 = 30.0;
+
+/// Cross-encoding every candidate is CPU-bound; rerank pre-trims to this pool.
+const RERANK_POOL: usize = 256;
 
 /// An ANN candidate with the raw signals recall projected for it.
 pub(crate) struct Candidate {
@@ -121,9 +125,8 @@ pub(crate) fn fuse_rerank(
     if cands.is_empty() {
         return Ok(Vec::new());
     }
-    // Scoring every candidate is CPU-bound, so pre-trim to the top RERANK_POOL by
-    // linear fusion; the dropped tail is the low-fusion, likely-irrelevant remainder.
-    const RERANK_POOL: usize = 256;
+    // Pre-trim to the top RERANK_POOL by linear fusion; the dropped tail is
+    // the low-fusion, likely-irrelevant remainder.
     if cands.len() > RERANK_POOL {
         let pre = fusion_scores(&cands, w, now_micros);
         let mut idx: Vec<usize> = (0..cands.len()).collect();
@@ -187,6 +190,78 @@ pub(crate) fn fuse_rerank(
     });
     scored.truncate(k);
     Ok(scored)
+}
+
+/// RRF-merge hit lists: sum of 1/(rrf_k + rank), first-seen fields, id tiebreak.
+pub(crate) fn rrf_merge(lists: Vec<Vec<AtomHit>>, rrf_k: f32) -> Vec<AtomHit> {
+    let mut merged: Vec<AtomHit> = Vec::new();
+    let mut index: FxHashMap<AtomId, usize> = FxHashMap::default();
+    for list in lists {
+        for (rank, hit) in list.into_iter().enumerate() {
+            let contrib = 1.0 / (rrf_k + rank as f32);
+            match index.get(&hit.id) {
+                Some(&i) => merged[i].score += contrib,
+                None => {
+                    index.insert(hit.id, merged.len());
+                    let mut h = hit;
+                    h.score = contrib;
+                    merged.push(h);
+                }
+            }
+        }
+    }
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.id.cmp(&b.id))
+    });
+    merged
+}
+
+/// One cross-encoder pass over the merged pool: pre-trim, Replace/Rrf-blend, top k.
+pub(crate) fn rerank_hits(
+    reranker: &dyn Reranker,
+    query: &str,
+    mut hits: Vec<AtomHit>,
+    strategy: RerankStrategy,
+    k: usize,
+) -> std::result::Result<Vec<AtomHit>, EmbedError> {
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+    hits.truncate(RERANK_POOL);
+    let passages: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
+    let ce_scores = reranker.rerank(query, &passages)?;
+    if ce_scores.len() != passages.len() {
+        return Err(EmbedError::Backend(format!(
+            "reranker returned {} scores for {} passages",
+            ce_scores.len(),
+            passages.len()
+        )));
+    }
+    let scores: Vec<f32> = match strategy {
+        RerankStrategy::Replace => ce_scores,
+        RerankStrategy::Rrf { k: rrf_k } => {
+            let pool: Vec<f32> = hits.iter().map(|h| h.score).collect();
+            let ce_rank = ranks_desc(&ce_scores);
+            let pool_rank = ranks_desc(&pool);
+            (0..hits.len())
+                .map(|i| 1.0 / (rrf_k + ce_rank[i] as f32) + 1.0 / (rrf_k + pool_rank[i] as f32))
+                .collect()
+        }
+    };
+    for (h, s) in hits.iter_mut().zip(&scores) {
+        h.score = *s;
+    }
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.id.cmp(&b.id))
+    });
+    hits.truncate(k);
+    Ok(hits)
 }
 
 #[cfg(test)]
@@ -348,5 +423,97 @@ mod tests {
             hits[0].score >= hits[1].score && hits[1].score >= hits[2].score,
             "RRF scores descending"
         );
+    }
+
+    fn hit(id: AtomId, text: &str) -> AtomHit {
+        AtomHit {
+            id,
+            kind: "fact".into(),
+            text: text.into(),
+            payload: Json::Null,
+            distance: 0.0,
+            score: 0.0,
+            created_at: 0,
+            immutable: false,
+        }
+    }
+
+    #[test]
+    fn rrf_merge_scores_cross_list_atoms_highest() {
+        // Atom 1 appears at rank 0 in both lists; single-list atoms trail it.
+        let merged = rrf_merge(
+            vec![
+                vec![hit(1, "a"), hit(2, "b")],
+                vec![hit(1, "a"), hit(3, "c")],
+            ],
+            60.0,
+        );
+        assert_eq!(merged[0].id, 1);
+        assert_eq!(merged.len(), 3, "deduped by id");
+        let expect = 2.0 / 60.0;
+        assert!((merged[0].score - expect).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rrf_merge_ties_break_by_id() {
+        // Atoms 2 and 3 both hold rank 1 in one list: equal score, id order.
+        let merged = rrf_merge(
+            vec![
+                vec![hit(1, "a"), hit(3, "c")],
+                vec![hit(1, "a"), hit(2, "b")],
+            ],
+            60.0,
+        );
+        assert_eq!(merged[1].id, 2);
+        assert_eq!(merged[2].id, 3);
+    }
+
+    #[test]
+    fn rrf_merge_empty_lists() {
+        assert!(rrf_merge(Vec::new(), 60.0).is_empty());
+        assert!(rrf_merge(vec![Vec::new(), Vec::new()], 60.0).is_empty());
+    }
+
+    #[test]
+    fn rerank_hits_replace_orders_by_cross_encoder() {
+        let pool = vec![
+            hit(1, "the sky is blue today"),
+            hit(2, "quick brown fox jumps"),
+        ];
+        let hits = rerank_hits(
+            &MockReranker,
+            "quick brown fox",
+            pool,
+            RerankStrategy::Replace,
+            2,
+        )
+        .unwrap();
+        assert_eq!(hits[0].id, 2, "most word overlap ranks first");
+    }
+
+    #[test]
+    fn rerank_hits_truncates_to_k() {
+        let pool = vec![hit(1, "a b"), hit(2, "c d"), hit(3, "e f")];
+        let hits = rerank_hits(&MockReranker, "a b", pool, RerankStrategy::Replace, 1).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn rerank_hits_rrf_blends_pool_order() {
+        // Atom 1 leads the pool, atom 2 wins the cross-encoder; RRF blends both.
+        let mut a = hit(1, "unrelated text");
+        a.score = 0.9;
+        let mut b = hit(2, "quick brown fox");
+        b.score = 0.1;
+        let hits = rerank_hits(
+            &MockReranker,
+            "quick brown fox",
+            vec![a, b],
+            RerankStrategy::Rrf { k: 60.0 },
+            2,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0].score >= hits[1].score);
     }
 }

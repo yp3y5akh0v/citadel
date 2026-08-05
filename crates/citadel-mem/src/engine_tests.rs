@@ -90,6 +90,326 @@ fn drop_missing_region_is_ok() {
 }
 
 #[test]
+fn detaching_a_region_scrubs_the_shared_sealed_ann_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("vault", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.remember("vault", AtomInput::new("fact", "cached secret"))
+        .unwrap();
+    eng.recall("vault", RecallQuery::by_text("cached secret", 5))
+        .unwrap();
+
+    let shared = eng.region_handle("vault").unwrap().ann;
+    assert!(shared.read().unwrap().is_some());
+    eng.drop_region("vault").unwrap();
+    assert!(
+        shared.read().unwrap().is_none(),
+        "a stale RegionHandle must observe the cache scrub immediately"
+    );
+}
+
+#[test]
+fn decrypted_json_scrub_walks_nested_values_and_object_keys() {
+    let mut payload = serde_json::json!({
+        "secret-key": ["secret-value", {"nested-key": "nested-value"}],
+        "public-number": 7
+    });
+    // Exact count (3 keys + 2 values) fails if recursion skips a nested container.
+    let scrubbed = zeroize_json_strings(&mut payload);
+    assert_eq!(
+        scrubbed, 5,
+        "every nested string value and object key must be visited and scrubbed"
+    );
+    assert_eq!(payload, serde_json::Value::Null);
+}
+
+#[test]
+fn public_ranking_writes_reject_non_finite_values_before_sql() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("finite", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let first = eng
+        .remember("finite", AtomInput::new("fact", "first"))
+        .unwrap();
+    let second = eng
+        .remember("finite", AtomInput::new("fact", "second"))
+        .unwrap();
+
+    let err = eng
+        .set_importance("finite", &[(first, 2.0), (second, f32::NAN)])
+        .unwrap_err();
+    assert!(matches!(err, MemError::Invalid(_)));
+    assert!(eng
+        .stored_atom_retrieval_state("finite")
+        .unwrap()
+        .iter()
+        .all(|state| state.score_bits() == 0.0f32.to_bits()));
+
+    for weight in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let err = eng
+            .link(first, second, EdgeKind::Refines, weight)
+            .unwrap_err();
+        assert!(matches!(err, MemError::Invalid(_)));
+    }
+    let err = eng
+        .link_with_evidence(
+            first,
+            second,
+            EdgeKind::Refines,
+            f32::INFINITY,
+            Some(serde_json::json!({"quote": "must not persist"})),
+        )
+        .unwrap_err();
+    assert!(matches!(err, MemError::Invalid(_)));
+    assert!(eng
+        .fetch_edges(Some(first), Some(second), None)
+        .unwrap()
+        .is_empty());
+}
+
+#[derive(Clone, Copy)]
+struct SelectivelyNonFiniteEmbedder {
+    passage: bool,
+    query: bool,
+}
+
+impl Embedder for SelectivelyNonFiniteEmbedder {
+    fn dim(&self) -> usize {
+        8
+    }
+
+    fn metric(&self) -> EmbeddingMetric {
+        EmbeddingMetric::Cosine
+    }
+
+    fn model_id(&self) -> &str {
+        match (self.passage, self.query) {
+            (true, false) => "nonfinite-passage",
+            (false, true) => "nonfinite-query",
+            (true, true) => "nonfinite-both",
+            (false, false) => "finite-control",
+        }
+    }
+
+    fn embed(
+        &self,
+        texts: &[&str],
+    ) -> std::result::Result<Vec<Vec<f32>>, crate::embed::EmbedError> {
+        Ok(texts
+            .iter()
+            .map(|_| {
+                let mut vector = vec![0.0; self.dim()];
+                if self.passage {
+                    vector[3] = f32::NAN;
+                }
+                vector
+            })
+            .collect())
+    }
+
+    fn embed_queries(
+        &self,
+        texts: &[&str],
+    ) -> std::result::Result<Vec<Vec<f32>>, crate::embed::EmbedError> {
+        Ok(texts
+            .iter()
+            .map(|_| {
+                let mut vector = vec![0.0; self.dim()];
+                if self.query {
+                    vector[5] = f32::INFINITY;
+                }
+                vector
+            })
+            .collect())
+    }
+}
+
+#[test]
+fn atom_inputs_and_passage_vectors_are_finite_before_plain_or_sealed_writes() {
+    for encrypted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if encrypted {
+            create_enc_db(dir.path())
+        } else {
+            create_db(dir.path())
+        };
+        let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+        let embedder = Arc::new(SelectivelyNonFiniteEmbedder {
+            passage: true,
+            query: false,
+        });
+        if encrypted {
+            eng.create_encrypted_region("finite-input", embedder)
+                .unwrap();
+        } else {
+            eng.create_region("finite-input", embedder).unwrap();
+        }
+
+        for atom in [
+            AtomInput::new("fact", "bad score").with_score(f32::NAN),
+            AtomInput::new("fact", "bad confidence").with_confidence(f32::NEG_INFINITY),
+        ] {
+            assert!(matches!(
+                eng.remember("finite-input", atom),
+                Err(MemError::Invalid(_))
+            ));
+        }
+        assert!(matches!(
+            eng.remember("finite-input", AtomInput::new("fact", "bad passage")),
+            Err(MemError::Invalid(_))
+        ));
+        assert!(matches!(
+            eng.remember_batch(
+                "finite-input",
+                vec![
+                    AtomInput::new("fact", "batch passage one"),
+                    AtomInput::new("fact", "batch passage two"),
+                ],
+            ),
+            Err(MemError::Invalid(_))
+        ));
+        assert!(matches!(
+            eng.remember_batch(
+                "finite-input",
+                vec![
+                    AtomInput::new("fact", "finite first"),
+                    AtomInput::new("fact", "bad second").with_score(f32::INFINITY),
+                ],
+            ),
+            Err(MemError::Invalid(_))
+        ));
+
+        assert!(eng
+            .stored_atom_retrieval_state("finite-input")
+            .unwrap()
+            .is_empty());
+        if encrypted {
+            assert!(
+                db.atom_store_live_owners().unwrap().is_empty(),
+                "rejected sealed inputs must not allocate an ACK slot"
+            );
+        }
+    }
+}
+
+#[test]
+fn query_vectors_are_finite_before_single_or_multi_recall_observation() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("explicit-query", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.remember("explicit-query", AtomInput::new("fact", "seed"))
+        .unwrap();
+
+    let mut invalid = vec![0.0; 8];
+    invalid[1] = f32::NAN;
+    assert!(matches!(
+        eng.recall(
+            "explicit-query",
+            RecallQuery::by_embedding(invalid.clone(), 1)
+        ),
+        Err(MemError::Invalid(_))
+    ));
+    assert!(eng.access_stats.lock().unwrap().is_empty());
+
+    let multi = MultiRecallQuery::new(
+        vec![
+            RecallQuery::by_embedding(vec![0.0; 8], 1),
+            RecallQuery::by_embedding(invalid, 1),
+        ],
+        1,
+    );
+    assert!(matches!(
+        eng.recall_many("explicit-query", multi),
+        Err(MemError::Invalid(_))
+    ));
+    assert!(
+        eng.access_stats.lock().unwrap().is_empty(),
+        "a bad later sub-query must reject the batch before the first access is observed"
+    );
+
+    for weights in [
+        FusionWeights {
+            semantic: f32::NAN,
+            ..FusionWeights::default()
+        },
+        FusionWeights {
+            keyword: f32::INFINITY,
+            ..FusionWeights::default()
+        },
+        FusionWeights {
+            recency: f32::NEG_INFINITY,
+            ..FusionWeights::default()
+        },
+        FusionWeights {
+            importance: f32::NAN,
+            ..FusionWeights::default()
+        },
+    ] {
+        assert!(matches!(
+            eng.recall(
+                "explicit-query",
+                RecallQuery::by_embedding(vec![0.0; 8], 1).with_weights(weights)
+            ),
+            Err(MemError::Invalid(_))
+        ));
+    }
+
+    for rrf_k in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+        assert!(matches!(
+            eng.recall_many(
+                "explicit-query",
+                MultiRecallQuery::new(vec![RecallQuery::by_embedding(vec![0.0; 8], 1)], 1)
+                    .with_rrf_k(rrf_k)
+            ),
+            Err(MemError::Invalid(_))
+        ));
+    }
+
+    eng.set_reranker(
+        Arc::new(crate::embed::MockReranker),
+        RerankStrategy::Rrf { k: f32::NAN },
+    );
+    assert!(matches!(
+        eng.recall("explicit-query", RecallQuery::by_embedding(vec![0.0; 8], 1)),
+        Err(MemError::Invalid(_))
+    ));
+    eng.clear_reranker();
+    assert!(
+        eng.access_stats.lock().unwrap().is_empty(),
+        "numeric validation must happen before recall records access"
+    );
+
+    for encrypted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = if encrypted {
+            create_enc_db(dir.path())
+        } else {
+            create_db(dir.path())
+        };
+        let eng = MemoryEngine::open(db).unwrap();
+        let embedder = Arc::new(SelectivelyNonFiniteEmbedder {
+            passage: false,
+            query: true,
+        });
+        if encrypted {
+            eng.create_encrypted_region("text-query", embedder).unwrap();
+        } else {
+            eng.create_region("text-query", embedder).unwrap();
+        }
+        eng.remember("text-query", AtomInput::new("fact", "seed"))
+            .unwrap();
+        assert!(matches!(
+            eng.recall("text-query", RecallQuery::by_text("needle", 1)),
+            Err(MemError::Invalid(_))
+        ));
+        assert!(eng.access_stats.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
 fn region_metadata_survives_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let id1 = {
@@ -102,6 +422,275 @@ fn region_metadata_survives_reopen() {
         .create_region("notes", Arc::new(MockEmbedder::new(8)))
         .unwrap();
     assert_eq!(id1, id2, "region persists across reopen");
+}
+
+#[test]
+fn stored_region_names_reads_sorted_persisted_live_inventory() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let writer = MemoryEngine::open(db.clone()).unwrap();
+    writer
+        .create_encrypted_region("Zebra", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    writer
+        .create_region("alpha", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    writer
+        .create_region(
+            "Middle",
+            Arc::new(MockEmbedder::with_metric(12, EmbeddingMetric::L2)),
+        )
+        .unwrap();
+
+    let inventory = MemoryEngine::open(db.clone()).unwrap();
+    assert_eq!(inventory.database_data_path(), db.data_path());
+    let identities = inventory.stored_region_identities().unwrap();
+    let fields: Vec<_> = identities
+        .iter()
+        .map(|identity| {
+            (
+                identity.name(),
+                identity.encrypted(),
+                identity.dim(),
+                identity.metric(),
+                identity.model_id(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        fields,
+        vec![
+            ("alpha", false, 8, EmbeddingMetric::Cosine, "mock"),
+            ("middle", false, 12, EmbeddingMetric::L2, "mock"),
+            ("zebra", true, 8, EmbeddingMetric::Cosine, "mock"),
+        ],
+        "identity inventory preserves every exact persisted reader binding"
+    );
+    assert_eq!(
+        inventory.stored_region_names().unwrap(),
+        vec!["alpha".to_owned(), "middle".to_owned(), "zebra".to_owned()],
+        "inventory comes from canonical persisted rows, not local attachments"
+    );
+    writer.drop_region("middle").unwrap();
+    assert_eq!(
+        inventory.stored_region_names().unwrap(),
+        vec!["alpha".to_owned(), "zebra".to_owned()]
+    );
+
+    let conn = Connection::open(&db).unwrap();
+    let zebra = writer.load_region_row(&conn, "zebra").unwrap().unwrap();
+    drop(conn);
+    db.region_store_tombstone(zebra.rsk_slot.unwrap(), zebra.id as u64)
+        .unwrap();
+    assert!(matches!(
+        inventory.stored_region_names(),
+        Err(MemError::RegionForgotten(name)) if name == "zebra"
+    ));
+}
+
+#[test]
+fn stored_atom_kinds_is_sorted_physical_inventory_without_decryption() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let writer = MemoryEngine::open(db.clone()).unwrap();
+    writer
+        .create_region("PlainKinds", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let sealed_id = writer
+        .create_encrypted_region("SealedKinds", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let expired = micros_now() - 1;
+    for atom in [
+        AtomInput::new("zeta", "plain z"),
+        AtomInput::new("alpha", "plain a"),
+        AtomInput::new("expired-only", "plain expired").with_expires_at(expired),
+        AtomInput::new("alpha", "plain duplicate"),
+    ] {
+        writer.remember("plainkinds", atom).unwrap();
+    }
+    writer
+        .remember("sealedkinds", AtomInput::new("sealed-z", "sealed z"))
+        .unwrap();
+    let corrupt = writer
+        .remember("sealedkinds", AtomInput::new("sealed-a", "sealed a"))
+        .unwrap();
+    writer
+        .remember(
+            "sealedkinds",
+            AtomInput::new("sealed-expired", "sealed expired").with_expires_at(expired),
+        )
+        .unwrap();
+    let residue = writer
+        .remember(
+            "sealedkinds",
+            AtomInput::new("erased-residue", "sealed residue"),
+        )
+        .unwrap();
+
+    // Inventory-only engine (no regions/embedders) opened while every ACK is live.
+    let inventory = MemoryEngine::open(db.clone()).unwrap();
+    let sealed_table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let conn = Connection::open(&db).unwrap();
+    let residue_row = conn
+        .query_params(
+            &format!("SELECT key_slot FROM {sealed_table} WHERE id = $1"),
+            &[Value::Integer(residue)],
+        )
+        .unwrap();
+    let residue_slot = as_int(&residue_row.rows[0][0]).unwrap() as u32;
+    conn.execute_params(
+        &format!("UPDATE {sealed_table} SET sealed = $1 WHERE id = $2"),
+        &[Value::Blob(vec![0xff]), Value::Integer(corrupt)],
+    )
+    .unwrap();
+    drop(conn);
+    db.atom_store_tombstone(residue_slot, residue as u64)
+        .unwrap();
+
+    assert_eq!(
+        inventory.stored_atom_kinds("PLAINKINDS").unwrap(),
+        vec![
+            "alpha".to_owned(),
+            "expired-only".to_owned(),
+            "zeta".to_owned()
+        ]
+    );
+    assert_eq!(
+        inventory.stored_atom_kinds("sealedkinds").unwrap(),
+        vec![
+            "erased-residue".to_owned(),
+            "sealed-a".to_owned(),
+            "sealed-expired".to_owned(),
+            "sealed-z".to_owned()
+        ],
+        "expired, undecryptable, and erased-ACK rows remain physical kind inventory"
+    );
+    assert!(matches!(
+        inventory.stored_atom_kinds("missing"),
+        Err(MemError::RegionNotFound(name)) if name == "missing"
+    ));
+
+    let conn = Connection::open(&db).unwrap();
+    let sealed = writer
+        .load_region_row(&conn, "sealedkinds")
+        .unwrap()
+        .unwrap();
+    drop(conn);
+    db.region_store_tombstone(sealed.rsk_slot.unwrap(), sealed_id as u64)
+        .unwrap();
+    assert!(matches!(
+        inventory.stored_atom_kinds("sealedkinds"),
+        Err(MemError::RegionForgotten(name)) if name == "sealedkinds"
+    ));
+}
+
+#[test]
+fn stored_atom_retrieval_state_is_exact_physical_metadata_without_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let writer = MemoryEngine::open(db.clone()).unwrap();
+    let region_id = writer
+        .create_encrypted_region("RetrievalState", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    writer
+        .create_region("PlainState", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let expired = micros_now() - 1;
+    let future = micros_now() + 1_000_000;
+    let exact_score = f32::from_bits(0x3eaa_aaab);
+    let turn = writer
+        .remember(
+            "retrievalstate",
+            AtomInput::new("turn", "turn content").with_score(0.0),
+        )
+        .unwrap();
+    let residue = writer
+        .remember(
+            "retrievalstate",
+            AtomInput::new("marker", "residue content")
+                .with_score(-0.0)
+                .with_expires_at(expired),
+        )
+        .unwrap();
+    let derived = writer
+        .remember(
+            "retrievalstate",
+            AtomInput::new("derived", "derived content")
+                .with_score(exact_score)
+                .with_expires_at(future),
+        )
+        .unwrap();
+    let plain = writer
+        .remember(
+            "plainstate",
+            AtomInput::new("plain", "plain content").with_score(0.0),
+        )
+        .unwrap();
+
+    // Open the reader first: reopening after the tombstone would reconcile it.
+    let inventory = MemoryEngine::open(db.clone()).unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let conn = Connection::open(&db).unwrap();
+    let residue_row = conn
+        .query_params(
+            &format!("SELECT key_slot FROM {table} WHERE id = $1"),
+            &[Value::Integer(residue)],
+        )
+        .unwrap();
+    let residue_slot = as_int(&residue_row.rows[0][0]).unwrap() as u32;
+    conn.execute_params(
+        &format!("UPDATE {table} SET sealed = $1 WHERE id = $2"),
+        &[Value::Blob(vec![0xff]), Value::Integer(turn)],
+    )
+    .unwrap();
+    drop(conn);
+    db.atom_store_tombstone(residue_slot, residue as u64)
+        .unwrap();
+
+    let states = inventory
+        .stored_atom_retrieval_state("RETRIEVALSTATE")
+        .unwrap();
+    assert_eq!(states.len(), 3);
+    assert_eq!(
+        states
+            .iter()
+            .map(|state| state.atom_id())
+            .collect::<Vec<_>>(),
+        vec![turn, residue, derived]
+    );
+    assert_eq!(states[0].kind(), "turn");
+    assert_eq!(states[0].score_bits(), 0.0f32.to_bits());
+    assert_eq!(states[0].expires_at(), None);
+    assert_eq!(states[1].kind(), "marker");
+    assert_eq!(states[1].score_bits(), (-0.0f32).to_bits());
+    assert_eq!(states[1].expires_at(), Some(expired));
+    assert_eq!(states[2].kind(), "derived");
+    assert_eq!(states[2].score_bits(), exact_score.to_bits());
+    assert_eq!(states[2].expires_at(), Some(future));
+
+    let plain_states = inventory.stored_atom_retrieval_state("plainstate").unwrap();
+    assert_eq!(plain_states.len(), 1);
+    assert_eq!(plain_states[0].atom_id(), plain);
+    assert_eq!(plain_states[0].kind(), "plain");
+    assert_eq!(plain_states[0].score_bits(), 0.0f32.to_bits());
+    assert_eq!(plain_states[0].expires_at(), None);
+    assert!(matches!(
+        inventory.stored_atom_retrieval_state("missing"),
+        Err(MemError::RegionNotFound(name)) if name == "missing"
+    ));
+
+    let conn = Connection::open(&db).unwrap();
+    let region = writer
+        .load_region_row(&conn, "retrievalstate")
+        .unwrap()
+        .unwrap();
+    drop(conn);
+    db.region_store_tombstone(region.rsk_slot.unwrap(), region_id as u64)
+        .unwrap();
+    assert!(matches!(
+        inventory.stored_atom_retrieval_state("retrievalstate"),
+        Err(MemError::RegionForgotten(name)) if name == "retrievalstate"
+    ));
 }
 
 #[test]
@@ -365,9 +954,9 @@ fn adversary_recovers_before_forget_then_fails_after() {
     );
 }
 
-/// Per-atom adversary: forgetting ONE atom tombstones only its key slot, so the captured
-/// sealed bytes become permanently undecryptable, while the region key and a sibling
-/// atom's key are untouched and the sibling still decrypts.
+/// Per-atom adversary: forgetting ONE atom tombstones only its key slot, so
+/// its sealed bytes become permanently undecryptable while the region key and
+/// a sibling atom's key are untouched and the sibling still decrypts.
 #[test]
 fn forget_atom_destroys_only_its_key() {
     let dir = tempfile::tempdir().unwrap();
@@ -416,7 +1005,8 @@ fn forget_atom_destroys_only_its_key() {
 
     eng.forget_atom("s", target).unwrap();
 
-    // After forget: target's ACK destroyed, sealed bytes undecryptable; region key untouched.
+    // After forget: target's ACK destroyed, sealed bytes undecryptable;
+    // region key untouched.
     let target_rec2 = db.atom_store_slot(target_slot).unwrap();
     assert_eq!(
         target_rec2.state,
@@ -560,9 +1150,10 @@ fn corrupt_sealed(db: &Arc<Database>, table: &str, id: AtomId) {
     conn.execute("COMMIT").unwrap();
 }
 
-/// `verify_atoms` re-authenticates sealed bytes off disk: an intact atom is Authentic, and
-/// flipping a byte of its stored ciphertext is caught as Tampered (CTR is malleable, so only
-/// the HMAC catches it) - and the batch does not abort on the bad atom.
+/// `verify_atoms` re-authenticates sealed bytes off disk: an intact atom is
+/// Authentic, and flipping a byte of stored ciphertext is caught as Tampered
+/// (CTR is malleable, so only the HMAC catches it); the batch does not abort
+/// on the bad atom.
 #[test]
 fn verify_atoms_detects_tampering_off_disk() {
     let dir = tempfile::tempdir().unwrap();
@@ -599,10 +1190,11 @@ fn verify_atoms_detects_tampering_off_disk() {
     );
 }
 
-/// KeyErased is the crash-recovery state: `forget` destroys the key BEFORE deleting the row,
-/// so a crash in between leaves the row present with its key gone. verify must report KeyErased
-/// (content unrecoverable), distinct from a never-stored id (Missing). A clean forget deletes
-/// the row too, which would read as Missing - so we simulate the partial state directly.
+/// KeyErased is the crash-recovery state: `forget` destroys the key BEFORE
+/// deleting the row, so a crash in between leaves the row present with its key
+/// gone. verify must report KeyErased (content unrecoverable), distinct from a
+/// never-stored id (Missing). A clean forget deletes the row too, reading as
+/// Missing, so we simulate the partial state directly.
 #[test]
 fn verify_atoms_reports_key_erased_and_missing() {
     let dir = tempfile::tempdir().unwrap();
@@ -638,8 +1230,8 @@ fn verify_atoms_reports_key_erased_and_missing() {
     assert_eq!(v[1].verdict, AttestVerdict::Missing, "never-stored id");
 }
 
-/// Origin-binding: a blob replayed from another atom's row fails because the HMAC is recomputed
-/// with the target id as authenticated data.
+/// Origin-binding: a blob replayed from another atom's row fails because the
+/// HMAC is recomputed with the target id as authenticated data.
 #[test]
 fn verify_atoms_rejects_replayed_blob_from_another_row() {
     let dir = tempfile::tempdir().unwrap();
@@ -680,8 +1272,8 @@ fn verify_atoms_rejects_replayed_blob_from_another_row() {
     );
 }
 
-/// Plaintext region: no per-atom MAC, so attestation is PlaintextUnattested (never a false
-/// Authentic); absent ids are Missing.
+/// Plaintext region: no per-atom MAC, so attestation is PlaintextUnattested
+/// (never a false Authentic); absent ids are Missing.
 #[test]
 fn verify_atoms_plaintext_is_unattested() {
     let dir = tempfile::tempdir().unwrap();
@@ -696,8 +1288,8 @@ fn verify_atoms_plaintext_is_unattested() {
     assert_eq!(v[1].verdict, AttestVerdict::Missing);
 }
 
-/// update_atom_payload (encrypted): payload replaced; edges, embedding, and seal integrity
-/// preserved; immutable/absent rejected.
+/// `update_atom_payload` (encrypted): payload replaced; edges, embedding, and
+/// seal integrity preserved; immutable/absent rejected.
 #[test]
 fn update_atom_payload_encrypted_preserves_embedding_edges_and_integrity() {
     let dir = tempfile::tempdir().unwrap();
@@ -745,7 +1337,8 @@ fn update_atom_payload_encrypted_preserves_embedding_edges_and_integrity() {
         .is_err());
 }
 
-/// update_atom_payload (plaintext): payload replaced; recall + edge preserved; immutable/absent rejected.
+/// `update_atom_payload` (plaintext): payload replaced; recall + edge
+/// preserved; immutable/absent rejected.
 #[test]
 fn update_atom_payload_plaintext_preserves_recall_and_edges() {
     let dir = tempfile::tempdir().unwrap();
@@ -821,6 +1414,72 @@ fn attaching_a_forgotten_region_yields_region_forgotten() {
     assert!(
         matches!(err, MemError::RegionForgotten(_)),
         "attaching a region whose key was destroyed must yield RegionForgotten, got: {err}"
+    );
+}
+
+#[test]
+fn cached_create_revalidates_destroyed_region_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(db.clone()).unwrap();
+    let region_id = eng
+        .create_encrypted_region("cached-create", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let slot = eng
+        .load_region_row(&conn, "cached-create")
+        .unwrap()
+        .unwrap()
+        .rsk_slot
+        .unwrap();
+    drop(conn);
+
+    db.region_store_tombstone(slot, region_id as u64).unwrap();
+    let err = eng
+        .create_encrypted_region("cached-create", Arc::new(MockEmbedder::new(8)))
+        .unwrap_err();
+    assert!(matches!(err, MemError::RegionForgotten(_)), "got {err}");
+    assert!(
+        matches!(
+            eng.region_handle("cached-create"),
+            Err(MemError::RegionNotFound(_))
+        ),
+        "the failed fast path must evict its dead cached handle"
+    );
+}
+
+#[test]
+fn cached_attach_revalidates_destroyed_region_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let owner = MemoryEngine::open(db.clone()).unwrap();
+    let region_id = owner
+        .create_encrypted_region("cached-attach", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let client = MemoryEngine::open(db.clone()).unwrap();
+    client
+        .attach_existing_region("cached-attach", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let slot = owner
+        .load_region_row(&conn, "cached-attach")
+        .unwrap()
+        .unwrap()
+        .rsk_slot
+        .unwrap();
+    drop(conn);
+
+    db.region_store_tombstone(slot, region_id as u64).unwrap();
+    let err = client
+        .attach_existing_region("cached-attach", Arc::new(MockEmbedder::new(8)))
+        .unwrap_err();
+    assert!(matches!(err, MemError::RegionForgotten(_)), "got {err}");
+    assert!(
+        matches!(
+            client.region_handle("cached-attach"),
+            Err(MemError::RegionNotFound(_))
+        ),
+        "the failed fast path must evict its dead cached handle"
     );
 }
 
@@ -1050,6 +1709,309 @@ fn reconcile_reclaims_orphan_atom_live_slot_on_open() {
     );
 }
 
+#[test]
+fn reconcile_with_no_live_atom_keys_removes_rows_edges_and_ann() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(db.clone()).unwrap();
+    let region_id = eng
+        .create_encrypted_region("all-dead", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng
+        .remember("all-dead", AtomInput::new("fact", "alpha"))
+        .unwrap();
+    let b = eng
+        .remember("all-dead", AtomInput::new("fact", "beta"))
+        .unwrap();
+    eng.link(a, b, EdgeKind::DerivedFrom, 1.0).unwrap();
+    eng.persist_ann_index("all-dead").unwrap();
+
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let seg_table = sealed_segment_table(&table, region_id);
+    let conn = Connection::open(&db).unwrap();
+    let rows = conn
+        .query_params(
+            &format!("SELECT id, key_slot, key_gen FROM {table} WHERE region_id = $1"),
+            &[Value::Integer(region_id)],
+        )
+        .unwrap();
+    let mut bindings: Vec<(u32, u64, u64)> = rows
+        .rows
+        .iter()
+        .map(|row| {
+            (
+                as_int(&row[1]).unwrap() as u32,
+                as_int(&row[0]).unwrap() as u64,
+                as_int(&row[2]).unwrap() as u64,
+            )
+        })
+        .collect();
+    let (slot, generation, pseudo_id) = read_annseg_meta(&conn, region_id)
+        .unwrap()
+        .expect("sealed ANN metadata");
+    bindings.push((slot, pseudo_id as u64, generation));
+    drop(conn);
+
+    db.atom_store_tombstone_batch(&bindings).unwrap();
+    assert!(
+        db.atom_store_live_owners().unwrap().is_empty(),
+        "fixture must exercise the zero-live-key reconciliation branch"
+    );
+    drop(eng);
+
+    let _reopened = MemoryEngine::open(db.clone()).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let atoms = conn
+        .query_params(
+            &format!("SELECT COUNT(*) FROM {table} WHERE region_id = $1"),
+            &[Value::Integer(region_id)],
+        )
+        .unwrap();
+    assert_eq!(as_int(&atoms.rows[0][0]).unwrap(), 0);
+    let edges = conn
+        .query_params(
+            "SELECT COUNT(*) FROM memory_edges WHERE src_id IN ($1, $2) OR dst_id IN ($1, $2)",
+            &[Value::Integer(a), Value::Integer(b)],
+        )
+        .unwrap();
+    assert_eq!(as_int(&edges.rows[0][0]).unwrap(), 0);
+    let meta = conn
+        .query_params(
+            "SELECT COUNT(*) FROM memory_meta WHERE key LIKE 'annseg_%'",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(as_int(&meta.rows[0][0]).unwrap(), 0);
+    assert!(
+        !db.manager()
+            .list_tables()
+            .unwrap()
+            .iter()
+            .any(|(name, _)| name.as_slice() == seg_table.as_bytes()),
+        "reopen cleanup must drop the row-less sealed ANN chunk table"
+    );
+}
+
+#[test]
+fn failed_sealed_inserts_tombstone_pending_keys_before_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(db.clone()).unwrap();
+    let region_id = eng
+        .create_encrypted_region("rollback", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let seed = eng
+        .remember("rollback", AtomInput::new("fact", "seed"))
+        .unwrap();
+    let baseline = db.atom_store_live_owners().unwrap();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_params(
+        "UPDATE memory_meta SET value = $1 WHERE key = 'next_atom_id'",
+        &[Value::Integer(seed)],
+    )
+    .unwrap();
+    drop(conn);
+
+    let assert_rolled_back = || {
+        assert_eq!(
+            db.atom_store_live_owners().unwrap(),
+            baseline,
+            "a failed call must not leave a second live owner until reopen"
+        );
+        let conn = Connection::open(&db).unwrap();
+        let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+        let count = conn
+            .query_params(
+                &format!("SELECT COUNT(*) FROM {table} WHERE region_id = $1"),
+                &[Value::Integer(region_id)],
+            )
+            .unwrap();
+        assert_eq!(as_int(&count.rows[0][0]).unwrap(), 1);
+        let next = conn
+            .query_params(
+                "SELECT value FROM memory_meta WHERE key = 'next_atom_id'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(as_int(&next.rows[0][0]).unwrap(), seed);
+    };
+
+    assert!(eng
+        .remember("rollback", AtomInput::new("fact", "single failure"))
+        .is_err());
+    assert_rolled_back();
+
+    assert!(eng
+        .remember_if_absent(
+            "rollback",
+            AtomInput::new("fact", "if-absent failure"),
+            &[],
+            None,
+        )
+        .is_err());
+    assert_rolled_back();
+
+    assert!(eng
+        .remember_batch(
+            "rollback",
+            vec![
+                AtomInput::new("fact", "batch failure one"),
+                AtomInput::new("fact", "batch failure two"),
+                AtomInput::new("fact", "batch failure three"),
+            ],
+        )
+        .is_err());
+    assert_rolled_back();
+    assert!(
+        eng.fetch_one("rollback", seed).unwrap().is_some(),
+        "the pre-existing slot with the duplicate owner remains live"
+    );
+}
+
+#[test]
+fn failed_encrypted_region_insert_tombstones_pending_region_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(db.clone()).unwrap();
+
+    FAILED_ENCRYPTED_REGION_WRAPPED_KEY.with(|captured| {
+        *captured.borrow_mut() = None;
+    });
+    FAIL_ENCRYPTED_REGION_AFTER_SLOT.with(|fail| fail.set(true));
+    let err = eng
+        .create_encrypted_region("region-rollback", Arc::new(MockEmbedder::new(8)))
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("injected encrypted-region failure after key-slot allocation"),
+        "wrong injected failure: {err}"
+    );
+
+    let wrapped = FAILED_ENCRYPTED_REGION_WRAPPED_KEY
+        .with(|captured| captured.borrow_mut().take())
+        .expect("fault point records the durable wrapped key for residue inspection");
+    assert!(
+        db.region_store_live_owners().unwrap().is_empty(),
+        "the failed call must leave no live region-key owner"
+    );
+    let record = db.region_store_slot(0).unwrap();
+    assert_eq!(record.state, SlotState::Tombstone);
+    assert_eq!(record.wrapped, [0u8; WRAPPED_KEY_SIZE]);
+    let sidecar = std::fs::read(db.region_store_path()).unwrap();
+    assert!(
+        !sidecar
+            .windows(wrapped.len())
+            .any(|window| window == wrapped.as_slice()),
+        "both physical slot copies must be scrubbed before failure returns"
+    );
+
+    let conn = Connection::open(&db).unwrap();
+    let rows = conn
+        .query_params(
+            "SELECT COUNT(*) FROM memory_regions WHERE name = $1",
+            &[Value::Text("region-rollback".into())],
+        )
+        .unwrap();
+    assert_eq!(as_int(&rows.rows[0][0]).unwrap(), 0);
+    drop(conn);
+
+    // The raw RCK stays unexposed: Zeroizing ownership is the structural guarantee.
+    eng.create_encrypted_region("region-rollback", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    assert_eq!(db.region_store_live_owners().unwrap().len(), 1);
+}
+
+#[test]
+fn failed_derived_link_rolls_back_inserted_row_and_pending_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(db.clone()).unwrap();
+    let region_id = eng
+        .create_encrypted_region("derived-rollback", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let seed = eng
+        .remember("derived-rollback", AtomInput::new("fact", "seed"))
+        .unwrap();
+    let baseline = db.atom_store_live_owners().unwrap();
+
+    // Fail only the provenance INSERT, after the ACK and atom row are written.
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("DROP TABLE memory_edges").unwrap();
+    conn.execute(
+        "CREATE TABLE memory_edges (\
+         src_id INTEGER NOT NULL, dst_id INTEGER NOT NULL, kind TEXT NOT NULL, \
+         weight REAL DEFAULT 1.0, PRIMARY KEY (src_id, dst_id, kind))",
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(eng
+        .remember_derived(
+            "derived-rollback",
+            AtomInput::new("fact", "must roll back"),
+            &[seed],
+            Some(serde_json::json!({"quote": "seed"})),
+        )
+        .is_err());
+    assert_eq!(db.atom_store_live_owners().unwrap(), baseline);
+    let conn = Connection::open(&db).unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let count = conn
+        .query_params(
+            &format!("SELECT COUNT(*) FROM {table} WHERE region_id = $1"),
+            &[Value::Integer(region_id)],
+        )
+        .unwrap();
+    assert_eq!(
+        as_int(&count.rows[0][0]).unwrap(),
+        1,
+        "the atom row shares the failed provenance transaction"
+    );
+}
+
+#[test]
+fn failed_sealed_ann_persist_cleans_key_chunks_and_metadata_before_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(db.clone()).unwrap();
+    let region_id = eng
+        .create_encrypted_region("ann-rollback", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.remember("ann-rollback", AtomInput::new("fact", "alpha"))
+        .unwrap();
+    eng.remember("ann-rollback", AtomInput::new("fact", "beta"))
+        .unwrap();
+    let baseline = db.atom_store_live_owners().unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let seg_table = sealed_segment_table(&table, region_id);
+
+    FAIL_SEALED_SEGMENT_AFTER_CHUNKS.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = eng.persist_ann_index("ann-rollback").unwrap_err();
+    assert!(
+        err.to_string().contains("after chunk commit"),
+        "wrong injected failure: {err}"
+    );
+    assert_eq!(
+        db.atom_store_live_owners().unwrap(),
+        baseline,
+        "the unpublished pseudo-key is tombstoned in the failing call"
+    );
+    let conn = Connection::open(&db).unwrap();
+    assert!(read_annseg_meta(&conn, region_id).unwrap().is_none());
+    assert!(
+        !db.manager()
+            .list_tables()
+            .unwrap()
+            .iter()
+            .any(|(name, _)| name.as_slice() == seg_table.as_bytes()),
+        "committed chunks are removed before returning the injected error"
+    );
+    drop(conn);
+
+    eng.persist_ann_index("ann-rollback")
+        .expect("a retry after rollback publishes a fresh segment");
+}
+
 /// Deleting an atom invalidates the cached PRISM index so it is not re-ranked later.
 /// (`region_handle` shares the cached `ann` Arc, so we can observe the cache here.)
 #[test]
@@ -1089,8 +2051,8 @@ fn delete_atoms_invalidates_ann_cache() {
     );
 }
 
-/// Dropping an encrypted region reclaims its atoms' key slots (tombstones + frees them),
-/// rather than leaking them LIVE-but-dead in the atom key store.
+/// Dropping an encrypted region reclaims its atoms' key slots (tombstones +
+/// frees them), rather than leaking them LIVE-but-dead in the atom key store.
 #[test]
 fn drop_region_reclaims_atom_key_slots() {
     let dir = tempfile::tempdir().unwrap();
@@ -1272,6 +2234,52 @@ fn encode_decode_atom_blob_roundtrip_and_malformed() {
     huge.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
     huge.extend_from_slice(&[1, 2, 3]);
     assert!(decode_atom_blob(&huge).is_err());
+}
+
+#[test]
+fn vector_only_atom_decoder_never_parses_text_or_payload() {
+    let expected = vec![1.25f32, -9.5, 0.0];
+    let mut blob = encode_atom_blob(&expected, "x", "y");
+    let text_offset = 2 + expected.len() * 4 + 4;
+    blob[text_offset] = 0xff;
+    let payload_offset = text_offset + 1 + 4;
+    blob[payload_offset] = 0xfe;
+
+    assert!(
+        decode_atom_blob(&blob).is_err(),
+        "the full decoder rejects the deliberately non-UTF8 fields"
+    );
+    assert_eq!(
+        decode_atom_embedding(&blob).unwrap(),
+        expected,
+        "the exact-vector path validates field framing without allocating strings"
+    );
+
+    blob.push(0);
+    assert!(
+        decode_atom_embedding(&blob).is_err(),
+        "structural validation still rejects trailing plaintext"
+    );
+    assert!(decode_atom_embedding(&blob[..blob.len() - 2]).is_err());
+}
+
+#[test]
+fn text_only_atom_decoder_never_materializes_payload() {
+    let embedding = [2.0f32, -4.0];
+    let text = "dedup needle";
+    let mut blob = encode_atom_blob(&embedding, text, "x");
+    let payload_offset = 2 + embedding.len() * 4 + 4 + text.len() + 4;
+    blob[payload_offset] = 0xff;
+
+    assert!(
+        decode_atom_blob(&blob).is_err(),
+        "the full decoder rejects the deliberately non-UTF8 payload"
+    );
+    assert_eq!(
+        decode_atom_text(&blob).unwrap(),
+        text,
+        "exact-text dedup validates payload framing without copying or parsing it"
+    );
 }
 
 #[test]
@@ -1649,7 +2657,7 @@ fn evolve_links_nearest_neighbor_with_inverse_distance_weight() {
     let edges = eng.fetch_edges(Some(a), None, None).unwrap();
     assert_eq!(edges.len(), 1, "one outgoing edge");
     assert_eq!(edges[0].dst_id, b, "edge points at the neighbor");
-    assert_eq!(edges[0].kind, EdgeKind::DerivedFrom);
+    assert_eq!(edges[0].kind, EdgeKind::SimilarTo);
 
     let expected = 1.0f32 / (1.0 + d);
     assert!(

@@ -38,6 +38,7 @@ fn semantic_query(text: &str) -> RecallQuery {
         weights: FusionWeights::semantic_only(),
         as_of_micros: None,
         graph_expand: None,
+        include_superseded: false,
     }
 }
 
