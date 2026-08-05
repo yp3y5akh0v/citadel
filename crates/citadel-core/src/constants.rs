@@ -58,6 +58,9 @@ pub const HKDF_INFO_RCK_MAC: &[u8] = b"citadel-rck-mac-v1";
 // atom key store, so destroying that slot erases one atom and destroying the
 // RCK erases the whole region.
 pub const HKDF_INFO_ATOM_WRAP: &[u8] = b"citadel-atom-wrap-v1";
+// Keyed-idempotency tag MAC key: derived from the region RCK under its own
+// label (never the atom-wrap KEK) so no plaintext equality tag reaches disk.
+pub const HKDF_INFO_IDENTITY_MAC: &[u8] = b"citadel-identity-mac-v1";
 pub const ATOM_STORE_MAGIC: u32 = 0x4154_4D53; // "ATMS"
 pub const ATOM_STORE_PREALLOC_SLOTS: u32 = 256; // initial capacity (grows append-only)
 

@@ -633,6 +633,15 @@ pub struct RememberOutcome {
     pub inserted: bool,
 }
 
+/// One member of the caller-declared source snapshot for
+/// [`remember_derived_checked`](crate::MemoryEngine::remember_derived_checked):
+/// an atom the derivation read and the SHA-256 of the text it read from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceSnapshot {
+    pub id: AtomId,
+    pub text_sha256: [u8; 32],
+}
+
 /// Per-kind structural digest of a region's atoms.
 #[derive(Debug, Clone)]
 pub struct KindDigest {
