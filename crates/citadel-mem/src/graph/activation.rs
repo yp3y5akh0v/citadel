@@ -28,12 +28,13 @@ fn build_diffusion(
     eng: &MemoryEngine,
     region: &str,
     turn_kind: &str,
+    derived_kind: &str,
 ) -> crate::Result<Option<Diffusion>> {
     let turn_ids = page_kind_ids(eng, region, turn_kind)?;
     if turn_ids.is_empty() {
         return Ok(None);
     }
-    let derived_ids = page_kind_ids(eng, region, "derived")?;
+    let derived_ids = page_kind_ids(eng, region, derived_kind)?;
     let region_ids: FxHashSet<AtomId> = turn_ids.iter().chain(&derived_ids).copied().collect();
 
     let mut index: FxHashMap<AtomId, usize> = FxHashMap::default();
@@ -117,7 +118,22 @@ impl Diffusion {
 /// Built once per scored run: per-question edge refetch dominated recall latency.
 #[derive(Default)]
 pub struct DiffusionCache {
-    slot: std::sync::Mutex<Option<std::sync::Arc<Diffusion>>>,
+    slot: std::sync::Mutex<Option<CachedDiffusion>>,
+}
+
+impl DiffusionCache {
+    /// Drop the cached graph; the controller must serialize resets against reads.
+    pub fn reset(&self) {
+        *self.slot.lock().unwrap() = None;
+    }
+}
+
+/// Graph + the inputs it was built from; mismatched inputs fail loud.
+struct CachedDiffusion {
+    region: String,
+    turn_kind: String,
+    derived_kind: String,
+    graph: std::sync::Arc<Diffusion>,
 }
 
 fn graph_for(
@@ -125,45 +141,75 @@ fn graph_for(
     eng: &MemoryEngine,
     region: &str,
     turn_kind: &str,
+    derived_kind: &str,
 ) -> crate::Result<Option<std::sync::Arc<Diffusion>>> {
-    if let Some(g) = cache.slot.lock().unwrap().clone() {
-        return Ok(Some(g));
+    if let Some(c) = cache.slot.lock().unwrap().as_ref() {
+        if c.region != region || c.turn_kind != turn_kind || c.derived_kind != derived_kind {
+            return Err(crate::MemError::Invalid(format!(
+                "diffusion cache bound to region '{}' kinds '{}'/'{}', not '{region}' \
+                 '{turn_kind}'/'{derived_kind}'",
+                c.region, c.turn_kind, c.derived_kind
+            )));
+        }
+        return Ok(Some(std::sync::Arc::clone(&c.graph)));
     }
-    let Some(g) = build_diffusion(eng, region, turn_kind)? else {
+    let Some(g) = build_diffusion(eng, region, turn_kind, derived_kind)? else {
         return Ok(None);
     };
     let g = std::sync::Arc::new(g);
-    *cache.slot.lock().unwrap() = Some(std::sync::Arc::clone(&g));
+    *cache.slot.lock().unwrap() = Some(CachedDiffusion {
+        region: region.to_string(),
+        turn_kind: turn_kind.to_string(),
+        derived_kind: derived_kind.to_string(),
+        graph: std::sync::Arc::clone(&g),
+    });
     Ok(Some(g))
 }
 
-/// [`activation_scores_cached`] keeping only ranked turn ids (read-path view order).
+/// [`activation_scores_cached`] keeping only the ranked turn ids - the
+/// read-path view order.
 pub fn activation_rerank_cached(
     cache: &DiffusionCache,
     eng: &MemoryEngine,
     region: &str,
     turn_kind: &str,
+    derived_kind: &str,
     seeds: &[(AtomId, f32)],
     k: usize,
 ) -> crate::Result<Vec<AtomId>> {
     Ok(
-        activation_scores_cached(cache, eng, region, turn_kind, seeds, k)?
+        activation_scores_cached(cache, eng, region, turn_kind, derived_kind, seeds, k)?
             .into_iter()
             .map(|(id, _)| id)
             .collect(),
     )
 }
 
-/// (turn, activation) desc from seeds + diffusion; score - seed = graph-added mass.
+/// Activation of a region's turns from seed score + diffusion, as
+/// `(turn id, activation)` sorted by descending activation (ties break by
+/// ascending id), truncated to `k`. The graph builds once per cache slot
+/// and is reused for every later call - the edge set is immutable once
+/// enrichment has converged, and the per-question rebuild (a full-turn
+/// page plus two global edge scans each) dominated diag wall time.
+///
+/// `seeds` are `(atom id, score)` pairs from the deterministic fusion
+/// ranking (rank-reciprocal scores work well; scale is irrelevant to the
+/// ordering as long as it is fixed) - derived-note hits may seed alongside
+/// turns. Every turn in the region participates, so evidence OUTSIDE the
+/// seeded pool can rise into the view. The activation itself is the score:
+/// seeds carry their fusion rank mass, everything else carries what the
+/// graph transmitted to it - so `score - seed` is the mass the graph added,
+/// a question-side evidence-strength signal no single hit provides.
 pub fn activation_scores_cached(
     cache: &DiffusionCache,
     eng: &MemoryEngine,
     region: &str,
     turn_kind: &str,
+    derived_kind: &str,
     seeds: &[(AtomId, f32)],
     k: usize,
 ) -> crate::Result<Vec<(AtomId, f32)>> {
-    let Some(graph) = graph_for(cache, eng, region, turn_kind)? else {
+    let Some(graph) = graph_for(cache, eng, region, turn_kind, derived_kind)? else {
         return Ok(Vec::new());
     };
     Ok(rank_turns(&graph, seeds, k))
@@ -201,7 +247,12 @@ fn page_kind_ids(eng: &MemoryEngine, region: &str, kind: &str) -> crate::Result<
     Ok(out)
 }
 
-/// Pinned ids evict the lowest unpinned entry and join at the tail (honest rank).
+/// Guarantee `pinned` ids a slot in `ranked`: each absent id evicts the
+/// lowest-ranked entry that is not itself pinned, then joins at the tail
+/// (its diffusion rank was below the cut, so the tail is its true
+/// position). Everything else keeps its order. If fewer unpinned entries
+/// exist than absent pinned ids, the view grows rather than dropping a
+/// pinned id.
 pub fn pin_into_view(ranked: &mut Vec<AtomId>, pinned: &[AtomId]) {
     let have: FxHashSet<AtomId> = ranked.iter().copied().collect();
     let missing: Vec<AtomId> = pinned
@@ -247,7 +298,16 @@ mod tests {
 
     /// Single-shot rank through a fresh cache (the only production path).
     fn rank(eng: &MemoryEngine, seeds: &[(AtomId, f32)], k: usize) -> Vec<AtomId> {
-        activation_rerank_cached(&DiffusionCache::default(), eng, "r", "turn", seeds, k).unwrap()
+        activation_rerank_cached(
+            &DiffusionCache::default(),
+            eng,
+            "r",
+            "turn",
+            "derived",
+            seeds,
+            k,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -270,7 +330,8 @@ mod tests {
         )
         .unwrap();
 
-        // Fusion never saw `hidden`; activation must pull it above `noise`.
+        // Fusion found only `strong` (rank 1) and `noise` (rank 2); `hidden`
+        // was invisible to it. Activation must pull `hidden` above `noise`.
         let ranked = rank(&eng, &[(strong, 1.0), (noise, 0.2)], 3);
         assert_eq!(ranked[0], strong);
         assert_eq!(
@@ -298,7 +359,10 @@ mod tests {
         // The weave linked the two facts; that is the only bridge.
         eng.link(f1, f2, EdgeKind::SimilarTo, 0.9).unwrap();
 
-        // A three-hop bridge must beat tail noise but NOT a mid-ranked hit.
+        // Noise seeded at deep-tail rank mass: a three-hop verified bridge
+        // must beat tail noise, but deliberately NOT a mid-ranked hit
+        // (similar-distractor precision - weak trickles shouldn't outrank
+        // real fusion signal).
         let ranked = rank(&eng, &[(seed_turn, 1.0), (noise, 0.02)], 3);
         assert_eq!(
             ranked[1], far_turn,
@@ -352,7 +416,8 @@ mod tests {
         let a = rank(&eng, &seeds, 13);
         let b = rank(&eng, &seeds, 13);
         assert_eq!(a, b, "bit-identical across runs");
-        // Cap + fan normalization keep the everywhere-cited hub below the seed.
+        // The hub is cited by every fact but the cap + fan normalization
+        // keep it below the actual seed.
         assert_eq!(a[0], others[0], "seed stays on top despite the hub");
     }
 
@@ -368,24 +433,61 @@ mod tests {
 
         let seeds = vec![(a, 1.0), (b, 0.4)];
         let cache = DiffusionCache::default();
-        let first = activation_rerank_cached(&cache, &eng, "r", "turn", &seeds, 3).unwrap();
+        let first =
+            activation_rerank_cached(&cache, &eng, "r", "turn", "derived", &seeds, 3).unwrap();
         // Second call takes the cached-graph path; results must not differ.
-        let second = activation_rerank_cached(&cache, &eng, "r", "turn", &seeds, 3).unwrap();
+        let second =
+            activation_rerank_cached(&cache, &eng, "r", "turn", "derived", &seeds, 3).unwrap();
         assert_eq!(first, second, "cache hit matches the build path");
         // An independently built cache agrees: construction is deterministic.
-        let other =
-            activation_rerank_cached(&DiffusionCache::default(), &eng, "r", "turn", &seeds, 3)
-                .unwrap();
+        let other = activation_rerank_cached(
+            &DiffusionCache::default(),
+            &eng,
+            "r",
+            "turn",
+            "derived",
+            &seeds,
+            3,
+        )
+        .unwrap();
         assert_eq!(first, other, "independent caches build the same graph");
         // The scores variant ranks identically (shared rank_turns).
-        let scored =
-            activation_scores_cached(&DiffusionCache::default(), &eng, "r", "turn", &seeds, 3)
-                .unwrap();
+        let scored = activation_scores_cached(
+            &DiffusionCache::default(),
+            &eng,
+            "r",
+            "turn",
+            "derived",
+            &seeds,
+            3,
+        )
+        .unwrap();
         assert_eq!(
             first,
             scored.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
             "rerank is exactly the id projection of the scores"
         );
+    }
+
+    #[test]
+    fn cache_refuses_mismatched_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = engine(dir.path());
+        let a = eng.remember("r", AtomInput::new("turn", "alpha")).unwrap();
+        let cache = DiffusionCache::default();
+        activation_rerank_cached(&cache, &eng, "r", "turn", "derived", &[(a, 1.0)], 1).unwrap();
+
+        let err = activation_rerank_cached(&cache, &eng, "r", "turn", "note", &[(a, 1.0)], 1)
+            .unwrap_err();
+        assert!(err.to_string().contains("diffusion cache bound"));
+        let err =
+            activation_rerank_cached(&cache, &eng, "other", "turn", "derived", &[(a, 1.0)], 1)
+                .unwrap_err();
+        assert!(err.to_string().contains("diffusion cache bound"));
+
+        // A reset drops the binding: the refused inputs now rebuild cleanly.
+        cache.reset();
+        activation_rerank_cached(&cache, &eng, "r", "turn", "note", &[(a, 1.0)], 1).unwrap();
     }
 
     #[test]

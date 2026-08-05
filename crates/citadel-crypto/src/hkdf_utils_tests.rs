@@ -96,6 +96,30 @@ fn seal_keys_deterministic_domain_separated_and_random_ikm_diverges() {
 }
 
 #[test]
+fn identity_mac_key_derivation_is_frozen() {
+    // Re-pinning orphans existing records; version the label instead.
+    let key = derive_identity_mac_key(&[0x42u8; 32]);
+    let hex: String = key.key.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        hex,
+        "1a8cd30ff2210ebedfacdbe104b1fda9c1f1c9846077ba3fb6f1e62a6e429eb6"
+    );
+}
+
+#[test]
+fn identity_mac_key_deterministic_and_domain_separated() {
+    let rck = [0x5Au8; 32];
+    let a = derive_identity_mac_key(&rck);
+    let b = derive_identity_mac_key(&rck);
+    assert_eq!(a.key, b.key);
+    // Identity tags must never be computable from (or leak) the atom-wrap KEK.
+    let wrap = derive_atom_wrap_key(&rck);
+    assert_ne!(a.key, wrap.kek, "identity MAC key reuses the atom-wrap KEK");
+    let other = derive_identity_mac_key(&[0x5Bu8; 32]);
+    assert_ne!(a.key, other.key);
+}
+
+#[test]
 fn region_key_wrap_unwrap_roundtrip_and_wrong_kek_rejected() {
     let rek = [0x42u8; 32];
     let region = derive_region_wrap_keys(&rek);

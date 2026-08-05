@@ -27,6 +27,6 @@ pub use types::{
     AtomAttestation, AtomHit, AtomId, AtomInput, AttestVerdict, Edge, EdgeKind, ErasureReceipt,
     EvictionPolicy, EvictionReport, EvolutionReport, FetchQuery, FusionWeights, GraphExpand,
     KindDigest, MultiRecallQuery, RecallQuery, RememberOutcome, RerankStrategy, SlotErasure,
-    StoredAtomRetrievalState, StoredEmbeddingsIdentity, StoredRegionIdentity, SummaryReport,
-    STORED_EMBEDDINGS_SCHEMA,
+    SourceSnapshot, StoredAtomRetrievalState, StoredEmbeddingsIdentity, StoredRegionIdentity,
+    SummaryReport, STORED_EMBEDDINGS_SCHEMA,
 };

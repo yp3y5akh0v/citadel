@@ -4,9 +4,9 @@ use zeroize::Zeroize;
 
 use citadel_core::{DEK_SIZE, KEY_SIZE, MAC_KEY_SIZE, WRAPPED_KEY_SIZE};
 use citadel_core::{
-    HKDF_INFO_ATOM_WRAP, HKDF_INFO_AUDIT_KEY, HKDF_INFO_DEK, HKDF_INFO_KEYFILE_MAC,
-    HKDF_INFO_KMS_MASTER, HKDF_INFO_MAC_KEY, HKDF_INFO_RCK_DEK, HKDF_INFO_RCK_MAC,
-    HKDF_INFO_REGION_STORE_MAC, HKDF_INFO_REGION_WRAP, HKDF_KMS_SALT,
+    HKDF_INFO_ATOM_WRAP, HKDF_INFO_AUDIT_KEY, HKDF_INFO_DEK, HKDF_INFO_IDENTITY_MAC,
+    HKDF_INFO_KEYFILE_MAC, HKDF_INFO_KMS_MASTER, HKDF_INFO_MAC_KEY, HKDF_INFO_RCK_DEK,
+    HKDF_INFO_RCK_MAC, HKDF_INFO_REGION_STORE_MAC, HKDF_INFO_REGION_WRAP, HKDF_KMS_SALT,
 };
 
 pub struct DerivedKeys {
@@ -208,6 +208,29 @@ pub fn derive_atom_wrap_key(rck: &[u8; KEY_SIZE]) -> AtomWrapKey {
     hk.expand(HKDF_INFO_ATOM_WRAP, &mut kek)
         .expect("HKDF expand should not fail for 32-byte output");
     AtomWrapKey { kek }
+}
+
+/// Per-region MAC key for keyed-idempotency tags, derived from the RCK under
+/// its own label (never the atom-wrap KEK). Zeroized on drop.
+pub struct IdentityMacKey {
+    pub key: [u8; KEY_SIZE],
+}
+
+impl Drop for IdentityMacKey {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+/// Derive the per-region identity-tag MAC key from the region's random
+/// content key (RCK).
+pub fn derive_identity_mac_key(rck: &[u8; KEY_SIZE]) -> IdentityMacKey {
+    let salt = [0u8; 32];
+    let hk = Hkdf::<Sha256>::new(Some(&salt), rck);
+    let mut key = [0u8; KEY_SIZE];
+    hk.expand(HKDF_INFO_IDENTITY_MAC, &mut key)
+        .expect("HKDF expand should not fail for 32-byte output");
+    IdentityMacKey { key }
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 const REWEIGHT_PAGE: usize = 1024;
 
 /// Mirrors the audit's cap: deeper chains are rejected there, never walked here.
-const REWEIGHT_DEPTH_CAP: usize = 8;
+const REWEIGHT_DEPTH_CAP: usize = super::audit::AUDIT_DEPTH_CAP;
 
 /// Reweight algorithm revision; bump on any behavior change (shape bound apart).
 pub const REWEIGHT_REVISION: u32 = 1;

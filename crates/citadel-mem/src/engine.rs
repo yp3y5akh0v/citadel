@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 use citadel::Database;
 use citadel_core::WRAPPED_KEY_SIZE;
 use citadel_crypto::blob_seal;
-use citadel_crypto::hkdf_utils::{derive_atom_wrap_key, derive_seal_keys, AtomWrapKey};
+use citadel_crypto::hkdf_utils::{
+    derive_atom_wrap_key, derive_identity_mac_key, derive_seal_keys, AtomWrapKey, IdentityMacKey,
+};
 use citadel_sql::executor::{AnnIndexSource, AnnSegmentInfo};
 use citadel_sql::{Connection, ExecutionResult, Value};
 use citadel_vector::{AnnIndex, Filter, Metric};
@@ -25,8 +27,8 @@ use crate::types::{
     AtomAttestation, AtomHit, AtomId, AtomInput, AttestVerdict, Edge, EdgeKind, ErasureReceipt,
     EvictionPolicy, EvictionReport, EvolutionReport, FetchQuery, FusionWeights, GraphExpand,
     KindDigest, MultiRecallQuery, RecallQuery, RememberOutcome, RerankStrategy, SlotErasure,
-    StoredAtomRetrievalState, StoredEmbeddingsIdentity, StoredRegionIdentity, SummaryReport,
-    ERASURE_SCOPE_CAVEAT, STORED_EMBEDDINGS_SCHEMA,
+    SourceSnapshot, StoredAtomRetrievalState, StoredEmbeddingsIdentity, StoredRegionIdentity,
+    SummaryReport, ERASURE_SCOPE_CAVEAT, STORED_EMBEDDINGS_SCHEMA,
 };
 use citadel::SlotState;
 
@@ -158,6 +160,12 @@ impl Drop for PendingRegionSlot {
     }
 }
 
+/// Both per-region secrets derived from one RCK unwrap.
+struct RegionKeys {
+    atom_wrap: Arc<AtomWrapKey>,
+    identity_mac: Arc<IdentityMacKey>,
+}
+
 /// A region attached to a live embedder in this process.
 struct RegionState {
     id: RegionId,
@@ -166,6 +174,8 @@ struct RegionState {
     embedder: Arc<dyn Embedder>,
     /// Encrypted regions: wraps/unwraps each atom's ACK (derived from the RCK).
     atom_wrap: Option<Arc<AtomWrapKey>>,
+    /// Encrypted regions: keyed MAC for identity tags (own HKDF label).
+    identity_mac: Option<Arc<IdentityMacKey>>,
     /// Lazy in-RAM ANN index over decrypted vectors for sealed recall.
     ann: Arc<RwLock<Option<SealedAnn>>>,
     /// Highest atom id; sealed recall reads it to detect post-snapshot inserts
@@ -181,6 +191,7 @@ struct RegionHandle {
     dim: u16,
     metric: EmbeddingMetric,
     atom_wrap: Option<Arc<AtomWrapKey>>,
+    identity_mac: Option<Arc<IdentityMacKey>>,
     ann: Arc<RwLock<Option<SealedAnn>>>,
     max_id: Arc<AtomicI64>,
 }
@@ -304,6 +315,14 @@ CREATE TABLE IF NOT EXISTS memory_edges (\
  weight REAL DEFAULT 1.0,\
  evidence_ref JSONB,\
  PRIMARY KEY (src_id, dst_id, kind));
+CREATE TABLE IF NOT EXISTS memory_idempotency (\
+ region_id INTEGER NOT NULL,\
+ kind TEXT NOT NULL,\
+ key_mac TEXT NOT NULL,\
+ request_mac TEXT NOT NULL,\
+ atom_id INTEGER NOT NULL,\
+ PRIMARY KEY (region_id, kind, key_mac));
+CREATE UNIQUE INDEX IF NOT EXISTS memory_idempotency_atom ON memory_idempotency (atom_id);
 INSERT INTO memory_meta (key, value) VALUES ('next_region_id', 1) ON CONFLICT (key) DO NOTHING;
 INSERT INTO memory_meta (key, value) VALUES ('next_atom_id', 1) ON CONFLICT (key) DO NOTHING;";
 
@@ -341,6 +360,7 @@ impl MemoryEngine {
         if engine.db.region_keys_enabled() && engine.db.atom_store_path().exists() {
             engine.reconcile_atom_store()?;
         }
+        engine.reconcile_identity_records()?;
         Ok(engine)
     }
 
@@ -417,6 +437,10 @@ impl MemoryEngine {
                     .join(", ");
                 with_write_txn(&conn, |c| {
                     c.execute_params(
+                        &format!("DELETE FROM memory_idempotency WHERE atom_id IN ({in_list})"),
+                        &[],
+                    )?;
+                    c.execute_params(
                         &format!(
                             "DELETE FROM memory_edges WHERE src_id IN ({in_list}) \
                              OR dst_id IN ({in_list})"
@@ -480,6 +504,92 @@ impl MemoryEngine {
             }
         }
         Ok(())
+    }
+
+    /// Open-time sweep: identity records whose region or atom row is gone
+    /// (removed by an older binary or direct SQL) are deleted; the lazy
+    /// self-heal only covers retried keys. Expired atoms keep their records
+    /// (expiry is the lookup's TTL semantics, not an orphan state).
+    fn reconcile_identity_records(&self) -> Result<()> {
+        let conn = Connection::open(&self.db)?;
+        let idents = conn.query_params("SELECT region_id, atom_id FROM memory_idempotency", &[])?;
+        if idents.rows.is_empty() {
+            return Ok(());
+        }
+        let mut by_region: FxHashMap<RegionId, Vec<AtomId>> = FxHashMap::default();
+        for row in &idents.rows {
+            by_region
+                .entry(as_int(&row[0])?)
+                .or_default()
+                .push(as_int(&row[1])?);
+        }
+        let regions = conn.query_params(
+            "SELECT id, embedding_dim, embedding_metric, encrypted FROM memory_regions",
+            &[],
+        )?;
+        let mut tables: FxHashMap<RegionId, String> = FxHashMap::default();
+        for row in &regions.rows {
+            let dim = u16::try_from(as_int(&row[1])?)
+                .map_err(|_| MemError::Invalid("stored embedding_dim out of range".into()))?;
+            let metric = metric_from_str(as_text(&row[2])?)?;
+            tables.insert(
+                as_int(&row[0])?,
+                atoms_table(dim, metric, as_exact_bool(&row[3], "encrypted")?),
+            );
+        }
+        let mut orphans: Vec<(RegionId, Vec<AtomId>)> = Vec::new();
+        for (region_id, atom_ids) in by_region {
+            let live: FxHashSet<AtomId> = match tables.get(&region_id) {
+                Some(table) if conn.table_schema(table).is_some() => {
+                    let in_list = atom_ids
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let qr = conn.query_params(
+                        &format!(
+                            "SELECT id FROM {table} WHERE region_id = $1 AND id IN ({in_list})"
+                        ),
+                        &[Value::Integer(region_id)],
+                    )?;
+                    qr.rows
+                        .iter()
+                        .map(|r| as_int(&r[0]))
+                        .collect::<Result<_>>()?
+                }
+                // The region row or its table is gone: all records orphaned.
+                _ => FxHashSet::default(),
+            };
+            let gone: Vec<AtomId> = atom_ids
+                .into_iter()
+                .filter(|id| !live.contains(id))
+                .collect();
+            if !gone.is_empty() {
+                orphans.push((region_id, gone));
+            }
+        }
+        if orphans.is_empty() {
+            return Ok(());
+        }
+        // Only the proven (region, atom) pairs - a global atom_id match
+        // could sweep a malformed duplicate in another region.
+        with_write_txn(&conn, |c| {
+            for (region_id, atom_ids) in &orphans {
+                let in_list = atom_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                c.execute_params(
+                    &format!(
+                        "DELETE FROM memory_idempotency \
+                         WHERE region_id = $1 AND atom_id IN ({in_list})"
+                    ),
+                    &[Value::Integer(*region_id)],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Record recall hits for `Lru`/`Stale` eviction. In-process and
@@ -546,7 +656,7 @@ impl MemoryEngine {
         let _kl = self.db.key_lifecycle_lock();
         let conn = Connection::open(&self.db)?;
         // A fresh region has no atoms; only a re-attach needs the MAX(id) scan.
-        let (id, atom_wrap, init_max) = match self.load_region_row(&conn, &key)? {
+        let (id, keys, init_max) = match self.load_region_row(&conn, &key)? {
             Some(existing) => {
                 let attached = self.check_attached_incarnation(
                     &key,
@@ -566,19 +676,19 @@ impl MemoryEngine {
                     return Ok(id);
                 }
                 existing.verify_matches(&key, dim, metric, &model_id, encrypted)?;
-                let atom_wrap = if encrypted {
+                let keys = if encrypted {
                     Some(self.attach_region_key(&key, &existing)?)
                 } else {
                     None
                 };
-                let table = atoms_table(dim, metric, atom_wrap.is_some());
+                let table = atoms_table(dim, metric, keys.is_some());
                 let max = self.reattach_max_id(&conn, &table, existing.id)?;
-                (existing.id, atom_wrap, max)
+                (existing.id, keys, max)
             }
             None if encrypted => {
-                let (id, wrap) =
+                let (id, keys) =
                     self.insert_encrypted_region(&conn, &key, dim, metric, &model_id)?;
-                (id, wrap, 0)
+                (id, keys, 0)
             }
             None => (
                 self.insert_region(&conn, &key, dim, metric, &model_id)?,
@@ -587,6 +697,10 @@ impl MemoryEngine {
             ),
         };
 
+        let (atom_wrap, identity_mac) = match keys {
+            Some(k) => (Some(k.atom_wrap), Some(k.identity_mac)),
+            None => (None, None),
+        };
         self.regions.lock().unwrap().insert(
             key,
             RegionState {
@@ -595,6 +709,7 @@ impl MemoryEngine {
                 metric,
                 embedder,
                 atom_wrap,
+                identity_mac,
                 ann: Arc::new(RwLock::new(None)),
                 max_id: Arc::new(AtomicI64::new(init_max)),
             },
@@ -640,10 +755,11 @@ impl MemoryEngine {
             return Ok(id);
         }
         existing.verify_matches(&key, dim, metric, &model_id, encrypted)?;
-        let atom_wrap = if encrypted {
-            Some(self.attach_region_key(&key, &existing)?)
+        let (atom_wrap, identity_mac) = if encrypted {
+            let k = self.attach_region_key(&key, &existing)?;
+            (Some(k.atom_wrap), Some(k.identity_mac))
         } else {
-            None
+            (None, None)
         };
         let table = atoms_table(dim, metric, atom_wrap.is_some());
         let init_max = self.reattach_max_id(&conn, &table, existing.id)?;
@@ -655,6 +771,7 @@ impl MemoryEngine {
                 metric,
                 embedder,
                 atom_wrap,
+                identity_mac,
                 ann: Arc::new(RwLock::new(None)),
                 max_id: Arc::new(AtomicI64::new(init_max)),
             },
@@ -738,6 +855,10 @@ impl MemoryEngine {
                 )?;
             }
             c.execute_params(
+                "DELETE FROM memory_idempotency WHERE region_id = $1",
+                &[Value::Integer(row.id)],
+            )?;
+            c.execute_params(
                 "DELETE FROM memory_regions WHERE id = $1",
                 &[Value::Integer(row.id)],
             )?;
@@ -819,6 +940,301 @@ impl MemoryEngine {
             .inspect_err(|e| self.evict_stale_region(&key, h.id, e))?;
         h.max_id.fetch_max(out.id, Ordering::Relaxed);
         Ok(out)
+    }
+
+    /// [`remember_if_absent`](Self::remember_if_absent) keyed by a
+    /// caller-supplied idempotency key instead of exact-text dedup: the same
+    /// key converges on the original atom without touching it or its
+    /// provenance; different keys store even identical texts.
+    ///
+    /// Keys are scoped to `(region, kind)`; the identity record also binds a
+    /// canonical tag over every semantic input. While the bound atom is
+    /// live, the same key with ANY changed input fails loudly (an edited
+    /// retry needs a NEW key); a stale binding self-heals and frees the key.
+    /// Encrypted regions store keyed BLAKE3 MACs, so no plaintext equality
+    /// tag reaches disk - but the MAC key is REGION-lifetime, so freed-page
+    /// residue of a purged record stays a guess-confirmation commitment for
+    /// a later RCK holder; only [`drop_region`](Self::drop_region) closes
+    /// that channel.
+    pub fn remember_if_absent_keyed(
+        &self,
+        region: &str,
+        atom: AtomInput,
+        sources: &[AtomId],
+        evidence_ref: Option<serde_json::Value>,
+        idempotency_key: &str,
+    ) -> Result<RememberOutcome> {
+        if idempotency_key.is_empty() {
+            return Err(MemError::Invalid("empty idempotency key".into()));
+        }
+        let key = region.to_ascii_lowercase();
+        let h = self.region_handle(&key)?;
+        let prep = prepare_atom_row(&h, &key, &atom)?;
+        let src_ids = dedup_sources(sources);
+        let mac = h.identity_mac.as_deref();
+        let key_tag = identity_key_tag(mac, &atom.kind, idempotency_key);
+        let request_tag = identity_request_tag(
+            mac,
+            &key_tag,
+            &atom,
+            &prep.payload,
+            &src_ids,
+            evidence_ref.as_ref(),
+        )?;
+
+        let conn = Connection::open(&self.db)?;
+        // Sealed inserts allocate keys before their rows commit; hold the guard
+        // so a concurrent reconcile cannot reclaim them mid-span.
+        let _kl = h.atom_wrap.is_some().then(|| self.db.key_lifecycle_lock());
+        let mut pending = PendingAtomSlots::new(Arc::clone(&self.db), 1);
+        let result = with_write_txn(&conn, |c| {
+            self.verify_region_live(c, &h, &key)?;
+            // Replay resolves first: the identical retry writes nothing, so
+            // it must converge even if a source has since been forgotten.
+            if let Some(id) = self.keyed_identity_hit(c, &h, &atom.kind, &key_tag, &request_tag)? {
+                return Ok(RememberOutcome {
+                    id,
+                    inserted: false,
+                });
+            }
+            verify_sources_exist(c, &h, &key, &src_ids)?;
+            let id = next_id(c, "next_atom_id")?;
+            c.execute_params(
+                "INSERT INTO memory_idempotency \
+                 (region_id, kind, key_mac, request_mac, atom_id) \
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    Value::Integer(h.id),
+                    Value::Text(atom.kind.as_str().into()),
+                    Value::Text(key_tag.as_str().into()),
+                    Value::Text(request_tag.as_str().into()),
+                    Value::Integer(id),
+                ],
+            )?;
+            self.insert_atom_row(c, &h, id, atom, prep, &mut pending)?;
+            link_derived_sources(c, id, &src_ids, evidence_ref.as_ref())?;
+            Ok(RememberOutcome { id, inserted: true })
+        });
+        let out = pending
+            .finish(result)
+            .inspect_err(|e| self.evict_stale_region(&key, h.id, e))?;
+        h.max_id.fetch_max(out.id, Ordering::Relaxed);
+        Ok(out)
+    }
+
+    /// Resolve a keyed write against the identity table inside the caller's
+    /// write transaction: `Some(id)` replays the original atom untouched,
+    /// `None` means insert fresh (any stale record was self-healed away),
+    /// and the same key bound to a different request tag fails loudly.
+    fn keyed_identity_hit(
+        &self,
+        conn: &Connection<'_>,
+        h: &RegionHandle,
+        kind: &str,
+        key_tag: &str,
+        request_tag: &str,
+    ) -> Result<Option<AtomId>> {
+        let qr = conn.query_params(
+            "SELECT request_mac, atom_id FROM memory_idempotency \
+             WHERE region_id = $1 AND kind = $2 AND key_mac = $3",
+            &[
+                Value::Integer(h.id),
+                Value::Text(kind.into()),
+                Value::Text(key_tag.into()),
+            ],
+        )?;
+        let Some(row) = qr.rows.first() else {
+            return Ok(None);
+        };
+        let atom_id = as_int(&row[1])?;
+        // Liveness first: expired or key-erased (sealed triple bind) targets
+        // count as absent and self-heal, freeing the key for rebinding; only
+        // a live binding may refuse a changed request.
+        let alive = if h.atom_wrap.is_some() {
+            let qr = conn.query_params(
+                &format!(
+                    "SELECT key_slot, key_gen FROM {} WHERE region_id = $1 AND id = $2 \
+                     AND (expires_at IS NULL OR expires_at > $3)",
+                    h.table
+                ),
+                &[
+                    Value::Integer(h.id),
+                    Value::Integer(atom_id),
+                    Value::Timestamp(now_micros()),
+                ],
+            )?;
+            match qr.rows.first() {
+                None => false,
+                Some(row) => {
+                    let rec = self.db.atom_store_slot(as_int(&row[0])? as u32)?;
+                    rec.state == SlotState::Live
+                        && rec.region_id == atom_id as u64
+                        && rec.gen == as_int(&row[1])? as u64
+                }
+            }
+        } else {
+            let qr = conn.query_params(
+                &format!(
+                    "SELECT id FROM {} WHERE region_id = $1 AND id = $2 \
+                     AND (expires_at IS NULL OR expires_at > $3)",
+                    h.table
+                ),
+                &[
+                    Value::Integer(h.id),
+                    Value::Integer(atom_id),
+                    Value::Timestamp(now_micros()),
+                ],
+            )?;
+            !qr.rows.is_empty()
+        };
+        if !alive {
+            conn.execute_params(
+                "DELETE FROM memory_idempotency \
+                 WHERE region_id = $1 AND kind = $2 AND key_mac = $3",
+                &[
+                    Value::Integer(h.id),
+                    Value::Text(kind.into()),
+                    Value::Text(key_tag.into()),
+                ],
+            )?;
+            return Ok(None);
+        }
+        if as_text(&row[0])? != request_tag {
+            return Err(MemError::Invalid(format!(
+                "idempotency key already bound to atom {atom_id} with a different request"
+            )));
+        }
+        Ok(Some(atom_id))
+    }
+
+    /// [`remember_derived`](Self::remember_derived) with caller-declared
+    /// snapshot validation: every `snapshot` member must be present,
+    /// unexpired, and still hash to its declared SHA-256, checked in the
+    /// same write transaction as the insert and the `DerivedFrom` edges for
+    /// `provenance` (a required subset of the snapshot). Validates only what
+    /// the caller declares; serializing ingest against derivation is the
+    /// controller's job.
+    pub fn remember_derived_checked(
+        &self,
+        region: &str,
+        atom: AtomInput,
+        snapshot: &[SourceSnapshot],
+        provenance: &[AtomId],
+        evidence_ref: Option<serde_json::Value>,
+    ) -> Result<AtomId> {
+        let mut declared: FxHashSet<AtomId> = FxHashSet::default();
+        for member in snapshot {
+            if !declared.insert(member.id) {
+                return Err(MemError::Invalid(format!(
+                    "duplicate snapshot id {}",
+                    member.id
+                )));
+            }
+        }
+        let src_ids = dedup_sources(provenance);
+        if let Some(missing) = src_ids.iter().find(|id| !declared.contains(id)) {
+            return Err(MemError::Invalid(format!(
+                "provenance atom {missing} is not in the declared snapshot"
+            )));
+        }
+        let key = region.to_ascii_lowercase();
+        let h = self.region_handle(&key)?;
+        let prep = prepare_atom_row(&h, &key, &atom)?;
+
+        let conn = Connection::open(&self.db)?;
+        // Sealed inserts allocate keys before their rows commit; hold the guard
+        // so a concurrent reconcile cannot reclaim them mid-span.
+        let _kl = h.atom_wrap.is_some().then(|| self.db.key_lifecycle_lock());
+        let mut pending = PendingAtomSlots::new(Arc::clone(&self.db), 1);
+        let result = with_write_txn(&conn, |c| {
+            self.verify_region_live(c, &h, &key)?;
+            self.verify_source_snapshot(c, &h, &key, snapshot)?;
+            let id = next_id(c, "next_atom_id")?;
+            self.insert_atom_row(c, &h, id, atom, prep, &mut pending)?;
+            link_derived_sources(c, id, &src_ids, evidence_ref.as_ref())?;
+            Ok(id)
+        });
+        let id = pending
+            .finish(result)
+            .inspect_err(|e| self.evict_stale_region(&key, h.id, e))?;
+        h.max_id.fetch_max(id, Ordering::Relaxed);
+        Ok(id)
+    }
+
+    /// Every snapshot member must be present, unexpired, and its stored text
+    /// must still hash to the declared digest - all read inside the caller's
+    /// write transaction.
+    fn verify_source_snapshot(
+        &self,
+        conn: &Connection<'_>,
+        h: &RegionHandle,
+        region_key: &str,
+        snapshot: &[SourceSnapshot],
+    ) -> Result<()> {
+        let now = now_micros();
+        for member in snapshot {
+            let id = member.id;
+            let text = match &h.atom_wrap {
+                None => {
+                    let qr = conn.query_params(
+                        &format!(
+                            "SELECT text_content, expires_at FROM {} \
+                             WHERE region_id = $1 AND id = $2",
+                            h.table
+                        ),
+                        &[Value::Integer(h.id), Value::Integer(id)],
+                    )?;
+                    let Some(row) = qr.rows.first() else {
+                        return Err(MemError::Invalid(format!(
+                            "source atom {id} not in region '{region_key}'"
+                        )));
+                    };
+                    verify_snapshot_unexpired(&row[1], id, now)?;
+                    match &row[0] {
+                        Value::Text(t) => t.to_string(),
+                        other => {
+                            return Err(MemError::Invalid(format!(
+                                "atom text is not text: {other:?}"
+                            )))
+                        }
+                    }
+                }
+                Some(atom_wrap) => {
+                    let qr = conn.query_params(
+                        &format!(
+                            "SELECT sealed, key_slot, key_gen, expires_at FROM {} \
+                             WHERE region_id = $1 AND id = $2",
+                            h.table
+                        ),
+                        &[Value::Integer(h.id), Value::Integer(id)],
+                    )?;
+                    let Some(row) = qr.rows.first() else {
+                        return Err(MemError::Invalid(format!(
+                            "source atom {id} not in region '{region_key}'"
+                        )));
+                    };
+                    verify_snapshot_unexpired(&row[3], id, now)?;
+                    let rec = self.db.atom_store_slot(as_int(&row[1])? as u32)?;
+                    if rec.state != SlotState::Live
+                        || rec.region_id != id as u64
+                        || rec.gen != as_int(&row[2])? as u64
+                    {
+                        return Err(MemError::Invalid(format!(
+                            "source atom {id} not in region '{region_key}'"
+                        )));
+                    }
+                    open_atom_text(atom_wrap, &rec.wrapped, id, as_blob(&row[0])?)?
+                }
+            };
+            let text = Zeroizing::new(text);
+            let got: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+            if got != member.text_sha256 {
+                return Err(MemError::Invalid(format!(
+                    "source atom {id} text changed since it was digested"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Write one atom row inside the caller's transaction.
@@ -2182,6 +2598,133 @@ impl MemoryEngine {
         })
     }
 
+    /// Every id must be live in the region: present, unexpired, and (sealed)
+    /// its key slot bound by (state, owner, generation) like every sealed
+    /// read. Runs inside the caller's write transaction.
+    fn verify_atoms_live(
+        &self,
+        conn: &Connection<'_>,
+        h: &RegionHandle,
+        region_key: &str,
+        ids: &[AtomId],
+    ) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let in_list = ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let not_live = |id: AtomId| {
+            MemError::Invalid(format!("atom {id} is not live in region '{region_key}'"))
+        };
+        if h.atom_wrap.is_some() {
+            let qr = conn.query_params(
+                &format!(
+                    "SELECT id, key_slot, key_gen FROM {} WHERE region_id = $1 \
+                     AND id IN ({in_list}) AND (expires_at IS NULL OR expires_at > $2)",
+                    h.table
+                ),
+                &[Value::Integer(h.id), Value::Timestamp(now_micros())],
+            )?;
+            let mut found: FxHashMap<AtomId, (u32, u64)> = FxHashMap::default();
+            for row in &qr.rows {
+                found.insert(
+                    as_int(&row[0])?,
+                    (as_int(&row[1])? as u32, as_int(&row[2])? as u64),
+                );
+            }
+            for &id in ids {
+                let Some(&(slot, gen)) = found.get(&id) else {
+                    return Err(not_live(id));
+                };
+                let rec = self.db.atom_store_slot(slot)?;
+                if rec.state != SlotState::Live || rec.region_id != id as u64 || rec.gen != gen {
+                    return Err(not_live(id));
+                }
+            }
+            return Ok(());
+        }
+        let qr = conn.query_params(
+            &format!(
+                "SELECT id FROM {} WHERE region_id = $1 AND id IN ({in_list}) \
+                 AND (expires_at IS NULL OR expires_at > $2)",
+                h.table
+            ),
+            &[Value::Integer(h.id), Value::Timestamp(now_micros())],
+        )?;
+        let present: FxHashSet<AtomId> = qr
+            .rows
+            .iter()
+            .map(|r| as_int(&r[0]))
+            .collect::<Result<_>>()?;
+        if let Some(&missing) = ids.iter().find(|id| !present.contains(id)) {
+            return Err(not_live(missing));
+        }
+        Ok(())
+    }
+
+    /// Replace the COMPLETE outgoing `kind` edge set of `src` in one write
+    /// transaction: src and every `(dst, weight, evidence)` must be live in
+    /// `region`, weights and duplicate destinations validate up front, the
+    /// set canonicalizes by ascending destination id, and an empty set
+    /// clears. Other kinds are untouched. Acyclic-kind cycle checks run
+    /// against the post-delete graph (removing edges can break cycles); a
+    /// violation rolls the whole replacement back.
+    ///
+    /// Crate-private until `(src, kind)`-set ownership is a public contract.
+    /// Cached-graph consumers must serialize mutation under a controller
+    /// lock and reset [`DiffusionCache`](crate::DiffusionCache)/route memos
+    /// after a successful replacement.
+    // Runtime consumer arrives with the AgenticMemory controller slice.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn replace_outgoing_edges(
+        &self,
+        region: &str,
+        src: AtomId,
+        kind: EdgeKind,
+        edges: &[(AtomId, f32, Option<serde_json::Value>)],
+    ) -> Result<()> {
+        let key = region.to_ascii_lowercase();
+        let h = self.region_handle(&key)?;
+        let mut canonical: Vec<&(AtomId, f32, Option<serde_json::Value>)> = edges.iter().collect();
+        canonical.sort_by_key(|e| e.0);
+        for e in &canonical {
+            validate_edge_weight(e.1)?;
+            if e.0 == src {
+                return Err(MemError::Cycle { src, dst: e.0 });
+            }
+        }
+        if let Some(pair) = canonical.windows(2).find(|w| w[0].0 == w[1].0) {
+            return Err(MemError::Invalid(format!(
+                "duplicate destination atom {}",
+                pair[0].0
+            )));
+        }
+        let mut live_ids: Vec<AtomId> = canonical.iter().map(|e| e.0).collect();
+        live_ids.push(src);
+        let live_ids = dedup_sources(&live_ids);
+
+        let conn = Connection::open(&self.db)?;
+        // Serialize the liveness predicate with drop_region's key-first
+        // erase span, as every encrypted region-bound write does.
+        let _kl = h.atom_wrap.is_some().then(|| self.db.key_lifecycle_lock());
+        with_write_txn(&conn, |c| {
+            self.verify_region_live(c, &h, &key)?;
+            self.verify_atoms_live(c, &h, &key, &live_ids)?;
+            c.execute_params(
+                "DELETE FROM memory_edges WHERE src_id = $1 AND kind = $2",
+                &[Value::Integer(src), Value::Text(kind.as_str().into())],
+            )?;
+            for e in &canonical {
+                link_edge(c, src, e.0, kind, e.1, e.2.as_ref())?;
+            }
+            Ok(())
+        })
+        .inspect_err(|e| self.evict_stale_region(&key, h.id, e))
+    }
+
     /// Recompute `SimilarTo` neighbor edges and score via recall; encrypted
     /// regions use the same full-region sealed ANN index.
     pub fn evolve(
@@ -2352,6 +2895,11 @@ impl MemoryEngine {
         }
 
         with_write_txn(&conn, |c| {
+            // Eviction targets come from region-scoped selectors, so the
+            // unqualified by-atom-id identity purge cannot cross regions.
+            c.execute(&format!(
+                "DELETE FROM memory_idempotency WHERE atom_id IN ({in_list})"
+            ))?;
             c.execute(&format!(
                 "DELETE FROM memory_edges WHERE src_id IN ({in_list}) OR dst_id IN ({in_list})"
             ))?;
@@ -2367,6 +2915,47 @@ impl MemoryEngine {
         })
     }
 
+    /// Destroy the keys of the region-scoped `ids` (overwrite + fsync +
+    /// read-back). The (slot, id, gen) binding lets a retry over recycled
+    /// crash residue skip it and still converge on the row delete.
+    fn erase_atom_keys(
+        &self,
+        conn: &Connection<'_>,
+        h: &RegionHandle,
+        in_list: &str,
+    ) -> Result<Vec<SlotErasure>> {
+        let qr = conn.query_params(
+            &format!(
+                "SELECT id, key_slot, key_gen FROM {table} \
+                 WHERE region_id = $1 AND id IN ({in_list})",
+                table = h.table
+            ),
+            &[Value::Integer(h.id)],
+        )?;
+        let slots: Vec<(u32, u64, u64)> = qr
+            .rows
+            .iter()
+            .map(|row| {
+                Ok((
+                    as_int(&row[1])? as u32,
+                    as_int(&row[0])? as u64,
+                    as_int(&row[2])? as u64,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(self
+            .db
+            .atom_store_tombstone_batch(&slots)?
+            .into_iter()
+            .map(|(slot, atom_id, old_gen, new_gen)| SlotErasure {
+                slot,
+                atom_id: atom_id as AtomId,
+                old_gen,
+                new_gen,
+            })
+            .collect())
+    }
+
     /// Erase the keys of `ids` (encrypted only) then delete their rows and
     /// edges, returning `(rows_deleted, slots_erased)`.
     fn erase_and_delete(
@@ -2377,7 +2966,6 @@ impl MemoryEngine {
     ) -> Result<(u64, Vec<SlotErasure>)> {
         // Tombstone -> row-delete -> segment-retire is one lifecycle span.
         let _kl = self.db.key_lifecycle_lock();
-        let table = &h.table;
         let in_list = ids
             .iter()
             .map(|id| id.to_string())
@@ -2387,63 +2975,15 @@ impl MemoryEngine {
         self.verify_region_live(&conn, h, region_key)?;
 
         // Encrypted path: destroy each atom's key before the row delete, so a
-        // crash leaves the content undecryptable. Plaintext has no key; the row
-        // delete is the whole operation. The full (slot, id, gen) binding lets
-        // a retry over crash residue whose slot was recycled skip it and still
-        // converge on the row delete.
+        // crash leaves the content undecryptable. Plaintext has no key; the
+        // row delete is the whole operation.
         let slots_erased = if h.atom_wrap.is_some() {
-            let qr = conn.query_params(
-                &format!(
-                    "SELECT id, key_slot, key_gen FROM {table} \
-                     WHERE region_id = $1 AND id IN ({in_list})"
-                ),
-                &[Value::Integer(h.id)],
-            )?;
-            let slots: Vec<(u32, u64, u64)> = qr
-                .rows
-                .iter()
-                .map(|row| {
-                    Ok((
-                        as_int(&row[1])? as u32,
-                        as_int(&row[0])? as u64,
-                        as_int(&row[2])? as u64,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            self.db
-                .atom_store_tombstone_batch(&slots)?
-                .into_iter()
-                .map(|(slot, atom_id, old_gen, new_gen)| SlotErasure {
-                    slot,
-                    atom_id: atom_id as AtomId,
-                    old_gen,
-                    new_gen,
-                })
-                .collect()
+            self.erase_atom_keys(&conn, h, &in_list)?
         } else {
             Vec::new()
         };
 
-        // Both paths: delete incident edges, then the rows. The row DELETE's
-        // own affected-row count is the honest `rows_deleted` for either path.
-        let rows_deleted = with_write_txn(&conn, |c| {
-            c.execute_params(
-                &format!(
-                    "DELETE FROM memory_edges WHERE \
-                     src_id IN (SELECT id FROM {table} WHERE region_id = $1 AND id IN ({in_list})) \
-                     OR dst_id IN (SELECT id FROM {table} WHERE region_id = $1 AND id IN ({in_list}))"
-                ),
-                &[Value::Integer(h.id)],
-            )?;
-            let deleted = c.execute_params(
-                &format!("DELETE FROM {table} WHERE region_id = $1 AND id IN ({in_list})"),
-                &[Value::Integer(h.id)],
-            )?;
-            Ok(match deleted {
-                ExecutionResult::RowsAffected(n) => n,
-                _ => 0,
-            })
-        })?;
+        let rows_deleted = with_write_txn(&conn, |c| delete_atoms_in_txn(c, h, &in_list))?;
 
         // Drop the cached ANN index so erased atoms are not re-ranked, and
         // crypto-erase the segment's key: its SQ8 codes are residue that must
@@ -2532,25 +3072,81 @@ impl MemoryEngine {
                 .inspect_err(|error| self.evict_stale_region(&key, h.id, error))?
         };
 
-        let slots_erased_empty = slots_erased.is_empty();
-        Ok(ErasureReceipt {
-            cryptographic_erasure: encrypted,
+        Ok(build_erasure_receipt(
+            encrypted,
             rows_deleted,
-            erased_count: slots_erased.len() as u64,
             slots_erased,
             immutable_skipped,
-            algorithm: if encrypted { "AES-256-KW(RFC3394)" } else { "" },
-            wrapped_key_size: if encrypted {
-                WRAPPED_KEY_SIZE as u32
+        ))
+    }
+
+    /// [`forget_atoms`](Self::forget_atoms) extended over the reverse
+    /// `DerivedFrom` closure, so no derived copy of forgotten content
+    /// survives. Classification, the closure walk, the immutable gate, key
+    /// destruction, and every delete run in ONE write transaction: a
+    /// concurrent writer observes the cascade entirely or not at all.
+    ///
+    /// Absent roots are ignored (a retry converges on a zero receipt); a
+    /// root owned by another region fails loudly. Cross-table roots read as
+    /// absent and the closure is region-scoped (regions are ownership
+    /// boundaries) - both best-effort by design. Without `force`, any
+    /// immutable atom in the closure refuses the whole cascade.
+    pub fn forget_atoms_with_dependents(
+        &self,
+        region: &str,
+        ids: &[AtomId],
+        force: bool,
+    ) -> Result<ErasureReceipt> {
+        let key = region.to_ascii_lowercase();
+        let h = self.region_handle(&key)?;
+        let encrypted = h.atom_wrap.is_some();
+
+        // One lifecycle span; tombstoning inside the txn is single-writer
+        // safe - a rollback leaves key-dead rows, healed by reconcile.
+        let _kl = self.db.key_lifecycle_lock();
+        let conn = Connection::open(&self.db)?;
+        let (rows_deleted, slots_erased) = with_write_txn(&conn, |c| {
+            self.verify_region_live(c, &h, &key)?;
+            let roots = classify_cascade_roots(c, &h, &key, ids)?;
+            if roots.is_empty() {
+                return Ok((0, Vec::new()));
+            }
+            let closure = dependent_closure(c, &h, &roots)?;
+            if !force {
+                let blockers = immutable_members(c, &h, &closure)?;
+                if !blockers.is_empty() {
+                    return Err(MemError::Invalid(format!(
+                        "cascade blocked by immutable atoms {blockers:?}; pass force to erase"
+                    )));
+                }
+            }
+            let in_list = closure
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let slots_erased = if encrypted {
+                self.erase_atom_keys(c, &h, &in_list)?
             } else {
-                0
-            },
-            // Claim durability only for erasures that passed the key store's
-            // overwrite + fsync + read-back gate; an empty one attests nothing.
-            fsync: encrypted && !slots_erased_empty,
-            readback_confirmed: encrypted && !slots_erased_empty,
-            scope_caveat: ERASURE_SCOPE_CAVEAT,
+                Vec::new()
+            };
+            let rows_deleted = delete_atoms_in_txn(c, &h, &in_list)?;
+            Ok((rows_deleted, slots_erased))
         })
+        .inspect_err(|e| self.evict_stale_region(&key, h.id, e))?;
+
+        // Unconditional like erase_and_delete's tail, so a crash between
+        // COMMIT and the segment retire converges on a zero-receipt retry.
+        *h.ann.write().unwrap() = None;
+        if encrypted {
+            self.retire_sealed_segment(&h, &conn)?;
+        }
+        Ok(build_erasure_receipt(
+            encrypted,
+            rows_deleted,
+            slots_erased,
+            Vec::new(),
+        ))
     }
 
     /// Crypto-erase a single atom: destroy its key (overwrite + fsync +
@@ -2843,6 +3439,7 @@ impl MemoryEngine {
             dim: st.dim,
             metric: st.metric,
             atom_wrap: st.atom_wrap.clone(),
+            identity_mac: st.identity_mac.clone(),
             ann: Arc::clone(&st.ann),
             max_id: Arc::clone(&st.max_id),
         })
@@ -3025,12 +3622,16 @@ impl MemoryEngine {
         self.live_region_wrapped(name, row).map(|_| ())
     }
 
-    fn attach_region_key(&self, name: &str, row: &RegionRow) -> Result<Arc<AtomWrapKey>> {
+    fn attach_region_key(&self, name: &str, row: &RegionRow) -> Result<RegionKeys> {
         let wrapped = self.live_region_wrapped(name, row)?;
         let mut rck = self.db.unwrap_region_key(&wrapped)?;
         let atom_wrap = derive_atom_wrap_key(&rck);
+        let identity_mac = derive_identity_mac_key(&rck);
         rck.zeroize();
-        Ok(Arc::new(atom_wrap))
+        Ok(RegionKeys {
+            atom_wrap: Arc::new(atom_wrap),
+            identity_mac: Arc::new(identity_mac),
+        })
     }
 
     /// Create a new encrypted region: generate a random RCK, wrap it, persist
@@ -3043,7 +3644,7 @@ impl MemoryEngine {
         dim: u16,
         metric: EmbeddingMetric,
         model_id: &str,
-    ) -> Result<(RegionId, Option<Arc<AtomWrapKey>>)> {
+    ) -> Result<(RegionId, Option<RegionKeys>)> {
         use rand::RngCore;
 
         // Caller holds the key-lifecycle guard across allocate -> row commit
@@ -3090,8 +3691,11 @@ impl MemoryEngine {
         });
         pending.finish(inserted)?;
 
-        let atom_wrap = derive_atom_wrap_key(&rck);
-        Ok((id, Some(Arc::new(atom_wrap))))
+        let keys = RegionKeys {
+            atom_wrap: Arc::new(derive_atom_wrap_key(&rck)),
+            identity_mac: Arc::new(derive_identity_mac_key(&rck)),
+        };
+        Ok((id, Some(keys)))
     }
 
     /// ANN recall over an encrypted region via an ephemeral in-RAM PRISM index
@@ -4741,6 +5345,100 @@ fn prepare_atom_row(h: &RegionHandle, key: &str, atom: &AtomInput) -> Result<Pre
     })
 }
 
+/// Domain tags for keyed-idempotency identity material.
+const IK_KEY_DOMAIN: &[u8] = b"citadel-mem-ik-key-v1";
+const IK_REQUEST_DOMAIN: &[u8] = b"citadel-mem-ik-req-v1";
+
+/// Hex identity tag over `material`: keyed BLAKE3 for encrypted regions (no
+/// plaintext-equality oracle reaches disk), plain BLAKE3 for plaintext ones.
+fn identity_tag(mac: Option<&IdentityMacKey>, material: &[u8]) -> String {
+    match mac {
+        Some(mac) => blake3::keyed_hash(&mac.key, material).to_hex().to_string(),
+        None => blake3::hash(material).to_hex().to_string(),
+    }
+}
+
+fn push_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+fn push_opt_micros(buf: &mut Vec<u8>, value: Option<i64>) {
+    match value {
+        Some(v) => {
+            buf.push(1);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        None => buf.push(0),
+    }
+}
+
+/// Identity tag of one caller idempotency key, bound to its `kind` scope so
+/// a key reused across kinds leaves no visible equality on disk.
+fn identity_key_tag(mac: Option<&IdentityMacKey>, kind: &str, idempotency_key: &str) -> String {
+    let mut material = Zeroizing::new(Vec::new());
+    push_len_prefixed(&mut material, IK_KEY_DOMAIN);
+    push_len_prefixed(&mut material, kind.as_bytes());
+    push_len_prefixed(&mut material, idempotency_key.as_bytes());
+    identity_tag(mac, &material)
+}
+
+/// Canonical tag binding every semantic input of one keyed remember (key
+/// tag included, so identical requests under different keys stay distinct
+/// on disk). `AtomInput` destructures exhaustively: a new field must extend
+/// the material AND bump the domain tag (frozen vectors pin the encoding).
+fn identity_request_tag(
+    mac: Option<&IdentityMacKey>,
+    key_tag: &str,
+    atom: &AtomInput,
+    payload_json: &str,
+    src_ids: &[AtomId],
+    evidence_ref: Option<&serde_json::Value>,
+) -> Result<String> {
+    let AtomInput {
+        kind,
+        text,
+        // The canonical serialization is `payload_json`.
+        payload: _,
+        score,
+        confidence,
+        created_at,
+        expires_at,
+        immutable,
+    } = atom;
+    let evidence = match evidence_ref {
+        Some(v) => serde_json::to_string(v)
+            .map_err(|e| MemError::Invalid(format!("evidence_ref not serializable: {e}")))?,
+        None => String::new(),
+    };
+    let mut material = Zeroizing::new(Vec::new());
+    push_len_prefixed(&mut material, IK_REQUEST_DOMAIN);
+    push_len_prefixed(&mut material, key_tag.as_bytes());
+    push_len_prefixed(&mut material, kind.as_bytes());
+    push_len_prefixed(&mut material, text.as_bytes());
+    push_len_prefixed(&mut material, payload_json.as_bytes());
+    material.extend_from_slice(&score.to_bits().to_le_bytes());
+    material.extend_from_slice(&confidence.to_bits().to_le_bytes());
+    push_opt_micros(&mut material, *created_at);
+    push_opt_micros(&mut material, *expires_at);
+    material.push(u8::from(*immutable));
+    material.extend_from_slice(&(src_ids.len() as u64).to_le_bytes());
+    for &id in src_ids {
+        material.extend_from_slice(&id.to_le_bytes());
+    }
+    push_len_prefixed(&mut material, evidence.as_bytes());
+    Ok(identity_tag(mac, &material))
+}
+
+/// Nullable `expires_at` gate for snapshot members: present-but-lapsed is a
+/// distinct, loud error (unlike recall, which silently hides expired atoms).
+fn verify_snapshot_unexpired(v: &Value, id: AtomId, now: i64) -> Result<()> {
+    match opt_ts(v) {
+        Some(t) if t <= now => Err(MemError::Invalid(format!("source atom {id} expired"))),
+        _ => Ok(()),
+    }
+}
+
 fn dedup_sources(sources: &[AtomId]) -> Vec<AtomId> {
     let mut ids = sources.to_vec();
     ids.sort_unstable();
@@ -4798,6 +5496,180 @@ fn link_derived_sources(
         link_edge(conn, id, src, EdgeKind::DerivedFrom, 1.0, evidence_ref)?;
     }
     Ok(())
+}
+
+/// Inside the caller's write transaction: delete identity records, incident
+/// edges, then rows of `in_list`, returning the row DELETE's count. All
+/// deletes subselect region-scoped rows, so unverified caller ids can never
+/// touch another region's records.
+fn delete_atoms_in_txn(conn: &Connection<'_>, h: &RegionHandle, in_list: &str) -> Result<u64> {
+    let table = &h.table;
+    conn.execute_params(
+        &format!(
+            "DELETE FROM memory_idempotency WHERE atom_id IN \
+             (SELECT id FROM {table} WHERE region_id = $1 AND id IN ({in_list}))"
+        ),
+        &[Value::Integer(h.id)],
+    )?;
+    conn.execute_params(
+        &format!(
+            "DELETE FROM memory_edges WHERE \
+             src_id IN (SELECT id FROM {table} WHERE region_id = $1 AND id IN ({in_list})) \
+             OR dst_id IN (SELECT id FROM {table} WHERE region_id = $1 AND id IN ({in_list}))"
+        ),
+        &[Value::Integer(h.id)],
+    )?;
+    let deleted = conn.execute_params(
+        &format!("DELETE FROM {table} WHERE region_id = $1 AND id IN ({in_list})"),
+        &[Value::Integer(h.id)],
+    )?;
+    Ok(match deleted {
+        ExecutionResult::RowsAffected(n) => n,
+        _ => 0,
+    })
+}
+
+fn build_erasure_receipt(
+    encrypted: bool,
+    rows_deleted: u64,
+    slots_erased: Vec<SlotErasure>,
+    immutable_skipped: Vec<AtomId>,
+) -> ErasureReceipt {
+    let slots_erased_empty = slots_erased.is_empty();
+    ErasureReceipt {
+        cryptographic_erasure: encrypted,
+        rows_deleted,
+        erased_count: slots_erased.len() as u64,
+        slots_erased,
+        immutable_skipped,
+        algorithm: if encrypted { "AES-256-KW(RFC3394)" } else { "" },
+        wrapped_key_size: if encrypted {
+            WRAPPED_KEY_SIZE as u32
+        } else {
+            0
+        },
+        // Claim durability only for erasures that passed the key store's
+        // overwrite + fsync + read-back gate; an empty one attests nothing.
+        fsync: encrypted && !slots_erased_empty,
+        readback_confirmed: encrypted && !slots_erased_empty,
+        scope_caveat: ERASURE_SCOPE_CAVEAT,
+    }
+}
+
+/// Split cascade roots: in this region -> seeds, absent -> ignored (retries
+/// converge), owned by another region -> loud error naming it. Runs inside
+/// the caller's write transaction.
+fn classify_cascade_roots(
+    conn: &Connection<'_>,
+    h: &RegionHandle,
+    region_key: &str,
+    ids: &[AtomId],
+) -> Result<Vec<AtomId>> {
+    let roots = dedup_sources(ids);
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    let in_list = roots
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let qr = conn.query_params(
+        &format!(
+            "SELECT id, region_id FROM {} WHERE id IN ({in_list})",
+            h.table
+        ),
+        &[],
+    )?;
+    let mut present = Vec::with_capacity(qr.rows.len());
+    for row in &qr.rows {
+        let id = as_int(&row[0])?;
+        let owner = as_int(&row[1])?;
+        if owner != h.id {
+            let named = conn.query_params(
+                "SELECT name FROM memory_regions WHERE id = $1",
+                &[Value::Integer(owner)],
+            )?;
+            let owner_name = match named.rows.first() {
+                Some(r) => format!("region '{}'", as_text(&r[0])?),
+                None => format!("region id {owner}"),
+            };
+            return Err(MemError::Invalid(format!(
+                "cascade root {id} belongs to {owner_name}, not '{region_key}'"
+            )));
+        }
+        present.push(id);
+    }
+    present.sort_unstable();
+    Ok(present)
+}
+
+/// The requested ids plus every region atom whose `DerivedFrom` closure
+/// reaches them, to a fixpoint (cycle-safe via the visited set). Runs inside
+/// the caller's write transaction.
+fn dependent_closure(
+    conn: &Connection<'_>,
+    h: &RegionHandle,
+    ids: &[AtomId],
+) -> Result<Vec<AtomId>> {
+    let mut visited: FxHashSet<AtomId> = ids.iter().copied().collect();
+    let mut wave: Vec<AtomId> = ids.to_vec();
+    while !wave.is_empty() {
+        let in_list = wave
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let qr = conn.query_params(
+            &format!(
+                "SELECT e.src_id FROM memory_edges e JOIN {} a \
+                 ON a.id = e.src_id AND a.region_id = $1 \
+                 WHERE e.kind = $2 AND e.dst_id IN ({in_list})",
+                h.table
+            ),
+            &[
+                Value::Integer(h.id),
+                Value::Text(EdgeKind::DerivedFrom.as_str().into()),
+            ],
+        )?;
+        let mut next = Vec::new();
+        for row in &qr.rows {
+            let id = as_int(&row[0])?;
+            if visited.insert(id) {
+                next.push(id);
+            }
+        }
+        wave = next;
+    }
+    let mut out: Vec<AtomId> = visited.into_iter().collect();
+    out.sort_unstable();
+    Ok(out)
+}
+
+/// Which of `ids` are immutable in the region, ascending. Runs inside the
+/// caller's write transaction.
+fn immutable_members(
+    conn: &Connection<'_>,
+    h: &RegionHandle,
+    ids: &[AtomId],
+) -> Result<Vec<AtomId>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let in_list = ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let qr = conn.query_params(
+        &format!(
+            "SELECT id FROM {} WHERE region_id = $1 AND id IN ({in_list}) \
+             AND immutable = 1 ORDER BY id",
+            h.table
+        ),
+        &[Value::Integer(h.id)],
+    )?;
+    qr.rows.iter().map(|r| as_int(&r[0])).collect()
 }
 
 /// Which of `ids` are the target of a `supersedes` edge (stale versions).

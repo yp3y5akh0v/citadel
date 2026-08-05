@@ -3310,3 +3310,216 @@ fn check_attached_rejects_mismatch_against_cached_region() {
         "cached encrypted-flag mismatch must error"
     );
 }
+
+#[test]
+fn replace_outgoing_edges_swaps_the_complete_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("r", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng.remember("r", AtomInput::new("n", "a")).unwrap();
+    let b = eng.remember("r", AtomInput::new("n", "b")).unwrap();
+    let c = eng.remember("r", AtomInput::new("n", "c")).unwrap();
+    let d = eng.remember("r", AtomInput::new("n", "d")).unwrap();
+    eng.link(a, b, EdgeKind::SimilarTo, 0.9).unwrap();
+    eng.link(a, c, EdgeKind::SimilarTo, 0.8).unwrap();
+    eng.link(a, b, EdgeKind::Refines, 1.0).unwrap();
+
+    // Unsorted input canonicalizes; the old set is fully replaced.
+    eng.replace_outgoing_edges(
+        "r",
+        a,
+        EdgeKind::SimilarTo,
+        &[
+            (d, 0.75, Some(serde_json::json!({"why": "new"}))),
+            (c, 0.5, None),
+        ],
+    )
+    .unwrap();
+    let edges = eng
+        .fetch_edges(Some(a), None, Some(EdgeKind::SimilarTo))
+        .unwrap();
+    let set: Vec<(AtomId, f32)> = edges.iter().map(|e| (e.dst_id, e.weight)).collect();
+    assert_eq!(set, vec![(c, 0.5), (d, 0.75)]);
+    assert_eq!(
+        edges.iter().find(|e| e.dst_id == d).unwrap().evidence_ref,
+        Some(serde_json::json!({"why": "new"}))
+    );
+    assert_eq!(
+        eng.fetch_edges(Some(a), None, Some(EdgeKind::Refines))
+            .unwrap()
+            .len(),
+        1,
+        "other kinds untouched"
+    );
+
+    // An empty set clears.
+    eng.replace_outgoing_edges("r", a, EdgeKind::SimilarTo, &[])
+        .unwrap();
+    assert!(eng
+        .fetch_edges(Some(a), None, Some(EdgeKind::SimilarTo))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn replace_outgoing_edges_validates_and_rolls_back_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("r", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.create_region("r2", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng.remember("r", AtomInput::new("n", "a")).unwrap();
+    let b = eng.remember("r", AtomInput::new("n", "b")).unwrap();
+    let c = eng.remember("r", AtomInput::new("n", "c")).unwrap();
+    let foreign = eng.remember("r2", AtomInput::new("n", "x")).unwrap();
+    eng.link(a, b, EdgeKind::SimilarTo, 0.9).unwrap();
+
+    // Dangling destination.
+    let err = eng
+        .replace_outgoing_edges("r", a, EdgeKind::SimilarTo, &[(987_654, 0.5, None)])
+        .unwrap_err();
+    assert!(err.to_string().contains("not live"), "{err}");
+    // Source owned by another region.
+    let err = eng
+        .replace_outgoing_edges("r", foreign, EdgeKind::SimilarTo, &[(a, 0.5, None)])
+        .unwrap_err();
+    assert!(err.to_string().contains("not live"), "{err}");
+    // Duplicate destinations.
+    let err = eng
+        .replace_outgoing_edges(
+            "r",
+            a,
+            EdgeKind::SimilarTo,
+            &[(b, 0.5, None), (b, 0.6, None)],
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("duplicate destination"), "{err}");
+    // Self-loop and non-finite weight.
+    assert!(matches!(
+        eng.replace_outgoing_edges("r", a, EdgeKind::SimilarTo, &[(a, 0.5, None)]),
+        Err(MemError::Cycle { .. })
+    ));
+    let err = eng
+        .replace_outgoing_edges("r", a, EdgeKind::SimilarTo, &[(b, f32::NAN, None)])
+        .unwrap_err();
+    assert!(err.to_string().contains("finite"), "{err}");
+
+    // Acyclic-kind violation surfaces after the in-transaction delete, so
+    // the rollback must restore the original set.
+    eng.link(a, b, EdgeKind::DependsOn, 1.0).unwrap();
+    eng.link(c, a, EdgeKind::DependsOn, 1.0).unwrap();
+    assert!(matches!(
+        eng.replace_outgoing_edges("r", a, EdgeKind::DependsOn, &[(c, 1.0, None)]),
+        Err(MemError::Cycle { .. })
+    ));
+    let depends = eng
+        .fetch_edges(Some(a), None, Some(EdgeKind::DependsOn))
+        .unwrap();
+    assert_eq!(depends.len(), 1, "rolled back to the original set");
+    assert_eq!(depends[0].dst_id, b);
+
+    // Every rejection left the SimilarTo set intact too.
+    let similar = eng
+        .fetch_edges(Some(a), None, Some(EdgeKind::SimilarTo))
+        .unwrap();
+    assert_eq!(similar.len(), 1);
+    assert_eq!(similar[0].dst_id, b);
+}
+
+#[test]
+fn replace_outgoing_edges_requires_truly_live_endpoints() {
+    // Expired destination (plaintext region): row present, TTL lapsed.
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("r", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng.remember("r", AtomInput::new("n", "a")).unwrap();
+    let lapsed = eng
+        .remember("r", AtomInput::new("n", "lapsed").with_expires_at(1))
+        .unwrap();
+    let err = eng
+        .replace_outgoing_edges("r", a, EdgeKind::SimilarTo, &[(lapsed, 0.5, None)])
+        .unwrap_err();
+    assert!(err.to_string().contains("not live"), "{err}");
+
+    // Key-erased destination (encrypted region): row present, slot dead -
+    // the crash-residue state the sealed triple bind must reject.
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let src = eng.remember("v", AtomInput::new("n", "src")).unwrap();
+    let dst = eng.remember("v", AtomInput::new("n", "dst")).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let qr = conn
+        .query_params(
+            &format!("SELECT key_slot, key_gen FROM {table} WHERE id = $1"),
+            &[Value::Integer(dst)],
+        )
+        .unwrap();
+    let slot = as_int(&qr.rows[0][0]).unwrap() as u32;
+    let gen = as_int(&qr.rows[0][1]).unwrap() as u64;
+    db.atom_store_tombstone_batch(&[(slot, dst as u64, gen)])
+        .unwrap();
+    let err = eng
+        .replace_outgoing_edges("v", src, EdgeKind::SimilarTo, &[(dst, 0.5, None)])
+        .unwrap_err();
+    assert!(err.to_string().contains("not live"), "{err}");
+}
+
+#[test]
+fn identity_tag_persisted_format_is_frozen() {
+    // Pins the persisted identity encoding: if it moves, bump the
+    // IK_*_DOMAIN version tags instead of re-pinning.
+    let atom = AtomInput::new("kind-a", "text-b")
+        .with_payload(serde_json::json!({"p": 1}))
+        .with_score(0.5)
+        .with_confidence(0.25)
+        .with_created_at(123)
+        .with_expires_at(456)
+        .immutable();
+    let payload_json = serde_json::to_string(&atom.payload).unwrap();
+    let evidence = serde_json::json!({"e": 2});
+
+    let plain_key = identity_key_tag(None, &atom.kind, "key-1");
+    let plain_req = identity_request_tag(
+        None,
+        &plain_key,
+        &atom,
+        &payload_json,
+        &[7, 9],
+        Some(&evidence),
+    )
+    .unwrap();
+    let mac = IdentityMacKey { key: [0x42; 32] };
+    let keyed_key = identity_key_tag(Some(&mac), &atom.kind, "key-1");
+    let keyed_req = identity_request_tag(
+        Some(&mac),
+        &keyed_key,
+        &atom,
+        &payload_json,
+        &[7, 9],
+        Some(&evidence),
+    )
+    .unwrap();
+    assert_eq!(
+        plain_key,
+        "c4b4b84a62057a3b3b5e6807cde597bb06f363aa15c7ae1201e2e7f68d3a9f0e"
+    );
+    assert_eq!(
+        plain_req,
+        "e2e7ca3a0d890eac10995c768b4c4b9e49181f5be9bd4feda4c6d6bf77e46484"
+    );
+    assert_eq!(
+        keyed_key,
+        "4b7e9ffa2b109dd90cbfe5c526930b3577fe09d2287e3b8e39d139d10bcebe9f"
+    );
+    assert_eq!(
+        keyed_req,
+        "de4ef94e9931c9bb99ce912f47bbb9a0680ae87c55346648be27660ad68d2157"
+    );
+}
