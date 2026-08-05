@@ -445,6 +445,20 @@ impl Ctx<'_> {
         req.temperature = Some(self.config.temperature);
         let resp = self.call_with_retry(&req)?;
         self.accrue_and_record(&req, &resp, prompt)?;
+        // A terminal or malformed reply still incurred spend, so trace it.
+        let refusal = match resp.finish_reason {
+            FinishReason::Stop | FinishReason::Length => None,
+            FinishReason::ToolUse if !resp.message.tool_calls.is_empty() => None,
+            FinishReason::ToolUse => {
+                Some("provider reported tool use without a dispatchable tool call")
+            }
+            FinishReason::Refusal => Some("provider refused the request"),
+            FinishReason::ContentFilter => Some("provider filtered the response content"),
+            FinishReason::Error => Some("provider reported an error disposition"),
+        };
+        if let Some(message) = refusal {
+            return Err(LlmError::Backend(message.into()).into());
+        }
         Ok(resp)
     }
 
@@ -1876,6 +1890,8 @@ fn value_to_response(v: &Value) -> CompletionResponse {
     let finish_reason = match v.get("finish_reason").and_then(Value::as_str) {
         Some("ToolUse") => FinishReason::ToolUse,
         Some("Length") => FinishReason::Length,
+        Some("Refusal") => FinishReason::Refusal,
+        Some("ContentFilter") => FinishReason::ContentFilter,
         Some("Error") => FinishReason::Error,
         _ => FinishReason::Stop,
     };
@@ -2797,5 +2813,109 @@ mod tests {
             1,
             "a write tool is dispatched once, not retried"
         );
+    }
+
+    #[test]
+    fn tool_use_without_dispatchable_calls_is_accounted_then_refused() {
+        let mut malformed = CompletionResponse::text("partial provider text");
+        malformed.finish_reason = FinishReason::ToolUse;
+        malformed.usage = TokenUsage {
+            input_tokens: 11,
+            output_tokens: 7,
+            cost_usd: Some(0.125),
+        };
+        let capture = testing::capturing(vec![malformed]);
+        let (_dir, agent) = agent_with_llm(capture.client(), AgentConfig::default());
+        let mut ctx = agent.new_ctx("goal".into());
+        let prompt = ctx.config.prompt_library.resolve(PromptId::Execute);
+        let request =
+            CompletionRequest::new(vec![prompt.as_system(), Message::user("continue the task")]);
+
+        let err = ctx
+            .complete(request, &prompt)
+            .expect_err("empty tool-use batch must fail closed");
+        assert!(matches!(err, AgentError::Llm(LlmError::Backend(_))));
+        assert_eq!(capture.requests().len(), 1);
+        assert_eq!(ctx.usage.tokens, 18);
+        assert_eq!(ctx.usage.cost_usd, 0.125);
+
+        let traces = ctx.graph.load_llm_traces().unwrap();
+        assert_eq!(traces.len(), 1, "the completed provider call is audited");
+        let response = &traces[0].1;
+        assert_eq!(response["finish_reason"], json!("ToolUse"));
+        assert_eq!(response["content"], json!("partial provider text"));
+        assert_eq!(response["tool_calls"], json!([]));
+    }
+
+    #[test]
+    fn hard_finish_dispositions_are_accounted_then_refused() {
+        let cases = [
+            (FinishReason::Refusal, "refused"),
+            (FinishReason::ContentFilter, "filtered"),
+            (FinishReason::Error, "error disposition"),
+        ];
+        let responses = cases
+            .iter()
+            .enumerate()
+            .map(|(index, (reason, _))| {
+                let mut response = CompletionResponse::tool_calls(vec![ToolCall {
+                    id: format!("call-{index}"),
+                    name: "tempting_tool".into(),
+                    arguments: json!({"unsafe": true}),
+                }]);
+                response.message.content = "tempting partial answer".into();
+                response.finish_reason = *reason;
+                response.usage = TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    cost_usd: Some(0.025),
+                };
+                response
+            })
+            .collect();
+        let capture = testing::capturing(responses);
+        let (_dir, agent) = agent_with_llm(capture.client(), AgentConfig::default());
+        let mut ctx = agent.new_ctx("goal".into());
+        let prompt = ctx.config.prompt_library.resolve(PromptId::Execute);
+
+        for (index, (_, message)) in cases.iter().enumerate() {
+            let request = CompletionRequest::new(vec![
+                prompt.as_system(),
+                Message::user(format!("attempt {index}")),
+            ]);
+            let err = ctx
+                .complete(request, &prompt)
+                .expect_err("hard provider disposition must fail closed");
+            assert!(matches!(err, AgentError::Llm(LlmError::Backend(_))));
+            assert!(err.to_string().contains(message));
+        }
+
+        assert_eq!(capture.requests().len(), cases.len());
+        assert_eq!(ctx.usage.tokens, 15);
+        assert!((ctx.usage.cost_usd - 0.075).abs() < 1e-12);
+        let traces = ctx.graph.load_llm_traces().unwrap();
+        assert_eq!(traces.len(), cases.len());
+        for (trace, (reason, _)) in traces.iter().zip(cases) {
+            assert_eq!(trace.1["finish_reason"], json!(format!("{reason:?}")));
+            assert_eq!(trace.1["content"], json!("tempting partial answer"));
+            assert_eq!(trace.1["tool_calls"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn replay_trace_preserves_every_finish_reason() {
+        for reason in [
+            FinishReason::Stop,
+            FinishReason::Length,
+            FinishReason::ToolUse,
+            FinishReason::Refusal,
+            FinishReason::ContentFilter,
+            FinishReason::Error,
+        ] {
+            let mut response = CompletionResponse::text("recorded");
+            response.finish_reason = reason;
+            let replayed = value_to_response(&response_to_value(&response));
+            assert_eq!(replayed.finish_reason, reason);
+        }
     }
 }
