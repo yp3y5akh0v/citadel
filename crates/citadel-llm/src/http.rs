@@ -1,7 +1,4 @@
-//! Shared blocking-HTTP plumbing for the provider backends (native-only).
-//!
-//! One ureq agent per client; non-2xx is returned as a normal response so the
-//! provider's error body can be read and classified into [`LlmError`].
+//! Blocking-HTTP for native backends; non-2xx returns so error bodies are readable.
 
 use std::time::Duration;
 
@@ -19,14 +16,10 @@ const TIMEOUT_GLOBAL_MARGIN_SECS: u64 = 60;
 /// Keep provider error bodies bounded in the error message / trace.
 const MAX_ERROR_BODY: usize = 500;
 
-/// HTTP deadlines for the LLM backends, derived from one receive budget.
-///
-/// Per-phase deadlines: a global timeout alone won't interrupt a read stalled
-/// on a half-closed socket; recv deadlines do.
+/// HTTP deadlines derived from `recv_secs`; a global one can't cut a stalled read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LlmTimeouts {
-    /// Seconds allowed for the response to start and the body to arrive.
-    /// Generous: deep-reasoning models can take minutes before responding.
+    /// Seconds for response start plus body; deep-reasoning models take minutes.
     pub recv_secs: u64,
 }
 
@@ -39,8 +32,7 @@ impl Default for LlmTimeouts {
 }
 
 impl LlmTimeouts {
-    /// Send scales with recv: API edges hold the socket before reading the body
-    /// for capacity-queued model tiers, and some stacks bill that to send.
+    /// Scales with recv: queued API edges stall the socket and bill it to send.
     fn send_secs(&self) -> u64 {
         TIMEOUT_SEND_FLOOR_SECS.max(self.recv_secs / 2)
     }
@@ -51,12 +43,7 @@ impl LlmTimeouts {
     }
 }
 
-/// The shared ureq agent: per-phase + global deadlines, non-2xx surfaced as a normal
-/// response so the provider error body is readable.
-///
-/// Connection pooling is disabled (`max_idle_connections* = 0`): on a long, rate-paced
-/// run the peer drops idle keep-alive sockets, and reusing a half-closed one could block
-/// a read past even the recv deadline. A fresh connection per request avoids it.
+/// Shared agent; pooling off: a peer-dropped idle socket blocks past recv deadline.
 pub(super) fn agent(timeouts: &LlmTimeouts) -> Agent {
     Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(TIMEOUT_CONNECT_SECS)))
@@ -71,9 +58,7 @@ pub(super) fn agent(timeouts: &LlmTimeouts) -> Agent {
         .into()
 }
 
-/// POST `body` as JSON to `url` with `headers`. Returns the parsed JSON on 2xx,
-/// a classified [`LlmError::Http`] for a non-2xx status (with `Retry-After`
-/// parsed when present), or [`LlmError::Transport`] for a pre-status failure.
+/// POST JSON; non-2xx becomes [`LlmError::Http`] with `Retry-After` when present.
 pub(super) fn post_json(
     agent: &Agent,
     url: &str,
@@ -117,10 +102,7 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Best-effort pre-call token estimate shared by the HTTP backends (~4 chars
-/// per token, never zero for a non-empty conversation). HTTP backends cannot
-/// count exactly without a network round-trip; the real counts arrive in the
-/// response usage.
+/// Pre-call estimate at ~4 chars/token; exact counts only arrive in response usage.
 pub(super) fn estimate_tokens(messages: &[Message]) -> usize {
     let chars: usize = messages.iter().map(message_chars).sum();
     (chars / 4).max(messages.len())

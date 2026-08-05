@@ -7,7 +7,7 @@ pub mod prompts;
 pub mod retrieval;
 pub mod run;
 
-use citadel_ai::Message;
+use citadel_llm::Message;
 use citadel_mem::AtomHit;
 
 use crate::core::benchmark::Benchmark;

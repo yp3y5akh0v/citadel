@@ -5,7 +5,7 @@ pub mod dataset;
 pub mod ingest;
 pub mod prompts;
 
-use citadel_ai::{LLMClient, Message, TokenUsage};
+use citadel_llm::{LLMClient, Message, TokenUsage};
 use citadel_mem::AtomHit;
 
 use crate::core::benchmark::Benchmark;

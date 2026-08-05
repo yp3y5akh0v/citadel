@@ -703,7 +703,7 @@ fn dml_on_one_table_keeps_the_other_tables_segment() {
         Some(AnnIndexSource::Loaded { segment_b3 }) => assert_eq!(segment_b3, info_t.segment_b3),
         other => panic!("t's segment must survive DML on another table: {other:?}"),
     }
-    // `other`'s own segment was purged by its DML and rebuilds honestly.
+    // `other`'s own segment was purged by its DML and rebuilds correctly.
     let _ = ids(
         &conn,
         "SELECT id FROM other ORDER BY v <-> '[1,1,1,1]'::VECTOR(4) LIMIT 3",
@@ -1013,7 +1013,7 @@ fn lookup_refuses_entries_that_predate_the_dml_marker() {
 #[test]
 fn two_indexed_columns_share_one_segment_fail_closed() {
     // The hidden tree is per-TABLE: persisting a second column REPLACES the
-    // first column's segment. The displaced column must degrade to an honest
+    // first column's segment. The displaced column must degrade to a real
     // rebuild (identity mismatch), never serve the wrong column's graph.
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());

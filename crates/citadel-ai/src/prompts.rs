@@ -10,7 +10,7 @@ use rustc_hash::FxHashMap;
 use citadel_mem::{MemError, MemoryEngine};
 use serde_json::Value;
 
-use crate::llm::Message;
+use citadel_llm::Message;
 
 // Curated default system prompts for the cognition-loop call sites.
 const PLANNER_DEFAULT: &str =

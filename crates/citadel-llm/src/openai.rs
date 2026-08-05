@@ -1,8 +1,4 @@
-//! OpenAI Chat Completions backend (native-only, `openai` feature).
-//!
-//! Also serves any OpenAI-compatible endpoint via [`OpenAiClient::with_base_url`].
-//! Tool-call `arguments` are a JSON string on the wire; stringified out,
-//! parsed back in.
+//! OpenAI-compatible Chat Completions; tool-call `arguments` are wire JSON strings.
 
 use serde_json::{json, Value};
 use ureq::Agent;
@@ -18,14 +14,12 @@ pub(super) const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// OpenAI's modern output-token cap field; `max_tokens` is deprecated there.
 pub(super) const OPENAI_MAX_TOKENS_FIELD: &str = "max_completion_tokens";
 
-/// Calls an OpenAI-compatible `/chat/completions` endpoint. The API key is held
-/// only in memory and never logged or persisted.
+/// OpenAI-compatible `/chat/completions` client; API key is never logged or stored.
 pub(crate) struct OpenAiClient {
     model: String,
     base_url: String,
     api_key: String,
-    /// Output-token-cap field: OpenAI wants `max_completion_tokens`, some
-    /// compatible servers (Ollama) only honor `max_tokens`.
+    /// OpenAI wants `max_completion_tokens`; Ollama only honors `max_tokens`.
     max_tokens_field: &'static str,
     /// Optional reasoning_effort (low|medium|high); omitted from the wire when None.
     reasoning_effort: Option<String>,
@@ -36,9 +30,7 @@ pub(crate) struct OpenAiClient {
 }
 
 impl OpenAiClient {
-    /// A client for any OpenAI-compatible endpoint (Together, OpenRouter, a
-    /// local Ollama `/v1`, ...). `base_url` is the path up to but excluding
-    /// `/chat/completions`.
+    /// `base_url` is the path up to but excluding `/chat/completions`.
     pub(crate) fn with_base_url(
         model: impl Into<String>,
         base_url: impl Into<String>,
@@ -62,8 +54,7 @@ impl OpenAiClient {
         self
     }
 
-    /// Override the output-token-cap field for a compatible server (Ollama and
-    /// Gemini's OpenAI-compat layer use `max_tokens`, not `max_completion_tokens`).
+    /// Ollama and Gemini compat want `max_tokens`, not `max_completion_tokens`.
     #[cfg(any(feature = "ollama", feature = "gemini"))]
     pub(super) fn max_tokens_field(mut self, field: &'static str) -> Self {
         self.max_tokens_field = field;
@@ -284,9 +275,7 @@ fn from_wire(
         }
     }
 
-    // Some local models emit a forced tool call as a JSON blob in `content` with an
-    // empty tool_calls array; recover it. Gated on `forced_tool` so the Auto path (a
-    // plain-text reply is a valid answer there) is never reinterpreted.
+    // Local models leak forced tool calls into content; Auto text must stay text.
     if forced_tool && tool_calls.is_empty() {
         if let Some(call) = recover_tool_call(&content, tool_names) {
             tool_calls.push(call);
@@ -392,7 +381,7 @@ fn extract_json_object(s: &str) -> Option<serde_json::Map<String, Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::ToolSpec;
+    use crate::ToolSpec;
 
     #[test]
     fn system_is_first_message_and_tools_are_wrapped() {

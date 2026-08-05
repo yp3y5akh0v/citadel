@@ -21,14 +21,8 @@ citadel-sql = { workspace = true }
 citadel-vector = { workspace = true }
 citadel-mem = { workspace = true }
 # All providers + file/command tools (ureq, no tokio): in the default wheel.
-citadel-ai = { workspace = true, features = [
-    "claude",
-    "openai",
-    "ollama",
-    "gemini",
-    "file-tools",
-    "command-tool",
-] }
+citadel-llm = { workspace = true, features = ["claude", "openai", "ollama", "gemini"] }
+citadel-ai = { workspace = true, features = ["file-tools", "command-tool"] }
 citadel-cli = { workspace = true }
 # MCP server (no tokio); its candle-embed+hub default is off in the workspace dep.
 citadel-mcp = { workspace = true }

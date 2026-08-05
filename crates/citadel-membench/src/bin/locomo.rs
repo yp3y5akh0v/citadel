@@ -37,7 +37,7 @@ use std::error::Error;
 use std::io::Write;
 use std::sync::Arc;
 
-use citadel_ai::LLMClient;
+use citadel_llm::LLMClient;
 use citadel_mem::{
     AtomHit, CandleEmbedder, CrossEncoder, Embedder, FusionWeights, MemoryEngine, RecallQuery,
     RerankStrategy, Reranker,
@@ -181,12 +181,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     // CITADEL_LOCOMO_READER_* / CITADEL_LOCOMO_JUDGE_* (default openai;
     // OPENAI_API_KEY is read inside the factory).
     let reader: Arc<dyn LLMClient> =
-        citadel_ai::factory::from_env("CITADEL_LOCOMO_READER", "openai", DEFAULT_READER_MODEL)
+        citadel_llm::factory::from_env("CITADEL_LOCOMO_READER", "openai", DEFAULT_READER_MODEL)
             .map_err(|e| format!("reader LLM: {e}"))?;
     let reader_model = reader.model_id().to_string();
 
     let judge_candidate: Arc<dyn LLMClient> =
-        citadel_ai::factory::from_env("CITADEL_LOCOMO_JUDGE", "openai", DEFAULT_JUDGE_MODEL)
+        citadel_llm::factory::from_env("CITADEL_LOCOMO_JUDGE", "openai", DEFAULT_JUDGE_MODEL)
             .map_err(|e| format!("judge LLM: {e}"))?;
     let judge_model = judge_candidate.model_id().to_string();
     // Reuse the reader Arc when the judge resolves to the same model.

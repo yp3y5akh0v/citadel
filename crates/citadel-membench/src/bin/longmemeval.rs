@@ -41,7 +41,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
-use citadel_ai::LLMClient;
+use citadel_llm::LLMClient;
 use citadel_mem::{
     CandleEmbedder, CrossEncoder, Embedder, MemoryEngine, MockEmbedder, RecallProfile, RecallQuery,
     RerankStrategy, Reranker,
@@ -155,9 +155,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         return run_retrieval_diag(&eng, &samples, embedder, encrypted, bench_db.reuse);
     }
 
-    let reader: Arc<dyn LLMClient> =
-        citadel_ai::factory::from_env("CITADEL_LONGMEMEVAL_READER", "openai", DEFAULT_READER_MODEL)
-            .map_err(|e| format!("reader LLM: {e}"))?;
+    let reader: Arc<dyn LLMClient> = citadel_llm::factory::from_env(
+        "CITADEL_LONGMEMEVAL_READER",
+        "openai",
+        DEFAULT_READER_MODEL,
+    )
+    .map_err(|e| format!("reader LLM: {e}"))?;
     let reader_model = reader.model_id().to_string();
     let reader_tpm = std::env::var("CITADEL_LONGMEMEVAL_READER_TPM")
         .ok()

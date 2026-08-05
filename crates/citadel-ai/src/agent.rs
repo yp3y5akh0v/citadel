@@ -23,10 +23,6 @@ use crate::graph::{
     BeliefGraph, CoInstantiationCheck, Evidence, Goal, GoalStatus, GraphError, Reflection,
     SelfModel, Task, TaskStatus, Verdict, VerifiedKind, CANDIDATE_KIND,
 };
-use crate::llm::{
-    request_hash, AssistantMessage, CompletionRequest, CompletionResponse, FinishReason, LLMClient,
-    LlmError, Message, TokenUsage, ToolCall, ToolChoice, ToolSpec,
-};
 use crate::prompts::{PromptId, PromptLibrary, ResolvedPrompt};
 use crate::propose::{
     Candidate, Completer, Elite, ProposalContext, ProposalOperator, ProposeError, RejectedCandidate,
@@ -36,13 +32,17 @@ use crate::tools::{
     ToolPermissions, ToolRegistry,
 };
 use crate::verify::{CheckerAttestation, Verifier, VerifyKind, VerifyRequest};
+use citadel_llm::{
+    request_hash, AssistantMessage, CompletionRequest, CompletionResponse, FinishReason, LLMClient,
+    LlmError, Message, TokenUsage, ToolCall, ToolChoice, ToolSpec,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     #[error(transparent)]
     Graph(#[from] GraphError),
     #[error(transparent)]
-    Llm(#[from] crate::llm::LlmError),
+    Llm(#[from] citadel_llm::LlmError),
     #[error("agent: {0}")]
     Other(String),
 }
@@ -1950,9 +1950,9 @@ impl LLMClient for ReplayClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::factory::testing;
     use crate::verify::{CheckerAttestation, VerifyError, VerifyOutcome};
     use citadel::{Argon2Profile, DatabaseBuilder};
+    use citadel_llm::factory::testing;
     use citadel_mem::{MemoryEngine, MockEmbedder};
 
     fn region() -> (tempfile::TempDir, Arc<MemoryEngine>) {
@@ -2371,7 +2371,7 @@ mod tests {
         // from_graph recovers the original model id from the traces (no magic string).
         let (_d2, eng2) = region();
         let graph2 = BeliefGraph::new(eng2, "agent");
-        let replay = crate::llm::factory::replay_from_graph(agent1.graph()).unwrap();
+        let replay = crate::replay::replay_from_graph(agent1.graph()).unwrap();
         let agent2 = Agent::new(
             replay.client(),
             graph2,

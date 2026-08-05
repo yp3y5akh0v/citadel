@@ -1,7 +1,7 @@
 //! Live Ollama smoke test (opt-in, ignored by default).
 //!
-//! Ollama is the local model runner; the model is Meta's Llama (no Chinese-origin
-//! models). This test needs a running daemon with a model pulled.
+//! Ollama is the local model runner; this test pulls Meta's Llama and needs a
+//! running daemon.
 //!
 //! Setup: install Ollama from <https://ollama.com>, then `ollama pull llama3.2:3b`
 //! (the daemon serves on <http://localhost:11434>).
@@ -12,8 +12,8 @@
 
 #![cfg(feature = "ollama")]
 
-use citadel_ai::factory;
-use citadel_ai::{CompletionRequest, FinishReason, Message};
+use citadel_llm::factory;
+use citadel_llm::{CompletionRequest, FinishReason, Message};
 
 #[test]
 #[ignore = "requires a running Ollama daemon with a model pulled (see file header)"]

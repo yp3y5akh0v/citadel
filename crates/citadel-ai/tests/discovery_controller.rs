@@ -6,14 +6,14 @@
 use std::sync::Arc;
 
 use citadel::{Argon2Profile, DatabaseBuilder};
-use citadel_ai::testing;
 use citadel_ai::{
     Agent, AgentBudget, AgentConfig, AgentResult, BeliefGraph, Candidate, CheckerAttestation,
-    Completer, CompletionRequest, CompletionResponse, DiscoveryGoal, DiscoveryReport, Goal,
-    LlmError, Message, ProposalContext, ProposalOperator, ProposeError, RejectedCandidate,
-    ScoredOutcome, TerminatedBy, ToolRegistry, VerifiedKind, Verifier, VerifyError, VerifyOutcome,
-    VerifyRequest,
+    Completer, DiscoveryGoal, DiscoveryReport, Goal, ProposalContext, ProposalOperator,
+    ProposeError, RejectedCandidate, ScoredOutcome, TerminatedBy, ToolRegistry, VerifiedKind,
+    Verifier, VerifyError, VerifyOutcome, VerifyRequest,
 };
+use citadel_llm::testing;
+use citadel_llm::{CompletionRequest, CompletionResponse, LlmError, Message};
 use citadel_mem::{MemoryEngine, MockEmbedder};
 use serde_json::json;
 

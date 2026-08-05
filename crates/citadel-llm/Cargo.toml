@@ -1,0 +1,39 @@
+[package]
+name = "citadeldb-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["llm", "client", "openai", "claude", "ollama"]
+categories = ["api-bindings"]
+description = "Provider-neutral LLM client layer for Citadel: request identity, canonical hashing, Claude/OpenAI/Ollama/Gemini backends"
+readme = "README.md"
+
+[lib]
+name = "citadel_llm"
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+# Keeps wire floats + request hashes identical to the unified workspace build.
+serde_json = { workspace = true, features = ["arbitrary_precision"] }
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+
+# Native-only: ureq does blocking std::net I/O (no wasm).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { workspace = true, optional = true }
+
+[features]
+default = []
+# Closure adapter + `testing` doubles; never a published API.
+test-util = []
+claude = ["dep:ureq"]
+openai = ["dep:ureq"]
+# Ollama uses the OpenAI wire format, so it reuses that adapter.
+ollama = ["openai"]
+# Gemini's OpenAI-compatible endpoint reuses that adapter (fixed URL, `max_tokens`).
+gemini = ["openai"]

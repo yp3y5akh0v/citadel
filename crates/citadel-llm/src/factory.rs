@@ -1,21 +1,16 @@
-//! Backend-agnostic [`LLMClient`] construction by provider name: the single door
-//! to a client - production backends via [`from_env`] / [`build`], closures via
-//! [`from_fn`], the replay double via [`replay_from_graph`], test doubles in
-//! [`testing`]. No silent fallback: an unknown, not-compiled, or key-less provider
-//! is a hard error, never a mock.
+//! [`LLMClient`] construction by provider name; no silent fallback to a mock.
 
 use std::sync::Arc;
 
-use crate::graph::{BeliefGraph, GraphError};
-use crate::llm::mock::MockClient;
+use crate::mock::MockClient;
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(feature = "claude", feature = "openai", feature = "ollama")
 ))]
-use crate::llm::LlmTimeouts;
-use crate::llm::{ClientRequestIdentity, LLMClient};
+use crate::LlmTimeouts;
+use crate::{ClientRequestIdentity, LLMClient};
 #[cfg(any(test, feature = "test-util"))]
-use crate::llm::{CompletionRequest, CompletionResponse, LlmError, Message};
+use crate::{CompletionRequest, CompletionResponse, LlmError, Message};
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
@@ -25,13 +20,7 @@ const KNOWN_PROVIDERS: &[&str] = &["mock", "claude", "openai", "ollama", "gemini
 #[cfg(feature = "gemini")]
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 
-/// Select an [`LLMClient`] from the environment: `{prefix}_PROVIDER` and
-/// `{prefix}_MODEL`, each falling back to the given default. API keys are read
-/// per provider (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`); ollama needs none. An
-/// endpoint override is honored per provider (`OPENAI_BASE_URL` / `OLLAMA_BASE_URL`).
-/// The HTTP receive deadline comes from `CITADEL_AI_LLM_TIMEOUT_SECS` (seconds,
-/// default 120; the send and global deadlines derive from it); HTTP-backend
-/// builds can set it programmatically via `from_env_with_timeouts` instead.
+/// Client from `{prefix}_PROVIDER` / `{prefix}_MODEL` plus any API key it requires.
 pub fn from_env(
     prefix: &str,
     default_provider: &str,
@@ -51,8 +40,7 @@ pub fn request_identity_from_env(
     Ok((model, request_identity_for_provider(&provider)?))
 }
 
-/// [`from_env`] with explicit HTTP deadlines instead of
-/// `CITADEL_AI_LLM_TIMEOUT_SECS`.
+/// [`from_env`] with explicit deadlines instead of `CITADEL_AI_LLM_TIMEOUT_SECS`.
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(feature = "claude", feature = "openai", feature = "ollama")
@@ -67,7 +55,6 @@ pub fn from_env_with_timeouts(
     build_with_timeouts(&provider, &model, timeouts)
 }
 
-/// `{prefix}_PROVIDER` / `{prefix}_MODEL`, each falling back to its default.
 fn provider_model(prefix: &str, default_provider: &str, default_model: &str) -> (String, String) {
     let provider = std::env::var(format!("{prefix}_PROVIDER"))
         .unwrap_or_else(|_| default_provider.to_string());
@@ -76,9 +63,7 @@ fn provider_model(prefix: &str, default_provider: &str, default_model: &str) -> 
     (provider, model)
 }
 
-/// Build an HTTP-backed client for `provider` + `model`, with HTTP deadlines
-/// from `CITADEL_AI_LLM_TIMEOUT_SECS`; any other name defers to [`fallback`].
-/// Compiled only when at least one HTTP backend is enabled.
+/// HTTP client for `provider`/`model`; deadlines from `CITADEL_AI_LLM_TIMEOUT_SECS`.
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(feature = "claude", feature = "openai", feature = "ollama")
@@ -101,29 +86,27 @@ pub fn build_with_timeouts(
         #[cfg(feature = "claude")]
         "claude" => {
             let key = require_key("ANTHROPIC_API_KEY", "claude")?;
-            let client = crate::llm::claude::ClaudeClient::new(model, key);
+            let client = crate::claude::ClaudeClient::new(model, key);
             Ok(Arc::new(client.with_timeouts(timeouts)))
         }
         #[cfg(feature = "openai")]
         "openai" => {
             let key = require_key("OPENAI_API_KEY", "openai")?;
-            let client =
-                crate::llm::openai::OpenAiClient::with_base_url(model, openai_base_url(), key)
-                    .identity_provider("openai");
+            let client = crate::openai::OpenAiClient::with_base_url(model, openai_base_url(), key)
+                .identity_provider("openai");
             Ok(Arc::new(client.with_timeouts(timeouts)))
         }
         #[cfg(feature = "ollama")]
         "ollama" => {
-            let client = crate::llm::ollama::OllamaClient::with_base_url(model, ollama_base_url());
+            let client = crate::ollama::OllamaClient::with_base_url(model, ollama_base_url());
             Ok(Arc::new(client.with_timeouts(timeouts)))
         }
         #[cfg(feature = "gemini")]
         "gemini" => {
-            // Own key so a Gemini reader can coexist with an `openai` judge; the
-            // compat layer wants `max_tokens`, and reasoning effort is optional.
+            // Compat layer wants `max_tokens`; own key so an openai judge coexists.
             let key = require_key("GEMINI_API_KEY", "gemini")?;
             let mut client =
-                crate::llm::openai::OpenAiClient::with_base_url(model, GEMINI_BASE_URL, key)
+                crate::openai::OpenAiClient::with_base_url(model, GEMINI_BASE_URL, key)
                     .max_tokens_field("max_tokens")
                     .identity_provider("gemini");
             if let Some(effort) = gemini_reasoning_effort() {
@@ -137,14 +120,12 @@ pub fn build_with_timeouts(
 
 #[cfg(feature = "openai")]
 fn openai_base_url() -> String {
-    std::env::var("OPENAI_BASE_URL")
-        .unwrap_or_else(|_| crate::llm::openai::DEFAULT_BASE_URL.to_string())
+    std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| crate::openai::DEFAULT_BASE_URL.to_string())
 }
 
 #[cfg(feature = "ollama")]
 fn ollama_base_url() -> String {
-    std::env::var("OLLAMA_BASE_URL")
-        .unwrap_or_else(|_| crate::llm::ollama::OLLAMA_BASE_URL.to_string())
+    std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| crate::ollama::OLLAMA_BASE_URL.to_string())
 }
 
 #[cfg(feature = "gemini")]
@@ -160,13 +141,13 @@ fn request_identity_for_provider(provider: &str) -> Result<ClientRequestIdentity
         "mock" => Ok(ClientRequestIdentity::in_process()),
         #[cfg(feature = "claude")]
         "claude" => {
-            let default_max_tokens = crate::llm::claude::DEFAULT_MAX_TOKENS.to_string();
+            let default_max_tokens = crate::claude::DEFAULT_MAX_TOKENS.to_string();
             Ok(ClientRequestIdentity::from_config(
                 "claude",
-                crate::llm::claude::API_URL,
+                crate::claude::API_URL,
                 &[
                     ("wire", "anthropic-messages-v1"),
-                    ("anthropic-version", crate::llm::claude::API_VERSION),
+                    ("anthropic-version", crate::claude::API_VERSION),
                     ("default_max_tokens", &default_max_tokens),
                 ],
             ))
@@ -177,10 +158,7 @@ fn request_identity_for_provider(provider: &str) -> Result<ClientRequestIdentity
             &openai_base_url(),
             &[
                 ("wire", "openai-chat-completions-v1"),
-                (
-                    "max_tokens_field",
-                    crate::llm::openai::OPENAI_MAX_TOKENS_FIELD,
-                ),
+                ("max_tokens_field", crate::openai::OPENAI_MAX_TOKENS_FIELD),
                 ("reasoning_effort", "<none>"),
             ],
         )),
@@ -212,8 +190,7 @@ fn request_identity_for_provider(provider: &str) -> Result<ClientRequestIdentity
     }
 }
 
-/// `CITADEL_AI_LLM_TIMEOUT_SECS` parsed into deadlines; env config belongs to
-/// the factory, the explicit `*_with_timeouts` paths bypass it.
+/// Deadlines from `CITADEL_AI_LLM_TIMEOUT_SECS`; `*_with_timeouts` bypasses it.
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(feature = "claude", feature = "openai", feature = "ollama")
@@ -222,8 +199,7 @@ fn timeouts_from_env() -> LlmTimeouts {
     parse_timeouts(std::env::var("CITADEL_AI_LLM_TIMEOUT_SECS").ok().as_deref())
 }
 
-/// Pure half of [`timeouts_from_env`]: a numeric value sets the receive
-/// budget; unset or malformed keeps the default.
+/// Pure half of [`timeouts_from_env`]; unset or malformed keeps the default.
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(feature = "claude", feature = "openai", feature = "ollama")
@@ -235,8 +211,7 @@ fn parse_timeouts(value: Option<&str>) -> LlmTimeouts {
         .unwrap_or_default()
 }
 
-/// Mock-only build (wasm, or no HTTP backend enabled): every non-mock provider is
-/// a hard error.
+/// Mock-only build (wasm or no HTTP backend); every non-mock name is an error.
 #[cfg(not(all(
     not(target_arch = "wasm32"),
     any(feature = "claude", feature = "openai", feature = "ollama")
@@ -245,8 +220,7 @@ pub fn build(provider: &str, _: &str) -> Result<Arc<dyn LLMClient>, String> {
     fallback(provider)
 }
 
-/// The non-HTTP outcomes: the always-available mock, a hard error for a
-/// recognized-but-not-compiled provider, or an unknown name.
+/// Non-HTTP outcomes: mock always builds, every other name is a hard error.
 fn fallback(provider: &str) -> Result<Arc<dyn LLMClient>, String> {
     match provider {
         "mock" => Ok(Arc::new(MockClient::replying("mock"))),
@@ -294,7 +268,7 @@ impl TokenCount {
     fn count(&self, messages: &[Message]) -> usize {
         match *self {
             TokenCount::CharsPerToken(n) => {
-                let chars: usize = messages.iter().map(crate::llm::mock::message_chars).sum();
+                let chars: usize = messages.iter().map(crate::mock::message_chars).sum();
                 (chars / n.max(1)).max(messages.len())
             }
             TokenCount::PerMessage(n) => messages.len() * n,
@@ -354,32 +328,6 @@ where
         tokens,
         complete,
     })
-}
-
-/// A record-replay client seeded from a graph's recorded traces (real model id, so
-/// request hashes match). [`Replay::misses`] is 0 on a faithful replay.
-pub fn replay_from_graph(graph: &BeliefGraph) -> Result<Replay, GraphError> {
-    let inner = Arc::new(crate::agent::ReplayClient::from_graph(graph)?);
-    let client: Arc<dyn LLMClient> = inner.clone();
-    Ok(Replay { client, inner })
-}
-
-/// A replay client plus its miss counter (a request with no recorded response
-/// bumps the count and errors).
-pub struct Replay {
-    client: Arc<dyn LLMClient>,
-    inner: Arc<crate::agent::ReplayClient>,
-}
-
-impl Replay {
-    pub fn client(&self) -> Arc<dyn LLMClient> {
-        Arc::clone(&self.client)
-    }
-
-    /// Requests with no recorded response (0 on a clean replay).
-    pub fn misses(&self) -> u32 {
-        self.inner.misses()
-    }
 }
 
 #[cfg(test)]
@@ -459,8 +407,7 @@ mod tests {
         assert!(err.contains("--features claude"), "{err}");
     }
 
-    // The pure half of the env read; mutating CITADEL_AI_LLM_TIMEOUT_SECS in
-    // a parallel test run would race other tests.
+    // Pure half only: mutating CITADEL_AI_LLM_TIMEOUT_SECS would race other tests.
     #[cfg(all(
         not(target_arch = "wasm32"),
         any(feature = "claude", feature = "openai", feature = "ollama")

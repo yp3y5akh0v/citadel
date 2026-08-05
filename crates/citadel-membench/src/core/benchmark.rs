@@ -1,7 +1,7 @@
 //! The contract a benchmark plugin implements; the engine drives recall + reader
 //! through it. Scoring varies per benchmark and is each plugin's own concern.
 
-use citadel_ai::Message;
+use citadel_llm::Message;
 use citadel_mem::AtomHit;
 
 pub trait Benchmark: Sync {

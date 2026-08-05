@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
-use citadel_ai::testing;
+use citadel_llm::testing;
 use citadel_mem::{Embedder, MemoryEngine, MockEmbedder};
 use citadel_membench::benchmarks::longmemeval::{dataset, run, LmevalConfig};
 use citadel_membench::{BenchConfig, Pacer};
@@ -133,11 +133,11 @@ fn agentic_routes_aggregation_and_falls_back_cleanly() {
     // Serial (concurrency 1): q_count consumes the first two scripted responses
     // (extraction JSON + final), q_plain the third (single-prompt).
     let reader = testing::scripted(vec![
-        citadel_ai::CompletionResponse::text(
+        citadel_llm::CompletionResponse::text(
             "[{\"item\":\"dog Rex\",\"date\":\"2023/05/01\"},{\"item\":\"cat Mia\",\"date\":\"2023/05/01\"}]",
         ),
-        citadel_ai::CompletionResponse::text("You mentioned 2 pets."),
-        citadel_ai::CompletionResponse::text("Rex, a golden retriever."),
+        citadel_llm::CompletionResponse::text("You mentioned 2 pets."),
+        citadel_llm::CompletionResponse::text("Rex, a golden retriever."),
     ]);
     let cfg = LmevalConfig {
         bench: BenchConfig {

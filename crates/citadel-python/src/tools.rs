@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use citadel_ai::{
     ExecPolicy, FileReadTool, FileWriteTool, FsPolicy, ListDirTool, MemRecallTool, MemRememberTool,
-    NetworkPolicy, RunCommandTool, Tool, ToolError, ToolPermissions, ToolRegistry, ToolSpec,
+    NetworkPolicy, RunCommandTool, Tool, ToolError, ToolPermissions, ToolRegistry,
 };
+use citadel_llm::ToolSpec;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::IntoPyObjectExt;

@@ -13,6 +13,7 @@ members = [
     "crates/sql-json-path",
     "crates/citadel-vector",
     "crates/citadel-mem",
+    "crates/citadel-llm",
     "crates/citadel-ai",
     "crates/citadel-mcp",
     "crates/citadel-membench",
@@ -36,6 +37,7 @@ default-members = [
     "crates/sql-json-path",
     "crates/citadel-vector",
     "crates/citadel-mem",
+    "crates/citadel-llm",
     "crates/citadel-ai",
     "crates/citadel-mcp",
     "crates/citadel-membench",
@@ -67,6 +69,7 @@ citadel = { package = "citadeldb", path = "citadel", version = "1.13.0" }
 citadel-sql = { package = "citadeldb-sql", path = "crates/citadel-sql", version = "1.13.0" }
 citadel-vector = { package = "citadeldb-vector", path = "crates/citadel-vector", version = "1.13.0" }
 citadel-mem = { package = "citadeldb-mem", path = "crates/citadel-mem", version = "1.13.0" }
+citadel-llm = { package = "citadeldb-llm", path = "crates/citadel-llm", version = "1.13.0" }
 citadel-ai = { package = "citadeldb-ai", path = "crates/citadel-ai", version = "1.13.0" }
 citadel-mcp = { package = "citadeldb-mcp", path = "crates/citadel-mcp", version = "1.13.0", default-features = false }
 citadel-membench = { package = "citadeldb-membench", path = "crates/citadel-membench", version = "1.13.0" }
@@ -96,6 +99,7 @@ thiserror = "2.0"
 
 parking_lot = "0.12"
 rayon = "1.10"
+fs2 = "0.4"
 
 libc = "0.2"
 io-uring = "0.7"

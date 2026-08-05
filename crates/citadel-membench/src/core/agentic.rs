@@ -4,7 +4,7 @@
 //! untouched, so "zero-LLM memory" stays intact. Scores from this path are
 //! reported as a separate labeled number.
 
-use citadel_ai::Message;
+use citadel_llm::Message;
 use citadel_mem::AtomHit;
 use serde::Deserialize;
 

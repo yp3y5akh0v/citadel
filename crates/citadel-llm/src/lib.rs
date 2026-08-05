@@ -1,12 +1,10 @@
-//! The `LLMClient` trait and its request/response types.
-//!
-//! Sync and one-shot (no tokio) to match citadel; parallel tool calls fan out
-//! via rayon at the loop, not here. Backends are feature-gated; `MockClient`
-//! is always built.
+//! Sync one-shot `LLMClient` trait and types; no tokio, rayon fans out at the loop.
 
 pub(crate) mod mock;
 
 pub mod factory;
+#[cfg(any(test, feature = "test-util"))]
+pub use factory::testing;
 
 // HTTP backends are native-only (ureq is blocking std I/O); wasm builds mock only.
 #[cfg(all(not(target_arch = "wasm32"), feature = "claude"))]
@@ -37,12 +35,10 @@ use sha2::{Digest, Sha256};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
-    /// A backend failure that is not HTTP/transport: mock exhaustion, replay
-    /// miss, or a malformed provider response body.
+    /// Non-HTTP/transport failure: mock exhaustion, replay miss, malformed body.
     #[error("llm backend error: {0}")]
     Backend(String),
-    /// A non-2xx HTTP status from a provider. `retry_after` is the parsed
-    /// `Retry-After` header (seconds), when the provider supplied one.
+    /// A non-2xx HTTP status; `retry_after` is the `Retry-After` header in seconds.
     #[error("llm http {status}: {message}")]
     Http {
         status: u16,
@@ -55,8 +51,7 @@ pub enum LlmError {
 }
 
 impl LlmError {
-    /// Whether retrying might succeed: 429/5xx/transport are transient; other 4xx,
-    /// malformed bodies, and mock/replay misses are terminal.
+    /// Whether a retry might succeed: only 429/5xx/transport are transient.
     pub fn is_retryable(&self) -> bool {
         match self {
             LlmError::Http { status, .. } => *status == 429 || (500..600).contains(status),
@@ -66,7 +61,7 @@ impl LlmError {
     }
 
     /// The server-requested retry delay in seconds, if the error carried one.
-    pub(crate) fn retry_after_secs(&self) -> Option<u64> {
+    pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
             LlmError::Http { retry_after, .. } => *retry_after,
             _ => None,
@@ -83,8 +78,7 @@ pub enum Message {
     Tool {
         call_id: String,
         content: String,
-        /// True if the tool call failed; lets a faithful backend mark the
-        /// provider tool-result as an error (e.g. Anthropic `is_error`).
+        /// True if the call failed; sets the wire error flag (Anthropic `is_error`).
         is_error: bool,
     },
 }
@@ -112,8 +106,7 @@ pub struct AssistantMessage {
     pub tool_calls: Vec<ToolCall>,
 }
 
-/// A function-schema tool the model may call. `input_schema` is raw JSON Schema
-/// (the format every provider accepts).
+/// A function-schema tool the model may call; `input_schema` is raw JSON Schema.
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
     pub name: String,
@@ -121,8 +114,7 @@ pub struct ToolSpec {
     pub input_schema: Value,
 }
 
-/// A model's request to invoke a tool. `arguments` is raw JSON, NOT schema-validated
-/// before dispatch - each [`Tool::call`] validates and coerces its own.
+/// A model's tool request; raw `arguments`, unvalidated until `Tool::call`.
 #[derive(Debug, Clone)]
 pub struct ToolCall {
     pub id: String,
@@ -130,8 +122,7 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
-/// How the model may use the offered tools. Mapped per backend in `to_wire` and
-/// folded into `canonical_json`, so the replay key stays deterministic.
+/// How the model may use tools; per-backend `to_wire` map, part of the replay key.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ToolChoice {
     /// Model decides (the provider default when tools are present).
@@ -143,9 +134,7 @@ pub enum ToolChoice {
     Tool(String),
 }
 
-/// Reasoning-spend cap for adaptive-thinking models (Anthropic
-/// `output_config.effort`). Without it a thinking model may spend the whole
-/// `max_tokens` budget reasoning and emit no text at all.
+/// Reasoning cap (Anthropic `output_config.effort`); else a model may emit no text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effort {
     Low,
@@ -172,11 +161,9 @@ pub struct CompletionRequest {
     pub tool_choice: ToolChoice,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
-    /// Reasoning-spend cap; omitted from the wire when `None`. Only set it for
-    /// models that accept `effort` (it 400s on e.g. Sonnet 4.5 / Haiku 4.5).
+    /// Reasoning cap; 400s on models without `effort` (e.g. Sonnet/Haiku 4.5).
     pub effort: Option<Effort>,
-    /// JSON Schema the reply must satisfy via provider structured outputs,
-    /// guaranteeing the first content block is text with valid JSON.
+    /// JSON Schema the reply must satisfy; first content block is valid JSON text.
     pub output_schema: Option<Value>,
     pub stop: Vec<String>,
 }
@@ -325,8 +312,7 @@ impl CompletionResponse {
     }
 }
 
-/// One-shot completion backend. Sync to match citadel; implement the three
-/// methods and plug in via `Arc<dyn LLMClient>`.
+/// One-shot completion backend; sync to match citadel's non-async core.
 pub trait LLMClient: Send + Sync {
     fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, LlmError>;
 
@@ -338,13 +324,11 @@ pub trait LLMClient: Send + Sync {
         ClientRequestIdentity::in_process()
     }
 
-    /// Best-effort token count, used for pre-call budget checks. Local backends
-    /// count exactly; HTTP backends may approximate.
+    /// Best-effort token count for pre-call budget checks; HTTP backends estimate.
     fn count_tokens(&self, messages: &[Message]) -> usize;
 }
 
-/// Deterministic JSON encoding of a request - the replay cache key. Messages keep
-/// their order (semantic); tools are sorted by name; every field is present.
+/// Replay-key JSON: message order semantic, tools name-sorted, every field present.
 pub fn canonical_json(req: &CompletionRequest) -> String {
     let mut tools: Vec<&ToolSpec> = req.tools.iter().collect();
     tools.sort_by(|a, b| a.name.cmp(&b.name));

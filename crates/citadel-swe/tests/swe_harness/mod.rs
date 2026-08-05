@@ -14,10 +14,11 @@ use citadel::{Argon2Profile, DatabaseBuilder};
 #[cfg(feature = "live")]
 use citadel_ai::AgentReport;
 use citadel_ai::{
-    Agent, AgentBudget, AgentConfig, BeliefGraph, CheckerAttestation, CompletionResponse,
-    FileReadTool, FileWriteTool, LLMClient, ListDirTool, RunCommandTool, ToolCall, ToolRegistry,
-    Verifier, VerifyError, VerifyKind, VerifyOutcome, VerifyRequest,
+    Agent, AgentBudget, AgentConfig, BeliefGraph, CheckerAttestation, FileReadTool, FileWriteTool,
+    ListDirTool, RunCommandTool, ToolRegistry, Verifier, VerifyError, VerifyKind, VerifyOutcome,
+    VerifyRequest,
 };
+use citadel_llm::{CompletionResponse, LLMClient, ToolCall};
 use citadel_mem::{Embedder, MemoryEngine, MockEmbedder};
 
 /// The checked-in task fixtures (stable regardless of the current directory).
@@ -208,7 +209,7 @@ pub fn build_agent(
     (memdir, agent)
 }
 
-/// Acceptance checker: certifies the agent's honest belief from its own green `cargo
+/// Acceptance checker: certifies the agent's belief from its own green `cargo
 /// test`, never the hidden test, so the independent scorer stays the truth for `solved`.
 /// Fail-closed; only Acceptance is judged.
 pub struct SweTestVerifier {

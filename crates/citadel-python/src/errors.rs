@@ -3,9 +3,9 @@
 use citadel::Error as CoreError;
 use citadel_ai::agent::AgentError as EngineAgentError;
 use citadel_ai::graph::GraphError;
-use citadel_ai::llm::LlmError as EngineLlmError;
 use citadel_ai::propose::ProposeError;
 use citadel_ai::tools::ToolError;
+use citadel_llm::LlmError as EngineLlmError;
 use citadel_mem::{EmbedError, MemError};
 use citadel_sql::SqlError;
 use citadel_vector::ann::AnnError;

@@ -5,7 +5,7 @@
 //! a bounded, audited critic. A subprocess/SMT/proof-checker impl is the caller's choice.
 
 use crate::graph::Goal;
-use crate::llm::ToolCall;
+use citadel_llm::ToolCall;
 
 /// Which decision a [`Verifier`] is asked to make.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
