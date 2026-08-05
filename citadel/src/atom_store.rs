@@ -33,6 +33,13 @@ const VERSION: u32 = REGION_STORE_VERSION;
 /// Slots appended per growth step once the free list and pre-allocated run are exhausted.
 const GROW_SLOTS: u32 = ATOM_STORE_PREALLOC_SLOTS;
 
+#[cfg(test)]
+std::thread_local! {
+    /// Fault-inject failure after durable LIVE bytes, before the slot returns.
+    static FAIL_LIVE_READBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_BATCH_READBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn build_header(mac_key: &[u8; KEY_SIZE], file_id: u64, slot_count: u32, gen: u64) -> [u8; BLOCK] {
     key_codec::build_header_block(mac_key, ATOM_STORE_MAGIC, VERSION, file_id, slot_count, gen)
 }
@@ -108,9 +115,51 @@ impl AtomKeyStore {
                 truncate_and_sync(path, aligned_len as u64)?;
             }
             let mut free = Vec::new();
+            // A torn erase can leave the sibling copy holding the key; scrub before reuse.
+            let mut stale: Vec<(u32, u64, u64)> = Vec::new();
             for i in 0..slot_count {
-                if view_from(&mac_key, &bytes, i)?.record.state != SlotState::Live {
+                let view = view_from(&mac_key, &bytes, i)?;
+                if view.record.state != SlotState::Live {
                     free.push(i);
+                }
+                if view.record.state == SlotState::Tombstone {
+                    let off = slot_offset(i, !view.authoritative_b);
+                    let o = off as usize;
+                    let sib_clean = parse_slot_block(&mac_key, &bytes[o..o + BLOCK])
+                        .is_some_and(|r| r.state == SlotState::Tombstone);
+                    if !sib_clean {
+                        stale.push((i, view.max_gen, off));
+                    }
+                }
+            }
+            if !stale.is_empty() {
+                let writes: Vec<(u64, [u8; BLOCK])> = stale
+                    .iter()
+                    .map(|&(_, gen, off)| {
+                        (
+                            off,
+                            build_slot_block(
+                                &mac_key,
+                                SlotState::Tombstone,
+                                0,
+                                gen,
+                                &[0u8; WRAPPED_KEY_SIZE],
+                            ),
+                        )
+                    })
+                    .collect();
+                write_blocks_synced(path, &writes)?;
+                let confirm = std::fs::read(path)?;
+                for &(slot, _, off) in &stale {
+                    let o = off as usize;
+                    match parse_slot_block(&mac_key, &confirm[o..o + BLOCK]) {
+                        Some(r) if r.state == SlotState::Tombstone => {}
+                        _ => {
+                            return Err(Error::RegionStoreCorrupt(format!(
+                                "open scrub of atom slot {slot} did not persist"
+                            )))
+                        }
+                    }
                 }
             }
             free.reverse();
@@ -207,9 +256,118 @@ impl AtomKeyStore {
     pub(crate) fn allocate_batch(&mut self, n: usize) -> Result<Vec<u32>> {
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
-            out.push(self.allocate_slot()?);
+            match self.allocate_slot() {
+                Ok(slot) => out.push(slot),
+                Err(source) => {
+                    // Restore every reservation already popped if a later grow fails.
+                    self.free.extend(out.into_iter().rev());
+                    return Err(source);
+                }
+            }
         }
         Ok(out)
+    }
+
+    /// Allocates and binds one atom key; no unguarded post-write error window.
+    pub(crate) fn allocate_write(
+        &mut self,
+        atom_id: u64,
+        wrapped: &[u8; WRAPPED_KEY_SIZE],
+    ) -> Result<(u32, u64)> {
+        let slot = self.allocate_slot()?;
+        match self.write_live(slot, atom_id, wrapped) {
+            Ok(generation) => Ok((slot, generation)),
+            Err(source) => match self.abort_reserved_slot(slot, atom_id) {
+                Ok(()) => Err(source),
+                Err(cleanup) => Err(Error::RegionStoreCorrupt(format!(
+                    "{source}; additionally failed to clean atom slot {slot}: {cleanup}"
+                ))),
+            },
+        }
+    }
+
+    /// Batch allocate and bind; reclaims every reservation on any failure.
+    pub(crate) fn allocate_write_batch(
+        &mut self,
+        items: &[(u64, [u8; WRAPPED_KEY_SIZE])],
+    ) -> Result<Vec<(u32, u64)>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let slots = self.allocate_batch(items.len())?;
+        let writes: Vec<(u32, u64, [u8; WRAPPED_KEY_SIZE])> = slots
+            .iter()
+            .zip(items)
+            .map(|(&slot, (atom_id, wrapped))| (slot, *atom_id, *wrapped))
+            .collect();
+        match self.write_live_batch(&writes) {
+            Ok(generations) => Ok(slots.into_iter().zip(generations).collect()),
+            Err(source) => {
+                let mut cleanup_errors = Vec::new();
+                for (&slot, (atom_id, _)) in slots.iter().zip(items) {
+                    if let Err(error) = self.abort_reserved_slot(slot, *atom_id) {
+                        cleanup_errors.push(format!("slot {slot}: {error}"));
+                    }
+                }
+                if cleanup_errors.is_empty() {
+                    Err(source)
+                } else {
+                    Err(Error::RegionStoreCorrupt(format!(
+                        "{source}; additionally failed to clean atom allocations: {}",
+                        cleanup_errors.join("; ")
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Reclaims a reserved slot; EMPTY is valid under the store lock.
+    fn abort_reserved_slot(&mut self, slot: u32, expected_atom_id: u64) -> Result<()> {
+        let view = self.view(slot)?;
+        match view.record.state {
+            SlotState::Live => {
+                if view.record.region_id != expected_atom_id {
+                    return Err(Error::RegionStoreCorrupt(format!(
+                        "reserved atom slot {slot} changed owner from {expected_atom_id} to {}",
+                        view.record.region_id
+                    )));
+                }
+                self.tombstone(slot, expected_atom_id)?;
+            }
+            SlotState::Tombstone => self.scrub_stale_sibling(slot, &view)?,
+            SlotState::Empty => {
+                let generation = view.max_gen.saturating_add(1);
+                let tombstone = build_slot_block(
+                    &self.mac_key,
+                    SlotState::Tombstone,
+                    0,
+                    generation,
+                    &[0u8; WRAPPED_KEY_SIZE],
+                );
+                for copy_b in [view.authoritative_b, !view.authoritative_b] {
+                    overwrite_in_place(&self.path, slot_offset(slot, copy_b), &tombstone)?;
+                }
+                for copy_b in [false, true] {
+                    match parse_slot_block(
+                        &self.mac_key,
+                        &self.read_block_at(slot_offset(slot, copy_b))?,
+                    ) {
+                        Some(record)
+                            if record.state == SlotState::Tombstone && record.gen == generation => {
+                        }
+                        _ => {
+                            return Err(Error::RegionStoreCorrupt(format!(
+                                "cleanup of reserved atom slot {slot} did not persist"
+                            )))
+                        }
+                    }
+                }
+            }
+        }
+        if !self.free.contains(&slot) {
+            self.free.push(slot);
+        }
+        Ok(())
     }
 
     fn grow(&mut self) -> Result<()> {
@@ -266,6 +424,12 @@ impl AtomKeyStore {
         let target_b = !view.authoritative_b;
         let off = slot_offset(slot, target_b);
         overwrite_in_place(&self.path, off, &block)?;
+        #[cfg(test)]
+        if FAIL_LIVE_READBACK.with(std::cell::Cell::take) {
+            return Err(Error::RegionStoreCorrupt(
+                "injected atom write_live read-back failure".into(),
+            ));
+        }
         // Re-read to confirm persistence before returning.
         match parse_slot_block(&self.mac_key, &self.read_block_at(off)?) {
             Some(r) if r.state == SlotState::Live && r.gen == new_gen => {}
@@ -302,6 +466,12 @@ impl AtomKeyStore {
             gens.push(new_gen);
         }
         write_blocks_synced(&self.path, &writes)?;
+        #[cfg(test)]
+        if FAIL_BATCH_READBACK.with(std::cell::Cell::take) {
+            return Err(Error::RegionStoreCorrupt(
+                "injected atom write_live_batch read-back failure".into(),
+            ));
+        }
         // Marker read-back confirms batch persisted.
         if let Some((off, new_gen)) = marker {
             match parse_slot_block(&self.mac_key, &self.read_block_at(off)?) {
@@ -316,13 +486,38 @@ impl AtomKeyStore {
         Ok(gens)
     }
 
+    /// Scrubs both copies to TOMBSTONE; a torn erase leaves the sibling keyed.
+    fn scrub_stale_sibling(&self, slot: u32, view: &SlotView) -> Result<()> {
+        let off = slot_offset(slot, !view.authoritative_b);
+        if let Some(r) = parse_slot_block(&self.mac_key, &self.read_block_at(off)?) {
+            if r.state == SlotState::Tombstone {
+                return Ok(());
+            }
+        }
+        let tomb = build_slot_block(
+            &self.mac_key,
+            SlotState::Tombstone,
+            0,
+            view.max_gen,
+            &[0u8; WRAPPED_KEY_SIZE],
+        );
+        overwrite_in_place(&self.path, off, &tomb)?;
+        match parse_slot_block(&self.mac_key, &self.read_block_at(off)?) {
+            Some(r) if r.state == SlotState::Tombstone => Ok(()),
+            _ => Err(Error::RegionStoreCorrupt(format!(
+                "sibling scrub of atom slot {slot} did not persist"
+            ))),
+        }
+    }
+
     /// Cryptographically erase `slot`: overwrite both copies in place with a zeroed
     /// TOMBSTONE (`gen+1`), fsync, and read back the authoritative copy to confirm
     /// before returning. Idempotent; frees the slot for reuse on a real transition.
     pub(crate) fn tombstone(&mut self, slot: u32, expected_atom_id: u64) -> Result<()> {
         let view = self.view(slot)?;
         match view.record.state {
-            SlotState::Tombstone => return Ok(()), // already erased + already free
+            // Already erased and free, but the sibling may still hold the key.
+            SlotState::Tombstone => return self.scrub_stale_sibling(slot, &view),
             SlotState::Empty => {
                 return Err(Error::RegionStoreCorrupt(format!(
                     "forget of atom slot {slot} which holds no live key"
@@ -345,7 +540,7 @@ impl AtomKeyStore {
             new_gen,
             &[0u8; WRAPPED_KEY_SIZE],
         );
-        // 1. Overwrite the copy holding the live wrapped key (commit point).
+        // The live copy first: overwriting it is the erase commit point.
         let live_copy_b = view.authoritative_b;
         overwrite_in_place(&self.path, slot_offset(slot, live_copy_b), &tomb)?;
         // Durability gate: re-read that copy and require TOMBSTONE at the new gen.
@@ -360,19 +555,15 @@ impl AtomKeyStore {
                 )))
             }
         }
-        // 2. Overwrite the sibling copy too, then free the slot for reuse.
         overwrite_in_place(&self.path, slot_offset(slot, !live_copy_b), &tomb)?;
         self.free.push(slot);
         Ok(())
     }
 
-    /// Erase many slots with TWO fsyncs (not 2N): overwrite all live copies (the commit point),
-    /// fsync, marker read-back, then all sibling copies and fsync. Skips already-tombstoned
-    /// slots; EMPTY or owner mismatch aborts before any write. Returns each erased slot as
-    /// `(slot, atom_id, old_gen, new_gen)`, confirmed Live -> Tombstone, for an erasure receipt.
+    /// Batch erase, two fsyncs; recycled slots skip, wrong generation fails loud.
     pub(crate) fn tombstone_batch(
         &mut self,
-        items: &[(u32, u64)],
+        items: &[(u32, u64, u64)],
     ) -> Result<Vec<(u32, u64, u64, u64)>> {
         if items.is_empty() {
             return Ok(Vec::new());
@@ -390,11 +581,16 @@ impl AtomKeyStore {
         let mut live_writes: Vec<(u64, [u8; BLOCK])> = Vec::with_capacity(items.len());
         let mut sibling_writes: Vec<(u64, [u8; BLOCK])> = Vec::with_capacity(items.len());
         let mut confirmed: Vec<(u32, u64, u64, u64)> = Vec::with_capacity(items.len());
-        let mut marker: Option<(u64, u64)> = None;
-        for &(slot, atom_id) in items {
+        // The receipt claims per-slot confirmation, so every slot is read back.
+        let mut readbacks: Vec<(u64, u64)> = Vec::with_capacity(items.len());
+        for &(slot, atom_id, expected_gen) in items {
             let view = view_from(&self.mac_key, &image, slot)?;
             match view.record.state {
-                SlotState::Tombstone => continue, // already erased + already free
+                // Already erased and free, but the sibling may still hold the key.
+                SlotState::Tombstone => {
+                    self.scrub_stale_sibling(slot, &view)?;
+                    continue;
+                }
                 SlotState::Empty => {
                     return Err(Error::RegionStoreCorrupt(format!(
                         "forget of atom slot {slot} which holds no live key"
@@ -403,9 +599,13 @@ impl AtomKeyStore {
                 SlotState::Live => {}
             }
             if view.record.region_id != atom_id {
+                // Recycled: the old key is already gone; skip, never wedge.
+                continue;
+            }
+            if view.record.gen != expected_gen {
                 return Err(Error::RegionStoreCorrupt(format!(
-                    "atom slot {slot} holds atom {} not {atom_id}",
-                    view.record.region_id
+                    "atom slot {slot} holds atom {atom_id} at gen {} not {expected_gen}",
+                    view.record.gen
                 )));
             }
             let new_gen = view.max_gen + 1;
@@ -413,7 +613,7 @@ impl AtomKeyStore {
             let live_off = slot_offset(slot, view.authoritative_b);
             live_writes.push((live_off, tomb));
             sibling_writes.push((slot_offset(slot, !view.authoritative_b), tomb));
-            marker = Some((live_off, new_gen));
+            readbacks.push((live_off, new_gen));
             confirmed.push((slot, atom_id, view.record.gen, new_gen));
         }
         if live_writes.is_empty() {
@@ -421,13 +621,14 @@ impl AtomKeyStore {
         }
         // Overwrite all live copies, one fsync: the batch commit point.
         write_blocks_synced(&self.path, &live_writes)?;
-        if let Some((off, new_gen)) = marker {
+        // Per-slot read-back: the proven-destroyed claim must be literally true.
+        for (off, new_gen) in readbacks {
             match parse_slot_block(&self.mac_key, &self.read_block_at(off)?) {
                 Some(r) if r.state == SlotState::Tombstone && r.gen == new_gen => {}
                 _ => {
-                    return Err(Error::RegionStoreCorrupt(
-                        "tombstone_batch marker slot did not persist".into(),
-                    ))
+                    return Err(Error::RegionStoreCorrupt(format!(
+                        "tombstone_batch slot at offset {off} did not persist"
+                    )))
                 }
             }
         }

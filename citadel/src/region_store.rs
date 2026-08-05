@@ -48,6 +48,12 @@ use crate::key_codec::{HEADER_MAC_INPUT, SLOT_MAC_INPUT};
 /// Slots appended per growth step once the pre-allocated run is exhausted.
 const GROW_SLOTS: u32 = REGION_STORE_PREALLOC_SLOTS;
 
+#[cfg(test)]
+std::thread_local! {
+    /// Fault-inject failure after durable LIVE bytes, before the slot returns.
+    static FAIL_LIVE_READBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Build a region-store header block (region magic/version).
 fn build_header_block(
     mac_key: &[u8; KEY_SIZE],
@@ -145,12 +151,20 @@ impl RegionKeyStore {
             if bytes.len() != aligned_len {
                 truncate_and_sync(path, aligned_len as u64)?;
             }
-            Ok(Self {
+            let store = Self {
                 path: path.to_path_buf(),
                 file_id,
                 mac_key,
                 slot_count,
-            })
+            };
+            // A torn erase can leave the sibling copy holding the key; scrub before reuse.
+            for i in 0..slot_count {
+                let view = store.view(&bytes, i)?;
+                if view.record.state == SlotState::Tombstone {
+                    store.scrub_stale_sibling(&bytes, i, &view)?;
+                }
+            }
+            Ok(store)
         } else {
             let slot_count = REGION_STORE_PREALLOC_SLOTS;
             let mut buf = Vec::with_capacity((2 + 2 * slot_count as usize) * BLOCK);
@@ -249,6 +263,70 @@ impl RegionKeyStore {
         Ok(self.slot_count - GROW_SLOTS)
     }
 
+    /// Allocates and binds one region key; on any failure the slot never escapes.
+    pub(crate) fn allocate_write(
+        &mut self,
+        region_id: u64,
+        wrapped: &[u8; WRAPPED_KEY_SIZE],
+    ) -> Result<(u32, u64)> {
+        let slot = self.allocate_slot()?;
+        match self.write_live(slot, region_id, wrapped) {
+            Ok(generation) => Ok((slot, generation)),
+            Err(source) => match self.abort_reserved_slot(slot, region_id) {
+                Ok(()) => Err(source),
+                Err(cleanup) => Err(Error::RegionStoreCorrupt(format!(
+                    "{source}; additionally failed to clean region slot {slot}: {cleanup}"
+                ))),
+            },
+        }
+    }
+
+    /// Reclaims a reserved slot, EMPTY included; safe only under the store lock.
+    fn abort_reserved_slot(&self, slot: u32, expected_region_id: u64) -> Result<()> {
+        let bytes = self.read_file()?;
+        let view = self.view(&bytes, slot)?;
+        match view.record.state {
+            SlotState::Live => {
+                if view.record.region_id != expected_region_id {
+                    return Err(Error::RegionStoreCorrupt(format!(
+                        "reserved region slot {slot} changed owner from {expected_region_id} to {}",
+                        view.record.region_id
+                    )));
+                }
+                self.tombstone(slot, expected_region_id)
+            }
+            SlotState::Tombstone => self.scrub_stale_sibling(&bytes, slot, &view),
+            SlotState::Empty => {
+                let generation = view.max_gen.saturating_add(1);
+                let tombstone = build_slot_block(
+                    &self.mac_key,
+                    SlotState::Tombstone,
+                    0,
+                    generation,
+                    &[0u8; WRAPPED_KEY_SIZE],
+                );
+                for copy_b in [view.authoritative_b, !view.authoritative_b] {
+                    overwrite_in_place(&self.path, slot_offset(slot, copy_b), &tombstone)?;
+                }
+                let confirmed = self.read_file()?;
+                for copy_b in [false, true] {
+                    let offset = slot_offset(slot, copy_b) as usize;
+                    match parse_slot_block(&self.mac_key, &confirmed[offset..offset + BLOCK]) {
+                        Some(record)
+                            if record.state == SlotState::Tombstone && record.gen == generation => {
+                        }
+                        _ => {
+                            return Err(Error::RegionStoreCorrupt(format!(
+                                "cleanup of reserved region slot {slot} did not persist"
+                            )))
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Append `GROW_SLOTS` zeroed-but-MAC'd slot pairs, fsync, then bump the header.
     /// Tail-durable-before-header so a crash mid-grow ignores the orphan tail.
     fn grow(&mut self) -> Result<()> {
@@ -304,6 +382,12 @@ impl RegionKeyStore {
         let target_b = !view.authoritative_b;
         let off = slot_offset(slot, target_b);
         overwrite_in_place(&self.path, off, &block)?;
+        #[cfg(test)]
+        if FAIL_LIVE_READBACK.with(std::cell::Cell::take) {
+            return Err(Error::RegionStoreCorrupt(
+                "injected region write_live read-back failure".into(),
+            ));
+        }
         // Durability gate: re-read the written copy, require LIVE at the new gen.
         let confirm = std::fs::read(&self.path)?;
         let o = off as usize;
@@ -329,7 +413,8 @@ impl RegionKeyStore {
         let bytes = self.read_file()?;
         let view = self.view(&bytes, slot)?;
         match view.record.state {
-            SlotState::Tombstone => return Ok(()),
+            // Already erased, but the sibling may still hold the key.
+            SlotState::Tombstone => return self.scrub_stale_sibling(&bytes, slot, &view),
             SlotState::Empty => {
                 return Err(Error::RegionStoreCorrupt(format!(
                     "forget of slot {slot} which holds no live key"
@@ -372,6 +457,32 @@ impl RegionKeyStore {
         //    copies consistent and removes any partially-written residue).
         overwrite_in_place(&self.path, slot_offset(slot, !live_copy_b), &tomb)?;
         Ok(())
+    }
+
+    /// Scrubs both copies to TOMBSTONE; a torn erase leaves the sibling keyed.
+    fn scrub_stale_sibling(&self, bytes: &[u8], slot: u32, view: &SlotView) -> Result<()> {
+        let off = slot_offset(slot, !view.authoritative_b);
+        let o = off as usize;
+        if let Some(r) = parse_slot_block(&self.mac_key, &bytes[o..o + BLOCK]) {
+            if r.state == SlotState::Tombstone {
+                return Ok(());
+            }
+        }
+        let tomb = build_slot_block(
+            &self.mac_key,
+            SlotState::Tombstone,
+            0,
+            view.max_gen,
+            &[0u8; WRAPPED_KEY_SIZE],
+        );
+        overwrite_in_place(&self.path, off, &tomb)?;
+        let confirm = self.read_file()?;
+        match parse_slot_block(&self.mac_key, &confirm[o..o + BLOCK]) {
+            Some(r) if r.state == SlotState::Tombstone => Ok(()),
+            _ => Err(Error::RegionStoreCorrupt(format!(
+                "sibling scrub of slot {slot} did not persist"
+            ))),
+        }
     }
 
     #[cfg(test)]

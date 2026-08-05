@@ -51,6 +51,30 @@ fn allocate_skips_live_and_recycles_tombstone() {
 }
 
 #[test]
+fn allocate_write_scrubs_a_live_slot_when_post_write_readback_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = store(dir.path());
+    let secret = [0xD7; WRAPPED_KEY_SIZE];
+
+    FAIL_LIVE_READBACK.with(|fail| fail.set(true));
+    let error = s.allocate_write(77, &secret).unwrap_err();
+    assert!(matches!(error, Error::RegionStoreCorrupt(_)));
+
+    let record = s.read_slot(0).unwrap();
+    assert_eq!(record.state, SlotState::Tombstone);
+    let bytes = std::fs::read(&s.path).unwrap();
+    assert!(
+        !contains_window(&bytes, &secret),
+        "the failed allocation must scrub the wrapped key before returning"
+    );
+    assert_eq!(
+        s.allocate_write(78, &[0xE8; WRAPPED_KEY_SIZE]).unwrap().0,
+        0,
+        "the failed reservation is immediately reusable"
+    );
+}
+
+#[test]
 fn tombstone_makes_wrapped_key_unrecoverable() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = store(dir.path());
@@ -156,6 +180,49 @@ fn higher_gen_tombstone_wins_over_torn_live_sibling() {
     overwrite_in_place(&s.path, slot_offset(slot, false), &tomb).unwrap();
 
     assert_eq!(s.read_slot(slot).unwrap().state, SlotState::Tombstone);
+}
+
+/// Torn-erase crash shape: the open scan and a tombstone retry each scrub.
+#[test]
+fn interrupted_erasure_sibling_is_scrubbed_on_open_and_on_retry() {
+    let key = [0x88u8; WRAPPED_KEY_SIZE];
+    let crash_shape = |s: &RegionKeyStore, slot: u32| {
+        let live = build_slot_block(&MAC_KEY, SlotState::Live, 4, 1, &key);
+        let tomb = build_slot_block(
+            &MAC_KEY,
+            SlotState::Tombstone,
+            0,
+            2,
+            &[0u8; WRAPPED_KEY_SIZE],
+        );
+        overwrite_in_place(&s.path, slot_offset(slot, true), &live).unwrap();
+        overwrite_in_place(&s.path, slot_offset(slot, false), &tomb).unwrap();
+    };
+    let key_gone = |path: &std::path::Path| {
+        let raw = std::fs::read(path).unwrap();
+        !raw.windows(WRAPPED_KEY_SIZE).any(|w| w == key)
+    };
+
+    // Reopen scrubs: the wrapped key is now physically unrecoverable.
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    crash_shape(&s, 0);
+    assert!(!key_gone(&s.path), "crash shape holds the key pre-scrub");
+    let reopened = store(dir.path());
+    assert!(key_gone(&reopened.path), "open scrubbed the stale sibling");
+    let raw = std::fs::read(&reopened.path).unwrap();
+    for copy_b in [false, true] {
+        let o = slot_offset(0, copy_b) as usize;
+        let rec = parse_slot_block(&MAC_KEY, &raw[o..o + BLOCK]).unwrap();
+        assert_eq!(rec.state, SlotState::Tombstone);
+    }
+
+    // A tombstone retry on the same shape (no reopen) scrubs too.
+    let dir2 = tempfile::tempdir().unwrap();
+    let s2 = store(dir2.path());
+    crash_shape(&s2, 0);
+    s2.tombstone(0, 4).unwrap();
+    assert!(key_gone(&s2.path), "retry scrubbed the stale sibling");
 }
 
 #[test]
