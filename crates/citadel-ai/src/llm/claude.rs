@@ -10,14 +10,14 @@ use ureq::Agent;
 use super::http::{agent, estimate_tokens, post_json, LlmTimeouts};
 use super::pricing;
 use super::{
-    AssistantMessage, CompletionRequest, CompletionResponse, FinishReason, LLMClient, LlmError,
-    Message, TokenUsage, ToolCall, ToolChoice,
+    AssistantMessage, ClientRequestIdentity, CompletionRequest, CompletionResponse, FinishReason,
+    LLMClient, LlmError, Message, TokenUsage, ToolCall, ToolChoice,
 };
 
-const API_URL: &str = "https://api.anthropic.com/v1/messages";
-const API_VERSION: &str = "2023-06-01";
+pub(super) const API_URL: &str = "https://api.anthropic.com/v1/messages";
+pub(super) const API_VERSION: &str = "2023-06-01";
 /// Anthropic requires `max_tokens`; used when the request leaves it unset.
-const DEFAULT_MAX_TOKENS: u32 = 4096;
+pub(super) const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 /// Calls api.anthropic.com. The API key is held only in memory and never
 /// logged or persisted.
@@ -57,6 +57,19 @@ impl LLMClient for ClaudeClient {
 
     fn model_id(&self) -> &str {
         &self.model
+    }
+
+    fn request_identity(&self) -> ClientRequestIdentity {
+        let default_max_tokens = DEFAULT_MAX_TOKENS.to_string();
+        ClientRequestIdentity::from_config(
+            "claude",
+            API_URL,
+            &[
+                ("wire", "anthropic-messages-v1"),
+                ("anthropic-version", API_VERSION),
+                ("default_max_tokens", &default_max_tokens),
+            ],
+        )
     }
 
     fn count_tokens(&self, messages: &[Message]) -> usize {

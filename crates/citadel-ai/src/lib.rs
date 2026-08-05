@@ -29,8 +29,8 @@ pub use llm::factory::testing;
 ))]
 pub use llm::LlmTimeouts;
 pub use llm::{
-    AssistantMessage, CompletionRequest, CompletionResponse, Effort, FinishReason, LLMClient,
-    LlmError, Message, TokenUsage, ToolCall, ToolChoice, ToolSpec,
+    AssistantMessage, ClientRequestIdentity, CompletionRequest, CompletionResponse, Effort,
+    FinishReason, LLMClient, LlmError, Message, TokenUsage, ToolCall, ToolChoice, ToolSpec,
 };
 pub use prompts::{Prompt, PromptId, PromptLibrary, PromptSource, ResolvedPrompt};
 pub use propose::{

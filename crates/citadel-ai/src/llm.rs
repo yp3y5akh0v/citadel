@@ -1,7 +1,8 @@
 //! The `LLMClient` trait and its request/response types.
 //!
-//! Sync and one-shot (no tokio) to match citadel; parallel tool calls fan out via
-//! rayon at the loop, not here. Backends are feature-gated; `MockClient` is always built.
+//! Sync and one-shot (no tokio) to match citadel; parallel tool calls fan out
+//! via rayon at the loop, not here. Backends are feature-gated; `MockClient`
+//! is always built.
 
 pub(crate) mod mock;
 
@@ -30,7 +31,9 @@ pub(crate) mod openai;
 ))]
 mod pricing;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
@@ -221,6 +224,81 @@ pub struct CompletionResponse {
     pub finish_reason: FinishReason,
 }
 
+/// Non-secret transport/wire identity; closes same-model different-wire aliases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientRequestIdentity {
+    provider: String,
+    endpoint_sha256: String,
+    wire_defaults_sha256: String,
+}
+
+impl ClientRequestIdentity {
+    pub(crate) fn from_config(
+        provider: &str,
+        endpoint: &str,
+        wire_defaults: &[(&str, &str)],
+    ) -> Self {
+        fn put_str(h: &mut Sha256, value: &str) {
+            h.update((value.len() as u64).to_le_bytes());
+            h.update(value.as_bytes());
+        }
+        fn hex(h: Sha256) -> String {
+            h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        let mut endpoint_hash = Sha256::new();
+        put_str(&mut endpoint_hash, "citadel-ai-client-endpoint-v1");
+        put_str(&mut endpoint_hash, endpoint.trim_end_matches('/'));
+
+        let mut defaults_hash = Sha256::new();
+        put_str(&mut defaults_hash, "citadel-ai-client-wire-defaults-v1");
+        defaults_hash.update((wire_defaults.len() as u64).to_le_bytes());
+        for (name, value) in wire_defaults {
+            put_str(&mut defaults_hash, name);
+            put_str(&mut defaults_hash, value);
+        }
+        Self {
+            provider: provider.to_string(),
+            endpoint_sha256: hex(endpoint_hash),
+            wire_defaults_sha256: hex(defaults_hash),
+        }
+    }
+
+    /// Identity for in-process clients; the canonical request is the only wire.
+    pub fn in_process() -> Self {
+        Self::from_config(
+            "in-process",
+            "in-process://llm-client",
+            &[("wire", "completion-request-v1")],
+        )
+    }
+
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn endpoint_sha256(&self) -> &str {
+        &self.endpoint_sha256
+    }
+
+    pub fn wire_defaults_sha256(&self) -> &str {
+        &self.wire_defaults_sha256
+    }
+
+    pub fn is_well_formed(&self) -> bool {
+        let hex64 = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        };
+        !self.provider.trim().is_empty()
+            && hex64(&self.endpoint_sha256)
+            && hex64(&self.wire_defaults_sha256)
+    }
+}
+
 impl CompletionResponse {
     /// A plain text reply with no tool calls.
     pub fn text(content: impl Into<String>) -> Self {
@@ -254,6 +332,11 @@ pub trait LLMClient: Send + Sync {
 
     /// Identifies which model produced a response (for trace logs).
     fn model_id(&self) -> &str;
+
+    /// Effective wire identity; HTTP backends override from their exact config.
+    fn request_identity(&self) -> ClientRequestIdentity {
+        ClientRequestIdentity::in_process()
+    }
 
     /// Best-effort token count, used for pre-call budget checks. Local backends
     /// count exactly; HTTP backends may approximate.

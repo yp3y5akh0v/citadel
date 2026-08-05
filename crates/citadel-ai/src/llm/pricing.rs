@@ -1,7 +1,8 @@
 //! Per-model USD pricing for filling [`TokenUsage::cost_usd`].
 //!
-//! Rates are USD per 1M tokens, point-in-time. An unknown model returns `None`
-//! (no guessed price); only models with confident rates are listed.
+//! Rates are USD per 1M tokens, point-in-time (verified 2026-07). An unknown
+//! model returns `None` (no guessed price); only models with confident rates
+//! are listed.
 
 use super::TokenUsage;
 
@@ -24,6 +25,13 @@ pub(super) fn pricing_for(model_id: &str) -> Option<ModelPricing> {
         (3.0, 15.0)
     } else if model_id.starts_with("claude-haiku-4") {
         (1.0, 5.0)
+    // gpt-4o-mini before gpt-4o: the longer family shares the shorter prefix.
+    } else if model_id.starts_with("gpt-4o-mini") {
+        (0.15, 0.6)
+    } else if model_id.starts_with("gpt-4o") {
+        (2.5, 10.0)
+    } else if model_id.starts_with("gemini-3.5-flash") {
+        (1.5, 9.0)
     } else {
         return None;
     };
@@ -60,6 +68,15 @@ mod tests {
             Some(1.0 + 5.0),
             "family prefix matches a date-suffixed id"
         );
+        assert_eq!(
+            cost_for("gpt-4o-mini", &usage),
+            Some(0.15 + 0.6),
+            "mini is not swallowed by the gpt-4o prefix"
+        );
+        assert_eq!(cost_for("gpt-4o-mini-2024-07-18", &usage), Some(0.15 + 0.6));
+        assert_eq!(cost_for("gpt-4o", &usage), Some(2.5 + 10.0));
+        assert_eq!(cost_for("gpt-4o-2024-08-06", &usage), Some(2.5 + 10.0));
+        assert_eq!(cost_for("gemini-3.5-flash", &usage), Some(1.5 + 9.0));
     }
 
     #[test]

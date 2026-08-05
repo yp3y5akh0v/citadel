@@ -8,12 +8,12 @@ use std::sync::Arc;
 
 use crate::graph::{BeliefGraph, GraphError};
 use crate::llm::mock::MockClient;
-use crate::llm::LLMClient;
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(feature = "claude", feature = "openai", feature = "ollama")
 ))]
 use crate::llm::LlmTimeouts;
+use crate::llm::{ClientRequestIdentity, LLMClient};
 #[cfg(any(test, feature = "test-util"))]
 use crate::llm::{CompletionRequest, CompletionResponse, LlmError, Message};
 
@@ -22,6 +22,8 @@ pub mod testing;
 
 /// Provider names the factory recognizes (whether or not compiled in this build).
 const KNOWN_PROVIDERS: &[&str] = &["mock", "claude", "openai", "ollama", "gemini"];
+#[cfg(feature = "gemini")]
+const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 
 /// Select an [`LLMClient`] from the environment: `{prefix}_PROVIDER` and
 /// `{prefix}_MODEL`, each falling back to the given default. API keys are read
@@ -37,6 +39,16 @@ pub fn from_env(
 ) -> Result<Arc<dyn LLMClient>, String> {
     let (provider, model) = provider_model(prefix, default_provider, default_model);
     build(&provider, &model)
+}
+
+/// Key-free identity resolution for preflight; the live client re-verifies it.
+pub fn request_identity_from_env(
+    prefix: &str,
+    default_provider: &str,
+    default_model: &str,
+) -> Result<(String, ClientRequestIdentity), String> {
+    let (provider, model) = provider_model(prefix, default_provider, default_model);
+    Ok((model, request_identity_for_provider(&provider)?))
 }
 
 /// [`from_env`] with explicit HTTP deadlines instead of
@@ -95,38 +107,108 @@ pub fn build_with_timeouts(
         #[cfg(feature = "openai")]
         "openai" => {
             let key = require_key("OPENAI_API_KEY", "openai")?;
-            let client = match std::env::var("OPENAI_BASE_URL") {
-                Ok(base) => crate::llm::openai::OpenAiClient::with_base_url(model, base, key),
-                Err(_) => crate::llm::openai::OpenAiClient::new(model, key),
-            };
+            let client =
+                crate::llm::openai::OpenAiClient::with_base_url(model, openai_base_url(), key)
+                    .identity_provider("openai");
             Ok(Arc::new(client.with_timeouts(timeouts)))
         }
         #[cfg(feature = "ollama")]
         "ollama" => {
-            let client = match std::env::var("OLLAMA_BASE_URL") {
-                Ok(base) => crate::llm::ollama::OllamaClient::with_base_url(model, base),
-                Err(_) => crate::llm::ollama::OllamaClient::new(model),
-            };
+            let client = crate::llm::ollama::OllamaClient::with_base_url(model, ollama_base_url());
             Ok(Arc::new(client.with_timeouts(timeouts)))
         }
         #[cfg(feature = "gemini")]
         "gemini" => {
             // Own key so a Gemini reader can coexist with an `openai` judge; the
             // compat layer wants `max_tokens`, and reasoning effort is optional.
-            const GEMINI_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
             let key = require_key("GEMINI_API_KEY", "gemini")?;
             let mut client =
-                crate::llm::openai::OpenAiClient::with_base_url(model, GEMINI_BASE, key)
-                    .max_tokens_field("max_tokens");
-            if let Ok(effort) = std::env::var("CITADEL_GEMINI_REASONING_EFFORT") {
-                let effort = effort.trim();
-                if !effort.is_empty() {
-                    client = client.reasoning_effort(effort);
-                }
+                crate::llm::openai::OpenAiClient::with_base_url(model, GEMINI_BASE_URL, key)
+                    .max_tokens_field("max_tokens")
+                    .identity_provider("gemini");
+            if let Some(effort) = gemini_reasoning_effort() {
+                client = client.reasoning_effort(effort);
             }
             Ok(Arc::new(client.with_timeouts(timeouts)))
         }
         other => fallback(other),
+    }
+}
+
+#[cfg(feature = "openai")]
+fn openai_base_url() -> String {
+    std::env::var("OPENAI_BASE_URL")
+        .unwrap_or_else(|_| crate::llm::openai::DEFAULT_BASE_URL.to_string())
+}
+
+#[cfg(feature = "ollama")]
+fn ollama_base_url() -> String {
+    std::env::var("OLLAMA_BASE_URL")
+        .unwrap_or_else(|_| crate::llm::ollama::OLLAMA_BASE_URL.to_string())
+}
+
+#[cfg(feature = "gemini")]
+fn gemini_reasoning_effort() -> Option<String> {
+    std::env::var("CITADEL_GEMINI_REASONING_EFFORT")
+        .ok()
+        .map(|effort| effort.trim().to_string())
+        .filter(|effort| !effort.is_empty())
+}
+
+fn request_identity_for_provider(provider: &str) -> Result<ClientRequestIdentity, String> {
+    match provider {
+        "mock" => Ok(ClientRequestIdentity::in_process()),
+        #[cfg(feature = "claude")]
+        "claude" => {
+            let default_max_tokens = crate::llm::claude::DEFAULT_MAX_TOKENS.to_string();
+            Ok(ClientRequestIdentity::from_config(
+                "claude",
+                crate::llm::claude::API_URL,
+                &[
+                    ("wire", "anthropic-messages-v1"),
+                    ("anthropic-version", crate::llm::claude::API_VERSION),
+                    ("default_max_tokens", &default_max_tokens),
+                ],
+            ))
+        }
+        #[cfg(feature = "openai")]
+        "openai" => Ok(ClientRequestIdentity::from_config(
+            "openai",
+            &openai_base_url(),
+            &[
+                ("wire", "openai-chat-completions-v1"),
+                (
+                    "max_tokens_field",
+                    crate::llm::openai::OPENAI_MAX_TOKENS_FIELD,
+                ),
+                ("reasoning_effort", "<none>"),
+            ],
+        )),
+        #[cfg(feature = "ollama")]
+        "ollama" => Ok(ClientRequestIdentity::from_config(
+            "ollama",
+            &ollama_base_url(),
+            &[
+                ("wire", "openai-chat-completions-v1"),
+                ("max_tokens_field", "max_tokens"),
+                ("reasoning_effort", "<none>"),
+            ],
+        )),
+        #[cfg(feature = "gemini")]
+        "gemini" => {
+            let effort = gemini_reasoning_effort();
+            Ok(ClientRequestIdentity::from_config(
+                "gemini",
+                GEMINI_BASE_URL,
+                &[
+                    ("wire", "openai-chat-completions-v1"),
+                    ("max_tokens_field", "max_tokens"),
+                    ("reasoning_effort", effort.as_deref().unwrap_or("<none>")),
+                ],
+            ))
+        }
+        p if KNOWN_PROVIDERS.contains(&p) => Err(not_compiled(p)),
+        p => Err(unknown_provider(p)),
     }
 }
 
@@ -304,10 +386,60 @@ impl Replay {
 mod tests {
     use super::*;
 
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(feature = "claude", feature = "openai", feature = "ollama")
+    ))]
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(feature = "claude", feature = "openai", feature = "ollama")
+    ))]
+    struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(feature = "claude", feature = "openai", feature = "ollama")
+    ))]
+    impl EnvGuard {
+        fn set(values: &[(&'static str, Option<&str>)]) -> Self {
+            let old = values
+                .iter()
+                .map(|(name, _)| (*name, std::env::var_os(name)))
+                .collect();
+            for (name, value) in values {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            Self(old)
+        }
+    }
+
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(feature = "claude", feature = "openai", feature = "ollama")
+    ))]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
     #[test]
     fn mock_is_always_available() {
         let llm = from_env("CITADEL_FACTORY_TEST_UNSET", "mock", "ignored").unwrap();
         assert_eq!(llm.model_id(), "mock");
+        let (_, resolved) =
+            request_identity_from_env("CITADEL_FACTORY_IDENTITY_UNSET", "mock", "ignored").unwrap();
+        assert_eq!(resolved, llm.request_identity());
     }
 
     #[test]
@@ -343,15 +475,65 @@ mod tests {
     #[cfg(all(not(target_arch = "wasm32"), feature = "ollama"))]
     #[test]
     fn from_env_reads_prefix_provider_and_model() {
-        std::env::set_var("CITADEL_ENVTEST_PROVIDER", "ollama");
-        std::env::set_var("CITADEL_ENVTEST_MODEL", "llama-envtest");
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("CITADEL_ENVTEST_PROVIDER", Some("ollama")),
+            ("CITADEL_ENVTEST_MODEL", Some("llama-envtest")),
+        ]);
         let llm = from_env("CITADEL_ENVTEST", "mock", "default-model").unwrap();
-        std::env::remove_var("CITADEL_ENVTEST_PROVIDER");
-        std::env::remove_var("CITADEL_ENVTEST_MODEL");
         assert_eq!(
             llm.model_id(),
             "llama-envtest",
             "PROVIDER+MODEL env honored"
         );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "openai"))]
+    #[test]
+    fn openai_pure_identity_matches_built_custom_endpoint() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("OPENAI_API_KEY", Some("not-a-real-key")),
+            (
+                "OPENAI_BASE_URL",
+                Some("https://gateway.invalid/custom/v1/"),
+            ),
+        ]);
+        let expected = request_identity_for_provider("openai").unwrap();
+        let client = build("openai", "same-model").unwrap();
+        assert_eq!(expected, client.request_identity());
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "ollama"))]
+    #[test]
+    fn ollama_pure_identity_matches_built_custom_endpoint() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[("OLLAMA_BASE_URL", Some("http://localhost:19999/custom/v1/"))]);
+        let expected = request_identity_for_provider("ollama").unwrap();
+        let client = build("ollama", "same-model").unwrap();
+        assert_eq!(expected, client.request_identity());
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "gemini"))]
+    #[test]
+    fn gemini_pure_identity_matches_built_reasoning_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("GEMINI_API_KEY", Some("not-a-real-key")),
+            ("CITADEL_GEMINI_REASONING_EFFORT", Some("low")),
+        ]);
+        let expected = request_identity_for_provider("gemini").unwrap();
+        let client = build("gemini", "same-model").unwrap();
+        assert_eq!(expected, client.request_identity());
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "claude"))]
+    #[test]
+    fn claude_pure_identity_matches_built_client() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[("ANTHROPIC_API_KEY", Some("not-a-real-key"))]);
+        let expected = request_identity_for_provider("claude").unwrap();
+        let client = build("claude", "same-model").unwrap();
+        assert_eq!(expected, client.request_identity());
     }
 }
