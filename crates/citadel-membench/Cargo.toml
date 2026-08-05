@@ -19,7 +19,6 @@ name = "citadel_membench"
 [dependencies]
 citadel-mem = { workspace = true }
 citadel-llm = { workspace = true }
-citadel-ai = { workspace = true }
 citadel = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
