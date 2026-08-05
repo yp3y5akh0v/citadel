@@ -237,14 +237,14 @@ impl RegionKeyStore {
         Ok(self.view(&bytes, i)?.record)
     }
 
-    /// `(slot, region_id)` for every LIVE slot.
-    pub(crate) fn live_owners(&self) -> Result<Vec<(u32, u64)>> {
+    /// `(slot, region_id, generation)` for every LIVE slot.
+    pub(crate) fn live_bindings(&self) -> Result<Vec<(u32, u64, u64)>> {
         let bytes = self.read_file()?;
         let mut live = Vec::new();
         for i in 0..self.slot_count {
             let rec = self.view(&bytes, i)?.record;
             if rec.state == SlotState::Live {
-                live.push((i, rec.region_id));
+                live.push((i, rec.region_id, rec.gen));
             }
         }
         Ok(live)

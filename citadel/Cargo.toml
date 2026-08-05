@@ -20,6 +20,8 @@ default = ["audit-log"]
 io-uring = ["citadel-io/io-uring"]
 fips = ["citadel-crypto/fips"]
 audit-log = ["dep:hmac", "dep:sha2"]
+# Internal crash-window hooks for downstream crates' tests; not a stable API.
+test-util = []
 
 [dependencies]
 citadel-core = { workspace = true }

@@ -480,15 +480,15 @@ fn tombstone_erases_sibling_copy_residue() {
 }
 
 #[test]
-fn live_owners_returns_exact_live_slot_region_pairs_in_order() {
+fn live_bindings_returns_exact_live_slot_region_gen_triples_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path());
-    s.write_live(2, 100, &[0xA2; WRAPPED_KEY_SIZE]).unwrap();
+    let g2 = s.write_live(2, 100, &[0xA2; WRAPPED_KEY_SIZE]).unwrap();
     s.write_live(3, 150, &[0xA3; WRAPPED_KEY_SIZE]).unwrap();
-    s.write_live(4, 200, &[0xA4; WRAPPED_KEY_SIZE]).unwrap();
+    let g4 = s.write_live(4, 200, &[0xA4; WRAPPED_KEY_SIZE]).unwrap();
     s.tombstone(3, 150).unwrap();
-    let owners = s.live_owners().unwrap();
-    assert_eq!(owners, vec![(2u32, 100u64), (4u32, 200u64)]);
+    let bindings = s.live_bindings().unwrap();
+    assert_eq!(bindings, vec![(2u32, 100u64, g2), (4u32, 200u64, g4)]);
 }
 
 #[test]

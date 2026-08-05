@@ -315,3 +315,86 @@ fn reopen_recovers_state_and_reuses_tombstones() {
     );
     assert!(!reused.contains(&live_slot), "live slot is not handed out");
 }
+
+#[test]
+fn normalize_torn_tombstones_finishes_an_interrupted_batch_erase() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = store(dir.path());
+    let bound = s
+        .allocate_write_batch(&[(41, wrapped(0x41)), (42, wrapped(0x42))])
+        .unwrap();
+    let items: Vec<(u32, u64, u64)> = bound
+        .iter()
+        .zip([41u64, 42u64])
+        .map(|(&(slot, gen), atom)| (slot, atom, gen))
+        .collect();
+
+    // Die after the first durable update (live copies), before the siblings.
+    fail_next_batch_before_sibling();
+    let err = s.tombstone_batch(&items).unwrap_err();
+    assert!(
+        err.to_string().contains("before the sibling scrub"),
+        "{err}"
+    );
+    for &(slot, _) in &bound {
+        assert_eq!(s.read_slot(slot).unwrap().state, SlotState::Tombstone);
+        let copies = s.slot_copies(slot).unwrap();
+        assert!(
+            copies
+                .iter()
+                .any(|c| c.as_ref().map(|r| r.state) != Some(SlotState::Tombstone)),
+            "precondition: a stale sibling record, got {copies:?}"
+        );
+    }
+
+    let repaired = s.normalize_torn_tombstones().unwrap();
+    assert_eq!(repaired, 2, "both torn slots repaired");
+    assert_eq!(s.normalize_torn_tombstones().unwrap(), 0, "idempotent");
+    for &(slot, _) in &bound {
+        let copies = s.slot_copies(slot).unwrap();
+        assert!(
+            copies
+                .iter()
+                .all(|c| c.as_ref().is_some_and(|r| r.state == SlotState::Tombstone)),
+            "both duplicate records normalized, got {copies:?}"
+        );
+    }
+
+    // The torn erase failed before its free push; normalization must restore the slots.
+    let mut reused = vec![s.allocate_slot().unwrap(), s.allocate_slot().unwrap()];
+    reused.sort_unstable();
+    let mut torn: Vec<u32> = bound.iter().map(|&(slot, _)| slot).collect();
+    torn.sort_unstable();
+    assert_eq!(reused, torn, "repaired slots are allocatable again");
+}
+
+#[test]
+fn tombstone_retries_restore_a_stranded_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = store(dir.path());
+    let (slot_a, gen_a) = s.allocate_write(71, &wrapped(0x71)).unwrap();
+    let (slot_b, gen_b) = s.allocate_write(72, &wrapped(0x72)).unwrap();
+
+    // Strand both slots: torn erases that failed before their free push.
+    fail_next_batch_before_sibling();
+    s.tombstone_batch(&[(slot_a, 71, gen_a)]).unwrap_err();
+    fail_next_batch_before_sibling();
+    s.tombstone_batch(&[(slot_b, 72, gen_b)]).unwrap_err();
+    assert!(!s.free.contains(&slot_a) && !s.free.contains(&slot_b));
+
+    // The single retry converges and restores its slot...
+    s.tombstone(slot_a, 71).unwrap();
+    assert!(s.free.contains(&slot_a));
+    // ...and so does the batch retry (a no-op receipt, never a wedge).
+    assert!(s
+        .tombstone_batch(&[(slot_b, 72, gen_b)])
+        .unwrap()
+        .is_empty());
+    assert!(s.free.contains(&slot_b));
+    for slot in [slot_a, slot_b] {
+        let copies = s.slot_copies(slot).unwrap();
+        assert!(copies
+            .iter()
+            .all(|c| c.as_ref().is_some_and(|r| r.state == SlotState::Tombstone)));
+    }
+}

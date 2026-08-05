@@ -25,6 +25,38 @@ fn open_db(path: &std::path::Path) -> Arc<Database> {
     )
 }
 
+/// Probe chunk 0 in the raw segment tree; the SQL catalog never sees it.
+fn seg_chunks_exist(db: &Database, region_id: RegionId, dim: u16) -> bool {
+    let table = atoms_table(dim, EmbeddingMetric::Cosine, true);
+    let seg = sealed_segment_table(&table, region_id);
+    let mut rtx = db.begin_read();
+    matches!(
+        rtx.table_get(seg.as_bytes(), &0u32.to_be_bytes()),
+        Ok(Some(_))
+    )
+}
+
+/// Whether the segment chunk TREE exists at all (even holed or empty).
+fn seg_tree_exists(db: &Database, region_id: RegionId, dim: u16) -> bool {
+    let table = atoms_table(dim, EmbeddingMetric::Cosine, true);
+    let seg = sealed_segment_table(&table, region_id);
+    db.begin_read()
+        .table_root_page(seg.as_bytes())
+        .unwrap()
+        .is_some()
+}
+
+fn open_enc_db(path: &std::path::Path) -> Arc<Database> {
+    Arc::new(
+        DatabaseBuilder::new(path.join("m.db"))
+            .passphrase(b"test-passphrase")
+            .enable_region_keys(true)
+            .argon2_profile(Argon2Profile::Iot)
+            .open()
+            .unwrap(),
+    )
+}
+
 fn create_enc_db(path: &std::path::Path) -> Arc<Database> {
     Arc::new(
         DatabaseBuilder::new(path.join("m.db"))
@@ -1985,7 +2017,7 @@ fn failed_sealed_ann_persist_cleans_key_chunks_and_metadata_before_return() {
     let table = atoms_table(8, EmbeddingMetric::Cosine, true);
     let seg_table = sealed_segment_table(&table, region_id);
 
-    FAIL_SEALED_SEGMENT_AFTER_CHUNKS.store(true, std::sync::atomic::Ordering::SeqCst);
+    FAIL_SEALED_SEGMENT_AFTER_CHUNKS.with(|f| f.set(true));
     let err = eng.persist_ann_index("ann-rollback").unwrap_err();
     assert!(
         err.to_string().contains("after chunk commit"),
@@ -3469,6 +3501,1196 @@ fn replace_outgoing_edges_requires_truly_live_endpoints() {
         .replace_outgoing_edges("v", src, EdgeKind::SimilarTo, &[(dst, 0.5, None)])
         .unwrap_err();
     assert!(err.to_string().contains("not live"), "{err}");
+}
+
+#[test]
+fn key_destruction_bumps_the_cache_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng.remember("v", AtomInput::new("fact", "x")).unwrap();
+
+    let before = db.cache_epoch();
+    eng.forget_atom("v", a).unwrap();
+    let after_forget = db.cache_epoch();
+    assert!(
+        after_forget > before,
+        "atom key tombstone must arm the epoch"
+    );
+
+    eng.drop_region("v").unwrap();
+    assert!(
+        db.cache_epoch() > after_forget,
+        "region key tombstone must arm the epoch"
+    );
+}
+
+#[test]
+fn failed_erase_arms_the_epoch_retires_the_segment_and_reopen_converges() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let region_id = eng
+        .create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let secret = eng
+        .remember("v", AtomInput::new("fact", "doomed secret"))
+        .unwrap();
+    let keep = eng
+        .remember("v", AtomInput::new("fact", "kept note"))
+        .unwrap();
+    eng.persist_ann_index("v").unwrap();
+
+    // Capture the lifecycle bindings before the interruption.
+    let conn = Connection::open(&db).unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let qr = conn
+        .query_params(
+            &format!("SELECT key_slot FROM {table} WHERE id = $1"),
+            &[Value::Integer(secret)],
+        )
+        .unwrap();
+    let secret_slot = as_int(&qr.rows[0][0]).unwrap() as u32;
+    let (seg_slot, _, _) = read_annseg_meta(&conn, region_id).unwrap().unwrap();
+    drop(conn);
+
+    // Warm the decrypted cache before the interrupted erase.
+    let warm: Vec<AtomId> = eng
+        .recall("v", RecallQuery::by_text("doomed secret", 10))
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    assert!(warm.contains(&secret));
+
+    let before = db.cache_epoch();
+    FAIL_ERASE_BEFORE_ROW_DELETE.with(|f| f.set(true));
+    let err = eng.forget_atoms("v", &[secret], false).unwrap_err();
+    assert!(err.to_string().contains("injected"), "{err}");
+    assert!(db.cache_epoch() > before, "epoch armed before the failure");
+
+    // Boundary: both keys Tombstone, tree and meta gone, the row alone survives.
+    assert_eq!(
+        db.atom_store_slot(secret_slot).unwrap().state,
+        SlotState::Tombstone
+    );
+    assert_eq!(
+        db.atom_store_slot(seg_slot).unwrap().state,
+        SlotState::Tombstone
+    );
+    assert!(!seg_chunks_exist(&db, region_id, 8));
+    let conn = Connection::open(&db).unwrap();
+    assert!(
+        read_annseg_meta(&conn, region_id).unwrap().is_none(),
+        "segment must retire before the commit"
+    );
+    let row = conn
+        .query_params(
+            &format!("SELECT id FROM {table} WHERE id = $1"),
+            &[Value::Integer(secret)],
+        )
+        .unwrap();
+    assert!(
+        !row.rows.is_empty(),
+        "the row outlives its key, never the reverse"
+    );
+    drop(conn);
+
+    // The row remains, but the warmed cache must refuse the stale plaintext.
+    let hits: Vec<AtomId> = eng
+        .recall("v", RecallQuery::by_text("doomed secret", 10))
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    assert!(
+        !hits.contains(&secret),
+        "stale cache served an erased atom: {hits:?}"
+    );
+    assert!(hits.contains(&keep));
+
+    // Reopen finishes the erase; only a direct table read observes the delete.
+    drop(eng);
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let residue = conn
+        .query_params(
+            &format!("SELECT id FROM {table} WHERE id = $1"),
+            &[Value::Integer(secret)],
+        )
+        .unwrap();
+    assert!(
+        residue.rows.is_empty(),
+        "reconcile must delete the residue row"
+    );
+    assert!(eng.fetch_one("v", keep).unwrap().is_some());
+}
+
+#[test]
+fn cascade_retires_the_segment_before_its_txn_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let region_id = eng
+        .create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let turn = eng.remember("v", AtomInput::new("turn", "root")).unwrap();
+    eng.remember_derived("v", AtomInput::new("derived", "cites"), &[turn], None)
+        .unwrap();
+    eng.persist_ann_index("v").unwrap();
+
+    FAIL_CASCADE_BEFORE_TXN.with(|f| f.set(true));
+    let err = eng
+        .forget_atoms_with_dependents("v", &[turn], false)
+        .unwrap_err();
+    assert!(err.to_string().contains("injected"), "{err}");
+
+    // The segment retired before the txn ever ran; the atoms are untouched.
+    let conn = Connection::open(&db).unwrap();
+    assert!(read_annseg_meta(&conn, region_id).unwrap().is_none());
+    drop(conn);
+    assert!(eng.fetch_one("v", turn).unwrap().is_some());
+
+    // The retry completes the cascade in full.
+    let receipt = eng
+        .forget_atoms_with_dependents("v", &[turn], false)
+        .unwrap();
+    assert_eq!(receipt.rows_deleted, 2);
+    assert_eq!(receipt.erased_count, 2);
+}
+
+#[test]
+fn reconcile_deletes_rows_whose_key_gen_moved() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng
+        .remember("v", AtomInput::new("fact", "gen drift"))
+        .unwrap();
+    drop(eng);
+
+    // (slot, owner) still matches; only the gen bind catches the drifted row.
+    let conn = Connection::open(&db).unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    conn.execute_params(
+        &format!("UPDATE {table} SET key_gen = key_gen + 1 WHERE id = $1"),
+        &[Value::Integer(a)],
+    )
+    .unwrap();
+    drop(conn);
+
+    let _eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let residue = conn
+        .query_params(
+            &format!("SELECT id FROM {table} WHERE id = $1"),
+            &[Value::Integer(a)],
+        )
+        .unwrap();
+    assert!(
+        residue.rows.is_empty(),
+        "gen-drifted row must reconcile away"
+    );
+    assert!(
+        db.atom_store_live_owners()
+            .unwrap()
+            .iter()
+            .all(|&(_, owner)| owner != a as u64),
+        "the unreferenced slot must be reclaimed"
+    );
+}
+
+#[test]
+fn reconcile_tombstones_drift_keys_before_rows_and_converges() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng.remember("v", AtomInput::new("fact", "drift")).unwrap();
+    drop(eng);
+
+    let conn = Connection::open(&db).unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    conn.execute_params(
+        &format!("UPDATE {table} SET key_gen = key_gen + 1 WHERE id = $1"),
+        &[Value::Integer(a)],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Interrupt between drift-key tombstones and row deletes: keys die first.
+    FAIL_RECONCILE_AFTER_DRIFT_KEYS.with(|f| f.set(true));
+    assert!(MemoryEngine::open(Arc::clone(&db)).is_err());
+    assert!(db
+        .atom_store_live_owners()
+        .unwrap()
+        .iter()
+        .all(|&(_, owner)| owner != a as u64));
+    let conn = Connection::open(&db).unwrap();
+    let rows = conn
+        .query_params(
+            &format!("SELECT id FROM {table} WHERE id = $1"),
+            &[Value::Integer(a)],
+        )
+        .unwrap();
+    assert!(
+        !rows.rows.is_empty(),
+        "the row outlives its key, never the reverse"
+    );
+    drop(conn);
+
+    // The retry converges: the key-dead row reconciles away.
+    let _eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let rows = conn
+        .query_params(
+            &format!("SELECT id FROM {table} WHERE id = $1"),
+            &[Value::Integer(a)],
+        )
+        .unwrap();
+    assert!(rows.rows.is_empty());
+}
+
+#[test]
+fn reconcile_drops_orphan_chunk_trees_without_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let region_id = eng
+        .create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.remember("v", AtomInput::new("fact", "x")).unwrap();
+    eng.persist_ann_index("v").unwrap();
+    drop(eng);
+
+    // Crash after chunk commit, before metadata publication: chunks, no meta.
+    let conn = Connection::open(&db).unwrap();
+    let (seg_slot, _, _) = read_annseg_meta(&conn, region_id).unwrap().unwrap();
+    for field in ["slot", "gen", "id"] {
+        conn.execute_params(
+            "DELETE FROM memory_meta WHERE key = $1",
+            &[Value::Text(format!("annseg_{field}:{region_id}").into())],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    assert!(seg_chunks_exist(&db, region_id, 8), "probe sanity");
+    assert_eq!(db.atom_store_slot(seg_slot).unwrap().state, SlotState::Live);
+
+    let _eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    assert!(
+        !seg_tree_exists(&db, region_id, 8),
+        "meta-less chunk tree must be swept"
+    );
+    assert_eq!(
+        db.atom_store_slot(seg_slot).unwrap().state,
+        SlotState::Tombstone,
+        "the unreferenced segment key must die"
+    );
+}
+
+#[test]
+fn content_changes_bump_the_cache_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng
+        .remember("v", AtomInput::new("fact", "mutable"))
+        .unwrap();
+
+    let e0 = db.cache_epoch();
+    eng.update_atom_payload("v", a, &serde_json::json!({"v": 2}))
+        .unwrap();
+    let e1 = db.cache_epoch();
+    assert!(e1 > e0, "sealed payload rewrite must arm the epoch");
+
+    assert_eq!(eng.set_importance("v", &[(a, 0.5)]).unwrap(), 1);
+    let e2 = db.cache_epoch();
+    assert!(e2 > e1, "an importance change must arm the epoch");
+    assert_eq!(eng.set_importance("v", &[(a, 0.5)]).unwrap(), 0);
+    assert_eq!(db.cache_epoch(), e2, "a converged pass writes nothing");
+
+    eng.evolve("v", a, 1, f32::MAX).unwrap();
+    assert!(db.cache_epoch() > e2, "evolve must arm the epoch");
+
+    // Armed even on a failed write, and again after: no cache can stamp current between.
+    let e3 = db.cache_epoch();
+    assert!(db.atom_store_tombstone(u32::MAX, 1).is_err());
+    assert!(
+        db.cache_epoch() >= e3 + 2,
+        "tombstone must bump before AND after the attempt"
+    );
+}
+
+#[test]
+fn interrupted_erase_converges_after_a_genuine_disk_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (secret, keep, region_id) = {
+        let db = create_enc_db(dir.path());
+        let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+        let region_id = eng
+            .create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+            .unwrap();
+        let secret = eng.remember("v", AtomInput::new("fact", "doomed")).unwrap();
+        let keep = eng.remember("v", AtomInput::new("fact", "kept")).unwrap();
+        eng.persist_ann_index("v").unwrap();
+        FAIL_ERASE_BEFORE_ROW_DELETE.with(|f| f.set(true));
+        eng.forget_atoms("v", &[secret], false).unwrap_err();
+        (secret, keep, region_id)
+        // Everything drops here: the interrupted state is only on disk.
+    };
+
+    let db = open_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let residue = conn
+        .query_params(
+            &format!("SELECT id FROM {table} WHERE id = $1"),
+            &[Value::Integer(secret)],
+        )
+        .unwrap();
+    assert!(residue.rows.is_empty(), "disk reopen must finish the erase");
+    assert!(read_annseg_meta(&conn, region_id).unwrap().is_none());
+    drop(conn);
+    assert!(eng.fetch_one("v", keep).unwrap().is_some());
+    let hits: Vec<AtomId> = eng
+        .recall("v", RecallQuery::by_text("doomed", 10))
+        .unwrap()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+    assert!(!hits.contains(&secret));
+}
+
+#[test]
+fn reconcile_clears_incomplete_segment_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let region_id = eng
+        .create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.remember("v", AtomInput::new("fact", "x")).unwrap();
+    eng.persist_ann_index("v").unwrap();
+    drop(eng);
+
+    // Break the record (older binary / direct SQL): one meta key disappears.
+    let conn = Connection::open(&db).unwrap();
+    let (seg_slot, _, _) = read_annseg_meta(&conn, region_id).unwrap().unwrap();
+    conn.execute_params(
+        "DELETE FROM memory_meta WHERE key = $1",
+        &[Value::Text(format!("annseg_id:{region_id}").into())],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(seg_chunks_exist(&db, region_id, 8), "probe sanity");
+    let _eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    assert_eq!(
+        db.atom_store_slot(seg_slot).unwrap().state,
+        SlotState::Tombstone,
+        "the unreferenced segment key must die"
+    );
+    let conn = Connection::open(&db).unwrap();
+    let leftovers = conn
+        .query_params("SELECT key FROM memory_meta WHERE key LIKE 'annseg_%'", &[])
+        .unwrap();
+    assert!(leftovers.rows.is_empty(), "incomplete metadata must clear");
+    assert!(
+        !seg_chunks_exist(&db, region_id, 8),
+        "orphaned chunk tree must drop"
+    );
+}
+
+#[test]
+fn segment_of_a_removed_region_is_reclaimed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let region_id = eng
+        .create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.remember("v", AtomInput::new("fact", "x")).unwrap();
+    eng.persist_ann_index("v").unwrap();
+    drop(eng);
+
+    // The parent region vanishes while the valid segment binding and tree survive.
+    let conn = Connection::open(&db).unwrap();
+    let (seg_slot, _, _) = read_annseg_meta(&conn, region_id).unwrap().unwrap();
+    conn.execute_params(
+        "DELETE FROM memory_regions WHERE id = $1",
+        &[Value::Integer(region_id)],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(seg_chunks_exist(&db, region_id, 8), "precondition: tree");
+
+    let _eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    assert_eq!(
+        db.atom_store_slot(seg_slot).unwrap().state,
+        SlotState::Tombstone,
+        "a region-less segment binding must not stay live"
+    );
+    let conn = Connection::open(&db).unwrap();
+    let leftovers = conn
+        .query_params("SELECT key FROM memory_meta WHERE key LIKE 'annseg_%'", &[])
+        .unwrap();
+    assert!(leftovers.rows.is_empty(), "region-less metadata must clear");
+    drop(conn);
+    // The physical catalog recovers the tree's name even with the parent gone.
+    assert!(
+        !seg_tree_exists(&db, region_id, 8),
+        "a parentless chunk tree must be swept via the table inventory"
+    );
+}
+
+#[test]
+fn direct_tombstone_cannot_overlap_a_sealed_read_span() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng
+        .remember("v", AtomInput::new("fact", "guarded"))
+        .unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let qr = conn
+        .query_params(
+            &format!("SELECT key_slot FROM {table} WHERE id = $1"),
+            &[Value::Integer(a)],
+        )
+        .unwrap();
+    let slot = as_int(&qr.rows[0][0]).unwrap() as u32;
+    drop(conn);
+
+    // The wrapper signals at its acquisition boundary; the barrier orders the span first.
+    let (at_boundary, boundary) = std::sync::mpsc::channel::<()>();
+    db.debug_set_destruction_acquire_hook(Some(Box::new(move || {
+        let _ = at_boundary.send(());
+    })));
+    let order = Arc::new(Mutex::new(Vec::<&str>::new()));
+    let start = Arc::new(std::sync::Barrier::new(2));
+    let destroyer = {
+        let db = Arc::clone(&db);
+        let order = Arc::clone(&order);
+        let start = Arc::clone(&start);
+        std::thread::spawn(move || {
+            start.wait();
+            // The acquiring wrapper must block until the read span ends.
+            db.atom_store_tombstone(slot, a as u64).unwrap();
+            order.lock().unwrap().push("destroy");
+        })
+    };
+    let h = eng.region_handle("v").unwrap();
+    eng.with_live_sealed_read("v", &h, |_, _, _| {
+        start.wait();
+        // The held capability excludes the destroyer; the lock itself is the proof.
+        boundary
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("destroyer must reach the acquisition boundary");
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "destruction completed inside the read span"
+        );
+        order.lock().unwrap().push("read-span-end");
+        Ok(())
+    })
+    .unwrap();
+    destroyer.join().unwrap();
+    assert_eq!(*order.lock().unwrap(), ["read-span-end", "destroy"]);
+}
+
+#[test]
+fn reconcile_retires_segments_whose_key_gen_moved() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let region_id = eng
+        .create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.remember("v", AtomInput::new("fact", "x")).unwrap();
+    eng.persist_ann_index("v").unwrap();
+    drop(eng);
+
+    // The (slot, owner) pair still matches; only the gen bind catches it.
+    let conn = Connection::open(&db).unwrap();
+    let (seg_slot, _, _) = read_annseg_meta(&conn, region_id).unwrap().unwrap();
+    conn.execute_params(
+        "UPDATE memory_meta SET value = value + 1 WHERE key = $1",
+        &[Value::Text(format!("annseg_gen:{region_id}").into())],
+    )
+    .unwrap();
+    drop(conn);
+
+    let _eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    assert_eq!(
+        db.atom_store_slot(seg_slot).unwrap().state,
+        SlotState::Tombstone
+    );
+    let conn = Connection::open(&db).unwrap();
+    assert!(
+        read_annseg_meta(&conn, region_id).unwrap().is_none(),
+        "gen-drifted segment must retire"
+    );
+    assert!(!seg_chunks_exist(&db, region_id, 8));
+}
+
+#[test]
+fn lifecycle_capabilities_are_bound_to_their_own_database() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let db_a = create_enc_db(dir_a.path());
+    let db_b = create_enc_db(dir_b.path());
+    let (slot_a, _) = db_a
+        .atom_store_allocate_write(7, &[0x11; WRAPPED_KEY_SIZE])
+        .unwrap();
+    let (slot_b, _) = db_b
+        .atom_store_allocate_write(9, &[0x22; WRAPPED_KEY_SIZE])
+        .unwrap();
+    assert_eq!(slot_a, slot_b, "fresh stores hand out the same slot index");
+
+    // Lifecycle spans are per-database: both capabilities held at once.
+    let kl_a = db_a.key_lifecycle_lock();
+    let kl_b = db_b.key_lifecycle_lock();
+    // Destruction is a method OF the capability, so B's cannot be aimed at A.
+    kl_b.atom_store_tombstone(slot_b, 9).unwrap();
+    drop(kl_b);
+    drop(kl_a);
+
+    assert_eq!(
+        db_b.atom_store_slot(slot_b).unwrap().state,
+        SlotState::Tombstone
+    );
+    let rec_a = db_a.atom_store_slot(slot_a).unwrap();
+    assert_eq!(rec_a.state, SlotState::Live);
+    assert_eq!(rec_a.region_id, 7);
+}
+
+#[test]
+fn interrupted_batch_erase_normalizes_records_before_rows_are_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng
+        .remember("v", AtomInput::new("fact", "torn one"))
+        .unwrap();
+    let b = eng
+        .remember("v", AtomInput::new("fact", "torn two"))
+        .unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let qr = conn
+        .query_params(&format!("SELECT id, key_slot FROM {table}"), &[])
+        .unwrap();
+    let slots: Vec<u32> = qr
+        .rows
+        .iter()
+        .map(|r| as_int(&r[1]).unwrap() as u32)
+        .collect();
+    assert_eq!(slots.len(), 2);
+    drop(conn);
+
+    // Die after the live-copy update, before the sibling record update.
+    db.debug_fail_next_atom_tombstone_batch_before_sibling();
+    let err = eng.forget_atoms("v", &[a, b], false).unwrap_err();
+    assert!(
+        err.to_string().contains("before the sibling scrub"),
+        "{err}"
+    );
+    drop(eng);
+
+    // Torn boundary: duplicate records disagree and the rows still exist.
+    for &slot in &slots {
+        let states: Vec<Option<SlotState>> = db
+            .debug_atom_slot_copies(slot)
+            .unwrap()
+            .iter()
+            .map(|c| c.as_ref().map(|r| r.state))
+            .collect();
+        assert!(
+            states.contains(&Some(SlotState::Tombstone))
+                && states.iter().any(|s| *s != Some(SlotState::Tombstone)),
+            "precondition: torn duplicate records, got {states:?}"
+        );
+    }
+
+    // Same-process retry halted before row deletes: records normalized, rows intact.
+    FAIL_RECONCILE_AFTER_DRIFT_KEYS.with(|f| f.set(true));
+    assert!(MemoryEngine::open(Arc::clone(&db)).is_err());
+    for &slot in &slots {
+        let copies = db.debug_atom_slot_copies(slot).unwrap();
+        assert!(
+            copies
+                .iter()
+                .all(|c| c.as_ref().is_some_and(|r| r.state == SlotState::Tombstone)),
+            "both duplicate records must be normalized, got {copies:?}"
+        );
+    }
+    let conn = Connection::open(&db).unwrap();
+    let rows = conn
+        .query_params(&format!("SELECT id FROM {table}"), &[])
+        .unwrap();
+    assert_eq!(rows.rows.len(), 2, "normalization precedes row removal");
+    drop(conn);
+
+    // The clean retry converges: rows follow their dead keys.
+    let _eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let rows = conn
+        .query_params(&format!("SELECT id FROM {table}"), &[])
+        .unwrap();
+    assert!(rows.rows.is_empty());
+}
+
+#[test]
+fn rows_of_a_removed_parent_region_reconcile_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let rid_a = eng
+        .create_encrypted_region("a", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let rid_b = eng
+        .create_encrypted_region("b", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    assert_ne!(rid_a, rid_b);
+    let atom_a = eng
+        .remember_if_absent_keyed(
+            "a",
+            AtomInput::new("fact", "doomed with region"),
+            &[],
+            None,
+            "parent-bound",
+        )
+        .unwrap()
+        .id;
+    let atom_b = eng.remember("b", AtomInput::new("fact", "keeper")).unwrap();
+
+    // Same dim and metric: both regions share ONE physical atoms table.
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let conn = Connection::open(&db).unwrap();
+    let qr = conn
+        .query_params(
+            &format!("SELECT id, key_slot, key_gen FROM {table} ORDER BY id"),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(qr.rows.len(), 2, "precondition: a shared physical table");
+    let binding = |aid: AtomId| {
+        let r = qr
+            .rows
+            .iter()
+            .find(|r| as_int(&r[0]).unwrap() == aid)
+            .unwrap();
+        (as_int(&r[1]).unwrap() as u32, as_int(&r[2]).unwrap() as u64)
+    };
+    let (slot_a, _) = binding(atom_a);
+    let (slot_b, gen_b) = binding(atom_b);
+    let rsk_a = {
+        let qr = conn
+            .query_params(
+                "SELECT rsk_slot FROM memory_regions WHERE id = $1",
+                &[Value::Integer(rid_a)],
+            )
+            .unwrap();
+        as_int(&qr.rows[0][0]).unwrap() as u32
+    };
+    let idents = conn
+        .query_params(
+            "SELECT atom_id FROM memory_idempotency WHERE region_id = $1",
+            &[Value::Integer(rid_a)],
+        )
+        .unwrap();
+    assert_eq!(idents.rows.len(), 1, "precondition: identity record");
+    // A's parent row vanishes; the key still matches, only the parent bind catches it.
+    conn.execute_params(
+        "DELETE FROM memory_regions WHERE id = $1",
+        &[Value::Integer(rid_a)],
+    )
+    .unwrap();
+    drop(conn);
+    drop(eng);
+
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let rows = conn
+        .query_params(
+            &format!("SELECT id FROM {table} WHERE id = $1"),
+            &[Value::Integer(atom_a)],
+        )
+        .unwrap();
+    assert!(
+        rows.rows.is_empty(),
+        "a parent-less row must reconcile away"
+    );
+    let idents = conn
+        .query_params(
+            "SELECT atom_id FROM memory_idempotency WHERE region_id = $1",
+            &[Value::Integer(rid_a)],
+        )
+        .unwrap();
+    assert!(idents.rows.is_empty(), "identity records die with the rows");
+    drop(conn);
+    assert_eq!(
+        db.atom_store_slot(slot_a).unwrap().state,
+        SlotState::Tombstone
+    );
+    assert_eq!(
+        db.region_store_slot(rsk_a).unwrap().state,
+        SlotState::Tombstone
+    );
+
+    // B is untouched: identical live binding and readable content.
+    let rec_b = db.atom_store_slot(slot_b).unwrap();
+    assert_eq!(rec_b.state, SlotState::Live);
+    assert_eq!(rec_b.region_id, atom_b as u64);
+    assert_eq!(rec_b.gen, gen_b);
+    eng.create_encrypted_region("b", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    assert!(eng.fetch_one("b", atom_b).unwrap().is_some());
+}
+
+/// Break a persisted segment via `mutate`; reconcile reclaims it, the atoms survive.
+fn assert_broken_segment_is_reclaimed(mutate: impl FnOnce(&Database, &str)) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let region_id = eng
+        .create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng.remember("v", AtomInput::new("fact", "x")).unwrap();
+    eng.persist_ann_index("v").unwrap();
+    drop(eng);
+
+    let conn = Connection::open(&db).unwrap();
+    let (seg_slot, _, _) = read_annseg_meta(&conn, region_id).unwrap().unwrap();
+    drop(conn);
+    assert!(seg_chunks_exist(&db, region_id, 8), "precondition: tree");
+    assert_eq!(db.atom_store_slot(seg_slot).unwrap().state, SlotState::Live);
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    mutate(&db, &sealed_segment_table(&table, region_id));
+
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    assert_eq!(
+        db.atom_store_slot(seg_slot).unwrap().state,
+        SlotState::Tombstone,
+        "an invalid segment's key must die"
+    );
+    let conn = Connection::open(&db).unwrap();
+    assert!(
+        read_annseg_meta(&conn, region_id).unwrap().is_none(),
+        "metadata clears only after the tree is handled"
+    );
+    drop(conn);
+    assert!(
+        !seg_tree_exists(&db, region_id, 8),
+        "residue tree must drop"
+    );
+    // The atoms themselves are untouched by segment reclamation.
+    eng.create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    assert!(eng.fetch_one("v", a).unwrap().is_some());
+}
+
+#[test]
+fn segment_metadata_without_a_tree_is_reclaimed() {
+    assert_broken_segment_is_reclaimed(|db, seg| {
+        let mut wtx = db.begin_write().unwrap();
+        wtx.drop_table(seg.as_bytes()).unwrap();
+        wtx.commit().unwrap();
+    });
+}
+
+#[test]
+fn segment_tree_without_a_count_record_is_reclaimed() {
+    assert_broken_segment_is_reclaimed(|db, seg| {
+        let mut wtx = db.begin_write().unwrap();
+        assert!(wtx
+            .table_delete(seg.as_bytes(), &0u32.to_be_bytes())
+            .unwrap());
+        wtx.commit().unwrap();
+    });
+}
+
+#[test]
+fn segment_tree_with_a_malformed_count_record_is_reclaimed() {
+    assert_broken_segment_is_reclaimed(|db, seg| {
+        let mut wtx = db.begin_write().unwrap();
+        assert!(wtx
+            .table_delete(seg.as_bytes(), &0u32.to_be_bytes())
+            .unwrap());
+        wtx.table_insert(seg.as_bytes(), &0u32.to_be_bytes(), &[0xAB, 0xCD])
+            .unwrap();
+        wtx.commit().unwrap();
+    });
+}
+
+#[test]
+fn segment_tree_missing_a_required_chunk_is_reclaimed() {
+    assert_broken_segment_is_reclaimed(|db, seg| {
+        let mut wtx = db.begin_write().unwrap();
+        assert!(wtx
+            .table_delete(seg.as_bytes(), &1u32.to_be_bytes())
+            .unwrap());
+        wtx.commit().unwrap();
+    });
+}
+
+#[test]
+fn unexpected_segment_probe_errors_propagate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let region_id = eng
+        .create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng.remember("v", AtomInput::new("fact", "x")).unwrap();
+    eng.persist_ann_index("v").unwrap();
+    drop(eng);
+    let conn = Connection::open(&db).unwrap();
+    let (seg_slot, _, _) = read_annseg_meta(&conn, region_id).unwrap().unwrap();
+    drop(conn);
+
+    FAIL_SEGMENT_PROBE.with(|f| f.set(true));
+    let err = match MemoryEngine::open(Arc::clone(&db)) {
+        Ok(_) => panic!("open must fail on the injected probe error"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("injected segment probe"), "{err}");
+
+    // Nothing was classified or destroyed on the error path.
+    assert_eq!(db.atom_store_slot(seg_slot).unwrap().state, SlotState::Live);
+    assert!(seg_chunks_exist(&db, region_id, 8));
+    let conn = Connection::open(&db).unwrap();
+    assert!(read_annseg_meta(&conn, region_id).unwrap().is_some());
+    drop(conn);
+
+    // The clean retry validates the intact segment and serves the atom.
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    assert!(eng.fetch_one("v", a).unwrap().is_some());
+}
+
+/// The atom's exact live `(slot, gen)` binding, read from its row.
+fn atom_binding(db: &Database, table: &str, id: AtomId) -> (u32, u64) {
+    let conn = Connection::open(db).unwrap();
+    let qr = conn
+        .query_params(
+            &format!("SELECT key_slot, key_gen FROM {table} WHERE id = $1"),
+            &[Value::Integer(id)],
+        )
+        .unwrap();
+    (
+        as_int(&qr.rows[0][0]).unwrap() as u32,
+        as_int(&qr.rows[0][1]).unwrap() as u64,
+    )
+}
+
+#[test]
+fn forged_segment_metadata_cannot_claim_an_atoms_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let region_id = eng
+        .create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng
+        .remember("v", AtomInput::new("fact", "claimed"))
+        .unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let (slot, gen) = atom_binding(&db, &table, a);
+    drop(eng);
+
+    // Forge metadata at the atom's exact binding; only the single-owner claim rejects it.
+    let conn = Connection::open(&db).unwrap();
+    write_annseg_meta(&conn, region_id, slot, gen, a).unwrap();
+    drop(conn);
+    let seg = sealed_segment_table(&table, region_id);
+    {
+        let mut wtx = db.begin_write().unwrap();
+        wtx.create_table(seg.as_bytes()).unwrap();
+        wtx.table_insert(seg.as_bytes(), &0u32.to_be_bytes(), &1u32.to_le_bytes())
+            .unwrap();
+        wtx.table_insert(seg.as_bytes(), &1u32.to_be_bytes(), &[0xEE; 32])
+            .unwrap();
+        wtx.commit().unwrap();
+    }
+    assert!(seg_chunks_exist(&db, region_id, 8), "precondition: tree");
+
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    // The atom's record is untouched; the forged claim lost everything.
+    let rec = db.atom_store_slot(slot).unwrap();
+    assert_eq!(rec.state, SlotState::Live);
+    assert_eq!(rec.gen, gen, "the atom's binding must survive the forgery");
+    let conn = Connection::open(&db).unwrap();
+    assert!(read_annseg_meta(&conn, region_id).unwrap().is_none());
+    drop(conn);
+    assert!(!seg_tree_exists(&db, region_id, 8));
+    eng.create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    assert!(eng.fetch_one("v", a).unwrap().is_some());
+}
+
+#[test]
+fn stale_segment_metadata_cannot_destroy_a_live_atom_on_retire() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let region_id = eng
+        .create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng
+        .remember("v", AtomInput::new("fact", "retire-safe"))
+        .unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let (slot, gen) = atom_binding(&db, &table, a);
+
+    // Forge metadata at the atom's triple; retire must refuse a binding with a row.
+    let conn = Connection::open(&db).unwrap();
+    write_annseg_meta(&conn, region_id, slot, gen, a).unwrap();
+    drop(conn);
+
+    // persist_ann_index retires the "previous segment" first.
+    eng.persist_ann_index("v").unwrap();
+    let rec = db.atom_store_slot(slot).unwrap();
+    assert_eq!(rec.state, SlotState::Live);
+    assert_eq!(rec.gen, gen, "retire must not act on forged metadata");
+    // The real persist published a fresh segment under its own binding.
+    let conn = Connection::open(&db).unwrap();
+    let (seg_slot, _, pseudo_id) = read_annseg_meta(&conn, region_id).unwrap().unwrap();
+    drop(conn);
+    assert_ne!(seg_slot, slot);
+    assert_ne!(pseudo_id, a);
+    assert!(eng.fetch_one("v", a).unwrap().is_some());
+}
+
+#[test]
+fn forged_segment_metadata_cannot_claim_another_regions_atom() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let rid_a = eng
+        .create_encrypted_region("a", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.create_encrypted_region("b", Arc::new(MockEmbedder::new(16)))
+        .unwrap();
+    eng.remember("a", AtomInput::new("fact", "local")).unwrap();
+    let b1 = eng
+        .remember("b", AtomInput::new("fact", "foreign"))
+        .unwrap();
+    let t16 = atoms_table(16, EmbeddingMetric::Cosine, true);
+    let (slot_b, gen_b) = atom_binding(&db, &t16, b1);
+
+    // Forge A's metadata at B's binding; the row-less check must span every table.
+    let conn = Connection::open(&db).unwrap();
+    write_annseg_meta(&conn, rid_a, slot_b, gen_b, b1).unwrap();
+    drop(conn);
+
+    // persist_ann_index("a") retires the "previous segment" first.
+    eng.persist_ann_index("a").unwrap();
+    let rec = db.atom_store_slot(slot_b).unwrap();
+    assert_eq!(rec.state, SlotState::Live);
+    assert_eq!(rec.gen, gen_b, "B's binding must survive A's retirement");
+    assert_eq!(rec.region_id, b1 as u64);
+    assert!(eng.fetch_one("b", b1).unwrap().is_some());
+    // A still published its own fresh segment under its own binding.
+    let conn = Connection::open(&db).unwrap();
+    let (seg_slot, _, pseudo_id) = read_annseg_meta(&conn, rid_a).unwrap().unwrap();
+    drop(conn);
+    assert_ne!(seg_slot, slot_b);
+    assert_ne!(pseudo_id, b1);
+}
+
+#[test]
+fn regions_with_an_inexact_key_binding_are_not_valid_parents() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let region_id = eng
+        .create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng
+        .remember("v", AtomInput::new("fact", "gen-bound"))
+        .unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let (atom_slot, _) = atom_binding(&db, &table, a);
+    drop(eng);
+
+    // rsk_gen drifts; only the gen bind catches it - the same bar as attachment.
+    let conn = Connection::open(&db).unwrap();
+    let qr = conn
+        .query_params(
+            "SELECT rsk_slot FROM memory_regions WHERE id = $1",
+            &[Value::Integer(region_id)],
+        )
+        .unwrap();
+    let rsk_slot = as_int(&qr.rows[0][0]).unwrap() as u32;
+    conn.execute_params(
+        "UPDATE memory_regions SET rsk_gen = rsk_gen + 1 WHERE id = $1",
+        &[Value::Integer(region_id)],
+    )
+    .unwrap();
+    drop(conn);
+
+    let _eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    assert_eq!(
+        db.region_store_slot(rsk_slot).unwrap().state,
+        SlotState::Tombstone,
+        "an inexact region binding must not stay live"
+    );
+    assert_eq!(
+        db.atom_store_slot(atom_slot).unwrap().state,
+        SlotState::Tombstone,
+        "children of an unattachable region are reclaimed"
+    );
+    let conn = Connection::open(&db).unwrap();
+    let rows = conn
+        .query_params(
+            &format!("SELECT id FROM {table} WHERE id = $1"),
+            &[Value::Integer(a)],
+        )
+        .unwrap();
+    assert!(rows.rows.is_empty());
+}
+
+#[test]
+fn regions_without_a_recorded_gen_are_reclaimed_like_inexact_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let region_id = eng
+        .create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let a = eng.remember("v", AtomInput::new("fact", "no gen")).unwrap();
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    let (atom_slot, _) = atom_binding(&db, &table, a);
+    drop(eng);
+
+    // A gen-less row can never attach (fails closed); reclaimed like any inexact binding.
+    let conn = Connection::open(&db).unwrap();
+    let qr = conn
+        .query_params(
+            "SELECT rsk_slot FROM memory_regions WHERE id = $1",
+            &[Value::Integer(region_id)],
+        )
+        .unwrap();
+    let rsk_slot = as_int(&qr.rows[0][0]).unwrap() as u32;
+    conn.execute_params(
+        "UPDATE memory_regions SET rsk_gen = NULL WHERE id = $1",
+        &[Value::Integer(region_id)],
+    )
+    .unwrap();
+    drop(conn);
+
+    let _eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    assert_eq!(
+        db.region_store_slot(rsk_slot).unwrap().state,
+        SlotState::Tombstone
+    );
+    assert_eq!(
+        db.atom_store_slot(atom_slot).unwrap().state,
+        SlotState::Tombstone
+    );
+    let conn = Connection::open(&db).unwrap();
+    let rows = conn
+        .query_params(
+            &format!("SELECT id FROM {table} WHERE id = $1"),
+            &[Value::Integer(a)],
+        )
+        .unwrap();
+    assert!(rows.rows.is_empty());
+}
+
+#[test]
+fn forged_duplicate_ids_lose_their_row_but_not_the_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_enc_db(dir.path());
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    eng.create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.create_encrypted_region("w", Arc::new(MockEmbedder::new(16)))
+        .unwrap();
+    let a = eng.remember("v", AtomInput::new("fact", "source")).unwrap();
+    eng.remember_derived("v", AtomInput::new("derived", "cites"), &[a], None)
+        .unwrap();
+    let w1 = eng.remember("w", AtomInput::new("fact", "other")).unwrap();
+    drop(eng);
+
+    let t16 = atoms_table(16, EmbeddingMetric::Cosine, true);
+    let conn = Connection::open(&db).unwrap();
+    let edges = conn
+        .query_params(
+            "SELECT src_id FROM memory_edges WHERE dst_id = $1",
+            &[Value::Integer(a)],
+        )
+        .unwrap();
+    assert_eq!(edges.rows.len(), 1, "precondition: a's provenance edge");
+    // Forge a cross-table duplicate onto a's id; a's graph must not die with it.
+    conn.execute_params(
+        &format!("UPDATE {t16} SET id = $1 WHERE id = $2"),
+        &[Value::Integer(a), Value::Integer(w1)],
+    )
+    .unwrap();
+    drop(conn);
+
+    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let dupes = conn
+        .query_params(
+            &format!("SELECT id FROM {t16} WHERE id = $1"),
+            &[Value::Integer(a)],
+        )
+        .unwrap();
+    assert!(dupes.rows.is_empty(), "the forged duplicate row must go");
+    let edges = conn
+        .query_params(
+            "SELECT src_id FROM memory_edges WHERE dst_id = $1",
+            &[Value::Integer(a)],
+        )
+        .unwrap();
+    assert_eq!(edges.rows.len(), 1, "the surviving atom keeps its graph");
+    drop(conn);
+    eng.create_encrypted_region("v", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    assert!(eng.fetch_one("v", a).unwrap().is_some());
+}
+
+#[test]
+fn table_name_parsers_are_canonical() {
+    let table = atoms_table(8, EmbeddingMetric::Cosine, true);
+    assert!(is_encrypted_atoms_table(&table));
+    assert!(!is_encrypted_atoms_table("memory_atoms_d8_cosine"));
+    assert!(!is_encrypted_atoms_table("memory_atoms_d08_cosine_enc"));
+    assert!(!is_encrypted_atoms_table("memory_atoms_dx_cosine_enc"));
+    assert!(!is_encrypted_atoms_table("memory_atoms_d8_flat_enc"));
+
+    let seg = sealed_segment_table(&table, 7);
+    assert_eq!(parse_sealed_segment_table(&seg), Some((7, table.as_str())));
+    // SQL-layer plaintext index trees and prefix-sharing user tables are never claimed.
+    assert_eq!(parse_sealed_segment_table("__annseg_rabbit"), None);
+    assert_eq!(parse_sealed_segment_table("__annseg_r5__x"), None);
+    assert_eq!(
+        parse_sealed_segment_table("__annseg_r05__memory_atoms_d8_cosine_enc"),
+        None
+    );
 }
 
 #[test]
