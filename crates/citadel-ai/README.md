@@ -11,4 +11,4 @@ This crate is part of the Citadel workspace.
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

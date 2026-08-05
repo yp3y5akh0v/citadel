@@ -162,7 +162,7 @@ jobs:
           ARCHIVE="${PREFIX}-${TAG}-${{ matrix.target }}.tar.gz"
           STAGING=$(mktemp -d)
           cp "target/${{ matrix.target }}/release/citadel" "$STAGING/"
-          cp README.md LICENSE-MIT LICENSE-APACHE "$STAGING/"
+          cp README.md LICENSE-APACHE "$STAGING/"
           tar czf "$ARCHIVE" -C "$STAGING" .
           shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
           echo "CLI_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
@@ -176,7 +176,7 @@ jobs:
           ARCHIVE="${PREFIX}-${TAG}-${{ matrix.target }}.zip"
           STAGING=$(mktemp -d)
           cp "target/${{ matrix.target }}/release/citadel.exe" "$STAGING/"
-          cp README.md LICENSE-MIT LICENSE-APACHE "$STAGING/"
+          cp README.md LICENSE-APACHE "$STAGING/"
           cd "$STAGING" && 7z a -tzip "$OLDPWD/$ARCHIVE" . && cd "$OLDPWD"
           sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
           echo "CLI_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
@@ -194,7 +194,7 @@ jobs:
           [ -f "$RELEASE/libcitadel_ffi.a" ] && cp "$RELEASE/libcitadel_ffi.a" "$STAGING/libcitadel.a"
           ls "$STAGING"/libcitadel.* >/dev/null 2>&1 || { echo "::error::No FFI libraries found"; exit 1; }
           cp crates/citadel-ffi/citadel.h "$STAGING/"
-          cp LICENSE-MIT LICENSE-APACHE "$STAGING/"
+          cp LICENSE-APACHE "$STAGING/"
           tar czf "$ARCHIVE" -C "$STAGING" .
           shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
           echo "FFI_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
@@ -212,7 +212,7 @@ jobs:
           [ -f "$RELEASE/libcitadel_ffi.a" ] && cp "$RELEASE/libcitadel_ffi.a" "$STAGING/libcitadel.a"
           ls "$STAGING"/libcitadel.* >/dev/null 2>&1 || { echo "::error::No FFI libraries found"; exit 1; }
           cp crates/citadel-ffi/citadel.h "$STAGING/"
-          cp LICENSE-MIT LICENSE-APACHE "$STAGING/"
+          cp LICENSE-APACHE "$STAGING/"
           tar czf "$ARCHIVE" -C "$STAGING" .
           shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
           echo "FFI_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
@@ -231,7 +231,7 @@ jobs:
           [ -f "$RELEASE/citadel_ffi.dll.lib" ] && cp "$RELEASE/citadel_ffi.dll.lib" "$STAGING/citadel.dll.lib"
           ls "$STAGING"/citadel.{dll,lib,dll.lib} >/dev/null 2>&1 || { echo "::error::No FFI libraries found"; exit 1; }
           cp crates/citadel-ffi/citadel.h "$STAGING/"
-          cp LICENSE-MIT LICENSE-APACHE "$STAGING/"
+          cp LICENSE-APACHE "$STAGING/"
           cd "$STAGING" && 7z a -tzip "$OLDPWD/$ARCHIVE" . && cd "$OLDPWD"
           sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
           echo "FFI_ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"

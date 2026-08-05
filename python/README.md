@@ -27,4 +27,4 @@ documentation and the SQL / vector / memory / agent APIs are at
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0

@@ -8,4 +8,4 @@ the [Citadel](https://github.com/yp3y5akh0v/citadel) repository.
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0
