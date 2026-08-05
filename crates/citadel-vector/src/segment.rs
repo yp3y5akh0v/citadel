@@ -1,8 +1,7 @@
 //! The ANNSEG body format: a storage-agnostic byte encoding of everything a
-//! built [`AnnIndex`] holds EXCEPT the f32 vectors. The vectors are rehydrated
-//! at load time from the table rows themselves - the rows are the source of
-//! truth, and the rehydration scan doubles as the staleness proof (it computes
-//! the content fingerprint the storage layer compares against its header).
+//! built [`AnnIndex`] holds, including build-form f32 vectors. Storage loaders
+//! may instead rehydrate vectors from table rows; that scan doubles as the
+//! staleness proof.
 //!
 //! Layout: a fixed sequence of REQUIRED sections, each
 //! `[tag u8][len u64 LE][payload][blake3(payload) 32B]`. Per-section hashes
@@ -16,6 +15,7 @@
 //! order - a scan-order fill silently corrupts every f32 rerank.
 
 use rustc_hash::FxHashMap;
+use zeroize::Zeroizing;
 
 use crate::ann::AnnIndex;
 use crate::prism::{
@@ -98,7 +98,7 @@ fn metric_from_tag(t: u8) -> Result<Metric, SegmentError> {
     })
 }
 
-/// Encode everything but the vectors. The output is the segment BODY; the
+/// Encode the complete build-form index. The output is the segment BODY; the
 /// storage layer wraps it in its header (fingerprint, config hash, counts).
 pub fn encode(index: &AnnIndex) -> Vec<u8> {
     let p = index.prism();
@@ -157,8 +157,9 @@ pub fn encode(index: &AnnIndex) -> Vec<u8> {
     out
 }
 
-/// Everything a segment carries; vectors arrive separately via
-/// [`SegmentParts::into_index`].
+/// Everything a decoded segment carries. Vectors reach the index from the
+/// embedded copy ([`SegmentParts::into_index_embedded`]) or via row rehydration
+/// ([`SegmentParts::into_index`]).
 pub struct SegmentParts {
     graph: Graph,
     local_graph: Graph,
@@ -174,7 +175,8 @@ pub struct SegmentParts {
     original_ids: Vec<u32>,
     id_map: Vec<u64>,
     attrs: Vec<Vec<u32>>,
-    vectors: Vec<f32>,
+    /// Zeroizing: sealed loaders may rehydrate rows, leaving this copy unconsumed.
+    vectors: Zeroizing<Vec<f32>>,
     n: usize,
 }
 
@@ -249,7 +251,7 @@ impl SegmentParts {
 
     /// Build the index from the segment's embedded build-form vectors - the fast cold-load path.
     pub fn into_index_embedded(mut self) -> AnnIndex {
-        let vectors = std::mem::take(&mut self.vectors);
+        let vectors = std::mem::take(self.vectors.as_mut());
         self.build(vectors)
     }
 }
@@ -354,7 +356,7 @@ pub fn decode(bytes: &[u8]) -> Result<SegmentParts, SegmentError> {
         original_ids,
         id_map,
         attrs,
-        vectors,
+        vectors: Zeroizing::new(vectors),
         n,
     })
 }
@@ -525,6 +527,16 @@ mod tests {
 
     fn build_fixture() -> AnnIndex {
         AnnIndex::build_with_attrs(fixture_rows(), 1, Metric::Cosine, 8).expect("build fixture")
+    }
+
+    #[test]
+    fn decoded_embedded_vectors_have_a_zeroizing_owner() {
+        fn require_zeroizing_owner(_: &Zeroizing<Vec<f32>>) {}
+
+        let index = build_fixture();
+        let parts = decode(&encode(&index)).expect("decode");
+        require_zeroizing_owner(&parts.vectors);
+        assert_eq!(parts.vectors.len(), parts.n() * usize::from(parts.dim()));
     }
 
     /// Rehydrate exactly as the storage loader will: RAW row vectors placed by

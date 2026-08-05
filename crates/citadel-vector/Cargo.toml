@@ -26,3 +26,4 @@ rand = { workspace = true }
 blake3 = { workspace = true }
 rustc-hash = { workspace = true }
 prism-ann = { workspace = true }
+zeroize = { workspace = true }

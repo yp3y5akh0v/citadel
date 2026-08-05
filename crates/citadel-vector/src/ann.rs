@@ -1,6 +1,20 @@
 //! In-memory ANN index wrapping the PRISM engine.
 
 use crate::prism::{Filter, Metric, PointStore, PrismConfig, PrismIndex};
+use zeroize::Zeroize;
+
+type AnnBuildRow = (u64, Vec<f32>, Vec<u32>);
+
+/// Source plaintext; scrubbed on every exit, including error early returns.
+struct SensitiveAnnRows(Vec<AnnBuildRow>);
+
+impl Drop for SensitiveAnnRows {
+    fn drop(&mut self) {
+        for (_, embedding, _) in &mut self.0 {
+            embedding.zeroize();
+        }
+    }
+}
 
 /// Request `k * OVER_FETCH` candidates to offset PRISM recall below 1.0.
 pub const OVER_FETCH: usize = 4;
@@ -74,15 +88,16 @@ impl AnnIndex {
     /// Build a filtered index from `(row_id, vector, attr_codes)` triples. Each
     /// attribute is a PRISM dimension; distinct tuples form the searchable cells.
     pub fn build_with_attrs(
-        mut rows: Vec<(u64, Vec<f32>, Vec<u32>)>,
+        rows: Vec<AnnBuildRow>,
         num_attrs: usize,
         metric: Metric,
         dim: u16,
     ) -> Result<Self, AnnError> {
-        if rows.is_empty() {
+        let mut rows = SensitiveAnnRows(rows);
+        if rows.0.is_empty() {
             return Err(AnnError::EmptyInput);
         }
-        for (rid, v, a) in &rows {
+        for (rid, v, a) in &rows.0 {
             if v.len() != dim as usize {
                 return Err(AnnError::DimMismatch {
                     expected: dim,
@@ -99,17 +114,18 @@ impl AnnIndex {
             }
         }
 
-        rows.sort_unstable_by_key(|(id, _, _)| *id);
-        let snapshot_max = rows.last().map(|(id, _, _)| *id).unwrap_or(0);
+        rows.0.sort_unstable_by_key(|(id, _, _)| *id);
+        let snapshot_max = rows.0.last().map(|(id, _, _)| *id).unwrap_or(0);
 
-        let n = rows.len();
+        let n = rows.0.len();
         let mut flat: Vec<f32> = Vec::with_capacity(n * dim as usize);
         let mut row_ids: Vec<u64> = Vec::with_capacity(n);
         // PRISM needs >=1 attribute dim; an all-zero column = one cell.
         let attr_dims = num_attrs.max(1);
         let mut attr_cols: Vec<Vec<u32>> = vec![Vec::with_capacity(n); attr_dims];
-        for (rid, v, a) in &rows {
+        for (rid, v, a) in &mut rows.0 {
             flat.extend_from_slice(v);
+            v.zeroize();
             row_ids.push(*rid);
             if num_attrs == 0 {
                 attr_cols[0].push(0);
