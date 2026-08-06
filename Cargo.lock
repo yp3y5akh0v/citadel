@@ -570,6 +570,7 @@ dependencies = [
  "rustyline",
  "serde_json",
  "tempfile",
+ "zeroize",
 ]
 
 [[package]]
