@@ -135,7 +135,7 @@ fn required_visible_tests(scratch: &Scratch, m: &TaskManifest) -> Vec<String> {
 }
 
 /// Recall embedder for an A/B arm: Mock when `CITADEL_SWE_SEMANTIC_RECALL` is
-/// unset (recall off), else a REAL bge-small (needs `--features candle-embed` +
+/// unset (recall off), else a REAL e5-large (needs `--features candle-embed` +
 /// `CITADEL_EMBEDDER_DIR`). No silent fallback - a missing one is a hard error.
 fn make_embedder(semantic: bool) -> Arc<dyn Embedder> {
     if !semantic {
@@ -145,10 +145,10 @@ fn make_embedder(semantic: bool) -> Arc<dyn Embedder> {
     {
         let dir = std::env::var("CITADEL_EMBEDDER_DIR").expect(
             "CITADEL_SWE_SEMANTIC_RECALL=1 requires CITADEL_EMBEDDER_DIR \
-             pointing at a local bge-small-en-v1.5 model directory",
+             pointing at a local e5-large model directory",
         );
-        let emb = citadel_mem::CandleEmbedder::bge_small(&dir)
-            .unwrap_or_else(|e| panic!("failed to load bge-small from {dir}: {e}"));
+        let emb = citadel_mem::CandleEmbedder::e5_large(&dir)
+            .unwrap_or_else(|e| panic!("failed to load e5-large from {dir}: {e}"));
         Arc::new(emb)
     }
     #[cfg(not(feature = "candle-embed"))]
