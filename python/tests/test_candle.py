@@ -7,24 +7,24 @@ import pytest
 import citadeldb
 from citadeldb import _core
 
-MODEL = os.environ.get("CITADEL_BGE_SMALL_DIR", "")
+MODEL = os.environ.get("CITADEL_EMBEDDER_DIR", "")
 
 pytestmark = pytest.mark.skipif(
     not hasattr(_core, "CandleEmbedder") or not MODEL or not os.path.isdir(MODEL),
-    reason="set CITADEL_BGE_SMALL_DIR to a local bge-small model (needs a candle-embed build)",
+    reason="set CITADEL_EMBEDDER_DIR to a local e5-large dir (needs a candle-embed build)",
 )
 
 
 def test_candle_embedder_loads_and_embeds():
-    emb = citadeldb.CandleEmbedder(MODEL, preset="bge-small")
-    assert emb.dim == 384 and emb.metric == "cosine"
-    assert emb.model_id == "bge-small-en-v1.5"
+    emb = citadeldb.CandleEmbedder(MODEL, preset="e5-large")
+    assert emb.dim == 1024 and emb.metric == "cosine"
+    assert emb.model_id == "e5-large"
     v = emb.embed(["a", "b c d"])
-    assert len(v) == 2 and len(v[0]) == 384
+    assert len(v) == 2 and len(v[0]) == 1024
 
 
 def test_candle_semantic_recall():
-    emb = citadeldb.CandleEmbedder(MODEL, preset="bge-small")
+    emb = citadeldb.CandleEmbedder(MODEL, preset="e5-large")
     mem = citadeldb.connect(key="k").memory()
     mem.create_region("kb", emb)
     for t in ["The Eiffel Tower is in Paris.", "Cats are small mammals.", "The sun is a star."]:

@@ -1,7 +1,7 @@
-//! Token-free proof that semantic recall (citadel-vector ANN via a real bge-small
+//! Token-free proof that semantic recall (citadel-vector ANN via a real e5-large
 //! embedder) surfaces a MEANING-relevant memory the word-overlap MockEmbedder misses.
 //!
-//! Ignored: needs a local bge-small-en-v1.5 dir in CITADEL_EMBEDDER_DIR. Run:
+//! Ignored: needs a local e5-large dir in CITADEL_EMBEDDER_DIR. Run:
 //!   CITADEL_EMBEDDER_DIR=... cargo test -p citadeldb-ai --features candle-embed \
 //!     --test recall_quality -- --ignored --nocapture
 #![cfg(feature = "candle-embed")]
@@ -47,19 +47,19 @@ fn ranked_recall(embedder: Arc<dyn Embedder>) -> Vec<(String, f32)> {
 }
 
 #[test]
-#[ignore = "needs CITADEL_EMBEDDER_DIR (a local bge-small-en-v1.5 dir)"]
+#[ignore = "needs CITADEL_EMBEDDER_DIR (a local e5-large dir)"]
 fn semantic_recall_surfaces_meaning_that_word_overlap_misses() {
     let dir = std::env::var("CITADEL_EMBEDDER_DIR")
-        .expect("set CITADEL_EMBEDDER_DIR to a local bge-small-en-v1.5 dir");
+        .expect("set CITADEL_EMBEDDER_DIR to a local e5-large dir");
 
-    let bge = ranked_recall(Arc::new(
-        CandleEmbedder::bge_small(&dir).expect("load bge-small"),
+    let semantic = ranked_recall(Arc::new(
+        CandleEmbedder::e5_large(&dir).expect("load e5-large"),
     ));
     let mock = ranked_recall(Arc::new(MockEmbedder::new(64)));
 
     eprintln!("[recall-quality] query: {QUERY:?}");
-    eprintln!("[recall-quality] bge-small ranking:");
-    for (t, s) in &bge {
+    eprintln!("[recall-quality] e5-large ranking:");
+    for (t, s) in &semantic {
         eprintln!("    {s:.4}  {t:?}");
     }
     eprintln!("[recall-quality] mock ranking:");
@@ -68,9 +68,9 @@ fn semantic_recall_surfaces_meaning_that_word_overlap_misses() {
     }
 
     assert_eq!(
-        bge[0].0, RELEVANT,
-        "bge-small must rank the MEANING-relevant memory first; got {:?}",
-        bge[0].0
+        semantic[0].0, RELEVANT,
+        "e5-large must rank the MEANING-relevant memory first; got {:?}",
+        semantic[0].0
     );
     assert_ne!(
         mock[0].0, RELEVANT,
