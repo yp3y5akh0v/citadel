@@ -309,9 +309,9 @@ pub(crate) struct PyCandleEmbedder {
 #[pymethods]
 impl PyCandleEmbedder {
     /// Load `config.json` + `tokenizer.json` + `model.safetensors` from `model_dir`.
-    /// `preset` selects pooling/prefixes: bge-small|bge-base|bge-large|minilm|e5-large|granite-r2.
+    /// `preset` selects pooling/prefixes: e5-large|bge-small|bge-base|bge-large|minilm|granite-r2.
     #[new]
-    #[pyo3(signature = (model_dir, preset="bge-small"))]
+    #[pyo3(signature = (model_dir, preset="e5-large"))]
     fn new(model_dir: &str, preset: &str) -> PyResult<Self> {
         let cfg = candle_config_for(preset)?;
         let inner = CandleEmbedder::from_dir(model_dir, cfg).map_err(to_pyerr)?;
