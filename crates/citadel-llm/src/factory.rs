@@ -132,17 +132,18 @@ pub fn build_with_timeouts(
     }
 }
 
-#[cfg(feature = "openai")]
+// These reach into the HTTP backend modules, which are cfg'd away on wasm32.
+#[cfg(all(not(target_arch = "wasm32"), feature = "openai"))]
 fn openai_base_url() -> String {
     std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| crate::openai::DEFAULT_BASE_URL.to_string())
 }
 
-#[cfg(feature = "ollama")]
+#[cfg(all(not(target_arch = "wasm32"), feature = "ollama"))]
 fn ollama_base_url() -> String {
     std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| crate::ollama::OLLAMA_BASE_URL.to_string())
 }
 
-#[cfg(feature = "gemini")]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gemini"))]
 fn gemini_reasoning_effort() -> Option<String> {
     std::env::var("CITADEL_GEMINI_REASONING_EFFORT")
         .ok()
@@ -164,9 +165,9 @@ fn request_identity_for_provider(
 
 fn resolved_base_url(provider: &str) -> Option<String> {
     match provider {
-        #[cfg(feature = "openai")]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "openai"))]
         "openai" => Some(openai_base_url()),
-        #[cfg(feature = "ollama")]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "ollama"))]
         "ollama" => Some(ollama_base_url()),
         _ => None,
     }
@@ -174,7 +175,7 @@ fn resolved_base_url(provider: &str) -> Option<String> {
 
 fn resolved_gemini_effort(provider: &str) -> Option<String> {
     match provider {
-        #[cfg(feature = "gemini")]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "gemini"))]
         "gemini" => gemini_reasoning_effort(),
         _ => None,
     }
@@ -189,7 +190,7 @@ fn identity_from_parts(
     let _ = (model, base_url, gemini_effort);
     match provider {
         "mock" => Ok(ClientRequestIdentity::in_process()),
-        #[cfg(feature = "claude")]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "claude"))]
         "claude" => {
             let default_max_tokens = crate::claude::DEFAULT_MAX_TOKENS.to_string();
             Ok(ClientRequestIdentity::from_config(
@@ -206,7 +207,7 @@ fn identity_from_parts(
                 ],
             ))
         }
-        #[cfg(feature = "openai")]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "openai"))]
         "openai" => {
             let request_effort = crate::openai::request_effort_support_for_model(model);
             Ok(crate::openai::client_request_identity(
@@ -218,7 +219,7 @@ fn identity_from_parts(
                 crate::OutputSchemaSupport::StrictJsonSchema,
             ))
         }
-        #[cfg(feature = "ollama")]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "ollama"))]
         "ollama" => Ok(crate::openai::client_request_identity(
             "ollama",
             base_url.ok_or("ollama identity requires a resolved base URL")?,
@@ -227,7 +228,7 @@ fn identity_from_parts(
             crate::openai::RequestEffortSupport::Unsupported,
             crate::OutputSchemaSupport::Unsupported,
         )),
-        #[cfg(feature = "gemini")]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "gemini"))]
         "gemini" => Ok(crate::openai::client_request_identity(
             "gemini",
             GEMINI_BASE_URL,
