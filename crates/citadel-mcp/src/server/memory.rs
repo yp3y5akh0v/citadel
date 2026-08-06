@@ -152,6 +152,7 @@ fn edge_kind(s: &str) -> Result<EdgeKind, ToolError> {
         "supersedes" => EdgeKind::Supersedes,
         "derived_from" => EdgeKind::DerivedFrom,
         "depends_on" => EdgeKind::DependsOn,
+        "similar_to" => EdgeKind::SimilarTo,
         other => {
             return Err(ToolError::InvalidParams(format!(
                 "unknown edge kind '{other}'"
@@ -160,7 +161,7 @@ fn edge_kind(s: &str) -> Result<EdgeKind, ToolError> {
     })
 }
 
-/// Schema fragment for the seven edge-kind enum values (reused by mem_link/edges/recall).
+/// Schema fragment for the eight edge-kind enum values (reused by mem_link/edges/recall).
 fn edge_kind_enum() -> Value {
     json!([
         "causes",
@@ -169,7 +170,8 @@ fn edge_kind_enum() -> Value {
         "precedes",
         "supersedes",
         "derived_from",
-        "depends_on"
+        "depends_on",
+        "similar_to"
     ])
 }
 
