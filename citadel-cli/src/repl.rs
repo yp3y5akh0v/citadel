@@ -7,6 +7,7 @@ use rustyline::{Config, Editor};
 
 use citadel::Database;
 use citadel_sql::Connection;
+use zeroize::Zeroizing;
 
 use crate::commands::{self, Action};
 use crate::formatter::{self, OutputMode};
@@ -37,7 +38,7 @@ impl Settings {
 pub fn run_interactive(
     mut db: Database,
     mut db_path: PathBuf,
-    mut passphrase: String,
+    mut passphrase: Zeroizing<String>,
     mut settings: Settings,
     init_file: Option<PathBuf>,
     init_cmd: Option<String>,
@@ -98,7 +99,7 @@ pub fn run_interactive(
                             Action::Reopen(new_path) => {
                                 let new_pass =
                                     match rpassword::prompt_password("Enter passphrase: ") {
-                                        Ok(p) => p,
+                                        Ok(p) => Zeroizing::new(p),
                                         Err(e) => {
                                             eprintln!("Error: {e}");
                                             continue;

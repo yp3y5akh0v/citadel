@@ -7,6 +7,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use clap::Parser;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::formatter::OutputMode;
 
@@ -58,7 +59,7 @@ struct Cli {
 
 /// Run the CLI with the given argv (argv[0] is the program name); returns exit code.
 pub fn run(args: Vec<String>) -> i32 {
-    let cli = match Cli::try_parse_from(args) {
+    let mut cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(e) => {
             let _ = e.print();
@@ -76,15 +77,16 @@ pub fn run(args: Vec<String>) -> i32 {
         }
     };
 
-    let passphrase = match &cli.passphrase {
-        Some(p) => p.clone(),
+    // Wiped on drop: the interactive prompt is the only copy of this one.
+    let passphrase: Zeroizing<String> = match &cli.passphrase {
+        Some(p) => Zeroizing::new(p.clone()),
         None => {
             if !std::io::stdin().is_terminal() {
                 eprintln!("Error: passphrase required (use --passphrase in non-interactive mode)");
                 return 1;
             }
             match rpassword::prompt_password("Enter passphrase: ") {
-                Ok(p) => p,
+                Ok(p) => Zeroizing::new(p),
                 Err(e) => {
                     eprintln!("Error reading passphrase: {e}");
                     return 1;
@@ -92,6 +94,8 @@ pub fn run(args: Vec<String>) -> i32 {
             }
         }
     };
+    // The parsed argv copy is redundant once it is held above.
+    cli.passphrase.zeroize();
 
     let db = if cli.create {
         match citadel::DatabaseBuilder::new(&db_path)
