@@ -23,6 +23,7 @@ use citadel_io::file_manager::FileHeader;
 use citadel_io::mmap_io::MmapPageIO;
 use citadel_io::traits::PageIO;
 use citadel_txn::manager::TxnManager;
+use zeroize::Zeroizing;
 
 use crate::database::Database;
 
@@ -42,7 +43,7 @@ use crate::database::Database;
 pub struct DatabaseBuilder {
     path: PathBuf,
     key_path: Option<PathBuf>,
-    passphrase: Option<Vec<u8>>,
+    passphrase: Option<Zeroizing<Vec<u8>>>,
     argon2_profile: Argon2Profile,
     cache_size: usize,
     cipher: CipherId,
@@ -75,7 +76,7 @@ impl DatabaseBuilder {
     }
 
     pub fn passphrase(mut self, passphrase: &[u8]) -> Self {
-        self.passphrase = Some(passphrase.to_vec());
+        self.passphrase = Some(Zeroizing::new(passphrase.to_vec()));
         self
     }
 
@@ -537,3 +538,7 @@ impl DatabaseBuilder {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "builder_tests.rs"]
+mod tests;
