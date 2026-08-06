@@ -904,6 +904,7 @@ enum EvictArgs {
     Lru {
         keep_fraction: f32,
     },
+    Expired,
     LowScore {
         score_threshold: f32,
         confidence_threshold: f32,
@@ -919,6 +920,7 @@ impl From<EvictArgs> for EvictionPolicy {
         match a {
             EvictArgs::Stale { older_than_micros } => EvictionPolicy::Stale { older_than_micros },
             EvictArgs::Lru { keep_fraction } => EvictionPolicy::Lru { keep_fraction },
+            EvictArgs::Expired => EvictionPolicy::Expired,
             EvictArgs::LowScore {
                 score_threshold,
                 confidence_threshold,
@@ -947,7 +949,7 @@ impl Tool for MemEvict {
                 "additionalProperties": false,
                 "properties": {
                     "policy": {"type": "string", "enum": [
-                        "stale", "lru", "low_score", "purge_region", "predicate_match"
+                        "stale", "lru", "expired", "low_score", "purge_region", "predicate_match"
                     ]},
                     "older_than_micros": {"type": "integer"},
                     "keep_fraction": {"type": "number"},

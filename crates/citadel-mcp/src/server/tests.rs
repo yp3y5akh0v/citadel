@@ -189,6 +189,22 @@ fn link_evolve_summarize_evict_happy_paths() {
     assert_eq!(evicted["result"]["isError"], json!(false));
 }
 
+/// `expired` drops only atoms whose TTL has lapsed; unexpired ones survive.
+#[test]
+fn mem_evict_expired_removes_only_lapsed_ttl() {
+    let (_d, eng) = engine();
+    let lapsed = eng
+        .remember("r", AtomInput::new("fact", "lapsed").with_expires_at(1))
+        .unwrap();
+    let live = eng.remember("r", AtomInput::new("fact", "kept")).unwrap();
+
+    let evicted = call(&eng, "mem_evict", json!({"policy": "expired"}));
+    assert_eq!(evicted["result"]["isError"], json!(false));
+
+    assert!(eng.fetch_one("r", lapsed).unwrap().is_none());
+    assert!(eng.fetch_one("r", live).unwrap().is_some());
+}
+
 /// `mem_link` rejects an edge to a non-existent atom (no dangling edges); real atoms link fine.
 #[test]
 fn mem_link_rejects_nonexistent_atoms() {
