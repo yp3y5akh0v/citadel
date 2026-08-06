@@ -255,3 +255,19 @@ def test_byo_embedder_embed_queries_used_for_query():
     mem.remember("r", {"kind": "fact", "text": "doc"})  # passage side -> embed
     mem.recall("r", text="q", k=1)  # query side -> embed_queries
     assert calls["embed_queries"] >= 1
+
+
+def test_recall_excludes_superseded_unless_opted_in():
+    mem = mem_db()
+    region(mem)
+    old = mem.remember("r", {"kind": "fact", "text": "alpha old value"})
+    new = mem.remember("r", {"kind": "fact", "text": "alpha new value"})
+    mem.link(new, old, "supersedes")
+
+    default_ids = {h.id for h in mem.recall("r", text="alpha", k=10)}
+    assert old not in default_ids, "a superseded atom is hidden by default"
+    assert new in default_ids
+
+    opts = citadeldb.RecallOptions(include_superseded=True)
+    opted_in = {h.id for h in mem.recall("r", text="alpha", k=10, options=opts)}
+    assert old in opted_in, "include_superseded must bring the old atom back"

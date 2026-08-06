@@ -234,6 +234,7 @@ class RecallOptions:
         weights: tuple[float, float, float, float] | None = ...,
         as_of_micros: int | None = ...,
         graph_expand: tuple[int, list[str]] | None = ...,
+        include_superseded: bool = ...,
     ) -> None: ...
 
 class Memory:
