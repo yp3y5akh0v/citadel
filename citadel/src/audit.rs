@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use zeroize::Zeroize;
 
 use citadel_core::{
     AUDIT_ENTRY_MAGIC, AUDIT_HEADER_SIZE, AUDIT_LOG_MAGIC, AUDIT_LOG_VERSION,
@@ -312,6 +313,12 @@ pub(crate) struct AuditLog {
     /// rotation so released binaries keep opening the database.
     version: u32,
     created_at: u64,
+}
+
+impl Drop for AuditLog {
+    fn drop(&mut self) {
+        self.audit_key.zeroize();
+    }
 }
 
 impl AuditLog {
