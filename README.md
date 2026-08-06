@@ -208,7 +208,7 @@ published systems are in
 - **Hot backup** - Consistent snapshots via MVCC, no write blocking
 - **Overflow pages** - Large values handled transparently, no size limits
 - **Cross-platform** - Windows, Linux, macOS. Python, C FFI (37 functions), and WebAssembly bindings
-- **5,000+ tests** - Unit, integration, torture tests across 20 crates
+- **5,200+ tests** - Unit, integration, torture tests across 21 crates
 
 ## Speed benchmarks
 
@@ -459,6 +459,8 @@ Reproduce with `cargo bench -p citadeldb-sql --bench h2h_bench`
 Agent layer:
 +---------------------------------------------+
 |                 citadel-ai                  |  Agent runtime (ReAct + Reflexion)
++---------------------------------------------+
+|                 citadel-llm                 |  LLM client layer: Claude, OpenAI, Ollama, Gemini
 +---------------------------------------------+
 
 Memory layer:
