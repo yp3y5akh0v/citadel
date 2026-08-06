@@ -99,7 +99,6 @@ thiserror = "2.0"
 
 parking_lot = "0.12"
 rayon = "1.10"
-fs2 = "0.4"
 
 libc = "0.2"
 io-uring = "0.7"
