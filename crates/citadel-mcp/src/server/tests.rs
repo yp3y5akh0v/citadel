@@ -374,6 +374,43 @@ fn mem_recall_attest_attaches_verdict_to_hits() {
     assert_eq!(hits[0]["attestation"]["aadBound"], true);
 }
 
+/// Recall hides atoms a newer atom supersedes; `include_superseded` is the way back.
+/// Without the flag an MCP client cannot reach superseded history at all.
+#[test]
+fn mem_recall_excludes_superseded_unless_asked() {
+    let (_d, eng) = engine();
+    let old = eng
+        .remember("r", AtomInput::new("fact", "alpha old value"))
+        .unwrap();
+    let new = eng
+        .remember("r", AtomInput::new("fact", "alpha new value"))
+        .unwrap();
+    eng.link(new, old, citadel_mem::EdgeKind::Supersedes, 1.0)
+        .unwrap();
+
+    let ids = |resp: &serde_json::Value| -> Vec<i64> {
+        resp["result"]["structuredContent"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_i64().unwrap())
+            .collect()
+    };
+
+    let default = call(&eng, "mem_recall", json!({"query": "alpha", "k": 10}));
+    assert!(!ids(&default).contains(&old), "superseded atom is hidden");
+
+    let opted = call(
+        &eng,
+        "mem_recall",
+        json!({"query": "alpha", "k": 10, "include_superseded": true}),
+    );
+    assert!(
+        ids(&opted).contains(&old),
+        "include_superseded must bring it back"
+    );
+}
+
 /// `mem_recall` attaches a `resource_link` content block per hit, each a dereferenceable
 /// `memory://atom/{id}` URI; the links resolve via `resources/read`. structuredContent is
 /// unchanged (the links are additive content blocks).

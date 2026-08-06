@@ -700,18 +700,20 @@ pub(crate) struct PyRecallOptions {
     weights: Option<FusionWeights>,
     as_of_micros: Option<i64>,
     graph_expand: Option<GraphExpand>,
+    include_superseded: bool,
 }
 
 #[pymethods]
 impl PyRecallOptions {
     #[new]
-    #[pyo3(signature = (*, payload_filter=None, weights=None, as_of_micros=None, graph_expand=None))]
+    #[pyo3(signature = (*, payload_filter=None, weights=None, as_of_micros=None, graph_expand=None, include_superseded=false))]
     fn new(
         py: Python<'_>,
         payload_filter: Option<Py<PyAny>>,
         weights: Option<(f32, f32, f32, f32)>,
         as_of_micros: Option<i64>,
         graph_expand: Option<(usize, Vec<String>)>,
+        include_superseded: bool,
     ) -> PyResult<Self> {
         let payload_filter = match &payload_filter {
             Some(p) => Some(py_to_json(py, p.bind(py))?),
@@ -738,6 +740,7 @@ impl PyRecallOptions {
             weights,
             as_of_micros,
             graph_expand,
+            include_superseded,
         })
     }
 }
@@ -842,6 +845,9 @@ impl PyMemory {
             }
             if let Some(ge) = &opts.graph_expand {
                 q = q.with_graph_expand(ge.clone());
+            }
+            if opts.include_superseded {
+                q = q.with_superseded(true);
             }
         }
         Ok(self
