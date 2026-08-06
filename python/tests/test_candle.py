@@ -7,11 +7,11 @@ import pytest
 import citadeldb
 from citadeldb import _core
 
-MODEL = r"C:\Users\yuriy\models\bge-small-en-v1.5"
+MODEL = os.environ.get("CITADEL_BGE_SMALL_DIR", "")
 
 pytestmark = pytest.mark.skipif(
-    not hasattr(_core, "CandleEmbedder") or not os.path.isdir(MODEL),
-    reason="requires a candle-embed build and a local bge-small model",
+    not hasattr(_core, "CandleEmbedder") or not MODEL or not os.path.isdir(MODEL),
+    reason="set CITADEL_BGE_SMALL_DIR to a local bge-small model (needs a candle-embed build)",
 )
 
 
