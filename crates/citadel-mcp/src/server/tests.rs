@@ -374,6 +374,38 @@ fn mem_recall_attest_attaches_verdict_to_hits() {
     assert_eq!(hits[0]["attestation"]["aadBound"], true);
 }
 
+/// The engine writes `similar_to` edges (mem_evolve, graph weave) and `mem_edges`
+/// emits that string, so the tools must also accept it as a filter.
+#[test]
+fn similar_to_edges_round_trip_through_the_tools() {
+    let (_d, eng) = engine();
+    let a = eng.remember("r", AtomInput::new("fact", "alpha")).unwrap();
+    let b = eng.remember("r", AtomInput::new("fact", "beta")).unwrap();
+
+    let linked = call(
+        &eng,
+        "mem_link",
+        json!({"src": a, "dst": b, "kind": "similar_to"}),
+    );
+    assert_eq!(
+        linked["result"]["isError"],
+        json!(false),
+        "mem_link accepts it"
+    );
+
+    let listed = call(&eng, "mem_edges", json!({"src": a, "kind": "similar_to"}));
+    assert_eq!(
+        listed["result"]["isError"],
+        json!(false),
+        "mem_edges filters by the same string it emits"
+    );
+    let edges = listed["result"]["structuredContent"]["edges"]
+        .as_array()
+        .unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["kind"], "similar_to");
+}
+
 /// Recall hides atoms a newer atom supersedes; `include_superseded` is the way back.
 /// Without the flag an MCP client cannot reach superseded history at all.
 #[test]

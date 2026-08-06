@@ -67,6 +67,7 @@ impl Drop for Permit<'_> {
 /// Refilling token bucket for a TPM limit: capacity = one burst, refill = `tpm/60`
 /// per second. The lock is held only for the arithmetic, never the sleep.
 pub struct TpmBucket {
+    tpm: u64,
     refill_per_sec: f64,
     capacity: f64,
     state: Mutex<BucketState>,
@@ -79,10 +80,12 @@ struct BucketState {
 
 impl TpmBucket {
     pub fn new(tpm: u64, burst_frac: f64) -> Self {
-        let tpm = tpm.max(1) as f64; // never 0 -> refill_per_sec > 0, no NaN/inf sleep
-        let capacity = (tpm * burst_frac).max(1.0);
+        let tpm = tpm.max(1); // never 0 -> refill_per_sec > 0, no NaN/inf sleep
+        let rate = tpm as f64;
+        let capacity = (rate * burst_frac).max(1.0);
         Self {
-            refill_per_sec: tpm / 60.0,
+            tpm,
+            refill_per_sec: rate / 60.0,
             capacity,
             state: Mutex::new(BucketState {
                 available: capacity,
@@ -127,6 +130,27 @@ pub struct Pacer {
     buckets: FxHashMap<String, Arc<TpmBucket>>,
 }
 
+/// Reader and judge can share a model id; the tighter limit has to win, or the
+/// looser one over-admits into the provider's real quota.
+fn insert_tighter_bucket(
+    buckets: &mut FxHashMap<String, Arc<TpmBucket>>,
+    key: String,
+    tpm: u64,
+    burst: f64,
+) {
+    let tpm = tpm.max(1);
+    match buckets.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if tpm < entry.get().tpm {
+                entry.insert(Arc::new(TpmBucket::new(tpm, burst)));
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(Arc::new(TpmBucket::new(tpm, burst)));
+        }
+    }
+}
+
 impl Pacer {
     /// Build buckets for the reader and judge models. Equal ids collapse to one
     /// shared bucket. `CITADEL_MEMBENCH_TPM_BURST_FRAC` (default 1.0) scales capacity.
@@ -134,16 +158,13 @@ impl Pacer {
         let burst = std::env::var("CITADEL_MEMBENCH_TPM_BURST_FRAC")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
-            .filter(|f| *f > 0.0)
+            // A non-finite fraction would make capacity infinite, silently
+            // disabling the limiter it was meant to scale.
+            .filter(|f| f.is_finite() && *f > 0.0)
             .unwrap_or(1.0);
         let mut buckets = FxHashMap::default();
-        buckets.insert(
-            reader_model.to_string(),
-            Arc::new(TpmBucket::new(reader_tpm, burst)),
-        );
-        buckets
-            .entry(judge_model.to_string())
-            .or_insert_with(|| Arc::new(TpmBucket::new(judge_tpm, burst)));
+        insert_tighter_bucket(&mut buckets, reader_model.to_string(), reader_tpm, burst);
+        insert_tighter_bucket(&mut buckets, judge_model.to_string(), judge_tpm, burst);
         Self { buckets }
     }
 
@@ -172,6 +193,9 @@ impl Pacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the tests that mutate process-global env vars.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn gate_caps_in_flight_and_releases_on_drop() {
@@ -215,5 +239,29 @@ mod tests {
         assert_eq!(default_tpm_for_model("gpt-4o-mini"), 2_000_000);
         assert_eq!(default_tpm_for_model("gpt-4o"), 200_000);
         assert!(default_tpm_for_model("gpt-4o-mini") > default_tpm_for_model("gpt-4o"));
+    }
+
+    #[test]
+    fn a_shared_model_keeps_the_tighter_limit_whichever_role_is_first() {
+        // The judge is tighter here, and it is inserted second.
+        let judge_second = Pacer::new("m", 900_000, "m", 1_000);
+        assert_eq!(judge_second.buckets.len(), 1);
+        assert_eq!(judge_second.buckets["m"].tpm, 1_000);
+
+        // Reader tighter, inserted first: still the tighter one.
+        let reader_first = Pacer::new("m", 1_000, "m", 900_000);
+        assert_eq!(reader_first.buckets["m"].tpm, 1_000);
+    }
+
+    #[test]
+    fn a_non_finite_burst_fraction_cannot_disable_the_limiter() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CITADEL_MEMBENCH_TPM_BURST_FRAC", "inf");
+        let p = Pacer::new("m", 600, "m", 600);
+        std::env::remove_var("CITADEL_MEMBENCH_TPM_BURST_FRAC");
+        assert!(
+            p.buckets["m"].capacity.is_finite(),
+            "an infinite burst would make every acquire free"
+        );
     }
 }
