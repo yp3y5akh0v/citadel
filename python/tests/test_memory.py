@@ -103,6 +103,16 @@ def test_evict_summarize_and_immutable():
     assert mem.count("r", "fact") == 1
 
 
+def test_evict_expired_removes_only_lapsed_ttl():
+    mem = mem_db()
+    region(mem)
+    mem.remember("r", {"kind": "fact", "text": "lapsed", "expires_at": 1})
+    mem.remember("r", {"kind": "fact", "text": "kept"})
+    removed = mem.evict("r", citadeldb.EvictionPolicy.expired())
+    assert removed == 1
+    assert mem.count("r", "fact") == 1
+
+
 def test_byo_python_embedder():
     class Bucketed:
         dim = 8

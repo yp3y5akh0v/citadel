@@ -511,6 +511,14 @@ impl PyEvictionPolicy {
         }
     }
 
+    /// Atoms whose `expires_at` TTL has lapsed.
+    #[staticmethod]
+    fn expired() -> Self {
+        Self {
+            inner: EvictionPolicy::Expired,
+        }
+    }
+
     /// Atoms below both thresholds.
     #[staticmethod]
     fn low_score(score_threshold: f32, confidence_threshold: f32) -> Self {
