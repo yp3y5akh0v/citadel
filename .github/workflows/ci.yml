@@ -97,11 +97,11 @@ jobs:
           key: ${{ matrix.name }}
       - run: cargo test --workspace ${{ matrix.features }}
 
-  # Opt-in citadel-ai backends the default workspace test skips; also proves wasm cfg-away.
+  # Opt-in backends the default workspace test skips; also proves wasm cfg-away.
   ai-backends:
     needs: [fmt, clippy]
     runs-on: ubuntu-latest
-    name: citadel-ai backends
+    name: llm + ai backends
     steps:
       - uses: actions/checkout@v5
       - name: Install pinned toolchain (rust-toolchain.toml)
@@ -109,6 +109,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ai-backends
+      # citadel-llm is its own published crate; do not let its coverage depend on
+      # another crate happening to enable its backend features.
+      - name: citadel-llm standalone (all features, mock-only, and wasm)
+        run: |
+          cargo clippy -p citadeldb-llm --all-targets --all-features -- -D warnings
+          cargo test -p citadeldb-llm --all-features
+          cargo clippy -p citadeldb-llm --all-targets --no-default-features -- -D warnings
+          cargo build -p citadeldb-llm --target wasm32-unknown-unknown --features claude,openai,ollama
       - name: clippy (backend + file-tools + command-tool features)
         run: cargo clippy -p citadeldb-ai --all-targets --features claude,openai,ollama,file-tools,command-tool -- -D warnings
       - name: test (backend + file-tools + command-tool features)
@@ -122,6 +130,9 @@ jobs:
         run: cargo clippy -p citadeldb-python --all-targets --features candle-embed -- -D warnings
       - name: wasm32 compiles with features gated away to mock-only
         run: cargo build -p citadeldb-ai --target wasm32-unknown-unknown --features claude,openai,ollama
+      # required-features hide these bins from --all-targets, so nothing else builds them.
+      - name: membench binaries
+        run: cargo check -p citadeldb-membench --features openai,candle-embed --bins
 
   # Build the wheel, run pytest, and type-check the stubs/facades.
   python:
