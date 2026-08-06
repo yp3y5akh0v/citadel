@@ -11,7 +11,7 @@ echo "Publishing version $version"
 crates=(
   citadeldb-core citadeldb-crypto citadeldb-io citadeldb-page citadeldb-buffer
   citadeldb-txn citadeldb-sync citadeldb citadeldb-sql-json-path citadeldb-vector
-  citadeldb-sql citadeldb-mem citadeldb-ai citadeldb-mcp citadeldb-cli
+  citadeldb-sql citadeldb-mem citadeldb-llm citadeldb-ai citadeldb-mcp citadeldb-cli
 )
 
 for c in "${crates[@]}"; do
