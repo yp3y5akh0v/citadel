@@ -9,6 +9,9 @@ pub mod replay;
 pub mod tools;
 pub mod verify;
 
+// These appear in this crate's public API; consumers must be able to name them.
+pub use citadel_llm::{AssistantMessage, LLMClient, LlmError, Message, ToolCall, ToolSpec};
+
 pub use agent::{
     Agent, AgentConfig, AgentError, AgentReport, AgentResult, CognitionState, DiscoveryGoal,
     DiscoveryReport, ReflectReason, RetryPolicy, TerminatedBy,
