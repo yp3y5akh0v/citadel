@@ -127,8 +127,7 @@ impl CandleConfig {
         }
     }
 
-    /// `intfloat/e5-large-v2` - the later retrain; weaker than v1 on our
-    /// retrieval, kept as a selectable option.
+    /// `intfloat/e5-large-v2` - the later retrain, selectable but not the default.
     pub fn e5_large_v2() -> Self {
         Self {
             model_id: "e5-large-v2".into(),

@@ -182,7 +182,7 @@ pub struct CompletionRequest {
     /// Strict reply schema; guarantees JSON text or a pre-dispatch refusal.
     pub output_schema: Option<Value>,
     pub stop: Vec<String>,
-    /// Best-effort seed; seedless temp-0 flips ~9% of answers (A/B noise floor).
+    /// Best-effort seed. Temperature 0 alone does not make a reply reproducible.
     pub seed: Option<u64>,
 }
 

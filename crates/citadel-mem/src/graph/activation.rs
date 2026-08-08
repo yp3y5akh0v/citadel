@@ -14,7 +14,7 @@ const ACTIVATION_CAP: f32 = 1.0;
 
 const ACTIVATION_PAGE: usize = 1024;
 
-/// The interned diffusion universe; undirected measured best - never rebuild Katz.
+/// The interned diffusion universe; edges are undirected and built once per cache slot.
 struct Diffusion {
     ids: Vec<AtomId>,
     index: FxHashMap<AtomId, usize>,
@@ -65,7 +65,7 @@ fn build_diffusion(
             } else {
                 1.0
             };
-            // Mutual pairs double-transmit; kept as-is, collapse is a scheduled A/B.
+            // Mutual pairs double-transmit; kept as-is.
             adjacency[s].push((d, w));
             adjacency[d].push((s, w));
         }
