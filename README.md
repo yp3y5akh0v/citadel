@@ -4,7 +4,7 @@
 
 <h1 align="center">Citadel</h1>
 
-<p align="center">Local-first encrypted memory engine for AI agents, built on an embedded SQL/vector database with zero-LLM ingest, MCP, and cryptographic forgetting.</p>
+<p align="center">Local-first encrypted memory for AI agents.</p>
 
 <p align="center">
   <a href="https://crates.io/crates/citadeldb"><img src="https://badgen.net/crates/v/citadeldb" alt="crates.io"></a>
@@ -20,7 +20,35 @@
 
 ## Quick Start
 
-### Memory
+```bash
+pip install citadeldb
+```
+
+```python
+import citadeldb
+
+db = citadeldb.connect("memory.cdl", key="your-passphrase", region_keys=True)
+mem = db.memory()
+mem.create_encrypted_region("chat", citadeldb.MockEmbedder(dim=64))
+
+mem.remember("chat", {"kind": "fact", "text": "Alice's cat is named Mochi"})
+berlin = mem.remember("chat", {"kind": "fact", "text": "Alice lives in Berlin"})
+
+for hit in mem.recall("chat", text="where does Alice live?", k=2):
+    print(f"{hit.score:.3f}  {hit.text}")
+# 0.850  Alice lives in Berlin
+# 0.200  Alice's cat is named Mochi
+
+# Forgetting destroys the atom's key, so the ciphertext is unrecoverable.
+receipt = mem.forget("chat", [berlin])
+print(receipt.cryptographic_erasure, receipt.algorithm)
+# True AES-256-KW(RFC3394)
+```
+
+`MockEmbedder` needs no download and is enough to try the API. For real recall
+quality use `CandleEmbedder` with a local e5-large, which is the benchmark setup.
+
+### Memory (Rust)
 
 Uses the `citadeldb` and `citadeldb-mem` crates (enable `citadeldb-mem`'s `candle-embed` feature). `e5_large` loads the recommended local embedder, and adding a `CrossEncoder` reranker gives the best recall (the benchmark config). Other presets (`bge_large`, `bge_small`, ...) or a custom `Embedder` work too.
 
