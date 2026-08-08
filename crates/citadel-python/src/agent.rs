@@ -348,6 +348,7 @@ pub(crate) struct PyAgentConfig {
     recall_context_k: usize,
     recall_context: RecallProfile,
     temperature: f32,
+    seed: Option<u64>,
     retry: RetryPolicy,
     verifier: Option<Arc<dyn Verifier>>,
     proposal_operator: Option<Arc<dyn ProposalOperator>>,
@@ -366,6 +367,7 @@ impl Default for PyAgentConfig {
             recall_context_k: c.recall_context_k,
             recall_context: c.recall_context,
             temperature: c.temperature,
+            seed: c.seed,
             retry: c.retry,
             verifier: c.verifier,
             proposal_operator: c.proposal_operator,
@@ -390,7 +392,7 @@ impl PyAgentConfig {
             proposal_operator: self.proposal_operator.clone(),
             max_repairs: self.max_repairs,
             temperature: self.temperature,
-            seed: AgentConfig::default().seed,
+            seed: self.seed,
         }
     }
 }
@@ -530,6 +532,16 @@ impl PyAgentConfig {
     #[setter]
     fn set_temperature(&mut self, value: f32) {
         self.temperature = value;
+    }
+
+    #[getter]
+    fn seed(&self) -> Option<u64> {
+        self.seed
+    }
+
+    #[setter]
+    fn set_seed(&mut self, value: Option<u64>) {
+        self.seed = value;
     }
 
     /// Capped, jittered backoff for transient tool/LLM failures. Transient errors

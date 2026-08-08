@@ -162,6 +162,9 @@ fn backoff_sleep(ms: u64) {
 fn backoff_sleep(_ms: u64) {}
 
 /// Tunables for a run. `verifier` None = fall back to a bounded audited critic.
+///
+/// Build from [`Default`] and override the fields you need, keeping `..Default::default()`.
+/// Tunables are added in minor releases, so an exhaustive literal will not keep compiling.
 pub struct AgentConfig {
     pub drift_bound: u32,
     pub max_replans: u32,

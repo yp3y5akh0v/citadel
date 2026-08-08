@@ -548,6 +548,7 @@ class AgentConfig:
     max_repairs: int
     recall_context_k: int
     temperature: float
+    seed: int | None
     def set_retry(self, base_ms: int, max_ms: int) -> None: ...
     def set_recall_context_weights(
         self,
