@@ -85,7 +85,8 @@ fn parse_fixed_offset(s: &str) -> Option<()> {
     let (hh, mm) = if let Some((h, m)) = rest.split_once(':') {
         (h, m)
     } else if rest.len() == 4 {
-        (&rest[..2], &rest[2..])
+        // len() counts bytes, so a multi-byte char can put index 2 mid-character.
+        rest.split_at_checked(2)?
     } else if rest.len() == 2 {
         (rest, "00")
     } else {
@@ -1159,6 +1160,17 @@ mod tests {
             .argon2_profile(Argon2Profile::Iot)
             .create()
             .unwrap()
+    }
+
+    #[test]
+    fn multibyte_timezone_offset_is_rejected_not_panicked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        // Four BYTES but three chars, so the +HHMM split lands mid-character.
+        assert!(conn.execute("SET TIME ZONE '+\u{20AC}a'").is_err());
+        assert!(conn.set_session_timezone("-\u{20AC}a").is_err());
+        assert_eq!(conn.session_timezone(), "UTC");
     }
 
     #[test]
