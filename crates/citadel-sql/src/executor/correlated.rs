@@ -1358,21 +1358,28 @@ pub(super) fn build_and_scan_correlated_with_read(
                             return false;
                         }
                     };
-                    let inner_col_map = ColumnMap::new(&filter_data.inner_schema.columns);
-                    let matched = if let Some(inner_rows) = filter_data.rows_by_key.get(&outer_key)
-                    {
-                        inner_rows.iter().any(|inner_row| {
-                            filter_data.non_eq_predicates.iter().all(|pred| {
-                                let bound =
-                                    bind_outer_values_in_expr(pred, &row, &outer_col_map, ctx);
-                                match eval_expr(&bound, &EvalCtx::new(&inner_col_map, inner_row)) {
-                                    Ok(v) => is_truthy(&v),
-                                    Err(_) => false,
-                                }
+                    let inner_col_map = filter_data.inner_schema.column_map();
+                    let matched = match filter_data.rows_by_key.get(&outer_key) {
+                        Some(inner_rows) if !inner_rows.is_empty() => {
+                            // The binding varies only with the outer row, so rebuilding the
+                            // predicate tree per inner row is pure allocator traffic.
+                            let bound: Vec<_> = filter_data
+                                .non_eq_predicates
+                                .iter()
+                                .map(|pred| {
+                                    bind_outer_values_in_expr(pred, &row, &outer_col_map, ctx)
+                                })
+                                .collect();
+                            inner_rows.iter().any(|inner_row| {
+                                bound.iter().all(|b| {
+                                    match eval_expr(b, &EvalCtx::new(inner_col_map, inner_row)) {
+                                        Ok(v) => is_truthy(&v),
+                                        Err(_) => false,
+                                    }
+                                })
                             })
-                        })
-                    } else {
-                        false
+                        }
+                        _ => false,
                     };
                     let passes = if ef.negated { !matched } else { matched };
                     if passes {
@@ -1609,18 +1616,25 @@ pub(super) fn handle_correlated_where_with_read(
                                 if key.iter().any(|v| v.is_null()) {
                                     return is_negated;
                                 }
-                                let found =
-                                    if let Some(inner_rows) = filter_data.rows_by_key.get(&key) {
-                                        inner_rows.iter().any(|inner_row| {
-                                            filter_data.non_eq_predicates.iter().all(|pred| {
-                                                let bound = bind_outer_values_in_expr(
+                                let found = match filter_data.rows_by_key.get(&key) {
+                                    Some(inner_rows) if !inner_rows.is_empty() => {
+                                        // Bind once per outer row, not once per inner row.
+                                        let bound: Vec<_> = filter_data
+                                            .non_eq_predicates
+                                            .iter()
+                                            .map(|pred| {
+                                                bind_outer_values_in_expr(
                                                     pred,
                                                     outer_row,
                                                     &outer_col_map,
                                                     ctx,
-                                                );
+                                                )
+                                            })
+                                            .collect();
+                                        inner_rows.iter().any(|inner_row| {
+                                            bound.iter().all(|b| {
                                                 match eval_expr(
-                                                    &bound,
+                                                    b,
                                                     &EvalCtx::new(&inner_col_map, inner_row),
                                                 ) {
                                                     Ok(val) => is_truthy(&val),
@@ -1628,9 +1642,9 @@ pub(super) fn handle_correlated_where_with_read(
                                                 }
                                             })
                                         })
-                                    } else {
-                                        false
-                                    };
+                                    }
+                                    _ => false,
+                                };
                                 if is_negated {
                                     !found
                                 } else {
