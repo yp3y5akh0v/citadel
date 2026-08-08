@@ -114,6 +114,32 @@ impl BTree {
         self.last_delete = None;
     }
 
+    /// Re-root after a spine CoW performed outside this type. The cached LIL paths name the
+    /// ancestors that CoW just superseded, so they cannot survive it.
+    pub fn reroot_after_external_cow(&mut self, new_root: PageId) {
+        self.root = new_root;
+        self.clear_lil_caches();
+    }
+
+    /// Rewrite the cached LIL paths after a CoW elsewhere in the tree moved ancestor pages.
+    ///
+    /// A no-split insert changes page ids but not tree shape, so a cached path stays valid
+    /// once its superseded ids are replaced. Dropping the cache instead would be correct but
+    /// would cost the append fast path on every insert that lands off the rightmost leaf.
+    fn remap_lil_paths(&mut self, moved: &[(PageId, PageId)]) {
+        if moved.is_empty() {
+            return;
+        }
+        for cache in [&mut self.last_insert, &mut self.last_delete] {
+            let Some((path, _)) = cache else { continue };
+            for (id, _) in path.iter_mut() {
+                if let Some(&(_, new_id)) = moved.iter().find(|(old, _)| old == id) {
+                    *id = new_id;
+                }
+            }
+        }
+    }
+
     pub fn debug_assert_lil_disjoint(&self) {
         debug_assert!(
             self.last_insert.is_none() || self.last_delete.is_none(),
@@ -389,9 +415,13 @@ impl BTree {
             let mut child = new_leaf_id;
             let mut is_rightmost = true;
             let mut new_path = path;
+            let mut moved: Vec<(PageId, PageId)> = Vec::new();
             for i in (0..new_path.len()).rev() {
                 let (ancestor_id, child_idx) = new_path[i];
                 let new_ancestor = cow_page(pages, alloc, ancestor_id, txn_id);
+                if new_ancestor != ancestor_id {
+                    moved.push((ancestor_id, new_ancestor));
+                }
                 let page = pages.get_mut(&new_ancestor).unwrap();
                 update_branch_child(page, child_idx, child);
                 if child_idx != page.num_cells() as usize {
@@ -405,6 +435,8 @@ impl BTree {
             if is_rightmost {
                 self.last_delete = None;
                 self.last_insert = Some((new_path, new_leaf_id));
+            } else {
+                self.remap_lil_paths(&moved);
             }
 
             if !key_exists {
@@ -524,9 +556,13 @@ impl BTree {
             let mut child = new_leaf_id;
             let mut is_rightmost = true;
             let mut new_path = path;
+            let mut moved: Vec<(PageId, PageId)> = Vec::new();
             for i in (0..new_path.len()).rev() {
                 let (ancestor_id, child_idx) = new_path[i];
                 let new_ancestor = cow_page(pages, alloc, ancestor_id, txn_id);
+                if new_ancestor != ancestor_id {
+                    moved.push((ancestor_id, new_ancestor));
+                }
                 let page = pages.get_mut(&new_ancestor).unwrap();
                 update_branch_child(page, child_idx, child);
                 if child_idx != page.num_cells() as usize {
@@ -540,6 +576,8 @@ impl BTree {
             if is_rightmost {
                 self.last_delete = None;
                 self.last_insert = Some((new_path, new_leaf_id));
+            } else {
+                self.remap_lil_paths(&moved);
             }
             self.entry_count += 1;
             return Ok(None);
@@ -662,9 +700,13 @@ impl BTree {
             let mut child = new_leaf_id;
             let mut is_rightmost = true;
             let mut new_path = path;
+            let mut moved: Vec<(PageId, PageId)> = Vec::new();
             for i in (0..new_path.len()).rev() {
                 let (ancestor_id, child_idx) = new_path[i];
                 let new_ancestor = cow_page(pages, alloc, ancestor_id, txn_id);
+                if new_ancestor != ancestor_id {
+                    moved.push((ancestor_id, new_ancestor));
+                }
                 let page = pages.get_mut(&new_ancestor).unwrap();
                 update_branch_child(page, child_idx, child);
                 if child_idx != page.num_cells() as usize {
@@ -678,6 +720,8 @@ impl BTree {
             if is_rightmost {
                 self.last_delete = None;
                 self.last_insert = Some((new_path, new_leaf_id));
+            } else {
+                self.remap_lil_paths(&moved);
             }
             self.entry_count += 1;
             return Ok(true);

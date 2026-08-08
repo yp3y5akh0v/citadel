@@ -51,7 +51,7 @@ pub(super) fn extend_joined_columns(out: &mut Vec<ColumnDef>, table: &(String, &
             generated_expr: None,
             generated_sql: None,
             generated_kind: None,
-            collation: crate::types::Collation::Binary,
+            collation: col.collation,
         });
     }
 }
@@ -253,7 +253,7 @@ pub(super) fn build_projected_columns(
                 generated_expr: None,
                 generated_sql: None,
                 generated_kind: None,
-                collation: crate::types::Collation::Binary,
+                collation: orig.collation,
             }
         })
         .collect()

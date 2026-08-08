@@ -2834,54 +2834,63 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             crate::json::fn_json_query(&evaluated[0], &evaluated[1], crate::types::DataType::Jsonb)
         }
         "JSONB_PATH_EXISTS" => {
+            check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
             crate::json::fn_jsonb_path_exists(&evaluated)
         }
         "JSONB_PATH_MATCH" => {
+            check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
             crate::json::fn_jsonb_path_match(&evaluated)
         }
         "JSONB_PATH_QUERY_FIRST" => {
+            check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
             crate::json::fn_jsonb_path_query_first(&evaluated)
         }
         "JSONB_PATH_QUERY_ARRAY" => {
+            check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
             crate::json::fn_jsonb_path_query_array(&evaluated)
         }
         "JSONB_PATH_EXISTS_TZ" => {
+            check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
             crate::json::fn_jsonb_path_exists_tz(&evaluated)
         }
         "JSONB_PATH_MATCH_TZ" => {
+            check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
             crate::json::fn_jsonb_path_match_tz(&evaluated)
         }
         "JSONB_PATH_QUERY_TZ" => {
+            check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
             crate::json::fn_jsonb_path_query_tz(&evaluated)
         }
         "JSONB_PATH_QUERY_FIRST_TZ" => {
+            check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
             crate::json::fn_jsonb_path_query_first_tz(&evaluated)
         }
         "JSONB_PATH_QUERY_ARRAY_TZ" => {
+            check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
@@ -3305,6 +3314,18 @@ fn date_trunc_in_zone(unit: &str, ts_utc: i64, tz: &str) -> Result<Value> {
         }
     };
     Ok(Value::Timestamp(rounded.timestamp().as_microsecond()))
+}
+
+/// For functions with optional trailing arguments, whose callee validates the upper bound.
+fn check_min_args(name: &str, args: &[Value], min: usize) -> Result<()> {
+    if args.len() < min {
+        Err(SqlError::InvalidValue(format!(
+            "{name} requires at least {min} argument(s), got {}",
+            args.len()
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 fn check_args(name: &str, args: &[Value], expected: usize) -> Result<()> {
