@@ -299,3 +299,11 @@ fn format_date_bc() {
     let bc1 = parse_date("0001-01-01 BC").unwrap();
     assert_eq!(format_date(bc1), "0001-01-01 BC");
 }
+
+#[test]
+fn multibyte_offset_is_rejected_not_panicked() {
+    // Four BYTES but three chars, so the +HHMM split lands mid-character.
+    assert!(resolve_timezone("+\u{20AC}a").is_err());
+    assert!(resolve_timezone("-\u{20AC}a").is_err());
+    assert!(resolve_timezone("+\u{00B1}\u{00B1}").is_err());
+}

@@ -149,9 +149,10 @@ impl std::fmt::Debug for Database {
     }
 }
 
-// TxnManager is internally synchronized (Mutex + Atomic)
-unsafe impl Send for Database {}
-unsafe impl Sync for Database {}
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Database>();
+};
 
 impl Database {
     #[cfg(feature = "audit-log")]

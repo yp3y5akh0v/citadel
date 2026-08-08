@@ -590,7 +590,8 @@ fn parse_iso_fixed_offset(s: &str) -> Option<i32> {
     let (hh, mm) = if let Some((h, m)) = rest.split_once(':') {
         (h, m)
     } else if rest.len() == 4 {
-        (&rest[..2], &rest[2..])
+        // len() counts bytes, so a multi-byte char can put index 2 mid-character.
+        rest.split_at_checked(2)?
     } else if rest.len() == 2 {
         (rest, "00")
     } else {
