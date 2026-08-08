@@ -17,7 +17,7 @@ pub const REWEIGHT_REVISION: u32 = 1;
 pub enum WeightShape {
     /// Raw count: 5 citations pull 5x harder than 1.
     Linear,
-    /// sqrt(count): committed default, best all@10 - beat linear and log.
+    /// sqrt(count): moderate compression, the default.
     #[default]
     Sqrt,
     /// ln(1+count): strongest compression - near-binary cited-vs-not.

@@ -156,6 +156,9 @@ pub struct Provenance {
     /// Adjacent turns rendered around each hit (0 = none).
     pub neighbor_radius: usize,
     pub temperature: f32,
+    /// Sampling seed sent with every reader/judge request (best-effort on the
+    /// provider side); pinned so paired runs are comparable.
+    pub sampling_seed: u64,
     /// Retrieval fusion weights (citadel-mem defaults); recorded for
     /// reproducibility.
     pub fusion_semantic: f32,
@@ -569,6 +572,7 @@ pub fn provenance(
         reader_order: config.reader_order.label().to_string(),
         neighbor_radius: config.neighbor_radius,
         temperature: 0.0,
+        sampling_seed: core::eval::SAMPLING_SEED,
         fusion_semantic: w.semantic,
         fusion_keyword: w.keyword,
         fusion_recency: w.recency,

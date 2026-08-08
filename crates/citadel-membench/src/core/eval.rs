@@ -24,6 +24,10 @@ use crate::{BenchConfig, ReaderOrder};
 /// cost.
 const DEFAULT_MAX_TOKENS: u32 = 512;
 
+/// Pinned so two runs of the same config are comparable. Temperature 0 alone is not
+/// reproducible: the reader rewrites a large share of its answers between runs.
+pub(crate) const SAMPLING_SEED: u64 = 1;
+
 /// Output-token cap: `CITADEL_MEMBENCH_MAX_TOKENS` overrides the caller's
 /// `default` (raise it for a reasoning/CoT reader whose thinking tokens would
 /// crowd out the answer).
@@ -257,6 +261,7 @@ fn read_assembled(
         .collect();
     let mut req = CompletionRequest::new(bench.reader_prompt(&view, q.text, q.date));
     req.temperature = Some(0.0);
+    req.seed = Some(SAMPLING_SEED);
     req.max_tokens = Some(max_output_tokens(reader_max_tokens));
     let resp = paced_complete(pacer, reader, &req)?;
     Ok(AnswerOutcome {
@@ -269,8 +274,7 @@ fn read_assembled(
 
 /// Recall the top-`config.top_k` memories, expand to the reader view, then ask
 /// the reader (paced + retried). Uses `RecallProfile::default`. No as-of is
-/// passed: grading recency as of the conversation's end measured worse
-/// (diag C-asof, -4.6 any@30).
+/// passed: grading recency as of the conversation's end measured worse.
 pub fn answer_question(
     bench: &dyn Benchmark,
     reader: &dyn LLMClient,
@@ -353,6 +357,7 @@ fn answer_aggregation(
 ) -> Result<Aggregation> {
     let mut extract = CompletionRequest::new(agentic::extraction_messages(view, q.text, q.date));
     extract.temperature = Some(0.0);
+    extract.seed = Some(SAMPLING_SEED);
     extract.max_tokens = Some(max_output_tokens(reader_max_tokens));
     let extracted = paced_complete(pacer, reader, &extract)?;
     let Some(items) = agentic::parse_items(&extracted.message.content) else {
@@ -364,6 +369,7 @@ fn answer_aggregation(
     messages.push(agentic::anchor_message(&items));
     let mut answer = CompletionRequest::new(messages);
     answer.temperature = Some(0.0);
+    answer.seed = Some(SAMPLING_SEED);
     answer.max_tokens = Some(max_output_tokens(reader_max_tokens));
     let resp = paced_complete(pacer, reader, &answer)?;
 
@@ -397,6 +403,7 @@ pub(crate) fn complete_judge(
         Message::user(user.to_string()),
     ]);
     req.temperature = Some(0.0);
+    req.seed = Some(SAMPLING_SEED);
     req.max_tokens = Some(max_output_tokens(DEFAULT_MAX_TOKENS));
     paced_complete(pacer, judge, &req)
 }
