@@ -1,0 +1,90 @@
+name: Release LangGraph
+
+# Pure-Python adapter, so one universal wheel rather than the per-platform matrix the
+# maturin packages need. The version comes from the release tag, so the checkout must be
+# unshallow or hatch-vcs cannot resolve it.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: packaging/citadeldb-langgraph
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build --outdir dist
+      - name: Fail if the tag did not resolve to a release version
+        run: |
+          set -e
+          ls dist
+          # A dev version means the tag was missing: publishing it would ship a pre-release.
+          if ls dist | grep -q "dev"; then
+            echo "version resolved to a dev build; the tag is not reachable" >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: langgraph-dist
+          path: packaging/citadeldb-langgraph/dist
+
+  test:
+    name: test (py${{ matrix.python }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: langgraph-dist
+          path: packaging/citadeldb-langgraph/dist
+      - name: Install the wheel and run the suite against it
+        run: |
+          set -e
+          pip install dist/*.whl pytest
+          # Run from a scratch dir so the tests import the installed package, not ./src.
+          mkdir -p /tmp/run && cp -r tests /tmp/run/
+          cd /tmp/run && pytest tests -q
+
+  publish:
+    name: Publish to PyPI
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    # Trusted Publishing (OIDC): needs its own PyPI publisher entry for
+    # citadeldb-langgraph, scoped to this workflow file + the pypi environment.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: langgraph-dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+          packages-dir: dist

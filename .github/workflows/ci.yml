@@ -161,3 +161,9 @@ jobs:
         run: mypy -p citadeldb
         env:
           MYPYPATH: python
+      # The LangGraph adapter rides the wheel just built, so a binding change that breaks
+      # it fails here instead of at release.
+      - name: langgraph store
+        run: |
+          pip install ./packaging/citadeldb-langgraph
+          pytest packaging/citadeldb-langgraph/tests -q
