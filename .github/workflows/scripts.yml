@@ -7,12 +7,14 @@ on:
     branches: [master]
     paths:
       - 'scripts/**'
-      - '.github/workflows/scripts.yml'
+      - 'packaging/**'
+      - '.github/workflows/*.yml'
   pull_request:
     branches: [master]
     paths:
       - 'scripts/**'
-      - '.github/workflows/scripts.yml'
+      - 'packaging/**'
+      - '.github/workflows/*.yml'
 
 jobs:
   syntax:
@@ -31,6 +33,24 @@ jobs:
             [ -e "$f" ] || continue
             node --check "$f"
           done
+      # A package under packaging/ with no release workflow ships nothing on a tag, and
+      # the omission only shows up when someone goes looking for it on PyPI.
+      - name: every packaged project has a release workflow
+        run: |
+          missing=0
+          for dir in packaging/*/; do
+            [ -f "$dir/pyproject.toml" ] || continue
+            name=$(grep -m1 '^name = ' "$dir/pyproject.toml" | cut -d'"' -f2)
+            # Only a release-* workflow or a publish script counts. A mention in ci.yml is
+            # a test, not a release, and would otherwise satisfy a looser check.
+            if ! grep -rqF "$dir" .github/workflows/release-*.yml \
+               && ! grep -rqF "$name" scripts/; then
+              echo "packaged but never released: $name ($dir)"
+              missing=1
+            fi
+          done
+          exit $missing
+
       # A crate added to the workspace but not to the publish script fails the
       # release halfway through, after earlier crates are already on crates.io.
       - name: every publishable crate is in the publish script
