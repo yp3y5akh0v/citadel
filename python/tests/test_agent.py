@@ -200,6 +200,16 @@ def test_config_getters_and_setters():
     assert cfg.temperature == pytest.approx(0.5)
 
 
+def test_seed_is_pinned_by_default_and_can_be_released():
+    """Temperature 0 alone does not make a control call reproducible."""
+    cfg = ag.AgentConfig()
+    assert cfg.seed == 1
+    cfg.seed = 7
+    assert cfg.seed == 7
+    cfg.seed = None
+    assert cfg.seed is None
+
+
 def test_recall_context_config_methods():
     cfg = ag.AgentConfig()
     cfg.set_recall_context_weights(0.5, 0.25, 0.0, 0.25)
