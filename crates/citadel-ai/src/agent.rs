@@ -181,8 +181,11 @@ pub struct AgentConfig {
     pub proposal_operator: Option<Arc<dyn ProposalOperator>>,
     /// Max error-feedback repair re-prompts per rejected discovery candidate (0 disables).
     pub max_repairs: u32,
-    /// Sampling temperature for control calls; 0.0 keeps them deterministic.
+    /// Sampling temperature for control calls.
     pub temperature: f32,
+    /// Sampling seed for control calls. Temperature 0 alone does not make a reply
+    /// reproducible; `None` leaves the backend free to vary.
+    pub seed: Option<u64>,
 }
 
 impl Default for AgentConfig {
@@ -200,6 +203,7 @@ impl Default for AgentConfig {
             proposal_operator: None,
             max_repairs: 2,
             temperature: 0.0,
+            seed: Some(1),
         }
     }
 }
@@ -440,9 +444,10 @@ impl Ctx<'_> {
         mut req: CompletionRequest,
         prompt: &ResolvedPrompt,
     ) -> AgentResult<CompletionResponse> {
-        // Every control call runs at the configured temperature (0 by default) so tool
-        // output is deterministic and schema-adherent across backends.
+        // Control calls carry the configured temperature and seed so tool output is
+        // reproducible and schema-adherent across backends.
         req.temperature = Some(self.config.temperature);
+        req.seed = self.config.seed;
         let resp = self.call_with_retry(&req)?;
         self.accrue_and_record(&req, &resp, prompt)?;
         // A terminal or malformed reply still incurred spend, so trace it.
@@ -1999,6 +2004,31 @@ mod tests {
             AgentConfig::default(),
         );
         (dir, agent)
+    }
+
+    /// Temperature 0 alone does not make a backend reply reproducible, so a control call
+    /// that omits the seed is not deterministic however the doc reads.
+    #[test]
+    fn control_calls_carry_the_configured_seed() {
+        let (_dir, eng) = region();
+        let cap = testing::capturing(vec![CompletionResponse::text("done")]);
+        let agent = Agent::new(
+            cap.client(),
+            BeliefGraph::new(eng, "agent"),
+            ToolRegistry::new(),
+            AgentBudget::default(),
+            AgentConfig {
+                seed: Some(7),
+                ..AgentConfig::default()
+            },
+        );
+        let _ = agent.run("say hello");
+        let reqs = cap.requests();
+        assert!(!reqs.is_empty(), "no control call was made");
+        for r in &reqs {
+            assert_eq!(r.seed, Some(7), "control call sent without the seed");
+            assert_eq!(r.temperature, Some(0.0));
+        }
     }
 
     fn agent_with_config(

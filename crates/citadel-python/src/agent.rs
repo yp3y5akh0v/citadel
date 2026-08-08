@@ -390,6 +390,7 @@ impl PyAgentConfig {
             proposal_operator: self.proposal_operator.clone(),
             max_repairs: self.max_repairs,
             temperature: self.temperature,
+            seed: AgentConfig::default().seed,
         }
     }
 }
