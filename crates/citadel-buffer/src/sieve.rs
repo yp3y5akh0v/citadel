@@ -8,6 +8,9 @@ pub struct SieveCache<V> {
     index: FxHashMap<u64, usize>,
     /// Moving eviction pointer.
     hand: usize,
+    /// Unoccupied slot indices. Popped on insert, pushed wherever a slot is vacated, so a
+    /// miss does not scan the whole entry vector to find somewhere to put the page.
+    free: Vec<usize>,
     /// Number of occupied slots.
     len: usize,
     capacity: usize,
@@ -44,6 +47,8 @@ impl<V: Default> SieveCache<V> {
             entries,
             index: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
             hand: 0,
+            // Reversed, so warm-up pops 0, 1, 2, ... and fills the vector in order.
+            free: (0..capacity).rev().collect(),
             len: 0,
             capacity,
         }
@@ -81,7 +86,7 @@ impl<V: Default> SieveCache<V> {
         }
 
         if self.len < self.capacity {
-            let idx = self.find_empty_slot();
+            let idx = self.take_free_slot();
             self.entries[idx].key = key;
             self.entries[idx].value = value;
             self.entries[idx].visited = true;
@@ -93,7 +98,7 @@ impl<V: Default> SieveCache<V> {
         }
 
         let evicted = self.evict()?;
-        let idx = self.find_empty_slot();
+        let idx = self.take_free_slot();
         self.entries[idx].key = key;
         self.entries[idx].value = value;
         self.entries[idx].visited = true;
@@ -134,6 +139,7 @@ impl<V: Default> SieveCache<V> {
             let evicted_key = self.entries[idx].key;
             let evicted_value = std::mem::take(&mut self.entries[idx].value);
             self.entries[idx].occupied = false;
+            self.free.push(idx);
             self.index.remove(&evicted_key);
             self.len -= 1;
 
@@ -141,13 +147,10 @@ impl<V: Default> SieveCache<V> {
         }
     }
 
-    fn find_empty_slot(&self) -> usize {
-        for (i, entry) in self.entries.iter().enumerate() {
-            if !entry.occupied {
-                return i;
-            }
-        }
-        unreachable!("find_empty_slot called when cache is full");
+    fn take_free_slot(&mut self) -> usize {
+        self.free
+            .pop()
+            .expect("a free slot exists whenever len < capacity or evict() just vacated one")
     }
 
     pub fn set_dirty(&mut self, key: u64) {
@@ -195,6 +198,7 @@ impl<V: Default> SieveCache<V> {
         if let Some(idx) = self.index.remove(&key) {
             let value = std::mem::take(&mut self.entries[idx].value);
             self.entries[idx].occupied = false;
+            self.free.push(idx);
             self.len -= 1;
             Some(value)
         } else {
@@ -228,6 +232,8 @@ impl<V: Default> SieveCache<V> {
             entry.dirty = false;
         }
         self.index.clear();
+        self.free.clear();
+        self.free.extend((0..self.capacity).rev());
         self.len = 0;
         self.hand = 0;
     }

@@ -132,6 +132,42 @@ fn remove_entry() {
     assert_eq!(cache.len(), 1);
 }
 
+/// Slots are handed out from a free list, so a vacated slot that is never returned would
+/// shrink the usable pool without any error.
+#[test]
+fn slots_are_reusable_after_eviction_and_removal() {
+    const CAP: usize = 8;
+    let mut cache = SieveCache::<u32>::new(CAP);
+
+    // Churn well past capacity so eviction recycles slots many times over.
+    for k in 0..200u64 {
+        cache.insert(k, k as u32).unwrap();
+    }
+    assert_eq!(cache.len(), CAP, "eviction must keep the pool full");
+
+    // Explicit removals return their slots too.
+    let live: Vec<u64> = (0..200u64).filter(|&k| cache.contains(k)).collect();
+    for k in &live {
+        cache.remove(*k);
+    }
+    assert_eq!(cache.len(), 0);
+
+    // The whole capacity is still usable, and every key is retrievable.
+    for k in 1000..(1000 + CAP as u64) {
+        cache.insert(k, k as u32).unwrap();
+    }
+    assert_eq!(cache.len(), CAP);
+    for k in 1000..(1000 + CAP as u64) {
+        assert_eq!(cache.get(k), Some(&(k as u32)), "slot for {k} was lost");
+    }
+
+    cache.clear();
+    for k in 0..CAP as u64 {
+        cache.insert(k, k as u32).unwrap();
+    }
+    assert_eq!(cache.len(), CAP, "clear must return every slot to the pool");
+}
+
 #[test]
 fn update_existing_key() {
     let mut cache = SieveCache::<u32>::new(4);
