@@ -1162,6 +1162,214 @@ mod tests {
             .unwrap()
     }
 
+    /// The streaming dedup key is the whole encoded row key, so a composite primary key made
+    /// every row unique and the fast path answered differently from the general one.
+    #[test]
+    fn distinct_agrees_across_paths_for_a_composite_pk() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE d (a INTEGER, b INTEGER, PRIMARY KEY (a, b))")
+            .unwrap();
+        for (a, b) in [(1, 1), (1, 2), (1, 3)] {
+            conn.execute(&format!("INSERT INTO d VALUES ({a}, {b})"))
+                .unwrap();
+        }
+        // The WHERE clause is what forces the general path, so the two must agree.
+        assert_eq!(row_count(&conn, "SELECT DISTINCT a FROM d"), 1);
+        assert_eq!(row_count(&conn, "SELECT DISTINCT a FROM d WHERE b > 0"), 1);
+    }
+
+    /// Joined columns were rebuilt with a hardcoded Binary collation, so any query containing
+    /// a JOIN silently compared case-sensitively.
+    #[test]
+    fn join_preserves_column_collation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE ca (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)")
+            .unwrap();
+        conn.execute("CREATE TABLE cb (id INTEGER PRIMARY KEY, aid INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO ca VALUES (1, 'Alice')").unwrap();
+        conn.execute("INSERT INTO cb VALUES (1, 1)").unwrap();
+
+        assert_eq!(
+            row_count(&conn, "SELECT name FROM ca WHERE name = 'alice'"),
+            1
+        );
+        assert_eq!(
+            row_count(
+                &conn,
+                "SELECT ca.name FROM ca JOIN cb ON cb.aid = ca.id WHERE ca.name = 'alice'"
+            ),
+            1,
+            "NOCASE collation was dropped when building the joined columns"
+        );
+    }
+
+    /// Value had no Vector arm in PartialEq, so a vector did not equal itself while Ord and
+    /// Hash both treated the pair as identical.
+    #[test]
+    fn vectors_compare_equal_to_themselves() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE vt (id INTEGER PRIMARY KEY, v VECTOR(3))")
+            .unwrap();
+        conn.execute("INSERT INTO vt VALUES (1, '[1,2,3]'::VECTOR(3))")
+            .unwrap();
+        conn.execute("INSERT INTO vt VALUES (2, '[1,2,3]'::VECTOR(3))")
+            .unwrap();
+
+        let eq = conn.query("SELECT count(*) FROM vt WHERE v = v").unwrap();
+        assert_eq!(
+            eq.rows[0][0],
+            Value::Integer(2),
+            "a vector must equal itself"
+        );
+        // Both DISTINCT paths must agree that the two rows hold the same vector.
+        assert_eq!(
+            row_count(&conn, "SELECT DISTINCT v FROM vt WHERE id > 0"),
+            1
+        );
+        assert_eq!(row_count(&conn, "SELECT DISTINCT v FROM vt"), 1);
+    }
+
+    /// A branch-rooted table with wide key gaps, so a later insert lands in a middle leaf.
+    fn seeded_gapped_table(conn: &Connection) {
+        // NOT NULL + fixed width, so a range UPDATE takes the in-place patch lane.
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        for i in 0..4000i64 {
+            conn.execute(&format!("INSERT INTO t VALUES ({}, {})", i * 10, i))
+                .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    }
+
+    fn row_count(conn: &Connection, sql: &str) -> usize {
+        conn.query(sql).unwrap().rows.len()
+    }
+
+    /// SAVEPOINT advances the write txn id, so the next insert CoWs the spine to fresh page
+    /// ids. An insert into a non-rightmost leaf left the last-insert cache naming the
+    /// superseded ancestors, and the following cached insert re-rooted the tree from them,
+    /// discarding the intervening write on an otherwise successful COMMIT.
+    #[test]
+    fn insert_after_savepoint_survives_a_cached_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        seeded_gapped_table(&conn);
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1000000, 1)").unwrap();
+        conn.execute("SAVEPOINT sp1").unwrap();
+        conn.execute("INSERT INTO t VALUES (15005, 2)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1000010, 3)").unwrap();
+        conn.execute("COMMIT").unwrap();
+
+        assert_eq!(row_count(&conn, "SELECT v FROM t WHERE id = 15005"), 1);
+        assert_eq!(row_count(&conn, "SELECT v FROM t WHERE id = 1000000"), 1);
+        assert_eq!(row_count(&conn, "SELECT v FROM t WHERE id = 1000010"), 1);
+    }
+
+    /// A middle-leaf insert rewrites the cached delete path through the newly copied page
+    /// ids. If that remap were wrong, the next cached delete would propagate over superseded
+    /// ancestors and re-root the tree from them.
+    #[test]
+    fn delete_through_a_remapped_cache_keeps_the_tree_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        seeded_gapped_table(&conn);
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("DELETE FROM t WHERE id = 1000").unwrap(); // arms the delete cache
+        conn.execute("SAVEPOINT sp1").unwrap(); // bumps txn_id, so the spine gets copied
+        conn.execute("INSERT INTO t VALUES (25005, 999)").unwrap(); // middle leaf -> remap
+        conn.execute("DELETE FROM t WHERE id = 1010").unwrap(); // same leaf -> cache hit
+        conn.execute("COMMIT").unwrap();
+
+        assert_eq!(row_count(&conn, "SELECT v FROM t WHERE id = 1000"), 0);
+        assert_eq!(row_count(&conn, "SELECT v FROM t WHERE id = 1010"), 0);
+        assert_eq!(row_count(&conn, "SELECT v FROM t WHERE id = 25005"), 1);
+        let total = conn.query("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(total.rows[0][0], Value::Integer(3999));
+    }
+
+    /// The range update re-roots the tree outside BTree's own methods; the same cached
+    /// append would otherwise revert every updated row.
+    #[test]
+    fn range_update_after_savepoint_survives_a_cached_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        seeded_gapped_table(&conn);
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1000000, 1)").unwrap();
+        conn.execute("SAVEPOINT sp1").unwrap();
+        // Sentinel no seeded row can already hold.
+        conn.execute("UPDATE t SET v = -1 WHERE id BETWEEN 10000 AND 20000")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1000010, 3)").unwrap();
+        conn.execute("COMMIT").unwrap();
+
+        let updated = row_count(&conn, "SELECT id FROM t WHERE v = -1");
+        assert_eq!(
+            updated, 1001,
+            "range update reverted after the cached append"
+        );
+    }
+
+    /// The path functions take 2..=4 arguments, but the NULL short-circuit indexed [0] and [1]
+    /// before the callee could reject a short list.
+    #[test]
+    fn jsonb_path_functions_reject_short_arg_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        for f in [
+            "JSONB_PATH_EXISTS",
+            "JSONB_PATH_MATCH",
+            "JSONB_PATH_QUERY_FIRST",
+            "JSONB_PATH_QUERY_ARRAY",
+            "JSONB_PATH_EXISTS_TZ",
+            "JSONB_PATH_MATCH_TZ",
+            "JSONB_PATH_QUERY_TZ",
+            "JSONB_PATH_QUERY_FIRST_TZ",
+            "JSONB_PATH_QUERY_ARRAY_TZ",
+        ] {
+            assert!(
+                conn.query(&format!("SELECT {f}()")).is_err(),
+                "{f} with 0 args"
+            );
+            assert!(
+                conn.query(&format!("SELECT {f}('{{}}')")).is_err(),
+                "{f} with 1 arg"
+            );
+        }
+        // A well-formed call still works.
+        conn.query("SELECT JSONB_PATH_EXISTS('{\"a\":1}'::JSONB, '$.a')")
+            .unwrap();
+    }
+
+    #[test]
+    fn strftime_rejects_bad_formats_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        for fmt in ["%", "%E", "%O", "%:", "%-", "%_", "%1", "%#"] {
+            let sql = format!("SELECT STRFTIME('{fmt}', CURRENT_TIMESTAMP)");
+            assert!(conn.query(&sql).is_err(), "STRFTIME('{fmt}') should error");
+        }
+        conn.query("SELECT STRFTIME('%Y-%m-%d', CURRENT_TIMESTAMP)")
+            .unwrap();
+    }
+
     #[test]
     fn multibyte_timezone_offset_is_rejected_not_panicked() {
         let dir = tempfile::tempdir().unwrap();

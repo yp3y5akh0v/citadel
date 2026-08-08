@@ -809,8 +809,9 @@ impl<'db> WriteTxn<'db> {
                     );
                     let key_for_walk = cell.key.to_vec();
                     let (mut path, _) = tree.walk_to_leaf(view.pages, &key_for_walk)?;
-                    tree.root =
+                    let new_root =
                         btree::propagate_cow_up(view.pages, alloc, txn_id, &mut path, new_id);
+                    tree.reroot_after_external_cow(new_root);
                     cursor.set_leaf_page_id(new_id);
                 }
                 cow_leaf = new_id;

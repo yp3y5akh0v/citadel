@@ -416,6 +416,13 @@ impl PartialEq for Value {
             (Value::TsVector(a), Value::TsVector(b)) => a == b,
             (Value::TsQuery(a), Value::TsQuery(b)) => a == b,
             (Value::Array(a), Value::Array(b)) => a == b,
+            // total_cmp rather than ==, so NaN and signed zero agree with Ord and Hash.
+            (Value::Vector(a), Value::Vector(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|(x, y)| x.total_cmp(y) == Ordering::Equal)
+            }
             _ => false,
         }
     }

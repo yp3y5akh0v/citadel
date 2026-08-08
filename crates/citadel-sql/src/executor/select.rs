@@ -2941,6 +2941,12 @@ fn try_streaming_distinct_with_read(
             .iter()
             .position(|&i| i as usize == col_idx)
         {
+            // The dedup key below is the whole encoded row key, which identifies the selected
+            // column only when the primary key has one. A composite key would make every row
+            // unique and stop deduplicating, so leave those to the general DISTINCT path.
+            if table_schema.primary_key_columns.len() > 1 {
+                return Ok(None);
+            }
             RawAggTarget::Pk(pk_pos)
         } else {
             let nonpk_order = non_pk.iter().position(|&i| i == col_idx).unwrap();

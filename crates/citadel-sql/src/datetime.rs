@@ -1177,7 +1177,10 @@ pub fn strftime(fmt: &str, v: &Value) -> Result<String> {
             prepared.push(c);
         }
     }
-    Ok(z.strftime(&prepared).to_string())
+    // Display is non-lenient: an unknown directive makes it fail, and `to_string` on a
+    // failing Display panics. Format fallibly so a bad format string is a SQL error.
+    jiff::fmt::strtime::format(&prepared, &z)
+        .map_err(|e| SqlError::InvalidValue(format!("strftime: invalid format '{fmt}': {e}")))
 }
 
 /// Session-agnostic util used by eval.rs for SQL INTERVAL comparison normalization.
