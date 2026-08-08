@@ -167,3 +167,7 @@ jobs:
         run: |
           pip install ./packaging/citadeldb-langgraph
           pytest packaging/citadeldb-langgraph/tests -q
+      - name: crewai backend
+        run: |
+          pip install ./packaging/citadeldb-crewai
+          pytest packaging/citadeldb-crewai/tests -q
