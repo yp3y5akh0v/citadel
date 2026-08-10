@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
 {% block title %}About - Citadel{% endblock %}
-{% block description %}Citadel is a single-author Rust workspace: a local-first encrypted memory engine for AI agents, built on an embedded SQL/vector database. {{ config.extra.crates }} crates, encryption as the load-bearing layer, cryptographic forgetting, reproducible benchmarks.{% endblock %}
+{% block description %}Citadel is a single-author Rust workspace: a local-first encrypted memory engine for AI agents, built on an embedded SQL/vector database. {{ config.extra.crates }} crates, encryption that cannot be turned off, cryptographic forgetting, reproducible benchmarks.{% endblock %}
 
 {% block content %}
 <main class="shell">
@@ -9,7 +9,7 @@
   <section class="about-hero">
     <div>
       <div class="kicker">About / The project</div>
-      <h1>A single-author Rust project that treats encryption as <em>load-bearing</em>.</h1>
+      <h1>A single-author Rust project with <em>no unencrypted mode</em>.</h1>
       <p class="sub">Not an option, not an extension, not a wrapper. A {{ config.extra.crates }}-crate Rust workspace: an encrypted memory engine with cryptographic forgetting, hybrid vector recall, and an MCP server - built on a full SQL engine with AES-256-CTR + HMAC page encryption, shadow paging, and a reproducible benchmark suite.</p>
     </div>
     <aside class="card">
@@ -30,8 +30,8 @@
           <div class="tenet">
             <div class="t-num">i.</div>
             <div>
-              <h3>Encryption is <span class="ac">load-bearing</span>.</h3>
-              <p>Every page is AES-256-CTR ciphertext with an HMAC-SHA256 tag. There is no unencrypted mode. You cannot disable it, forget to enable it, or ship a build without it. The file format itself refuses to exist in plaintext.</p>
+              <h3>The file format is <span class="ac">always encrypted</span>.</h3>
+              <p>Every page is AES-256-CTR ciphertext with an HMAC-SHA256 tag. There is no unencrypted mode. You cannot disable it, forget to enable it, or ship a build without it.</p>
             </div>
           </div>
           <div class="tenet">
