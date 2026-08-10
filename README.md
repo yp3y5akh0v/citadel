@@ -2,15 +2,14 @@
   <img src="https://raw.githubusercontent.com/yp3y5akh0v/citadel/HEAD/.github/banner.png" alt="Citadel" width="600">
 </p>
 
-<h1 align="center">Citadel</h1>
-
-<p align="center">Local-first encrypted memory for AI agents.</p>
-
 <p align="center">
   <a href="https://crates.io/crates/citadeldb"><img src="https://badgen.net/crates/v/citadeldb" alt="crates.io"></a>
   <a href="https://www.npmjs.com/package/@citadeldb/wasm"><img src="https://img.shields.io/npm/v/@citadeldb/wasm" alt="npm"></a>
   <a href="https://pypi.org/project/citadeldb/"><img src="https://img.shields.io/pypi/v/citadeldb?label=pypi%20citadeldb" alt="PyPI citadeldb"></a>
   <a href="https://pypi.org/project/citadeldb-mcp/"><img src="https://img.shields.io/pypi/v/citadeldb-mcp?label=pypi%20citadeldb-mcp" alt="PyPI citadeldb-mcp"></a>
+  <a href="https://pypi.org/project/citadeldb-langgraph/"><img src="https://img.shields.io/pypi/v/citadeldb-langgraph?label=pypi%20citadeldb-langgraph" alt="PyPI citadeldb-langgraph"></a>
+  <a href="https://pypi.org/project/citadeldb-crewai/"><img src="https://img.shields.io/pypi/v/citadeldb-crewai?label=pypi%20citadeldb-crewai" alt="PyPI citadeldb-crewai"></a>
+  <br>
   <a href="https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mcp"><img src="https://img.shields.io/badge/MCP-dev.citadeldb%2Fmcp-blue" alt="MCP registry: dev.citadeldb/mcp"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml"><img src="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LoCoMo%20(gpt--4o--mini)-85.7%25-success" alt="LoCoMo 85.7% (gpt-4o-mini)"></a>
@@ -150,6 +149,45 @@ citadel> .dump users
 citadel> .keygen
 citadel> .listen 4248 <KEY>              # Terminal A
 citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
+```
+
+### LangGraph
+
+`citadeldb-langgraph` is a drop-in [`BaseStore`](https://langchain-ai.github.io/langgraph/reference/store/),
+so `create_react_agent(store=...)` and the rest of the LangGraph API work unchanged. Namespace
+prefix search is served by an index rather than a scan, TTLs refresh on read, and deleting a
+key destroys it cryptographically.
+
+```bash
+pip install citadeldb-langgraph
+```
+
+```python
+from citadeldb_langgraph import CitadelStore
+
+store = CitadelStore("agent.cdl", key="your-passphrase")
+store.put(("users", "alice"), "prefs", {"theme": "dark"})
+store.search(("users",))                     # every namespace under users/
+store.forget_namespace(("users", "alice"))   # cryptographic erasure, returns a count
+```
+
+### CrewAI
+
+`citadeldb-crewai` implements CrewAI's `StorageBackend`. One call at startup routes every
+crew's memory through Citadel; a crew that names its own backend keeps it.
+`MemoryRecord.importance` maps onto the native atom score, so it survives as a ranking signal
+instead of metadata the store ignores.
+
+```bash
+pip install citadeldb-crewai
+```
+
+```python
+from citadeldb_crewai import use_citadel
+
+use_citadel("crew_memory.cdl", key="your-passphrase")
+
+crew = Crew(agents=[...], tasks=[...], memory=True)   # unchanged
 ```
 
 ### MCP
