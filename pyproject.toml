@@ -59,3 +59,8 @@ manifest-path = "crates/citadel-python/Cargo.toml"
 python-source = "python"
 module-name = "citadeldb._core"
 features = ["pyo3/extension-module"]
+
+# Two adapter test roots at once make this file the rootdir, and its config the only
+# one read, so the async tests each adapter declares would go unhandled here.
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

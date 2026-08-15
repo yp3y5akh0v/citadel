@@ -10,6 +10,8 @@ site/static/wasm/*.js
 /notes/
 __pycache__/
 *.py[cod]
+# maturin build output; the .pyd is caught by the line above only by accident.
+*.pdb
 .pytest_cache/
 .mypy_cache/
 /dist/

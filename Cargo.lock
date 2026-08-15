@@ -710,6 +710,7 @@ dependencies = [
 name = "citadeldb-python"
 version = "1.15.0"
 dependencies = [
+ "blake3",
  "citadeldb",
  "citadeldb-ai",
  "citadeldb-cli",
@@ -720,6 +721,7 @@ dependencies = [
  "citadeldb-vector",
  "numpy",
  "pyo3",
+ "rand 0.8.6",
  "self_cell",
  "serde_json",
 ]
