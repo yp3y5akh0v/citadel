@@ -1,8 +1,6 @@
 name: Release LangGraph
 
-# Pure-Python adapter, so one universal wheel rather than the per-platform matrix the
-# maturin packages need. The version comes from the release tag, so the checkout must be
-# unshallow or hatch-vcs cannot resolve it.
+# Pure-Python wheel; fetch-depth 0 or hatch-vcs cannot resolve the tag.
 
 on:
   push:
@@ -34,7 +32,7 @@ jobs:
         run: |
           set -e
           ls dist
-          # A dev version means the tag was missing: publishing it would ship a pre-release.
+          # A dev version means the tag is unreachable; never publish it.
           if ls dist | grep -q "dev"; then
             echo "version resolved to a dev build; the tag is not reachable" >&2
             exit 1
@@ -65,7 +63,7 @@ jobs:
         run: |
           set -e
           pip install dist/*.whl pytest
-          # Run from a scratch dir so the tests import the installed package, not ./src.
+          # Scratch dir so tests import the installed wheel, not ./src.
           mkdir -p /tmp/run && cp -r tests /tmp/run/
           cd /tmp/run && pytest tests -q
 
@@ -74,8 +72,7 @@ jobs:
     needs: [build, test]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    # Trusted Publishing (OIDC): needs its own PyPI publisher entry for
-    # citadeldb-langgraph, scoped to this workflow file + the pypi environment.
+    # OIDC publisher entry is per package and per workflow file.
     environment: pypi
     permissions:
       id-token: write

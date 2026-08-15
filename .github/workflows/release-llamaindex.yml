@@ -1,4 +1,4 @@
-name: Release CrewAI
+name: Release LlamaIndex
 
 # Pure-Python wheel; fetch-depth 0 or hatch-vcs cannot resolve the tag.
 
@@ -13,7 +13,7 @@ permissions:
 
 defaults:
   run:
-    working-directory: packaging/citadeldb-crewai
+    working-directory: packaging/citadeldb-llamaindex
 
 jobs:
   build:
@@ -39,8 +39,8 @@ jobs:
           fi
       - uses: actions/upload-artifact@v4
         with:
-          name: crewai-dist
-          path: packaging/citadeldb-crewai/dist
+          name: llamaindex-dist
+          path: packaging/citadeldb-llamaindex/dist
 
   test:
     name: test (py${{ matrix.python }})
@@ -49,7 +49,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # crewai caps at <3.14.
         python: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v5
@@ -58,14 +57,14 @@ jobs:
           python-version: ${{ matrix.python }}
       - uses: actions/download-artifact@v4
         with:
-          name: crewai-dist
-          path: packaging/citadeldb-crewai/dist
+          name: llamaindex-dist
+          path: packaging/citadeldb-llamaindex/dist
       - name: Install the wheel and run the suite against it
         run: |
           set -e
-          pip install dist/*.whl pytest
-          # Scratch dir so tests import the installed wheel, not ./src.
-          mkdir -p /tmp/run && cp -r tests /tmp/run/
+          pip install dist/*.whl pytest pytest-asyncio
+          # Scratch dir imports the wheel; pyproject carries asyncio_mode.
+          mkdir -p /tmp/run && cp -r tests pyproject.toml /tmp/run/
           cd /tmp/run && pytest tests -q
 
   publish:
@@ -80,7 +79,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: crewai-dist
+          name: llamaindex-dist
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
