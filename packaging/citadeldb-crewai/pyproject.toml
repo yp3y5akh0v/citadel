@@ -7,8 +7,7 @@ name = "citadeldb-crewai"
 dynamic = ["version"]
 description = "CrewAI memory backed by Citadel: encrypted at rest, with deletes that destroy the key"
 readme = "README.md"
-# Upper bound mirrors crewai's own, so 3.14 fails with a version error rather than an
-# unresolvable dependency conflict.
+# Upper bound mirrors crewai's own, so 3.14 fails with a clear error.
 requires-python = ">=3.10,<3.14"
 license = "Apache-2.0"
 authors = [{ name = "Yuriy Peysakhov" }]
@@ -20,7 +19,8 @@ classifiers = [
   "Topic :: Database",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = ["citadeldb>=1.14", "crewai>=1.0"]
+# A record replaces under its own id, which needs the keyed write added in 1.16.
+dependencies = ["citadeldb>=1.16", "crewai>=1.0"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
@@ -29,7 +29,7 @@ test = ["pytest>=8"]
 Homepage = "https://citadeldb.dev"
 Repository = "https://github.com/yp3y5akh0v/citadel"
 
-# The version comes from the release tag, so it tracks the workspace with nothing to bump.
+# The version comes from the release tag, so there is nothing to bump.
 [tool.hatch.version]
 source = "vcs"
 raw-options = { root = "../..", tag_regex = '^v(?P<version>\d+\.\d+\.\d+)$' }

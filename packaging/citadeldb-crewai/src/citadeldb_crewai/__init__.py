@@ -1,4 +1,4 @@
-"""CrewAI memory backed by Citadel: encrypted at rest, with deletes that destroy the key."""
+"""CrewAI memory backed by Citadel, encrypted at rest."""
 
 from importlib.metadata import PackageNotFoundError, version
 
@@ -12,21 +12,13 @@ except PackageNotFoundError:  # running from a source tree, never installed
     __version__ = "0+unknown"
 
 
-# CrewAI's default storage spec. Claiming it is what routes an ordinary crew to Citadel;
-# a crew naming any other backend picked it deliberately and is left alone.
+# Claiming CrewAI's default spec is what routes an unconfigured crew here.
 _DEFAULT_SPEC = "lancedb"
 _EXPLICIT_SPEC = "citadel"
 
 
-def use_citadel(path: str = "crew_memory.cdl", key: str = "crewai", **kwargs) -> CitadelBackend:
-    """Route CrewAI memory through Citadel, process-wide.
-
-    One backend is built and reused: Citadel is embedded and one handle owns the file.
-
-    Crews that name a different backend keep it, so this cannot silently displace a
-    deliberate `storage="qdrant-edge"` or a LanceDB path. Pass `storage="citadel"` to opt a
-    single crew in without calling this at all.
-    """
+def use_citadel(path: str = "crew_memory.cdl", key: str = "", **kwargs) -> CitadelBackend:
+    """Route CrewAI memory through Citadel, process-wide."""
     from crewai.memory.storage.factory import set_memory_storage_factory
 
     backend = CitadelBackend(path, key, **kwargs)

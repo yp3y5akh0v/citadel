@@ -1,5 +1,6 @@
 import time
 
+import citadeldb
 import pytest
 from langgraph.store.base import ListNamespacesOp, MatchCondition
 
@@ -72,6 +73,24 @@ def test_search_filter(store):
     store.put(("filt",), "b", {"kind": "y", "n": 2})
     hits = store.search(("filt",), filter={"kind": "y"}, limit=5)
     assert [h.value["n"] for h in hits] == [2]
+
+
+def test_search_without_a_query_pages_past_the_rows_it_first_reads(tmp_path):
+    """A bounded fetch reads the oldest rows, which can hold no match at all."""
+    deep = CitadelStore(str(tmp_path / "deep.cdl"), key="test-passphrase")
+    for i in range(80):
+        deep.put(("bulk",), f"chaff{i}", {"kind": "chaff"})
+    deep.put(("bulk",), "wanted", {"kind": "gold"})
+    hits = deep.search(("bulk",), filter={"kind": "gold"}, limit=5)
+    assert [h.key for h in hits] == ["wanted"]
+
+
+def test_search_honours_offset_after_filtering(tmp_path):
+    offset = CitadelStore(str(tmp_path / "offset.cdl"), key="test-passphrase")
+    for i in range(6):
+        offset.put(("page",), f"k{i}", {"kind": "keep" if i % 2 else "drop"})
+    hits = offset.search(("page",), filter={"kind": "keep"}, limit=2, offset=1)
+    assert [h.key for h in hits] == ["k3", "k5"]
 
 
 def test_namespace_element_may_contain_a_slash(store):
@@ -148,16 +167,209 @@ def test_forget_namespace_exact_spares_children(store):
     assert store.get(("ex", "child"), "b") is not None
 
 
-def test_second_handle_explains_the_lock(store, tmp_path):
-    path = str(tmp_path / "locked.cdl")
+def test_a_second_store_shares_the_open_handle(store, tmp_path):
+    """`citadeldb.connect` reopens onto the live database, so both see one file."""
+    path = str(tmp_path / "shared.cdl")
     first = CitadelStore(path, key="pw")
-    with pytest.raises(RuntimeError, match="one handle owns the file"):
-        CitadelStore(path, key="pw")
+    second = CitadelStore(path, key="pw")
+    first.put(("ns",), "k", {"v": 1})
+    assert second.get(("ns",), "k").value == {"v": 1}
+
+
+def test_a_second_store_cannot_use_a_different_passphrase(store, tmp_path):
+    """The same error a first open raises, so it reports nothing about the file."""
+    path = str(tmp_path / "terms.cdl")
+    first = CitadelStore(path, key="pw")
+    with pytest.raises(citadeldb.EncryptionError):
+        CitadelStore(path, key="other")
     assert first is not None
 
 
+def test_erasure_is_complete_past_one_page(tmp_path, monkeypatch):
+    """A capped fetch would erase one page and report the whole namespace erased."""
+    from citadeldb_langgraph import store as mod
+
+    monkeypatch.setattr(mod, "PAGE", 7)
+    s = CitadelStore(str(tmp_path / "page.cdl"), key="pw")
+    for i in range(50):
+        s.put(("bulk", "u1"), f"k{i}", {"v": i})
+
+    assert len(s.search(("bulk",), limit=500)) == 50
+    assert s.forget_namespace(("bulk", "u1")) == 50
+    assert s.search(("bulk",), limit=500) == []
+
+
+def test_a_passphrase_is_required(tmp_path):
+    """An empty key opens an unprotected file that still looks encrypted."""
+    with pytest.raises(ValueError, match="passphrase"):
+        CitadelStore(str(tmp_path / "nokey.cdl"), key="")
+
+
+def test_a_compiled_graph_injects_the_store_into_a_node(tmp_path):
+    from typing import TypedDict
+
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.store.base import BaseStore
+
+    class State(TypedDict):
+        out: str
+
+    def node(state: State, *, store: BaseStore) -> State:
+        store.put(("graph",), "k", {"text": "written from inside a node"})
+        return {"out": store.get(("graph",), "k").value["text"]}
+
+    s = CitadelStore(str(tmp_path / "graph.cdl"), key="pw")
+    builder = StateGraph(State)
+    builder.add_node("n", node)
+    builder.add_edge(START, "n")
+    builder.add_edge("n", END)
+
+    result = builder.compile(store=s).invoke({"out": ""})
+    assert result["out"] == "written from inside a node"
+    assert s.get(("graph",), "k").value == {"text": "written from inside a node"}
+
+
+def test_a_compiled_graph_works_on_the_async_path(tmp_path):
+    """No asyncio_mode here, so an `async def` test would be skipped."""
+    import asyncio
+    from typing import TypedDict
+
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.store.base import BaseStore
+
+    class State(TypedDict):
+        out: str
+
+    async def node(state: State, *, store: BaseStore) -> State:
+        await store.aput(("graph",), "k", {"text": "async node"})
+        got = await store.aget(("graph",), "k")
+        return {"out": got.value["text"]}
+
+    s = CitadelStore(str(tmp_path / "agraph.cdl"), key="pw")
+    builder = StateGraph(State)
+    builder.add_node("n", node)
+    builder.add_edge(START, "n")
+    builder.add_edge("n", END)
+
+    result = asyncio.run(builder.compile(store=s).ainvoke({"out": ""}))
+    assert result["out"] == "async node"
+
+
+def test_it_survives_a_reopen(tmp_path):
+    """A region's embedder lives in memory, so reattach is the failure point."""
+    import gc
+
+    p = str(tmp_path / "reopen.cdl")
+    first = CitadelStore(p, key="pw")
+    first.put(("users", "alice"), "prefs", {"text": "the disk was full"})
+    del first
+    gc.collect()
+
+    again = CitadelStore(p, key="pw")
+    assert again.get(("users", "alice"), "prefs").value == {"text": "the disk was full"}
+    assert again.list_namespaces() == [("users", "alice")]
+    assert again.search(("users",), query="why did it break?", limit=1)
+
+
+def test_a_wrong_passphrase_cannot_reopen(tmp_path):
+    import gc
+
+    p = str(tmp_path / "enc.cdl")
+    first = CitadelStore(p, key="right")
+    first.put(("ns",), "k", {"secret": "value"})
+    del first
+    gc.collect()
+
+    with pytest.raises(citadeldb.EncryptionError):
+        CitadelStore(p, key="wrong")
+
+
+def test_concurrent_writes_all_land(tmp_path):
+    """The engine is shared across threads."""
+    import concurrent.futures as cf
+
+    s = CitadelStore(str(tmp_path / "conc.cdl"), key="pw")
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        list(ex.map(lambda i: s.put(("c",), f"k{i}", {"v": i}), range(40)))
+    assert len(s.search(("c",), limit=100)) == 40
+
+
+def test_filter_operators_match_the_reference(store):
+    """BaseStore documents $eq/$ne/$gt/$gte/$lt/$lte. Comparing a filter value
+    with == makes every operator form a dict compared against a number, which
+    matches nothing at all."""
+    store.put(("ops",), "a", {"score": 5, "tag": "x"})
+    store.put(("ops",), "b", {"score": 1, "tag": "y"})
+
+    def keys(f):
+        return sorted(i.key for i in store.search(("ops",), filter=f, limit=10))
+
+    assert keys({"score": {"$eq": 5}}) == ["a"]
+    assert keys({"score": {"$gt": 4.99}}) == ["a"]
+    assert keys({"score": {"$gte": 5}}) == ["a"]
+    assert keys({"score": {"$lt": 5}}) == ["b"]
+    assert keys({"score": {"$lte": 1}}) == ["b"]
+    assert keys({"tag": {"$ne": "x"}}) == ["b"]
+    # Two operators on one field are an AND, and a plain value still means equal.
+    assert keys({"score": {"$gte": 1, "$lte": 1}}) == ["b"]
+    assert keys({"tag": "x"}) == ["a"]
+
+
+def test_a_ranked_search_with_a_filter_finds_a_buried_match(tmp_path):
+    """op.filter is settled after ranking, so a fixed k answers short whenever
+    the only matching row ranks below it."""
+    s = CitadelStore(str(tmp_path / "buried.cdl"), key="pw")
+    for i in range(400):
+        s.put(("ns",), f"chaff{i}", {"text": f"why did the release break run {i}",
+                                     "keep": False})
+    s.put(("ns",), "gold", {"text": "the deployment failed", "keep": True})
+    found = s.search(("ns",), query="why did the release break?",
+                     filter={"keep": True}, limit=1)
+    assert [i.key for i in found] == ["gold"]
+
+
+def test_concurrent_writes_to_one_key_leave_one_item(tmp_path):
+    """A (namespace, key) is unique in BaseStore, so writers racing on one key
+    must supersede rather than each add a row."""
+    import concurrent.futures as cf
+
+    s = CitadelStore(str(tmp_path / "onekey.cdl"), key="pw")
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(lambda i: s.put(("c",), "same", {"v": i}), range(64)))
+
+    found = s.search(("c",), limit=500)
+    assert len(found) == 1, f"one key, {len(found)} rows"
+    # And the key really is gone afterwards, not merely one row lighter.
+    s.delete(("c",), "same")
+    assert s.get(("c",), "same") is None
+    assert s.search(("c",), limit=500) == []
+
+
+def test_the_event_loop_is_not_blocked(store):
+    """The bindings are sync, so abatch has to run them off the loop."""
+    import asyncio
+
+    async def main():
+        ticks = 0
+
+        async def tick():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0)
+
+        ticker = asyncio.create_task(tick())
+        await asyncio.sleep(0)
+        for i in range(40):
+            await store.aput(("loop",), f"k{i}", {"v": i})
+        await store.asearch(("loop",), limit=5)
+        ticker.cancel()
+        assert ticks > 1, "the loop made no progress during a store call"
+
+    asyncio.run(main())
+
+
 def test_async_surface(store):
-    """abatch runs the sync batch on a worker thread, so the loop is never blocked."""
     import asyncio
 
     async def main():

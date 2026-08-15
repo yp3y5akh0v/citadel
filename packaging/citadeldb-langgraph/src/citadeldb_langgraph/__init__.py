@@ -1,4 +1,4 @@
-"""A LangGraph store backed by Citadel: encrypted at rest, semantic search, real deletes."""
+"""LangGraph store backed by Citadel: encrypted, semantic, real deletes."""
 
 from importlib.metadata import PackageNotFoundError, version
 

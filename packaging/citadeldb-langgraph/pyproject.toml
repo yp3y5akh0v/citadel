@@ -18,7 +18,8 @@ classifiers = [
   "Topic :: Database",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = ["citadeldb>=1.14", "langgraph>=0.2"]
+# A key replaces under its own name, which needs the keyed write added in 1.16.
+dependencies = ["citadeldb>=1.16", "langgraph>=0.2"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
@@ -27,7 +28,7 @@ test = ["pytest>=8"]
 Homepage = "https://citadeldb.dev"
 Repository = "https://github.com/yp3y5akh0v/citadel"
 
-# The version comes from the release tag, so it tracks the workspace with nothing to bump.
+# The version comes from the release tag, so there is nothing to bump.
 [tool.hatch.version]
 source = "vcs"
 raw-options = { root = "../..", tag_regex = '^v(?P<version>\d+\.\d+\.\d+)$' }
