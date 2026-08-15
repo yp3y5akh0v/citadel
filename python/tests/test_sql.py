@@ -1,6 +1,7 @@
 """Encrypted SQL surface: connect, execute/query (+ params), scripts, admin."""
 
 import datetime as dt
+import gc
 import os
 import tempfile
 
@@ -116,6 +117,72 @@ def test_backup_and_change_passphrase():
     del db
     db2 = citadeldb.connect(path, key="pw2")
     assert db2.query("SELECT COUNT(*) FROM t").rows[0][0] == 1
+
+
+def test_a_rekey_is_honoured_by_the_open_file_table():
+    """A cached digest would admit the revoked key and refuse the current."""
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "rekey.cdl")
+    db = citadeldb.connect(path, key="old", create=True)
+    db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+    db.change_passphrase("old", "new")
+
+    assert citadeldb.connect(path, key="new").tables() == ["t"]
+    with pytest.raises(citadeldb.EncryptionError):
+        citadeldb.connect(path, key="old")
+
+
+def test_a_restored_key_file_is_honoured_by_the_open_file_table():
+    """Restoring rewrites the key file behind every handle; a digest would miss it."""
+    d = tempfile.mkdtemp()
+    path, backup = os.path.join(d, "restore.cdl"), os.path.join(d, "escrow.bin")
+    db = citadeldb.connect(path, key="old", create=True)
+    db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+    db.export_key_backup("old", "escrow-pass", backup)
+    citadeldb.Database.restore_key_from_backup(backup, "escrow-pass", "new", path)
+
+    assert citadeldb.connect(path, key="new").tables() == ["t"]
+    with pytest.raises(citadeldb.EncryptionError):
+        citadeldb.connect(path, key="old")
+
+
+def test_verify_passphrase_reads_the_key_file():
+    db = citadeldb.connect(os.path.join(tempfile.mkdtemp(), "v.cdl"), key="pw",
+                           create=True)
+    assert db.verify_passphrase("pw") is True
+    assert db.verify_passphrase("nope") is False
+    db.change_passphrase("pw", "pw2")
+    assert db.verify_passphrase("pw") is False
+    assert db.verify_passphrase("pw2") is True
+
+
+def test_a_wrong_passphrase_fails_alike_open_or_not():
+    """Otherwise the exception itself reports whether this process holds the file."""
+    d = tempfile.mkdtemp()
+    closed, held = os.path.join(d, "closed.cdl"), os.path.join(d, "held.cdl")
+    citadeldb.connect(closed, key="pw", create=True).close()
+    keep_open = citadeldb.connect(held, key="pw", create=True)
+
+    with pytest.raises(citadeldb.EncryptionError) as fresh:
+        citadeldb.connect(closed, key="wrong")
+    with pytest.raises(citadeldb.EncryptionError) as reopen:
+        citadeldb.connect(held, key="wrong")
+    assert type(fresh.value) is type(reopen.value)
+    assert keep_open.tables() == []
+
+
+def test_a_file_this_process_still_holds_reopens_onto_the_live_database():
+    """An engine outlives its handle and still holds the file."""
+    path = os.path.join(tempfile.mkdtemp(), "held.cdl")
+    db = citadeldb.connect(path, key="pw", create=True, region_keys=True)
+    engine = db.memory()
+    engine.create_encrypted_region("r", citadeldb.MockEmbedder(dim=8))
+    db.close()
+
+    again = citadeldb.connect(path, key="pw", region_keys=True)
+    # One engine per database, so the region the closed handle made is still there.
+    assert again.memory().count("r", "k") == 0
+    assert again.is_closed is False
 
 
 def test_errors():

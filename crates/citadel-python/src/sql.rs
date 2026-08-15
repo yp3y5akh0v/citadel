@@ -1,5 +1,6 @@
 //! Encrypted SQL surface: `Database`, `QueryResult`, and DB administration.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use citadel::{Argon2Profile, CipherId, Database, DatabaseBuilder, KdfAlgorithm, SyncMode};
@@ -15,7 +16,7 @@ use pyo3::types::{
 use pyo3::IntoPyObjectExt;
 use self_cell::self_cell;
 
-use crate::errors::programming_err;
+use crate::errors::{encryption_err, programming_err};
 use crate::mem::PyMemory;
 use crate::vector::require_finite;
 use crate::{ann_index_source_dict, ann_segment_info_dict, to_pyerr, value_to_py};
@@ -27,6 +28,208 @@ self_cell!(
         dependent: Connection,
     }
 );
+
+/// The one connection over a file, shared by every handle to it.
+///
+/// One connection, not one per handle: each caches the schema it loaded, so a second
+/// would not see a table the first created.
+struct SharedConn {
+    cell: DbCell,
+    /// Watched from other threads, which must not touch `cell` at all: alive for
+    /// exactly as long as some handle still holds this connection. Atomic where the
+    /// connection itself is not, since only this crosses a thread boundary.
+    token: Arc<()>,
+}
+
+impl SharedConn {
+    fn open(owner: Arc<Database>) -> PyResult<Self> {
+        Ok(Self {
+            cell: DbCell::try_new(owner, |owner| Connection::open(owner)).map_err(to_pyerr)?,
+            token: Arc::new(()),
+        })
+    }
+}
+
+thread_local! {
+    /// Connections this thread owns. Weak, so a closed handle releases its own.
+    static OPEN_CONNS: std::cell::RefCell<
+        std::collections::HashMap<std::path::PathBuf, std::rc::Weak<SharedConn>>,
+    > = Default::default();
+}
+
+/// One open file: the database its handles share, its memory engine, and the terms
+/// last accepted for it.
+///
+/// Weak throughout, so the file is released once the last handle and engine drop.
+struct OpenFile {
+    db: std::sync::Weak<Database>,
+    engine: std::sync::Weak<MemoryEngine>,
+    /// Live while a handle still holds the connection. A connection is pinned to its
+    /// thread, so this is how another one tells "in use" from "opened here and gone".
+    conn: std::sync::Weak<()>,
+    owner_thread: std::thread::ThreadId,
+    /// The key file's hash when `passphrase` was accepted. A rekey or a restore from
+    /// backup rewrites that file, so the digest below cannot outlive the key it names.
+    key_file: [u8; 32],
+    /// Keyed digest of the accepted passphrase; the passphrase itself is not kept.
+    passphrase: [u8; 32],
+}
+
+/// Files this process holds open, by canonical path. A second real open would fail
+/// on the whole-file lock, so a reopen builds another connection over this instead.
+static OPEN_FILES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, OpenFile>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Random per process, so a digest read out of memory is worthless anywhere else.
+static DIGEST_KEY: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+    let mut k = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut k);
+    k
+});
+
+fn passphrase_digest(key: &str) -> [u8; 32] {
+    *blake3::keyed_hash(&DIGEST_KEY, key.as_bytes()).as_bytes()
+}
+
+/// Constant time, so a rejected passphrase leaks nothing through how long it took.
+fn same_digest(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// One key per file, through symlinks and Windows case-insensitivity. `None` until
+/// the file exists, which can only ever be a lookup miss.
+fn identity(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    std::fs::canonicalize(path).ok()
+}
+
+fn file_hash(path: &std::path::Path) -> PyResult<[u8; 32]> {
+    let bytes = std::fs::read(path).map_err(|e| to_pyerr(citadel::Error::Io(e)))?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
+/// The database this process already holds at `ident`, or `None` to open the file.
+///
+/// The caller holds the registry lock, so a racing open cannot land between this
+/// lookup and the insert that follows it.
+fn reuse(
+    open: &mut std::collections::HashMap<std::path::PathBuf, OpenFile>,
+    ident: &std::path::Path,
+    path: &str,
+    key: &str,
+    region_keys: bool,
+    options: bool,
+    create: Option<bool>,
+) -> PyResult<Option<Arc<Database>>> {
+    let Some(entry) = open.get_mut(ident) else {
+        return Ok(None);
+    };
+    let Some(db) = entry.db.upgrade() else {
+        open.remove(ident);
+        return Ok(None);
+    };
+
+    // Passphrase first, and as the same error a fresh open raises: a caller without
+    // it must not learn from the reply that the file is open, nor on what terms.
+    let key_file = file_hash(db.key_path())?;
+    let digest = passphrase_digest(key);
+    let accepted = if key_file == entry.key_file {
+        same_digest(&digest, &entry.passphrase)
+    } else {
+        db.verify_passphrase(key.as_bytes()).map_err(to_pyerr)?
+    };
+    if !accepted {
+        return Err(encryption_err(format!(
+            "wrong passphrase for {path}, which this process already holds open"
+        )));
+    }
+    entry.key_file = key_file;
+    entry.passphrase = digest;
+
+    // A connection belongs to the thread that opened it, so a live one elsewhere
+    // cannot be shared. Once its last handle drops, this thread may take it over.
+    if entry.conn.strong_count() > 0 && entry.owner_thread != std::thread::current().id() {
+        return Err(programming_err(format!(
+            "{path} is open on another thread of this process. A connection belongs to \
+             the thread that opened it, so open it once and dispatch work to that \
+             thread, or pass the memory engine, which any thread may use."
+        )));
+    }
+
+    if create == Some(true) {
+        return Err(programming_err(format!(
+            "{path} is already open in this process, so `create=True` cannot be \
+             honoured. Use a different path, or connect without `create`."
+        )));
+    }
+    if db.region_keys_enabled() != region_keys {
+        return Err(programming_err(format!(
+            "{path} is already open in this process with region_keys={}",
+            db.region_keys_enabled()
+        )));
+    }
+    if options {
+        return Err(programming_err(format!(
+            "{path} is already open in this process, so `options` cannot be applied. \
+             Pass them on the first connect."
+        )));
+    }
+    Ok(Some(db))
+}
+
+/// A handle over `owner`, joining the connection this thread already has for it.
+///
+/// Each handle keeps its own reference, so one holder closing leaves the rest working
+/// and the file is released only when the last of them drops.
+fn attach(
+    open: &mut std::collections::HashMap<std::path::PathBuf, OpenFile>,
+    ident: Option<&std::path::Path>,
+    owner: Arc<Database>,
+) -> PyResult<PyDatabase> {
+    let Some(ident) = ident else {
+        // In-memory: no file to contend over, so nothing to share it with.
+        return Ok(PyDatabase::new(Rc::new(SharedConn::open(owner)?)));
+    };
+    let live = OPEN_CONNS
+        .with_borrow(|c| c.get(ident).and_then(std::rc::Weak::upgrade))
+        // Only when it wraps this database: a connection cached over a predecessor at
+        // the same path would silently drop the one just opened.
+        .filter(|c| Arc::ptr_eq(c.cell.borrow_owner(), &owner));
+    let conn = match live {
+        Some(conn) => conn,
+        None => {
+            let conn = Rc::new(SharedConn::open(owner)?);
+            OPEN_CONNS.with_borrow_mut(|c| c.insert(ident.to_path_buf(), Rc::downgrade(&conn)));
+            conn
+        }
+    };
+    if let Some(entry) = open.get_mut(ident) {
+        entry.conn = Arc::downgrade(&conn.token);
+        entry.owner_thread = std::thread::current().id();
+    }
+    Ok(PyDatabase::new(conn))
+}
+
+/// The one engine over this database, built on first use.
+///
+/// Engines cache regions separately, so a second would not see a region the first
+/// created.
+fn shared_engine(db: &Arc<Database>) -> PyResult<Arc<MemoryEngine>> {
+    let ident = identity(db.data_path());
+    let mut open = OPEN_FILES.lock().unwrap();
+    if let Some(i) = ident.as_ref() {
+        if let Some(engine) = open.get(i).and_then(|e| e.engine.upgrade()) {
+            return Ok(engine);
+        }
+    }
+    let engine = Arc::new(MemoryEngine::open(Arc::clone(db)).map_err(to_pyerr)?);
+    if let Some(i) = ident {
+        if let Some(entry) = open.get_mut(&i) {
+            entry.engine = Arc::downgrade(&engine);
+        }
+    }
+    Ok(engine)
+}
 
 /// Convert a Python value to a SQL bind [`Value`] (positional `$1..$N` params).
 fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
@@ -158,14 +361,25 @@ fn to_values(py: Python<'_>, params: &Option<Vec<Py<PyAny>>>) -> PyResult<Option
 /// handle is pinned to its creating thread (like sqlite3's default).
 #[pyclass(unsendable, name = "Database")]
 pub(crate) struct PyDatabase {
-    cell: Option<DbCell>,
+    /// Shared with every other handle to this file, so closing is per handle.
+    conn: Option<Rc<SharedConn>>,
+    /// Cached from the open-file table, which keeps one engine per database.
+    memory: std::cell::OnceCell<Arc<MemoryEngine>>,
 }
 
 impl PyDatabase {
-    /// Borrow the live cell, or raise if the database has been closed.
+    fn new(conn: Rc<SharedConn>) -> Self {
+        Self {
+            conn: Some(conn),
+            memory: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Borrow the live cell, or raise if this handle has been closed.
     fn cell(&self) -> PyResult<&DbCell> {
-        self.cell
+        self.conn
             .as_ref()
+            .map(|c| &c.cell)
             .ok_or_else(|| programming_err("operation on a closed Database"))
     }
 }
@@ -247,9 +461,12 @@ impl PyDatabase {
 
     /// Open the memory engine over this database (shares the underlying storage).
     fn memory(&self) -> PyResult<PyMemory> {
-        let db = self.cell()?.borrow_owner().clone();
-        let engine = MemoryEngine::open(db).map_err(to_pyerr)?;
-        Ok(PyMemory::from_engine(Arc::new(engine)))
+        if let Some(engine) = self.memory.get() {
+            return Ok(PyMemory::from_engine(Arc::clone(engine)));
+        }
+        let engine = shared_engine(self.cell()?.borrow_owner())?;
+        let _ = self.memory.set(Arc::clone(&engine));
+        Ok(PyMemory::from_engine(engine))
     }
 
     /// Storage statistics: `{tree_depth, entry_count, total_pages, high_water_mark, merkle_root}`.
@@ -291,6 +508,14 @@ impl PyDatabase {
         self.cell()?
             .borrow_owner()
             .compact(std::path::Path::new(dest))
+            .map_err(to_pyerr)
+    }
+
+    /// Whether `passphrase` unwraps this database, read from the key file.
+    fn verify_passphrase(&self, passphrase: &str) -> PyResult<bool> {
+        self.cell()?
+            .borrow_owner()
+            .verify_passphrase(passphrase.as_bytes())
             .map_err(to_pyerr)
     }
 
@@ -393,10 +618,19 @@ impl PyDatabase {
             .map(|p| p.to_string_lossy().into_owned()))
     }
 
-    /// Release this handle's connection and database reference. Later calls raise;
-    /// a still-open `memory()` keeps the database alive until it drops too.
+    /// Release this handle's connection and database reference. Later calls raise.
+    /// Other handles over the same file are unaffected; the file is released once
+    /// the last of them, and any engine they built, has dropped.
     fn close(&mut self) {
-        self.cell = None;
+        self.conn = None;
+        // Drop the cached engine too, or closing would not release the database.
+        self.memory.take();
+    }
+
+    /// True once `close` has run on this handle; other handles are unaffected.
+    #[getter]
+    fn is_closed(&self) -> bool {
+        self.conn.is_none()
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -415,7 +649,7 @@ impl PyDatabase {
     }
 
     fn __repr__(&self) -> &'static str {
-        if self.cell.is_some() {
+        if self.conn.is_some() {
             "Database(open)"
         } else {
             "Database(closed)"
@@ -606,22 +840,60 @@ pub(crate) fn connect(
         b
     };
     let in_memory = matches!(path.as_deref(), None | Some("") | Some(":memory:"));
-    let db = if in_memory {
-        configure(DatabaseBuilder::new(""))
+    // Held across the lookup and the insert: two threads racing to open one new file
+    // would otherwise both open it, and the loser would fail on the file lock.
+    let mut open = OPEN_FILES.lock().unwrap();
+    if in_memory {
+        let db = configure(DatabaseBuilder::new(""))
             .create_in_memory()
-            .map_err(to_pyerr)?
-    } else {
-        let p = path.as_deref().unwrap();
-        let builder = configure(DatabaseBuilder::new(p));
-        let exists = std::path::Path::new(p).exists();
+            .map_err(to_pyerr)?;
+        return attach(&mut open, None, Arc::new(db));
+    }
+
+    let p = path.as_deref().unwrap();
+    if let Some(ident) = identity(std::path::Path::new(p)) {
+        let shared = reuse(
+            &mut open,
+            &ident,
+            p,
+            key,
+            region_keys,
+            options.is_some(),
+            create,
+        )?;
+        if let Some(db) = shared {
+            return attach(&mut open, Some(&ident), db);
+        }
+    }
+
+    let builder = configure(DatabaseBuilder::new(p));
+    let exists = std::path::Path::new(p).exists();
+    let owner = Arc::new(
         match create {
             Some(true) => builder.create(),
             Some(false) => builder.open(),
             None if exists => builder.open(),
             None => builder.create(),
         }
-        .map_err(to_pyerr)?
-    };
-    let cell = DbCell::try_new(Arc::new(db), |owner| Connection::open(owner)).map_err(to_pyerr)?;
-    Ok(PyDatabase { cell: Some(cell) })
+        .map_err(to_pyerr)?,
+    );
+    let ident = identity(owner.data_path());
+    if let Some(ident) = ident.clone() {
+        // Dropped files are only ever noticed on their own path, so a long-lived
+        // process would otherwise keep an entry per file it had ever opened.
+        open.retain(|_, e| e.db.strong_count() > 0);
+        OPEN_CONNS.with_borrow_mut(|c| c.retain(|_, w| w.strong_count() > 0));
+        open.insert(
+            ident,
+            OpenFile {
+                db: Arc::downgrade(&owner),
+                engine: std::sync::Weak::new(),
+                conn: std::sync::Weak::new(),
+                owner_thread: std::thread::current().id(),
+                key_file: file_hash(owner.key_path())?,
+                passphrase: passphrase_digest(key),
+            },
+        );
+    }
+    attach(&mut open, ident.as_deref(), owner)
 }

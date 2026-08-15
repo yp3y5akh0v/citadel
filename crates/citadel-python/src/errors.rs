@@ -346,6 +346,12 @@ pub(crate) fn programming_err(msg: impl Into<String>) -> PyErr {
     ProgrammingError::new_err(msg.into())
 }
 
+/// Raise an `EncryptionError` for a passphrase the binding rejected before the
+/// engine saw it, so a caller cannot tell the two apart.
+pub(crate) fn encryption_err(msg: impl Into<String>) -> PyErr {
+    EncryptionError::new_err(msg.into())
+}
+
 /// Register the exception classes on the `_core` module.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();

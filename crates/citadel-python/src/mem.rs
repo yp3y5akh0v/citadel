@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use citadel_mem::types::{
-    AtomAttestation, AtomHit, AtomInput, EdgeKind, ErasureReceipt, EvictionPolicy, FusionWeights,
-    GraphExpand, RecallQuery, RerankStrategy, SlotErasure,
+    AtomAttestation, AtomHit, AtomInput, EdgeKind, ErasureReceipt, EvictionPolicy, FetchQuery,
+    FusionWeights, GraphExpand, RecallQuery, RerankStrategy, SlotErasure,
 };
 #[cfg(feature = "candle-embed")]
 use citadel_mem::{CandleConfig, CandleEmbedder, CrossEncoder};
@@ -95,6 +95,10 @@ fn dict_to_atom_input(py: Python<'_>, d: &Bound<'_, PyDict>) -> PyResult<AtomInp
             .map(|v| v.extract())
             .transpose()?
             .unwrap_or(false),
+        // Supplying a vector skips the region embedder; the dim is still validated.
+        embedding: dict_item(d, "embedding")?
+            .map(|v| v.extract::<Vec<f32>>())
+            .transpose()?,
     })
 }
 
@@ -756,6 +760,8 @@ impl PyRecallOptions {
 // ---- the engine ------------------------------------------------------------
 
 /// The memory engine over a `Database`. Obtain via `db.memory()`.
+///
+/// Holds no `Database` reference: a handle is pinned to its creating thread.
 #[pyclass(name = "Memory")]
 pub(crate) struct PyMemory {
     inner: Arc<MemoryEngine>,
@@ -798,6 +804,44 @@ impl PyMemory {
     fn remember(&self, py: Python<'_>, region: &str, atom: &Bound<'_, PyDict>) -> PyResult<i64> {
         let input = dict_to_atom_input(py, atom)?;
         self.inner.remember(region, input).map_err(to_pyerr)
+    }
+
+    /// Remember one atom as the sole occupant of `key`, superseding whatever atom
+    /// that key named before. Insert, rebind and the old row's delete commit
+    /// together, so concurrent writers to one key serialize instead of each
+    /// inserting. Returns the atom's id; an identical retry returns the stored
+    /// one untouched. Keys are scoped to `(region, kind)`.
+    fn remember_replacing_keyed(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        atom: &Bound<'_, PyDict>,
+        key: &str,
+    ) -> PyResult<i64> {
+        let input = dict_to_atom_input(py, atom)?;
+        self.inner
+            .remember_replacing_keyed(region, input, key)
+            .map(|o| o.id)
+            .map_err(to_pyerr)
+    }
+
+    /// `remember_replacing_keyed` over `(atom, key)` pairs in one transaction,
+    /// which keeps bulk ingest at one fsync for the batch rather than one per
+    /// atom. Returns their ids, in order. Keys must be distinct within a batch.
+    fn remember_replacing_keyed_batch(
+        &self,
+        py: Python<'_>,
+        region: &str,
+        entries: Vec<(Py<PyDict>, String)>,
+    ) -> PyResult<Vec<i64>> {
+        let inputs = entries
+            .iter()
+            .map(|(atom, key)| Ok((dict_to_atom_input(py, atom.bind(py))?, key.clone())))
+            .collect::<PyResult<Vec<_>>>()?;
+        self.inner
+            .remember_replacing_keyed_batch(region, inputs)
+            .map(|outs| outs.into_iter().map(|o| o.id).collect())
+            .map_err(to_pyerr)
     }
 
     /// Remember a list of atom dicts in one transaction. Returns their ids.
@@ -868,7 +912,11 @@ impl PyMemory {
     }
 
     /// Non-semantic fetch of a `kind`, optionally narrowed by a JSONB `payload_filter`.
-    #[pyo3(signature = (region, kind, *, payload_filter=None, limit=100))]
+    ///
+    /// Always id-ascending; `newest` takes the last `limit` rows, `after_id` pages.
+    #[pyo3(signature =(region, kind, *, payload_filter=None, limit=100, newest=false, after_id=None))]
+    // The parameter list is the Python keyword signature; a struct would break it.
+    #[allow(clippy::too_many_arguments)]
     fn fetch(
         &self,
         py: Python<'_>,
@@ -876,14 +924,19 @@ impl PyMemory {
         kind: &str,
         payload_filter: Option<Py<PyAny>>,
         limit: usize,
+        newest: bool,
+        after_id: Option<i64>,
     ) -> PyResult<Vec<PyAtomHit>> {
-        let pf = match &payload_filter {
+        let mut q = FetchQuery::new(limit).with_kind(kind);
+        q.payload_filter = match &payload_filter {
             Some(p) => Some(py_to_json(py, p.bind(py))?),
             None => None,
         };
+        q.newest = newest;
+        q.after_id = after_id;
         Ok(self
             .inner
-            .fetch(region, kind, pf.as_ref(), limit)
+            .fetch_range(region, &q)
             .map_err(to_pyerr)?
             .into_iter()
             .map(PyAtomHit::from_hit)
