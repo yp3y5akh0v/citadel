@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "citadeldb-haystack"
+dynamic = ["version"]
+description = "Haystack document store backed by Citadel: encrypted at rest, with deletes that destroy the key"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Yuriy Peysakhov" }]
+keywords = ["haystack", "rag", "document-store", "vector-store", "encryption"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Database",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# The precomputed vector needs the `embedding` field added in citadeldb 1.16.
+dependencies = ["citadeldb>=1.16", "haystack-ai>=2.9,<4"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.urls]
+Homepage = "https://citadeldb.dev"
+Repository = "https://github.com/yp3y5akh0v/citadel"
+
+# The version comes from the release tag, so there is nothing to bump.
+[tool.hatch.version]
+source = "vcs"
+raw-options = { root = "../..", tag_regex = '^v(?P<version>\d+\.\d+\.\d+)$' }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/citadeldb_haystack"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

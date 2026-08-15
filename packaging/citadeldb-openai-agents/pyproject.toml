@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "citadeldb-openai-agents"
+dynamic = ["version"]
+description = "OpenAI Agents SDK sessions backed by Citadel: encrypted at rest, with deletes that destroy the key"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Yuriy Peysakhov" }]
+keywords = ["openai", "agents", "session", "memory", "agent", "encryption"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Database",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# The floor is the version whose session protocol this was built against.
+# A filtered recall answers `k` matching rows from 1.16; before it, a session's
+# own items could rank outside the scan and search would return short.
+dependencies = ["citadeldb>=1.16", "openai-agents>=0.20.0,<1"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.urls]
+Homepage = "https://citadeldb.dev"
+Repository = "https://github.com/yp3y5akh0v/citadel"
+
+# The version comes from the release tag, so there is nothing to bump.
+[tool.hatch.version]
+source = "vcs"
+raw-options = { root = "../..", tag_regex = '^v(?P<version>\d+\.\d+\.\d+)$' }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/citadeldb_openai_agents"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

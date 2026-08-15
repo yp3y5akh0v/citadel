@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+# Named for the framework's owner: "agent framework" alone reads as a category.
+name = "citadeldb-ms-agent-framework"
+dynamic = ["version"]
+description = "Microsoft Agent Framework chat history backed by Citadel: encrypted at rest, with deletes that destroy the key"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Yuriy Peysakhov" }]
+keywords = [
+  "microsoft-agent-framework", "agent-framework", "autogen", "agents", "memory",
+  "chat-history", "encryption",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Database",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# A filtered recall answers `k` matching rows from 1.16; before it, a scope's
+# own memories could rank outside the scan and recall would return short.
+dependencies = ["citadeldb>=1.16", "agent-framework-core>=1.13,<2"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.urls]
+Homepage = "https://citadeldb.dev"
+Repository = "https://github.com/yp3y5akh0v/citadel"
+
+# The version comes from the release tag, so there is nothing to bump.
+[tool.hatch.version]
+source = "vcs"
+raw-options = { root = "../..", tag_regex = '^v(?P<version>\d+\.\d+\.\d+)$' }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/citadeldb_ms_agent_framework"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
