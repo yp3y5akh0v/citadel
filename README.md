@@ -7,9 +7,6 @@
   <a href="https://www.npmjs.com/package/@citadeldb/wasm"><img src="https://img.shields.io/npm/v/@citadeldb/wasm" alt="npm"></a>
   <a href="https://pypi.org/project/citadeldb/"><img src="https://img.shields.io/pypi/v/citadeldb?label=pypi%20citadeldb" alt="PyPI citadeldb"></a>
   <a href="https://pypi.org/project/citadeldb-mcp/"><img src="https://img.shields.io/pypi/v/citadeldb-mcp?label=pypi%20citadeldb-mcp" alt="PyPI citadeldb-mcp"></a>
-  <br>
-  <a href="https://pypi.org/project/citadeldb-langgraph/"><img src="https://img.shields.io/pypi/v/citadeldb-langgraph?label=pypi%20citadeldb-langgraph" alt="PyPI citadeldb-langgraph"></a>
-  <a href="https://pypi.org/project/citadeldb-crewai/"><img src="https://img.shields.io/pypi/v/citadeldb-crewai?label=pypi%20citadeldb-crewai" alt="PyPI citadeldb-crewai"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mcp"><img src="https://img.shields.io/badge/MCP-dev.citadeldb%2Fmcp-blue" alt="MCP registry: dev.citadeldb/mcp"></a>
   <br>
   <a href="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml"><img src="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -152,12 +149,23 @@ citadel> .listen 4248 <KEY>              # Terminal A
 citadel> .sync 127.0.0.1:4248 <KEY>      # Terminal B
 ```
 
-### LangGraph
+### Agent frameworks
 
-`citadeldb-langgraph` is a drop-in [`BaseStore`](https://langchain-ai.github.io/langgraph/reference/store/),
-so `create_react_agent(store=...)` and the rest of the LangGraph API work unchanged. Namespace
-prefix search is served by an index rather than a scan, TTLs refresh on read, and deleting a
-key destroys it cryptographically.
+Each package implements that framework's own storage interface, so existing code keeps
+working and only the constructor changes. Deleting through any of them destroys the
+record's key, not just its row, and search is ranked recall rather than a `LIKE`.
+
+| Framework | Package | Implements |
+|---|---|---|
+| [LangGraph](packaging/citadeldb-langgraph) | [`citadeldb-langgraph`](https://pypi.org/project/citadeldb-langgraph/) | `BaseStore` |
+| [CrewAI](packaging/citadeldb-crewai) | [`citadeldb-crewai`](https://pypi.org/project/citadeldb-crewai/) | `StorageBackend` |
+| [OpenAI Agents SDK](packaging/citadeldb-openai-agents) | [`citadeldb-openai-agents`](https://pypi.org/project/citadeldb-openai-agents/) | `Session` |
+| [Google ADK](packaging/citadeldb-google-adk) | [`citadeldb-google-adk`](https://pypi.org/project/citadeldb-google-adk/) | `BaseMemoryService` |
+| [LlamaIndex](packaging/citadeldb-llamaindex) | [`citadeldb-llamaindex`](https://pypi.org/project/citadeldb-llamaindex/) | `BasePydanticVectorStore` |
+| [LangChain](packaging/citadeldb-langchain) | [`citadeldb-langchain`](https://pypi.org/project/citadeldb-langchain/) | `VectorStore`, `BaseChatMessageHistory` |
+| [Haystack](packaging/citadeldb-haystack) | [`citadeldb-haystack`](https://pypi.org/project/citadeldb-haystack/) | `DocumentStore` |
+| [Microsoft Agent Framework](packaging/citadeldb-ms-agent-framework) | [`citadeldb-ms-agent-framework`](https://pypi.org/project/citadeldb-ms-agent-framework/) | `HistoryProvider`, `ContextProvider` |
+| [Strands Agents](packaging/citadeldb-strands-agents) | [`citadeldb-strands-agents`](https://pypi.org/project/citadeldb-strands-agents/) | `SessionRepository` |
 
 ```bash
 pip install citadeldb-langgraph
@@ -172,24 +180,9 @@ store.search(("users",))                     # every namespace under users/
 store.forget_namespace(("users", "alice"))   # cryptographic erasure, returns a count
 ```
 
-### CrewAI
-
-`citadeldb-crewai` implements CrewAI's `StorageBackend`. One call at startup routes every
-crew's memory through Citadel; a crew that names its own backend keeps it.
-`MemoryRecord.importance` maps onto the native atom score, so it survives as a ranking signal
-instead of metadata the store ignores.
-
-```bash
-pip install citadeldb-crewai
-```
-
-```python
-from citadeldb_crewai import use_citadel
-
-use_citadel("crew_memory.cdl", key="your-passphrase")
-
-crew = Crew(agents=[...], tasks=[...], memory=True)   # unchanged
-```
+One database serves every adapter on the thread that opened it, so a graph's long-term
+store and its session transcripts can share one encrypted file. See [`packaging/`](packaging/) for each
+package's own README.
 
 ### MCP
 
