@@ -4745,3 +4745,506 @@ fn identity_tag_persisted_format_is_frozen() {
         "de4ef94e9931c9bb99ce912f47bbb9a0680ae87c55346648be27660ad68d2157"
     );
 }
+
+fn unit(dim: usize, axis: usize) -> Vec<f32> {
+    let mut v = vec![0.0f32; dim];
+    v[axis] = 1.0;
+    v
+}
+
+#[test]
+fn supplied_embedding_is_stored_instead_of_embedding_the_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+
+    // The texts are identical, so only the supplied vectors can tell them apart.
+    eng.remember(
+        "s",
+        AtomInput::new("note", "same text").with_embedding(unit(8, 0)),
+    )
+    .unwrap();
+    eng.remember(
+        "s",
+        AtomInput::new("note", "same text").with_embedding(unit(8, 7)),
+    )
+    .unwrap();
+
+    let hits = eng
+        .recall("s", RecallQuery::by_embedding(unit(8, 7), 1))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(
+        hits[0].distance < 1e-3,
+        "the text was embedded instead of the supplied vector (distance {})",
+        hits[0].distance
+    );
+}
+
+#[test]
+fn supplied_embedding_of_the_wrong_dim_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+
+    let err = eng
+        .remember(
+            "s",
+            AtomInput::new("note", "x").with_embedding(vec![1.0, 0.0, 0.0]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, MemError::DimMismatch { .. }), "got {err:?}");
+}
+
+#[test]
+fn batch_mixes_supplied_and_embedded_vectors() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+
+    // The middle atom has no vector, so exactly one text reaches the embedder.
+    let ids = eng
+        .remember_batch(
+            "s",
+            vec![
+                AtomInput::new("note", "supplied one").with_embedding(unit(8, 0)),
+                AtomInput::new("note", "engine embeds this"),
+                AtomInput::new("note", "supplied two").with_embedding(unit(8, 7)),
+            ],
+        )
+        .unwrap();
+    assert_eq!(ids.len(), 3);
+
+    let hits = eng
+        .recall("s", RecallQuery::by_embedding(unit(8, 7), 1))
+        .unwrap();
+    assert_eq!(hits[0].text, "supplied two", "wrong slot got the vector");
+    assert!(hits[0].distance < 1e-3, "distance {}", hits[0].distance);
+}
+
+#[test]
+fn fetch_newest_takes_the_last_rows_still_ascending() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_db(dir.path())).unwrap();
+    eng.create_region("r", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    for n in 0..5 {
+        eng.remember("r", AtomInput::new("note", n.to_string()))
+            .unwrap();
+    }
+
+    let q = FetchQuery::new(2).with_kind("note").newest();
+    let texts: Vec<String> = eng
+        .fetch_range("r", &q)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.text)
+        .collect();
+    assert_eq!(texts, vec!["3".to_string(), "4".to_string()]);
+}
+
+#[test]
+fn fetch_newest_on_a_sealed_region_honours_the_payload_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    // The filter runs after decryption, so the descending walk keeps paging.
+    for n in 0..6 {
+        let keep = n % 2 == 0;
+        eng.remember(
+            "s",
+            AtomInput::new("note", n.to_string()).with_payload(serde_json::json!({ "keep": keep })),
+        )
+        .unwrap();
+    }
+
+    let mut q = FetchQuery::new(2).with_kind("note").newest();
+    q.payload_filter = Some(serde_json::json!({ "keep": true }));
+    let texts: Vec<String> = eng
+        .fetch_range("s", &q)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.text)
+        .collect();
+    assert_eq!(texts, vec!["2".to_string(), "4".to_string()]);
+}
+
+fn keyed(kind: &str, text: &str, sid: &str) -> AtomInput {
+    AtomInput::new(kind, text).with_payload(serde_json::json!({ "sid": sid }))
+}
+
+#[test]
+fn a_keyed_replace_leaves_one_atom_per_key() {
+    for encrypted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+        let embedder = Arc::new(MockEmbedder::new(8));
+        if encrypted {
+            eng.create_encrypted_region("r", embedder).unwrap();
+        } else {
+            eng.create_region("r", embedder).unwrap();
+        }
+
+        let first = eng
+            .remember_replacing_keyed("r", keyed("note", "version one", "a"), "k")
+            .unwrap();
+        assert!(first.inserted, "encrypted={encrypted}");
+        let second = eng
+            .remember_replacing_keyed("r", keyed("note", "version two", "a"), "k")
+            .unwrap();
+        assert!(second.inserted, "encrypted={encrypted}");
+        assert_ne!(first.id, second.id, "encrypted={encrypted}");
+
+        let live = eng.fetch("r", "note", None, 100).unwrap();
+        let texts: Vec<&str> = live.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, vec!["version two"], "encrypted={encrypted}");
+        assert!(
+            eng.fetch_one("r", first.id).unwrap().is_none(),
+            "the superseded atom is still readable, encrypted={encrypted}"
+        );
+    }
+}
+
+#[test]
+fn an_identical_keyed_replace_replays_instead_of_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("r", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+
+    let first = eng
+        .remember_replacing_keyed("r", keyed("note", "same", "a"), "k")
+        .unwrap();
+    let retry = eng
+        .remember_replacing_keyed("r", keyed("note", "same", "a"), "k")
+        .unwrap();
+    // A retry is not an edit: it converges on the stored atom rather than
+    // superseding it, so the id a caller already holds stays valid.
+    assert_eq!(retry.id, first.id);
+    assert!(!retry.inserted);
+    assert_eq!(eng.count("r", "note").unwrap(), 1);
+}
+
+#[test]
+fn distinct_keys_replace_independently() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("r", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    for round in 0..3 {
+        for slot in ["a", "b", "c"] {
+            eng.remember_replacing_keyed(
+                "r",
+                keyed("note", &format!("{slot} round {round}"), slot),
+                slot,
+            )
+            .unwrap();
+        }
+    }
+    let mut texts: Vec<String> = eng
+        .fetch("r", "note", None, 100)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.text)
+        .collect();
+    texts.sort();
+    assert_eq!(texts, ["a round 2", "b round 2", "c round 2"]);
+}
+
+#[test]
+fn concurrent_keyed_replaces_of_one_key_leave_one_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = Arc::new(MemoryEngine::open(create_enc_db(dir.path())).unwrap());
+    eng.create_encrypted_region("r", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+
+    // Read-modify-write from outside lets every writer observe "absent" and
+    // insert, leaving one key backed by as many rows as there were writers.
+    let start = Arc::new(std::sync::Barrier::new(8));
+    let writers: Vec<_> = (0..8)
+        .map(|n| {
+            let eng = Arc::clone(&eng);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                eng.remember_replacing_keyed("r", keyed("note", &format!("write {n}"), "a"), "k")
+            })
+        })
+        .collect();
+    let ids: Vec<AtomId> = writers
+        .into_iter()
+        .map(|w| w.join().unwrap().unwrap().id)
+        .collect();
+
+    let live = eng.fetch("r", "note", None, 100).unwrap();
+    assert_eq!(live.len(), 1, "one key, {} rows: {live:?}", live.len());
+    // The survivor is one of the writes, not a merge or a lost update.
+    assert!(
+        ids.contains(&live[0].id),
+        "survivor {live:?} is not any write"
+    );
+}
+
+#[test]
+fn a_keyed_batch_replaces_and_inserts_in_one_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("r", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    eng.remember_replacing_keyed_batch(
+        "r",
+        vec![
+            (keyed("note", "a first", "a"), "a".into()),
+            (keyed("note", "b first", "b"), "b".into()),
+        ],
+    )
+    .unwrap();
+
+    // One batch spanning a replay, a replace and a fresh insert.
+    let out = eng
+        .remember_replacing_keyed_batch(
+            "r",
+            vec![
+                (keyed("note", "a first", "a"), "a".into()),
+                (keyed("note", "b second", "b"), "b".into()),
+                (keyed("note", "c first", "c"), "c".into()),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        out.iter().map(|o| o.inserted).collect::<Vec<_>>(),
+        vec![false, true, true]
+    );
+
+    let mut texts: Vec<String> = eng
+        .fetch("r", "note", None, 100)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.text)
+        .collect();
+    texts.sort();
+    assert_eq!(texts, ["a first", "b second", "c first"]);
+}
+
+#[test]
+fn one_key_twice_in_a_batch_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("r", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    // Two atoms for one key have no defensible answer, so it must not pick one.
+    let err = eng
+        .remember_replacing_keyed_batch(
+            "r",
+            vec![
+                (keyed("note", "first", "a"), "dup".into()),
+                (keyed("note", "second", "a"), "dup".into()),
+            ],
+        )
+        .unwrap_err();
+    assert!(format!("{err}").contains("twice in one batch"), "{err}");
+    assert_eq!(eng.count("r", "note").unwrap(), 0, "the batch wrote anyway");
+}
+
+/// 300 nearer rows in another partition, against a first window of 64.
+const BURIED_CHAFF: usize = 300;
+
+/// A sealed region holding `BURIED_CHAFF` rows that outrank one filtered target.
+fn buried_target_region(dir: &std::path::Path) -> MemoryEngine {
+    let eng = MemoryEngine::open(create_enc_db(dir)).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    // Distinct but near-parallel to the query, so every one of them outranks the
+    // target and no two share a vector.
+    let chaff: Vec<AtomInput> = (0..BURIED_CHAFF)
+        .map(|i| {
+            let mut v = vec![0.0f32; 8];
+            v[0] = 1.0;
+            v[1] = i as f32 * 1e-4;
+            AtomInput::new("note", format!("noise {i}"))
+                .with_payload(serde_json::json!({ "sid": "noisy" }))
+                .with_embedding(v)
+        })
+        .collect();
+    eng.remember_batch("s", chaff).unwrap();
+    let mut far = vec![0.0f32; 8];
+    far[1] = 1.0;
+    eng.remember_batch(
+        "s",
+        vec![AtomInput::new("note", "the one that matters")
+            .with_payload(serde_json::json!({ "sid": "quiet" }))
+            .with_embedding(far)],
+    )
+    .unwrap();
+    eng
+}
+
+fn near_query() -> Vec<f32> {
+    let mut v = vec![0.0f32; 8];
+    v[0] = 1.0;
+    v
+}
+
+#[test]
+fn sealed_recall_widens_past_the_candidate_window_to_satisfy_a_payload_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = buried_target_region(dir.path());
+
+    // Control: the target really is out of reach of the first window, so this
+    // test cannot pass by the target happening to rank well.
+    let unfiltered = eng
+        .recall("s", RecallQuery::by_embedding(near_query(), 1))
+        .unwrap();
+    assert_eq!(unfiltered.len(), 1);
+    assert!(
+        unfiltered[0].text.starts_with("noise "),
+        "chaff must outrank the target, got {:?}",
+        unfiltered[0].text
+    );
+
+    let hits = eng
+        .recall(
+            "s",
+            RecallQuery::by_embedding(near_query(), 1)
+                .with_payload_filter(serde_json::json!({ "sid": "quiet" })),
+        )
+        .unwrap();
+    let texts: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
+    assert_eq!(texts, vec!["the one that matters"]);
+}
+
+#[test]
+fn sealed_recall_stops_widening_once_the_window_spans_the_region() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = buried_target_region(dir.path());
+    // No atom carries this, so every widening step comes back empty. The loop
+    // has to end on the region rather than on a satisfied filter.
+    let hits = eng
+        .recall(
+            "s",
+            RecallQuery::by_embedding(near_query(), 1)
+                .with_payload_filter(serde_json::json!({ "sid": "absent" })),
+        )
+        .unwrap();
+    assert!(hits.is_empty(), "got {hits:?}");
+}
+
+#[test]
+fn sealed_recall_widens_past_a_window_of_expired_atoms() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    // Expiry is read off the decrypted atom, so the dead rows are ranked first
+    // and dropped afterwards, exactly as a payload filter would be.
+    let expired = micros_now() - 1;
+    let dead: Vec<AtomInput> = (0..BURIED_CHAFF)
+        .map(|i| {
+            let mut v = vec![0.0f32; 8];
+            v[0] = 1.0;
+            v[1] = i as f32 * 1e-4;
+            AtomInput::new("note", format!("expired {i}"))
+                .with_expires_at(expired)
+                .with_embedding(v)
+        })
+        .collect();
+    eng.remember_batch("s", dead).unwrap();
+    let mut far = vec![0.0f32; 8];
+    far[1] = 1.0;
+    eng.remember_batch(
+        "s",
+        vec![AtomInput::new("note", "still alive").with_embedding(far)],
+    )
+    .unwrap();
+
+    let hits = eng
+        .recall("s", RecallQuery::by_embedding(near_query(), 1))
+        .unwrap();
+    let texts: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
+    assert_eq!(texts, vec!["still alive"]);
+}
+
+#[test]
+fn sealed_recall_widens_past_a_window_of_superseded_atoms() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    // Supersession is a row relation resolved after ranking, so stale versions
+    // occupy the window and are removed from it.
+    let mut far = vec![0.0f32; 8];
+    far[1] = 1.0;
+    let current = eng
+        .remember_batch(
+            "s",
+            vec![AtomInput::new("note", "the current version").with_embedding(far)],
+        )
+        .unwrap()[0];
+    for i in 0..BURIED_CHAFF {
+        let mut v = vec![0.0f32; 8];
+        v[0] = 1.0;
+        v[1] = i as f32 * 1e-4;
+        let stale = eng
+            .remember(
+                "s",
+                AtomInput::new("note", format!("old {i}")).with_embedding(v),
+            )
+            .unwrap();
+        eng.link(current, stale, EdgeKind::Supersedes, 1.0).unwrap();
+    }
+
+    let hits = eng
+        .recall("s", RecallQuery::by_embedding(near_query(), 1))
+        .unwrap();
+    let texts: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
+    assert_eq!(texts, vec!["the current version"]);
+}
+
+#[test]
+fn sealed_recall_returns_every_filtered_match_it_can_reach() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = buried_target_region(dir.path());
+    // Fewer matches than asked for: widening must run to the end of the region
+    // and still answer with the one that exists.
+    let hits = eng
+        .recall(
+            "s",
+            RecallQuery::by_embedding(near_query(), 5)
+                .with_payload_filter(serde_json::json!({ "sid": "quiet" })),
+        )
+        .unwrap();
+    let texts: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
+    assert_eq!(texts, vec!["the one that matters"]);
+}
+
+#[test]
+fn fetch_newest_respects_after_id_as_a_lower_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = MemoryEngine::open(create_enc_db(dir.path())).unwrap();
+    eng.create_encrypted_region("s", Arc::new(MockEmbedder::new(8)))
+        .unwrap();
+    let mut ids = Vec::new();
+    for n in 0..4 {
+        ids.push(
+            eng.remember("s", AtomInput::new("note", n.to_string()))
+                .unwrap(),
+        );
+    }
+
+    // Walking down, `after_id` is a fixed bound, not the ascending watermark.
+    let q = FetchQuery::new(10)
+        .with_kind("note")
+        .with_after_id(ids[1])
+        .newest();
+    let texts: Vec<String> = eng
+        .fetch_range("s", &q)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.text)
+        .collect();
+    assert_eq!(texts, vec!["2".to_string(), "3".to_string()]);
+}

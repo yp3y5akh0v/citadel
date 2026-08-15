@@ -1159,6 +1159,181 @@ impl MemoryEngine {
         Ok(out)
     }
 
+    /// [`remember_if_absent_keyed`](Self::remember_if_absent_keyed) that
+    /// supersedes instead of refusing: changed input replaces the atom the key
+    /// named, an identical retry replays it. Insert, rebind and the old row's
+    /// delete commit together, so a key names one atom and writers serialize.
+    /// The old key dies after that commit; a crash between leaves an unnamed key
+    /// for reconcile. [`forget_atoms`](Self::forget_atoms) erases for compliance.
+    pub fn remember_replacing_keyed(
+        &self,
+        region: &str,
+        atom: AtomInput,
+        idempotency_key: &str,
+    ) -> Result<RememberOutcome> {
+        let mut out =
+            self.remember_replacing_keyed_batch(region, vec![(atom, idempotency_key.to_string())])?;
+        out.pop()
+            .ok_or_else(|| MemError::Invalid("keyed replace returned no outcome".into()))
+    }
+
+    /// [`remember_replacing_keyed`](Self::remember_replacing_keyed) over a batch
+    /// in one transaction, keeping the batched seal-and-allocate: one fsync for
+    /// the batch where a per-atom loop pays one each. Outcomes come back per
+    /// entry, in order. Keys must be distinct within a batch; two atoms for one
+    /// key refuses rather than guessing.
+    pub fn remember_replacing_keyed_batch(
+        &self,
+        region: &str,
+        entries: Vec<(AtomInput, String)>,
+    ) -> Result<Vec<RememberOutcome>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let key = region.to_ascii_lowercase();
+        let h = self.region_handle(&key)?;
+        let (atoms, keys): (Vec<AtomInput>, Vec<String>) = entries.into_iter().unzip();
+        let mut distinct = FxHashSet::default();
+        for k in &keys {
+            if k.is_empty() {
+                return Err(MemError::Invalid("empty idempotency key".into()));
+            }
+            if !distinct.insert(k.as_str()) {
+                return Err(MemError::Invalid(format!(
+                    "idempotency key {k:?} appears twice in one batch"
+                )));
+            }
+        }
+        let vecs = self.vectorise_atoms(&key, &h, &atoms)?;
+        let mac = h.identity_mac.as_deref();
+        let kinds: Vec<String> = atoms.iter().map(|a| a.kind.clone()).collect();
+        let mut tags: Vec<(String, String)> = Vec::with_capacity(atoms.len());
+        for (atom, k) in atoms.iter().zip(&keys) {
+            let payload_json = serde_json::to_string(&atom.payload)
+                .map_err(|e| MemError::Invalid(format!("payload not serializable: {e}")))?;
+            let key_tag = identity_key_tag(mac, &atom.kind, k);
+            let request_tag = identity_request_tag(mac, &key_tag, atom, &payload_json, &[], None)?;
+            tags.push((key_tag, request_tag));
+        }
+
+        let encrypted = h.atom_wrap.is_some();
+        let table = h.table.clone();
+        let conn = Connection::open(&self.db)?;
+        // One span over both the inserts' key allocation and the supersedes'
+        // destruction, so no reconcile reclaims either mid-replace.
+        let _kl = encrypted.then(|| self.db.key_lifecycle_lock());
+        if let Some(kl) = _kl.as_ref() {
+            // Before the txn: a crash cannot leave erased codes under a live segment key.
+            self.retire_sealed_segment(&h, &conn, kl)?;
+        }
+        let mut pending = PendingAtomSlots::new(_kl.as_ref(), atoms.len());
+        let result = with_write_txn(&conn, |c| {
+            self.verify_region_live(c, &h, &key)?;
+            // All resolved before any insert, so no entry supersedes itself.
+            let mut bound: Vec<Option<(String, AtomId)>> = Vec::with_capacity(kinds.len());
+            for (kind, (key_tag, _)) in kinds.iter().zip(&tags) {
+                bound.push(self.live_keyed_binding(c, &h, kind, key_tag)?);
+            }
+            // An identical retry writes nothing, so it never reaches the id range.
+            let mut atoms: Vec<Option<AtomInput>> = atoms.into_iter().map(Some).collect();
+            let mut vecs: Vec<Option<Vec<f32>>> = vecs.into_iter().map(Some).collect();
+            let mut writing: Vec<usize> = Vec::with_capacity(kinds.len());
+            let mut outcomes: Vec<Option<RememberOutcome>> = vec![None; kinds.len()];
+            for i in 0..kinds.len() {
+                match &bound[i] {
+                    Some((request, id)) if request == &tags[i].1 => {
+                        outcomes[i] = Some(RememberOutcome {
+                            id: *id,
+                            inserted: false,
+                        });
+                    }
+                    _ => writing.push(i),
+                }
+            }
+            let fresh: Vec<AtomInput> = writing
+                .iter()
+                .map(|&i| atoms[i].take().expect("each index is taken once"))
+                .collect();
+            let fresh_vecs: Vec<Vec<f32>> = writing
+                .iter()
+                .map(|&i| vecs[i].take().expect("each index is taken once"))
+                .collect();
+            let ids = self.insert_atom_rows(c, &h, &table, fresh, fresh_vecs, &mut pending)?;
+
+            let mut stale: Vec<AtomId> = Vec::new();
+            for (slot, &i) in writing.iter().enumerate() {
+                let id = ids[slot];
+                let params = [
+                    Value::Integer(h.id),
+                    Value::Text(kinds[i].as_str().into()),
+                    Value::Text(tags[i].0.as_str().into()),
+                    Value::Text(tags[i].1.as_str().into()),
+                    Value::Integer(id),
+                ];
+                match bound[i].take() {
+                    Some((_, superseded)) => {
+                        c.execute_params(
+                            "UPDATE memory_idempotency SET request_mac = $4, atom_id = $5 \
+                             WHERE region_id = $1 AND kind = $2 AND key_mac = $3",
+                            &params,
+                        )?;
+                        stale.push(superseded);
+                    }
+                    None => {
+                        c.execute_params(
+                            "INSERT INTO memory_idempotency \
+                             (region_id, kind, key_mac, request_mac, atom_id) \
+                             VALUES ($1, $2, $3, $4, $5)",
+                            &params,
+                        )?;
+                    }
+                }
+                outcomes[i] = Some(RememberOutcome { id, inserted: true });
+            }
+
+            let doomed = if stale.is_empty() {
+                Vec::new()
+            } else {
+                let in_list = stale
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // Read while the rows still name their keys; the delete orphans them.
+                let slots = if encrypted {
+                    atom_key_slots(c, &h, &in_list)?
+                } else {
+                    Vec::new()
+                };
+                delete_atoms_in_txn(c, &h, &in_list)?;
+                slots
+            };
+            let outcomes: Vec<RememberOutcome> = outcomes
+                .into_iter()
+                .map(|o| o.expect("every entry is replayed or written"))
+                .collect();
+            Ok((outcomes, doomed))
+        });
+        let (out, doomed) = pending
+            .finish(result)
+            .inspect_err(|e| self.evict_stale_region(&key, h.id, e))?;
+        if !doomed.is_empty() {
+            // Non-empty only on the sealed path, which is where the guard is held.
+            let kl = _kl.as_ref().expect("sealed slots imply a lifecycle span");
+            kl.atom_store_tombstone_batch(&doomed)?;
+        }
+        if let Some(max) = out.iter().map(|o| o.id).max() {
+            h.max_id.fetch_max(max, Ordering::Relaxed);
+        }
+        if doomed.is_empty() {
+            self.note_sealed_insert(&h);
+        } else {
+            // A deleted row invalidates the cached index outright.
+            *h.ann.write().unwrap() = None;
+        }
+        Ok(out)
+    }
+
     /// Resolve a keyed write against the identity table inside the caller's
     /// write transaction: `Some(id)` replays the original atom untouched,
     /// `None` means insert fresh (any stale record was self-healed away),
@@ -1171,6 +1346,27 @@ impl MemoryEngine {
         key_tag: &str,
         request_tag: &str,
     ) -> Result<Option<AtomId>> {
+        let Some((bound, atom_id)) = self.live_keyed_binding(conn, h, kind, key_tag)? else {
+            return Ok(None);
+        };
+        if bound != request_tag {
+            return Err(MemError::Invalid(format!(
+                "idempotency key already bound to atom {atom_id} with a different request"
+            )));
+        }
+        Ok(Some(atom_id))
+    }
+
+    /// The live atom a key names and the request tag it was bound under, inside
+    /// the caller's write transaction. A binding whose atom is gone, expired or
+    /// key-erased is deleted here and reads as absent, freeing the key.
+    fn live_keyed_binding(
+        &self,
+        conn: &Connection<'_>,
+        h: &RegionHandle,
+        kind: &str,
+        key_tag: &str,
+    ) -> Result<Option<(String, AtomId)>> {
         let qr = conn.query_params(
             "SELECT request_mac, atom_id FROM memory_idempotency \
              WHERE region_id = $1 AND kind = $2 AND key_mac = $3",
@@ -1236,12 +1432,7 @@ impl MemoryEngine {
             )?;
             return Ok(None);
         }
-        if as_text(&row[0])? != request_tag {
-            return Err(MemError::Invalid(format!(
-                "idempotency key already bound to atom {atom_id} with a different request"
-            )));
-        }
-        Ok(Some(atom_id))
+        Ok(Some((as_text(&row[0])?.to_string(), atom_id)))
     }
 
     /// [`remember_derived`](Self::remember_derived) with caller-declared
@@ -1514,36 +1705,92 @@ impl MemoryEngine {
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
 
-        // Reject bad ranking values before the embedder/txn: one shared input boundary.
-        for atom in &atoms {
-            validate_atom_input(atom)?;
-        }
-
-        let texts: Vec<&str> = atoms.iter().map(|a| a.text.as_str()).collect();
-        let vecs = h.embedder.embed(&texts)?;
-        if vecs.len() != atoms.len() {
-            return Err(MemError::Invalid(format!(
-                "embedder returned {} vectors for {} texts",
-                vecs.len(),
-                atoms.len()
-            )));
-        }
-        for vector in &vecs {
-            validate_embedding(&key, h.dim, vector, "passage")?;
-        }
-
-        let n = atoms.len();
+        let vecs = self.vectorise_atoms(&key, &h, &atoms)?;
         let table = h.table.clone();
         let conn = Connection::open(&self.db)?;
         // Sealed inserts allocate keys before their rows commit; hold the guard
         // so a concurrent reconcile cannot reclaim them mid-span.
         let _kl = h.atom_wrap.is_some().then(|| self.db.key_lifecycle_lock());
-        let mut pending = PendingAtomSlots::new(_kl.as_ref(), n);
+        let mut pending = PendingAtomSlots::new(_kl.as_ref(), atoms.len());
         let result = with_write_txn(&conn, |c| {
             self.verify_region_live(c, &h, &key)?;
-            let start = next_id_range(c, "next_atom_id", n as i64)?;
-            let ids: Vec<AtomId> = (0..n as i64).map(|o| start + o).collect();
+            self.insert_atom_rows(c, &h, &table, atoms, vecs, &mut pending)
+        });
+        let ids = pending
+            .finish(result)
+            .inspect_err(|e| self.evict_stale_region(&key, h.id, e))?;
+        if let Some(&last) = ids.last() {
+            h.max_id.fetch_max(last, Ordering::Relaxed);
+            self.note_sealed_insert(&h);
+        }
+        Ok(ids)
+    }
 
+    /// Validate and vectorise atoms before any transaction: one shared input
+    /// boundary, and the embedder never runs with a write txn open.
+    fn vectorise_atoms(
+        &self,
+        key: &str,
+        h: &RegionHandle,
+        atoms: &[AtomInput],
+    ) -> Result<Vec<Vec<f32>>> {
+        for atom in atoms {
+            validate_atom_input(atom)?;
+        }
+
+        // Only atoms without a supplied vector reach the embedder.
+        let texts: Vec<&str> = atoms
+            .iter()
+            .filter(|a| a.embedding.is_none())
+            .map(|a| a.text.as_str())
+            .collect();
+        let embedded = if texts.is_empty() {
+            Vec::new()
+        } else {
+            h.embedder.embed(&texts)?
+        };
+        if embedded.len() != texts.len() {
+            return Err(MemError::Invalid(format!(
+                "embedder returned {} vectors for {} texts",
+                embedded.len(),
+                texts.len()
+            )));
+        }
+        let mut taken = 0usize;
+        let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(atoms.len());
+        for atom in atoms {
+            let vector = match &atom.embedding {
+                Some(supplied) => supplied.clone(),
+                None => {
+                    let v = embedded[taken].clone();
+                    taken += 1;
+                    v
+                }
+            };
+            validate_embedding(key, h.dim, &vector, "passage")?;
+            vecs.push(vector);
+        }
+        Ok(vecs)
+    }
+
+    /// Insert vectorised atoms inside the caller's transaction, sealing and
+    /// allocating every key in one batch (one fsync, not one per atom).
+    fn insert_atom_rows(
+        &self,
+        c: &Connection<'_>,
+        h: &RegionHandle,
+        table: &str,
+        atoms: Vec<AtomInput>,
+        vecs: Vec<Vec<f32>>,
+        pending: &mut PendingAtomSlots<'_>,
+    ) -> Result<Vec<AtomId>> {
+        let n = atoms.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let start = next_id_range(c, "next_atom_id", n as i64)?;
+        let ids: Vec<AtomId> = (0..n as i64).map(|o| start + o).collect();
+        {
             if let Some(atom_wrap) = &h.atom_wrap {
                 // Seal all atoms, persist their wrapped ACKs with one fsync.
                 let mut sealed_blobs: Vec<Vec<u8>> = Vec::with_capacity(n);
@@ -1566,7 +1813,7 @@ impl MemoryEngine {
                     let created = Value::Timestamp(atom.created_at.unwrap_or_else(now_micros));
                     insert_sealed_atom(
                         c,
-                        &table,
+                        table,
                         id,
                         h.id,
                         &atom.kind,
@@ -1611,14 +1858,6 @@ impl MemoryEngine {
                     )?;
                 }
             }
-            Ok(ids)
-        });
-        let ids = pending
-            .finish(result)
-            .inspect_err(|e| self.evict_stale_region(&key, h.id, e))?;
-        if let Some(&last) = ids.last() {
-            h.max_id.fetch_max(last, Ordering::Relaxed);
-            self.note_sealed_insert(&h);
         }
         Ok(ids)
     }
@@ -1685,13 +1924,20 @@ impl MemoryEngine {
                 &format!(
                     "SELECT id, kind, CAST(payload AS TEXT), text_content, score, immutable, created_at \
                      FROM {table} WHERE region_id = $1{preds} \
-                     ORDER BY id LIMIT {limit}",
+                     ORDER BY id {dir} LIMIT {limit}",
                     table = h.table,
+                    dir = if q.newest { "DESC" } else { "ASC" },
                     limit = q.limit
                 ),
                 &params,
             )?;
-            qr.rows.iter().map(|row| parse_fetched(row)).collect()
+            let mut hits: Vec<AtomHit> =
+                qr.rows.iter().map(|row| parse_fetched(row)).collect::<Result<_>>()?;
+            // The window was taken from the end; callers still read oldest first.
+            if q.newest {
+                hits.reverse();
+            }
+            Ok(hits)
         })
     }
 
@@ -3146,25 +3392,7 @@ impl MemoryEngine {
         in_list: &str,
         kl: &KeyLifecycleGuard<'_>,
     ) -> Result<Vec<SlotErasure>> {
-        let qr = conn.query_params(
-            &format!(
-                "SELECT id, key_slot, key_gen FROM {table} \
-                 WHERE region_id = $1 AND id IN ({in_list})",
-                table = h.table
-            ),
-            &[Value::Integer(h.id)],
-        )?;
-        let slots: Vec<(u32, u64, u64)> = qr
-            .rows
-            .iter()
-            .map(|row| {
-                Ok((
-                    as_int(&row[1])? as u32,
-                    as_int(&row[0])? as u64,
-                    as_int(&row[2])? as u64,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let slots = atom_key_slots(conn, h, in_list)?;
         Ok(kl
             .atom_store_tombstone_batch(&slots)?
             .into_iter()
@@ -3927,6 +4155,10 @@ impl MemoryEngine {
     /// ANN recall over an encrypted region via an ephemeral in-RAM PRISM index
     /// from decrypted vectors (no ANN/FTS index runs over ciphertext); cached
     /// per region and zeroized on drop.
+    ///
+    /// Supersession, expiry and the payload filter read plaintext, so they can
+    /// only discard after the window is cut. Widen until `k` survive or the
+    /// window spans the region.
     fn recall_sealed_candidates(
         &self,
         h: &RegionHandle,
@@ -3936,9 +4168,37 @@ impl MemoryEngine {
         atom_wrap: &AtomWrapKey,
         kl: &KeyLifecycleGuard<'_>,
     ) -> Result<Vec<Candidate>> {
+        let mut cand_k = q.k.saturating_mul(CAND_OVERFETCH).max(MIN_CANDIDATES);
+        loop {
+            let (cands, spanned) =
+                self.sealed_window_candidates(h, q, qvec, conn, atom_wrap, kl, cand_k)?;
+            // Short is ambiguous: survivors ran out, or the window did. The window
+            // is the nearest `cand_k`, so widening only appends.
+            if spanned || cands.len() >= q.k {
+                return Ok(cands);
+            }
+            cand_k = cand_k.saturating_mul(2);
+        }
+    }
+
+    /// Decrypted candidates for one candidate window, and whether that window
+    /// already spanned every atom the scan can reach.
+    #[allow(clippy::too_many_arguments)]
+    fn sealed_window_candidates(
+        &self,
+        h: &RegionHandle,
+        q: &RecallQuery,
+        qvec: &[f32],
+        conn: &Connection<'_>,
+        atom_wrap: &AtomWrapKey,
+        kl: &KeyLifecycleGuard<'_>,
+        cand_k: usize,
+    ) -> Result<(Vec<Candidate>, bool)> {
         let table = &h.table;
-        let cand_k = q.k.saturating_mul(CAND_OVERFETCH).max(MIN_CANDIDATES);
         let mut ranked = self.sealed_ann_candidates(h, conn, qvec, q, cand_k, kl)?;
+        // Fewer ids than asked for means every atom was reached. Read before the
+        // retains below, which shrink it for reasons that are not exhaustion.
+        let spanned = ranked.len() < cand_k;
         if !q.include_superseded {
             // Drop stale versions before any cache read or decrypt.
             let ids: Vec<AtomId> = ranked.iter().map(|&(id, _)| id).collect();
@@ -3946,7 +4206,7 @@ impl MemoryEngine {
             ranked.retain(|(id, _)| !stale.contains(id));
         }
         if ranked.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), spanned));
         }
 
         // Build candidates from the index-build cache, so the hot path touches
@@ -4036,7 +4296,7 @@ impl MemoryEngine {
         }
 
         assign_bm25_ranks(&mut cands, &query_terms);
-        Ok(cands)
+        Ok((cands, spanned))
     }
 
     /// Top `cand_k` `(atom_id, distance)` for a sealed region: search the
@@ -4140,7 +4400,6 @@ impl MemoryEngine {
             }
         }
 
-        // Search under a shared read lock.
         let guard = h.ann.read().unwrap();
         let Some(sa) = guard.as_ref() else {
             return Ok(Vec::new());
@@ -4176,18 +4435,34 @@ impl MemoryEngine {
             " AND (expires_at IS NULL OR expires_at > ${})",
             params.len()
         );
+        // Walking down, `after_id` is a fixed bound, not the ascending watermark.
+        if q.newest {
+            if let Some(after) = q.after_id {
+                params.push(Value::Integer(after));
+                preds += &format!(" AND id > ${}", params.len());
+            }
+        }
         // The payload filter runs after decryption, so page by id until
         // `limit` is met or drained; the id cursor doubles as the watermark.
         let page_param = params.len() + 1;
+        let (cmp, dir) = if q.newest {
+            ("<", "DESC")
+        } else {
+            (">", "ASC")
+        };
         let sql = format!(
             "SELECT id, kind, sealed, score, immutable, created_at FROM {table} \
-             WHERE region_id = $1{preds} AND id > ${page_param} \
-             ORDER BY id LIMIT {EXACT_SCAN_LIMIT}",
+             WHERE region_id = $1{preds} AND id {cmp} ${page_param} \
+             ORDER BY id {dir} LIMIT {EXACT_SCAN_LIMIT}",
             table = h.table
         );
 
         let mut out = Vec::new();
-        let mut last_id: AtomId = q.after_id.unwrap_or(i64::MIN);
+        let mut last_id: AtomId = if q.newest {
+            i64::MAX
+        } else {
+            q.after_id.unwrap_or(i64::MIN)
+        };
         'pages: loop {
             let mut page_params = params.clone();
             page_params.push(Value::Integer(last_id));
@@ -4227,6 +4502,10 @@ impl MemoryEngine {
             if batch < EXACT_SCAN_LIMIT {
                 break;
             }
+        }
+        // The window was taken from the end; callers still read oldest first.
+        if q.newest {
+            out.reverse();
         }
         Ok(out)
     }
@@ -5632,7 +5911,10 @@ struct PreparedAtomRow {
 
 fn prepare_atom_row(h: &RegionHandle, key: &str, atom: &AtomInput) -> Result<PreparedAtomRow> {
     validate_atom_input(atom)?;
-    let vec = embed_one(&*h.embedder, &atom.text)?;
+    let vec = match &atom.embedding {
+        Some(supplied) => supplied.clone(),
+        None => embed_one(&*h.embedder, &atom.text)?,
+    };
     validate_embedding(key, h.dim, &vec, "passage")?;
     let payload = serde_json::to_string(&atom.payload)
         .map_err(|e| MemError::Invalid(format!("payload not serializable: {e}")))?;
@@ -5705,6 +5987,8 @@ fn identity_request_tag(
         created_at,
         expires_at,
         immutable,
+        // Not identity material: hashing it would change every key already written.
+        embedding: _,
     } = atom;
     let evidence = match evidence_ref {
         Some(v) => serde_json::to_string(v)
@@ -5802,6 +6086,33 @@ fn link_derived_sources(
 /// edges, then rows of `in_list`, returning the row DELETE's count. All
 /// deletes subselect region-scoped rows, so unverified caller ids can never
 /// touch another region's records.
+/// `(slot, atom_id, generation)` per atom key, which only its live row names:
+/// read this before deleting the rows that hold it.
+fn atom_key_slots(
+    conn: &Connection<'_>,
+    h: &RegionHandle,
+    in_list: &str,
+) -> Result<Vec<(u32, u64, u64)>> {
+    let qr = conn.query_params(
+        &format!(
+            "SELECT id, key_slot, key_gen FROM {table} \
+             WHERE region_id = $1 AND id IN ({in_list})",
+            table = h.table
+        ),
+        &[Value::Integer(h.id)],
+    )?;
+    qr.rows
+        .iter()
+        .map(|row| {
+            Ok((
+                as_int(&row[1])? as u32,
+                as_int(&row[0])? as u64,
+                as_int(&row[2])? as u64,
+            ))
+        })
+        .collect()
+}
+
 fn delete_atoms_in_txn(conn: &Connection<'_>, h: &RegionHandle, in_list: &str) -> Result<u64> {
     let table = &h.table;
     conn.execute_params(

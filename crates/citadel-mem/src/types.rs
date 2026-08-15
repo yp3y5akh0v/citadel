@@ -163,6 +163,8 @@ pub struct AtomInput {
     pub expires_at: Option<i64>,
     /// Protected from eviction (except `PurgeRegion`).
     pub immutable: bool,
+    /// Vector to store instead of embedding `text`; keeps one vector space.
+    pub embedding: Option<Vec<f32>>,
 }
 
 impl AtomInput {
@@ -176,6 +178,7 @@ impl AtomInput {
             created_at: None,
             expires_at: None,
             immutable: false,
+            embedding: None,
         }
     }
 
@@ -206,6 +209,12 @@ impl AtomInput {
 
     pub fn immutable(mut self) -> Self {
         self.immutable = true;
+        self
+    }
+
+    /// Store `vector` rather than embedding `text`.
+    pub fn with_embedding(mut self, vector: Vec<f32>) -> Self {
+        self.embedding = Some(vector);
         self
     }
 }
@@ -450,6 +459,8 @@ pub struct FetchQuery {
     pub created_from: Option<i64>,
     pub created_before: Option<i64>,
     pub limit: usize,
+    /// Take the newest `limit` rows; results stay id-ascending either way.
+    pub newest: bool,
 }
 
 impl FetchQuery {
@@ -461,6 +472,7 @@ impl FetchQuery {
             created_from: None,
             created_before: None,
             limit,
+            newest: false,
         }
     }
 
@@ -486,6 +498,12 @@ impl FetchQuery {
 
     pub fn with_created_before(mut self, micros: i64) -> Self {
         self.created_before = Some(micros);
+        self
+    }
+
+    /// Select the newest `limit` rows instead of the oldest.
+    pub fn newest(mut self) -> Self {
+        self.newest = true;
         self
     }
 }
