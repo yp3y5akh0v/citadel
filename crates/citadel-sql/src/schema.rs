@@ -189,6 +189,17 @@ impl SchemaManager {
             .map(|(k, v)| (k.as_str(), v.as_str()))
     }
 
+    /// Carry TEMP aliases onto a freshly loaded manager.
+    ///
+    /// They live only in memory, so a reload would otherwise hide this connection's
+    /// TEMP tables while their rows stay on disk under the prefixed name.
+    pub fn adopt_temp_aliases(&mut self, prior: &SchemaManager) {
+        for (name, prefixed) in prior.temp_alias_iter() {
+            self.temp_aliases
+                .insert(name.to_string(), prefixed.to_string());
+        }
+    }
+
     pub fn resolve_temp(&self, name: &str) -> String {
         let lower = name.to_ascii_lowercase();
         if let Some(prefixed) = self.temp_aliases.get(&lower) {

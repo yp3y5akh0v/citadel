@@ -474,14 +474,48 @@ impl<'a> Connection<'a> {
         self.inner.borrow_mut().set_session_timezone_impl(tz)
     }
 
+    /// A miss that another connection's DDL would explain, so it is worth reloading for.
+    fn is_schema_miss(&self, e: &SqlError) -> bool {
+        matches!(
+            e,
+            SqlError::TableNotFound(_) | SqlError::ColumnNotFound(_) | SqlError::ViewNotFound(_)
+        ) && !self.in_transaction()
+    }
+
+    /// Run `f`, reloading the schema and retrying once if it missed on a name.
+    ///
+    /// The schema is read at open, so reloading only on a miss keeps the happy path
+    /// free of any staleness check.
+    fn with_schema_retry<T>(
+        &self,
+        mut f: impl FnMut(&mut ConnectionInner<'a>) -> Result<T>,
+    ) -> Result<T> {
+        // Bound, not matched on directly: the guard borrows, and the scrutinee's own
+        // borrow would still be live.
+        let first = f(&mut self.inner.borrow_mut());
+        match first {
+            Err(ref e) if self.is_schema_miss(e) => {}
+            other => return other,
+        }
+        // `generation` counts local edits, so the reload is the only check.
+        let mut fresh = SchemaManager::load(self.db)?;
+        {
+            let mut inner = self.inner.borrow_mut();
+            fresh.bump_generation_past(inner.schema.generation());
+            fresh.adopt_temp_aliases(&inner.schema);
+            inner.schema = fresh;
+        }
+        // The retry's own error: it names what is missing from the schema now in force,
+        // where the first names only what was missing from the stale one.
+        f(&mut self.inner.borrow_mut())
+    }
+
     pub fn execute(&self, sql: &str) -> Result<ExecutionResult> {
-        self.inner.borrow_mut().execute_impl(self.db, sql)
+        self.with_schema_retry(|inner| inner.execute_impl(self.db, sql))
     }
 
     pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<ExecutionResult> {
-        self.inner
-            .borrow_mut()
-            .execute_params_impl(self.db, sql, params)
+        self.with_schema_retry(|inner| inner.execute_params_impl(self.db, sql, params))
     }
 
     /// Execute `;`-separated SQL statements. Stops at the first failure.
@@ -497,7 +531,7 @@ impl<'a> Connection<'a> {
         };
         let mut completed = Vec::with_capacity(stmts.len());
         for stmt in stmts {
-            match self.inner.borrow_mut().dispatch(self.db, &stmt, &[]) {
+            match self.with_schema_retry(|inner| inner.dispatch(self.db, &stmt, &[])) {
                 Ok(r) => completed.push(r),
                 Err(e) => {
                     return ScriptExecution {
@@ -514,7 +548,7 @@ impl<'a> Connection<'a> {
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<Vec<ExecutionResult>> {
-        self.inner.borrow_mut().execute_batch_impl(self.db, sql)
+        self.with_schema_retry(|inner| inner.execute_batch_impl(self.db, sql))
     }
 
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
@@ -565,8 +599,11 @@ impl<'a> Connection<'a> {
     }
 
     pub fn refresh_schema(&self) -> Result<()> {
-        let new_schema = SchemaManager::load(self.db)?;
-        self.inner.borrow_mut().schema = new_schema;
+        let mut new_schema = SchemaManager::load(self.db)?;
+        let mut inner = self.inner.borrow_mut();
+        new_schema.bump_generation_past(inner.schema.generation());
+        new_schema.adopt_temp_aliases(&inner.schema);
+        inner.schema = new_schema;
         Ok(())
     }
 
@@ -712,7 +749,9 @@ impl<'a> ConnectionInner<'a> {
                 Ok(results)
             }
             Err(e) => {
-                self.schema = SchemaManager::load(db)?;
+                let mut fresh = SchemaManager::load(db)?;
+                fresh.adopt_temp_aliases(&self.schema);
+                self.schema = fresh;
                 Err(e)
             }
         }
@@ -730,6 +769,7 @@ impl<'a> ConnectionInner<'a> {
         }
         if let Ok(mut fresh) = SchemaManager::load(db) {
             fresh.bump_generation_past(self.schema.generation());
+            fresh.adopt_temp_aliases(&self.schema);
             self.schema = fresh;
         }
         self.reset_txn_state();
@@ -966,6 +1006,7 @@ impl<'a> ConnectionInner<'a> {
                         wtx.abort();
                         let mut fresh = SchemaManager::load(db)?;
                         fresh.bump_generation_past(self.schema.generation());
+                        fresh.adopt_temp_aliases(&self.schema);
                         self.schema = fresh;
                     }
                     ActiveTxn::Read(_rtx) => {}

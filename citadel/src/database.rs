@@ -553,6 +553,44 @@ impl Database {
         Ok(())
     }
 
+    /// Whether `passphrase` unwraps this database, read from the key file so a
+    /// rekey cannot leave the answer stale.
+    ///
+    /// Checks the key file's `file_id` as the open path does, so a key file belonging
+    /// to a different database cannot pass on its MAC alone.
+    pub fn verify_passphrase(&self, passphrase: &[u8]) -> Result<bool> {
+        use citadel_crypto::kdf::derive_mk;
+        use citadel_crypto::key_manager::KeyFile;
+
+        if self.key_path.as_os_str().is_empty() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "an in-memory database has no key file to verify against",
+            )));
+        }
+        let key_data = fs::read(&self.key_path)?;
+        if key_data.len() != KEY_FILE_SIZE {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "key file has incorrect size",
+            )));
+        }
+        let key_buf: [u8; KEY_FILE_SIZE] = key_data.try_into().unwrap();
+        let kf = KeyFile::deserialize(&key_buf)?;
+        if kf.file_id != self.file_id {
+            return Ok(false); // a key file for some other database
+        }
+        let mk = derive_mk(
+            kf.kdf_algorithm,
+            passphrase,
+            &kf.argon2_salt,
+            kf.argon2_m_cost,
+            kf.argon2_t_cost,
+            kf.argon2_p_cost,
+        )?;
+        Ok(kf.verify_mac(&mk).is_ok())
+    }
+
     pub fn integrity_check(&self) -> Result<IntegrityReport> {
         let report = self.manager.integrity_check()?;
 

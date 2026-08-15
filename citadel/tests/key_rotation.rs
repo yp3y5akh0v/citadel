@@ -37,6 +37,23 @@ fn change_passphrase_basic() {
 }
 
 #[test]
+fn verify_passphrase_tracks_the_key_file_not_the_open_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let db = fast_builder(&db_path).create().unwrap();
+
+    assert!(db.verify_passphrase(b"original-passphrase").unwrap());
+    assert!(!db.verify_passphrase(b"not-the-passphrase").unwrap());
+
+    db.change_passphrase(b"original-passphrase", b"new-passphrase")
+        .unwrap();
+
+    // The handle stays usable, but the passphrase that opens the file has moved.
+    assert!(!db.verify_passphrase(b"original-passphrase").unwrap());
+    assert!(db.verify_passphrase(b"new-passphrase").unwrap());
+}
+
+#[test]
 fn change_passphrase_wrong_old() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
