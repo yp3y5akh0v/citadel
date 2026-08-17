@@ -432,7 +432,9 @@ impl AnnTopKPlan {
         let mut target = want;
         loop {
             target = target.min(max_target);
-            let hits = index.search_filtered_default_ef(&self.query_vec, target, filter);
+            let hits = index
+                .search_filtered_default_ef(&self.query_vec, target, filter)
+                .map_err(|e| SqlError::InvalidValue(format!("ANN search failed: {e}")))?;
             let mut survivors: Vec<RankedRow> = Vec::with_capacity(want);
             for (id, dist) in &hits {
                 encode_int_key_into(*id as i64, &mut key_buf);
@@ -756,7 +758,11 @@ fn try_load_segment(
     };
     if header.format_version != ann_persist::ANNSEG_FORMAT_VERSION {
         return refuse(
-            format!("format v{} (this binary reads v2)", header.format_version),
+            format!(
+                "format v{} (this binary reads v{})",
+                header.format_version,
+                ann_persist::ANNSEG_FORMAT_VERSION
+            ),
             false,
         );
     }
@@ -815,7 +821,10 @@ fn try_load_segment(
     }
 
     // Vectors ride in the segment (TAG_VECTORS), so the load is a bulk read, no rescan.
-    let index = parts.into_index_embedded();
+    let index = match parts.into_index_embedded() {
+        Ok(index) => index,
+        Err(e) => return refuse(format!("index assembly: {e}"), true),
+    };
     Ok(LoadOutcome::Loaded(Box::new(CachedAnnIndex {
         index,
         dicts: header.dict_maps(),

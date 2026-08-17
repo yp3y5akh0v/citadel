@@ -121,7 +121,7 @@ fn run_recall_eval(spec: RecallSpec) {
     let mut sum_recall = 0.0_f32;
     for q in &queries {
         let truth = brute_force_top_k(&rows, q, spec.metric, spec.k);
-        let hits = index.search_with_ef(q, spec.k, spec.ef);
+        let hits = index.search_with_ef(q, spec.k, spec.ef).expect("search");
         let predicted: Vec<u64> = hits.into_iter().map(|(id, _)| id).collect();
         sum_recall += recall_at_k(&predicted, &truth);
     }

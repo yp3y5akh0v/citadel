@@ -4,6 +4,8 @@ pub use prism_ann::{
     binary, construct, distance, filter, graph, io, ivf, partition, point, quantize, search,
 };
 
+pub use prism_ann::{PrismError, PrismResult};
+
 pub use prism_ann::binary::BinaryStore;
 pub use prism_ann::construct::{PrismConfig, PrismIndex};
 pub use prism_ann::distance::Metric;

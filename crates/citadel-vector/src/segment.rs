@@ -19,7 +19,8 @@ use zeroize::Zeroizing;
 
 use crate::ann::AnnIndex;
 use crate::prism::{
-    BinaryStore, Cell, Graph, Metric, PartitionTree, PointStore, PrismConfig, PrismIndex, SQ8Store,
+    BinaryStore, Cell, Graph, Metric, PartitionTree, PointStore, PrismConfig, PrismError,
+    PrismIndex, SQ8Store,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -38,10 +39,11 @@ pub enum SegmentError {
     RehydrationIncomplete { expected: usize, got: usize },
     #[error("segment internal inconsistency: {0}")]
     Inconsistent(&'static str),
+    #[error("PRISM rejected the decoded segment: {0}")]
+    Prism(#[from] PrismError),
 }
 
 const TAG_GRAPH: u8 = 1;
-const TAG_LOCAL_GRAPH: u8 = 2;
 const TAG_SQ8: u8 = 3;
 const TAG_BINARY: u8 = 4;
 const TAG_TREE: u8 = 5;
@@ -56,7 +58,7 @@ const TAG_VECTORS: u8 = 8;
 /// version: bump it whenever build or search semantics change shape.
 pub fn prism_config_hash(cfg: &PrismConfig) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(b"citadel-annseg-config-v2");
+    h.update(b"citadel-annseg-config-v3");
     for v in [
         cfg.m_local as u64,
         cfg.m_greedy as u64,
@@ -104,55 +106,52 @@ pub fn encode(index: &AnnIndex) -> Vec<u8> {
     let p = index.prism();
     let mut out = Vec::new();
 
-    section(&mut out, TAG_GRAPH, |b| encode_graph(b, &p.graph));
-    section(&mut out, TAG_LOCAL_GRAPH, |b| {
-        encode_graph(b, &p.local_graph)
-    });
+    section(&mut out, TAG_GRAPH, |b| encode_graph(b, p.graph()));
     section(&mut out, TAG_SQ8, |b| {
-        push_u64(b, p.sq8.dim() as u64);
-        push_slice_u8(b, p.sq8.codes());
-        push_slice_f32(b, p.sq8.mins());
-        push_slice_f32(b, p.sq8.scales());
+        push_u64(b, p.sq8().dim() as u64);
+        push_slice_u8(b, p.sq8().codes());
+        push_slice_f32(b, p.sq8().mins());
+        push_slice_f32(b, p.sq8().scales());
     });
     section(&mut out, TAG_BINARY, |b| {
-        push_u64(b, p.binary.code_words() as u64);
-        push_u64(b, p.binary.block_size() as u64);
-        push_slice_u64(b, p.binary.codes());
-        push_slice_f32(b, p.binary.signs());
+        push_u64(b, p.binary().code_words() as u64);
+        push_u64(b, p.binary().block_size() as u64);
+        push_slice_u64(b, p.binary().codes());
+        push_slice_f32(b, p.binary().signs());
     });
     section(&mut out, TAG_TREE, |b| {
-        push_u64(b, p.tree.k as u64);
-        push_u64(b, p.tree.split_order.len() as u64);
-        for &s in &p.tree.split_order {
+        push_u64(b, p.tree().num_attributes() as u64);
+        push_u64(b, p.tree().split_order().len() as u64);
+        for &s in p.tree().split_order() {
             push_u64(b, s as u64);
         }
-        push_u64(b, p.tree.cells.len() as u64);
-        for cell in &p.tree.cells {
-            push_slice_u32(b, &cell.values);
-            push_slice_u32(b, &cell.point_ids);
+        push_u64(b, p.tree().cells().len() as u64);
+        for cell in p.tree().cells() {
+            push_slice_u32(b, cell.values());
+            push_slice_u32(b, cell.point_ids());
         }
     });
     section(&mut out, TAG_IDS, |b| {
         push_u64(b, index.snapshot_max);
         b.push(metric_tag(index.metric));
         b.extend_from_slice(&index.dim.to_le_bytes());
-        push_u64(b, u64::from(p.global_medoid));
-        push_slice_u32(b, &p.medoids);
-        push_slice_u32(b, &p.point_cell);
-        push_slice_u32(b, &p.original_ids);
+        push_u64(b, u64::from(p.global_medoid()));
+        push_slice_u32(b, p.medoids());
+        push_slice_u32(b, p.point_cell());
+        push_slice_u32(b, p.original_ids());
         push_slice_u64(b, index.id_map());
     });
     section(&mut out, TAG_ATTRS, |b| {
-        push_u64(b, p.store.attrs.len() as u64);
-        push_u64(b, p.store.len as u64);
-        for col in &p.store.attrs {
+        push_u64(b, p.store().attributes().len() as u64);
+        push_u64(b, p.store().len() as u64);
+        for col in p.store().attributes() {
             push_slice_u32(b, col);
         }
     });
     // The f32 vectors in PRISM slot order, so a cold load is a bulk read, not a rescan.
     section(&mut out, TAG_VECTORS, |b| {
-        push_u64(b, p.store.dim as u64);
-        push_slice_f32(b, &p.store.vectors);
+        push_u64(b, p.store().dim() as u64);
+        push_slice_f32(b, p.store().vectors());
     });
     out
 }
@@ -162,7 +161,6 @@ pub fn encode(index: &AnnIndex) -> Vec<u8> {
 /// ([`SegmentParts::into_index`]).
 pub struct SegmentParts {
     graph: Graph,
-    local_graph: Graph,
     sq8: SQ8Store,
     binary: BinaryStore,
     tree: PartitionTree,
@@ -207,22 +205,27 @@ impl SegmentParts {
     }
 
     /// Assemble the index from vectors ALREADY in PRISM-internal slot order.
-    fn build(self, vectors: Vec<f32>) -> AnnIndex {
-        let store = PointStore::from_parts(vectors, self.dim as usize, self.attrs);
-        let prism = PrismIndex {
+    fn build(self, vectors: Vec<f32>) -> Result<AnnIndex, SegmentError> {
+        let store = PointStore::from_parts(vectors, self.dim as usize, self.attrs)?;
+        let prism = PrismIndex::from_parts(
             store,
-            tree: self.tree,
-            graph: self.graph,
-            local_graph: self.local_graph,
-            medoids: self.medoids,
-            global_medoid: self.global_medoid,
-            point_cell: self.point_cell,
-            original_ids: self.original_ids,
-            sq8: self.sq8,
-            binary: self.binary,
-            config: AnnIndex::active_config(self.metric),
-        };
-        AnnIndex::from_parts(prism, self.id_map, self.snapshot_max, self.metric, self.dim)
+            self.tree,
+            self.graph,
+            self.medoids,
+            self.global_medoid,
+            self.point_cell,
+            self.original_ids,
+            self.sq8,
+            self.binary,
+            AnnIndex::active_config(self.metric),
+        )?;
+        Ok(AnnIndex::from_parts(
+            prism,
+            self.id_map,
+            self.snapshot_max,
+            self.metric,
+            self.dim,
+        ))
     }
 
     /// Build the index from externally-rehydrated vectors (id_map order); the sealed-load path.
@@ -246,11 +249,11 @@ impl SegmentParts {
         if self.metric == Metric::Cosine {
             crate::prism::distance::normalize_rows(&mut vectors, self.dim as usize);
         }
-        Ok(self.build(vectors))
+        self.build(vectors)
     }
 
     /// Build the index from the segment's embedded build-form vectors - the fast cold-load path.
-    pub fn into_index_embedded(mut self) -> AnnIndex {
+    pub fn into_index_embedded(mut self) -> Result<AnnIndex, SegmentError> {
         let vectors = std::mem::take(self.vectors.as_mut());
         self.build(vectors)
     }
@@ -263,8 +266,6 @@ pub fn decode(bytes: &[u8]) -> Result<SegmentParts, SegmentError> {
 
     let g = r.section(TAG_GRAPH, "graph")?;
     let graph = decode_graph(&mut Reader { buf: g, at: 0 }, "graph")?;
-    let lg = r.section(TAG_LOCAL_GRAPH, "local_graph")?;
-    let local_graph = decode_graph(&mut Reader { buf: lg, at: 0 }, "local_graph")?;
 
     let s = r.section(TAG_SQ8, "sq8")?;
     let mut sr = Reader { buf: s, at: 0 };
@@ -272,7 +273,7 @@ pub fn decode(bytes: &[u8]) -> Result<SegmentParts, SegmentError> {
     let codes = sr.slice_u8("sq8")?.to_vec();
     let mins = sr.slice_f32("sq8")?;
     let scales = sr.slice_f32("sq8")?;
-    let sq8 = SQ8Store::from_parts(codes, mins, scales, sq8_dim);
+    let sq8 = SQ8Store::from_parts(codes, mins, scales, sq8_dim)?;
 
     let b = r.section(TAG_BINARY, "binary")?;
     let mut br = Reader { buf: b, at: 0 };
@@ -280,7 +281,7 @@ pub fn decode(bytes: &[u8]) -> Result<SegmentParts, SegmentError> {
     let block_size = br.u64("binary")? as usize;
     let bcodes = br.slice_u64("binary")?;
     let signs = br.slice_f32("binary")?;
-    let binary = BinaryStore::from_parts(bcodes, code_words, signs, block_size);
+    let binary = BinaryStore::from_parts(bcodes, code_words, signs, block_size)?;
 
     let t = r.section(TAG_TREE, "tree")?;
     let mut tr = Reader { buf: t, at: 0 };
@@ -295,13 +296,8 @@ pub fn decode(bytes: &[u8]) -> Result<SegmentParts, SegmentError> {
     for _ in 0..cells_len {
         let values = tr.slice_u32("tree")?;
         let point_ids = tr.slice_u32("tree")?;
-        cells.push(Cell { values, point_ids });
+        cells.push(Cell::from_parts(values, point_ids));
     }
-    let tree = PartitionTree {
-        cells,
-        split_order,
-        k,
-    };
 
     let i = r.section(TAG_IDS, "ids")?;
     let mut ir = Reader { buf: i, at: 0 };
@@ -341,9 +337,9 @@ pub fn decode(bytes: &[u8]) -> Result<SegmentParts, SegmentError> {
     if id_map.len() != n || original_ids.len() != n || point_cell.len() != n {
         return Err(SegmentError::Inconsistent("id arrays disagree on n"));
     }
+    let tree = PartitionTree::from_parts(cells, split_order, k, n)?;
     Ok(SegmentParts {
         graph,
-        local_graph,
         sq8,
         binary,
         tree,
@@ -362,9 +358,9 @@ pub fn decode(bytes: &[u8]) -> Result<SegmentParts, SegmentError> {
 }
 
 fn encode_graph(b: &mut Vec<u8>, g: &Graph) {
-    push_u64(b, g.n as u64);
-    push_slice_u32(b, &g.offsets);
-    push_slice_u32(b, &g.neighbors);
+    push_u64(b, g.len() as u64);
+    push_slice_u32(b, g.offsets());
+    push_slice_u32(b, g.neighbor_ids());
 }
 
 fn decode_graph(r: &mut Reader<'_>, what: &'static str) -> Result<Graph, SegmentError> {
@@ -374,11 +370,7 @@ fn decode_graph(r: &mut Reader<'_>, what: &'static str) -> Result<Graph, Segment
     if offsets.len() != n + 1 {
         return Err(SegmentError::Inconsistent("graph offsets length != n+1"));
     }
-    Ok(Graph {
-        offsets,
-        neighbors,
-        n,
-    })
+    Ok(Graph::from_parts(offsets, neighbors, n)?)
 }
 
 fn section(out: &mut Vec<u8>, tag: u8, fill: impl FnOnce(&mut Vec<u8>)) {
@@ -565,8 +557,12 @@ mod tests {
         let query: Vec<f32> = (0..8).map(|d| d as f32 * 0.7).collect();
         for code in [0u32, 1] {
             let filter = crate::prism::Filter::new(vec![(0, vec![code])]);
-            let a = index.search_filtered(&query, 8, 64, &filter);
-            let b = loaded.search_filtered(&query, 8, 64, &filter);
+            let a = index
+                .search_filtered(&query, 8, 64, &filter)
+                .expect("search");
+            let b = loaded
+                .search_filtered(&query, 8, 64, &filter)
+                .expect("search");
             assert_eq!(a, b, "filtered (attr0={code}) results identical");
             assert!(!a.is_empty(), "filter {code} matches half the fixture");
         }
@@ -600,7 +596,10 @@ mod tests {
         assert_eq!(parts.n(), 1);
         let (vectors, filled) = rehydrate(&rows, &parts);
         let loaded = parts.into_index(vectors, filled).expect("into_index");
-        assert_eq!(loaded.search(&[1.0, 2.0], 1), vec![(42, 0.0)]);
+        assert_eq!(
+            loaded.search(&[1.0, 2.0], 1).expect("search"),
+            vec![(42, 0.0)]
+        );
     }
 
     #[test]
@@ -671,11 +670,11 @@ mod tests {
         // into_index_embedded (the fast path) must rebuild a search-identical index.
         let index = build_fixture();
         let parts = decode(&encode(&index)).expect("decode");
-        let loaded = parts.into_index_embedded();
+        let loaded = parts.into_index_embedded().expect("into_index_embedded");
         let query: Vec<f32> = (0..8).map(|d| d as f32 * 0.3).collect();
         assert_eq!(
-            index.search(&query, 10),
-            loaded.search(&query, 10),
+            index.search(&query, 10).expect("search"),
+            loaded.search(&query, 10).expect("search"),
             "embedded-vector load must answer EXACTLY like the original"
         );
         assert_eq!(index.snapshot_max, loaded.snapshot_max);
@@ -695,7 +694,7 @@ mod tests {
             payload_spots.push(at + 9 + len / 2);
             at += 1 + 8 + len + 32;
         }
-        assert_eq!(payload_spots.len(), 8, "all eight sections present");
+        assert_eq!(payload_spots.len(), 7, "all seven sections present");
         for spot in payload_spots {
             let mut corrupt = bytes.clone();
             corrupt[spot] ^= 0xFF;

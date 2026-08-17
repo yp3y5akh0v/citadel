@@ -20,7 +20,7 @@ use rustc_hash::FxHashMap;
 use crate::error::{Result, SqlError};
 
 /// Bump on ANY layout change of the header or the segment body.
-pub const ANNSEG_FORMAT_VERSION: u16 = 2;
+pub const ANNSEG_FORMAT_VERSION: u16 = 3;
 
 const MAGIC: &[u8; 7] = b"ANNSEG\0";
 

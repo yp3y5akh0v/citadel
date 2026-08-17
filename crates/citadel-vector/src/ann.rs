@@ -1,6 +1,6 @@
 //! In-memory ANN index wrapping the PRISM engine.
 
-use crate::prism::{Filter, Metric, PointStore, PrismConfig, PrismIndex};
+use crate::prism::{Filter, Metric, PointStore, PrismConfig, PrismError, PrismIndex};
 use zeroize::Zeroize;
 
 type AnnBuildRow = (u64, Vec<f32>, Vec<u32>);
@@ -40,6 +40,8 @@ pub enum AnnError {
         got: usize,
         row_id: u64,
     },
+    #[error("PRISM rejected the index: {0}")]
+    Prism(#[from] PrismError),
 }
 
 // binary_rerank=0: the Hamming pre-filter kills recall on continuous vectors.
@@ -136,12 +138,12 @@ impl AnnIndex {
             }
         }
 
-        let store = PointStore::from_parts(flat, dim as usize, attr_cols);
-        let prism = PrismIndex::build(store, prism_config(metric));
+        let store = PointStore::from_parts(flat, dim as usize, attr_cols)?;
+        let prism = PrismIndex::build(store, prism_config(metric))?;
 
         // PRISM reorders points by cell; remap to external row_ids.
         let id_map: Vec<u64> = prism
-            .original_ids
+            .original_ids()
             .iter()
             .map(|&old| row_ids[old as usize])
             .collect();
@@ -190,13 +192,18 @@ impl AnnIndex {
     }
 
     /// Top-k search returning `(row_id, distance)` ascending, at the default ef.
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
-        let ef = (k * OVER_FETCH).max(self.prism.config.beam_width);
+    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u64, f32)>, PrismError> {
+        let ef = (k * OVER_FETCH).max(self.prism.config().beam_width);
         self.search_with_ef(query, k, ef)
     }
 
     /// Unfiltered search with an explicit beam width `ef`.
-    pub fn search_with_ef(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
+    pub fn search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Result<Vec<(u64, f32)>, PrismError> {
         self.search_filtered(query, k, ef, &Filter::none())
     }
 
@@ -206,8 +213,8 @@ impl AnnIndex {
         query: &[f32],
         k: usize,
         filter: &Filter,
-    ) -> Vec<(u64, f32)> {
-        let ef = (k * OVER_FETCH).max(self.prism.config.beam_width);
+    ) -> Result<Vec<(u64, f32)>, PrismError> {
+        let ef = (k * OVER_FETCH).max(self.prism.config().beam_width);
         self.search_filtered(query, k, ef, filter)
     }
 
@@ -223,17 +230,19 @@ impl AnnIndex {
         k: usize,
         ef: usize,
         filter: &Filter,
-    ) -> Vec<(u64, f32)> {
+    ) -> Result<Vec<(u64, f32)>, PrismError> {
         debug_assert_eq!(query.len(), self.dim as usize);
         let sqrt_l2 = self.metric == Metric::L2;
-        self.prism
-            .search(query, filter, k, ef)
+        Ok(self
+            .prism
+            .search(query, filter, k, ef)?
+            .results
             .into_iter()
             .map(|r| {
                 let dist = if sqrt_l2 { r.dist.sqrt() } else { r.dist };
                 (self.id_map[r.id as usize], dist)
             })
-            .collect()
+            .collect())
     }
 
     /// Number of indexed rows.
@@ -309,7 +318,7 @@ mod tests {
         let n = 200;
         let rows = synth_rows(n, 8);
         let idx = AnnIndex::build(rows, Metric::L2, 8).unwrap();
-        let hits = idx.search(&[0.5; 8], 5);
+        let hits = idx.search(&[0.5; 8], 5).expect("search");
         assert!(!hits.is_empty());
         for (rid, _d) in &hits {
             assert!(*rid >= 1 && *rid <= n as u64);
@@ -332,7 +341,7 @@ mod tests {
         let rows = synth_rows(50, 16);
         let idx = AnnIndex::build(rows, Metric::Cosine, 16).unwrap();
         assert_eq!(idx.metric, Metric::Cosine);
-        assert_eq!(idx.prism.config.metric, Metric::Cosine);
+        assert_eq!(idx.prism.config().metric, Metric::Cosine);
     }
 
     #[test]
@@ -340,7 +349,7 @@ mod tests {
         let rows = synth_rows(50, 16);
         let idx = AnnIndex::build(rows, Metric::InnerProduct, 16).unwrap();
         assert_eq!(idx.metric, Metric::InnerProduct);
-        assert_eq!(idx.prism.config.metric, Metric::InnerProduct);
+        assert_eq!(idx.prism.config().metric, Metric::InnerProduct);
     }
 
     /// attr 0 = i % 2; row_id = i + 1.
@@ -356,7 +365,9 @@ mod tests {
     #[test]
     fn build_with_attrs_filters_by_attribute() {
         let idx = AnnIndex::build_with_attrs(attr_rows(100, 8), 1, Metric::L2, 8).unwrap();
-        let hits = idx.search_filtered(&[0.5; 8], 10, 200, &Filter::eq(0, 1));
+        let hits = idx
+            .search_filtered(&[0.5; 8], 10, 200, &Filter::eq(0, 1))
+            .expect("search");
         assert!(!hits.is_empty());
         assert!(hits.len() <= 10);
         for (rid, _) in &hits {
@@ -368,7 +379,7 @@ mod tests {
     #[test]
     fn build_with_attrs_unfiltered_spans_all_cells() {
         let idx = AnnIndex::build_with_attrs(attr_rows(100, 8), 1, Metric::L2, 8).unwrap();
-        let hits = idx.search_with_ef(&[0.5; 8], 10, 200);
+        let hits = idx.search_with_ef(&[0.5; 8], 10, 200).expect("search");
         assert_eq!(hits.len(), 10);
         for (rid, _) in &hits {
             assert!(*rid >= 1 && *rid <= 100);
@@ -387,7 +398,9 @@ mod tests {
             .collect();
         let idx = AnnIndex::build_with_attrs(rows, 2, Metric::L2, dim).unwrap();
         let filter = Filter::new(vec![(0, vec![1]), (1, vec![2])]);
-        let hits = idx.search_filtered(&[0.5; 8], 10, 200, &filter);
+        let hits = idx
+            .search_filtered(&[0.5; 8], 10, 200, &filter)
+            .expect("search");
         assert!(!hits.is_empty());
         for (rid, _) in &hits {
             let i = rid - 1;
@@ -414,7 +427,7 @@ mod tests {
     fn build_delegates_to_attrs_path() {
         let idx = AnnIndex::build(synth_rows(50, 8), Metric::L2, 8).unwrap();
         assert_eq!(idx.indexed_len(), 50);
-        let hits = idx.search(&[0.3; 8], 5);
+        let hits = idx.search(&[0.3; 8], 5).expect("search");
         assert!(!hits.is_empty());
     }
 }

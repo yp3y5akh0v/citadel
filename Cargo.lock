@@ -2864,9 +2864,9 @@ dependencies = [
 
 [[package]]
 name = "prism-ann"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c79e210695f60f5ea4eb2e8e77faca147bae77a8317c31baa01ba8343071a3f"
+checksum = "23af684b18cbd923f65b2f894a706656e9e3166a9462da3084599e900a86e5af"
 dependencies = [
  "byteorder",
  "memmap2",

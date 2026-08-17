@@ -190,7 +190,8 @@ impl PyVectorIndex {
         let results = match ef {
             Some(ef) => self.inner.search_filtered(&q, k, ef, f),
             None => self.inner.search_filtered_default_ef(&q, k, f),
-        };
+        }
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
         let dists: Vec<f32> = results.iter().map(|(_, d)| *d).collect();
         Ok((PyArray1::from_vec(py, ids), PyArray1::from_vec(py, dists)))

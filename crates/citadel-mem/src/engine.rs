@@ -4750,6 +4750,8 @@ fn search_sealed_index(
 
     let mut ranked: Vec<(AtomId, f32)> = filter
         .map(|f| sa.index.search_filtered_default_ef(qvec, cand_k, &f))
+        .transpose()
+        .map_err(|e| MemError::Invalid(format!("sealed ANN search failed: {e}")))?
         .unwrap_or_default()
         .into_iter()
         .map(|(id, d)| (id as AtomId, d))

@@ -2348,7 +2348,7 @@ fn ann_index_distances_match_vec_distance_for_all_metrics() {
         EmbeddingMetric::Cosine,
     ] {
         let idx = AnnIndex::build(rows.clone(), ann_metric(m), 4).unwrap();
-        let hits = idx.search(&q, rows.len());
+        let hits = idx.search(&q, rows.len()).expect("search");
         assert_eq!(hits.len(), rows.len());
         for (rid, d) in hits {
             let v = &rows.iter().find(|(id, _)| *id == rid).unwrap().1;

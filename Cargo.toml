@@ -93,7 +93,7 @@ base64 = "0.22"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 blake3 = "1"
 rustc-hash = "2.1"
-prism-ann = "0.2"
+prism-ann = "0.3"
 
 thiserror = "2.0"
 
