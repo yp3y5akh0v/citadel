@@ -224,6 +224,69 @@ fn reader_view_expands_neighbors_dedups_and_orders() {
 }
 
 #[test]
+fn session_reader_order_keeps_best_session_first_and_turns_chronological() {
+    let samples = parse_root(&fixture()).unwrap();
+    let s = &samples[0];
+    let (_dir, eng) = open_engine();
+    let embedder: Arc<dyn Embedder> = Arc::new(MockEmbedder::new(DIM));
+    eng.create_region(&s.sample_id, embedder).unwrap();
+    let ids = ingest_sample(&eng, &s.sample_id, s).unwrap();
+    let hit = |i: usize| eng.fetch_one(&s.sample_id, ids[i]).unwrap().unwrap();
+    let config = BenchConfig {
+        reader_order: ReaderOrder::Sessions,
+        ..BenchConfig::default()
+    };
+
+    // Session 2 arrives out of conversation order, so it must be restored.
+    let grouped = reader_view(
+        &eng,
+        &s.sample_id,
+        vec![hit(4), hit(0), hit(3), hit(2)],
+        config,
+    )
+    .unwrap();
+    assert_eq!(
+        grouped.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![ids[4], ids[0], ids[2], ids[3]]
+    );
+
+    let rendered = render(&build_reader_prompt(&grouped, "What happened?", true));
+    let s10 = rendered
+        .find("[Session 10 from noon on 20 Mar 2024]")
+        .unwrap();
+    let s1 = rendered.find("[Session 1 from 2pm on 1 Jan 2024]").unwrap();
+    let s2 = rendered.find("[Session 2 from 3pm on 5 Jan 2024]").unwrap();
+    assert!(s10 < s1 && s1 < s2, "session block relevance order");
+    assert!(
+        rendered.find("Rex is a golden retriever").unwrap()
+            < rendered.find("I paid 1200 dollars").unwrap(),
+        "conversation order inside session 2"
+    );
+
+    // LongMemEval uses string session_id metadata. The same ordering contract
+    // applies, while an atom with neither schema fails instead of flattening.
+    let mut later = hit(3);
+    let mut earlier = hit(2);
+    for item in [&mut later, &mut earlier] {
+        let payload = item.payload.as_object_mut().unwrap();
+        payload.remove("session");
+        payload.insert("session_id".into(), serde_json::json!("session-2"));
+    }
+    let grouped = reader_view(&eng, &s.sample_id, vec![later, earlier], config).unwrap();
+    assert_eq!(
+        grouped.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+        vec![ids[2], ids[3]]
+    );
+
+    let mut missing = hit(0);
+    missing.payload.as_object_mut().unwrap().remove("session");
+    let error = reader_view(&eng, &s.sample_id, vec![missing], config).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("requires numeric payload.session"));
+}
+
+#[test]
 fn reader_prompt_contains_only_passed_hits_not_gold_or_evidence() {
     let samples = parse_root(&fixture()).unwrap();
     let s = &samples[0];
@@ -242,7 +305,7 @@ fn reader_prompt_contains_only_passed_hits_not_gold_or_evidence() {
     assert_eq!(hits.len(), 1, "k=1 yields exactly one hit");
     let retrieved_text = hits[0].text.clone();
 
-    let prompt = build_reader_prompt(&hits, "What breed is Rex?");
+    let prompt = build_reader_prompt(&hits, "What breed is Rex?", false);
     let blob = render(&prompt);
 
     // The single retrieved turn and the question are present.
@@ -328,6 +391,13 @@ fn run_sample_is_token_free_end_to_end() {
     let judge = testing::scripted(repeat_text("CORRECT", s.qa.len()));
 
     let results = run_sample(&eng, s, embedder, &*reader, &*judge, BenchConfig::default()).unwrap();
+    for (qa_index, result) in results.iter().enumerate() {
+        assert_eq!(result.sample_id, s.sample_id);
+        assert_eq!(result.qa_index, qa_index);
+    }
+    let audit_row = serde_json::to_value(&results[0]).unwrap();
+    assert_eq!(audit_row["sample_id"], s.sample_id);
+    assert_eq!(audit_row["qa_index"], 0);
     assert_eq!(results.len(), s.qa.len());
 
     let report = aggregate(&results, prov());
@@ -573,6 +643,8 @@ fn concurrent_questions_match_serial_byte_for_byte() {
 
 fn res(category: Category, correct: bool) -> QuestionResult {
     QuestionResult {
+        sample_id: "fixture".into(),
+        qa_index: 0,
         category,
         scorable: true,
         correct,
@@ -593,6 +665,8 @@ fn res(category: Category, correct: bool) -> QuestionResult {
 /// An unscorable result: a scored question with an empty gold key.
 fn unscorable(category: Category) -> QuestionResult {
     QuestionResult {
+        sample_id: "fixture".into(),
+        qa_index: 0,
         category,
         scorable: false,
         correct: false,
@@ -659,6 +733,7 @@ fn provenance_records_the_reader_models_rate_not_a_hardcoded_one() {
         "n",
         sha.clone(),
     );
+    assert!(!mini.agentic, "the default benchmark is single-reader-call");
     assert!((mini.cost_rate_input_usd_per_m - 0.15).abs() < 1e-9);
     assert!((mini.cost_rate_output_usd_per_m - 0.60).abs() < 1e-9);
     // A gpt-4o reader records gpt-4o's rate, proving it derives from the model.

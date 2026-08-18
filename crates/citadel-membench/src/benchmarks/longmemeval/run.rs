@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use citadel_llm::LLMClient;
+use citadel_llm::{LLMClient, TokenUsage};
 use citadel_mem::{Embedder, MemoryEngine};
 
 use super::dataset::LmSample;
@@ -84,9 +84,10 @@ pub fn run(
     let failed = AtomicBool::new(false);
     let observed = Mutex::new(on_emit);
     let err_slot: Mutex<Option<BenchError>> = Mutex::new(None);
+    let spent: Mutex<TokenUsage> = Mutex::new(TokenUsage::default());
     let (tx, rx) = std::sync::mpsc::channel::<(usize, (String, String))>();
-    let (next_r, failed_r, observed_r, err_r, gate_r, bench_r) =
-        (&next, &failed, &observed, &err_slot, &gate, &bench);
+    let (next_r, failed_r, observed_r, err_r, gate_r, bench_r, spent_r) =
+        (&next, &failed, &observed, &err_slot, &gate, &bench, &spent);
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -117,6 +118,7 @@ pub fn run(
                 };
                 match outcome {
                     Ok(o) => {
+                        spent_r.lock().expect("usage poisoned").add(&o.usage);
                         let emit = (*observed_r.lock().expect("observer poisoned"))(
                             i,
                             &s.question_id,
@@ -150,6 +152,19 @@ pub fn run(
     eprintln!(
         "  phase 2 (answer {total}) {:.1}s",
         t_answer.elapsed().as_secs_f64()
+    );
+    let spent = spent.into_inner().expect("usage poisoned");
+    // None for local models and for snapshots absent from the pricing table.
+    let cost = match spent.cost_usd {
+        Some(usd) => format!("est cost ~${usd:.4}"),
+        None => "cost unpriced".into(),
+    };
+    eprintln!(
+        "  tokens: in {} / out {}  (mean {:.0} / {:.0} per question)  {cost}",
+        spent.input_tokens,
+        spent.output_tokens,
+        f64::from(spent.input_tokens) / total as f64,
+        f64::from(spent.output_tokens) / total as f64,
     );
     let mut slots: Vec<Option<(String, String)>> = (0..total).map(|_| None).collect();
     for (i, pair) in rx {

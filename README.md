@@ -10,7 +10,7 @@
   <a href="https://github.com/yp3y5akh0v/citadel/tree/HEAD/crates/citadel-mcp"><img src="https://img.shields.io/badge/MCP-dev.citadeldb%2Fmcp-blue" alt="MCP registry: dev.citadeldb/mcp"></a>
   <br>
   <a href="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml"><img src="https://github.com/yp3y5akh0v/citadel/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LoCoMo%20(gpt--4o--mini)-85.7%25-success" alt="LoCoMo 85.7% (gpt-4o-mini)"></a>
+  <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LoCoMo%20(gpt--4o--mini)-87.2%25-success" alt="LoCoMo 87.2% (gpt-4o-mini, mean of 3 runs)"></a>
   <a href="https://github.com/yp3y5akh0v/citadel/blob/HEAD/crates/citadel-membench/RESULTS.md"><img src="https://img.shields.io/badge/LongMemEval--S%20(gpt--4o)-86.2%25-success" alt="LongMemEval-S 86.2% (gpt-4o reader)"></a>
   <a href="https://github.com/yp3y5akh0v/citadel#license"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
 </p>
@@ -210,12 +210,16 @@ then use `--embedder e5-large --reranker ms-marco-minilm`. Omit both for instant
 
 Citadel is scored on the LoCoMo and LongMemEval long-term-memory benchmarks. Execution speed against unencrypted SQLite across 58 head-to-head benchmarks is under [Speed benchmarks](#speed-benchmarks).
 
-**LoCoMo** - `gpt-4o-mini` reader and judge (the field's standard setup):
+**LoCoMo** - `gpt-4o-mini` reader and judge (the 2025 paper-comparison protocol), mean of 3 runs:
 
 | Metric | Score |
 |---|---|
-| Overall | 85.7% |
+| Overall | 87.2% +/- 0.3 |
 | Full context at the same reader (no retrieval) | 72.9% |
+
+Retrieval is identical across the three runs; the spread is reader and judge
+nondeterminism. A manual audit estimates that ~6.4% of LoCoMo answer keys are erroneous,
+so raw accuracy should be interpreted with that annotation noise in mind.
 
 Memory is built with no LLM - raw turns only, indexed and recalled deterministically.
 

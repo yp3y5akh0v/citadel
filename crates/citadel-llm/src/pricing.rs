@@ -1,4 +1,4 @@
-//! USD pricing per 1M tokens (verified 2026-07); unknown models: None, no guesses.
+//! USD pricing per 1M tokens (verified 2026-08); unknown models: None, no guesses.
 
 use super::openai_models::{gpt5_model, Gpt5Model};
 #[cfg(any(
@@ -49,6 +49,9 @@ pub(super) fn pricing_for(model_id: &str) -> Option<ModelPricing> {
     // gpt-4o-mini before gpt-4o: the longer family shares the shorter prefix.
     } else if model_id.starts_with("gpt-4o-mini") {
         (0.15, 0.6)
+    // The launch snapshot is priced double every later gpt-4o snapshot.
+    } else if model_id == "gpt-4o-2024-05-13" {
+        (5.0, 15.0)
     } else if model_id.starts_with("gpt-4o") {
         (2.5, 10.0)
     } else if model_id.starts_with("gemini-3.5-flash") {
@@ -104,6 +107,11 @@ mod tests {
         assert_eq!(cost_for("gpt-4o-mini-2024-07-18", &usage), Some(0.15 + 0.6));
         assert_eq!(cost_for("gpt-4o", &usage), Some(2.5 + 10.0));
         assert_eq!(cost_for("gpt-4o-2024-08-06", &usage), Some(2.5 + 10.0));
+        assert_eq!(
+            cost_for("gpt-4o-2024-05-13", &usage),
+            Some(5.0 + 15.0),
+            "the launch snapshot is not swallowed by the gpt-4o prefix"
+        );
         assert_eq!(cost_for("gpt-5-mini", &usage), Some(0.25 + 2.0));
         assert_eq!(cost_for("gpt-5-mini-2025-08-07", &usage), Some(0.25 + 2.0));
         assert_eq!(cost_for("gpt-5", &usage), Some(1.25 + 10.0));

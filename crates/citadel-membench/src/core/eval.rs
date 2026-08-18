@@ -12,7 +12,7 @@ use citadel_llm::{
     CompletionRequest, CompletionResponse, LLMClient, LlmError, Message, TokenUsage,
 };
 use citadel_mem::{AtomHit, AtomId, MemoryEngine, RecallProfile, RecallQuery};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::core::agentic;
 use crate::core::benchmark::Benchmark;
@@ -214,10 +214,55 @@ pub fn reader_view(
             }
         }
     }
-    if config.reader_order == ReaderOrder::Chrono {
-        view.sort_by_key(|h| h.id);
+    match config.reader_order {
+        ReaderOrder::Chrono => view.sort_by_key(|h| h.id),
+        ReaderOrder::Relevance => {}
+        ReaderOrder::Sessions => view = session_grouped(view)?,
     }
     Ok(view)
+}
+
+/// The best hit fixes each session's position; turns inside it return to
+/// conversation order. Session metadata is required: there is no flat fallback.
+fn session_grouped(view: Vec<AtomHit>) -> Result<Vec<AtomHit>> {
+    #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+    enum SessionKey {
+        Number(i64),
+        Text(String),
+    }
+
+    let mut order = Vec::new();
+    let mut blocks: FxHashMap<SessionKey, Vec<AtomHit>> = FxHashMap::default();
+    for hit in view {
+        let session = if let Some(session) =
+            hit.payload.get("session").and_then(|value| value.as_i64())
+        {
+            SessionKey::Number(session)
+        } else if let Some(session_id) = hit
+            .payload
+            .get("session_id")
+            .and_then(|value| value.as_str())
+        {
+            SessionKey::Text(session_id.to_owned())
+        } else {
+            return Err(crate::BenchError::Dataset(
+                "session reader order requires numeric payload.session or string payload.session_id on every hit"
+                    .into(),
+            ));
+        };
+        if !blocks.contains_key(&session) {
+            order.push(session.clone());
+        }
+        blocks.entry(session).or_default().push(hit);
+    }
+
+    let mut grouped = Vec::new();
+    for session in order {
+        let mut block = blocks.remove(&session).expect("session block was inserted");
+        block.sort_unstable_by_key(|hit| hit.id);
+        grouped.extend(block);
+    }
+    Ok(grouped)
 }
 
 /// The reader's answer plus retrieval facts: latency, token usage, and the

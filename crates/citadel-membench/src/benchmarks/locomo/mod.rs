@@ -13,7 +13,15 @@ use crate::core::error::Result;
 use crate::core::ratelimit::Pacer;
 
 /// The LoCoMo benchmark plugin.
-pub struct Locomo;
+pub struct Locomo {
+    session_headers: bool,
+}
+
+impl Locomo {
+    pub(crate) fn new(session_headers: bool) -> Self {
+        Self { session_headers }
+    }
+}
 
 impl Benchmark for Locomo {
     fn gold_id_key(&self) -> &str {
@@ -22,7 +30,7 @@ impl Benchmark for Locomo {
 
     // LoCoMo dialogue lines carry their own dates; there is no separate current-date anchor.
     fn reader_prompt(&self, hits: &[AtomHit], question: &str, _current_date: &str) -> Vec<Message> {
-        prompts::build_reader_prompt(hits, question)
+        prompts::build_reader_prompt(hits, question, self.session_headers)
     }
 
     fn known_flaws(&self) -> &str {

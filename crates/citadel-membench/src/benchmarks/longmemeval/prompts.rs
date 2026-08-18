@@ -9,8 +9,8 @@ pub(crate) const KNOWN_FLAWS: &str = "Emit-only harness: citadel produces a JSON
      hypothesis file (question_id + hypothesis per line); the official score comes from \
      the repo's evaluate_qa.py (gpt-4o-2024-08-06 judge, per-question-type prompts) then \
      print_qa_metrics.py, NOT from citadel. The reader model is a chosen component and \
-     MUST be named with any number; the comparable like-for-like field uses a gpt-4o \
-     reader (~82-86), while vendor 94-95 figures use stronger readers. The reader \
+     MUST be named with any number; the headline uses a gpt-4o reader, while \
+     gpt-4o-mini runs are lower-cost diagnostics and are not reader-matched. The reader \
      replicates the official run_generation.py CoT prompt (generic, category-blind) with \
      Current Date = question_date; recall uses the scored RecallProfile default (no \
      as-of). Gold is dual: session-level \
@@ -33,7 +33,9 @@ fn split_turn(text: &str) -> (&str, &str) {
 
 /// Reader prompt matching the official `run_generation.py` (CoT + `nl`
 /// history): turns regrouped into `### Session N` blocks ordered by date,
-/// turns within a session in conversation order (ascending atom id).
+/// turns within a session in conversation order (ascending atom id). The
+/// regrouping makes the prompt invariant to hit order for a fixed hit set with
+/// distinct session timestamps, so a reader-order knob cannot reach it.
 pub fn build_reader_prompt(hits: &[AtomHit], question: &str, current_date: &str) -> Vec<Message> {
     let mut by_sid: FxHashMap<&str, usize> = FxHashMap::default();
     let mut sessions: Vec<SessionBlock> = Vec::new();
@@ -110,7 +112,6 @@ mod tests {
         let Message::User(text) = &msg[0] else {
             panic!("expected a user message");
         };
-        println!("----- PROMPT -----\n{text}\n------------------");
         // Older session (s2, 05/01) renders before s1 (06/01).
         let p2 = text
             .find("Session Date: 2023/05/01")
@@ -133,5 +134,15 @@ mod tests {
             "inline date moved to header"
         );
         assert!(text.contains("Question: who?") && text.contains("Current Date: 2023/07/01"));
+
+        let permuted = vec![hits[2].clone(), hits[0].clone(), hits[1].clone()];
+        let permuted_msg = build_reader_prompt(&permuted, "who?", "2023/07/01");
+        let Message::User(permuted_text) = &permuted_msg[0] else {
+            panic!("expected a user message");
+        };
+        assert_eq!(
+            text, permuted_text,
+            "retrieval-list order must not change a distinct-date LongMemEval prompt"
+        );
     }
 }

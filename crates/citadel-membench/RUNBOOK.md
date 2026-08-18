@@ -25,6 +25,7 @@ CPU: swap `cuda-embed` -> `candle-embed`.
 - `CITADEL_LONGMEMEVAL_EMBEDDER` - e5-large|e5-large-v2|bge-large|bge-base|bge-small|granite-r2 (default e5-large).
 - `CITADEL_RERANKER_DIR=<RERANKER_DIR>` - cross-encoder reranker dir (ms-marco-MiniLM-L-6-v2); the best-recall config, matching LoCoMo. Omit for embedder-only.
 - `CITADEL_LONGMEMEVAL_RERANK_STRATEGY` - replace|rrf (default rrf).
+- `CITADEL_LONGMEMEVAL_READER_MODEL` - reader model (default `gpt-4o`, the headline/comparable tier). Set `gpt-4o-mini` explicitly only for a lower-cost diagnostic.
 - `CITADEL_LONGMEMEVAL_OUT` - prediction JSONL path.
 - `CITADEL_LONGMEMEVAL_READER_CONCURRENCY` - reader calls in flight.
 - `CITADEL_LONGMEMEVAL_READER_TPM` - per-model tokens/min (default is model-aware: gpt-4o-mini -> 2M, else 200k).
@@ -38,11 +39,10 @@ CPU: swap `cuda-embed` -> `candle-embed`.
 Set `OPENAI_API_KEY`, `PYO3_PYTHON`, `CITADEL_EMBEDDER_DIR=<EMBEDDER_DIR>`,
 `CITADEL_LONGMEMEVAL_EMBEDDER=e5-large`, `CITADEL_RERANKER_DIR=<RERANKER_DIR>` (best recall),
 `CITADEL_LONGMEMEVAL_OUT=<OUT>`, `CITADEL_LONGMEMEVAL_READER_CONCURRENCY=8`, then run the build
-command above. For the full-haystack `longmemeval_s_cleaned.json` run, add
-`CITADEL_LONGMEMEVAL_READER_MODEL=gpt-4o`.
+command above. The full-haystack headline reader defaults to `gpt-4o`.
 Phase 1 ingests one region per question (`ingested N/500`); phase 2 runs the reader
 (`answered N/500`, where OpenAI charges happen) and writes the JSONL at the end.
-Reader defaults: gpt-4o-mini, the official CoT prompt, max_tokens 800.
+Reader defaults: gpt-4o, the official CoT prompt, max_tokens 800.
 
 ## Reuse a persisted DB (skip the ~2h ingest)
 Full-haystack ingest dominates wall-clock (~2h for `longmemeval_s_cleaned.json`; the work
@@ -77,7 +77,9 @@ LongMemEval retrieval metric. This is citadel's own retrieval-quality measure.
 `benchmarks/longmemeval/prompts.rs::build_reader_prompt` replicates the official
 `run_generation.py` CoT template: generic instruction, retrieved chats sorted by date,
 `Current Date: {question_date}`, single user message, `Answer (step by step):`. No
-per-type tailoring; the reader never sees the type label, gold, or `has_answer`.
+per-type tailoring; the reader never sees the type label, gold, or `has_answer`. This
+canonical date/conversation ordering is fixed; LongMemEval does not expose the LoCoMo
+reader-order switch because regrouping here would erase that input ordering.
 
 ## Verify before any commit
 ```

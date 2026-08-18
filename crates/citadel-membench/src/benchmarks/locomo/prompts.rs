@@ -36,7 +36,11 @@ pub(crate) const KNOWN_FLAWS: &str = "De facto LLM-judge protocol, not the paper
 /// isolates gold.
 ///
 /// [`reader_view`]: crate::core::eval::reader_view
-pub fn build_reader_prompt(hits: &[AtomHit], question: &str) -> Vec<Message> {
+pub fn build_reader_prompt(
+    hits: &[AtomHit],
+    question: &str,
+    session_headers: bool,
+) -> Vec<Message> {
     let system = "You answer the question using ONLY the provided memories. Each \
          memory is a line from a past conversation, prefixed with the date it was \
          said and the speaker, and may end with a photo description in the form \
@@ -80,7 +84,24 @@ pub fn build_reader_prompt(hits: &[AtomHit], question: &str) -> Vec<Message> {
          combination. Answer concisely.";
 
     let mut user = String::from("Memories:\n");
+    let mut last_session = None;
     for (rank, hit) in hits.iter().enumerate() {
+        if session_headers {
+            let session = hit
+                .payload
+                .get("session")
+                .and_then(|value| value.as_i64())
+                .expect("session-grouped LoCoMo hit must carry numeric payload.session");
+            if last_session != Some(session) {
+                let date = hit
+                    .payload
+                    .get("date_time")
+                    .and_then(|value| value.as_str())
+                    .expect("session-grouped LoCoMo hit must carry payload.date_time");
+                user.push_str(&format!("\n[Session {session} from {date}]\n"));
+                last_session = Some(session);
+            }
+        }
         user.push_str(&format!("{}. {}\n", rank + 1, hit.text));
     }
     user.push_str(&format!("\nQuestion: {question}"));

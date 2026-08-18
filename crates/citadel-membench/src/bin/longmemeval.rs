@@ -14,9 +14,8 @@
 //!
 //! Dataset path: argv[1] or CITADEL_LONGMEMEVAL_DATASET. Env knobs:
 //!   CITADEL_LONGMEMEVAL_OUT=path        predictions (def hypotheses.jsonl)
-//!   CITADEL_LONGMEMEVAL_READER_MODEL=m  reader model (default gpt-4o-mini)
+//!   CITADEL_LONGMEMEVAL_READER_MODEL=m  reader model (default gpt-4o)
 //!   CITADEL_LONGMEMEVAL_TOP_K=n         memories per question (default 50)
-//!   CITADEL_LONGMEMEVAL_READER_ORDER    relevance|chrono order (def rel)
 //!   CITADEL_LONGMEMEVAL_NEIGHBOR_RADIUS=n  adjacent turns per hit (default 0)
 //!   CITADEL_LONGMEMEVAL_READER_CONCURRENCY  reader calls in flight (default 3)
 //!   CITADEL_LONGMEMEVAL_READER_TPM      tokens/min cap (default per model)
@@ -50,7 +49,7 @@ use citadel_membench::benchmarks::longmemeval::retrieval::{distinct_session_ids,
 use citadel_membench::benchmarks::longmemeval::{dataset, ingest, run, LmevalConfig};
 use citadel_membench::{default_tpm_for_model, BenchConfig, Pacer, ReaderOrder};
 
-const DEFAULT_READER_MODEL: &str = "gpt-4o-mini";
+const DEFAULT_READER_MODEL: &str = "gpt-4o";
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -61,6 +60,14 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if let Ok(value) = std::env::var("CITADEL_LONGMEMEVAL_READER_ORDER") {
+        return Err(format!(
+            "CITADEL_LONGMEMEVAL_READER_ORDER={value:?} is unsupported: LongMemEval uses one \
+             canonical prompt order (sessions by date, turns by conversation order); unset it"
+        )
+        .into());
+    }
+
     let dataset_path = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("CITADEL_LONGMEMEVAL_DATASET").ok())
@@ -169,20 +176,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let pacer = Pacer::new(&reader_model, reader_tpm, &reader_model, reader_tpm);
     eprintln!("reader: {reader_model}  embedder: {}", embedder.model_id());
 
-    // Reader-presentation knobs (mirror LoCoMo); not engine recall.
-    let reader_order = match std::env::var("CITADEL_LONGMEMEVAL_READER_ORDER")
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "chrono" => ReaderOrder::Chrono,
-        "relevance" => ReaderOrder::Relevance,
-        _ => BenchConfig::default().reader_order,
-    };
     let cfg = LmevalConfig {
         bench: BenchConfig {
             top_k: env_usize("CITADEL_LONGMEMEVAL_TOP_K", 50),
-            reader_order,
+            // Inert: build_reader_prompt regroups by session and re-sorts.
+            reader_order: ReaderOrder::Relevance,
             neighbor_radius: env_usize("CITADEL_LONGMEMEVAL_NEIGHBOR_RADIUS", 0),
             // Official CoT gen_length; the reader's step-by-step answer needs
             // the headroom.
@@ -207,7 +205,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &cfg,
         &mut |_, qid, _hyp| {
             done += 1;
-            if done % 10 == 0 || done == total {
+            if done.is_multiple_of(10) || done == total {
                 eprintln!("  answered {done}/{total} ({qid})");
             }
             Ok(())

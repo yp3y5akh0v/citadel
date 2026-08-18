@@ -58,6 +58,9 @@ pub enum ReaderOrder {
     Chrono,
     /// Fusion/reranker relevance order, best hit first.
     Relevance,
+    /// Sessions ordered by their best-ranked hit, chronological within each
+    /// session. The retrieved set is unchanged.
+    Sessions,
 }
 
 impl ReaderOrder {
@@ -65,6 +68,7 @@ impl ReaderOrder {
         match self {
             ReaderOrder::Chrono => "chrono",
             ReaderOrder::Relevance => "relevance",
+            ReaderOrder::Sessions => "sessions",
         }
     }
 }
@@ -103,6 +107,10 @@ impl Default for BenchConfig {
 /// The per-question outcome, before aggregation.
 #[derive(Debug, Clone, Serialize)]
 pub struct QuestionResult {
+    /// Stable row identity. `sample_id + qa_index` is unique even when the
+    /// dataset repeats the same question text or assigns it conflicting labels.
+    pub sample_id: String,
+    pub qa_index: usize,
     pub category: Category,
     /// Unscorable (empty gold key) is excluded; adversarial is always scorable.
     pub scorable: bool,
@@ -155,6 +163,8 @@ pub struct Provenance {
     pub reader_order: String,
     /// Adjacent turns rendered around each hit (0 = none).
     pub neighbor_radius: usize,
+    /// Whether the optional multi-call aggregation reader was enabled.
+    pub agentic: bool,
     pub temperature: f32,
     /// Sampling seed sent with every reader/judge request (best-effort on the
     /// provider side); pinned so paired runs are comparable.
@@ -325,6 +335,7 @@ pub fn run_sample_observed(
                         judge,
                         config,
                         &sample.qa[i],
+                        i,
                         gi,
                         pacer,
                         rg,
@@ -391,6 +402,7 @@ fn process_one_question(
     judge: &dyn LLMClient,
     config: BenchConfig,
     qa: &QaSample,
+    qa_index: usize,
     gold_index: &FxHashMap<&str, String>,
     pacer: &Pacer,
     reader_gate: &Gate,
@@ -401,6 +413,8 @@ fn process_one_question(
     // gate/pacer.
     if qa.category.is_scored() && qa.gold.trim().is_empty() {
         return Ok(QuestionResult {
+            sample_id: region.to_owned(),
+            qa_index,
             category: qa.category,
             scorable: false,
             correct: false,
@@ -418,7 +432,7 @@ fn process_one_question(
         });
     }
 
-    let bench = Locomo;
+    let bench = Locomo::new(config.reader_order == ReaderOrder::Sessions);
     let outcome = {
         let _permit = reader_gate.acquire();
         let q = Question {
@@ -446,6 +460,8 @@ fn process_one_question(
     let gold_turn_texts = resolve_gold_texts(&qa.evidence, gold_index);
 
     Ok(QuestionResult {
+        sample_id: region.to_owned(),
+        qa_index,
         category: qa.category,
         scorable: true,
         correct,
@@ -571,6 +587,7 @@ pub fn provenance(
         top_k: config.top_k,
         reader_order: config.reader_order.label().to_string(),
         neighbor_radius: config.neighbor_radius,
+        agentic: config.agentic,
         temperature: 0.0,
         sampling_seed: core::eval::SAMPLING_SEED,
         fusion_semantic: w.semantic,
@@ -581,7 +598,7 @@ pub fn provenance(
         dataset_sha256: dataset_sha256.into(),
         cost_rate_input_usd_per_m: rate_in,
         cost_rate_output_usd_per_m: rate_out,
-        known_flaws: Locomo.known_flaws().to_string(),
+        known_flaws: Locomo::new(false).known_flaws().to_string(),
     }
 }
 

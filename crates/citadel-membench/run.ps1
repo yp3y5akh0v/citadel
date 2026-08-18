@@ -52,8 +52,11 @@ New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $env:CITADEL_EMBEDDER_DIR        = $EmbedderDir
 $env:CITADEL_LOCOMO_EMBEDDER      = $Embedder
 $env:CITADEL_LOCOMO_RERANK_STRATEGY = "rrf"
+$env:CITADEL_LOCOMO_READER_ORDER = "sessions"
 $env:CITADEL_LOCOMO_NEIGHBOR_RADIUS = "$NeighborRadius"
 $env:CITADEL_LOCOMO_ENCRYPTED     = $Encrypted
+# Single-reader-call lane: never inherit multi-call aggregation from a parent shell.
+Remove-Item Env:\CITADEL_LOCOMO_AGENTIC -ErrorAction SilentlyContinue
 if ($RerankDir) { $env:CITADEL_RERANKER_DIR = $RerankDir }
 
 # Judge always runs on gpt-4o-mini (OPENAI_API_KEY); the reader may use a different
@@ -91,7 +94,7 @@ if ($MaxSamples -gt 0) {
 $report = Join-Path $dir "report.json"
 $log    = Join-Path $dir "run.log"
 $embLabel = if ($Embedder) { $Embedder } else { "e5-large" }
-"run: $Label  reader=$Reader ($ReaderProvider) judge=$Judge maxSamples=$MaxSamples encrypted=$Encrypted embedder=$embLabel  started $(Get-Date -Format o)" | Set-Content $log
+"run: $Label  reader=$Reader ($ReaderProvider) judge=$Judge order=sessions agentic=false maxSamples=$MaxSamples encrypted=$Encrypted embedder=$embLabel  started $(Get-Date -Format o)" | Set-Content $log
 Write-Host "run dir: $dir"
 Write-Host "watch:   pwsh -File watch.ps1"
 
@@ -115,5 +118,6 @@ Remove-Item Env:\CITADEL_LOCOMO_READER_PROVIDER -ErrorAction SilentlyContinue
 Remove-Item Env:\CITADEL_GEMINI_REASONING_EFFORT -ErrorAction SilentlyContinue
 Remove-Item Env:\CITADEL_MEMBENCH_MAX_TOKENS -ErrorAction SilentlyContinue
 Remove-Item Env:\CITADEL_LOCOMO_MAX_SAMPLES -ErrorAction SilentlyContinue
+Remove-Item Env:\CITADEL_LOCOMO_READER_ORDER -ErrorAction SilentlyContinue
 Remove-Item Env:\CITADEL_LOCOMO_NEIGHBOR_RADIUS -ErrorAction SilentlyContinue
 Write-Host "done: EXIT=$code  ->  $dir"

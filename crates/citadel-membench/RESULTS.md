@@ -12,31 +12,34 @@ prompts, a per-question audit, and the run's limitations.
 ## Full 10-conversation LoCoMo (encrypted, reader and judge `gpt-4o-mini`)
 
 Reference configuration (citadel defaults): encrypted regions, `e5-large` (v1) embedder +
-`ms-marco-minilm` cross-encoder reranker, top-50 retrieval in relevance order,
-temperature 0, raw-turn plus photo-caption ingestion with
+`ms-marco-minilm` cross-encoder reranker, top-50 retrieval presented session-grouped
+(each session block sits at the rank of its best hit, turns inside it in conversation
+order), temperature 0, raw-turn plus photo-caption ingestion with
 each session's date prefixed into the indexed turn text (`[date] speaker: text`). Scored
 categories are multi-hop, temporal, open-domain, and single-hop; the adversarial
 (unanswerable) category is reported separately as an abstention metric.
 
-Three independent full runs (n=1540 scored questions each), measured 2026-07-09; the
+Three independent full runs (n=1540 scored questions each), measured 2026-08-18; the
 Mean +/- SD column is the sample mean and standard deviation across the three. The Run
 1-3 columns show the full run-to-run range; the spread is hosted-model (gpt-4o-mini)
 nondeterminism, not the engine.
 
 | Metric | Run 1 | Run 2 | Run 3 | Mean +/- SD |
 |---|---|---|---|---|
-| Overall scored (n=1540) | 85.5% | 85.4% | 86.0% | 85.7% +/- 0.3% |
-| single_hop (n=841) | 91.9% | 91.8% | 92.6% | 92.1% +/- 0.5% |
-| multi_hop (n=282) | 81.2% | 81.2% | 81.6% | 81.3% +/- 0.2% |
-| temporal (n=321) | 78.8% | 78.2% | 79.1% | 78.7% +/- 0.5% |
-| open_domain (n=96) | 64.6% | 65.6% | 64.6% | 64.9% +/- 0.6% |
-| Adversarial abstention (n=446) | 67.0% | 66.6% | 67.3% | 67.0% +/- 0.3% |
-| p95 recall latency | 1.0 s | 0.6 s | 2.2 s | host-load bound |
-| Token cost (USD) | ~$1.12 | ~$1.12 | ~$1.12 | ~$1.12 |
+| Overall scored (n=1540) | 87.0% | 87.6% | 87.0% | 87.2% +/- 0.3% |
+| single_hop (n=841) | 93.6% | 93.9% | 94.1% | 93.9% +/- 0.2% |
+| multi_hop (n=282) | 82.3% | 83.3% | 81.9% | 82.5% +/- 0.7% |
+| temporal (n=321) | 80.7% | 81.0% | 80.1% | 80.6% +/- 0.5% |
+| open_domain (n=96) | 64.6% | 66.7% | 63.5% | 64.9% +/- 1.6% |
+| Adversarial abstention (n=446) | 65.5% | 65.7% | 66.6% | 65.9% +/- 0.6% |
+| p95 recall latency | 0.9 s | 0.7 s | 1.7 s | host-load bound |
+| Token cost (USD) | ~$1.23 | ~$1.23 | ~$1.23 | ~$1.23 |
 
 All runs are at temperature 0; retrieval is deterministic (the in-memory index is rebuilt
-the same way each time), so only the reader/judge-dependent metrics vary run to run. Cost is
-computed from the recorded token counts (~6.9M in / ~0.14M out per run) at gpt-4o-mini rates
+the same way each time), so only the reader/judge-dependent metrics vary run to run. All
+1,986 questions returned a byte-identical top-50 in every run; the scored
+spread is 9 answers of 1,540 (0.58 points). Cost is
+computed from the recorded token counts (~7.7M in / ~0.14M out per run) at gpt-4o-mini rates
 ($0.15 / $0.60 per M). This triple ran under concurrent desktop load, which bounds the p95
 recall latency; an idle-machine triple on bit-identical retrieval measured p95 447-516 ms.
 
@@ -47,7 +50,8 @@ within-date rates.
 
 **Embedder.** The default is `e5-large` (v1). Retrieval is reader-bound, so the embedder is a
 within-noise choice; on this benchmark `e5-large` matches or slightly beats the alternatives
-(85.7% vs 85.5% for `bge-large` over 3 runs each, same reranker + fusion). Deterministic
+(85.7% vs 85.5% for `bge-large` over 3 runs each on an earlier reader configuration,
+same reranker + fusion; the embedder ranking is unchanged). Deterministic
 retrieval recall (recall@50, hybrid fusion, no reranker) across the encoders we evaluated:
 
 | Embedder | recall@50 |
@@ -69,14 +73,15 @@ the region into an ephemeral in-memory nearest-neighbor index whose plaintext ve
 are zeroized when it is dropped, so the retrieval ceiling and end-to-end accuracy are
 identical to a plaintext store.
 
-## How 85.7% compares (matched reader and judge)
+## How 87.2% compares (2025 paper protocol)
 
-Both reader and judge are `gpt-4o-mini`, the models the published field uses, so the
-scored number is directly comparable against the field:
+Both reader and judge are `gpt-4o-mini`, matching the 2025 Mem0 paper results listed
+below. This table is a comparison to that fixed paper protocol, not to newer vendor
+pipelines that use different readers and memory construction:
 
 | System | Overall (scored) | Source |
 |---|---|---|
-| **citadel-mem (encrypted)** | **85.7%** (3-run mean) | this work |
+| **citadel-mem (encrypted)** | **87.2%** (3-run mean) | this work |
 | Full-context, no retrieval | 72.9% | arXiv 2504.19413 |
 | Mem0 (graph) | 68.4% | arXiv 2504.19413 |
 | Mem0 | 66.9% | arXiv 2504.19413 |
@@ -84,9 +89,10 @@ scored number is directly comparable against the field:
 | LangMem | 58.1% | arXiv 2504.19413 |
 | OpenAI memory | 52.9% | arXiv 2504.19413 |
 
-The 85.7% mean is 17 to 33 points higher than these reported memory systems, and 13 points
+The 87.2% mean is 19 to 34 points higher than these reported memory systems, and 14 points
 above the full-context, no-retrieval baseline. Their scores are taken from the Mem0 paper
-(Chhikara et al., 2025).
+(Chhikara et al., 2025). Newer vendor results are excluded from this table because their
+reader and memory-building protocols differ and they are not reproduced here.
 
 This number uses a zero-LLM memory path: raw turns in, vector + BM25 + cross-encoder
 out, with no LLM touching the memory at ingest or retrieval, so ingestion costs no
@@ -95,7 +101,7 @@ to build or search the store. The other systems run an LLM
 over the conversation to build memory (fact extraction, temporal knowledge graphs, or
 context curation).
 
-79% of scored misses have the gold already in the prompt and the reader still missed it
+77% of scored misses have the gold already in the prompt and the reader still missed it
 (Self-audit below), so reader quality dominates the remaining error.
 
 ## LongMemEval_S (full-haystack)
@@ -149,7 +155,7 @@ embedder_model:    e5-large  (GPU)
 reranker_model:    ms-marco-MiniLM-L-6-v2  (RRF fusion, k = 20)
 regions:           encrypted (per-atom sealed; per-atom/region cryptographic erasure)
 top_k:             50
-reader_order:      relevance
+reader_order:      sessions
 neighbor_radius:   0
 temperature:       0.0
 fusion weights:    semantic 0.45, keyword 0.20, recency 0.20, importance 0.15
@@ -185,7 +191,7 @@ OpenAI API key.
 Build (GPU embedder; use `candle-embed` instead of `cuda-embed` for CPU):
 
 ```bash
-cargo build -p citadeldb-membench --features openai,cuda-embed --bin locomo
+cargo build --release -p citadeldb-membench --features openai,cuda-embed --bin locomo
 ```
 
 Full live run (encrypted by default; the script reads the key from a file and never
@@ -203,7 +209,7 @@ evidence recall (A / B / C / C-asof / D / D-asof):
 CITADEL_LOCOMO_ENCRYPTED=true CITADEL_LOCOMO_RETRIEVAL_DIAG=1 CITADEL_LOCOMO_EMBEDDER=e5-large \
   CITADEL_EMBEDDER_DIR=/path/to/e5-large \
   CITADEL_RERANKER_DIR=/path/to/ms-marco-MiniLM-L-6-v2 \
-  ./target/debug/locomo locomo10.json
+  ./target/release/locomo locomo10.json
 ```
 
 ## Self-audit
@@ -214,12 +220,12 @@ reader-fixable) versus a reader miss (gold retrieved, answer still wrong).
 
 Across the full run (Run 1), recall@50 = 94.5% (1451/1536); the denominator is 1536
 rather than 1540 because four scored questions list no gold-evidence turns and are
-excluded from the recall computation. Of 223 scored misses, 46 are retrieval gaps and
-177 are reader misses - 79% of the remaining error is reader-bound. By category:
-single_hop 68 (18 gap, 50 reader), temporal 68 (10 gap, 58 reader), multi_hop 53 (8
-gap, 45 reader), open_domain 34 (10 gap, 24 reader). Some reader misses are LoCoMo
-gold-key errors (the gold turn is attributed to the wrong speaker); the audit flags
-candidates by a speaker-mismatch heuristic.
+excluded from the recall computation. Of 200 scored misses, 45 are retrieval gaps and
+154 are reader misses - 77% of the remaining error is reader-bound. By category:
+temporal 62 (11 gap, 51 reader), single_hop 54 (17 gap, 37 reader), multi_hop 50 (7
+gap, 43 reader), open_domain 34 (10 gap, 23 reader, 1 with no gold listed). Some
+reader misses are LoCoMo gold-key errors (the gold turn is attributed to the wrong
+speaker); the audit flags candidates by a speaker-mismatch heuristic.
 
 Layered retrieval diagnostic (token-free, `CITADEL_LOCOMO_RETRIEVAL_DIAG`, n=1536).
 Each cell is any%/all%: some gold turn in the top-k versus every gold turn in the
@@ -251,12 +257,13 @@ but on the gold topic and reports how often it marks them correct, bounding judg
 lenience. On this probe the judge marked 0 of 40 correct (0.0% false-accept).
 
 Run-to-run noise decomposes by diffing the per-question audits of the three full
-runs (identical retrieval): 909 of 1,986 answers differ textually between runs at
-temperature 0; 78 questions flip correct/incorrect (52 scored, 26 adversarial) - 66
-because the reader's answer changed, 12 because the judge flipped on an identical
-answer. The judge-side flips concentrate in temporal golds of the form "the week
-before [date]", where an answer naming the anchor date sits on the accept/reject
-boundary. The +/-0.3% band is entirely reader/judge-side; retrieval contributes none.
+runs (identical retrieval): 911 of 1,986 answers differ textually between runs at
+temperature 0; 72 questions flip correct/incorrect (46 scored, 26 adversarial) - 67
+because the reader's answer changed, 5 because the judge flipped on a byte-identical
+answer. The 5 judge-side flips are all partial-credit boundaries: the answer names
+some of a multi-part gold, or the question is open-ended and the gold is one of
+several defensible replies. The +/-0.3% band is entirely reader/judge-side;
+retrieval contributes none.
 
 ## Limitations
 
@@ -269,16 +276,16 @@ boundary. The +/-0.3% band is entirely reader/judge-side; retrieval contributes 
   so ranking is effectively semantic plus BM25 keyword.
 - LoCoMo gold labels contain errors (the harness lists candidates), putting a ceiling
   below 100%. The retrieval ceiling and per-question audit are in each run's local report.
-- conv-26 is the development split on which the configuration (top-50, relevance order,
-  no neighbor expansion, date-prefixed indexing) was selected; the full-run figures are
-  the reportable ones. The retrieval defaults (fusion ratio, RRF k, rerank pool)
+- conv-26 is the development split on which the configuration (top-50, session-grouped
+  order, no neighbor expansion, date-prefixed indexing) was selected; the full-run
+  figures are the reportable ones. The retrieval defaults (fusion ratio, RRF k, rerank pool)
   were likewise selected on the token-free diagnostic and the same dev split.
 - Top-50 retrieval trades abstention for accuracy: with more retrieved content the
-  reader answers more unanswerable questions (abstention 67.0%).
+  reader answers more unanswerable questions (abstention 65.9%).
 - Three runs at temperature 0; the hosted reader and judge are not bit-deterministic, so
-  scored accuracy varies run-to-run (85.7% +/- 0.3%; a 2026-07-04 triple on bit-identical
-  retrieval measured 86.0% +/- 0.3%). Retrieval is deterministic, so recall@50 is
-  identical (94.5%, the same 1451/1536 questions) across all runs.
+  scored accuracy varies run-to-run (87.2% +/- 0.3%; earlier triples on bit-identical
+  retrieval measured 86.0% +/- 0.3% and 85.7% +/- 0.3%). Retrieval is deterministic, so
+  recall@50 is identical (94.5%, the same 1451/1536 questions) across all runs.
 
 ## Prompts
 

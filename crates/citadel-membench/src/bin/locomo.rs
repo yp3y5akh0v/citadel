@@ -10,7 +10,7 @@
 //!   CITADEL_LOCOMO_READER_MODEL=m     answer model (default gpt-4o-mini)
 //!   CITADEL_LOCOMO_JUDGE_MODEL=m      scoring model (default gpt-4o-mini)
 //!   CITADEL_LOCOMO_TOP_K=n            memories per question (default 50)
-//!   CITADEL_LOCOMO_READER_ORDER       chrono|relevance prompt order (def rel)
+//!   CITADEL_LOCOMO_READER_ORDER       sessions|chrono|relevance (def sessions)
 //!   CITADEL_LOCOMO_NEIGHBOR_RADIUS=n  adjacent turns per hit (default 0)
 //!   CITADEL_LOCOMO_AGENTIC=1          agentic reader for aggregation Qs
 //!   CITADEL_LOCOMO_RERANK_STRATEGY    replace|rrf (default rrf)
@@ -229,7 +229,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             samples.len(),
             sample.sample_id
         );
-        let conv_id = sample.sample_id.clone();
         let rs = run_sample_observed(
             &eng,
             sample,
@@ -239,7 +238,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             config,
             bench_db.reuse,
             &pacer,
-            &mut |r| prog.observe(r, &conv_id, live_trace.as_mut()),
+            &mut |r| prog.observe(r, live_trace.as_mut()),
         )?;
         results.extend(rs);
     }
@@ -294,7 +293,6 @@ impl LiveProgress {
     fn observe(
         &mut self,
         r: &QuestionResult,
-        conv_id: &str,
         trace: Option<&mut std::fs::File>,
     ) -> citadel_membench::Result<()> {
         self.done += 1;
@@ -314,7 +312,8 @@ impl LiveProgress {
         // One JSON line per question (direct, tail-able write).
         if let Some(w) = trace {
             let line = serde_json::json!({
-                "conv": conv_id,
+                "conv": r.sample_id,
+                "qa_index": r.qa_index,
                 "category": r.category.label(),
                 "scorable": r.scorable,
                 "correct": r.correct,
@@ -330,7 +329,7 @@ impl LiveProgress {
         }
 
         // Running table every 25 questions (and on the last).
-        if self.done % 25 == 0 || self.done == self.total {
+        if self.done.is_multiple_of(25) || self.done == self.total {
             let (mut c, mut t) = (0usize, 0usize);
             let mut parts = Vec::new();
             for (label, (ok, n)) in &self.cat {
@@ -359,13 +358,16 @@ impl LiveProgress {
 fn bench_config_from_env() -> BenchConfig {
     let d = BenchConfig::default();
     let reader_order = match std::env::var("CITADEL_LOCOMO_READER_ORDER")
-        .unwrap_or_default()
+        .unwrap_or_else(|_| "sessions".into())
         .to_ascii_lowercase()
         .as_str()
     {
         "chrono" => ReaderOrder::Chrono,
         "relevance" => ReaderOrder::Relevance,
-        _ => d.reader_order,
+        "sessions" => ReaderOrder::Sessions,
+        other => panic!(
+            "CITADEL_LOCOMO_READER_ORDER must be sessions, chrono, or relevance; got {other}"
+        ),
     };
     BenchConfig {
         top_k: env_usize("CITADEL_LOCOMO_TOP_K", 1, d.top_k),
@@ -543,7 +545,6 @@ fn run_retrieval_diag(
             }
         }
     }
-
     eprintln!(
         "\n=== layered retrieval diagnostic: evidence recall@{}/{}/{} as any%/all% ===",
         KS[0], KS[1], KS[2]
