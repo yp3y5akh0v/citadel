@@ -4,8 +4,8 @@ Distribution packages built from this workspace. Each adapter is versioned from 
 tag and `citadeldb-mcp` from the workspace crate version; each is built and published by
 its own workflow under [`.github/workflows/`](../.github/workflows).
 
-Every adapter requires `citadeldb>=1.16`, so that release goes to PyPI first or their test
-jobs cannot resolve it.
+Every adapter requires `citadeldb>=2.0,<3`. Their test jobs build that wheel in-run and
+install it with `--find-links`, so they never wait on PyPI and the release order is free.
 
 ## Agent framework adapters
 

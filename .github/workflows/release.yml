@@ -26,7 +26,9 @@ jobs:
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "$GITHUB_REF_NAME"
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "$GITHUB_REF_NAME"
 
   build-release:
     needs: create-release
@@ -240,10 +242,10 @@ jobs:
         if: matrix.cli
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.ref_name }}" "${{ env.CLI_ARCHIVE }}" "${{ env.CLI_ARCHIVE }}.sha256"
+        run: gh release upload --clobber "${{ github.ref_name }}" "${{ env.CLI_ARCHIVE }}" "${{ env.CLI_ARCHIVE }}.sha256"
 
       - name: Upload FFI
         if: matrix.ffi
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.ref_name }}" "${{ env.FFI_ARCHIVE }}" "${{ env.FFI_ARCHIVE }}.sha256"
+        run: gh release upload --clobber "${{ github.ref_name }}" "${{ env.FFI_ARCHIVE }}" "${{ env.FFI_ARCHIVE }}.sha256"

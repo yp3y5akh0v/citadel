@@ -42,9 +42,32 @@ jobs:
           name: strands-agents-dist
           path: packaging/citadeldb-strands-agents/dist
 
+  core:
+    name: build citadeldb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.10
+            3.11
+            3.12
+            3.13
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          manylinux: auto
+          args: --release --out core-dist --find-interpreter
+          sccache: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-dist
+          path: core-dist
+
   test:
     name: test (py${{ matrix.python }})
-    needs: build
+    needs: [build, core]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -59,10 +82,16 @@ jobs:
         with:
           name: strands-agents-dist
           path: packaging/citadeldb-strands-agents/dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: core-dist
+          path: packaging/citadeldb-strands-agents/core-dist
       - name: Install the wheel and run the suite against it
         run: |
           set -e
-          pip install dist/*.whl pytest
+          pip install pytest numpy
+          pip install --no-index --find-links core-dist citadeldb
+          pip install dist/*.whl
           # Scratch dir so tests import the installed wheel, not ./src.
           mkdir -p /tmp/run && cp -r tests pyproject.toml /tmp/run/
           cd /tmp/run && pytest tests -q

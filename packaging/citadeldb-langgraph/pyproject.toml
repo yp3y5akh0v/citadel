@@ -18,8 +18,8 @@ classifiers = [
   "Topic :: Database",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# A key replaces under its own name, which needs the keyed write added in 1.16.
-dependencies = ["citadeldb>=1.16", "langgraph>=0.2"]
+# A key replaces under its own name, which needs the keyed write added in 2.0.
+dependencies = ["citadeldb>=2.0,<3", "langgraph>=0.2"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
