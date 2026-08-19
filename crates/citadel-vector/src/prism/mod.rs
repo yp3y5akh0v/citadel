@@ -1,8 +1,6 @@
 //! Re-exports the PRISM filtered-ANN core from the `prism-ann` crate.
 
-pub use prism_ann::{
-    binary, construct, distance, filter, graph, io, ivf, partition, point, quantize, search,
-};
+pub use prism_ann::distance;
 
 pub use prism_ann::{PrismError, PrismResult};
 
