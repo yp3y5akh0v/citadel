@@ -119,6 +119,14 @@ impl CipherId {
             _ => None,
         }
     }
+
+    /// The name to show a user, matching how the algorithm is written in its spec.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Aes256Ctr => "AES-256-CTR",
+            Self::ChaCha20 => "ChaCha20",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +161,14 @@ impl KdfAlgorithm {
             0 => Some(Self::Argon2id),
             1 => Some(Self::Pbkdf2HmacSha256),
             _ => None,
+        }
+    }
+
+    /// The name to show a user, matching how the algorithm is written in its spec.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Argon2id => "Argon2id",
+            Self::Pbkdf2HmacSha256 => "PBKDF2-HMAC-SHA256",
         }
     }
 }
