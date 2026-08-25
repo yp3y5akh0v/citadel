@@ -54,6 +54,33 @@ fn kdf_algorithm_roundtrip() {
 }
 
 #[test]
+fn cipher_id_labels_every_variant() {
+    for v in 0..=u8::MAX {
+        let Some(c) = CipherId::from_u8(v) else {
+            continue;
+        };
+        assert!(!c.as_str().is_empty(), "{c:?} has no label");
+    }
+    assert_eq!(CipherId::Aes256Ctr.as_str(), "AES-256-CTR");
+    assert_eq!(CipherId::ChaCha20.as_str(), "ChaCha20");
+}
+
+#[test]
+fn kdf_algorithm_labels_every_variant() {
+    for v in 0..=u8::MAX {
+        let Some(k) = KdfAlgorithm::from_u8(v) else {
+            continue;
+        };
+        assert!(!k.as_str().is_empty(), "{k:?} has no label");
+    }
+    assert_eq!(KdfAlgorithm::Argon2id.as_str(), "Argon2id");
+    assert_eq!(
+        KdfAlgorithm::Pbkdf2HmacSha256.as_str(),
+        "PBKDF2-HMAC-SHA256"
+    );
+}
+
+#[test]
 fn argon2_profiles() {
     assert_eq!(Argon2Profile::Iot.m_cost(), 19 * 1024);
     assert_eq!(Argon2Profile::Desktop.m_cost(), 64 * 1024);
