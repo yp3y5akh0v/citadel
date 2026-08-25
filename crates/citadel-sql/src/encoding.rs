@@ -296,8 +296,10 @@ pub fn decode_key_value(data: &[u8]) -> Result<(Value, usize)> {
                 return Err(SqlError::InvalidValue("truncated vector key".into()));
             }
             let elems: Vec<f32> = inner[2..]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             Ok((Value::Vector(std::sync::Arc::from(elems)), n + 1))
         }

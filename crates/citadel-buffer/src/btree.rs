@@ -1139,11 +1139,9 @@ fn split_branch_with_insert(
             .collect();
         let old_rc = page.right_child();
 
-        let mut result = Vec::with_capacity(n + 1);
-        let final_rc;
-
         if child_idx < n {
             let old_key = cells[child_idx].1.clone();
+            let mut result = Vec::with_capacity(n + 1);
             for (i, (child, key)) in cells.into_iter().enumerate() {
                 if i == child_idx {
                     result.push((new_left, sep_key.to_vec()));
@@ -1152,14 +1150,12 @@ fn split_branch_with_insert(
                     result.push((child, key));
                 }
             }
-            final_rc = old_rc;
+            (result, old_rc)
         } else {
-            result = cells;
+            let mut result = cells;
             result.push((new_left, sep_key.to_vec()));
-            final_rc = new_right;
+            (result, new_right)
         }
-
-        (result, final_rc)
     };
 
     let total = new_cells.len();
