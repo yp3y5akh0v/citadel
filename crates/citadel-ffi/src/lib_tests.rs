@@ -9,10 +9,28 @@ fn temp_path() -> (tempfile::TempDir, CString) {
 }
 
 #[test]
+fn named_table_hash_collision_has_a_dedicated_ffi_code() {
+    let error = citadel_core::Error::NamedTableHashCollision {
+        requested: "collision_table_134778".into(),
+        existing: "collision_table_51661".into(),
+        hash: 0xab88_afb6,
+    };
+    assert_eq!(map_error(&error), CitadelError::NamedTableHashCollision);
+}
+
+#[test]
 fn interrupted_has_a_dedicated_ffi_code() {
     assert_eq!(
         map_error(&citadel_core::Error::Interrupted),
         CitadelError::Interrupted
+    );
+}
+
+#[test]
+fn failed_transaction_has_a_dedicated_ffi_code() {
+    assert_eq!(
+        map_error(&citadel_core::Error::TransactionFailed),
+        CitadelError::TransactionFailed
     );
 }
 

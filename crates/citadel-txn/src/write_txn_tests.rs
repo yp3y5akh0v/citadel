@@ -272,6 +272,35 @@ fn value_above_inline_round_trips_via_overflow() {
 }
 
 #[test]
+fn reclaimed_page_zero_is_not_used_as_an_overflow_chain_page() {
+    let mgr = create_test_manager();
+
+    // The first CoW frees the initial root at page zero. A second commit moves
+    // the other physical slot forward, making page zero reclaimable.
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.insert(b"seed", b"one").unwrap();
+    wtx.commit().unwrap();
+
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.insert(b"seed", b"two").unwrap();
+    wtx.commit().unwrap();
+
+    // Overflow chains encode zero as their terminator. The overflow allocator
+    // must leave reclaimed page zero for the tree CoW instead of using it as
+    // the first chain page.
+    let value = vec![0x5a; citadel_core::MAX_INLINE_VALUE_SIZE + 1];
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.insert(b"overflow", &value).unwrap();
+    wtx.commit().unwrap();
+
+    let mut rtx = mgr.begin_read();
+    assert_eq!(
+        rtx.get(b"overflow").unwrap().as_deref(),
+        Some(value.as_slice())
+    );
+}
+
+#[test]
 fn value_above_absolute_cap_is_rejected() {
     let mgr = create_test_manager();
     let mut wtx = mgr.begin_write().unwrap();
@@ -339,6 +368,130 @@ fn table_already_exists() {
 }
 
 #[test]
+fn create_table_rejects_uncommitted_and_committed_hash_collisions() {
+    const FIRST: &[u8] = b"collision_table_51661";
+    const SECOND: &[u8] = b"collision_table_134778";
+    const HASH: u32 = 0xab88_afb6;
+
+    let mgr = create_test_manager();
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.create_table(FIRST).unwrap();
+    assert!(matches!(
+        wtx.create_table(SECOND),
+        Err(citadel_core::Error::NamedTableHashCollision {
+            requested,
+            existing,
+            hash: HASH,
+        }) if requested == "collision_table_134778" && existing == "collision_table_51661"
+    ));
+    wtx.commit().unwrap();
+
+    let mut wtx = mgr.begin_write().unwrap();
+    assert!(matches!(
+        wtx.create_table(SECOND),
+        Err(citadel_core::Error::NamedTableHashCollision {
+            requested,
+            existing,
+            hash: HASH,
+        }) if requested == "collision_table_134778" && existing == "collision_table_51661"
+    ));
+}
+
+#[test]
+fn rename_rejects_other_collisions_but_excludes_the_old_name() {
+    const FIRST: &[u8] = b"collision_table_51661";
+    const SECOND: &[u8] = b"collision_table_134778";
+
+    let mgr = create_test_manager();
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.create_table(FIRST).unwrap();
+    wtx.create_table(b"rename_source").unwrap();
+    wtx.commit().unwrap();
+
+    let mut wtx = mgr.begin_write().unwrap();
+    assert!(matches!(
+        wtx.rename_table(b"rename_source", SECOND),
+        Err(citadel_core::Error::NamedTableHashCollision {
+            requested,
+            existing,
+            hash: 0xab88_afb6,
+        }) if requested == "collision_table_134778" && existing == "collision_table_51661"
+    ));
+    wtx.abort();
+
+    let mgr = create_test_manager();
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.create_table(FIRST).unwrap();
+    wtx.commit().unwrap();
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.rename_table(FIRST, SECOND).unwrap();
+    wtx.commit().unwrap();
+    assert_eq!(mgr.list_tables().unwrap()[0].0, SECOND);
+}
+
+#[test]
+fn nonexistent_colliding_name_never_aliases_a_slot_entry() {
+    const FIRST: &[u8] = b"collision_table_51661";
+    const MISSING: &[u8] = b"collision_table_134778";
+
+    let mgr = create_test_manager();
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.create_table(FIRST).unwrap();
+    wtx.table_insert(FIRST, b"kept", b"original").unwrap();
+    wtx.commit().unwrap();
+
+    // The slot lookup itself aliases these names by construction. Transaction
+    // APIs must prove the exact catalog name before they trust this result.
+    assert!(mgr.current_slot().named_entry_root(MISSING).is_some());
+
+    let mut rtx = mgr.begin_read();
+    assert!(matches!(
+        rtx.table_get(MISSING, b"kept"),
+        Err(citadel_core::Error::TableNotFound(_))
+    ));
+    drop(rtx);
+
+    let mut wtx = mgr.begin_write().unwrap();
+    assert!(matches!(
+        wtx.table_get(MISSING, b"kept"),
+        Err(citadel_core::Error::TableNotFound(_))
+    ));
+    wtx.abort();
+
+    let mut wtx = mgr.begin_write().unwrap();
+    assert!(matches!(
+        wtx.table_insert(MISSING, b"injected", b"bad"),
+        Err(citadel_core::Error::TableNotFound(_))
+    ));
+    wtx.abort();
+
+    let mut wtx = mgr.begin_write().unwrap();
+    assert!(matches!(
+        wtx.drop_table(MISSING),
+        Err(citadel_core::Error::TableNotFound(_))
+    ));
+    wtx.abort();
+
+    let mut wtx = mgr.begin_write().unwrap();
+    assert!(matches!(
+        wtx.rename_table(MISSING, b"renamed_missing"),
+        Err(citadel_core::Error::TableNotFound(_))
+    ));
+    wtx.abort();
+
+    let mut rtx = mgr.begin_read();
+    assert_eq!(
+        rtx.table_get(FIRST, b"kept").unwrap(),
+        Some(b"original".to_vec())
+    );
+    assert_eq!(rtx.table_get(FIRST, b"injected").unwrap(), None);
+    let tables = mgr.list_tables().unwrap();
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].0, FIRST);
+    assert_eq!(tables[0].1.entry_count, 1);
+}
+
+#[test]
 fn table_for_each_named() {
     let mgr = create_test_manager();
 
@@ -362,10 +515,9 @@ fn table_for_each_named() {
     wtx.commit().unwrap();
 }
 
-use citadel_core::MAX_INLINE_VALUE_SIZE;
-use citadel_core::MAX_KEY_SIZE;
+use citadel_core::{CancelToken, Error, MAX_INLINE_VALUE_SIZE, MAX_KEY_SIZE};
 
-use super::InsertOutcome;
+use super::{cancel_on_nth_tree_free, InsertOutcome};
 
 #[test]
 fn insert_or_fetch_new_key_returns_inserted() {
@@ -665,6 +817,43 @@ fn update_sorted_grows_rows_into_overflow_without_loss() {
 }
 
 #[test]
+fn update_sorted_preloads_every_cold_leaf_path() {
+    let mgr = create_test_manager();
+    {
+        let mut seed = mgr.begin_write().unwrap();
+        seed.create_table(b"t").unwrap();
+        for i in 0..400u32 {
+            let key = format!("k{i:04}");
+            seed.table_insert(b"t", key.as_bytes(), &[b'a'; 120])
+                .unwrap();
+        }
+        seed.commit().unwrap();
+    }
+
+    // A fresh write transaction has no table leaf paths resident. The first
+    // and last keys deliberately select different leaves.
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.ensure_table(b"t").unwrap();
+    assert!(wtx.named_trees[b"t".as_slice()].depth > 1);
+    let pairs: Vec<(&[u8], &[u8])> = vec![
+        (b"k0000".as_slice(), b"first".as_slice()),
+        (b"k0399".as_slice(), b"last".as_slice()),
+    ];
+    assert_eq!(wtx.table_update_sorted(b"t", &pairs).unwrap(), 2);
+    wtx.commit().unwrap();
+
+    let mut rtx = mgr.begin_read();
+    assert_eq!(
+        rtx.table_get(b"t", b"k0000").unwrap(),
+        Some(b"first".to_vec())
+    );
+    assert_eq!(
+        rtx.table_get(b"t", b"k0399").unwrap(),
+        Some(b"last".to_vec())
+    );
+}
+
+#[test]
 fn update_sorted_shrink_frees_replaced_overflow_chain() {
     let mgr = create_test_manager();
     let big = vec![0xAB; MAX_INLINE_VALUE_SIZE * 4 + 17];
@@ -816,6 +1005,66 @@ fn update_range_materializes_overflow_rows_for_callback() {
         expected[0] = b'P';
         assert_eq!(wtx.table_get(b"t", &[i]).unwrap(), Some(expected));
     }
+}
+
+#[test]
+fn callback_failure_after_a_write_makes_commit_refuse_the_prefix() {
+    let mgr = create_test_manager();
+    {
+        let mut seed = mgr.begin_write().unwrap();
+        seed.create_table(b"t").unwrap();
+        seed.table_insert(b"t", b"a", b"old-a").unwrap();
+        seed.table_insert(b"t", b"b", b"old-b").unwrap();
+        seed.commit().unwrap();
+    }
+
+    let mut wtx = mgr.begin_write().unwrap();
+    let mut visited = 0;
+    let error = wtx
+        .table_update_range::<_, Error>(b"t", b"a", |_, value| {
+            visited += 1;
+            if visited == 2 {
+                return Err(Error::Sync("injected callback failure".into()));
+            }
+            value[0] = b'X';
+            Ok(Some(true))
+        })
+        .unwrap_err();
+    assert!(matches!(error, Error::Sync(_)));
+    assert!(matches!(wtx.check_usable(), Err(Error::TransactionFailed)));
+    assert!(matches!(wtx.commit(), Err(Error::TransactionFailed)));
+
+    let mut rtx = mgr.begin_read();
+    assert_eq!(rtx.table_get(b"t", b"a").unwrap(), Some(b"old-a".to_vec()));
+    assert_eq!(rtx.table_get(b"t", b"b").unwrap(), Some(b"old-b".to_vec()));
+}
+
+#[test]
+fn cancellation_during_tree_free_makes_truncate_uncommittable() {
+    let mgr = create_test_manager();
+    {
+        let mut seed = mgr.begin_write().unwrap();
+        seed.create_table(b"t").unwrap();
+        for i in 0..200u32 {
+            seed.table_insert(b"t", format!("k{i:04}").as_bytes(), &[b'v'; 120])
+                .unwrap();
+        }
+        seed.commit().unwrap();
+    }
+
+    let mut wtx = mgr.begin_write().unwrap();
+    let token = CancelToken::new();
+    wtx.set_cancel(Some(token));
+    let error = {
+        let _cancel = cancel_on_nth_tree_free(2);
+        wtx.table_truncate(b"t").unwrap_err()
+    };
+    assert!(matches!(error, Error::Interrupted));
+    assert!(wtx.is_poisoned());
+    assert!(matches!(wtx.commit(), Err(Error::Interrupted)));
+
+    let mut rtx = mgr.begin_read();
+    assert_eq!(rtx.table_entry_count(b"t").unwrap(), 200);
 }
 
 #[test]

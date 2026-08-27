@@ -9,3 +9,7 @@ pub mod scan_iter;
 pub mod write_txn;
 
 pub use scan_iter::{TableIter, TxnScanAdapter};
+
+#[cfg(test)]
+#[path = "cancel_scan_tests.rs"]
+mod cancel_scan_tests;

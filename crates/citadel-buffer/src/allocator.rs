@@ -38,6 +38,33 @@ impl PageAllocator {
         id
     }
 
+    /// Allocate a page whose id is not zero.
+    ///
+    /// Overflow chains use page zero as their on-disk terminator, but page zero
+    /// is also a real page that can re-enter the reclaim pool, so overflow
+    /// writers take it from here and leave it for types that can represent it.
+    pub fn allocate_nonzero(&mut self) -> PageId {
+        if self.next_page_id == 0 {
+            self.ready_to_use.push(PageId(0));
+            self.next_page_id = 1;
+        }
+
+        let id = match self
+            .ready_to_use
+            .iter()
+            .rposition(|page_id| page_id.as_u32() != 0)
+        {
+            Some(index) => self.ready_to_use.swap_remove(index),
+            None => {
+                let id = PageId(self.next_page_id);
+                self.next_page_id += 1;
+                id
+            }
+        };
+        self.allocated_this_txn.push(id);
+        id
+    }
+
     /// Not immediately reusable - goes into pending-free list.
     pub fn free(&mut self, page_id: PageId) {
         self.freed_this_txn.push(page_id);

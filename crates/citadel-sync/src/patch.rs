@@ -3,7 +3,9 @@ use crate::diff::DiffResult;
 use crate::node_id::NodeId;
 
 const PATCH_MAGIC: u32 = 0x53594E43; // "SYNC"
-const PATCH_VERSION: u8 = 1;
+                                     // Version 2 entries always carry logical values; version 1 could carry a
+                                     // database-local OverflowRef in place of an overflow value.
+const PATCH_VERSION: u8 = 2;
 
 const FLAG_HAS_CRDT: u8 = 0x01;
 

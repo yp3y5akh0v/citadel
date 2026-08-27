@@ -582,6 +582,63 @@ fn update_sorted_reports_replaced_overflow_head() {
 }
 
 #[test]
+fn update_sorted_check_stops_before_the_next_pair() {
+    let (mut pages, mut alloc, mut tree) = new_tree();
+    for key in [b"k1", b"k2", b"k3"] {
+        tree.insert(
+            &mut pages,
+            &mut alloc,
+            TxnId(1),
+            key,
+            ValueType::Inline,
+            b"old",
+        )
+        .unwrap();
+    }
+
+    let mut checks = 0;
+    let mut replaced = Vec::new();
+    let mut skipped = Vec::new();
+    let err = tree
+        .update_sorted_with(
+            &mut pages,
+            &mut alloc,
+            TxnId(2),
+            &[
+                (b"k1".as_slice(), ValueType::Inline, b"new".as_slice()),
+                (b"k2".as_slice(), ValueType::Inline, b"new".as_slice()),
+                (b"k3".as_slice(), ValueType::Inline, b"new".as_slice()),
+            ],
+            &mut replaced,
+            &mut skipped,
+            || {
+                checks += 1;
+                if checks == 3 {
+                    Err(Error::Interrupted)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(err, Error::Interrupted));
+    assert_eq!(checks, 3);
+    assert_eq!(
+        tree.search(&pages, b"k1").unwrap(),
+        Some((ValueType::Inline, b"new".to_vec()))
+    );
+    assert_eq!(
+        tree.search(&pages, b"k2").unwrap(),
+        Some((ValueType::Inline, b"new".to_vec()))
+    );
+    assert_eq!(
+        tree.search(&pages, b"k3").unwrap(),
+        Some((ValueType::Inline, b"old".to_vec()))
+    );
+}
+
+#[test]
 fn deep_tree_ascending_delete_with_wide_keys() {
     let (mut pages, mut alloc, mut tree) = new_tree();
     // 2000-byte keys: leaf fanout ~4, branch fanout ~5, so 40 keys give a

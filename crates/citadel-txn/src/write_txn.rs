@@ -1,7 +1,9 @@
 //! Write transaction: CoW mutations with shadow-paging commit.
 
 use citadel_core::types::{PageId, PageType, TxnId, ValueType};
-use citadel_core::{Error, Result, MAX_INLINE_VALUE_SIZE, MAX_KEY_SIZE, MAX_VALUE_SIZE};
+use citadel_core::{
+    CancelToken, Error, Result, MAX_INLINE_VALUE_SIZE, MAX_KEY_SIZE, MAX_VALUE_SIZE,
+};
 use citadel_io::file_manager::CommitSlot;
 use citadel_page::branch_node;
 use citadel_page::leaf_node::OverflowRef;
@@ -9,6 +11,7 @@ use citadel_page::overflow;
 use citadel_page::page::Page;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use citadel_buffer::allocator::{AllocCheckpoint, PageAllocator};
@@ -17,17 +20,86 @@ use citadel_buffer::cursor::{Cursor, PageLoader, PageMap};
 
 use crate::catalog::TableDescriptor;
 use crate::manager::TxnManager;
+use crate::merkle;
 use crate::overflow_io;
+use crate::read_txn::ScanCount;
 
 thread_local! {
     static PATH_BUF: std::cell::RefCell<Vec<(PageId, usize)>> =
         std::cell::RefCell::new(Vec::with_capacity(8));
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Deterministic cancellation injection for loops that expose no callback
+    /// or I/O hook (notably catalog reconstruction and commit finalization).
+    static CANCEL_ON_NTH_WRITE_CHECK: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static CANCEL_ON_NTH_TREE_FREE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct CancelOnNthWriteCheckGuard {
+    previous: Option<usize>,
+}
+
+#[cfg(test)]
+impl Drop for CancelOnNthWriteCheckGuard {
+    fn drop(&mut self) {
+        CANCEL_ON_NTH_WRITE_CHECK.with(|remaining| remaining.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cancel_on_nth_write_check(nth: usize) -> CancelOnNthWriteCheckGuard {
+    assert!(nth > 0);
+    let previous = CANCEL_ON_NTH_WRITE_CHECK.with(|remaining| remaining.replace(Some(nth)));
+    CancelOnNthWriteCheckGuard { previous }
+}
+
+#[cfg(test)]
+pub(crate) struct CancelOnNthTreeFreeGuard {
+    previous: Option<usize>,
+}
+
+#[cfg(test)]
+impl Drop for CancelOnNthTreeFreeGuard {
+    fn drop(&mut self) {
+        CANCEL_ON_NTH_TREE_FREE.with(|remaining| remaining.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cancel_on_nth_tree_free(nth: usize) -> CancelOnNthTreeFreeGuard {
+    assert!(nth > 0);
+    let previous = CANCEL_ON_NTH_TREE_FREE.with(|remaining| remaining.replace(Some(nth)));
+    CancelOnNthTreeFreeGuard { previous }
+}
+
 #[derive(Debug, Clone)]
 pub enum InsertOutcome {
     Inserted,
     Existed(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteFailure {
+    Cancelled,
+    Failed,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct MutationMarker(u64);
+
+impl WriteFailure {
+    fn error(self) -> Error {
+        match self {
+            Self::Cancelled => Error::Interrupted,
+            Self::Failed => Error::TransactionFailed,
+        }
+    }
 }
 
 struct WritePages<'a> {
@@ -76,6 +148,17 @@ pub struct WriteTxn<'a> {
     /// Set by refresh_all_catalog_descriptors: commit even when nothing
     /// changed, so the inactive slot is rewritten (and resealed V1).
     force_commit: bool,
+    /// UPDATE and DELETE scan through here, so a cancellation covering only the
+    /// read path would stop the quickest queries and leave the long ones running.
+    cancel: Option<CancelToken>,
+    /// A failed mutation can leave a prefix in the CoW page set or allocator.
+    /// Keep cancellation distinct from other failures so commit reports the
+    /// cause accurately while refusing both states.
+    failure: Option<WriteFailure>,
+    /// Advances after each successful low-level mutation. Statement executors
+    /// use it to distinguish an error before any write from an error after a
+    /// partially applied batch.
+    mutation_sequence: u64,
 }
 
 #[derive(Clone)]
@@ -87,6 +170,8 @@ pub struct WriteTxnSnapshot {
     catalog_dirty: bool,
     loaded_tree_meta: FxHashMap<Vec<u8>, (PageId, u16)>,
     deferred_fk_checks_len: usize,
+    failure: Option<WriteFailure>,
+    mutation_sequence: u64,
 }
 
 impl<'db> WriteTxn<'db> {
@@ -123,7 +208,195 @@ impl<'db> WriteTxn<'db> {
             deferred_fk_checks: Vec::new(),
             fk_check_cache: FxHashMap::default(),
             force_commit: false,
+            cancel: None,
+            failure: None,
+            mutation_sequence: 0,
         }
+    }
+
+    pub fn set_cancel(&mut self, token: Option<CancelToken>) {
+        self.cancel = token;
+    }
+
+    /// Record that cancellation may have left a partially applied operation.
+    #[doc(hidden)]
+    pub fn mark_cancelled(&mut self) {
+        if self.failure.is_none() {
+            self.failure = Some(WriteFailure::Cancelled);
+        }
+    }
+
+    /// Refuse commit after a higher layer reports a non-cancellation failure
+    /// that may have followed one or more successful low-level mutations.
+    #[doc(hidden)]
+    pub fn mark_failed(&mut self) {
+        Self::mark_failed_with(&mut self.failure);
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.failure.is_some()
+    }
+
+    /// Verify that an earlier mutation has not made this transaction unusable.
+    /// Unlike `is_poisoned`, this preserves whether that operation was
+    /// cancelled or failed for another reason.
+    pub fn check_usable(&self) -> Result<()> {
+        match self.failure {
+            Some(failure) => Err(failure.error()),
+            None => Ok(()),
+        }
+    }
+
+    /// Opaque checkpoint used by statement executors to detect partial writes.
+    #[doc(hidden)]
+    pub fn mutation_marker(&self) -> MutationMarker {
+        MutationMarker(self.mutation_sequence)
+    }
+
+    #[doc(hidden)]
+    pub fn mutated_since(&self, marker: MutationMarker) -> bool {
+        self.mutation_sequence != marker.0
+    }
+
+    pub fn cancel_token(&self) -> Option<&CancelToken> {
+        self.cancel.as_ref()
+    }
+
+    /// Refuse a mutation once the token is tripped.
+    ///
+    /// Checking at the mutation covers every apply loop across the executor,
+    /// including ones added later, for one relaxed load per row applied.
+    ///
+    /// It does NOT poison: this transaction cannot see statement
+    /// boundaries, so it cannot tell a refusal that changed nothing from one
+    /// that stopped part-way. The statement layer knows, and poisons there.
+    #[inline]
+    fn check_cancel(&self) -> Result<()> {
+        self.check_usable()?;
+        match &self.cancel {
+            Some(t) => {
+                #[cfg(test)]
+                CANCEL_ON_NTH_WRITE_CHECK.with(|remaining| {
+                    if let Some(checks) = remaining.get() {
+                        if checks == 1 {
+                            remaining.set(None);
+                            t.cancel();
+                        } else {
+                            remaining.set(Some(checks - 1));
+                        }
+                    }
+                });
+                t.check()
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Check at the far side of a mutation. Once work may have been applied,
+    /// observing cancellation must also make the transaction uncommittable.
+    #[inline]
+    fn finish_mutation<T>(&mut self, value: T, changed: bool) -> Result<T> {
+        let Self {
+            cancel,
+            failure,
+            mutation_sequence,
+            ..
+        } = self;
+        Self::finish_mutation_with(cancel.as_ref(), failure, mutation_sequence, value, changed)
+    }
+
+    #[inline]
+    fn finish_mutation_with<T>(
+        cancel: Option<&CancelToken>,
+        failure: &mut Option<WriteFailure>,
+        mutation_sequence: &mut u64,
+        value: T,
+        changed: bool,
+    ) -> Result<T> {
+        if changed {
+            *mutation_sequence = mutation_sequence.wrapping_add(1);
+        }
+        match cancel {
+            Some(token) => match token.check() {
+                Ok(()) => Ok(value),
+                Err(err) => {
+                    Self::record_failure(failure, &err);
+                    Err(err)
+                }
+            },
+            None => Ok(value),
+        }
+    }
+
+    #[inline]
+    fn record_failure(failure: &mut Option<WriteFailure>, err: &Error) {
+        if failure.is_none() {
+            *failure = Some(if matches!(err, Error::Interrupted) {
+                WriteFailure::Cancelled
+            } else {
+                WriteFailure::Failed
+            });
+        }
+    }
+
+    #[inline]
+    fn fail<T>(&mut self, err: Error) -> Result<T> {
+        Self::record_failure(&mut self.failure, &err);
+        Err(err)
+    }
+
+    #[inline]
+    fn fail_with<T>(failure: &mut Option<WriteFailure>, err: Error) -> Result<T> {
+        Self::record_failure(failure, &err);
+        Err(err)
+    }
+
+    #[inline]
+    fn mark_failed_with(failure: &mut Option<WriteFailure>) {
+        if failure.is_none() {
+            *failure = Some(WriteFailure::Failed);
+        }
+    }
+
+    /// Freeing an overflow chain mutates the allocator a page at a time. Any
+    /// error can therefore leave a prefix in the pending-free set; make that
+    /// transaction uncommittable before propagating the error.
+    fn free_overflow_chain(&mut self, first: PageId) -> Result<()> {
+        let Self {
+            pages,
+            alloc,
+            manager,
+            cancel,
+            failure,
+            ..
+        } = self;
+        let mut view = WritePages { pages, manager };
+        Self::free_overflow_chain_with_parts(&mut view, alloc, first, cancel.as_ref(), failure)
+    }
+
+    fn free_overflow_chain_with_parts(
+        loader: &mut dyn PageLoader,
+        alloc: &mut PageAllocator,
+        first: PageId,
+        cancel: Option<&CancelToken>,
+        failure: &mut Option<WriteFailure>,
+    ) -> Result<()> {
+        let result = overflow_io::free_chain_with_cancel(loader, alloc, first, cancel);
+        if let Err(err) = &result {
+            Self::record_failure(failure, err);
+        }
+        result
+    }
+
+    /// Database-wide scan telemetry across all transactions and threads.
+    /// Monotonic; use [`WriteTxn::measure_scans`] for an isolated operation.
+    pub fn rows_scanned(&self) -> u64 {
+        self.manager.rows_scanned()
+    }
+
+    /// Begin an operation-local scan measurement on this transaction's thread.
+    pub fn measure_scans(&self) -> crate::manager::ScanMeasurement {
+        self.manager.measure_scans()
     }
 
     #[inline]
@@ -170,7 +443,10 @@ impl<'db> WriteTxn<'db> {
     /// The table's catalog root in its committed view (a lookup, no scan); a
     /// version stamp.
     pub fn table_root_page(&self, table: &[u8]) -> Result<Option<PageId>> {
-        self.manager.table_root(table)
+        self.check_cancel()?;
+        let root = self.manager.table_root(table)?;
+        self.check_cancel()?;
+        Ok(root)
     }
 
     pub fn pending_free_count(&self) -> usize {
@@ -178,9 +454,10 @@ impl<'db> WriteTxn<'db> {
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.check_cancel()?;
         self.preload_path(self.tree.root, key)?;
         let tree = self.tree.clone();
-        match tree.search(&self.pages, key)? {
+        let value = match tree.search(&self.pages, key)? {
             Some((ValueType::Tombstone, _)) => Ok(None),
             Some((ValueType::Overflow, payload)) => {
                 let oref = OverflowRef::from_bytes(&payload);
@@ -188,13 +465,22 @@ impl<'db> WriteTxn<'db> {
             }
             Some((_, value)) => Ok(Some(value)),
             None => Ok(None),
-        }
+        }?;
+        self.check_cancel()?;
+        Ok(value)
     }
 
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<bool> {
+        self.check_cancel()?;
         Self::validate_key_value(key, value)?;
-        let (val_type, val_payload) = self.stage_value(value);
-        Self::insert_into_tree(
+        let root = self.tree.root;
+        let lil_hit =
+            value.len() <= MAX_INLINE_VALUE_SIZE && self.tree.lil_would_hit(&self.pages, key);
+        if !lil_hit {
+            self.preload_path(root, key)?;
+        }
+        let (val_type, val_payload) = self.stage_value(value)?;
+        let inserted = Self::insert_into_tree(
             &mut self.tree,
             &mut self.pages,
             &mut self.alloc,
@@ -203,7 +489,15 @@ impl<'db> WriteTxn<'db> {
             key,
             val_type,
             val_payload.as_ref(),
-        )
+        );
+        let (inserted, replaced) = match inserted {
+            Ok(result) => result,
+            Err(err) => return self.fail(err),
+        };
+        if let Some(head) = replaced {
+            self.free_overflow_chain(head)?;
+        }
+        self.finish_mutation(inserted, true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -216,12 +510,12 @@ impl<'db> WriteTxn<'db> {
         key: &[u8],
         val_type: ValueType,
         val_bytes: &[u8],
-    ) -> Result<bool> {
+    ) -> Result<(bool, Option<PageId>)> {
         if val_type == ValueType::Inline {
             if let Some(was_new) =
                 tree.try_lil_insert(pages, alloc, txn_id, key, val_type, val_bytes)?
             {
-                return Ok(was_new);
+                return Ok((was_new, None));
             }
         }
 
@@ -230,28 +524,25 @@ impl<'db> WriteTxn<'db> {
         let (was_new, replaced) = tree.insert_at_leaf(
             pages, alloc, txn_id, key, val_type, val_bytes, path, leaf_id,
         )?;
-        if let Some(head) = replaced {
-            let mut view = WritePages { pages, manager };
-            overflow_io::free_chain(&mut view, alloc, head)?;
-        }
-        Ok(was_new)
+        Ok((was_new, replaced))
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
+        self.check_cancel()?;
         let root = self.tree.root;
         let overflow_head = self.peek_overflow_head(root, key)?;
         self.preload_path(root, key)?;
         let deleted = self
             .tree
-            .delete(&mut self.pages, &mut self.alloc, self.txn_id, key)?;
+            .delete(&mut self.pages, &mut self.alloc, self.txn_id, key);
+        let deleted = match deleted {
+            Ok(deleted) => deleted,
+            Err(err) => return self.fail(err),
+        };
         if let Some(head) = overflow_head {
-            let mut view = WritePages {
-                pages: &mut self.pages,
-                manager: self.manager,
-            };
-            overflow_io::free_chain(&mut view, &mut self.alloc, head)?;
+            self.free_overflow_chain(head)?;
         }
-        Ok(deleted)
+        self.finish_mutation(deleted, deleted)
     }
 
     fn peek_overflow_head(&mut self, root: PageId, key: &[u8]) -> Result<Option<PageId>> {
@@ -268,10 +559,16 @@ impl<'db> WriteTxn<'db> {
     where
         F: FnMut(&[u8], &[u8]) -> Result<()>,
     {
+        self.check_cancel()?;
         let root = self.tree.root;
         self.preload_all_pages(root)?;
+        let mut count = ScanCount::new(self.manager);
         let mut cursor = Cursor::first(&self.pages, root)?;
         while cursor.is_valid() {
+            if let Some(t) = self.cancel.as_ref() {
+                t.check()?;
+            }
+            count.rows += 1;
             let overflow = cursor
                 .current_ref(&self.pages)
                 .and_then(|c| match c.val_type {
@@ -292,27 +589,39 @@ impl<'db> WriteTxn<'db> {
     }
 
     fn materialize_overflow(&mut self, oref: &OverflowRef) -> Result<Vec<u8>> {
-        let mut view = WritePages {
-            pages: &mut self.pages,
-            manager: self.manager,
-        };
-        overflow_io::read_chain_value(&mut view, oref)
+        let Self {
+            pages,
+            manager,
+            cancel,
+            ..
+        } = self;
+        let mut view = WritePages { pages, manager };
+        overflow_io::read_chain_value_with_cancel(&mut view, oref, cancel.as_ref())
     }
 
     pub fn table_entry_count(&mut self, table: &[u8]) -> Result<u64> {
+        self.check_cancel()?;
         self.ensure_table(table)?;
-        Ok(self.named_trees[table].entry_count)
+        let count = self.named_trees[table].entry_count;
+        self.check_cancel()?;
+        Ok(count)
     }
 
     pub fn table_for_each<F>(&mut self, table: &[u8], mut f: F) -> Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> Result<()>,
     {
+        self.check_cancel()?;
         self.ensure_table(table)?;
         let root = self.named_trees[table].root;
         self.preload_all_pages(root)?;
+        let mut count = ScanCount::new(self.manager);
         let mut cursor = Cursor::first(&self.pages, root)?;
         while cursor.is_valid() {
+            if let Some(t) = self.cancel.as_ref() {
+                t.check()?;
+            }
+            count.rows += 1;
             let overflow = cursor
                 .current_ref(&self.pages)
                 .and_then(|c| match c.val_type {
@@ -336,14 +645,21 @@ impl<'db> WriteTxn<'db> {
     where
         F: FnMut(&[u8], &[u8]) -> Result<bool>,
     {
+        self.check_cancel()?;
         self.ensure_table(table)?;
         let root = self.named_trees[table].root;
+        let cancel = self.cancel.clone();
+        let mut count = ScanCount::new(self.manager);
         let mut view = WritePages {
             pages: &mut self.pages,
             manager: self.manager,
         };
         let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
         while let Some(cell) = cursor.current_ref_lazy(&mut view) {
+            if let Some(t) = cancel.as_ref() {
+                t.check()?;
+            }
+            count.rows += 1;
             match cell.val_type {
                 ValueType::Tombstone => {}
                 ValueType::Inline => {
@@ -357,7 +673,11 @@ impl<'db> WriteTxn<'db> {
                         let c = cursor.current_ref_lazy(&mut view).unwrap();
                         (c.key.to_vec(), OverflowRef::from_bytes(c.value))
                     };
-                    let materialized = overflow_io::read_chain_value(&mut view, &oref)?;
+                    let materialized = overflow_io::read_chain_value_with_cancel(
+                        &mut view,
+                        &oref,
+                        cancel.as_ref(),
+                    )?;
                     if !f(&key, &materialized)? {
                         break;
                     }
@@ -374,6 +694,7 @@ impl<'db> WriteTxn<'db> {
         table: &[u8],
         start_key: &[u8],
     ) -> Result<crate::scan_iter::TableIter<WriteTxnScanAdapter<'a, 'db>>> {
+        self.check_cancel()?;
         self.ensure_table(table)?;
         let root = self.named_trees[table].root;
         let cursor = {
@@ -383,11 +704,25 @@ impl<'db> WriteTxn<'db> {
             };
             Cursor::seek_lazy(&mut view, root, start_key)?
         };
-        let adapter = WriteTxnScanAdapter { txn: self };
+        let measurements = self.manager.active_scan_measurements();
+        let adapter = WriteTxnScanAdapter {
+            txn: self,
+            measurements,
+        };
         Ok(crate::scan_iter::TableIter::new(adapter, cursor))
     }
 
     pub fn create_table(&mut self, name: &[u8]) -> Result<()> {
+        self.create_table_impl(name, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_table_without_hash_guard_for_test(&mut self, name: &[u8]) -> Result<()> {
+        self.create_table_impl(name, false)
+    }
+
+    fn create_table_impl(&mut self, name: &[u8], reject_hash_collision: bool) -> Result<()> {
+        self.check_cancel()?;
         self.fk_check_cache.clear();
         self.ensure_catalog()?;
 
@@ -406,6 +741,9 @@ impl<'db> WriteTxn<'db> {
                 ));
             }
         }
+        if reject_hash_collision {
+            self.reject_table_name_hash_collision(name, None)?;
+        }
 
         let page_id = self.alloc.allocate();
         let mut leaf = Page::new(page_id, PageType::Leaf, self.txn_id);
@@ -415,7 +753,7 @@ impl<'db> WriteTxn<'db> {
         let new_tree = BTree::from_existing(page_id, 1, 0);
         self.named_trees.insert(name.to_vec(), new_tree);
         self.catalog_dirty = true;
-        Ok(())
+        self.finish_mutation((), true)
     }
 
     /// Format-upgrade primitive: rewrite every listed table's catalog
@@ -424,38 +762,51 @@ impl<'db> WriteTxn<'db> {
     /// rename trick); force_commit lets an unchanged pass still rewrite the
     /// other physical slot.
     pub fn refresh_all_catalog_descriptors(&mut self, names: &[Vec<u8>]) -> Result<()> {
+        self.check_cancel()?;
+        // Resolve every name before changing descriptor state. A missing or
+        // unreadable later table then leaves the transaction unchanged.
         for name in names {
             self.ensure_table(name)?;
+        }
+        for name in names {
             self.loaded_tree_meta.remove(name.as_slice());
             self.catalog_dirty = true;
+            self.finish_mutation((), true)?;
         }
         self.force_commit = true;
-        Ok(())
+        self.finish_mutation((), true)
     }
 
     pub fn drop_table(&mut self, name: &[u8]) -> Result<()> {
+        self.check_cancel()?;
         // Cache keys are parent-table names: only the dropped table's entry
         // can go stale.
         self.invalidate_fk_cache_for(name);
         self.ensure_table(name)?;
         self.ensure_catalog()?;
 
-        let tree = self.named_trees.remove(name).unwrap();
-        self.free_tree_pages(tree.root)?;
-
+        let tree = self.named_trees[name].clone();
         let catalog_root = self.catalog.as_ref().unwrap().root;
         self.preload_path(catalog_root, name)?;
-        self.catalog.as_mut().unwrap().delete(
+
+        self.free_tree_pages(tree.root)?;
+        self.named_trees.remove(name);
+
+        let deleted = self.catalog.as_mut().unwrap().delete(
             &mut self.pages,
             &mut self.alloc,
             self.txn_id,
             name,
-        )?;
+        );
+        if let Err(err) = deleted {
+            return self.fail(err);
+        }
         self.catalog_dirty = true;
-        Ok(())
+        self.finish_mutation((), true)
     }
 
     pub fn rename_table(&mut self, old_name: &[u8], new_name: &[u8]) -> Result<()> {
+        self.check_cancel()?;
         self.fk_check_cache.clear();
         self.ensure_table(old_name)?;
 
@@ -480,6 +831,12 @@ impl<'db> WriteTxn<'db> {
                 ));
             }
         }
+        self.reject_table_name_hash_collision(new_name, Some(old_name))?;
+
+        // Both catalog paths are now resident, so no cold read can fail after
+        // the in-memory name map has moved.
+        let catalog_root = self.catalog.as_ref().unwrap().root;
+        self.preload_path(catalog_root, old_name)?;
 
         let tree = self.named_trees.remove(old_name).unwrap();
         self.named_trees.insert(new_name.to_vec(), tree);
@@ -490,16 +847,17 @@ impl<'db> WriteTxn<'db> {
         // as an alias. finalize_catalog still writes the new name (it iterates
         // named_trees).
 
-        let catalog_root = self.catalog.as_ref().unwrap().root;
-        self.preload_path(catalog_root, old_name)?;
-        self.catalog.as_mut().unwrap().delete(
+        let deleted = self.catalog.as_mut().unwrap().delete(
             &mut self.pages,
             &mut self.alloc,
             self.txn_id,
             old_name,
-        )?;
+        );
+        if let Err(err) = deleted {
+            return self.fail(err);
+        }
         self.catalog_dirty = true;
-        Ok(())
+        self.finish_mutation((), true)
     }
 
     pub fn table_insert(&mut self, table: &[u8], key: &[u8], value: &[u8]) -> Result<bool> {
@@ -520,20 +878,28 @@ impl<'db> WriteTxn<'db> {
         value: &[u8],
         invalidate_fk: bool,
     ) -> Result<bool> {
+        self.check_cancel()?;
         Self::validate_key_value(key, value)?;
         if invalidate_fk {
             self.invalidate_fk_cache_for(table);
         }
         self.ensure_table(table)?;
-        self.stage_and_insert(table, key, value)
+        let inserted = self.stage_and_insert(table, key, value)?;
+        self.finish_mutation(inserted, true)
     }
 
     /// Stage `value` and insert through the split-safe tree path, freeing any
     /// replaced overflow chain. Table must already be ensured.
     fn stage_and_insert(&mut self, table: &[u8], key: &[u8], value: &[u8]) -> Result<bool> {
-        let (val_type, val_payload) = self.stage_value(value);
+        let root = self.named_trees[table].root;
+        let lil_hit = value.len() <= MAX_INLINE_VALUE_SIZE
+            && self.named_trees[table].lil_would_hit(&self.pages, key);
+        if !lil_hit {
+            self.preload_path(root, key)?;
+        }
+        let (val_type, val_payload) = self.stage_value(value)?;
         let tree = self.named_trees.get_mut(table).unwrap();
-        Self::insert_into_tree(
+        let inserted = Self::insert_into_tree(
             tree,
             &mut self.pages,
             &mut self.alloc,
@@ -542,7 +908,15 @@ impl<'db> WriteTxn<'db> {
             key,
             val_type,
             val_payload.as_ref(),
-        )
+        );
+        let (inserted, replaced) = match inserted {
+            Ok(result) => result,
+            Err(err) => return self.fail(err),
+        };
+        if let Some(head) = replaced {
+            self.free_overflow_chain(head)?;
+        }
+        Ok(inserted)
     }
 
     #[inline]
@@ -552,20 +926,31 @@ impl<'db> WriteTxn<'db> {
         key: &[u8],
         value: &[u8],
     ) -> Result<bool> {
+        self.check_cancel()?;
         Self::validate_key_value(key, value)?;
         self.invalidate_fk_cache_for(table);
-        let (val_type, val_payload) = self.stage_value(value);
+        // Resolve the table before staging an oversized value. Catalog lookup
+        // can fail or be cancelled; staging first would leave allocated
+        // overflow pages in an otherwise committable transaction.
+        self.ensure_table(table)?;
+        let root = self.named_trees[table].root;
+        let lil_hit = value.len() <= MAX_INLINE_VALUE_SIZE
+            && self.named_trees[table].lil_would_hit(&self.pages, key);
+        if !lil_hit {
+            self.preload_path(root, key)?;
+        }
+        let (val_type, val_payload) = self.stage_value(value)?;
         let val_bytes = val_payload.as_ref();
-        let inserted = self.insert_if_absent_staged(table, key, val_type, val_bytes)?;
+        let inserted = self.insert_if_absent_staged(table, key, val_type, val_bytes);
+        let inserted = match inserted {
+            Ok(inserted) => inserted,
+            Err(err) => return self.fail(err),
+        };
         if !inserted && val_type == ValueType::Overflow {
             let oref = OverflowRef::from_bytes(val_bytes);
-            let mut view = WritePages {
-                pages: &mut self.pages,
-                manager: self.manager,
-            };
-            overflow_io::free_chain(&mut view, &mut self.alloc, oref.first_page)?;
+            self.free_overflow_chain(oref.first_page)?;
         }
-        Ok(inserted)
+        self.finish_mutation(inserted, inserted)
     }
 
     fn insert_if_absent_staged(
@@ -614,6 +999,7 @@ impl<'db> WriteTxn<'db> {
         F: FnMut(&[u8]) -> std::result::Result<UpsertAction, E>,
         E: From<Error>,
     {
+        self.check_cancel()?;
         Self::validate_key_value(key, default_value)?;
         self.invalidate_fk_cache_for(table);
         self.ensure_table(table)?;
@@ -630,7 +1016,7 @@ impl<'db> WriteTxn<'db> {
             None => None,
         };
 
-        match existing {
+        let outcome = match existing {
             Some(old) => match f(&old)? {
                 UpsertAction::Skip => Ok(UpsertOutcome::Skipped),
                 UpsertAction::Replace(new_bytes) => {
@@ -643,7 +1029,9 @@ impl<'db> WriteTxn<'db> {
                 self.stage_and_insert(table, key, default_value)?;
                 Ok(UpsertOutcome::Inserted)
             }
-        }
+        }?;
+        let changed = !matches!(outcome, UpsertOutcome::Skipped);
+        self.finish_mutation(outcome, changed).map_err(E::from)
     }
 
     pub fn table_insert_or_fetch(
@@ -652,12 +1040,21 @@ impl<'db> WriteTxn<'db> {
         key: &[u8],
         value: &[u8],
     ) -> Result<InsertOutcome> {
+        self.check_cancel()?;
         Self::validate_key_value(key, value)?;
         self.invalidate_fk_cache_for(table);
         if !self.named_trees.contains_key(table) {
             self.ensure_table(table)?;
         }
-        let (val_type, val_payload) = self.stage_value(value);
+        // Load every fallible tree path before staging an overflow chain. A
+        // failed cold-page walk must not leave allocated pages behind.
+        let root = self.named_trees[table].root;
+        let lil_hit = value.len() <= MAX_INLINE_VALUE_SIZE
+            && self.named_trees[table].lil_would_hit(&self.pages, key);
+        if !lil_hit {
+            self.preload_path(root, key)?;
+        }
+        let (val_type, val_payload) = self.stage_value(value)?;
         let val_bytes = val_payload.as_ref();
 
         let Self {
@@ -666,50 +1063,130 @@ impl<'db> WriteTxn<'db> {
             alloc,
             manager,
             txn_id,
+            cancel,
+            failure,
+            mutation_sequence,
             ..
         } = self;
         let tree = named_trees.get_mut(table).unwrap();
-        let root = tree.root;
         let manager = *manager;
         let txn_id = *txn_id;
 
-        let lil_hit = val_type == ValueType::Inline && tree.lil_would_hit(pages, key);
-        if !lil_hit {
-            Self::preload_path_raw(pages, manager, root, key)?;
-        }
-        let outcome = tree.insert_or_fetch(pages, alloc, txn_id, key, val_type, val_bytes)?;
+        let outcome = tree.insert_or_fetch(pages, alloc, txn_id, key, val_type, val_bytes);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => return Self::fail_with(failure, err),
+        };
         if outcome.is_some() && val_type == ValueType::Overflow {
             // Key already existed: drop the chain staged for the new value.
             let oref = OverflowRef::from_bytes(val_bytes);
             let mut view = WritePages { pages, manager };
-            overflow_io::free_chain(&mut view, alloc, oref.first_page)?;
+            Self::free_overflow_chain_with_parts(
+                &mut view,
+                alloc,
+                oref.first_page,
+                cancel.as_ref(),
+                failure,
+            )?;
         }
-        match outcome {
+        let result: Result<InsertOutcome> = match outcome {
             None => Ok(InsertOutcome::Inserted),
             Some((ValueType::Overflow, payload)) => {
                 let oref = OverflowRef::from_bytes(&payload);
                 let mut view = WritePages { pages, manager };
-                let value = overflow_io::read_chain_value(&mut view, &oref)?;
-                Ok(InsertOutcome::Existed(value))
+                overflow_io::read_chain_value_with_cancel(&mut view, &oref, cancel.as_ref())
+                    .map(InsertOutcome::Existed)
             }
             Some((_, value)) => Ok(InsertOutcome::Existed(value)),
+        };
+        match result {
+            Ok(result) => {
+                let changed = matches!(result, InsertOutcome::Inserted);
+                Self::finish_mutation_with(
+                    cancel.as_ref(),
+                    failure,
+                    mutation_sequence,
+                    result,
+                    changed,
+                )
+            }
+            Err(err) => {
+                // `insert_or_fetch` may already have inserted, or staged and
+                // freed an unused overflow value, before it materializes the
+                // existing one returned to the caller.
+                Self::fail_with(failure, err)
+            }
         }
     }
 
     /// Batch-update existing keys. Keys must be sorted.
     pub fn table_update_sorted(&mut self, table: &[u8], pairs: &[(&[u8], &[u8])]) -> Result<u64> {
+        self.check_cancel()?;
         if pairs.is_empty() {
             return Ok(0);
         }
         self.invalidate_fk_cache_for(table);
         self.ensure_table(table)?;
+        let cancel = self.cancel.clone();
+
+        // `update_sorted_with` walks again when a key crosses a leaf boundary.
+        // Load the union of all batch paths while the transaction is unchanged,
+        // or a cold later leaf fails after an earlier pair has been applied.
+        let root = self.named_trees[table].root;
+        let mut pair_index = 0;
+        while pair_index < pairs.len() {
+            self.check_cancel()?;
+            let leaf_id =
+                Self::descend_to_leaf(&mut self.pages, self.manager, root, pairs[pair_index].0)?;
+            let last_key = {
+                let page = self.pages.get(&leaf_id).unwrap();
+                let cell_count = page.num_cells();
+                (cell_count > 0).then(|| {
+                    citadel_page::leaf_node::read_cell(page, cell_count - 1)
+                        .key
+                        .to_vec()
+                })
+            };
+            pair_index += 1;
+            if let Some(last_key) = last_key {
+                while pair_index < pairs.len() && pairs[pair_index].0 <= last_key.as_slice() {
+                    pair_index += 1;
+                }
+            }
+        }
+        self.check_cancel()?;
 
         // Stage every value first: anything above the inline threshold goes
         // to an overflow chain, so each leaf cell stays page-sized.
+        let allocated_before_staging = self.alloc.allocated_this_txn().len();
         let mut staged: Vec<(ValueType, Cow<'_, [u8]>)> = Vec::with_capacity(pairs.len());
         for &(key, value) in pairs {
-            Self::validate_key_value(key, value)?;
-            staged.push(self.stage_value(value));
+            if let Some(token) = &cancel {
+                if let Err(err) = token.check() {
+                    // A prior value may already have allocated an overflow
+                    // chain. Refuse a later commit rather than publishing that
+                    // incomplete staging work.
+                    if self.alloc.allocated_this_txn().len() > allocated_before_staging {
+                        return self.fail(err);
+                    }
+                    return Err(err);
+                }
+            }
+            if let Err(err) = Self::validate_key_value(key, value) {
+                if self.alloc.allocated_this_txn().len() > allocated_before_staging {
+                    return self.fail(err);
+                }
+                return Err(err);
+            }
+            match self.stage_value(value) {
+                Ok(staged_value) => staged.push(staged_value),
+                Err(err) => {
+                    if self.alloc.allocated_this_txn().len() > allocated_before_staging {
+                        return self.fail(err);
+                    }
+                    return Err(err);
+                }
+            }
         }
         let staged_pairs: Vec<(&[u8], ValueType, &[u8])> = pairs
             .iter()
@@ -723,24 +1200,34 @@ impl<'db> WriteTxn<'db> {
             alloc,
             manager,
             txn_id,
+            failure,
+            mutation_sequence,
             ..
         } = self;
         let tree = named_trees.get_mut(table).unwrap();
         let manager = *manager;
-        Self::descend_to_leaf(pages, manager, tree.root, pairs[0].0)?;
         let mut replaced_overflow = Vec::new();
         let mut skipped = Vec::new();
-        let count = tree.update_sorted(
+        let count = match tree.update_sorted_with(
             pages,
             alloc,
             *txn_id,
             &staged_pairs,
             &mut replaced_overflow,
             &mut skipped,
-        )?;
+            || match &cancel {
+                Some(token) => token.check(),
+                None => Ok(()),
+            },
+        ) {
+            Ok(count) => count,
+            Err(err) => {
+                return Self::fail_with(failure, err);
+            }
+        };
         for head in replaced_overflow {
             let mut view = WritePages { pages, manager };
-            overflow_io::free_chain(&mut view, alloc, head)?;
+            Self::free_overflow_chain_with_parts(&mut view, alloc, head, cancel.as_ref(), failure)?;
         }
         // Chains staged for pairs update_sorted did not apply (absent or
         // duplicate key) would otherwise orphan their pages.
@@ -748,10 +1235,27 @@ impl<'db> WriteTxn<'db> {
             if let (ValueType::Overflow, payload) = &staged[i] {
                 let oref = OverflowRef::from_bytes(payload);
                 let mut view = WritePages { pages, manager };
-                overflow_io::free_chain(&mut view, alloc, oref.first_page)?;
+                Self::free_overflow_chain_with_parts(
+                    &mut view,
+                    alloc,
+                    oref.first_page,
+                    cancel.as_ref(),
+                    failure,
+                )?;
             }
         }
-        Ok(count)
+        if let Some(token) = &cancel {
+            if let Err(err) = token.check() {
+                return Self::fail_with(failure, err);
+            }
+        }
+        Self::finish_mutation_with(
+            cancel.as_ref(),
+            failure,
+            mutation_sequence,
+            count,
+            count > 0,
+        )
     }
 
     /// Fused scan + in-place patch from `start_key`. Callback:
@@ -766,6 +1270,7 @@ impl<'db> WriteTxn<'db> {
         F: FnMut(&[u8], &mut [u8]) -> std::result::Result<Option<bool>, E>,
         E: From<Error>,
     {
+        self.check_cancel()?;
         self.invalidate_fk_cache_for(table);
         self.ensure_table(table)?;
         let Self {
@@ -774,6 +1279,9 @@ impl<'db> WriteTxn<'db> {
             alloc,
             manager,
             txn_id,
+            cancel,
+            failure,
+            mutation_sequence,
             ..
         } = self;
         let tree = named_trees.get_mut(table).unwrap();
@@ -781,115 +1289,170 @@ impl<'db> WriteTxn<'db> {
         let manager = *manager;
         let txn_id = *txn_id;
 
+        let mut scanned = ScanCount::new(manager);
         let mut view = WritePages { pages, manager };
         let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
 
         let mut count: u64 = 0;
         let mut cow_leaf = PageId::INVALID;
 
-        while cursor.is_valid() {
-            let leaf_id = cursor.leaf_page_id();
-            view.ensure_loaded(leaf_id)?;
-
-            let val_type = {
-                let page = view.pages.get(&leaf_id).unwrap();
-                citadel_page::leaf_node::read_cell(page, cursor.cell_index()).val_type
-            };
-            if val_type == ValueType::Tombstone {
-                cursor.next_lazy(&mut view)?;
-                continue;
-            }
-
-            if cow_leaf != leaf_id {
-                let new_id = btree::cow_page(view.pages, alloc, leaf_id, txn_id);
-                if new_id != leaf_id {
-                    let cell = citadel_page::leaf_node::read_cell(
-                        view.pages.get(&new_id).unwrap(),
-                        cursor.cell_index(),
-                    );
-                    let key_for_walk = cell.key.to_vec();
-                    let (mut path, _) = tree.walk_to_leaf(view.pages, &key_for_walk)?;
-                    let new_root =
-                        btree::propagate_cow_up(view.pages, alloc, txn_id, &mut path, new_id);
-                    tree.reroot_after_external_cow(new_root);
-                    cursor.set_leaf_page_id(new_id);
-                }
-                cow_leaf = new_id;
-            }
-
-            if val_type == ValueType::Overflow {
-                // The cell holds an 8-byte OverflowRef: materialize the chain
-                // into a scratch buffer for the callback, and on modification
-                // write a fresh chain and free the old one. The ref is
-                // overwritten in place, so cell indices are unaffected.
-                let (key, oref) = {
-                    let page = view.pages.get(&cow_leaf).unwrap();
-                    let cell = citadel_page::leaf_node::read_cell(page, cursor.cell_index());
-                    (cell.key.to_vec(), OverflowRef::from_bytes(cell.value))
-                };
-                let mut scratch = overflow_io::read_chain_value(&mut view, &oref)?;
-                match f(&key, &mut scratch)? {
-                    Some(true) => {
-                        let first = overflow::write_chain(
-                            &scratch,
-                            txn_id,
-                            || alloc.allocate(),
-                            |pid, page| {
-                                view.pages.insert(pid, page);
-                            },
-                        );
-                        let new_ref = OverflowRef {
-                            first_page: first,
-                            total_len: scratch.len() as u32,
-                        };
-                        let page = view.pages.get_mut(&cow_leaf).unwrap();
-                        let replaced = citadel_page::leaf_node::update_value_in_place(
-                            page,
-                            cursor.cell_index(),
-                            ValueType::Overflow,
-                            &new_ref.to_bytes(),
-                        );
-                        debug_assert!(replaced, "8-byte overflow ref must overwrite in place");
-                        overflow_io::free_chain(&mut view, alloc, oref.first_page)?;
-                        count += 1;
+        // Poisoned on EVERY error, not only a cancel: this is the only scan that
+        // mutates as it walks, so any error can leave a patched prefix that a
+        // caller could otherwise clear the token and commit.
+        let walked = (|| -> std::result::Result<u64, E> {
+            while cursor.is_valid() {
+                if let Some(t) = cancel.as_ref() {
+                    if let Err(err) = t.check() {
+                        Self::record_failure(failure, &err);
+                        return Err(E::from(err));
                     }
+                }
+                scanned.rows += 1;
+                let leaf_id = cursor.leaf_page_id();
+                view.ensure_loaded(leaf_id)?;
+
+                let val_type = {
+                    let page = view.pages.get(&leaf_id).unwrap();
+                    citadel_page::leaf_node::read_cell(page, cursor.cell_index()).val_type
+                };
+                if val_type == ValueType::Tombstone {
+                    cursor.next_lazy(&mut view)?;
+                    continue;
+                }
+
+                if cow_leaf != leaf_id {
+                    let new_id = btree::cow_page(view.pages, alloc, leaf_id, txn_id);
+                    if new_id != leaf_id {
+                        let cell = citadel_page::leaf_node::read_cell(
+                            view.pages.get(&new_id).unwrap(),
+                            cursor.cell_index(),
+                        );
+                        let key_for_walk = cell.key.to_vec();
+                        let (mut path, _) = tree.walk_to_leaf(view.pages, &key_for_walk)?;
+                        let new_root =
+                            btree::propagate_cow_up(view.pages, alloc, txn_id, &mut path, new_id);
+                        tree.reroot_after_external_cow(new_root);
+                        cursor.set_leaf_page_id(new_id);
+                    }
+                    cow_leaf = new_id;
+                }
+
+                if val_type == ValueType::Overflow {
+                    // The ref is overwritten in place, so cell indices are
+                    // unaffected.
+                    let (key, oref) = {
+                        let page = view.pages.get(&cow_leaf).unwrap();
+                        let cell = citadel_page::leaf_node::read_cell(page, cursor.cell_index());
+                        (cell.key.to_vec(), OverflowRef::from_bytes(cell.value))
+                    };
+                    let mut scratch = overflow_io::read_chain_value_with_cancel(
+                        &mut view,
+                        &oref,
+                        cancel.as_ref(),
+                    )?;
+                    match f(&key, &mut scratch)? {
+                        Some(true) => {
+                            let mut payload_digest =
+                                merkle::OverflowPayloadDigest::new(scratch.len() as u32);
+                            let first = overflow::write_chain_with_cancel(
+                                &scratch,
+                                txn_id,
+                                || alloc.allocate_nonzero(),
+                                |pid, page| {
+                                    payload_digest.update(overflow::read_data(&page));
+                                    view.pages.insert(pid, page);
+                                },
+                                cancel.as_ref(),
+                            );
+                            let first = match first {
+                                Ok(first) => first,
+                                Err(err) => {
+                                    Self::record_failure(failure, &err);
+                                    return Err(E::from(err));
+                                }
+                            };
+                            let payload_digest = payload_digest.finalize();
+                            view.pages
+                                .get_mut(&first)
+                                .expect("new overflow head is staged")
+                                .set_merkle_hash(&payload_digest);
+                            let new_ref = OverflowRef {
+                                first_page: first,
+                                total_len: scratch.len() as u32,
+                            };
+                            let page = view.pages.get_mut(&cow_leaf).unwrap();
+                            let replaced = citadel_page::leaf_node::update_value_in_place(
+                                page,
+                                cursor.cell_index(),
+                                ValueType::Overflow,
+                                &new_ref.to_bytes(),
+                            );
+                            debug_assert!(replaced, "8-byte overflow ref must overwrite in place");
+                            let freed = overflow_io::free_chain_with_cancel(
+                                &mut view,
+                                alloc,
+                                oref.first_page,
+                                cancel.as_ref(),
+                            );
+                            if let Err(err) = freed {
+                                Self::record_failure(failure, &err);
+                                return Err(E::from(err));
+                            }
+                            count += 1;
+                        }
+                        Some(false) => {}
+                        None => break,
+                    }
+                    cursor.next_lazy(&mut view)?;
+                    continue;
+                }
+
+                let page = view.pages.get_mut(&cow_leaf).unwrap();
+                let ci = cursor.cell_index();
+                let cell_off = page.cell_offset(ci) as usize;
+                let key_len =
+                    u16::from_le_bytes(page.data[cell_off..cell_off + 2].try_into().unwrap())
+                        as usize;
+                let val_len =
+                    u32::from_le_bytes(page.data[cell_off + 2..cell_off + 6].try_into().unwrap())
+                        as usize;
+                let key_start = cell_off + 6;
+                let val_start = cell_off + 7 + key_len;
+
+                // Split borrow: key immutable, value mutable, non-overlapping.
+                let (before_val, from_val) = page.data.split_at_mut(val_start);
+                let key = &before_val[key_start..key_start + key_len];
+                let value = &mut from_val[..val_len];
+
+                match f(key, value)? {
+                    Some(true) => count += 1,
                     Some(false) => {}
                     None => break,
                 }
+
                 cursor.next_lazy(&mut view)?;
-                continue;
             }
+            Ok(count)
+        })();
 
-            let page = view.pages.get_mut(&cow_leaf).unwrap();
-            let ci = cursor.cell_index();
-            let cell_off = page.cell_offset(ci) as usize;
-            let key_len =
-                u16::from_le_bytes(page.data[cell_off..cell_off + 2].try_into().unwrap()) as usize;
-            let val_len =
-                u32::from_le_bytes(page.data[cell_off + 2..cell_off + 6].try_into().unwrap())
-                    as usize;
-            let key_start = cell_off + 6;
-            let val_start = cell_off + 7 + key_len;
-
-            // Split borrow: key (immutable) and value (mutable) from
-            // non-overlapping regions
-            let (before_val, from_val) = page.data.split_at_mut(val_start);
-            let key = &before_val[key_start..key_start + key_len];
-            let value = &mut from_val[..val_len];
-
-            match f(key, value)? {
-                Some(true) => count += 1,
-                Some(false) => {}
-                None => break,
+        match walked {
+            Ok(count) => Self::finish_mutation_with(
+                cancel.as_ref(),
+                failure,
+                mutation_sequence,
+                count,
+                count > 0,
+            )
+            .map_err(E::from),
+            Err(err) => {
+                Self::mark_failed_with(failure);
+                Err(err)
             }
-
-            cursor.next_lazy(&mut view)?;
         }
-
-        Ok(count)
     }
 
     pub fn table_delete(&mut self, table: &[u8], key: &[u8]) -> Result<bool> {
+        self.check_cancel()?;
         self.invalidate_fk_cache_for(table);
         self.ensure_table(table)?;
         let Self {
@@ -898,6 +1461,9 @@ impl<'db> WriteTxn<'db> {
             alloc,
             manager,
             txn_id,
+            cancel,
+            failure,
+            mutation_sequence,
             ..
         } = self;
         let tree = named_trees.get_mut(table).unwrap();
@@ -906,17 +1472,34 @@ impl<'db> WriteTxn<'db> {
 
         // LIL fast path: most cascade deletes hit the same leaf as the previous
         // delete. `try_lil_delete` returns Some on cache hit, None on miss.
-        if let Some((deleted, overflow_head)) = tree.try_lil_delete(pages, alloc, txn_id, key)? {
+        let lil_deleted = tree.try_lil_delete(pages, alloc, txn_id, key);
+        let lil_deleted = match lil_deleted {
+            Ok(result) => result,
+            Err(err) => return Self::fail_with(failure, err),
+        };
+        if let Some((deleted, overflow_head)) = lil_deleted {
             if let Some(head) = overflow_head {
                 let mut view = WritePages { pages, manager };
-                overflow_io::free_chain(&mut view, alloc, head)?;
+                Self::free_overflow_chain_with_parts(
+                    &mut view,
+                    alloc,
+                    head,
+                    cancel.as_ref(),
+                    failure,
+                )?;
             }
-            return Ok(deleted);
+            return Self::finish_mutation_with(
+                cancel.as_ref(),
+                failure,
+                mutation_sequence,
+                deleted,
+                deleted,
+            );
         }
 
         // Slow path: walk + delete.
         let root = tree.root;
-        let (overflow_head, deleted) = PATH_BUF.with(|pb| -> Result<_> {
+        let deleted = PATH_BUF.with(|pb| -> Result<_> {
             let mut path = pb.borrow_mut();
             path.clear();
             let leaf_id = Self::walk_loading_into(pages, manager, root, key, &mut path)?;
@@ -928,18 +1511,29 @@ impl<'db> WriteTxn<'db> {
             };
             let d = tree.delete_at_leaf(pages, alloc, txn_id, key, &mut path, leaf_id)?;
             Ok((head, d))
-        })?;
+        });
+        let (overflow_head, deleted) = match deleted {
+            Ok(result) => result,
+            Err(err) => return Self::fail_with(failure, err),
+        };
 
         if let Some(head) = overflow_head {
             let mut view = WritePages { pages, manager };
-            overflow_io::free_chain(&mut view, alloc, head)?;
+            Self::free_overflow_chain_with_parts(&mut view, alloc, head, cancel.as_ref(), failure)?;
         }
-        Ok(deleted)
+        Self::finish_mutation_with(
+            cancel.as_ref(),
+            failure,
+            mutation_sequence,
+            deleted,
+            deleted,
+        )
     }
 
     /// Drop all pages, reset to an empty leaf. Returns pre-truncation entry
     /// count.
     pub fn table_truncate(&mut self, table: &[u8]) -> Result<u64> {
+        self.check_cancel()?;
         self.invalidate_fk_cache_for(table);
         self.ensure_table(table)?;
 
@@ -953,14 +1547,15 @@ impl<'db> WriteTxn<'db> {
 
         self.named_trees
             .insert(table.to_vec(), BTree::from_existing(new_root, 1, 0));
-        Ok(old_tree.entry_count)
+        self.finish_mutation(old_tree.entry_count, true)
     }
 
     pub fn table_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.check_cancel()?;
         self.ensure_table(table)?;
         let root = self.named_trees[table].root;
         let leaf_id = Self::descend_to_leaf(&mut self.pages, self.manager, root, key)?;
-        match BTree::search_at_leaf(&self.pages, leaf_id, key)? {
+        let value = match BTree::search_at_leaf(&self.pages, leaf_id, key)? {
             Some((ValueType::Tombstone, _)) => Ok(None),
             Some((ValueType::Overflow, payload)) => {
                 let oref = OverflowRef::from_bytes(&payload);
@@ -968,12 +1563,35 @@ impl<'db> WriteTxn<'db> {
             }
             Some((_, value)) => Ok(Some(value)),
             None => Ok(None),
-        }
+        }?;
+        self.check_cancel()?;
+        Ok(value)
     }
 
-    pub fn commit(mut self) -> Result<()> {
+    pub fn commit(self) -> Result<()> {
+        self.commit_with_generation().map(|_| ())
+    }
+
+    /// Commit and return the exact manager generation produced while writer
+    /// exclusion is still held. Sync uses this to distinguish a no-op commit
+    /// from a durable commit without racing a later writer.
+    #[doc(hidden)]
+    pub fn commit_with_generation(mut self) -> Result<u64> {
+        if let Some(failure) = self.failure {
+            return Err(failure.error());
+        }
+        // The only check a statement that never enters a scan loop gets: a
+        // VALUES insert or a point update reaches here directly.
+        if let Some(token) = &self.cancel {
+            token.check()?;
+        }
         let (catalog_root, catalog_refreshed) = self.finalize_catalog()?;
-        self.manager.commit_write(
+        // Last point before durable commit: after commit_write starts a cancel
+        // races with completion, and reporting Interrupted on success is a lie.
+        if let Some(token) = &self.cancel {
+            token.check()?;
+        }
+        let generation = self.manager.commit_write(
             self.base_txn_id,
             self.txn_id,
             &mut self.pages,
@@ -987,7 +1605,7 @@ impl<'db> WriteTxn<'db> {
             self.force_commit,
         )?;
         self.committed = true;
-        Ok(())
+        Ok(generation)
     }
 
     pub fn abort(mut self) {
@@ -1014,6 +1632,8 @@ impl<'db> WriteTxn<'db> {
         self.catalog = snap.catalog;
         self.catalog_dirty = snap.catalog_dirty;
         self.loaded_tree_meta = snap.loaded_tree_meta;
+        self.failure = snap.failure;
+        self.mutation_sequence = snap.mutation_sequence;
         self.deferred_fk_checks
             .truncate(snap.deferred_fk_checks_len);
         self.fk_check_cache.clear();
@@ -1029,6 +1649,8 @@ impl<'db> WriteTxn<'db> {
             catalog_dirty: self.catalog_dirty,
             loaded_tree_meta: self.loaded_tree_meta.clone(),
             deferred_fk_checks_len: self.deferred_fk_checks.len(),
+            failure: self.failure,
+            mutation_sequence: self.mutation_sequence,
         }
     }
 
@@ -1054,26 +1676,100 @@ impl<'db> WriteTxn<'db> {
 
     /// Stage a value: borrow inline (the tree copies it anyway), own the
     /// overflow ref.
-    fn stage_value<'v>(&mut self, value: &'v [u8]) -> (ValueType, Cow<'v, [u8]>) {
+    fn stage_value<'v>(&mut self, value: &'v [u8]) -> Result<(ValueType, Cow<'v, [u8]>)> {
         if value.len() <= MAX_INLINE_VALUE_SIZE {
-            return (ValueType::Inline, Cow::Borrowed(value));
+            return Ok((ValueType::Inline, Cow::Borrowed(value)));
         }
-        let txn_id = self.txn_id;
-        let alloc = &mut self.alloc;
-        let pages = &mut self.pages;
-        let first = overflow::write_chain(
+        let allocated_before = self.alloc.allocated_this_txn().len();
+        let Self {
+            txn_id,
+            pages,
+            alloc,
+            cancel,
+            failure,
+            ..
+        } = self;
+        let txn_id = *txn_id;
+        let mut payload_digest = merkle::OverflowPayloadDigest::new(value.len() as u32);
+        let staged = overflow::write_chain_with_cancel(
             value,
             txn_id,
-            || alloc.allocate(),
+            || alloc.allocate_nonzero(),
             |pid, page| {
+                payload_digest.update(overflow::read_data(&page));
                 pages.insert(pid, page);
             },
+            cancel.as_ref(),
         );
+        let first = match staged {
+            Ok(first) => first,
+            Err(err) => {
+                if alloc.allocated_this_txn().len() > allocated_before {
+                    Self::record_failure(failure, &err);
+                }
+                return Err(err);
+            }
+        };
+        let payload_digest = payload_digest.finalize();
+        pages
+            .get_mut(&first)
+            .expect("new overflow head is staged")
+            .set_merkle_hash(&payload_digest);
         let oref = OverflowRef {
             first_page: first,
             total_len: value.len() as u32,
         };
-        (ValueType::Overflow, Cow::Owned(oref.to_bytes().to_vec()))
+        Ok((ValueType::Overflow, Cow::Owned(oref.to_bytes().to_vec())))
+    }
+
+    /// Reject a name the commit slot's 32-bit named-table cache cannot hold
+    /// unambiguously. DDL is rare, so scan the catalog rather than add lookup
+    /// cost or mutable global state to every ordinary table access.
+    fn reject_table_name_hash_collision(
+        &mut self,
+        requested: &[u8],
+        excluded: Option<&[u8]>,
+    ) -> Result<()> {
+        use citadel_io::file_manager::table_name_hash;
+
+        let requested_hash = table_name_hash(requested);
+        for existing in self.named_trees.keys() {
+            self.check_cancel()?;
+            if existing.as_slice() != requested
+                && excluded != Some(existing.as_slice())
+                && table_name_hash(existing) == requested_hash
+            {
+                return Err(Error::NamedTableHashCollision {
+                    requested: String::from_utf8_lossy(requested).into_owned(),
+                    existing: String::from_utf8_lossy(existing).into_owned(),
+                    hash: requested_hash,
+                });
+            }
+        }
+
+        self.ensure_catalog()?;
+        let catalog_root = self.catalog.as_ref().unwrap().root;
+        self.preload_all_pages(catalog_root)?;
+        let mut cursor = Cursor::first(&self.pages, catalog_root)?;
+        while cursor.is_valid() {
+            self.check_cancel()?;
+            if let Some(cell) = cursor.current_ref(&self.pages) {
+                let existing = cell.key;
+                if cell.val_type != ValueType::Tombstone
+                    && existing != requested
+                    && excluded != Some(existing)
+                    && table_name_hash(existing) == requested_hash
+                {
+                    return Err(Error::NamedTableHashCollision {
+                        requested: String::from_utf8_lossy(requested).into_owned(),
+                        existing: String::from_utf8_lossy(existing).into_owned(),
+                        hash: requested_hash,
+                    });
+                }
+            }
+            cursor.next(&self.pages)?;
+        }
+        self.check_cancel()
     }
 
     fn ensure_catalog(&mut self) -> Result<()> {
@@ -1105,6 +1801,7 @@ impl<'db> WriteTxn<'db> {
         let mut depth: u16 = 1;
         let mut current = root;
         loop {
+            self.check_cancel()?;
             if !self.pages.contains_key(&current) {
                 let page = self.manager.fetch_page_owned(current)?;
                 self.pages.insert(current, page);
@@ -1130,42 +1827,54 @@ impl<'db> WriteTxn<'db> {
     }
 
     fn ensure_table(&mut self, name: &[u8]) -> Result<()> {
+        self.check_cancel()?;
         if self.named_trees.contains_key(name) {
             return Ok(());
         }
 
-        if let Some((root, depth)) = self.old_slot.named_entry_root(name) {
-            let entry_count = self.old_slot.named_entry_count(name).unwrap_or(0);
-            let tree = BTree::from_existing(root, depth, entry_count);
-            self.loaded_tree_meta.insert(name.to_vec(), (root, depth));
-            self.named_trees.insert(name.to_vec(), tree);
-            return Ok(());
-        }
-
+        // Prove the exact name exists before consulting the commit slot. Slot
+        // entries carry only a 32-bit name hash, so looking there first can
+        // turn a nonexistent colliding name into an alias for a live table.
         self.ensure_catalog()?;
-
         let catalog_root = self.catalog.as_ref().unwrap().root;
         self.preload_path(catalog_root, name)?;
 
-        match self.catalog.as_ref().unwrap().search(&self.pages, name)? {
+        let mut desc = match self.catalog.as_ref().unwrap().search(&self.pages, name)? {
             Some((ValueType::Tombstone, _)) | None => {
                 return Err(Error::TableNotFound(
                     String::from_utf8_lossy(name).into_owned(),
                 ));
             }
-            Some((_, desc_bytes)) => {
-                let desc = TableDescriptor::deserialize(&desc_bytes);
-                let entry_count = self
-                    .old_slot
-                    .named_entry_count(name)
-                    .unwrap_or(desc.entry_count);
-                let tree = BTree::from_existing(desc.root_page, desc.depth, entry_count);
-                self.loaded_tree_meta
-                    .insert(name.to_vec(), (desc.root_page, desc.depth));
-                self.named_trees.insert(name.to_vec(), tree);
+            Some((ValueType::Inline, desc_bytes)) => {
+                TableDescriptor::try_deserialize(&desc_bytes).ok_or(Error::DatabaseCorrupted)?
             }
+            Some(_) => return Err(Error::DatabaseCorrupted),
+        };
+
+        // Even when this snapshot has no slot entry yet, loading a table from
+        // an already-collided catalog and committing it would create one. Keep
+        // legacy collisions read-only until an explicit repair path exists.
+        self.manager
+            .reject_named_table_hash_collision(name, self.cancel.as_ref())?;
+
+        // In SyncMode::Off the slot may be the only durable record of the
+        // table's current root/count while the exact catalog descriptor lags.
+        if let Some((root, depth)) = self.old_slot.named_entry_root(name) {
+            let Some(entry_count) = self.old_slot.named_entry_count(name) else {
+                return Err(Error::DatabaseCorrupted);
+            };
+            desc.root_page = root;
+            desc.depth = depth;
+            desc.entry_count = entry_count;
+        } else if let Some(entry_count) = self.old_slot.named_entry_count(name) {
+            desc.entry_count = entry_count;
         }
-        Ok(())
+
+        let tree = BTree::from_existing(desc.root_page, desc.depth, desc.entry_count);
+        self.loaded_tree_meta
+            .insert(name.to_vec(), (desc.root_page, desc.depth));
+        self.named_trees.insert(name.to_vec(), tree);
+        self.check_cancel()
     }
 
     /// Returns the new catalog root and the hashes whose descriptors were
@@ -1174,6 +1883,7 @@ impl<'db> WriteTxn<'db> {
     fn finalize_catalog(&mut self) -> Result<(PageId, FxHashSet<u32>)> {
         use citadel_io::file_manager::table_name_hash;
 
+        self.check_cancel()?;
         if !self.catalog_dirty && self.named_trees.is_empty() {
             return Ok((self.old_slot.catalog_root, FxHashSet::default()));
         }
@@ -1181,17 +1891,23 @@ impl<'db> WriteTxn<'db> {
         // SyncMode::Off: skip catalog update if only roots changed (cached in
         // slot)
         if !self.catalog_dirty && self.manager.sync_mode() == citadel_core::types::SyncMode::Off {
-            let needs_catalog = self.named_trees.iter().any(|(name, tree)| {
-                match self.loaded_tree_meta.get(name.as_slice()) {
+            let mut needs_catalog = false;
+            for (name, tree) in &self.named_trees {
+                self.check_cancel()?;
+                let structurally_changed = match self.loaded_tree_meta.get(name.as_slice()) {
                     Some(&(_, old_depth)) => tree.depth != old_depth,
                     None => true, // new table
+                };
+                if structurally_changed {
+                    needs_catalog = true;
+                    break;
                 }
-            });
+            }
             // The skip makes the slot the moved roots' only record, so it is
             // legal only when the touched trees plus carried stale entries fit
             // the V1 capacity (else a dropped entry's stale descriptor wins on
             // reopen).
-            if !needs_catalog && self.slot_entries_fit() {
+            if !needs_catalog && self.slot_entries_fit()? {
                 return Ok((self.old_slot.catalog_root, FxHashSet::default()));
             }
         }
@@ -1200,28 +1916,25 @@ impl<'db> WriteTxn<'db> {
             self.ensure_catalog()?;
         }
 
-        let structural_entries: Vec<(Vec<u8>, [u8; 20])> = self
-            .named_trees
-            .iter()
-            .filter(
-                |(name, tree)| match self.loaded_tree_meta.get(name.as_slice()) {
-                    Some(&(old_root, old_depth)) => {
-                        tree.root != old_root || tree.depth != old_depth
-                    }
-                    None => true,
-                },
-            )
-            .map(|(name, tree)| {
+        let mut structural_entries: Vec<(Vec<u8>, [u8; 20])> = Vec::new();
+        for (name, tree) in &self.named_trees {
+            self.check_cancel()?;
+            let structurally_changed = match self.loaded_tree_meta.get(name.as_slice()) {
+                Some(&(old_root, old_depth)) => tree.root != old_root || tree.depth != old_depth,
+                None => true,
+            };
+            if structurally_changed {
                 let desc = TableDescriptor::from_tree(tree);
-                (name.clone(), desc.serialize())
-            })
-            .collect();
+                structural_entries.push((name.clone(), desc.serialize()));
+            }
+        }
 
         if structural_entries.is_empty() {
             return Ok((self.catalog.as_ref().unwrap().root, FxHashSet::default()));
         }
 
         for (name, value) in &structural_entries {
+            self.check_cancel()?;
             let catalog = self.catalog.as_ref().unwrap();
             let catalog_root = catalog.root;
             self.preload_path(catalog_root, name)?;
@@ -1235,11 +1948,13 @@ impl<'db> WriteTxn<'db> {
                 value,
             )?;
         }
+        self.check_cancel()?;
 
-        let refreshed = structural_entries
-            .iter()
-            .map(|(name, _)| table_name_hash(name))
-            .collect();
+        let mut refreshed = FxHashSet::default();
+        for (name, _) in &structural_entries {
+            self.check_cancel()?;
+            refreshed.insert(table_name_hash(name));
+        }
         Ok((self.catalog.as_ref().unwrap().root, refreshed))
     }
 
@@ -1247,27 +1962,37 @@ impl<'db> WriteTxn<'db> {
     /// stale entries must fit the V1 capacity (stale entries are never dropped
     /// by serialize). Counting all touched trees as stale over-approximates,
     /// so it can only refuse a skip early, never admit an unsafe one.
-    fn slot_entries_fit(&self) -> bool {
+    fn slot_entries_fit(&self) -> Result<bool> {
         use citadel_io::file_manager::table_name_hash;
-        let known: rustc_hash::FxHashSet<u32> = self
-            .named_trees
-            .keys()
-            .chain(self.loaded_tree_meta.keys())
-            .map(|name| table_name_hash(name))
-            .collect();
-        let carried_stale = self
-            .old_slot
-            .named_table_entries
-            .iter()
-            .filter(|&&(hash, ..)| !known.contains(&hash) && self.old_slot.entry_is_stale(hash))
-            .count();
-        self.named_trees.len() + carried_stale <= citadel_core::SLOT_NAMED_MAX_ENTRIES_V1
+        let mut known: rustc_hash::FxHashSet<u32> = FxHashSet::default();
+        for name in self.named_trees.keys().chain(self.loaded_tree_meta.keys()) {
+            self.check_cancel()?;
+            known.insert(table_name_hash(name));
+        }
+        let mut carried_stale = 0usize;
+        for &(hash, ..) in &self.old_slot.named_table_entries {
+            self.check_cancel()?;
+            if !known.contains(&hash) && self.old_slot.entry_is_stale(hash) {
+                carried_stale += 1;
+            }
+        }
+        Ok(self.named_trees.len() + carried_stale <= citadel_core::SLOT_NAMED_MAX_ENTRIES_V1)
     }
 
     fn free_tree_pages(&mut self, root: PageId) -> Result<()> {
         let mut stack = vec![root];
         let mut overflow_heads: Vec<PageId> = Vec::new();
+        let mut tree_pages = Vec::new();
+        let mut tree_seen = FxHashSet::default();
+
+        // Preflight the complete tree before changing allocator state. A cold
+        // read or malformed later page must leave the table fully committable.
         while let Some(current) = stack.pop() {
+            self.check_cancel()?;
+            if !tree_seen.insert(current) {
+                return Err(Error::DatabaseCorrupted);
+            }
+            tree_pages.push(current);
             if !self.pages.contains_key(&current) {
                 let page = self.manager.fetch_page_owned(current)?;
                 self.pages.insert(current, page);
@@ -1292,24 +2017,73 @@ impl<'db> WriteTxn<'db> {
                         }
                     }
                 }
-                _ => {}
+                _ => return Err(Error::InvalidPageType(page.page_type_raw(), current)),
             }
-            self.alloc.free(current);
         }
+
+        // Overflow pages are not in the B-tree walk. Validate and load every
+        // chain before freeing either kind of page, and reject shared/cyclic
+        // references rather than adding the same page to pending-free twice.
+        let mut overflow_pages = Vec::new();
+        let mut overflow_seen = FxHashSet::default();
         for head in overflow_heads {
-            let mut view = WritePages {
-                pages: &mut self.pages,
-                manager: self.manager,
+            self.check_cancel()?;
+            let chain = {
+                let mut view = WritePages {
+                    pages: &mut self.pages,
+                    manager: self.manager,
+                };
+                overflow_io::collect_chain_pages_with_cancel(&mut view, head, self.cancel.as_ref())?
             };
-            overflow_io::free_chain(&mut view, &mut self.alloc, head)?;
+            for page_id in chain {
+                if tree_seen.contains(&page_id) || !overflow_seen.insert(page_id) {
+                    return Err(Error::CorruptOverflowChain(format!(
+                        "page {page_id} is referenced more than once"
+                    )));
+                }
+                overflow_pages.push(page_id);
+            }
         }
-        Ok(())
+
+        let cancel = self.cancel.clone();
+        let Self {
+            alloc,
+            failure,
+            mutation_sequence,
+            ..
+        } = self;
+        let mut freed_any = false;
+        for page_id in tree_pages.into_iter().chain(overflow_pages) {
+            if let Some(token) = &cancel {
+                #[cfg(test)]
+                CANCEL_ON_NTH_TREE_FREE.with(|remaining| {
+                    if let Some(frees) = remaining.get() {
+                        if frees == 1 {
+                            remaining.set(None);
+                            token.cancel();
+                        } else {
+                            remaining.set(Some(frees - 1));
+                        }
+                    }
+                });
+                if let Err(err) = token.check() {
+                    if freed_any {
+                        Self::record_failure(failure, &err);
+                    }
+                    return Err(err);
+                }
+            }
+            alloc.free(page_id);
+            freed_any = true;
+        }
+        Self::finish_mutation_with(cancel.as_ref(), failure, mutation_sequence, (), freed_any)
     }
 
     fn count_leaf_entries(&mut self, root: PageId) -> Result<u64> {
         let mut count: u64 = 0;
         let mut stack = vec![root];
         while let Some(current) = stack.pop() {
+            self.check_cancel()?;
             if !self.pages.contains_key(&current) {
                 let page = self.manager.fetch_page_owned(current)?;
                 self.pages.insert(current, page);
@@ -1331,6 +2105,7 @@ impl<'db> WriteTxn<'db> {
                 _ => {}
             }
         }
+        self.check_cancel()?;
         Ok(count)
     }
 
@@ -1362,15 +2137,6 @@ impl<'db> WriteTxn<'db> {
                 _ => return Err(Error::InvalidPageType(page.page_type_raw(), current)),
             }
         }
-    }
-
-    fn preload_path_raw(
-        pages: &mut FxHashMap<PageId, Page>,
-        manager: &TxnManager,
-        root: PageId,
-        key: &[u8],
-    ) -> Result<()> {
-        Self::descend_to_leaf(pages, manager, root, key).map(|_| ())
     }
 
     fn walk_loading(
@@ -1417,6 +2183,10 @@ impl<'db> WriteTxn<'db> {
     fn preload_all_pages(&mut self, root: PageId) -> Result<()> {
         let mut stack = vec![root];
         while let Some(current) = stack.pop() {
+            // Completes before `for_each` yields anything; see the read side.
+            if let Some(t) = self.cancel.as_ref() {
+                t.check()?;
+            }
             if !self.pages.contains_key(&current) {
                 let page = self.manager.fetch_page_owned(current)?;
                 self.pages.insert(current, page);
@@ -1452,6 +2222,7 @@ impl<'db> Drop for WriteTxn<'db> {
 /// Scan adapter wrapping a `&mut WriteTxn` for use with [`crate::TableIter`].
 pub struct WriteTxnScanAdapter<'a, 'db: 'a> {
     txn: &'a mut WriteTxn<'db>,
+    measurements: Vec<Arc<AtomicU64>>,
 }
 
 impl<'a, 'db: 'a> crate::scan_iter::TxnScanAdapter for WriteTxnScanAdapter<'a, 'db> {
@@ -1461,6 +2232,16 @@ impl<'a, 'db: 'a> crate::scan_iter::TxnScanAdapter for WriteTxnScanAdapter<'a, '
             manager: self.txn.manager,
         };
         f(&mut view)
+    }
+
+    fn cancel(&self) -> Option<&CancelToken> {
+        self.txn.cancel.as_ref()
+    }
+
+    fn record_rows_scanned(&self, rows: u64) {
+        self.txn
+            .manager
+            .add_rows_scanned_to(rows, &self.measurements);
     }
 }
 

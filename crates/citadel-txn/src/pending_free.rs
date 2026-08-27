@@ -20,7 +20,28 @@ pub struct PendingFreeEntry {
 
 /// Maximum entries per pending-free page.
 /// Body layout: [entry_count: u32 (4B)] [entries: 12B each] [padding]
-const MAX_ENTRIES_PER_PAGE: usize = (USABLE_SIZE - 4) / PENDING_FREE_ENTRY_SIZE;
+pub(crate) const MAX_ENTRIES_PER_PAGE: usize = (USABLE_SIZE - 4) / PENDING_FREE_ENTRY_SIZE;
+
+/// Decode one pending-free page without trusting its entry count.
+pub(crate) fn read_page_entries(page: &Page) -> Result<Vec<PendingFreeEntry>> {
+    if page.page_type() != Some(PageType::PendingFree) {
+        return Err(Error::InvalidPageType(page.page_type_raw(), page.page_id()));
+    }
+    let entry_count = read_entry_count(page);
+    if entry_count > MAX_ENTRIES_PER_PAGE {
+        return Err(Error::DatabaseCorrupted);
+    }
+
+    let data_start = PAGE_HEADER_SIZE + 4;
+    let mut entries = Vec::with_capacity(entry_count);
+    for index in 0..entry_count {
+        entries.push(read_entry_at(
+            &page.data,
+            data_start + index * PENDING_FREE_ENTRY_SIZE,
+        ));
+    }
+    Ok(entries)
+}
 
 /// Read all entries from the pending-free chain stored in the page map.
 pub fn read_chain(pages: &FxHashMap<PageId, Page>, root: PageId) -> Result<Vec<PendingFreeEntry>> {
@@ -30,16 +51,22 @@ pub fn read_chain(pages: &FxHashMap<PageId, Page>, root: PageId) -> Result<Vec<P
 
     let mut entries = Vec::new();
     let mut current = root;
+    let mut chain_pages = FxHashSet::default();
+    let mut entry_pages = FxHashSet::default();
 
     while current.is_valid() {
+        if !chain_pages.insert(current) {
+            return Err(Error::DatabaseCorrupted);
+        }
         let page = pages.get(&current).ok_or(Error::PageOutOfBounds(current))?;
-
-        let entry_count = read_entry_count(page);
-        let data_start = PAGE_HEADER_SIZE + 4;
-
-        for i in 0..entry_count {
-            let offset = data_start + i * PENDING_FREE_ENTRY_SIZE;
-            entries.push(read_entry_at(&page.data, offset));
+        if page.page_id() != current {
+            return Err(Error::DatabaseCorrupted);
+        }
+        for entry in read_page_entries(page)? {
+            if !entry_pages.insert(entry.page_id) {
+                return Err(Error::DatabaseCorrupted);
+            }
+            entries.push(entry);
         }
 
         // Next page in chain via right_child field (INVALID = end of chain)
@@ -47,6 +74,10 @@ pub fn read_chain(pages: &FxHashMap<PageId, Page>, root: PageId) -> Result<Vec<P
         if !current.is_valid() {
             break;
         }
+    }
+
+    if entry_pages.iter().any(|page| chain_pages.contains(page)) {
+        return Err(Error::DatabaseCorrupted);
     }
 
     Ok(entries)
@@ -114,10 +145,18 @@ pub fn collect_chain_page_ids(
 
     let mut ids = Vec::new();
     let mut current = root;
+    let mut seen = FxHashSet::default();
 
     while current.is_valid() {
+        if !seen.insert(current) {
+            return Err(Error::DatabaseCorrupted);
+        }
         ids.push(current);
         let page = pages.get(&current).ok_or(Error::PageOutOfBounds(current))?;
+        if page.page_id() != current {
+            return Err(Error::DatabaseCorrupted);
+        }
+        let _ = read_page_entries(page)?;
         current = page.right_child();
         if !current.is_valid() {
             break;

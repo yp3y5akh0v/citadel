@@ -19,6 +19,24 @@ fn allocate_from_ready_to_use() {
 }
 
 #[test]
+fn nonzero_allocation_preserves_page_zero_for_other_page_types() {
+    let mut alloc = PageAllocator::new(0);
+
+    assert_eq!(alloc.allocate_nonzero(), PageId(1));
+    assert_eq!(alloc.allocate(), PageId(0));
+    assert_eq!(alloc.high_water_mark(), 2);
+}
+
+#[test]
+fn nonzero_allocation_skips_reclaimed_page_zero() {
+    let mut alloc = PageAllocator::new(10);
+    alloc.add_ready_to_use(vec![PageId(7), PageId(0)]);
+
+    assert_eq!(alloc.allocate_nonzero(), PageId(7));
+    assert_eq!(alloc.allocate(), PageId(0));
+}
+
+#[test]
 fn free_and_commit() {
     let mut alloc = PageAllocator::new(5);
     alloc.free(PageId(1));

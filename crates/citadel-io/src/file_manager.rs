@@ -6,11 +6,11 @@
 //! `[0..SLOT_CHECKSUM]`. V1 keeps that checksum (pre-v1 binaries still open the
 //! file) and adds a truncated HMAC-SHA256 over the rest, so tampering with
 //! `merkle_root` or the named entries fails [`recover`]. Non-goals: (1)
-//! downgrade resistance holds only after a file earns HEADER_FLAG_SLOTS_V1 (at
-//! birth, or at upgrade for pre-v1) - before that the MAC catches corruption
-//! but not a slot re-encoded whole as legacy; (2) no anti-rollback - the
-//! per-page MAC omits the commit generation, so reverting to an older genuine
-//! state needs an external freshness anchor.
+//! downgrade resistance holds only after a file earns a V1 requirement (the
+//! compatibility header bit here, or an authenticated requirement supplied by
+//! the facade from its key file) - before that the MAC catches corruption but
+//! not a slot re-encoded whole as legacy; (2) no anti-rollback - reverting a
+//! complete authentic data/key-file set needs an external freshness anchor.
 use citadel_core::types::{PageId, TxnId};
 use citadel_core::{Error, Result};
 use citadel_core::{
@@ -20,7 +20,8 @@ use citadel_core::{
     HEADER_FLAGS_OFFSET, HEADER_FLAG_SLOTS_V1, MAC_KEY_SIZE, MAC_SIZE, MAGIC, MERKLE_HASH_SIZE,
     PAGE_SIZE, SLOT_CATALOG_ROOT, SLOT_CHECKSUM, SLOT_DEK_ID, SLOT_ENCRYPTION_EPOCH,
     SLOT_ENTRY_STALE, SLOT_FORMAT_MARKER, SLOT_HIGH_WATER_MARK, SLOT_MAC, SLOT_MAC_DOMAIN,
-    SLOT_MAC_SIZE, SLOT_MARKER_V1, SLOT_MERKLE_ROOT, SLOT_NAMED_ENTRIES, SLOT_NAMED_ENTRY_SIZE,
+    SLOT_MAC_SIZE, SLOT_MARKER_V1, SLOT_MERKLE_ROOT, SLOT_MERKLE_SCHEME,
+    SLOT_MERKLE_SCHEME_LOGICAL_OVERFLOW_V1, SLOT_NAMED_ENTRIES, SLOT_NAMED_ENTRY_SIZE,
     SLOT_NAMED_MAX_ENTRIES, SLOT_NAMED_MAX_ENTRIES_V1, SLOT_PENDING_FREE_ROOT, SLOT_TOTAL_PAGES,
     SLOT_TREE_DEPTH, SLOT_TREE_ENTRIES, SLOT_TREE_ROOT, SLOT_TXN_ID,
 };
@@ -42,11 +43,47 @@ pub enum SlotFormat {
     Unknown,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Merkle hash semantics used by one commit generation.
+///
+/// The marker is per slot rather than global: released writers rewrite a slot
+/// from a zeroed buffer, so any later old-writer commit automatically records
+/// `Legacy` instead of accidentally preserving a newer scheme declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MerkleScheme {
+    /// Released scheme: overflow leaf values hash their physical reference.
+    #[default]
+    Legacy,
+    /// Overflow leaf values hash their logical length and payload digest.
+    LogicalOverflowV1,
+    /// Unrecognized marker (corruption or a future unsupported scheme).
+    Unknown,
+}
+
+impl MerkleScheme {
+    fn from_marker(marker: u16) -> Self {
+        match marker {
+            0 => Self::Legacy,
+            SLOT_MERKLE_SCHEME_LOGICAL_OVERFLOW_V1 => Self::LogicalOverflowV1,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn marker(self) -> u16 {
+        match self {
+            Self::Legacy => 0,
+            Self::LogicalOverflowV1 => SLOT_MERKLE_SCHEME_LOGICAL_OVERFLOW_V1,
+            // Keep Unknown fail-closed even if a caller tries to serialize it.
+            Self::Unknown => u16::MAX,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CommitSlot {
     pub txn_id: TxnId,
     pub tree_root: PageId,
     pub tree_depth: u16,
+    pub merkle_scheme: MerkleScheme,
     pub tree_entries: u64,
     pub catalog_root: PageId,
     pub total_pages: u32,
@@ -114,6 +151,8 @@ impl CommitSlot {
         buf[SLOT_TREE_ROOT..SLOT_TREE_ROOT + 4]
             .copy_from_slice(&self.tree_root.as_u32().to_le_bytes());
         buf[SLOT_TREE_DEPTH..SLOT_TREE_DEPTH + 2].copy_from_slice(&self.tree_depth.to_le_bytes());
+        buf[SLOT_MERKLE_SCHEME..SLOT_MERKLE_SCHEME + 2]
+            .copy_from_slice(&self.merkle_scheme.marker().to_le_bytes());
         buf[SLOT_TREE_ENTRIES..SLOT_TREE_ENTRIES + 8]
             .copy_from_slice(&self.tree_entries.to_le_bytes());
         buf[SLOT_CATALOG_ROOT..SLOT_CATALOG_ROOT + 4]
@@ -208,6 +247,11 @@ impl CommitSlot {
                     .try_into()
                     .unwrap(),
             ),
+            merkle_scheme: MerkleScheme::from_marker(u16::from_le_bytes(
+                buf[SLOT_MERKLE_SCHEME..SLOT_MERKLE_SCHEME + 2]
+                    .try_into()
+                    .unwrap(),
+            )),
             tree_entries: u64::from_le_bytes(
                 buf[SLOT_TREE_ENTRIES..SLOT_TREE_ENTRIES + 8]
                     .try_into()
@@ -260,7 +304,7 @@ impl CommitSlot {
     }
 
     pub fn verify_checksum(&self) -> bool {
-        if self.slot_format == SlotFormat::Unknown {
+        if self.slot_format == SlotFormat::Unknown || self.merkle_scheme == MerkleScheme::Unknown {
             return false;
         }
         let buf = self.serialize();
@@ -272,6 +316,9 @@ impl CommitSlot {
     /// and the named entries that the keyless checksum omits. Legacy slots
     /// pass vacuously so pre-v1 files keep opening (see the module doc).
     pub fn verify_mac(&self, mac_key: &[u8; MAC_KEY_SIZE]) -> bool {
+        if self.merkle_scheme == MerkleScheme::Unknown {
+            return false;
+        }
         match self.slot_format {
             SlotFormat::Legacy => true,
             SlotFormat::Unknown => false,
@@ -300,7 +347,9 @@ impl CommitSlot {
             .iter()
             .find(|&&(hash, ..)| hash == h)
             .and_then(|&(_, _, root, depth)| {
-                if root != 0 {
+                // (0, 0) is the absent-cache sentinel. Page zero itself is a
+                // valid reclaimed B-tree root, whose depth is always nonzero.
+                if root != 0 || depth != 0 {
                     Some((PageId(root), depth))
                 } else {
                     None
@@ -328,6 +377,7 @@ pub fn table_name_hash(name: &[u8]) -> u32 {
     xxhash_rust::xxh64::xxh64(name, 0x7461626C) as u32
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
     pub magic: u32,
     pub format_version: u32,
@@ -411,6 +461,7 @@ impl FileHeader {
             txn_id: TxnId(0),
             tree_root: PageId(0),
             tree_depth: 0,
+            merkle_scheme: MerkleScheme::LogicalOverflowV1,
             tree_entries: 0,
             catalog_root: PageId::INVALID,
             total_pages: 0,
@@ -498,24 +549,43 @@ pub fn read_header_flags(io: &dyn PageIO) -> Result<u8> {
     Ok(buf[0])
 }
 
-/// Stamp HEADER_FLAG_SLOTS_V1 (one-way) once both slots are sealed V1, so
-/// legacy slots are rejected thereafter. Returns whether the flag is set.
-/// A lost write just re-runs on the next open.
-pub fn mark_slots_v1_if_upgraded(io: &dyn PageIO) -> Result<bool> {
+/// Stamp HEADER_FLAG_SLOTS_V1 (one-way) once both slots are checksum-valid,
+/// authenticated V1 records, so legacy slots are rejected thereafter. Returns
+/// whether the flag is set. A lost write just re-runs on the next open.
+pub fn mark_slots_v1_if_upgraded(io: &dyn PageIO, mac_key: &[u8; MAC_KEY_SIZE]) -> Result<bool> {
     let flags = read_header_flags(io)?;
     if flags & HEADER_FLAG_SLOTS_V1 != 0 {
         return Ok(true);
     }
     let both_v1 = (0..2).try_fold(true, |acc, idx| {
-        read_commit_slot(io, idx).map(|slot| acc && slot.slot_format == SlotFormat::V1)
+        read_commit_slot(io, idx).map(|slot| {
+            acc && slot.slot_format == SlotFormat::V1
+                && slot.verify_checksum()
+                && slot.verify_mac(mac_key)
+        })
     })?;
     if both_v1 {
         io.write_at(HEADER_FLAGS_OFFSET as u64, &[flags | HEADER_FLAG_SLOTS_V1])?;
+        io.fsync()?;
     }
     Ok(both_v1)
 }
 
 pub fn recover(io: &dyn PageIO, mac_key: &[u8; MAC_KEY_SIZE]) -> Result<(usize, CommitSlot)> {
+    recover_with_v1_requirement(io, mac_key, false)
+}
+
+/// Recover with an optional requirement authenticated outside the mutable
+/// data header (currently the facade's MAC-covered key-file marker).
+///
+/// The legacy [`recover`] entry point remains header-only for lower-level
+/// callers that manage no key file. A protected caller must never retry that
+/// path after this one rejects a downgrade.
+pub fn recover_with_v1_requirement(
+    io: &dyn PageIO,
+    mac_key: &[u8; MAC_KEY_SIZE],
+    authenticated_v1_required: bool,
+) -> Result<(usize, CommitSlot)> {
     let god_byte = read_god_byte(io)?;
     let active = (god_byte & GOD_BIT_ACTIVE_SLOT) as usize;
     let inactive = 1 - active;
@@ -526,7 +596,8 @@ pub fn recover(io: &dyn PageIO, mac_key: &[u8; MAC_KEY_SIZE]) -> Result<(usize, 
     // A checksum-valid legacy slot in a flagged file is downgrade evidence
     // (rollback or a pre-v1 binary wrote it). Refuse loudly rather than
     // silently open the older generation.
-    let v1_required = read_header_flags(io)? & HEADER_FLAG_SLOTS_V1 != 0;
+    let v1_required =
+        authenticated_v1_required || read_header_flags(io)? & HEADER_FLAG_SLOTS_V1 != 0;
     if v1_required {
         for slot in [&slot_active, &slot_inactive] {
             if slot.slot_format == SlotFormat::Legacy && slot.verify_checksum() {
@@ -534,7 +605,10 @@ pub fn recover(io: &dyn PageIO, mac_key: &[u8; MAC_KEY_SIZE]) -> Result<(usize, 
             }
         }
     }
-    let format_ok = |slot: &CommitSlot| !v1_required || slot.slot_format == SlotFormat::V1;
+    let format_ok = |slot: &CommitSlot| {
+        slot.merkle_scheme != MerkleScheme::Unknown
+            && (!v1_required || slot.slot_format == SlotFormat::V1)
+    };
 
     let active_valid =
         format_ok(&slot_active) && slot_active.verify_checksum() && slot_active.verify_mac(mac_key);

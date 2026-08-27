@@ -10,6 +10,17 @@ fn sample_hash() -> MerkleHash {
 }
 
 #[test]
+fn released_session_entry_tags_are_rejected_before_entry_exchange() {
+    for legacy_tag in [0u8, 1u8, 12u8, 13u8, 14u8, 15u8] {
+        let frame = [legacy_tag, 0, 0, 0, 0];
+        assert!(matches!(
+            SyncMessage::deserialize(&frame),
+            Err(ProtocolError::UnknownMessageType(tag)) if tag == legacy_tag
+        ));
+    }
+}
+
+#[test]
 fn hello_roundtrip() {
     let msg = SyncMessage::Hello {
         node_id: NodeId::from_u64(42),
