@@ -40,6 +40,8 @@ pub enum AnnError {
         got: usize,
         row_id: u64,
     },
+    #[error("ANN build contains duplicate row_id {0}")]
+    DuplicateRowId(u64),
     #[error("PRISM rejected the index: {0}")]
     Prism(#[from] PrismError),
 }
@@ -117,6 +119,9 @@ impl AnnIndex {
         }
 
         rows.0.sort_unstable_by_key(|(id, _, _)| *id);
+        if let Some(duplicate) = rows.0.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+            return Err(AnnError::DuplicateRowId(duplicate[0].0));
+        }
         let snapshot_max = rows.0.last().map(|(id, _, _)| *id).unwrap_or(0);
 
         let n = rows.0.len();
@@ -160,7 +165,7 @@ impl AnnIndex {
     /// Reassemble from persisted parts (the ANN segment decode path). The
     /// caller is responsible for `prism.store.vectors` being in PRISM-internal
     /// (cell-reordered) order - see `segment::SegmentParts::into_index`.
-    pub fn from_parts(
+    pub(crate) fn from_parts(
         prism: PrismIndex,
         id_map: Vec<u64>,
         snapshot_max: u64,
@@ -289,6 +294,21 @@ mod tests {
                 row_id: 1
             }
         ));
+    }
+
+    #[test]
+    fn build_rejects_duplicate_external_row_ids() {
+        let error = AnnIndex::build(
+            vec![
+                (7, vec![1.0, 2.0]),
+                (8, vec![3.0, 4.0]),
+                (7, vec![5.0, 6.0]),
+            ],
+            Metric::L2,
+            2,
+        )
+        .unwrap_err();
+        assert!(matches!(error, AnnError::DuplicateRowId(7)));
     }
 
     #[test]

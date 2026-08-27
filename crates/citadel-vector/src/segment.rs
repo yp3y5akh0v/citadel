@@ -14,6 +14,7 @@
 //! place each scanned row's vector at `inverse(id_map)[row_id]`, never in scan
 //! order - a scan-order fill silently corrupts every f32 rerank.
 
+use citadel_core::CancelToken;
 use rustc_hash::FxHashMap;
 use zeroize::Zeroizing;
 
@@ -39,8 +40,82 @@ pub enum SegmentError {
     RehydrationIncomplete { expected: usize, got: usize },
     #[error("segment internal inconsistency: {0}")]
     Inconsistent(&'static str),
+    #[error("segment count in {0} exceeds the available payload")]
+    CountOutOfBounds(&'static str),
+    #[error("segment value in {0} exceeds its supported range")]
+    ValueOutOfBounds(&'static str),
+    #[error("segment allocation failed in {0}")]
+    Allocation(&'static str),
+    #[error("segment has trailing data in {0}")]
+    TrailingData(&'static str),
+    #[error("segment contains duplicate external row id {0}")]
+    DuplicateRowId(u64),
+    #[error("segment snapshot max {got} does not match maximum row id {expected}")]
+    SnapshotMax { expected: u64, got: u64 },
     #[error("PRISM rejected the decoded segment: {0}")]
     Prism(#[from] PrismError),
+}
+
+/// Failure from a cancellable segment operation.
+///
+/// Interruption is separate from malformed segment data so a
+/// storage loader never mistakes a cancelled read for corruption.
+#[derive(Debug, thiserror::Error)]
+pub enum SegmentOperationError {
+    #[error("segment operation interrupted")]
+    Interrupted,
+    #[error("segment allocation failed in {0}")]
+    Allocation(&'static str),
+    #[error(transparent)]
+    Segment(#[from] SegmentError),
+}
+
+const CANCEL_CHUNK_BYTES: usize = 64 * 1024;
+const CANCEL_CHUNK_U32_ITEMS: usize = CANCEL_CHUNK_BYTES / size_of::<u32>();
+const CANCEL_CHUNK_U64_ITEMS: usize = CANCEL_CHUNK_BYTES / size_of::<u64>();
+const CANCEL_CHUNK_COLLECTIONS: usize = 1024;
+const SECTION_FRAME_BYTES: usize = 1 + 8 + 32;
+
+struct CancelContext<'a> {
+    token: Option<&'a CancelToken>,
+    work: usize,
+    #[cfg(test)]
+    test_hook: Option<&'a mut dyn FnMut(usize)>,
+}
+
+impl<'a> CancelContext<'a> {
+    fn new(token: Option<&'a CancelToken>) -> Self {
+        Self {
+            token,
+            work: 0,
+            #[cfg(test)]
+            test_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_hook(token: Option<&'a CancelToken>, test_hook: &'a mut dyn FnMut(usize)) -> Self {
+        Self {
+            token,
+            work: 0,
+            test_hook: Some(test_hook),
+        }
+    }
+
+    fn checkpoint(&mut self) -> Result<(), SegmentOperationError> {
+        #[cfg(test)]
+        if let Some(hook) = self.test_hook.as_deref_mut() {
+            hook(self.work);
+        }
+        if self.token.is_some_and(CancelToken::is_cancelled) {
+            return Err(SegmentOperationError::Interrupted);
+        }
+        Ok(())
+    }
+
+    fn advance(&mut self, amount: usize) {
+        self.work = self.work.saturating_add(amount);
+    }
 }
 
 const TAG_GRAPH: u8 = 1;
@@ -58,28 +133,37 @@ const TAG_VECTORS: u8 = 8;
 /// version: bump it whenever build or search semantics change shape.
 pub fn prism_config_hash(cfg: &PrismConfig) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(b"citadel-annseg-config-v3");
+    h.update(b"citadel-annseg-config-v4");
     for v in [
         cfg.m_local as u64,
         cfg.m_greedy as u64,
         cfg.m_random as u64,
         cfg.t as u64,
-        cfg.beam_width as u64,
-        cfg.binary_rerank as u64,
     ] {
         h.update(&v.to_le_bytes());
     }
+    for v in [cfg.alpha, cfg.vamana_alpha] {
+        h.update(&v.to_le_bytes());
+    }
     for v in [
-        cfg.alpha,
-        cfg.vamana_alpha,
-        cfg.sigma_high,
-        cfg.sigma_low,
-        cfg.beta,
-        cfg.epsilon,
+        cfg.beam_width as u64,
+        cfg.cross_cell_exact_ranking_limit as u64,
     ] {
         h.update(&v.to_le_bytes());
     }
     h.update(&[metric_tag(cfg.metric)]);
+    for v in [cfg.sigma_high, cfg.sigma_low, cfg.beta, cfg.epsilon] {
+        h.update(&v.to_le_bytes());
+    }
+    for v in [
+        cfg.binary_rerank as u64,
+        cfg.scan_threshold as u64,
+        cfg.multi_cell_scan_threshold as u64,
+        cfg.graph_expansion as u64,
+        cfg.build_seed,
+    ] {
+        h.update(&v.to_le_bytes());
+    }
     *h.finalize().as_bytes()
 }
 
@@ -103,57 +187,108 @@ fn metric_from_tag(t: u8) -> Result<Metric, SegmentError> {
 /// Encode the complete build-form index. The output is the segment BODY; the
 /// storage layer wraps it in its header (fingerprint, config hash, counts).
 pub fn encode(index: &AnnIndex) -> Vec<u8> {
-    let p = index.prism();
-    let mut out = Vec::new();
+    match encode_with_cancel(index, None) {
+        Ok(mut encoded) => std::mem::take(encoded.as_mut()),
+        Err(SegmentOperationError::Interrupted) => {
+            unreachable!("segment encoding without a cancellation token was interrupted")
+        }
+        Err(SegmentOperationError::Allocation(where_)) => {
+            panic!("segment encoding allocation failed in {where_}")
+        }
+        Err(SegmentOperationError::Segment(error)) => {
+            panic!("segment encoding failed: {error}")
+        }
+    }
+}
 
-    section(&mut out, TAG_GRAPH, |b| encode_graph(b, p.graph()));
-    section(&mut out, TAG_SQ8, |b| {
-        push_u64(b, p.sq8().dim() as u64);
-        push_slice_u8(b, p.sq8().codes());
-        push_slice_f32(b, p.sq8().mins());
-        push_slice_f32(b, p.sq8().scales());
-    });
-    section(&mut out, TAG_BINARY, |b| {
-        push_u64(b, p.binary().code_words() as u64);
-        push_u64(b, p.binary().block_size() as u64);
-        push_slice_u64(b, p.binary().codes());
-        push_slice_f32(b, p.binary().signs());
-    });
-    section(&mut out, TAG_TREE, |b| {
-        push_u64(b, p.tree().num_attributes() as u64);
-        push_u64(b, p.tree().split_order().len() as u64);
-        for &s in p.tree().split_order() {
-            push_u64(b, s as u64);
+/// Encode the complete build-form index while observing `cancel` during large
+/// copies, numeric-array serialization, and section hashing.
+///
+/// The returned plaintext owns a zeroizing buffer. Sections are written
+/// directly into that buffer and their lengths are backpatched, avoiding the
+/// second unzeroized payload buffer that per-section assembly would require.
+pub fn encode_with_cancel(
+    index: &AnnIndex,
+    cancel: Option<&CancelToken>,
+) -> Result<Zeroizing<Vec<u8>>, SegmentOperationError> {
+    let mut context = CancelContext::new(cancel);
+    encode_with_context(index, &mut context)
+}
+
+fn encode_with_context(
+    index: &AnnIndex,
+    context: &mut CancelContext<'_>,
+) -> Result<Zeroizing<Vec<u8>>, SegmentOperationError> {
+    context.checkpoint()?;
+    let p = index.prism();
+    let expected_len = encoded_len(index, context)?;
+    let mut out = Zeroizing::new(Vec::new());
+    out.try_reserve_exact(expected_len)
+        .map_err(|_| SegmentOperationError::Allocation("encode output"))?;
+
+    write_section(out.as_mut(), context, TAG_GRAPH, |b, context| {
+        encode_graph(b, p.graph(), context)
+    })?;
+    write_section(out.as_mut(), context, TAG_SQ8, |b, context| {
+        put_u64(b, p.sq8().dim() as u64, context);
+        put_slice_u8(b, p.sq8().codes(), context)?;
+        put_slice_f32(b, p.sq8().mins(), context)?;
+        put_slice_f32(b, p.sq8().scales(), context)
+    })?;
+    write_section(out.as_mut(), context, TAG_BINARY, |b, context| {
+        put_u64(b, p.binary().code_words() as u64, context);
+        put_u64(b, p.binary().block_size() as u64, context);
+        put_slice_u64(b, p.binary().codes(), context)?;
+        put_slice_f32(b, p.binary().signs(), context)
+    })?;
+    write_section(out.as_mut(), context, TAG_TREE, |b, context| {
+        put_u64(b, p.tree().num_attributes() as u64, context);
+        put_u64(b, p.tree().split_order().len() as u64, context);
+        for values in p.tree().split_order().chunks(CANCEL_CHUNK_U64_ITEMS) {
+            context.checkpoint()?;
+            for &value in values {
+                put_u64(b, value as u64, context);
+            }
         }
-        push_u64(b, p.tree().cells().len() as u64);
+        put_u64(b, p.tree().cells().len() as u64, context);
         for cell in p.tree().cells() {
-            push_slice_u32(b, cell.values());
-            push_slice_u32(b, cell.point_ids());
+            context.checkpoint()?;
+            put_slice_u32(b, cell.values(), context)?;
+            put_slice_u32(b, cell.point_ids(), context)?;
         }
-    });
-    section(&mut out, TAG_IDS, |b| {
-        push_u64(b, index.snapshot_max);
-        b.push(metric_tag(index.metric));
-        b.extend_from_slice(&index.dim.to_le_bytes());
-        push_u64(b, u64::from(p.global_medoid()));
-        push_slice_u32(b, p.medoids());
-        push_slice_u32(b, p.point_cell());
-        push_slice_u32(b, p.original_ids());
-        push_slice_u64(b, index.id_map());
-    });
-    section(&mut out, TAG_ATTRS, |b| {
-        push_u64(b, p.store().attributes().len() as u64);
-        push_u64(b, p.store().len() as u64);
+        Ok(())
+    })?;
+    write_section(out.as_mut(), context, TAG_IDS, |b, context| {
+        put_u64(b, index.snapshot_max, context);
+        put_u8(b, metric_tag(index.metric), context);
+        put_bytes_small(b, &index.dim.to_le_bytes(), context);
+        put_u64(b, u64::from(p.global_medoid()), context);
+        put_slice_u32(b, p.medoids(), context)?;
+        put_slice_u32(b, p.point_cell(), context)?;
+        put_slice_u32(b, p.original_ids(), context)?;
+        put_slice_u64(b, index.id_map(), context)
+    })?;
+    write_section(out.as_mut(), context, TAG_ATTRS, |b, context| {
+        put_u64(b, p.store().attributes().len() as u64, context);
+        put_u64(b, p.store().len() as u64, context);
         for col in p.store().attributes() {
-            push_slice_u32(b, col);
+            context.checkpoint()?;
+            put_slice_u32(b, col, context)?;
         }
-    });
+        Ok(())
+    })?;
     // The f32 vectors in PRISM slot order, so a cold load is a bulk read, not a rescan.
-    section(&mut out, TAG_VECTORS, |b| {
-        push_u64(b, p.store().dim() as u64);
-        push_slice_f32(b, p.store().vectors());
-    });
-    out
+    write_section(out.as_mut(), context, TAG_VECTORS, |b, context| {
+        put_u64(b, p.store().dim() as u64, context);
+        put_slice_f32(b, p.store().vectors(), context)
+    })?;
+    context.checkpoint()?;
+    debug_assert_eq!(
+        out.len(),
+        expected_len,
+        "encoded length calculation drifted"
+    );
+    Ok(out)
 }
 
 /// Everything a decoded segment carries. Vectors reach the index from the
@@ -191,8 +326,74 @@ impl SegmentParts {
         self.metric
     }
 
+    pub fn snapshot_max(&self) -> u64 {
+        self.snapshot_max
+    }
+
     pub fn id_map(&self) -> &[u64] {
         &self.id_map
+    }
+
+    /// Whether every persisted attribute code belongs to the corresponding
+    /// storage-envelope dictionary. The segment format owns the numeric
+    /// columns; their external value dictionaries live in its SQL or memory
+    /// envelope and must be cross-checked there. An unfiltered envelope has no
+    /// dictionaries and matches PRISM's single synthetic all-zero column.
+    pub fn attributes_fit_domains(&self, domain_sizes: &[usize]) -> bool {
+        self.attributes_fit_domains_with_cancel(domain_sizes, None)
+            .expect("attribute-domain validation without a cancellation token was interrupted")
+    }
+
+    /// Cancellable form of [`Self::attributes_fit_domains`].
+    pub fn attributes_fit_domains_with_cancel(
+        &self,
+        domain_sizes: &[usize],
+        cancel: Option<&CancelToken>,
+    ) -> Result<bool, SegmentOperationError> {
+        let mut context = CancelContext::new(cancel);
+        self.attributes_fit_domains_with_context(domain_sizes, &mut context)
+    }
+
+    fn attributes_fit_domains_with_context(
+        &self,
+        domain_sizes: &[usize],
+        context: &mut CancelContext<'_>,
+    ) -> Result<bool, SegmentOperationError> {
+        context.checkpoint()?;
+
+        // PRISM represents an unfiltered index as one synthetic all-zero
+        // attribute column, while its storage envelope has no dictionaries.
+        if domain_sizes.is_empty() {
+            if self.attrs.len() != 1 {
+                return Ok(false);
+            }
+            for chunk in self.attrs[0].chunks(CANCEL_CHUNK_U32_ITEMS) {
+                context.checkpoint()?;
+                if chunk.iter().any(|&code| code != 0) {
+                    context.checkpoint()?;
+                    return Ok(false);
+                }
+                context.advance(size_of_val(chunk));
+            }
+            context.checkpoint()?;
+            return Ok(true);
+        }
+
+        if self.attrs.len() != domain_sizes.len() {
+            return Ok(false);
+        }
+        for (column, &size) in self.attrs.iter().zip(domain_sizes) {
+            for chunk in column.chunks(CANCEL_CHUNK_U32_ITEMS) {
+                context.checkpoint()?;
+                if chunk.iter().any(|&code| (code as usize) >= size) {
+                    context.checkpoint()?;
+                    return Ok(false);
+                }
+                context.advance(size_of_val(chunk));
+            }
+        }
+        context.checkpoint()?;
+        Ok(true)
     }
 
     /// `row_id -> PRISM-internal slot`: the PERMUTATION the rehydration loader uses.
@@ -262,83 +463,256 @@ impl SegmentParts {
 /// Decode a segment body. Every section's BLAKE3 must verify; any mismatch is
 /// a corruption refusal, never a partial result.
 pub fn decode(bytes: &[u8]) -> Result<SegmentParts, SegmentError> {
+    match decode_with_cancel(bytes, None) {
+        Ok(parts) => Ok(parts),
+        Err(SegmentOperationError::Segment(error)) => Err(error),
+        Err(SegmentOperationError::Allocation(where_)) => Err(SegmentError::Allocation(where_)),
+        Err(SegmentOperationError::Interrupted) => {
+            unreachable!("decoding without a cancellation token cannot be interrupted")
+        }
+    }
+}
+
+/// Decode a segment body while observing `cancel` during section hashing and
+/// numeric-array materialization. Interruption is not reported as corruption.
+pub fn decode_with_cancel(
+    bytes: &[u8],
+    cancel: Option<&CancelToken>,
+) -> Result<SegmentParts, SegmentOperationError> {
+    let mut context = CancelContext::new(cancel);
+    decode_with_context(bytes, &mut context)
+}
+
+fn decode_with_context(
+    bytes: &[u8],
+    context: &mut CancelContext<'_>,
+) -> Result<SegmentParts, SegmentOperationError> {
+    context.checkpoint()?;
     let mut r = Reader { buf: bytes, at: 0 };
 
-    let g = r.section(TAG_GRAPH, "graph")?;
-    let graph = decode_graph(&mut Reader { buf: g, at: 0 }, "graph")?;
+    let g = r.section(TAG_GRAPH, "graph", context)?;
+    let mut gr = Reader { buf: g, at: 0 };
+    let graph_n = gr.count("graph")?;
+    let mut graph_offsets = gr.slice_u32("graph", context)?;
+    let mut graph_neighbors = gr.slice_u32("graph", context)?;
+    gr.finish("graph")?;
+    if graph_n.checked_add(1) != Some(graph_offsets.len()) {
+        return Err(SegmentError::Inconsistent("graph offsets length != n+1").into());
+    }
 
-    let s = r.section(TAG_SQ8, "sq8")?;
+    let s = r.section(TAG_SQ8, "sq8", context)?;
     let mut sr = Reader { buf: s, at: 0 };
-    let sq8_dim = sr.u64("sq8")? as usize;
-    let codes = sr.slice_u8("sq8")?.to_vec();
-    let mins = sr.slice_f32("sq8")?;
-    let scales = sr.slice_f32("sq8")?;
-    let sq8 = SQ8Store::from_parts(codes, mins, scales, sq8_dim)?;
+    let sq8_dim = sr.count("sq8")?;
+    let mut codes = sr.slice_u8("sq8", context)?;
+    let mut mins = sr.slice_f32("sq8", context)?;
+    let mut scales = sr.slice_f32("sq8", context)?;
+    sr.finish("sq8")?;
 
-    let b = r.section(TAG_BINARY, "binary")?;
+    let b = r.section(TAG_BINARY, "binary", context)?;
     let mut br = Reader { buf: b, at: 0 };
-    let code_words = br.u64("binary")? as usize;
-    let block_size = br.u64("binary")? as usize;
-    let bcodes = br.slice_u64("binary")?;
-    let signs = br.slice_f32("binary")?;
-    let binary = BinaryStore::from_parts(bcodes, code_words, signs, block_size)?;
+    let code_words = br.count("binary")?;
+    let block_size = br.count("binary")?;
+    let mut bcodes = br.slice_u64("binary", context)?;
+    let mut signs = br.slice_f32("binary", context)?;
+    br.finish("binary")?;
 
-    let t = r.section(TAG_TREE, "tree")?;
+    let t = r.section(TAG_TREE, "tree", context)?;
     let mut tr = Reader { buf: t, at: 0 };
-    let k = tr.u64("tree")? as usize;
-    let so_len = tr.u64("tree")? as usize;
-    let mut split_order = Vec::with_capacity(so_len);
-    for _ in 0..so_len {
-        split_order.push(tr.u64("tree")? as usize);
+    let k = tr.count("tree")?;
+    let so_len = tr.count("tree")?;
+    if so_len > tr.remaining().saturating_sub(8) / 8 {
+        return Err(SegmentError::CountOutOfBounds("tree split order").into());
     }
-    let cells_len = tr.u64("tree")? as usize;
-    let mut cells = Vec::with_capacity(cells_len);
+    let mut split_order = Zeroizing::new(Vec::new());
+    split_order
+        .try_reserve_exact(so_len)
+        .map_err(|_| SegmentOperationError::Allocation("tree split order"))?;
+    for chunk_start in (0..so_len).step_by(CANCEL_CHUNK_U64_ITEMS) {
+        context.checkpoint()?;
+        let chunk_end = (chunk_start + CANCEL_CHUNK_U64_ITEMS).min(so_len);
+        for _ in chunk_start..chunk_end {
+            split_order.push(tr.count("tree split order")?);
+        }
+        context.advance((chunk_end - chunk_start) * 8);
+    }
+    context.checkpoint()?;
+    let cells_len = tr.count("tree")?;
+    if cells_len > tr.remaining() / 16 {
+        return Err(SegmentError::CountOutOfBounds("tree cells").into());
+    }
+    let mut cells = Vec::new();
+    cells
+        .try_reserve_exact(cells_len)
+        .map_err(|_| SegmentOperationError::Allocation("tree cells"))?;
     for _ in 0..cells_len {
-        let values = tr.slice_u32("tree")?;
-        let point_ids = tr.slice_u32("tree")?;
-        cells.push(Cell::from_parts(values, point_ids));
+        context.checkpoint()?;
+        let mut values = tr.slice_u32("tree", context)?;
+        let mut point_ids = tr.slice_u32("tree", context)?;
+        cells.push(Cell::from_parts(
+            std::mem::take(values.as_mut()),
+            std::mem::take(point_ids.as_mut()),
+        ));
     }
+    tr.finish("tree")?;
 
-    let i = r.section(TAG_IDS, "ids")?;
+    let i = r.section(TAG_IDS, "ids", context)?;
     let mut ir = Reader { buf: i, at: 0 };
     let snapshot_max = ir.u64("ids")?;
     let metric = metric_from_tag(ir.u8("ids")?)?;
     let dim = ir.u16("ids")?;
-    let global_medoid = ir.u64("ids")? as u32;
-    let medoids = ir.slice_u32("ids")?;
-    let point_cell = ir.slice_u32("ids")?;
-    let original_ids = ir.slice_u32("ids")?;
-    let id_map = ir.slice_u64("ids")?;
+    let global_medoid = u32::try_from(ir.u64("ids")?)
+        .map_err(|_| SegmentError::ValueOutOfBounds("global medoid"))?;
+    let mut medoids = ir.slice_u32("ids", context)?;
+    let mut point_cell = ir.slice_u32("ids", context)?;
+    let mut original_ids = ir.slice_u32("ids", context)?;
+    let mut id_map = ir.slice_u64("ids", context)?;
+    ir.finish("ids")?;
 
-    let a = r.section(TAG_ATTRS, "attrs")?;
+    let a = r.section(TAG_ATTRS, "attrs", context)?;
     let mut ar = Reader { buf: a, at: 0 };
-    let attr_k = ar.u64("attrs")? as usize;
-    let n = ar.u64("attrs")? as usize;
-    let mut attrs = Vec::with_capacity(attr_k);
-    for _ in 0..attr_k {
-        let col = ar.slice_u32("attrs")?;
-        if col.len() != n {
-            return Err(SegmentError::Inconsistent("attr column length != n"));
-        }
-        attrs.push(col);
+    let attr_k = ar.count("attrs")?;
+    let n = ar.count("attrs")?;
+    if attr_k > ar.remaining() / 8 {
+        return Err(SegmentError::CountOutOfBounds("attribute columns").into());
     }
+    let mut raw_attrs = Vec::new();
+    raw_attrs
+        .try_reserve_exact(attr_k)
+        .map_err(|_| SegmentOperationError::Allocation("attribute columns"))?;
+    for _ in 0..attr_k {
+        context.checkpoint()?;
+        let col = ar.slice_u32("attrs", context)?;
+        if col.len() != n {
+            return Err(SegmentError::Inconsistent("attr column length != n").into());
+        }
+        raw_attrs.push(col);
+    }
+    ar.finish("attrs")?;
 
-    let v = r.section(TAG_VECTORS, "vectors")?;
+    let v = r.section(TAG_VECTORS, "vectors", context)?;
+    r.finish("body")?;
     let mut vr = Reader { buf: v, at: 0 };
-    let vdim = vr.u64("vectors")? as usize;
-    let vectors = vr.slice_f32("vectors")?;
-    if vdim != dim as usize || vectors.len() != n * dim as usize {
+    let vdim = vr.count("vectors")?;
+    let vectors = vr.slice_f32("vectors", context)?;
+    vr.finish("vectors")?;
+    let expected_vectors = n
+        .checked_mul(dim as usize)
+        .ok_or(SegmentError::Inconsistent("n*dim overflows usize"))?;
+    if vdim != dim as usize {
+        return Err(SegmentError::Inconsistent(
+            "vector section dimension disagrees with ids dimension",
+        )
+        .into());
+    }
+    if vectors.len() != expected_vectors {
         return Err(SegmentError::VectorLen {
-            expected: n * dim as usize,
+            expected: expected_vectors,
             got: vectors.len(),
-        });
+        }
+        .into());
     }
 
     if id_map.len() != n || original_ids.len() != n || point_cell.len() != n {
-        return Err(SegmentError::Inconsistent("id arrays disagree on n"));
+        return Err(SegmentError::Inconsistent("id arrays disagree on n").into());
     }
-    let tree = PartitionTree::from_parts(cells, split_order, k, n)?;
-    Ok(SegmentParts {
+    if n > u32::MAX as usize {
+        return Err(SegmentError::Inconsistent("point count exceeds u32 ids").into());
+    }
+    let mut row_by_original = Vec::new();
+    row_by_original
+        .try_reserve_exact(n)
+        .map_err(|_| SegmentOperationError::Allocation("external row-id order"))?;
+    row_by_original.resize(n, 0u64);
+    let mut seen_original = Vec::new();
+    seen_original
+        .try_reserve_exact(n)
+        .map_err(|_| SegmentOperationError::Allocation("original-id permutation"))?;
+    seen_original.resize(n, false);
+    for (internal, (&original_id, &row_id)) in original_ids.iter().zip(id_map.iter()).enumerate() {
+        if internal % CANCEL_CHUNK_COLLECTIONS == 0 {
+            context.checkpoint()?;
+        }
+        let original = original_id as usize;
+        if original >= n || seen_original[original] {
+            return Err(
+                SegmentError::Inconsistent("original ids are not a permutation of 0..n").into(),
+            );
+        }
+        seen_original[original] = true;
+        row_by_original[original] = row_id;
+        context.advance(size_of::<u32>() + size_of::<u64>());
+    }
+
+    let mut previous = None;
+    for (original, &row_id) in row_by_original.iter().enumerate() {
+        if original % CANCEL_CHUNK_COLLECTIONS == 0 {
+            context.checkpoint()?;
+        }
+        if let Some(prior) = previous {
+            if row_id == prior {
+                return Err(SegmentError::DuplicateRowId(row_id).into());
+            }
+            if row_id < prior {
+                return Err(SegmentError::Inconsistent(
+                    "external row ids do not follow original-id order",
+                )
+                .into());
+            }
+        }
+        previous = Some(row_id);
+        context.advance(size_of::<u64>());
+    }
+    if let Some(expected) = previous {
+        if snapshot_max != expected {
+            return Err(SegmentError::SnapshotMax {
+                expected,
+                got: snapshot_max,
+            }
+            .into());
+        }
+    }
+    drop(row_by_original);
+    drop(seen_original);
+    context.checkpoint()?;
+
+    let graph = Graph::from_parts(
+        std::mem::take(graph_offsets.as_mut()),
+        std::mem::take(graph_neighbors.as_mut()),
+        graph_n,
+    )
+    .map_err(SegmentError::from)?;
+    context.checkpoint()?;
+    let sq8 = SQ8Store::from_parts(
+        std::mem::take(codes.as_mut()),
+        std::mem::take(mins.as_mut()),
+        std::mem::take(scales.as_mut()),
+        sq8_dim,
+    )
+    .map_err(SegmentError::from)?;
+    context.checkpoint()?;
+    let binary = BinaryStore::from_parts(
+        std::mem::take(bcodes.as_mut()),
+        code_words,
+        std::mem::take(signs.as_mut()),
+        block_size,
+    )
+    .map_err(SegmentError::from)?;
+    context.checkpoint()?;
+    let tree = PartitionTree::from_parts(cells, std::mem::take(split_order.as_mut()), k, n)
+        .map_err(SegmentError::from)?;
+    context.checkpoint()?;
+    let mut attrs = Vec::new();
+    attrs
+        .try_reserve_exact(raw_attrs.len())
+        .map_err(|_| SegmentOperationError::Allocation("decoded attributes"))?;
+    for (index, mut col) in raw_attrs.into_iter().enumerate() {
+        if index % CANCEL_CHUNK_COLLECTIONS == 0 {
+            context.checkpoint()?;
+        }
+        attrs.push(std::mem::take(col.as_mut()));
+    }
+    context.checkpoint()?;
+    let parts = SegmentParts {
         graph,
         sq8,
         binary,
@@ -347,70 +721,213 @@ pub fn decode(bytes: &[u8]) -> Result<SegmentParts, SegmentError> {
         metric,
         dim,
         global_medoid,
-        medoids,
-        point_cell,
-        original_ids,
-        id_map,
+        medoids: std::mem::take(medoids.as_mut()),
+        point_cell: std::mem::take(point_cell.as_mut()),
+        original_ids: std::mem::take(original_ids.as_mut()),
+        id_map: std::mem::take(id_map.as_mut()),
         attrs,
-        vectors: Zeroizing::new(vectors),
+        vectors,
         n,
-    })
+    };
+    context.checkpoint()?;
+    Ok(parts)
 }
 
-fn encode_graph(b: &mut Vec<u8>, g: &Graph) {
-    push_u64(b, g.len() as u64);
-    push_slice_u32(b, g.offsets());
-    push_slice_u32(b, g.neighbor_ids());
-}
-
-fn decode_graph(r: &mut Reader<'_>, what: &'static str) -> Result<Graph, SegmentError> {
-    let n = r.u64(what)? as usize;
-    let offsets = r.slice_u32(what)?;
-    let neighbors = r.slice_u32(what)?;
-    if offsets.len() != n + 1 {
-        return Err(SegmentError::Inconsistent("graph offsets length != n+1"));
+fn encoded_len(
+    index: &AnnIndex,
+    context: &mut CancelContext<'_>,
+) -> Result<usize, SegmentOperationError> {
+    fn slice_len(items: usize, width: u8) -> u128 {
+        8 + (items as u128) * u128::from(width)
     }
-    Ok(Graph::from_parts(offsets, neighbors, n)?)
-}
 
-fn section(out: &mut Vec<u8>, tag: u8, fill: impl FnOnce(&mut Vec<u8>)) {
-    let mut payload = Vec::new();
-    fill(&mut payload);
-    out.push(tag);
-    push_u64(out, payload.len() as u64);
-    let hash = blake3::hash(&payload);
-    out.extend_from_slice(&payload);
-    out.extend_from_slice(hash.as_bytes());
-}
+    let p = index.prism();
+    let mut len = (7 * SECTION_FRAME_BYTES) as u128;
 
-fn push_u64(b: &mut Vec<u8>, v: u64) {
-    b.extend_from_slice(&v.to_le_bytes());
-}
+    len += 8 + slice_len(p.graph().offsets().len(), 4);
+    len += slice_len(p.graph().neighbor_ids().len(), 4);
 
-fn push_slice_u8(b: &mut Vec<u8>, s: &[u8]) {
-    push_u64(b, s.len() as u64);
-    b.extend_from_slice(s);
-}
+    len += 8 + slice_len(p.sq8().codes().len(), 1);
+    len += slice_len(p.sq8().mins().len(), 4);
+    len += slice_len(p.sq8().scales().len(), 4);
 
-fn push_slice_u32(b: &mut Vec<u8>, s: &[u32]) {
-    push_u64(b, s.len() as u64);
-    for &v in s {
-        b.extend_from_slice(&v.to_le_bytes());
+    len += 16 + slice_len(p.binary().codes().len(), 8);
+    len += slice_len(p.binary().signs().len(), 4);
+
+    len += 24 + (p.tree().split_order().len() as u128) * 8;
+    for cell in p.tree().cells() {
+        context.checkpoint()?;
+        len += slice_len(cell.values().len(), 4);
+        len += slice_len(cell.point_ids().len(), 4);
     }
+
+    len += 19 + slice_len(p.medoids().len(), 4);
+    len += slice_len(p.point_cell().len(), 4);
+    len += slice_len(p.original_ids().len(), 4);
+    len += slice_len(index.id_map().len(), 8);
+
+    len += 16;
+    for col in p.store().attributes() {
+        context.checkpoint()?;
+        len += slice_len(col.len(), 4);
+    }
+
+    len += 8 + slice_len(p.store().vectors().len(), 4);
+    usize::try_from(len)
+        .map_err(|_| SegmentError::Inconsistent("encoded segment length overflows usize").into())
 }
 
-fn push_slice_u64(b: &mut Vec<u8>, s: &[u64]) {
-    push_u64(b, s.len() as u64);
-    for &v in s {
-        b.extend_from_slice(&v.to_le_bytes());
-    }
+fn write_section(
+    out: &mut Vec<u8>,
+    context: &mut CancelContext<'_>,
+    tag: u8,
+    fill: impl FnOnce(&mut Vec<u8>, &mut CancelContext<'_>) -> Result<(), SegmentOperationError>,
+) -> Result<(), SegmentOperationError> {
+    context.checkpoint()?;
+    put_u8(out, tag, context);
+    let length_offset = out.len();
+    put_bytes_small(out, &[0; 8], context);
+    let payload_offset = out.len();
+    fill(out, context)?;
+
+    let payload_len = out.len() - payload_offset;
+    let payload_len = u64::try_from(payload_len)
+        .map_err(|_| SegmentError::Inconsistent("section length overflows u64"))?;
+    out[length_offset..length_offset + 8].copy_from_slice(&payload_len.to_le_bytes());
+    let hash = digest_with_context(&out[payload_offset..], context)?;
+    put_bytes_small(out, &hash, context);
+    Ok(())
 }
 
-fn push_slice_f32(b: &mut Vec<u8>, s: &[f32]) {
-    push_u64(b, s.len() as u64);
-    for &v in s {
-        b.extend_from_slice(&v.to_le_bytes());
+fn encode_graph(
+    out: &mut Vec<u8>,
+    graph: &Graph,
+    context: &mut CancelContext<'_>,
+) -> Result<(), SegmentOperationError> {
+    put_u64(out, graph.len() as u64, context);
+    put_slice_u32(out, graph.offsets(), context)?;
+    put_slice_u32(out, graph.neighbor_ids(), context)
+}
+
+fn put_u8(out: &mut Vec<u8>, value: u8, context: &mut CancelContext<'_>) {
+    assert_spare_capacity(out, 1);
+    out.push(value);
+    context.advance(1);
+}
+
+fn put_u64(out: &mut Vec<u8>, value: u64, context: &mut CancelContext<'_>) {
+    put_bytes_small(out, &value.to_le_bytes(), context);
+}
+
+fn put_bytes_small(out: &mut Vec<u8>, bytes: &[u8], context: &mut CancelContext<'_>) {
+    assert_spare_capacity(out, bytes.len());
+    out.extend_from_slice(bytes);
+    context.advance(bytes.len());
+}
+
+#[inline]
+fn assert_spare_capacity(out: &Vec<u8>, additional: usize) {
+    debug_assert!(
+        out.len()
+            .checked_add(additional)
+            .is_some_and(|required| required <= out.capacity()),
+        "encoded length calculation under-allocated"
+    );
+}
+
+fn put_slice_u8(
+    out: &mut Vec<u8>,
+    values: &[u8],
+    context: &mut CancelContext<'_>,
+) -> Result<(), SegmentOperationError> {
+    put_u64(out, values.len() as u64, context);
+    for chunk in values.chunks(CANCEL_CHUNK_BYTES) {
+        context.checkpoint()?;
+        assert_spare_capacity(out, chunk.len());
+        out.extend_from_slice(chunk);
+        context.advance(chunk.len());
     }
+    context.checkpoint()
+}
+
+fn put_slice_u32(
+    out: &mut Vec<u8>,
+    values: &[u32],
+    context: &mut CancelContext<'_>,
+) -> Result<(), SegmentOperationError> {
+    put_u64(out, values.len() as u64, context);
+    for chunk in values.chunks(CANCEL_CHUNK_U32_ITEMS) {
+        context.checkpoint()?;
+        assert_spare_capacity(out, chunk.len() * 4);
+        for &value in chunk {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        context.advance(chunk.len() * 4);
+    }
+    context.checkpoint()
+}
+
+fn put_slice_u64(
+    out: &mut Vec<u8>,
+    values: &[u64],
+    context: &mut CancelContext<'_>,
+) -> Result<(), SegmentOperationError> {
+    put_u64(out, values.len() as u64, context);
+    for chunk in values.chunks(CANCEL_CHUNK_U64_ITEMS) {
+        context.checkpoint()?;
+        assert_spare_capacity(out, chunk.len() * 8);
+        for &value in chunk {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        context.advance(chunk.len() * 8);
+    }
+    context.checkpoint()
+}
+
+fn put_slice_f32(
+    out: &mut Vec<u8>,
+    values: &[f32],
+    context: &mut CancelContext<'_>,
+) -> Result<(), SegmentOperationError> {
+    put_u64(out, values.len() as u64, context);
+    for chunk in values.chunks(CANCEL_CHUNK_U32_ITEMS) {
+        context.checkpoint()?;
+        assert_spare_capacity(out, chunk.len() * 4);
+        for &value in chunk {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        context.advance(chunk.len() * 4);
+    }
+    context.checkpoint()
+}
+
+#[cfg(test)]
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    digest_with_cancel(bytes, None).expect("a digest without a cancellation token cannot fail")
+}
+
+/// BLAKE3 digest that observes `cancel` between bounded input chunks.
+pub fn digest_with_cancel(
+    bytes: &[u8],
+    cancel: Option<&CancelToken>,
+) -> Result<[u8; 32], SegmentOperationError> {
+    let mut context = CancelContext::new(cancel);
+    digest_with_context(bytes, &mut context)
+}
+
+fn digest_with_context(
+    bytes: &[u8],
+    context: &mut CancelContext<'_>,
+) -> Result<[u8; 32], SegmentOperationError> {
+    context.checkpoint()?;
+    let mut hasher = blake3::Hasher::new();
+    for chunk in bytes.chunks(CANCEL_CHUNK_BYTES) {
+        context.checkpoint()?;
+        hasher.update(chunk);
+        context.advance(chunk.len());
+    }
+    context.checkpoint()?;
+    Ok(*hasher.finalize().as_bytes())
 }
 
 struct Reader<'a> {
@@ -419,6 +936,18 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.at
+    }
+
+    fn finish(&self, what: &'static str) -> Result<(), SegmentError> {
+        if self.at == self.buf.len() {
+            Ok(())
+        } else {
+            Err(SegmentError::TrailingData(what))
+        }
+    }
+
     fn take(&mut self, n: usize, what: &'static str) -> Result<&'a [u8], SegmentError> {
         let end = self
             .at
@@ -442,66 +971,124 @@ impl<'a> Reader<'a> {
         Ok(u64::from_le_bytes(self.take(8, what)?.try_into().unwrap()))
     }
 
+    fn count(&mut self, what: &'static str) -> Result<usize, SegmentError> {
+        usize::try_from(self.u64(what)?).map_err(|_| SegmentError::CountOutOfBounds(what))
+    }
+
     /// One framed section: tag + length + payload + verified BLAKE3.
-    fn section(&mut self, tag: u8, what: &'static str) -> Result<&'a [u8], SegmentError> {
+    fn section(
+        &mut self,
+        tag: u8,
+        what: &'static str,
+        context: &mut CancelContext<'_>,
+    ) -> Result<&'a [u8], SegmentOperationError> {
+        context.checkpoint()?;
         let got = self.u8(what)?;
         if got != tag {
-            return Err(SegmentError::BadTag { expected: tag, got });
+            return Err(SegmentError::BadTag { expected: tag, got }.into());
         }
-        let len = self.u64(what)? as usize;
+        let len = self.count(what)?;
         let payload = self.take(len, what)?;
         let hash: [u8; 32] = self.take(32, what)?.try_into().unwrap();
-        if *blake3::hash(payload).as_bytes() != hash {
-            return Err(SegmentError::SectionHash(what));
+        if digest_with_context(payload, context)? != hash {
+            return Err(SegmentError::SectionHash(what).into());
         }
         Ok(payload)
     }
 
-    fn slice_u8(&mut self, what: &'static str) -> Result<&'a [u8], SegmentError> {
-        let len = self.u64(what)? as usize;
-        self.take(len, what)
+    fn slice_u8(
+        &mut self,
+        what: &'static str,
+        context: &mut CancelContext<'_>,
+    ) -> Result<Zeroizing<Vec<u8>>, SegmentOperationError> {
+        let len = self.count(what)?;
+        let raw = self.take(len, what)?;
+        let mut values = Zeroizing::new(Vec::new());
+        values
+            .try_reserve_exact(len)
+            .map_err(|_| SegmentOperationError::Allocation(what))?;
+        for chunk in raw.chunks(CANCEL_CHUNK_BYTES) {
+            context.checkpoint()?;
+            values.extend_from_slice(chunk);
+            context.advance(chunk.len());
+        }
+        context.checkpoint()?;
+        Ok(values)
     }
 
-    fn slice_u32(&mut self, what: &'static str) -> Result<Vec<u32>, SegmentError> {
-        let len = self.u64(what)? as usize;
+    fn slice_u32(
+        &mut self,
+        what: &'static str,
+        context: &mut CancelContext<'_>,
+    ) -> Result<Zeroizing<Vec<u32>>, SegmentOperationError> {
+        let len = self.count(what)?;
         let raw = self.take(
             len.checked_mul(4).ok_or(SegmentError::Truncated(what))?,
             what,
         )?;
-        Ok(raw
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| u32::from_le_bytes(*c))
-            .collect())
+        let mut values = Zeroizing::new(Vec::new());
+        values
+            .try_reserve_exact(len)
+            .map_err(|_| SegmentOperationError::Allocation(what))?;
+        for chunk in raw.chunks(CANCEL_CHUNK_BYTES) {
+            context.checkpoint()?;
+            for encoded in chunk.as_chunks::<4>().0 {
+                values.push(u32::from_le_bytes(*encoded));
+            }
+            context.advance(chunk.len());
+        }
+        context.checkpoint()?;
+        Ok(values)
     }
 
-    fn slice_u64(&mut self, what: &'static str) -> Result<Vec<u64>, SegmentError> {
-        let len = self.u64(what)? as usize;
+    fn slice_u64(
+        &mut self,
+        what: &'static str,
+        context: &mut CancelContext<'_>,
+    ) -> Result<Zeroizing<Vec<u64>>, SegmentOperationError> {
+        let len = self.count(what)?;
         let raw = self.take(
             len.checked_mul(8).ok_or(SegmentError::Truncated(what))?,
             what,
         )?;
-        Ok(raw
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|c| u64::from_le_bytes(*c))
-            .collect())
+        let mut values = Zeroizing::new(Vec::new());
+        values
+            .try_reserve_exact(len)
+            .map_err(|_| SegmentOperationError::Allocation(what))?;
+        for chunk in raw.chunks(CANCEL_CHUNK_BYTES) {
+            context.checkpoint()?;
+            for encoded in chunk.as_chunks::<8>().0 {
+                values.push(u64::from_le_bytes(*encoded));
+            }
+            context.advance(chunk.len());
+        }
+        context.checkpoint()?;
+        Ok(values)
     }
 
-    fn slice_f32(&mut self, what: &'static str) -> Result<Vec<f32>, SegmentError> {
-        let len = self.u64(what)? as usize;
+    fn slice_f32(
+        &mut self,
+        what: &'static str,
+        context: &mut CancelContext<'_>,
+    ) -> Result<Zeroizing<Vec<f32>>, SegmentOperationError> {
+        let len = self.count(what)?;
         let raw = self.take(
             len.checked_mul(4).ok_or(SegmentError::Truncated(what))?,
             what,
         )?;
-        Ok(raw
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect())
+        let mut values = Zeroizing::new(Vec::new());
+        values
+            .try_reserve_exact(len)
+            .map_err(|_| SegmentOperationError::Allocation(what))?;
+        for chunk in raw.chunks(CANCEL_CHUNK_BYTES) {
+            context.checkpoint()?;
+            for encoded in chunk.as_chunks::<4>().0 {
+                values.push(f32::from_le_bytes(*encoded));
+            }
+            context.advance(chunk.len());
+        }
+        context.checkpoint()?;
+        Ok(values)
     }
 }
 
@@ -527,6 +1114,314 @@ mod tests {
         AnnIndex::build_with_attrs(fixture_rows(), 1, Metric::Cosine, 8).expect("build fixture")
     }
 
+    fn edit_section_payload(bytes: &mut Vec<u8>, tag: u8, edit: impl FnOnce(&mut Vec<u8>)) {
+        let mut at = 0usize;
+        while at < bytes.len() {
+            let len = u64::from_le_bytes(bytes[at + 1..at + 9].try_into().unwrap()) as usize;
+            let payload_start = at + 9;
+            let payload_end = payload_start + len;
+            let frame_end = payload_end + 32;
+            if bytes[at] == tag {
+                let mut payload = bytes[payload_start..payload_end].to_vec();
+                edit(&mut payload);
+                let mut frame = Vec::with_capacity(9 + payload.len() + 32);
+                frame.push(tag);
+                frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+                frame.extend_from_slice(&payload);
+                frame.extend_from_slice(blake3::hash(&payload).as_bytes());
+                bytes.splice(at..frame_end, frame);
+                return;
+            }
+            at = frame_end;
+        }
+        panic!("section tag {tag} not found");
+    }
+
+    fn read_u64_at(bytes: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+    }
+
+    fn ids_original_and_row_offsets(payload: &[u8]) -> ((usize, usize), (usize, usize)) {
+        let mut at = 8 + 1 + 2 + 8;
+        for _ in 0..2 {
+            let len = read_u64_at(payload, at) as usize;
+            at += 8 + len * size_of::<u32>();
+        }
+        let original_count = read_u64_at(payload, at) as usize;
+        let original_at = at + 8;
+        at = original_at + original_count * size_of::<u32>();
+        let row_count = read_u64_at(payload, at) as usize;
+        let row_at = at + 8;
+        ((original_at, original_count), (row_at, row_count))
+    }
+
+    #[test]
+    fn encoded_segment_has_a_stable_wire_digest() {
+        fn require_zeroizing_bytes(_: &Zeroizing<Vec<u8>>) {}
+
+        let index = build_fixture();
+        let encoded = encode_with_cancel(&index, None).expect("encode fixture");
+        require_zeroizing_bytes(&encoded);
+        assert_eq!(encode(&index).as_slice(), encoded.as_slice());
+        assert_eq!(
+            digest(&encoded),
+            [
+                51, 215, 194, 155, 99, 119, 90, 139, 225, 232, 32, 234, 67, 166, 245, 249, 153, 35,
+                53, 213, 82, 76, 120, 139, 27, 215, 226, 230, 115, 58, 126, 231,
+            ]
+        );
+    }
+
+    #[test]
+    fn encode_cancellation_is_deterministic_and_mid_work() {
+        use std::cell::Cell;
+
+        let index = build_fixture();
+        let completed_at = Cell::new(0);
+        let mut completion_hook = |work| completed_at.set(work);
+        let mut completion_context = CancelContext::with_hook(None, &mut completion_hook);
+        encode_with_context(&index, &mut completion_context).expect("uncancelled encode");
+
+        let token = CancelToken::new();
+        let cancelled_at = Cell::new(None);
+        let mut hook = |work| {
+            if work >= 512 && !token.is_cancelled() {
+                cancelled_at.set(Some(work));
+                token.cancel();
+            }
+        };
+        let mut context = CancelContext::with_hook(Some(&token), &mut hook);
+        let result = encode_with_context(&index, &mut context);
+
+        assert!(matches!(result, Err(SegmentOperationError::Interrupted)));
+        assert!(cancelled_at.get().is_some_and(|work| {
+            work >= 512 && work < completed_at.get() && work < 512 + CANCEL_CHUNK_BYTES + 1024
+        }));
+    }
+
+    #[test]
+    fn decode_cancellation_is_deterministic_and_not_corruption() {
+        use std::cell::Cell;
+
+        let bytes = encode(&build_fixture());
+        let completed_at = Cell::new(0);
+        let mut completion_hook = |work| completed_at.set(work);
+        let mut completion_context = CancelContext::with_hook(None, &mut completion_hook);
+        decode_with_context(&bytes, &mut completion_context).expect("uncancelled decode");
+
+        let token = CancelToken::new();
+        let cancelled_at = Cell::new(None);
+        let mut hook = |work| {
+            if work >= 512 && !token.is_cancelled() {
+                cancelled_at.set(Some(work));
+                token.cancel();
+            }
+        };
+        let mut context = CancelContext::with_hook(Some(&token), &mut hook);
+        let result = decode_with_context(&bytes, &mut context);
+
+        assert!(matches!(result, Err(SegmentOperationError::Interrupted)));
+        assert!(cancelled_at.get().is_some_and(|work| {
+            work >= 512 && work < completed_at.get() && work < 512 + CANCEL_CHUNK_BYTES + 1024
+        }));
+    }
+
+    #[test]
+    fn digest_cancellation_is_deterministic_and_mid_work() {
+        use std::cell::Cell;
+
+        let bytes = vec![0xA5; CANCEL_CHUNK_BYTES * 3];
+        let token = CancelToken::new();
+        let cancelled_at = Cell::new(None);
+        let mut hook = |work| {
+            if work >= CANCEL_CHUNK_BYTES && !token.is_cancelled() {
+                cancelled_at.set(Some(work));
+                token.cancel();
+            }
+        };
+        let mut context = CancelContext::with_hook(Some(&token), &mut hook);
+        let result = digest_with_context(&bytes, &mut context);
+
+        assert!(matches!(result, Err(SegmentOperationError::Interrupted)));
+        assert_eq!(cancelled_at.get(), Some(CANCEL_CHUNK_BYTES));
+        assert_eq!(digest(&bytes), *blake3::hash(&bytes).as_bytes());
+    }
+
+    #[test]
+    fn public_cancellable_apis_refuse_a_pre_cancelled_token() {
+        let index = build_fixture();
+        let bytes = encode(&index);
+        let parts = decode(&bytes).expect("decode fixture");
+        let token = CancelToken::new();
+        token.cancel();
+
+        assert!(matches!(
+            encode_with_cancel(&index, Some(&token)),
+            Err(SegmentOperationError::Interrupted)
+        ));
+        assert!(matches!(
+            decode_with_cancel(&bytes, Some(&token)),
+            Err(SegmentOperationError::Interrupted)
+        ));
+        assert!(matches!(
+            digest_with_cancel(&bytes, Some(&token)),
+            Err(SegmentOperationError::Interrupted)
+        ));
+        assert!(matches!(
+            parts.attributes_fit_domains_with_cancel(&[2], Some(&token)),
+            Err(SegmentOperationError::Interrupted)
+        ));
+    }
+
+    #[test]
+    fn malicious_collection_counts_are_refused_without_allocating() {
+        let encoded = encode(&build_fixture());
+
+        let mut split_order = encoded.clone();
+        edit_section_payload(&mut split_order, TAG_TREE, |payload| {
+            payload[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        });
+        assert!(matches!(
+            decode(&split_order),
+            Err(SegmentError::CountOutOfBounds("tree split order"))
+        ));
+
+        let mut cells = encoded.clone();
+        edit_section_payload(&mut cells, TAG_TREE, |payload| {
+            let split_order_len = read_u64_at(payload, 8) as usize;
+            let cells_len_at = 16 + split_order_len * 8;
+            payload[cells_len_at..cells_len_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        });
+        assert!(matches!(
+            decode(&cells),
+            Err(SegmentError::CountOutOfBounds("tree cells"))
+        ));
+
+        let mut attrs = encoded;
+        edit_section_payload(&mut attrs, TAG_ATTRS, |payload| {
+            payload[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        });
+        assert!(matches!(
+            decode(&attrs),
+            Err(SegmentError::CountOutOfBounds("attribute columns"))
+        ));
+    }
+
+    #[test]
+    fn duplicate_row_ids_and_wrong_snapshot_max_are_refused() {
+        let encoded = encode(&build_fixture());
+
+        let mut duplicate = encoded.clone();
+        edit_section_payload(&mut duplicate, TAG_IDS, |payload| {
+            let ((original_at, original_count), (row_at, row_count)) =
+                ids_original_and_row_offsets(payload);
+            assert_eq!(original_count, row_count);
+            let mut internal_zero = None;
+            let mut internal_one = None;
+            for internal in 0..original_count {
+                let at = original_at + internal * size_of::<u32>();
+                match u32::from_le_bytes(payload[at..at + 4].try_into().unwrap()) {
+                    0 => internal_zero = Some(internal),
+                    1 => internal_one = Some(internal),
+                    _ => {}
+                }
+            }
+            let zero_row = row_at + internal_zero.expect("original id 0") * size_of::<u64>();
+            let one_row = row_at + internal_one.expect("original id 1") * size_of::<u64>();
+            let duplicate_row = payload[zero_row..zero_row + 8].to_vec();
+            payload[one_row..one_row + 8].copy_from_slice(&duplicate_row);
+        });
+        assert!(matches!(
+            decode(&duplicate),
+            Err(SegmentError::DuplicateRowId(_))
+        ));
+
+        let mut wrong_max = encoded;
+        edit_section_payload(&mut wrong_max, TAG_IDS, |payload| {
+            payload[..8].copy_from_slice(&0u64.to_le_bytes());
+        });
+        assert!(matches!(
+            decode(&wrong_max),
+            Err(SegmentError::SnapshotMax { .. })
+        ));
+    }
+
+    #[test]
+    fn row_ids_must_match_the_persisted_original_id_permutation() {
+        let mut encoded = encode(&build_fixture());
+        edit_section_payload(&mut encoded, TAG_IDS, |payload| {
+            let ((original_at, original_count), (row_at, row_count)) =
+                ids_original_and_row_offsets(payload);
+            assert_eq!(original_count, row_count);
+            let mut internal_zero = None;
+            let mut internal_last = None;
+            for internal in 0..original_count {
+                let at = original_at + internal * size_of::<u32>();
+                let original = u32::from_le_bytes(payload[at..at + 4].try_into().unwrap());
+                if original == 0 {
+                    internal_zero = Some(internal);
+                } else if original as usize == original_count - 1 {
+                    internal_last = Some(internal);
+                }
+            }
+            let first = row_at + internal_zero.expect("original id 0") * size_of::<u64>();
+            let last = row_at + internal_last.expect("last original id") * size_of::<u64>();
+            for offset in 0..size_of::<u64>() {
+                payload.swap(first + offset, last + offset);
+            }
+        });
+
+        assert!(matches!(
+            decode(&encoded),
+            Err(SegmentError::Inconsistent(
+                "external row ids do not follow original-id order"
+            ))
+        ));
+    }
+
+    #[test]
+    fn out_of_range_global_medoid_is_not_truncated() {
+        let mut encoded = encode(&build_fixture());
+        edit_section_payload(&mut encoded, TAG_IDS, |payload| {
+            let global_medoid_at = 8 + 1 + 2;
+            payload[global_medoid_at..global_medoid_at + 8]
+                .copy_from_slice(&(u64::from(u32::MAX) + 1).to_le_bytes());
+        });
+
+        assert!(matches!(
+            decode(&encoded),
+            Err(SegmentError::ValueOutOfBounds("global medoid"))
+        ));
+    }
+
+    #[test]
+    fn trailing_body_or_section_data_is_refused() {
+        let encoded = encode(&build_fixture());
+        let mut trailing_body = encoded.clone();
+        trailing_body.push(0);
+        assert!(matches!(
+            decode(&trailing_body),
+            Err(SegmentError::TrailingData("body"))
+        ));
+
+        for (tag, name) in [
+            (TAG_GRAPH, "graph"),
+            (TAG_SQ8, "sq8"),
+            (TAG_BINARY, "binary"),
+            (TAG_TREE, "tree"),
+            (TAG_IDS, "ids"),
+            (TAG_ATTRS, "attrs"),
+            (TAG_VECTORS, "vectors"),
+        ] {
+            let mut trailing_section = encoded.clone();
+            edit_section_payload(&mut trailing_section, tag, |payload| payload.push(0));
+            assert!(matches!(
+                decode(&trailing_section),
+                Err(SegmentError::TrailingData(found)) if found == name
+            ));
+        }
+    }
+
     #[test]
     fn decoded_embedded_vectors_have_a_zeroizing_owner() {
         fn require_zeroizing_owner(_: &Zeroizing<Vec<f32>>) {}
@@ -535,6 +1430,47 @@ mod tests {
         let parts = decode(&encode(&index)).expect("decode");
         require_zeroizing_owner(&parts.vectors);
         assert_eq!(parts.vectors.len(), parts.n() * usize::from(parts.dim()));
+    }
+
+    #[test]
+    fn attribute_codes_must_fit_the_envelope_domains() {
+        let parts = decode(&encode(&build_fixture())).expect("decode");
+        assert!(parts.attributes_fit_domains(&[2]));
+        assert!(!parts.attributes_fit_domains(&[1]));
+        assert!(!parts.attributes_fit_domains(&[]));
+    }
+
+    #[test]
+    fn unfiltered_index_accepts_its_synthetic_attribute_column() {
+        let index = AnnIndex::build(
+            vec![(1, vec![0.0, 1.0]), (2, vec![1.0, 0.0])],
+            Metric::L2,
+            2,
+        )
+        .expect("build unfiltered index");
+        let parts = decode(&encode(&index)).expect("decode unfiltered index");
+        assert!(parts.attributes_fit_domains(&[]));
+    }
+
+    #[test]
+    fn attribute_domain_validation_is_cancellable_mid_scan() {
+        use std::cell::Cell;
+
+        let mut parts = decode(&encode(&build_fixture())).expect("decode fixture");
+        parts.attrs = vec![vec![0; CANCEL_CHUNK_U32_ITEMS * 3]];
+        let token = CancelToken::new();
+        let cancelled_at = Cell::new(None);
+        let mut hook = |work| {
+            if work >= CANCEL_CHUNK_BYTES && !token.is_cancelled() {
+                cancelled_at.set(Some(work));
+                token.cancel();
+            }
+        };
+        let mut context = CancelContext::with_hook(Some(&token), &mut hook);
+        let result = parts.attributes_fit_domains_with_context(&[1], &mut context);
+
+        assert!(matches!(result, Err(SegmentOperationError::Interrupted)));
+        assert_eq!(cancelled_at.get(), Some(CANCEL_CHUNK_BYTES));
     }
 
     /// Rehydrate exactly as the storage loader will: RAW row vectors placed by
@@ -758,6 +1694,10 @@ mod tests {
                 ..base.clone()
             },
             PrismConfig {
+                cross_cell_exact_ranking_limit: base.cross_cell_exact_ranking_limit + 1,
+                ..base.clone()
+            },
+            PrismConfig {
                 metric: Metric::L2,
                 ..base.clone()
             },
@@ -781,6 +1721,22 @@ mod tests {
                 binary_rerank: base.binary_rerank + 1,
                 ..base.clone()
             },
+            PrismConfig {
+                scan_threshold: base.scan_threshold + 1,
+                ..base.clone()
+            },
+            PrismConfig {
+                multi_cell_scan_threshold: base.multi_cell_scan_threshold + 1,
+                ..base.clone()
+            },
+            PrismConfig {
+                graph_expansion: base.graph_expansion + 1,
+                ..base.clone()
+            },
+            PrismConfig {
+                build_seed: base.build_seed.wrapping_add(1),
+                ..base.clone()
+            },
         ];
         for (i, v) in variants.iter().enumerate() {
             assert_ne!(
@@ -789,5 +1745,36 @@ mod tests {
                 "config field {i} must perturb the hash"
             );
         }
+    }
+
+    #[test]
+    fn config_hash_has_a_stable_known_answer() {
+        let config = PrismConfig {
+            m_local: 48,
+            m_greedy: 12,
+            m_random: 4,
+            t: 2,
+            alpha: 1.0,
+            vamana_alpha: 1.25,
+            beam_width: 128,
+            cross_cell_exact_ranking_limit: 4_096,
+            metric: Metric::Cosine,
+            sigma_high: 0.2,
+            sigma_low: 0.01,
+            beta: 3.5,
+            epsilon: 0.25,
+            binary_rerank: 2,
+            scan_threshold: 20_000,
+            multi_cell_scan_threshold: 500_000,
+            graph_expansion: 3,
+            build_seed: 0x5052_4953_4d41_4e4e,
+        };
+        assert_eq!(
+            prism_config_hash(&config),
+            [
+                95, 143, 137, 222, 77, 172, 87, 119, 176, 84, 108, 111, 103, 214, 3, 209, 96, 209,
+                230, 6, 56, 166, 208, 21, 181, 51, 92, 164, 118, 45, 183, 135,
+            ]
+        );
     }
 }
