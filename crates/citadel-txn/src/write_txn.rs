@@ -89,6 +89,19 @@ enum WriteFailure {
     Failed,
 }
 
+/// A callback panic can unwind after earlier rows were patched in place.
+struct WriteScanPanicGuard<'a> {
+    failure: &'a mut Option<WriteFailure>,
+}
+
+impl Drop for WriteScanPanicGuard<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() && self.failure.is_none() {
+            *self.failure = Some(WriteFailure::Failed);
+        }
+    }
+}
+
 #[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct MutationMarker(u64);
@@ -1299,11 +1312,12 @@ impl<'db> WriteTxn<'db> {
         // Poisoned on EVERY error, not only a cancel: this is the only scan that
         // mutates as it walks, so any error can leave a patched prefix that a
         // caller could otherwise clear the token and commit.
+        let panic_guard = WriteScanPanicGuard { failure };
         let walked = (|| -> std::result::Result<u64, E> {
             while cursor.is_valid() {
                 if let Some(t) = cancel.as_ref() {
                     if let Err(err) = t.check() {
-                        Self::record_failure(failure, &err);
+                        Self::record_failure(panic_guard.failure, &err);
                         return Err(E::from(err));
                     }
                 }
@@ -1367,7 +1381,7 @@ impl<'db> WriteTxn<'db> {
                             let first = match first {
                                 Ok(first) => first,
                                 Err(err) => {
-                                    Self::record_failure(failure, &err);
+                                    Self::record_failure(panic_guard.failure, &err);
                                     return Err(E::from(err));
                                 }
                             };
@@ -1395,7 +1409,7 @@ impl<'db> WriteTxn<'db> {
                                 cancel.as_ref(),
                             );
                             if let Err(err) = freed {
-                                Self::record_failure(failure, &err);
+                                Self::record_failure(panic_guard.failure, &err);
                                 return Err(E::from(err));
                             }
                             count += 1;
@@ -1434,18 +1448,17 @@ impl<'db> WriteTxn<'db> {
             }
             Ok(count)
         })();
-
         match walked {
             Ok(count) => Self::finish_mutation_with(
                 cancel.as_ref(),
-                failure,
+                panic_guard.failure,
                 mutation_sequence,
                 count,
                 count > 0,
             )
             .map_err(E::from),
             Err(err) => {
-                Self::mark_failed_with(failure);
+                Self::mark_failed_with(panic_guard.failure);
                 Err(err)
             }
         }

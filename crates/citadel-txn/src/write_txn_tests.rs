@@ -1040,6 +1040,38 @@ fn callback_failure_after_a_write_makes_commit_refuse_the_prefix() {
 }
 
 #[test]
+fn callback_panic_after_a_write_makes_commit_refuse_the_prefix() {
+    let mgr = create_test_manager();
+    {
+        let mut seed = mgr.begin_write().unwrap();
+        seed.create_table(b"t").unwrap();
+        seed.table_insert(b"t", b"a", b"old-a").unwrap();
+        seed.table_insert(b"t", b"b", b"old-b").unwrap();
+        seed.commit().unwrap();
+    }
+
+    let mut wtx = mgr.begin_write().unwrap();
+    let mut visited = 0;
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = wtx.table_update_range::<_, Error>(b"t", b"a", |_, value| {
+            visited += 1;
+            if visited == 2 {
+                panic!("injected callback panic");
+            }
+            value[0] = b'X';
+            Ok(Some(true))
+        });
+    }));
+    assert!(panic.is_err());
+    assert!(matches!(wtx.check_usable(), Err(Error::TransactionFailed)));
+    assert!(matches!(wtx.commit(), Err(Error::TransactionFailed)));
+
+    let mut rtx = mgr.begin_read();
+    assert_eq!(rtx.table_get(b"t", b"a").unwrap(), Some(b"old-a".to_vec()));
+    assert_eq!(rtx.table_get(b"t", b"b").unwrap(), Some(b"old-b".to_vec()));
+}
+
+#[test]
 fn cancellation_during_tree_free_makes_truncate_uncommittable() {
     let mgr = create_test_manager();
     {
