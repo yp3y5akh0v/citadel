@@ -9,6 +9,14 @@ fn temp_path() -> (tempfile::TempDir, CString) {
 }
 
 #[test]
+fn interrupted_has_a_dedicated_ffi_code() {
+    assert_eq!(
+        map_error(&citadel_core::Error::Interrupted),
+        CitadelError::Interrupted
+    );
+}
+
+#[test]
 fn create_open_close() {
     let (_dir, cpath) = temp_path();
     let pass = b"secret";

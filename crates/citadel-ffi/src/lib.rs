@@ -36,6 +36,7 @@ pub enum CitadelError {
     NoWriteTransaction = -14,
     WriteTransactionActive = -15,
     SqlError = -16,
+    Interrupted = -18,
     InternalPanic = -99,
 }
 
@@ -121,6 +122,7 @@ fn map_error(err: &citadel_core::Error) -> CitadelError {
         citadel_core::Error::PassphraseRequired => CitadelError::PassphraseRequired,
         citadel_core::Error::NoWriteTransaction => CitadelError::NoWriteTransaction,
         citadel_core::Error::WriteTransactionActive => CitadelError::WriteTransactionActive,
+        citadel_core::Error::Interrupted => CitadelError::Interrupted,
         _ => CitadelError::IoError,
     }
 }

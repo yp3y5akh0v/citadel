@@ -35,7 +35,7 @@ create_exception!(
     citadeldb,
     OperationalError,
     CitadelError,
-    "Operational failure outside the caller's control (lock, I/O, buffer/resource limit)."
+    "Operation interrupted or failed at runtime (cancellation, lock, I/O, resource limit)."
 );
 create_exception!(
     citadeldb,
@@ -116,7 +116,9 @@ fn core_category(e: &CoreError) -> Category {
         | CoreError::RegionSealTampered
         | CoreError::RegionStoreCorrupt(_)
         | CoreError::InvalidPageType(_, _) => Integrity,
-        CoreError::DatabaseLocked
+        // DB-API has no cancellation class, so an interrupt lands here.
+        CoreError::Interrupted
+        | CoreError::DatabaseLocked
         | CoreError::TransactionTooLarge { .. }
         | CoreError::PageOutOfBounds(_)
         | CoreError::BufferPoolFull
