@@ -105,6 +105,9 @@ pub enum Error {
 
     #[error("per-region cryptographic erasure requires a file-backed database (not in-memory)")]
     RegionKeysRequireFile,
+
+    #[error("the operation was cancelled")]
+    Interrupted,
 }
 
 #[cfg(test)]
