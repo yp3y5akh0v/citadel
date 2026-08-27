@@ -115,6 +115,18 @@ fn unsupported_version_error() {
 }
 
 #[test]
+fn version_one_physical_overflow_patches_are_rejected() {
+    let mut data = SyncPatch::empty(NodeId::from_u64(1)).serialize();
+    assert_eq!(data[4], 2);
+    data[4] = 1;
+
+    assert!(matches!(
+        SyncPatch::deserialize(&data),
+        Err(PatchError::UnsupportedVersion(1))
+    ));
+}
+
+#[test]
 fn truncated_header_error() {
     let err = SyncPatch::deserialize(&[0u8; 5]).unwrap_err();
     assert!(matches!(err, PatchError::Truncated { .. }));

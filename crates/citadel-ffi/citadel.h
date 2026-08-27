@@ -35,7 +35,9 @@ enum citadel_error_t
     NoWriteTransaction = -14,
     WriteTransactionActive = -15,
     SqlError = -16,
+    NamedTableHashCollision = -17,
     Interrupted = -18,
+    TransactionFailed = -19,
     InternalPanic = -99,
 };
 #ifndef __cplusplus

@@ -82,6 +82,15 @@ pub enum Error {
     #[error("table already exists: {0}")]
     TableAlreadyExists(String),
 
+    #[error(
+        "table name {requested:?} collides with existing table {existing:?} in commit-slot hash {hash:#010x}"
+    )]
+    NamedTableHashCollision {
+        requested: String,
+        existing: String,
+        hash: u32,
+    },
+
     #[error("passphrase is required")]
     PassphraseRequired,
 
@@ -108,6 +117,11 @@ pub enum Error {
 
     #[error("the operation was cancelled")]
     Interrupted,
+
+    #[error(
+        "write transaction cannot be committed because an earlier mutation failed; roll it back"
+    )]
+    TransactionFailed,
 }
 
 #[cfg(test)]

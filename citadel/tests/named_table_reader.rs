@@ -41,7 +41,7 @@ fn named_table_reader() {
     wtx.commit().unwrap();
 
     let table_root = db.manager().table_root(b"users").unwrap().unwrap();
-    let reader = LocalTreeReader::for_table(db.manager(), table_root).unwrap();
+    let reader = LocalTreeReader::for_table(db.manager(), b"users").unwrap();
     let (root, hash) = reader.root_info().unwrap();
 
     assert_eq!(root, table_root);
@@ -65,9 +65,10 @@ fn table_reader_can_read_entries() {
     wtx.commit().unwrap();
 
     let table_root = db.manager().table_root(b"data").unwrap().unwrap();
-    let reader = LocalTreeReader::for_table(db.manager(), table_root).unwrap();
+    let reader = LocalTreeReader::for_table(db.manager(), b"data").unwrap();
 
     // Read leaf entries from root (single leaf page for small table)
+    reader.page_digest(table_root).unwrap();
     let entries = reader.leaf_entries(table_root).unwrap();
     assert_eq!(entries.len(), 2);
 
@@ -88,14 +89,69 @@ fn two_table_readers_differ() {
     wtx.table_insert(b"t2", b"k", b"val_t2").unwrap();
     wtx.commit().unwrap();
 
-    let root1 = db.manager().table_root(b"t1").unwrap().unwrap();
-    let root2 = db.manager().table_root(b"t2").unwrap().unwrap();
-
-    let reader1 = LocalTreeReader::for_table(db.manager(), root1).unwrap();
-    let reader2 = LocalTreeReader::for_table(db.manager(), root2).unwrap();
+    let reader1 = LocalTreeReader::for_table(db.manager(), b"t1").unwrap();
+    let reader2 = LocalTreeReader::for_table(db.manager(), b"t2").unwrap();
 
     let (_, hash1) = reader1.root_info().unwrap();
     let (_, hash2) = reader2.root_info().unwrap();
 
     assert_ne!(hash1, hash2);
+}
+
+#[test]
+fn readers_reject_pages_outside_their_advertised_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fast_builder(&dir.path().join("test.db")).create().unwrap();
+
+    let mut wtx = db.begin_write().unwrap();
+    wtx.insert(b"default", b"value").unwrap();
+    for table in [
+        b"first".as_slice(),
+        b"second".as_slice(),
+        b"doomed".as_slice(),
+    ] {
+        wtx.create_table(table).unwrap();
+        wtx.table_insert(table, b"key", b"value").unwrap();
+    }
+    wtx.commit().unwrap();
+
+    let first_root = db.manager().table_root(b"first").unwrap().unwrap();
+    let second_root = db.manager().table_root(b"second").unwrap().unwrap();
+    let doomed_root = db.manager().table_root(b"doomed").unwrap().unwrap();
+    assert_ne!(first_root, second_root);
+
+    let default_reader = LocalTreeReader::new(db.manager());
+    assert!(matches!(
+        default_reader.page_digest(first_root),
+        Err(citadel_core::Error::DatabaseCorrupted)
+    ));
+    assert!(matches!(
+        default_reader.leaf_entries(first_root),
+        Err(citadel_core::Error::DatabaseCorrupted)
+    ));
+
+    let first_reader = LocalTreeReader::for_table(db.manager(), b"first").unwrap();
+    first_reader.page_digest(first_root).unwrap();
+    assert!(matches!(
+        first_reader.page_digest(second_root),
+        Err(citadel_core::Error::DatabaseCorrupted)
+    ));
+    assert!(matches!(
+        first_reader.leaf_entries(second_root),
+        Err(citadel_core::Error::DatabaseCorrupted)
+    ));
+
+    let _stale_horizon = db.begin_read();
+    let mut wtx = db.begin_write().unwrap();
+    wtx.drop_table(b"doomed").unwrap();
+    wtx.create_table(b"live").unwrap();
+    wtx.table_insert(b"live", b"key", b"new").unwrap();
+    wtx.commit().unwrap();
+    let live_reader = LocalTreeReader::for_table(db.manager(), b"live").unwrap();
+    let (live_root, _) = live_reader.root_info().unwrap();
+    assert_ne!(live_root, doomed_root);
+    assert!(matches!(
+        live_reader.page_digest(doomed_root),
+        Err(citadel_core::Error::DatabaseCorrupted)
+    ));
 }

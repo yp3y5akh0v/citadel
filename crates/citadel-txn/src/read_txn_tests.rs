@@ -97,6 +97,69 @@ fn read_nonexistent_table() {
 }
 
 #[test]
+fn list_tables_uses_one_catalog_snapshot() {
+    let mgr = create_test_manager();
+
+    let mut wtx = mgr.begin_write().unwrap();
+    for name in [b"alpha".as_slice(), b"beta".as_slice()] {
+        wtx.create_table(name).unwrap();
+        wtx.table_insert(name, b"generation", b"old").unwrap();
+    }
+    wtx.commit().unwrap();
+
+    let mut snapshot = mgr.begin_read();
+
+    let mut wtx = mgr.begin_write().unwrap();
+    wtx.drop_table(b"alpha").unwrap();
+    wtx.drop_table(b"beta").unwrap();
+    wtx.commit().unwrap();
+    let mut wtx = mgr.begin_write().unwrap();
+    for name in [b"alpha".as_slice(), b"beta".as_slice()] {
+        wtx.create_table(name).unwrap();
+        wtx.table_insert(name, b"generation", b"new").unwrap();
+    }
+    wtx.commit().unwrap();
+
+    let mut tables = snapshot.list_tables().unwrap();
+    tables.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        tables
+            .iter()
+            .map(|(name, _)| name.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"alpha".as_slice(), b"beta".as_slice()]
+    );
+    for (name, descriptor) in tables {
+        assert_eq!(
+            snapshot.table_root_page(&name).unwrap(),
+            Some(descriptor.root_page)
+        );
+        assert_eq!(
+            snapshot.table_get(&name, b"generation").unwrap(),
+            Some(b"old".to_vec())
+        );
+    }
+}
+
+#[test]
+fn reachable_page_read_uses_the_transaction_high_water_mark() {
+    let mgr = create_test_manager();
+    let snapshot = mgr.begin_read();
+    let snapshot_high_water_mark = snapshot.snapshot.high_water_mark;
+
+    let mut writer = mgr.begin_write().unwrap();
+    writer.insert(b"future", b"value").unwrap();
+    writer.commit().unwrap();
+    let future_root = mgr.current_slot().tree_root;
+    assert!(future_root.as_u32() >= snapshot_high_water_mark);
+
+    assert!(matches!(
+        snapshot.read_reachable_page(future_root),
+        Err(citadel_core::Error::PageOutOfBounds(page_id)) if page_id == future_root
+    ));
+}
+
+#[test]
 fn for_each_default_table() {
     let mgr = create_test_manager();
 

@@ -5,9 +5,12 @@ use crate::apply::ApplyResult;
 use crate::diff::{DiffEntry, MerkleHash, PageDigest};
 use crate::node_id::NodeId;
 
-/// Message type tags for wire format.
-const MSG_HELLO: u8 = 0;
-const MSG_HELLO_ACK: u8 = 1;
+/// Message type tags for wire format. The v2 default-tree and named-table
+/// session entry tags use new values: released peers transmit physical overflow
+/// references while this protocol transmits logical payload bytes, so a peer
+/// must reject the other version rather than store an 8-byte ref as a value.
+const MSG_HELLO: u8 = 16;
+const MSG_HELLO_ACK: u8 = 17;
 const MSG_DIGEST_REQUEST: u8 = 2;
 const MSG_DIGEST_RESPONSE: u8 = 3;
 const MSG_ENTRIES_REQUEST: u8 = 4;
@@ -18,10 +21,10 @@ const MSG_DONE: u8 = 8;
 const MSG_ERROR: u8 = 9;
 const MSG_PULL_REQUEST: u8 = 10;
 const MSG_PULL_RESPONSE: u8 = 11;
-const MSG_TABLE_LIST_REQUEST: u8 = 12;
-const MSG_TABLE_LIST_RESPONSE: u8 = 13;
-const MSG_TABLE_SYNC_BEGIN: u8 = 14;
-const MSG_TABLE_SYNC_END: u8 = 15;
+const MSG_TABLE_LIST_REQUEST: u8 = 18;
+const MSG_TABLE_LIST_RESPONSE: u8 = 19;
+const MSG_TABLE_SYNC_BEGIN: u8 = 20;
+const MSG_TABLE_SYNC_END: u8 = 21;
 
 /// Metadata about a named table for multi-table sync negotiation.
 #[derive(Debug, Clone, PartialEq, Eq)]

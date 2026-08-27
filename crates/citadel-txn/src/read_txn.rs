@@ -1,10 +1,11 @@
 //! Read transaction: MVCC snapshot isolation. RAII reader registration.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Weak};
 
 use citadel_core::types::{PageId, PageType, TxnId, ValueType};
-use citadel_core::{Error, Result};
+use citadel_core::{CancelToken, Error, Result};
 use citadel_io::file_manager::CommitSlot;
 use citadel_page::leaf_node::OverflowRef;
 use citadel_page::page::Page;
@@ -19,6 +20,7 @@ use crate::overflow_io;
 struct ReadPages<'a> {
     cache: &'a mut FxHashMap<PageId, Arc<Page>>,
     manager: &'a TxnManager,
+    high_water_mark: u32,
 }
 
 impl PageMap for ReadPages<'_> {
@@ -30,22 +32,73 @@ impl PageMap for ReadPages<'_> {
 impl PageLoader for ReadPages<'_> {
     fn ensure_loaded(&mut self, id: PageId) -> Result<()> {
         if !self.cache.contains_key(&id) {
-            let arc = self.manager.fetch_page(id)?;
+            let arc = self
+                .manager
+                .fetch_reachable_page(id, self.high_water_mark)?;
             self.cache.insert(id, arc);
         }
         Ok(())
     }
 }
 
+/// Counts rows a scan saw and adds them to the manager when the scan ends.
+///
+/// A guard rather than a line before each `return`: a scan ends exhausted,
+/// stopped by its callback, cancelled, or failed on a torn page, and all of
+/// them read rows worth reporting. The count accumulates in a plain field and
+/// flushes once, so the hot loop pays no atomic cost.
+pub(crate) struct ScanCount<'m> {
+    manager: &'m TxnManager,
+    measurements: Vec<Arc<AtomicU64>>,
+    pub rows: u64,
+}
+
+impl<'m> ScanCount<'m> {
+    pub(crate) fn new(manager: &'m TxnManager) -> Self {
+        Self::with_measurements(manager, manager.active_scan_measurements())
+    }
+
+    pub(crate) fn with_measurements(
+        manager: &'m TxnManager,
+        measurements: Vec<Arc<AtomicU64>>,
+    ) -> Self {
+        Self {
+            manager,
+            measurements,
+            rows: 0,
+        }
+    }
+}
+
+impl Drop for ScanCount<'_> {
+    fn drop(&mut self) {
+        self.manager
+            .add_rows_scanned_to(self.rows, &self.measurements);
+    }
+}
+
 /// Cell iteration over a leaf slice (materializing overflow through `view`).
 /// Callback returns `false` to stop.
-fn scan_leaf_cells<F>(view: &mut ReadPages<'_>, leaves: &[Arc<Page>], mut f: F) -> Result<()>
+///
+/// Checked once per leaf, not per cell: a leaf bounds the work between checks,
+/// and an atomic load per cell would show up in the scan benchmarks.
+fn scan_leaf_cells<F>(
+    view: &mut ReadPages<'_>,
+    leaves: &[Arc<Page>],
+    cancel: Option<&CancelToken>,
+    count: &mut ScanCount<'_>,
+    mut f: F,
+) -> Result<()>
 where
     F: FnMut(&[u8], &[u8]) -> bool,
 {
     for page in leaves {
+        if let Some(c) = cancel {
+            c.check()?;
+        }
         let n = page.num_cells();
         for i in 0..n {
+            count.rows += 1;
             let cell = leaf_node::read_cell(page, i);
             match cell.val_type {
                 ValueType::Tombstone => continue,
@@ -57,7 +110,8 @@ where
                 ValueType::Overflow => {
                     let oref = OverflowRef::from_bytes(cell.value);
                     let key_owned = cell.key.to_vec();
-                    let materialized = overflow_io::read_chain_value(view, &oref)?;
+                    let materialized =
+                        overflow_io::read_chain_value_with_cancel(view, &oref, cancel)?;
                     if !f(&key_owned, &materialized) {
                         return Ok(());
                     }
@@ -75,6 +129,11 @@ where
 pub struct LeafShardScanner<'t> {
     manager: &'t TxnManager,
     cache: FxHashMap<PageId, Arc<Page>>,
+    measurements: Vec<Arc<AtomicU64>>,
+    high_water_mark: u32,
+    /// Inherited from the producing txn so a cancel reaches every shard; a
+    /// per-shard flag would let the rest run on after one stopped.
+    cancel: Option<CancelToken>,
 }
 
 impl LeafShardScanner<'_> {
@@ -84,11 +143,23 @@ impl LeafShardScanner<'_> {
     where
         F: FnMut(&[u8], &[u8]) -> bool,
     {
+        let Self {
+            manager,
+            cache,
+            measurements,
+            high_water_mark,
+            cancel,
+        } = self;
+        if let Some(token) = cancel.as_ref() {
+            token.check()?;
+        }
+        let mut count = ScanCount::with_measurements(manager, measurements.clone());
         let mut view = ReadPages {
-            cache: &mut self.cache,
-            manager: self.manager,
+            cache,
+            manager,
+            high_water_mark: *high_water_mark,
         };
-        scan_leaf_cells(&mut view, leaves, f)
+        scan_leaf_cells(&mut view, leaves, cancel.as_ref(), &mut count, f)
     }
 }
 
@@ -118,6 +189,17 @@ pub struct ReadTxn<'a> {
     snapshot: Arc<CommitSlot>,
     commit_generation: u64,
     page_cache: FxHashMap<PageId, Arc<Page>>,
+    /// Exact catalog resolutions for this immutable snapshot. Commit-slot
+    /// entries are keyed by a 32-bit hash, so a slot root is trusted only
+    /// after this cache has proved the requested name itself is live.
+    resolved_tables: FxHashMap<Vec<u8>, TableDescriptor>,
+    /// Operation counters inherited before this transaction is handed to
+    /// parallel workers. Weak handles expire when their measurement guard
+    /// ends, so reusing the transaction cannot charge a completed span.
+    scan_measurements: Vec<Weak<AtomicU64>>,
+    /// A field rather than a scan parameter: threading it through would change
+    /// every scan signature, and a new scan cannot forget to accept it.
+    cancel: Option<CancelToken>,
 }
 
 impl<'db> ReadTxn<'db> {
@@ -133,7 +215,62 @@ impl<'db> ReadTxn<'db> {
             snapshot,
             commit_generation,
             page_cache: FxHashMap::default(),
+            resolved_tables: FxHashMap::default(),
+            scan_measurements: manager
+                .active_scan_measurements()
+                .iter()
+                .map(Arc::downgrade)
+                .collect(),
+            cancel: None,
         }
+    }
+
+    pub fn set_cancel(&mut self, token: Option<CancelToken>) {
+        self.cancel = token;
+    }
+
+    pub fn cancel_token(&self) -> Option<&CancelToken> {
+        self.cancel.as_ref()
+    }
+
+    #[inline]
+    fn check_cancel(&self) -> Result<()> {
+        match &self.cancel {
+            Some(token) => token.check(),
+            None => Ok(()),
+        }
+    }
+
+    /// Database-wide scan telemetry across all transactions and threads.
+    /// Monotonic; use [`ReadTxn::measure_scans`] for an isolated operation.
+    pub fn rows_scanned(&self) -> u64 {
+        self.manager.rows_scanned()
+    }
+
+    /// Begin an operation-local scan measurement for this transaction. The weak
+    /// copy propagates it through worker handoffs and pull-iterator lifetimes.
+    pub fn measure_scans(&mut self) -> crate::manager::ScanMeasurement {
+        self.scan_measurements
+            .retain(|measurement| measurement.strong_count() > 0);
+        let measurement = self.manager.measure_scans();
+        self.scan_measurements.push(measurement.weak_counter());
+        measurement
+    }
+
+    fn captured_scan_measurements(&self) -> Vec<Arc<AtomicU64>> {
+        let mut measurements = self.manager.active_scan_measurements();
+        for inherited in &self.scan_measurements {
+            let Some(inherited) = inherited.upgrade() else {
+                continue;
+            };
+            if !measurements
+                .iter()
+                .any(|active| Arc::ptr_eq(active, &inherited))
+            {
+                measurements.push(inherited);
+            }
+        }
+        measurements
     }
 
     pub fn txn_id(&self) -> TxnId {
@@ -148,6 +285,22 @@ impl<'db> ReadTxn<'db> {
         self.snapshot.tree_root
     }
 
+    /// Merkle root captured with this transaction's default-tree root.
+    pub fn root_hash(&self) -> [u8; citadel_core::MERKLE_HASH_SIZE] {
+        if self.has_logical_merkle_hashes() {
+            self.snapshot.merkle_root
+        } else {
+            [0u8; citadel_core::MERKLE_HASH_SIZE]
+        }
+    }
+
+    /// Whether every nonzero page hash in this snapshot uses the logical
+    /// overflow-value scheme. Legacy snapshots must expose all hashes as
+    /// unknown to sync because their hashes do not cover overflow payloads.
+    pub fn has_logical_merkle_hashes(&self) -> bool {
+        self.snapshot.merkle_scheme == citadel_io::file_manager::MerkleScheme::LogicalOverflowV1
+    }
+
     pub fn entry_count(&self) -> u64 {
         self.snapshot.tree_entries
     }
@@ -155,11 +308,121 @@ impl<'db> ReadTxn<'db> {
     /// The table's catalog root in this txn (a lookup, no scan); a version
     /// stamp.
     pub fn table_root_page(&self, table: &[u8]) -> Result<Option<PageId>> {
-        self.manager.table_root(table)
+        self.check_cancel()?;
+        let root = match self.lookup_table_uncached(table) {
+            Ok(desc) => Some(desc.root_page),
+            Err(Error::TableNotFound(_)) => None,
+            Err(err) => return Err(err),
+        };
+        self.check_cancel()?;
+        Ok(root)
+    }
+
+    /// List named tables exactly as they exist in this transaction's catalog
+    /// snapshot, including commit-slot root overrides for that same snapshot.
+    pub fn list_tables(&self) -> Result<Vec<(Vec<u8>, TableDescriptor)>> {
+        self.check_cancel()?;
+        let catalog_root = self.snapshot.catalog_root;
+        if !catalog_root.is_valid() {
+            return Ok(Vec::new());
+        }
+
+        let mut tables = Vec::new();
+        let mut visited = FxHashSet::default();
+        let mut names = FxHashSet::default();
+        let mut names_by_hash = FxHashMap::<u32, Vec<u8>>::default();
+        let snapshot = Arc::clone(&self.snapshot);
+        let mut stack = vec![catalog_root];
+        while let Some(page_id) = stack.pop() {
+            self.check_cancel()?;
+            if !visited.insert(page_id) {
+                return Err(Error::DatabaseCorrupted);
+            }
+            let page = self.read_reachable_page(page_id)?;
+            match page.page_type() {
+                Some(PageType::Leaf) => {
+                    for index in 0..page.num_cells() {
+                        let cell = leaf_node::read_cell(&page, index);
+                        if cell.val_type == ValueType::Tombstone {
+                            continue;
+                        }
+                        if cell.val_type != ValueType::Inline {
+                            return Err(Error::DatabaseCorrupted);
+                        }
+                        let name = cell.key.to_vec();
+                        if !names.insert(name.clone()) {
+                            return Err(Error::DatabaseCorrupted);
+                        }
+                        let hash = citadel_io::file_manager::table_name_hash(&name);
+                        if let Some(existing) = names_by_hash.insert(hash, name.clone()) {
+                            if existing != name {
+                                return Err(Error::NamedTableHashCollision {
+                                    requested: String::from_utf8_lossy(&name).into_owned(),
+                                    existing: String::from_utf8_lossy(&existing).into_owned(),
+                                    hash,
+                                });
+                            }
+                        }
+                        let mut descriptor = TableDescriptor::try_deserialize(cell.value)
+                            .ok_or(Error::DatabaseCorrupted)?;
+                        if let Some((root, depth)) = snapshot.named_entry_root(&name) {
+                            descriptor.root_page = root;
+                            descriptor.depth = depth;
+                            descriptor.entry_count = snapshot
+                                .named_entry_count(&name)
+                                .ok_or(Error::DatabaseCorrupted)?;
+                        }
+                        tables.push((name, descriptor));
+                    }
+                }
+                Some(PageType::Branch) => {
+                    for index in 0..page.num_cells() as usize {
+                        stack.push(branch_node::get_child(&page, index));
+                    }
+                    let right = page.right_child();
+                    if !right.is_valid() {
+                        return Err(Error::DatabaseCorrupted);
+                    }
+                    stack.push(right);
+                }
+                _ => return Err(Error::InvalidPageType(page.page_type_raw(), page_id)),
+            }
+        }
+
+        self.check_cancel()?;
+        Ok(tables)
+    }
+
+    /// Read a page reached from a root or branch in this transaction.
+    ///
+    /// This is a low-level snapshot bridge: `page_id` must come from the same
+    /// transaction's tree walk. The method enforces the snapshot high-water
+    /// bound and embedded page ID, but cannot prove that caller-side ancestry.
+    pub fn read_reachable_page(&self, page_id: PageId) -> Result<Page> {
+        self.check_cancel()?;
+        let page = self
+            .manager
+            .read_reachable_page(page_id, self.snapshot.high_water_mark)?;
+        self.check_cancel()?;
+        Ok(page)
+    }
+
+    /// Materialize an overflow reference read from a reachable leaf in this
+    /// transaction.
+    pub fn read_reachable_overflow_value(&self, reference: &OverflowRef) -> Result<Vec<u8>> {
+        self.manager.read_overflow_value(
+            reference,
+            self.snapshot.high_water_mark,
+            self.snapshot.merkle_scheme,
+            self.cancel.as_ref(),
+        )
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.search_tree(self.snapshot.tree_root, key)
+        self.check_cancel()?;
+        let value = self.search_tree(self.snapshot.tree_root, key)?;
+        self.check_cancel()?;
+        Ok(value)
     }
 
     pub fn contains_key(&mut self, key: &[u8]) -> Result<bool> {
@@ -170,10 +433,17 @@ impl<'db> ReadTxn<'db> {
     where
         F: FnMut(&[u8], &[u8]) -> Result<()>,
     {
+        self.check_cancel()?;
         let root = self.snapshot.tree_root;
         self.preload_all_pages(root)?;
+        let measurements = self.captured_scan_measurements();
+        let mut count = ScanCount::with_measurements(self.manager, measurements);
         let mut cursor = Cursor::first(&self.page_cache, root)?;
         while cursor.is_valid() {
+            if let Some(t) = self.cancel.as_ref() {
+                t.check()?;
+            }
+            count.rows += 1;
             let overflow = cursor
                 .current_ref(&self.page_cache)
                 .and_then(|c| match c.val_type {
@@ -194,20 +464,22 @@ impl<'db> ReadTxn<'db> {
     }
 
     fn materialize_overflow(&mut self, oref: &OverflowRef) -> Result<Vec<u8>> {
-        let mut view = ReadPages {
-            cache: &mut self.page_cache,
-            manager: self.manager,
-        };
-        overflow_io::read_chain_value(&mut view, oref)
+        self.read_reachable_overflow_value(oref)
     }
 
     pub fn table_entry_count(&mut self, table: &[u8]) -> Result<u64> {
-        Ok(self.lookup_table(table)?.entry_count)
+        self.check_cancel()?;
+        let count = self.lookup_table(table)?.entry_count;
+        self.check_cancel()?;
+        Ok(count)
     }
 
     pub fn table_get(&mut self, table: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.check_cancel()?;
         let desc = self.lookup_table(table)?;
-        self.search_tree(desc.root_page, key)
+        let value = self.search_tree(desc.root_page, key)?;
+        self.check_cancel()?;
+        Ok(value)
     }
 
     pub fn table_contains_key(&mut self, table: &[u8], key: &[u8]) -> Result<bool> {
@@ -218,10 +490,17 @@ impl<'db> ReadTxn<'db> {
     where
         F: FnMut(&[u8], &[u8]) -> Result<()>,
     {
+        self.check_cancel()?;
         let desc = self.lookup_table(table)?;
         self.preload_all_pages(desc.root_page)?;
+        let measurements = self.captured_scan_measurements();
+        let mut count = ScanCount::with_measurements(self.manager, measurements);
         let mut cursor = Cursor::first(&self.page_cache, desc.root_page)?;
         while cursor.is_valid() {
+            if let Some(t) = self.cancel.as_ref() {
+                t.check()?;
+            }
+            count.rows += 1;
             let overflow = cursor
                 .current_ref(&self.page_cache)
                 .and_then(|c| match c.val_type {
@@ -246,14 +525,23 @@ impl<'db> ReadTxn<'db> {
     where
         F: FnMut(&[u8], &[u8]) -> Result<bool>,
     {
+        self.check_cancel()?;
         let desc = self.lookup_table(table)?;
         let root = desc.root_page;
+        let cancel = self.cancel.clone();
+        let measurements = self.captured_scan_measurements();
+        let mut count = ScanCount::with_measurements(self.manager, measurements);
         let mut view = ReadPages {
             cache: &mut self.page_cache,
             manager: self.manager,
+            high_water_mark: self.snapshot.high_water_mark,
         };
         let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
         while let Some(c) = cursor.current_ref_lazy(&mut view) {
+            if let Some(t) = cancel.as_ref() {
+                t.check()?;
+            }
+            count.rows += 1;
             let kind = c.val_type;
             match kind {
                 ValueType::Tombstone => {}
@@ -268,7 +556,11 @@ impl<'db> ReadTxn<'db> {
                         let c = cursor.current_ref_lazy(&mut view).unwrap();
                         (c.key.to_vec(), OverflowRef::from_bytes(c.value))
                     };
-                    let materialized = overflow_io::read_chain_value(&mut view, &oref)?;
+                    let materialized = overflow_io::read_chain_value_with_cancel(
+                        &mut view,
+                        &oref,
+                        cancel.as_ref(),
+                    )?;
                     if !f(&key, &materialized)? {
                         break;
                     }
@@ -288,17 +580,25 @@ impl<'db> ReadTxn<'db> {
     where
         F: FnMut(&[u8], &[u8]) -> Result<bool>,
     {
+        self.check_cancel()?;
         let desc = self.lookup_table(table)?;
         let root = desc.root_page;
+        let cancel = self.cancel.clone();
+        let measurements = self.captured_scan_measurements();
+        let mut count = ScanCount::with_measurements(self.manager, measurements);
         let mut view = ReadPages {
             cache: &mut self.page_cache,
             manager: self.manager,
+            high_water_mark: self.snapshot.high_water_mark,
         };
         let mut cursor = Cursor::seek_lazy(&mut view, root, start_key)?;
         if !cursor.is_valid() {
             return Ok(());
         }
         loop {
+            if let Some(t) = cancel.as_ref() {
+                t.check()?;
+            }
             view.ensure_loaded(cursor.leaf_page_id())?;
             let leaf_page = view
                 .cache
@@ -308,6 +608,7 @@ impl<'db> ReadTxn<'db> {
             let n = leaf_page.num_cells();
             let mut idx = cursor.cell_index();
             while idx < n {
+                count.rows += 1;
                 let cell = leaf_node::read_cell(&leaf_page, idx);
                 let continue_scan = match cell.val_type {
                     ValueType::Tombstone => true,
@@ -315,7 +616,11 @@ impl<'db> ReadTxn<'db> {
                     ValueType::Overflow => {
                         let oref = OverflowRef::from_bytes(cell.value);
                         let key_owned = cell.key.to_vec();
-                        let materialized = overflow_io::read_chain_value(&mut view, &oref)?;
+                        let materialized = overflow_io::read_chain_value_with_cancel(
+                            &mut view,
+                            &oref,
+                            cancel.as_ref(),
+                        )?;
                         f(&key_owned, &materialized)?
                     }
                 };
@@ -338,16 +643,22 @@ impl<'db> ReadTxn<'db> {
         table: &[u8],
         start_key: &[u8],
     ) -> Result<crate::scan_iter::TableIter<ReadTxnScanAdapter<'a, 'db>>> {
+        self.check_cancel()?;
         let desc = self.lookup_table(table)?;
         let root = desc.root_page;
         let cursor = {
             let mut view = ReadPages {
                 cache: &mut self.page_cache,
                 manager: self.manager,
+                high_water_mark: self.snapshot.high_water_mark,
             };
             Cursor::seek_lazy(&mut view, root, start_key)?
         };
-        let adapter = ReadTxnScanAdapter { txn: self };
+        let measurements = self.captured_scan_measurements();
+        let adapter = ReadTxnScanAdapter {
+            txn: self,
+            measurements,
+        };
         Ok(crate::scan_iter::TableIter::new(adapter, cursor))
     }
 
@@ -357,16 +668,22 @@ impl<'db> ReadTxn<'db> {
         table: &[u8],
         start_key: &[u8],
     ) -> Result<crate::scan_iter::TableIter<OwnedReadTxnAdapter<'db>>> {
+        self.check_cancel()?;
         let desc = self.lookup_table(table)?;
         let root = desc.root_page;
         let cursor = {
             let mut view = ReadPages {
                 cache: &mut self.page_cache,
                 manager: self.manager,
+                high_water_mark: self.snapshot.high_water_mark,
             };
             Cursor::seek_lazy(&mut view, root, start_key)?
         };
-        let adapter = OwnedReadTxnAdapter { txn: self };
+        let measurements = self.captured_scan_measurements();
+        let adapter = OwnedReadTxnAdapter {
+            txn: self,
+            measurements,
+        };
         Ok(crate::scan_iter::TableIter::new(adapter, cursor))
     }
 
@@ -386,19 +703,31 @@ impl<'db> ReadTxn<'db> {
     where
         F: FnMut(&[u8], &[u8]) -> bool,
     {
+        self.check_cancel()?;
+        let cancel = self.cancel.clone();
+        let measurements = self.captured_scan_measurements();
+        let mut count = ScanCount::with_measurements(self.manager, measurements);
         let mut view = ReadPages {
             cache: &mut self.page_cache,
             manager: self.manager,
+            high_water_mark: self.snapshot.high_water_mark,
         };
-        scan_leaf_cells(&mut view, leaves, f)
+        scan_leaf_cells(&mut view, leaves, cancel.as_ref(), &mut count, f)
     }
 
     /// A scanner for parallel leaf iteration, borrow-tied to this txn so the
     /// snapshot registration outlives every shard using it.
     pub fn shard_scanner(&self) -> LeafShardScanner<'_> {
+        // A scanner built on a Rayon worker has no caller thread-local stack:
+        // counters inherited before handoff bridge that, thread-local ones cover
+        // direct use, and both sources can name the same measurement.
+        let measurements = self.captured_scan_measurements();
         LeafShardScanner {
             manager: self.manager,
             cache: FxHashMap::default(),
+            measurements,
+            high_water_mark: self.snapshot.high_water_mark,
+            cancel: self.cancel.clone(),
         }
     }
 
@@ -419,10 +748,17 @@ impl<'db> ReadTxn<'db> {
         page_id: PageId,
         leaves: &mut Vec<Arc<Page>>,
     ) -> Result<()> {
+        // Runs to completion before `table_scan_raw` emits a row, so skipping it
+        // leaves the whole descent of a large table uncancellable.
+        if let Some(t) = self.cancel.as_ref() {
+            t.check()?;
+        }
         let page = if let Some(p) = self.page_cache.get(&page_id) {
             Arc::clone(p)
         } else {
-            let arc = self.manager.fetch_page(page_id)?;
+            let arc = self
+                .manager
+                .fetch_reachable_page(page_id, self.snapshot.high_water_mark)?;
             self.page_cache.insert(page_id, Arc::clone(&arc));
             arc
         };
@@ -447,15 +783,18 @@ impl<'db> ReadTxn<'db> {
     }
 
     fn lookup_table(&mut self, name: &[u8]) -> Result<TableDescriptor> {
-        if let Some((root, depth)) = self.snapshot.named_entry_root(name) {
-            let entry_count = self.snapshot.named_entry_count(name).unwrap_or(0);
-            return Ok(TableDescriptor {
-                root_page: root,
-                entry_count,
-                depth,
-                flags: 0,
-            });
+        self.check_cancel()?;
+        if let Some(desc) = self.resolved_tables.get(name) {
+            return Ok(desc.clone());
         }
+
+        let desc = self.lookup_table_uncached(name)?;
+        self.resolved_tables.insert(name.to_vec(), desc.clone());
+        Ok(desc)
+    }
+
+    fn lookup_table_uncached(&self, name: &[u8]) -> Result<TableDescriptor> {
+        self.check_cancel()?;
 
         let catalog_root = self.snapshot.catalog_root;
         if !catalog_root.is_valid() {
@@ -465,19 +804,23 @@ impl<'db> ReadTxn<'db> {
         }
 
         let mut current = catalog_root;
-        loop {
-            let page = self.load_page(current)?;
+        let mut desc = loop {
+            self.check_cancel()?;
+            let page = self.read_reachable_page(current)?;
             match page.page_type() {
                 Some(PageType::Leaf) => {
-                    return match leaf_node::search(page, name) {
+                    break match leaf_node::search(&page, name) {
                         Ok(idx) => {
-                            let cell = leaf_node::read_cell(page, idx);
+                            let cell = leaf_node::read_cell(&page, idx);
                             if cell.val_type == ValueType::Tombstone {
                                 Err(Error::TableNotFound(
                                     String::from_utf8_lossy(name).into_owned(),
                                 ))
+                            } else if cell.val_type != ValueType::Inline {
+                                Err(Error::DatabaseCorrupted)
                             } else {
-                                Ok(TableDescriptor::deserialize(cell.value))
+                                TableDescriptor::try_deserialize(cell.value)
+                                    .ok_or(Error::DatabaseCorrupted)
                             }
                         }
                         Err(_) => Err(Error::TableNotFound(
@@ -486,14 +829,32 @@ impl<'db> ReadTxn<'db> {
                     };
                 }
                 Some(PageType::Branch) => {
-                    let idx = branch_node::search_child_index(page, name);
-                    current = branch_node::get_child(page, idx);
+                    let idx = branch_node::search_child_index(&page, name);
+                    current = branch_node::get_child(&page, idx);
                 }
                 _ => {
                     return Err(Error::InvalidPageType(page.page_type_raw(), current));
                 }
             }
+        }?;
+
+        // The catalog proves the exact name exists. Only now is it safe to
+        // consult the hash-only slot cache; in Off mode this root/count can be
+        // newer than the descriptor. A legacy catalog with two live names for
+        // this hash remains ambiguous and is rejected by the lazy index.
+        if let Some((root, depth)) = self.snapshot.named_entry_root(name) {
+            self.manager
+                .reject_named_table_hash_collision(name, self.cancel.as_ref())?;
+            let Some(entry_count) = self.snapshot.named_entry_count(name) else {
+                return Err(Error::DatabaseCorrupted);
+            };
+            desc.root_page = root;
+            desc.depth = depth;
+            desc.entry_count = entry_count;
         }
+
+        self.check_cancel()?;
+        Ok(desc)
     }
 
     /// Search for a key in an arbitrary B+ tree starting at `root`.
@@ -527,11 +888,7 @@ impl<'db> ReadTxn<'db> {
             None => Ok(None),
             Some((ValueType::Overflow, payload)) => {
                 let oref = OverflowRef::from_bytes(&payload);
-                let mut view = ReadPages {
-                    cache: &mut self.page_cache,
-                    manager: self.manager,
-                };
-                overflow_io::read_chain_value(&mut view, &oref).map(Some)
+                self.materialize_overflow(&oref).map(Some)
             }
             Some((_, value)) => Ok(Some(value)),
         }
@@ -539,7 +896,9 @@ impl<'db> ReadTxn<'db> {
 
     fn load_page(&mut self, page_id: PageId) -> Result<&Page> {
         if !self.page_cache.contains_key(&page_id) {
-            let arc = self.manager.fetch_page(page_id)?;
+            let arc = self
+                .manager
+                .fetch_reachable_page(page_id, self.snapshot.high_water_mark)?;
             self.page_cache.insert(page_id, arc);
         }
         Ok(self.page_cache.get(&page_id).unwrap())
@@ -548,8 +907,15 @@ impl<'db> ReadTxn<'db> {
     fn preload_all_pages(&mut self, root: PageId) -> Result<()> {
         let mut stack = vec![root];
         while let Some(current) = stack.pop() {
+            // Runs to completion before `for_each` yields anything, so without
+            // its own check a cancel waits out the whole tree walk.
+            if let Some(t) = self.cancel.as_ref() {
+                t.check()?;
+            }
             if !self.page_cache.contains_key(&current) {
-                let arc = self.manager.fetch_page(current)?;
+                let arc = self
+                    .manager
+                    .fetch_reachable_page(current, self.snapshot.high_water_mark)?;
                 self.page_cache.insert(current, arc);
             }
             let page: &Page = self.page_cache.get(&current).unwrap();
@@ -582,6 +948,7 @@ impl<'db> Drop for ReadTxn<'db> {
 /// Scan adapter wrapping a `&mut ReadTxn` for use with [`crate::TableIter`].
 pub struct ReadTxnScanAdapter<'a, 'db: 'a> {
     txn: &'a mut ReadTxn<'db>,
+    measurements: Vec<Arc<AtomicU64>>,
 }
 
 impl<'a, 'db: 'a> crate::scan_iter::TxnScanAdapter for ReadTxnScanAdapter<'a, 'db> {
@@ -589,14 +956,26 @@ impl<'a, 'db: 'a> crate::scan_iter::TxnScanAdapter for ReadTxnScanAdapter<'a, 'd
         let mut view = ReadPages {
             cache: &mut self.txn.page_cache,
             manager: self.txn.manager,
+            high_water_mark: self.txn.snapshot.high_water_mark,
         };
         f(&mut view)
+    }
+
+    fn cancel(&self) -> Option<&CancelToken> {
+        self.txn.cancel.as_ref()
+    }
+
+    fn record_rows_scanned(&self, rows: u64) {
+        self.txn
+            .manager
+            .add_rows_scanned_to(rows, &self.measurements);
     }
 }
 
 /// Scan adapter owning a `ReadTxn` for iterators that outlive a borrow scope.
 pub struct OwnedReadTxnAdapter<'db> {
     txn: ReadTxn<'db>,
+    measurements: Vec<Arc<AtomicU64>>,
 }
 
 impl<'db> crate::scan_iter::TxnScanAdapter for OwnedReadTxnAdapter<'db> {
@@ -604,8 +983,19 @@ impl<'db> crate::scan_iter::TxnScanAdapter for OwnedReadTxnAdapter<'db> {
         let mut view = ReadPages {
             cache: &mut self.txn.page_cache,
             manager: self.txn.manager,
+            high_water_mark: self.txn.snapshot.high_water_mark,
         };
         f(&mut view)
+    }
+
+    fn cancel(&self) -> Option<&CancelToken> {
+        self.txn.cancel.as_ref()
+    }
+
+    fn record_rows_scanned(&self, rows: u64) {
+        self.txn
+            .manager
+            .add_rows_scanned_to(rows, &self.measurements);
     }
 }
 

@@ -2,22 +2,26 @@
 
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use citadel_buffer::allocator::PageAllocator;
 use citadel_buffer::btree::BTree;
 use citadel_buffer::pool::BufferPool;
 use citadel_core::types::{PageId, TxnId};
 use citadel_core::{
-    Error, Result, BODY_SIZE, DEK_SIZE, GOD_BIT_ACTIVE_SLOT, GOD_BIT_RECOVERY, MAC_KEY_SIZE,
-    PAGE_SIZE, SLOT_ENTRY_STALE, SLOT_NAMED_MAX_ENTRIES_V1,
+    CancelToken, Error, Result, BODY_SIZE, DEK_SIZE, GOD_BIT_ACTIVE_SLOT, GOD_BIT_RECOVERY,
+    MAC_KEY_SIZE, PAGE_SIZE, SLOT_ENTRY_STALE, SLOT_NAMED_MAX_ENTRIES_V1,
 };
 use citadel_crypto::page_cipher;
 use citadel_io::file_manager::{
     self, ensure_file_size, page_offset, write_commit_slot, write_god_byte, CommitSlot,
+    MerkleScheme,
 };
 use citadel_io::traits::PageIO;
 use citadel_page::page::Page;
@@ -28,7 +32,239 @@ use crate::pending_free;
 use crate::read_txn::ReadTxn;
 use crate::write_txn::WriteTxn;
 
+static NEXT_MANAGER_ID: AtomicU64 = AtomicU64::new(1);
+
+type NamedTableHashCollisions = FxHashMap<u32, (Vec<u8>, Vec<u8>)>;
+
+fn allocate_manager_id() -> u64 {
+    NEXT_MANAGER_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("transaction-manager id space exhausted")
+}
+
+fn record_named_table_hash(
+    name: &[u8],
+    first_by_hash: &mut FxHashMap<u32, Vec<u8>>,
+    collisions: &mut NamedTableHashCollisions,
+) {
+    let hash = file_manager::table_name_hash(name);
+    if let Some(first) = first_by_hash.get(&hash) {
+        if first.as_slice() != name {
+            collisions
+                .entry(hash)
+                .or_insert_with(|| (first.clone(), name.to_vec()));
+        }
+    } else {
+        first_by_hash.insert(hash, name.to_vec());
+    }
+}
+
+/// Catalog values are fixed-size inline records. Runtime walkers must reject
+/// malformed cells instead of either treating an overflow reference as a
+/// descriptor or letting the indexing contract of `deserialize` panic.
+fn decode_catalog_descriptor(
+    value_type: citadel_core::types::ValueType,
+    value: &[u8],
+) -> Result<TableDescriptor> {
+    if value_type != citadel_core::types::ValueType::Inline {
+        return Err(Error::DatabaseCorrupted);
+    }
+    TableDescriptor::try_deserialize(value).ok_or(Error::DatabaseCorrupted)
+}
+
+#[derive(Clone, Copy)]
+struct CheckedBranchCellLocation {
+    child: PageId,
+    child_offset: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CheckedLeafCellLocation {
+    key_start: usize,
+    key_len: usize,
+    value_type: citadel_core::types::ValueType,
+    value_start: usize,
+    value_len: usize,
+}
+
+impl CheckedLeafCellLocation {
+    fn key<'a>(&self, page: &'a Page) -> &'a [u8] {
+        &page.data[self.key_start..self.key_start + self.key_len]
+    }
+
+    fn value<'a>(&self, page: &'a Page) -> &'a [u8] {
+        &page.data[self.value_start..self.value_start + self.value_len]
+    }
+}
+
+fn checked_cell_offsets(page: &Page) -> Result<Vec<usize>> {
+    let count = page.num_cells() as usize;
+    let pointer_end = citadel_core::PAGE_HEADER_SIZE
+        .checked_add(count.checked_mul(2).ok_or(Error::DatabaseCorrupted)?)
+        .ok_or(Error::DatabaseCorrupted)?;
+    if pointer_end > BODY_SIZE {
+        return Err(Error::DatabaseCorrupted);
+    }
+
+    let cell_area_start = page.cell_area_start() as usize;
+    if cell_area_start < pointer_end || cell_area_start > BODY_SIZE {
+        return Err(Error::DatabaseCorrupted);
+    }
+
+    let mut offsets = Vec::with_capacity(count);
+    for index in 0..count {
+        let pointer = citadel_core::PAGE_HEADER_SIZE + index * 2;
+        let offset = u16::from_le_bytes([page.data[pointer], page.data[pointer + 1]]) as usize;
+        if offset < cell_area_start || offset >= BODY_SIZE {
+            return Err(Error::DatabaseCorrupted);
+        }
+        offsets.push(offset);
+    }
+    Ok(offsets)
+}
+
+fn checked_branch_cell_locations(page: &Page) -> Result<Vec<CheckedBranchCellLocation>> {
+    let offsets = checked_cell_offsets(page)?;
+    let mut cells = Vec::with_capacity(offsets.len());
+    let mut spans = Vec::with_capacity(offsets.len());
+    for offset in offsets {
+        let fixed_end = offset.checked_add(6).ok_or(Error::DatabaseCorrupted)?;
+        if fixed_end > BODY_SIZE {
+            return Err(Error::DatabaseCorrupted);
+        }
+        let key_len = u16::from_le_bytes([page.data[offset + 4], page.data[offset + 5]]) as usize;
+        let end = fixed_end
+            .checked_add(key_len)
+            .filter(|&end| end <= BODY_SIZE)
+            .ok_or(Error::DatabaseCorrupted)?;
+        spans.push((offset, end));
+        cells.push(CheckedBranchCellLocation {
+            child: PageId(u32::from_le_bytes([
+                page.data[offset],
+                page.data[offset + 1],
+                page.data[offset + 2],
+                page.data[offset + 3],
+            ])),
+            child_offset: offset,
+        });
+    }
+    spans.sort_unstable_by_key(|&(start, _)| start);
+    if spans.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(Error::DatabaseCorrupted);
+    }
+    Ok(cells)
+}
+
+fn checked_leaf_cell_locations(page: &Page) -> Result<Vec<CheckedLeafCellLocation>> {
+    let offsets = checked_cell_offsets(page)?;
+    let mut cells = Vec::with_capacity(offsets.len());
+    let mut spans = Vec::with_capacity(offsets.len());
+    for offset in offsets {
+        let fixed_end = offset.checked_add(6).ok_or(Error::DatabaseCorrupted)?;
+        if fixed_end > BODY_SIZE {
+            return Err(Error::DatabaseCorrupted);
+        }
+        let key_len = u16::from_le_bytes([page.data[offset], page.data[offset + 1]]) as usize;
+        let value_len = u32::from_le_bytes([
+            page.data[offset + 2],
+            page.data[offset + 3],
+            page.data[offset + 4],
+            page.data[offset + 5],
+        ]) as usize;
+        let value_type_offset = fixed_end
+            .checked_add(key_len)
+            .filter(|&offset| offset < BODY_SIZE)
+            .ok_or(Error::DatabaseCorrupted)?;
+        let end = value_type_offset
+            .checked_add(1)
+            .and_then(|start| start.checked_add(value_len))
+            .filter(|&end| end <= BODY_SIZE)
+            .ok_or(Error::DatabaseCorrupted)?;
+        let value_type = citadel_core::types::ValueType::from_u8(page.data[value_type_offset])
+            .ok_or(Error::DatabaseCorrupted)?;
+        spans.push((offset, end));
+        cells.push(CheckedLeafCellLocation {
+            key_start: fixed_end,
+            key_len,
+            value_type,
+            value_start: value_type_offset + 1,
+            value_len,
+        });
+    }
+    spans.sort_unstable_by_key(|&(start, _)| start);
+    if spans.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(Error::DatabaseCorrupted);
+    }
+    Ok(cells)
+}
+
+fn checked_overflow_reference(page: &Page, cell: CheckedLeafCellLocation) -> Result<(PageId, u32)> {
+    if cell.value_len != 8 {
+        return Err(Error::CorruptOverflowChain(format!(
+            "overflow reference on page {} has {} bytes instead of 8",
+            page.page_id(),
+            cell.value_len
+        )));
+    }
+    let value = cell.value(page);
+    let first_page = PageId(u32::from_le_bytes([value[0], value[1], value[2], value[3]]));
+    let total_len = u32::from_le_bytes([value[4], value[5], value[6], value[7]]);
+    Ok((first_page, total_len))
+}
+
+struct ActiveScanMeasurement {
+    manager_id: u64,
+    counter: Arc<AtomicU64>,
+}
+
+thread_local! {
+    static ACTIVE_SCAN_MEASUREMENTS: RefCell<Vec<ActiveScanMeasurement>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Operation-local count of storage entries examined by scans.
+///
+/// Thread-bound: nested guards each receive the rows scanned while they are
+/// active, and never observe another thread's or another database's scans.
+#[must_use = "dropping the guard ends the scan measurement"]
+pub struct ScanMeasurement {
+    manager_id: u64,
+    counter: Arc<AtomicU64>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl ScanMeasurement {
+    /// Rows flushed by completed scans in this operation. Counts publish when a
+    /// scan guard or pull iterator drops, so this is not a live progress counter.
+    pub fn rows_scanned(&self) -> u64 {
+        self.counter.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn weak_counter(&self) -> std::sync::Weak<AtomicU64> {
+        Arc::downgrade(&self.counter)
+    }
+}
+
+impl Drop for ScanMeasurement {
+    fn drop(&mut self) {
+        let _ = ACTIVE_SCAN_MEASUREMENTS.try_with(|measurements| {
+            let mut measurements = measurements.borrow_mut();
+            let index = measurements.iter().rposition(|entry| {
+                entry.manager_id == self.manager_id && Arc::ptr_eq(&entry.counter, &self.counter)
+            });
+            debug_assert!(
+                index.is_some(),
+                "scan measurement missing from its thread-local stack"
+            );
+            if let Some(index) = index {
+                measurements.remove(index);
+            }
+        });
+    }
+}
+
 pub struct TxnManager {
+    id: u64,
     io: Box<dyn PageIO>,
     dek: [u8; DEK_SIZE],
     mac_key: [u8; MAC_KEY_SIZE],
@@ -36,9 +272,18 @@ pub struct TxnManager {
     pool: Mutex<BufferPool>,
     next_txn_id: AtomicU64,
     commit_generation: AtomicU64,
+    /// Database-wide storage entries examined since this manager opened.
+    /// Monotonic telemetry only; operation-local measurements use the
+    /// thread-local counters above. Each scan flushes both sets once on drop.
+    rows_scanned: AtomicU64,
+    /// Full catalog names for hashes that are ambiguous in legacy databases.
+    /// New DDL prevents these; the first named-table access populates the map,
+    /// so open stays O(1) and later hash-only lookups need no catalog scan.
+    named_table_hash_collisions: OnceLock<NamedTableHashCollisions>,
+    named_table_hash_collision_init: Mutex<()>,
     write_active: AtomicBool,
-    /// HEADER_FLAG_SLOTS_V1 state, cached at open/create and refreshed by
-    /// mark_slots_v1: a flagged file must never receive a legacy slot.
+    /// Effective V1 requirement: either the compatibility data-header bit or
+    /// an authenticated key-file requirement supplied by the facade.
     slots_flagged: AtomicBool,
     state: Mutex<ManagerState>,
     sync_mode: citadel_core::types::SyncMode,
@@ -48,6 +293,53 @@ pub struct TxnManager {
     secure_delete: AtomicBool,
     /// Reusable encrypt output buffer, capped at COMMIT_ARENA_PAGES pages.
     commit_arena: Mutex<Vec<u8>>,
+}
+
+/// Exclusive access to commit-slot metadata while writers are blocked.
+///
+/// Slot promotion spans multiple reads and durable writes, so keeping them on
+/// this guard makes it impossible to run part of that sequence uncommitted.
+#[must_use = "dropping the guard releases writer exclusion"]
+pub struct WriterExclusion<'a> {
+    manager: &'a TxnManager,
+}
+
+impl WriterExclusion<'_> {
+    pub fn both_slots_v1(&self) -> Result<bool> {
+        (0..2).try_fold(true, |all_v1, idx| {
+            file_manager::read_commit_slot(&*self.manager.io, idx).map(|slot| {
+                all_v1
+                    && slot.slot_format == file_manager::SlotFormat::V1
+                    && slot.verify_checksum()
+                    && slot.verify_mac(&self.manager.mac_key)
+            })
+        })
+    }
+
+    /// Verify both slots and activate the in-memory V1 backstop.
+    pub fn require_authenticated_v1(&self) -> Result<()> {
+        if !self.both_slots_v1()? {
+            return Err(Error::DatabaseCorrupted);
+        }
+        self.manager.slots_flagged.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Stamp the one-way compatibility flag after both slots are V1.
+    pub fn mark_slots_v1(&self) -> Result<bool> {
+        let flagged =
+            file_manager::mark_slots_v1_if_upgraded(&*self.manager.io, &self.manager.mac_key)?;
+        if flagged {
+            self.manager.slots_flagged.store(true, Ordering::Release);
+        }
+        Ok(flagged)
+    }
+}
+
+impl Drop for WriterExclusion<'_> {
+    fn drop(&mut self) {
+        self.manager.write_active.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Commit encrypt/write chunk size; bounds arena retention and transient
@@ -73,6 +365,35 @@ struct ManagerState {
     recycled_pages: Option<FxHashMap<PageId, Page>>,
 }
 
+/// A stable on-disk commit-slot snapshot held while writers are excluded.
+///
+/// Both slots come from one header read, and the exclusion is held for this
+/// value's lifetime, so no commit can flip the active slot or recycle pages.
+pub(crate) struct IntegritySnapshot<'a> {
+    exclusion: WriterExclusion<'a>,
+    active_slot: usize,
+    v1_required: bool,
+    slots: [CommitSlot; 2],
+}
+
+impl IntegritySnapshot<'_> {
+    pub(crate) fn active_slot(&self) -> usize {
+        self.active_slot
+    }
+
+    pub(crate) fn slots(&self) -> &[CommitSlot; 2] {
+        &self.slots
+    }
+
+    pub(crate) fn v1_required(&self) -> bool {
+        self.v1_required
+    }
+
+    pub(crate) fn slot_mac_valid(&self, slot: usize) -> bool {
+        self.slots[slot].verify_mac(&self.exclusion.manager.mac_key)
+    }
+}
+
 impl TxnManager {
     pub fn open(
         io: Box<dyn PageIO>,
@@ -84,6 +405,26 @@ impl TxnManager {
         Self::open_with_sync(io, dek, mac_key, epoch, cache_size, Default::default())
     }
 
+    /// Open while enforcing a V1 requirement authenticated by a higher layer.
+    pub fn open_with_v1_requirement(
+        io: Box<dyn PageIO>,
+        dek: [u8; DEK_SIZE],
+        mac_key: [u8; MAC_KEY_SIZE],
+        epoch: u32,
+        cache_size: usize,
+        authenticated_v1_required: bool,
+    ) -> Result<Self> {
+        Self::open_with_sync_and_v1_requirement(
+            io,
+            dek,
+            mac_key,
+            epoch,
+            cache_size,
+            Default::default(),
+            authenticated_v1_required,
+        )
+    }
+
     pub fn open_with_sync(
         io: Box<dyn PageIO>,
         dek: [u8; DEK_SIZE],
@@ -92,14 +433,32 @@ impl TxnManager {
         cache_size: usize,
         sync_mode: citadel_core::types::SyncMode,
     ) -> Result<Self> {
-        let (active_slot, slot) = file_manager::recover(&*io, &mac_key)?;
+        Self::open_with_sync_and_v1_requirement(
+            io, dek, mac_key, epoch, cache_size, sync_mode, false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_sync_and_v1_requirement(
+        io: Box<dyn PageIO>,
+        dek: [u8; DEK_SIZE],
+        mac_key: [u8; MAC_KEY_SIZE],
+        epoch: u32,
+        cache_size: usize,
+        sync_mode: citadel_core::types::SyncMode,
+        authenticated_v1_required: bool,
+    ) -> Result<Self> {
+        let (active_slot, slot) =
+            file_manager::recover_with_v1_requirement(&*io, &mac_key, authenticated_v1_required)?;
         // One-way: once both slots are sealed V1, legacy slots are rejected.
-        let slots_flagged = file_manager::mark_slots_v1_if_upgraded(&*io)?;
+        let header_flagged = file_manager::mark_slots_v1_if_upgraded(&*io, &mac_key)?;
+        let slots_flagged = authenticated_v1_required || header_flagged;
         let file_size = io.file_size()?;
 
         let next_txn_id = slot.txn_id.as_u64() + 1;
 
         Ok(Self {
+            id: allocate_manager_id(),
             io,
             dek,
             mac_key,
@@ -107,6 +466,9 @@ impl TxnManager {
             pool: Mutex::new(BufferPool::new(cache_size)),
             next_txn_id: AtomicU64::new(next_txn_id),
             commit_generation: AtomicU64::new(0),
+            rows_scanned: AtomicU64::new(0),
+            named_table_hash_collisions: OnceLock::new(),
+            named_table_hash_collision_init: Mutex::new(()),
             write_active: AtomicBool::new(false),
             slots_flagged: AtomicBool::new(slots_flagged),
             state: Mutex::new(ManagerState {
@@ -201,6 +563,7 @@ impl TxnManager {
             encryption_epoch: epoch,
             dek_id,
             merkle_root: merkle_root_hash,
+            merkle_scheme: citadel_io::file_manager::MerkleScheme::LogicalOverflowV1,
             ..Default::default()
         };
         slot.seal(&mac_key);
@@ -209,6 +572,7 @@ impl TxnManager {
         let file_size = io.file_size()?;
 
         Ok(Self {
+            id: allocate_manager_id(),
             io,
             dek,
             mac_key,
@@ -216,6 +580,9 @@ impl TxnManager {
             pool: Mutex::new(BufferPool::new(cache_size)),
             next_txn_id: AtomicU64::new(2),
             commit_generation: AtomicU64::new(0),
+            rows_scanned: AtomicU64::new(0),
+            named_table_hash_collisions: OnceLock::new(),
+            named_table_hash_collision_init: Mutex::new(()),
             write_active: AtomicBool::new(false),
             // New files are flagged at birth (FileHeader::new).
             slots_flagged: AtomicBool::new(true),
@@ -263,27 +630,55 @@ impl TxnManager {
         self.commit_generation.load(Ordering::Acquire)
     }
 
-    /// One-way HEADER_FLAG_SLOTS_V1 stamp, callable mid-session by the
-    /// facade's upgrade_format after it reseals both slots (open() also runs
-    /// it). Returns whether the flag is set afterwards.
-    pub fn mark_slots_v1(&self) -> Result<bool> {
-        let flagged = file_manager::mark_slots_v1_if_upgraded(&*self.io)?;
-        self.slots_flagged.store(flagged, Ordering::Release);
-        Ok(flagged)
-    }
-
-    /// Cached HEADER_FLAG_SLOTS_V1 state of the underlying file.
+    /// Effective V1 requirement, including an authenticated key-file marker.
     pub fn slots_flagged(&self) -> bool {
         self.slots_flagged.load(Ordering::Acquire)
     }
 
-    pub fn begin_write(&self) -> Result<WriteTxn<'_>> {
+    /// Exclude commits while a caller coordinates commit-slot metadata with
+    /// another durable policy marker.
+    pub fn exclude_writers(&self) -> Result<WriterExclusion<'_>> {
         if self
             .write_active
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
             return Err(Error::WriteTransactionActive);
+        }
+        Ok(WriterExclusion { manager: self })
+    }
+
+    pub fn begin_write(&self) -> Result<WriteTxn<'_>> {
+        Ok(self
+            .begin_write_inner(None)?
+            .expect("an unconditional writer has no generation mismatch"))
+    }
+
+    /// Begin a writer only if no commit has occurred since `expected_generation`.
+    /// The generation check happens while holding single-writer exclusion, so a
+    /// writer cannot commit between the check and the returned transaction.
+    #[doc(hidden)]
+    pub fn begin_write_if_generation(
+        &self,
+        expected_generation: u64,
+    ) -> Result<Option<WriteTxn<'_>>> {
+        self.begin_write_inner(Some(expected_generation))
+    }
+
+    fn begin_write_inner(&self, expected_generation: Option<u64>) -> Result<Option<WriteTxn<'_>>> {
+        if self
+            .write_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(Error::WriteTransactionActive);
+        }
+
+        if expected_generation
+            .is_some_and(|expected| self.commit_generation.load(Ordering::Acquire) != expected)
+        {
+            self.write_active.store(false, Ordering::SeqCst);
+            return Ok(None);
         }
 
         let mut state = self.state.lock();
@@ -307,7 +702,9 @@ impl TxnManager {
             snapshot.tree_entries,
         );
 
-        Ok(WriteTxn::new(self, txn_id, snapshot, tree, alloc, recycled))
+        Ok(Some(WriteTxn::new(
+            self, txn_id, snapshot, tree, alloc, recycled,
+        )))
     }
 
     pub(crate) fn fetch_page(&self, page_id: PageId) -> Result<Arc<Page>> {
@@ -329,6 +726,21 @@ impl TxnManager {
         self.pool.lock().insert_if_absent(page_id, Arc::clone(&arc));
 
         Ok(arc)
+    }
+
+    pub(crate) fn fetch_reachable_page(
+        &self,
+        page_id: PageId,
+        high_water_mark: u32,
+    ) -> Result<Arc<Page>> {
+        if page_id.as_u32() >= high_water_mark {
+            return Err(Error::PageOutOfBounds(page_id));
+        }
+        let page = self.fetch_page(page_id)?;
+        if page.page_id() != page_id {
+            return Err(Error::DatabaseCorrupted);
+        }
+        Ok(page)
     }
 
     pub(crate) fn next_write_txn_id(&self) -> TxnId {
@@ -404,17 +816,23 @@ impl TxnManager {
         loaded_tree_meta: &FxHashMap<Vec<u8>, (PageId, u16)>,
         catalog_refreshed: &FxHashSet<u32>,
         force_commit: bool,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        // Write transactions also cache snapshot pages for reads. Only pages
+        // owned by this transaction (new/COW pages carry a txn id at or above
+        // its base id) are dirty; cached older pages must not turn an equal
+        // CRDT comparison or other read-only writer into a physical commit.
+        let has_dirty_pages = pages.values().any(|page| page.txn_id() >= base_txn_id);
         let is_noop = !force_commit
-            && pages.is_empty()
+            && !has_dirty_pages
             && alloc.freed_this_txn().is_empty()
             && tree.root == old_slot.tree_root
             && tree.depth == old_slot.tree_depth
             && tree.entry_count == old_slot.tree_entries
             && catalog_root == old_slot.catalog_root;
         if is_noop {
+            let generation = self.commit_generation.load(Ordering::Acquire);
             self.write_active.store(false, Ordering::SeqCst);
-            return Ok(());
+            return Ok(generation);
         }
 
         let (active_slot, reclaim_horizon, current_god_byte, cached_file_size) = {
@@ -427,6 +845,16 @@ impl TxnManager {
             )
         };
         let inactive_slot_idx = 1 - active_slot;
+
+        // Validate durable reclaim metadata before touching allocator state or
+        // the recovery marker, so a structural error leaves this process and
+        // the next open on the unchanged committed slot.
+        self.load_pending_free_chain(
+            pages,
+            old_slot.pending_free_root,
+            old_slot.high_water_mark,
+            old_slot.txn_id,
+        )?;
 
         if self.sync_mode != citadel_core::types::SyncMode::Off {
             let recovery_god_byte = current_god_byte | GOD_BIT_RECOVERY;
@@ -457,7 +885,6 @@ impl TxnManager {
                 .collect()
         };
         let (new_pf_root, available) = {
-            self.load_pending_free_chain(pages, old_slot.pending_free_root)?;
             pending_free::process_chain(
                 pages,
                 alloc,
@@ -472,7 +899,9 @@ impl TxnManager {
             )?
         };
 
-        let merkle_root_hash = if self.sync_mode != citadel_core::types::SyncMode::Off {
+        let merkle_root_hash = if self.sync_mode != citadel_core::types::SyncMode::Off
+            && old_slot.merkle_scheme == citadel_io::file_manager::MerkleScheme::LogicalOverflowV1
+        {
             let hash =
                 crate::merkle::compute_tree_merkle(pages, tree.root, base_txn_id, &|page_id| {
                     self.fetch_merkle_hash(page_id)
@@ -495,11 +924,19 @@ impl TxnManager {
             }
             hash
         } else {
-            // Off skips Merkle recompute, but dirty pages keep their pre-edit
-            // hash (cow_page clones the header). Zero it so merkle_diff can't
-            // prune a changed subtree as identical (zero forces traversal).
+            // Off mode and legacy Merkle slots cannot certify dirty subtrees.
+            // Legacy hashes cover only the physical overflow reference, not
+            // the payload, so an incremental rewrite cannot safely promote
+            // the slot to the logical-overflow scheme. Zero dirty tree hashes
+            // and keep the slot untrusted until a full compaction rebuild.
             for page in pages.values_mut() {
-                if page.txn_id() >= base_txn_id {
+                if page.txn_id() >= base_txn_id
+                    && matches!(
+                        page.page_type(),
+                        Some(citadel_core::types::PageType::Leaf)
+                            | Some(citadel_core::types::PageType::Branch)
+                    )
+                {
                     page.set_merkle_hash(&[0u8; citadel_core::MERKLE_HASH_SIZE]);
                 }
             }
@@ -537,25 +974,33 @@ impl TxnManager {
             }
             for chunk in dirty_page_info.chunks(COMMIT_ARENA_PAGES) {
                 let bufs = &mut arena[..chunk.len() * PAGE_SIZE];
-                let encrypt_one = |(dst, &(_, page_id)): (&mut [u8], &(u64, PageId))| {
+                // The destination is a page-sized array by type, so the length is a
+                // guarantee rather than a runtime check inside the encrypt loop.
+                let encrypt_one = |(dst, &(_, page_id)): (&mut [u8; PAGE_SIZE], &(u64, PageId))| {
                     let page = &pages[&page_id];
                     page_cipher::encrypt_page_with_hmac(
                         &self.dek,
                         hmac_state,
                         page_id,
                         page.as_bytes(),
-                        dst.try_into().expect("arena chunk is PAGE_SIZE"),
+                        dst,
                     );
                 };
                 #[cfg(feature = "parallel")]
                 {
                     use rayon::prelude::*;
+                    // Rayon has no const-generic chunker, so the conversion lives here.
                     bufs.par_chunks_exact_mut(PAGE_SIZE)
+                        .map(|dst| {
+                            <&mut [u8; PAGE_SIZE]>::try_from(dst).expect("arena chunk is PAGE_SIZE")
+                        })
                         .zip(chunk.par_iter())
                         .for_each(encrypt_one);
                 }
                 #[cfg(not(feature = "parallel"))]
-                bufs.chunks_exact_mut(PAGE_SIZE)
+                bufs.as_chunks_mut::<PAGE_SIZE>()
+                    .0
+                    .iter_mut()
                     .zip(chunk.iter())
                     .for_each(encrypt_one);
 
@@ -565,8 +1010,8 @@ impl TxnManager {
                 } else {
                     let refs: Vec<(u64, &[u8; PAGE_SIZE])> = chunk
                         .iter()
-                        .zip(arena.chunks_exact(PAGE_SIZE))
-                        .map(|(&(offset, _), buf)| (offset, buf.try_into().unwrap()))
+                        .zip(arena.as_chunks::<PAGE_SIZE>().0)
+                        .map(|(&(offset, _), buf)| (offset, buf))
                         .collect();
                     self.io.write_pages_ref(&refs)?;
                 }
@@ -606,6 +1051,7 @@ impl TxnManager {
             encryption_epoch: self.epoch,
             dek_id: old_slot.dek_id,
             merkle_root: merkle_root_hash,
+            merkle_scheme: old_slot.merkle_scheme,
             named_table_entries,
             ..Default::default()
         };
@@ -655,7 +1101,7 @@ impl TxnManager {
             }
         }
 
-        {
+        let generation = {
             let mut state = self.state.lock();
             state.active_slot = inactive_slot_idx;
             state.current_slot = Arc::new(new_slot);
@@ -668,12 +1114,10 @@ impl TxnManager {
                 state.zeroed_up_to = watermark;
             }
             state.recycled_pages = Some(std::mem::take(pages));
-            self.commit_generation.fetch_add(1, Ordering::Release);
-        }
-
+            self.commit_generation.fetch_add(1, Ordering::Release) + 1
+        };
         self.write_active.store(false, Ordering::SeqCst);
-
-        Ok(())
+        Ok(generation)
     }
 
     pub(crate) fn abort_write(&self) {
@@ -707,8 +1151,183 @@ impl TxnManager {
             .unwrap_or(TxnId(u64::MAX))
     }
 
+    /// Database-wide storage-scan telemetry since this manager opened. Monotonic
+    /// across threads; use [`TxnManager::measure_scans`] for one operation.
+    pub fn rows_scanned(&self) -> u64 {
+        self.rows_scanned.load(Ordering::Relaxed)
+    }
+
+    /// Begin an operation-local scan measurement on the current thread.
+    ///
+    /// Measurements nest; other managers and other threads stay isolated.
+    pub fn measure_scans(&self) -> ScanMeasurement {
+        let counter = Arc::new(AtomicU64::new(0));
+        ACTIVE_SCAN_MEASUREMENTS.with(|measurements| {
+            measurements.borrow_mut().push(ActiveScanMeasurement {
+                manager_id: self.id,
+                counter: Arc::clone(&counter),
+            });
+        });
+        ScanMeasurement {
+            manager_id: self.id,
+            counter,
+            _not_send: PhantomData,
+        }
+    }
+
+    pub(crate) fn active_scan_measurements(&self) -> Vec<Arc<AtomicU64>> {
+        ACTIVE_SCAN_MEASUREMENTS.with(|measurements| {
+            measurements
+                .borrow()
+                .iter()
+                .filter(|entry| entry.manager_id == self.id)
+                .map(|entry| Arc::clone(&entry.counter))
+                .collect()
+        })
+    }
+
+    pub(crate) fn add_rows_scanned_to(&self, rows: u64, measurements: &[Arc<AtomicU64>]) {
+        if rows == 0 {
+            return;
+        }
+        self.rows_scanned.fetch_add(rows, Ordering::Relaxed);
+        for measurement in measurements {
+            measurement.fetch_add(rows, Ordering::Relaxed);
+        }
+    }
+
     pub fn current_slot(&self) -> CommitSlot {
         self.state.lock().current_slot.as_ref().clone()
+    }
+
+    /// Refuse a hash-only named-table lookup when an opened catalog contains
+    /// more than one full name for that 32-bit slot hash.
+    pub(crate) fn reject_named_table_hash_collision(
+        &self,
+        requested: &[u8],
+        cancel: Option<&CancelToken>,
+    ) -> Result<()> {
+        let collisions = self.named_table_hash_collisions(cancel)?;
+        if collisions.is_empty() {
+            return Ok(());
+        }
+        let hash = file_manager::table_name_hash(requested);
+        let Some((first, second)) = collisions.get(&hash) else {
+            return Ok(());
+        };
+        let existing = if first.as_slice() == requested {
+            second
+        } else {
+            first
+        };
+        Err(Error::NamedTableHashCollision {
+            requested: String::from_utf8_lossy(requested).into_owned(),
+            existing: String::from_utf8_lossy(existing).into_owned(),
+            hash,
+        })
+    }
+
+    /// Lazily build the legacy-catalog collision index once. Initialization
+    /// failures are returned and leave the cell unset so a later call can
+    /// retry; after success, the fast path is a lock-free `OnceLock::get`.
+    fn named_table_hash_collisions(
+        &self,
+        cancel: Option<&CancelToken>,
+    ) -> Result<&NamedTableHashCollisions> {
+        if let Some(token) = cancel {
+            token.check()?;
+        }
+        if let Some(collisions) = self.named_table_hash_collisions.get() {
+            return Ok(collisions);
+        }
+        let _init = self.named_table_hash_collision_init.lock();
+        if let Some(token) = cancel {
+            token.check()?;
+        }
+        if self.named_table_hash_collisions.get().is_none() {
+            let collisions = self.scan_named_table_hash_collisions(cancel)?;
+            let _ = self.named_table_hash_collisions.set(collisions);
+        }
+        Ok(self
+            .named_table_hash_collisions
+            .get()
+            .expect("named-table collision index initialized while holding its lock"))
+    }
+
+    fn scan_named_table_hash_collisions(
+        &self,
+        cancel: Option<&CancelToken>,
+    ) -> Result<NamedTableHashCollisions> {
+        use citadel_core::types::{PageType, ValueType};
+        use citadel_page::{branch_node, leaf_node};
+
+        let root = self.current_slot().catalog_root;
+        if !root.is_valid() {
+            return Ok(FxHashMap::default());
+        }
+
+        let mut first_by_hash: FxHashMap<u32, Vec<u8>> = FxHashMap::default();
+        let mut collisions = FxHashMap::default();
+        let mut visited = FxHashSet::default();
+        let mut stack = vec![root];
+        while let Some(page_id) = stack.pop() {
+            if let Some(token) = cancel {
+                token.check()?;
+            }
+            if !visited.insert(page_id) {
+                return Err(Error::DatabaseCorrupted);
+            }
+            let page = self.read_page_from_disk(page_id)?;
+            match page.page_type() {
+                Some(PageType::Leaf) => {
+                    for index in 0..page.num_cells() {
+                        if let Some(token) = cancel {
+                            token.check()?;
+                        }
+                        let cell = leaf_node::read_cell(&page, index);
+                        if cell.val_type == ValueType::Tombstone {
+                            continue;
+                        }
+                        record_named_table_hash(cell.key, &mut first_by_hash, &mut collisions);
+                    }
+                }
+                Some(PageType::Branch) => {
+                    for index in 0..page.num_cells() as usize {
+                        stack.push(branch_node::get_child(&page, index));
+                    }
+                    let right = page.right_child();
+                    if right.is_valid() {
+                        stack.push(right);
+                    }
+                }
+                _ => return Err(Error::InvalidPageType(page.page_type_raw(), page_id)),
+            }
+        }
+        Ok(collisions)
+    }
+
+    /// Exclude writers and read both raw commit slots from one header image.
+    ///
+    /// The guard holds single-writer exclusion until dropped, so slot selection
+    /// and every page reached from those slots form one coherent snapshot.
+    pub(crate) fn integrity_snapshot(&self) -> Result<IntegritySnapshot<'_>> {
+        let exclusion = self.exclude_writers()?;
+        // Move the guard into the snapshot before doing I/O so every error
+        // path releases the writer exclusion.
+        let mut snapshot = IntegritySnapshot {
+            exclusion,
+            active_slot: 0,
+            v1_required: false,
+            slots: std::array::from_fn(|_| CommitSlot::default()),
+        };
+        let mut header_buf = [0u8; citadel_core::FILE_HEADER_SIZE];
+        self.io.read_at(0, &mut header_buf)?;
+        let header = file_manager::FileHeader::deserialize(&header_buf)?;
+        snapshot.active_slot = header.active_slot();
+        snapshot.v1_required = self.slots_flagged.load(Ordering::Acquire)
+            || header.flags & citadel_core::HEADER_FLAG_SLOTS_V1 != 0;
+        snapshot.slots = header.slots;
+        Ok(snapshot)
     }
 
     pub fn reader_count(&self) -> usize {
@@ -720,8 +1339,21 @@ impl TxnManager {
         use citadel_core::types::ValueType;
         use citadel_page::{branch_node, leaf_node};
 
+        let _collision_init = if self.named_table_hash_collisions.get().is_none() {
+            Some(self.named_table_hash_collision_init.lock())
+        } else {
+            None
+        };
+        let populate_collisions =
+            _collision_init.is_some() && self.named_table_hash_collisions.get().is_none();
+        let mut first_by_hash = FxHashMap::default();
+        let mut collisions = FxHashMap::default();
+        let mut collision_scan_complete = true;
         let slot = self.current_slot();
         if !slot.catalog_root.is_valid() {
+            if populate_collisions {
+                let _ = self.named_table_hash_collisions.set(collisions);
+            }
             return Ok(Vec::new());
         }
 
@@ -733,12 +1365,14 @@ impl TxnManager {
                 Some(citadel_core::types::PageType::Leaf) => {
                     for i in 0..page.num_cells() {
                         let cell = leaf_node::read_cell(&page, i);
-                        if cell.val_type != ValueType::Tombstone
-                            && cell.value.len() >= crate::catalog::TABLE_DESCRIPTOR_SIZE
-                        {
-                            let desc = TableDescriptor::deserialize(cell.value);
-                            tables.push((cell.key.to_vec(), desc));
+                        if cell.val_type == ValueType::Tombstone {
+                            continue;
                         }
+                        if populate_collisions {
+                            record_named_table_hash(cell.key, &mut first_by_hash, &mut collisions);
+                        }
+                        let desc = decode_catalog_descriptor(cell.val_type, cell.value)?;
+                        tables.push((cell.key.to_vec(), desc));
                     }
                 }
                 Some(citadel_core::types::PageType::Branch) => {
@@ -750,8 +1384,11 @@ impl TxnManager {
                         stack.push(right);
                     }
                 }
-                _ => {}
+                _ => collision_scan_complete = false,
             }
+        }
+        if populate_collisions && collision_scan_complete {
+            let _ = self.named_table_hash_collisions.set(collisions);
         }
         Ok(tables)
     }
@@ -772,11 +1409,11 @@ impl TxnManager {
                 Some(citadel_core::types::PageType::Leaf) => {
                     for i in 0..page.num_cells() {
                         let cell = leaf_node::read_cell(&page, i);
-                        if cell.key == name
-                            && cell.val_type != ValueType::Tombstone
-                            && cell.value.len() >= crate::catalog::TABLE_DESCRIPTOR_SIZE
-                        {
-                            let desc = TableDescriptor::deserialize(cell.value);
+                        if cell.key == name {
+                            if cell.val_type == ValueType::Tombstone {
+                                return Ok(None);
+                            }
+                            let desc = decode_catalog_descriptor(cell.val_type, cell.value)?;
                             return Ok(Some(desc.root_page));
                         }
                     }
@@ -800,8 +1437,78 @@ impl TxnManager {
         integrity::run_integrity_check(self)
     }
 
+    /// Run the integrity walk with cooperative cancellation. The writer
+    /// exclusion is held by an RAII snapshot, so an interrupted walk releases
+    /// it on the same path as every other early return.
+    pub fn integrity_check_with_cancel(
+        &self,
+        cancel: Option<&CancelToken>,
+    ) -> Result<IntegrityReport> {
+        integrity::run_integrity_check_with_cancel(self, cancel)
+    }
+
+    /// Materialize and authenticate one overflow reference.
+    ///
+    /// Callers that obtained `reference` from a raw page must keep a stable
+    /// transaction snapshot or writer exclusion across both operations.
+    pub(crate) fn read_overflow_value(
+        &self,
+        reference: &citadel_page::leaf_node::OverflowRef,
+        high_water_mark: u32,
+        merkle_scheme: MerkleScheme,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<u8>> {
+        if let Some(token) = cancel {
+            token.check()?;
+        }
+        let total_len = reference.total_len as usize;
+        if total_len > citadel_core::MAX_VALUE_SIZE {
+            return Err(Error::CorruptOverflowChain(format!(
+                "declared length {total_len} exceeds maximum {}",
+                citadel_core::MAX_VALUE_SIZE
+            )));
+        }
+        let mut value = Vec::with_capacity(total_len);
+        let require_digest = match merkle_scheme {
+            MerkleScheme::Legacy => false,
+            MerkleScheme::LogicalOverflowV1 => true,
+            MerkleScheme::Unknown => return Err(Error::DatabaseCorrupted),
+        };
+        match cancel {
+            Some(token) => {
+                self.walk_overflow_chain_checked(
+                    reference.first_page,
+                    reference.total_len,
+                    high_water_mark,
+                    require_digest,
+                    || token.check(),
+                    |_, chunk| {
+                        value.extend_from_slice(chunk);
+                        Ok(())
+                    },
+                )?;
+            }
+            None => {
+                self.walk_overflow_chain_checked(
+                    reference.first_page,
+                    reference.total_len,
+                    high_water_mark,
+                    require_digest,
+                    || Ok(()),
+                    |_, chunk| {
+                        value.extend_from_slice(chunk);
+                        Ok(())
+                    },
+                )?;
+            }
+        }
+        Ok(value)
+    }
+
     pub fn backup_to(&self, dest_io: &dyn PageIO) -> Result<()> {
         use std::collections::HashSet;
+
+        let _writer_exclusion = self.exclude_writers()?;
         let slot = self.current_slot();
 
         let mut reachable = HashSet::new();
@@ -809,7 +1516,7 @@ impl TxnManager {
 
         if slot.catalog_root.is_valid() {
             let table_roots = self.collect_catalog_pages(slot.catalog_root, &mut reachable)?;
-            for root in table_roots {
+            for (_, root) in table_roots {
                 self.collect_tree_pages(root, &mut reachable)?;
             }
         }
@@ -817,8 +1524,8 @@ impl TxnManager {
         // After a SyncMode::Off catalog skip, a slot entry is the sole record
         // of a table's CURRENT root; the (stale) catalog descriptor alone
         // would omit the live subtree from the backup.
-        for &(_, _, root, _) in &slot.named_table_entries {
-            if root != 0 {
+        for &(_, _, root, depth) in &slot.named_table_entries {
+            if root != 0 || depth != 0 {
                 self.collect_tree_pages(PageId(root), &mut reachable)?;
             }
         }
@@ -854,115 +1561,107 @@ impl TxnManager {
     }
 
     pub fn compact_to(&self, dest_io: &dyn PageIO) -> Result<()> {
-        use citadel_core::types::ValueType;
-        use citadel_page::{branch_node, leaf_node};
         use std::collections::HashSet;
 
+        let _writer_exclusion = self.exclude_writers()?;
         let slot = self.current_slot();
         let mut next_id: u32 = 0;
         let mut old_to_new: FxHashMap<PageId, PageId> = FxHashMap::default();
         let mut catalog_leaves: HashSet<PageId> = HashSet::new();
+        let mut table_roots = Vec::new();
+        let mut catalog_table_hashes = FxHashSet::default();
 
         // After an Off catalog skip the slot entry, not the stale descriptor,
         // holds the current root/count/depth; rewrite the compacted catalog
         // from it or the skip commits' rows vanish from the copy.
-        let slot_overrides: FxHashMap<u32, (PageId, u64, u16)> = slot
-            .named_table_entries
-            .iter()
-            .filter(|&&(_, _, root, _)| root != 0)
-            .map(|&(hash, count, root, depth)| {
-                (hash, (PageId(root), count & !SLOT_ENTRY_STALE, depth))
-            })
-            .collect();
+        let mut slot_overrides: FxHashMap<u32, (PageId, u64, u16)> = FxHashMap::default();
+        for &(hash, count, root, depth) in &slot.named_table_entries {
+            if root == 0 && depth == 0 {
+                continue;
+            }
+            if slot_overrides
+                .insert(hash, (PageId(root), count & !SLOT_ENTRY_STALE, depth))
+                .is_some()
+            {
+                return Err(Error::DatabaseCorrupted);
+            }
+        }
 
         self.assign_new_ids(slot.tree_root, &mut old_to_new, &mut next_id)?;
 
         if slot.catalog_root.is_valid() {
-            let table_roots = {
+            let catalog_tables = {
                 let mut reachable = HashSet::new();
                 self.collect_catalog_pages(slot.catalog_root, &mut reachable)?
             };
+            catalog_table_hashes.extend(catalog_tables.iter().map(|&(hash, _)| hash));
+            table_roots = catalog_tables
+                .into_iter()
+                .filter_map(|(hash, root)| (!slot_overrides.contains_key(&hash)).then_some(root))
+                .collect();
 
             self.assign_new_ids(slot.catalog_root, &mut old_to_new, &mut next_id)?;
 
             self.collect_catalog_leaf_pages(slot.catalog_root, &mut catalog_leaves)?;
 
-            for root in &table_roots {
-                self.assign_new_ids(*root, &mut old_to_new, &mut next_id)?;
+            for &root in &table_roots {
+                self.assign_new_ids(root, &mut old_to_new, &mut next_id)?;
             }
         }
         for &(root, ..) in slot_overrides.values() {
             self.assign_new_ids(root, &mut old_to_new, &mut next_id)?;
         }
 
+        // Only the hash memo is retained; decrypted pages are read on demand
+        // and discarded, so a large tree does not have to fit in memory.
+        let mut compacted_hashes = FxHashMap::default();
+        let mut overflow_digests = FxHashMap::default();
+        let mut hashing = FxHashSet::default();
+        let mut logical_roots = vec![slot.tree_root];
+        if slot.catalog_root.is_valid() {
+            logical_roots.push(slot.catalog_root);
+        }
+        logical_roots.extend(table_roots.iter().copied());
+        logical_roots.extend(slot_overrides.values().map(|&(root, ..)| root));
+        for root in logical_roots {
+            self.compute_compacted_tree_merkle(
+                root,
+                &old_to_new,
+                &catalog_leaves,
+                &slot_overrides,
+                &mut compacted_hashes,
+                &mut overflow_digests,
+                &mut hashing,
+                slot.high_water_mark,
+            )?;
+        }
+        let root_merkle = compacted_hashes
+            .get(&slot.tree_root)
+            .copied()
+            .ok_or(Error::DatabaseCorrupted)?;
+
         let total_pages = next_id;
         let needed_size =
             citadel_core::FILE_HEADER_SIZE as u64 + total_pages as u64 * PAGE_SIZE as u64;
         dest_io.truncate(needed_size)?;
 
-        let mut root_merkle = [0u8; citadel_core::MERKLE_HASH_SIZE];
         for (&old_id, &new_id) in &old_to_new {
-            let mut page = self.read_page_from_disk(old_id)?;
-
-            page.set_page_id(new_id);
-
-            if page.page_type() == Some(citadel_core::types::PageType::Branch) {
-                for i in 0..page.num_cells() as usize {
-                    let old_child = branch_node::get_child(&page, i);
-                    if let Some(&new_child) = old_to_new.get(&old_child) {
-                        let offset = page.cell_offset(i as u16) as usize;
-                        page.data[offset..offset + 4]
-                            .copy_from_slice(&new_child.as_u32().to_le_bytes());
-                    }
-                }
-                let old_right = page.right_child();
-                if old_right.is_valid() {
-                    if let Some(&new_right) = old_to_new.get(&old_right) {
-                        page.set_right_child(new_right);
-                    }
-                }
-            }
-
-            if catalog_leaves.contains(&old_id) {
-                for i in 0..page.num_cells() {
-                    let cell = leaf_node::read_cell(&page, i);
-                    if cell.val_type != ValueType::Tombstone
-                        && cell.value.len() >= crate::catalog::TABLE_DESCRIPTOR_SIZE
-                    {
-                        let desc = TableDescriptor::deserialize(cell.value);
-                        let hash = file_manager::table_name_hash(cell.key);
-                        let cell_off = page.cell_offset(i) as usize;
-                        let key_len = u16::from_le_bytes(
-                            page.data[cell_off..cell_off + 2].try_into().unwrap(),
-                        ) as usize;
-                        let value_start = cell_off + 6 + key_len + 1;
-                        // Slot entry wins over a (possibly stale) descriptor:
-                        // rewrite root, count, and depth from the entry so
-                        // the compacted catalog is current.
-                        if let Some(&(cur_root, cur_count, cur_depth)) = slot_overrides.get(&hash) {
-                            let new_root = old_to_new
-                                .get(&cur_root)
-                                .copied()
-                                .ok_or(citadel_core::Error::PageOutOfBounds(cur_root))?;
-                            page.data[value_start..value_start + 4]
-                                .copy_from_slice(&new_root.as_u32().to_le_bytes());
-                            page.data[value_start + 4..value_start + 12]
-                                .copy_from_slice(&cur_count.to_le_bytes());
-                            page.data[value_start + 12..value_start + 14]
-                                .copy_from_slice(&cur_depth.to_le_bytes());
-                        } else if let Some(&new_root) = old_to_new.get(&desc.root_page) {
-                            page.data[value_start..value_start + 4]
-                                .copy_from_slice(&new_root.as_u32().to_le_bytes());
-                        }
-                    }
-                }
+            let page = self.read_reachable_page(old_id, slot.high_water_mark)?;
+            let mut page = self.rewrite_compacted_page(
+                old_id,
+                page,
+                &old_to_new,
+                &catalog_leaves,
+                &slot_overrides,
+            )?;
+            debug_assert_eq!(page.page_id(), new_id);
+            if let Some(hash) = compacted_hashes.get(&old_id) {
+                page.set_merkle_hash(hash);
+            } else if let Some(digest) = overflow_digests.get(&old_id) {
+                page.set_merkle_hash(digest);
             }
 
             page.update_checksum();
-
-            if old_id == slot.tree_root {
-                root_merkle = page.merkle_hash();
-            }
 
             let offset = page_offset(new_id);
             let mut encrypted = [0u8; PAGE_SIZE];
@@ -994,6 +1693,31 @@ impl TxnManager {
             PageId::INVALID
         };
 
+        let named_table_entries = slot
+            .named_table_entries
+            .iter()
+            .map(|&(hash, count, root, depth)| {
+                if catalog_table_hashes.contains(&hash) || (root == 0 && depth == 0) {
+                    return Ok((hash, count & !SLOT_ENTRY_STALE, 0, 0));
+                }
+
+                // No catalog descriptor was available to receive this root.
+                // Keep its remapped slot entry as the sole durable locator;
+                // marking it stale prevents a later cache-capacity trim from
+                // dropping it before a repair can restore the full name.
+                let remapped = old_to_new
+                    .get(&PageId(root))
+                    .copied()
+                    .ok_or(Error::PageOutOfBounds(PageId(root)))?;
+                Ok((
+                    hash,
+                    (count & !SLOT_ENTRY_STALE) | SLOT_ENTRY_STALE,
+                    remapped.as_u32(),
+                    depth,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let mut new_slot = CommitSlot {
             txn_id: slot.txn_id,
             tree_root: new_tree_root,
@@ -1006,14 +1730,10 @@ impl TxnManager {
             encryption_epoch: slot.encryption_epoch,
             dek_id: slot.dek_id,
             merkle_root: root_merkle,
-            // Root/depth zeroed (cache rebuilt on demand) and the stale flag
-            // stripped: the compacted catalog was rewritten from the slot
-            // entries above, so every descriptor is current again.
-            named_table_entries: slot
-                .named_table_entries
-                .iter()
-                .map(|&(hash, count, _, _)| (hash, count & !SLOT_ENTRY_STALE, 0, 0))
-                .collect(),
+            merkle_scheme: citadel_io::file_manager::MerkleScheme::LogicalOverflowV1,
+            // Catalog-backed entries become ordinary rebuildable caches.
+            // Slot-only roots retain their remapped locator above.
+            named_table_entries,
             ..Default::default()
         };
         new_slot.seal(&self.mac_key);
@@ -1032,22 +1752,54 @@ impl TxnManager {
         root: PageId,
         reachable: &mut std::collections::HashSet<PageId>,
     ) -> Result<()> {
-        use citadel_page::branch_node;
+        use citadel_core::types::{PageType, ValueType};
 
+        let high_water_mark = self.current_slot().high_water_mark;
+        let mut seen = std::collections::HashSet::new();
         let mut stack = vec![root];
         while let Some(page_id) = stack.pop() {
-            if !reachable.insert(page_id) {
+            if !seen.insert(page_id) {
+                return Err(Error::DatabaseCorrupted);
+            }
+            if reachable.contains(&page_id) {
                 continue;
             }
-            let page = self.read_page_from_disk(page_id)?;
-            if page.page_type() == Some(citadel_core::types::PageType::Branch) {
-                for i in 0..page.num_cells() as usize {
-                    stack.push(branch_node::get_child(&page, i));
+            let page = self.read_reachable_page(page_id, high_water_mark)?;
+            reachable.insert(page_id);
+            match page.page_type() {
+                Some(PageType::Leaf) => {
+                    for cell in checked_leaf_cell_locations(&page)? {
+                        if cell.value_type != ValueType::Overflow {
+                            continue;
+                        }
+                        let (first_page, total_len) = checked_overflow_reference(&page, cell)?;
+                        self.walk_overflow_chain(
+                            first_page,
+                            total_len,
+                            high_water_mark,
+                            |overflow_id, _| {
+                                if !seen.insert(overflow_id) {
+                                    return Err(Error::CorruptOverflowChain(format!(
+                                        "overflow page {overflow_id} is referenced more than once"
+                                    )));
+                                }
+                                reachable.insert(overflow_id);
+                                Ok(())
+                            },
+                        )?;
+                    }
                 }
-                let right = page.right_child();
-                if right.is_valid() {
+                Some(PageType::Branch) => {
+                    for cell in checked_branch_cell_locations(&page)? {
+                        stack.push(cell.child);
+                    }
+                    let right = page.right_child();
+                    if !right.is_valid() {
+                        return Err(Error::DatabaseCorrupted);
+                    }
                     stack.push(right);
                 }
+                _ => return Err(Error::InvalidPageType(page.page_type_raw(), page_id)),
             }
         }
         Ok(())
@@ -1057,39 +1809,57 @@ impl TxnManager {
         &self,
         catalog_root: PageId,
         reachable: &mut std::collections::HashSet<PageId>,
-    ) -> Result<Vec<PageId>> {
-        use citadel_core::types::ValueType;
-        use citadel_page::{branch_node, leaf_node};
+    ) -> Result<Vec<(u32, PageId)>> {
+        use citadel_core::types::{PageType, ValueType};
 
+        let high_water_mark = self.current_slot().high_water_mark;
         let mut table_roots = Vec::new();
+        let mut first_name_by_hash: FxHashMap<u32, Vec<u8>> = FxHashMap::default();
+        let mut seen = std::collections::HashSet::new();
         let mut stack = vec![catalog_root];
         while let Some(page_id) = stack.pop() {
-            if !reachable.insert(page_id) {
-                continue;
+            if !seen.insert(page_id) || !reachable.insert(page_id) {
+                return Err(Error::DatabaseCorrupted);
             }
-            let page = self.read_page_from_disk(page_id)?;
+            let page = self.read_reachable_page(page_id, high_water_mark)?;
             match page.page_type() {
-                Some(citadel_core::types::PageType::Leaf) => {
-                    for i in 0..page.num_cells() {
-                        let cell = leaf_node::read_cell(&page, i);
-                        if cell.val_type != ValueType::Tombstone && cell.value.len() >= 4 {
-                            let desc = TableDescriptor::deserialize(cell.value);
-                            if desc.root_page.is_valid() {
-                                table_roots.push(desc.root_page);
+                Some(PageType::Leaf) => {
+                    for cell in checked_leaf_cell_locations(&page)? {
+                        if cell.value_type == ValueType::Tombstone {
+                            continue;
+                        }
+                        let desc = decode_catalog_descriptor(cell.value_type, cell.value(&page))?;
+                        if desc.root_page.is_valid() {
+                            let name = cell.key(&page);
+                            let hash = file_manager::table_name_hash(name);
+                            if let Some(first) = first_name_by_hash.get(&hash) {
+                                if first.as_slice() != name {
+                                    return Err(Error::NamedTableHashCollision {
+                                        requested: String::from_utf8_lossy(name).into_owned(),
+                                        existing: String::from_utf8_lossy(first).into_owned(),
+                                        hash,
+                                    });
+                                }
+                            } else {
+                                first_name_by_hash.insert(hash, name.to_vec());
                             }
+                            table_roots.push((hash, desc.root_page));
+                        } else {
+                            return Err(Error::DatabaseCorrupted);
                         }
                     }
                 }
-                Some(citadel_core::types::PageType::Branch) => {
-                    for i in 0..page.num_cells() as usize {
-                        stack.push(branch_node::get_child(&page, i));
+                Some(PageType::Branch) => {
+                    for cell in checked_branch_cell_locations(&page)? {
+                        stack.push(cell.child);
                     }
                     let right = page.right_child();
-                    if right.is_valid() {
-                        stack.push(right);
+                    if !right.is_valid() {
+                        return Err(Error::DatabaseCorrupted);
                     }
+                    stack.push(right);
                 }
-                _ => {}
+                _ => return Err(Error::InvalidPageType(page.page_type_raw(), page_id)),
             }
         }
         Ok(table_roots)
@@ -1100,12 +1870,29 @@ impl TxnManager {
         root: PageId,
         reachable: &mut std::collections::HashSet<PageId>,
     ) -> Result<()> {
+        use citadel_core::types::PageType;
+
+        let high_water_mark = self.current_slot().high_water_mark;
+        let mut seen = std::collections::HashSet::new();
         let mut current = root;
         while current.is_valid() {
-            if !reachable.insert(current) {
-                break;
+            if !seen.insert(current) || !reachable.insert(current) {
+                return Err(Error::DatabaseCorrupted);
             }
-            let page = self.read_page_from_disk(current)?;
+            let page = self.read_reachable_page(current, high_water_mark)?;
+            if page.page_type() != Some(PageType::PendingFree) {
+                return Err(Error::InvalidPageType(page.page_type_raw(), current));
+            }
+            let count = u32::from_le_bytes(
+                page.data[citadel_core::PAGE_HEADER_SIZE..citadel_core::PAGE_HEADER_SIZE + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let max_entries =
+                (citadel_core::USABLE_SIZE - 4) / citadel_core::PENDING_FREE_ENTRY_SIZE;
+            if count > max_entries {
+                return Err(Error::DatabaseCorrupted);
+            }
             current = page.right_child();
         }
         Ok(())
@@ -1116,25 +1903,32 @@ impl TxnManager {
         catalog_root: PageId,
         leaves: &mut std::collections::HashSet<PageId>,
     ) -> Result<()> {
-        use citadel_page::branch_node;
+        use citadel_core::types::PageType;
 
+        let high_water_mark = self.current_slot().high_water_mark;
+        let mut seen = std::collections::HashSet::new();
         let mut stack = vec![catalog_root];
         while let Some(page_id) = stack.pop() {
-            let page = self.read_page_from_disk(page_id)?;
+            if !seen.insert(page_id) {
+                return Err(Error::DatabaseCorrupted);
+            }
+            let page = self.read_reachable_page(page_id, high_water_mark)?;
             match page.page_type() {
-                Some(citadel_core::types::PageType::Leaf) => {
+                Some(PageType::Leaf) => {
+                    checked_leaf_cell_locations(&page)?;
                     leaves.insert(page_id);
                 }
-                Some(citadel_core::types::PageType::Branch) => {
-                    for i in 0..page.num_cells() as usize {
-                        stack.push(branch_node::get_child(&page, i));
+                Some(PageType::Branch) => {
+                    for cell in checked_branch_cell_locations(&page)? {
+                        stack.push(cell.child);
                     }
                     let right = page.right_child();
-                    if right.is_valid() {
-                        stack.push(right);
+                    if !right.is_valid() {
+                        return Err(Error::DatabaseCorrupted);
                     }
+                    stack.push(right);
                 }
-                _ => {}
+                _ => return Err(Error::InvalidPageType(page.page_type_raw(), page_id)),
             }
         }
         Ok(())
@@ -1146,56 +1940,435 @@ impl TxnManager {
         mapping: &mut FxHashMap<PageId, PageId>,
         next_id: &mut u32,
     ) -> Result<()> {
-        use citadel_page::branch_node;
+        use citadel_core::types::{PageType, ValueType};
 
+        if mapping.contains_key(&root) {
+            return Ok(());
+        }
+        let high_water_mark = self.current_slot().high_water_mark;
+        let mut seen = FxHashSet::default();
         let mut stack = vec![root];
         while let Some(page_id) = stack.pop() {
+            if !seen.insert(page_id) {
+                return Err(Error::DatabaseCorrupted);
+            }
             if mapping.contains_key(&page_id) {
                 continue;
             }
+            let page = self.read_reachable_page(page_id, high_water_mark)?;
             mapping.insert(page_id, PageId(*next_id));
-            *next_id += 1;
+            *next_id = next_id.checked_add(1).ok_or(Error::DatabaseCorrupted)?;
 
-            let page = self.read_page_from_disk(page_id)?;
-            if page.page_type() == Some(citadel_core::types::PageType::Branch) {
-                for i in 0..page.num_cells() as usize {
-                    stack.push(branch_node::get_child(&page, i));
+            match page.page_type() {
+                Some(PageType::Leaf) => {
+                    for cell in checked_leaf_cell_locations(&page)? {
+                        if cell.value_type != ValueType::Overflow {
+                            continue;
+                        }
+                        let (first_page, total_len) = checked_overflow_reference(&page, cell)?;
+                        self.walk_overflow_chain(
+                            first_page,
+                            total_len,
+                            high_water_mark,
+                            |overflow_id, _| {
+                                if !seen.insert(overflow_id) {
+                                    return Err(Error::CorruptOverflowChain(format!(
+                                        "overflow page {overflow_id} is referenced more than once"
+                                    )));
+                                }
+                                if let std::collections::hash_map::Entry::Vacant(entry) =
+                                    mapping.entry(overflow_id)
+                                {
+                                    entry.insert(PageId(*next_id));
+                                    *next_id =
+                                        next_id.checked_add(1).ok_or(Error::DatabaseCorrupted)?;
+                                }
+                                Ok(())
+                            },
+                        )?;
+                    }
                 }
-                let right = page.right_child();
-                if right.is_valid() {
+                Some(PageType::Branch) => {
+                    for cell in checked_branch_cell_locations(&page)? {
+                        stack.push(cell.child);
+                    }
+                    let right = page.right_child();
+                    if !right.is_valid() {
+                        return Err(Error::DatabaseCorrupted);
+                    }
                     stack.push(right);
                 }
+                _ => return Err(Error::InvalidPageType(page.page_type_raw(), page_id)),
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn read_reachable_page(
+        &self,
+        page_id: PageId,
+        high_water_mark: u32,
+    ) -> Result<Page> {
+        if page_id.as_u32() >= high_water_mark {
+            return Err(Error::PageOutOfBounds(page_id));
+        }
+        let page = self.read_page_from_disk(page_id)?;
+        if page.page_id() != page_id {
+            return Err(Error::DatabaseCorrupted);
+        }
+        Ok(page)
+    }
+
+    fn walk_overflow_chain<F>(
+        &self,
+        first_page: PageId,
+        total_len: u32,
+        high_water_mark: u32,
+        visit: F,
+    ) -> Result<[u8; citadel_core::MERKLE_HASH_SIZE]>
+    where
+        F: FnMut(PageId, &[u8]) -> Result<()>,
+    {
+        self.walk_overflow_chain_checked(
+            first_page,
+            total_len,
+            high_water_mark,
+            false,
+            || Ok(()),
+            visit,
+        )
+    }
+
+    fn walk_overflow_chain_checked<C, F>(
+        &self,
+        first_page: PageId,
+        total_len: u32,
+        high_water_mark: u32,
+        require_digest: bool,
+        mut check: C,
+        mut visit: F,
+    ) -> Result<[u8; citadel_core::MERKLE_HASH_SIZE]>
+    where
+        C: FnMut() -> Result<()>,
+        F: FnMut(PageId, &[u8]) -> Result<()>,
+    {
+        use citadel_core::types::PageType;
+        use citadel_page::overflow;
+
+        if first_page.as_u32() == 0 || total_len as usize > citadel_core::MAX_VALUE_SIZE {
+            return Err(Error::CorruptOverflowChain(
+                "overflow reference has an invalid first page or length".to_owned(),
+            ));
+        }
+
+        let expected_max = overflow::pages_needed(total_len as usize);
+        let mut current = first_page;
+        let mut seen = FxHashSet::default();
+        let mut actual_len = 0u64;
+        let mut page_count = 0usize;
+        let mut stored_digest = None;
+        let mut payload_digest = crate::merkle::OverflowPayloadDigest::new(total_len);
+        check()?;
+        while current.as_u32() != 0 {
+            check()?;
+            if !seen.insert(current) {
+                return Err(Error::CorruptOverflowChain(format!(
+                    "overflow chain beginning at {first_page} contains a cycle"
+                )));
+            }
+            let page = self.read_reachable_page(current, high_water_mark)?;
+            if page.page_type() != Some(PageType::Overflow) {
+                return Err(Error::InvalidPageType(page.page_type_raw(), current));
+            }
+            let data_len = overflow::data_len(&page) as usize;
+            if data_len > overflow::OVERFLOW_DATA_CAPACITY {
+                return Err(Error::CorruptOverflowChain(format!(
+                    "overflow page {current} declares {data_len} bytes"
+                )));
+            }
+            let data = overflow::read_data(&page);
+            page_count += 1;
+            if page_count > expected_max {
+                return Err(Error::CorruptOverflowChain(format!(
+                    "overflow chain beginning at {first_page} has too many pages"
+                )));
+            }
+            actual_len = actual_len
+                .checked_add(data_len as u64)
+                .ok_or_else(|| Error::CorruptOverflowChain("overflow length overflow".into()))?;
+            if stored_digest.is_none() {
+                stored_digest = Some(page.merkle_hash());
+            }
+            payload_digest.update(data);
+            visit(current, data)?;
+            current = overflow::next_page(&page);
+        }
+        check()?;
+        if actual_len != u64::from(total_len) {
+            return Err(Error::CorruptOverflowChain(format!(
+                "overflow chain beginning at {first_page} stores {actual_len} bytes, expected {total_len}"
+            )));
+        }
+        let actual_digest = payload_digest.finalize();
+        let stored_digest = stored_digest.ok_or_else(|| {
+            Error::CorruptOverflowChain(format!(
+                "overflow chain beginning at {first_page} has no head page"
+            ))
+        })?;
+        if require_digest && stored_digest == [0u8; citadel_core::MERKLE_HASH_SIZE] {
+            return Err(Error::CorruptOverflowChain(format!(
+                "overflow head {first_page} is missing its logical payload digest"
+            )));
+        }
+        if stored_digest != [0u8; citadel_core::MERKLE_HASH_SIZE] && stored_digest != actual_digest
+        {
+            return Err(Error::CorruptOverflowChain(format!(
+                "overflow head {first_page} payload digest does not match its contents"
+            )));
+        }
+        Ok(actual_digest)
+    }
+
+    fn rewrite_compacted_page(
+        &self,
+        old_id: PageId,
+        mut page: Page,
+        mapping: &FxHashMap<PageId, PageId>,
+        catalog_leaves: &std::collections::HashSet<PageId>,
+        slot_overrides: &FxHashMap<u32, (PageId, u64, u16)>,
+    ) -> Result<Page> {
+        use citadel_core::types::{PageType, ValueType};
+
+        let new_id = mapping
+            .get(&old_id)
+            .copied()
+            .ok_or(Error::PageOutOfBounds(old_id))?;
+        page.set_page_id(new_id);
+
+        match page.page_type() {
+            Some(PageType::Branch) => {
+                for cell in checked_branch_cell_locations(&page)? {
+                    let new_child = mapping
+                        .get(&cell.child)
+                        .copied()
+                        .ok_or(Error::PageOutOfBounds(cell.child))?;
+                    page.data[cell.child_offset..cell.child_offset + 4]
+                        .copy_from_slice(&new_child.as_u32().to_le_bytes());
+                }
+                let old_right = page.right_child();
+                if !old_right.is_valid() {
+                    return Err(Error::DatabaseCorrupted);
+                }
+                let new_right = mapping
+                    .get(&old_right)
+                    .copied()
+                    .ok_or(Error::PageOutOfBounds(old_right))?;
+                page.set_right_child(new_right);
+            }
+            Some(PageType::Leaf) => {
+                let cells = checked_leaf_cell_locations(&page)?;
+                for cell in &cells {
+                    if cell.value_type != ValueType::Overflow {
+                        continue;
+                    }
+                    let (old_first, _) = checked_overflow_reference(&page, *cell)?;
+                    let new_first = mapping
+                        .get(&old_first)
+                        .copied()
+                        .ok_or(Error::PageOutOfBounds(old_first))?;
+                    page.data[cell.value_start..cell.value_start + 4]
+                        .copy_from_slice(&new_first.as_u32().to_le_bytes());
+                }
+
+                if catalog_leaves.contains(&old_id) {
+                    for cell in cells {
+                        if cell.value_type == ValueType::Tombstone {
+                            continue;
+                        }
+                        let descriptor =
+                            decode_catalog_descriptor(cell.value_type, cell.value(&page))?;
+                        let table_hash = file_manager::table_name_hash(cell.key(&page));
+                        let (source_root, override_meta) = match slot_overrides.get(&table_hash) {
+                            Some(&(root, count, depth)) => (root, Some((count, depth))),
+                            None => (descriptor.root_page, None),
+                        };
+                        if !source_root.is_valid() {
+                            return Err(Error::DatabaseCorrupted);
+                        }
+                        let new_root = mapping
+                            .get(&source_root)
+                            .copied()
+                            .ok_or(Error::PageOutOfBounds(source_root))?;
+                        page.data[cell.value_start..cell.value_start + 4]
+                            .copy_from_slice(&new_root.as_u32().to_le_bytes());
+                        if let Some((count, depth)) = override_meta {
+                            page.data[cell.value_start + 4..cell.value_start + 12]
+                                .copy_from_slice(&count.to_le_bytes());
+                            page.data[cell.value_start + 12..cell.value_start + 14]
+                                .copy_from_slice(&depth.to_le_bytes());
+                        }
+                    }
+                }
+            }
+            Some(PageType::Overflow) => {
+                let old_next = page.right_child();
+                if old_next.as_u32() != 0 {
+                    let new_next = mapping
+                        .get(&old_next)
+                        .copied()
+                        .ok_or(Error::PageOutOfBounds(old_next))?;
+                    page.set_right_child(new_next);
+                }
+            }
+            _ => return Err(Error::InvalidPageType(page.page_type_raw(), old_id)),
+        }
+        Ok(page)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compute_compacted_tree_merkle(
+        &self,
+        page_id: PageId,
+        mapping: &FxHashMap<PageId, PageId>,
+        catalog_leaves: &std::collections::HashSet<PageId>,
+        slot_overrides: &FxHashMap<u32, (PageId, u64, u16)>,
+        hashes: &mut FxHashMap<PageId, [u8; citadel_core::MERKLE_HASH_SIZE]>,
+        overflow_digests: &mut FxHashMap<PageId, [u8; citadel_core::MERKLE_HASH_SIZE]>,
+        hashing: &mut FxHashSet<PageId>,
+        high_water_mark: u32,
+    ) -> Result<[u8; citadel_core::MERKLE_HASH_SIZE]> {
+        use citadel_core::types::PageType;
+
+        if let Some(hash) = hashes.get(&page_id) {
+            return Ok(*hash);
+        }
+        if !hashing.insert(page_id) {
+            return Err(Error::DatabaseCorrupted);
+        }
+
+        let page = self.read_reachable_page(page_id, high_water_mark)?;
+        let hash = match page.page_type() {
+            Some(PageType::Leaf) => {
+                let page = if catalog_leaves.contains(&page_id) {
+                    self.rewrite_compacted_page(
+                        page_id,
+                        page,
+                        mapping,
+                        catalog_leaves,
+                        slot_overrides,
+                    )?
+                } else {
+                    page
+                };
+                self.hash_leaf_page(&page, high_water_mark, overflow_digests)?
+            }
+            Some(PageType::Branch) => {
+                let cells = checked_branch_cell_locations(&page)?;
+                let right = page.right_child();
+                if !right.is_valid() {
+                    return Err(Error::DatabaseCorrupted);
+                }
+                let mut hasher = blake3::Hasher::new();
+                for child in cells
+                    .into_iter()
+                    .map(|cell| cell.child)
+                    .chain(std::iter::once(right))
+                {
+                    let child_hash = self.compute_compacted_tree_merkle(
+                        child,
+                        mapping,
+                        catalog_leaves,
+                        slot_overrides,
+                        hashes,
+                        overflow_digests,
+                        hashing,
+                        high_water_mark,
+                    )?;
+                    hasher.update(&child_hash);
+                }
+                let full = hasher.finalize();
+                let mut hash = [0u8; citadel_core::MERKLE_HASH_SIZE];
+                hash.copy_from_slice(&full.as_bytes()[..citadel_core::MERKLE_HASH_SIZE]);
+                hash
+            }
+            _ => return Err(Error::InvalidPageType(page.page_type_raw(), page_id)),
+        };
+        hashing.remove(&page_id);
+        hashes.insert(page_id, hash);
+        Ok(hash)
+    }
+
+    fn hash_leaf_page(
+        &self,
+        page: &Page,
+        high_water_mark: u32,
+        overflow_digests: &mut FxHashMap<PageId, [u8; citadel_core::MERKLE_HASH_SIZE]>,
+    ) -> Result<[u8; citadel_core::MERKLE_HASH_SIZE]> {
+        let cells = checked_leaf_cell_locations(page)?;
+        crate::merkle::hash_logical_leaf_cells(
+            cells
+                .iter()
+                .map(|cell| (cell.key(page), cell.value_type, cell.value(page))),
+            |reference| {
+                let digest = self.walk_overflow_chain(
+                    reference.first_page,
+                    reference.total_len,
+                    high_water_mark,
+                    |_, _| Ok(()),
+                )?;
+                overflow_digests.insert(reference.first_page, digest);
+                Ok(digest)
+            },
+        )
     }
 
     fn load_pending_free_chain(
         &self,
         pages: &mut FxHashMap<PageId, Page>,
         root: PageId,
+        high_water_mark: u32,
+        slot_txn: TxnId,
     ) -> Result<()> {
+        // Local reclaim invariants only. Proving an entry is absent from every
+        // live tree needs an O(database) walk per commit, so that stays behind
+        // the explicit integrity_check boundary.
         if !root.is_valid() {
             return Ok(());
         }
 
         let mut current = root;
+        let mut chain_pages = FxHashSet::default();
+        let mut entry_pages = FxHashSet::default();
         while current.is_valid() {
-            if let std::collections::hash_map::Entry::Vacant(e) = pages.entry(current) {
-                let page = self.fetch_page_owned(current)?;
-                let next = page.right_child();
-                e.insert(page);
-                if !next.is_valid() {
-                    break;
-                }
-                current = next;
-            } else {
-                let next = pages.get(&current).unwrap().right_child();
-                if !next.is_valid() {
-                    break;
-                }
-                current = next;
+            if current.as_u32() >= high_water_mark {
+                return Err(Error::PageOutOfBounds(current));
             }
+            if !chain_pages.insert(current) {
+                return Err(Error::DatabaseCorrupted);
+            }
+            if let std::collections::hash_map::Entry::Vacant(entry) = pages.entry(current) {
+                let page = self.fetch_page_owned(current)?;
+                entry.insert(page);
+            }
+            let page = pages.get(&current).unwrap();
+            if page.page_id() != current || page.txn_id() > slot_txn {
+                return Err(Error::DatabaseCorrupted);
+            }
+            for entry in pending_free::read_page_entries(page)? {
+                if !entry.page_id.is_valid()
+                    || entry.page_id.as_u32() >= high_water_mark
+                    || entry.freed_at_txn == TxnId::ZERO
+                    || entry.freed_at_txn > slot_txn
+                    || !entry_pages.insert(entry.page_id)
+                {
+                    return Err(Error::DatabaseCorrupted);
+                }
+            }
+            current = page.right_child();
+        }
+
+        if entry_pages.iter().any(|page| chain_pages.contains(page)) {
+            return Err(Error::DatabaseCorrupted);
         }
 
         Ok(())

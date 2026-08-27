@@ -24,12 +24,28 @@ impl TableDescriptor {
     }
 
     pub fn deserialize(buf: &[u8]) -> Self {
+        // Preserve the public prefix-decoding contract: a caller that already
+        // validated its record may supply the 16-byte prefix with no reserved
+        // tail, or a longer future record this version cannot read in full.
         Self {
             root_page: PageId(u32::from_le_bytes(buf[0..4].try_into().unwrap())),
             entry_count: u64::from_le_bytes(buf[4..12].try_into().unwrap()),
             depth: u16::from_le_bytes(buf[12..14].try_into().unwrap()),
             flags: u16::from_le_bytes(buf[14..16].try_into().unwrap()),
         }
+    }
+
+    /// Decode a catalog descriptor only when its complete on-disk shape is
+    /// present. Catalog lookup paths consume untrusted page contents, so they
+    /// must not use the indexing/panic contract of [`Self::deserialize`].
+    pub fn try_deserialize(buf: &[u8]) -> Option<Self> {
+        let buf: &[u8; TABLE_DESCRIPTOR_SIZE] = buf.try_into().ok()?;
+        Some(Self {
+            root_page: PageId(u32::from_le_bytes(buf[0..4].try_into().unwrap())),
+            entry_count: u64::from_le_bytes(buf[4..12].try_into().unwrap()),
+            depth: u16::from_le_bytes(buf[12..14].try_into().unwrap()),
+            flags: u16::from_le_bytes(buf[14..16].try_into().unwrap()),
+        })
     }
 
     pub fn from_tree(tree: &BTree) -> Self {

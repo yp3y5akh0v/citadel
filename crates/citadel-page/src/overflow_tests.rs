@@ -1,5 +1,6 @@
 use super::*;
 use citadel_core::types::{PageType, TxnId};
+use citadel_core::{CancelToken, Error};
 
 #[test]
 fn overflow_page_write_read() {
@@ -98,4 +99,112 @@ fn write_chain_multi_page_links() {
         cur = next_page(p);
     }
     assert_eq!(acc, data);
+}
+
+#[test]
+fn cancellable_write_stops_during_the_allocation_pass() {
+    let data = vec![0x71; OVERFLOW_DATA_CAPACITY * 5 + 1];
+    let token = CancelToken::new();
+    let cancel_from_alloc = token.clone();
+    let mut allocated = 0u32;
+    let mut pages = std::collections::HashMap::new();
+
+    let err = write_chain_with_cancel(
+        &data,
+        TxnId(3),
+        || {
+            allocated += 1;
+            if allocated == 2 {
+                cancel_from_alloc.cancel();
+            }
+            PageId(300 + allocated)
+        },
+        |pid, page| {
+            pages.insert(pid, page);
+        },
+        Some(&token),
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, Error::Interrupted), "got {err:?}");
+    assert_eq!(allocated, 2);
+    assert!(
+        pages.is_empty(),
+        "construction ran after allocation cancelled"
+    );
+}
+
+#[test]
+fn cancellable_write_stops_during_the_page_build_pass() {
+    let data = vec![0x72; OVERFLOW_DATA_CAPACITY * 5 + 1];
+    let token = CancelToken::new();
+    let cancel_from_sink = token.clone();
+    let mut allocated = 0u32;
+    let mut sunk = 0usize;
+    let mut pages = std::collections::HashMap::new();
+
+    let err = write_chain_with_cancel(
+        &data,
+        TxnId(4),
+        || {
+            allocated += 1;
+            PageId(400 + allocated)
+        },
+        |pid, page| {
+            sunk += 1;
+            pages.insert(pid, page);
+            if sunk == 2 {
+                cancel_from_sink.cancel();
+            }
+        },
+        Some(&token),
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, Error::Interrupted), "got {err:?}");
+    assert_eq!(allocated as usize, pages_needed(data.len()));
+    assert_eq!(sunk, 2);
+    assert_eq!(pages.len(), 2);
+}
+
+#[test]
+fn no_token_write_is_byte_for_byte_equivalent_to_the_fast_path() {
+    let data = vec![0x73; OVERFLOW_DATA_CAPACITY * 3 + 19];
+    let mut fast_pages = std::collections::HashMap::new();
+    let mut checked_pages = std::collections::HashMap::new();
+    let mut fast_id = 500u32;
+    let mut checked_id = 500u32;
+
+    let fast_first = write_chain(
+        &data,
+        TxnId(5),
+        || {
+            let id = PageId(fast_id);
+            fast_id += 1;
+            id
+        },
+        |pid, page| {
+            fast_pages.insert(pid, page);
+        },
+    );
+    let checked_first = write_chain_with_cancel(
+        &data,
+        TxnId(5),
+        || {
+            let id = PageId(checked_id);
+            checked_id += 1;
+            id
+        },
+        |pid, page| {
+            checked_pages.insert(pid, page);
+        },
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(checked_first, fast_first);
+    assert_eq!(checked_pages.len(), fast_pages.len());
+    for (id, expected) in fast_pages {
+        assert_eq!(checked_pages[&id].data, expected.data, "page {id}");
+    }
 }

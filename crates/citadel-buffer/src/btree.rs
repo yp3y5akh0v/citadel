@@ -757,6 +757,36 @@ impl BTree {
         replaced_overflow: &mut Vec<PageId>,
         skipped: &mut Vec<usize>,
     ) -> Result<u64> {
+        self.update_sorted_with(
+            pages,
+            alloc,
+            txn_id,
+            pairs,
+            replaced_overflow,
+            skipped,
+            || Ok(()),
+        )
+    }
+
+    /// Bulk-update existing keys, calling `check` before each pair is applied.
+    ///
+    /// Keeping the check inside the hot loop lets higher layers interrupt a
+    /// large batch without splitting it into smaller batches and paying for a
+    /// fresh tree walk at every boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_sorted_with<F>(
+        &mut self,
+        pages: &mut FxHashMap<PageId, Page>,
+        alloc: &mut PageAllocator,
+        txn_id: TxnId,
+        pairs: &[(&[u8], ValueType, &[u8])],
+        replaced_overflow: &mut Vec<PageId>,
+        skipped: &mut Vec<usize>,
+        mut check: F,
+    ) -> Result<u64>
+    where
+        F: FnMut() -> Result<()>,
+    {
         if pairs.is_empty() {
             return Ok(0);
         }
@@ -773,6 +803,7 @@ impl BTree {
         let mut need_walk = false;
 
         for (pair_idx, &(key, val_type, value)) in pairs.iter().enumerate() {
+            check()?;
             let past_leaf = need_walk || {
                 let page = pages.get(&cow_leaf).unwrap();
                 let n = page.num_cells();

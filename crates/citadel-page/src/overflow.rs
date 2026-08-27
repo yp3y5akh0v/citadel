@@ -11,7 +11,7 @@
 
 use crate::page::Page;
 use citadel_core::types::PageId;
-use citadel_core::PAGE_HEADER_SIZE;
+use citadel_core::{CancelToken, Result, PAGE_HEADER_SIZE};
 
 /// Maximum data payload per overflow page.
 /// 8160 (body) - 64 (header) - 4 (data_len field) = 8092 bytes.
@@ -96,6 +96,60 @@ where
         sink(pid, p);
     }
     ids[0]
+}
+
+/// Cancellable form of [`write_chain`], checked once per page in both the
+/// allocation and construction passes and again after the final sink.
+///
+/// The `None` lane delegates to the original infallible implementation, so a
+/// caller without cancellation enabled keeps the exact no-check fast path.
+/// On error, allocation and sink callbacks may already have run for a prefix;
+/// callers that own transactional state must roll that work back or poison it.
+pub fn write_chain_with_cancel<F, S>(
+    data: &[u8],
+    txn_id: citadel_core::types::TxnId,
+    allocate: F,
+    sink: S,
+    cancel: Option<&CancelToken>,
+) -> Result<citadel_core::types::PageId>
+where
+    F: FnMut() -> citadel_core::types::PageId,
+    S: FnMut(citadel_core::types::PageId, Page),
+{
+    let Some(token) = cancel else {
+        return Ok(write_chain(data, txn_id, allocate, sink));
+    };
+
+    use citadel_core::types::{PageId, PageType};
+    let needed = pages_needed(data.len());
+    token.check()?;
+    let mut allocate = allocate;
+    let mut ids: Vec<PageId> = Vec::with_capacity(needed);
+    for _ in 0..needed {
+        token.check()?;
+        ids.push(allocate());
+    }
+    token.check()?;
+
+    let mut sink = sink;
+    for i in 0..needed {
+        token.check()?;
+        let pid = ids[i];
+        let mut page = Page::new(pid, PageType::Overflow, txn_id);
+        let start = i * OVERFLOW_DATA_CAPACITY;
+        let end = (start + OVERFLOW_DATA_CAPACITY).min(data.len());
+        write_data(&mut page, &data[start..end]);
+        let next = if i + 1 < needed {
+            ids[i + 1]
+        } else {
+            PageId(0)
+        };
+        set_next_page(&mut page, next);
+        page.update_checksum();
+        sink(pid, page);
+    }
+    token.check()?;
+    Ok(ids[0])
 }
 
 #[cfg(test)]

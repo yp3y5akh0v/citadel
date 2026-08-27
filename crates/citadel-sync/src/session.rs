@@ -146,7 +146,7 @@ impl SyncSession {
         manager: &TxnManager,
         transport: &dyn SyncTransport,
     ) -> std::result::Result<SyncOutcome, SyncError> {
-        let local_reader = LocalTreeReader::new(manager);
+        let mut local_reader = LocalTreeReader::new(manager);
         let (local_root, local_hash) = local_reader.root_info().map_err(SyncError::Database)?;
 
         let remote_hash = match transport.recv()? {
@@ -185,40 +185,44 @@ impl SyncSession {
             already_in_sync: false,
         };
 
-        loop {
+        'messages: loop {
             let msg = transport.recv()?;
             match msg {
                 SyncMessage::DigestRequest { page_ids } => {
-                    let reader = LocalTreeReader::new(manager);
-                    let mut digests = Vec::with_capacity(page_ids.len());
-                    for pid in &page_ids {
-                        match reader.page_digest(*pid) {
-                            Ok(d) => digests.push(d),
-                            Err(e) => {
-                                transport.send(&SyncMessage::Error {
-                                    message: e.to_string(),
-                                })?;
-                                continue;
-                            }
+                    let Some(page_id) = single_page_request(&page_ids) else {
+                        transport.send(&SyncMessage::Error {
+                            message: "digest request must contain exactly one valid page".into(),
+                        })?;
+                        continue;
+                    };
+                    match local_reader.page_digest(page_id) {
+                        Ok(digest) => transport.send(&SyncMessage::DigestResponse {
+                            digests: vec![digest],
+                        })?,
+                        Err(error) => {
+                            transport.send(&SyncMessage::Error {
+                                message: error.to_string(),
+                            })?;
+                            continue 'messages;
                         }
                     }
-                    transport.send(&SyncMessage::DigestResponse { digests })?;
                 }
                 SyncMessage::EntriesRequest { page_ids } => {
-                    let reader = LocalTreeReader::new(manager);
-                    let mut entries = Vec::new();
-                    for pid in &page_ids {
-                        match reader.leaf_entries(*pid) {
-                            Ok(e) => entries.extend(e),
-                            Err(e) => {
-                                transport.send(&SyncMessage::Error {
-                                    message: e.to_string(),
-                                })?;
-                                continue;
-                            }
+                    let Some(page_id) = single_page_request(&page_ids) else {
+                        transport.send(&SyncMessage::Error {
+                            message: "entries request must contain exactly one valid page".into(),
+                        })?;
+                        continue;
+                    };
+                    match local_reader.leaf_entries(page_id) {
+                        Ok(entries) => transport.send(&SyncMessage::EntriesResponse { entries })?,
+                        Err(error) => {
+                            transport.send(&SyncMessage::Error {
+                                message: error.to_string(),
+                            })?;
+                            continue 'messages;
                         }
                     }
-                    transport.send(&SyncMessage::EntriesResponse { entries })?;
                 }
                 SyncMessage::PatchData { data } => {
                     let patch = SyncPatch::deserialize(&data).map_err(SyncError::Patch)?;
@@ -227,8 +231,9 @@ impl SyncSession {
                     transport.send(&SyncMessage::PatchAck { result })?;
                 }
                 SyncMessage::PullRequest => {
-                    let reader = LocalTreeReader::new(manager);
-                    let (root_page, root_hash) = reader.root_info().map_err(SyncError::Database)?;
+                    local_reader = LocalTreeReader::new(manager);
+                    let (root_page, root_hash) =
+                        local_reader.root_info().map_err(SyncError::Database)?;
                     transport.send(&SyncMessage::PullResponse {
                         root_page,
                         root_hash,
@@ -303,10 +308,11 @@ impl SyncSession {
             }
         };
 
-        let local_tables = manager.list_tables().map_err(SyncError::Database)?;
+        let local_readers =
+            LocalTreeReader::for_all_tables(manager).map_err(SyncError::Database)?;
 
         let mut all_names: Vec<Vec<u8>> = Vec::new();
-        for (name, _) in &local_tables {
+        for (name, _) in &local_readers {
             if !name.starts_with(b"__idx_") && !all_names.contains(name) {
                 all_names.push(name.clone());
             }
@@ -320,19 +326,15 @@ impl SyncSession {
         let mut results = Vec::new();
 
         for table_name in &all_names {
-            let local_info = local_tables.iter().find(|(n, _)| n == table_name);
+            let local_reader = local_readers
+                .iter()
+                .find(|(name, _)| name == table_name)
+                .map(|(_, reader)| reader);
             let remote_info = remote_tables.iter().find(|t| t.name == *table_name);
 
-            let local_root = local_info
-                .map(|(_, desc)| desc.root_page)
-                .unwrap_or(PageId::INVALID);
-            let local_hash = if local_root.is_valid() {
-                manager
-                    .read_page_from_disk(local_root)
-                    .map(|p| p.merkle_hash())
-                    .unwrap_or([0u8; citadel_core::MERKLE_HASH_SIZE])
-            } else {
-                [0u8; citadel_core::MERKLE_HASH_SIZE]
+            let (local_root, local_hash) = match local_reader {
+                Some(reader) => reader.root_info().map_err(SyncError::Database)?,
+                None => (PageId::INVALID, UNKNOWN_HASH),
             };
 
             let remote_root = remote_info.map(|t| t.root_page).unwrap_or(PageId::INVALID);
@@ -355,11 +357,11 @@ impl SyncSession {
             })?;
 
             if local_root.is_valid() && remote_root.is_valid() {
-                let local_reader =
-                    LocalTreeReader::for_table(manager, local_root).map_err(SyncError::Database)?;
+                let local_reader = local_reader
+                    .ok_or(SyncError::Database(citadel_core::Error::DatabaseCorrupted))?;
                 let remote_reader = RemoteTreeReader::new(transport, remote_root, remote_hash);
                 let diff =
-                    merkle_diff(&local_reader, &remote_reader).map_err(SyncError::Database)?;
+                    merkle_diff(local_reader, &remote_reader).map_err(SyncError::Database)?;
 
                 if !diff.is_empty() {
                     let patch =
@@ -381,8 +383,8 @@ impl SyncSession {
                     }
                 }
             } else if local_root.is_valid() {
-                let local_reader =
-                    LocalTreeReader::for_table(manager, local_root).map_err(SyncError::Database)?;
+                let local_reader = local_reader
+                    .ok_or(SyncError::Database(citadel_core::Error::DatabaseCorrupted))?;
                 let entries = local_reader
                     .subtree_entries(local_root)
                     .map_err(SyncError::Database)?;
@@ -439,93 +441,104 @@ impl SyncSession {
             }
         }
 
-        let local_tables = manager.list_tables().map_err(SyncError::Database)?;
-        let table_infos: Vec<TableInfo> = local_tables
-            .iter()
-            .filter(|(name, _)| !name.starts_with(b"__idx_"))
-            .filter_map(|(name, desc)| {
-                if desc.root_page.is_valid() {
-                    let hash = manager
-                        .read_page_from_disk(desc.root_page)
-                        .map(|p| p.merkle_hash())
-                        .unwrap_or([0u8; citadel_core::MERKLE_HASH_SIZE]);
-                    Some(TableInfo {
-                        name: name.clone(),
-                        root_page: desc.root_page,
-                        root_hash: hash,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let local_readers =
+            LocalTreeReader::for_all_tables(manager).map_err(SyncError::Database)?;
+        let mut table_infos = Vec::with_capacity(local_readers.len());
+        for (name, reader) in &local_readers {
+            if name.starts_with(b"__idx_") {
+                continue;
+            }
+            let (root_page, root_hash) = reader.root_info().map_err(SyncError::Database)?;
+            if root_page.is_valid() {
+                table_infos.push(TableInfo {
+                    name: name.clone(),
+                    root_page,
+                    root_hash,
+                });
+            }
+        }
         transport.send(&SyncMessage::TableListResponse {
             tables: table_infos,
         })?;
 
         let mut results = Vec::new();
         let mut current_table: Option<Vec<u8>> = None;
+        let mut current_reader: Option<usize> = None;
 
-        loop {
+        'messages: loop {
             let msg = transport.recv()?;
             match msg {
                 SyncMessage::TableSyncBegin { table_name, .. } => {
+                    if table_name.starts_with(b"__idx_") {
+                        current_table = None;
+                        current_reader = None;
+                        transport.send(&SyncMessage::Error {
+                            message: "internal index tables cannot be synchronized directly".into(),
+                        })?;
+                        continue;
+                    }
+                    current_reader = local_readers
+                        .iter()
+                        .position(|(name, _)| name == &table_name);
                     current_table = Some(table_name);
                 }
                 SyncMessage::TableSyncEnd { .. } => {
                     current_table = None;
+                    current_reader = None;
                 }
                 SyncMessage::DigestRequest { page_ids } => {
-                    let reader = if let Some(ref tname) = current_table {
-                        let root = manager.table_root(tname).map_err(SyncError::Database)?;
-                        if let Some(r) = root {
-                            LocalTreeReader::for_table(manager, r).map_err(SyncError::Database)?
-                        } else {
-                            LocalTreeReader::new(manager)
-                        }
-                    } else {
-                        LocalTreeReader::new(manager)
+                    let Some(reader) = current_reader
+                        .and_then(|index| local_readers.get(index))
+                        .map(|(_, reader)| reader)
+                    else {
+                        transport.send(&SyncMessage::Error {
+                            message: "digest request without an advertised table snapshot".into(),
+                        })?;
+                        continue;
                     };
-
-                    let mut digests = Vec::with_capacity(page_ids.len());
-                    for pid in &page_ids {
-                        match reader.page_digest(*pid) {
-                            Ok(d) => digests.push(d),
-                            Err(e) => {
-                                transport.send(&SyncMessage::Error {
-                                    message: e.to_string(),
-                                })?;
-                                continue;
-                            }
+                    let Some(page_id) = single_page_request(&page_ids) else {
+                        transport.send(&SyncMessage::Error {
+                            message: "digest request must contain exactly one valid page".into(),
+                        })?;
+                        continue;
+                    };
+                    match reader.page_digest(page_id) {
+                        Ok(digest) => transport.send(&SyncMessage::DigestResponse {
+                            digests: vec![digest],
+                        })?,
+                        Err(error) => {
+                            transport.send(&SyncMessage::Error {
+                                message: error.to_string(),
+                            })?;
+                            continue 'messages;
                         }
                     }
-                    transport.send(&SyncMessage::DigestResponse { digests })?;
                 }
                 SyncMessage::EntriesRequest { page_ids } => {
-                    let reader = if let Some(ref tname) = current_table {
-                        let root = manager.table_root(tname).map_err(SyncError::Database)?;
-                        if let Some(r) = root {
-                            LocalTreeReader::for_table(manager, r).map_err(SyncError::Database)?
-                        } else {
-                            LocalTreeReader::new(manager)
-                        }
-                    } else {
-                        LocalTreeReader::new(manager)
+                    let Some(reader) = current_reader
+                        .and_then(|index| local_readers.get(index))
+                        .map(|(_, reader)| reader)
+                    else {
+                        transport.send(&SyncMessage::Error {
+                            message: "entries request without an advertised table snapshot".into(),
+                        })?;
+                        continue;
                     };
-
-                    let mut entries = Vec::new();
-                    for pid in &page_ids {
-                        match reader.leaf_entries(*pid) {
-                            Ok(e) => entries.extend(e),
-                            Err(e) => {
-                                transport.send(&SyncMessage::Error {
-                                    message: e.to_string(),
-                                })?;
-                                continue;
-                            }
+                    let Some(page_id) = single_page_request(&page_ids) else {
+                        transport.send(&SyncMessage::Error {
+                            message: "entries request must contain exactly one valid page".into(),
+                        })?;
+                        continue;
+                    };
+                    match reader.leaf_entries(page_id) {
+                        Ok(entries) => transport.send(&SyncMessage::EntriesResponse { entries })?,
+                        Err(error) => {
+                            transport.send(&SyncMessage::Error {
+                                message: error.to_string(),
+                            })?;
+                            continue 'messages;
                         }
                     }
-                    transport.send(&SyncMessage::EntriesResponse { entries })?;
                 }
                 SyncMessage::PatchData { data } => {
                     let patch = SyncPatch::deserialize(&data).map_err(SyncError::Patch)?;
@@ -579,5 +592,12 @@ impl SyncSession {
         let patch = SyncPatch::from_diff(self.config.node_id, &diff, self.config.crdt_aware);
         let result = apply_patch(manager, &patch).map_err(SyncError::Database)?;
         Ok(result)
+    }
+}
+
+fn single_page_request(page_ids: &[PageId]) -> Option<PageId> {
+    match page_ids {
+        [page_id] if page_id.is_valid() => Some(*page_id),
+        _ => None,
     }
 }

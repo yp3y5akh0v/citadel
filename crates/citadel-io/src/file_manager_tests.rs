@@ -26,6 +26,7 @@ fn sample_slot() -> CommitSlot {
 /// checksum over [0..SLOT_CHECKSUM], no marker, no MAC.
 fn serialize_legacy(slot: &CommitSlot) -> [u8; COMMIT_SLOT_SIZE] {
     let mut legacy = slot.clone();
+    legacy.merkle_scheme = MerkleScheme::Legacy;
     legacy.slot_format = SlotFormat::Legacy;
     legacy.slot_mac = [0u8; SLOT_MAC_SIZE];
     legacy.serialize()
@@ -41,6 +42,7 @@ fn commit_slot_serialize_roundtrip() {
     assert_eq!(slot2.txn_id, TxnId(42));
     assert_eq!(slot2.tree_root, PageId(10));
     assert_eq!(slot2.tree_depth, 3);
+    assert_eq!(slot2.merkle_scheme, MerkleScheme::Legacy);
     assert_eq!(slot2.tree_entries, 1000);
     assert_eq!(slot2.catalog_root, PageId(11));
     assert_eq!(slot2.total_pages, 100);
@@ -50,6 +52,30 @@ fn commit_slot_serialize_roundtrip() {
     assert_eq!(slot2.dek_id, [0xAA; MAC_SIZE]);
     assert_eq!(slot2.merkle_root, [0xBB; MERKLE_HASH_SIZE]);
     assert_eq!(slot2.named_table_entries, vec![(0x12345678, 500, 77, 3)]);
+}
+
+#[test]
+fn logical_overflow_merkle_scheme_roundtrips_in_checksum_covered_bytes() {
+    assert_eq!(SLOT_MERKLE_SCHEME, 14);
+    const { assert!(SLOT_MERKLE_SCHEME + 2 <= SLOT_CHECKSUM) };
+
+    let mut slot = sample_slot();
+    slot.merkle_scheme = MerkleScheme::LogicalOverflowV1;
+    slot.seal(&test_mac_key());
+
+    let buf = slot.serialize();
+    assert_eq!(
+        u16::from_le_bytes(
+            buf[SLOT_MERKLE_SCHEME..SLOT_MERKLE_SCHEME + 2]
+                .try_into()
+                .unwrap()
+        ),
+        SLOT_MERKLE_SCHEME_LOGICAL_OVERFLOW_V1
+    );
+    let round_tripped = CommitSlot::deserialize(&buf);
+    assert_eq!(round_tripped.merkle_scheme, MerkleScheme::LogicalOverflowV1);
+    assert!(round_tripped.verify_checksum());
+    assert!(round_tripped.verify_mac(&test_mac_key()));
 }
 
 #[test]
@@ -100,9 +126,11 @@ fn sealed_slot_roundtrip_verifies_mac() {
 #[test]
 fn legacy_format_slot_still_accepted() {
     let buf = serialize_legacy(&sample_slot());
+    assert_eq!(&buf[SLOT_MERKLE_SCHEME..SLOT_MERKLE_SCHEME + 2], &[0, 0]);
     assert!(buf[SLOT_FORMAT_MARKER..].iter().all(|&b| b == 0));
 
     let slot = CommitSlot::deserialize(&buf);
+    assert_eq!(slot.merkle_scheme, MerkleScheme::Legacy);
     assert_eq!(slot.slot_format, SlotFormat::Legacy);
     assert!(slot.verify_checksum());
     assert!(slot.verify_mac(&test_mac_key()));
@@ -174,6 +202,38 @@ fn unknown_slot_marker_never_verifies() {
     assert!(!slot2.verify_mac(&test_mac_key()));
 }
 
+#[test]
+fn unknown_merkle_scheme_never_verifies_or_recovers() {
+    use crate::memory_io::MemoryPageIO;
+
+    let mac_key = test_mac_key();
+    let io = MemoryPageIO::new();
+    let mut header = FileHeader::new(0xA5, [0x77; MAC_SIZE]);
+    header.slots[0].merkle_scheme = MerkleScheme::Unknown;
+    for slot in &mut header.slots {
+        slot.seal(&mac_key);
+    }
+    write_file_header(&io, &header).unwrap();
+
+    let slot = read_commit_slot(&io, 0).unwrap();
+    assert_eq!(slot.merkle_scheme, MerkleScheme::Unknown);
+    assert!(!slot.verify_checksum());
+    assert!(!slot.verify_mac(&mac_key));
+    assert_eq!(
+        recover(&io, &mac_key).unwrap().0,
+        1,
+        "the unsupported active slot must not hide an older supported slot"
+    );
+
+    header.slots[1].merkle_scheme = MerkleScheme::Unknown;
+    header.slots[1].seal(&mac_key);
+    write_commit_slot(&io, 1, &header.slots[1]).unwrap();
+    assert!(matches!(
+        recover(&io, &mac_key),
+        Err(Error::DatabaseCorrupted)
+    ));
+}
+
 /// Counts past the legacy capacity stay Unknown; a legacy-full count reads
 /// as Legacy even if a tampered v1 count byte produced it (re-routing gains
 /// nothing - flagged files reject non-V1 slots anyway).
@@ -237,12 +297,19 @@ fn stale_entry_flag_roundtrip() {
     slot.named_table_entries = vec![
         (table_name_hash(b"stale"), 5 | SLOT_ENTRY_STALE, 42, 3),
         (table_name_hash(b"fresh"), 7, 43, 2),
+        (table_name_hash(b"page-zero-root"), 1, 0, 1),
+        (table_name_hash(b"catalog-only"), 1, 0, 0),
     ];
     slot.seal(&test_mac_key());
     let slot2 = CommitSlot::deserialize(&slot.serialize());
     assert!(slot2.verify_mac(&test_mac_key()));
     assert_eq!(slot2.named_entry_root(b"stale"), Some((PageId(42), 3)));
     assert_eq!(slot2.named_entry_root(b"fresh"), Some((PageId(43), 2)));
+    assert_eq!(
+        slot2.named_entry_root(b"page-zero-root"),
+        Some((PageId(0), 1))
+    );
+    assert_eq!(slot2.named_entry_root(b"catalog-only"), None);
     assert_eq!(slot2.named_entry_count(b"stale"), Some(5));
     assert!(slot2.entry_is_stale(table_name_hash(b"stale")));
     assert!(!slot2.entry_is_stale(table_name_hash(b"fresh")));
@@ -359,6 +426,36 @@ fn flagged_file_rejects_legacy_downgrade() {
     assert_eq!(idx, 0, "unflagged pre-v1 files keep accepting legacy slots");
 }
 
+#[test]
+fn authenticated_requirement_rejects_downgrade_after_header_flag_is_cleared() {
+    use crate::memory_io::MemoryPageIO;
+
+    let mac_key = test_mac_key();
+    let io = MemoryPageIO::new();
+    let mut header = FileHeader::new(0x99, [0xEE; MAC_SIZE]);
+    for slot in &mut header.slots {
+        slot.seal(&mac_key);
+    }
+    write_file_header(&io, &header).unwrap();
+
+    // The attacker can rewrite the mutable header byte and generate a valid
+    // keyless legacy checksum, but cannot clear the key-file requirement that
+    // the caller supplied after authenticating it.
+    io.write_at(HEADER_FLAGS_OFFSET as u64, &[0]).unwrap();
+    for idx in 0..2 {
+        let mut legacy = read_commit_slot(&io, idx).unwrap();
+        legacy.slot_format = SlotFormat::Legacy;
+        legacy.slot_mac = [0u8; SLOT_MAC_SIZE];
+        write_commit_slot(&io, idx, &legacy).unwrap();
+    }
+
+    assert!(recover(&io, &mac_key).is_ok(), "direct compatibility path");
+    assert!(matches!(
+        recover_with_v1_requirement(&io, &mac_key, true),
+        Err(Error::SlotDowngradeDetected)
+    ));
+}
+
 /// The one-way upgrade stamps the flag only once both physical slots are V1.
 #[test]
 fn mark_slots_v1_waits_for_both_slots() {
@@ -375,13 +472,13 @@ fn mark_slots_v1_waits_for_both_slots() {
     }
     write_file_header(&io, &header).unwrap();
 
-    mark_slots_v1_if_upgraded(&io).unwrap();
+    mark_slots_v1_if_upgraded(&io, &mac_key).unwrap();
     assert_eq!(read_header_flags(&io).unwrap() & HEADER_FLAG_SLOTS_V1, 0);
 
     let mut sealed = sample_slot();
     sealed.seal(&mac_key);
     write_commit_slot(&io, 0, &sealed).unwrap();
-    mark_slots_v1_if_upgraded(&io).unwrap();
+    mark_slots_v1_if_upgraded(&io, &mac_key).unwrap();
     assert_eq!(
         read_header_flags(&io).unwrap() & HEADER_FLAG_SLOTS_V1,
         0,
@@ -389,7 +486,7 @@ fn mark_slots_v1_waits_for_both_slots() {
     );
 
     write_commit_slot(&io, 1, &sealed).unwrap();
-    mark_slots_v1_if_upgraded(&io).unwrap();
+    mark_slots_v1_if_upgraded(&io, &mac_key).unwrap();
     assert_ne!(read_header_flags(&io).unwrap() & HEADER_FLAG_SLOTS_V1, 0);
 }
 
@@ -535,7 +632,7 @@ fn mark_slots_v1_idempotent_and_skips_corrupt() {
     )
     .unwrap();
 
-    mark_slots_v1_if_upgraded(&io).unwrap();
+    mark_slots_v1_if_upgraded(&io, &mac_key).unwrap();
     assert_eq!(
         read_header_flags(&io).unwrap() & HEADER_FLAG_SLOTS_V1,
         0,
@@ -549,12 +646,33 @@ fn mark_slots_v1_idempotent_and_skips_corrupt() {
     legacy.slot_format = SlotFormat::Legacy;
     legacy.slot_mac = [0u8; SLOT_MAC_SIZE];
     write_commit_slot(&io, 0, &legacy).unwrap();
-    mark_slots_v1_if_upgraded(&io).unwrap();
+    mark_slots_v1_if_upgraded(&io, &mac_key).unwrap();
     assert_ne!(
         read_header_flags(&io).unwrap() & HEADER_FLAG_SLOTS_V1,
         0,
         "the flag is one-way: never cleared"
     );
+}
+
+#[test]
+fn mark_slots_v1_requires_authenticated_slots_not_only_format_markers() {
+    use crate::memory_io::MemoryPageIO;
+
+    let mac_key = test_mac_key();
+    let io = MemoryPageIO::new();
+    let mut header = FileHeader::new(0xC4, [0x66; MAC_SIZE]);
+    header.flags = 0;
+    for slot in &mut header.slots {
+        slot.seal(&mac_key);
+    }
+
+    // Keep the V1 marker and keyless checksum valid while invalidating the
+    // HMAC. A format-only check would permanently stamp this incomplete state.
+    header.slots[1].tree_entries = header.slots[1].tree_entries.wrapping_add(1);
+    write_file_header(&io, &header).unwrap();
+
+    assert!(!mark_slots_v1_if_upgraded(&io, &mac_key).unwrap());
+    assert_eq!(read_header_flags(&io).unwrap() & HEADER_FLAG_SLOTS_V1, 0);
 }
 
 #[test]
@@ -571,8 +689,39 @@ fn file_header_serialize_roundtrip() {
     assert_eq!(header2.file_id, 0x1234);
     assert_eq!(header2.god_byte, 0);
     assert_ne!(header2.flags & HEADER_FLAG_SLOTS_V1, 0);
+    assert!(header2
+        .slots
+        .iter()
+        .all(|slot| slot.merkle_scheme == MerkleScheme::LogicalOverflowV1));
     assert_eq!(header2.active_slot(), 0);
     assert!(!header2.recovery_required());
+}
+
+/// The field-by-field test above covers the fields someone remembered to list.
+/// This one covers every field, including both commit slots, so a field the
+/// serializer drops fails here instead of surviving to a reopen.
+#[test]
+fn file_header_roundtrip_preserves_every_field() {
+    let mut header = FileHeader::new(0x1234, [0xBB; MAC_SIZE]);
+    header.god_byte = 0x01;
+    header.slots[0].txn_id = TxnId(77);
+    header.slots[0].tree_root = PageId(9);
+    header.slots[0].tree_entries = 4242;
+    header.slots[0].merkle_root = [0x5A; MERKLE_HASH_SIZE];
+    header.slots[0].named_table_entries = vec![(1, 2, 3, 4), (5, 6, 7, 8)];
+    header.slots[1].txn_id = TxnId(76);
+    header.slots[1].high_water_mark = 31;
+
+    let round_tripped = FileHeader::deserialize(&header.serialize()).unwrap();
+
+    // `checksum` is computed by serialize(), so it is the one field that cannot
+    // match what went in. Adopt it deliberately, after checking it was computed.
+    for (i, slot) in round_tripped.slots.iter().enumerate() {
+        assert_ne!(slot.checksum, 0, "slot {i} checksum was never computed");
+        header.slots[i].checksum = slot.checksum;
+    }
+
+    assert_eq!(round_tripped, header);
 }
 
 #[test]

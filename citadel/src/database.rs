@@ -836,8 +836,6 @@ impl Database {
         let mut txn = self.manager.begin_write()?;
         txn.refresh_all_catalog_descriptors(&[])?;
         txn.commit()?;
-        let slots_flagged = self.manager.mark_slots_v1()?;
-
         #[cfg(feature = "audit-log")]
         let audit_upgraded = match self.audit_log {
             Some(ref mutex) => mutex.lock().upgrade_to_v2()?,
@@ -845,6 +843,10 @@ impl Database {
         };
         #[cfg(not(feature = "audit-log"))]
         let audit_upgraded = false;
+
+        let upgrade_exclusion = self.manager.exclude_writers()?;
+        upgrade_exclusion.require_authenticated_v1()?;
+        let slots_flagged = upgrade_exclusion.mark_slots_v1()?;
 
         Ok(UpgradeReport {
             tables_refreshed: names.len(),

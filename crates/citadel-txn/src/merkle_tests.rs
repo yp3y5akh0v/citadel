@@ -56,6 +56,96 @@ fn leaf_hash_changes_with_data() {
 }
 
 #[test]
+fn overflow_payload_digest_is_streaming_and_content_sensitive() {
+    let value_a = vec![b'a'; 20_000];
+    let value_b = vec![b'b'; 20_000];
+
+    let mut streaming = OverflowPayloadDigest::new(value_a.len() as u32);
+    for chunk in value_a.chunks(997) {
+        streaming.update(chunk);
+    }
+
+    assert_eq!(streaming.finalize(), overflow_payload_hash(&value_a));
+    assert_ne!(
+        overflow_payload_hash(&value_a),
+        overflow_payload_hash(&value_b),
+        "equal-length divergent values need different authenticated digests"
+    );
+}
+
+#[test]
+fn overflow_payload_digest_known_answer() {
+    let value = b"CitadelDB overflow payload known-answer\0\xff";
+
+    assert_eq!(
+        overflow_payload_hash(value),
+        [
+            0x29, 0xb7, 0x72, 0x2f, 0x92, 0x15, 0xaa, 0x8b, 0x20, 0x8e, 0x77, 0xd2, 0x97, 0x0c,
+            0xe0, 0x58, 0x6f, 0x7d, 0xe8, 0x87, 0x53, 0x94, 0x83, 0xf3, 0x43, 0x59, 0x16, 0x59,
+        ],
+        "changing the domain separator or digest framing is a format change"
+    );
+}
+
+#[test]
+fn logical_overflow_leaf_hash_excludes_physical_page_ids() {
+    let payload_a = vec![b'a'; 20_000];
+    let payload_b = vec![b'b'; 20_000];
+    let digest_a = overflow_payload_hash(&payload_a);
+    let digest_b = overflow_payload_hash(&payload_b);
+    let ref_a = leaf_node::OverflowRef {
+        first_page: PageId(7),
+        total_len: payload_a.len() as u32,
+    }
+    .to_bytes();
+    let ref_b = leaf_node::OverflowRef {
+        first_page: PageId(91),
+        total_len: payload_a.len() as u32,
+    }
+    .to_bytes();
+
+    let hash_at_7 = hash_logical_leaf_cells(
+        [(b"large".as_slice(), ValueType::Overflow, ref_a.as_slice())],
+        |_| Ok(digest_a),
+    )
+    .unwrap();
+    let hash_at_91 = hash_logical_leaf_cells(
+        [(b"large".as_slice(), ValueType::Overflow, ref_b.as_slice())],
+        |_| Ok(digest_a),
+    )
+    .unwrap();
+    let divergent = hash_logical_leaf_cells(
+        [(b"large".as_slice(), ValueType::Overflow, ref_b.as_slice())],
+        |_| Ok(digest_b),
+    )
+    .unwrap();
+
+    assert_eq!(hash_at_7, hash_at_91);
+    assert_ne!(hash_at_7, divergent);
+}
+
+#[test]
+fn logical_overflow_leaf_hash_rejects_a_missing_head_digest() {
+    let reference = leaf_node::OverflowRef {
+        first_page: PageId(7),
+        total_len: 20_000,
+    }
+    .to_bytes();
+
+    let err = hash_logical_leaf_cells(
+        [(
+            b"large".as_slice(),
+            ValueType::Overflow,
+            reference.as_slice(),
+        )],
+        |_| Ok([0u8; MERKLE_HASH_SIZE]),
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, Error::CorruptOverflowChain(_)));
+}
+
+#[test]
 fn empty_leaf_hash() {
     let leaf = make_leaf(PageId(0), TxnId(1), &[]);
     let h = compute_leaf_hash(&leaf);
@@ -184,6 +274,43 @@ fn reads_clean_hash_from_pool() {
     assert_ne!(root_hash, [0u8; MERKLE_HASH_SIZE]);
 
     assert!(!pages.contains_key(&PageId(2)));
+}
+
+#[test]
+fn unknown_clean_child_propagates_to_the_dirty_root() {
+    let dirty_txn = TxnId(5);
+    let dirty_leaf = make_leaf(PageId(1), dirty_txn, &[(b"a", b"1")]);
+    let later_dirty_leaf = make_leaf(PageId(3), dirty_txn, &[(b"z", b"2")]);
+    let branch = make_branch(
+        PageId(0),
+        dirty_txn,
+        &[(PageId(1), b"g"), (PageId(2), b"m")],
+        PageId(3),
+    );
+
+    let mut pages: FxHashMap<PageId, Page> = FxHashMap::default();
+    pages.insert(PageId(0), branch);
+    pages.insert(PageId(1), dirty_leaf);
+    pages.insert(PageId(3), later_dirty_leaf);
+
+    let root_hash = compute_tree_merkle(&mut pages, PageId(0), dirty_txn, &|page_id| {
+        assert_eq!(page_id, PageId(2));
+        Ok([0u8; MERKLE_HASH_SIZE])
+    })
+    .unwrap();
+
+    assert_eq!(root_hash, [0u8; MERKLE_HASH_SIZE]);
+    assert_eq!(pages[&PageId(0)].merkle_hash(), root_hash);
+    assert_ne!(
+        pages[&PageId(1)].merkle_hash(),
+        [0u8; MERKLE_HASH_SIZE],
+        "known descendants can retain their useful hashes"
+    );
+    assert_ne!(
+        pages[&PageId(3)].merkle_hash(),
+        [0u8; MERKLE_HASH_SIZE],
+        "UNKNOWN must not stop later dirty descendants from being rehashed"
+    );
 }
 
 #[test]

@@ -116,8 +116,9 @@ fn core_category(e: &CoreError) -> Category {
         | CoreError::RegionSealTampered
         | CoreError::RegionStoreCorrupt(_)
         | CoreError::InvalidPageType(_, _) => Integrity,
-        // DB-API has no cancellation class, so an interrupt lands here.
+        // DB-API has no cancellation or failed-transaction exception class.
         CoreError::Interrupted
+        | CoreError::TransactionFailed
         | CoreError::DatabaseLocked
         | CoreError::TransactionTooLarge { .. }
         | CoreError::PageOutOfBounds(_)
@@ -129,6 +130,7 @@ fn core_category(e: &CoreError) -> Category {
         | CoreError::WriteTransactionActive
         | CoreError::TableNotFound(_)
         | CoreError::TableAlreadyExists(_)
+        | CoreError::NamedTableHashCollision { .. }
         | CoreError::RegionKeysDisabled
         | CoreError::RegionKeysRequireFile => Programming,
         CoreError::KeyTooLarge { .. } | CoreError::ValueTooLarge { .. } => Data,

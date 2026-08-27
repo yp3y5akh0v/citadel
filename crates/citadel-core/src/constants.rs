@@ -102,6 +102,10 @@ pub const DEFAULT_BUFFER_POOL_SIZE: usize = 256; // pages (2 MiB decrypted)
 pub const SLOT_TXN_ID: usize = 0;
 pub const SLOT_TREE_ROOT: usize = 8;
 pub const SLOT_TREE_DEPTH: usize = 12;
+// Merkle hash scheme for this commit generation. Released writers left these
+// reserved bytes zero, so zero remains the legacy overflow-reference scheme.
+pub const SLOT_MERKLE_SCHEME: usize = 14;
+pub const SLOT_MERKLE_SCHEME_LOGICAL_OVERFLOW_V1: u16 = 1;
 pub const SLOT_TREE_ENTRIES: usize = 16;
 pub const SLOT_CATALOG_ROOT: usize = 24;
 pub const SLOT_TOTAL_PAGES: usize = 28;
