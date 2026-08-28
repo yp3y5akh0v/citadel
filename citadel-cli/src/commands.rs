@@ -156,8 +156,18 @@ const DOT_COMMANDS: &[DotCommand] = &[
 
 pub enum Action {
     Continue,
+    Failed,
     Quit,
+    QuitFailed,
     Reopen(String),
+}
+
+fn command_action(success: bool) -> Action {
+    if success {
+        Action::Continue
+    } else {
+        Action::Failed
+    }
 }
 
 pub fn execute_dot_command(
@@ -175,125 +185,77 @@ pub fn execute_dot_command(
     let args: Vec<&str> = parts[1..].to_vec();
 
     match cmd.as_str() {
-        ".help" => {
-            cmd_help(&args, out);
-            Action::Continue
-        }
+        ".help" => command_action(cmd_help(&args, out)),
         ".quit" | ".exit" => Action::Quit,
         ".tables" => {
             cmd_tables(conn, out);
             Action::Continue
         }
-        ".schema" => {
-            cmd_schema(&args, conn, out);
-            Action::Continue
-        }
-        ".indexes" => {
-            cmd_indexes(&args, conn, out);
-            Action::Continue
-        }
-        ".mode" => {
-            cmd_mode(&args, settings, out);
-            Action::Continue
-        }
-        ".headers" => {
-            cmd_headers(&args, settings, out);
-            Action::Continue
-        }
+        ".schema" => command_action(cmd_schema(&args, conn, out)),
+        ".indexes" => command_action(cmd_indexes(&args, conn, out)),
+        ".mode" => command_action(cmd_mode(&args, settings, out)),
+        ".headers" => command_action(cmd_headers(&args, settings, out)),
         ".nullvalue" => {
             cmd_nullvalue(&args, settings, out);
             Action::Continue
         }
-        ".timer" => {
-            cmd_timer(&args, settings, out);
-            Action::Continue
-        }
-        ".changes" => {
-            cmd_changes(&args, settings, out);
-            Action::Continue
-        }
+        ".timer" => command_action(cmd_timer(&args, settings, out)),
+        ".changes" => command_action(cmd_changes(&args, settings, out)),
         ".stats" => {
             cmd_stats(db, out);
             Action::Continue
         }
-        ".backup" => {
-            cmd_backup(&args, db, out);
-            Action::Continue
-        }
-        ".compact" => {
-            cmd_compact(&args, db, out);
-            Action::Continue
-        }
+        ".backup" => command_action(cmd_backup(&args, db, out)),
+        ".compact" => command_action(cmd_compact(&args, db, out)),
         ".verify" => {
-            cmd_verify(db, out);
-            Action::Continue
+            if cmd_verify(db, out) {
+                Action::Continue
+            } else {
+                Action::Failed
+            }
         }
-        ".upgrade" => {
-            cmd_upgrade(db, out);
-            Action::Continue
-        }
+        ".upgrade" => command_action(cmd_upgrade(db, out)),
         ".audit" => {
-            cmd_audit(&args, db, out);
-            Action::Continue
+            if cmd_audit(&args, db, out) {
+                Action::Continue
+            } else {
+                Action::Failed
+            }
         }
-        ".rekey" => {
-            cmd_rekey(db, out);
-            Action::Continue
-        }
-        ".dump" => {
-            cmd_dump(&args, conn, out);
-            Action::Continue
-        }
-        ".read" => {
-            cmd_read(&args, db, conn, settings, out);
-            Action::Continue
-        }
+        ".rekey" => command_action(cmd_rekey(db, out)),
+        ".dump" => command_action(cmd_dump(&args, conn, settings, out)),
+        ".read" => cmd_read(&args, db, conn, settings, out),
         ".open" => {
             if args.is_empty() {
                 let _ = writeln!(out, "Usage: .open PATH");
-                return Action::Continue;
+                return Action::Failed;
             }
             if conn.in_transaction() {
                 let _ = writeln!(out, "Error: COMMIT or ROLLBACK first");
-                return Action::Continue;
+                return Action::Failed;
             }
             Action::Reopen(args[0].to_string())
         }
-        ".output" => {
-            cmd_output(&args, settings, out);
-            Action::Continue
-        }
-        ".width" => {
-            cmd_width(&args, settings, out);
-            Action::Continue
-        }
-        ".sync" => {
-            cmd_sync(&args, db, conn, out);
-            Action::Continue
-        }
-        ".listen" => {
-            cmd_listen(&args, db, conn, out);
-            Action::Continue
-        }
+        ".output" => command_action(cmd_output(&args, settings, out)),
+        ".width" => command_action(cmd_width(&args, settings, out)),
+        ".sync" => command_action(cmd_sync(&args, db, conn, out)),
+        ".listen" => command_action(cmd_listen(&args, db, conn, out)),
         ".keygen" => {
             cmd_keygen(out);
             Action::Continue
         }
-        ".nodeid" => {
-            cmd_nodeid(db, out);
-            Action::Continue
-        }
+        ".nodeid" => command_action(cmd_nodeid(db, out)),
         _ => {
             let _ = writeln!(
                 out,
                 "Unknown command: {cmd}. Use .help for available commands."
             );
-            Action::Continue
+            Action::Failed
         }
     }
 }
 
-fn cmd_help(args: &[&str], out: &mut dyn Write) {
+fn cmd_help(args: &[&str], out: &mut dyn Write) -> bool {
     if let Some(name) = args.first() {
         let search = if name.starts_with('.') {
             name.to_string()
@@ -302,14 +264,16 @@ fn cmd_help(args: &[&str], out: &mut dyn Write) {
         };
         if let Some(cmd) = DOT_COMMANDS.iter().find(|c| c.name == search) {
             let _ = writeln!(out, "{} {}  -- {}", cmd.name, cmd.args, cmd.description);
+            true
         } else {
             let _ = writeln!(out, "Unknown command: {search}");
+            false
         }
-        return;
-    }
-
-    for cmd in DOT_COMMANDS {
-        let _ = writeln!(out, "{:<16} {:<12} {}", cmd.name, cmd.args, cmd.description);
+    } else {
+        for cmd in DOT_COMMANDS {
+            let _ = writeln!(out, "{:<16} {:<12} {}", cmd.name, cmd.args, cmd.description);
+        }
+        true
     }
 }
 
@@ -321,7 +285,7 @@ fn cmd_tables(conn: &Connection<'_>, out: &mut dyn Write) {
     }
 }
 
-fn cmd_schema(args: &[&str], conn: &Connection<'_>, out: &mut dyn Write) {
+fn cmd_schema(args: &[&str], conn: &Connection<'_>, out: &mut dyn Write) -> bool {
     let tables = if let Some(name) = args.first() {
         vec![name.to_string()]
     } else {
@@ -330,6 +294,7 @@ fn cmd_schema(args: &[&str], conn: &Connection<'_>, out: &mut dyn Write) {
         t
     };
 
+    let mut success = true;
     for name in &tables {
         if let Some(schema) = conn.table_schema(name) {
             let mut ddl = format!("CREATE TABLE {} (\n", name);
@@ -354,11 +319,13 @@ fn cmd_schema(args: &[&str], conn: &Connection<'_>, out: &mut dyn Write) {
             let _ = writeln!(out, "{ddl}");
         } else {
             let _ = writeln!(out, "Error: table '{name}' not found");
+            success = false;
         }
     }
+    success
 }
 
-fn cmd_indexes(args: &[&str], conn: &Connection<'_>, out: &mut dyn Write) {
+fn cmd_indexes(args: &[&str], conn: &Connection<'_>, out: &mut dyn Write) -> bool {
     let tables = if let Some(name) = args.first() {
         vec![name.to_string()]
     } else {
@@ -367,6 +334,7 @@ fn cmd_indexes(args: &[&str], conn: &Connection<'_>, out: &mut dyn Write) {
         t
     };
 
+    let mut success = true;
     for name in &tables {
         if let Some(schema) = conn.table_schema(name) {
             for idx in &schema.indices {
@@ -384,31 +352,45 @@ fn cmd_indexes(args: &[&str], conn: &Connection<'_>, out: &mut dyn Write) {
                     col_names.join(", ")
                 );
             }
+        } else {
+            let _ = writeln!(out, "Error: table '{name}' not found");
+            success = false;
         }
     }
+    success
 }
 
-fn cmd_mode(args: &[&str], settings: &mut Settings, out: &mut dyn Write) {
+fn cmd_mode(args: &[&str], settings: &mut Settings, out: &mut dyn Write) -> bool {
     if let Some(mode_str) = args.first() {
         if let Some(mode) = OutputMode::from_str_opt(mode_str) {
             settings.mode = mode;
+            true
         } else {
             let _ = writeln!(
                 out,
                 "Unknown mode: {mode_str}. Use: box, table, csv, json, line"
             );
+            false
         }
     } else {
         let _ = writeln!(out, "Current mode: {}", settings.mode);
+        true
     }
 }
 
-fn cmd_headers(args: &[&str], settings: &mut Settings, out: &mut dyn Write) {
+fn cmd_headers(args: &[&str], settings: &mut Settings, out: &mut dyn Write) -> bool {
     match args.first().copied() {
-        Some("on") => settings.show_headers = true,
-        Some("off") => settings.show_headers = false,
+        Some("on") => {
+            settings.show_headers = true;
+            true
+        }
+        Some("off") => {
+            settings.show_headers = false;
+            true
+        }
         _ => {
             let _ = writeln!(out, "Usage: .headers on|off");
+            false
         }
     }
 }
@@ -421,22 +403,36 @@ fn cmd_nullvalue(args: &[&str], settings: &mut Settings, out: &mut dyn Write) {
     }
 }
 
-fn cmd_timer(args: &[&str], settings: &mut Settings, out: &mut dyn Write) {
+fn cmd_timer(args: &[&str], settings: &mut Settings, out: &mut dyn Write) -> bool {
     match args.first().copied() {
-        Some("on") => settings.timer = true,
-        Some("off") => settings.timer = false,
+        Some("on") => {
+            settings.timer = true;
+            true
+        }
+        Some("off") => {
+            settings.timer = false;
+            true
+        }
         _ => {
             let _ = writeln!(out, "Usage: .timer on|off");
+            false
         }
     }
 }
 
-fn cmd_changes(args: &[&str], settings: &mut Settings, out: &mut dyn Write) {
+fn cmd_changes(args: &[&str], settings: &mut Settings, out: &mut dyn Write) -> bool {
     match args.first().copied() {
-        Some("on") => settings.show_changes = true,
-        Some("off") => settings.show_changes = false,
+        Some("on") => {
+            settings.show_changes = true;
+            true
+        }
+        Some("off") => {
+            settings.show_changes = false;
+            true
+        }
         _ => {
             let _ = writeln!(out, "Usage: .changes on|off");
+            false
         }
     }
 }
@@ -454,37 +450,43 @@ fn cmd_stats(db: &Database, out: &mut dyn Write) {
     let _ = writeln!(out, "Merkle root:      {merkle_hex}");
 }
 
-fn cmd_backup(args: &[&str], db: &Database, out: &mut dyn Write) {
+fn cmd_backup(args: &[&str], db: &Database, out: &mut dyn Write) -> bool {
     if let Some(path) = args.first() {
         match db.backup(Path::new(path)) {
             Ok(()) => {
                 let _ = writeln!(out, "Backup created: {path}");
+                true
             }
             Err(e) => {
                 let _ = writeln!(out, "Error: {e}");
+                false
             }
         }
     } else {
         let _ = writeln!(out, "Usage: .backup PATH");
+        false
     }
 }
 
-fn cmd_compact(args: &[&str], db: &Database, out: &mut dyn Write) {
+fn cmd_compact(args: &[&str], db: &Database, out: &mut dyn Write) -> bool {
     if let Some(path) = args.first() {
         match db.compact(Path::new(path)) {
             Ok(()) => {
                 let _ = writeln!(out, "Compacted to: {path}");
+                true
             }
             Err(e) => {
                 let _ = writeln!(out, "Error: {e}");
+                false
             }
         }
     } else {
         let _ = writeln!(out, "Usage: .compact PATH");
+        false
     }
 }
 
-fn cmd_upgrade(db: &Database, out: &mut dyn Write) {
+fn cmd_upgrade(db: &Database, out: &mut dyn Write) -> bool {
     match db.upgrade_format() {
         Ok(report) => {
             let _ = writeln!(out, "Tables refreshed: {}", report.tables_refreshed);
@@ -506,87 +508,161 @@ fn cmd_upgrade(db: &Database, out: &mut dyn Write) {
                     "already current (or disabled)"
                 }
             );
+            true
         }
         Err(e) => {
             let _ = writeln!(out, "Error: {e}");
+            false
         }
     }
 }
 
-fn cmd_verify(db: &Database, out: &mut dyn Write) {
-    match db.integrity_check() {
+fn cmd_verify(db: &Database, out: &mut dyn Write) -> bool {
+    match db.integrity_check_quiet() {
         Ok(report) => {
             let _ = writeln!(out, "Pages checked: {}", report.pages_checked);
             if report.errors.is_empty() {
                 let _ = writeln!(out, "No errors found.");
+                true
             } else {
                 let _ = writeln!(out, "Errors found: {}", report.errors.len());
                 for err in &report.errors {
-                    let _ = writeln!(out, "  {err:?}");
+                    let _ = writeln!(out, "  {err}");
                 }
+                let tampered = report.tampered().count();
+                if tampered > 0 {
+                    let _ = writeln!(
+                        out,
+                        "{tampered} of those mean the bytes on disk were altered, not merely \
+                         unreadable."
+                    );
+                }
+                false
             }
         }
         Err(e) => {
             let _ = writeln!(out, "Error: {e}");
+            false
         }
     }
 }
 
-fn cmd_audit(args: &[&str], db: &Database, out: &mut dyn Write) {
-    if args.first().copied() == Some("verify") {
-        match db.verify_audit_log() {
-            Ok(result) => {
-                let _ = writeln!(out, "Entries verified: {}", result.entries_verified);
-                if result.chain_valid {
-                    let _ = writeln!(out, "HMAC chain: valid");
-                } else {
-                    let _ = writeln!(out, "HMAC chain: BROKEN");
-                    if let Some(seq) = result.chain_break_at {
-                        let _ = writeln!(out, "Chain break at sequence: {seq}");
-                    }
-                }
+fn cmd_audit(args: &[&str], db: &Database, out: &mut dyn Write) -> bool {
+    macro_rules! emit {
+        ($($arg:tt)*) => {
+            if writeln!(out, $($arg)*).is_err() {
+                return false;
             }
-            Err(e) => {
-                let _ = writeln!(out, "Error: {e}");
-            }
-        }
-        return;
+        };
     }
 
-    if let Some(path) = db.audit_log_path() {
-        match citadel::read_audit_log(&path) {
-            Ok(entries) => {
-                if entries.is_empty() {
-                    let _ = writeln!(out, "No audit entries.");
-                    return;
+    let verify = args.len() == 1 && args[0].eq_ignore_ascii_case("verify");
+    if !args.is_empty() && !verify {
+        emit!("Usage: .audit [verify]");
+        return false;
+    }
+
+    if verify {
+        match db.verify_audit_chain() {
+            Ok(segments) => {
+                let mut total = 0u64;
+                let mut broken = false;
+                let mut count_shortfall = db.audit_entries_missing().unwrap_or(0);
+                for (path, result) in &segments {
+                    total += result.entries_verified;
+                    let name = escaped_file_name(path);
+                    if result.chain_valid {
+                        count_shortfall = count_shortfall.saturating_add(result.entries_missing());
+                        emit!("{name}: valid ({} entries)", result.entries_verified);
+                    } else {
+                        broken = true;
+                        emit!("{name}: BROKEN");
+                        if let Some(seq) = result.chain_break_at {
+                            emit!("  chain break at sequence: {seq}");
+                        }
+                        if result.entries_declared != result.entries_verified {
+                            emit!(
+                                "  header declared {}, verified {} before the break",
+                                result.entries_declared,
+                                result.entries_verified
+                            );
+                        }
+                    }
                 }
-                for entry in &entries {
-                    let _ = writeln!(
-                        out,
-                        "[seq={:>4}] {:>20} {:?}  detail={}B",
-                        entry.sequence_no,
-                        entry.timestamp,
-                        entry.event_type,
-                        entry.detail.len(),
+                emit!("Entries verified: {total}");
+                emit!("HMAC chain: {}", if broken { "BROKEN" } else { "valid" });
+                if count_shortfall > 0 {
+                    emit!(
+                        "Header-count consistency: short by {count_shortfall} entries (count is not authenticated)"
+                    );
+                } else {
+                    emit!(
+                        "Header-count consistency: no mismatch observed (not an anti-rollback guarantee)"
                     );
                 }
-                let _ = writeln!(out, "Total: {} entries", entries.len());
+                !broken && count_shortfall == 0
             }
             Err(e) => {
-                let _ = writeln!(out, "Error reading audit log: {e}");
+                emit!("Error: {e}");
+                false
             }
         }
     } else {
-        let _ = writeln!(out, "Audit logging is not enabled.");
+        let mut current_path = None;
+        let visited = db.visit_verified_audit_history(|path, entry| {
+            if current_path.as_deref() != Some(path) {
+                let name = escaped_file_name(path);
+                writeln!(out, "-- {name} --").map_err(citadel::Error::from)?;
+                current_path = Some(path.to_path_buf());
+            }
+            let detail = citadel::AuditDetail::decode(entry.event_type, &entry.detail);
+            let shown = detail.to_string();
+            let separator = if shown.is_empty() { "" } else { "  " };
+            writeln!(
+                out,
+                "[seq={:>4}] {:>20} {}{separator}{shown}",
+                entry.sequence_no,
+                entry.timestamp,
+                entry.event_type.as_str(),
+            )
+            .map_err(citadel::Error::from)?;
+            Ok(())
+        });
+        match visited {
+            Ok(None) => {
+                emit!("Audit logging is not enabled.");
+                true
+            }
+            Ok(Some(0)) => {
+                emit!("No audit entries.");
+                true
+            }
+            Ok(Some(total)) => {
+                emit!("Total: {total} entries");
+                true
+            }
+            Err(error) => {
+                emit!("Error verifying audit history: {error}");
+                false
+            }
+        }
     }
 }
 
-fn cmd_rekey(db: &Database, out: &mut dyn Write) {
+fn escaped_file_name(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    format!("{name:?}")
+}
+
+fn cmd_rekey(db: &Database, out: &mut dyn Write) -> bool {
     let old_pass = match rpassword::prompt_password("Current passphrase: ") {
         Ok(p) => p,
         Err(e) => {
             let _ = writeln!(out, "Error: {e}");
-            return;
+            return false;
         }
     };
 
@@ -594,7 +670,7 @@ fn cmd_rekey(db: &Database, out: &mut dyn Write) {
         Ok(p) => p,
         Err(e) => {
             let _ = writeln!(out, "Error: {e}");
-            return;
+            return false;
         }
     };
 
@@ -602,85 +678,51 @@ fn cmd_rekey(db: &Database, out: &mut dyn Write) {
         Ok(p) => p,
         Err(e) => {
             let _ = writeln!(out, "Error: {e}");
-            return;
+            return false;
         }
     };
 
     if new_pass != confirm {
         let _ = writeln!(out, "Error: passphrases do not match");
-        return;
+        return false;
     }
 
     match db.change_passphrase(old_pass.as_bytes(), new_pass.as_bytes()) {
         Ok(()) => {
             let _ = writeln!(out, "Passphrase changed successfully.");
+            true
         }
         Err(e) => {
             let _ = writeln!(out, "Error: {e}");
+            false
         }
     }
 }
 
-fn cmd_dump(args: &[&str], conn: &Connection<'_>, out: &mut dyn Write) {
-    let tables = if let Some(name) = args.first() {
-        vec![name.to_string()]
-    } else {
-        let mut t: Vec<String> = conn.tables().into_iter().map(|s| s.to_string()).collect();
-        t.sort();
-        t
+fn cmd_dump(
+    args: &[&str],
+    conn: &Connection<'_>,
+    settings: &mut Settings,
+    out: &mut dyn Write,
+) -> bool {
+    let result = match settings.output_file.as_mut() {
+        Some(file) => dump_data(conn, args.first().copied(), file),
+        None => dump_data(conn, args.first().copied(), out),
     };
-
-    let _ = writeln!(out, "BEGIN TRANSACTION;");
-
-    for name in &tables {
-        if let Some(schema) = conn.table_schema(name) {
-            let mut ddl = format!("CREATE TABLE {} (\n", name);
-            for (i, col) in schema.columns.iter().enumerate() {
-                if i > 0 {
-                    ddl.push_str(",\n");
-                }
-                ddl.push_str(&format!("  {} {}", col.name, col.data_type));
-                if !col.nullable {
-                    ddl.push_str(" NOT NULL");
-                }
-            }
-            if !schema.primary_key_columns.is_empty() {
-                let pk_cols: Vec<&str> = schema
-                    .primary_key_columns
-                    .iter()
-                    .filter_map(|&idx| schema.columns.get(idx as usize).map(|c| c.name.as_str()))
-                    .collect();
-                ddl.push_str(&format!(",\n  PRIMARY KEY ({})", pk_cols.join(", ")));
-            }
-            ddl.push_str("\n);");
-            let _ = writeln!(out, "{ddl}");
-
-            for idx in &schema.indices {
-                let unique = if idx.unique { "UNIQUE " } else { "" };
-                let col_names: Vec<String> = idx
-                    .column_positions_iter()
-                    .filter_map(|ci| schema.columns.get(ci as usize).map(|c| c.name.clone()))
-                    .collect();
-                let _ = writeln!(
-                    out,
-                    "CREATE {unique}INDEX {} ON {} ({});",
-                    idx.name,
-                    name,
-                    col_names.join(", ")
-                );
-            }
+    match result {
+        Ok(success) => success,
+        Err(error) => {
+            let _ = writeln!(out, "Error writing dump: {error}");
+            false
         }
     }
-
-    let _ = writeln!(out, "COMMIT;");
 }
 
-pub fn dump_data(
+fn dump_data(
     conn: &Connection<'_>,
     table_name: Option<&str>,
-    _settings: &Settings,
     out: &mut dyn Write,
-) {
+) -> std::io::Result<bool> {
     let tables = if let Some(name) = table_name {
         vec![name.to_string()]
     } else {
@@ -689,8 +731,9 @@ pub fn dump_data(
         t
     };
 
-    let _ = writeln!(out, "BEGIN TRANSACTION;");
+    writeln!(out, "BEGIN TRANSACTION;")?;
 
+    let mut success = true;
     for name in &tables {
         if let Some(schema) = conn.table_schema(name) {
             let mut ddl = format!("CREATE TABLE {} (\n", name);
@@ -712,7 +755,7 @@ pub fn dump_data(
                 ddl.push_str(&format!(",\n  PRIMARY KEY ({})", pk_cols.join(", ")));
             }
             ddl.push_str("\n);");
-            let _ = writeln!(out, "{ddl}");
+            writeln!(out, "{ddl}")?;
 
             for idx in &schema.indices {
                 let unique = if idx.unique { "UNIQUE " } else { "" };
@@ -720,13 +763,13 @@ pub fn dump_data(
                     .column_positions_iter()
                     .filter_map(|ci| schema.columns.get(ci as usize).map(|c| c.name.clone()))
                     .collect();
-                let _ = writeln!(
+                writeln!(
                     out,
                     "CREATE {unique}INDEX {} ON {} ({});",
                     idx.name,
                     name,
                     col_names.join(", ")
-                );
+                )?;
             }
 
             let col_names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
@@ -737,23 +780,28 @@ pub fn dump_data(
                 Ok(qr) => {
                     for row in &qr.rows {
                         let values: Vec<String> = row.iter().map(sql_literal).collect();
-                        let _ = writeln!(
+                        writeln!(
                             out,
                             "INSERT INTO {} ({}) VALUES ({});",
                             name,
                             col_list,
                             values.join(", ")
-                        );
+                        )?;
                     }
                 }
                 Err(e) => {
-                    let _ = writeln!(out, "-- Error dumping {name}: {e}");
+                    writeln!(out, "-- Error dumping {name}: {e}")?;
+                    success = false;
                 }
             }
+        } else {
+            writeln!(out, "-- Error: table '{name}' not found")?;
+            success = false;
         }
     }
 
-    let _ = writeln!(out, "COMMIT;");
+    writeln!(out, "COMMIT;")?;
+    Ok(success)
 }
 
 fn sql_literal(v: &citadel_sql::Value) -> String {
@@ -829,24 +877,58 @@ fn cmd_read(
     conn: &Connection<'_>,
     settings: &mut Settings,
     out: &mut dyn Write,
-) {
+) -> Action {
     let path = match args.first() {
         Some(p) => *p,
         None => {
             let _ = writeln!(out, "Usage: .read FILE");
-            return;
+            return Action::Failed;
         }
     };
 
-    let content = match fs::read_to_string(path) {
+    let canonical = match fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(e) => {
+            let _ = writeln!(out, "Error resolving file: {e}");
+            return Action::Failed;
+        }
+    };
+    if settings.read_stack.contains(&canonical) {
+        let _ = writeln!(
+            out,
+            "Error: recursive .read detected: {}",
+            canonical.display()
+        );
+        return Action::Failed;
+    }
+    if settings.read_stack.len() >= 32 {
+        let _ = writeln!(out, "Error: .read nesting exceeds 32 files");
+        return Action::Failed;
+    }
+
+    let content = match fs::read_to_string(&canonical) {
         Ok(c) => c,
         Err(e) => {
             let _ = writeln!(out, "Error reading file: {e}");
-            return;
+            return Action::Failed;
         }
     };
 
+    settings.read_stack.push(canonical);
+    let outcome = run_read_content(&content, db, conn, settings, out);
+    settings.read_stack.pop();
+    outcome
+}
+
+fn run_read_content(
+    content: &str,
+    db: &Database,
+    conn: &Connection<'_>,
+    settings: &mut Settings,
+    out: &mut dyn Write,
+) -> Action {
     let mut buf = String::new();
+    let mut success = true;
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with("--") {
@@ -854,7 +936,22 @@ fn cmd_read(
         }
 
         if trimmed.starts_with('.') {
-            execute_dot_command(trimmed, db, conn, settings, out);
+            match execute_dot_command(trimmed, db, conn, settings, out) {
+                Action::Continue => {}
+                Action::Failed => success = false,
+                Action::Quit => {
+                    return if success {
+                        Action::Quit
+                    } else {
+                        Action::QuitFailed
+                    };
+                }
+                Action::QuitFailed => return Action::QuitFailed,
+                Action::Reopen(path) => {
+                    let _ = writeln!(out, "Error: .open is unavailable inside .read ({path})");
+                    success = false;
+                }
+            }
             continue;
         }
 
@@ -868,21 +965,46 @@ fn cmd_read(
                 match conn.execute(sql) {
                     Ok(result) => {
                         let output = formatter::format_result(&result, settings);
-                        if !output.is_empty() {
-                            let _ = writeln!(out, "{output}");
+                        if !output.is_empty() && !write_result_output(settings, out, &output) {
+                            success = false;
                         }
                         if settings.timer {
                             let elapsed = start.elapsed();
-                            let _ = writeln!(out, "Run Time: {:.3}s", elapsed.as_secs_f64());
+                            if !write_result_output(
+                                settings,
+                                out,
+                                &format!("Run Time: {:.3}s", elapsed.as_secs_f64()),
+                            ) {
+                                success = false;
+                            }
                         }
                     }
                     Err(e) => {
                         let _ = writeln!(out, "Error: {e}");
+                        success = false;
                     }
                 }
             }
             buf.clear();
         }
+    }
+    if !buf.trim().is_empty() {
+        let _ = writeln!(out, "Error: incomplete SQL at end of .read input");
+        success = false;
+    }
+    command_action(success)
+}
+
+fn write_result_output(settings: &mut Settings, out: &mut dyn Write, text: &str) -> bool {
+    let result = match settings.output_file.as_mut() {
+        Some(file) => writeln!(file, "{text}"),
+        None => writeln!(out, "{text}"),
+    };
+    if let Err(error) = result {
+        let _ = writeln!(out, "Error writing output: {error}");
+        false
+    } else {
+        true
     }
 }
 
@@ -903,28 +1025,31 @@ fn has_complete_sql(s: &str) -> bool {
     !in_single && !in_double && trimmed.ends_with(';')
 }
 
-fn cmd_output(args: &[&str], settings: &mut Settings, out: &mut dyn Write) {
+fn cmd_output(args: &[&str], settings: &mut Settings, out: &mut dyn Write) -> bool {
     if args.is_empty() {
         settings.output_file = None;
         let _ = writeln!(out, "Output: stdout");
+        true
     } else {
         match fs::File::create(args[0]) {
             Ok(f) => {
                 settings.output_file = Some(f);
                 let _ = writeln!(out, "Output: {}", args[0]);
+                true
             }
             Err(e) => {
                 let _ = writeln!(out, "Error opening output file: {e}");
+                false
             }
         }
     }
 }
 
-fn cmd_width(args: &[&str], settings: &mut Settings, out: &mut dyn Write) {
+fn cmd_width(args: &[&str], settings: &mut Settings, out: &mut dyn Write) -> bool {
     if args.is_empty() {
         settings.column_widths.clear();
         let _ = writeln!(out, "Column widths reset.");
-        return;
+        return true;
     }
 
     let mut widths = Vec::new();
@@ -933,24 +1058,25 @@ fn cmd_width(args: &[&str], settings: &mut Settings, out: &mut dyn Write) {
             Ok(w) => widths.push(w),
             Err(_) => {
                 let _ = writeln!(out, "Error: '{arg}' is not a valid width");
-                return;
+                return false;
             }
         }
     }
     settings.column_widths = widths;
+    true
 }
 
-fn cmd_sync(args: &[&str], db: &Database, conn: &Connection<'_>, out: &mut dyn Write) {
+fn cmd_sync(args: &[&str], db: &Database, conn: &Connection<'_>, out: &mut dyn Write) -> bool {
     if args.len() < 2 {
         let _ = writeln!(out, "Usage: .sync HOST:PORT KEY");
-        return;
+        return false;
     }
     let addr = args[0];
     let sync_key = match citadel::SyncKey::from_base64(args[1]) {
         Ok(k) => k,
         Err(e) => {
             let _ = writeln!(out, "Error: {e}");
-            return;
+            return false;
         }
     };
 
@@ -961,18 +1087,21 @@ fn cmd_sync(args: &[&str], db: &Database, conn: &Connection<'_>, out: &mut dyn W
             print_sync_outcome(&outcome, out);
             if let Err(e) = conn.refresh_schema() {
                 let _ = writeln!(out, "Warning: failed to refresh schema: {e}");
+                return false;
             }
+            true
         }
         Err(e) => {
             let _ = writeln!(out, "Error: {e}");
+            false
         }
     }
 }
 
-fn cmd_listen(args: &[&str], db: &Database, conn: &Connection<'_>, out: &mut dyn Write) {
+fn cmd_listen(args: &[&str], db: &Database, conn: &Connection<'_>, out: &mut dyn Write) -> bool {
     if args.is_empty() {
         let _ = writeln!(out, "Usage: .listen [PORT] KEY");
-        return;
+        return false;
     }
 
     let (port, key_str) = if args.len() >= 2 {
@@ -980,7 +1109,7 @@ fn cmd_listen(args: &[&str], db: &Database, conn: &Connection<'_>, out: &mut dyn
             Ok(p) => (p, args[1]),
             Err(_) => {
                 let _ = writeln!(out, "Error: invalid port '{}'", args[0]);
-                return;
+                return false;
             }
         }
     } else {
@@ -991,7 +1120,7 @@ fn cmd_listen(args: &[&str], db: &Database, conn: &Connection<'_>, out: &mut dyn
         Ok(k) => k,
         Err(e) => {
             let _ = writeln!(out, "Error: {e}");
-            return;
+            return false;
         }
     };
 
@@ -999,7 +1128,7 @@ fn cmd_listen(args: &[&str], db: &Database, conn: &Connection<'_>, out: &mut dyn
         Ok(l) => l,
         Err(e) => {
             let _ = writeln!(out, "Error binding port {port}: {e}");
-            return;
+            return false;
         }
     };
 
@@ -1010,7 +1139,7 @@ fn cmd_listen(args: &[&str], db: &Database, conn: &Connection<'_>, out: &mut dyn
         Ok(pair) => pair,
         Err(e) => {
             let _ = writeln!(out, "Error accepting connection: {e}");
-            return;
+            return false;
         }
     };
 
@@ -1021,10 +1150,13 @@ fn cmd_listen(args: &[&str], db: &Database, conn: &Connection<'_>, out: &mut dyn
             print_sync_outcome(&outcome, out);
             if let Err(e) = conn.refresh_schema() {
                 let _ = writeln!(out, "Warning: failed to refresh schema: {e}");
+                return false;
             }
+            true
         }
         Err(e) => {
             let _ = writeln!(out, "Error: {e}");
+            false
         }
     }
 }
@@ -1034,13 +1166,15 @@ fn cmd_keygen(out: &mut dyn Write) {
     let _ = writeln!(out, "{}", key.to_base64());
 }
 
-fn cmd_nodeid(db: &Database, out: &mut dyn Write) {
+fn cmd_nodeid(db: &Database, out: &mut dyn Write) -> bool {
     match db.node_id() {
         Ok(id) => {
             let _ = writeln!(out, "{id}");
+            true
         }
         Err(e) => {
             let _ = writeln!(out, "Error: {e}");
+            false
         }
     }
 }
@@ -1065,30 +1199,65 @@ fn print_sync_outcome(outcome: &citadel::SyncOutcome, out: &mut dyn Write) {
     );
 }
 
-pub fn execute_dot_command_mut(
-    input: &str,
-    db: &Database,
-    conn: &Connection<'_>,
-    settings: &mut Settings,
-    out: &mut dyn Write,
-) -> Action {
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    let cmd = parts
-        .first()
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
+#[cfg(test)]
+mod tests {
+    use super::{escaped_file_name, execute_dot_command, Action};
+    use crate::formatter::OutputMode;
+    use crate::repl::Settings;
+    use std::io::{Error, ErrorKind, Write};
+    use std::path::Path;
 
-    match cmd.as_str() {
-        ".dump" => {
-            let args: Vec<&str> = parts[1..].to_vec();
-            dump_data(conn, args.first().copied(), settings, out);
-            Action::Continue
+    struct BrokenWriter;
+
+    impl Write for BrokenWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(Error::new(ErrorKind::BrokenPipe, "injected write failure"))
         }
-        ".read" => {
-            let args: Vec<&str> = parts[1..].to_vec();
-            cmd_read(&args, db, conn, settings, out);
-            Action::Continue
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
-        _ => execute_dot_command(input, db, conn, settings, out),
+    }
+
+    #[test]
+    fn audit_file_names_escape_terminal_controls() {
+        let shown = escaped_file_name(Path::new("vault\n\u{1b}[31m.citadel-audit"));
+
+        assert!(shown.contains("\\n"), "{shown:?}");
+        assert!(!shown.contains('\n'), "{shown:?}");
+        assert!(!shown.contains('\u{1b}'), "{shown:?}");
+    }
+
+    #[test]
+    fn audit_and_dump_propagate_output_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output-errors.cdl");
+        let builder = citadel::DatabaseBuilder::new(&path).passphrase(b"test-passphrase");
+        #[cfg(not(feature = "fips"))]
+        let builder = builder.argon2_profile(citadel::Argon2Profile::Iot);
+        #[cfg(feature = "fips")]
+        let builder = builder
+            .kdf_algorithm(citadel::KdfAlgorithm::Pbkdf2HmacSha256)
+            .pbkdf2_iterations(600_000);
+        let db = builder.create().unwrap();
+        let conn = citadel_sql::Connection::open(&db).unwrap();
+        let mut settings = Settings {
+            mode: OutputMode::Box,
+            show_headers: true,
+            null_display: "NULL".to_owned(),
+            timer: false,
+            show_changes: false,
+            use_color: false,
+            column_widths: Vec::new(),
+            output_file: None,
+            read_stack: Vec::new(),
+        };
+
+        for command in [".audit", ".dump"] {
+            assert!(matches!(
+                execute_dot_command(command, &db, &conn, &mut settings, &mut BrokenWriter,),
+                Action::Failed
+            ));
+        }
     }
 }

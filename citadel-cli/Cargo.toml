@@ -21,8 +21,7 @@ name = "citadel"
 path = "src/main.rs"
 
 [features]
-default = ["audit-log"]
-audit-log = ["citadel/audit-log"]
+default = []
 fips = ["citadel/fips"]
 io-uring = ["citadel/io-uring"]
 

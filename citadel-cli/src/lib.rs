@@ -98,10 +98,12 @@ pub fn run(args: Vec<String>) -> i32 {
     cli.passphrase.zeroize();
 
     let db = if cli.create {
-        match citadel::DatabaseBuilder::new(&db_path)
-            .passphrase(passphrase.as_bytes())
-            .create()
-        {
+        let builder = citadel::DatabaseBuilder::new(&db_path).passphrase(passphrase.as_bytes());
+        #[cfg(feature = "fips")]
+        let builder = builder
+            .kdf_algorithm(citadel::KdfAlgorithm::Pbkdf2HmacSha256)
+            .pbkdf2_iterations(600_000);
+        match builder.create() {
             Ok(db) => db,
             Err(e) => {
                 eprintln!("Error creating database: {e}");
@@ -145,6 +147,7 @@ pub fn run(args: Vec<String>) -> i32 {
         use_color,
         column_widths: Vec::new(),
         output_file: None,
+        read_stack: Vec::new(),
     };
 
     if let Some(ref sql) = cli.sql {
@@ -175,10 +178,18 @@ fn run_batch(db: &citadel::Database, sql: &str, settings: &mut repl::Settings) -
         Ok(result) => {
             let output = formatter::format_result(&result, settings);
             if !output.is_empty() {
-                settings.write_output(&output);
+                if let Err(error) = settings.write_output(&output) {
+                    eprintln!("Error writing output: {error}");
+                    return 1;
+                }
             }
             if settings.timer {
-                settings.write_output(&format!("Run Time: {:.3}s", start.elapsed().as_secs_f64()));
+                if let Err(error) = settings
+                    .write_output(&format!("Run Time: {:.3}s", start.elapsed().as_secs_f64()))
+                {
+                    eprintln!("Error writing output: {error}");
+                    return 1;
+                }
             }
             0
         }
@@ -202,6 +213,7 @@ fn run_piped(db: &citadel::Database, settings: &mut repl::Settings) -> i32 {
 
     let mut buf = String::new();
     let stdin = io::stdin();
+    let mut failed = false;
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -218,7 +230,19 @@ fn run_piped(db: &citadel::Database, settings: &mut repl::Settings) -> i32 {
         }
 
         if trimmed.starts_with('.') {
-            commands::execute_dot_command_mut(trimmed, db, &conn, settings, &mut io::stdout());
+            match commands::execute_dot_command(trimmed, db, &conn, settings, &mut io::stdout()) {
+                commands::Action::Continue => {}
+                commands::Action::Failed => failed = true,
+                commands::Action::Quit => break,
+                commands::Action::QuitFailed => {
+                    failed = true;
+                    break;
+                }
+                commands::Action::Reopen(path) => {
+                    eprintln!("Error: .open is unavailable in piped input ({path})");
+                    failed = true;
+                }
+            }
             continue;
         }
 
@@ -228,24 +252,24 @@ fn run_piped(db: &citadel::Database, settings: &mut repl::Settings) -> i32 {
         if has_complete_statement(&buf) {
             let sql = buf.trim();
             if !sql.is_empty() {
-                execute_and_display(&conn, sql, &mut *settings);
+                failed |= !execute_and_display(&conn, sql, &mut *settings);
             }
             buf.clear();
         }
     }
 
     if !buf.trim().is_empty() {
-        execute_and_display(&conn, buf.trim(), settings);
+        failed |= !execute_and_display(&conn, buf.trim(), settings);
     }
 
-    0
+    i32::from(failed)
 }
 
 fn execute_and_display(
     conn: &citadel_sql::Connection<'_>,
     sql: &str,
     settings: &mut repl::Settings,
-) {
+) -> bool {
     use std::time::Instant;
 
     let start = Instant::now();
@@ -253,14 +277,24 @@ fn execute_and_display(
         Ok(result) => {
             let output = formatter::format_result(&result, settings);
             if !output.is_empty() {
-                settings.write_output(&output);
+                if let Err(error) = settings.write_output(&output) {
+                    eprintln!("Error writing output: {error}");
+                    return false;
+                }
             }
             if settings.timer {
-                settings.write_output(&format!("Run Time: {:.3}s", start.elapsed().as_secs_f64()));
+                if let Err(error) = settings
+                    .write_output(&format!("Run Time: {:.3}s", start.elapsed().as_secs_f64()))
+                {
+                    eprintln!("Error writing output: {error}");
+                    return false;
+                }
             }
+            true
         }
         Err(e) => {
             eprintln!("Error: {e}");
+            false
         }
     }
 }

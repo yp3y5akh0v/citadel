@@ -12,7 +12,10 @@
 //! (the region store reads the whole small file; the atom store does random-access
 //! single-slot reads), so they share this codec but not their store types.
 
-use citadel_core::{KEY_SIZE, REGION_STORE_BLOCK, WRAPPED_KEY_SIZE};
+use std::io::{BufReader, Read};
+use std::path::Path;
+
+use citadel_core::{Error, Result, KEY_SIZE, REGION_STORE_BLOCK, WRAPPED_KEY_SIZE};
 use citadel_crypto::mac::{hmac_sha256, verify_hmac_sha256};
 
 pub(crate) const BLOCK: usize = REGION_STORE_BLOCK;
@@ -155,4 +158,83 @@ pub(crate) fn parse_slot_block(mac_key: &[u8; KEY_SIZE], b: &[u8]) -> Option<Slo
         gen,
         wrapped,
     })
+}
+
+/// Read authenticated slot counts without creating, repairing, or caching a
+/// key store. The file is streamed through one no-follow handle.
+pub(crate) fn inspect_store_counts(
+    path: &Path,
+    mac_key: &[u8; KEY_SIZE],
+    magic: u32,
+    version: u32,
+    file_id: u64,
+    label: &str,
+) -> Result<(u32, u32)> {
+    let file = citadel_io::durable::open_regular_read(path)?;
+    let length = file.metadata()?.len();
+    if length < (2 * BLOCK) as u64 {
+        return Err(Error::RegionStoreCorrupt(format!(
+            "{label} store is smaller than its header"
+        )));
+    }
+
+    let mut file = BufReader::with_capacity(64 * 1024, file);
+    let mut header_a = [0u8; BLOCK];
+    let mut header_b = [0u8; BLOCK];
+    file.read_exact(&mut header_a)?;
+    file.read_exact(&mut header_b)?;
+    let a = parse_header_block(mac_key, magic, version, file_id, &header_a);
+    let b = parse_header_block(mac_key, magic, version, file_id, &header_b);
+    let declared = match (a, b) {
+        (Some((count_a, gen_a)), Some((count_b, gen_b))) => {
+            if gen_a >= gen_b {
+                count_a
+            } else {
+                count_b
+            }
+        }
+        (Some((count, _)), None) | (None, Some((count, _))) => count,
+        (None, None) => {
+            return Err(Error::RegionStoreCorrupt(format!(
+                "{label} store has no valid header copy"
+            )));
+        }
+    };
+
+    let complete_slots =
+        ((length - (2 * BLOCK) as u64) / (2 * BLOCK) as u64).min(u64::from(u32::MAX)) as u32;
+    if declared > complete_slots {
+        return Err(Error::RegionStoreCorrupt(format!(
+            "{label} store header declares {declared} slots, but only {complete_slots} are complete"
+        )));
+    }
+    let total = declared;
+    let mut tombstoned = 0u32;
+    for slot in 0..total {
+        let mut block_a = [0u8; BLOCK];
+        let mut block_b = [0u8; BLOCK];
+        file.read_exact(&mut block_a)?;
+        file.read_exact(&mut block_b)?;
+        let a = parse_slot_block(mac_key, &block_a);
+        let b = parse_slot_block(mac_key, &block_b);
+        let record = match (a, b) {
+            (Some(a), Some(b)) => {
+                if b.gen > a.gen {
+                    b
+                } else {
+                    a
+                }
+            }
+            (Some(record), None) | (None, Some(record)) => record,
+            (None, None) => {
+                return Err(Error::RegionStoreCorrupt(format!(
+                    "{label} slot {slot} has no valid copy"
+                )));
+            }
+        };
+        if record.state == SlotState::Tombstone {
+            tombstoned += 1;
+        }
+    }
+    Ok((total, tombstoned))
 }

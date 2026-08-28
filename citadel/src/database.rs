@@ -20,6 +20,8 @@ use citadel_txn::read_txn::ReadTxn;
 use citadel_txn::write_txn::WriteTxn;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
+#[cfg(feature = "audit-log")]
+use zeroize::Zeroizing;
 
 use crate::atom_store::AtomKeyStore;
 #[cfg(feature = "audit-log")]
@@ -87,13 +89,32 @@ pub type SharedCache = Mutex<FxHashMap<String, Arc<dyn Any + Send + Sync>>>;
 pub type SqlCacheHandle = Arc<SharedCache>;
 
 /// Database statistics read from the current commit slot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbStats {
     pub tree_depth: u16,
     pub entry_count: u64,
     pub total_pages: u32,
     pub high_water_mark: u32,
     pub merkle_root: [u8; MERKLE_HASH_SIZE],
+}
+
+/// Slot counts for one sidecar key store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SlotCounts {
+    /// Allocated slots, including empty and tombstoned capacity.
+    pub total_slots: u32,
+    /// Tombstones not yet reused: a lower bound, not lifetime erasures.
+    pub tombstoned: u32,
+}
+
+/// Key-store counts for a vault inspection.
+/// `None` means the sidecar has not been created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeyStoreFacts {
+    pub region: Option<SlotCounts>,
+    pub atom: Option<SlotCounts>,
 }
 
 /// Outcome of [`Database::upgrade_format`].
@@ -526,6 +547,11 @@ impl Database {
         &self.data_path
     }
 
+    /// Authenticated, non-secret facts from the current key-file image.
+    pub fn key_file(&self) -> crate::inspect::KeyFileInfo {
+        crate::inspect::KeyFileInfo::from_key_file(&self.key_file_state.lock().trusted)
+    }
+
     pub fn key_path(&self) -> &Path {
         &self.key_path
     }
@@ -893,8 +919,7 @@ impl Database {
     }
 
     pub fn integrity_check(&self) -> Result<IntegrityReport> {
-        let cancel = self.cancel_token();
-        let report = self.manager.integrity_check_with_cancel(cancel.as_ref())?;
+        let report = self.integrity_check_quiet()?;
 
         #[cfg(feature = "audit-log")]
         {
@@ -907,6 +932,67 @@ impl Database {
         }
 
         Ok(report)
+    }
+
+    /// Run [`Database::integrity_check`] without writing an audit entry.
+    pub fn integrity_check_quiet(&self) -> Result<IntegrityReport> {
+        let cancel = self.cancel_token();
+        self.manager.integrity_check_with_cancel(cancel.as_ref())
+    }
+
+    /// Slot counts for both sidecar key stores.
+    ///
+    /// Missing stores report `None`; this method never creates or repairs them.
+    /// If either store exists, the database must have been opened with region
+    /// keys enabled or this returns [`Error::RegionKeysDisabled`].
+    pub fn key_store_facts(&self) -> Result<KeyStoreFacts> {
+        if self.key_path.as_os_str().is_empty() {
+            return Ok(KeyStoreFacts {
+                region: None,
+                atom: None,
+            });
+        }
+
+        let region_path = self.region_store_path();
+        let atom_path = self.atom_store_path();
+        let region_exists = durable::path_entry_exists(&region_path)?;
+        let atom_exists = durable::path_entry_exists(&atom_path)?;
+        if !region_exists && !atom_exists {
+            return Ok(KeyStoreFacts {
+                region: None,
+                atom: None,
+            });
+        }
+
+        let mac_key = self.region_store_mac_key()?;
+        let region = if region_exists {
+            let _store = self.region_store.lock();
+            match RegionKeyStore::inspect_counts(&region_path, self.file_id, &mac_key) {
+                Ok((total_slots, tombstoned)) => Some(SlotCounts {
+                    total_slots,
+                    tombstoned,
+                }),
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let atom = if atom_exists {
+            let _store = self.atom_store.lock();
+            match AtomKeyStore::inspect_counts(&atom_path, self.file_id, &mac_key) {
+                Ok((total_slots, tombstoned)) => Some(SlotCounts {
+                    total_slots,
+                    tombstoned,
+                }),
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+
+        Ok(KeyStoreFacts { region, atom })
     }
 
     /// Create a hot backup via MVCC snapshot. Also copies the key file.
@@ -1353,16 +1439,74 @@ impl Database {
         }
     }
 
-    /// Every audit log file, newest first: the live log then its rotated
-    /// predecessors, empty when audit logging is off. Discovery errors are
-    /// returned rather than hidden behind an incomplete list.
+    #[cfg(feature = "audit-log")]
+    fn discover_audit_log_paths(&self) -> Result<Vec<PathBuf>> {
+        let paths = crate::audit::audit_log_paths_while_locked(&self.data_path)?;
+        if paths.is_empty() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "audit logging is enabled but its history is missing",
+            )));
+        }
+        Ok(paths)
+    }
+
+    /// A moment-in-time list of audit log names, newest first, or empty when
+    /// logging is off. Rotation is excluded while names are captured but can
+    /// rename them after return; use [`Database::visit_verified_audit_history`]
+    /// to read a stable authenticated snapshot.
     #[cfg(feature = "audit-log")]
     pub fn audit_log_paths(&self) -> Result<Vec<PathBuf>> {
-        if self.audit_log.is_some() && !self.data_path.as_os_str().is_empty() {
-            crate::audit::audit_log_paths(&self.data_path)
-        } else {
-            Ok(Vec::new())
+        let Some(audit) = &self.audit_log else {
+            return Ok(Vec::new());
+        };
+        if self.data_path.as_os_str().is_empty() {
+            return Ok(Vec::new());
         }
+        let _guard = audit.lock();
+        self.discover_audit_log_paths()
+    }
+
+    /// Visit authenticated audit entries oldest first without loading the full
+    /// history into memory. Open segment handles are snapshotted while rotation
+    /// is excluded; verification and callbacks run after releasing the writer.
+    /// Authentication, generation, identity, and header-shortfall failures are
+    /// returned before the first callback. `None` means logging is disabled;
+    /// `Some(n)` is the number of entries visited.
+    #[cfg(feature = "audit-log")]
+    pub fn visit_verified_audit_history<F>(&self, visitor: F) -> Result<Option<u64>>
+    where
+        F: FnMut(&Path, &crate::audit::AuditEntry) -> Result<()>,
+    {
+        let Some(audit) = &self.audit_log else {
+            return Ok(None);
+        };
+        if self.data_path.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let guard = audit.lock();
+        let audit_key = Zeroizing::new(*guard.audit_key());
+        let missing_at_open = guard.missing_at_open();
+        let mut snapshot = crate::audit::AuditHistorySnapshot::open_while_locked(&self.data_path)?;
+        drop(guard);
+        if missing_at_open > 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("audit history was short by {missing_at_open} entries when opened"),
+            )));
+        }
+        snapshot
+            .verify_and_visit(&audit_key, self.file_id, visitor)
+            .map(Some)
+    }
+
+    /// Entries in the live audit log file, or `None` when logging is off.
+    ///
+    /// Rotated predecessors are not counted; use
+    /// [`Database::visit_verified_audit_history`] to total the whole chain.
+    #[cfg(feature = "audit-log")]
+    pub fn live_audit_entry_count(&self) -> Option<u64> {
+        self.audit_log.as_ref().map(|m| m.lock().entry_count())
     }
 
     /// Entries the live log's header claimed at open that its records no longer
@@ -1391,8 +1535,10 @@ impl Database {
             .as_ref()
             .ok_or_else(|| Error::Io(std::io::Error::other("audit logging is not enabled")))?;
         let guard = audit.lock();
-        let key = guard.audit_key();
-        crate::audit::verify_audit_chain(&self.data_path, key, self.file_id)
+        let audit_key = Zeroizing::new(*guard.audit_key());
+        let mut snapshot = crate::audit::AuditHistorySnapshot::open_while_locked(&self.data_path)?;
+        drop(guard);
+        snapshot.verify(&audit_key, self.file_id)
     }
 
     /// Verify the audit log's HMAC chain integrity.
