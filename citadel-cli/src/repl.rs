@@ -22,15 +22,16 @@ pub struct Settings {
     pub use_color: bool,
     pub column_widths: Vec<usize>,
     pub output_file: Option<std::fs::File>,
+    pub(crate) read_stack: Vec<PathBuf>,
 }
 
 impl Settings {
-    pub fn write_output(&mut self, text: &str) {
+    pub fn write_output(&mut self, text: &str) -> std::io::Result<()> {
         use std::io::Write;
         if let Some(ref mut f) = self.output_file {
-            let _ = writeln!(f, "{text}");
+            writeln!(f, "{text}")
         } else {
-            println!("{text}");
+            writeln!(std::io::stdout().lock(), "{text}")
         }
     }
 }
@@ -88,14 +89,14 @@ pub fn run_interactive(
                     }
 
                     if buf.is_empty() && trimmed.starts_with('.') {
-                        match commands::execute_dot_command_mut(
+                        match commands::execute_dot_command(
                             trimmed,
                             &db,
                             &conn,
                             &mut settings,
                             &mut std::io::stdout(),
                         ) {
-                            Action::Quit => break 'outer,
+                            Action::Quit | Action::QuitFailed => break 'outer,
                             Action::Reopen(new_path) => {
                                 let new_pass =
                                     match rpassword::prompt_password("Enter passphrase: ") {
@@ -138,7 +139,7 @@ pub fn run_interactive(
                                     }
                                 }
                             }
-                            Action::Continue => {
+                            Action::Continue | Action::Failed => {
                                 update_helper_schema(&mut rl, &conn);
                             }
                         }
@@ -191,11 +192,18 @@ fn execute_sql(conn: &Connection<'_>, _db: &Database, sql: &str, settings: &mut 
         Ok(result) => {
             let output = formatter::format_result(&result, settings);
             if !output.is_empty() {
-                settings.write_output(&output);
+                if let Err(error) = settings.write_output(&output) {
+                    eprintln!("Error writing output: {error}");
+                    return;
+                }
             }
             if settings.timer {
                 let elapsed = start.elapsed();
-                settings.write_output(&format!("Run Time: {:.3}s", elapsed.as_secs_f64()));
+                if let Err(error) =
+                    settings.write_output(&format!("Run Time: {:.3}s", elapsed.as_secs_f64()))
+                {
+                    eprintln!("Error writing output: {error}");
+                }
             }
         }
         Err(e) => {
@@ -212,7 +220,7 @@ fn execute_sql(conn: &Connection<'_>, _db: &Database, sql: &str, settings: &mut 
 fn execute_single(conn: &Connection<'_>, db: &Database, input: &str, settings: &mut Settings) {
     let trimmed = input.trim();
     if trimmed.starts_with('.') {
-        commands::execute_dot_command_mut(trimmed, db, conn, settings, &mut std::io::stdout());
+        commands::execute_dot_command(trimmed, db, conn, settings, &mut std::io::stdout());
     } else {
         execute_sql(conn, db, trimmed, settings);
     }
@@ -230,7 +238,9 @@ fn execute_batch_sql(conn: &Connection<'_>, db: &Database, content: &str, settin
             let mut out = Vec::new();
             commands::execute_dot_command(trimmed, db, conn, settings, &mut out);
             if !out.is_empty() {
-                settings.write_output(&String::from_utf8_lossy(&out));
+                if let Err(error) = settings.write_output(&String::from_utf8_lossy(&out)) {
+                    eprintln!("Error writing output: {error}");
+                }
             }
             continue;
         }
@@ -244,7 +254,9 @@ fn execute_batch_sql(conn: &Connection<'_>, db: &Database, content: &str, settin
                     Ok(result) => {
                         let output = formatter::format_result(&result, settings);
                         if !output.is_empty() {
-                            settings.write_output(&output);
+                            if let Err(error) = settings.write_output(&output) {
+                                eprintln!("Error writing output: {error}");
+                            }
                         }
                     }
                     Err(e) => {

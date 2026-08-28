@@ -1,6 +1,7 @@
 mod atom_store;
 mod builder;
 mod database;
+mod inspect;
 mod key_codec;
 mod region_store;
 
@@ -11,14 +12,18 @@ pub mod audit;
 pub use builder::DatabaseBuilder;
 pub use citadel_sync::SyncKey;
 pub use database::{
-    Database, DbStats, KeyLifecycleGuard, SharedCache, SqlCacheHandle, SyncOutcome, UpgradeReport,
+    Database, DbStats, KeyLifecycleGuard, KeyStoreFacts, SharedCache, SlotCounts, SqlCacheHandle,
+    SyncOutcome, UpgradeReport,
+};
+pub use inspect::{
+    default_key_path, inspect_vault, inspect_vault_with_key, KeyFileInfo, KeyFileStatus, VaultInfo,
 };
 pub use key_codec::{SlotRecord, SlotState};
 
 #[cfg(feature = "audit-log")]
 pub use audit::{
-    read_audit_log, scan_corrupted_audit_log, verify_audit_log, AuditConfig, AuditEntry,
-    AuditEventType, AuditVerifyResult, ScanResult,
+    read_audit_log, scan_corrupted_audit_log, verify_audit_log, AuditConfig, AuditDetail,
+    AuditEntry, AuditEventType, AuditVerifyResult, ScanResult,
 };
 pub use citadel_core::error::{Error, Result};
 pub use citadel_core::types::{Argon2Profile, CipherId, KdfAlgorithm, SyncMode};

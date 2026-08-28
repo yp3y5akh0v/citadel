@@ -485,6 +485,21 @@ impl RegionKeyStore {
         }
     }
 
+    pub(crate) fn inspect_counts(
+        path: &Path,
+        file_id: u64,
+        mac_key: &[u8; KEY_SIZE],
+    ) -> Result<(u32, u32)> {
+        key_codec::inspect_store_counts(
+            path,
+            mac_key,
+            REGION_STORE_MAGIC,
+            REGION_STORE_VERSION,
+            file_id,
+            "region",
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn slot_count(&self) -> u32 {
         self.slot_count

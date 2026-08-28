@@ -71,6 +71,97 @@ impl AuditEventType {
             _ => None,
         }
     }
+
+    /// The name to show a user for this event.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DatabaseCreated => "Database created",
+            Self::DatabaseOpened => "Database opened",
+            Self::DatabaseClosed => "Database closed",
+            Self::PassphraseChanged => "Passphrase changed",
+            Self::KeyBackupExported => "Key backup exported",
+            Self::BackupCreated => "Backup created",
+            Self::CompactionPerformed => "Compaction performed",
+            Self::IntegrityCheckPerformed => "Integrity check performed",
+        }
+    }
+}
+
+/// An [`AuditEntry`]'s event-specific detail. Malformed shapes remain `Raw`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AuditDetail {
+    Empty,
+    /// The cipher and KDF the database was created with.
+    Created {
+        cipher: citadel_core::types::CipherId,
+        kdf: citadel_core::types::KdfAlgorithm,
+    },
+    /// Where a backup, key export or compaction wrote to.
+    Path(String),
+    /// How many errors the integrity check found.
+    IntegrityErrors(u32),
+    /// Bytes that do not decode under this event's shape.
+    Raw(Vec<u8>),
+}
+
+impl AuditDetail {
+    pub fn decode(event: AuditEventType, detail: &[u8]) -> Self {
+        use citadel_core::types::{CipherId, KdfAlgorithm};
+
+        let raw = || Self::Raw(detail.to_vec());
+        match event {
+            AuditEventType::DatabaseOpened
+            | AuditEventType::DatabaseClosed
+            | AuditEventType::PassphraseChanged => {
+                if detail.is_empty() {
+                    Self::Empty
+                } else {
+                    raw()
+                }
+            }
+            AuditEventType::DatabaseCreated => match detail {
+                [c, k] => match (CipherId::from_u8(*c), KdfAlgorithm::from_u8(*k)) {
+                    (Some(cipher), Some(kdf)) => Self::Created { cipher, kdf },
+                    _ => raw(),
+                },
+                _ => raw(),
+            },
+            AuditEventType::BackupCreated
+            | AuditEventType::KeyBackupExported
+            | AuditEventType::CompactionPerformed => {
+                let Some((len_bytes, rest)) = detail.split_at_checked(2) else {
+                    return raw();
+                };
+                let len = u16::from_le_bytes([len_bytes[0], len_bytes[1]]) as usize;
+                if rest.len() != len {
+                    return raw();
+                }
+                match std::str::from_utf8(rest) {
+                    Ok(s) => Self::Path(s.to_string()),
+                    Err(_) => raw(),
+                }
+            }
+            AuditEventType::IntegrityCheckPerformed => match detail.try_into() {
+                Ok(b) => Self::IntegrityErrors(u32::from_le_bytes(b)),
+                Err(_) => raw(),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for AuditDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => Ok(()),
+            Self::Created { cipher, kdf } => write!(f, "{}, {}", cipher.as_str(), kdf.as_str()),
+            Self::Path(p) => write!(f, "{p:?}"),
+            Self::IntegrityErrors(0) => write!(f, "no errors"),
+            Self::IntegrityErrors(1) => write!(f, "1 error"),
+            Self::IntegrityErrors(n) => write!(f, "{n} errors"),
+            Self::Raw(bytes) => write!(f, "{} undecoded bytes", bytes.len()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +200,7 @@ impl AuditVerifyResult {
 }
 
 /// Audit log file header (64 bytes).
+#[derive(Clone)]
 struct AuditHeader {
     magic: u32,
     version: u32,
@@ -237,11 +329,22 @@ enum RawRecord {
     Malformed,
 }
 
-/// Read one record at `start` (caller seeked there). Any framing fault is
-/// Malformed; the internal-consistency check (entry_len == 56 + detail_len,
-/// known event type) stops a torn record from swallowing later valid records
-/// as a phantom. HMAC validity is the caller's job.
-fn read_raw_record(file: &mut File, start: u64) -> citadel_core::Result<RawRecord> {
+/// Read one record at `start` without crossing `end` (caller seeked there).
+/// Any framing fault is Malformed; the internal-consistency check stops a torn
+/// record from swallowing later valid records as a phantom. HMAC validity is
+/// the caller's job.
+fn read_raw_record_before(
+    file: &mut File,
+    start: u64,
+    end: u64,
+) -> citadel_core::Result<RawRecord> {
+    if start
+        .checked_add(8)
+        .is_none_or(|prefix_end| prefix_end > end)
+    {
+        return Ok(RawRecord::Malformed);
+    }
+
     let mut magic_buf = [0u8; 4];
     match file.read_exact(&mut magic_buf) {
         Ok(()) => {}
@@ -260,6 +363,15 @@ fn read_raw_record(file: &mut File, start: u64) -> citadel_core::Result<RawRecor
     }
     let entry_len = u32::from_le_bytes(len_buf) as usize;
     if !(MIN_ENTRY_LEN..=MAX_ENTRY_LEN).contains(&entry_len) {
+        return Ok(RawRecord::Malformed);
+    }
+    let Some(record_end) = start
+        .checked_add(4)
+        .and_then(|offset| offset.checked_add(entry_len as u64))
+    else {
+        return Ok(RawRecord::Malformed);
+    };
+    if record_end > end {
         return Ok(RawRecord::Malformed);
     }
 
@@ -295,18 +407,22 @@ fn read_raw_record(file: &mut File, start: u64) -> citadel_core::Result<RawRecor
         detail: entry_buf[20..20 + detail_len].to_vec(),
         hmac,
         hmac_input,
-        end: start + 4 + entry_len as u64,
+        end: record_end,
     })))
 }
 
-/// Scan forward from `from` for the next candidate entry magic. Returns its
-/// offset, or None when no candidate exists before EOF.
-fn find_entry_magic(file: &mut File, mut from: u64) -> citadel_core::Result<Option<u64>> {
+fn find_entry_magic_before(
+    file: &mut File,
+    mut from: u64,
+    end: u64,
+) -> citadel_core::Result<Option<u64>> {
     const CHUNK: u64 = 8192;
     let magic = AUDIT_ENTRY_MAGIC.to_le_bytes();
-    let end = file.seek(SeekFrom::End(0))?;
     let mut buf = [0u8; CHUNK as usize];
-    while from + 4 <= end {
+    while from
+        .checked_add(4)
+        .is_some_and(|prefix_end| prefix_end <= end)
+    {
         file.seek(SeekFrom::Start(from))?;
         let want = (end - from).min(CHUNK) as usize;
         file.read_exact(&mut buf[..want])?;
@@ -438,6 +554,10 @@ impl AuditLog {
         self.discard_on_drop = false;
     }
 
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.entry_count
+    }
+
     pub(crate) fn missing_at_open(&self) -> u64 {
         self.missing_at_open
     }
@@ -530,10 +650,11 @@ impl AuditLog {
         let mut entry_count = 0u64;
         let mut valid_end = AUDIT_HEADER_SIZE as u64;
         let mut cursor = valid_end;
+        let scan_end = file.metadata()?.len();
 
-        loop {
+        while cursor < scan_end {
             file.seek(SeekFrom::Start(cursor))?;
-            match read_raw_record(&mut file, cursor)? {
+            match read_raw_record_before(&mut file, cursor, scan_end)? {
                 RawRecord::Parsed(rec) => {
                     sequence_no = rec.sequence_no;
                     prev_hmac = rec.hmac;
@@ -543,10 +664,12 @@ impl AuditLog {
                 }
                 // Resync past garbage: crash recovery can leave a torn record
                 // with valid entries appended after it.
-                RawRecord::Malformed => match find_entry_magic(&mut file, cursor + 1)? {
-                    Some(next) => cursor = next,
-                    None => break,
-                },
+                RawRecord::Malformed => {
+                    match find_entry_magic_before(&mut file, cursor + 1, scan_end)? {
+                        Some(next) => cursor = next,
+                        None => break,
+                    }
+                }
             }
         }
 
@@ -1611,7 +1734,7 @@ fn rotated_path(base: &Path, index: u32) -> PathBuf {
     PathBuf::from(name)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AuditFilePath {
     generation: u32,
     path: PathBuf,
@@ -1698,6 +1821,7 @@ fn discover_audit_files_from_live(live: &Path) -> citadel_core::Result<AuditFile
     })
 }
 
+#[cfg(test)]
 fn discover_audit_files(data_path: &Path) -> citadel_core::Result<AuditFileDiscovery> {
     discover_audit_files_from_live(&resolve_audit_path(data_path))
 }
@@ -1715,16 +1839,24 @@ pub(crate) fn ensure_no_retained_audit_history(live: &Path) -> citadel_core::Res
     Ok(())
 }
 
-/// Every audit log file for `data_path`, newest first: the live log, then its
-/// rotated predecessors `.1`, `.2`, and so on.
-///
-/// A v2 HMAC chain spans adjacent retained generations; legacy v1 generations
-/// restart their chains but keep continuous sequence numbers, so verifying only
-/// the live log verifies only the newest segment. Discovery errors are returned
-/// rather than reported as an empty history.
-pub fn audit_log_paths(data_path: &Path) -> citadel_core::Result<Vec<PathBuf>> {
-    discover_audit_files(data_path)
-        .map(|discovery| discovery.files.into_iter().map(|file| file.path).collect())
+/// Caller must exclude in-process audit rotation or hold the data-file lock.
+pub(crate) fn audit_log_paths_while_locked(data_path: &Path) -> citadel_core::Result<Vec<PathBuf>> {
+    let discovery = discover_audit_files_while_locked(data_path)?;
+    if discovery.suspicious_numeric_name {
+        return Err(invalid_audit_data(
+            "audit history contains a malformed or non-regular generation",
+        ));
+    }
+    for file in &discovery.files {
+        citadel_io::durable::open_regular_read(&file.path)?;
+    }
+    Ok(discovery.files.into_iter().map(|file| file.path).collect())
+}
+
+fn discover_audit_files_while_locked(data_path: &Path) -> citadel_core::Result<AuditFileDiscovery> {
+    let live = resolve_audit_path(data_path);
+    ensure_no_audit_maintenance(&live)?;
+    discover_audit_files_from_live(&live)
 }
 
 pub(crate) fn resolve_audit_path(data_path: &Path) -> PathBuf {
@@ -1733,9 +1865,12 @@ pub(crate) fn resolve_audit_path(data_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Read all entries from an audit log file (no key needed). Resyncs past
-/// unparseable regions as open_existing does, so entries preserved after
-/// mid-file garbage are still returned.
+/// Recover structurally parseable entries without authenticating them.
+///
+/// This keyless reader resynchronizes past malformed regions and is intended
+/// for forensic recovery. Do not present its entries as verified audit facts;
+/// use [`Database::visit_verified_audit_history`](crate::Database::visit_verified_audit_history)
+/// on an open vault when authenticity matters.
 pub fn read_audit_log(path: &Path) -> citadel_core::Result<Vec<AuditEntry>> {
     let mut file = citadel_io::durable::open_regular_read(path)?;
 
@@ -1745,10 +1880,11 @@ pub fn read_audit_log(path: &Path) -> citadel_core::Result<Vec<AuditEntry>> {
 
     let mut entries = Vec::new();
     let mut cursor = AUDIT_HEADER_SIZE as u64;
+    let scan_end = file.metadata()?.len();
 
-    loop {
+    while cursor < scan_end {
         file.seek(SeekFrom::Start(cursor))?;
-        match read_raw_record(&mut file, cursor)? {
+        match read_raw_record_before(&mut file, cursor, scan_end)? {
             RawRecord::Parsed(rec) => {
                 cursor = rec.end;
                 let rec = *rec;
@@ -1760,10 +1896,12 @@ pub fn read_audit_log(path: &Path) -> citadel_core::Result<Vec<AuditEntry>> {
                     hmac: rec.hmac,
                 });
             }
-            RawRecord::Malformed => match find_entry_magic(&mut file, cursor + 1)? {
-                Some(next) => cursor = next,
-                None => break,
-            },
+            RawRecord::Malformed => {
+                match find_entry_magic_before(&mut file, cursor + 1, scan_end)? {
+                    Some(next) => cursor = next,
+                    None => break,
+                }
+            }
         }
     }
 
@@ -1809,11 +1947,24 @@ fn verify_audit_file(
     audit_key: &[u8; KEY_SIZE],
 ) -> citadel_core::Result<AuditFileVerification> {
     let mut file = citadel_io::durable::open_regular_read(path)?;
+    let end = file.metadata()?.len();
+    let header = read_audit_header(&mut file)?;
+    verify_audit_reader(&mut file, end, header, audit_key)
+}
 
+fn read_audit_header(file: &mut File) -> citadel_core::Result<AuditHeader> {
+    file.seek(SeekFrom::Start(0))?;
     let mut header_buf = [0u8; AUDIT_HEADER_SIZE];
     file.read_exact(&mut header_buf)?;
-    let header = AuditHeader::deserialize(&header_buf)?;
+    AuditHeader::deserialize(&header_buf)
+}
 
+fn verify_audit_reader(
+    file: &mut File,
+    end: u64,
+    header: AuditHeader,
+    audit_key: &[u8; KEY_SIZE],
+) -> citadel_core::Result<AuditFileVerification> {
     // Rotated files chain their first entry from the previous file's tip,
     // recorded in the header at rotation; first-generation and legacy v1
     // files seed zeros.
@@ -1824,8 +1975,19 @@ fn verify_audit_file(
     let mut cursor = AUDIT_HEADER_SIZE as u64;
 
     loop {
+        if cursor >= end {
+            return Ok(finish_audit_verification(
+                header,
+                entries_verified,
+                true,
+                None,
+                first_sequence,
+                last_seq,
+                prev_hmac,
+            ));
+        }
         file.seek(SeekFrom::Start(cursor))?;
-        match read_raw_record(&mut file, cursor)? {
+        match read_raw_record_before(file, cursor, end)? {
             RawRecord::Parsed(rec) => {
                 if !verify_entry_hmac(audit_key, &prev_hmac, &rec.hmac_input, &rec.hmac) {
                     return Ok(finish_audit_verification(
@@ -1860,7 +2022,7 @@ fn verify_audit_file(
             RawRecord::Malformed => {
                 let mut probe = cursor + 1;
                 loop {
-                    match find_entry_magic(&mut file, probe)? {
+                    match find_entry_magic_before(file, probe, end)? {
                         None => {
                             // Clean EOF or a trailing torn fragment. The chain
                             // links, which is not the same as complete: compare
@@ -1877,7 +2039,7 @@ fn verify_audit_file(
                         }
                         Some(next) => {
                             file.seek(SeekFrom::Start(next))?;
-                            if matches!(read_raw_record(&mut file, next)?, RawRecord::Parsed(_)) {
+                            if let RawRecord::Parsed(_) = read_raw_record_before(file, next, end)? {
                                 return Ok(finish_audit_verification(
                                     header,
                                     entries_verified,
@@ -1935,7 +2097,8 @@ pub fn verify_audit_log(
 /// The oldest retained segment has no external anchor, so replacing the whole
 /// history (or rolling back the newest segment with its count) stays outside
 /// v2's detection boundary.
-pub(crate) fn verify_audit_chain(
+#[cfg(test)]
+fn verify_audit_chain(
     data_path: &Path,
     audit_key: &[u8; KEY_SIZE],
     expected_file_id: u64,
@@ -1969,6 +2132,19 @@ pub(crate) fn verify_audit_chain(
         });
     }
 
+    validate_audit_chain_segments(&mut segments, suspicious_numeric_name, expected_file_id);
+
+    Ok(segments
+        .into_iter()
+        .map(|segment| (segment.file.path, segment.result))
+        .collect())
+}
+
+fn validate_audit_chain_segments(
+    segments: &mut [AuditChainSegment],
+    suspicious_numeric_name: bool,
+    expected_file_id: u64,
+) {
     // Path discovery does not hide a missing live file or a hole like [.0, .2].
     // Attach the boundary failure to the newer existing file, where an otherwise
     // continuous history stops.
@@ -2020,16 +2196,202 @@ pub(crate) fn verify_audit_chain(
         }
     }
 
-    for segment in &mut segments {
+    for segment in segments {
         if segment.header.file_id != expected_file_id {
             segment.mark_boundary_invalid();
         }
     }
+}
 
-    Ok(segments
-        .into_iter()
-        .map(|segment| (segment.file.path, segment.result))
-        .collect())
+struct AuditSnapshotFile {
+    file: AuditFilePath,
+    handle: File,
+    end: u64,
+    header: AuditHeader,
+}
+
+/// Open handles and fixed end offsets captured while the database excludes
+/// rotation. Verification and iteration can then release the writer mutex
+/// without losing a retained generation or following a replacement path.
+pub(crate) struct AuditHistorySnapshot {
+    files: Vec<AuditSnapshotFile>,
+    suspicious_numeric_name: bool,
+}
+
+impl AuditHistorySnapshot {
+    pub(crate) fn open_while_locked(data_path: &Path) -> citadel_core::Result<Self> {
+        let discovery = discover_audit_files_while_locked(data_path)?;
+        if discovery.files.is_empty() {
+            return Err(invalid_audit_data(
+                "audit history is missing; no live or retained generation remains",
+            ));
+        }
+
+        let mut snapshots = Vec::with_capacity(discovery.files.len());
+        for file in discovery.files {
+            let mut handle = citadel_io::durable::open_regular_read(&file.path)?;
+            let end = handle.metadata()?.len();
+            if end < AUDIT_HEADER_SIZE as u64 {
+                return Err(invalid_audit_data("audit file is shorter than its header"));
+            }
+            let header = read_audit_header(&mut handle)?;
+            snapshots.push(AuditSnapshotFile {
+                file,
+                handle,
+                end,
+                header,
+            });
+        }
+        Ok(Self {
+            files: snapshots,
+            suspicious_numeric_name: discovery.suspicious_numeric_name,
+        })
+    }
+
+    fn verify_segments(
+        &mut self,
+        audit_key: &[u8; KEY_SIZE],
+        expected_file_id: u64,
+    ) -> citadel_core::Result<Vec<AuditChainSegment>> {
+        let mut segments = Vec::with_capacity(self.files.len());
+        for snapshot in &mut self.files {
+            let AuditFileVerification {
+                header,
+                result,
+                first_sequence,
+                last_sequence,
+                tip,
+            } = verify_audit_reader(
+                &mut snapshot.handle,
+                snapshot.end,
+                snapshot.header.clone(),
+                audit_key,
+            )?;
+            segments.push(AuditChainSegment {
+                file: snapshot.file.clone(),
+                header,
+                result,
+                first_sequence,
+                last_sequence,
+                tip,
+            });
+        }
+        validate_audit_chain_segments(
+            &mut segments,
+            self.suspicious_numeric_name,
+            expected_file_id,
+        );
+        Ok(segments)
+    }
+
+    pub(crate) fn verify(
+        &mut self,
+        audit_key: &[u8; KEY_SIZE],
+        expected_file_id: u64,
+    ) -> citadel_core::Result<Vec<(PathBuf, AuditVerifyResult)>> {
+        Ok(self
+            .verify_segments(audit_key, expected_file_id)?
+            .into_iter()
+            .map(|segment| (segment.file.path, segment.result))
+            .collect())
+    }
+
+    pub(crate) fn verify_and_visit<F>(
+        &mut self,
+        audit_key: &[u8; KEY_SIZE],
+        expected_file_id: u64,
+        mut visitor: F,
+    ) -> citadel_core::Result<u64>
+    where
+        F: FnMut(&Path, &AuditEntry) -> citadel_core::Result<()>,
+    {
+        let segments = self.verify_segments(audit_key, expected_file_id)?;
+
+        for segment in &segments {
+            if !segment.result.chain_valid {
+                return Err(invalid_audit_data(format!(
+                    "audit generation {} failed authentication",
+                    segment.file.generation
+                )));
+            }
+            if segment.result.entries_missing() > 0 {
+                return Err(invalid_audit_data(format!(
+                    "audit generation {} is shorter than its header count",
+                    segment.file.generation
+                )));
+            }
+        }
+
+        let mut total = 0u64;
+        for index in (0..self.files.len()).rev() {
+            let snapshot = &mut self.files[index];
+            let expected = segments[index].result.entries_verified;
+            let visited = visit_verified_audit_reader(
+                &mut snapshot.handle,
+                snapshot.end,
+                &snapshot.header,
+                audit_key,
+                expected,
+                &snapshot.file.path,
+                &mut visitor,
+            )?;
+            total = total
+                .checked_add(visited)
+                .ok_or_else(|| invalid_audit_data("audit entry count overflow"))?;
+        }
+        Ok(total)
+    }
+}
+
+fn visit_verified_audit_reader<F>(
+    file: &mut File,
+    end: u64,
+    header: &AuditHeader,
+    audit_key: &[u8; KEY_SIZE],
+    expected: u64,
+    path: &Path,
+    visitor: &mut F,
+) -> citadel_core::Result<u64>
+where
+    F: FnMut(&Path, &AuditEntry) -> citadel_core::Result<()>,
+{
+    let mut prev_hmac = header.effective_chain_seed();
+    let mut previous_sequence = None;
+    let mut visited = 0u64;
+    let mut cursor = AUDIT_HEADER_SIZE as u64;
+    while cursor < end {
+        file.seek(SeekFrom::Start(cursor))?;
+        let RawRecord::Parsed(record) = read_raw_record_before(file, cursor, end)? else {
+            break;
+        };
+        if !verify_entry_hmac(audit_key, &prev_hmac, &record.hmac_input, &record.hmac)
+            || previous_sequence
+                .is_some_and(|sequence: u64| sequence.checked_add(1) != Some(record.sequence_no))
+        {
+            return Err(invalid_audit_data(
+                "audit history changed while its verified snapshot was read",
+            ));
+        }
+
+        let entry = AuditEntry {
+            timestamp: record.timestamp,
+            sequence_no: record.sequence_no,
+            event_type: record.event_type,
+            detail: record.detail,
+            hmac: record.hmac,
+        };
+        visitor(path, &entry)?;
+        prev_hmac = entry.hmac;
+        previous_sequence = Some(entry.sequence_no);
+        visited += 1;
+        cursor = record.end;
+    }
+    if visited != expected {
+        return Err(invalid_audit_data(
+            "audit history changed while its verified snapshot was read",
+        ));
+    }
+    Ok(visited)
 }
 
 /// Scan a corrupted audit log, recovering entries past damaged regions by
@@ -2209,6 +2571,124 @@ mod tests {
             hmac_hex,
             "95e592de73cb71f42a027cbe659ad084fe4f4299224545afa99b309a117193fb"
         );
+    }
+
+    #[test]
+    fn audit_snapshot_excludes_entries_appended_after_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().join("vault.cdl");
+        let audit_path = resolve_audit_path(&data_path);
+        let key = [0x42; KEY_SIZE];
+        let mut log = AuditLog::create(
+            &audit_path,
+            7,
+            key,
+            AuditConfig {
+                enabled: true,
+                max_file_size: u64::MAX,
+                max_rotated_files: 2,
+            },
+            true,
+        )
+        .unwrap();
+        log.log(AuditEventType::DatabaseCreated, &[]).unwrap();
+        let mut snapshot = AuditHistorySnapshot::open_while_locked(&data_path).unwrap();
+
+        log.log(AuditEventType::DatabaseOpened, &[]).unwrap();
+
+        let mut sequences = Vec::new();
+        let visited = snapshot
+            .verify_and_visit(&key, 7, |_, entry| {
+                sequences.push(entry.sequence_no);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visited, 1);
+        assert_eq!(sequences, [1]);
+    }
+
+    #[test]
+    fn audit_snapshot_survives_rotation_of_its_pinned_live_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().join("vault.cdl");
+        let audit_path = resolve_audit_path(&data_path);
+        let key = [0x42; KEY_SIZE];
+        let mut log = AuditLog::create(
+            &audit_path,
+            7,
+            key,
+            AuditConfig {
+                enabled: true,
+                max_file_size: 100,
+                max_rotated_files: 1,
+            },
+            true,
+        )
+        .unwrap();
+        log.log(AuditEventType::DatabaseCreated, &[]).unwrap();
+        let mut snapshot = AuditHistorySnapshot::open_while_locked(&data_path).unwrap();
+
+        log.log(AuditEventType::DatabaseOpened, &[]).unwrap();
+        log.log(AuditEventType::IntegrityCheckPerformed, &[])
+            .unwrap();
+        let paths = audit_log_paths_while_locked(&data_path).unwrap();
+        assert_eq!(paths.len(), 2);
+        let retained_sequences: Vec<u64> = paths
+            .iter()
+            .rev()
+            .flat_map(|path| read_audit_log(path).unwrap())
+            .map(|entry| entry.sequence_no)
+            .collect();
+        assert_eq!(retained_sequences, [2, 3]);
+
+        let mut sequences = Vec::new();
+        let visited = snapshot
+            .verify_and_visit(&key, 7, |_, entry| {
+                sequences.push(entry.sequence_no);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visited, 1);
+        assert_eq!(sequences, [1]);
+    }
+
+    #[test]
+    fn audit_snapshot_authenticates_everything_before_the_first_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().join("vault.cdl");
+        let audit_path = resolve_audit_path(&data_path);
+        let key = [0x42; KEY_SIZE];
+        let mut log = AuditLog::create(&audit_path, 7, key, AuditConfig::default(), true).unwrap();
+        log.log(AuditEventType::DatabaseCreated, &[]).unwrap();
+        log.log(AuditEventType::DatabaseOpened, &[]).unwrap();
+        drop(log);
+
+        let last_hmac_byte = fs::metadata(&audit_path).unwrap().len() - 1;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&audit_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(last_hmac_byte)).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0x80;
+        file.seek(SeekFrom::Start(last_hmac_byte)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut snapshot = AuditHistorySnapshot::open_while_locked(&data_path).unwrap();
+        let mut callbacks = 0;
+        let error = snapshot
+            .verify_and_visit(&key, 7, |_, _| {
+                callbacks += 1;
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("failed authentication"));
+        assert_eq!(callbacks, 0);
     }
 
     #[test]
@@ -3040,13 +3520,13 @@ mod tests {
         let non_directory = dir.path().join("not-a-directory");
         fs::write(&non_directory, b"file").unwrap();
 
-        let error = audit_log_paths(&non_directory.join("vault.citadel")).unwrap_err();
+        let error = audit_log_paths_while_locked(&non_directory.join("vault.citadel")).unwrap_err();
         assert!(matches!(error, citadel_core::Error::Io(_)));
     }
 
     fn retained_sequences(data_path: &Path) -> Vec<u64> {
         let mut sequences = Vec::new();
-        for path in audit_log_paths(data_path).unwrap() {
+        for path in audit_log_paths_while_locked(data_path).unwrap() {
             sequences.extend(
                 read_audit_log(&path)
                     .unwrap()
@@ -3138,7 +3618,7 @@ mod tests {
         recovered.log(AuditEventType::DatabaseClosed, &[]).unwrap();
         drop(recovered);
 
-        for path in audit_log_paths(&data_path).unwrap() {
+        for path in audit_log_paths_while_locked(&data_path).unwrap() {
             let mut bytes = [0u8; AUDIT_HEADER_SIZE];
             File::open(path).unwrap().read_exact(&mut bytes).unwrap();
             assert_eq!(

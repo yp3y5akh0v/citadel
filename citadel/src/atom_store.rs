@@ -714,6 +714,14 @@ impl AtomKeyStore {
         Ok(confirmed)
     }
 
+    pub(crate) fn inspect_counts(
+        path: &Path,
+        file_id: u64,
+        mac_key: &[u8; KEY_SIZE],
+    ) -> Result<(u32, u32)> {
+        key_codec::inspect_store_counts(path, mac_key, ATOM_STORE_MAGIC, VERSION, file_id, "atom")
+    }
+
     #[cfg(test)]
     pub(crate) fn slot_count(&self) -> u32 {
         self.slot_count
