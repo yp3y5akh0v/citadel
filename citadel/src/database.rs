@@ -10,6 +10,7 @@ use citadel_core::{
     CancelToken, Error, Result, KEY_FILE_SIZE, KEY_SIZE, MERKLE_HASH_SIZE, WRAPPED_KEY_SIZE,
 };
 use citadel_crypto::hkdf_utils::RegionWrapKeys;
+use citadel_crypto::key_manager::{KeyFile, KeyFileAuthKey};
 use citadel_io::durable;
 #[cfg(not(target_arch = "wasm32"))]
 use citadel_io::mmap_io::MmapPageIO;
@@ -107,6 +108,189 @@ pub struct UpgradeReport {
     pub audit_upgraded: bool,
 }
 
+/// Last authenticated key-file image plus the narrow key that can reseal its
+/// metadata. Serializing rewrites prevents passphrase change and format
+/// upgrade from racing or authenticating bytes replaced on disk after open.
+pub(crate) struct KeyFileState {
+    trusted: KeyFile,
+    auth_key: KeyFileAuthKey,
+}
+
+impl KeyFileState {
+    pub(crate) fn new(trusted: KeyFile, auth_key: KeyFileAuthKey) -> Self {
+        Self { trusted, auth_key }
+    }
+
+    pub(crate) fn slots_v1_required(&self) -> bool {
+        self.trusted.slots_v1_required()
+    }
+
+    #[cfg(feature = "audit-log")]
+    pub(crate) fn audit_v2_required(&self) -> bool {
+        self.trusted.audit_v2_required()
+    }
+
+    pub(crate) fn require_v1_slots(&mut self) {
+        self.trusted.require_v1_slots(&self.auth_key);
+    }
+
+    #[cfg(feature = "audit-log")]
+    pub(crate) fn require_audit_v2(&mut self) {
+        self.trusted.require_audit_v2(&self.auth_key);
+    }
+
+    pub(crate) fn serialize(&self) -> [u8; citadel_core::KEY_FILE_SIZE] {
+        self.trusted.serialize()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn replace_trusted(
+        &mut self,
+        path: &Path,
+        replacement: KeyFile,
+        operation: &'static str,
+    ) -> Result<()> {
+        self.replace_trusted_outcome(path, replacement)?
+            .into_result(operation)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn replace_trusted_outcome(
+        &mut self,
+        path: &Path,
+        replacement: KeyFile,
+    ) -> Result<PublishedWriteOutcome> {
+        self.replace_trusted_with(path, replacement, durable::atomic_write_with_status)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn replace_trusted_with(
+        &mut self,
+        path: &Path,
+        replacement: KeyFile,
+        write: impl FnOnce(
+            &Path,
+            &[u8],
+        ) -> std::result::Result<(), citadel_io::durable::AtomicWriteError>,
+    ) -> Result<PublishedWriteOutcome> {
+        match write(path, &replacement.serialize()) {
+            Ok(()) => {
+                self.trusted = replacement;
+                Ok(PublishedWriteOutcome::Durable)
+            }
+            Err(error) if error.was_published() => {
+                self.trusted = replacement;
+                Ok(PublishedWriteOutcome::DurabilityUnconfirmed(
+                    error.into_inner(),
+                ))
+            }
+            Err(error) => Err(Error::Io(error.into_inner())),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+enum PublishedWriteOutcome {
+    Durable,
+    DurabilityUnconfirmed(std::io::Error),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PublishedWriteOutcome {
+    fn into_result(self, operation: &'static str) -> Result<()> {
+        match self {
+            Self::Durable => Ok(()),
+            Self::DurabilityUnconfirmed(source) => {
+                Err(Error::DurabilityFailureAfterOperation { operation, source })
+            }
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "audit-log"))]
+fn finish_audited_operation(
+    operation: &'static str,
+    publication: PublishedWriteOutcome,
+    audit: Result<()>,
+) -> Result<()> {
+    match (publication, audit) {
+        (PublishedWriteOutcome::Durable, Ok(())) => Ok(()),
+        (PublishedWriteOutcome::Durable, Err(source)) => Err(Error::AuditFailureAfterOperation {
+            operation,
+            source: Box::new(source),
+        }),
+        (PublishedWriteOutcome::DurabilityUnconfirmed(source), Ok(())) => {
+            Err(Error::DurabilityFailureAfterOperation { operation, source })
+        }
+        (PublishedWriteOutcome::DurabilityUnconfirmed(durability), Err(audit)) => {
+            Err(Error::DurabilityAndAuditFailureAfterOperation {
+                operation,
+                durability,
+                audit: Box::new(audit),
+            })
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn atomic_write_outcome(path: &Path, bytes: &[u8]) -> Result<PublishedWriteOutcome> {
+    match durable::atomic_write_with_status(path, bytes) {
+        Ok(()) => Ok(PublishedWriteOutcome::Durable),
+        Err(error) if error.was_published() => Ok(PublishedWriteOutcome::DurabilityUnconfirmed(
+            error.into_inner(),
+        )),
+        Err(error) => Err(Error::Io(error.into_inner())),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn atomic_write_for_operation(
+    path: &Path,
+    bytes: &[u8],
+    operation: &'static str,
+) -> Result<()> {
+    atomic_write_outcome(path, bytes)?.into_result(operation)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct CreatedFileGuard {
+    paths: Vec<PathBuf>,
+    armed: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl CreatedFileGuard {
+    pub(crate) fn new() -> Self {
+        Self {
+            paths: Vec::new(),
+            armed: true,
+        }
+    }
+
+    pub(crate) fn track(&mut self, path: impl Into<PathBuf>) {
+        self.paths.push(path.into());
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for CreatedFileGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for path in self.paths.iter().rev() {
+            if fs::remove_file(path).is_ok() {
+                let _ = durable::fsync_directory(path);
+            }
+        }
+    }
+}
+
 /// An open Citadel database (`Send + Sync`).
 ///
 /// Exclusively locks the database file for its lifetime.
@@ -116,6 +300,7 @@ pub struct Database {
     key_path: PathBuf,
     /// Database file_id (from the file header), binding the region key store.
     file_id: u64,
+    key_file_state: Mutex<KeyFileState>,
     #[cfg(feature = "audit-log")]
     audit_log: Option<Mutex<AuditLog>>,
     /// Shared cache for higher-level crates (e.g. citadel-sql ANN indexes).
@@ -165,6 +350,7 @@ impl Database {
         data_path: PathBuf,
         key_path: PathBuf,
         file_id: u64,
+        key_file_state: KeyFileState,
         region_keys: Option<RegionWrapKeys>,
         audit_log: Option<AuditLog>,
     ) -> Self {
@@ -173,6 +359,7 @@ impl Database {
             data_path,
             key_path,
             file_id,
+            key_file_state: Mutex::new(key_file_state),
             audit_log: audit_log.map(Mutex::new),
             sql_caches: Arc::new(Mutex::new(FxHashMap::default())),
             region_keys,
@@ -192,6 +379,7 @@ impl Database {
         data_path: PathBuf,
         key_path: PathBuf,
         file_id: u64,
+        key_file_state: KeyFileState,
         region_keys: Option<RegionWrapKeys>,
     ) -> Self {
         Self {
@@ -199,6 +387,7 @@ impl Database {
             data_path,
             key_path,
             file_id,
+            key_file_state: Mutex::new(key_file_state),
             sql_caches: Arc::new(Mutex::new(FxHashMap::default())),
             region_keys,
             region_store: Mutex::new(None),
@@ -339,6 +528,80 @@ impl Database {
 
     pub fn key_path(&self) -> &Path {
         &self.key_path
+    }
+
+    /// Re-read the sidecar and require the exact image authenticated at open (or
+    /// written by the last serialized rewrite). The data-file lock does not cover
+    /// this path, so an update must not bless an offline replacement with a MAC.
+    fn read_unchanged_key_file(&self, state: &KeyFileState) -> Result<KeyFile> {
+        Ok(self.read_unchanged_key_file_with_permissions(state)?.0)
+    }
+
+    /// Read bytes and permissions through one no-follow handle so a backup
+    /// cannot authenticate one key image and copy metadata from another.
+    fn read_unchanged_key_file_with_permissions(
+        &self,
+        state: &KeyFileState,
+    ) -> Result<(KeyFile, fs::Permissions)> {
+        let (image, metadata) = durable::read_regular_file_exact::<KEY_FILE_SIZE>(&self.key_path)?;
+        let current = KeyFile::deserialize(&image)?;
+        if current.serialize() != state.trusted.serialize() {
+            return Err(Error::KeyFileIntegrity);
+        }
+        Ok((current, metadata.permissions()))
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "audit-log"))]
+    fn refuse_copy_audit_sidecars(dest_path: &Path) -> Result<()> {
+        let audit_path = crate::audit::resolve_audit_path(dest_path);
+        crate::builder::DatabaseBuilder::refuse_stale_sidecar(&audit_path, "audit log")?;
+        crate::builder::DatabaseBuilder::refuse_stale_sidecar(
+            &crate::audit::rotation_work_path(&audit_path),
+            "audit rotation journal",
+        )?;
+        crate::builder::DatabaseBuilder::refuse_stale_sidecar(
+            &crate::audit::audit_upgrade_path(&audit_path),
+            "audit upgrade image",
+        )?;
+        crate::audit::ensure_no_retained_audit_history(&audit_path)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refuse_copy_sidecars(dest_path: &Path) -> Result<PathBuf> {
+        let dest_key_path = resolve_key_path_for(dest_path);
+        crate::builder::DatabaseBuilder::refuse_stale_sidecar(&dest_key_path, "key file")?;
+        crate::builder::DatabaseBuilder::refuse_stale_sidecar(
+            &region_store_path_for(&dest_key_path),
+            "region key store",
+        )?;
+        crate::builder::DatabaseBuilder::refuse_stale_sidecar(
+            &atom_store_path_for(&dest_key_path),
+            "atom key store",
+        )?;
+        #[cfg(feature = "audit-log")]
+        Self::refuse_copy_audit_sidecars(dest_path)?;
+        Ok(dest_key_path)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write_trusted_key_copy(
+        dest: &Path,
+        key_file: &KeyFile,
+        permissions: fs::Permissions,
+    ) -> Result<()> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(dest)?;
+        let write = (|| -> std::io::Result<()> {
+            std::io::Write::write_all(&mut file, &key_file.serialize())?;
+            file.set_permissions(permissions)?;
+            file.sync_all()
+        })();
+        if let Err(error) = write {
+            drop(file);
+            let _ = fs::remove_file(dest);
+            return Err(error.into());
+        }
+        drop(file);
+        Ok(())
     }
 
     /// Database file identifier from the file header. citadel-mem binds the
@@ -546,17 +809,10 @@ impl Database {
     /// Change the database passphrase (re-wraps REK, no page re-encryption).
     pub fn change_passphrase(&self, old_passphrase: &[u8], new_passphrase: &[u8]) -> Result<()> {
         use citadel_crypto::kdf::{derive_mk, generate_salt};
-        use citadel_crypto::key_manager::{unwrap_rek, wrap_rek, KeyFile};
+        use citadel_crypto::key_manager::{unwrap_rek, wrap_rek};
 
-        let key_data = fs::read(&self.key_path)?;
-        if key_data.len() != KEY_FILE_SIZE {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "key file has incorrect size",
-            )));
-        }
-        let key_buf: [u8; KEY_FILE_SIZE] = key_data.try_into().unwrap();
-        let kf = KeyFile::deserialize(&key_buf)?;
+        let mut state = self.key_file_state.lock();
+        let kf = self.read_unchanged_key_file(&state)?;
 
         let old_mk = derive_mk(
             kf.kdf_algorithm,
@@ -585,14 +841,23 @@ impl Database {
         let mut new_kf = kf.clone();
         new_kf.argon2_salt = new_salt;
         new_kf.wrapped_rek = new_wrapped;
-        new_kf.update_mac(&new_mk);
+        if new_kf.slots_v1_required() {
+            new_kf.update_mac_with_auth_key(&state.auth_key);
+        } else {
+            new_kf.update_mac(&new_mk)?;
+        }
 
-        durable::atomic_write(&self.key_path, &new_kf.serialize())?;
+        let publication = state.replace_trusted_outcome(&self.key_path, new_kf)?;
+        drop(state);
 
         #[cfg(feature = "audit-log")]
-        self.log_audit(AuditEventType::PassphraseChanged, &[]);
+        {
+            let audit = self.log_audit(AuditEventType::PassphraseChanged, &[]);
+            finish_audited_operation("passphrase change", publication, audit)
+        }
 
-        Ok(())
+        #[cfg(not(feature = "audit-log"))]
+        publication.into_result("passphrase change")
     }
 
     /// Whether `passphrase` unwraps this database, read from the key file so a
@@ -602,7 +867,6 @@ impl Database {
     /// to a different database cannot pass on its MAC alone.
     pub fn verify_passphrase(&self, passphrase: &[u8]) -> Result<bool> {
         use citadel_crypto::kdf::derive_mk;
-        use citadel_crypto::key_manager::KeyFile;
 
         if self.key_path.as_os_str().is_empty() {
             return Err(Error::Io(std::io::Error::new(
@@ -610,15 +874,10 @@ impl Database {
                 "an in-memory database has no key file to verify against",
             )));
         }
-        let key_data = fs::read(&self.key_path)?;
-        if key_data.len() != KEY_FILE_SIZE {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "key file has incorrect size",
-            )));
-        }
-        let key_buf: [u8; KEY_FILE_SIZE] = key_data.try_into().unwrap();
-        let kf = KeyFile::deserialize(&key_buf)?;
+        let kf = {
+            let state = self.key_file_state.lock();
+            self.read_unchanged_key_file(&state)?
+        };
         if kf.file_id != self.file_id {
             return Ok(false); // a key file for some other database
         }
@@ -640,10 +899,11 @@ impl Database {
         #[cfg(feature = "audit-log")]
         {
             let error_count = report.errors.len() as u32;
-            self.log_audit(
+            self.log_audit_after_operation(
+                "integrity check",
                 AuditEventType::IntegrityCheckPerformed,
                 &error_count.to_le_bytes(),
-            );
+            )?;
         }
 
         Ok(report)
@@ -652,24 +912,37 @@ impl Database {
     /// Create a hot backup via MVCC snapshot. Also copies the key file.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn backup(&self, dest_path: &Path) -> Result<()> {
-        let dest_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(dest_path)?;
-        let dest_io = MmapPageIO::try_new(dest_file)?;
-        self.manager.backup_to(&dest_io)?;
+        let dest_key_path = Self::refuse_copy_sidecars(dest_path)?;
+        let mut created = CreatedFileGuard::new();
+        {
+            let _lifecycle = self.key_lifecycle.lock();
+            let (trusted_key_file, key_permissions) = {
+                let key_state = self.key_file_state.lock();
+                self.read_unchanged_key_file_with_permissions(&key_state)?
+            };
+            let dest_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(dest_path)?;
+            created.track(dest_path);
+            citadel_io::file_lock::try_lock_exclusive(&dest_file)?;
+            let dest_io = MmapPageIO::try_new(dest_file)?;
+            self.manager.backup_to(&dest_io)?;
 
-        let dest_key_path = resolve_key_path_for(dest_path);
-        durable::copy_and_sync(&self.key_path, &dest_key_path)?;
-        self.copy_region_store_to(&dest_key_path)?;
+            Self::write_trusted_key_copy(&dest_key_path, &trusted_key_file, key_permissions)?;
+            created.track(&dest_key_path);
+            self.copy_region_store_to(&dest_key_path, &mut created)?;
 
-        // Persist the new directory entries (data, key, and sidecar files all
-        // live in dest_path's directory); file fsyncs alone don't cover them.
-        durable::fsync_directory(dest_path)?;
+            // File fsyncs do not persist the new directory entries.
+            durable::fsync_directory(dest_path)?;
+            #[cfg(feature = "audit-log")]
+            Self::refuse_copy_audit_sidecars(dest_path)?;
+        }
+        created.disarm();
 
         #[cfg(feature = "audit-log")]
-        self.log_audit_with_path(AuditEventType::BackupCreated, dest_path);
+        self.log_audit_with_path("database backup", AuditEventType::BackupCreated, dest_path)?;
 
         Ok(())
     }
@@ -686,17 +959,12 @@ impl Database {
     ) -> Result<()> {
         use citadel_crypto::kdf::derive_mk;
         use citadel_crypto::key_backup::create_key_backup;
-        use citadel_crypto::key_manager::{unwrap_rek, KeyFile};
+        use citadel_crypto::key_manager::unwrap_rek;
 
-        let key_data = fs::read(&self.key_path)?;
-        if key_data.len() != KEY_FILE_SIZE {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "key file has incorrect size",
-            )));
-        }
-        let key_buf: [u8; KEY_FILE_SIZE] = key_data.try_into().unwrap();
-        let kf = KeyFile::deserialize(&key_buf)?;
+        let kf = {
+            let state = self.key_file_state.lock();
+            self.read_unchanged_key_file(&state)?
+        };
 
         let mk = derive_mk(
             kf.kdf_algorithm,
@@ -720,20 +988,34 @@ impl Database {
             kf.argon2_t_cost,
             kf.argon2_p_cost,
             kf.current_epoch,
+            kf.flags,
         )?;
 
-        durable::write_and_sync(dest_path, &backup_data)?;
+        let publication = atomic_write_outcome(dest_path, &backup_data)?;
 
         #[cfg(feature = "audit-log")]
-        self.log_audit_with_path(AuditEventType::KeyBackupExported, dest_path);
+        {
+            let audit = self.log_audit_path(AuditEventType::KeyBackupExported, dest_path);
+            finish_audited_operation("key backup export", publication, audit)
+        }
 
-        Ok(())
+        #[cfg(not(feature = "audit-log"))]
+        publication.into_result("key backup export")
     }
 
     /// Restore a key file from an encrypted backup (static; no `Database`).
     ///
-    /// Unwraps the REK using `backup_passphrase`, then creates a new key file
-    /// protected by `new_db_passphrase`.
+    /// Unwraps the REK using `backup_passphrase`, validates it against the
+    /// destination database, then creates a new key file protected by
+    /// `new_db_passphrase`. `backup_path` must directly name a regular file;
+    /// symlinks, reparse points, and special files are rejected.
+    ///
+    /// An older backup may predate the authenticated slot-policy bit. When the
+    /// current data file proves both slots are authenticated V1 (or its one-way
+    /// header bit is set), restore carries that earned policy forward rather than
+    /// reopening a downgrade window. With audit logging, restore also upgrades the
+    /// current sidecar before establishing its separate v2 policy; without that
+    /// feature it can only preserve the witness carried by the backup.
     pub fn restore_key_from_backup(
         backup_path: &Path,
         backup_passphrase: &[u8],
@@ -741,24 +1023,30 @@ impl Database {
         db_path: &Path,
     ) -> Result<()> {
         use citadel_core::{
-            KEY_BACKUP_SIZE, KEY_FILE_MAGIC, KEY_FILE_VERSION, MAC_SIZE, WRAPPED_KEY_SIZE,
+            FILE_HEADER_SIZE, HEADER_FLAG_SLOTS_V1, KEY_BACKUP_SIZE, KEY_FILE_MAGIC,
+            KEY_FILE_VERSION, MAC_SIZE, WRAPPED_KEY_SIZE,
         };
         use citadel_crypto::kdf::{derive_mk, generate_salt};
         use citadel_crypto::key_backup::restore_rek_from_backup;
-        use citadel_crypto::key_manager::wrap_rek;
-        use citadel_crypto::key_manager::KeyFile;
+        use citadel_crypto::key_manager::{wrap_rek, KeyFile, KEY_FILE_FLAG_SLOTS_V1_REQUIRED};
+        use citadel_crypto::page_cipher::compute_dek_id;
+        use citadel_io::file_manager::{FileHeader, SlotFormat};
 
-        let backup_data = fs::read(backup_path)?;
-        if backup_data.len() != KEY_BACKUP_SIZE {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "backup file has incorrect size",
-            )));
-        }
-        let backup_buf: [u8; KEY_BACKUP_SIZE] = backup_data.try_into().unwrap();
+        let (backup_buf, _) = durable::read_regular_file_exact::<KEY_BACKUP_SIZE>(backup_path)?;
 
         let restored = restore_rek_from_backup(&backup_buf, backup_passphrase)?;
-
+        // Fail a restore against an open database before spending another KDF.
+        // Only a preflight: the lock is reacquired below and held across
+        // validation and durable replacement.
+        {
+            let db_file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(db_path)?;
+            citadel_io::file_lock::try_lock_exclusive(&db_file)?;
+        }
+        // Run the expensive KDF before holding the database lock;
+        // only validation and durable replacement need serialization.
         let new_salt = generate_salt();
         let new_mk = derive_mk(
             restored.kdf_algorithm,
@@ -768,8 +1056,81 @@ impl Database {
             restored.kdf_param2,
             restored.kdf_param3,
         )?;
-
         let new_wrapped = wrap_rek(&new_mk, &restored.rek);
+
+        // Match normal open's lifetime lock: restoring a sidecar while another
+        // handle commits or rekeys could publish a key image for an unvalidated
+        // database generation.
+        let mut db_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(db_path)?;
+        citadel_io::file_lock::try_lock_exclusive(&db_file)?;
+        let mut header_buf = [0u8; FILE_HEADER_SIZE];
+        std::io::Read::read_exact(&mut db_file, &mut header_buf)?;
+        let header = FileHeader::deserialize(&header_buf)?;
+        if header.file_id != restored.file_id {
+            return Err(Error::KeyFileMismatch);
+        }
+
+        let mut restored_flags = restored.key_file_flags;
+        if header.flags & HEADER_FLAG_SLOTS_V1 != 0 {
+            restored_flags |= KEY_FILE_FLAG_SLOTS_V1_REQUIRED;
+        }
+        let v1_required = restored_flags & KEY_FILE_FLAG_SLOTS_V1_REQUIRED != 0;
+        if v1_required
+            && header
+                .slots
+                .iter()
+                .any(|slot| slot.slot_format == SlotFormat::Legacy && slot.verify_checksum())
+        {
+            return Err(Error::SlotDowngradeDetected);
+        }
+
+        let expected_dek_id = compute_dek_id(&restored.keys.mac_key, &restored.keys.dek);
+        let backup_matches_data = header.slots.iter().any(|slot| {
+            slot.verify_checksum()
+                && slot.dek_id == expected_dek_id
+                && if v1_required {
+                    slot.slot_format == SlotFormat::V1 && slot.verify_mac(&restored.keys.mac_key)
+                } else {
+                    slot.slot_format == SlotFormat::Legacy
+                        || slot.verify_mac(&restored.keys.mac_key)
+                }
+        });
+        if !backup_matches_data {
+            return Err(Error::KeyFileMismatch);
+        }
+
+        let both_slots_authenticated_v1 = header.slots.iter().all(|slot| {
+            slot.slot_format == SlotFormat::V1
+                && slot.verify_checksum()
+                && slot.verify_mac(&restored.keys.mac_key)
+        });
+        if both_slots_authenticated_v1 {
+            restored_flags |= KEY_FILE_FLAG_SLOTS_V1_REQUIRED;
+        }
+
+        #[cfg(feature = "audit-log")]
+        if restored_flags & KEY_FILE_FLAG_SLOTS_V1_REQUIRED != 0 {
+            let audit_path = crate::audit::resolve_audit_path(db_path);
+            crate::audit::recover_rotation(&audit_path, &restored.keys.audit_key)?;
+            crate::audit::recover_abandoned_audit_upgrade(&audit_path)?;
+            if durable::path_entry_exists(&audit_path)? {
+                let mut audit = AuditLog::open_existing(
+                    &audit_path,
+                    restored.file_id,
+                    restored.keys.audit_key,
+                    crate::audit::AuditConfig::default(),
+                    restored_flags & citadel_crypto::key_manager::KEY_FILE_FLAG_AUDIT_V2_REQUIRED
+                        != 0,
+                )?;
+                audit.upgrade_to_v2()?;
+            } else {
+                crate::audit::ensure_no_retained_audit_history(&audit_path)?;
+            }
+            restored_flags |= citadel_crypto::key_manager::KEY_FILE_FLAG_AUDIT_V2_REQUIRED;
+        }
 
         let mut new_kf = KeyFile {
             magic: KEY_FILE_MAGIC,
@@ -781,6 +1142,7 @@ impl Database {
             argon2_p_cost: restored.kdf_param3,
             cipher_id: restored.cipher_id,
             kdf_algorithm: restored.kdf_algorithm,
+            flags: restored_flags,
             wrapped_rek: new_wrapped,
             current_epoch: restored.epoch,
             prev_wrapped_rek: [0u8; WRAPPED_KEY_SIZE],
@@ -788,10 +1150,18 @@ impl Database {
             rotation_active: false,
             file_mac: [0u8; MAC_SIZE],
         };
-        new_kf.update_mac(&new_mk);
+        if new_kf.slots_v1_required() {
+            let auth_key = KeyFileAuthKey::from_database_mac_key(&restored.keys.mac_key);
+            new_kf.update_mac_with_auth_key(&auth_key);
+        } else {
+            new_kf.update_mac(&new_mk)?;
+        }
 
         let key_path = resolve_key_path_for(db_path);
-        durable::atomic_write(&key_path, &new_kf.serialize())?;
+        if durable::path_entry_exists(&key_path)? {
+            drop(durable::open_regular_read(&key_path)?);
+        }
+        atomic_write_for_operation(&key_path, &new_kf.serialize(), "key-file restore")?;
 
         Ok(())
     }
@@ -799,24 +1169,41 @@ impl Database {
     /// Compact the database into a new file. Also copies the key file.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn compact(&self, dest_path: &Path) -> Result<()> {
-        let dest_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(dest_path)?;
-        let dest_io = MmapPageIO::try_new(dest_file)?;
-        self.manager.compact_to(&dest_io)?;
+        let dest_key_path = Self::refuse_copy_sidecars(dest_path)?;
+        let mut created = CreatedFileGuard::new();
+        {
+            let _lifecycle = self.key_lifecycle.lock();
+            let (trusted_key_file, key_permissions) = {
+                let key_state = self.key_file_state.lock();
+                self.read_unchanged_key_file_with_permissions(&key_state)?
+            };
+            let dest_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(dest_path)?;
+            created.track(dest_path);
+            citadel_io::file_lock::try_lock_exclusive(&dest_file)?;
+            let dest_io = MmapPageIO::try_new(dest_file)?;
+            self.manager.compact_to(&dest_io)?;
 
-        let dest_key_path = resolve_key_path_for(dest_path);
-        durable::copy_and_sync(&self.key_path, &dest_key_path)?;
-        self.copy_region_store_to(&dest_key_path)?;
+            Self::write_trusted_key_copy(&dest_key_path, &trusted_key_file, key_permissions)?;
+            created.track(&dest_key_path);
+            self.copy_region_store_to(&dest_key_path, &mut created)?;
 
-        // Persist the new directory entries (data, key, and sidecar files all
-        // live in dest_path's directory); file fsyncs alone don't cover them.
-        durable::fsync_directory(dest_path)?;
+            // File fsyncs do not persist the new directory entries.
+            durable::fsync_directory(dest_path)?;
+            #[cfg(feature = "audit-log")]
+            Self::refuse_copy_audit_sidecars(dest_path)?;
+        }
+        created.disarm();
 
         #[cfg(feature = "audit-log")]
-        self.log_audit_with_path(AuditEventType::CompactionPerformed, dest_path);
+        self.log_audit_with_path(
+            "database compaction",
+            AuditEventType::CompactionPerformed,
+            dest_path,
+        )?;
 
         Ok(())
     }
@@ -828,15 +1215,24 @@ impl Database {
     /// live retains a recoverable key that `forget` cannot reach, so backup
     /// retention is the operator's job (see `region_store_path`).
     #[cfg(not(target_arch = "wasm32"))]
-    fn copy_region_store_to(&self, dest_key_path: &Path) -> Result<()> {
+    fn copy_region_store_to(
+        &self,
+        dest_key_path: &Path,
+        created: &mut CreatedFileGuard,
+    ) -> Result<()> {
+        let _region_store = self.region_store.lock();
+        let _atom_store = self.atom_store.lock();
         let src = self.region_store_path();
-        if src.exists() {
+        if durable::path_entry_exists(&src)? {
             let dest = region_store_path_for(dest_key_path);
-            durable::copy_and_sync(&src, &dest)?;
+            durable::copy_new_and_sync(&src, &dest)?;
+            created.track(dest);
         }
         let atom_src = self.atom_store_path();
-        if atom_src.exists() {
-            durable::copy_and_sync(&atom_src, &atom_store_path_for(dest_key_path))?;
+        if durable::path_entry_exists(&atom_src)? {
+            let dest = atom_store_path_for(dest_key_path);
+            durable::copy_new_and_sync(&atom_src, &dest)?;
+            created.track(dest);
         }
         Ok(())
     }
@@ -859,10 +1255,28 @@ impl Database {
     }
 
     /// Convert a pre-v1 file to the protected format: reseal both slots V1
-    /// (for any table count), stamp the one-way HEADER_FLAG_SLOTS_V1, and
-    /// upgrade the audit header to v2. One-way (pre-v1 binaries can no longer
-    /// open it) and idempotent.
+    /// (for any table count), persist an authenticated key-file requirement,
+    /// stamp the compatibility HEADER_FLAG_SLOTS_V1, and upgrade the audit
+    /// header to v2. One-way (pre-v1 binaries can no longer open it) and
+    /// idempotent.
+    ///
+    /// The marker detects a data-header/slot downgrade while the current key file
+    /// remains trusted. Restoring an older authentic unflagged key file removes
+    /// that witness; a database also rolled back or rewritten to a valid legacy-slot
+    /// shape is then indistinguishable without an external freshness anchor.
     pub fn upgrade_format(&self) -> Result<UpgradeReport> {
+        let _lifecycle = self.key_lifecycle.lock();
+        // Refuse an externally replaced key sidecar before touching either
+        // commit slot. Keep internal key-file rewrites serialized through the
+        // full upgrade, then recheck immediately before publishing policy.
+        let mut key_file_state = if self.key_path.as_os_str().is_empty() {
+            None
+        } else {
+            let state = self.key_file_state.lock();
+            self.read_unchanged_key_file(&state)?;
+            Some(state)
+        };
+
         let names: Vec<Vec<u8>> = self
             .manager
             .list_tables()?
@@ -879,16 +1293,47 @@ impl Database {
         let mut txn = self.manager.begin_write()?;
         txn.refresh_all_catalog_descriptors(&[])?;
         txn.commit()?;
+        // Audit must reach v2 before authenticated metadata makes that
+        // requirement permanent. The inverse order could strand the vault beside
+        // a v1 audit file it is required to reject.
         #[cfg(feature = "audit-log")]
-        let audit_upgraded = match self.audit_log {
-            Some(ref mutex) => mutex.lock().upgrade_to_v2()?,
-            None => false,
+        let (audit_upgraded, audit_v2_ready) = match self.audit_log {
+            Some(ref mutex) => (mutex.lock().upgrade_to_v2()?, true),
+            None => (false, false),
         };
         #[cfg(not(feature = "audit-log"))]
         let audit_upgraded = false;
+        #[cfg(not(feature = "audit-log"))]
+        let audit_v2_ready = false;
 
+        // Exclude writers from the final both-slot check through both durable
+        // markers, or a concurrent commit could replace one V1 slot between the
+        // check and the key-file requirement landing.
         let upgrade_exclusion = self.manager.exclude_writers()?;
+        // Arm the in-process backstop before any durable policy write, so a
+        // later key/header failure leaves this handle conservatively V1-only
+        // and a retry can finish the idempotent work.
         upgrade_exclusion.require_authenticated_v1()?;
+
+        if let Some(state) = key_file_state.as_mut() {
+            let current = self.read_unchanged_key_file(state)?;
+            if !current.slots_v1_required() || (audit_v2_ready && !current.audit_v2_required()) {
+                let mut protected = current;
+                protected.require_v1_slots(&state.auth_key);
+                if audit_v2_ready {
+                    protected.require_audit_v2(&state.auth_key);
+                }
+                state.replace_trusted(
+                    &self.key_path,
+                    protected,
+                    "authenticated format policy upgrade",
+                )?;
+            }
+        }
+
+        // The authenticated marker lands before the mutable compatibility header.
+        // The backstop armed above means a failed header write cannot let a
+        // legacy slot through this handle.
         let slots_flagged = upgrade_exclusion.mark_slots_v1()?;
 
         Ok(UpgradeReport {
@@ -908,6 +1353,48 @@ impl Database {
         }
     }
 
+    /// Every audit log file, newest first: the live log then its rotated
+    /// predecessors, empty when audit logging is off. Discovery errors are
+    /// returned rather than hidden behind an incomplete list.
+    #[cfg(feature = "audit-log")]
+    pub fn audit_log_paths(&self) -> Result<Vec<PathBuf>> {
+        if self.audit_log.is_some() && !self.data_path.as_os_str().is_empty() {
+            crate::audit::audit_log_paths(&self.data_path)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Entries the live log's header claimed at open that its records no longer
+    /// held, or `None` when logging is off.
+    ///
+    /// An unauthenticated consistency signal, not an anti-rollback guarantee: it
+    /// catches uncoordinated truncation when the mutable count was left behind,
+    /// but an offline writer can lower the count too. Opening recounts and then
+    /// overwrites the field, so a mismatch is retained here once, at open.
+    #[cfg(feature = "audit-log")]
+    pub fn audit_entries_missing(&self) -> Option<u64> {
+        self.audit_log.as_ref().map(|m| m.lock().missing_at_open())
+    }
+
+    /// Verify every audit log file, newest first, pairing each with its result.
+    ///
+    /// Beyond each segment's local HMACs, this checks generation continuity,
+    /// database identity, sequence continuity, and v2 seed handoff.
+    /// [`Database::verify_audit_log`] covers only the newest segment and trusts
+    /// its header seed. Identity and count fields stay mutable consistency
+    /// checks; the oldest retained seed has no anti-rollback anchor.
+    #[cfg(feature = "audit-log")]
+    pub fn verify_audit_chain(&self) -> Result<Vec<(PathBuf, crate::audit::AuditVerifyResult)>> {
+        let audit = self
+            .audit_log
+            .as_ref()
+            .ok_or_else(|| Error::Io(std::io::Error::other("audit logging is not enabled")))?;
+        let guard = audit.lock();
+        let key = guard.audit_key();
+        crate::audit::verify_audit_chain(&self.data_path, key, self.file_id)
+    }
+
     /// Verify the audit log's HMAC chain integrity.
     #[cfg(feature = "audit-log")]
     pub fn verify_audit_log(&self) -> Result<crate::audit::AuditVerifyResult> {
@@ -921,21 +1408,64 @@ impl Database {
     }
 
     #[cfg(feature = "audit-log")]
-    pub(crate) fn log_audit(&self, event_type: AuditEventType, detail: &[u8]) {
+    pub(crate) fn log_audit(&self, event_type: AuditEventType, detail: &[u8]) -> Result<()> {
         if let Some(ref mutex) = self.audit_log {
-            let _ = mutex.lock().log(event_type, detail);
+            mutex.lock().log(event_type, detail)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "audit-log")]
+    pub(crate) fn log_audit_after_operation(
+        &self,
+        operation: &'static str,
+        event_type: AuditEventType,
+        detail: &[u8],
+    ) -> Result<()> {
+        self.log_audit(event_type, detail)
+            .map_err(|source| Error::AuditFailureAfterOperation {
+                operation,
+                source: Box::new(source),
+            })
+    }
+
+    #[cfg(feature = "audit-log")]
+    pub(crate) fn retain_created_audit_history(&self) {
+        if let Some(ref mutex) = self.audit_log {
+            mutex.lock().retain_created_history();
         }
     }
 
     #[cfg(feature = "audit-log")]
-    fn log_audit_with_path(&self, event_type: AuditEventType, path: &Path) {
+    fn log_audit_with_path(
+        &self,
+        operation: &'static str,
+        event_type: AuditEventType,
+        path: &Path,
+    ) -> Result<()> {
+        self.log_audit_path(event_type, path)
+            .map_err(|source| Error::AuditFailureAfterOperation {
+                operation,
+                source: Box::new(source),
+            })
+    }
+
+    #[cfg(feature = "audit-log")]
+    fn log_audit_path(&self, event_type: AuditEventType, path: &Path) -> Result<()> {
         let path_str = path.to_string_lossy();
         let path_bytes = path_str.as_bytes();
-        let len = (path_bytes.len() as u16).to_le_bytes();
+        let len = u16::try_from(path_bytes.len())
+            .map_err(|_| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "audit path detail exceeds 65535 bytes",
+                ))
+            })?
+            .to_le_bytes();
         let mut detail = Vec::with_capacity(2 + path_bytes.len());
         detail.extend_from_slice(&len);
         detail.extend_from_slice(path_bytes);
-        self.log_audit(event_type, &detail);
+        self.log_audit(event_type, &detail)
     }
 }
 
@@ -1050,7 +1580,7 @@ fn sync_err_to_core(e: citadel_sync::transport::SyncError) -> Error {
 #[cfg(feature = "audit-log")]
 impl Drop for Database {
     fn drop(&mut self) {
-        self.log_audit(AuditEventType::DatabaseClosed, &[]);
+        let _ = self.log_audit(AuditEventType::DatabaseClosed, &[]);
     }
 }
 
@@ -1090,6 +1620,89 @@ mod sql_cache_tests {
 
     #[derive(Debug, PartialEq)]
     struct Marker(u32);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn created_file_guard_removes_only_armed_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let removed = dir.path().join("removed");
+        let retained = dir.path().join("retained");
+        fs::write(&removed, b"owned").unwrap();
+        fs::write(&retained, b"complete").unwrap();
+
+        {
+            let mut guard = CreatedFileGuard::new();
+            guard.track(&removed);
+        }
+        {
+            let mut guard = CreatedFileGuard::new();
+            guard.track(&retained);
+            guard.disarm();
+        }
+
+        assert!(!removed.exists());
+        assert_eq!(fs::read(retained).unwrap(), b"complete");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn published_key_replacement_updates_the_live_trusted_image() {
+        let (current, keys) = citadel_crypto::key_manager::create_key_file(
+            b"password",
+            7,
+            citadel_core::types::CipherId::Aes256Ctr,
+            citadel_core::types::KdfAlgorithm::Argon2id,
+            64,
+            1,
+            1,
+        )
+        .unwrap();
+        let auth_key = KeyFileAuthKey::from_database_mac_key(&keys.mac_key);
+        let mut state = KeyFileState::new(current.clone(), auth_key);
+        let mut replacement = current;
+        replacement.current_epoch += 1;
+        let expected = replacement.serialize();
+
+        let publication = state
+            .replace_trusted_with(Path::new("unused"), replacement, |_, _| {
+                Err(citadel_io::durable::AtomicWriteError::Published(
+                    std::io::Error::other("injected directory sync failure"),
+                ))
+            })
+            .unwrap();
+
+        assert!(matches!(
+            publication,
+            PublishedWriteOutcome::DurabilityUnconfirmed(_)
+        ));
+        assert_eq!(state.serialize(), expected);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "audit-log"))]
+    #[test]
+    fn audited_publication_preserves_durability_and_audit_failures() {
+        let error = finish_audited_operation(
+            "test operation",
+            PublishedWriteOutcome::DurabilityUnconfirmed(std::io::Error::other(
+                "directory sync failed",
+            )),
+            Err(Error::Io(std::io::Error::other("audit disk full"))),
+        )
+        .unwrap_err();
+
+        match error {
+            Error::DurabilityAndAuditFailureAfterOperation {
+                operation,
+                durability,
+                audit,
+            } => {
+                assert_eq!(operation, "test operation");
+                assert_eq!(durability.to_string(), "directory sync failed");
+                assert_eq!(audit.to_string(), "I/O error: audit disk full");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
 
     #[test]
     fn insert_then_get_round_trips() {

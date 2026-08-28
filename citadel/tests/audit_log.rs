@@ -1,26 +1,40 @@
+#![cfg(feature = "audit-log")]
+
 use std::path::Path;
 
+#[cfg(not(feature = "fips"))]
+use citadel::Argon2Profile;
+#[cfg(feature = "fips")]
+use citadel::KdfAlgorithm;
 use citadel::{
     read_audit_log, scan_corrupted_audit_log, verify_audit_log, AuditConfig, AuditEventType,
-    Database, DatabaseBuilder, KdfAlgorithm,
+    Database, DatabaseBuilder,
 };
 
+fn test_builder(path: impl Into<std::path::PathBuf>) -> DatabaseBuilder {
+    let builder = DatabaseBuilder::new(path).cache_size(64);
+    #[cfg(not(feature = "fips"))]
+    {
+        builder.argon2_profile(Argon2Profile::Iot)
+    }
+    #[cfg(feature = "fips")]
+    {
+        builder
+            .kdf_algorithm(KdfAlgorithm::Pbkdf2HmacSha256)
+            .pbkdf2_iterations(600_000)
+    }
+}
+
 fn create_test_db(dir: &Path, passphrase: &[u8]) -> Database {
-    DatabaseBuilder::new(dir.join("test.citadel"))
+    test_builder(dir.join("test.citadel"))
         .passphrase(passphrase)
-        .kdf_algorithm(KdfAlgorithm::Pbkdf2HmacSha256)
-        .pbkdf2_iterations(600_000)
-        .cache_size(64)
         .create()
         .unwrap()
 }
 
 fn open_test_db(dir: &Path, passphrase: &[u8]) -> Database {
-    DatabaseBuilder::new(dir.join("test.citadel"))
+    test_builder(dir.join("test.citadel"))
         .passphrase(passphrase)
-        .kdf_algorithm(KdfAlgorithm::Pbkdf2HmacSha256)
-        .pbkdf2_iterations(600_000)
-        .cache_size(64)
         .open()
         .unwrap()
 }
@@ -47,6 +61,26 @@ fn get_audit_key(dir: &Path, passphrase: &[u8]) -> [u8; 32] {
         open_key_file(&key_buf, passphrase, header.file_id).unwrap()
     });
     keys.audit_key
+}
+
+fn create_rotated_history(dir: &Path, passphrase: &[u8]) {
+    let config = AuditConfig {
+        enabled: true,
+        max_file_size: 200,
+        max_rotated_files: 3,
+    };
+    let db = test_builder(dir.join("test.citadel"))
+        .passphrase(passphrase)
+        .audit_config(config)
+        .create()
+        .unwrap();
+    for _ in 0..14 {
+        db.integrity_check().unwrap();
+    }
+    drop(db);
+
+    assert!(audit_path(dir).with_extension("citadel-audit.1").exists());
+    assert!(audit_path(dir).with_extension("citadel-audit.2").exists());
 }
 
 #[test]
@@ -112,6 +146,42 @@ fn audit_log_passphrase_change() {
         .filter(|e| e.event_type == AuditEventType::PassphraseChanged)
         .collect();
     assert_eq!(change_events.len(), 1);
+}
+
+#[test]
+fn audit_failure_reports_that_the_passphrase_change_already_completed() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = AuditConfig {
+        enabled: true,
+        max_file_size: 65,
+        max_rotated_files: 3,
+    };
+    let db = test_builder(dir.path().join("test.citadel"))
+        .passphrase(b"old")
+        .audit_config(config)
+        .create()
+        .unwrap();
+
+    let mut work_name = audit_path(dir.path()).as_os_str().to_os_string();
+    work_name.push(".rotation-work");
+    let work = std::path::PathBuf::from(work_name);
+    std::fs::create_dir(&work).unwrap();
+    std::fs::write(work.join("unknown"), b"blocks recovery").unwrap();
+
+    let error = db.change_passphrase(b"old", b"new").unwrap_err();
+    match error {
+        citadel::Error::AuditFailureAfterOperation { operation, .. } => {
+            assert_eq!(operation, "passphrase change");
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert!(db.verify_passphrase(b"new").unwrap());
+    assert!(!db.verify_passphrase(b"old").unwrap());
+
+    drop(db);
+    std::fs::remove_file(work.join("unknown")).unwrap();
+    std::fs::remove_dir(work).unwrap();
+    drop(open_test_db(dir.path(), b"new"));
 }
 
 #[test]
@@ -247,11 +317,8 @@ fn audit_disabled_no_file() {
         max_file_size: 10 * 1024 * 1024,
         max_rotated_files: 3,
     };
-    let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
+    let db = test_builder(dir.path().join("test.citadel"))
         .passphrase(b"pass")
-        .kdf_algorithm(KdfAlgorithm::Pbkdf2HmacSha256)
-        .pbkdf2_iterations(600_000)
-        .cache_size(64)
         .audit_config(config)
         .create()
         .unwrap();
@@ -262,11 +329,8 @@ fn audit_disabled_no_file() {
 #[test]
 fn audit_in_memory_no_log() {
     let dir = tempfile::tempdir().unwrap();
-    let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
+    let db = test_builder(dir.path().join("test.citadel"))
         .passphrase(b"pass")
-        .kdf_algorithm(KdfAlgorithm::Pbkdf2HmacSha256)
-        .pbkdf2_iterations(600_000)
-        .cache_size(64)
         .create_in_memory()
         .unwrap();
     drop(db);
@@ -391,6 +455,37 @@ fn audit_file_format_magic() {
 }
 
 #[test]
+fn current_database_rejects_a_v1_audit_header_downgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let pass = b"pass";
+    drop(create_test_db(dir.path(), pass));
+
+    let path = audit_path(dir.path());
+    let mut bytes = std::fs::read(&path).unwrap();
+    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 2);
+    assert_eq!(&bytes[32..64], &[0u8; 32]);
+    bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+    std::fs::write(&path, bytes).unwrap();
+
+    // A first-generation v2 file seeds from zero, as v1 verification does, so
+    // the records still verify if the mutable version word is considered alone.
+    let audit_key = get_audit_key(dir.path(), pass);
+    assert!(verify_audit_log(&path, &audit_key).unwrap().chain_valid);
+
+    let error = match test_builder(dir.path().join("test.citadel"))
+        .passphrase(pass)
+        .open()
+    {
+        Ok(db) => {
+            drop(db);
+            panic!("a current database accepted a downgraded audit header")
+        }
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("audit-log downgrade detected"));
+}
+
+#[test]
 fn audit_entry_detail_data() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_test_db(dir.path(), b"pass");
@@ -404,7 +499,35 @@ fn audit_entry_detail_data() {
 
     assert_eq!(create_entry.detail.len(), 2);
     assert_eq!(create_entry.detail[0], 0); // cipher_id
-    assert_eq!(create_entry.detail[1], 1); // kdf_algorithm
+    let expected_kdf = if cfg!(feature = "fips") { 1 } else { 0 };
+    assert_eq!(create_entry.detail[1], expected_kdf);
+}
+
+#[cfg(unix)]
+#[test]
+fn open_refuses_key_and_audit_symlinks_even_when_the_targets_are_valid() {
+    use std::os::unix::fs::symlink;
+
+    for suffix in [".citadel-keys", ".citadel-audit"] {
+        let dir = tempfile::tempdir().unwrap();
+        drop(create_test_db(dir.path(), b"pass"));
+        let data = dir.path().join("test.citadel");
+        let sidecar = dir.path().join(format!("test.citadel{suffix}"));
+        let moved = dir.path().join("moved-sidecar");
+        std::fs::rename(&sidecar, &moved).unwrap();
+        symlink(&moved, &sidecar).unwrap();
+        let before = std::fs::read(&moved).unwrap();
+
+        test_builder(data)
+            .passphrase(b"pass")
+            .open()
+            .expect_err("storage sidecars must not be followed through symlinks");
+        assert_eq!(std::fs::read(&moved).unwrap(), before);
+        assert!(std::fs::symlink_metadata(&sidecar)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
 }
 
 #[test]
@@ -416,11 +539,8 @@ fn audit_rotation_triggers_on_size() {
         max_rotated_files: 2,
     };
 
-    let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
+    let db = test_builder(dir.path().join("test.citadel"))
         .passphrase(b"pass")
-        .kdf_algorithm(KdfAlgorithm::Pbkdf2HmacSha256)
-        .pbkdf2_iterations(600_000)
-        .cache_size(64)
         .audit_config(config)
         .create()
         .unwrap();
@@ -444,11 +564,8 @@ fn audit_rotation_deletes_old_files() {
         max_rotated_files: 1,
     };
 
-    let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
+    let db = test_builder(dir.path().join("test.citadel"))
         .passphrase(b"pass")
-        .kdf_algorithm(KdfAlgorithm::Pbkdf2HmacSha256)
-        .pbkdf2_iterations(600_000)
-        .cache_size(64)
         .audit_config(config)
         .create()
         .unwrap();
@@ -474,11 +591,8 @@ fn audit_verify_chain_valid_after_rotation() {
         max_rotated_files: 2,
     };
 
-    let db = DatabaseBuilder::new(dir.path().join("test.citadel"))
+    let db = test_builder(dir.path().join("test.citadel"))
         .passphrase(pass)
-        .kdf_algorithm(KdfAlgorithm::Pbkdf2HmacSha256)
-        .pbkdf2_iterations(600_000)
-        .cache_size(64)
         .audit_config(config)
         .create()
         .unwrap();
@@ -503,6 +617,154 @@ fn audit_verify_chain_valid_after_rotation() {
 
     let rotated_result = verify_audit_log(&rotated_1, &audit_key).unwrap();
     assert!(rotated_result.chain_valid);
+}
+
+#[test]
+fn audit_chain_detects_a_missing_rotation_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let pass = b"pass";
+    create_rotated_history(dir.path(), pass);
+
+    let rotated_1 = dir.path().join("test.citadel.citadel-audit.1");
+    let rotated_2 = dir.path().join("test.citadel.citadel-audit.2");
+    std::fs::remove_file(&rotated_1).unwrap();
+
+    let db = open_test_db(dir.path(), pass);
+    let paths = db.audit_log_paths().unwrap();
+    assert!(
+        paths.contains(&rotated_2),
+        "discovery must not stop at the missing .1 and hide .2"
+    );
+    let verified = db.verify_audit_chain().unwrap();
+    assert!(
+        verified.iter().any(|(_, result)| !result.chain_valid),
+        "a generation gap must break whole-history verification"
+    );
+}
+
+#[test]
+fn open_refuses_to_replace_a_missing_live_log_beside_retained_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let pass = b"pass";
+    create_rotated_history(dir.path(), pass);
+
+    let live = audit_path(dir.path());
+    let retained = live.with_extension("citadel-audit.1");
+    assert!(retained.exists());
+    std::fs::remove_file(&live).unwrap();
+
+    let error = match test_builder(dir.path().join("test.citadel"))
+        .passphrase(pass)
+        .open()
+    {
+        Ok(db) => {
+            drop(db);
+            panic!("missing live audit history was silently replaced")
+        }
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("rotated generations"));
+    assert!(
+        !live.exists(),
+        "the refused open created a detached live log"
+    );
+    assert!(retained.exists());
+}
+
+#[test]
+fn audit_chain_detects_reordered_individually_valid_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let pass = b"pass";
+    create_rotated_history(dir.path(), pass);
+
+    let rotated_1 = dir.path().join("test.citadel.citadel-audit.1");
+    let rotated_2 = dir.path().join("test.citadel.citadel-audit.2");
+    let swap = dir.path().join("audit-swap.tmp");
+    std::fs::rename(&rotated_1, &swap).unwrap();
+    std::fs::rename(&rotated_2, &rotated_1).unwrap();
+    std::fs::rename(&swap, &rotated_2).unwrap();
+
+    let audit_key = get_audit_key(dir.path(), pass);
+    assert!(
+        verify_audit_log(&rotated_1, &audit_key)
+            .unwrap()
+            .chain_valid
+    );
+    assert!(
+        verify_audit_log(&rotated_2, &audit_key)
+            .unwrap()
+            .chain_valid
+    );
+
+    let db = open_test_db(dir.path(), pass);
+    let verified = db.verify_audit_chain().unwrap();
+    assert!(
+        verified.iter().any(|(_, result)| !result.chain_valid),
+        "per-file verification must not substitute for seed handoff and sequence order"
+    );
+}
+
+#[test]
+fn audit_chain_checks_every_segment_file_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let pass = b"pass";
+    create_rotated_history(dir.path(), pass);
+
+    let rotated_1 = dir.path().join("test.citadel.citadel-audit.1");
+    let mut bytes = std::fs::read(&rotated_1).unwrap();
+    let file_id = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    bytes[8..16].copy_from_slice(&(file_id ^ 1).to_le_bytes());
+    std::fs::write(&rotated_1, bytes).unwrap();
+
+    let audit_key = get_audit_key(dir.path(), pass);
+    assert!(
+        verify_audit_log(&rotated_1, &audit_key)
+            .unwrap()
+            .chain_valid,
+        "the legacy single-file API does not know the expected database identity"
+    );
+
+    let db = open_test_db(dir.path(), pass);
+    let verified = db.verify_audit_chain().unwrap();
+    let (_, result) = verified
+        .iter()
+        .find(|(path, _)| path == &rotated_1)
+        .unwrap();
+    assert!(!result.chain_valid);
+}
+
+#[test]
+fn audit_chain_detects_count_patched_tail_cut_in_a_rotated_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let pass = b"pass";
+    create_rotated_history(dir.path(), pass);
+
+    let rotated_1 = dir.path().join("test.citadel.citadel-audit.1");
+    let entries = read_audit_log(&rotated_1).unwrap();
+    assert!(entries.len() >= 2);
+    let bytes = std::fs::read(&rotated_1).unwrap();
+    let mut end = 64usize;
+    for _ in 0..entries.len() - 1 {
+        end += 4;
+        let len = u32::from_le_bytes(bytes[end..end + 4].try_into().unwrap()) as usize;
+        end += len;
+    }
+    let mut truncated = bytes[..end].to_vec();
+    let declared = u64::from_le_bytes(truncated[24..32].try_into().unwrap());
+    truncated[24..32].copy_from_slice(&(declared - 1).to_le_bytes());
+    std::fs::write(&rotated_1, truncated).unwrap();
+
+    let audit_key = get_audit_key(dir.path(), pass);
+    let local = verify_audit_log(&rotated_1, &audit_key).unwrap();
+    assert!(local.chain_valid);
+    assert_eq!(local.entries_missing(), 0);
+
+    let db = open_test_db(dir.path(), pass);
+    let verified = db.verify_audit_chain().unwrap();
+    assert!(
+        verified.iter().any(|(_, result)| !result.chain_valid),
+        "the successor seed must expose a patched-count tail cut in its predecessor"
+    );
 }
 
 #[test]
@@ -687,16 +949,88 @@ fn scenario_truncation_detected_by_count() {
     let entries_after = read_audit_log(&ap).unwrap();
     assert_eq!(entries_after.len(), original_count - 1);
 
+    // Cutting the tail takes the linking MAC with it, so the remainder is a
+    // shorter chain that verifies. A count left behind exposes this particular
+    // uncoordinated cut, but the count itself is not authenticated.
     let audit_key = get_audit_key(dir.path(), pass);
     let result = verify_audit_log(&ap, &audit_key).unwrap();
     assert!(result.chain_valid);
     assert_eq!(result.entries_verified, (original_count - 1) as u64);
+    assert_eq!(result.entries_declared, original_count as u64);
+    assert_eq!(result.entries_missing(), 1);
+}
 
-    // Header entry_count still reflects original total - mismatch reveals
-    // truncation
-    let header_data = std::fs::read(&ap).unwrap();
-    let header_count = u64::from_le_bytes(header_data[24..32].try_into().unwrap());
-    assert_ne!(header_count as usize, entries_after.len());
+#[test]
+fn truncated_log_reports_its_shortfall_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let pass = b"pass";
+
+    let db = create_test_db(dir.path(), pass);
+    db.integrity_check().unwrap();
+    drop(db);
+
+    let ap = audit_path(dir.path());
+    let entries = read_audit_log(&ap).unwrap();
+    let original_count = entries.len();
+    assert!(original_count >= 3);
+
+    let data = std::fs::read(&ap).unwrap();
+    let mut offset = 64usize;
+    for _ in 0..original_count - 1 {
+        offset += 4;
+        let entry_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += entry_len;
+    }
+    std::fs::write(&ap, &data[..offset]).unwrap();
+
+    // Opening recounts and the open event rewrites the header, so a shortfall is
+    // legible for one moment. This surface keeps that best-effort signal.
+    let db = open_test_db(dir.path(), pass);
+    assert_eq!(db.audit_entries_missing(), Some(1));
+
+    // The chain itself still verifies: this mismatch is a separate consistency
+    // warning, not authenticated proof of what happened.
+    let verified = db.verify_audit_chain().unwrap();
+    assert!(verified.iter().all(|(_, r)| r.chain_valid));
+}
+
+#[test]
+fn an_untouched_log_reports_no_shortfall() {
+    let dir = tempfile::tempdir().unwrap();
+    let pass = b"pass";
+
+    let db = create_test_db(dir.path(), pass);
+    db.integrity_check().unwrap();
+    drop(db);
+
+    let db = open_test_db(dir.path(), pass);
+    assert_eq!(db.audit_entries_missing(), Some(0));
+    for (_, result) in db.verify_audit_chain().unwrap() {
+        assert_eq!(result.entries_missing(), 0);
+    }
+}
+
+#[test]
+fn a_torn_trailing_write_is_not_a_shortfall() {
+    let dir = tempfile::tempdir().unwrap();
+    let pass = b"pass";
+
+    let db = create_test_db(dir.path(), pass);
+    db.integrity_check().unwrap();
+    drop(db);
+
+    // An entry is synced before the header count that covers it, so a crash
+    // between the two leaves more records than the header declares. Benign, and
+    // the opposite direction from a removal.
+    let ap = audit_path(dir.path());
+    let data = std::fs::read(&ap).unwrap();
+    let count = u64::from_le_bytes(data[24..32].try_into().unwrap());
+    let mut patched = data.clone();
+    patched[24..32].copy_from_slice(&(count - 1).to_le_bytes());
+    std::fs::write(&ap, &patched).unwrap();
+
+    let db = open_test_db(dir.path(), pass);
+    assert_eq!(db.audit_entries_missing(), Some(0));
 }
 
 #[test]

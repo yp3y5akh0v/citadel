@@ -11,7 +11,7 @@ use citadel_core::{
 
 use crate::hkdf_utils::derive_keys_from_rek;
 use crate::kdf::derive_mk;
-use crate::key_manager::{unwrap_rek, wrap_rek};
+use crate::key_manager::{key_file_flags_valid, unwrap_rek, wrap_rek};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -23,6 +23,8 @@ pub struct KeyBackup {
     pub file_id: u64,
     pub cipher_id: CipherId,
     pub kdf_algorithm: KdfAlgorithm,
+    /// Authenticated key-file format requirements carried through restore.
+    pub key_file_flags: u16,
     pub kdf_param1: u32,
     pub kdf_param2: u32,
     pub kdf_param3: u32,
@@ -41,7 +43,7 @@ impl KeyBackup {
         buf[8..16].copy_from_slice(&self.file_id.to_le_bytes());
         buf[16] = self.cipher_id as u8;
         buf[17] = self.kdf_algorithm as u8;
-        // [18..20] reserved
+        buf[18..20].copy_from_slice(&self.key_file_flags.to_le_bytes());
         buf[20..24].copy_from_slice(&self.kdf_param1.to_le_bytes());
         buf[24..28].copy_from_slice(&self.kdf_param2.to_le_bytes());
         buf[28..32].copy_from_slice(&self.kdf_param3.to_le_bytes());
@@ -73,12 +75,18 @@ impl KeyBackup {
         let kdf_algorithm =
             KdfAlgorithm::from_u8(buf[17]).ok_or(citadel_core::Error::UnsupportedKdf(buf[17]))?;
 
+        let key_file_flags = u16::from_le_bytes(buf[18..20].try_into().unwrap());
+        if !key_file_flags_valid(key_file_flags) {
+            return Err(citadel_core::Error::KeyFileIntegrity);
+        }
+
         Ok(Self {
             magic,
             version,
             file_id: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
             cipher_id,
             kdf_algorithm,
+            key_file_flags,
             kdf_param1: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
             kdf_param2: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
             kdf_param3: u32::from_le_bytes(buf[28..32].try_into().unwrap()),
@@ -127,8 +135,8 @@ fn compute_backup_mac(mac_key: &[u8; KEY_SIZE], data: &[u8]) -> [u8; MAC_SIZE] {
     out
 }
 
-/// Create a key backup, wrapping the REK under a BEK derived from
-/// `backup_passphrase`.
+/// Create a key backup, preserving the authenticated key-file requirements and
+/// wrapping the REK under a BEK derived from `backup_passphrase`.
 #[allow(clippy::too_many_arguments)]
 pub fn create_key_backup(
     rek: &[u8; KEY_SIZE],
@@ -140,7 +148,11 @@ pub fn create_key_backup(
     kdf_param2: u32,
     kdf_param3: u32,
     epoch: u32,
+    key_file_flags: u16,
 ) -> citadel_core::Result<[u8; KEY_BACKUP_SIZE]> {
+    if !key_file_flags_valid(key_file_flags) {
+        return Err(citadel_core::Error::KeyFileIntegrity);
+    }
     let backup_salt = crate::kdf::generate_salt();
 
     let bek = derive_mk(
@@ -160,6 +172,7 @@ pub fn create_key_backup(
         file_id,
         cipher_id,
         kdf_algorithm,
+        key_file_flags,
         kdf_param1,
         kdf_param2,
         kdf_param3,
@@ -202,6 +215,7 @@ pub fn restore_rek_from_backup(
         file_id: backup.file_id,
         cipher_id: backup.cipher_id,
         kdf_algorithm: backup.kdf_algorithm,
+        key_file_flags: backup.key_file_flags,
         kdf_param1: backup.kdf_param1,
         kdf_param2: backup.kdf_param2,
         kdf_param3: backup.kdf_param3,
@@ -215,6 +229,8 @@ pub struct RestoreResult {
     pub file_id: u64,
     pub cipher_id: CipherId,
     pub kdf_algorithm: KdfAlgorithm,
+    /// Authenticated key-file policy flags preserved by the backup.
+    pub key_file_flags: u16,
     pub kdf_param1: u32,
     pub kdf_param2: u32,
     pub kdf_param3: u32,

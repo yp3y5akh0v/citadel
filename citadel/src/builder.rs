@@ -1,5 +1,5 @@
 #[cfg(not(target_arch = "wasm32"))]
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -9,7 +9,9 @@ use citadel_core::{Error, Result, DEFAULT_BUFFER_POOL_SIZE, PBKDF2_MIN_ITERATION
 #[cfg(not(target_arch = "wasm32"))]
 use citadel_core::{FILE_HEADER_SIZE, KEY_FILE_SIZE};
 use citadel_crypto::hkdf_utils::RegionWrapKeys;
-use citadel_crypto::key_manager::{create_key_file, create_key_file_with_region_keys};
+use citadel_crypto::key_manager::{
+    create_key_file, create_key_file_with_region_keys, KeyFileAuthKey,
+};
 #[cfg(not(target_arch = "wasm32"))]
 use citadel_crypto::key_manager::{open_key_file, open_key_file_with_region_keys};
 use citadel_crypto::page_cipher::compute_dek_id;
@@ -25,7 +27,9 @@ use citadel_io::traits::PageIO;
 use citadel_txn::manager::TxnManager;
 use zeroize::Zeroizing;
 
-use crate::database::Database;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::database::{atomic_write_for_operation, CreatedFileGuard};
+use crate::database::{Database, KeyFileState};
 
 /// Builder for creating or opening a Citadel database.
 ///
@@ -40,6 +44,13 @@ use crate::database::Database;
 ///     .create()
 ///     .unwrap();
 /// ```
+/// Key-file identity and authenticated state shared by both `finish` variants.
+struct FileIdentity {
+    key_path: PathBuf,
+    file_id: u64,
+    key_file: KeyFileState,
+}
+
 pub struct DatabaseBuilder {
     path: PathBuf,
     key_path: Option<PathBuf>,
@@ -165,6 +176,21 @@ impl DatabaseBuilder {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn refuse_stale_sidecar(path: &std::path::Path, what: &str) -> Result<()> {
+        if durable::path_entry_exists(path)? {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "{what} already exists at {}, but its database does not. It belongs to a \
+                     database that was deleted without it; move it aside to create a new one here.",
+                    path.display()
+                ),
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn create_page_io(file: std::fs::File) -> Box<dyn PageIO> {
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         {
@@ -224,31 +250,79 @@ impl DatabaseBuilder {
     fn finish(
         self,
         manager: TxnManager,
-        key_path: PathBuf,
-        file_id: u64,
+        file: FileIdentity,
         audit_key: [u8; citadel_core::KEY_SIZE],
         region_keys: Option<RegionWrapKeys>,
         initial_event: Option<(crate::audit::AuditEventType, Vec<u8>)>,
     ) -> Result<Database> {
         use crate::audit;
+        let FileIdentity {
+            key_path,
+            file_id,
+            mut key_file,
+        } = file;
 
-        let audit_log = if self.audit_config.enabled && !self.path.as_os_str().is_empty() {
+        // Audit enforcement has its own authenticated marker. Slots may have
+        // become V1 while audit logging was disabled; using the slot marker
+        // would reject the still-valid legacy audit before the upgrade.
+        let audit_v2_required = key_file.audit_v2_required();
+        let mut audit_log = if self.audit_config.enabled && !self.path.as_os_str().is_empty() {
             let audit_path = audit::resolve_audit_path(&self.path);
-            let log = if audit_path.exists() {
-                audit::AuditLog::open_existing(&audit_path, file_id, audit_key, self.audit_config)?
-            } else {
-                audit::AuditLog::create(
+            audit::recover_rotation(&audit_path, &audit_key)?;
+            let log = if durable::path_entry_exists(&audit_path)? {
+                audit::AuditLog::open_existing(
                     &audit_path,
                     file_id,
                     audit_key,
                     self.audit_config,
-                    manager.slots_flagged(),
+                    audit_v2_required,
                 )?
+            } else {
+                let mut log = audit::AuditLog::create(
+                    &audit_path,
+                    file_id,
+                    audit_key,
+                    self.audit_config,
+                    // A missing sidecar has no legacy history to preserve.
+                    // Once the data slots are protected, create v2 directly
+                    // instead of durably writing v1 only to rewrite it below.
+                    audit_v2_required || manager.slots_flagged(),
+                )?;
+                log.discard_if_initialization_fails();
+                log
             };
             Some(log)
         } else {
             None
         };
+
+        // Heal each authenticated policy independently: a legacy audit upgrades
+        // before its marker becomes durable, and a disabled audit leaves the
+        // marker unset so enabling it later repairs the same way. All idempotent,
+        // so an interrupted open resumes safely.
+        if manager.slots_flagged() && !key_path.as_os_str().is_empty() {
+            let upgrade_audit = audit_log.is_some() && !key_file.audit_v2_required();
+            if upgrade_audit {
+                audit_log.as_mut().expect("checked above").upgrade_to_v2()?;
+            }
+
+            let mut key_file_changed = false;
+            if !key_file.slots_v1_required() {
+                key_file.require_v1_slots();
+                key_file_changed = true;
+            }
+            if upgrade_audit {
+                key_file.require_audit_v2();
+                key_file_changed = true;
+            }
+            if key_file_changed {
+                atomic_write_for_operation(
+                    &key_path,
+                    &key_file.serialize(),
+                    "authenticated format policy repair",
+                )?;
+            }
+        }
 
         manager.set_secure_delete(self.secure_delete);
         let db = Database::new(
@@ -256,12 +330,17 @@ impl DatabaseBuilder {
             self.path,
             key_path,
             file_id,
+            key_file,
             region_keys,
             audit_log,
         );
 
         if let Some((event, detail)) = initial_event {
-            db.log_audit(event, &detail);
+            // Neither a failed create (rolled back by CreatedFileGuard) nor a
+            // failed open completed from the caller's view, so this stays an
+            // ordinary audit error rather than AuditFailureAfterOperation.
+            db.log_audit(event, &detail)?;
+            db.retain_created_audit_history();
         }
 
         Ok(db)
@@ -271,18 +350,35 @@ impl DatabaseBuilder {
     fn finish(
         self,
         manager: TxnManager,
-        key_path: PathBuf,
-        file_id: u64,
+        file: FileIdentity,
         _audit_key: [u8; citadel_core::KEY_SIZE],
         region_keys: Option<RegionWrapKeys>,
         _initial_event: Option<((), Vec<u8>)>,
     ) -> Result<Database> {
+        let FileIdentity {
+            key_path,
+            file_id,
+            mut key_file,
+        } = file;
+        if manager.slots_flagged()
+            && !key_file.slots_v1_required()
+            && !key_path.as_os_str().is_empty()
+        {
+            key_file.require_v1_slots();
+            #[cfg(not(target_arch = "wasm32"))]
+            atomic_write_for_operation(
+                &key_path,
+                &key_file.serialize(),
+                "authenticated format policy repair",
+            )?;
+        }
         manager.set_secure_delete(self.secure_delete);
         Ok(Database::new(
             manager,
             self.path,
             key_path,
             file_id,
+            key_file,
             region_keys,
         ))
     }
@@ -297,6 +393,10 @@ impl DatabaseBuilder {
         #[cfg(feature = "fips")]
         self.validate_fips()?;
         self.validate_cache_size()?;
+        #[cfg(feature = "audit-log")]
+        if self.audit_config.enabled {
+            crate::audit::validate_audit_config(&self.audit_config)?;
+        }
 
         let passphrase = self
             .passphrase
@@ -304,29 +404,41 @@ impl DatabaseBuilder {
             .ok_or(Error::PassphraseRequired)?;
 
         let key_path = self.resolve_key_path();
+        // Fail before creating the data file rather than leave a partial vault
+        // when an orphaned sidecar is present.
+        Self::refuse_stale_sidecar(&key_path, "key file")?;
+        #[cfg(feature = "audit-log")]
+        if !self.path.as_os_str().is_empty() {
+            let audit_path = crate::audit::resolve_audit_path(&self.path);
+            Self::refuse_stale_sidecar(&audit_path, "audit log")?;
+            Self::refuse_stale_sidecar(
+                &crate::audit::rotation_work_path(&audit_path),
+                "audit rotation journal",
+            )?;
+            Self::refuse_stale_sidecar(
+                &crate::audit::audit_upgrade_path(&audit_path),
+                "audit upgrade image",
+            )?;
+            crate::audit::ensure_no_retained_audit_history(&audit_path)?;
+        }
+
         let file_id: u64 = rand::random();
 
         let (kf, keys, region_keys) = self.create_keys(passphrase, file_id)?;
+        let key_file_auth = KeyFileAuthKey::from_database_mac_key(&keys.mac_key);
 
-        // Existence guard before the key file is written: create() on an
-        // existing database must not overwrite its key material.
+        let mut created = CreatedFileGuard::new();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(&self.path)?;
+        created.track(&self.path);
 
-        let init = file_lock::try_lock_exclusive(&file)
-            .and_then(|()| Ok(durable::fsync_directory(&self.path)?))
-            .and_then(|()| Ok(durable::write_and_sync(&key_path, &kf.serialize())?));
-        if let Err(e) = init {
-            // Best-effort: remove the just-created data file so a retried
-            // create() can succeed. Drop the handle first - Windows cannot
-            // delete a file with an open locked handle.
-            drop(file);
-            let _ = fs::remove_file(&self.path);
-            return Err(e);
-        }
+        file_lock::try_lock_exclusive(&file)?;
+        durable::fsync_directory(&self.path)?;
+        durable::write_new_and_sync(&key_path, &kf.serialize())?;
+        created.track(&key_path);
 
         let dek_id = compute_dek_id(&keys.mac_key, &keys.dek);
         let io = Self::create_page_io(file);
@@ -350,14 +462,21 @@ impl DatabaseBuilder {
         #[cfg(not(feature = "audit-log"))]
         let event: Option<((), Vec<u8>)> = None;
 
-        self.finish(
+        let result = self.finish(
             manager,
-            key_path,
-            file_id,
+            FileIdentity {
+                key_path,
+                file_id,
+                key_file: KeyFileState::new(kf, key_file_auth),
+            },
             keys.audit_key,
             region_keys,
             event,
-        )
+        );
+        if result.is_ok() {
+            created.disarm();
+        }
+        result
     }
 
     /// Create a new in-memory database (volatile, no file I/O).
@@ -383,7 +502,8 @@ impl DatabaseBuilder {
 
         let file_id: u64 = rand::random();
 
-        let (_kf, keys, region_keys) = self.create_keys(passphrase, file_id)?;
+        let (kf, keys, region_keys) = self.create_keys(passphrase, file_id)?;
+        let key_file_auth = KeyFileAuthKey::from_database_mac_key(&keys.mac_key);
 
         let dek_id = compute_dek_id(&keys.mac_key, &keys.dek);
         let io: Box<dyn PageIO> = Box::new(citadel_io::memory_io::MemoryPageIO::new());
@@ -403,8 +523,11 @@ impl DatabaseBuilder {
         self.path = PathBuf::new();
         self.finish(
             manager,
-            PathBuf::new(),
-            file_id,
+            FileIdentity {
+                key_path: PathBuf::new(),
+                file_id,
+                key_file: KeyFileState::new(kf, key_file_auth),
+            },
             keys.audit_key,
             region_keys,
             None,
@@ -415,6 +538,10 @@ impl DatabaseBuilder {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(self) -> Result<Database> {
         self.validate_cache_size()?;
+        #[cfg(feature = "audit-log")]
+        if self.audit_config.enabled {
+            crate::audit::validate_audit_config(&self.audit_config)?;
+        }
 
         let passphrase = self
             .passphrase
@@ -432,27 +559,22 @@ impl DatabaseBuilder {
         file.read_exact(&mut header_buf)?;
         let header = FileHeader::deserialize(&header_buf)?;
 
-        let key_data = fs::read(&key_path)?;
-        if key_data.len() != KEY_FILE_SIZE {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "key file has incorrect size",
-            )));
-        }
-        let key_buf: [u8; KEY_FILE_SIZE] = key_data.try_into().unwrap();
+        let (key_buf, _) = durable::read_regular_file_exact::<KEY_FILE_SIZE>(&key_path)?;
         let (kf, keys, region_keys) = self.open_keys(&key_buf, passphrase, header.file_id)?;
+        let key_file_auth = KeyFileAuthKey::from_database_mac_key(&keys.mac_key);
 
         let dek_id = compute_dek_id(&keys.mac_key, &keys.dek);
 
         let io = Self::create_page_io(file);
 
-        let manager = TxnManager::open_with_sync(
+        let manager = TxnManager::open_with_sync_and_v1_requirement(
             io,
             keys.dek,
             keys.mac_key,
             kf.current_epoch,
             self.cache_size,
             self.sync_mode,
+            kf.slots_v1_required(),
         )?;
 
         let slot = manager.current_slot();
@@ -467,8 +589,11 @@ impl DatabaseBuilder {
 
         self.finish(
             manager,
-            key_path,
-            header.file_id,
+            FileIdentity {
+                key_path,
+                file_id: header.file_id,
+                key_file: KeyFileState::new(kf, key_file_auth),
+            },
             keys.audit_key,
             region_keys,
             event,

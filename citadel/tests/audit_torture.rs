@@ -1,3 +1,5 @@
+#![cfg(feature = "audit-log")]
+
 use std::path::Path;
 
 use citadel::{

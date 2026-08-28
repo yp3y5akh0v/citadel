@@ -1,5 +1,56 @@
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn path_entry_exists_counts_a_dangling_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let link = dir.path().join("reserved-sidecar");
+    symlink(dir.path().join("missing-target"), &link).unwrap();
+
+    assert!(path_entry_exists(&link).unwrap());
+    assert!(!link.try_exists().unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn regular_file_open_refuses_symlinks_and_fifos() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    let link = dir.path().join("link");
+    let fifo = dir.path().join("fifo");
+    fs::write(&target, b"data").unwrap();
+    symlink(&target, &link).unwrap();
+    let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+
+    assert!(open_regular_read(&link).is_err());
+    assert!(open_regular_read(&fifo).is_err());
+    assert_eq!(read_regular_file(&target).unwrap().0, b"data");
+    assert!(read_regular_file_exact::<4>(&link).is_err());
+    assert!(read_regular_file_exact::<4>(&fifo).is_err());
+}
+
+#[test]
+fn exact_regular_file_read_rejects_the_wrong_size_before_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let exact = dir.path().join("exact");
+    let short = dir.path().join("short");
+    let long = dir.path().join("long");
+    fs::write(&exact, b"data").unwrap();
+    fs::write(&short, b"dat").unwrap();
+    fs::write(&long, b"data!").unwrap();
+
+    assert_eq!(read_regular_file_exact::<4>(&exact).unwrap().0, *b"data");
+    for path in [&short, &long] {
+        let error = read_regular_file_exact::<4>(path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+}
+
 #[test]
 fn atomic_write_creates_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -24,14 +75,74 @@ fn atomic_write_replaces_existing() {
 }
 
 #[test]
-fn atomic_write_no_temp_file_left() {
+fn atomic_write_does_not_touch_the_legacy_temp_sibling() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.dat");
     let temp_path = path.with_extension("tmp");
+    fs::write(&temp_path, b"unrelated").unwrap();
 
     atomic_write(&path, b"data").unwrap();
 
-    assert!(!temp_path.exists());
+    assert_eq!(fs::read(&temp_path).unwrap(), b"unrelated");
+    let prefix = format!("{}.tmp.", path.file_name().unwrap().to_string_lossy());
+    assert!(fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(&prefix)));
+}
+
+#[test]
+fn atomic_write_reports_a_failure_after_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.dat");
+    fs::write(&path, b"old").unwrap();
+
+    let error = atomic_write_with_directory_sync(&path, b"new", |_| {
+        Err(std::io::Error::other("injected directory sync failure"))
+    })
+    .unwrap_err();
+
+    assert!(error.was_published());
+    assert_eq!(fs::read(&path).unwrap(), b"new");
+}
+
+#[test]
+fn atomic_write_preserves_the_destination_before_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.dat");
+    fs::write(&path, b"old").unwrap();
+
+    let error = atomic_write_with_callbacks(
+        &path,
+        b"new",
+        || Err(std::io::Error::other("injected pre-publish failure")),
+        |_| panic!("directory sync must not run before publication"),
+    )
+    .unwrap_err();
+
+    assert!(!error.was_published());
+    assert_eq!(fs::read(&path).unwrap(), b"old");
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_write_refuses_to_replace_a_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    let link = dir.path().join("link");
+    fs::write(&target, b"keep me").unwrap();
+    symlink(&target, &link).unwrap();
+
+    let error = atomic_write_with_status(&link, b"replacement").unwrap_err();
+    assert!(!error.was_published());
+    assert_eq!(fs::read(&target).unwrap(), b"keep me");
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }
 
 #[test]
@@ -43,6 +154,30 @@ fn write_and_sync_creates_file() {
 
     let data = fs::read(&path).unwrap();
     assert_eq!(data, b"hello");
+}
+
+#[test]
+fn write_new_and_sync_never_truncates_an_existing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("existing");
+    std::fs::write(&path, b"keep me").unwrap();
+
+    let error = write_new_and_sync(&path, b"replacement").unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
+}
+
+#[test]
+fn copy_new_and_sync_never_truncates_an_existing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let destination = dir.path().join("destination");
+    std::fs::write(&source, b"new bytes").unwrap();
+    std::fs::write(&destination, b"keep me").unwrap();
+
+    let error = copy_new_and_sync(&source, &destination).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&destination).unwrap(), b"keep me");
 }
 
 // Callers (database create/backup/compact) rely on this to persist new

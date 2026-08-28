@@ -1,8 +1,9 @@
 use aes_kw::Kek;
+use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use citadel_core::types::{CipherId, KdfAlgorithm};
 use citadel_core::{
@@ -18,6 +19,52 @@ use crate::kdf::derive_mk;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Authenticated key-file metadata requires V1 commit slots.
+///
+/// Stored in the formerly reserved `[46..48]` field and covered by the key-file
+/// MAC; zero remains the released legacy format. Not a freshness anchor:
+/// restoring an older authentic unflagged key file removes the witness.
+pub const KEY_FILE_FLAG_SLOTS_V1_REQUIRED: u16 = 0x0001;
+/// Authenticated key-file metadata requires a v2 audit-log header.
+///
+/// Separate from the commit-slot requirement: audit logging can be disabled
+/// while a legacy vault's slots are upgraded, and the sidecar must remain
+/// eligible for a later coordinated upgrade.
+pub const KEY_FILE_FLAG_AUDIT_V2_REQUIRED: u16 = 0x0002;
+pub(crate) const KEY_FILE_KNOWN_FLAGS: u16 =
+    KEY_FILE_FLAG_SLOTS_V1_REQUIRED | KEY_FILE_FLAG_AUDIT_V2_REQUIRED;
+const KEY_FILE_DATA_MAC_INFO: &[u8] = b"citadel-keyfile-data-mac-v1";
+
+pub(crate) fn key_file_flags_valid(flags: u16) -> bool {
+    flags & !KEY_FILE_KNOWN_FLAGS == 0
+        && (flags & KEY_FILE_FLAG_AUDIT_V2_REQUIRED == 0
+            || flags & KEY_FILE_FLAG_SLOTS_V1_REQUIRED != 0)
+}
+
+/// Domain-separated capability for authenticating key-file metadata after the
+/// database has been opened. An open database retains this instead of the
+/// passphrase-derived master key or raw REK, allowing one-way upgrades.
+pub struct KeyFileAuthKey([u8; KEY_SIZE]);
+
+impl KeyFileAuthKey {
+    /// Derive the key-file authentication capability from a database MAC key.
+    /// This applies a dedicated HKDF context; the input is neither a master key
+    /// nor an already-derived key-file authentication key.
+    pub fn from_database_mac_key(database_mac_key: &[u8; KEY_SIZE]) -> Self {
+        let hk = Hkdf::<Sha256>::new(Some(&[0u8; KEY_SIZE]), database_mac_key);
+        let mut key = [0u8; KEY_SIZE];
+        hk.expand(KEY_FILE_DATA_MAC_INFO, &mut key)
+            .expect("HKDF expand should not fail for 32-byte output");
+        Self(key)
+    }
+}
+
+impl Drop for KeyFileAuthKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 /// On-disk key file representation (172 bytes fixed).
 #[derive(Clone)]
 pub struct KeyFile {
@@ -30,6 +77,8 @@ pub struct KeyFile {
     pub argon2_p_cost: u32,
     pub cipher_id: CipherId,
     pub kdf_algorithm: KdfAlgorithm,
+    /// Authenticated format requirements; zero for released legacy key files.
+    pub flags: u16,
     pub wrapped_rek: [u8; WRAPPED_KEY_SIZE],
     pub current_epoch: u32,
     pub prev_wrapped_rek: [u8; WRAPPED_KEY_SIZE],
@@ -51,7 +100,7 @@ impl KeyFile {
         buf[40..44].copy_from_slice(&self.argon2_p_cost.to_le_bytes());
         buf[44] = self.cipher_id as u8;
         buf[45] = self.kdf_algorithm as u8;
-        // [46..48] reserved
+        buf[46..48].copy_from_slice(&self.flags.to_le_bytes());
         buf[48..88].copy_from_slice(&self.wrapped_rek);
         buf[88..92].copy_from_slice(&self.current_epoch.to_le_bytes());
         buf[92..132].copy_from_slice(&self.prev_wrapped_rek);
@@ -82,6 +131,19 @@ impl KeyFile {
         let kdf_algorithm =
             KdfAlgorithm::from_u8(buf[45]).ok_or(citadel_core::Error::UnsupportedKdf(buf[45]))?;
 
+        let flags = u16::from_le_bytes(buf[46..48].try_into().unwrap());
+        if !key_file_flags_valid(flags) {
+            return Err(citadel_core::Error::KeyFileIntegrity);
+        }
+        let rotation_active = match buf[136] {
+            0 => false,
+            1 => true,
+            _ => return Err(citadel_core::Error::KeyFileIntegrity),
+        };
+        if buf[137..140] != [0, 0, 0] {
+            return Err(citadel_core::Error::KeyFileIntegrity);
+        }
+
         Ok(Self {
             magic,
             version,
@@ -92,19 +154,30 @@ impl KeyFile {
             argon2_p_cost: u32::from_le_bytes(buf[40..44].try_into().unwrap()),
             cipher_id,
             kdf_algorithm,
+            flags,
             wrapped_rek: buf[48..88].try_into().unwrap(),
             current_epoch: u32::from_le_bytes(buf[88..92].try_into().unwrap()),
             prev_wrapped_rek: buf[92..132].try_into().unwrap(),
             prev_epoch: u32::from_le_bytes(buf[132..136].try_into().unwrap()),
-            rotation_active: buf[136] != 0,
+            rotation_active,
             file_mac: buf[140..172].try_into().unwrap(),
         })
     }
 
     /// Verify the key file HMAC using the Master Key.
     pub fn verify_mac(&self, mk: &[u8; KEY_SIZE]) -> citadel_core::Result<()> {
-        let mac_key = derive_keyfile_mac_key(mk);
-        let computed = compute_file_mac(&mac_key, &self.serialize()[..140]);
+        if self.slots_v1_required() {
+            let rek = unwrap_rek(mk, &self.wrapped_rek)
+                .map_err(|_| citadel_core::Error::BadPassphrase)?;
+            let keys = derive_keys_from_rek(&rek);
+            let auth_key = KeyFileAuthKey::from_database_mac_key(&keys.mac_key);
+            return self.verify_mac_with_auth_key(&auth_key);
+        }
+        self.verify_mac_with_key(&derive_keyfile_mac_key(mk))
+    }
+
+    fn verify_mac_with_key(&self, mac_key: &[u8; KEY_SIZE]) -> citadel_core::Result<()> {
+        let computed = compute_file_mac(mac_key, &self.serialize()[..140]);
         if self.file_mac.ct_eq(&computed).into() {
             Ok(())
         } else {
@@ -113,10 +186,58 @@ impl KeyFile {
     }
 
     /// Recompute and set the file MAC.
-    pub fn update_mac(&mut self, mk: &[u8; KEY_SIZE]) {
-        let mac_key = derive_keyfile_mac_key(mk);
+    pub fn update_mac(&mut self, mk: &[u8; KEY_SIZE]) -> citadel_core::Result<()> {
+        if self.slots_v1_required() {
+            let rek = unwrap_rek(mk, &self.wrapped_rek)
+                .map_err(|_| citadel_core::Error::KeyFileIntegrity)?;
+            let keys = derive_keys_from_rek(&rek);
+            let auth_key = KeyFileAuthKey::from_database_mac_key(&keys.mac_key);
+            self.update_mac_with_auth_key(&auth_key);
+        } else {
+            self.update_mac_with_key(&derive_keyfile_mac_key(mk));
+        }
+        Ok(())
+    }
+
+    fn update_mac_with_key(&mut self, mac_key: &[u8; KEY_SIZE]) {
         let data = self.serialize();
-        self.file_mac = compute_file_mac(&mac_key, &data[..140]);
+        self.file_mac = compute_file_mac(mac_key, &data[..140]);
+    }
+
+    /// Whether this authenticated key file permanently requires V1 slots.
+    #[inline]
+    pub fn slots_v1_required(&self) -> bool {
+        self.flags & KEY_FILE_FLAG_SLOTS_V1_REQUIRED != 0
+    }
+
+    /// Whether this authenticated key file permanently requires audit v2.
+    #[inline]
+    pub fn audit_v2_required(&self) -> bool {
+        self.flags & KEY_FILE_FLAG_AUDIT_V2_REQUIRED != 0
+    }
+
+    /// Verify a flagged key file with the capability retained by an open database.
+    pub fn verify_mac_with_auth_key(&self, auth_key: &KeyFileAuthKey) -> citadel_core::Result<()> {
+        self.verify_mac_with_key(&auth_key.0)
+    }
+
+    /// Set the one-way V1 requirement and authenticate the resulting image.
+    pub fn require_v1_slots(&mut self, auth_key: &KeyFileAuthKey) {
+        self.flags |= KEY_FILE_FLAG_SLOTS_V1_REQUIRED;
+        self.update_mac_with_auth_key(auth_key);
+    }
+
+    /// Set the one-way audit-v2 requirement and authenticate the image. Audit v2
+    /// is only made mandatory for a vault whose slots are already protected, so
+    /// this also establishes that prerequisite.
+    pub fn require_audit_v2(&mut self, auth_key: &KeyFileAuthKey) {
+        self.flags |= KEY_FILE_FLAG_SLOTS_V1_REQUIRED | KEY_FILE_FLAG_AUDIT_V2_REQUIRED;
+        self.update_mac_with_auth_key(auth_key);
+    }
+
+    /// Re-authenticate flagged metadata after another key-file field changes.
+    pub fn update_mac_with_auth_key(&mut self, auth_key: &KeyFileAuthKey) {
+        self.update_mac_with_key(&auth_key.0);
     }
 }
 
@@ -214,6 +335,7 @@ pub fn create_key_file_with_region_keys(
         argon2_p_cost: p_cost,
         cipher_id,
         kdf_algorithm,
+        flags: KEY_FILE_FLAG_SLOTS_V1_REQUIRED | KEY_FILE_FLAG_AUDIT_V2_REQUIRED,
         wrapped_rek: wrapped,
         current_epoch: 1,
         prev_wrapped_rek: [0u8; WRAPPED_KEY_SIZE],
@@ -221,7 +343,8 @@ pub fn create_key_file_with_region_keys(
         rotation_active: false,
         file_mac: [0u8; MAC_SIZE],
     };
-    kf.update_mac(&mk);
+    let auth_key = KeyFileAuthKey::from_database_mac_key(&keys.mac_key);
+    kf.update_mac_with_auth_key(&auth_key);
 
     Ok((kf, keys, region))
 }
@@ -238,6 +361,10 @@ pub fn open_key_file(
 
 /// Like [`open_key_file`] but also returns the region wrap keys (see
 /// [`create_key_file_with_region_keys`]).
+///
+/// A flagged file's metadata key is derived from the unwrapped REK, so a wrong
+/// passphrase and a damaged wrapped REK are indistinguishable until unwrap and
+/// both report [`citadel_core::Error::BadPassphrase`].
 pub fn open_key_file_with_region_keys(
     buf: &[u8; KEY_FILE_SIZE],
     passphrase: &[u8],
@@ -259,11 +386,20 @@ pub fn open_key_file_with_region_keys(
         kf.argon2_p_cost,
     )?;
 
-    kf.verify_mac(&mk)?;
+    // Released key files use the passphrase-derived MAC. Flagged files use a
+    // database-derived key so an open handle can make authenticated metadata
+    // updates without retaining the master key.
+    if !kf.slots_v1_required() {
+        kf.verify_mac(&mk)?;
+    }
 
     let rek = unwrap_rek(&mk, &kf.wrapped_rek).map_err(|_| citadel_core::Error::BadPassphrase)?;
 
     let keys = derive_keys_from_rek(&rek);
+    if kf.slots_v1_required() {
+        let auth_key = KeyFileAuthKey::from_database_mac_key(&keys.mac_key);
+        kf.verify_mac_with_auth_key(&auth_key)?;
+    }
     let region = derive_region_wrap_keys(&rek);
 
     Ok((kf, keys, region))

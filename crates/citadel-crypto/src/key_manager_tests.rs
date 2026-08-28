@@ -1,6 +1,105 @@
 use super::*;
 
 #[test]
+fn key_file_data_mac_info_has_stable_known_answer() {
+    let auth_key = KeyFileAuthKey::from_database_mac_key(&[0x42; KEY_SIZE]);
+
+    assert_eq!(
+        auth_key.0,
+        [
+            0xa1, 0xe4, 0xef, 0xf2, 0x37, 0x64, 0x4e, 0x7c, 0x34, 0x14, 0xde, 0xe1, 0xf1, 0x9d,
+            0x81, 0x5c, 0x89, 0x4b, 0x67, 0xa4, 0x1b, 0xd8, 0xa5, 0xb9, 0x51, 0x55, 0x26, 0xd4,
+            0x8b, 0x11, 0xaf, 0xde,
+        ]
+    );
+}
+
+#[test]
+fn key_file_policy_layout_has_a_stable_known_answer() {
+    let mut key_file = KeyFile {
+        magic: KEY_FILE_MAGIC,
+        version: KEY_FILE_VERSION,
+        file_id: 0x0102_0304_0506_0708,
+        argon2_salt: [0x10; ARGON2_SALT_SIZE],
+        argon2_m_cost: 0x1112_1314,
+        argon2_t_cost: 0x2122_2324,
+        argon2_p_cost: 0x3132_3334,
+        cipher_id: CipherId::ChaCha20,
+        kdf_algorithm: KdfAlgorithm::Pbkdf2HmacSha256,
+        flags: KEY_FILE_FLAG_SLOTS_V1_REQUIRED | KEY_FILE_FLAG_AUDIT_V2_REQUIRED,
+        wrapped_rek: [0x22; WRAPPED_KEY_SIZE],
+        current_epoch: 0x4142_4344,
+        prev_wrapped_rek: [0x33; WRAPPED_KEY_SIZE],
+        prev_epoch: 0x5152_5354,
+        rotation_active: true,
+        file_mac: [0x44; MAC_SIZE],
+    };
+    let hex: String = key_file
+        .serialize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    assert_eq!(
+        hex,
+        "5359454b010000000807060504030201101010101010101010101010101010101413121124232221343332310101030022222222222222222222222222222222222222222222222222222222222222222222222222222222444342413333333333333333333333333333333333333333333333333333333333333333333333333333333354535251010000004444444444444444444444444444444444444444444444444444444444444444"
+    );
+
+    let auth_key = KeyFileAuthKey::from_database_mac_key(&[0x42; KEY_SIZE]);
+    key_file.update_mac_with_auth_key(&auth_key);
+    assert_eq!(
+        key_file.file_mac,
+        [
+            0x7c, 0x97, 0x66, 0x65, 0x66, 0x51, 0x25, 0xcf, 0xa7, 0xfd, 0x50, 0xe7, 0xfb, 0xdf,
+            0x5f, 0x56, 0xc7, 0xfe, 0x68, 0x1a, 0xb0, 0x6c, 0x4f, 0x97, 0x7c, 0x04, 0x96, 0xb0,
+            0x5c, 0xf3, 0xe3, 0x5d,
+        ]
+    );
+}
+
+#[test]
+fn noncanonical_rotation_flag_is_rejected_before_mac_verification() {
+    let (key_file, _) = create_key_file(
+        b"password",
+        42,
+        CipherId::Aes256Ctr,
+        KdfAlgorithm::Argon2id,
+        64,
+        1,
+        1,
+    )
+    .unwrap();
+    let mut serialized = key_file.serialize();
+    serialized[136] = 2;
+
+    assert!(matches!(
+        KeyFile::deserialize(&serialized),
+        Err(citadel_core::Error::KeyFileIntegrity)
+    ));
+}
+
+#[test]
+fn nonzero_key_file_padding_is_rejected_before_mac_verification() {
+    let (key_file, _) = create_key_file(
+        b"password",
+        42,
+        CipherId::Aes256Ctr,
+        KdfAlgorithm::Argon2id,
+        64,
+        1,
+        1,
+    )
+    .unwrap();
+    let mut serialized = key_file.serialize();
+    serialized[137] = 1;
+
+    assert!(matches!(
+        KeyFile::deserialize(&serialized),
+        Err(citadel_core::Error::KeyFileIntegrity)
+    ));
+}
+
+#[test]
 fn key_file_serialize_deserialize_roundtrip() {
     let (kf, _keys) = create_key_file(
         b"test-password",
@@ -22,6 +121,8 @@ fn key_file_serialize_deserialize_roundtrip() {
     assert_eq!(deserialized.file_id, 0x1234567890ABCDEF);
     assert_eq!(deserialized.cipher_id, CipherId::Aes256Ctr);
     assert_eq!(deserialized.kdf_algorithm, KdfAlgorithm::Argon2id);
+    assert!(deserialized.slots_v1_required());
+    assert!(deserialized.audit_v2_required());
     assert_eq!(deserialized.current_epoch, 1);
     assert!(!deserialized.rotation_active);
 }
@@ -187,7 +288,171 @@ fn open_key_file_wrong_password() {
 
     let serialized = kf.serialize();
     let result = open_key_file(&serialized, b"wrong-password", 42);
-    assert!(result.is_err());
+    assert!(matches!(result, Err(citadel_core::Error::BadPassphrase)));
+}
+
+#[test]
+fn released_zero_flag_key_file_still_opens() {
+    let passphrase = b"legacy-password";
+    let (mut kf, expected) = create_key_file(
+        passphrase,
+        42,
+        CipherId::Aes256Ctr,
+        KdfAlgorithm::Argon2id,
+        64,
+        1,
+        1,
+    )
+    .unwrap();
+    let mk = crate::kdf::derive_mk_argon2id(
+        passphrase,
+        &kf.argon2_salt,
+        kf.argon2_m_cost,
+        kf.argon2_t_cost,
+        kf.argon2_p_cost,
+    )
+    .unwrap();
+
+    // Reproduce the released image: reserved flags are zero and the MAC is
+    // derived from the passphrase master key.
+    kf.flags = 0;
+    kf.update_mac(&mk).unwrap();
+    let (opened, actual) = open_key_file(&kf.serialize(), passphrase, 42).unwrap();
+    assert!(!opened.slots_v1_required());
+    assert!(!opened.audit_v2_required());
+    assert_eq!(actual.dek, expected.dek);
+    assert_eq!(actual.mac_key, expected.mac_key);
+}
+
+#[test]
+fn clearing_authenticated_v1_requirement_is_detected() {
+    let (kf, _) = create_key_file(
+        b"password",
+        42,
+        CipherId::Aes256Ctr,
+        KdfAlgorithm::Argon2id,
+        64,
+        1,
+        1,
+    )
+    .unwrap();
+    let mut serialized = kf.serialize();
+    serialized[46..48].copy_from_slice(&0u16.to_le_bytes());
+
+    let result = open_key_file(&serialized, b"password", 42);
+    assert!(matches!(result, Err(citadel_core::Error::KeyFileIntegrity)));
+}
+
+#[test]
+fn flagged_key_file_mac_update_rejects_a_wrong_master_key_without_mutation() {
+    let (mut key_file, _) = create_key_file(
+        b"password",
+        42,
+        CipherId::Aes256Ctr,
+        KdfAlgorithm::Argon2id,
+        64,
+        1,
+        1,
+    )
+    .unwrap();
+    let before = key_file.file_mac;
+
+    assert!(matches!(
+        key_file.update_mac(&[0x42; KEY_SIZE]),
+        Err(citadel_core::Error::KeyFileIntegrity)
+    ));
+    assert_eq!(key_file.file_mac, before);
+}
+
+#[test]
+fn flagged_key_file_verification_reports_a_wrong_passphrase() {
+    let (key_file, _) = create_key_file(
+        b"password",
+        42,
+        CipherId::Aes256Ctr,
+        KdfAlgorithm::Argon2id,
+        64,
+        1,
+        1,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        key_file.verify_mac(&[0x42; KEY_SIZE]),
+        Err(citadel_core::Error::BadPassphrase)
+    ));
+}
+
+#[test]
+fn setting_authenticated_v1_requirement_on_a_legacy_mac_is_detected() {
+    let passphrase = b"password";
+    let (mut kf, _) = create_key_file(
+        passphrase,
+        42,
+        CipherId::Aes256Ctr,
+        KdfAlgorithm::Argon2id,
+        64,
+        1,
+        1,
+    )
+    .unwrap();
+    let mk = crate::kdf::derive_mk_argon2id(
+        passphrase,
+        &kf.argon2_salt,
+        kf.argon2_m_cost,
+        kf.argon2_t_cost,
+        kf.argon2_p_cost,
+    )
+    .unwrap();
+    kf.flags = 0;
+    kf.update_mac(&mk).unwrap();
+    let mut serialized = kf.serialize();
+    serialized[46..48].copy_from_slice(&KEY_FILE_FLAG_SLOTS_V1_REQUIRED.to_le_bytes());
+
+    let result = open_key_file(&serialized, passphrase, 42);
+    assert!(matches!(result, Err(citadel_core::Error::KeyFileIntegrity)));
+}
+
+#[test]
+fn unknown_key_file_policy_flags_are_rejected() {
+    let (kf, _) = create_key_file(
+        b"password",
+        42,
+        CipherId::Aes256Ctr,
+        KdfAlgorithm::Argon2id,
+        64,
+        1,
+        1,
+    )
+    .unwrap();
+    let mut serialized = kf.serialize();
+    serialized[46..48].copy_from_slice(&0x0040u16.to_le_bytes());
+
+    assert!(matches!(
+        KeyFile::deserialize(&serialized),
+        Err(citadel_core::Error::KeyFileIntegrity)
+    ));
+}
+
+#[test]
+fn audit_v2_requirement_without_protected_slots_is_rejected() {
+    let (kf, _) = create_key_file(
+        b"password",
+        42,
+        CipherId::Aes256Ctr,
+        KdfAlgorithm::Argon2id,
+        64,
+        1,
+        1,
+    )
+    .unwrap();
+    let mut serialized = kf.serialize();
+    serialized[46..48].copy_from_slice(&KEY_FILE_FLAG_AUDIT_V2_REQUIRED.to_le_bytes());
+
+    assert!(matches!(
+        KeyFile::deserialize(&serialized),
+        Err(citadel_core::Error::KeyFileIntegrity)
+    ));
 }
 
 #[test]

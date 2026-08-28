@@ -124,6 +124,9 @@ fn core_category(e: &CoreError) -> Category {
         | CoreError::PageOutOfBounds(_)
         | CoreError::BufferPoolFull
         | CoreError::Io(_)
+        | CoreError::AuditFailureAfterOperation { .. }
+        | CoreError::DurabilityFailureAfterOperation { .. }
+        | CoreError::DurabilityAndAuditFailureAfterOperation { .. }
         | CoreError::Sync(_)
         | CoreError::FipsViolation(_) => Operational,
         CoreError::NoWriteTransaction

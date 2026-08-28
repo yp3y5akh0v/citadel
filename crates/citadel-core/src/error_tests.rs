@@ -17,6 +17,46 @@ fn error_from_io() {
 }
 
 #[test]
+fn post_operation_audit_error_preserves_the_outcome_and_source() {
+    let error = Error::AuditFailureAfterOperation {
+        operation: "passphrase change",
+        source: Box::new(Error::Io(std::io::Error::other("disk full"))),
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "passphrase change completed, but audit logging failed: I/O error: disk full"
+    );
+}
+
+#[test]
+fn post_operation_durability_error_preserves_the_outcome_and_source() {
+    let error = Error::DurabilityFailureAfterOperation {
+        operation: "passphrase change",
+        source: std::io::Error::other("directory sync failed"),
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "passphrase change completed, but its directory entry could not be confirmed durable: directory sync failed"
+    );
+}
+
+#[test]
+fn combined_post_operation_error_preserves_both_failures() {
+    let error = Error::DurabilityAndAuditFailureAfterOperation {
+        operation: "passphrase change",
+        durability: std::io::Error::other("directory sync failed"),
+        audit: Box::new(Error::Io(std::io::Error::other("audit disk full"))),
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "passphrase change completed, but its directory entry could not be confirmed durable: directory sync failed; audit logging also failed: I/O error: audit disk full"
+    );
+}
+
+#[test]
 fn named_table_hash_collision_keeps_both_names_and_hash() {
     let error = Error::NamedTableHashCollision {
         requested: "collision_table_134778".into(),
