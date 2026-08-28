@@ -1921,3 +1921,82 @@ fn iterator_drop_flushes_to_the_measurement_captured_at_construction() {
         "iterator drop lost the span that was active at construction"
     );
 }
+
+#[test]
+fn catalog_readers_reject_an_authenticated_malformed_page_without_panicking() {
+    let mgr = create_test_manager();
+    let mut writer = mgr.begin_write().unwrap();
+    writer.create_table(b"catalog-entry").unwrap();
+    writer.commit().unwrap();
+
+    let catalog_root = mgr.current_slot().catalog_root;
+    let mut malformed = mgr.fetch_page_owned(catalog_root).unwrap();
+    malformed.set_num_cells(u16::MAX);
+    malformed.update_checksum();
+
+    let mut encrypted = [0u8; PAGE_SIZE];
+    page_cipher::encrypt_page(
+        &mgr.dek,
+        &mgr.mac_key,
+        catalog_root,
+        mgr.epoch,
+        malformed.as_bytes(),
+        &mut encrypted,
+    );
+    mgr.io
+        .write_page(page_offset(catalog_root), &encrypted)
+        .unwrap();
+    mgr.pool.lock().invalidate(catalog_root);
+
+    let root = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        mgr.begin_read().table_root_page(b"catalog-entry")
+    }));
+    assert!(root.is_ok(), "catalog lookup must not unwind");
+    assert!(matches!(root.unwrap(), Err(Error::DatabaseCorrupted)));
+
+    let listed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        mgr.begin_read().list_tables()
+    }));
+    assert!(listed.is_ok(), "catalog decoding must not unwind");
+    assert!(matches!(listed.unwrap(), Err(Error::DatabaseCorrupted)));
+}
+
+#[test]
+fn catalog_lookup_rejects_an_authenticated_cross_page_cycle() {
+    let mgr = create_test_manager();
+    let mut writer = mgr.begin_write().unwrap();
+    writer.create_table(b"catalog-entry").unwrap();
+    writer.commit().unwrap();
+
+    let slot = mgr.current_slot();
+    let catalog_root = slot.catalog_root;
+    let second_page = slot.tree_root;
+    assert_ne!(catalog_root, second_page);
+
+    let rewrite_as_branch = |page_id, right_child| {
+        let mut page = mgr.fetch_page_owned(page_id).unwrap();
+        page.set_page_type(PageType::Branch);
+        page.rebuild_cells(&[]);
+        page.set_right_child(right_child);
+        page.update_checksum();
+
+        let mut encrypted = [0u8; PAGE_SIZE];
+        page_cipher::encrypt_page(
+            &mgr.dek,
+            &mgr.mac_key,
+            page_id,
+            mgr.epoch,
+            page.as_bytes(),
+            &mut encrypted,
+        );
+        mgr.io.write_page(page_offset(page_id), &encrypted).unwrap();
+        mgr.pool.lock().invalidate(page_id);
+    };
+    rewrite_as_branch(catalog_root, second_page);
+    rewrite_as_branch(second_page, catalog_root);
+
+    assert!(matches!(
+        mgr.begin_read().table_root_page(b"catalog-entry"),
+        Err(Error::DatabaseCorrupted)
+    ));
+}

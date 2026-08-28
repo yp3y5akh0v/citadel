@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::protocol::SyncMessage;
+use crate::protocol::{SyncMessage, MAX_SYNC_MESSAGE_SIZE};
 use crate::sync_key::SyncKey;
 use crate::transport::{SyncError, SyncTransport};
 
@@ -12,9 +12,6 @@ const NOISE_PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 
 /// Max plaintext per Noise message (65535 - 16 byte AEAD tag).
 const NOISE_MAX_PAYLOAD: usize = 65535 - 16;
-
-/// Maximum total message size: 64 MiB.
-const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -128,7 +125,7 @@ impl SyncTransport for NoiseTransport {
         if self.closed.load(Ordering::Relaxed) {
             return Err(SyncError::Closed);
         }
-        let plaintext = msg.serialize();
+        let plaintext = msg.serialize()?;
         let state = &mut *self.state.lock().unwrap();
 
         state
@@ -160,7 +157,7 @@ impl SyncTransport for NoiseTransport {
         let mut len_buf = [0u8; 4];
         state.stream.read_exact(&mut len_buf)?;
         let total_len = u32::from_le_bytes(len_buf);
-        if total_len > MAX_MESSAGE_SIZE {
+        if total_len as usize > MAX_SYNC_MESSAGE_SIZE {
             return Err(SyncError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("message too large: {total_len} bytes"),
@@ -169,19 +166,44 @@ impl SyncTransport for NoiseTransport {
 
         let mut plaintext = Vec::with_capacity(total_len as usize);
         let mut pt_buf = [0u8; 65535];
+        let mut ct_buf = [0u8; 65535];
         while plaintext.len() < total_len as usize {
             let mut chunk_len_buf = [0u8; 2];
             state.stream.read_exact(&mut chunk_len_buf)?;
             let chunk_len = u16::from_le_bytes(chunk_len_buf) as usize;
 
-            let mut ct_buf = vec![0u8; chunk_len];
-            state.stream.read_exact(&mut ct_buf)?;
+            state.stream.read_exact(&mut ct_buf[..chunk_len])?;
 
             let pt_len = state
                 .noise
-                .read_message(&ct_buf, &mut pt_buf)
+                .read_message(&ct_buf[..chunk_len], &mut pt_buf)
                 .map_err(noise_err)?;
+            if pt_len == 0 {
+                return Err(SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Noise frame made no progress",
+                )));
+            }
+            let next_len = plaintext.len().checked_add(pt_len).ok_or_else(|| {
+                SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Noise message length overflow",
+                ))
+            })?;
+            if next_len > total_len as usize {
+                return Err(SyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Noise chunk exceeds the declared message length",
+                )));
+            }
             plaintext.extend_from_slice(&pt_buf[..pt_len]);
+        }
+
+        if plaintext.len() != total_len as usize {
+            return Err(SyncError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Noise message length mismatch",
+            )));
         }
 
         Ok(SyncMessage::deserialize(&plaintext)?)

@@ -952,27 +952,35 @@ pub struct SyncOutcome {
 
 const NODE_ID_KEY: &[u8] = b"__citadel_node_id";
 
+fn decode_node_id(data: &[u8]) -> Option<citadel_sync::NodeId> {
+    Some(citadel_sync::NodeId::from_bytes(data.try_into().ok()?))
+}
+
 impl Database {
     /// Get or create a persistent NodeId for this database.
     pub fn node_id(&self) -> Result<citadel_sync::NodeId> {
-        let mut rtx = self.manager.begin_read();
+        let mut rtx = self.begin_read();
         if let Some(data) = rtx.get(NODE_ID_KEY)? {
-            if data.len() == 8 {
-                return Ok(citadel_sync::NodeId::from_bytes(
-                    data[..8].try_into().unwrap(),
-                ));
-            }
+            return decode_node_id(&data).ok_or(Error::DatabaseCorrupted);
         }
         drop(rtx);
 
+        let mut wtx = self.begin_write()?;
+        // Another caller may have initialized the ID after the optimistic
+        // read. Recheck under the single-writer lock before creating one.
+        if let Some(data) = wtx.get(NODE_ID_KEY)? {
+            return decode_node_id(&data).ok_or(Error::DatabaseCorrupted);
+        }
         let node_id = citadel_sync::NodeId::random();
-        let mut wtx = self.manager.begin_write()?;
         wtx.insert(NODE_ID_KEY, &node_id.to_bytes())?;
         wtx.commit()?;
         Ok(node_id)
     }
 
     /// Push local named tables to a remote peer.
+    ///
+    /// Tables commit independently, so an error can follow earlier tables being
+    /// applied; retrying resumes from the peers' durable state.
     pub fn sync_to(&self, addr: &str, sync_key: &citadel_sync::SyncKey) -> Result<SyncOutcome> {
         let node_id = self.node_id()?;
         let transport =
@@ -999,6 +1007,9 @@ impl Database {
     }
 
     /// Handle an incoming sync session from a remote peer.
+    ///
+    /// Tables commit independently, so an error can follow earlier tables being
+    /// applied; retrying resumes from the peers' durable state.
     pub fn handle_sync(
         &self,
         stream: std::net::TcpStream,

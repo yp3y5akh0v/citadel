@@ -14,6 +14,97 @@ fn read_write_leaf_cell() {
 }
 
 #[test]
+fn checked_reader_accepts_a_well_formed_leaf() {
+    let mut page = Page::new(PageId(0), PageType::Leaf, TxnId(1));
+    insert(&mut page, b"alpha", ValueType::Inline, b"one");
+    insert(&mut page, b"beta", ValueType::Tombstone, b"");
+
+    let cells = read_cells_checked(&page).unwrap();
+    assert_eq!(cells.len(), 2);
+    assert_eq!(cells[0].key, b"alpha");
+    assert_eq!(cells[1].val_type, ValueType::Tombstone);
+}
+
+#[test]
+fn checked_reader_rejects_invalid_value_type_without_defaulting_to_inline() {
+    let mut page = Page::new(PageId(0), PageType::Leaf, TxnId(1));
+    insert(&mut page, b"key", ValueType::Inline, b"value");
+    let offset = page.cell_offset(0) as usize;
+    page.data[offset + 6 + b"key".len()] = u8::MAX;
+
+    let decoded = std::panic::catch_unwind(|| read_cells_checked(&page));
+    assert!(decoded.is_ok(), "checked decoding must not unwind");
+    let error = decoded.unwrap().unwrap_err();
+    assert!(error.to_string().contains("invalid value type"));
+}
+
+#[test]
+fn checked_reader_rejects_truncated_and_overlapping_cells() {
+    let mut truncated = Page::new(PageId(0), PageType::Leaf, TxnId(1));
+    insert(&mut truncated, b"key", ValueType::Inline, b"value");
+    let offset = truncated.cell_offset(0) as usize;
+    truncated.data[offset + 2..offset + 6].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(read_cells_checked(&truncated)
+        .unwrap_err()
+        .to_string()
+        .contains("value ends"));
+
+    let mut overlapping = Page::new(PageId(0), PageType::Leaf, TxnId(1));
+    insert(&mut overlapping, b"alpha", ValueType::Inline, b"one");
+    insert(&mut overlapping, b"beta", ValueType::Inline, b"two");
+    overlapping.set_cell_offset(1, overlapping.cell_offset(0));
+    assert!(read_cells_checked(&overlapping)
+        .unwrap_err()
+        .to_string()
+        .contains("overlap"));
+}
+
+#[test]
+fn checked_reader_rejects_free_space_and_key_order_corruption() {
+    let mut free_space = Page::new(PageId(0), PageType::Leaf, TxnId(1));
+    insert(&mut free_space, b"key", ValueType::Inline, b"value");
+    free_space.set_free_space(free_space.free_space() + 1);
+    assert!(read_cells_checked(&free_space)
+        .unwrap_err()
+        .to_string()
+        .contains("free-space accounting"));
+
+    let mut unordered = Page::new(PageId(0), PageType::Leaf, TxnId(1));
+    unordered.write_cell(&build_cell(b"beta", ValueType::Inline, b"two"));
+    unordered.write_cell(&build_cell(b"alpha", ValueType::Inline, b"one"));
+    assert!(read_cells_checked(&unordered)
+        .unwrap_err()
+        .to_string()
+        .contains("not strictly ordered"));
+}
+
+#[test]
+fn checked_reader_rejects_malformed_overflow_references() {
+    let mut wrong_width = Page::new(PageId(0), PageType::Leaf, TxnId(1));
+    insert(&mut wrong_width, b"key", ValueType::Overflow, &[0u8; 7]);
+    assert!(read_cells_checked(&wrong_width)
+        .unwrap_err()
+        .to_string()
+        .contains("instead of 8"));
+
+    let mut zero_page = Page::new(PageId(0), PageType::Leaf, TxnId(1));
+    let reference = OverflowRef {
+        first_page: PageId(0),
+        total_len: 4096,
+    };
+    insert(
+        &mut zero_page,
+        b"key",
+        ValueType::Overflow,
+        &reference.to_bytes(),
+    );
+    assert!(read_cells_checked(&zero_page)
+        .unwrap_err()
+        .to_string()
+        .contains("invalid first page"));
+}
+
+#[test]
 fn insert_maintains_sorted_order() {
     let mut page = Page::new(PageId(0), PageType::Leaf, TxnId(1));
 

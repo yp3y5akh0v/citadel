@@ -389,6 +389,7 @@ fn tree_reader_leaf_entries() {
     let reader = LocalTreeReader::new(db.manager());
     let (root_pid, _) = reader.root_info().unwrap();
 
+    reader.page_digest(root_pid).unwrap();
     let entries = reader.leaf_entries(root_pid).unwrap();
     assert_eq!(entries.len(), 3);
     assert_eq!(entries[0].key, b"aaa");

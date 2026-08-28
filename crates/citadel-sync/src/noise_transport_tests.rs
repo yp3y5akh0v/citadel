@@ -29,6 +29,7 @@ fn encrypted_roundtrip() {
         node_id: NodeId::from_u64(42),
         root_page: PageId(10),
         root_hash: [1u8; MERKLE_HASH_SIZE],
+        crdt_aware: false,
     };
     client.send(&msg).unwrap();
     match server.recv().unwrap() {
@@ -36,6 +37,7 @@ fn encrypted_roundtrip() {
             node_id,
             root_page,
             root_hash,
+            ..
         } => {
             assert_eq!(node_id, NodeId::from_u64(42));
             assert_eq!(root_page, PageId(10));
@@ -122,6 +124,7 @@ fn multiple_messages() {
             node_id: NodeId::from_u64(i),
             root_page: PageId(0),
             root_hash: [0u8; MERKLE_HASH_SIZE],
+            crdt_aware: false,
         })
         .unwrap();
     }

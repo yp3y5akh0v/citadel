@@ -1,7 +1,7 @@
 use std::net::TcpListener;
 use std::thread;
 
-use citadel::{Argon2Profile, DatabaseBuilder, SyncKey};
+use citadel::{Argon2Profile, CancelToken, DatabaseBuilder, Error, SyncKey};
 
 fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
     DatabaseBuilder::new(path)
@@ -47,6 +47,31 @@ fn node_id_stable_within_session() {
     let id1 = db.node_id().unwrap();
     let id2 = db.node_id().unwrap();
     assert_eq!(id1, id2);
+}
+
+#[test]
+fn malformed_persisted_node_id_is_not_silently_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fast_builder(&dir.path().join("test.db")).create().unwrap();
+    let mut write = db.begin_write().unwrap();
+    write.insert(b"__citadel_node_id", b"short").unwrap();
+    write.commit().unwrap();
+
+    assert!(matches!(db.node_id(), Err(Error::DatabaseCorrupted)));
+}
+
+#[test]
+fn node_id_observes_the_database_cancel_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fast_builder(&dir.path().join("test.db")).create().unwrap();
+    let token = CancelToken::new();
+    token.cancel();
+    db.set_cancel(Some(token));
+
+    assert!(matches!(db.node_id(), Err(Error::Interrupted)));
+
+    db.set_cancel(None);
+    assert!(db.node_id().is_ok());
 }
 
 #[test]
@@ -269,7 +294,7 @@ fn sync_preserves_responder_data() {
 }
 
 #[test]
-fn sync_skips_index_tables_over_tcp() {
+fn sync_rejects_reserved_tables_over_tcp_without_mutating_destination() {
     let dir = tempfile::tempdir().unwrap();
     let key = test_sync_key();
     let db_a = fast_builder(&dir.path().join("a.db")).create().unwrap();
@@ -285,21 +310,45 @@ fn sync_skips_index_tables_over_tcp() {
         wtx.commit().unwrap();
     }
 
+    {
+        let mut wtx = db_b.begin_write().unwrap();
+        wtx.create_table(b"data").unwrap();
+        wtx.table_insert(b"data", b"keep", b"local").unwrap();
+        wtx.commit().unwrap();
+    }
+
     let listener = listen_random_port();
     let addr = addr_of(&listener);
 
-    thread::scope(|s| {
-        s.spawn(|| {
+    let (initiator, responder) = thread::scope(|s| {
+        let responder = s.spawn(|| {
             let (stream, _) = listener.accept().unwrap();
-            db_b.handle_sync(stream, &key).unwrap();
+            db_b.handle_sync(stream, &key)
         });
-        let outcome = db_a.sync_to(&addr, &key).unwrap();
-        assert!(outcome.tables_synced.iter().any(|(n, _)| n == b"data"));
-        assert!(!outcome
-            .tables_synced
-            .iter()
-            .any(|(n, _)| n.starts_with(b"__idx_")));
+        let initiator = db_a.sync_to(&addr, &key);
+        (initiator, responder.join().unwrap())
     });
+
+    assert!(initiator
+        .unwrap_err()
+        .to_string()
+        .contains("reserved table"));
+    assert!(responder
+        .unwrap_err()
+        .to_string()
+        .contains("reserved table"));
+
+    let mut rtx = db_b.begin_read();
+    assert_eq!(
+        rtx.table_get(b"data", b"keep").unwrap().as_deref(),
+        Some(b"local".as_slice())
+    );
+    assert!(rtx.table_get(b"data", b"k").unwrap().is_none());
+    assert!(!rtx
+        .list_tables()
+        .unwrap()
+        .iter()
+        .any(|(name, _)| name.starts_with(b"__")));
 }
 
 #[test]

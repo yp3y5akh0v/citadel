@@ -3,6 +3,114 @@ use citadel_core::{
     BODY_SIZE, CHECKSUM_SIZE, MERKLE_HASH_OFFSET, MERKLE_HASH_SIZE, PAGE_HEADER_SIZE, USABLE_SIZE,
 };
 
+/// A malformed slotted-page cell layout. The message stays behind a private field
+/// so callers can report corruption detail without the individual checks becoming
+/// public compatibility surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellDecodeError {
+    detail: String,
+}
+
+impl CellDecodeError {
+    pub(crate) fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for CellDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for CellDecodeError {}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CellSpan {
+    pub index: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Read the cell-pointer array only after proving that it and the declared
+/// cell area fit inside the decrypted page body.
+pub(crate) fn checked_cell_offsets(page: &Page) -> Result<Vec<usize>, CellDecodeError> {
+    let count = page.num_cells() as usize;
+    let pointer_bytes = count.checked_mul(2).ok_or_else(|| {
+        CellDecodeError::new(format!(
+            "cell pointer count {count} overflows address space"
+        ))
+    })?;
+    let pointer_end = PAGE_HEADER_SIZE.checked_add(pointer_bytes).ok_or_else(|| {
+        CellDecodeError::new(format!(
+            "cell pointer count {count} overflows address space"
+        ))
+    })?;
+    if pointer_end > BODY_SIZE {
+        return Err(CellDecodeError::new(format!(
+            "cell pointer array ends at {pointer_end}, beyond page body {BODY_SIZE}"
+        )));
+    }
+
+    let cell_area_start = page.cell_area_start() as usize;
+    if cell_area_start < pointer_end || cell_area_start > BODY_SIZE {
+        return Err(CellDecodeError::new(format!(
+            "cell area starts at {cell_area_start}, outside {pointer_end}..={BODY_SIZE}"
+        )));
+    }
+
+    let mut offsets = Vec::with_capacity(count);
+    for index in 0..count {
+        let pointer = PAGE_HEADER_SIZE + index * 2;
+        let offset = u16::from_le_bytes([page.data[pointer], page.data[pointer + 1]]) as usize;
+        if offset < cell_area_start || offset >= BODY_SIZE {
+            return Err(CellDecodeError::new(format!(
+                "cell {index} offset {offset} lies outside cell area {cell_area_start}..{BODY_SIZE}"
+            )));
+        }
+        offsets.push(offset);
+    }
+    Ok(offsets)
+}
+
+/// Validate relationships common to every slotted-page cell format: live cells may
+/// not overlap, and free space must account exactly for the pointer array and cells.
+pub(crate) fn validate_cell_layout(
+    page: &Page,
+    spans: &mut [CellSpan],
+) -> Result<(), CellDecodeError> {
+    spans.sort_unstable_by_key(|span| span.start);
+    if let Some(pair) = spans.windows(2).find(|pair| pair[0].end > pair[1].start) {
+        return Err(CellDecodeError::new(format!(
+            "cells {} and {} overlap at byte {}",
+            pair[0].index, pair[1].index, pair[1].start
+        )));
+    }
+
+    let pointer_bytes = spans
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| CellDecodeError::new("free-space pointer accounting overflow"))?;
+    let cell_bytes = spans.iter().try_fold(0usize, |total, span| {
+        total
+            .checked_add(span.end - span.start)
+            .ok_or_else(|| CellDecodeError::new("free-space cell accounting overflow"))
+    })?;
+    let expected = USABLE_SIZE
+        .checked_sub(pointer_bytes)
+        .and_then(|space| space.checked_sub(cell_bytes))
+        .ok_or_else(|| CellDecodeError::new("live cells exceed usable page space"))?;
+    let recorded = page.free_space() as usize;
+    if recorded != expected {
+        return Err(CellDecodeError::new(format!(
+            "free-space accounting records {recorded} bytes, expected {expected}"
+        )));
+    }
+    Ok(())
+}
+
 /// Decrypted page body (8160 bytes).
 ///
 /// Layout:

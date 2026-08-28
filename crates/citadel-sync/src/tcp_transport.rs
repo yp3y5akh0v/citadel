@@ -4,11 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::protocol::SyncMessage;
+use crate::protocol::{SyncMessage, MAX_SYNC_MESSAGE_SIZE};
 use crate::transport::{SyncError, SyncTransport};
-
-/// Maximum message size: 64 MiB.
-const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const SEND_DEADLINE: Duration = Duration::from_secs(120);
@@ -84,7 +81,7 @@ impl SyncTransport for TcpTransport {
         if self.closed.load(Ordering::Relaxed) {
             return Err(SyncError::Closed);
         }
-        let data = msg.serialize();
+        let data = msg.serialize()?;
         let len = data.len() as u32;
         let deadline = Instant::now() + SEND_DEADLINE;
         let mut stream = self.stream.lock().unwrap();
@@ -104,7 +101,7 @@ impl SyncTransport for TcpTransport {
         stream.read_exact(&mut len_buf)?;
         let len = u32::from_le_bytes(len_buf);
 
-        if len > MAX_MESSAGE_SIZE {
+        if len as usize > MAX_SYNC_MESSAGE_SIZE {
             return Err(SyncError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("message too large: {len} bytes"),

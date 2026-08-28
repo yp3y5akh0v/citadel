@@ -304,15 +304,12 @@ fn serialize_roundtrip_500_entries() {
             } else {
                 EntryKind::Put
             };
+            let crdt_meta = meta(rng.gen_range(1..10000), rng.gen_range(0..100), rng.gen());
             citadel_sync::PatchEntry {
                 key,
-                value,
+                value: encode_lww_value(&crdt_meta, kind, &value),
                 kind,
-                crdt_meta: Some(meta(
-                    rng.gen_range(1..10000),
-                    rng.gen_range(0..100),
-                    rng.gen(),
-                )),
+                crdt_meta: Some(crdt_meta),
             }
         })
         .collect();
@@ -323,7 +320,7 @@ fn serialize_roundtrip_500_entries() {
         crdt_aware: true,
     };
 
-    let bytes = patch.serialize();
+    let bytes = patch.serialize().unwrap();
     let restored = SyncPatch::deserialize(&bytes).unwrap();
 
     assert_eq!(restored.len(), 500);

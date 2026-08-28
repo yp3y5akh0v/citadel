@@ -1,6 +1,8 @@
+use std::collections::{BTreeSet, HashMap, HashSet};
+
 use citadel_txn::manager::TxnManager;
 
-use crate::apply::{apply_patch, apply_patch_to_table, ApplyResult};
+use crate::apply::{apply_patch_if_generation, apply_patch_to_table_if_generation, ApplyResult};
 use crate::diff::{merkle_diff, MerkleHash, TreeReader, UNKNOWN_HASH};
 use crate::local_reader::LocalTreeReader;
 use crate::node_id::NodeId;
@@ -9,6 +11,7 @@ use crate::protocol::{SyncMessage, TableInfo};
 use crate::transport::{msg_name, RemoteTreeReader, SyncError, SyncTransport};
 
 use citadel_core::types::PageId;
+use citadel_core::MAX_KEY_SIZE;
 
 /// Sync direction for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +70,7 @@ impl SyncSession {
             node_id: self.config.node_id,
             root_page: local_root,
             root_hash: local_hash,
+            crdt_aware: self.config.crdt_aware,
         })?;
 
         let (remote_root, remote_hash, in_sync) = match transport.recv()? {
@@ -74,8 +78,16 @@ impl SyncSession {
                 root_page,
                 root_hash,
                 in_sync,
+                crdt_aware,
                 ..
-            } => (root_page, root_hash, in_sync),
+            } => {
+                if crdt_aware != self.config.crdt_aware {
+                    return Err(SyncError::Handshake(
+                        "peer uses a different CRDT mode".into(),
+                    ));
+                }
+                (root_page, root_hash, in_sync)
+            }
             SyncMessage::Error { message } => return Err(SyncError::Remote(message)),
             other => {
                 return Err(SyncError::UnexpectedMessage {
@@ -84,6 +96,13 @@ impl SyncSession {
                 })
             }
         };
+
+        let hashes_in_sync = local_hash == remote_hash && local_hash != UNKNOWN_HASH;
+        if in_sync != hashes_in_sync {
+            return Err(SyncError::Handshake(
+                "peer sent an in_sync flag inconsistent with the advertised root hash".into(),
+            ));
+        }
 
         if in_sync {
             transport.send(&SyncMessage::Done)?;
@@ -104,7 +123,7 @@ impl SyncSession {
         if self.config.direction == SyncDirection::Push
             || self.config.direction == SyncDirection::Bidirectional
         {
-            let result = self.initiator_push(manager, transport, remote_root, remote_hash)?;
+            let result = self.initiator_push(&local_reader, transport, remote_root, remote_hash)?;
             outcome.pushed = Some(result);
         }
 
@@ -132,7 +151,8 @@ impl SyncSession {
                 (remote_root, remote_hash)
             };
 
-            let result = self.initiator_pull(manager, transport, pull_root, pull_hash)?;
+            let result =
+                self.initiator_pull(manager, &local_reader, transport, pull_root, pull_hash)?;
             outcome.pulled = Some(result);
         }
 
@@ -147,10 +167,25 @@ impl SyncSession {
         transport: &dyn SyncTransport,
     ) -> std::result::Result<SyncOutcome, SyncError> {
         let mut local_reader = LocalTreeReader::new(manager);
-        let (local_root, local_hash) = local_reader.root_info().map_err(SyncError::Database)?;
+        let mut expected_generation = local_reader.commit_generation();
+        let (local_root, local_hash) = notify_database_result(local_reader.root_info(), transport)?;
 
         let remote_hash = match transport.recv()? {
-            SyncMessage::Hello { root_hash, .. } => root_hash,
+            SyncMessage::Hello {
+                root_hash,
+                crdt_aware,
+                ..
+            } => {
+                if crdt_aware != self.config.crdt_aware {
+                    transport.send(&SyncMessage::Error {
+                        message: "peers use different CRDT modes".into(),
+                    })?;
+                    return Err(SyncError::Handshake(
+                        "peer uses a different CRDT mode".into(),
+                    ));
+                }
+                root_hash
+            }
             SyncMessage::Error { message } => return Err(SyncError::Remote(message)),
             other => {
                 return Err(SyncError::UnexpectedMessage {
@@ -168,10 +203,22 @@ impl SyncSession {
             root_page: local_root,
             root_hash: local_hash,
             in_sync,
+            crdt_aware: self.config.crdt_aware,
         })?;
 
         if in_sync {
-            let _ = transport.recv()?;
+            match transport.recv()? {
+                SyncMessage::Done => {}
+                other => {
+                    transport.send(&SyncMessage::Error {
+                        message: "expected Done after an in-sync handshake".into(),
+                    })?;
+                    return Err(SyncError::UnexpectedMessage {
+                        expected: "Done".into(),
+                        actual: msg_name(&other).into(),
+                    });
+                }
+            }
             return Ok(SyncOutcome {
                 pushed: None,
                 pulled: None,
@@ -191,7 +238,7 @@ impl SyncSession {
                 SyncMessage::DigestRequest { page_ids } => {
                     let Some(page_id) = single_page_request(&page_ids) else {
                         transport.send(&SyncMessage::Error {
-                            message: "digest request must contain exactly one valid page".into(),
+                            message: "digest request must contain exactly one page".into(),
                         })?;
                         continue;
                     };
@@ -210,7 +257,7 @@ impl SyncSession {
                 SyncMessage::EntriesRequest { page_ids } => {
                     let Some(page_id) = single_page_request(&page_ids) else {
                         transport.send(&SyncMessage::Error {
-                            message: "entries request must contain exactly one valid page".into(),
+                            message: "entries request must contain exactly one page".into(),
                         })?;
                         continue;
                     };
@@ -225,15 +272,37 @@ impl SyncSession {
                     }
                 }
                 SyncMessage::PatchData { data } => {
-                    let patch = SyncPatch::deserialize(&data).map_err(SyncError::Patch)?;
-                    let result = apply_patch(manager, &patch).map_err(SyncError::Database)?;
+                    let patch = notify_patch_result(SyncPatch::deserialize(&data), transport)?;
+                    if patch.crdt_aware != self.config.crdt_aware {
+                        transport.send(&SyncMessage::Error {
+                            message: "patch CRDT mode differs from the negotiated session".into(),
+                        })?;
+                        return Err(SyncError::Handshake(
+                            "patch uses a different CRDT mode".into(),
+                        ));
+                    }
+                    let Some((result, generation)) = notify_database_result(
+                        apply_patch_if_generation(manager, &patch, expected_generation),
+                        transport,
+                    )?
+                    else {
+                        let error = "sync target changed after its root was advertised";
+                        transport.send(&SyncMessage::Error {
+                            message: error.into(),
+                        })?;
+                        return Err(SyncError::Database(citadel_core::Error::Sync(error.into())));
+                    };
+                    expected_generation = generation;
                     outcome.pushed = Some(result.clone());
                     transport.send(&SyncMessage::PatchAck { result })?;
                 }
                 SyncMessage::PullRequest => {
+                    // A preceding push may have committed, so advertise one fresh
+                    // snapshot and retain that reader for the whole pull phase.
                     local_reader = LocalTreeReader::new(manager);
+                    expected_generation = local_reader.commit_generation();
                     let (root_page, root_hash) =
-                        local_reader.root_info().map_err(SyncError::Database)?;
+                        notify_database_result(local_reader.root_info(), transport)?;
                     transport.send(&SyncMessage::PullResponse {
                         root_page,
                         root_hash,
@@ -259,43 +328,36 @@ impl SyncSession {
     /// Push: diff(local -> remote) via merkle_diff, send patch.
     fn initiator_push(
         &self,
-        manager: &TxnManager,
+        local_reader: &LocalTreeReader<'_>,
         transport: &dyn SyncTransport,
         remote_root: PageId,
         remote_hash: MerkleHash,
     ) -> std::result::Result<ApplyResult, SyncError> {
-        let local_reader = LocalTreeReader::new(manager);
         let remote_reader = RemoteTreeReader::new(transport, remote_root, remote_hash);
 
         // source = local, target = remote
-        let diff = merkle_diff(&local_reader, &remote_reader).map_err(SyncError::Database)?;
+        let diff = notify_database_result(merkle_diff(local_reader, &remote_reader), transport)?;
 
         if diff.is_empty() {
             return Ok(ApplyResult::empty());
         }
 
-        let patch = SyncPatch::from_diff(self.config.node_id, &diff, self.config.crdt_aware);
-        let patch_data = patch.serialize();
-
-        transport.send(&SyncMessage::PatchData { data: patch_data })?;
-
-        match transport.recv()? {
-            SyncMessage::PatchAck { result } => Ok(result),
-            SyncMessage::Error { message } => Err(SyncError::Remote(message)),
-            other => Err(SyncError::UnexpectedMessage {
-                expected: "PatchAck".into(),
-                actual: msg_name(&other).into(),
-            }),
-        }
+        let patch = SyncPatch::from_diff_owned(self.config.node_id, diff, self.config.crdt_aware);
+        send_patch_and_wait(&patch, transport)
     }
 
     /// Run multi-table sync as the initiator.
+    ///
+    /// Each table commits independently, so an error can leave earlier tables
+    /// durable: treat it as a potentially partial sync.
     pub fn sync_tables_as_initiator(
         &self,
         manager: &TxnManager,
         transport: &dyn SyncTransport,
     ) -> std::result::Result<Vec<(Vec<u8>, ApplyResult)>, SyncError> {
-        transport.send(&SyncMessage::TableListRequest)?;
+        transport.send(&SyncMessage::TableListRequest {
+            crdt_aware: self.config.crdt_aware,
+        })?;
 
         let remote_tables = match transport.recv()? {
             SyncMessage::TableListResponse { tables } => tables,
@@ -307,33 +369,47 @@ impl SyncSession {
                 })
             }
         };
-
-        let local_readers =
-            LocalTreeReader::for_all_tables(manager).map_err(SyncError::Database)?;
-
-        let mut all_names: Vec<Vec<u8>> = Vec::new();
-        for (name, _) in &local_readers {
-            if !name.starts_with(b"__idx_") && !all_names.contains(name) {
-                all_names.push(name.clone());
-            }
+        if let Err(message) = validate_table_infos(&remote_tables) {
+            transport.send(&SyncMessage::Error {
+                message: message.clone(),
+            })?;
+            return Err(SyncError::Database(citadel_core::Error::Sync(message)));
         }
-        for info in &remote_tables {
-            if !info.name.starts_with(b"__idx_") && !all_names.contains(&info.name) {
-                all_names.push(info.name.clone());
-            }
+
+        let (_, local_tables) =
+            notify_database_result(LocalTreeReader::for_all_tables(manager), transport)?;
+        if let Some((name, _)) = local_tables
+            .iter()
+            .find(|(name, _)| is_reserved_table(name))
+        {
+            let message = format!(
+                "all-table sync does not support reserved table '{}'",
+                String::from_utf8_lossy(name)
+            );
+            transport.send(&SyncMessage::Error {
+                message: message.clone(),
+            })?;
+            return Err(SyncError::Database(citadel_core::Error::Sync(message)));
         }
+
+        let local_tables: HashMap<_, _> = local_tables.into_iter().collect();
+        let remote_tables: HashMap<_, _> = remote_tables
+            .into_iter()
+            .map(|info| (info.name.clone(), info))
+            .collect();
+        let all_names: BTreeSet<_> = local_tables
+            .keys()
+            .chain(remote_tables.keys())
+            .cloned()
+            .collect();
 
         let mut results = Vec::new();
 
-        for table_name in &all_names {
-            let local_reader = local_readers
-                .iter()
-                .find(|(name, _)| name == table_name)
-                .map(|(_, reader)| reader);
-            let remote_info = remote_tables.iter().find(|t| t.name == *table_name);
-
+        for table_name in all_names {
+            let remote_info = remote_tables.get(&table_name);
+            let local_reader = local_tables.get(&table_name);
             let (local_root, local_hash) = match local_reader {
-                Some(reader) => reader.root_info().map_err(SyncError::Database)?,
+                Some(reader) => notify_database_result(reader.root_info(), transport)?,
                 None => (PageId::INVALID, UNKNOWN_HASH),
             };
 
@@ -356,62 +432,32 @@ impl SyncSession {
                 root_hash: local_hash,
             })?;
 
-            if local_root.is_valid() && remote_root.is_valid() {
-                let local_reader = local_reader
-                    .ok_or(SyncError::Database(citadel_core::Error::DatabaseCorrupted))?;
+            if let (Some(local_reader), true) = (local_reader, remote_root.is_valid()) {
                 let remote_reader = RemoteTreeReader::new(transport, remote_root, remote_hash);
                 let diff =
-                    merkle_diff(local_reader, &remote_reader).map_err(SyncError::Database)?;
+                    notify_database_result(merkle_diff(local_reader, &remote_reader), transport)?;
 
                 if !diff.is_empty() {
-                    let patch =
-                        SyncPatch::from_diff(self.config.node_id, &diff, self.config.crdt_aware);
-                    transport.send(&SyncMessage::PatchData {
-                        data: patch.serialize(),
-                    })?;
-                    match transport.recv()? {
-                        SyncMessage::PatchAck { result } => {
-                            results.push((table_name.clone(), result));
-                        }
-                        SyncMessage::Error { message } => return Err(SyncError::Remote(message)),
-                        other => {
-                            return Err(SyncError::UnexpectedMessage {
-                                expected: "PatchAck".into(),
-                                actual: msg_name(&other).into(),
-                            })
-                        }
-                    }
+                    let patch = SyncPatch::from_diff_owned(
+                        self.config.node_id,
+                        diff,
+                        self.config.crdt_aware,
+                    );
+                    let result = send_patch_and_wait(&patch, transport)?;
+                    results.push((table_name.clone(), result));
                 }
-            } else if local_root.is_valid() {
-                let local_reader = local_reader
-                    .ok_or(SyncError::Database(citadel_core::Error::DatabaseCorrupted))?;
-                let entries = local_reader
-                    .subtree_entries(local_root)
-                    .map_err(SyncError::Database)?;
-                if !entries.is_empty() {
-                    let diff = crate::diff::DiffResult {
-                        entries,
-                        pages_compared: 0,
-                        subtrees_skipped: 0,
-                    };
-                    let patch =
-                        SyncPatch::from_diff(self.config.node_id, &diff, self.config.crdt_aware);
-                    transport.send(&SyncMessage::PatchData {
-                        data: patch.serialize(),
-                    })?;
-                    match transport.recv()? {
-                        SyncMessage::PatchAck { result } => {
-                            results.push((table_name.clone(), result));
-                        }
-                        SyncMessage::Error { message } => return Err(SyncError::Remote(message)),
-                        other => {
-                            return Err(SyncError::UnexpectedMessage {
-                                expected: "PatchAck".into(),
-                                actual: msg_name(&other).into(),
-                            })
-                        }
-                    }
-                }
+            } else if let Some(local_reader) = local_reader {
+                let entries =
+                    notify_database_result(local_reader.subtree_entries(local_root), transport)?;
+                let diff = crate::diff::DiffResult {
+                    entries,
+                    pages_compared: 0,
+                    subtrees_skipped: 0,
+                };
+                let patch =
+                    SyncPatch::from_diff_owned(self.config.node_id, diff, self.config.crdt_aware);
+                let result = send_patch_and_wait(&patch, transport)?;
+                results.push((table_name.clone(), result));
             }
 
             transport.send(&SyncMessage::TableSyncEnd {
@@ -424,13 +470,25 @@ impl SyncSession {
     }
 
     /// Handle multi-table sync as the responder.
+    ///
+    /// Each table commits independently, so an error can leave earlier tables
+    /// durable: treat it as a potentially partial sync.
     pub fn handle_table_sync_as_responder(
         &self,
         manager: &TxnManager,
         transport: &dyn SyncTransport,
     ) -> std::result::Result<Vec<(Vec<u8>, ApplyResult)>, SyncError> {
         match transport.recv()? {
-            SyncMessage::TableListRequest => {}
+            SyncMessage::TableListRequest { crdt_aware } => {
+                if crdt_aware != self.config.crdt_aware {
+                    transport.send(&SyncMessage::Error {
+                        message: "peers use different CRDT modes".into(),
+                    })?;
+                    return Err(SyncError::Handshake(
+                        "peer uses a different CRDT mode".into(),
+                    ));
+                }
+            }
             SyncMessage::Done => return Ok(Vec::new()),
             SyncMessage::Error { message } => return Err(SyncError::Remote(message)),
             other => {
@@ -441,21 +499,38 @@ impl SyncSession {
             }
         }
 
-        let local_readers =
-            LocalTreeReader::for_all_tables(manager).map_err(SyncError::Database)?;
-        let mut table_infos = Vec::with_capacity(local_readers.len());
-        for (name, reader) in &local_readers {
-            if name.starts_with(b"__idx_") {
-                continue;
-            }
-            let (root_page, root_hash) = reader.root_info().map_err(SyncError::Database)?;
-            if root_page.is_valid() {
-                table_infos.push(TableInfo {
-                    name: name.clone(),
-                    root_page,
-                    root_hash,
-                });
-            }
+        let (mut expected_generation, local_tables) =
+            notify_database_result(LocalTreeReader::for_all_tables(manager), transport)?;
+        if let Some((name, _)) = local_tables
+            .iter()
+            .find(|(name, _)| is_reserved_table(name))
+        {
+            let message = format!(
+                "all-table sync does not support reserved table '{}'",
+                String::from_utf8_lossy(name)
+            );
+            transport.send(&SyncMessage::Error {
+                message: message.clone(),
+            })?;
+            return Err(SyncError::Database(citadel_core::Error::Sync(message)));
+        }
+        let mut table_readers = HashMap::with_capacity(local_tables.len());
+        let mut table_infos = Vec::new();
+        for (name, reader) in local_tables {
+            let (root_page, root_hash) = notify_database_result(reader.root_info(), transport)?;
+            table_infos.push(TableInfo {
+                name: name.clone(),
+                root_page,
+                root_hash,
+            });
+            table_readers.insert(name, reader);
+        }
+        table_infos.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        if let Err(message) = validate_table_infos(&table_infos) {
+            transport.send(&SyncMessage::Error {
+                message: message.clone(),
+            })?;
+            return Err(SyncError::Database(citadel_core::Error::Sync(message)));
         }
         transport.send(&SyncMessage::TableListResponse {
             tables: table_infos,
@@ -463,42 +538,71 @@ impl SyncSession {
 
         let mut results = Vec::new();
         let mut current_table: Option<Vec<u8>> = None;
-        let mut current_reader: Option<usize> = None;
 
         'messages: loop {
             let msg = transport.recv()?;
             match msg {
-                SyncMessage::TableSyncBegin { table_name, .. } => {
-                    if table_name.starts_with(b"__idx_") {
-                        current_table = None;
-                        current_reader = None;
+                SyncMessage::TableSyncBegin {
+                    table_name,
+                    root_page,
+                    ..
+                } => {
+                    if current_table.is_some() {
                         transport.send(&SyncMessage::Error {
-                            message: "internal index tables cannot be synchronized directly".into(),
+                            message: "nested table sync scope".into(),
                         })?;
                         continue;
                     }
-                    current_reader = local_readers
-                        .iter()
-                        .position(|(name, _)| name == &table_name);
+                    if table_name.is_empty() || table_name.len() > MAX_KEY_SIZE {
+                        transport.send(&SyncMessage::Error {
+                            message: format!("invalid table sync name length {}", table_name.len()),
+                        })?;
+                        continue;
+                    }
+                    if is_reserved_table(&table_name) {
+                        transport.send(&SyncMessage::Error {
+                            message: "reserved tables cannot be synchronized directly".into(),
+                        })?;
+                        continue;
+                    }
+                    let locally_advertised = table_readers.contains_key(table_name.as_slice());
+                    if !locally_advertised && !root_page.is_valid() {
+                        transport.send(&SyncMessage::Error {
+                            message: "table was advertised by neither peer".into(),
+                        })?;
+                        continue;
+                    }
                     current_table = Some(table_name);
                 }
-                SyncMessage::TableSyncEnd { .. } => {
+                SyncMessage::TableSyncEnd { table_name } => {
+                    if current_table.as_deref() != Some(table_name.as_slice()) {
+                        transport.send(&SyncMessage::Error {
+                            message: "table sync end does not match the active table".into(),
+                        })?;
+                        continue;
+                    }
                     current_table = None;
-                    current_reader = None;
                 }
                 SyncMessage::DigestRequest { page_ids } => {
-                    let Some(reader) = current_reader
-                        .and_then(|index| local_readers.get(index))
-                        .map(|(_, reader)| reader)
-                    else {
+                    let Some(tname) = current_table.as_ref() else {
                         transport.send(&SyncMessage::Error {
-                            message: "digest request without an advertised table snapshot".into(),
+                            message: "digest request outside a table sync".into(),
                         })?;
                         continue;
                     };
+                    let Some(reader) = table_readers.get(tname.as_slice()) else {
+                        transport.send(&SyncMessage::Error {
+                            message: format!(
+                                "table '{}' was not advertised",
+                                String::from_utf8_lossy(tname)
+                            ),
+                        })?;
+                        continue;
+                    };
+
                     let Some(page_id) = single_page_request(&page_ids) else {
                         transport.send(&SyncMessage::Error {
-                            message: "digest request must contain exactly one valid page".into(),
+                            message: "digest request must contain exactly one page".into(),
                         })?;
                         continue;
                     };
@@ -515,18 +619,25 @@ impl SyncSession {
                     }
                 }
                 SyncMessage::EntriesRequest { page_ids } => {
-                    let Some(reader) = current_reader
-                        .and_then(|index| local_readers.get(index))
-                        .map(|(_, reader)| reader)
-                    else {
+                    let Some(tname) = current_table.as_ref() else {
                         transport.send(&SyncMessage::Error {
-                            message: "entries request without an advertised table snapshot".into(),
+                            message: "entries request outside a table sync".into(),
                         })?;
                         continue;
                     };
+                    let Some(reader) = table_readers.get(tname.as_slice()) else {
+                        transport.send(&SyncMessage::Error {
+                            message: format!(
+                                "table '{}' was not advertised",
+                                String::from_utf8_lossy(tname)
+                            ),
+                        })?;
+                        continue;
+                    };
+
                     let Some(page_id) = single_page_request(&page_ids) else {
                         transport.send(&SyncMessage::Error {
-                            message: "entries request must contain exactly one valid page".into(),
+                            message: "entries request must contain exactly one page".into(),
                         })?;
                         continue;
                     };
@@ -541,18 +652,48 @@ impl SyncSession {
                     }
                 }
                 SyncMessage::PatchData { data } => {
-                    let patch = SyncPatch::deserialize(&data).map_err(SyncError::Patch)?;
-                    let result = if let Some(ref tname) = current_table {
-                        apply_patch_to_table(manager, tname, &patch).map_err(SyncError::Database)?
-                    } else {
-                        apply_patch(manager, &patch).map_err(SyncError::Database)?
+                    let Some(table_name) = current_table.as_ref() else {
+                        transport.send(&SyncMessage::Error {
+                            message: "patch outside a table sync".into(),
+                        })?;
+                        continue;
                     };
-                    if let Some(ref tname) = current_table {
-                        results.push((tname.clone(), result.clone()));
+                    let patch = notify_patch_result(SyncPatch::deserialize(&data), transport)?;
+                    if patch.crdt_aware != self.config.crdt_aware {
+                        transport.send(&SyncMessage::Error {
+                            message: "patch CRDT mode differs from the negotiated session".into(),
+                        })?;
+                        return Err(SyncError::Handshake(
+                            "patch uses a different CRDT mode".into(),
+                        ));
                     }
+                    let Some((result, generation)) = notify_database_result(
+                        apply_patch_to_table_if_generation(
+                            manager,
+                            table_name,
+                            &patch,
+                            expected_generation,
+                        ),
+                        transport,
+                    )?
+                    else {
+                        let error = "sync target changed after its table list was advertised";
+                        transport.send(&SyncMessage::Error {
+                            message: error.into(),
+                        })?;
+                        return Err(SyncError::Database(citadel_core::Error::Sync(error.into())));
+                    };
+                    expected_generation = generation;
+                    results.push((table_name.clone(), result.clone()));
                     transport.send(&SyncMessage::PatchAck { result })?;
                 }
-                SyncMessage::Done => break,
+                SyncMessage::Done if current_table.is_none() => break,
+                SyncMessage::Done => {
+                    return Err(SyncError::UnexpectedMessage {
+                        expected: "TableSyncEnd".into(),
+                        actual: "Done".into(),
+                    });
+                }
                 SyncMessage::Error { message } => return Err(SyncError::Remote(message)),
                 _ => {
                     transport.send(&SyncMessage::Error {
@@ -569,12 +710,12 @@ impl SyncSession {
     fn initiator_pull(
         &self,
         manager: &TxnManager,
+        local_reader: &LocalTreeReader<'_>,
         transport: &dyn SyncTransport,
         remote_root: PageId,
         remote_hash: MerkleHash,
     ) -> std::result::Result<ApplyResult, SyncError> {
-        let local_reader = LocalTreeReader::new(manager);
-        let (_, local_hash) = local_reader.root_info().map_err(SyncError::Database)?;
+        let (_, local_hash) = notify_database_result(local_reader.root_info(), transport)?;
 
         if local_hash == remote_hash && local_hash != UNKNOWN_HASH {
             return Ok(ApplyResult::empty());
@@ -583,14 +724,25 @@ impl SyncSession {
         let remote_reader = RemoteTreeReader::new(transport, remote_root, remote_hash);
 
         // source = remote, target = local
-        let diff = merkle_diff(&remote_reader, &local_reader).map_err(SyncError::Database)?;
+        let diff = notify_database_result(merkle_diff(&remote_reader, local_reader), transport)?;
 
         if diff.is_empty() {
             return Ok(ApplyResult::empty());
         }
 
-        let patch = SyncPatch::from_diff(self.config.node_id, &diff, self.config.crdt_aware);
-        let result = apply_patch(manager, &patch).map_err(SyncError::Database)?;
+        let patch = SyncPatch::from_diff_owned(self.config.node_id, diff, self.config.crdt_aware);
+        let Some((result, _generation)) = notify_database_result(
+            apply_patch_if_generation(manager, &patch, local_reader.commit_generation()),
+            transport,
+        )?
+        else {
+            return notify_database_result(
+                Err(citadel_core::Error::Sync(
+                    "sync target changed while its diff was being computed".into(),
+                )),
+                transport,
+            );
+        };
         Ok(result)
     }
 }
@@ -601,3 +753,102 @@ fn single_page_request(page_ids: &[PageId]) -> Option<PageId> {
         _ => None,
     }
 }
+
+fn is_reserved_table(name: &[u8]) -> bool {
+    name.starts_with(b"__")
+}
+
+fn serialize_patch(
+    patch: &SyncPatch,
+    transport: &dyn SyncTransport,
+) -> std::result::Result<Vec<u8>, SyncError> {
+    patch.try_serialize().map_err(|error| {
+        let _ = transport.send(&SyncMessage::Error {
+            message: error.to_string(),
+        });
+        SyncError::Patch(error)
+    })
+}
+
+fn send_patch_and_wait(
+    patch: &SyncPatch,
+    transport: &dyn SyncTransport,
+) -> std::result::Result<ApplyResult, SyncError> {
+    transport.send(&SyncMessage::PatchData {
+        data: serialize_patch(patch, transport)?,
+    })?;
+    match transport.recv()? {
+        SyncMessage::PatchAck { result } => Ok(result),
+        SyncMessage::Error { message } => Err(SyncError::Remote(message)),
+        other => Err(SyncError::UnexpectedMessage {
+            expected: "PatchAck".into(),
+            actual: msg_name(&other).into(),
+        }),
+    }
+}
+
+fn notify_patch_result<T>(
+    result: std::result::Result<T, crate::patch::PatchError>,
+    transport: &dyn SyncTransport,
+) -> std::result::Result<T, SyncError> {
+    result.map_err(|error| {
+        let _ = transport.send(&SyncMessage::Error {
+            message: error.to_string(),
+        });
+        SyncError::Patch(error)
+    })
+}
+
+fn notify_database_result<T>(
+    result: citadel_core::Result<T>,
+    transport: &dyn SyncTransport,
+) -> std::result::Result<T, SyncError> {
+    result.map_err(|error| {
+        let _ = transport.send(&SyncMessage::Error {
+            message: error.to_string(),
+        });
+        SyncError::Database(error)
+    })
+}
+
+fn validate_table_infos(tables: &[TableInfo]) -> std::result::Result<(), String> {
+    let mut names = HashSet::with_capacity(tables.len());
+    let mut roots = HashSet::with_capacity(tables.len());
+    for table in tables {
+        if table.name.is_empty() || table.name.len() > MAX_KEY_SIZE {
+            return Err(format!(
+                "invalid advertised table name length {}",
+                table.name.len()
+            ));
+        }
+        if is_reserved_table(&table.name) {
+            return Err(format!(
+                "all-table sync does not support reserved table '{}'",
+                String::from_utf8_lossy(&table.name)
+            ));
+        }
+        if !names.insert(table.name.as_slice()) {
+            return Err(format!(
+                "table '{}' was advertised more than once",
+                String::from_utf8_lossy(&table.name)
+            ));
+        }
+        if !table.root_page.is_valid() {
+            return Err(format!(
+                "table '{}' advertised an invalid root page",
+                String::from_utf8_lossy(&table.name)
+            ));
+        }
+        if !roots.insert(table.root_page) {
+            return Err(format!(
+                "root page {} was advertised for more than one table",
+                table.root_page.as_u32()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod tests;

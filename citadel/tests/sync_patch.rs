@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
+use citadel_core::constants::MAX_INLINE_VALUE_SIZE;
+use citadel_core::types::ValueType;
 use citadel_sync::{
-    apply_patch, decode_lww_value, encode_lww_value, merkle_diff, ApplyResult, CrdtMeta, EntryKind,
-    HlcTimestamp, LocalTreeReader, NodeId, SyncPatch,
+    apply_patch, apply_patch_to_table, decode_lww_value, encode_lww_value, merkle_diff,
+    ApplyResult, CrdtMeta, EntryKind, HlcTimestamp, LocalTreeReader, NodeId, SyncPatch,
 };
 
 const NS: i64 = 1_000_000_000;
@@ -71,12 +73,105 @@ fn diff_serialize_apply_roundtrip() {
     let d = merkle_diff(&r1, &r2).unwrap();
 
     let patch = SyncPatch::from_diff(NodeId::from_u64(1), &d, false);
-    let serialized = patch.serialize();
+    let serialized = patch.serialize().unwrap();
     let deserialized = SyncPatch::deserialize(&serialized).unwrap();
 
     let result = apply_patch(target.manager(), &deserialized).unwrap();
     assert_eq!(result.entries_applied as usize, collect_all(&source).len());
     assert_eq!(collect_all(&source), collect_all(&target));
+}
+
+#[test]
+fn overflow_values_survive_default_and_named_patch_roundtrips() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = fast_builder(&dir.path().join("s.db")).create().unwrap();
+    let target = fast_builder(&dir.path().join("t.db")).create().unwrap();
+    let default_value = vec![0xA1; MAX_INLINE_VALUE_SIZE + 4096];
+    let named_value = vec![0xB2; MAX_INLINE_VALUE_SIZE + 8192];
+
+    for db in [&source, &target] {
+        let mut wtx = db.begin_write().unwrap();
+        wtx.create_table(b"large_values").unwrap();
+        wtx.commit().unwrap();
+    }
+    let mut wtx = source.begin_write().unwrap();
+    wtx.insert(b"default", &default_value).unwrap();
+    wtx.table_insert(b"large_values", b"named", &named_value)
+        .unwrap();
+    wtx.commit().unwrap();
+
+    let source_default = LocalTreeReader::new(source.manager());
+    let target_default = LocalTreeReader::new(target.manager());
+    let default_diff = merkle_diff(&source_default, &target_default).unwrap();
+    assert_eq!(
+        default_diff
+            .entries
+            .iter()
+            .find(|entry| entry.key == b"default")
+            .unwrap()
+            .value,
+        default_value
+    );
+    let default_patch = SyncPatch::deserialize(
+        &SyncPatch::from_diff(NodeId::from_u64(1), &default_diff, false)
+            .serialize()
+            .unwrap(),
+    )
+    .unwrap();
+    apply_patch(target.manager(), &default_patch).unwrap();
+
+    let source_named = LocalTreeReader::for_table(source.manager(), b"large_values").unwrap();
+    let target_named = LocalTreeReader::for_table(target.manager(), b"large_values").unwrap();
+    let named_diff = merkle_diff(&source_named, &target_named).unwrap();
+    assert_eq!(
+        named_diff
+            .entries
+            .iter()
+            .find(|entry| entry.key == b"named")
+            .unwrap()
+            .value,
+        named_value
+    );
+    let named_patch = SyncPatch::deserialize(
+        &SyncPatch::from_diff(NodeId::from_u64(1), &named_diff, false)
+            .serialize()
+            .unwrap(),
+    )
+    .unwrap();
+    apply_patch_to_table(target.manager(), b"large_values", &named_patch).unwrap();
+
+    let mut read = target.begin_read();
+    assert_eq!(read.get(b"default").unwrap().unwrap(), default_value);
+    assert_eq!(
+        read.table_get(b"large_values", b"named").unwrap().unwrap(),
+        named_value
+    );
+}
+
+#[test]
+fn same_length_divergent_overflow_value_is_emitted_by_merkle_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = fast_builder(&dir.path().join("s.db")).create().unwrap();
+    let target = fast_builder(&dir.path().join("t.db")).create().unwrap();
+    let len = MAX_INLINE_VALUE_SIZE + 4096;
+    let source_value = vec![0x51; len];
+    let target_value = vec![0xA7; len];
+
+    let mut source_write = source.begin_write().unwrap();
+    source_write.insert(b"large", &source_value).unwrap();
+    source_write.commit().unwrap();
+    let mut target_write = target.begin_write().unwrap();
+    target_write.insert(b"large", &target_value).unwrap();
+    target_write.commit().unwrap();
+
+    let source_reader = LocalTreeReader::new(source.manager());
+    let target_reader = LocalTreeReader::new(target.manager());
+    let diff = merkle_diff(&source_reader, &target_reader).unwrap();
+
+    assert_eq!(diff.entries.len(), 1);
+    assert_eq!(diff.entries[0].key, b"large");
+    assert_eq!(diff.entries[0].value, source_value);
+    assert_eq!(diff.entries[0].val_type, ValueType::Overflow as u8);
 }
 
 #[test]
@@ -391,7 +486,7 @@ fn large_patch_1000_entries() {
     assert_eq!(d.subtrees_skipped, 0);
 
     let patch = SyncPatch::from_diff(NodeId::from_u64(1), &d, false);
-    let bytes = patch.serialize();
+    let bytes = patch.serialize().unwrap();
     let restored = SyncPatch::deserialize(&bytes).unwrap();
     apply_patch(target.manager(), &restored).unwrap();
 

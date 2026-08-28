@@ -46,7 +46,7 @@ impl SyncTransport for MemoryTransport {
         if self.closed.load(Ordering::Relaxed) {
             return Err(SyncError::Closed);
         }
-        let data = msg.serialize();
+        let data = msg.serialize()?;
         let tx = self.tx.lock().unwrap();
         tx.send(data).map_err(|_| SyncError::Closed)
     }

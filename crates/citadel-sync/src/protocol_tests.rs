@@ -21,23 +21,71 @@ fn released_session_entry_tags_are_rejected_before_entry_exchange() {
 }
 
 #[test]
+fn current_session_entry_wire_tags_are_frozen() {
+    let messages = [
+        (
+            SyncMessage::Hello {
+                node_id: NodeId::from_u64(1),
+                root_page: PageId(1),
+                root_hash: [0u8; MERKLE_HASH_SIZE],
+                crdt_aware: false,
+            },
+            16u8,
+        ),
+        (
+            SyncMessage::HelloAck {
+                node_id: NodeId::from_u64(1),
+                root_page: PageId(1),
+                root_hash: [0u8; MERKLE_HASH_SIZE],
+                in_sync: false,
+                crdt_aware: false,
+            },
+            17u8,
+        ),
+        (SyncMessage::TableListRequest { crdt_aware: false }, 18u8),
+        (SyncMessage::TableListResponse { tables: Vec::new() }, 19u8),
+        (
+            SyncMessage::TableSyncBegin {
+                table_name: b"table".to_vec(),
+                root_page: PageId(1),
+                root_hash: [0u8; MERKLE_HASH_SIZE],
+            },
+            20u8,
+        ),
+        (
+            SyncMessage::TableSyncEnd {
+                table_name: b"table".to_vec(),
+            },
+            21u8,
+        ),
+    ];
+
+    for (message, expected_tag) in messages {
+        assert_eq!(message.serialize().unwrap()[0], expected_tag);
+    }
+}
+
+#[test]
 fn hello_roundtrip() {
     let msg = SyncMessage::Hello {
         node_id: NodeId::from_u64(42),
         root_page: PageId(7),
         root_hash: sample_hash(),
+        crdt_aware: true,
     };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::Hello {
             node_id,
             root_page,
             root_hash,
+            crdt_aware,
         } => {
             assert_eq!(node_id, NodeId::from_u64(42));
             assert_eq!(root_page, PageId(7));
             assert_eq!(root_hash, sample_hash());
+            assert!(crdt_aware);
         }
         _ => panic!("wrong variant"),
     }
@@ -50,8 +98,9 @@ fn hello_ack_roundtrip() {
         root_page: PageId(3),
         root_hash: sample_hash(),
         in_sync: true,
+        crdt_aware: true,
     };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::HelloAck {
@@ -59,11 +108,13 @@ fn hello_ack_roundtrip() {
             root_page,
             root_hash,
             in_sync,
+            crdt_aware,
         } => {
             assert_eq!(node_id, NodeId::from_u64(99));
             assert_eq!(root_page, PageId(3));
             assert_eq!(root_hash, sample_hash());
             assert!(in_sync);
+            assert!(crdt_aware);
         }
         _ => panic!("wrong variant"),
     }
@@ -74,7 +125,7 @@ fn digest_request_roundtrip() {
     let msg = SyncMessage::DigestRequest {
         page_ids: vec![PageId(1), PageId(5), PageId(100)],
     };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::DigestRequest { page_ids } => {
@@ -102,7 +153,7 @@ fn digest_response_roundtrip() {
             },
         ],
     };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::DigestResponse { digests } => {
@@ -120,7 +171,7 @@ fn entries_request_roundtrip() {
     let msg = SyncMessage::EntriesRequest {
         page_ids: vec![PageId(10)],
     };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::EntriesRequest { page_ids } => {
@@ -146,7 +197,7 @@ fn entries_response_roundtrip() {
             },
         ],
     };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::EntriesResponse { entries } => {
@@ -163,7 +214,7 @@ fn patch_data_roundtrip() {
     let msg = SyncMessage::PatchData {
         data: vec![1, 2, 3, 4, 5],
     };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::PatchData { data: d } => {
@@ -182,7 +233,7 @@ fn patch_ack_roundtrip() {
             entries_equal: 2,
         },
     };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::PatchAck { result } => {
@@ -196,7 +247,7 @@ fn patch_ack_roundtrip() {
 
 #[test]
 fn done_roundtrip() {
-    let data = SyncMessage::Done.serialize();
+    let data = SyncMessage::Done.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     assert!(matches!(decoded, SyncMessage::Done));
 }
@@ -206,7 +257,7 @@ fn error_roundtrip() {
     let msg = SyncMessage::Error {
         message: "something broke".into(),
     };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::Error { message } => {
@@ -218,7 +269,7 @@ fn error_roundtrip() {
 
 #[test]
 fn pull_request_roundtrip() {
-    let data = SyncMessage::PullRequest.serialize();
+    let data = SyncMessage::PullRequest.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     assert!(matches!(decoded, SyncMessage::PullRequest));
 }
@@ -229,7 +280,7 @@ fn pull_response_roundtrip() {
         root_page: PageId(15),
         root_hash: sample_hash(),
     };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::PullResponse {
@@ -259,7 +310,7 @@ fn unknown_message_type() {
 #[test]
 fn empty_digest_request() {
     let msg = SyncMessage::DigestRequest { page_ids: vec![] };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::DigestRequest { page_ids } => assert!(page_ids.is_empty()),
@@ -269,9 +320,14 @@ fn empty_digest_request() {
 
 #[test]
 fn table_list_request_roundtrip() {
-    let data = SyncMessage::TableListRequest.serialize();
+    let data = SyncMessage::TableListRequest { crdt_aware: true }
+        .serialize()
+        .unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
-    assert!(matches!(decoded, SyncMessage::TableListRequest));
+    assert!(matches!(
+        decoded,
+        SyncMessage::TableListRequest { crdt_aware: true }
+    ));
 }
 
 #[test]
@@ -290,7 +346,7 @@ fn table_list_response_roundtrip() {
             },
         ],
     };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::TableListResponse { tables } => {
@@ -308,7 +364,7 @@ fn table_list_response_roundtrip() {
 #[test]
 fn table_list_response_empty() {
     let msg = SyncMessage::TableListResponse { tables: vec![] };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::TableListResponse { tables } => assert!(tables.is_empty()),
@@ -323,7 +379,7 @@ fn table_sync_begin_roundtrip() {
         root_page: PageId(77),
         root_hash: sample_hash(),
     };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::TableSyncBegin {
@@ -344,7 +400,7 @@ fn table_sync_end_roundtrip() {
     let msg = SyncMessage::TableSyncEnd {
         table_name: b"products".to_vec(),
     };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::TableSyncEnd { table_name } => {
@@ -357,10 +413,164 @@ fn table_sync_end_roundtrip() {
 #[test]
 fn empty_entries_response() {
     let msg = SyncMessage::EntriesResponse { entries: vec![] };
-    let data = msg.serialize();
+    let data = msg.serialize().unwrap();
     let decoded = SyncMessage::deserialize(&data).unwrap();
     match decoded {
         SyncMessage::EntriesResponse { entries } => assert!(entries.is_empty()),
         _ => panic!("wrong variant"),
     }
+}
+
+fn raw_message(message_type: u8, payload: &[u8]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(5 + payload.len());
+    data.push(message_type);
+    data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    data.extend_from_slice(payload);
+    data
+}
+
+#[test]
+fn impossible_collection_counts_are_rejected_before_allocation() {
+    for message_type in [
+        MSG_DIGEST_REQUEST,
+        MSG_DIGEST_RESPONSE,
+        MSG_ENTRIES_REQUEST,
+        MSG_ENTRIES_RESPONSE,
+        MSG_TABLE_LIST_RESPONSE,
+    ] {
+        let data = raw_message(message_type, &u32::MAX.to_le_bytes());
+        assert!(matches!(
+            SyncMessage::deserialize(&data),
+            Err(ProtocolError::InvalidCount { .. })
+        ));
+    }
+}
+
+#[test]
+fn impossible_page_child_count_is_rejected_before_allocation() {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&7u32.to_le_bytes());
+    payload.extend_from_slice(&(PageType::Branch as u16).to_le_bytes());
+    payload.extend_from_slice(&[0u8; MERKLE_HASH_SIZE]);
+    payload.extend_from_slice(&u32::MAX.to_le_bytes());
+
+    assert!(matches!(
+        SyncMessage::deserialize(&raw_message(MSG_DIGEST_RESPONSE, &payload)),
+        Err(ProtocolError::InvalidCount { .. })
+    ));
+}
+
+#[test]
+fn invalid_page_type_is_not_coerced_to_a_leaf() {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&7u32.to_le_bytes());
+    payload.extend_from_slice(&u16::MAX.to_le_bytes());
+    payload.extend_from_slice(&[0u8; MERKLE_HASH_SIZE]);
+    payload.extend_from_slice(&0u32.to_le_bytes());
+
+    assert!(matches!(
+        SyncMessage::deserialize(&raw_message(MSG_DIGEST_RESPONSE, &payload)),
+        Err(ProtocolError::InvalidPageType(u16::MAX))
+    ));
+}
+
+#[test]
+fn trailing_frame_and_fixed_payload_bytes_are_rejected() {
+    let mut done = SyncMessage::Done.serialize().unwrap();
+    done.push(0xAA);
+    assert!(matches!(
+        SyncMessage::deserialize(&done),
+        Err(ProtocolError::UnexpectedLength { .. })
+    ));
+
+    let hello = SyncMessage::Hello {
+        node_id: NodeId::from_u64(1),
+        root_page: PageId(1),
+        root_hash: sample_hash(),
+        crdt_aware: false,
+    };
+    let mut bytes = hello.serialize().unwrap();
+    bytes[1..5].copy_from_slice(&42u32.to_le_bytes());
+    bytes.push(0xBB);
+    assert!(matches!(
+        SyncMessage::deserialize(&bytes),
+        Err(ProtocolError::UnexpectedLength { .. })
+    ));
+}
+
+#[test]
+fn branch_child_count_is_bounded_by_a_physical_page() {
+    let count = MAX_BRANCH_CHILDREN + 1;
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&7u32.to_le_bytes());
+    payload.extend_from_slice(&(PageType::Branch as u16).to_le_bytes());
+    payload.extend_from_slice(&[0u8; MERKLE_HASH_SIZE]);
+    payload.extend_from_slice(&(count as u32).to_le_bytes());
+    payload.resize(payload.len() + count * 4, 0);
+
+    assert!(matches!(
+        SyncMessage::deserialize(&raw_message(MSG_DIGEST_RESPONSE, &payload)),
+        Err(ProtocolError::InvalidCount { max, .. }) if max == MAX_BRANCH_CHILDREN
+    ));
+}
+
+#[test]
+fn noncanonical_boolean_bytes_are_rejected() {
+    let mut hello = SyncMessage::Hello {
+        node_id: NodeId::from_u64(1),
+        root_page: PageId(1),
+        root_hash: sample_hash(),
+        crdt_aware: false,
+    }
+    .serialize()
+    .unwrap();
+    hello[45] = 2;
+    assert!(matches!(
+        SyncMessage::deserialize(&hello),
+        Err(ProtocolError::InvalidBoolean { .. })
+    ));
+}
+
+#[test]
+fn outbound_collection_count_matches_the_decoder_limit() {
+    let message = SyncMessage::DigestRequest {
+        page_ids: vec![PageId(1); MAX_WIRE_ITEMS + 1],
+    };
+    assert!(matches!(
+        message.serialize(),
+        Err(ProtocolError::InvalidCount { max, .. }) if max == MAX_WIRE_ITEMS
+    ));
+}
+
+#[test]
+fn outbound_entry_type_matches_the_decoder() {
+    let message = SyncMessage::EntriesResponse {
+        entries: vec![DiffEntry {
+            key: b"key".to_vec(),
+            value: Vec::new(),
+            val_type: u8::MAX,
+        }],
+    };
+    assert!(matches!(
+        message.serialize(),
+        Err(ProtocolError::InvalidValueType(u8::MAX))
+    ));
+}
+
+#[test]
+fn public_serializer_rejects_non_roundtrippable_field_lengths() {
+    let message = SyncMessage::EntriesResponse {
+        entries: vec![DiffEntry {
+            key: vec![b'k'; MAX_KEY_SIZE + 1],
+            value: Vec::new(),
+            val_type: citadel_core::types::ValueType::Inline as u8,
+        }],
+    };
+    assert!(matches!(
+        message.serialize(),
+        Err(ProtocolError::InvalidFieldLength { .. })
+    ));
 }
