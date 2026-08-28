@@ -10,6 +10,7 @@ fn pair_send_recv() {
         node_id: NodeId::from_u64(1),
         root_page: PageId(0),
         root_hash: [0u8; MERKLE_HASH_SIZE],
+        crdt_aware: false,
     };
     a.send(&msg).unwrap();
     let received = b.recv().unwrap();
@@ -39,6 +40,7 @@ fn ordering_preserved() {
             node_id: NodeId::from_u64(i),
             root_page: PageId(0),
             root_hash: [0u8; MERKLE_HASH_SIZE],
+            crdt_aware: false,
         })
         .unwrap();
     }
@@ -74,4 +76,22 @@ fn dropped_sender_causes_recv_error() {
     drop(a);
     let err = b.recv().unwrap_err();
     assert!(matches!(err, SyncError::Closed));
+}
+
+#[test]
+fn send_rejects_an_oversized_public_message_before_serializing() {
+    let (a, _b) = MemoryTransport::pair();
+    let error = a
+        .send(&SyncMessage::EntriesResponse {
+            entries: vec![crate::diff::DiffEntry {
+                key: vec![b'k'; citadel_core::MAX_KEY_SIZE + 1],
+                value: Vec::new(),
+                val_type: citadel_core::types::ValueType::Inline as u8,
+            }],
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        SyncError::Protocol(crate::protocol::ProtocolError::InvalidFieldLength { .. })
+    ));
 }

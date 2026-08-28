@@ -7,12 +7,16 @@
 //! - cell[i].child handles keys where key[i-1] <= k < key[i] (key[-1] = -∞)
 //! - right_child handles keys where key[n-1] <= k
 
-use crate::page::Page;
-use citadel_core::types::PageId;
+use std::collections::HashSet;
+
+use crate::page::{checked_cell_offsets, validate_cell_layout, CellDecodeError, CellSpan, Page};
+use citadel_core::types::{PageId, PageType};
+use citadel_core::BODY_SIZE;
 
 /// Size of fixed fields in a branch cell (child: 4 + key_len: 2).
 const BRANCH_CELL_FIXED: usize = 6;
 
+#[derive(Debug, Clone, Copy)]
 pub struct BranchCell<'a> {
     pub child: PageId,
     pub key: &'a [u8],
@@ -28,6 +32,96 @@ pub fn read_cell(page: &Page, i: u16) -> BranchCell<'_> {
         child: PageId(child),
         key,
     }
+}
+
+/// Decode and validate every branch cell without unchecked indexing. Beyond the
+/// shared layout checks, this enforces the invariants a caller needs before
+/// following child pointers: separators strictly ordered, and every child valid,
+/// unique within the page, and not a self-reference.
+pub fn read_cells_checked(page: &Page) -> Result<Vec<BranchCell<'_>>, CellDecodeError> {
+    if page.page_type() != Some(PageType::Branch) {
+        return Err(CellDecodeError::new(format!(
+            "checked branch decode received page type {}",
+            page.page_type_raw()
+        )));
+    }
+
+    let offsets = checked_cell_offsets(page)?;
+    let mut cells = Vec::with_capacity(offsets.len());
+    let mut spans = Vec::with_capacity(offsets.len());
+    for (index, offset) in offsets.into_iter().enumerate() {
+        let fixed_end = offset.checked_add(BRANCH_CELL_FIXED).ok_or_else(|| {
+            CellDecodeError::new(format!("branch cell {index} header length overflows"))
+        })?;
+        if fixed_end > BODY_SIZE {
+            return Err(CellDecodeError::new(format!(
+                "branch cell {index} header ends at {fixed_end}, beyond page body {BODY_SIZE}"
+            )));
+        }
+        let child = PageId(u32::from_le_bytes([
+            page.data[offset],
+            page.data[offset + 1],
+            page.data[offset + 2],
+            page.data[offset + 3],
+        ]));
+        let key_len = u16::from_le_bytes([page.data[offset + 4], page.data[offset + 5]]) as usize;
+        let end = fixed_end.checked_add(key_len).ok_or_else(|| {
+            CellDecodeError::new(format!("branch cell {index} key length overflows"))
+        })?;
+        if end > BODY_SIZE {
+            return Err(CellDecodeError::new(format!(
+                "branch cell {index} key ends at {end}, beyond page body {BODY_SIZE}"
+            )));
+        }
+        spans.push(CellSpan {
+            index,
+            start: offset,
+            end,
+        });
+        cells.push(BranchCell {
+            child,
+            key: &page.data[fixed_end..end],
+        });
+    }
+    validate_cell_layout(page, &mut spans)?;
+
+    if let Some((index, _)) = cells
+        .windows(2)
+        .enumerate()
+        .find(|(_, pair)| pair[0].key >= pair[1].key)
+    {
+        return Err(CellDecodeError::new(format!(
+            "branch separator keys {index} and {} are not strictly ordered",
+            index + 1
+        )));
+    }
+
+    let own_page = page.page_id();
+    let mut children = HashSet::with_capacity(cells.len() + 1);
+    for (index, child) in cells
+        .iter()
+        .map(|cell| cell.child)
+        .chain(std::iter::once(page.right_child()))
+        .enumerate()
+    {
+        if !child.is_valid() {
+            return Err(CellDecodeError::new(format!(
+                "branch child {index} is invalid"
+            )));
+        }
+        if child == own_page {
+            return Err(CellDecodeError::new(format!(
+                "branch child {index} points back to page {own_page}"
+            )));
+        }
+        if !children.insert(child) {
+            return Err(CellDecodeError::new(format!(
+                "branch child {index} duplicates page {child}"
+            )));
+        }
+    }
+
+    Ok(cells)
 }
 
 /// Get the total byte size of a branch cell on disk.

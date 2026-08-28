@@ -22,6 +22,7 @@ fn connect_and_exchange() {
         node_id: NodeId::from_u64(42),
         root_page: PageId(10),
         root_hash: [1u8; MERKLE_HASH_SIZE],
+        crdt_aware: false,
     };
     client.send(&msg).unwrap();
     match server.recv().unwrap() {
@@ -29,6 +30,7 @@ fn connect_and_exchange() {
             node_id,
             root_page,
             root_hash,
+            ..
         } => {
             assert_eq!(node_id, NodeId::from_u64(42));
             assert_eq!(root_page, PageId(10));
@@ -57,12 +59,14 @@ fn roundtrip_all_types() {
             node_id: NodeId::from_u64(1),
             root_page: PageId(0),
             root_hash: [0u8; MERKLE_HASH_SIZE],
+            crdt_aware: false,
         },
         SyncMessage::HelloAck {
             node_id: NodeId::from_u64(2),
             root_page: PageId(5),
             root_hash: [2u8; MERKLE_HASH_SIZE],
             in_sync: false,
+            crdt_aware: false,
         },
         SyncMessage::DigestRequest {
             page_ids: vec![PageId(1), PageId(2)],
@@ -97,8 +101,8 @@ fn roundtrip_all_types() {
 
     for expected in &messages {
         let received = b.recv().unwrap();
-        let expected_bytes = expected.serialize();
-        let received_bytes = received.serialize();
+        let expected_bytes = expected.serialize().unwrap();
+        let received_bytes = received.serialize().unwrap();
         assert_eq!(expected_bytes, received_bytes);
     }
 }
@@ -151,6 +155,7 @@ fn multiple_messages() {
             node_id: NodeId::from_u64(i),
             root_page: PageId(0),
             root_hash: [0u8; MERKLE_HASH_SIZE],
+            crdt_aware: false,
         })
         .unwrap();
     }

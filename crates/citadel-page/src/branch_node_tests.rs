@@ -24,6 +24,63 @@ fn read_write_branch_cell() {
 }
 
 #[test]
+fn checked_reader_accepts_a_well_formed_branch() {
+    let mut page = make_branch_page(&[b"cat", b"dog"], &[PageId(1), PageId(2)], PageId(3));
+    page.set_page_id(PageId(10));
+
+    let cells = read_cells_checked(&page).unwrap();
+    assert_eq!(cells.len(), 2);
+    assert_eq!(cells[0].key, b"cat");
+    assert_eq!(cells[1].child, PageId(2));
+}
+
+#[test]
+fn checked_reader_rejects_an_out_of_bounds_pointer_array_without_panicking() {
+    let mut page = make_branch_page(&[b"key"], &[PageId(1)], PageId(2));
+    page.set_page_id(PageId(10));
+    page.set_num_cells(u16::MAX);
+
+    let decoded = std::panic::catch_unwind(|| read_cells_checked(&page));
+    assert!(decoded.is_ok(), "checked decoding must not unwind");
+    let error = decoded.unwrap().unwrap_err();
+    assert!(error.to_string().contains("pointer array"));
+}
+
+#[test]
+fn checked_reader_rejects_overlapping_cells() {
+    let mut page = make_branch_page(&[b"cat", b"dog"], &[PageId(1), PageId(2)], PageId(3));
+    page.set_page_id(PageId(10));
+    page.set_cell_offset(1, page.cell_offset(0));
+
+    let error = read_cells_checked(&page).unwrap_err();
+    assert!(error.to_string().contains("overlap"));
+}
+
+#[test]
+fn checked_reader_rejects_unordered_keys_and_bad_children() {
+    let mut unordered = make_branch_page(&[b"dog", b"cat"], &[PageId(1), PageId(2)], PageId(3));
+    unordered.set_page_id(PageId(10));
+    assert!(read_cells_checked(&unordered)
+        .unwrap_err()
+        .to_string()
+        .contains("not strictly ordered"));
+
+    let mut duplicate = make_branch_page(&[b"cat"], &[PageId(1)], PageId(1));
+    duplicate.set_page_id(PageId(10));
+    assert!(read_cells_checked(&duplicate)
+        .unwrap_err()
+        .to_string()
+        .contains("duplicates"));
+
+    let mut self_ref = make_branch_page(&[b"cat"], &[PageId(10)], PageId(2));
+    self_ref.set_page_id(PageId(10));
+    assert!(read_cells_checked(&self_ref)
+        .unwrap_err()
+        .to_string()
+        .contains("points back"));
+}
+
+#[test]
 fn search_finds_correct_child() {
     let page = make_branch_page(
         &[b"cat", b"dog", b"fox"],

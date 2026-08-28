@@ -116,3 +116,312 @@ fn zero_hashes_never_prune_subtrees() {
     assert_eq!(result.subtrees_skipped, 0);
     assert_eq!(result.entries, vec![entry(b"v2")]);
 }
+
+#[test]
+fn hostile_tree_reader_cannot_emit_an_unknown_value_type() {
+    let source = SingleLeafReader {
+        hash: [1u8; MERKLE_HASH_SIZE],
+        entry: DiffEntry {
+            key: b"key".to_vec(),
+            value: b"value".to_vec(),
+            val_type: u8::MAX,
+        },
+    };
+    let target = SingleLeafReader {
+        hash: [2u8; MERKLE_HASH_SIZE],
+        entry: DiffEntry {
+            key: b"other".to_vec(),
+            value: b"value".to_vec(),
+            val_type: citadel_core::types::ValueType::Inline as u8,
+        },
+    };
+
+    assert!(matches!(
+        merkle_diff(&source, &target),
+        Err(citadel_core::Error::DatabaseCorrupted)
+    ));
+}
+
+#[test]
+fn custom_reader_entry_lengths_cannot_exceed_wire_limits() {
+    assert!(matches!(
+        validate_diff_entry_fields(
+            MAX_KEY_SIZE + 1,
+            0,
+            citadel_core::types::ValueType::Inline as u8
+        ),
+        Err(citadel_core::Error::KeyTooLarge { max, .. }) if max == MAX_KEY_SIZE
+    ));
+    assert!(matches!(
+        validate_diff_entry_fields(
+            1,
+            MAX_SYNC_VALUE_SIZE + 1,
+            citadel_core::types::ValueType::Inline as u8
+        ),
+        Err(citadel_core::Error::Sync(message))
+            if message.contains("streaming sync is required")
+    ));
+    assert!(matches!(
+        validate_diff_entry_fields(1, 1, citadel_core::types::ValueType::Tombstone as u8),
+        Err(citadel_core::Error::DatabaseCorrupted)
+    ));
+}
+
+struct CyclicRemoteReader;
+
+impl TreeReader for CyclicRemoteReader {
+    fn root_info(&self) -> Result<(PageId, MerkleHash)> {
+        Ok((PageId(7), UNKNOWN_HASH))
+    }
+
+    fn page_digest(&self, page_id: PageId) -> Result<PageDigest> {
+        Ok(PageDigest {
+            page_id,
+            page_type: PageType::Branch,
+            merkle_hash: UNKNOWN_HASH,
+            children: vec![page_id],
+        })
+    }
+
+    fn leaf_entries(&self, _page_id: PageId) -> Result<Vec<DiffEntry>> {
+        panic!("a cyclic branch must never be treated as a leaf")
+    }
+}
+
+#[test]
+fn hostile_subtree_cycle_is_rejected_without_recursing() {
+    let target = SingleLeafReader {
+        hash: UNKNOWN_HASH,
+        entry: DiffEntry {
+            key: b"target".to_vec(),
+            value: b"value".to_vec(),
+            val_type: 0,
+        },
+    };
+
+    assert!(matches!(
+        merkle_diff(&CyclicRemoteReader, &target),
+        Err(citadel_core::Error::DatabaseCorrupted)
+    ));
+}
+
+struct SharedChildReader;
+
+impl TreeReader for SharedChildReader {
+    fn root_info(&self) -> Result<(PageId, MerkleHash)> {
+        Ok((PageId(9), UNKNOWN_HASH))
+    }
+
+    fn page_digest(&self, page_id: PageId) -> Result<PageDigest> {
+        Ok(if page_id == PageId(9) {
+            PageDigest {
+                page_id,
+                page_type: PageType::Branch,
+                merkle_hash: UNKNOWN_HASH,
+                children: vec![PageId(10), PageId(10)],
+            }
+        } else {
+            PageDigest {
+                page_id,
+                page_type: PageType::Leaf,
+                merkle_hash: UNKNOWN_HASH,
+                children: Vec::new(),
+            }
+        })
+    }
+
+    fn leaf_entries(&self, _page_id: PageId) -> Result<Vec<DiffEntry>> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn duplicate_child_reference_is_rejected() {
+    assert!(matches!(
+        SharedChildReader.subtree_entries(PageId(9)),
+        Err(citadel_core::Error::DatabaseCorrupted)
+    ));
+}
+
+struct OversizedAcyclicBranch;
+
+impl TreeReader for OversizedAcyclicBranch {
+    fn root_info(&self) -> Result<(PageId, MerkleHash)> {
+        Ok((PageId(1), UNKNOWN_HASH))
+    }
+
+    fn page_digest(&self, page_id: PageId) -> Result<PageDigest> {
+        Ok(PageDigest {
+            page_id,
+            page_type: PageType::Branch,
+            merkle_hash: UNKNOWN_HASH,
+            children: (0..=MAX_BRANCH_CHILDREN)
+                .map(|index| PageId(index as u32 + 2))
+                .collect(),
+        })
+    }
+
+    fn leaf_entries(&self, _page_id: PageId) -> Result<Vec<DiffEntry>> {
+        panic!("an impossible branch fanout must be rejected before traversal")
+    }
+}
+
+#[test]
+fn acyclic_but_physically_impossible_branch_is_bounded() {
+    assert!(matches!(
+        OversizedAcyclicBranch.subtree_entries(PageId(1)),
+        Err(citadel_core::Error::DatabaseCorrupted)
+    ));
+}
+
+struct CrossBoundarySource;
+
+impl TreeReader for CrossBoundarySource {
+    fn root_info(&self) -> Result<(PageId, MerkleHash)> {
+        Ok((PageId(1), UNKNOWN_HASH))
+    }
+
+    fn page_digest(&self, page_id: PageId) -> Result<PageDigest> {
+        Ok(match page_id {
+            PageId(1) => PageDigest {
+                page_id,
+                page_type: PageType::Branch,
+                merkle_hash: UNKNOWN_HASH,
+                children: vec![PageId(2), PageId(3)],
+            },
+            PageId(2) => PageDigest {
+                page_id,
+                page_type: PageType::Leaf,
+                merkle_hash: [7u8; MERKLE_HASH_SIZE],
+                children: Vec::new(),
+            },
+            PageId(3) => PageDigest {
+                page_id,
+                page_type: PageType::Branch,
+                merkle_hash: UNKNOWN_HASH,
+                children: vec![PageId(2)],
+            },
+            _ => panic!("unexpected page"),
+        })
+    }
+
+    fn leaf_entries(&self, _page_id: PageId) -> Result<Vec<DiffEntry>> {
+        Ok(Vec::new())
+    }
+}
+
+struct CrossBoundaryTarget;
+
+impl TreeReader for CrossBoundaryTarget {
+    fn root_info(&self) -> Result<(PageId, MerkleHash)> {
+        Ok((PageId(10), UNKNOWN_HASH))
+    }
+
+    fn page_digest(&self, page_id: PageId) -> Result<PageDigest> {
+        Ok(match page_id {
+            PageId(10) => PageDigest {
+                page_id,
+                page_type: PageType::Branch,
+                merkle_hash: UNKNOWN_HASH,
+                children: vec![PageId(20), PageId(30)],
+            },
+            PageId(20) => PageDigest {
+                page_id,
+                page_type: PageType::Leaf,
+                merkle_hash: [7u8; MERKLE_HASH_SIZE],
+                children: Vec::new(),
+            },
+            PageId(30) => PageDigest {
+                page_id,
+                page_type: PageType::Leaf,
+                merkle_hash: UNKNOWN_HASH,
+                children: Vec::new(),
+            },
+            _ => panic!("unexpected page"),
+        })
+    }
+
+    fn leaf_entries(&self, _page_id: PageId) -> Result<Vec<DiffEntry>> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn subtree_collection_cannot_revisit_a_page_seen_by_paired_walk() {
+    assert!(matches!(
+        merkle_diff(&CrossBoundarySource, &CrossBoundaryTarget),
+        Err(citadel_core::Error::DatabaseCorrupted)
+    ));
+}
+
+struct MultiLeafBudgetSource;
+
+impl TreeReader for MultiLeafBudgetSource {
+    fn root_info(&self) -> Result<(PageId, MerkleHash)> {
+        Ok((PageId(1), UNKNOWN_HASH))
+    }
+
+    fn page_digest(&self, page_id: PageId) -> Result<PageDigest> {
+        Ok(if page_id == PageId(1) {
+            PageDigest {
+                page_id,
+                page_type: PageType::Branch,
+                merkle_hash: UNKNOWN_HASH,
+                children: vec![PageId(2), PageId(3)],
+            }
+        } else {
+            PageDigest {
+                page_id,
+                page_type: PageType::Leaf,
+                merkle_hash: UNKNOWN_HASH,
+                children: Vec::new(),
+            }
+        })
+    }
+
+    fn leaf_entries(&self, page_id: PageId) -> Result<Vec<DiffEntry>> {
+        Ok(vec![DiffEntry {
+            key: page_id.as_u32().to_be_bytes().to_vec(),
+            value: vec![0; MAX_DIFF_BYTES / 2],
+            val_type: citadel_core::types::ValueType::Inline as u8,
+        }])
+    }
+}
+
+struct MultiLeafBudgetTarget;
+
+impl TreeReader for MultiLeafBudgetTarget {
+    fn root_info(&self) -> Result<(PageId, MerkleHash)> {
+        Ok((PageId(10), UNKNOWN_HASH))
+    }
+
+    fn page_digest(&self, page_id: PageId) -> Result<PageDigest> {
+        Ok(if page_id == PageId(10) {
+            PageDigest {
+                page_id,
+                page_type: PageType::Branch,
+                merkle_hash: UNKNOWN_HASH,
+                children: vec![PageId(20), PageId(30)],
+            }
+        } else {
+            PageDigest {
+                page_id,
+                page_type: PageType::Leaf,
+                merkle_hash: [page_id.as_u32() as u8; MERKLE_HASH_SIZE],
+                children: Vec::new(),
+            }
+        })
+    }
+
+    fn leaf_entries(&self, _page_id: PageId) -> Result<Vec<DiffEntry>> {
+        panic!("target entries are not needed for a source-to-target diff")
+    }
+}
+
+#[test]
+fn aggregate_budget_stops_multiple_large_leaf_responses() {
+    assert!(matches!(
+        merkle_diff(&MultiLeafBudgetSource, &MultiLeafBudgetTarget),
+        Err(citadel_core::Error::Sync(message)) if message.contains("sync payload limit")
+    ));
+}

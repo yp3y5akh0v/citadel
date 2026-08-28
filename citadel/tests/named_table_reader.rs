@@ -1,4 +1,6 @@
 use citadel::{Argon2Profile, DatabaseBuilder};
+use citadel_core::constants::MAX_INLINE_VALUE_SIZE;
+use citadel_core::types::ValueType;
 use citadel_core::MERKLE_HASH_SIZE;
 use citadel_sync::diff::TreeReader;
 use citadel_sync::LocalTreeReader;
@@ -99,6 +101,119 @@ fn two_table_readers_differ() {
 }
 
 #[test]
+fn readers_materialize_overflow_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fast_builder(&dir.path().join("test.db")).create().unwrap();
+    let large = vec![0xA5; MAX_INLINE_VALUE_SIZE + 4096];
+
+    let mut wtx = db.begin_write().unwrap();
+    wtx.insert(b"default-large", &large).unwrap();
+    wtx.create_table(b"large_table").unwrap();
+    wtx.table_insert(b"large_table", b"named-large", &large)
+        .unwrap();
+    wtx.commit().unwrap();
+
+    let default_reader = LocalTreeReader::new(db.manager());
+    let (default_root, _) = default_reader.root_info().unwrap();
+    let default_entries = default_reader.subtree_entries(default_root).unwrap();
+    assert_eq!(default_entries.len(), 1);
+    assert_eq!(default_entries[0].value, large);
+    assert_eq!(default_entries[0].val_type, ValueType::Overflow as u8);
+
+    let named_reader = LocalTreeReader::for_table(db.manager(), b"large_table").unwrap();
+    let (named_root, _) = named_reader.root_info().unwrap();
+    let named_entries = named_reader.subtree_entries(named_root).unwrap();
+    assert_eq!(named_entries.len(), 1);
+    assert_eq!(named_entries[0].value, large);
+    assert_eq!(named_entries[0].val_type, ValueType::Overflow as u8);
+}
+
+#[test]
+fn reader_retains_its_snapshot_across_page_reclamation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fast_builder(&dir.path().join("test.db"))
+        .cache_size(1)
+        .create()
+        .unwrap();
+    let old_value = vec![0x3C; MAX_INLINE_VALUE_SIZE + 1024];
+
+    let mut wtx = db.begin_write().unwrap();
+    for i in 0..24u32 {
+        wtx.insert(&i.to_be_bytes(), &old_value).unwrap();
+    }
+    wtx.commit().unwrap();
+
+    let reader = LocalTreeReader::new(db.manager());
+    let (old_root, _) = reader.root_info().unwrap();
+
+    for round in 0..6u32 {
+        let mut wtx = db.begin_write().unwrap();
+        if round == 0 {
+            for i in 0..24u32 {
+                wtx.delete(&i.to_be_bytes()).unwrap();
+            }
+        }
+        for i in 0..64u32 {
+            let key = (10_000 + round * 64 + i).to_be_bytes();
+            wtx.insert(&key, &vec![round as u8; 512]).unwrap();
+        }
+        wtx.commit().unwrap();
+    }
+
+    let entries = reader.subtree_entries(old_root).unwrap();
+    assert_eq!(entries.len(), 24);
+    for (index, entry) in entries.iter().enumerate() {
+        assert_eq!(entry.key, (index as u32).to_be_bytes());
+        assert_eq!(entry.value, old_value);
+    }
+}
+
+#[test]
+fn named_reader_keeps_the_resolved_table_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fast_builder(&dir.path().join("test.db"))
+        .cache_size(1)
+        .create()
+        .unwrap();
+    let old_value = vec![0x6D; MAX_INLINE_VALUE_SIZE + 512];
+
+    let mut wtx = db.begin_write().unwrap();
+    wtx.create_table(b"rotating").unwrap();
+    wtx.table_insert(b"rotating", b"old-key", &old_value)
+        .unwrap();
+    wtx.commit().unwrap();
+
+    let reader = LocalTreeReader::for_table(db.manager(), b"rotating").unwrap();
+    let (old_root, _) = reader.root_info().unwrap();
+
+    let mut wtx = db.begin_write().unwrap();
+    wtx.drop_table(b"rotating").unwrap();
+    wtx.commit().unwrap();
+    let mut wtx = db.begin_write().unwrap();
+    wtx.create_table(b"rotating").unwrap();
+    wtx.table_insert(b"rotating", b"new-key", b"new-value")
+        .unwrap();
+    wtx.commit().unwrap();
+
+    for round in 0..4u32 {
+        let mut wtx = db.begin_write().unwrap();
+        for i in 0..64u32 {
+            wtx.insert(
+                &(20_000 + round * 64 + i).to_be_bytes(),
+                &vec![round as u8; 256],
+            )
+            .unwrap();
+        }
+        wtx.commit().unwrap();
+    }
+
+    let entries = reader.subtree_entries(old_root).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].key, b"old-key");
+    assert_eq!(entries[0].value, old_value);
+}
+
+#[test]
 fn readers_reject_pages_outside_their_advertised_tree() {
     let dir = tempfile::tempdir().unwrap();
     let db = fast_builder(&dir.path().join("test.db")).create().unwrap();
@@ -141,6 +256,8 @@ fn readers_reject_pages_outside_their_advertised_tree() {
         Err(citadel_core::Error::DatabaseCorrupted)
     ));
 
+    // Keep the old page physically valid while proving that a reader for a
+    // later snapshot still cannot use its ID as an entry point.
     let _stale_horizon = db.begin_read();
     let mut wtx = db.begin_write().unwrap();
     wtx.drop_table(b"doomed").unwrap();

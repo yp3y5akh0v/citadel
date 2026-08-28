@@ -356,8 +356,9 @@ impl<'db> ReadTxn<'db> {
             let page = self.read_reachable_page(page_id)?;
             match page.page_type() {
                 Some(PageType::Leaf) => {
-                    for index in 0..page.num_cells() {
-                        let cell = leaf_node::read_cell(&page, index);
+                    let cells = leaf_node::read_cells_checked(&page)
+                        .map_err(|_| Error::DatabaseCorrupted)?;
+                    for cell in cells {
                         if cell.val_type == ValueType::Tombstone {
                             continue;
                         }
@@ -391,14 +392,12 @@ impl<'db> ReadTxn<'db> {
                     }
                 }
                 Some(PageType::Branch) => {
-                    for index in 0..page.num_cells() as usize {
-                        stack.push(branch_node::get_child(&page, index));
+                    let cells = branch_node::read_cells_checked(&page)
+                        .map_err(|_| Error::DatabaseCorrupted)?;
+                    for cell in cells {
+                        stack.push(cell.child);
                     }
-                    let right = page.right_child();
-                    if !right.is_valid() {
-                        return Err(Error::DatabaseCorrupted);
-                    }
-                    stack.push(right);
+                    stack.push(page.right_child());
                 }
                 _ => return Err(Error::InvalidPageType(page.page_type_raw(), page_id)),
             }
@@ -819,14 +818,20 @@ impl<'db> ReadTxn<'db> {
         }
 
         let mut current = catalog_root;
+        let mut visited = FxHashSet::default();
         let mut desc = loop {
             self.check_cancel()?;
+            if !visited.insert(current) {
+                return Err(Error::DatabaseCorrupted);
+            }
             let page = self.read_reachable_page(current)?;
             match page.page_type() {
                 Some(PageType::Leaf) => {
-                    break match leaf_node::search(&page, name) {
+                    let cells = leaf_node::read_cells_checked(&page)
+                        .map_err(|_| Error::DatabaseCorrupted)?;
+                    break match cells.binary_search_by(|cell| cell.key.cmp(name)) {
                         Ok(idx) => {
-                            let cell = leaf_node::read_cell(&page, idx);
+                            let cell = cells[idx];
                             if cell.val_type == ValueType::Tombstone {
                                 Err(Error::TableNotFound(
                                     String::from_utf8_lossy(name).into_owned(),
@@ -844,8 +849,24 @@ impl<'db> ReadTxn<'db> {
                     };
                 }
                 Some(PageType::Branch) => {
-                    let idx = branch_node::search_child_index(&page, name);
-                    current = branch_node::get_child(&page, idx);
+                    let cells = branch_node::read_cells_checked(&page)
+                        .map_err(|_| Error::DatabaseCorrupted)?;
+                    // Find the first separator strictly greater than the name.
+                    let mut lo = 0usize;
+                    let mut hi = cells.len();
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        if name < cells[mid].key {
+                            hi = mid;
+                        } else {
+                            lo = mid + 1;
+                        }
+                    }
+                    current = if lo < cells.len() {
+                        cells[lo].child
+                    } else {
+                        page.right_child()
+                    };
                 }
                 _ => {
                     return Err(Error::InvalidPageType(page.page_type_raw(), current));

@@ -74,12 +74,17 @@ impl TreeReader for RemoteTreeReader<'_> {
             .map_err(sync_to_core)?;
 
         match self.transport.recv().map_err(sync_to_core)? {
-            SyncMessage::DigestResponse { mut digests } if !digests.is_empty() => {
+            SyncMessage::DigestResponse { mut digests }
+                if digests.len() == 1 && digests[0].page_id == page_id =>
+            {
                 Ok(digests.remove(0))
             }
-            SyncMessage::DigestResponse { .. } => Err(citadel_core::Error::Io(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "empty digest response"),
-            )),
+            SyncMessage::DigestResponse { .. } => {
+                Err(citadel_core::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "digest response must contain exactly the requested page",
+                )))
+            }
             SyncMessage::Error { message } => {
                 Err(citadel_core::Error::Io(std::io::Error::other(message)))
             }
@@ -128,7 +133,7 @@ pub(crate) fn msg_name(msg: &SyncMessage) -> &'static str {
         SyncMessage::Error { .. } => "Error",
         SyncMessage::PullRequest => "PullRequest",
         SyncMessage::PullResponse { .. } => "PullResponse",
-        SyncMessage::TableListRequest => "TableListRequest",
+        SyncMessage::TableListRequest { .. } => "TableListRequest",
         SyncMessage::TableListResponse { .. } => "TableListResponse",
         SyncMessage::TableSyncBegin { .. } => "TableSyncBegin",
         SyncMessage::TableSyncEnd { .. } => "TableSyncEnd",

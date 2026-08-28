@@ -8,11 +8,18 @@ fn meta(wall_ns: i64, logical: i32, node: u64) -> CrdtMeta {
 #[test]
 fn empty_patch_roundtrip() {
     let patch = SyncPatch::empty(NodeId::from_u64(42));
-    let data = patch.serialize();
+    let data = patch.serialize().unwrap();
     let decoded = SyncPatch::deserialize(&data).unwrap();
     assert!(decoded.is_empty());
     assert_eq!(decoded.source_node, NodeId::from_u64(42));
     assert!(!decoded.crdt_aware);
+}
+
+#[test]
+fn patch_magic_and_version_wire_bytes_are_frozen() {
+    let data = SyncPatch::empty(NodeId::from_u64(42)).serialize().unwrap();
+
+    assert_eq!(&data[..5], b"CNYS\x02");
 }
 
 #[test]
@@ -36,7 +43,7 @@ fn patch_with_entries_roundtrip() {
         crdt_aware: false,
     };
 
-    let data = patch.serialize();
+    let data = patch.serialize().unwrap();
     let decoded = SyncPatch::deserialize(&data).unwrap();
     assert_eq!(decoded.len(), 2);
     assert_eq!(decoded.entries[0].key, b"key1");
@@ -53,13 +60,13 @@ fn crdt_patch_roundtrip() {
         entries: vec![
             PatchEntry {
                 key: b"key1".to_vec(),
-                value: b"value1".to_vec(),
+                value: crate::crdt::encode_lww_value(&m, EntryKind::Put, b"value1"),
                 kind: EntryKind::Put,
                 crdt_meta: Some(m),
             },
             PatchEntry {
                 key: b"key2".to_vec(),
-                value: Vec::new(),
+                value: crate::crdt::encode_lww_value(&m, EntryKind::Tombstone, b""),
                 kind: EntryKind::Tombstone,
                 crdt_meta: Some(m),
             },
@@ -67,7 +74,7 @@ fn crdt_patch_roundtrip() {
         crdt_aware: true,
     };
 
-    let data = patch.serialize();
+    let data = patch.serialize().unwrap();
     let decoded = SyncPatch::deserialize(&data).unwrap();
     assert_eq!(decoded.len(), 2);
     assert!(decoded.crdt_aware);
@@ -92,7 +99,7 @@ fn large_values_roundtrip() {
         crdt_aware: false,
     };
 
-    let data = patch.serialize();
+    let data = patch.serialize().unwrap();
     let decoded = SyncPatch::deserialize(&data).unwrap();
     assert_eq!(decoded.entries[0].key, big_key);
     assert_eq!(decoded.entries[0].value, big_val);
@@ -100,7 +107,7 @@ fn large_values_roundtrip() {
 
 #[test]
 fn invalid_magic_error() {
-    let mut data = SyncPatch::empty(NodeId::from_u64(1)).serialize();
+    let mut data = SyncPatch::empty(NodeId::from_u64(1)).serialize().unwrap();
     data[0] = 0xFF; // corrupt magic
     let err = SyncPatch::deserialize(&data).unwrap_err();
     assert!(matches!(err, PatchError::InvalidMagic { .. }));
@@ -108,7 +115,7 @@ fn invalid_magic_error() {
 
 #[test]
 fn unsupported_version_error() {
-    let mut data = SyncPatch::empty(NodeId::from_u64(1)).serialize();
+    let mut data = SyncPatch::empty(NodeId::from_u64(1)).serialize().unwrap();
     data[4] = 99; // bad version
     let err = SyncPatch::deserialize(&data).unwrap_err();
     assert!(matches!(err, PatchError::UnsupportedVersion(99)));
@@ -116,7 +123,7 @@ fn unsupported_version_error() {
 
 #[test]
 fn version_one_physical_overflow_patches_are_rejected() {
-    let mut data = SyncPatch::empty(NodeId::from_u64(1)).serialize();
+    let mut data = SyncPatch::empty(NodeId::from_u64(1)).serialize().unwrap();
     assert_eq!(data[4], 2);
     data[4] = 1;
 
@@ -144,7 +151,7 @@ fn truncated_entry_error() {
         }],
         crdt_aware: false,
     };
-    let mut data = patch.serialize();
+    let mut data = patch.serialize().unwrap();
     data.truncate(data.len() - 3); // cut off end of value
     let err = SyncPatch::deserialize(&data).unwrap_err();
     assert!(matches!(err, PatchError::Truncated { .. }));
@@ -162,7 +169,7 @@ fn invalid_entry_kind_error() {
         }],
         crdt_aware: false,
     };
-    let mut data = patch.serialize();
+    let mut data = patch.serialize().unwrap();
     data[18 + 6] = 255;
     let err = SyncPatch::deserialize(&data).unwrap_err();
     assert!(matches!(err, PatchError::InvalidEntryKind(255)));
@@ -185,7 +192,7 @@ fn many_entries_roundtrip() {
         crdt_aware: false,
     };
 
-    let data = patch.serialize();
+    let data = patch.serialize().unwrap();
     let decoded = SyncPatch::deserialize(&data).unwrap();
     assert_eq!(decoded.len(), 1000);
     for (i, entry) in decoded.entries.iter().enumerate() {
@@ -220,6 +227,56 @@ fn from_diff_non_crdt() {
 }
 
 #[test]
+fn impossible_entry_count_is_rejected_before_allocation() {
+    let mut data = SyncPatch::empty(NodeId::from_u64(1)).serialize().unwrap();
+    data[14..18].copy_from_slice(&u32::MAX.to_le_bytes());
+
+    assert!(matches!(
+        SyncPatch::deserialize(&data),
+        Err(PatchError::InvalidEntryCount { .. })
+    ));
+}
+
+#[test]
+fn crdt_wire_metadata_and_kind_must_match_the_encoded_value() {
+    let encoded_meta = meta(1, 0, 1);
+    let claimed_meta = meta(2, 0, 2);
+    let patch = SyncPatch {
+        source_node: NodeId::from_u64(2),
+        entries: vec![PatchEntry {
+            key: b"victim".to_vec(),
+            value: crate::crdt::encode_lww_value(&encoded_meta, EntryKind::Put, b"resurrect"),
+            kind: EntryKind::Tombstone,
+            crdt_meta: Some(claimed_meta),
+        }],
+        crdt_aware: true,
+    };
+
+    assert!(matches!(
+        SyncPatch::deserialize(&patch.serialize_unchecked()),
+        Err(PatchError::InvalidCrdtEntry { .. })
+    ));
+}
+
+#[test]
+fn from_diff_preserves_a_physical_tombstone() {
+    let diff = DiffResult {
+        entries: vec![crate::diff::DiffEntry {
+            key: b"removed".to_vec(),
+            value: b"not-a-logical-value".to_vec(),
+            val_type: citadel_core::types::ValueType::Tombstone as u8,
+        }],
+        pages_compared: 1,
+        subtrees_skipped: 0,
+    };
+
+    let patch = SyncPatch::from_diff(NodeId::from_u64(1), &diff, false);
+    assert_eq!(patch.entries[0].kind, EntryKind::Tombstone);
+    assert!(patch.entries[0].value.is_empty());
+    assert!(patch.entries[0].crdt_meta.is_none());
+}
+
+#[test]
 fn from_diff_crdt_extracts_meta() {
     let m = meta(1_000_000_000, 5, 42);
     let crdt_value = crate::crdt::encode_lww_value(&m, EntryKind::Put, b"user-data");
@@ -239,4 +296,47 @@ fn from_diff_crdt_extracts_meta() {
     assert!(patch.crdt_aware);
     assert_eq!(patch.entries[0].crdt_meta, Some(m));
     assert_eq!(patch.entries[0].kind, EntryKind::Put);
+}
+
+#[test]
+fn hostile_declared_value_length_is_rejected_before_copying() {
+    let mut data = SyncPatch::empty(NodeId::from_u64(1)).serialize().unwrap();
+    data[14..18].copy_from_slice(&1u32.to_le_bytes());
+    data.extend_from_slice(&1u16.to_le_bytes());
+    data.extend_from_slice(&u32::MAX.to_le_bytes());
+    data.push(EntryKind::Put as u8);
+    data.push(b'k');
+
+    assert!(matches!(
+        SyncPatch::deserialize(&data),
+        Err(PatchError::InvalidEntry { .. })
+    ));
+}
+
+#[test]
+fn trailing_patch_bytes_are_rejected() {
+    let mut data = SyncPatch::empty(NodeId::from_u64(1)).serialize().unwrap();
+    data.push(0xAA);
+    assert!(matches!(
+        SyncPatch::deserialize(&data),
+        Err(PatchError::TrailingData { .. })
+    ));
+}
+
+#[test]
+fn public_serializer_rejects_a_non_roundtrippable_key() {
+    let patch = SyncPatch {
+        source_node: NodeId::from_u64(1),
+        entries: vec![PatchEntry {
+            key: vec![b'k'; citadel_core::MAX_KEY_SIZE + 1],
+            value: Vec::new(),
+            kind: EntryKind::Put,
+            crdt_meta: None,
+        }],
+        crdt_aware: false,
+    };
+    assert!(matches!(
+        patch.serialize(),
+        Err(PatchError::InvalidEntry { .. })
+    ));
 }

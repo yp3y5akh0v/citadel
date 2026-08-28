@@ -185,7 +185,7 @@ fn sync_empty_tables_no_crash() {
 }
 
 #[test]
-fn sync_skips_index_tables() {
+fn all_table_sync_rejects_reserved_source_tables() {
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
     let db_a = fast_builder(&dir_a.path().join("a.db")).create().unwrap();
@@ -210,13 +210,94 @@ fn sync_skips_index_tables() {
     let mgr_b = db_b.manager();
 
     thread::scope(|s| {
-        let h = s.spawn(|| sess_a.sync_tables_as_initiator(mgr_a, &ta).unwrap());
-        sess_b.handle_table_sync_as_responder(mgr_b, &tb).unwrap();
-        let results = h.join().unwrap();
-        // Should sync "data" but NOT "__idx_data_name"
-        assert!(results.iter().any(|(name, _)| name == b"data"));
-        assert!(!results.iter().any(|(name, _)| name.starts_with(b"__idx_")));
+        let h = s.spawn(|| sess_a.sync_tables_as_initiator(mgr_a, &ta));
+        let responder = sess_b.handle_table_sync_as_responder(mgr_b, &tb);
+        let initiator = h.join().unwrap();
+        assert!(initiator
+            .unwrap_err()
+            .to_string()
+            .contains("reserved table"));
+        assert!(responder
+            .unwrap_err()
+            .to_string()
+            .contains("reserved table"));
     });
+
+    let mut rtx = db_b.begin_read();
+    assert!(rtx.table_get(b"data", b"k").unwrap().is_none());
+}
+
+#[test]
+fn all_table_sync_rejects_reserved_destination_tables() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let db_a = fast_builder(&dir_a.path().join("a.db")).create().unwrap();
+    let db_b = fast_builder(&dir_b.path().join("b.db")).create().unwrap();
+
+    let mut wtx = db_b.begin_write().unwrap();
+    wtx.create_table(b"__annseg_memory").unwrap();
+    wtx.table_insert(b"__annseg_memory", b"segment", b"keep")
+        .unwrap();
+    wtx.commit().unwrap();
+
+    let (ta, tb) = MemoryTransport::pair();
+    let sess_a = session(1);
+    let sess_b = session(2);
+    thread::scope(|s| {
+        let h = s.spawn(|| sess_a.sync_tables_as_initiator(db_a.manager(), &ta));
+        let responder = sess_b.handle_table_sync_as_responder(db_b.manager(), &tb);
+        let initiator = h.join().unwrap();
+        assert!(initiator
+            .unwrap_err()
+            .to_string()
+            .contains("reserved table"));
+        assert!(responder
+            .unwrap_err()
+            .to_string()
+            .contains("reserved table"));
+    });
+
+    assert_eq!(
+        db_b.begin_read()
+            .table_get(b"__annseg_memory", b"segment")
+            .unwrap()
+            .as_deref(),
+        Some(b"keep".as_slice())
+    );
+}
+
+#[test]
+fn remote_only_empty_table_is_created_by_an_acknowledged_patch() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let db_a = fast_builder(&dir_a.path().join("a.db")).create().unwrap();
+    let db_b = fast_builder(&dir_b.path().join("b.db")).create().unwrap();
+
+    let mut wtx = db_a.begin_write().unwrap();
+    wtx.create_table(b"empty_remote_only").unwrap();
+    wtx.commit().unwrap();
+
+    let (ta, tb) = MemoryTransport::pair();
+    let sess_a = session(1);
+    let sess_b = session(2);
+    thread::scope(|s| {
+        let h = s.spawn(|| {
+            sess_a
+                .sync_tables_as_initiator(db_a.manager(), &ta)
+                .unwrap()
+        });
+        sess_b
+            .handle_table_sync_as_responder(db_b.manager(), &tb)
+            .unwrap();
+        h.join().unwrap();
+    });
+
+    assert!(db_b
+        .begin_read()
+        .list_tables()
+        .unwrap()
+        .iter()
+        .any(|(name, _)| name == b"empty_remote_only"));
 }
 
 #[test]
