@@ -91,10 +91,12 @@ fn key_store_facts_authenticate_without_repairing_torn_copies() {
     let db = builder(&path).enable_region_keys(true).create().unwrap();
     let wrapped = db.wrap_region_key(&[7u8; citadel::core::KEY_SIZE]).unwrap();
 
-    let (region_slot, _) = db.region_store_allocate_write(41, &wrapped).unwrap();
-    db.region_store_tombstone(region_slot, 41).unwrap();
-    let (atom_slot, _) = db.atom_store_allocate_write(51, &wrapped).unwrap();
-    db.atom_store_tombstone(atom_slot, 51).unwrap();
+    let (region_slot, region_generation) = db.region_store_allocate_write(41, &wrapped).unwrap();
+    db.region_store_tombstone(region_slot, 41, region_generation)
+        .unwrap();
+    let (atom_slot, atom_generation) = db.atom_store_allocate_write(51, &wrapped).unwrap();
+    db.atom_store_tombstone(atom_slot, 51, atom_generation)
+        .unwrap();
 
     let region_path = db.region_store_path();
     let atom_path = db.atom_store_path();

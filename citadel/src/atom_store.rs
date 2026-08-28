@@ -32,6 +32,11 @@ use crate::key_codec::{
 const VERSION: u32 = REGION_STORE_VERSION;
 /// Slots appended per growth step once the free list and pre-allocated run are exhausted.
 const GROW_SLOTS: u32 = ATOM_STORE_PREALLOC_SLOTS;
+const MAX_BINDING_GENERATION: u64 = i64::MAX as u64;
+
+fn generation_is_reusable(max_gen: u64) -> bool {
+    max_gen < MAX_BINDING_GENERATION
+}
 
 #[cfg(test)]
 std::thread_local! {
@@ -95,6 +100,24 @@ impl AtomKeyStore {
         file_id: u64,
         mac_key: [u8; KEY_SIZE],
     ) -> Result<Self> {
+        Self::open(path, file_id, mac_key, true)
+    }
+
+    /// Open an existing store without manufacturing one for a read-only caller.
+    pub(crate) fn open_existing(
+        path: &Path,
+        file_id: u64,
+        mac_key: [u8; KEY_SIZE],
+    ) -> Result<Self> {
+        Self::open(path, file_id, mac_key, false)
+    }
+
+    fn open(
+        path: &Path,
+        file_id: u64,
+        mac_key: [u8; KEY_SIZE],
+        create_missing: bool,
+    ) -> Result<Self> {
         let mac_key = Zeroizing::new(mac_key);
         if path.exists() {
             let bytes = std::fs::read(path)?;
@@ -131,7 +154,7 @@ impl AtomKeyStore {
             let mut stale: Vec<(u32, u64, u64)> = Vec::new();
             for i in 0..slot_count {
                 let view = view_from(&mac_key, &bytes, i)?;
-                if view.record.state != SlotState::Live {
+                if view.record.state != SlotState::Live && generation_is_reusable(view.max_gen) {
                     free.push(i);
                 }
                 if view.record.state == SlotState::Tombstone {
@@ -182,7 +205,7 @@ impl AtomKeyStore {
                 slot_count,
                 free,
             })
-        } else {
+        } else if create_missing {
             let slot_count = ATOM_STORE_PREALLOC_SLOTS;
             let mut buf = Vec::with_capacity((2 + 2 * slot_count as usize) * BLOCK);
             let hdr = build_header(&mac_key, file_id, slot_count, 1);
@@ -201,29 +224,239 @@ impl AtomKeyStore {
                 slot_count,
                 free: (0..slot_count).rev().collect(),
             })
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("atom key store '{}' is missing", path.display()),
+            )
+            .into())
         }
     }
 
     fn read_block_at(&self, offset: u64) -> Result<[u8; BLOCK]> {
         let mut f = OpenOptions::new().read(true).open(&self.path)?;
-        f.seek(SeekFrom::Start(offset))?;
+        Self::read_block_from(&mut f, offset)
+    }
+
+    fn read_block_from(file: &mut std::fs::File, offset: u64) -> Result<[u8; BLOCK]> {
+        file.seek(SeekFrom::Start(offset))?;
         let mut buf = [0u8; BLOCK];
-        f.read_exact(&mut buf)?;
+        file.read_exact(&mut buf)?;
         Ok(buf)
     }
 
-    /// Authoritative view of slot `i` via two single-block reads (no whole-file read).
-    fn view(&self, i: u32) -> Result<SlotView> {
+    fn existing_slot_count(
+        file: &mut std::fs::File,
+        file_id: u64,
+        mac_key: &[u8; KEY_SIZE],
+    ) -> Result<u32> {
+        let a = Self::read_block_from(file, 0)?;
+        let b = Self::read_block_from(file, BLOCK as u64)?;
+        let declared = match (
+            parse_header(mac_key, file_id, &a),
+            parse_header(mac_key, file_id, &b),
+        ) {
+            (Some((sa, ga)), Some((sb, gb))) => {
+                if ga >= gb {
+                    sa
+                } else {
+                    sb
+                }
+            }
+            (Some((slots, _)), None) | (None, Some((slots, _))) => slots,
+            (None, None) => {
+                return Err(Error::RegionStoreCorrupt(
+                    "no valid atom-store header copy (wrong key or corrupt store)".into(),
+                ))
+            }
+        };
+        let len = file.metadata()?.len() as usize;
+        let on_disk = len
+            .saturating_sub(2 * BLOCK)
+            .checked_div(2 * BLOCK)
+            .unwrap_or(0) as u32;
+        Ok(declared.min(on_disk))
+    }
+
+    /// Read selected records without installing an allocator or scanning unrelated slots.
+    pub(crate) fn read_existing_slots(
+        path: &Path,
+        file_id: u64,
+        mac_key: [u8; KEY_SIZE],
+        slots: &[u32],
+    ) -> Result<Vec<SlotRecord>> {
+        Self::read_existing_slot_results(path, file_id, mac_key, slots)?
+            .into_iter()
+            .collect()
+    }
+
+    /// Read selected records through one file open while isolating a malformed slot.
+    pub(crate) fn read_existing_slot_results(
+        path: &Path,
+        file_id: u64,
+        mac_key: [u8; KEY_SIZE],
+        slots: &[u32],
+    ) -> Result<Vec<Result<SlotRecord>>> {
+        let mac_key = Zeroizing::new(mac_key);
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let slot_count = Self::existing_slot_count(&mut file, file_id, &mac_key)?;
+        Ok(slots
+            .iter()
+            .map(|&slot| {
+                if slot >= slot_count {
+                    return Err(Error::RegionStoreCorrupt(format!(
+                        "atom slot {slot} out of bounds"
+                    )));
+                }
+                let a = Self::read_block_from(&mut file, slot_offset(slot, false))?;
+                let b = Self::read_block_from(&mut file, slot_offset(slot, true))?;
+                pick_view(&mac_key, slot, &a, &b).map(|view| view.record)
+            })
+            .collect())
+    }
+
+    /// Compare selected exact bindings with one file open and no wrapped-key result copies.
+    pub(crate) fn read_existing_bindings_live(
+        path: &Path,
+        file_id: u64,
+        mac_key: [u8; KEY_SIZE],
+        bindings: &[(u32, u64, u64)],
+    ) -> Result<Vec<bool>> {
+        let mac_key = Zeroizing::new(mac_key);
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let slot_count = Self::existing_slot_count(&mut file, file_id, &mac_key)?;
+        bindings
+            .iter()
+            .map(|&(slot, owner, generation)| {
+                if slot >= slot_count {
+                    return Err(Error::RegionStoreCorrupt(format!(
+                        "atom slot {slot} out of bounds"
+                    )));
+                }
+                let a = Self::read_block_from(&mut file, slot_offset(slot, false))?;
+                let b = Self::read_block_from(&mut file, slot_offset(slot, true))?;
+                let record = pick_view(&mac_key, slot, &a, &b)?.record;
+                Ok(record.state == SlotState::Live
+                    && record.region_id == owner
+                    && record.gen == generation)
+            })
+            .collect()
+    }
+
+    fn read_existing_image(
+        path: &Path,
+        file_id: u64,
+        mac_key: [u8; KEY_SIZE],
+    ) -> Result<(Zeroizing<[u8; KEY_SIZE]>, Vec<u8>, u32)> {
+        let mac_key = Zeroizing::new(mac_key);
+        let bytes = std::fs::read(path)?;
+        if bytes.len() < 2 * BLOCK {
+            return Err(Error::RegionStoreCorrupt(
+                "atom store smaller than header".into(),
+            ));
+        }
+        let declared = match (
+            parse_header(&mac_key, file_id, &bytes[..BLOCK]),
+            parse_header(&mac_key, file_id, &bytes[BLOCK..2 * BLOCK]),
+        ) {
+            (Some((sa, ga)), Some((sb, gb))) => {
+                if ga >= gb {
+                    sa
+                } else {
+                    sb
+                }
+            }
+            (Some((slots, _)), None) | (None, Some((slots, _))) => slots,
+            (None, None) => {
+                return Err(Error::RegionStoreCorrupt(
+                    "no valid atom-store header copy (wrong key or corrupt store)".into(),
+                ))
+            }
+        };
+        let on_disk = ((bytes.len() - 2 * BLOCK) / (2 * BLOCK)) as u32;
+        Ok((mac_key, bytes, declared.min(on_disk)))
+    }
+
+    /// Read the complete live inventory in one file read without building a free list.
+    pub(crate) fn read_existing_live_bindings(
+        path: &Path,
+        file_id: u64,
+        mac_key: [u8; KEY_SIZE],
+    ) -> Result<Vec<(u32, u64, u64)>> {
+        let (mac_key, bytes, slot_count) = Self::read_existing_image(path, file_id, mac_key)?;
+        let mut live = Vec::new();
+        for slot in 0..slot_count {
+            let record = view_from(&mac_key, &bytes, slot)?.record;
+            if record.state == SlotState::Live {
+                live.push((slot, record.region_id, record.gen));
+            }
+        }
+        Ok(live)
+    }
+
+    /// Read all live wrapped keys in one file read without building a free list.
+    pub(crate) fn read_existing_live_wrapped(
+        path: &Path,
+        file_id: u64,
+        mac_key: [u8; KEY_SIZE],
+    ) -> Result<FxHashMap<u64, [u8; WRAPPED_KEY_SIZE]>> {
+        let (mac_key, bytes, slot_count) = Self::read_existing_image(path, file_id, mac_key)?;
+        let mut live = FxHashMap::default();
+        for slot in 0..slot_count {
+            let record = view_from(&mac_key, &bytes, slot)?.record;
+            if record.state == SlotState::Live {
+                live.insert(record.region_id, record.wrapped);
+            }
+        }
+        Ok(live)
+    }
+
+    fn view_from_file(&self, file: &mut std::fs::File, i: u32) -> Result<SlotView> {
         if i >= self.slot_count {
             return Err(Error::RegionStoreCorrupt(format!(
                 "atom slot {i} out of bounds"
             )));
         }
-        let ba = self.read_block_at(slot_offset(i, false))?;
-        let bb = self.read_block_at(slot_offset(i, true))?;
+        let ba = Self::read_block_from(file, slot_offset(i, false))?;
+        let bb = Self::read_block_from(file, slot_offset(i, true))?;
         pick_view(&self.mac_key, i, &ba, &bb)
     }
 
+    /// Authoritative views for selected slots with one file open.
+    pub(crate) fn read_slots(&self, slots: &[u32]) -> Result<Vec<SlotRecord>> {
+        self.read_slot_results(slots)?.into_iter().collect()
+    }
+
+    /// Read selected records with one file open while retaining per-slot errors.
+    pub(crate) fn read_slot_results(&self, slots: &[u32]) -> Result<Vec<Result<SlotRecord>>> {
+        let mut file = OpenOptions::new().read(true).open(&self.path)?;
+        Ok(slots
+            .iter()
+            .map(|&slot| self.view_from_file(&mut file, slot).map(|view| view.record))
+            .collect())
+    }
+
+    /// Compare exact bindings with one file open and no wrapped-key result copies.
+    pub(crate) fn bindings_live(&self, bindings: &[(u32, u64, u64)]) -> Result<Vec<bool>> {
+        let mut file = OpenOptions::new().read(true).open(&self.path)?;
+        bindings
+            .iter()
+            .map(|&(slot, owner, generation)| {
+                let record = self.view_from_file(&mut file, slot)?.record;
+                Ok(record.state == SlotState::Live
+                    && record.region_id == owner
+                    && record.gen == generation)
+            })
+            .collect()
+    }
+
+    /// Authoritative view of slot `i` via two single-block reads (no whole-file read).
+    fn view(&self, i: u32) -> Result<SlotView> {
+        let mut file = OpenOptions::new().read(true).open(&self.path)?;
+        self.view_from_file(&mut file, i)
+    }
+
+    #[cfg(test)]
     pub(crate) fn read_slot(&self, slot: u32) -> Result<SlotRecord> {
         Ok(self.view(slot)?.record)
     }
@@ -268,15 +501,18 @@ impl AtomKeyStore {
             let off = slot_offset(i, !view.authoritative_b) as usize;
             let sib_clean = parse_slot_block(&self.mac_key, &bytes[off..off + BLOCK])
                 .is_some_and(|r| r.state == SlotState::Tombstone);
-            let stranded = !free.contains(&i);
-            if sib_clean && !stranded {
+            let reusable = generation_is_reusable(view.max_gen);
+            let listed_free = free.contains(&i);
+            if sib_clean && reusable == listed_free {
                 continue;
             }
             if !sib_clean {
                 self.scrub_stale_sibling(i, &view)?;
             }
-            if stranded {
+            if reusable && !listed_free {
                 self.free.push(i);
+            } else if !reusable && listed_free {
+                self.free.retain(|&slot| slot != i);
             }
             repaired += 1;
         }
@@ -284,8 +520,8 @@ impl AtomKeyStore {
     }
 
     /// Push `slot` exactly once: a retried erase must never hand it to two allocations.
-    fn restore_free(&mut self, slot: u32) {
-        if !self.free.contains(&slot) {
+    fn restore_free(&mut self, slot: u32, max_gen: u64) {
+        if generation_is_reusable(max_gen) && !self.free.contains(&slot) {
             self.free.push(slot);
         }
     }
@@ -395,11 +631,19 @@ impl AtomKeyStore {
                         view.record.region_id
                     )));
                 }
-                self.tombstone(slot, expected_atom_id)?;
+                self.tombstone(slot, expected_atom_id, view.record.gen)?;
             }
-            SlotState::Tombstone => self.scrub_stale_sibling(slot, &view)?,
+            SlotState::Tombstone => {
+                self.scrub_stale_sibling(slot, &view)?;
+                self.restore_free(slot, view.max_gen);
+                return Ok(());
+            }
             SlotState::Empty => {
-                let generation = view.max_gen.saturating_add(1);
+                let generation = view.max_gen.checked_add(1).ok_or_else(|| {
+                    Error::RegionStoreCorrupt(format!(
+                        "atom slot {slot} generation overflow during reservation cleanup"
+                    ))
+                })?;
                 let tombstone = build_slot_block(
                     &self.mac_key,
                     SlotState::Tombstone,
@@ -425,15 +669,21 @@ impl AtomKeyStore {
                         }
                     }
                 }
+                self.restore_free(slot, generation);
+                return Ok(());
             }
-        }
-        if !self.free.contains(&slot) {
-            self.free.push(slot);
         }
         Ok(())
     }
 
     fn grow(&mut self) -> Result<()> {
+        let new_count = self
+            .slot_count
+            .checked_add(GROW_SLOTS)
+            .ok_or_else(|| Error::RegionStoreCorrupt("atom-store slot count overflow".into()))?;
+        let gen = self.header_gen()?.checked_add(1).ok_or_else(|| {
+            Error::RegionStoreCorrupt("atom-store header generation overflow".into())
+        })?;
         let empty = empty_slot_block(&self.mac_key);
         let mut tail = Vec::with_capacity(GROW_SLOTS as usize * 2 * BLOCK);
         for _ in 0..GROW_SLOTS {
@@ -442,8 +692,6 @@ impl AtomKeyStore {
         }
         append_and_sync(&self.path, &tail)?;
 
-        let new_count = self.slot_count + GROW_SLOTS;
-        let gen = self.header_gen()?.saturating_add(1);
         let hdr = build_header(&self.mac_key, self.file_id, new_count, gen);
         overwrite_in_place(&self.path, key_codec::header_offset(false), &hdr)?;
         overwrite_in_place(&self.path, key_codec::header_offset(true), &hdr)?;
@@ -482,7 +730,14 @@ impl AtomKeyStore {
         wrapped: &[u8; WRAPPED_KEY_SIZE],
     ) -> Result<u64> {
         let view = self.view(slot)?;
-        let new_gen = view.max_gen + 1;
+        let new_gen = view.max_gen.checked_add(1).ok_or_else(|| {
+            Error::RegionStoreCorrupt(format!("atom slot {slot} generation overflow"))
+        })?;
+        if new_gen > MAX_BINDING_GENERATION {
+            return Err(Error::RegionStoreCorrupt(format!(
+                "atom slot {slot} generation exceeds the database binding range"
+            )));
+        }
         let block = build_slot_block(&self.mac_key, SlotState::Live, atom_id, new_gen, wrapped);
         let target_b = !view.authoritative_b;
         let off = slot_offset(slot, target_b);
@@ -514,13 +769,20 @@ impl AtomKeyStore {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        let image = std::fs::read(&self.path)?;
+        let mut file = OpenOptions::new().read(true).open(&self.path)?;
         let mut gens = Vec::with_capacity(items.len());
         let mut writes: Vec<(u64, [u8; BLOCK])> = Vec::with_capacity(items.len());
         let mut marker: Option<(u64, u64)> = None;
         for &(slot, atom_id, wrapped) in items {
-            let view = view_from(&self.mac_key, &image, slot)?;
-            let new_gen = view.max_gen + 1;
+            let view = self.view_from_file(&mut file, slot)?;
+            let new_gen = view.max_gen.checked_add(1).ok_or_else(|| {
+                Error::RegionStoreCorrupt(format!("atom slot {slot} generation overflow"))
+            })?;
+            if new_gen > MAX_BINDING_GENERATION {
+                return Err(Error::RegionStoreCorrupt(format!(
+                    "atom slot {slot} generation exceeds the database binding range"
+                )));
+            }
             let block =
                 build_slot_block(&self.mac_key, SlotState::Live, atom_id, new_gen, &wrapped);
             let off = slot_offset(slot, !view.authoritative_b);
@@ -575,14 +837,32 @@ impl AtomKeyStore {
 
     /// Cryptographically erase `slot`: overwrite both copies in place with a zeroed
     /// TOMBSTONE (`gen+1`), fsync, and read back the authoritative copy to confirm
-    /// before returning. Idempotent; frees the slot for reuse on a real transition.
-    pub(crate) fn tombstone(&mut self, slot: u32, expected_atom_id: u64) -> Result<()> {
+    /// before returning. A retry accepts a later tombstone because it proves the
+    /// expected key is already gone; a recycled same-owner LIVE slot is never erased.
+    pub(crate) fn tombstone(
+        &mut self,
+        slot: u32,
+        expected_atom_id: u64,
+        expected_generation: u64,
+    ) -> Result<()> {
         let view = self.view(slot)?;
         match view.record.state {
             // A torn erase leaves the sibling keyed and the slot stranded; finish both.
             SlotState::Tombstone => {
+                let minimum_tombstone_generation =
+                    expected_generation.checked_add(1).ok_or_else(|| {
+                        Error::RegionStoreCorrupt(format!(
+                            "atom slot {slot} generation cannot advance past {expected_generation}"
+                        ))
+                    })?;
+                if view.record.gen < minimum_tombstone_generation {
+                    return Err(Error::RegionStoreCorrupt(format!(
+                        "atom slot {slot} is tombstoned at gen {} before {minimum_tombstone_generation}",
+                        view.record.gen
+                    )));
+                }
                 self.scrub_stale_sibling(slot, &view)?;
-                self.restore_free(slot);
+                self.restore_free(slot, view.max_gen);
                 return Ok(());
             }
             SlotState::Empty => {
@@ -598,8 +878,16 @@ impl AtomKeyStore {
                 view.record.region_id
             )));
         }
+        if view.record.gen != expected_generation {
+            return Err(Error::RegionStoreCorrupt(format!(
+                "atom slot {slot} holds atom {expected_atom_id} at gen {} not {expected_generation}",
+                view.record.gen
+            )));
+        }
 
-        let new_gen = view.max_gen + 1;
+        let new_gen = view.max_gen.checked_add(1).ok_or_else(|| {
+            Error::RegionStoreCorrupt(format!("atom slot {slot} generation overflow"))
+        })?;
         let tomb = build_slot_block(
             &self.mac_key,
             SlotState::Tombstone,
@@ -623,7 +911,7 @@ impl AtomKeyStore {
             }
         }
         overwrite_in_place(&self.path, slot_offset(slot, !live_copy_b), &tomb)?;
-        self.free.push(slot);
+        self.restore_free(slot, new_gen);
         Ok(())
     }
 
@@ -635,7 +923,15 @@ impl AtomKeyStore {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        let image = std::fs::read(&self.path)?;
+        let mut unique_slots = FxHashSet::default();
+        for &(slot, ..) in items {
+            if !unique_slots.insert(slot) {
+                return Err(Error::RegionStoreCorrupt(format!(
+                    "duplicate atom slot {slot} in tombstone batch"
+                )));
+            }
+        }
+        let mut file = OpenOptions::new().read(true).open(&self.path)?;
         let tomb_block = |mac_key: &[u8; KEY_SIZE], gen: u64| {
             build_slot_block(
                 mac_key,
@@ -651,12 +947,24 @@ impl AtomKeyStore {
         // The receipt claims per-slot confirmation, so every slot is read back.
         let mut readbacks: Vec<(u64, u64)> = Vec::with_capacity(items.len());
         for &(slot, atom_id, expected_gen) in items {
-            let view = view_from(&self.mac_key, &image, slot)?;
+            let view = self.view_from_file(&mut file, slot)?;
             match view.record.state {
                 // A torn erase leaves the sibling keyed and the slot stranded; finish both.
                 SlotState::Tombstone => {
+                    let minimum_tombstone_generation =
+                        expected_gen.checked_add(1).ok_or_else(|| {
+                            Error::RegionStoreCorrupt(format!(
+                                "atom slot {slot} generation cannot advance past {expected_gen}"
+                            ))
+                        })?;
+                    if view.record.gen < minimum_tombstone_generation {
+                        return Err(Error::RegionStoreCorrupt(format!(
+                            "atom slot {slot} is tombstoned at gen {} before {minimum_tombstone_generation}",
+                            view.record.gen
+                        )));
+                    }
                     self.scrub_stale_sibling(slot, &view)?;
-                    self.restore_free(slot);
+                    self.restore_free(slot, view.max_gen);
                     continue;
                 }
                 SlotState::Empty => {
@@ -676,7 +984,9 @@ impl AtomKeyStore {
                     view.record.gen
                 )));
             }
-            let new_gen = view.max_gen + 1;
+            let new_gen = view.max_gen.checked_add(1).ok_or_else(|| {
+                Error::RegionStoreCorrupt(format!("atom slot {slot} generation overflow"))
+            })?;
             let tomb = tomb_block(&self.mac_key, new_gen);
             let live_off = slot_offset(slot, view.authoritative_b);
             live_writes.push((live_off, tomb));
@@ -708,8 +1018,8 @@ impl AtomKeyStore {
         }
         // Overwrite all sibling copies, one fsync; free the slots.
         write_blocks_synced(&self.path, &sibling_writes)?;
-        for &(slot, ..) in &confirmed {
-            self.free.push(slot);
+        for &(slot, _, _, tombstone_gen) in &confirmed {
+            self.restore_free(slot, tombstone_gen);
         }
         Ok(confirmed)
     }

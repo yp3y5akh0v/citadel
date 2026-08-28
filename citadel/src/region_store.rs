@@ -29,6 +29,8 @@
 //! The slot/header HMAC (keyed by `store_mac_key`) provides integrity and torn-write
 //! detection only; the secrecy of the wrapped RCK rests on AES-256-KW.
 
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use citadel_core::{
@@ -47,6 +49,11 @@ use crate::key_codec::{HEADER_MAC_INPUT, SLOT_MAC_INPUT};
 
 /// Slots appended per growth step once the pre-allocated run is exhausted.
 const GROW_SLOTS: u32 = REGION_STORE_PREALLOC_SLOTS;
+const MAX_BINDING_GENERATION: u64 = i64::MAX as u64;
+
+fn generation_is_reusable(max_gen: u64) -> bool {
+    max_gen < MAX_BINDING_GENERATION
+}
 
 #[cfg(test)]
 std::thread_local! {
@@ -117,6 +124,24 @@ impl RegionKeyStore {
         file_id: u64,
         mac_key: [u8; KEY_SIZE],
     ) -> Result<Self> {
+        Self::open(path, file_id, mac_key, true)
+    }
+
+    /// Open the existing sidecar for mutation without manufacturing a new one.
+    pub(crate) fn open_existing(
+        path: &Path,
+        file_id: u64,
+        mac_key: [u8; KEY_SIZE],
+    ) -> Result<Self> {
+        Self::open(path, file_id, mac_key, false)
+    }
+
+    fn open(
+        path: &Path,
+        file_id: u64,
+        mac_key: [u8; KEY_SIZE],
+        create_missing: bool,
+    ) -> Result<Self> {
         let mac_key = Zeroizing::new(mac_key);
         if path.exists() {
             let bytes = std::fs::read(path)?;
@@ -165,7 +190,7 @@ impl RegionKeyStore {
                 }
             }
             Ok(store)
-        } else {
+        } else if create_missing {
             let slot_count = REGION_STORE_PREALLOC_SLOTS;
             let mut buf = Vec::with_capacity((2 + 2 * slot_count as usize) * BLOCK);
             let hdr = build_header_block(&mac_key, file_id, slot_count, 1);
@@ -183,7 +208,92 @@ impl RegionKeyStore {
                 mac_key,
                 slot_count,
             })
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("region key store '{}' is missing", path.display()),
+            )
+            .into())
         }
+    }
+
+    fn read_block_from(file: &mut std::fs::File, offset: u64) -> Result<[u8; BLOCK]> {
+        file.seek(SeekFrom::Start(offset))?;
+        let mut block = [0u8; BLOCK];
+        file.read_exact(&mut block)?;
+        Ok(block)
+    }
+
+    fn existing_slot_count(
+        file: &mut std::fs::File,
+        file_id: u64,
+        mac_key: &[u8; KEY_SIZE],
+    ) -> Result<u32> {
+        let header_a = Self::read_block_from(file, 0)?;
+        let header_b = Self::read_block_from(file, BLOCK as u64)?;
+        let declared = match (
+            parse_header_block(mac_key, file_id, &header_a),
+            parse_header_block(mac_key, file_id, &header_b),
+        ) {
+            (Some((sa, ga)), Some((sb, gb))) => {
+                if ga >= gb {
+                    sa
+                } else {
+                    sb
+                }
+            }
+            (Some((slots, _)), None) | (None, Some((slots, _))) => slots,
+            (None, None) => {
+                return Err(Error::RegionStoreCorrupt(
+                    "no valid header copy (wrong key or corrupt store)".into(),
+                ))
+            }
+        };
+        let on_disk = file
+            .metadata()?
+            .len()
+            .saturating_sub((2 * BLOCK) as u64)
+            .checked_div((2 * BLOCK) as u64)
+            .unwrap_or(0) as u32;
+        Ok(declared.min(on_disk))
+    }
+
+    /// Read selected slots through one file open without creating,
+    /// truncating, healing, or installing a store.
+    pub(crate) fn read_existing_slots(
+        path: &Path,
+        file_id: u64,
+        mac_key: [u8; KEY_SIZE],
+        slots: &[u32],
+    ) -> Result<Vec<SlotRecord>> {
+        Self::read_existing_slot_results(path, file_id, mac_key, slots)?
+            .into_iter()
+            .collect()
+    }
+
+    /// Read through one file open while isolating corruption to its selected slot.
+    pub(crate) fn read_existing_slot_results(
+        path: &Path,
+        file_id: u64,
+        mac_key: [u8; KEY_SIZE],
+        slots: &[u32],
+    ) -> Result<Vec<Result<SlotRecord>>> {
+        let mac_key = Zeroizing::new(mac_key);
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let slot_count = Self::existing_slot_count(&mut file, file_id, &mac_key)?;
+        Ok(slots
+            .iter()
+            .map(|&slot| {
+                if slot >= slot_count {
+                    return Err(Error::RegionStoreCorrupt(format!(
+                        "slot {slot} out of bounds"
+                    )));
+                }
+                let a = Self::read_block_from(&mut file, slot_offset(slot, false))?;
+                let b = Self::read_block_from(&mut file, slot_offset(slot, true))?;
+                pick_view(&mac_key, slot, &a, &b).map(|view| view.record)
+            })
+            .collect())
     }
 
     fn read_file(&self) -> Result<Vec<u8>> {
@@ -192,49 +302,38 @@ impl RegionKeyStore {
 
     /// Authoritative view of slot `i` from the given file image.
     fn view(&self, bytes: &[u8], i: u32) -> Result<SlotView> {
-        let off_a = slot_offset(i, false) as usize;
-        let off_b = slot_offset(i, true) as usize;
-        if bytes.len() < off_b + BLOCK {
-            return Err(Error::RegionStoreCorrupt(format!("slot {i} out of bounds")));
-        }
-        let a = parse_slot_block(&self.mac_key, &bytes[off_a..off_a + BLOCK]);
-        let b = parse_slot_block(&self.mac_key, &bytes[off_b..off_b + BLOCK]);
-        match (a, b) {
-            (Some(ra), Some(rb)) => {
-                if rb.gen > ra.gen {
-                    Ok(SlotView {
-                        record: rb,
-                        authoritative_b: true,
-                        max_gen: rb.gen,
-                    })
-                } else {
-                    Ok(SlotView {
-                        record: ra,
-                        authoritative_b: false,
-                        max_gen: ra.gen,
-                    })
-                }
-            }
-            (Some(ra), None) => Ok(SlotView {
-                record: ra,
-                authoritative_b: false,
-                max_gen: ra.gen,
-            }),
-            (None, Some(rb)) => Ok(SlotView {
-                record: rb,
-                authoritative_b: true,
-                max_gen: rb.gen,
-            }),
-            (None, None) => Err(Error::RegionStoreCorrupt(format!(
-                "slot {i} has no valid copy"
-            ))),
-        }
+        read_view(&self.mac_key, bytes, i)
     }
 
     /// Authoritative record for slot `i` (used by the engine to attach a region).
     pub(crate) fn read_slot(&self, i: u32) -> Result<SlotRecord> {
-        let bytes = self.read_file()?;
-        Ok(self.view(&bytes, i)?.record)
+        Ok(self
+            .read_slots(&[i])?
+            .pop()
+            .expect("one requested region slot returns one record"))
+    }
+
+    /// Authoritative selected records, preserving input order and duplicates.
+    pub(crate) fn read_slots(&self, slots: &[u32]) -> Result<Vec<SlotRecord>> {
+        self.read_slot_results(slots)?.into_iter().collect()
+    }
+
+    /// Selected records from one file open, retaining an error beside only its bad slot.
+    pub(crate) fn read_slot_results(&self, slots: &[u32]) -> Result<Vec<Result<SlotRecord>>> {
+        let mut file = OpenOptions::new().read(true).open(&self.path)?;
+        Ok(slots
+            .iter()
+            .map(|&slot| {
+                if slot >= self.slot_count {
+                    return Err(Error::RegionStoreCorrupt(format!(
+                        "slot {slot} out of bounds"
+                    )));
+                }
+                let a = Self::read_block_from(&mut file, slot_offset(slot, false))?;
+                let b = Self::read_block_from(&mut file, slot_offset(slot, true))?;
+                pick_view(&self.mac_key, slot, &a, &b).map(|view| view.record)
+            })
+            .collect())
     }
 
     /// `(slot, region_id, generation)` for every LIVE slot.
@@ -254,8 +353,8 @@ impl RegionKeyStore {
     pub(crate) fn allocate_slot(&mut self) -> Result<u32> {
         let bytes = self.read_file()?;
         for i in 0..self.slot_count {
-            let st = self.view(&bytes, i)?.record.state;
-            if st == SlotState::Empty || st == SlotState::Tombstone {
+            let view = self.view(&bytes, i)?;
+            if view.record.state != SlotState::Live && generation_is_reusable(view.max_gen) {
                 return Ok(i);
             }
         }
@@ -293,11 +392,15 @@ impl RegionKeyStore {
                         view.record.region_id
                     )));
                 }
-                self.tombstone(slot, expected_region_id)
+                self.tombstone(slot, expected_region_id, view.record.gen)
             }
             SlotState::Tombstone => self.scrub_stale_sibling(&bytes, slot, &view),
             SlotState::Empty => {
-                let generation = view.max_gen.saturating_add(1);
+                let generation = view.max_gen.checked_add(1).ok_or_else(|| {
+                    Error::RegionStoreCorrupt(format!(
+                        "region slot {slot} generation overflow during reservation cleanup"
+                    ))
+                })?;
                 let tombstone = build_slot_block(
                     &self.mac_key,
                     SlotState::Tombstone,
@@ -330,6 +433,14 @@ impl RegionKeyStore {
     /// Append `GROW_SLOTS` zeroed-but-MAC'd slot pairs, fsync, then bump the header.
     /// Tail-durable-before-header so a crash mid-grow ignores the orphan tail.
     fn grow(&mut self) -> Result<()> {
+        let new_count = self
+            .slot_count
+            .checked_add(GROW_SLOTS)
+            .ok_or_else(|| Error::RegionStoreCorrupt("region-store slot count overflow".into()))?;
+        let bytes = self.read_file()?;
+        let gen = self.header_gen(&bytes)?.checked_add(1).ok_or_else(|| {
+            Error::RegionStoreCorrupt("region-store header generation overflow".into())
+        })?;
         let empty = empty_slot_block(&self.mac_key);
         let mut tail = Vec::with_capacity(GROW_SLOTS as usize * 2 * BLOCK);
         for _ in 0..GROW_SLOTS {
@@ -338,9 +449,6 @@ impl RegionKeyStore {
         }
         append_and_sync(&self.path, &tail)?;
 
-        let new_count = self.slot_count + GROW_SLOTS;
-        let bytes = self.read_file()?;
-        let gen = self.header_gen(&bytes)?.saturating_add(1);
         let hdr = build_header_block(&self.mac_key, self.file_id, new_count, gen);
         overwrite_in_place(&self.path, header_offset(false), &hdr)?;
         overwrite_in_place(&self.path, header_offset(true), &hdr)?;
@@ -375,7 +483,14 @@ impl RegionKeyStore {
     ) -> Result<u64> {
         let bytes = self.read_file()?;
         let view = self.view(&bytes, slot)?;
-        let new_gen = view.max_gen + 1;
+        let new_gen = view.max_gen.checked_add(1).ok_or_else(|| {
+            Error::RegionStoreCorrupt(format!("region slot {slot} generation overflow"))
+        })?;
+        if new_gen > MAX_BINDING_GENERATION {
+            return Err(Error::RegionStoreCorrupt(format!(
+                "region slot {slot} generation exceeds the database binding range"
+            )));
+        }
         let block = build_slot_block(&self.mac_key, SlotState::Live, region_id, new_gen, wrapped);
         // Write the copy that is NOT currently authoritative, so the live copy is
         // preserved until the new one is durable; the higher gen then wins.
@@ -407,14 +522,33 @@ impl RegionKeyStore {
     ///
     /// The authoritative copy (which physically holds the live wrapped key) is
     /// overwritten and read-back-confirmed FIRST - the commit point - so that even a
-    /// crash immediately afterwards leaves no recoverable wrapped key. Idempotent:
-    /// an already-tombstoned slot returns `Ok`.
-    pub(crate) fn tombstone(&self, slot: u32, expected_region_id: u64) -> Result<()> {
+    /// crash immediately afterwards leaves no recoverable wrapped key. A retry accepts
+    /// a later tombstone because it proves the expected key is already gone.
+    pub(crate) fn tombstone(
+        &self,
+        slot: u32,
+        expected_region_id: u64,
+        expected_generation: u64,
+    ) -> Result<()> {
         let bytes = self.read_file()?;
         let view = self.view(&bytes, slot)?;
         match view.record.state {
             // Already erased, but the sibling may still hold the key.
-            SlotState::Tombstone => return self.scrub_stale_sibling(&bytes, slot, &view),
+            SlotState::Tombstone => {
+                let minimum_tombstone_generation =
+                    expected_generation.checked_add(1).ok_or_else(|| {
+                        Error::RegionStoreCorrupt(format!(
+                        "region slot {slot} generation cannot advance past {expected_generation}"
+                    ))
+                    })?;
+                if view.record.gen < minimum_tombstone_generation {
+                    return Err(Error::RegionStoreCorrupt(format!(
+                        "region slot {slot} is tombstoned at gen {} before {minimum_tombstone_generation}",
+                        view.record.gen
+                    )));
+                }
+                return self.scrub_stale_sibling(&bytes, slot, &view);
+            }
             SlotState::Empty => {
                 return Err(Error::RegionStoreCorrupt(format!(
                     "forget of slot {slot} which holds no live key"
@@ -428,8 +562,16 @@ impl RegionKeyStore {
                 view.record.region_id
             )));
         }
+        if view.record.gen != expected_generation {
+            return Err(Error::RegionStoreCorrupt(format!(
+                "slot {slot} holds region {expected_region_id} at gen {} not {expected_generation}",
+                view.record.gen
+            )));
+        }
 
-        let new_gen = view.max_gen + 1;
+        let new_gen = view.max_gen.checked_add(1).ok_or_else(|| {
+            Error::RegionStoreCorrupt(format!("region slot {slot} generation overflow"))
+        })?;
         let tomb = build_slot_block(
             &self.mac_key,
             SlotState::Tombstone,
@@ -503,6 +645,52 @@ impl RegionKeyStore {
     #[cfg(test)]
     pub(crate) fn slot_count(&self) -> u32 {
         self.slot_count
+    }
+}
+
+fn read_view(mac_key: &[u8; KEY_SIZE], bytes: &[u8], slot: u32) -> Result<SlotView> {
+    let off_a = slot_offset(slot, false) as usize;
+    let off_b = slot_offset(slot, true) as usize;
+    if bytes.len() < off_b + BLOCK {
+        return Err(Error::RegionStoreCorrupt(format!(
+            "slot {slot} out of bounds"
+        )));
+    }
+    pick_view(
+        mac_key,
+        slot,
+        &bytes[off_a..off_a + BLOCK],
+        &bytes[off_b..off_b + BLOCK],
+    )
+}
+
+fn pick_view(
+    mac_key: &[u8; KEY_SIZE],
+    slot: u32,
+    block_a: &[u8],
+    block_b: &[u8],
+) -> Result<SlotView> {
+    let a = parse_slot_block(mac_key, block_a);
+    let b = parse_slot_block(mac_key, block_b);
+    match (a, b) {
+        (Some(ra), Some(rb)) if rb.gen > ra.gen => Ok(SlotView {
+            record: rb,
+            authoritative_b: true,
+            max_gen: rb.gen,
+        }),
+        (Some(ra), Some(_)) | (Some(ra), None) => Ok(SlotView {
+            record: ra,
+            authoritative_b: false,
+            max_gen: ra.gen,
+        }),
+        (None, Some(rb)) => Ok(SlotView {
+            record: rb,
+            authoritative_b: true,
+            max_gen: rb.gen,
+        }),
+        (None, None) => Err(Error::RegionStoreCorrupt(format!(
+            "slot {slot} has no valid copy"
+        ))),
     }
 }
 

@@ -51,9 +51,9 @@ fn assert_invalid<T: std::fmt::Debug>(result: Result<T, MemError>, needle: &str)
     );
 }
 
-fn assert_region_not_found<T: std::fmt::Debug>(result: Result<T, MemError>) {
+fn assert_region_not_attached<T: std::fmt::Debug>(result: Result<T, MemError>) {
     assert!(
-        matches!(result, Err(MemError::RegionNotFound(_))),
+        matches!(result, Err(MemError::RegionNotAttached(_))),
         "dead region key must refuse the operation, got {result:?}"
     );
 }
@@ -242,8 +242,12 @@ fn encrypted_scan_skips_an_atom_after_its_key_is_erased() {
     let Value::Integer(slot) = qr.rows[0][0] else {
         panic!("key_slot is not an integer")
     };
-    db.atom_store_tombstone(slot as u32, erased_id as u64)
-        .unwrap();
+    db.atom_store_tombstone(
+        slot as u32,
+        erased_id as u64,
+        db.atom_store_slot(slot as u32).unwrap().gen,
+    )
+    .unwrap();
 
     let remaining = vec![expected[1].clone()];
     let after = eng
@@ -278,17 +282,25 @@ fn encrypted_scan_refuses_a_dead_region_key_even_when_rows_remain() {
     let Value::Integer(slot) = qr.rows[0][1] else {
         panic!("rsk_slot is not an integer")
     };
-    db.region_store_tombstone(slot as u32, region_id as u64)
-        .unwrap();
+    db.region_store_tombstone(
+        slot as u32,
+        region_id as u64,
+        db.region_store_slot(slot as u32).unwrap().gen,
+    )
+    .unwrap();
 
     assert!(matches!(
         eng.stored_embeddings_identity("vault", "fact"),
-        Err(MemError::RegionNotFound(_))
+        Err(MemError::RegionNotAttached(_))
     ));
     assert!(matches!(
         eng.stored_embeddings_identity("vault", "fact"),
-        Err(MemError::RegionNotFound(_))
+        Err(MemError::RegionNotAttached(_))
     ));
+    let err = eng
+        .attach_existing_region("vault", Arc::new(MockEmbedder::new(DIM)))
+        .expect_err("a tombstoned region key cannot be reattached");
+    assert!(matches!(err, MemError::RegionForgotten(_)), "got {err}");
 }
 
 #[test]
@@ -379,29 +391,39 @@ fn every_sealed_surface_refuses_a_cross_engine_partial_region_drop() {
     drop(conn);
 
     // Key-first crash window: RSK dead while row, ciphertext, and ACKs remain.
-    db.region_store_tombstone(rsk_slot as u32, region_id as u64)
-        .unwrap();
+    db.region_store_tombstone(
+        rsk_slot as u32,
+        region_id as u64,
+        db.region_store_slot(rsk_slot as u32).unwrap().gen,
+    )
+    .unwrap();
 
-    assert_region_not_found(clients[0].fetch("vault", "fact", None, 10));
-    assert_region_not_found(clients[1].fetch_one("vault", atom));
-    assert_region_not_found(clients[2].fetch_last("vault", "fact"));
-    assert_region_not_found(clients[3].count("vault", "fact"));
-    assert_region_not_found(clients[4].recall("vault", RecallQuery::by_text("cached secret", 5)));
-    assert_region_not_found(clients[5].recall_many(
+    assert_region_not_attached(clients[0].fetch("vault", "fact", None, 10));
+    assert_region_not_attached(clients[1].fetch_one("vault", atom));
+    assert_region_not_attached(clients[2].fetch_last("vault", "fact"));
+    assert_region_not_attached(clients[3].count("vault", "fact"));
+    assert_region_not_attached(
+        clients[4].recall("vault", RecallQuery::by_text("cached secret", 5)),
+    );
+    assert_region_not_attached(clients[5].recall_many(
         "vault",
         MultiRecallQuery::new(vec![RecallQuery::by_text("secret", 5)], 5),
     ));
-    assert_region_not_found(clients[6].persist_ann_index("vault"));
-    assert_region_not_found(clients[7].ann_cache_status("vault"));
-    assert_region_not_found(clients[8].verify_atoms("vault", &[atom]));
-    assert_region_not_found(clients[9].summarize("vault", 0));
-    assert_region_not_found(clients[10].stored_embeddings_identity("vault", "fact"));
-    assert_region_not_found(clients[11].update_atom_payload(
+    assert_region_not_attached(clients[6].persist_ann_index("vault"));
+    assert_region_not_attached(clients[7].ann_cache_status("vault"));
+    assert_region_not_attached(clients[8].verify_atoms("vault", &[atom]));
+    assert_region_not_attached(clients[9].summarize("vault", 0));
+    assert_region_not_attached(clients[10].stored_embeddings_identity("vault", "fact"));
+    assert_region_not_attached(clients[11].update_atom_payload(
         "vault",
         atom,
         &json!({"must_not": "write"}),
     ));
-    assert_region_not_found(clients[12].set_importance("vault", &[(atom, 99.0)]));
+    assert_region_not_attached(clients[12].set_importance("vault", &[(atom, 99.0)]));
+    let err = owner
+        .attach_existing_region("vault", Arc::new(MockEmbedder::new(DIM)))
+        .expect_err("a tombstoned region key cannot be reattached");
+    assert!(matches!(err, MemError::RegionForgotten(_)), "got {err}");
 
     let after = Connection::open(&db)
         .unwrap()
@@ -449,7 +471,7 @@ fn failed_attach_to_different_successor_config_evicts_stale_handle() {
         ));
         assert!(matches!(
             client.fetch(&region, "fact", None, 1),
-            Err(MemError::RegionNotFound(_))
+            Err(MemError::RegionNotAttached(_))
         ));
         client
             .attach_existing_region(&region, Arc::new(MockEmbedder::new(16)))

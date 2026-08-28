@@ -742,11 +742,12 @@ fn cascade_and_drop_region_interleave_atomically() {
     let result = eng.forget_atoms_with_dependents("r", &[turn], false);
     dropper.join().unwrap();
 
-    // The lifecycle lock serializes the erasure spans: full receipt or
-    // region gone, never a partial cascade.
+    // The lifecycle lock serializes the erasure spans: full receipt or an unavailable
+    // region, never a partial cascade. The drop invalidates cached handles before its
+    // durable row cleanup, so the losing operation can observe either taxonomy state.
     match result {
         Ok(receipt) => assert_eq!(receipt.rows_deleted, 2, "complete cascade"),
-        Err(MemError::RegionNotFound(_)) => {}
+        Err(MemError::RegionNotFound(_) | MemError::RegionNotAttached(_)) => {}
         Err(e) => panic!("unexpected cascade error: {e}"),
     }
 }

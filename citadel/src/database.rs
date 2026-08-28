@@ -87,21 +87,46 @@ impl<'a> KeyLifecycleGuard<'a> {
         self.db.memory_atom_callbacks.lock().contains_key(&atom_id)
     }
 
+    /// Atom ids currently held by external callbacks in this lifecycle span.
+    #[doc(hidden)]
+    pub fn memory_atom_callback_ids(&self) -> Vec<u64> {
+        self.db
+            .memory_atom_callbacks
+            .lock()
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Refuse an erasure plan while an external callback holds any target atom.
+    #[doc(hidden)]
+    pub fn ensure_memory_atoms_unreserved(&self, atom_ids: &[u64]) -> Result<()> {
+        let callbacks = self.db.memory_atom_callbacks.lock();
+        if let Some(atom_id) = atom_ids
+            .iter()
+            .copied()
+            .find(|atom_id| callbacks.contains_key(atom_id))
+        {
+            return Err(Error::AtomInUse { atom_id });
+        }
+        Ok(())
+    }
+
     /// Drop memory-owned state only after releasing the lifecycle capability.
     #[doc(hidden)]
     pub fn retire_memory(&self, state: Box<dyn Any + Send>) {
         self.retired_memory.borrow_mut().push(state);
     }
 
-    /// Cryptographically erase region key `slot` (no-op if already erased).
-    pub fn region_store_tombstone(&self, slot: u32, region_id: u64) -> Result<()> {
+    /// Cryptographically erase the exact region-key slot generation.
+    pub fn region_store_tombstone(&self, slot: u32, region_id: u64, generation: u64) -> Result<()> {
         if self.memory_region_active(region_id) {
             return Err(Error::RegionInUse { region_id });
         }
-        let result = self.db.with_region_store(|s| {
+        let result = self.db.with_existing_region_store(|s| {
             // Bump before and after: a cache built between them is never stamped current.
             self.db.bump_cache_epoch();
-            let result = s.tombstone(slot, region_id);
+            let result = s.tombstone(slot, region_id, generation);
             self.db.bump_cache_epoch();
             result
         });
@@ -111,15 +136,15 @@ impl<'a> KeyLifecycleGuard<'a> {
         result
     }
 
-    /// Cryptographically erase atom key `slot` (no-op if already erased).
-    pub fn atom_store_tombstone(&self, slot: u32, atom_id: u64) -> Result<()> {
+    /// Cryptographically erase the exact atom-key slot generation.
+    pub fn atom_store_tombstone(&self, slot: u32, atom_id: u64, generation: u64) -> Result<()> {
         if self.memory_atom_callback_active(atom_id) {
             return Err(Error::AtomInUse { atom_id });
         }
-        let result = self.db.with_atom_store(|s| {
+        let result = self.db.with_existing_atom_store(|s| {
             // Armed before and after the attempt (see region_store_tombstone).
             self.db.bump_cache_epoch();
-            let result = s.tombstone(slot, atom_id);
+            let result = s.tombstone(slot, atom_id, generation);
             self.db.bump_cache_epoch();
             result
         });
@@ -137,24 +162,15 @@ impl<'a> KeyLifecycleGuard<'a> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        let reserved = {
-            let callbacks = self.db.memory_atom_callbacks.lock();
-            items
-                .iter()
-                .map(|&(_, atom_id, _)| atom_id)
-                .find(|atom_id| callbacks.contains_key(atom_id))
-        };
-        if let Some(atom_id) = reserved {
-            return Err(Error::AtomInUse { atom_id });
-        }
-        let result = self.db.with_atom_store(|s| {
+        let atom_ids: Vec<u64> = items.iter().map(|&(_, atom_id, _)| atom_id).collect();
+        self.ensure_memory_atoms_unreserved(&atom_ids)?;
+        let result = self.db.with_existing_atom_store(|s| {
             // Armed before and after the attempt (see region_store_tombstone).
             self.db.bump_cache_epoch();
             let result = s.tombstone_batch(items);
             self.db.bump_cache_epoch();
             result
         });
-        let atom_ids: Vec<u64> = items.iter().map(|&(_, atom_id, _)| atom_id).collect();
         self.retired_memory
             .borrow_mut()
             .extend(self.db.drain_memory_atom_caches(&atom_ids));
@@ -163,7 +179,8 @@ impl<'a> KeyLifecycleGuard<'a> {
 
     /// Finish torn batch erases; no epoch bump - only already-armed keys are touched.
     pub fn normalize_atom_store_torn_erases(&self) -> Result<usize> {
-        self.db.with_atom_store(|s| s.normalize_torn_tombstones())
+        self.db
+            .with_existing_atom_store(|s| s.normalize_torn_tombstones())
     }
 }
 
@@ -978,6 +995,22 @@ impl Database {
         f(guard.as_mut().expect("region store initialized above"))
     }
 
+    /// Open an existing region store for mutation without manufacturing one.
+    fn with_existing_region_store<T>(
+        &self,
+        f: impl FnOnce(&mut RegionKeyStore) -> Result<T>,
+    ) -> Result<T> {
+        let mut guard = self.region_store.lock();
+        if guard.is_none() {
+            *guard = Some(RegionKeyStore::open_existing(
+                &self.region_store_path(),
+                self.file_id,
+                self.region_store_mac_key()?,
+            )?);
+        }
+        f(guard.as_mut().expect("region store initialized above"))
+    }
+
     /// Allocate a slot and store the wrapped RCK (fsync'd); returns `(slot,
     /// gen)`.
     pub fn region_store_allocate_write(
@@ -990,14 +1023,63 @@ impl Database {
 
     /// The authoritative record of region key `slot`.
     pub fn region_store_slot(&self, slot: u32) -> Result<SlotRecord> {
-        self.with_region_store(|s| s.read_slot(slot))
+        let mut guard = self.region_store.lock();
+        match guard.as_mut() {
+            Some(store) => store.read_slot(slot),
+            None => RegionKeyStore::read_existing_slots(
+                &self.region_store_path(),
+                self.file_id,
+                self.region_store_mac_key()?,
+                &[slot],
+            )
+            .map(|mut records| {
+                records
+                    .pop()
+                    .expect("one requested region slot returns one record")
+            }),
+        }
     }
 
-    /// Cryptographically erase region key `slot` (no-op if erased); acquires the span.
-    pub fn region_store_tombstone(&self, slot: u32, region_id: u64) -> Result<()> {
+    /// Authoritative region-key records from one store lock and file open.
+    pub fn region_store_slots(&self, slots: &[u32]) -> Result<Vec<SlotRecord>> {
+        if slots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut guard = self.region_store.lock();
+        match guard.as_mut() {
+            Some(store) => store.read_slots(slots),
+            None => RegionKeyStore::read_existing_slots(
+                &self.region_store_path(),
+                self.file_id,
+                self.region_store_mac_key()?,
+                slots,
+            ),
+        }
+    }
+
+    /// Per-slot region-key results from one file open.
+    #[doc(hidden)]
+    pub fn region_store_slot_results(&self, slots: &[u32]) -> Result<Vec<Result<SlotRecord>>> {
+        if slots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut guard = self.region_store.lock();
+        match guard.as_mut() {
+            Some(store) => store.read_slot_results(slots),
+            None => RegionKeyStore::read_existing_slot_results(
+                &self.region_store_path(),
+                self.file_id,
+                self.region_store_mac_key()?,
+                slots,
+            ),
+        }
+    }
+
+    /// Cryptographically erase an exact region-key generation; acquires the span.
+    pub fn region_store_tombstone(&self, slot: u32, region_id: u64, generation: u64) -> Result<()> {
         self.fire_destruction_acquire_hook();
         self.key_lifecycle_lock()
-            .region_store_tombstone(slot, region_id)
+            .region_store_tombstone(slot, region_id, generation)
     }
 
     /// `(slot, region_id)` for every LIVE region key slot.
@@ -1011,7 +1093,7 @@ impl Database {
 
     /// `(slot, region_id, gen)` per LIVE slot - the binding a reconciler matches.
     pub fn region_store_live_bindings(&self) -> Result<Vec<(u32, u64, u64)>> {
-        self.with_region_store(|s| s.live_bindings())
+        self.with_existing_region_store(|store| store.live_bindings())
     }
 
     /// Path to the sidecar per-atom key store, `{key_path}` with the
@@ -1027,6 +1109,23 @@ impl Database {
         if guard.is_none() {
             let mac_key = self.region_store_mac_key()?;
             *guard = Some(AtomKeyStore::create_or_open(
+                &self.atom_store_path(),
+                self.file_id,
+                mac_key,
+            )?);
+        }
+        f(guard.as_mut().expect("atom store initialized above"))
+    }
+
+    /// Read an existing atom-key store without allowing inspection to create it.
+    fn with_existing_atom_store<T>(
+        &self,
+        f: impl FnOnce(&mut AtomKeyStore) -> Result<T>,
+    ) -> Result<T> {
+        let mut guard = self.atom_store.lock();
+        if guard.is_none() {
+            let mac_key = self.region_store_mac_key()?;
+            *guard = Some(AtomKeyStore::open_existing(
                 &self.atom_store_path(),
                 self.file_id,
                 mac_key,
@@ -1059,14 +1158,70 @@ impl Database {
 
     /// The authoritative record of atom key `slot` (its wrapped ACK and state).
     pub fn atom_store_slot(&self, slot: u32) -> Result<SlotRecord> {
-        self.with_atom_store(|s| s.read_slot(slot))
+        Ok(self
+            .atom_store_slots(&[slot])?
+            .pop()
+            .expect("one requested atom slot returns one record"))
     }
 
-    /// Cryptographically erase atom key `slot` (no-op if erased); acquires the span.
-    pub fn atom_store_tombstone(&self, slot: u32, atom_id: u64) -> Result<()> {
+    /// Authoritative records for selected atom-key slots under one store lock and file open.
+    pub fn atom_store_slots(&self, slots: &[u32]) -> Result<Vec<SlotRecord>> {
+        if slots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut guard = self.atom_store.lock();
+        match guard.as_mut() {
+            Some(store) => store.read_slots(slots),
+            None => AtomKeyStore::read_existing_slots(
+                &self.atom_store_path(),
+                self.file_id,
+                self.region_store_mac_key()?,
+                slots,
+            ),
+        }
+    }
+
+    /// Per-slot atom-key records from one file open.
+    #[doc(hidden)]
+    pub fn atom_store_slot_results(&self, slots: &[u32]) -> Result<Vec<Result<SlotRecord>>> {
+        if slots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut guard = self.atom_store.lock();
+        match guard.as_mut() {
+            Some(store) => store.read_slot_results(slots),
+            None => AtomKeyStore::read_existing_slot_results(
+                &self.atom_store_path(),
+                self.file_id,
+                self.region_store_mac_key()?,
+                slots,
+            ),
+        }
+    }
+
+    /// Exact atom-key liveness without exporting wrapped key bytes to the caller.
+    #[doc(hidden)]
+    pub fn atom_store_bindings_live(&self, bindings: &[(u32, u64, u64)]) -> Result<Vec<bool>> {
+        if bindings.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut guard = self.atom_store.lock();
+        match guard.as_mut() {
+            Some(store) => store.bindings_live(bindings),
+            None => AtomKeyStore::read_existing_bindings_live(
+                &self.atom_store_path(),
+                self.file_id,
+                self.region_store_mac_key()?,
+                bindings,
+            ),
+        }
+    }
+
+    /// Cryptographically erase an exact atom-key generation; acquires the span.
+    pub fn atom_store_tombstone(&self, slot: u32, atom_id: u64, generation: u64) -> Result<()> {
         self.fire_destruction_acquire_hook();
         self.key_lifecycle_lock()
-            .atom_store_tombstone(slot, atom_id)
+            .atom_store_tombstone(slot, atom_id, generation)
     }
 
     /// Batch erase, two fsyncs; recycled skips, returns receipts; acquires the span.
@@ -1083,7 +1238,15 @@ impl Database {
 
     /// Every LIVE atom key's `atom_id -> wrapped ACK`, in one whole-file pass.
     pub fn atom_store_live_wrapped(&self) -> Result<FxHashMap<u64, [u8; WRAPPED_KEY_SIZE]>> {
-        self.with_atom_store(|s| s.live_wrapped())
+        let mut guard = self.atom_store.lock();
+        match guard.as_mut() {
+            Some(store) => store.live_wrapped(),
+            None => AtomKeyStore::read_existing_live_wrapped(
+                &self.atom_store_path(),
+                self.file_id,
+                self.region_store_mac_key()?,
+            ),
+        }
     }
 
     /// `(slot, atom_id)` for every LIVE atom key slot.
@@ -1097,7 +1260,28 @@ impl Database {
 
     /// `(slot, atom_id, gen)` per LIVE slot - the binding a reconciler matches.
     pub fn atom_store_live_bindings(&self) -> Result<Vec<(u32, u64, u64)>> {
-        self.with_atom_store(|s| s.live_bindings())
+        Ok(self
+            .atom_store_live_bindings_if_present()?
+            .unwrap_or_default())
+    }
+
+    /// The complete live binding inventory, preserving absence of the sidecar.
+    #[doc(hidden)]
+    pub fn atom_store_live_bindings_if_present(&self) -> Result<Option<Vec<(u32, u64, u64)>>> {
+        let mut guard = self.atom_store.lock();
+        let result = match guard.as_mut() {
+            Some(store) => store.live_bindings(),
+            None => AtomKeyStore::read_existing_live_bindings(
+                &self.atom_store_path(),
+                self.file_id,
+                self.region_store_mac_key()?,
+            ),
+        };
+        match result {
+            Ok(bindings) => Ok(Some(bindings)),
+            Err(Error::Io(source)) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// One-shot `tombstone_batch` failure before the sibling scrub - the torn window.
@@ -1111,7 +1295,7 @@ impl Database {
     #[cfg(any(test, feature = "test-util"))]
     #[doc(hidden)]
     pub fn debug_atom_slot_copies(&self, slot: u32) -> Result<[Option<SlotRecord>; 2]> {
-        self.with_atom_store(|s| s.slot_copies(slot))
+        self.with_existing_atom_store(|store| store.slot_copies(slot))
     }
 
     /// Number of currently active readers.
@@ -2049,6 +2233,34 @@ mod sql_cache_tests {
             .argon2_profile(Argon2Profile::Iot)
             .create()
             .unwrap()
+    }
+
+    #[test]
+    fn read_and_destruction_paths_do_not_manufacture_missing_key_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseBuilder::new(dir.path().join("keys.db"))
+            .passphrase(b"x")
+            .enable_region_keys(true)
+            .argon2_profile(Argon2Profile::Iot)
+            .create()
+            .unwrap();
+        let region_path = db.region_store_path();
+        let atom_path = db.atom_store_path();
+        assert!(!region_path.exists());
+        assert!(!atom_path.exists());
+
+        assert!(db.region_store_slot(0).is_err());
+        assert!(db.region_store_slots(&[0, 0]).is_err());
+        assert!(db.region_store_tombstone(0, 1, 0).is_err());
+        assert!(db.atom_store_slot(0).is_err());
+        assert!(db.atom_store_live_wrapped().is_err());
+        assert!(db.atom_store_tombstone(0, 1, 0).is_err());
+        assert!(db
+            .key_lifecycle_lock()
+            .normalize_atom_store_torn_erases()
+            .is_err());
+        assert!(!region_path.exists());
+        assert!(!atom_path.exists());
     }
 
     #[derive(Debug, PartialEq)]

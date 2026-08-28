@@ -211,7 +211,7 @@ fn mem_category(e: &MemError) -> Category {
         MemError::Core(e) => core_category(e),
         MemError::Io(_) => Operational,
         MemError::RegionForgotten(_) => Encryption,
-        MemError::RegionNotFound(_) => Programming,
+        MemError::RegionNotFound(_) | MemError::RegionNotAttached(_) => Programming,
         MemError::Cycle { .. } => Integrity,
         MemError::DimMismatch { .. }
         | MemError::MetricMismatch { .. }

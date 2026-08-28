@@ -7,6 +7,97 @@ use crate::embed::EmbeddingMetric;
 /// Stable identifier for a memory atom (globally unique across per-dim tables).
 pub type AtomId = i64;
 
+/// Persisted region description returned by [`crate::MemoryMaintenance`].
+///
+/// This is inventory, not a readability claim. An encrypted region whose key was erased
+/// remains visible here so a maintenance client can report it as unavailable; `count_region`,
+/// `fetch_range`, and `verify_atoms` establish whether its content is still readable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRegionInfo {
+    name: String,
+    encrypted: bool,
+    dim: u16,
+    metric: EmbeddingMetric,
+    model_id: String,
+}
+
+impl MemoryRegionInfo {
+    pub(crate) fn new(
+        name: String,
+        encrypted: bool,
+        dim: u16,
+        metric: EmbeddingMetric,
+        model_id: String,
+    ) -> Self {
+        Self {
+            name,
+            encrypted,
+            dim,
+            metric,
+            model_id,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn encrypted(&self) -> bool {
+        self.encrypted
+    }
+
+    pub fn dim(&self) -> u16 {
+        self.dim
+    }
+
+    pub fn metric(&self) -> EmbeddingMetric {
+        self.metric
+    }
+
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+}
+
+/// One region and the result of counting it during an inventory pass held under
+/// one key-lifecycle guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRegionInventory {
+    region: MemoryRegionInfo,
+    live_atoms: Option<u64>,
+    unavailable: Option<String>,
+}
+
+impl MemoryRegionInventory {
+    pub(crate) fn available(region: MemoryRegionInfo, live_atoms: u64) -> Self {
+        Self {
+            region,
+            live_atoms: Some(live_atoms),
+            unavailable: None,
+        }
+    }
+
+    pub(crate) fn from_error(region: MemoryRegionInfo, error: impl ToString) -> Self {
+        Self {
+            region,
+            live_atoms: None,
+            unavailable: Some(error.to_string()),
+        }
+    }
+
+    pub fn region(&self) -> &MemoryRegionInfo {
+        &self.region
+    }
+
+    pub fn live_atoms(&self) -> Option<u64> {
+        self.live_atoms
+    }
+
+    pub fn unavailable(&self) -> Option<&str> {
+        self.unavailable.as_deref()
+    }
+}
+
 /// Persisted identity fields; construction validates encrypted rows' live RSK.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredRegionIdentity {

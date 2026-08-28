@@ -48,7 +48,8 @@ fn tombstone_region_key_but_leave_row(db: &Database, name: &str) {
         Value::Integer(slot) => u32::try_from(slot).unwrap(),
         ref other => panic!("rsk_slot is not an integer: {other:?}"),
     };
-    db.region_store_tombstone(slot, id as u64).unwrap();
+    db.region_store_tombstone(slot, id as u64, db.region_store_slot(slot).unwrap().gen)
+        .unwrap();
 }
 
 /// Every insertion path refuses a stale handle: the write txn re-verifies the row.
@@ -162,7 +163,7 @@ fn stale_plaintext_handles_refuse_reads_mutators_and_ann_persistence() {
 
         let error = op(&client, &region, predecessor).unwrap_err();
         assert!(
-            matches!(error, MemError::RegionNotFound(_)),
+            matches!(error, MemError::RegionNotAttached(_)),
             "{name} accepted a stale plaintext incarnation: {error}"
         );
     }
@@ -282,13 +283,20 @@ fn tombstoned_region_key_with_live_row_cannot_be_resurrected() {
         let live_acks = db.atom_store_live_owners().unwrap().len();
         let err = op(&writer, &region).unwrap_err();
         assert!(
-            matches!(err, MemError::RegionNotFound(_)),
+            matches!(err, MemError::RegionNotAttached(_)),
             "{name} must reject a dead RSK with a surviving row, got: {err}"
         );
         assert_eq!(
             db.atom_store_live_owners().unwrap().len(),
             live_acks,
             "{name} allocated an ACK after region-key erasure"
+        );
+        let err = writer
+            .attach_existing_region(&region, Arc::new(MockEmbedder::new(8)))
+            .expect_err("a tombstoned region key cannot be reattached");
+        assert!(
+            matches!(err, MemError::RegionForgotten(_)),
+            "{name} must expose the erased key when reattachment validates it, got: {err}"
         );
     }
 }
@@ -311,17 +319,17 @@ fn stale_handles_never_write_into_a_recreated_region() {
         .remember("vault", AtomInput::new("fact", "successor atom"))
         .unwrap();
 
-    // The stale handle sees the name bound, but the incarnation differs.
+    // The drop invalidates every engine's stale handle before the name is recreated.
     let err = writer
         .remember("vault", AtomInput::new("fact", "stale write"))
         .unwrap_err();
-    assert!(matches!(err, MemError::RegionNotFound(_)), "got: {err}");
+    assert!(matches!(err, MemError::RegionNotAttached(_)), "got: {err}");
 
-    // The refusal evicted the stale entry; a re-attach binds the successor cleanly.
+    // The engine remains detached until an explicit attach binds the successor.
     let err = writer
         .fetch("vault", "fact", None, 10)
         .expect_err("stale entry must be gone after the refused write");
-    assert!(matches!(err, MemError::RegionNotFound(_)), "got: {err}");
+    assert!(matches!(err, MemError::RegionNotAttached(_)), "got: {err}");
     writer
         .attach_existing_region("vault", Arc::new(MockEmbedder::new(8)))
         .unwrap();

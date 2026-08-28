@@ -136,7 +136,7 @@ fn reclassifying_ends_an_attachment_the_new_label_contradicts() {
         .remember(REGION, citadel_mem::AtomInput::new("note", "epsilon zeta"))
         .expect_err("the contradicted attachment is gone");
     assert!(
-        matches!(err, MemError::RegionNotFound(_)),
+        matches!(err, MemError::RegionNotAttached(ref name) if name == REGION),
         "expected the region to be detached, got {err:?}"
     );
 

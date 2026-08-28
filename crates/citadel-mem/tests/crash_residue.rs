@@ -155,7 +155,12 @@ fn drop_region_retry_after_tombstone_crash_converges() {
             other => panic!("rsk_slot: {other:?}"),
         },
     );
-    db.region_store_tombstone(slot, region_id as u64).unwrap();
+    db.region_store_tombstone(
+        slot,
+        region_id as u64,
+        db.region_store_slot(slot).unwrap().gen,
+    )
+    .unwrap();
 
     eng.drop_region("vault").unwrap();
 
