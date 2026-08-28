@@ -12,8 +12,9 @@ pub mod audit;
 pub use builder::DatabaseBuilder;
 pub use citadel_sync::SyncKey;
 pub use database::{
-    Database, DbStats, KeyLifecycleGuard, KeyStoreFacts, SharedCache, SlotCounts, SqlCacheHandle,
-    SyncOutcome, UpgradeReport,
+    Database, DbStats, KeyLifecycleGuard, KeyStoreFacts, MemoryAtomCallbackGuard,
+    MemoryAtomInvalidator, MemoryEdgesGuard, MemoryRegionGuard, MemoryRegionInvalidator,
+    SharedCache, SlotCounts, SqlCacheHandle, SyncOutcome, UpgradeReport,
 };
 pub use inspect::{
     default_key_path, inspect_vault, inspect_vault_with_key, KeyFileInfo, KeyFileStatus, VaultInfo,

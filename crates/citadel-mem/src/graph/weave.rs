@@ -1,15 +1,13 @@
-//! Deterministic SimilarTo weave; constants frozen - edges cannot be deleted.
+//! Deterministic managed `SimilarTo` weave.
 
-use crate::{
-    AtomId, EdgeKind, FetchQuery, FusionWeights, MemoryEngine, MultiRecallQuery, RecallQuery,
-};
+use crate::{AtomId, FetchQuery, MemoryEngine};
 
-/// Frozen (module doc): neighbor count and the ceiling beyond which similar is noise.
+/// Default neighbor count and the ceiling beyond which similarity is noise.
 pub const WEAVE_NEIGHBORS: usize = 3;
 pub const WEAVE_MAX_DISTANCE: f32 = 0.30;
 
-/// Weave algorithm revision; bump on any behavior change - edges cannot be deleted.
-pub const WEAVE_REVISION: u32 = 1;
+/// Weave algorithm revision; bump on any behavior change.
+pub const WEAVE_REVISION: u32 = 2;
 
 const WEAVE_PAGE: usize = 1024;
 
@@ -29,6 +27,31 @@ pub fn weave_similar_notes(
     neighbors: usize,
     max_distance: f32,
 ) -> crate::Result<WeaveStats> {
+    weave_similar_notes_mode(eng, region, derived_kind, neighbors, max_distance, false)
+}
+
+/// Rebuild a legacy weave, adopting every outgoing `SimilarTo` edge as managed.
+///
+/// This migration removes authored `SimilarTo` edges from the derived notes.
+/// Use [`weave_similar_notes`] when ownership tracking is already present.
+pub fn weave_similar_notes_replacing(
+    eng: &MemoryEngine,
+    region: &str,
+    derived_kind: &str,
+    neighbors: usize,
+    max_distance: f32,
+) -> crate::Result<WeaveStats> {
+    weave_similar_notes_mode(eng, region, derived_kind, neighbors, max_distance, true)
+}
+
+fn weave_similar_notes_mode(
+    eng: &MemoryEngine,
+    region: &str,
+    derived_kind: &str,
+    neighbors: usize,
+    max_distance: f32,
+    replace_all_similarity: bool,
+) -> crate::Result<WeaveStats> {
     let mut stats = WeaveStats::default();
     let mut after: Option<AtomId> = None;
     loop {
@@ -43,23 +66,19 @@ pub fn weave_similar_notes(
         after = Some(last.id);
         for note in &page {
             stats.notes += 1;
-            // Asymmetric embedders may not self-retrieve: bound by counting links.
-            let q = RecallQuery::by_text(&note.text, neighbors + 1)
-                .with_weights(FusionWeights::semantic_only())
-                .with_kinds(vec![derived_kind.to_string()]);
-            let found = eng.recall_many(region, MultiRecallQuery::new(vec![q], neighbors + 1))?;
-            let mut written = 0usize;
-            for n in found {
-                if written == neighbors {
-                    break;
-                }
-                if n.id == note.id || n.distance > max_distance {
-                    continue;
-                }
-                eng.link(note.id, n.id, EdgeKind::SimilarTo, 1.0 / (1.0 + n.distance))?;
-                stats.edges += 1;
-                written += 1;
-            }
+            let kinds = vec![derived_kind.to_string()];
+            let report = if replace_all_similarity {
+                eng.evolve_with_kinds_replacing_similarity(
+                    region,
+                    note.id,
+                    neighbors,
+                    max_distance,
+                    kinds,
+                )?
+            } else {
+                eng.evolve_with_kinds(region, note.id, neighbors, max_distance, kinds)?
+            };
+            stats.edges += report.links_added;
         }
     }
     Ok(stats)
@@ -68,7 +87,7 @@ pub fn weave_similar_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AtomInput, MockEmbedder};
+    use crate::{AtomInput, EdgeKind, MockEmbedder};
     use std::sync::Arc;
 
     fn engine(dir: &std::path::Path) -> MemoryEngine {
@@ -150,6 +169,31 @@ mod tests {
             weave_similar_notes(&eng, "r", "derived", 3, 0.3).unwrap(),
             WeaveStats::default()
         );
+    }
+
+    #[test]
+    fn replacing_weave_adopts_legacy_edges_without_widening_the_kind_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = engine(dir.path());
+        let turn = eng
+            .remember("r", AtomInput::new("turn", "raw turn"))
+            .unwrap();
+        let first = eng
+            .remember("r", AtomInput::new("derived", "first note"))
+            .unwrap();
+        let second = eng
+            .remember("r", AtomInput::new("derived", "second note"))
+            .unwrap();
+        eng.link(first, turn, EdgeKind::SimilarTo, 0.25).unwrap();
+
+        let stats = weave_similar_notes_replacing(&eng, "r", "derived", 1, f32::MAX).unwrap();
+        assert_eq!(stats.notes, 2);
+        let first_edges = eng
+            .fetch_edges(Some(first), None, Some(EdgeKind::SimilarTo))
+            .unwrap();
+        assert_eq!(first_edges.len(), 1);
+        assert_eq!(first_edges[0].dst_id, second);
+        assert_ne!(first_edges[0].dst_id, turn);
     }
 
     #[test]

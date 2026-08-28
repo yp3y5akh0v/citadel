@@ -346,7 +346,7 @@ fn sealed_chunk_loss_heals_and_next_persist_recovers() {
         .create()
         .unwrap();
     let db = Arc::new(db);
-    let eng = MemoryEngine::open(Arc::clone(&db)).unwrap();
+    let eng = Arc::new(MemoryEngine::open(Arc::clone(&db)).unwrap());
     eng.create_encrypted_region("vault", embedder()).unwrap();
     for i in 0..20 {
         eng.remember("vault", AtomInput::new("fact", format!("note {i}")))
@@ -362,7 +362,16 @@ fn sealed_chunk_loss_heals_and_next_persist_recovers() {
         wtx.commit().unwrap();
     }
 
-    let hits = eng.recall("vault", semantic_query("note 3")).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = Arc::clone(&eng);
+    let recall = std::thread::spawn(move || {
+        let _ = tx.send(worker.recall("vault", semantic_query("note 3")));
+    });
+    let hits = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("segment healing must not deadlock cache invalidation")
+        .unwrap();
+    recall.join().unwrap();
     assert!(!hits.is_empty(), "recall survives the orphaned segment");
     match eng.ann_cache_status("vault").unwrap() {
         Some(AnnIndexSource::Built { refusal: Some(r) }) => {

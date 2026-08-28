@@ -77,3 +77,19 @@ fn failed_transaction_tells_the_caller_to_roll_back() {
         "write transaction cannot be committed because an earlier mutation failed; roll it back"
     );
 }
+
+#[test]
+fn region_in_use_keeps_the_region_id() {
+    assert_eq!(
+        Error::RegionInUse { region_id: 42 }.to_string(),
+        "memory region 42 is in use by another operation"
+    );
+}
+
+#[test]
+fn atom_in_use_keeps_the_atom_id() {
+    assert_eq!(
+        Error::AtomInUse { atom_id: 73 }.to_string(),
+        "memory atom 73 is in use by an external callback"
+    );
+}

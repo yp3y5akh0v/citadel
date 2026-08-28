@@ -1,5 +1,6 @@
 //! MemoryEngine: region lifecycle on top of citadel's encrypted SQL store.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -7,7 +8,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sha2::{Digest, Sha256};
 
-use citadel::{Database, KeyLifecycleGuard};
+use citadel::{
+    Database, KeyLifecycleGuard, MemoryAtomCallbackGuard, MemoryEdgesGuard, MemoryRegionGuard,
+};
 use citadel_core::WRAPPED_KEY_SIZE;
 use citadel_crypto::blob_seal;
 use citadel_crypto::hkdf_utils::{
@@ -20,13 +23,13 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::embed::{Embedder, EmbeddingMetric, Reranker};
 use crate::error::{MemError, Result};
-use crate::fusion::{fuse_rank, fuse_rerank, rerank_hits, rrf_merge, Candidate};
+use crate::fusion::{fuse_rank, fuse_rerank, rerank_hits, rrf_merge, Candidate, RERANK_POOL};
 use crate::types::{
     AtomAttestation, AtomHit, AtomId, AtomInput, AttestVerdict, Edge, EdgeKind, ErasureReceipt,
     EvictionPolicy, EvictionReport, EvolutionReport, FetchQuery, FusionWeights, GraphExpand,
-    KindDigest, MultiRecallQuery, RecallQuery, RememberOutcome, RerankStrategy, SlotErasure,
-    SourceSnapshot, StoredAtomRetrievalState, StoredEmbeddingsIdentity, StoredRegionIdentity,
-    SummaryReport, ERASURE_SCOPE_CAVEAT, STORED_EMBEDDINGS_SCHEMA,
+    KindDigest, MultiRecallQuery, RecallQuery, ReembedReport, RememberOutcome, RerankStrategy,
+    SlotErasure, SourceSnapshot, StoredAtomRetrievalState, StoredEmbeddingsIdentity,
+    StoredRegionIdentity, SummaryReport, ERASURE_SCOPE_CAVEAT, STORED_EMBEDDINGS_SCHEMA,
 };
 use citadel::SlotState;
 
@@ -66,9 +69,24 @@ std::thread_local! {
     static FAIL_SEGMENT_PROBE: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
     };
+    static FAIL_REEMBED_AFTER_SEGMENT_RETIRE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
     static FAILED_ENCRYPTED_REGION_WRAPPED_KEY:
         std::cell::RefCell<Option<Zeroizing<[u8; WRAPPED_KEY_SIZE]>>> =
             const { std::cell::RefCell::new(None) };
+    /// Deterministically trip and detach a database token after SQL has
+    /// returned but while a public operation is still doing local work.
+    static CANCEL_AFTER_LOCAL_WORK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn debug_fire_cancel_after_local_work() {
+    let hook = CANCEL_AFTER_LOCAL_WORK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 /// Stable identifier for a memory region (row id in `memory_regions`).
@@ -193,6 +211,8 @@ struct RegionState {
     dim: u16,
     metric: EmbeddingMetric,
     embedder: Arc<dyn Embedder>,
+    /// Snapshotted before any engine lock is taken; embedder callbacks are external code.
+    model_id: Arc<str>,
     /// Encrypted regions: wraps/unwraps each atom's ACK (derived from the RCK).
     atom_wrap: Option<Arc<AtomWrapKey>>,
     /// Encrypted regions: keyed MAC for identity tags (own HKDF label).
@@ -211,6 +231,7 @@ struct RegionHandle {
     embedder: Arc<dyn Embedder>,
     dim: u16,
     metric: EmbeddingMetric,
+    model_id: Arc<str>,
     atom_wrap: Option<Arc<AtomWrapKey>>,
     identity_mac: Option<Arc<IdentityMacKey>>,
     ann: Arc<RwLock<Option<SealedAnn>>>,
@@ -231,6 +252,22 @@ struct SealedAnn {
     source: AnnIndexSource,
     /// [`Database::cache_epoch`] at build; once it moves, stale plaintext is refused.
     build_epoch: u64,
+}
+
+/// Detached state whose decrypted ANN is zeroized with it, outside shared locks.
+struct RetiredRegionState {
+    id: RegionId,
+    _ann: Option<SealedAnn>,
+    _state: RegionState,
+}
+
+fn retire_region_state(state: RegionState) -> RetiredRegionState {
+    let ann = state.ann.write().unwrap().take();
+    RetiredRegionState {
+        id: state.id,
+        _ann: ann,
+        _state: state,
+    }
 }
 
 /// Per-atom fields a sealed recall needs, decrypted once at index build.
@@ -296,7 +333,9 @@ fn ann_metric(m: EmbeddingMetric) -> Metric {
 /// Encrypted-first memory engine over a shared [`Database`].
 pub struct MemoryEngine {
     db: Arc<Database>,
-    regions: Mutex<FxHashMap<String, RegionState>>,
+    regions: Arc<Mutex<FxHashMap<String, RegionState>>>,
+    _region_invalidator: Arc<citadel::MemoryRegionInvalidator>,
+    _atom_invalidator: Arc<citadel::MemoryAtomInvalidator>,
     /// Cross-encoder + strategy applied in `recall` before truncation (`None`
     /// = linear fusion). Snapshotted before the callback so the guard is not
     /// held across a re-entrant reranker.
@@ -318,6 +357,427 @@ type AttachMaxSnapshot = (u64, FxHashMap<RegionId, i64>);
 /// One region's in-process read hits: `atom -> (last access micros, count)`.
 type RegionAccessStats = FxHashMap<AtomId, (i64, u32)>;
 
+/// A recall request paired with its validated query vector.
+#[derive(Clone, Copy)]
+struct ResolvedRecall<'a> {
+    query: &'a RecallQuery,
+    vector: &'a [f32],
+}
+
+/// Atoms committed per re-embedding batch.
+const REEMBED_BATCH: usize = 256;
+
+/// Durable checkpoint written before the first batch and advanced with each commit.
+#[derive(Clone, PartialEq, Eq)]
+struct ReembedMark {
+    to_model: String,
+    to_dim: u16,
+    to_metric: String,
+    /// The highest atom id already converted. Resume starts after it.
+    done_through: i64,
+    phase: ReembedPhase,
+}
+
+/// Independently resumable stages of re-embedding.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReembedPhase {
+    /// Vectors are being converted. The region holds two models at once, so it
+    /// is closed to attach, read and write.
+    Vectors,
+    /// Vectors and provenance are correct, but access remains closed until the
+    /// `SimilarTo` web has been repaired over the new vector space.
+    Repair,
+}
+
+impl ReembedPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Vectors => "vectors",
+            Self::Repair => "repair",
+        }
+    }
+}
+
+/// Record the in-flight migration while preserving unrelated metadata.
+fn write_reembed_mark(conn: &Connection, region_id: i64, mark: &ReembedMark) -> Result<()> {
+    let json = mark_json(read_metadata(conn, region_id)?.as_deref(), mark)?;
+    conn.execute_params(
+        "UPDATE memory_regions SET metadata = $1 WHERE id = $2",
+        &[Value::Text(json.into()), Value::Integer(region_id)],
+    )?;
+    Ok(())
+}
+
+/// Keys owned by the re-embedding checkpoint.
+const REEMBED_MARK_KEYS: [&str; 5] = [
+    "reembed_to_model",
+    "reembed_to_dim",
+    "reembed_to_metric",
+    "reembed_done_through",
+    "reembed_phase",
+];
+
+fn metadata_object(existing: Option<&str>) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let Some(existing) = existing else {
+        return Ok(serde_json::Map::new());
+    };
+    match serde_json::from_str(existing) {
+        Ok(serde_json::Value::Object(map)) => Ok(map),
+        Ok(_) => Err(MemError::Invalid(
+            "memory region metadata must be a JSON object".into(),
+        )),
+        Err(error) => Err(MemError::Invalid(format!(
+            "memory region metadata is malformed JSON: {error}"
+        ))),
+    }
+}
+
+fn mark_json(existing: Option<&str>, mark: &ReembedMark) -> Result<String> {
+    let mut doc = metadata_object(existing)?;
+    doc.insert("reembed_to_model".into(), mark.to_model.clone().into());
+    doc.insert("reembed_to_dim".into(), mark.to_dim.into());
+    doc.insert("reembed_to_metric".into(), mark.to_metric.clone().into());
+    doc.insert("reembed_done_through".into(), mark.done_through.into());
+    doc.insert("reembed_phase".into(), mark.phase.as_str().into());
+    Ok(serde_json::Value::Object(doc).to_string())
+}
+
+/// Remove the checkpoint while preserving unrelated metadata.
+fn without_mark(existing: Option<&str>) -> Result<Option<String>> {
+    let mut doc = metadata_object(existing)?;
+    for k in REEMBED_MARK_KEYS {
+        doc.remove(k);
+    }
+    Ok((!doc.is_empty()).then(|| serde_json::Value::Object(doc).to_string()))
+}
+
+/// The row's `metadata` as JSON text. The column is JSONB, so it reads back as
+/// encoded bytes and the cast is what decodes it.
+fn read_metadata(conn: &Connection, region_id: i64) -> Result<Option<String>> {
+    let qr = conn.query_params(
+        "SELECT CAST(metadata AS TEXT) FROM memory_regions WHERE id = $1",
+        &[Value::Integer(region_id)],
+    )?;
+    Ok(qr.rows.first().and_then(|r| match &r[0] {
+        Value::Text(t) => Some(t.to_string()),
+        _ => None,
+    }))
+}
+
+fn parse_reembed_mark(metadata: Option<&str>, region_id: i64) -> Result<Option<ReembedMark>> {
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    let doc = metadata_object(Some(metadata))?;
+    if !REEMBED_MARK_KEYS.iter().any(|key| doc.contains_key(*key)) {
+        return Ok(None);
+    }
+    let invalid = |field: &str| {
+        MemError::Invalid(format!(
+            "memory region {region_id} has an incomplete or invalid re-embed mark ({field})"
+        ))
+    };
+    let to_model = doc
+        .get("reembed_to_model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid("reembed_to_model"))?
+        .to_owned();
+    let to_dim = doc
+        .get("reembed_to_dim")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| invalid("reembed_to_dim"))?;
+    let to_metric = doc
+        .get("reembed_to_metric")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid("reembed_to_metric"))?
+        .to_owned();
+    metric_from_str(&to_metric).map_err(|_| invalid("reembed_to_metric"))?;
+    let done_through = doc
+        .get("reembed_done_through")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| invalid("reembed_done_through"))?;
+    let phase = match doc.get("reembed_phase").and_then(serde_json::Value::as_str) {
+        Some("vectors") => ReembedPhase::Vectors,
+        Some("repair") => ReembedPhase::Repair,
+        _ => return Err(invalid("reembed_phase")),
+    };
+    Ok(Some(ReembedMark {
+        to_model,
+        to_dim,
+        to_metric,
+        done_through,
+        phase,
+    }))
+}
+
+fn validate_repair_mark(
+    mark: &ReembedMark,
+    model_id: &str,
+    dim: u16,
+    metric: EmbeddingMetric,
+    region_id: i64,
+) -> Result<()> {
+    if mark.phase == ReembedPhase::Repair
+        && (mark.to_model != model_id || mark.to_dim != dim || mark.to_metric != metric_tag(metric))
+    {
+        return Err(MemError::Invalid(format!(
+            "memory region {region_id} has a repair mark that disagrees with its stored provenance"
+        )));
+    }
+    Ok(())
+}
+
+/// Clear a zero-progress migration while preserving unrelated metadata.
+fn clear_reembed_mark(conn: &Connection, region_id: i64) -> Result<()> {
+    if let Some(rest) = without_mark(read_metadata(conn, region_id)?.as_deref())? {
+        conn.execute_params(
+            "UPDATE memory_regions SET metadata = $1 WHERE id = $2",
+            &[Value::Text(rest.into()), Value::Integer(region_id)],
+        )?;
+        return Ok(());
+    }
+    conn.execute_params(
+        "UPDATE memory_regions SET metadata = NULL WHERE id = $1",
+        &[Value::Integer(region_id)],
+    )?;
+    Ok(())
+}
+
+/// Restore pre-migration metadata through an uncancelled recovery transaction.
+fn restore_reembed_metadata(
+    conn: &Connection,
+    region_id: i64,
+    metadata: Option<&str>,
+) -> Result<()> {
+    conn.execute_params_uncancelled_recovery(
+        "UPDATE memory_regions SET metadata = $1 WHERE id = $2",
+        &[
+            metadata
+                .map(|json| Value::Text(json.into()))
+                .unwrap_or(Value::Null),
+            Value::Integer(region_id),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Restore metadata only while this caller still owns the first checkpoint.
+/// Recovery is uncancelled because the operation's token may already be tripped.
+fn restore_reembed_metadata_if_unchanged(
+    conn: &Connection,
+    region_id: i64,
+    expected: &ReembedMark,
+    metadata: Option<&str>,
+) -> Result<()> {
+    conn.execute_params_uncancelled_recovery(
+        "UPDATE memory_regions SET metadata = $1 WHERE id = $2 \
+         AND metadata ->> 'reembed_to_model' = $3 \
+         AND metadata ->> 'reembed_to_dim' = $4 \
+         AND metadata ->> 'reembed_to_metric' = $5 \
+         AND metadata ->> 'reembed_done_through' = $6 \
+         AND metadata ->> 'reembed_phase' = $7",
+        &[
+            metadata
+                .map(|json| Value::Text(json.into()))
+                .unwrap_or(Value::Null),
+            Value::Integer(region_id),
+            Value::Text(expected.to_model.as_str().into()),
+            Value::Text(expected.to_dim.to_string().into()),
+            Value::Text(expected.to_metric.as_str().into()),
+            Value::Text(expected.done_through.to_string().into()),
+            Value::Text(expected.phase.as_str().into()),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Atomically publish provenance and advance the checkpoint to graph repair.
+fn publish_reembed(conn: &Connection, region_id: i64, mark: &ReembedMark) -> Result<()> {
+    let repair = ReembedMark {
+        to_model: mark.to_model.clone(),
+        to_dim: mark.to_dim,
+        to_metric: mark.to_metric.clone(),
+        done_through: mark.done_through,
+        phase: ReembedPhase::Repair,
+    };
+    conn.execute_params(
+        "UPDATE memory_regions SET model_id = $1, embedding_dim = $2, embedding_metric = $3, \
+         metadata = $4 WHERE id = $5",
+        &[
+            Value::Text(mark.to_model.as_str().into()),
+            Value::Integer(mark.to_dim as i64),
+            Value::Text(mark.to_metric.as_str().into()),
+            Value::Text(mark_json(read_metadata(conn, region_id)?.as_deref(), &repair)?.into()),
+            Value::Integer(region_id),
+        ],
+    )?;
+    Ok(())
+}
+
+/// What the vector stage leaves for the repair stage that follows it.
+struct Migration {
+    report: ReembedReport,
+    region_id: RegionId,
+    /// The exact repair-phase mark this call observed or published. `None`
+    /// means the region already used this provenance and needed no work.
+    repair: Option<ReembedMark>,
+}
+
+/// What one migration batch needs beyond the rows it is writing.
+struct BatchContext<'a> {
+    /// `Some` for a sealed region, whose text lives inside the blob.
+    atom_wrap: Option<&'a AtomWrapKey>,
+    region_id: RegionId,
+    /// Advanced inside the batch's own transaction, so the rows and the record
+    /// of how far the migration got can never disagree.
+    checkpoint: &'a ReembedMark,
+    cancel: Option<&'a citadel_core::CancelToken>,
+}
+
+/// One bounded page of atoms a re-embed has to recompute.
+#[derive(Default)]
+struct ReembedWork {
+    atoms: Vec<ReembedAtom>,
+    /// Atoms stored with a vector but no text.
+    empty_text: u64,
+    /// Highest row id the page read, including rows whose erased key made them
+    /// unrecoverable. Pagination must advance even when every row is skipped.
+    last_id: Option<AtomId>,
+}
+
+struct ReembedAtom {
+    id: AtomId,
+    text: String,
+    /// Present only for a sealed atom; retained so resealing does not decrypt
+    /// and decode the same row a third time.
+    payload_json: Option<Zeroizing<String>>,
+}
+
+impl Drop for ReembedWork {
+    fn drop(&mut self) {
+        // Sealed-region text was plaintext only for this migration page.
+        for atom in &mut self.atoms {
+            atom.text.zeroize();
+        }
+    }
+}
+
+/// An atom's vector plus the two columns recall scoring derives from it.
+struct AtomState {
+    embedding: Vec<f32>,
+    access_count: i64,
+    created: i64,
+}
+
+/// The exact durable rule that produced one atom's managed `SimilarTo` edges.
+struct WeaveShape {
+    src: AtomId,
+    neighbors: usize,
+    max_distance: f32,
+    kinds: Vec<String>,
+}
+
+type ManagedSimilarityEdge = (AtomId, f32, Option<serde_json::Value>);
+
+/// How a recall run differs between one caller query and a multi-query member.
+#[derive(Clone, Copy)]
+struct RecallMode {
+    rerank: bool,
+    record_access: bool,
+}
+
+impl RecallMode {
+    /// A caller's recall.
+    const USER: Self = Self {
+        rerank: true,
+        record_access: true,
+    };
+    /// A sub-query of `recall_many`, which reranks the merged pool instead.
+    const SUBQUERY: Self = Self {
+        rerank: false,
+        record_access: true,
+    };
+    /// Deterministic derived-data maintenance.
+    const INTERNAL: Self = Self {
+        rerank: false,
+        record_access: false,
+    };
+}
+
+/// What a re-embed did to the region's `SimilarTo` web.
+#[derive(Default)]
+struct WeaveRebuild {
+    /// Edges recomputed over the new vectors.
+    rewoven: u64,
+    /// Stale edges nothing could recompute.
+    cleared: u64,
+}
+
+/// A bounded set of atom ids as a SQL `IN` list.
+fn id_list(ids: &[AtomId]) -> String {
+    ids.iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn live_region_atom_ids(
+    conn: &Connection<'_>,
+    tables: &[String],
+    region_id: RegionId,
+    ids: &[AtomId],
+) -> Result<FxHashSet<AtomId>> {
+    let mut live = FxHashSet::default();
+    for page in ids.chunks(REEMBED_BATCH) {
+        if page.is_empty() {
+            continue;
+        }
+        let list = id_list(page);
+        for table in tables {
+            let rows = conn.query_params(
+                &format!("SELECT id FROM {table} WHERE region_id = $1 AND id IN ({list})"),
+                &[Value::Integer(region_id)],
+            )?;
+            for row in &rows.rows {
+                live.insert(as_int(&row[0])?);
+            }
+        }
+    }
+    Ok(live)
+}
+
+fn check_cancel(cancel: Option<&citadel_core::CancelToken>) -> Result<()> {
+    if let Some(token) = cancel {
+        token.check().map_err(MemError::Core)?;
+    }
+    Ok(())
+}
+
+fn segment_operation_error(error: citadel_vector::segment::SegmentOperationError) -> MemError {
+    match error {
+        citadel_vector::segment::SegmentOperationError::Interrupted => {
+            MemError::Core(citadel_core::Error::Interrupted)
+        }
+        citadel_vector::segment::SegmentOperationError::Allocation(where_) => {
+            MemError::Invalid(format!("ANN segment allocation failed in {where_}"))
+        }
+        citadel_vector::segment::SegmentOperationError::Segment(source) => {
+            MemError::Invalid(format!("ANN segment operation failed: {source}"))
+        }
+    }
+}
+
+/// Check and retain the database token that governs one external call.
+fn check_db_cancel(db: &Database) -> Result<Option<citadel_core::CancelToken>> {
+    let cancel = db.cancel_token();
+    check_cancel(cancel.as_ref())?;
+    Ok(cancel)
+}
+
 const BOOTSTRAP_SQL: &str = "\
 CREATE TABLE IF NOT EXISTS memory_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS memory_regions (\
@@ -338,6 +798,20 @@ CREATE TABLE IF NOT EXISTS memory_edges (\
  weight REAL DEFAULT 1.0,\
  evidence_ref JSONB,\
  PRIMARY KEY (src_id, dst_id, kind));
+CREATE TABLE IF NOT EXISTS memory_similarity_policies (\
+ region_id INTEGER NOT NULL,\
+ src_id INTEGER PRIMARY KEY,\
+ neighbors INTEGER NOT NULL,\
+ max_distance REAL NOT NULL,\
+ kinds JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS memory_similarity_edges (\
+ src_id INTEGER NOT NULL,\
+ dst_id INTEGER NOT NULL,\
+ PRIMARY KEY (src_id, dst_id));
+CREATE INDEX IF NOT EXISTS memory_similarity_policies_region \
+ ON memory_similarity_policies (region_id, src_id);
+CREATE INDEX IF NOT EXISTS memory_similarity_edges_dst \
+ ON memory_similarity_edges (dst_id);
 CREATE TABLE IF NOT EXISTS memory_idempotency (\
  region_id INTEGER NOT NULL,\
  kind TEXT NOT NULL,\
@@ -370,9 +844,60 @@ impl MemoryEngine {
                 ));
             }
         } // drop the connection's borrow before moving `db`
+        let regions = Arc::new(Mutex::new(FxHashMap::<String, RegionState>::default()));
+        let weak_regions = Arc::downgrade(&regions);
+        let region_invalidator: Arc<citadel::MemoryRegionInvalidator> =
+            Arc::new(move |region_id| {
+                let regions = weak_regions.upgrade()?;
+                let detached = {
+                    let mut regions = regions.lock().unwrap();
+                    let key = regions.iter().find_map(|(key, state)| {
+                        (state.id as u64 == region_id).then(|| key.clone())
+                    });
+                    key.and_then(|key| regions.remove(&key))
+                };
+                detached.map(|state| {
+                    Box::new(retire_region_state(state)) as Box<dyn std::any::Any + Send>
+                })
+            });
+        db.register_memory_region_invalidator(Arc::clone(&region_invalidator));
+        let weak_regions = Arc::downgrade(&regions);
+        let atom_invalidator: Arc<citadel::MemoryAtomInvalidator> = Arc::new(move |atom_ids| {
+            let Some(regions) = weak_regions.upgrade() else {
+                return Vec::new();
+            };
+            let atom_ids: FxHashSet<AtomId> = atom_ids
+                .iter()
+                .filter_map(|&id| AtomId::try_from(id).ok())
+                .collect();
+            if atom_ids.is_empty() {
+                return Vec::new();
+            }
+            let caches: Vec<_> = regions
+                .lock()
+                .unwrap()
+                .values()
+                .map(|state| Arc::clone(&state.ann))
+                .collect();
+            caches
+                .into_iter()
+                .filter_map(|cache| {
+                    let mut cache = cache.write().unwrap();
+                    cache
+                        .as_ref()
+                        .is_some_and(|ann| atom_ids.iter().any(|id| ann.cached.contains_key(id)))
+                        .then(|| cache.take())
+                        .flatten()
+                        .map(|ann| Box::new(ann) as Box<dyn std::any::Any + Send>)
+                })
+                .collect()
+        });
+        db.register_memory_atom_invalidator(Arc::clone(&atom_invalidator));
         let engine = Self {
             db,
-            regions: Mutex::new(FxHashMap::default()),
+            regions,
+            _region_invalidator: region_invalidator,
+            _atom_invalidator: atom_invalidator,
             reranker: RwLock::new(None),
             attach_max: Mutex::new(FxHashMap::default()),
             access_stats: Mutex::new(FxHashMap::default()),
@@ -384,6 +909,7 @@ impl MemoryEngine {
             engine.reconcile_atom_store()?;
         }
         engine.reconcile_identity_records()?;
+        engine.reconcile_similarity_state()?;
         Ok(engine)
     }
 
@@ -426,6 +952,7 @@ impl MemoryEngine {
     fn reconcile_atom_store(&self) -> Result<()> {
         // Serialize against in-flight allocate->commit spans on other handles.
         let _kl = self.db.key_lifecycle_lock();
+        let _edges_guard = self.db.memory_edges_lock();
         // Phase 0 - normalize torn erases before any row or slot binding is forgotten.
         _kl.normalize_atom_store_torn_erases()?;
         let conn = Connection::open(&self.db)?;
@@ -446,11 +973,19 @@ impl MemoryEngine {
             FxHashMap::default()
         };
         let regions = conn.query_params(
-            "SELECT id, embedding_dim, embedding_metric, rsk_slot, rsk_gen \
+            "SELECT id, embedding_dim, embedding_metric, rsk_slot, rsk_gen, model_id, \
+             CAST(metadata AS TEXT) \
              FROM memory_regions WHERE encrypted = 1",
             &[],
         )?;
         let mut region_tables: FxHashMap<RegionId, String> = FxHashMap::default();
+        // A shape-changing re-embed moves converted rows to the destination
+        // table BEFORE the row that describes the region is updated, so a
+        // region interrupted part-way legitimately has rows in two tables. The
+        // row's own shape names only the source; a reconcile that knew nothing
+        // else would read every converted row as belonging to no region, and
+        // orphan here means the atom's key is destroyed and its row deleted.
+        let mut migrating_to: FxHashMap<RegionId, String> = FxHashMap::default();
         for row in &regions.rows {
             let dim = u16::try_from(as_int(&row[1])?)
                 .map_err(|_| MemError::Invalid("stored embedding_dim out of range".into()))?;
@@ -463,7 +998,25 @@ impl MemoryEngine {
                 .and_then(|key| region_live.get(&key))
                 .is_some_and(|&gen| opt_u64(&row[4]) == Some(gen));
             if bound {
-                region_tables.insert(id, atoms_table(dim, metric, true));
+                let home = atoms_table(dim, metric, true);
+                let metadata = match &row[6] {
+                    Value::Text(value) => Some(value.as_str()),
+                    Value::Null => None,
+                    _ => {
+                        return Err(MemError::Invalid(format!(
+                            "memory region {id} has unreadable metadata"
+                        )))
+                    }
+                };
+                if let Some(mark) = parse_reembed_mark(metadata, id)? {
+                    validate_repair_mark(&mark, as_text(&row[5])?, dim, metric, id)?;
+                    let destination =
+                        atoms_table(mark.to_dim, metric_from_str(&mark.to_metric)?, true);
+                    if destination != home {
+                        migrating_to.insert(id, destination);
+                    }
+                }
+                region_tables.insert(id, home);
             }
         }
         // Catalog-driven table list: rows of a removed parent region still scan.
@@ -494,7 +1047,8 @@ impl MemoryEngine {
                 match slot.zip(owner).zip(gen) {
                     Some(((slot, owner), gen))
                         if live_gens.get(&(slot, owner)) == Some(&gen)
-                            && region_tables.get(&rid) == Some(table) =>
+                            && (region_tables.get(&rid) == Some(table)
+                                || migrating_to.get(&rid) == Some(table)) =>
                     {
                         row_claims.insert((slot, owner));
                         valid_ids.insert(id);
@@ -621,6 +1175,7 @@ impl MemoryEngine {
                         &format!("DELETE FROM memory_idempotency WHERE atom_id IN ({dead_list})"),
                         &[],
                     )?;
+                    delete_similarity_state_for_atom_list(c, &dead_list)?;
                     c.execute_params(
                         &format!(
                             "DELETE FROM memory_edges WHERE src_id IN ({dead_list}) \
@@ -654,42 +1209,64 @@ impl MemoryEngine {
                 .push(as_int(&row[1])?);
         }
         let regions = conn.query_params(
-            "SELECT id, embedding_dim, embedding_metric, encrypted FROM memory_regions",
+            "SELECT id, embedding_dim, embedding_metric, encrypted, model_id, \
+             CAST(metadata AS TEXT) FROM memory_regions",
             &[],
         )?;
-        let mut tables: FxHashMap<RegionId, String> = FxHashMap::default();
+        // Both tables, for the same reason the encrypted reconcile needs both:
+        // a region part-way through a shape-changing re-embed has its converted
+        // rows in the destination while the row still names the source. Looking
+        // only at the source finds none of them and deletes their identity
+        // records, which is what makes a repeated `remember` write a duplicate.
+        let mut tables: FxHashMap<RegionId, Vec<String>> = FxHashMap::default();
         for row in &regions.rows {
             let dim = u16::try_from(as_int(&row[1])?)
                 .map_err(|_| MemError::Invalid("stored embedding_dim out of range".into()))?;
             let metric = metric_from_str(as_text(&row[2])?)?;
-            tables.insert(
-                as_int(&row[0])?,
-                atoms_table(dim, metric, as_exact_bool(&row[3], "encrypted")?),
-            );
+            let encrypted = as_exact_bool(&row[3], "encrypted")?;
+            let region_id = as_int(&row[0])?;
+            let home = atoms_table(dim, metric, encrypted);
+            let mut homes = vec![home.clone()];
+            let metadata = match &row[5] {
+                Value::Text(value) => Some(value.as_str()),
+                Value::Null => None,
+                _ => {
+                    return Err(MemError::Invalid(format!(
+                        "memory region {region_id} has unreadable metadata"
+                    )))
+                }
+            };
+            if let Some(mark) = parse_reembed_mark(metadata, region_id)? {
+                validate_repair_mark(&mark, as_text(&row[4])?, dim, metric, region_id)?;
+                let destination =
+                    atoms_table(mark.to_dim, metric_from_str(&mark.to_metric)?, encrypted);
+                if destination != home {
+                    homes.push(destination);
+                }
+            }
+            tables.insert(region_id, homes);
         }
         let mut orphans: Vec<(RegionId, Vec<AtomId>)> = Vec::new();
         for (region_id, atom_ids) in by_region {
-            let live: FxHashSet<AtomId> = match tables.get(&region_id) {
-                Some(table) if conn.table_schema(table).is_some() => {
-                    let in_list = atom_ids
-                        .iter()
-                        .map(|id| id.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let qr = conn.query_params(
-                        &format!(
-                            "SELECT id FROM {table} WHERE region_id = $1 AND id IN ({in_list})"
-                        ),
-                        &[Value::Integer(region_id)],
-                    )?;
-                    qr.rows
-                        .iter()
-                        .map(|r| as_int(&r[0]))
-                        .collect::<Result<_>>()?
+            let in_list = atom_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            // The region row or its tables are gone: all records orphaned.
+            let mut live: FxHashSet<AtomId> = FxHashSet::default();
+            for table in tables.get(&region_id).into_iter().flatten() {
+                if conn.table_schema(table).is_none() {
+                    continue;
                 }
-                // The region row or its table is gone: all records orphaned.
-                _ => FxHashSet::default(),
-            };
+                let qr = conn.query_params(
+                    &format!("SELECT id FROM {table} WHERE region_id = $1 AND id IN ({in_list})"),
+                    &[Value::Integer(region_id)],
+                )?;
+                for r in &qr.rows {
+                    live.insert(as_int(&r[0])?);
+                }
+            }
             let gone: Vec<AtomId> = atom_ids
                 .into_iter()
                 .filter(|id| !live.contains(id))
@@ -722,33 +1299,173 @@ impl MemoryEngine {
         })
     }
 
+    /// Remove managed-similarity sidecars whose atom or policy disappeared.
+    /// Untracked `SimilarTo` rows remain authored data; only pairs that still
+    /// carry explicit engine ownership may be deleted automatically.
+    fn reconcile_similarity_state(&self) -> Result<()> {
+        let _kl = self.db.key_lifecycle_lock();
+        let _edges_guard = self.db.memory_edges_lock();
+        let conn = Connection::open(&self.db)?;
+        let regions = conn.query(
+            "SELECT id, embedding_dim, embedding_metric, model_id, encrypted, rsk_slot, rsk_gen \
+             FROM memory_regions",
+        )?;
+        let mut region_tables = FxHashMap::default();
+        for values in &regions.rows {
+            let row = parse_region_row(values)?;
+            region_tables.insert(row.id, self.region_atom_tables(&conn, &row)?);
+        }
+
+        let mut invalid_policies = FxHashSet::default();
+        let mut delete_owned = Vec::new();
+        let mut after = i64::MIN;
+        loop {
+            let page = conn.query_params(
+                &format!(
+                    "SELECT region_id, src_id FROM memory_similarity_policies \
+                     WHERE src_id > $1 ORDER BY src_id LIMIT {REEMBED_BATCH}"
+                ),
+                &[Value::Integer(after)],
+            )?;
+            let Some(last) = page.rows.last() else {
+                break;
+            };
+            after = as_int(&last[1])?;
+
+            let mut by_region: FxHashMap<RegionId, Vec<AtomId>> = FxHashMap::default();
+            for row in &page.rows {
+                by_region
+                    .entry(as_int(&row[0])?)
+                    .or_default()
+                    .push(as_int(&row[1])?);
+            }
+            for (region_id, sources) in by_region {
+                let Some(tables) = region_tables.get(&region_id) else {
+                    invalid_policies.extend(sources);
+                    continue;
+                };
+                let live_sources = live_region_atom_ids(&conn, tables, region_id, &sources)?;
+                invalid_policies.extend(
+                    sources
+                        .iter()
+                        .filter(|src| !live_sources.contains(src))
+                        .copied(),
+                );
+                let valid_sources: Vec<_> = sources
+                    .into_iter()
+                    .filter(|src| live_sources.contains(src))
+                    .collect();
+                if valid_sources.is_empty() {
+                    continue;
+                }
+                let tracked = conn.query(&format!(
+                    "SELECT src_id, dst_id FROM memory_similarity_edges WHERE src_id IN ({})",
+                    id_list(&valid_sources)
+                ))?;
+                let mut destinations = Vec::with_capacity(tracked.rows.len());
+                let mut pairs = Vec::with_capacity(tracked.rows.len());
+                for row in &tracked.rows {
+                    let pair = (as_int(&row[0])?, as_int(&row[1])?);
+                    destinations.push(pair.1);
+                    pairs.push(pair);
+                }
+                destinations.sort_unstable();
+                destinations.dedup();
+                let live_destinations =
+                    live_region_atom_ids(&conn, tables, region_id, &destinations)?;
+                delete_owned.extend(
+                    pairs
+                        .into_iter()
+                        .filter(|(_, dst)| !live_destinations.contains(dst)),
+                );
+            }
+        }
+
+        with_write_txn(&conn, |c| {
+            for &(src, dst) in &delete_owned {
+                c.execute_params(
+                    "DELETE FROM memory_edges WHERE src_id = $1 AND dst_id = $2 \
+                     AND kind = 'similar_to'",
+                    &[Value::Integer(src), Value::Integer(dst)],
+                )?;
+            }
+            for &(src, dst) in &delete_owned {
+                c.execute_params(
+                    "DELETE FROM memory_similarity_edges WHERE src_id = $1 AND dst_id = $2",
+                    &[Value::Integer(src), Value::Integer(dst)],
+                )?;
+            }
+            let mut invalid: Vec<_> = invalid_policies.iter().copied().collect();
+            invalid.sort_unstable();
+            for sources in invalid.chunks(REEMBED_BATCH) {
+                let ids = id_list(sources);
+                let owned = c.query(&format!(
+                    "SELECT src_id, dst_id FROM memory_similarity_edges \
+                     WHERE src_id IN ({ids})"
+                ))?;
+                for row in &owned.rows {
+                    c.execute_params(
+                        "DELETE FROM memory_edges WHERE src_id = $1 AND dst_id = $2 \
+                         AND kind = 'similar_to'",
+                        &[
+                            Value::Integer(as_int(&row[0])?),
+                            Value::Integer(as_int(&row[1])?),
+                        ],
+                    )?;
+                }
+                c.execute(&format!(
+                    "DELETE FROM memory_similarity_edges WHERE src_id IN ({ids})"
+                ))?;
+                c.execute(&format!(
+                    "DELETE FROM memory_similarity_policies WHERE src_id IN ({ids})"
+                ))?;
+            }
+            c.execute(
+                "DELETE FROM memory_similarity_edges WHERE src_id NOT IN \
+                 (SELECT src_id FROM memory_similarity_policies)",
+            )?;
+            Ok(())
+        })
+    }
+
     /// Record recall hits for `Lru`/`Stale` eviction. In-process and
     /// write-free, so recall never serializes behind the writer.
-    fn note_access(&self, region_id: RegionId, ids: impl IntoIterator<Item = AtomId>) {
+    fn note_access(
+        &self,
+        region_id: RegionId,
+        ids: impl IntoIterator<Item = AtomId>,
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<()> {
         let now = now_micros();
         let mut stats = self.access_stats.lock().unwrap();
         let region = stats.entry(region_id).or_default();
         for id in ids {
+            check_cancel(cancel)?;
             let entry = region.entry(id).or_insert((0, 0));
             entry.0 = now;
             entry.1 += 1;
         }
+        check_cancel(cancel)?;
+        Ok(())
     }
 
     /// Attach a cross-encoder reranker for later `recall`s, per `strategy`.
     pub fn set_reranker(&self, reranker: Arc<dyn Reranker>, strategy: RerankStrategy) {
-        *self.reranker.write().unwrap() = Some((reranker, strategy));
+        let previous = self.reranker.write().unwrap().replace((reranker, strategy));
+        drop(previous);
     }
 
     /// Detach any reranker so subsequent `recall`s use linear fusion only.
     pub fn clear_reranker(&self) {
-        *self.reranker.write().unwrap() = None;
+        let previous = self.reranker.write().unwrap().take();
+        drop(previous);
     }
 
     /// Get-or-create a plaintext region bound to `embedder` (dim/metric/model
     /// must match).
     pub fn create_region(&self, name: &str, embedder: Arc<dyn Embedder>) -> Result<RegionId> {
-        self.create_region_inner(name, embedder, false)
+        let cancel = check_db_cancel(&self.db)?;
+        self.create_region_inner(name, embedder, false, cancel.as_ref())
     }
 
     /// Get-or-create an encrypted region: each atom sealed under its own random
@@ -759,10 +1476,11 @@ impl MemoryEngine {
         name: &str,
         embedder: Arc<dyn Embedder>,
     ) -> Result<RegionId> {
+        let cancel = check_db_cancel(&self.db)?;
         if !self.db.region_keys_enabled() {
             return Err(MemError::Core(citadel_core::Error::RegionKeysDisabled));
         }
-        self.create_region_inner(name, embedder, true)
+        self.create_region_inner(name, embedder, true, cancel.as_ref())
     }
 
     fn create_region_inner(
@@ -770,6 +1488,7 @@ impl MemoryEngine {
         name: &str,
         embedder: Arc<dyn Embedder>,
         encrypted: bool,
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<RegionId> {
         let key = name.to_ascii_lowercase();
         let dim = u16::try_from(embedder.dim()).map_err(|_| {
@@ -777,32 +1496,50 @@ impl MemoryEngine {
         })?;
         let metric = embedder.metric();
         let model_id = embedder.model_id().to_string();
+        validate_model_id(&model_id)?;
+        check_cancel(cancel)?;
 
         // Region incarnation is persisted state, not a property of this
         // engine's local attachment map. Hold the lifecycle guard across the
         // lookup/create and state replacement so a cross-engine drop cannot
         // interleave, and always consult the row before accepting a cached
         // handle (drop + recreate binds the same name to a fresh id).
+        let mut retired_states = Vec::new();
         let _kl = self.db.key_lifecycle_lock();
+        check_cancel(cancel)?;
         let conn = Connection::open(&self.db)?;
         // A fresh region has no atoms; only a re-attach needs the MAX(id) scan.
         let (id, keys, init_max) = match self.load_region_row(&conn, &key)? {
             Some(existing) => {
-                let attached = self.check_attached_incarnation(
-                    &key,
-                    existing.id,
-                    dim,
-                    metric,
-                    &model_id,
-                    encrypted,
+                // Refused rather than served: a marked region holds vectors from
+                // two models at once, so recall would rank across vector spaces
+                // and report nothing wrong. Naming the call that finishes it is
+                // what turns a silent half-migration into an instructed one.
+                if let Some(mark) = self.read_reembed_mark(&conn, existing.id)? {
+                    return Err(MemError::Invalid(format!(
+                        "region '{key}' stopped during re-embedding to '{}'; resume \
+                         reembed_region before using it",
+                        mark.to_model
+                    )));
+                }
+                let (attached, stale) = self.check_attached_incarnation(
+                    &key, &existing, dim, metric, &model_id, encrypted,
                 )?;
+                if stale {
+                    if let Some(state) = self.take_attached_region(&key, None) {
+                        retired_states.push(state);
+                    }
+                }
                 if attached.is_some() && encrypted {
                     if let Err(err) = self.verify_region_key_live(&key, &existing) {
-                        self.remove_attached_incarnation(&key, existing.id);
+                        if let Some(state) = self.take_attached_region(&key, Some(existing.id)) {
+                            retired_states.push(state);
+                        }
                         return Err(err);
                     }
                 }
                 if let Some(id) = attached {
+                    check_cancel(cancel)?;
                     return Ok(id);
                 }
                 existing.verify_matches(&key, dim, metric, &model_id, encrypted)?;
@@ -812,38 +1549,47 @@ impl MemoryEngine {
                     None
                 };
                 let table = atoms_table(dim, metric, keys.is_some());
-                let max = self.reattach_max_id(&conn, &table, existing.id)?;
+                let max = self.reattach_max_id(&conn, &table, existing.id, cancel)?;
+                check_cancel(cancel)?;
                 (existing.id, keys, max)
             }
             None if encrypted => {
+                check_cancel(cancel)?;
                 let (id, keys) =
                     self.insert_encrypted_region(&conn, &key, dim, metric, &model_id, &_kl)?;
                 (id, keys, 0)
             }
-            None => (
-                self.insert_region(&conn, &key, dim, metric, &model_id)?,
-                None,
-                0,
-            ),
+            None => {
+                check_cancel(cancel)?;
+                (
+                    self.insert_region(&conn, &key, dim, metric, &model_id)?,
+                    None,
+                    0,
+                )
+            }
         };
 
         let (atom_wrap, identity_mac) = match keys {
             Some(k) => (Some(k.atom_wrap), Some(k.identity_mac)),
             None => (None, None),
         };
-        self.regions.lock().unwrap().insert(
+        let replaced = self.regions.lock().unwrap().insert(
             key,
             RegionState {
                 id,
                 dim,
                 metric,
                 embedder,
+                model_id: Arc::from(model_id.as_str()),
                 atom_wrap,
                 identity_mac,
                 ann: Arc::new(RwLock::new(None)),
                 max_id: Arc::new(AtomicI64::new(init_max)),
             },
         );
+        if let Some(state) = replaced {
+            retired_states.push(retire_region_state(state));
+        }
         Ok(id)
     }
 
@@ -853,35 +1599,91 @@ impl MemoryEngine {
         name: &str,
         embedder: Arc<dyn Embedder>,
     ) -> Result<RegionId> {
+        let cancel = check_db_cancel(&self.db)?;
+        self.attach_existing_region_inner(name, embedder, cancel.as_ref(), false)
+    }
+
+    fn attach_reembed_region(
+        &self,
+        name: &str,
+        embedder: Arc<dyn Embedder>,
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<RegionId> {
+        self.attach_existing_region_inner(name, embedder, cancel, true)
+    }
+
+    fn attach_existing_region_inner(
+        &self,
+        name: &str,
+        embedder: Arc<dyn Embedder>,
+        cancel: Option<&citadel_core::CancelToken>,
+        allow_repair: bool,
+    ) -> Result<RegionId> {
         let key = name.to_ascii_lowercase();
         let dim = u16::try_from(embedder.dim()).map_err(|_| {
             MemError::Invalid(format!("embedding dim {} too large", embedder.dim()))
         })?;
         let metric = embedder.metric();
         let model_id = embedder.model_id().to_string();
+        validate_model_id(&model_id)?;
+        check_cancel(cancel)?;
 
         // One lifecycle span so a concurrent drop_region orders around this attach.
+        let mut retired_states = Vec::new();
         let _kl = self.db.key_lifecycle_lock();
+        check_cancel(cancel)?;
         let conn = Connection::open(&self.db)?;
         let Some(existing) = self.load_region_row(&conn, &key)? else {
             // A failed attach must not leave a stale local map entry usable by reads.
-            self.detach_attached_region(&key, None);
+            if let Some(state) = self.take_attached_region(&key, None) {
+                retired_states.push(state);
+            }
             return Err(MemError::RegionNotFound(key));
         };
+        // Refused rather than served: a marked region holds vectors from two
+        // models at once, so recall would rank across vector spaces and report
+        // nothing wrong. Naming the call that finishes it turns a silent
+        // half-migration into an instructed one.
+        if let Some(mark) = self.read_reembed_mark(&conn, existing.id)? {
+            if allow_repair {
+                validate_repair_mark(
+                    &mark,
+                    &existing.model_id,
+                    existing.dim,
+                    existing.metric,
+                    existing.id,
+                )?;
+            }
+            if mark.phase != ReembedPhase::Repair || !allow_repair {
+                return Err(MemError::Invalid(format!(
+                    "region '{key}' stopped during re-embedding to '{}'; resume reembed_region \
+                     before using it",
+                    mark.to_model
+                )));
+            }
+        }
         let encrypted = existing.encrypted;
         if encrypted && !self.db.region_keys_enabled() {
             return Err(MemError::Core(citadel_core::Error::RegionKeysDisabled));
         }
         // Already attached in this process (existence is proven above).
-        let attached =
-            self.check_attached_incarnation(&key, existing.id, dim, metric, &model_id, encrypted)?;
+        let (attached, stale) =
+            self.check_attached_incarnation(&key, &existing, dim, metric, &model_id, encrypted)?;
+        if stale {
+            if let Some(state) = self.take_attached_region(&key, None) {
+                retired_states.push(state);
+            }
+        }
         if attached.is_some() && encrypted {
             if let Err(err) = self.verify_region_key_live(&key, &existing) {
-                self.remove_attached_incarnation(&key, existing.id);
+                if let Some(state) = self.take_attached_region(&key, Some(existing.id)) {
+                    retired_states.push(state);
+                }
                 return Err(err);
             }
         }
         if let Some(id) = attached {
+            check_cancel(cancel)?;
             return Ok(id);
         }
         existing.verify_matches(&key, dim, metric, &model_id, encrypted)?;
@@ -892,37 +1694,1223 @@ impl MemoryEngine {
             (None, None)
         };
         let table = atoms_table(dim, metric, atom_wrap.is_some());
-        let init_max = self.reattach_max_id(&conn, &table, existing.id)?;
-        self.regions.lock().unwrap().insert(
+        let init_max = self.reattach_max_id(&conn, &table, existing.id, cancel)?;
+        check_cancel(cancel)?;
+        let replaced = self.regions.lock().unwrap().insert(
             key,
             RegionState {
                 id: existing.id,
                 dim,
                 metric,
                 embedder,
+                model_id: Arc::from(model_id.as_str()),
                 atom_wrap,
                 identity_mac,
                 ann: Arc::new(RwLock::new(None)),
                 max_id: Arc::new(AtomicI64::new(init_max)),
             },
         );
+        if let Some(state) = replaced {
+            retired_states.push(retire_region_state(state));
+        }
         Ok(existing.id)
     }
 
-    /// Drop a region and all its atoms and incident edges. No-op if absent.
+    /// Correct which model a region says produced its vectors, touching none of
+    /// them.
     ///
-    /// Encrypted: the region key is destroyed (overwrite + fsync + read-back)
-    /// before any row delete, so a crash leaves the content undecryptable.
-    pub fn drop_region(&self, name: &str) -> Result<()> {
+    /// The counterpart to `reembed_region`, for the opposite fault. There the
+    /// vectors are wrong and must be recomputed; here they are right and only
+    /// the label is false. Re-embedding would be both wasteful and, for a region
+    /// whose atoms carry vectors but no text, impossible.
+    ///
+    /// The fault this exists to repair is one the shipped integrations wrote.
+    /// An integration that embeds caller-side still had to hand
+    /// `create_encrypted_region` an embedder, so it passed a `MockEmbedder` it
+    /// never called - and the region recorded `model_id = "mock"` over genuine
+    /// vectors from a real model. Nothing about those stores is damaged; their
+    /// provenance simply lies.
+    ///
+    /// **Deliberately not automatic.** The engine cannot tell a region whose
+    /// vectors really came from `MockEmbedder` - a real mock user, whose data is
+    /// meaningless and should stay labelled - from one where an integration
+    /// mislabelled real vectors. Only the caller knows, so only the caller may
+    /// assert it. What the engine does instead is refuse the mismatched attach
+    /// with a message naming this call, which turns a silent breakage into an
+    /// instructed one.
+    ///
+    /// An attachment the new label contradicts is detached. Re-attach with the
+    /// model the region now names.
+    pub fn reclassify_region(&self, name: &str, model_id: String) -> Result<()> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = name.to_ascii_lowercase();
-        // Tombstone -> row-delete -> segment-retire is one lifecycle span.
+        let recorded = model_id.as_str();
+        validate_model_id(recorded)?;
+
+        // The same span drop_region holds: this rewrites the region row, and a
+        // concurrent drop must order around it rather than interleave.
         let _kl = self.db.key_lifecycle_lock();
         let conn = Connection::open(&self.db)?;
         let Some(row) = self.load_region_row(&conn, &key)? else {
-            self.detach_attached_region(&key, None);
+            return Err(MemError::RegionNotFound(key));
+        };
+        if _kl.memory_region_active(row.id as u64) {
+            return Err(MemError::Core(citadel_core::Error::RegionInUse {
+                region_id: row.id as u64,
+            }));
+        }
+        // A relabel is not a way past a half-migration. Renaming the target
+        // model would make the resume take the "already on this model" early
+        // return, leaving the mark standing and the region unattachable with
+        // nothing able to finish it.
+        if let Some(mark) = self.read_reembed_mark(&conn, row.id)? {
+            return Err(MemError::Invalid(format!(
+                "region '{key}' is part-way through a re-embed to '{}'; finish or resume that \
+                 with reembed_region before relabelling it",
+                mark.to_model
+            )));
+        }
+        check_cancel(cancel.as_ref())?;
+
+        conn.execute_params(
+            "UPDATE memory_regions SET model_id = $1 WHERE id = $2",
+            &[Value::Text(recorded.into()), Value::Integer(row.id)],
+        )?;
+        let retired = if row.model_id == recorded {
+            Vec::new()
+        } else {
+            self.db.drain_memory_region_caches(row.id as u64)
+        };
+        drop(_kl);
+        drop(retired);
+        Ok(())
+    }
+
+    /// The `SimilarTo` web is rebuilt over the new vectors rather than left
+    /// asserting a nearness the old space implied and this one does not.
+    ///
+    /// Recall quality is **not** preserved and cannot be: a new model is a new
+    /// vector space with different neighbours, so `FusionWeights`, thresholds
+    /// and any `RecallProfile` calibration tuned on the old model no longer
+    /// describe this region. Only re-measurement fixes that.
+    pub fn reembed_region(
+        &self,
+        name: &str,
+        new_embedder: Arc<dyn Embedder>,
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<ReembedReport> {
+        // The explicit token governs memory-side phase checks. With `None`, a
+        // snapshot of the handle token does. Database statements always retain
+        // the handle-wide cancellation policy as an additional stop source.
+        let database_cancel = self.db.cancel_token();
+        let cancel = cancel.or(database_cancel.as_ref());
+        check_cancel(cancel)?;
+        let key = name.to_ascii_lowercase();
+        let mut migration = self.migrate_region_vectors(&key, Arc::clone(&new_embedder), cancel)?;
+        check_cancel(cancel)?;
+        let rebuild = if let Some(expected_repair) = migration.repair.as_ref() {
+            // Repair is the only code allowed to attach and read a region while
+            // its repair mark stands. Always pass through the durable attach
+            // check so another engine's cached pre-migration handle is evicted.
+            self.attach_reembed_region(&key, new_embedder, cancel)?;
+            let h = self.region_handle(&key)?;
+            migration.report.ann_rebuilt =
+                self.rebuild_region_ann(&h.table, h.atom_wrap.is_some(), cancel)?;
+            check_cancel(cancel)?;
+
+            // The repair and retirement are one edge-mutation span. Releasing
+            // between them lets an edge writer win the single-writer slot, make
+            // this call fail while its graph is already repaired, and publish a
+            // new edge under a still-standing repair mark.
+            let kl = self.db.key_lifecycle_lock();
+            let edges_guard = self.db.memory_edges_lock();
+            let conn = Connection::open(&self.db)?;
+            let rebuild = match self.read_reembed_mark(&conn, migration.region_id)? {
+                None => WeaveRebuild::default(),
+                Some(current) if current == *expected_repair => {
+                    let rebuild = self.reweave_similarity_edges(&key, cancel, &kl, &edges_guard)?;
+
+                    // Retire the mark only after the graph is durable. A
+                    // cancellation before this point leaves an idempotent
+                    // repair for the next call.
+                    check_cancel(cancel)?;
+                    clear_reembed_mark(&conn, migration.region_id)?;
+                    rebuild
+                }
+                Some(_) => {
+                    return Err(MemError::Invalid(format!(
+                        "region '{key}' changed its re-embed repair while this retry was waiting"
+                    )))
+                }
+            };
+            rebuild
+        } else {
+            WeaveRebuild::default()
+        };
+
+        migration.report.similarity_edges_rewoven = rebuild.rewoven;
+        migration.report.similarity_edges_cleared = rebuild.cleared;
+        Ok(migration.report)
+    }
+
+    /// Put the region's atoms on the new model's vectors.
+    ///
+    /// Holds the key lifecycle capability while inspecting or mutating durable
+    /// region state, but releases it around the external embedder callback.
+    /// The vectors-phase mark closes the target region during that gap, and the
+    /// exact row and checkpoint are revalidated after every callback.
+    fn migrate_region_vectors(
+        &self,
+        key: &str,
+        new_embedder: Arc<dyn Embedder>,
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Migration> {
+        let new_dim = u16::try_from(new_embedder.dim()).map_err(|_| {
+            MemError::Invalid(format!("embedding dim {} too large", new_embedder.dim()))
+        })?;
+        let new_metric = new_embedder.metric();
+        let new_model = new_embedder.model_id().to_string();
+        validate_model_id(&new_model)?;
+
+        // Durable inspection and mutation are serialized with key destruction.
+        // The guard is released only for the external callback below, then
+        // reacquired before its result can affect storage.
+        let mut key_lifecycle = self.db.key_lifecycle_lock();
+        let conn = Connection::open(&self.db)?;
+        let Some(row) = self.load_region_row(&conn, key)? else {
+            return Err(MemError::RegionNotFound(key.into()));
+        };
+        if key_lifecycle.memory_region_active(row.id as u64) {
+            return Err(MemError::Core(citadel_core::Error::RegionInUse {
+                region_id: row.id as u64,
+            }));
+        }
+
+        let standing = self.read_reembed_mark(&conn, row.id)?;
+        if let Some(mark) = standing.as_ref() {
+            validate_repair_mark(mark, &row.model_id, row.dim, row.metric, row.id)?;
+        }
+
+        // A matching repair checkpoint still has graph work to resume.
+        if row.dim == new_dim && row.metric == new_metric && row.model_id == new_model {
+            if matches!(&standing, Some(mark) if mark.phase == ReembedPhase::Vectors) {
+                return Err(MemError::Invalid(format!(
+                    "memory region {} has a vectors-phase re-embed mark but already records its \
+                     target provenance",
+                    row.id
+                )));
+            }
+            return Ok(Migration {
+                report: ReembedReport {
+                    model_id: new_model,
+                    ..Default::default()
+                },
+                region_id: row.id,
+                repair: standing,
+            });
+        }
+        let table = atoms_table(row.dim, row.metric, row.encrypted);
+        // A different width or metric means a different physical table, because
+        // its name is a function of (dim, metric, encrypted). Rows move; ids do
+        // not change, which is what keeps edges and idempotency records valid.
+        let destination = atoms_table(new_dim, new_metric, row.encrypted);
+        let moving = destination != table;
+
+        // Resume only matching vector work. Repair-phase provenance is complete,
+        // so a new target may supersede it and rebuild the graph afterwards.
+        let resuming_matching_vectors = matches!(
+            standing.as_ref(),
+            Some(mark)
+                if mark.phase == ReembedPhase::Vectors
+                    && mark.to_model == new_model
+                    && mark.to_dim == new_dim
+                    && mark.to_metric == metric_tag(new_metric)
+        );
+        let resume_from = match standing.as_ref() {
+            Some(mark)
+                if mark.phase == ReembedPhase::Vectors
+                    && mark.to_model == new_model
+                    && mark.to_dim == new_dim
+                    && mark.to_metric == metric_tag(new_metric) =>
+            {
+                mark.done_through
+            }
+            Some(mark) if mark.phase == ReembedPhase::Vectors => {
+                return Err(MemError::Invalid(format!(
+                    "region '{key}' is part-way through a re-embed to model '{}' ({} dim, {}); \
+                     finish that one before starting another",
+                    mark.to_model, mark.to_dim, mark.to_metric
+                )))
+            }
+            _ => 0,
+        };
+
+        // Before the mark, not after it: a token already tripped when the call
+        // arrives has converted nothing, and marking a healthy region would
+        // make it unattachable for a migration that never began.
+        check_cancel(cancel)?;
+
+        if moving {
+            ensure_atoms_table(&conn, new_dim, new_metric, row.encrypted)?;
+        }
+        let atom_wrap = if row.encrypted {
+            Some(self.attach_region_key(key, &row)?.atom_wrap)
+        } else {
+            None
+        };
+
+        // Capture the whole value, not only the re-embed fields. A zero-progress
+        // attempt made while an older repair mark stands must put that mark (and
+        // any unrelated metadata keys) back byte-for-byte.
+        let metadata_before_mark = read_metadata(&conn, row.id)?;
+
+        // Mark before enumerating atoms so concurrent writes cannot escape the
+        // migration plan. `done_through` makes committed batches resumable.
+        let first_checkpoint = ReembedMark {
+            to_model: new_model.clone(),
+            to_dim: new_dim,
+            to_metric: metric_tag(new_metric).to_string(),
+            done_through: resume_from,
+            phase: ReembedPhase::Vectors,
+        };
+        write_reembed_mark(&conn, row.id, &first_checkpoint)?;
+        // Unlike the database-wide capability, this narrow reservation may
+        // cross external code. It prevents only destruction of this source
+        // region; callbacks remain free to use every other encrypted region.
+        let _region_reservation = key_lifecycle.reserve_memory_region(row.id as u64);
+
+        // Validate the whole region before making the first vector durable. A
+        // later empty-text row cannot be discovered after an earlier page was
+        // committed: that would leave a migration which can never finish. The
+        // preflight is paged, so this invariant does not require holding every
+        // atom's plaintext in memory at once.
+        let empty_text = match self.count_empty_reembed_text(
+            &conn,
+            &table,
+            row.id,
+            atom_wrap.as_deref(),
+            cancel,
+        ) {
+            Ok(count) => count,
+            Err(e) => {
+                if !resuming_matching_vectors {
+                    restore_reembed_metadata(&conn, row.id, metadata_before_mark.as_deref())?;
+                }
+                return Err(e);
+            }
+        };
+        if empty_text > 0 {
+            // Nothing was converted, so a region this call marked itself is put
+            // back as it was. One that arrived marked keeps its mark: that
+            // migration is genuinely in flight and this refusal is not its end.
+            if !resuming_matching_vectors {
+                restore_reembed_metadata(&conn, row.id, metadata_before_mark.as_deref())?;
+            }
+            return Err(MemError::Invalid(format!(
+                "region '{key}' has {} atom(s) stored with a vector but no text, so no new \
+                 vector can be computed for them; re-embedding would leave them on the old \
+                 model's vectors while reporting the region converted",
+                empty_text
+            )));
+        }
+
+        let mut migrated = 0u64;
+        let batches = (|| {
+            let mut after = resume_from;
+            let mut durable_checkpoint = first_checkpoint.clone();
+            loop {
+                check_cancel(cancel)?;
+                let page = self.collect_reembed_work(
+                    &conn,
+                    &table,
+                    row.id,
+                    atom_wrap.as_deref(),
+                    after,
+                    cancel,
+                )?;
+                let Some(last_read) = page.last_id else {
+                    break;
+                };
+                after = last_read;
+                if page.atoms.is_empty() {
+                    continue;
+                }
+
+                let chunk = page.atoms.as_slice();
+                let texts: Vec<&str> = chunk.iter().map(|atom| atom.text.as_str()).collect();
+                check_cancel(cancel)?;
+                let atom_ids = chunk
+                    .iter()
+                    .map(|atom| {
+                        u64::try_from(atom.id).map_err(|_| {
+                            MemError::Invalid(format!(
+                                "atom id {} cannot name an atom key",
+                                atom.id
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let _atom_callback_reservation = row
+                    .encrypted
+                    .then(|| key_lifecycle.reserve_memory_atom_callbacks(&atom_ids));
+                // Embeddings are plaintext too. Keep the whole returned batch
+                // under an RAII scrubber so success, validation errors and
+                // cancellation after the external call all clear it.
+                //
+                // No database/key capability may cross this external call. A
+                // callback is allowed to use the same database (for example to
+                // recall configuration or record accounting in another sealed
+                // region), and those paths acquire the lifecycle guard too.
+                drop(key_lifecycle);
+                let embedded = new_embedder.embed(&texts).map(Zeroizing::new);
+                key_lifecycle = self.db.key_lifecycle_lock();
+
+                // While the callback ran, a drop or another resume was free to
+                // order ahead of us. Trust the computed vectors only if this is
+                // still the same region incarnation at the exact checkpoint we
+                // released. This check happens before cancellation/error
+                // propagation so all exits once again own the lifecycle guard.
+                self.verify_reembed_continuation(&conn, key, &row, &durable_checkpoint)?;
+                let vectors = embedded?;
+                // Embedders are external and cannot be interrupted cooperatively.
+                // Observe a cancellation that landed inside the call BEFORE the
+                // batch transaction, so an abandoned computation cannot become a
+                // newly durable prefix.
+                check_cancel(cancel)?;
+                if vectors.len() != chunk.len() {
+                    return Err(MemError::Invalid(format!(
+                        "embedder returned {} vectors for {} atoms",
+                        vectors.len(),
+                        chunk.len()
+                    )));
+                }
+                // The same boundary every other write crosses. Counting the vectors
+                // says nothing about their width or their values, and a NaN written
+                // here would be a stored embedding no caller could have produced
+                // through `remember`.
+                for vector in vectors.iter() {
+                    validate_embedding(key, new_dim, vector, "re-embedded")?;
+                }
+                // Advanced inside the batch's own transaction, not after it: this
+                // is the only record of how much is already durable, and a crash
+                // between the rows and their checkpoint would leave the two
+                // disagreeing about where a resume should start.
+                let last_id = chunk.last().expect("chunks never yields an empty slice").id;
+                let next_checkpoint = ReembedMark {
+                    to_model: new_model.clone(),
+                    to_dim: new_dim,
+                    to_metric: metric_tag(new_metric).to_string(),
+                    done_through: last_id,
+                    phase: ReembedPhase::Vectors,
+                };
+                let ctx = BatchContext {
+                    atom_wrap: atom_wrap.as_deref(),
+                    region_id: row.id,
+                    checkpoint: &next_checkpoint,
+                    cancel,
+                };
+                migrated += if moving {
+                    self.move_reembedded_batch(
+                        &conn,
+                        &table,
+                        &destination,
+                        chunk,
+                        vectors.as_slice(),
+                        &ctx,
+                    )? as u64
+                } else {
+                    self.write_reembedded_batch(&conn, &table, chunk, vectors.as_slice(), &ctx)?
+                        as u64
+                };
+                durable_checkpoint = next_checkpoint;
+                check_cancel(cancel)?;
+            }
+
+            // After the last page and before the provenance flip. A cancellation
+            // that races a completed final batch leaves its checkpoint standing,
+            // which is exactly what a resume needs.
+            check_cancel(cancel)?;
+            if row.encrypted {
+                self.retire_sealed_segment_parts(&conn, row.id, &table, &key_lifecycle)?;
+            }
+            #[cfg(test)]
+            if FAIL_REEMBED_AFTER_SEGMENT_RETIRE.with(std::cell::Cell::take) {
+                return Err(MemError::Invalid(
+                    "injected re-embed failure after segment retirement".into(),
+                ));
+            }
+            Ok(key_lifecycle)
+        })();
+
+        let key_lifecycle = match batches {
+            Ok(key_lifecycle) => key_lifecycle,
+            Err(e) => {
+                // A migration that converted nothing leaves nothing to resume,
+                // so a mark this call wrote itself is taken back.
+                if migrated == 0 && !resuming_matching_vectors {
+                    restore_reembed_metadata_if_unchanged(
+                        &conn,
+                        row.id,
+                        &first_checkpoint,
+                        metadata_before_mark.as_deref(),
+                    )?;
+                }
+                return Err(e);
+            }
+        };
+
+        // Provenance last, and together with the mark: until this lands the
+        // region still describes itself by the model its vectors were actually
+        // written with, and by the shape whose table its rows are in.
+        let repair = ReembedMark {
+            to_model: new_model.clone(),
+            to_dim: new_dim,
+            to_metric: metric_tag(new_metric).to_string(),
+            done_through: 0,
+            phase: ReembedPhase::Repair,
+        };
+        publish_reembed(&conn, row.id, &repair)?;
+
+        // Every engine over this Database may hold an ANN index and embedder for
+        // the old provenance. Detach all of them before reopening this region
+        // for repair; their user-owned embedders are dropped outside the lock.
+        let retired_states = self.db.drain_memory_region_caches(row.id as u64);
+        drop(key_lifecycle);
+        drop(retired_states);
+
+        Ok(Migration {
+            report: ReembedReport {
+                atoms_migrated: migrated,
+                model_id: new_model,
+                ..Default::default()
+            },
+            region_id: row.id,
+            repair: Some(repair),
+        })
+    }
+
+    /// Rebuild the region's `SimilarTo` web over the new vectors.
+    ///
+    /// The edges are derived data: they assert "these two atoms are near each
+    /// other", measured in a vector space the migration just replaced. Leaving
+    /// them would leave a false claim in the graph. Managed edges are rebuilt
+    /// from the policy persisted by `evolve`; authored edges are never touched:
+    /// `Causes`,
+    /// `Contradicts`, `Refines`, `Precedes`, `Supersedes`, `DerivedFrom` and
+    /// `DependsOn` record what someone asserted, not what a vector space
+    /// implied.
+    fn reweave_similarity_edges(
+        &self,
+        key: &str,
+        cancel: Option<&citadel_core::CancelToken>,
+        kl: &KeyLifecycleGuard<'_>,
+        edges_guard: &MemoryEdgesGuard<'_>,
+    ) -> Result<WeaveRebuild> {
+        check_cancel(cancel)?;
+        let h = self.region_handle(key)?;
+        let mut rewoven = 0u64;
+        let mut cleared = 0u64;
+        let mut after = i64::MIN;
+
+        // Page region atom ids first, bounding each IN list and the
+        // source/rebuilt bookkeeping. `read_weave_shapes` independently
+        // keyset-pages the matching edges and carries a source's aggregate
+        // across page boundaries, so high fan-out is not materialized at once.
+        loop {
+            let sources = self.next_similarity_sources(&h, after, cancel)?;
+            let Some(last_source) = sources.last().copied() else {
+                break;
+            };
+            after = last_source;
+            let shapes = self.read_weave_shapes(&h, &sources, cancel)?;
+
+            for shape in &shapes {
+                check_cancel(cancel)?;
+                let neighbours = self.similar_neighbours_guarded(key, &h, shape, cancel, kl)?;
+                check_cancel(cancel)?;
+                self.db.debug_fire_memory_edges_reweave_hook();
+                let replacement = match neighbours {
+                    Some(neighbours) => self.replace_managed_similarity_edges_locked(
+                        key,
+                        &h,
+                        shape.src,
+                        &neighbours,
+                        cancel,
+                        (kl, edges_guard),
+                    )?,
+                    None => self.clear_managed_similarity_source_locked(
+                        key,
+                        &h,
+                        shape.src,
+                        cancel,
+                        kl,
+                        edges_guard,
+                    )?,
+                };
+                rewoven += replacement.rewoven;
+                cleared += replacement.cleared;
+                check_cancel(cancel)?;
+            }
+        }
+        Ok(WeaveRebuild { rewoven, cleared })
+    }
+
+    /// The next bounded page of region atoms whose outgoing web must be checked.
+    fn next_similarity_sources(
+        &self,
+        h: &RegionHandle,
+        after: AtomId,
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<AtomId>> {
+        check_cancel(cancel)?;
+        let conn = Connection::open(&self.db)?;
+        let qr = conn.query_params(
+            &format!(
+                "SELECT src_id FROM memory_similarity_policies \
+                 WHERE region_id = $1 AND src_id > $2 ORDER BY src_id LIMIT {REEMBED_BATCH}"
+            ),
+            &[Value::Integer(h.id), Value::Integer(after)],
+        )?;
+        check_cancel(cancel)?;
+        let mut ids = Vec::with_capacity(qr.rows.len());
+        for row in &qr.rows {
+            check_cancel(cancel)?;
+            ids.push(as_int(&row[0])?);
+        }
+        Ok(ids)
+    }
+
+    /// Read the exact rules that produced the managed similarity edges.
+    fn read_weave_shapes(
+        &self,
+        h: &RegionHandle,
+        scope: &[AtomId],
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<WeaveShape>> {
+        check_cancel(cancel)?;
+        let conn = Connection::open(&self.db)?;
+        let ids = id_list(scope);
+        let qr = conn.query_params(
+            &format!(
+                "SELECT src_id, neighbors, max_distance, CAST(kinds AS TEXT) \
+                 FROM memory_similarity_policies WHERE region_id = $1 AND src_id IN ({ids}) \
+                 ORDER BY src_id"
+            ),
+            &[Value::Integer(h.id)],
+        )?;
+        let mut shapes = Vec::with_capacity(qr.rows.len());
+        for row in &qr.rows {
+            check_cancel(cancel)?;
+            let neighbors = usize::try_from(as_int(&row[1])?).map_err(|_| {
+                MemError::Invalid("stored similarity neighbor count is out of range".into())
+            })?;
+            let max_distance = as_f32(&row[2]);
+            if !max_distance.is_finite() {
+                return Err(MemError::Invalid(
+                    "stored similarity distance ceiling must be finite".into(),
+                ));
+            }
+            let mut kinds: Vec<String> = serde_json::from_str(as_text(&row[3])?).map_err(|e| {
+                MemError::Invalid(format!("stored similarity kind filter is invalid: {e}"))
+            })?;
+            kinds.sort();
+            kinds.dedup();
+            shapes.push(WeaveShape {
+                src: as_int(&row[0])?,
+                neighbors,
+                max_distance,
+                kinds,
+            });
+        }
+        Ok(shapes)
+    }
+
+    /// The neighbours one atom's rule selects from the new vectors.
+    fn similar_neighbours_guarded(
+        &self,
+        key: &str,
+        h: &RegionHandle,
+        shape: &WeaveShape,
+        cancel: Option<&citadel_core::CancelToken>,
+        kl: &KeyLifecycleGuard<'_>,
+    ) -> Result<Option<Vec<ManagedSimilarityEdge>>> {
+        check_cancel(cancel)?;
+        let conn = Connection::open(&self.db)?;
+        self.verify_region_live_for_repair(&conn, h, key)?;
+        let live = conn.query_params(
+            &format!(
+                "SELECT 1 FROM {} WHERE id = $1 AND region_id = $2 \
+                 AND (expires_at IS NULL OR expires_at > $3) LIMIT 1",
+                h.table
+            ),
+            &[
+                Value::Integer(shape.src),
+                Value::Integer(h.id),
+                Value::Timestamp(now_micros()),
+            ],
+        )?;
+        if live.rows.is_empty() {
+            return Ok(None);
+        }
+        let state = self.read_atom_state_locked(&conn, key, h, shape.src)?;
+        check_cancel(cancel)?;
+        // Pure distance ordering, as the weave does: the fused score would rank
+        // by signals that have nothing to do with the neighbourhood.
+        let kinds = shape.kinds.clone();
+        let qvec = state.embedding;
+        let query = RecallQuery::by_embedding(qvec.clone(), shape.neighbors.saturating_add(1))
+            .with_kinds(kinds)
+            .with_weights(FusionWeights::semantic_only());
+        let candidates = if h.atom_wrap.is_some() {
+            self.recall_sealed_candidates(
+                h,
+                ResolvedRecall {
+                    query: &query,
+                    vector: &qvec,
+                },
+                &conn,
+                kl,
+                cancel,
+            )?
+        } else {
+            self.recall_plain_semantic_candidates(h, &query, &qvec, &conn, cancel)?
+        };
+        let recalled = fuse_rank(
+            candidates,
+            FusionWeights::semantic_only(),
+            query.as_of_micros.unwrap_or_else(now_micros),
+            query.k,
+        );
+        // Fusion itself is local work after the candidate pipeline; retain the
+        // operation token across it without replacing the Database-global token.
+        check_cancel(cancel)?;
+        Ok(Some(
+            recalled
+                .into_iter()
+                .filter(|n| n.id != shape.src && n.distance <= shape.max_distance)
+                .take(shape.neighbors)
+                .map(|n| (n.id, 1.0 / (1.0 + n.distance.max(0.0)), None))
+                .collect(),
+        ))
+    }
+
+    fn clear_managed_similarity_source_locked(
+        &self,
+        key: &str,
+        h: &RegionHandle,
+        src: AtomId,
+        cancel: Option<&citadel_core::CancelToken>,
+        lifecycle: &KeyLifecycleGuard<'_>,
+        _edges_guard: &MemoryEdgesGuard<'_>,
+    ) -> Result<WeaveRebuild> {
+        let conn = Connection::open(&self.db)?;
+        with_write_txn(&conn, |c| {
+            check_cancel(cancel)?;
+            self.verify_region_live_for_repair(c, h, key)?;
+            let old = c.query_params(
+                "SELECT COUNT(*) FROM memory_similarity_edges WHERE src_id = $1",
+                &[Value::Integer(src)],
+            )?;
+            let old = old
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .map(as_int)
+                .transpose()?
+                .unwrap_or(0)
+                .max(0) as u64;
+            c.execute_params(
+                "DELETE FROM memory_edges WHERE src_id = $1 AND kind = 'similar_to' \
+                 AND dst_id IN (SELECT dst_id FROM memory_similarity_edges WHERE src_id = $1)",
+                &[Value::Integer(src)],
+            )?;
+            c.execute_params(
+                "DELETE FROM memory_similarity_edges WHERE src_id = $1",
+                &[Value::Integer(src)],
+            )?;
+            c.execute_params(
+                "DELETE FROM memory_similarity_policies WHERE src_id = $1",
+                &[Value::Integer(src)],
+            )?;
+            check_cancel(cancel)?;
+            Ok(WeaveRebuild {
+                rewoven: 0,
+                cleared: old,
+            })
+        })
+        .inspect_err(|e| self.defer_stale_region(key, h.id, e, lifecycle))
+    }
+
+    /// Exact semantic candidates for the repair path while its caller owns the
+    /// lifecycle and edge guards. This is the semantic-only subset of
+    /// `recall_impl`; keeping it here avoids re-entering the lifecycle wrapper.
+    fn recall_plain_semantic_candidates(
+        &self,
+        h: &RegionHandle,
+        q: &RecallQuery,
+        qvec: &[f32],
+        conn: &Connection<'_>,
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<Vec<Candidate>> {
+        let distop = match h.metric {
+            EmbeddingMetric::Cosine => "<=>",
+            EmbeddingMetric::L2 => "<->",
+            EmbeddingMetric::InnerProduct => "<#>",
+        };
+        let mut params = vec![Value::Vector(qvec.to_vec().into()), Value::Integer(h.id)];
+        let mut predicates = vec!["region_id = $2".to_string()];
+        if !q.kinds.is_empty() {
+            let mut placeholders = Vec::with_capacity(q.kinds.len());
+            for kind in &q.kinds {
+                check_cancel(cancel)?;
+                params.push(Value::Text(kind.clone().into()));
+                placeholders.push(format!("${}", params.len()));
+            }
+            predicates.push(format!("kind IN ({})", placeholders.join(", ")));
+        }
+        params.push(Value::Timestamp(now_micros()));
+        predicates.push(format!(
+            "(expires_at IS NULL OR expires_at > ${})",
+            params.len()
+        ));
+        if !q.include_superseded {
+            predicates.push(
+                "id NOT IN (SELECT dst_id FROM memory_edges WHERE kind = 'supersedes')".into(),
+            );
+        }
+        let qr = conn.query_params(
+            &format!(
+                "SELECT id, kind, CAST(payload AS TEXT), text_content, score, created_at, \
+                 embedding {distop} $1, 0.0, immutable FROM {} WHERE {} \
+                 ORDER BY embedding {distop} $1, id LIMIT {}",
+                h.table,
+                predicates.join(" AND "),
+                q.k
+            ),
+            &params,
+        )?;
+        let mut candidates = Vec::with_capacity(qr.rows.len());
+        for row in &qr.rows {
+            check_cancel(cancel)?;
+            candidates.push(parse_candidate(row)?);
+        }
+        check_cancel(cancel)?;
+        Ok(candidates)
+    }
+
+    /// Persist an ANN index over the region's new vectors.
+    ///
+    /// An encrypted region has no plaintext vector column to index - it recalls
+    /// by decrypt-then-rank - so there is nothing to rebuild and the report says
+    /// so rather than claiming a rebuild that never applied.
+    fn rebuild_region_ann(
+        &self,
+        table: &str,
+        encrypted: bool,
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<bool> {
+        check_cancel(cancel)?;
+        if encrypted {
+            return Ok(false);
+        }
+        // A persisted ANN segment is an optional accelerator: every read has an
+        // exact-scan fallback, and `ann_rebuilt = false` is the established way
+        // this best-effort step reports an open/build/I/O refusal. Cancellation
+        // is different. Swallowing it would let the migration clear its repair
+        // mark and report success after the Database token stopped the build.
+        let rebuilt = match Connection::open(&self.db) {
+            Ok(conn) => match conn.persist_ann_index(table, "embedding") {
+                Ok(_) => true,
+                Err(citadel_sql::SqlError::Storage(citadel_core::Error::Interrupted)) => {
+                    return Err(MemError::Core(citadel_core::Error::Interrupted));
+                }
+                Err(_) => false,
+            },
+            Err(citadel_sql::SqlError::Storage(citadel_core::Error::Interrupted)) => {
+                return Err(MemError::Core(citadel_core::Error::Interrupted));
+            }
+            Err(_) => false,
+        };
+        // Index construction/persistence is an uninterruptible lower-layer call.
+        // If cancellation landed inside it, leave the repair mark standing and
+        // let a retry rebuild/reweave idempotently.
+        check_cancel(cancel)?;
+        Ok(rebuilt)
+    }
+
+    /// Give one batch of atoms their new vectors, in a single transaction.
+    ///
+    /// An `UPDATE` keyed by id, never a delete-and-reinsert: the row keeps its
+    /// id and therefore its edges, and every column this statement does not
+    /// name is preserved because it is never touched. That is what makes the
+    /// preservation guarantee structural rather than something the code has to
+    /// remember to uphold column by column.
+    fn write_reembedded_batch(
+        &self,
+        conn: &Connection<'_>,
+        table: &str,
+        batch: &[ReembedAtom],
+        vectors: &[Vec<f32>],
+        ctx: &BatchContext<'_>,
+    ) -> Result<usize> {
+        let atom_wrap = ctx.atom_wrap;
+        conn.execute("BEGIN")?;
+        let result = (|| -> Result<usize> {
+            for (atom, vector) in batch.iter().zip(vectors) {
+                check_cancel(ctx.cancel)?;
+                let id = atom.id;
+                match atom_wrap {
+                    None => {
+                        conn.execute_params(
+                            &format!("UPDATE {table} SET embedding = $1 WHERE id = $2"),
+                            &[Value::Vector(vector.clone().into()), Value::Integer(id)],
+                        )?;
+                    }
+                    Some(wrap) => {
+                        let qr = conn.query_params(
+                            &format!("SELECT key_slot, key_gen FROM {table} WHERE id = $1"),
+                            &[Value::Integer(id)],
+                        )?;
+                        let Some(r) = qr.rows.first() else { continue };
+                        let Some(wrapped) = exact_live_atom_wrapped(&self.db, id, &r[0], &r[1])?
+                        else {
+                            continue;
+                        };
+                        let payload = atom.payload_json.as_deref().ok_or_else(|| {
+                            MemError::Invalid(format!(
+                                "sealed atom {id} is missing its opened payload"
+                            ))
+                        })?;
+                        // Reseal under the atom's existing key, so its slot and
+                        // generation stay valid and nothing has to be retired.
+                        let sealed = reseal_atom(wrap, &wrapped, id, vector, &atom.text, payload)?;
+                        conn.execute_params(
+                            &format!("UPDATE {table} SET sealed = $1 WHERE id = $2"),
+                            &[Value::Blob(sealed), Value::Integer(id)],
+                        )?;
+                    }
+                }
+            }
+            check_cancel(ctx.cancel)?;
+            write_reembed_mark(conn, ctx.region_id, ctx.checkpoint)?;
+            check_cancel(ctx.cancel)?;
+            Ok(batch.len())
+        })();
+        match result {
+            Ok(n) => {
+                if let Err(error) = check_cancel(ctx.cancel) {
+                    let _ = conn.execute("ROLLBACK");
+                    return Err(error);
+                }
+                conn.execute("COMMIT")?;
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Move one batch of atoms to a differently-shaped atoms table, giving them
+    /// their new vectors on the way.
+    ///
+    /// The insert names **every** column and takes each value from the source
+    /// row, so nothing is defaulted back to zero on the way across: not
+    /// `access_count`, not `accessed_at`, not `confidence`, not `expires_at`.
+    /// The id is carried too, which is what keeps `memory_edges` and
+    /// `memory_idempotency` pointing at the same atoms - ids come from one
+    /// global counter, so the same id is free in the destination table.
+    ///
+    /// The source table is never dropped, even when this empties it. Its name is
+    /// a function of `(dim, metric, encrypted)`, so every region of that shape
+    /// shares it, and an unconditional drop would take another region's rows
+    /// with it. An empty table costs nothing; that mistake is unrecoverable.
+    fn move_reembedded_batch(
+        &self,
+        conn: &Connection<'_>,
+        source: &str,
+        destination: &str,
+        batch: &[ReembedAtom],
+        vectors: &[Vec<f32>],
+        ctx: &BatchContext<'_>,
+    ) -> Result<usize> {
+        let atom_wrap = ctx.atom_wrap;
+        conn.execute("BEGIN")?;
+        let result = (|| -> Result<usize> {
+            for (atom, vector) in batch.iter().zip(vectors) {
+                check_cancel(ctx.cancel)?;
+                let id = atom.id;
+                match atom_wrap {
+                    None => {
+                        let qr = conn.query_params(
+                            &format!(
+                                "SELECT region_id, kind, payload, text_content, score, \
+                                 confidence, access_count, immutable, created_at, accessed_at, \
+                                 expires_at FROM {source} WHERE id = $1"
+                            ),
+                            &[Value::Integer(id)],
+                        )?;
+                        let Some(r) = qr.rows.first() else { continue };
+                        conn.execute_params(
+                            &format!(
+                                "INSERT INTO {destination} (id, region_id, kind, embedding, \
+                                 payload, text_content, score, confidence, access_count, \
+                                 immutable, created_at, accessed_at, expires_at) \
+                                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
+                            ),
+                            &[
+                                Value::Integer(id),
+                                r[0].clone(),
+                                r[1].clone(),
+                                Value::Vector(vector.clone().into()),
+                                r[2].clone(),
+                                r[3].clone(),
+                                r[4].clone(),
+                                r[5].clone(),
+                                r[6].clone(),
+                                r[7].clone(),
+                                r[8].clone(),
+                                r[9].clone(),
+                                r[10].clone(),
+                            ],
+                        )?;
+                    }
+                    Some(wrap) => {
+                        let qr = conn.query_params(
+                            &format!(
+                                "SELECT region_id, kind, key_slot, key_gen, score, \
+                                 confidence, access_count, immutable, created_at, accessed_at, \
+                                 expires_at FROM {source} WHERE id = $1"
+                            ),
+                            &[Value::Integer(id)],
+                        )?;
+                        let Some(r) = qr.rows.first() else { continue };
+                        let Some(wrapped) = exact_live_atom_wrapped(&self.db, id, &r[2], &r[3])?
+                        else {
+                            continue;
+                        };
+                        let payload = atom.payload_json.as_deref().ok_or_else(|| {
+                            MemError::Invalid(format!(
+                                "sealed atom {id} is missing its opened payload"
+                            ))
+                        })?;
+                        // Resealed under the atom's own existing key, so its
+                        // slot and generation move across unchanged and the key
+                        // store is never touched.
+                        let sealed = reseal_atom(wrap, &wrapped, id, vector, &atom.text, payload)?;
+                        conn.execute_params(
+                            &format!(
+                                "INSERT INTO {destination} (id, region_id, kind, sealed, \
+                                 key_slot, key_gen, score, confidence, access_count, immutable, \
+                                 created_at, accessed_at, expires_at) \
+                                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
+                            ),
+                            &[
+                                Value::Integer(id),
+                                r[0].clone(),
+                                r[1].clone(),
+                                Value::Blob(sealed),
+                                r[2].clone(),
+                                r[3].clone(),
+                                r[4].clone(),
+                                r[5].clone(),
+                                r[6].clone(),
+                                r[7].clone(),
+                                r[8].clone(),
+                                r[9].clone(),
+                                r[10].clone(),
+                            ],
+                        )?;
+                    }
+                }
+                conn.execute_params(
+                    &format!("DELETE FROM {source} WHERE id = $1"),
+                    &[Value::Integer(id)],
+                )?;
+            }
+            check_cancel(ctx.cancel)?;
+            write_reembed_mark(conn, ctx.region_id, ctx.checkpoint)?;
+            check_cancel(ctx.cancel)?;
+            Ok(batch.len())
+        })();
+        match result {
+            Ok(n) => {
+                if let Err(error) = check_cancel(ctx.cancel) {
+                    let _ = conn.execute("ROLLBACK");
+                    return Err(error);
+                }
+                conn.execute("COMMIT")?;
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Count atoms that cannot be re-embedded without retaining the region's
+    /// plaintext. This preflight keeps the all-or-nothing empty-text rule while
+    /// using the same bounded, cancellable pages as conversion.
+    fn count_empty_reembed_text(
+        &self,
+        conn: &Connection<'_>,
+        table: &str,
+        region_id: RegionId,
+        atom_wrap: Option<&AtomWrapKey>,
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<u64> {
+        let mut empty_text = 0u64;
+        let mut after = i64::MIN;
+        loop {
+            let page =
+                self.collect_reembed_work(conn, table, region_id, atom_wrap, after, cancel)?;
+            empty_text += page.empty_text;
+            let Some(last_id) = page.last_id else {
+                break;
+            };
+            after = last_id;
+        }
+        Ok(empty_text)
+    }
+
+    /// Read one bounded atom/text page, counting rows that have no text.
+    fn collect_reembed_work(
+        &self,
+        conn: &Connection<'_>,
+        table: &str,
+        region_id: RegionId,
+        atom_wrap: Option<&AtomWrapKey>,
+        after: AtomId,
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<ReembedWork> {
+        check_cancel(cancel)?;
+        let mut atoms = Vec::with_capacity(REEMBED_BATCH);
+        let mut empty_text = 0u64;
+        let mut last_id = None;
+
+        match atom_wrap {
+            None => {
+                let qr = conn.query_params(
+                    &format!(
+                        "SELECT id, text_content FROM {table} \
+                         WHERE region_id = $1 AND id > $2 ORDER BY id LIMIT {REEMBED_BATCH}"
+                    ),
+                    &[Value::Integer(region_id), Value::Integer(after)],
+                )?;
+                check_cancel(cancel)?;
+                for r in &qr.rows {
+                    check_cancel(cancel)?;
+                    let id = as_int(&r[0])?;
+                    last_id = Some(id);
+                    let text = match &r[1] {
+                        Value::Text(t) => t.to_string(),
+                        _ => String::new(),
+                    };
+                    if text.is_empty() {
+                        empty_text += 1;
+                    } else {
+                        atoms.push(ReembedAtom {
+                            id,
+                            text,
+                            payload_json: None,
+                        });
+                    }
+                }
+            }
+            Some(wrap) => {
+                // Sealed regions keep the text inside the blob, so it has to be
+                // opened to be re-embedded.
+                let qr = conn.query_params(
+                    &format!(
+                        "SELECT id, sealed, key_slot, key_gen FROM {table} \
+                         WHERE region_id = $1 AND id > $2 ORDER BY id LIMIT {REEMBED_BATCH}"
+                    ),
+                    &[Value::Integer(region_id), Value::Integer(after)],
+                )?;
+                check_cancel(cancel)?;
+                for r in &qr.rows {
+                    check_cancel(cancel)?;
+                    let id = as_int(&r[0])?;
+                    last_id = Some(id);
+                    let Some(wrapped) = exact_live_atom_wrapped(&self.db, id, &r[2], &r[3])? else {
+                        // The atom's key is gone, so its content is already
+                        // unrecoverable. Skipping is right; counting it as
+                        // migrated would not be.
+                        continue;
+                    };
+                    check_cancel(cancel)?;
+                    let (text, mut payload) =
+                        open_atom_content(wrap, &wrapped, id, as_blob(&r[1])?)?;
+                    let mut text = Zeroizing::new(text);
+                    check_cancel(cancel)?;
+                    if text.is_empty() {
+                        empty_text += 1;
+                    } else {
+                        let encoded = serde_json::to_string(&payload);
+                        zeroize_json_strings(&mut payload);
+                        let payload_json = Zeroizing::new(encoded.map_err(|error| {
+                            MemError::Invalid(format!("payload not serializable: {error}"))
+                        })?);
+                        atoms.push(ReembedAtom {
+                            id,
+                            text: std::mem::take(&mut *text),
+                            payload_json: Some(payload_json),
+                        });
+                    }
+                    zeroize_json_strings(&mut payload);
+                }
+            }
+        }
+        Ok(ReembedWork {
+            atoms,
+            empty_text,
+            last_id,
+        })
+    }
+
+    ///
+    /// For an encrypted region, key destruction is the irreversible boundary.
+    /// Cancellation or another cleanup error after that point can return an
+    /// error even though the content is already unrecoverable; retrying (or
+    /// reopening, which reconciles residue) finishes the idempotent cleanup.
+    pub fn drop_region(&self, name: &str) -> Result<()> {
+        let cancel = check_db_cancel(&self.db)?;
+        let key = name.to_ascii_lowercase();
+        // Tombstone -> row-delete -> segment-retire is one lifecycle span.
+        let retired_state;
+        let shared_retired;
+        let _kl = self.db.key_lifecycle_lock();
+        let _edges_guard = self.db.memory_edges_lock();
+        let conn = Connection::open(&self.db)?;
+        let Some(row) = self.load_region_row(&conn, &key)? else {
+            #[cfg(test)]
+            debug_fire_cancel_after_local_work();
+            check_cancel(cancel.as_ref())?;
+            retired_state = self.take_attached_region(&key, None);
+            shared_retired = retired_state
+                .as_ref()
+                .map(|state| self.db.drain_memory_region_caches(state.id as u64))
+                .unwrap_or_default();
+            drop(_edges_guard);
+            drop(_kl);
+            drop(retired_state);
+            drop(shared_retired);
             return Ok(());
         };
+        if _kl.memory_region_active(row.id as u64) {
+            return Err(MemError::Core(citadel_core::Error::RegionInUse {
+                region_id: row.id as u64,
+            }));
+        }
         let atoms = atoms_table(row.dim, row.metric, row.encrypted);
+        // A region stopped part-way through a shape-changing re-embed has rows
+        // in the destination too. Deleting only the table the row names would
+        // leave the converted ones behind - orphaned, and for an encrypted
+        // region still holding a live key after the region that owned it is
+        // gone. Erasure has to be complete on its own, not left to reconcile.
+        let homes = self.region_atom_tables(&conn, &row)?;
 
         // Destroy the key and drop the atom-wrap cache before deleting rows.
         if row.encrypted {
@@ -934,6 +2922,10 @@ impl MemoryEngine {
             })?;
             // Only THIS row's slot; retries converge; TOMBSTONE still scrubs a torn sibling.
             let rec = self.db.region_store_slot(slot)?;
+            #[cfg(test)]
+            debug_fire_cancel_after_local_work();
+            // Last cancellation point before the region key can be destroyed.
+            check_cancel(cancel.as_ref())?;
             if rec.state == SlotState::Tombstone
                 || (rec.state == SlotState::Live
                     && rec.region_id == row.id as u64
@@ -942,45 +2934,88 @@ impl MemoryEngine {
                 _kl.region_store_tombstone(slot, row.id as u64)?;
             }
         }
-        self.detach_attached_region(&key, Some(row.id));
+        retired_state = self.take_attached_region(&key, Some(row.id));
+        shared_retired = self.db.drain_memory_region_caches(row.id as u64);
 
         // Reclaim the region's atom key slots (RCK gone, so these are dead).
-        if row.encrypted && conn.table_schema(&atoms).is_some() {
-            let qr = conn.query_params(
-                &format!("SELECT id, key_slot, key_gen FROM {atoms} WHERE region_id = $1"),
-                &[Value::Integer(row.id)],
-            )?;
-            let slots: Vec<(u32, u64, u64)> = qr
-                .rows
-                .iter()
-                .map(|r| {
-                    Ok((
+        if row.encrypted {
+            let mut slots: Vec<(u32, u64, u64)> = Vec::new();
+            for table in &homes {
+                if conn.table_schema(table).is_none() {
+                    continue;
+                }
+                let qr = conn.query_params(
+                    &format!("SELECT id, key_slot, key_gen FROM {table} WHERE region_id = $1"),
+                    &[Value::Integer(row.id)],
+                )?;
+                for r in &qr.rows {
+                    slots.push((
                         as_int(&r[1])? as u32,
                         as_int(&r[0])? as u64,
                         as_int(&r[2])? as u64,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
+                    ));
+                }
+            }
             _kl.atom_store_tombstone_batch(&slots)?;
         }
         // The sealed segment holds embedding-derived residue; its row-less key
         // must die with the region.
         if row.encrypted {
             self.retire_sealed_segment_parts(&conn, row.id, &atoms, &_kl)?;
+        } else {
+            #[cfg(test)]
+            debug_fire_cancel_after_local_work();
+            check_cancel(cancel.as_ref())?;
         }
 
         with_write_txn(&conn, |c| {
-            if c.table_schema(&atoms).is_some() {
+            let managed = c.query_params(
+                "SELECT e.src_id, e.dst_id FROM memory_similarity_edges e \
+                 JOIN memory_similarity_policies p ON p.src_id = e.src_id \
+                 WHERE p.region_id = $1",
+                &[Value::Integer(row.id)],
+            )?;
+            for edge in &managed.rows {
+                c.execute_params(
+                    "DELETE FROM memory_edges WHERE src_id = $1 AND dst_id = $2 \
+                     AND kind = 'similar_to'",
+                    &[
+                        Value::Integer(as_int(&edge[0])?),
+                        Value::Integer(as_int(&edge[1])?),
+                    ],
+                )?;
+            }
+            c.execute_params(
+                "DELETE FROM memory_similarity_edges WHERE src_id IN \
+                 (SELECT src_id FROM memory_similarity_policies WHERE region_id = $1)",
+                &[Value::Integer(row.id)],
+            )?;
+            c.execute_params(
+                "DELETE FROM memory_similarity_policies WHERE region_id = $1",
+                &[Value::Integer(row.id)],
+            )?;
+            for table in &homes {
+                if c.table_schema(table).is_none() {
+                    continue;
+                }
                 c.execute_params(
                     &format!(
-                        "DELETE FROM memory_edges WHERE src_id IN \
-                         (SELECT id FROM {atoms} WHERE region_id = $1) \
-                         OR dst_id IN (SELECT id FROM {atoms} WHERE region_id = $1)"
+                        "DELETE FROM memory_similarity_edges WHERE src_id IN \
+                         (SELECT id FROM {table} WHERE region_id = $1) \
+                         OR dst_id IN (SELECT id FROM {table} WHERE region_id = $1)"
                     ),
                     &[Value::Integer(row.id)],
                 )?;
                 c.execute_params(
-                    &format!("DELETE FROM {atoms} WHERE region_id = $1"),
+                    &format!(
+                        "DELETE FROM memory_edges WHERE src_id IN \
+                         (SELECT id FROM {table} WHERE region_id = $1) \
+                         OR dst_id IN (SELECT id FROM {table} WHERE region_id = $1)"
+                    ),
+                    &[Value::Integer(row.id)],
+                )?;
+                c.execute_params(
+                    &format!("DELETE FROM {table} WHERE region_id = $1"),
                     &[Value::Integer(row.id)],
                 )?;
             }
@@ -994,6 +3029,10 @@ impl MemoryEngine {
             )?;
             Ok(())
         })?;
+        drop(_edges_guard);
+        drop(_kl);
+        drop(retired_state);
+        drop(shared_retired);
         Ok(())
     }
 
@@ -1011,24 +3050,35 @@ impl MemoryEngine {
     ) -> Result<AtomId> {
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
-        let prep = prepare_atom_row(&h, &key, &atom)?;
+        let cancel = check_db_cancel(&self.db)?;
+        let _provenance = self.reserve_region_provenance(&key, &h, cancel.as_ref())?;
+        let prep = prepare_atom_row(&h, &key, &atom, cancel.as_ref())?;
         let src_ids = dedup_sources(sources);
 
         let conn = Connection::open(&self.db)?;
         // Keys precede row commit; guard against a mid-span reconcile reclaim.
         let _kl = h.atom_wrap.is_some().then(|| self.db.key_lifecycle_lock());
+        let edges_guard = self.db.memory_edges_lock();
         let mut pending = PendingAtomSlots::new(_kl.as_ref(), 1);
         let result = with_write_txn(&conn, |c| {
+            check_cancel(cancel.as_ref())?;
             self.verify_region_live(c, &h, &key)?;
             verify_sources_exist(c, &h, &key, &src_ids)?;
             let id = next_id(c, "next_atom_id")?;
             self.insert_atom_row(c, &h, id, atom, prep, &mut pending)?;
-            link_derived_sources(c, id, &src_ids, evidence_ref.as_ref())?;
+            link_derived_sources(c, id, &src_ids, evidence_ref.as_ref(), &edges_guard)?;
+            check_cancel(cancel.as_ref())?;
             Ok(id)
         });
-        let id = pending
-            .finish(result)
-            .inspect_err(|e| self.evict_stale_region(&key, h.id, e))?;
+        let id = match pending.finish(result) {
+            Ok(id) => id,
+            Err(error) => {
+                drop(edges_guard);
+                drop(_kl);
+                self.evict_stale_region(&key, h.id, &error);
+                return Err(error);
+            }
+        };
         h.max_id.fetch_max(id, Ordering::Relaxed);
         self.note_sealed_insert(&h);
         Ok(id)
@@ -1044,18 +3094,25 @@ impl MemoryEngine {
     ) -> Result<RememberOutcome> {
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
-        let prep = prepare_atom_row(&h, &key, &atom)?;
+        let cancel = check_db_cancel(&self.db)?;
+        let _provenance = self.reserve_region_provenance(&key, &h, cancel.as_ref())?;
+        let prep = prepare_atom_row(&h, &key, &atom, cancel.as_ref())?;
         let src_ids = dedup_sources(sources);
 
         let conn = Connection::open(&self.db)?;
         // Keys precede row commit; guard against a mid-span reconcile reclaim.
         let _kl = h.atom_wrap.is_some().then(|| self.db.key_lifecycle_lock());
+        let edges_guard = self.db.memory_edges_lock();
         let mut pending = PendingAtomSlots::new(_kl.as_ref(), 1);
         let result = with_write_txn(&conn, |c| {
+            check_cancel(cancel.as_ref())?;
             self.verify_region_live(c, &h, &key)?;
             verify_sources_exist(c, &h, &key, &src_ids)?;
-            if let Some(id) = self.find_atom_by_text(c, &h, &atom.kind, &atom.text)? {
-                link_derived_sources(c, id, &src_ids, evidence_ref.as_ref())?;
+            if let Some(id) =
+                self.find_atom_by_text(c, &h, &atom.kind, &atom.text, cancel.as_ref())?
+            {
+                link_derived_sources(c, id, &src_ids, evidence_ref.as_ref(), &edges_guard)?;
+                check_cancel(cancel.as_ref())?;
                 return Ok(RememberOutcome {
                     id,
                     inserted: false,
@@ -1063,12 +3120,19 @@ impl MemoryEngine {
             }
             let id = next_id(c, "next_atom_id")?;
             self.insert_atom_row(c, &h, id, atom, prep, &mut pending)?;
-            link_derived_sources(c, id, &src_ids, evidence_ref.as_ref())?;
+            link_derived_sources(c, id, &src_ids, evidence_ref.as_ref(), &edges_guard)?;
+            check_cancel(cancel.as_ref())?;
             Ok(RememberOutcome { id, inserted: true })
         });
-        let out = pending
-            .finish(result)
-            .inspect_err(|e| self.evict_stale_region(&key, h.id, e))?;
+        let out = match pending.finish(result) {
+            Ok(out) => out,
+            Err(error) => {
+                drop(edges_guard);
+                drop(_kl);
+                self.evict_stale_region(&key, h.id, &error);
+                return Err(error);
+            }
+        };
         h.max_id.fetch_max(out.id, Ordering::Relaxed);
         if out.inserted {
             self.note_sealed_insert(&h);
@@ -1103,7 +3167,9 @@ impl MemoryEngine {
         }
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
-        let prep = prepare_atom_row(&h, &key, &atom)?;
+        let cancel = check_db_cancel(&self.db)?;
+        let _provenance = self.reserve_region_provenance(&key, &h, cancel.as_ref())?;
+        let prep = prepare_atom_row(&h, &key, &atom, cancel.as_ref())?;
         let src_ids = dedup_sources(sources);
         let mac = h.identity_mac.as_deref();
         let key_tag = identity_key_tag(mac, &atom.kind, idempotency_key);
@@ -1120,12 +3186,15 @@ impl MemoryEngine {
         // Sealed inserts allocate keys before their rows commit; hold the guard
         // so a concurrent reconcile cannot reclaim them mid-span.
         let _kl = h.atom_wrap.is_some().then(|| self.db.key_lifecycle_lock());
+        let edges_guard = self.db.memory_edges_lock();
         let mut pending = PendingAtomSlots::new(_kl.as_ref(), 1);
         let result = with_write_txn(&conn, |c| {
+            check_cancel(cancel.as_ref())?;
             self.verify_region_live(c, &h, &key)?;
             // Replay resolves first: the identical retry writes nothing, so
             // it must converge even if a source has since been forgotten.
             if let Some(id) = self.keyed_identity_hit(c, &h, &atom.kind, &key_tag, &request_tag)? {
+                check_cancel(cancel.as_ref())?;
                 return Ok(RememberOutcome {
                     id,
                     inserted: false,
@@ -1146,12 +3215,19 @@ impl MemoryEngine {
                 ],
             )?;
             self.insert_atom_row(c, &h, id, atom, prep, &mut pending)?;
-            link_derived_sources(c, id, &src_ids, evidence_ref.as_ref())?;
+            link_derived_sources(c, id, &src_ids, evidence_ref.as_ref(), &edges_guard)?;
+            check_cancel(cancel.as_ref())?;
             Ok(RememberOutcome { id, inserted: true })
         });
-        let out = pending
-            .finish(result)
-            .inspect_err(|e| self.evict_stale_region(&key, h.id, e))?;
+        let out = match pending.finish(result) {
+            Ok(out) => out,
+            Err(error) => {
+                drop(edges_guard);
+                drop(_kl);
+                self.evict_stale_region(&key, h.id, &error);
+                return Err(error);
+            }
+        };
         h.max_id.fetch_max(out.id, Ordering::Relaxed);
         if out.inserted {
             self.note_sealed_insert(&h);
@@ -1187,7 +3263,11 @@ impl MemoryEngine {
         region: &str,
         entries: Vec<(AtomInput, String)>,
     ) -> Result<Vec<RememberOutcome>> {
+        let cancel = check_db_cancel(&self.db)?;
         if entries.is_empty() {
+            #[cfg(test)]
+            debug_fire_cancel_after_local_work();
+            check_cancel(cancel.as_ref())?;
             return Ok(Vec::new());
         }
         let key = region.to_ascii_lowercase();
@@ -1204,7 +3284,8 @@ impl MemoryEngine {
                 )));
             }
         }
-        let vecs = self.vectorise_atoms(&key, &h, &atoms)?;
+        let _provenance = self.reserve_region_provenance(&key, &h, cancel.as_ref())?;
+        let vecs = self.vectorise_atoms(&key, &h, &atoms, cancel.as_ref())?;
         let mac = h.identity_mac.as_deref();
         let kinds: Vec<String> = atoms.iter().map(|a| a.kind.clone()).collect();
         let mut tags: Vec<(String, String)> = Vec::with_capacity(atoms.len());
@@ -1217,21 +3298,26 @@ impl MemoryEngine {
         }
 
         let encrypted = h.atom_wrap.is_some();
-        let table = h.table.clone();
         let conn = Connection::open(&self.db)?;
         // One span over both the inserts' key allocation and the supersedes'
         // destruction, so no reconcile reclaims either mid-replace.
         let _kl = encrypted.then(|| self.db.key_lifecycle_lock());
+        let edges_guard = self.db.memory_edges_lock();
+        #[cfg(test)]
+        debug_fire_cancel_after_local_work();
+        check_cancel(cancel.as_ref())?;
         if let Some(kl) = _kl.as_ref() {
             // Before the txn: a crash cannot leave erased codes under a live segment key.
             self.retire_sealed_segment(&h, &conn, kl)?;
         }
         let mut pending = PendingAtomSlots::new(_kl.as_ref(), atoms.len());
         let result = with_write_txn(&conn, |c| {
+            check_cancel(cancel.as_ref())?;
             self.verify_region_live(c, &h, &key)?;
             // All resolved before any insert, so no entry supersedes itself.
             let mut bound: Vec<Option<(String, AtomId)>> = Vec::with_capacity(kinds.len());
             for (kind, (key_tag, _)) in kinds.iter().zip(&tags) {
+                check_cancel(cancel.as_ref())?;
                 bound.push(self.live_keyed_binding(c, &h, kind, key_tag)?);
             }
             // An identical retry writes nothing, so it never reaches the id range.
@@ -1240,6 +3326,7 @@ impl MemoryEngine {
             let mut writing: Vec<usize> = Vec::with_capacity(kinds.len());
             let mut outcomes: Vec<Option<RememberOutcome>> = vec![None; kinds.len()];
             for i in 0..kinds.len() {
+                check_cancel(cancel.as_ref())?;
                 match &bound[i] {
                     Some((request, id)) if request == &tags[i].1 => {
                         outcomes[i] = Some(RememberOutcome {
@@ -1258,10 +3345,12 @@ impl MemoryEngine {
                 .iter()
                 .map(|&i| vecs[i].take().expect("each index is taken once"))
                 .collect();
-            let ids = self.insert_atom_rows(c, &h, &table, fresh, fresh_vecs, &mut pending)?;
+            let ids =
+                self.insert_atom_rows(c, &h, fresh, fresh_vecs, &mut pending, cancel.as_ref())?;
 
             let mut stale: Vec<AtomId> = Vec::new();
             for (slot, &i) in writing.iter().enumerate() {
+                check_cancel(cancel.as_ref())?;
                 let id = ids[slot];
                 let params = [
                     Value::Integer(h.id),
@@ -1305,18 +3394,25 @@ impl MemoryEngine {
                 } else {
                     Vec::new()
                 };
-                delete_atoms_in_txn(c, &h, &in_list)?;
+                delete_atoms_in_txn(c, &h, &in_list, &edges_guard)?;
                 slots
             };
             let outcomes: Vec<RememberOutcome> = outcomes
                 .into_iter()
                 .map(|o| o.expect("every entry is replayed or written"))
                 .collect();
+            check_cancel(cancel.as_ref())?;
             Ok((outcomes, doomed))
         });
-        let (out, doomed) = pending
-            .finish(result)
-            .inspect_err(|e| self.evict_stale_region(&key, h.id, e))?;
+        let (out, doomed) = match pending.finish(result) {
+            Ok(done) => done,
+            Err(error) => {
+                drop(edges_guard);
+                drop(_kl);
+                self.evict_stale_region(&key, h.id, &error);
+                return Err(error);
+            }
+        };
         if !doomed.is_empty() {
             // Non-empty only on the sealed path, which is where the guard is held.
             let kl = _kl.as_ref().expect("sealed slots imply a lifecycle span");
@@ -1467,24 +3563,35 @@ impl MemoryEngine {
         }
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
-        let prep = prepare_atom_row(&h, &key, &atom)?;
+        let cancel = check_db_cancel(&self.db)?;
+        let _provenance = self.reserve_region_provenance(&key, &h, cancel.as_ref())?;
+        let prep = prepare_atom_row(&h, &key, &atom, cancel.as_ref())?;
 
         let conn = Connection::open(&self.db)?;
         // Sealed inserts allocate keys before their rows commit; hold the guard
         // so a concurrent reconcile cannot reclaim them mid-span.
         let _kl = h.atom_wrap.is_some().then(|| self.db.key_lifecycle_lock());
+        let edges_guard = self.db.memory_edges_lock();
         let mut pending = PendingAtomSlots::new(_kl.as_ref(), 1);
         let result = with_write_txn(&conn, |c| {
+            check_cancel(cancel.as_ref())?;
             self.verify_region_live(c, &h, &key)?;
-            self.verify_source_snapshot(c, &h, &key, snapshot)?;
+            self.verify_source_snapshot(c, &h, &key, snapshot, cancel.as_ref())?;
             let id = next_id(c, "next_atom_id")?;
             self.insert_atom_row(c, &h, id, atom, prep, &mut pending)?;
-            link_derived_sources(c, id, &src_ids, evidence_ref.as_ref())?;
+            link_derived_sources(c, id, &src_ids, evidence_ref.as_ref(), &edges_guard)?;
+            check_cancel(cancel.as_ref())?;
             Ok(id)
         });
-        let id = pending
-            .finish(result)
-            .inspect_err(|e| self.evict_stale_region(&key, h.id, e))?;
+        let id = match pending.finish(result) {
+            Ok(id) => id,
+            Err(error) => {
+                drop(edges_guard);
+                drop(_kl);
+                self.evict_stale_region(&key, h.id, &error);
+                return Err(error);
+            }
+        };
         h.max_id.fetch_max(id, Ordering::Relaxed);
         self.note_sealed_insert(&h);
         Ok(id)
@@ -1499,9 +3606,11 @@ impl MemoryEngine {
         h: &RegionHandle,
         region_key: &str,
         snapshot: &[SourceSnapshot],
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<()> {
         let now = now_micros();
         for member in snapshot {
+            check_cancel(cancel)?;
             let id = member.id;
             let text = match &h.atom_wrap {
                 None => {
@@ -1563,6 +3672,7 @@ impl MemoryEngine {
                 )));
             }
         }
+        check_cancel(cancel)?;
         Ok(())
     }
 
@@ -1644,6 +3754,7 @@ impl MemoryEngine {
         h: &RegionHandle,
         kind: &str,
         text: &str,
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<Option<AtomId>> {
         let table = &h.table;
         let Some(atom_wrap) = &h.atom_wrap else {
@@ -1660,6 +3771,7 @@ impl MemoryEngine {
                     Value::Timestamp(now_micros()),
                 ],
             )?;
+            check_cancel(cancel)?;
             return qr.rows.first().map(|r| as_int(&r[0])).transpose();
         };
         let qr = conn.query_params(
@@ -1674,6 +3786,7 @@ impl MemoryEngine {
             ],
         )?;
         for row in &qr.rows {
+            check_cancel(cancel)?;
             let id = as_int(&row[0])?;
             let rec = self.db.atom_store_slot(as_int(&row[2])? as u32)?;
             // Erased/recycled key: unrecoverable text cannot match - skip like recall.
@@ -1691,34 +3804,45 @@ impl MemoryEngine {
             )?);
             let hit = row_text.as_str() == text;
             if hit {
+                check_cancel(cancel)?;
                 return Ok(Some(id));
             }
         }
+        check_cancel(cancel)?;
         Ok(None)
     }
 
     /// Embed + store atoms in one transaction; faster than looping `remember`.
     pub fn remember_batch(&self, region: &str, atoms: Vec<AtomInput>) -> Result<Vec<AtomId>> {
+        let cancel = check_db_cancel(&self.db)?;
         if atoms.is_empty() {
             return Ok(Vec::new());
         }
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
+        let _provenance = self.reserve_region_provenance(&key, &h, cancel.as_ref())?;
 
-        let vecs = self.vectorise_atoms(&key, &h, &atoms)?;
-        let table = h.table.clone();
+        let vecs = self.vectorise_atoms(&key, &h, &atoms, cancel.as_ref())?;
         let conn = Connection::open(&self.db)?;
         // Sealed inserts allocate keys before their rows commit; hold the guard
         // so a concurrent reconcile cannot reclaim them mid-span.
         let _kl = h.atom_wrap.is_some().then(|| self.db.key_lifecycle_lock());
         let mut pending = PendingAtomSlots::new(_kl.as_ref(), atoms.len());
         let result = with_write_txn(&conn, |c| {
+            check_cancel(cancel.as_ref())?;
             self.verify_region_live(c, &h, &key)?;
-            self.insert_atom_rows(c, &h, &table, atoms, vecs, &mut pending)
+            let ids = self.insert_atom_rows(c, &h, atoms, vecs, &mut pending, cancel.as_ref())?;
+            check_cancel(cancel.as_ref())?;
+            Ok(ids)
         });
-        let ids = pending
-            .finish(result)
-            .inspect_err(|e| self.evict_stale_region(&key, h.id, e))?;
+        let ids = match pending.finish(result) {
+            Ok(ids) => ids,
+            Err(error) => {
+                drop(_kl);
+                self.evict_stale_region(&key, h.id, &error);
+                return Err(error);
+            }
+        };
         if let Some(&last) = ids.last() {
             h.max_id.fetch_max(last, Ordering::Relaxed);
             self.note_sealed_insert(&h);
@@ -1733,8 +3857,10 @@ impl MemoryEngine {
         key: &str,
         h: &RegionHandle,
         atoms: &[AtomInput],
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<Vec<Vec<f32>>> {
         for atom in atoms {
+            check_cancel(cancel)?;
             validate_atom_input(atom)?;
         }
 
@@ -1747,7 +3873,10 @@ impl MemoryEngine {
         let embedded = if texts.is_empty() {
             Vec::new()
         } else {
-            h.embedder.embed(&texts)?
+            check_cancel(cancel)?;
+            let embedded = h.embedder.embed(&texts);
+            check_cancel(cancel)?;
+            embedded?
         };
         if embedded.len() != texts.len() {
             return Err(MemError::Invalid(format!(
@@ -1759,6 +3888,7 @@ impl MemoryEngine {
         let mut taken = 0usize;
         let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(atoms.len());
         for atom in atoms {
+            check_cancel(cancel)?;
             let vector = match &atom.embedding {
                 Some(supplied) => supplied.clone(),
                 None => {
@@ -1779,11 +3909,12 @@ impl MemoryEngine {
         &self,
         c: &Connection<'_>,
         h: &RegionHandle,
-        table: &str,
         atoms: Vec<AtomInput>,
         vecs: Vec<Vec<f32>>,
         pending: &mut PendingAtomSlots<'_>,
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<Vec<AtomId>> {
+        let table = &h.table;
         let n = atoms.len();
         if n == 0 {
             return Ok(Vec::new());
@@ -1796,6 +3927,7 @@ impl MemoryEngine {
                 let mut sealed_blobs: Vec<Vec<u8>> = Vec::with_capacity(n);
                 let mut key_items: Vec<(u64, [u8; WRAPPED_KEY_SIZE])> = Vec::with_capacity(n);
                 for ((atom, vec), &id) in atoms.iter().zip(&vecs).zip(&ids) {
+                    check_cancel(cancel)?;
                     let payload = serde_json::to_string(&atom.payload)
                         .map_err(|e| MemError::Invalid(format!("payload not serializable: {e}")))?;
                     let (sealed, wrapped) = seal_atom(atom_wrap, id, vec, &atom.text, &payload);
@@ -1804,11 +3936,13 @@ impl MemoryEngine {
                 }
                 let slots = self.db.atom_store_allocate_batch(&key_items)?;
                 for (&id, &(slot, generation)) in ids.iter().zip(&slots) {
+                    check_cancel(cancel)?;
                     pending.track(slot, id as u64, generation);
                 }
                 for (((atom, &id), sealed), &(slot, gen)) in
                     atoms.iter().zip(&ids).zip(sealed_blobs).zip(&slots)
                 {
+                    check_cancel(cancel)?;
                     let expires = atom.expires_at.map(Value::Timestamp).unwrap_or(Value::Null);
                     let created = Value::Timestamp(atom.created_at.unwrap_or_else(now_micros));
                     insert_sealed_atom(
@@ -1836,6 +3970,7 @@ impl MemoryEngine {
                       $10, CURRENT_TIMESTAMP, $11)"
                 );
                 for ((atom, vec), &id) in atoms.into_iter().zip(vecs).zip(&ids) {
+                    check_cancel(cancel)?;
                     let payload = serde_json::to_string(&atom.payload)
                         .map_err(|e| MemError::Invalid(format!("payload not serializable: {e}")))?;
                     let expires = atom.expires_at.map(Value::Timestamp).unwrap_or(Value::Null);
@@ -1859,6 +3994,7 @@ impl MemoryEngine {
                 }
             }
         }
+        check_cancel(cancel)?;
         Ok(ids)
     }
 
@@ -1878,15 +4014,18 @@ impl MemoryEngine {
 
     /// Deterministic id-order listing; resume by passing the last id as `after_id`.
     pub fn fetch_range(&self, region: &str, q: &FetchQuery) -> Result<Vec<AtomHit>> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
         if q.limit == 0 {
             return Ok(Vec::new());
         }
         if h.atom_wrap.is_some() {
-            return self.with_live_sealed_read(&key, &h, |conn, atom_wrap, _kl| {
-                self.fetch_sealed(&h, q, conn, atom_wrap)
-            });
+            let hits = self.with_live_sealed_read(&key, &h, |conn, atom_wrap, _kl| {
+                self.fetch_sealed(&h, q, conn, atom_wrap, cancel.as_ref())
+            })?;
+            check_cancel(cancel.as_ref())?;
+            return Ok(hits);
         }
 
         let mut params: Vec<Value> = vec![Value::Integer(h.id)];
@@ -1919,7 +4058,7 @@ impl MemoryEngine {
             params.len()
         );
 
-        self.with_live_plain_access(&key, &h, |conn| {
+        let hits = self.with_live_plain_access(&key, &h, |conn| {
             let qr = conn.query_params(
                 &format!(
                     "SELECT id, kind, CAST(payload AS TEXT), text_content, score, immutable, created_at \
@@ -1931,54 +4070,89 @@ impl MemoryEngine {
                 ),
                 &params,
             )?;
-            let mut hits: Vec<AtomHit> =
-                qr.rows.iter().map(|row| parse_fetched(row)).collect::<Result<_>>()?;
+            let mut hits = Vec::with_capacity(qr.rows.len());
+            for row in &qr.rows {
+                #[cfg(test)]
+                debug_fire_cancel_after_local_work();
+                check_cancel(cancel.as_ref())?;
+                hits.push(parse_fetched(row)?);
+            }
             // The window was taken from the end; callers still read oldest first.
             if q.newest {
                 hits.reverse();
             }
             Ok(hits)
-        })
+        })?;
+        check_cancel(cancel.as_ref())?;
+        Ok(hits)
     }
 
     /// Count atoms of `kind` without materializing them (`kind` is plaintext in
     /// both flavors). A sealed region counts only atoms whose key is live.
     pub fn count(&self, region: &str, kind: &str) -> Result<u64> {
+        self.count_matching(region, Some(kind))
+    }
+
+    /// Count every live atom in the region, whatever its kind. Callers that must show a
+    /// region's size have no kind to name and no way to enumerate the kinds present, so
+    /// without this the only options are paging to exhaustion or reading the per-region
+    /// atoms table directly.
+    pub fn count_region(&self, region: &str) -> Result<u64> {
+        self.count_matching(region, None)
+    }
+
+    /// `None` counts every kind. TTL-expired rows are excluded either way, and a sealed
+    /// region still counts only atoms whose key is live.
+    fn count_matching(&self, region: &str, kind: Option<&str>) -> Result<u64> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
-        let ttl_params = [
-            Value::Integer(h.id),
-            Value::Text(kind.into()),
-            Value::Timestamp(now_micros()),
-        ];
+        let mut params: Vec<Value> = vec![Value::Integer(h.id)];
+        let kind_pred = match kind {
+            Some(kind) => {
+                params.push(Value::Text(kind.into()));
+                " AND kind = $2"
+            }
+            None => "",
+        };
+        // Numbered from what precedes it, so dropping the kind predicate does not leave a
+        // dangling parameter index.
+        params.push(Value::Timestamp(now_micros()));
+        let ttl_pred = format!(
+            " AND (expires_at IS NULL OR expires_at > ${})",
+            params.len()
+        );
         if h.atom_wrap.is_some() {
-            return self.with_live_sealed_read(&key, &h, |conn, _, _kl| {
+            let live = self.with_live_sealed_read(&key, &h, |conn, _, _kl| {
                 let wrapped = self.db.atom_store_live_wrapped()?;
                 let qr = conn.query_params(
                     &format!(
-                        "SELECT id FROM {table} WHERE region_id = $1 AND kind = $2 \
-                         AND (expires_at IS NULL OR expires_at > $3)",
+                        "SELECT id FROM {table} WHERE region_id = $1{kind_pred}{ttl_pred}",
                         table = h.table
                     ),
-                    &ttl_params,
+                    &params,
                 )?;
                 let mut live = 0u64;
                 for row in &qr.rows {
+                    #[cfg(test)]
+                    debug_fire_cancel_after_local_work();
+                    check_cancel(cancel.as_ref())?;
                     if wrapped.contains_key(&(as_int(&row[0])? as u64)) {
                         live += 1;
                     }
                 }
                 Ok(live)
-            });
+            })?;
+            check_cancel(cancel.as_ref())?;
+            return Ok(live);
         }
-        self.with_live_plain_access(&key, &h, |conn| {
+        let count = self.with_live_plain_access(&key, &h, |conn| {
             let qr = conn.query_params(
                 &format!(
-                    "SELECT COUNT(*) FROM {table} WHERE region_id = $1 AND kind = $2 \
-                     AND (expires_at IS NULL OR expires_at > $3)",
+                    "SELECT COUNT(*) FROM {table} WHERE region_id = $1{kind_pred}{ttl_pred}",
                     table = h.table
                 ),
-                &ttl_params,
+                &params,
             )?;
             match qr.rows.first().and_then(|r| r.first()) {
                 Some(Value::Integer(n)) => Ok(*n as u64),
@@ -1986,7 +4160,9 @@ impl MemoryEngine {
                     "COUNT returned no integer: {other:?}"
                 ))),
             }
-        })
+        })?;
+        check_cancel(cancel.as_ref())?;
+        Ok(count)
     }
 
     /// Exact (unnormalized) data path: a binding check for external cache-set locks.
@@ -1996,6 +4172,7 @@ impl MemoryEngine {
 
     /// Persisted region identities; a half-erased encrypted region fails closed.
     pub fn stored_region_identities(&self) -> Result<Vec<StoredRegionIdentity>> {
+        let cancel = check_db_cancel(&self.db)?;
         let _kl = self.db.key_lifecycle_lock();
         let conn = Connection::open(&self.db)?;
         let qr = conn.query_params(
@@ -2005,6 +4182,7 @@ impl MemoryEngine {
         )?;
         let mut identities = Vec::with_capacity(qr.rows.len());
         for row in &qr.rows {
+            check_cancel(cancel.as_ref())?;
             let name = as_text(&row[0])?;
             let persisted = parse_region_row(&row[1..])?;
             if persisted.encrypted {
@@ -2019,21 +4197,53 @@ impl MemoryEngine {
             ));
         }
         identities.sort_by(|left, right| left.name().cmp(right.name()));
+        check_cancel(cancel.as_ref())?;
         Ok(identities)
+    }
+
+    /// One persisted region identity; an encrypted row must still have a live RSK.
+    pub fn stored_region_identity(&self, name: &str) -> Result<Option<StoredRegionIdentity>> {
+        let cancel = check_db_cancel(&self.db)?;
+        let key = name.to_ascii_lowercase();
+        let _kl = self.db.key_lifecycle_lock();
+        let conn = Connection::open(&self.db)?;
+        let Some(persisted) = self.load_region_row(&conn, &key)? else {
+            check_cancel(cancel.as_ref())?;
+            return Ok(None);
+        };
+        if persisted.encrypted {
+            self.verify_region_key_live(&key, &persisted)?;
+        }
+        check_cancel(cancel.as_ref())?;
+        Ok(Some(StoredRegionIdentity::new(
+            key,
+            persisted.encrypted,
+            persisted.dim,
+            persisted.metric,
+            persisted.model_id,
+        )))
     }
 
     /// Exact persisted region names, sorted deterministically.
     pub fn stored_region_names(&self) -> Result<Vec<String>> {
-        self.stored_region_identities().map(|identities| {
-            identities
-                .into_iter()
-                .map(|identity| identity.name().to_owned())
-                .collect()
-        })
+        let cancel = check_db_cancel(&self.db)?;
+        let identities = self.stored_region_identities()?;
+        let mut names = Vec::with_capacity(identities.len());
+        for identity in identities {
+            #[cfg(test)]
+            debug_fire_cancel_after_local_work();
+            check_cancel(cancel.as_ref())?;
+            names.push(identity.name().to_owned());
+        }
+        #[cfg(test)]
+        debug_fire_cancel_after_local_work();
+        check_cancel(cancel.as_ref())?;
+        Ok(names)
     }
 
     /// Stored kinds: storage inventory (expired rows stay visible), never decrypts.
     pub fn stored_atom_kinds(&self, region: &str) -> Result<Vec<String>> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let _kl = self.db.key_lifecycle_lock();
         let conn = Connection::open(&self.db)?;
@@ -2043,12 +4253,18 @@ impl MemoryEngine {
             &format!("SELECT DISTINCT kind FROM {table} WHERE region_id = $1"),
             &[Value::Integer(row.id)],
         )?;
-        let mut kinds = qr
-            .rows
-            .iter()
-            .map(|stored| Ok(as_text(&stored[0])?.to_owned()))
-            .collect::<Result<Vec<_>>>()?;
+        let mut kinds = Vec::with_capacity(qr.rows.len());
+        for stored in &qr.rows {
+            #[cfg(test)]
+            debug_fire_cancel_after_local_work();
+            check_cancel(cancel.as_ref())?;
+            kinds.push(as_text(&stored[0])?.to_owned());
+        }
+        check_cancel(cancel.as_ref())?;
         kinds.sort();
+        #[cfg(test)]
+        debug_fire_cancel_after_local_work();
+        check_cancel(cancel.as_ref())?;
         Ok(kinds)
     }
 
@@ -2057,6 +4273,7 @@ impl MemoryEngine {
         &self,
         region: &str,
     ) -> Result<Vec<StoredAtomRetrievalState>> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let _kl = self.db.key_lifecycle_lock();
         let conn = Connection::open(&self.db)?;
@@ -2068,19 +4285,21 @@ impl MemoryEngine {
             ),
             &[Value::Integer(row.id)],
         )?;
-        let mut states = qr
-            .rows
-            .iter()
-            .map(|stored| {
-                Ok(StoredAtomRetrievalState::new(
-                    as_int(&stored[0])?,
-                    as_text(&stored[1])?.to_owned(),
-                    exact_f32_bits(&stored[2])?,
-                    exact_opt_ts(&stored[3])?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        states.sort_by_key(StoredAtomRetrievalState::atom_id);
+        let mut states = Vec::with_capacity(qr.rows.len());
+        for stored in &qr.rows {
+            #[cfg(test)]
+            debug_fire_cancel_after_local_work();
+            check_cancel(cancel.as_ref())?;
+            states.push(StoredAtomRetrievalState::new(
+                as_int(&stored[0])?,
+                as_text(&stored[1])?.to_owned(),
+                exact_f32_bits(&stored[2])?,
+                exact_opt_ts(&stored[3])?,
+            ));
+        }
+        #[cfg(test)]
+        debug_fire_cancel_after_local_work();
+        check_cancel(cancel.as_ref())?;
         Ok(states)
     }
 
@@ -2109,10 +4328,12 @@ impl MemoryEngine {
         kind: &str,
         expected: Option<&[(AtomId, Vec<f32>)]>,
     ) -> Result<StoredEmbeddingsIdentity> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
         if let Some(expected) = expected {
             validate_expected_embeddings(expected, usize::from(h.dim))?;
+            check_cancel(cancel.as_ref())?;
         }
 
         let params = [
@@ -2122,7 +4343,7 @@ impl MemoryEngine {
         ];
         let mut scan = StoredEmbeddingScan::new(&key, kind, h.dim, expected);
         if h.atom_wrap.is_some() {
-            return self.with_live_sealed_read(&key, &h, |conn, atom_wrap, _kl| {
+            let result = self.with_live_sealed_read(&key, &h, |conn, atom_wrap, _kl| {
                 let qr = conn.query_params(
                     &format!(
                         "SELECT id, sealed, key_slot, key_gen FROM {table} \
@@ -2133,6 +4354,7 @@ impl MemoryEngine {
                     &params,
                 )?;
                 for row in &qr.rows {
+                    check_cancel(cancel.as_ref())?;
                     let id = as_int(&row[0])?;
                     let Some(wrapped_ack) =
                         exact_live_atom_wrapped(&self.db, id, &row[2], &row[3])?
@@ -2146,10 +4368,12 @@ impl MemoryEngine {
                     result?;
                 }
                 scan.finish()
-            });
+            })?;
+            check_cancel(cancel.as_ref())?;
+            return Ok(result);
         }
 
-        self.with_live_plain_access(&key, &h, |conn| {
+        let result = self.with_live_plain_access(&key, &h, |conn| {
             let qr = conn.query_params(
                 &format!(
                     "SELECT id, embedding FROM {table} WHERE region_id = $1 AND kind = $2 \
@@ -2159,6 +4383,7 @@ impl MemoryEngine {
                 &params,
             )?;
             for row in &qr.rows {
+                check_cancel(cancel.as_ref())?;
                 let id = as_int(&row[0])?;
                 let embedding = match &row[1] {
                     Value::Vector(vector) => vector.as_ref(),
@@ -2171,7 +4396,9 @@ impl MemoryEngine {
                 scan.consume(id, embedding)?;
             }
             scan.finish()
-        })
+        })?;
+        check_cancel(cancel.as_ref())?;
+        Ok(result)
     }
 
     /// Freeze the region's ANN index into a persisted segment so a cold attach
@@ -2179,57 +4406,73 @@ impl MemoryEngine {
     /// random erasable-store key, so destroying that slot crypto-erases every
     /// on-disk embedding derivative.
     pub fn persist_ann_index(&self, region: &str) -> Result<AnnSegmentInfo> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
         if h.atom_wrap.is_some() {
             return self.with_live_sealed_read(&key, &h, |conn, _, _kl| {
-                self.persist_sealed_segment(&h, conn, _kl)
+                self.persist_sealed_segment(&h, conn, _kl, cancel.as_ref())
             });
         }
         self.with_live_plain_access(&key, &h, |conn| {
+            #[cfg(test)]
+            debug_fire_cancel_after_local_work();
+            check_cancel(cancel.as_ref())?;
             Ok(conn.persist_ann_index(&h.table, "embedding")?)
         })
     }
 
     /// [`ann_cache_status`](Self::ann_cache_status) plus whether the entry is current.
     pub fn ann_cache_status_current(&self, region: &str) -> Result<Option<(AnnIndexSource, bool)>> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
-        if h.atom_wrap.is_some() {
-            return self.with_live_sealed_read(&key, &h, |_, _, _| {
+        let status = if h.atom_wrap.is_some() {
+            self.with_live_sealed_read(&key, &h, |_, _, _| {
                 Ok(h.ann
                     .read()
                     .unwrap()
                     .as_ref()
                     .map(|sa| (sa.source.clone(), sa.build_epoch == self.db.cache_epoch())))
-            });
-        }
-        self.with_live_plain_access(&key, &h, |conn| {
-            Ok(conn
-                .ann_cache_status(&h.table, "embedding")?
-                .map(|(source, _)| (source, true)))
-        })
+            })?
+        } else {
+            self.with_live_plain_access(&key, &h, |conn| {
+                Ok(conn
+                    .ann_cache_status(&h.table, "embedding")?
+                    .map(|(source, _)| (source, true)))
+            })?
+        };
+        #[cfg(test)]
+        debug_fire_cancel_after_local_work();
+        check_cancel(cancel.as_ref())?;
+        Ok(status)
     }
 
     /// Serving ANN index: `Loaded` or `Built`; `None` if unbuilt or epoch-stale.
     pub fn ann_cache_status(&self, region: &str) -> Result<Option<AnnIndexSource>> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
-        if h.atom_wrap.is_some() {
-            return self.with_live_sealed_read(&key, &h, |_, _, _| {
+        let status = if h.atom_wrap.is_some() {
+            self.with_live_sealed_read(&key, &h, |_, _, _| {
                 Ok(h.ann
                     .read()
                     .unwrap()
                     .as_ref()
                     .filter(|sa| sa.build_epoch == self.db.cache_epoch())
                     .map(|sa| sa.source.clone()))
-            });
-        }
-        self.with_live_plain_access(&key, &h, |conn| {
-            Ok(conn
-                .ann_cache_status(&h.table, "embedding")?
-                .map(|(source, _)| source))
-        })
+            })?
+        } else {
+            self.with_live_plain_access(&key, &h, |conn| {
+                Ok(conn
+                    .ann_cache_status(&h.table, "embedding")?
+                    .map(|(source, _)| source))
+            })?
+        };
+        #[cfg(test)]
+        debug_fire_cancel_after_local_work();
+        check_cancel(cancel.as_ref())?;
+        Ok(status)
     }
 
     /// Persist a sealed region's ANN graph: scan + decrypt (with the
@@ -2241,6 +4484,7 @@ impl MemoryEngine {
         h: &RegionHandle,
         conn: &Connection<'_>,
         kl: &KeyLifecycleGuard<'_>,
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<AnnSegmentInfo> {
         let atom_wrap = h.atom_wrap.as_ref().expect("sealed persist");
 
@@ -2250,6 +4494,7 @@ impl MemoryEngine {
             conn,
             &self.db,
             h,
+            cancel,
             &mut |id, kind, sealed, wrapped, _, _, _, _| {
                 let emb = open_atom_embedding(atom_wrap, wrapped, id, sealed)?;
                 let next = kind_codes.len() as u32;
@@ -2259,6 +4504,7 @@ impl MemoryEngine {
             },
         )?
         .0;
+        check_cancel(cancel)?;
         if triples.is_empty() {
             return Err(MemError::Invalid(
                 "nothing to persist: the sealed region has no live atoms".into(),
@@ -2267,10 +4513,12 @@ impl MemoryEngine {
         let n = triples.len() as u64;
         let index = AnnIndex::build_with_attrs(triples, 1, ann_metric(h.metric), h.dim)
             .map_err(|e| MemError::Invalid(format!("sealed ANN build: {e}")))?;
+        check_cancel(cancel)?;
 
         // Inner plaintext: [fp 32][config_hash 32][kind_codes][segment body];
         // zeroized after seal.
-        let body = Zeroizing::new(citadel_vector::segment::encode(&index));
+        let body = citadel_vector::segment::encode_with_cancel(&index, cancel)
+            .map_err(segment_operation_error)?;
         let mut inner = Zeroizing::new(Vec::with_capacity(body.len() + 256));
         inner.extend_from_slice(&fingerprint);
         // Pin the PRISM config (incl. search-geometry version): a binary whose
@@ -2280,13 +4528,23 @@ impl MemoryEngine {
         ));
         inner.extend_from_slice(&(kind_codes.len() as u32).to_le_bytes());
         let mut kinds: Vec<(&String, &u32)> = kind_codes.iter().collect();
+        check_cancel(cancel)?;
         kinds.sort_by_key(|&(_, code)| *code);
+        check_cancel(cancel)?;
         for (kind, &code) in kinds {
+            check_cancel(cancel)?;
             inner.extend_from_slice(&(kind.len() as u32).to_le_bytes());
             inner.extend_from_slice(kind.as_bytes());
             inner.extend_from_slice(&code.to_le_bytes());
         }
         inner.extend_from_slice(&body);
+
+        // Allocating the pseudo-id is the first durable write. Everything
+        // above is reversible local work, so observe this operation's token
+        // once more before crossing that boundary.
+        #[cfg(test)]
+        debug_fire_cancel_after_local_work();
+        check_cancel(cancel)?;
 
         // Seal under a fresh segment key; the pseudo-atom id binds the AAD and
         // owns the erasable slot. Drawn from the atom-id sequence, so it can
@@ -2297,10 +4555,15 @@ impl MemoryEngine {
         rand::thread_rng().fill_bytes(sk.as_mut());
         let seal_keys = derive_seal_keys(&sk);
         let sealed = blob_seal::seal(&seal_keys, pseudo_id as u64, &inner);
+        let segment_b3 = citadel_vector::segment::digest_with_cancel(&sealed, cancel)
+            .map_err(segment_operation_error)?;
         let wrapped_sk = atom_wrap.wrap_atom_key(&sk);
 
         // Retire any previous segment first (old key must not survive as
         // decryptable residue), then key-before-data like atoms.
+        // Catch cancellation that arrives while sealing before destroying an
+        // existing segment. The consumed sequence value is harmless.
+        check_cancel(cancel)?;
         self.retire_sealed_segment(h, conn, kl)?;
         let mut pending = PendingAtomSlots::new(Some(kl), 1);
         let seg_table = sealed_segment_table(&h.table, h.id);
@@ -2337,7 +4600,7 @@ impl MemoryEngine {
             write_annseg_meta(conn, h.id, slot, gen, pseudo_id)?;
 
             Ok(AnnSegmentInfo {
-                segment_b3: *blake3::hash(&sealed).as_bytes(),
+                segment_b3,
                 content_fingerprint: fingerprint,
                 n,
                 dim: h.dim,
@@ -2361,41 +4624,39 @@ impl MemoryEngine {
 
     /// Try to serve the persisted segment: unwrap its key, decrypt, decode, and
     /// rehydrate from live rows whose fingerprint must match the sealed one.
-    /// Any failure heals (retires the orphan key) and falls back to a scan
-    /// build, carrying the reason in `Err(Some(reason))`.
+    /// Any persisted-state failure returns a refusal for the caller to retire
+    /// after releasing the cache lock, then falls back to a scan build.
     #[allow(clippy::type_complexity)]
     fn try_load_sealed_segment(
         &self,
         h: &RegionHandle,
         conn: &Connection<'_>,
         epoch: u64,
-        kl: &KeyLifecycleGuard<'_>,
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<std::result::Result<SealedAnn, Option<String>>> {
         use zeroize::Zeroize;
         let atom_wrap = h.atom_wrap.as_ref().expect("sealed load");
         let Some((slot, gen, pseudo_id)) = read_annseg_meta(conn, h.id)? else {
             return Ok(Err(None));
         };
-        let heal =
-            |this: &Self, why: &str| -> Result<std::result::Result<SealedAnn, Option<String>>> {
-                this.retire_sealed_segment(h, conn, kl)?;
-                Ok(Err(Some(why.to_string())))
-            };
+        let refuse = |why: &str| -> Result<std::result::Result<SealedAnn, Option<String>>> {
+            #[cfg(test)]
+            debug_fire_cancel_after_local_work();
+            check_cancel(cancel)?;
+            Ok(Err(Some(why.to_string())))
+        };
         let rec = match self.db.atom_store_slot(slot) {
             Ok(rec) => rec,
-            Err(e) => return heal(self, &format!("slot read: {e}")),
+            Err(e) => return refuse(&format!("slot read: {e}")),
         };
         if rec.state != citadel::SlotState::Live
             || rec.region_id != pseudo_id as u64
             || rec.gen != gen
         {
-            return heal(
-                self,
-                &format!(
-                    "slot mismatch: state={:?} owner={} (want {pseudo_id}) gen={} (want {gen})",
-                    rec.state, rec.region_id, rec.gen
-                ),
-            );
+            return refuse(&format!(
+                "slot mismatch: state={:?} owner={} (want {pseudo_id}) gen={} (want {gen})",
+                rec.state, rec.region_id, rec.gen
+            ));
         }
 
         let seg_table = sealed_segment_table(&h.table, h.id);
@@ -2403,28 +4664,30 @@ impl MemoryEngine {
             let mut rtx = self.db.begin_read();
             let Ok(Some(count_bytes)) = rtx.table_get(seg_table.as_bytes(), &0u32.to_be_bytes())
             else {
-                return heal(self, "chunk count row missing");
+                return refuse("chunk count row missing");
             };
             let count = u32::from_le_bytes(match count_bytes.as_slice().try_into() {
                 Ok(b) => b,
-                Err(_) => return heal(self, "chunk count malformed"),
+                Err(_) => return refuse("chunk count malformed"),
             });
             if !plausible_chunk_count(count) {
-                return heal(self, "chunk count implausible");
+                return refuse("chunk count implausible");
             }
             let mut sealed = Vec::new();
             for i in 1..=count {
+                check_cancel(cancel)?;
                 match rtx.table_get(seg_table.as_bytes(), &i.to_be_bytes()) {
                     Ok(Some(chunk)) => sealed.extend_from_slice(&chunk),
-                    _ => return heal(self, "chunk missing"),
+                    _ => return refuse("chunk missing"),
                 }
             }
+            check_cancel(cancel)?;
             sealed
         };
 
         let mut sk = match atom_wrap.unwrap_atom_key(&rec.wrapped) {
             Ok(sk) => sk,
-            Err(_) => return heal(self, "segment key unwrap failed"),
+            Err(_) => return refuse("segment key unwrap failed"),
         };
         let seal_keys = derive_seal_keys(&sk);
         sk.zeroize();
@@ -2436,18 +4699,30 @@ impl MemoryEngine {
                      decryption (corrupt); rebuilding from scan",
                     h.id
                 );
-                return heal(self, "authenticated decryption failed");
+                return refuse("authenticated decryption failed");
             }
         };
-        let parsed = parse_sealed_segment(&inner);
+        check_cancel(cancel)?;
+        let parsed = match parse_sealed_segment(&inner, cancel) {
+            Ok(parsed) => parsed,
+            Err(citadel_vector::segment::SegmentOperationError::Interrupted) => {
+                return Err(MemError::Core(citadel_core::Error::Interrupted));
+            }
+            Err(error @ citadel_vector::segment::SegmentOperationError::Allocation(_)) => {
+                return Err(segment_operation_error(error));
+            }
+            Err(citadel_vector::segment::SegmentOperationError::Segment(source)) => {
+                return refuse(&format!("inner segment decode failed: {source}"));
+            }
+        };
         let Some((stored_fp, stored_cfg, kind_codes, parts)) = parsed else {
-            return heal(self, "inner parse/decode failed");
+            return refuse("inner parse/decode failed");
         };
         let active_cfg = citadel_vector::segment::prism_config_hash(&AnnIndex::active_config(
             ann_metric(h.metric),
         ));
         if stored_cfg != active_cfg {
-            return heal(self, "prism config changed since the segment was built");
+            return refuse("prism config changed since the segment was built");
         }
 
         // Rehydrate by decrypting live rows, placed by the id_map permutation;
@@ -2462,6 +4737,7 @@ impl MemoryEngine {
             conn,
             &self.db,
             h,
+            cancel,
             &mut |id, kind, sealed_row, wrapped, score, created, immutable, expires| {
                 let Some(&slot) = slot_of.get(&(id as u64)) else {
                     unknown = true;
@@ -2489,24 +4765,23 @@ impl MemoryEngine {
         if unknown || live_fp != stored_fp || filled != parts.n() {
             // Stale (liveness or content moved): expected after forgets that
             // bypassed explicit retirement.
-            return heal(
-                self,
-                &format!(
-                    "stale: unknown={unknown} fp_match={} filled={filled}/{}",
-                    live_fp == stored_fp,
-                    parts.n()
-                ),
-            );
+            return refuse(&format!(
+                "stale: unknown={unknown} fp_match={} filled={filled}/{}",
+                live_fp == stored_fp,
+                parts.n()
+            ));
         }
-        let segment_b3 = *blake3::hash(&sealed).as_bytes();
+        let segment_b3 = citadel_vector::segment::digest_with_cancel(&sealed, cancel)
+            .map_err(segment_operation_error)?;
         // Pre-validate while the buffer is still zeroizing-owned; PRISM scrubs on drop.
         if filled != parts.n() || vectors.len() != parts.n() * dim {
-            return heal(self, "sealed ANN vector rehydration shape changed");
+            return refuse("sealed ANN vector rehydration shape changed");
         }
         let index = match parts.into_index(std::mem::take(vectors.as_mut()), filled) {
             Ok(i) => i,
-            Err(e) => return heal(self, &format!("into_index: {e}")),
+            Err(e) => return refuse(&format!("into_index: {e}")),
         };
+        check_cancel(cancel)?;
         Ok(Ok(SealedAnn {
             index,
             kind_codes,
@@ -2614,14 +4889,17 @@ impl MemoryEngine {
     }
 
     pub fn fetch_one(&self, region: &str, atom_id: AtomId) -> Result<Option<AtomHit>> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
         if h.atom_wrap.is_some() {
-            return self.with_live_sealed_read(&key, &h, |conn, atom_wrap, _kl| {
+            let hit = self.with_live_sealed_read(&key, &h, |conn, atom_wrap, _kl| {
                 self.fetch_one_sealed(&h, atom_id, conn, atom_wrap)
-            });
+            })?;
+            check_cancel(cancel.as_ref())?;
+            return Ok(hit);
         }
-        self.with_live_plain_access(&key, &h, |conn| {
+        let hit = self.with_live_plain_access(&key, &h, |conn| {
             let qr = conn.query_params(
                 &format!(
                     "SELECT id, kind, CAST(payload AS TEXT), text_content, score, immutable, created_at \
@@ -2636,19 +4914,24 @@ impl MemoryEngine {
                 ],
             )?;
             qr.rows.first().map(|row| parse_fetched(row)).transpose()
-        })
+        })?;
+        check_cancel(cancel.as_ref())?;
+        Ok(hit)
     }
 
     /// Most recent atom of `kind` in `region` (highest id), or `None`.
     pub fn fetch_last(&self, region: &str, kind: &str) -> Result<Option<AtomHit>> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
         if h.atom_wrap.is_some() {
-            return self.with_live_sealed_read(&key, &h, |conn, atom_wrap, _kl| {
-                self.fetch_last_sealed(&h, kind, conn, atom_wrap)
-            });
+            let hit = self.with_live_sealed_read(&key, &h, |conn, atom_wrap, _kl| {
+                self.fetch_last_sealed(&h, kind, conn, atom_wrap, cancel.as_ref())
+            })?;
+            check_cancel(cancel.as_ref())?;
+            return Ok(hit);
         }
-        self.with_live_plain_access(&key, &h, |conn| {
+        let hit = self.with_live_plain_access(&key, &h, |conn| {
             let qr = conn.query_params(
                 &format!(
                     "SELECT id, kind, CAST(payload AS TEXT), text_content, score, immutable, created_at \
@@ -2663,7 +4946,9 @@ impl MemoryEngine {
                 ],
             )?;
             qr.rows.first().map(|row| parse_fetched(row)).transpose()
-        })
+        })?;
+        check_cancel(cancel.as_ref())?;
+        Ok(hit)
     }
 
     /// Read edges from `memory_edges`, filtered by any of `src`/`dst`/`kind`.
@@ -2673,6 +4958,7 @@ impl MemoryEngine {
         dst: Option<AtomId>,
         kind: Option<EdgeKind>,
     ) -> Result<Vec<Edge>> {
+        let cancel = check_db_cancel(&self.db)?;
         let mut params: Vec<Value> = Vec::new();
         let mut clauses: Vec<String> = Vec::new();
         if let Some(s) = src {
@@ -2701,7 +4987,18 @@ impl MemoryEngine {
             ),
             &params,
         )?;
-        qr.rows.iter().map(|row| parse_edge(row)).collect()
+        let edges = qr
+            .rows
+            .iter()
+            .map(|row| {
+                #[cfg(test)]
+                debug_fire_cancel_after_local_work();
+                check_cancel(cancel.as_ref())?;
+                parse_edge(row)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        check_cancel(cancel.as_ref())?;
+        Ok(edges)
     }
 
     /// Replace an atom's JSONB payload; errors if it is absent or immutable.
@@ -2711,10 +5008,14 @@ impl MemoryEngine {
         atom_id: AtomId,
         payload: &serde_json::Value,
     ) -> Result<()> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
         if h.atom_wrap.is_some() {
             return self.with_live_sealed_read(&key, &h, |conn, atom_wrap, _kl| {
+                #[cfg(test)]
+                debug_fire_cancel_after_local_work();
+                check_cancel(cancel.as_ref())?;
                 // Epoch + retire precede the rewrite: the old payload survives nowhere.
                 self.db.bump_cache_epoch();
                 self.retire_sealed_segment(&h, conn, _kl)?;
@@ -2727,6 +5028,9 @@ impl MemoryEngine {
             .map_err(|e| MemError::Invalid(format!("payload not serializable: {e}")))?;
 
         self.with_live_plain_access(&key, &h, |conn| {
+            #[cfg(test)]
+            debug_fire_cancel_after_local_work();
+            check_cancel(cancel.as_ref())?;
             with_write_txn(conn, |c| {
                 let res = c.execute_params(
                     &format!(
@@ -2752,7 +5056,11 @@ impl MemoryEngine {
 
     /// Set fusion importance; same-value skips make a converged pass write nothing.
     pub fn set_importance(&self, region: &str, updates: &[(AtomId, f32)]) -> Result<usize> {
+        let cancel = check_db_cancel(&self.db)?;
         if updates.is_empty() {
+            #[cfg(test)]
+            debug_fire_cancel_after_local_work();
+            check_cancel(cancel.as_ref())?;
             return Ok(0);
         }
         if let Some((atom_id, _)) = updates
@@ -2791,6 +5099,9 @@ impl MemoryEngine {
         };
         if h.atom_wrap.is_some() {
             return self.with_live_sealed_read(&key, &h, |conn, _, _kl| {
+                #[cfg(test)]
+                debug_fire_cancel_after_local_work();
+                check_cancel(cancel.as_ref())?;
                 let updated = apply(conn)?;
                 if updated > 0 {
                     // The index bakes importance in; the bump drops all handles' caches.
@@ -2801,7 +5112,12 @@ impl MemoryEngine {
                 Ok(updated)
             });
         }
-        self.with_live_plain_access(&key, &h, apply)
+        self.with_live_plain_access(&key, &h, |conn| {
+            #[cfg(test)]
+            debug_fire_cancel_after_local_work();
+            check_cancel(cancel.as_ref())?;
+            apply(conn)
+        })
     }
 
     /// Hybrid recall: ANN retrieval then fusion re-ranking; top `q.k` atoms.
@@ -2810,11 +5126,13 @@ impl MemoryEngine {
     /// region (cached; post-snapshot tail exact-ranked); keyword is in-Rust
     /// BM25, not SQL `ts_rank`.
     pub fn recall(&self, region: &str, q: RecallQuery) -> Result<Vec<AtomHit>> {
-        self.recall_impl(region, q, true)
+        let cancel = check_db_cancel(&self.db)?;
+        self.recall_impl(region, q, RecallMode::USER, cancel.as_ref())
     }
 
     /// Multi-query recall: one batch embed, RRF merge with dedup, one rerank pass.
     pub fn recall_many(&self, region: &str, q: MultiRecallQuery) -> Result<Vec<AtomHit>> {
+        let cancel = check_db_cancel(&self.db)?;
         if q.k == 0 || q.queries.is_empty() {
             return Ok(Vec::new());
         }
@@ -2834,6 +5152,7 @@ impl MemoryEngine {
         };
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
+        let _provenance = self.reserve_region_provenance(&key, &h, cancel.as_ref())?;
 
         let mut queries = q.queries;
         let need: Vec<usize> = queries
@@ -2851,7 +5170,10 @@ impl MemoryEngine {
                     })
                 })
                 .collect::<Result<_>>()?;
-            let embs = h.embedder.embed_queries(&texts)?;
+            check_cancel(cancel.as_ref())?;
+            let embs = h.embedder.embed_queries(&texts);
+            check_cancel(cancel.as_ref())?;
+            let embs = embs?;
             if embs.len() != need.len() {
                 return Err(MemError::Invalid(format!(
                     "embedder returned {} vectors for {} queries",
@@ -2869,40 +5191,52 @@ impl MemoryEngine {
                 validate_embedding(&key, h.dim, vector, "query")?;
             }
         }
-        drop(h);
-
         let mut lists = Vec::with_capacity(queries.len());
         for sq in queries {
-            lists.push(self.recall_impl(region, sq, false)?);
+            lists.push(self.recall_impl(region, sq, RecallMode::SUBQUERY, cancel.as_ref())?);
+            check_cancel(cancel.as_ref())?;
         }
         let mut merged = rrf_merge(lists, q.rrf_k);
+        check_cancel(cancel.as_ref())?;
 
         match (reranker.as_ref(), &q.rerank_query) {
             (Some((r, strategy)), Some(text)) => {
-                Ok(rerank_hits(r.as_ref(), text, merged, *strategy, q.k)?)
+                check_cancel(cancel.as_ref())?;
+                let _callback = self.reserve_reranker_atoms(
+                    &key,
+                    &h,
+                    merged.iter().take(RERANK_POOL).map(|hit| hit.id),
+                )?;
+                check_cancel(cancel.as_ref())?;
+                let reranked = rerank_hits(r.as_ref(), text, merged, *strategy, q.k);
+                check_cancel(cancel.as_ref())?;
+                Ok(reranked?)
             }
             _ => {
                 merged.truncate(q.k);
+                check_cancel(cancel.as_ref())?;
                 Ok(merged)
             }
         }
     }
 
-    /// `use_reranker: false`: recall_many reranks the merged pool, not per sub-query.
     fn recall_impl(
         &self,
         region: &str,
         q: RecallQuery,
-        use_reranker: bool,
+        mode: RecallMode,
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<Vec<AtomHit>> {
+        let cancel = cancel.cloned();
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
         if q.k == 0 {
             return Ok(Vec::new());
         }
+        let _provenance = self.reserve_region_provenance(&key, &h, cancel.as_ref())?;
         validate_fusion_weights(q.weights)?;
         // Validate before storage access so bad RRF config leaves no access accounting.
-        let reranker = if use_reranker {
+        let reranker = if mode.rerank {
             let snapshot = self.reranker.read().unwrap().clone();
             if let Some((_, strategy)) = &snapshot {
                 validate_rerank_strategy(*strategy)?;
@@ -2918,23 +5252,47 @@ impl MemoryEngine {
                 let text = q.text.as_deref().ok_or_else(|| {
                     MemError::Invalid("recall requires either text or embedding".into())
                 })?;
-                embed_query_one(&*h.embedder, text)?
+                check_cancel(cancel.as_ref())?;
+                let qvec = embed_query_one(&*h.embedder, text);
+                check_cancel(cancel.as_ref())?;
+                qvec?
             }
         };
         validate_embedding(&key, h.dim, &qvec, "query")?;
 
         if h.atom_wrap.is_some() {
-            let cands = self.with_live_sealed_read(&key, &h, |conn, atom_wrap, _kl| {
-                self.recall_sealed_candidates(&h, &q, &qvec, conn, atom_wrap, _kl)
+            let cands = self.with_live_sealed_read(&key, &h, |conn, _atom_wrap, _kl| {
+                self.recall_sealed_candidates(
+                    &h,
+                    ResolvedRecall {
+                        query: &q,
+                        vector: &qvec,
+                    },
+                    conn,
+                    _kl,
+                    cancel.as_ref(),
+                )
             })?;
+            check_cancel(cancel.as_ref())?;
             let as_of = q.as_of_micros.unwrap_or_else(now_micros);
             // Rerankers may re-enter the engine; the lifecycle lock is non-reentrant.
             let mut hits = match (reranker.as_ref(), &q.text) {
                 (Some((r, strategy)), Some(text)) => {
-                    fuse_rerank(r.as_ref(), text, cands, q.weights, as_of, *strategy, q.k)?
+                    check_cancel(cancel.as_ref())?;
+                    let _callback = self.reserve_reranker_atoms(
+                        &key,
+                        &h,
+                        cands.iter().map(|candidate| candidate.id),
+                    )?;
+                    check_cancel(cancel.as_ref())?;
+                    let reranked =
+                        fuse_rerank(r.as_ref(), text, cands, q.weights, as_of, *strategy, q.k);
+                    check_cancel(cancel.as_ref())?;
+                    reranked?
                 }
                 _ => fuse_rank(cands, q.weights, as_of, q.k),
             };
+            check_cancel(cancel.as_ref())?;
             if let Some(ge) = &q.graph_expand {
                 let seeds: Vec<AtomId> = hits.iter().map(|hit| hit.id).collect();
                 let present: FxHashSet<AtomId> = seeds.iter().copied().collect();
@@ -2947,12 +5305,24 @@ impl MemoryEngine {
                             kind_allowlist: &q.kinds,
                             payload_filter: q.payload_filter.as_ref(),
                         };
-                        expand_graph_sealed(conn, atom_wrap, &wrapped, scope, &seeds, ge)
+                        expand_graph_sealed(
+                            conn,
+                            atom_wrap,
+                            &wrapped,
+                            scope,
+                            &seeds,
+                            ge,
+                            cancel.as_ref(),
+                        )
                     })?;
+                check_cancel(cancel.as_ref())?;
                 expanded.retain(|hit| !present.contains(&hit.id));
                 hits.extend(expanded);
             }
-            self.note_access(h.id, hits.iter().map(|a| a.id));
+            check_cancel(cancel.as_ref())?;
+            if mode.record_access {
+                self.note_access(h.id, hits.iter().map(|a| a.id), cancel.as_ref())?;
+            }
             return Ok(hits);
         }
 
@@ -3008,20 +5378,37 @@ impl MemoryEngine {
 
         let mut cands = self.with_live_plain_access(&key, &h, |conn| {
             let qr = conn.query_params(&sql, &params)?;
-            qr.rows
-                .iter()
-                .map(|r| parse_candidate(r))
-                .collect::<Result<Vec<_>>>()
+            let mut cands = Vec::with_capacity(qr.rows.len());
+            for row in &qr.rows {
+                #[cfg(test)]
+                debug_fire_cancel_after_local_work();
+                check_cancel(cancel.as_ref())?;
+                cands.push(parse_candidate(row)?);
+            }
+            Ok(cands)
         })?;
+        check_cancel(cancel.as_ref())?;
         let query_terms = query_keyword_terms(q.text.as_deref());
-        assign_bm25_ranks(&mut cands, &query_terms);
+        assign_bm25_ranks(&mut cands, &query_terms, cancel.as_ref())?;
+        check_cancel(cancel.as_ref())?;
         let as_of = q.as_of_micros.unwrap_or_else(now_micros);
         let mut hits = match (reranker.as_ref(), &q.text) {
             (Some((r, strategy)), Some(text)) => {
-                fuse_rerank(r.as_ref(), text, cands, q.weights, as_of, *strategy, q.k)?
+                check_cancel(cancel.as_ref())?;
+                let _callback = self.reserve_reranker_atoms(
+                    &key,
+                    &h,
+                    cands.iter().map(|candidate| candidate.id),
+                )?;
+                check_cancel(cancel.as_ref())?;
+                let reranked =
+                    fuse_rerank(r.as_ref(), text, cands, q.weights, as_of, *strategy, q.k);
+                check_cancel(cancel.as_ref())?;
+                reranked?
             }
             _ => fuse_rank(cands, q.weights, as_of, q.k),
         };
+        check_cancel(cancel.as_ref())?;
 
         if let Some(ge) = &q.graph_expand {
             let seeds: Vec<AtomId> = hits.iter().map(|h| h.id).collect();
@@ -3033,12 +5420,16 @@ impl MemoryEngine {
                     kind_allowlist: &q.kinds,
                     payload_filter: q.payload_filter.as_ref(),
                 };
-                expand_graph(conn, scope, &seeds, ge)
+                expand_graph(conn, scope, &seeds, ge, cancel.as_ref())
             })?;
+            check_cancel(cancel.as_ref())?;
             expanded.retain(|e| !present.contains(&e.id));
             hits.extend(expanded);
         }
-        self.note_access(h.id, hits.iter().map(|a| a.id));
+        check_cancel(cancel.as_ref())?;
+        if mode.record_access {
+            self.note_access(h.id, hits.iter().map(|a| a.id), cancel.as_ref())?;
+        }
         Ok(hits)
     }
 
@@ -3056,10 +5447,29 @@ impl MemoryEngine {
         weight: f32,
         evidence_ref: Option<serde_json::Value>,
     ) -> Result<()> {
+        let cancel = check_db_cancel(&self.db)?;
         validate_edge_weight(weight)?;
+        let edges_guard = self.db.memory_edges_lock();
         let conn = Connection::open(&self.db)?;
         with_write_txn(&conn, |c| {
-            link_edge(c, src, dst, kind, weight, evidence_ref.as_ref())
+            check_cancel(cancel.as_ref())?;
+            link_edge(
+                c,
+                src,
+                dst,
+                kind,
+                weight,
+                evidence_ref.as_ref(),
+                &edges_guard,
+            )?;
+            if kind == EdgeKind::SimilarTo {
+                c.execute_params(
+                    "DELETE FROM memory_similarity_edges WHERE src_id = $1 AND dst_id = $2",
+                    &[Value::Integer(src), Value::Integer(dst)],
+                )?;
+            }
+            check_cancel(cancel.as_ref())?;
+            Ok(())
         })
     }
 
@@ -3130,64 +5540,210 @@ impl MemoryEngine {
         Ok(())
     }
 
-    /// Replace the COMPLETE outgoing `kind` edge set of `src` in one write
-    /// transaction: src and every `(dst, weight, evidence)` must be live in
-    /// `region`, weights and duplicate destinations validate up front, the
-    /// set canonicalizes by ascending destination id, and an empty set
-    /// clears. Other kinds are untouched. Acyclic-kind cycle checks run
-    /// against the post-delete graph (removing edges can break cycles); a
-    /// violation rolls the whole replacement back.
-    ///
-    /// Crate-private until `(src, kind)`-set ownership is a public contract.
-    /// Cached-graph consumers must serialize mutation under a controller
-    /// lock and reset [`DiffusionCache`](crate::DiffusionCache)/route memos
-    /// after a successful replacement.
-    // Runtime consumer arrives with the AgenticMemory controller slice.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn replace_outgoing_edges(
+    /// Replace only engine-managed similarity edges; authored `SimilarTo`
+    /// assertions remain untouched even when they share the same source.
+    fn replace_managed_similarity_edges_locked(
         &self,
-        region: &str,
+        key: &str,
+        h: &RegionHandle,
         src: AtomId,
-        kind: EdgeKind,
-        edges: &[(AtomId, f32, Option<serde_json::Value>)],
-    ) -> Result<()> {
-        let key = region.to_ascii_lowercase();
-        let h = self.region_handle(&key)?;
-        let mut canonical: Vec<&(AtomId, f32, Option<serde_json::Value>)> = edges.iter().collect();
-        canonical.sort_by_key(|e| e.0);
-        for e in &canonical {
+        edges: &[ManagedSimilarityEdge],
+        cancel: Option<&citadel_core::CancelToken>,
+        guards: (&KeyLifecycleGuard<'_>, &MemoryEdgesGuard<'_>),
+    ) -> Result<WeaveRebuild> {
+        let conn = Connection::open(&self.db)?;
+        with_write_txn(&conn, |c| {
+            self.replace_managed_similarity_edges_in_txn(
+                c, key, h, src, edges, cancel, true, false, guards.1,
+            )
+        })
+        .inspect_err(|e| self.defer_stale_region(key, h.id, e, guards.0))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replace_managed_similarity_edges_in_txn(
+        &self,
+        c: &Connection<'_>,
+        key: &str,
+        h: &RegionHandle,
+        src: AtomId,
+        edges: &[ManagedSimilarityEdge],
+        cancel: Option<&citadel_core::CancelToken>,
+        allow_repair: bool,
+        replace_all_similarity: bool,
+        edges_guard: &MemoryEdgesGuard<'_>,
+    ) -> Result<WeaveRebuild> {
+        let mut canonical = BTreeMap::new();
+        for e in edges {
+            check_cancel(cancel)?;
             validate_edge_weight(e.1)?;
             if e.0 == src {
                 return Err(MemError::Cycle { src, dst: e.0 });
             }
+            if canonical.insert(e.0, e).is_some() {
+                return Err(MemError::Invalid(format!(
+                    "duplicate destination atom {}",
+                    e.0
+                )));
+            }
         }
-        if let Some(pair) = canonical.windows(2).find(|w| w[0].0 == w[1].0) {
-            return Err(MemError::Invalid(format!(
-                "duplicate destination atom {}",
-                pair[0].0
-            )));
-        }
-        let mut live_ids: Vec<AtomId> = canonical.iter().map(|e| e.0).collect();
+        let mut live_ids: Vec<AtomId> = canonical.keys().copied().collect();
         live_ids.push(src);
         let live_ids = dedup_sources(&live_ids);
-
-        let conn = Connection::open(&self.db)?;
-        // Serialize the liveness predicate with drop_region's key-first
-        // erase span, as every encrypted region-bound write does.
-        let _kl = h.atom_wrap.is_some().then(|| self.db.key_lifecycle_lock());
-        with_write_txn(&conn, |c| {
-            self.verify_region_live(c, &h, &key)?;
-            self.verify_atoms_live(c, &h, &key, &live_ids)?;
+        check_cancel(cancel)?;
+        if allow_repair {
+            self.verify_region_live_for_repair(c, h, key)?;
+        } else {
+            self.verify_region_live(c, h, key)?;
+        }
+        self.verify_atoms_live(c, h, key, &live_ids)?;
+        let old = if replace_all_similarity {
+            c.query_params(
+                "SELECT dst_id FROM memory_edges WHERE src_id = $1 AND kind = 'similar_to'",
+                &[Value::Integer(src)],
+            )?
+        } else {
+            c.query_params(
+                "SELECT dst_id FROM memory_similarity_edges WHERE src_id = $1",
+                &[Value::Integer(src)],
+            )?
+        };
+        let old: FxHashSet<AtomId> = old
+            .rows
+            .iter()
+            .map(|row| {
+                check_cancel(cancel)?;
+                as_int(&row[0])
+            })
+            .collect::<Result<_>>()?;
+        let cleared = old
+            .iter()
+            .filter(|dst| !canonical.contains_key(dst))
+            .count() as u64;
+        if replace_all_similarity {
             c.execute_params(
-                "DELETE FROM memory_edges WHERE src_id = $1 AND kind = $2",
-                &[Value::Integer(src), Value::Text(kind.as_str().into())],
+                "DELETE FROM memory_edges WHERE src_id = $1 AND kind = 'similar_to'",
+                &[Value::Integer(src)],
             )?;
-            for e in &canonical {
-                link_edge(c, src, e.0, kind, e.1, e.2.as_ref())?;
+        } else {
+            c.execute_params(
+                "DELETE FROM memory_edges WHERE src_id = $1 AND kind = 'similar_to' \
+                 AND dst_id IN (SELECT dst_id FROM memory_similarity_edges WHERE src_id = $1)",
+                &[Value::Integer(src)],
+            )?;
+        }
+        c.execute_params(
+            "DELETE FROM memory_similarity_edges WHERE src_id = $1",
+            &[Value::Integer(src)],
+        )?;
+        let mut written = 0u64;
+        for e in canonical.values() {
+            check_cancel(cancel)?;
+            let existing = c.query_params(
+                "SELECT 1 FROM memory_edges WHERE src_id = $1 AND dst_id = $2 \
+                 AND kind = 'similar_to' LIMIT 1",
+                &[Value::Integer(src), Value::Integer(e.0)],
+            )?;
+            if !existing.rows.is_empty() {
+                continue;
             }
-            Ok(())
+            link_edge(
+                c,
+                src,
+                e.0,
+                EdgeKind::SimilarTo,
+                e.1,
+                e.2.as_ref(),
+                edges_guard,
+            )?;
+            c.execute_params(
+                "INSERT INTO memory_similarity_edges (src_id, dst_id) VALUES ($1, $2)",
+                &[Value::Integer(src), Value::Integer(e.0)],
+            )?;
+            written += 1;
+        }
+        check_cancel(cancel)?;
+        Ok(WeaveRebuild {
+            rewoven: written,
+            cleared,
         })
-        .inspect_err(|e| self.evict_stale_region(&key, h.id, e))
+    }
+
+    /// Read one atom's vector and scoring columns, sealed or plaintext.
+    ///
+    /// Takes the key lifecycle lock through the live-access wrappers, so a
+    /// caller already inside such a span must not call this.
+    fn read_atom_state(&self, key: &str, h: &RegionHandle, atom_id: AtomId) -> Result<AtomState> {
+        if h.atom_wrap.is_some() {
+            self.with_live_sealed_read(key, h, |conn, _, _kl| {
+                self.read_atom_state_locked(conn, key, h, atom_id)
+            })
+        } else {
+            self.with_live_plain_access(key, h, |conn| {
+                self.read_atom_state_locked(conn, key, h, atom_id)
+            })
+        }
+    }
+
+    /// Read state while the caller already owns the lifecycle span and has
+    /// verified the region incarnation.
+    fn read_atom_state_locked(
+        &self,
+        conn: &Connection<'_>,
+        key: &str,
+        h: &RegionHandle,
+        atom_id: AtomId,
+    ) -> Result<AtomState> {
+        let missing = || MemError::Invalid(format!("atom {atom_id} not in region '{key}'"));
+        if let Some(atom_wrap) = h.atom_wrap.as_deref() {
+            let qr = conn.query_params(
+                &format!(
+                    "SELECT sealed, access_count, created_at, key_slot, key_gen FROM {} \
+                     WHERE id = $1 AND region_id = $2",
+                    h.table
+                ),
+                &[Value::Integer(atom_id), Value::Integer(h.id)],
+            )?;
+            let row = qr.rows.first().ok_or_else(missing)?;
+            let rec = self.db.atom_store_slot(as_int(&row[3])? as u32)?;
+            if rec.state != SlotState::Live
+                || rec.region_id != atom_id as u64
+                || rec.gen != as_int(&row[4])? as u64
+            {
+                return Err(missing());
+            }
+            return Ok(AtomState {
+                embedding: open_atom_embedding(
+                    atom_wrap,
+                    &rec.wrapped,
+                    atom_id,
+                    as_blob(&row[0])?,
+                )?,
+                access_count: as_int(&row[1])?.max(0),
+                created: as_ts(&row[2]),
+            });
+        }
+
+        let qr = conn.query_params(
+            &format!(
+                "SELECT embedding, access_count, created_at FROM {} \
+                 WHERE id = $1 AND region_id = $2",
+                h.table
+            ),
+            &[Value::Integer(atom_id), Value::Integer(h.id)],
+        )?;
+        let row = qr.rows.first().ok_or_else(missing)?;
+        let Value::Vector(v) = &row[0] else {
+            return Err(MemError::Invalid(format!(
+                "atom embedding not a vector: {:?}",
+                row[0]
+            )));
+        };
+        Ok(AtomState {
+            embedding: v.to_vec(),
+            access_count: as_int(&row[1])?.max(0),
+            created: as_ts(&row[2]),
+        })
     }
 
     /// Recompute `SimilarTo` neighbor edges and score via recall; encrypted
@@ -3199,71 +5755,94 @@ impl MemoryEngine {
         neighbors: usize,
         max_distance: f32,
     ) -> Result<EvolutionReport> {
+        self.evolve_with_kinds_mode(region, atom_id, neighbors, max_distance, Vec::new(), false)
+    }
+
+    /// Recompute one atom's similarity web after adopting every existing
+    /// outgoing `SimilarTo` edge as derived data.
+    ///
+    /// This is the explicit migration path for edges created before ownership
+    /// tracking was available. It also removes authored `SimilarTo` edges from
+    /// this source, so use [`evolve`](Self::evolve) unless the caller knows the
+    /// whole outgoing similarity web is engine-generated.
+    pub fn evolve_replacing_similarity(
+        &self,
+        region: &str,
+        atom_id: AtomId,
+        neighbors: usize,
+        max_distance: f32,
+    ) -> Result<EvolutionReport> {
+        self.evolve_with_kinds_mode(region, atom_id, neighbors, max_distance, Vec::new(), true)
+    }
+
+    pub(crate) fn evolve_with_kinds(
+        &self,
+        region: &str,
+        atom_id: AtomId,
+        neighbors: usize,
+        max_distance: f32,
+        kinds: Vec<String>,
+    ) -> Result<EvolutionReport> {
+        self.evolve_with_kinds_mode(region, atom_id, neighbors, max_distance, kinds, false)
+    }
+
+    pub(crate) fn evolve_with_kinds_replacing_similarity(
+        &self,
+        region: &str,
+        atom_id: AtomId,
+        neighbors: usize,
+        max_distance: f32,
+        kinds: Vec<String>,
+    ) -> Result<EvolutionReport> {
+        self.evolve_with_kinds_mode(region, atom_id, neighbors, max_distance, kinds, true)
+    }
+
+    fn evolve_with_kinds_mode(
+        &self,
+        region: &str,
+        atom_id: AtomId,
+        neighbors: usize,
+        max_distance: f32,
+        mut kinds: Vec<String>,
+        replace_all_similarity: bool,
+    ) -> Result<EvolutionReport> {
+        if !max_distance.is_finite() {
+            return Err(MemError::Invalid(
+                "similarity distance ceiling must be finite".into(),
+            ));
+        }
+        kinds.sort();
+        kinds.dedup();
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
+        let _provenance = self.reserve_region_provenance(&key, &h, cancel.as_ref())?;
         let table = h.table.clone();
 
-        let (embedding, access_count, created) = if h.atom_wrap.is_some() {
-            self.with_live_sealed_read(&key, &h, |conn, atom_wrap, _kl| {
-                let qr = conn.query_params(
-                    &format!(
-                        "SELECT sealed, access_count, created_at, key_slot, key_gen FROM {table} \
-                         WHERE id = $1 AND region_id = $2"
-                    ),
-                    &[Value::Integer(atom_id), Value::Integer(h.id)],
-                )?;
-                let row = qr.rows.first().ok_or_else(|| {
-                    MemError::Invalid(format!("atom {atom_id} not in region '{key}'"))
-                })?;
-                let rec = self.db.atom_store_slot(as_int(&row[3])? as u32)?;
-                if rec.state != SlotState::Live
-                    || rec.region_id != atom_id as u64
-                    || rec.gen != as_int(&row[4])? as u64
-                {
-                    return Err(MemError::Invalid(format!(
-                        "atom {atom_id} not in region '{key}'"
-                    )));
-                }
-                let emb = open_atom_embedding(atom_wrap, &rec.wrapped, atom_id, as_blob(&row[0])?)?;
-                Ok((emb, as_int(&row[1])?.max(0), as_ts(&row[2])))
-            })?
-        } else {
-            self.with_live_plain_access(&key, &h, |conn| {
-                let qr = conn.query_params(
-                    &format!(
-                        "SELECT embedding, access_count, created_at FROM {table} \
-                         WHERE id = $1 AND region_id = $2"
-                    ),
-                    &[Value::Integer(atom_id), Value::Integer(h.id)],
-                )?;
-                let row = qr.rows.first().ok_or_else(|| {
-                    MemError::Invalid(format!("atom {atom_id} not in region '{key}'"))
-                })?;
-                let embedding = match &row[0] {
-                    Value::Vector(v) => v.to_vec(),
-                    other => {
-                        return Err(MemError::Invalid(format!(
-                            "atom embedding not a vector: {other:?}"
-                        )))
-                    }
-                };
-                Ok((embedding, as_int(&row[1])?.max(0), as_ts(&row[2])))
-            })?
-        };
+        let state = self.read_atom_state(&key, &h, atom_id)?;
 
-        let mut found = self.recall(
-            &key,
-            RecallQuery::by_embedding(embedding, neighbors.saturating_add(1)),
-        )?;
+        let query = RecallQuery::by_embedding(state.embedding.clone(), neighbors.saturating_add(1))
+            .with_kinds(kinds.clone())
+            .with_weights(FusionWeights::semantic_only());
+        let mut found = self.recall_impl(&key, query, RecallMode::INTERNAL, cancel.as_ref())?;
         found.retain(|n| n.id != atom_id && n.distance <= max_distance);
+        found.truncate(neighbors);
+        let edges = found
+            .iter()
+            .map(|n| (n.id, 1.0 / (1.0 + n.distance.max(0.0)), None))
+            .collect::<Vec<_>>();
 
-        let age_days = (now_micros() - created).max(0) as f32 / 1e6 / 86_400.0;
+        let age_days = (now_micros() - state.created).max(0) as f32 / 1e6 / 86_400.0;
         let recency = (-std::f32::consts::LN_2 * age_days / 30.0).exp();
-        let new_score = recency * (1.0 + (access_count as f32).ln_1p());
+        let new_score = recency * (1.0 + (state.access_count as f32).ln_1p());
 
         // Serialize the RSK liveness check with drop_region's key-first erase span.
         let _kl = h.atom_wrap.is_some().then(|| self.db.key_lifecycle_lock());
+        let edges_guard = self.db.memory_edges_lock();
         let conn = Connection::open(&self.db)?;
+        #[cfg(test)]
+        debug_fire_cancel_after_local_work();
+        check_cancel(cancel.as_ref())?;
         if h.atom_wrap.is_some() {
             // Epoch + retire precede the commit: pre-evolve scores survive nowhere.
             self.db.bump_cache_epoch();
@@ -3273,12 +5852,37 @@ impl MemoryEngine {
                 _kl.as_ref().expect("sealed span holds the guard"),
             )?;
         }
-        with_write_txn(&conn, |c| {
-            self.verify_region_live(c, &h, &key)?;
-            for n in &found {
-                let weight = 1.0 / (1.0 + n.distance.max(0.0));
-                link_edge(c, atom_id, n.id, EdgeKind::SimilarTo, weight, None)?;
-            }
+        let replacement = with_write_txn(&conn, |c| {
+            let replacement = self.replace_managed_similarity_edges_in_txn(
+                c,
+                &key,
+                &h,
+                atom_id,
+                &edges,
+                cancel.as_ref(),
+                false,
+                replace_all_similarity,
+                &edges_guard,
+            )?;
+            let kinds_json = serde_json::to_string(&kinds).map_err(|e| {
+                MemError::Invalid(format!("similarity kind filter is not serializable: {e}"))
+            })?;
+            c.execute_params(
+                "INSERT INTO memory_similarity_policies \
+                 (region_id, src_id, neighbors, max_distance, kinds) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (src_id) DO UPDATE SET region_id = $1, neighbors = $3, \
+                 max_distance = $4, kinds = $5",
+                &[
+                    Value::Integer(h.id),
+                    Value::Integer(atom_id),
+                    Value::Integer(i64::try_from(neighbors).map_err(|_| {
+                        MemError::Invalid("similarity neighbor count is out of range".into())
+                    })?),
+                    Value::Real(max_distance as f64),
+                    Value::Text(kinds_json.into()),
+                ],
+            )?;
             c.execute_params(
                 &format!("UPDATE {table} SET score = $1 WHERE id = $2 AND region_id = $3"),
                 &[
@@ -3287,15 +5891,24 @@ impl MemoryEngine {
                     Value::Integer(h.id),
                 ],
             )?;
-            Ok(())
-        })
-        .inspect_err(|e| self.evict_stale_region(&key, h.id, e))?;
+            check_cancel(cancel.as_ref())?;
+            Ok(replacement)
+        });
+        let replacement = match replacement {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                drop(edges_guard);
+                drop(_kl);
+                self.evict_stale_region(&key, h.id, &error);
+                return Err(error);
+            }
+        };
         // The cached recall index holds the pre-evolve score; rebuild it on
         // next recall.
         *h.ann.write().unwrap() = None;
 
         Ok(EvolutionReport {
-            links_added: found.len(),
+            links_added: replacement.rewoven as usize,
             score: new_score,
         })
     }
@@ -3304,16 +5917,21 @@ impl MemoryEngine {
     /// except `PurgeRegion`. Evicted atoms are crypto-erased (key destroyed
     /// before the row); `PredicateMatch` decrypts each atom to test the
     /// payload, other policies use plaintext metadata columns.
+    ///
+    /// On encrypted regions, an error after key destruction does not mean the
+    /// content remains decryptable. Retry or reopen to finish residue cleanup.
     pub fn evict(&self, region: &str, policy: EvictionPolicy) -> Result<EvictionReport> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
         let table = h.table.clone();
 
         // Bind the whole eviction to one incarnation; a stale handle must not succeed.
         let _kl = self.db.key_lifecycle_lock();
+        let _edges_guard = self.db.memory_edges_lock();
         let conn = Connection::open(&self.db)?;
         if let Err(error) = self.verify_region_live(&conn, &h, &key) {
-            self.evict_stale_region(&key, h.id, &error);
+            self.defer_stale_region(&key, h.id, &error, &_kl);
             return Err(error);
         }
         // Snapshot this region's in-process access stats out of the lock;
@@ -3328,11 +5946,28 @@ impl MemoryEngine {
         let ids = match (&h.atom_wrap, &policy) {
             // Payload containment can't be pushed to SQL over sealed rows;
             // filter in Rust after decrypt.
-            (Some(atom_wrap), EvictionPolicy::PredicateMatch { predicate }) => {
-                self.evict_predicate_sealed_ids(&h, predicate, &conn, atom_wrap.as_ref())?
-            }
-            _ => evict_target_ids(&conn, &table, h.id, &policy, now_micros(), &accessed)?,
+            (Some(atom_wrap), EvictionPolicy::PredicateMatch { predicate }) => self
+                .evict_predicate_sealed_ids(
+                    &h,
+                    predicate,
+                    &conn,
+                    atom_wrap.as_ref(),
+                    cancel.as_ref(),
+                )?,
+            _ => evict_target_ids(
+                &conn,
+                &table,
+                h.id,
+                &policy,
+                now_micros(),
+                &accessed,
+                cancel.as_ref(),
+            )?,
         };
+        #[cfg(test)]
+        debug_fire_cancel_after_local_work();
+        // Last cancellation point before a sealed segment or atom key can be destroyed.
+        check_cancel(cancel.as_ref())?;
         if ids.is_empty() {
             return Ok(EvictionReport { removed: 0 });
         }
@@ -3342,6 +5977,8 @@ impl MemoryEngine {
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(", ");
+        // Formatting a large target set is still reversible local work.
+        check_cancel(cancel.as_ref())?;
 
         // Segment first, then keys, then rows; the full binding lets retries converge.
         if h.atom_wrap.is_some() {
@@ -3365,16 +6002,7 @@ impl MemoryEngine {
         }
 
         with_write_txn(&conn, |c| {
-            // Eviction targets come from region-scoped selectors, so the
-            // unqualified by-atom-id identity purge cannot cross regions.
-            c.execute(&format!(
-                "DELETE FROM memory_idempotency WHERE atom_id IN ({in_list})"
-            ))?;
-            c.execute(&format!(
-                "DELETE FROM memory_edges WHERE src_id IN ({in_list}) OR dst_id IN ({in_list})"
-            ))?;
-            c.execute(&format!("DELETE FROM {table} WHERE id IN ({in_list})"))?;
-            Ok(())
+            delete_atoms_in_txn(c, &h, &in_list, &_edges_guard).map(|_| ())
         })?;
         *h.ann.write().unwrap() = None;
         Ok(EvictionReport {
@@ -3412,9 +6040,11 @@ impl MemoryEngine {
         region_key: &str,
         h: &RegionHandle,
         ids: &[AtomId],
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<(u64, Vec<SlotErasure>)> {
         // Tombstone -> row-delete -> segment-retire is one lifecycle span.
         let _kl = self.db.key_lifecycle_lock();
+        let edges_guard = self.db.memory_edges_lock();
         let in_list = ids
             .iter()
             .map(|id| id.to_string())
@@ -3422,6 +6052,10 @@ impl MemoryEngine {
             .join(", ");
         let conn = Connection::open(&self.db)?;
         self.verify_region_live(&conn, h, region_key)?;
+        #[cfg(test)]
+        debug_fire_cancel_after_local_work();
+        // Last cancellation point before a sealed segment or atom key can be destroyed.
+        check_cancel(cancel)?;
 
         // Encrypted: segment, keys, then rows; plaintext's row delete is the whole op.
         let slots_erased = if h.atom_wrap.is_some() {
@@ -3438,7 +6072,8 @@ impl MemoryEngine {
             ));
         }
 
-        let rows_deleted = with_write_txn(&conn, |c| delete_atoms_in_txn(c, h, &in_list))?;
+        let rows_deleted =
+            with_write_txn(&conn, |c| delete_atoms_in_txn(c, h, &in_list, &edges_guard))?;
         *h.ann.write().unwrap() = None;
         Ok((rows_deleted, slots_erased))
     }
@@ -3447,15 +6082,21 @@ impl MemoryEngine {
     /// (overwrite/fsync/read-back) before its row, leaving it undecryptable on
     /// a crash. Privileged: ignores `immutable`;
     /// [`forget_atoms`](Self::forget_atoms) is the model-safe variant.
+    /// An interruption after key destruction may leave already-unrecoverable
+    /// row residue for an idempotent retry or open-time reconciliation.
     pub fn delete_atoms(&self, region: &str, ids: &[AtomId]) -> Result<EvictionReport> {
+        let cancel = check_db_cancel(&self.db)?;
         if ids.is_empty() {
+            #[cfg(test)]
+            debug_fire_cancel_after_local_work();
+            check_cancel(cancel.as_ref())?;
             return Ok(EvictionReport { removed: 0 });
         }
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
         // Honest count: nonexistent/deleted ids do not inflate `removed`.
         let (rows_deleted, _) = self
-            .erase_and_delete(&key, &h, ids)
+            .erase_and_delete(&key, &h, ids, cancel.as_ref())
             .inspect_err(|error| self.evict_stale_region(&key, h.id, error))?;
         Ok(EvictionReport {
             removed: rows_deleted,
@@ -3467,12 +6108,17 @@ impl MemoryEngine {
     /// region this is a logical delete (the receipt's `cryptographic_erasure`
     /// is false). Immutable atoms are skipped (reported in `immutable_skipped`)
     /// unless `force` is set.
+    ///
+    /// A returned error after encrypted key destruction cannot roll that
+    /// destruction back and therefore carries no receipt. Retry or reopen to
+    /// finish cleanup; do not interpret the error as proof the data survived.
     pub fn forget_atoms(
         &self,
         region: &str,
         ids: &[AtomId],
         force: bool,
     ) -> Result<ErasureReceipt> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
         let encrypted = h.atom_wrap.is_some();
@@ -3481,10 +6127,10 @@ impl MemoryEngine {
         let mut targets: Vec<AtomId> = ids.to_vec();
         {
             // Even an empty request must certify the incarnation, not a stale handle.
-            let _kl = self.db.key_lifecycle_lock();
+            let kl = self.db.key_lifecycle_lock();
             let conn = Connection::open(&self.db)?;
             if let Err(error) = self.verify_region_live(&conn, &h, &key) {
-                self.evict_stale_region(&key, h.id, &error);
+                self.defer_stale_region(&key, h.id, &error, &kl);
                 return Err(error);
             }
             if !force && !ids.is_empty() {
@@ -3503,7 +6149,10 @@ impl MemoryEngine {
                 let skip: FxHashSet<AtomId> = qr
                     .rows
                     .iter()
-                    .map(|r| as_int(&r[0]))
+                    .map(|r| {
+                        check_cancel(cancel.as_ref())?;
+                        as_int(&r[0])
+                    })
                     .collect::<Result<_>>()?;
                 if !skip.is_empty() {
                     targets.retain(|id| !skip.contains(id));
@@ -3513,10 +6162,16 @@ impl MemoryEngine {
             }
         }
 
+        #[cfg(test)]
+        debug_fire_cancel_after_local_work();
+        // This is the last cancellation point before encrypted key destruction.
+        // Once erasure starts, the existing fail-secure cleanup semantics apply.
+        check_cancel(cancel.as_ref())?;
+
         let (rows_deleted, slots_erased) = if targets.is_empty() {
             (0, Vec::new())
         } else {
-            self.erase_and_delete(&key, &h, &targets)
+            self.erase_and_delete(&key, &h, &targets, cancel.as_ref())
                 .inspect_err(|error| self.evict_stale_region(&key, h.id, error))?
         };
 
@@ -3539,12 +6194,17 @@ impl MemoryEngine {
     /// absent and the closure is region-scoped (regions are ownership
     /// boundaries) - both best-effort by design. Without `force`, any
     /// immutable atom in the closure refuses the whole cascade.
+    ///
+    /// The SQL deletion is transactional, but encrypted key destruction is
+    /// deliberately fail-secure and cannot be rolled back. Cancellation after
+    /// that boundary may leave key-dead rows for retry/open-time reconciliation.
     pub fn forget_atoms_with_dependents(
         &self,
         region: &str,
         ids: &[AtomId],
         force: bool,
     ) -> Result<ErasureReceipt> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
         let encrypted = h.atom_wrap.is_some();
@@ -3552,7 +6212,12 @@ impl MemoryEngine {
         // One lifecycle span; tombstoning inside the txn is single-writer
         // safe - a rollback leaves key-dead rows, healed by reconcile.
         let _kl = self.db.key_lifecycle_lock();
+        let edges_guard = self.db.memory_edges_lock();
         let conn = Connection::open(&self.db)?;
+        #[cfg(test)]
+        debug_fire_cancel_after_local_work();
+        // Last cancellation point before a sealed segment can be destroyed.
+        check_cancel(cancel.as_ref())?;
         if encrypted {
             // Before the txn: a crash cannot leave erased codes under a live segment key.
             self.retire_sealed_segment(&h, &conn, &_kl)?;
@@ -3566,6 +6231,7 @@ impl MemoryEngine {
         let (rows_deleted, slots_erased) = with_write_txn(&conn, |c| {
             self.verify_region_live(c, &h, &key)?;
             let roots = classify_cascade_roots(c, &h, &key, ids)?;
+            check_cancel(cancel.as_ref())?;
             if roots.is_empty() {
                 return Ok((0, Vec::new()));
             }
@@ -3583,15 +6249,17 @@ impl MemoryEngine {
                 .map(|id| id.to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
+            // Do not begin atom-key destruction after the captured operation token trips.
+            check_cancel(cancel.as_ref())?;
             let slots_erased = if encrypted {
                 self.erase_atom_keys(c, &h, &in_list, &_kl)?
             } else {
                 Vec::new()
             };
-            let rows_deleted = delete_atoms_in_txn(c, &h, &in_list)?;
+            let rows_deleted = delete_atoms_in_txn(c, &h, &in_list, &edges_guard)?;
             Ok((rows_deleted, slots_erased))
         })
-        .inspect_err(|e| self.evict_stale_region(&key, h.id, e))?;
+        .inspect_err(|e| self.defer_stale_region(&key, h.id, e, &_kl))?;
 
         *h.ann.write().unwrap() = None;
         Ok(build_erasure_receipt(
@@ -3611,8 +6279,9 @@ impl MemoryEngine {
     /// Re-authenticate atoms by id, one [`AtomAttestation`] per id in order.
     /// Reads sealed bytes fresh from disk (not the recall cache) and recomputes
     /// the id-bound HMAC, catching tampering or a blob replayed from another
-    /// row. Never aborts; every id gets a verdict.
+    /// row. Apart from cancellation, every requested id gets a verdict.
     pub fn verify_atoms(&self, region: &str, ids: &[AtomId]) -> Result<Vec<AtomAttestation>> {
+        let cancel = check_db_cancel(&self.db)?;
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -3626,26 +6295,29 @@ impl MemoryEngine {
             .join(", ");
 
         if h.atom_wrap.is_some() {
-            return self.with_live_sealed_read(&key, &h, |conn, atom_wrap, _kl| {
-                self.verify_atoms_sealed(&h, ids, &in_list, conn, atom_wrap)
-            });
+            let attestations = self.with_live_sealed_read(&key, &h, |conn, atom_wrap, _kl| {
+                self.verify_atoms_sealed(&h, ids, &in_list, conn, atom_wrap, cancel.as_ref())
+            })?;
+            check_cancel(cancel.as_ref())?;
+            return Ok(attestations);
         }
 
         // Plaintext region: no per-atom MAC. Present ids are
         // PlaintextUnattested, absent ids are Missing.
-        self.with_live_plain_access(&key, &h, |conn| {
+        let attestations = self.with_live_plain_access(&key, &h, |conn| {
             let qr = conn.query_params(
                 &format!("SELECT id FROM {table} WHERE region_id = $1 AND id IN ({in_list})"),
                 &[Value::Integer(h.id)],
             )?;
-            let present: FxHashSet<AtomId> = qr
-                .rows
-                .iter()
-                .map(|r| as_int(&r[0]))
-                .collect::<Result<_>>()?;
-            Ok(ids
-                .iter()
-                .map(|&id| AtomAttestation {
+            let mut present: FxHashSet<AtomId> = FxHashSet::default();
+            for row in &qr.rows {
+                check_cancel(cancel.as_ref())?;
+                present.insert(as_int(&row[0])?);
+            }
+            let mut out = Vec::with_capacity(ids.len());
+            for &id in ids {
+                check_cancel(cancel.as_ref())?;
+                out.push(AtomAttestation {
                     atom_id: id,
                     verdict: if present.contains(&id) {
                         AttestVerdict::PlaintextUnattested
@@ -3655,9 +6327,12 @@ impl MemoryEngine {
                     aad_bound: false,
                     key_slot: None,
                     key_gen: None,
-                })
-                .collect())
-        })
+                });
+            }
+            Ok(out)
+        })?;
+        check_cancel(cancel.as_ref())?;
+        Ok(attestations)
     }
 
     fn verify_atoms_sealed(
@@ -3667,6 +6342,7 @@ impl MemoryEngine {
         in_list: &str,
         conn: &Connection<'_>,
         atom_wrap: &AtomWrapKey,
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<Vec<AtomAttestation>> {
         // Encrypted region: read sealed + key binding fresh (off the recall
         // cache), then re-authenticate each off disk.
@@ -3680,6 +6356,7 @@ impl MemoryEngine {
         )?;
         let mut found: FxHashMap<AtomId, (u32, Vec<u8>, u64)> = FxHashMap::default();
         for row in &qr.rows {
+            check_cancel(cancel)?;
             let id = as_int(&row[0])?;
             let slot = as_int(&row[1])? as u32;
             let sealed = match &row[2] {
@@ -3692,6 +6369,7 @@ impl MemoryEngine {
 
         let mut out = Vec::with_capacity(ids.len());
         for &id in ids {
+            check_cancel(cancel)?;
             let Some((slot, sealed, row_gen)) = found.get(&id) else {
                 out.push(AtomAttestation {
                     atom_id: id,
@@ -3747,6 +6425,7 @@ impl MemoryEngine {
     /// Per-kind counts, time span, and avg score/confidence since
     /// `since_micros` (no LLM).
     pub fn summarize(&self, region: &str, since_micros: i64) -> Result<SummaryReport> {
+        let cancel = check_db_cancel(&self.db)?;
         let key = region.to_ascii_lowercase();
         let h = self.region_handle(&key)?;
         let read = |conn: &Connection<'_>| -> Result<SummaryReport> {
@@ -3767,6 +6446,9 @@ impl MemoryEngine {
             let mut kinds = Vec::with_capacity(qr.rows.len());
             let mut total = 0u64;
             for row in &qr.rows {
+                #[cfg(test)]
+                debug_fire_cancel_after_local_work();
+                check_cancel(cancel.as_ref())?;
                 let count = as_int(&row[1])?.max(0) as u64;
                 total += count;
                 kinds.push(KindDigest {
@@ -3780,35 +6462,54 @@ impl MemoryEngine {
             }
             Ok(SummaryReport { total, kinds })
         };
-        if h.atom_wrap.is_some() {
-            self.with_live_sealed_read(&key, &h, |conn, _, _kl| read(conn))
+        let report = if h.atom_wrap.is_some() {
+            self.with_live_sealed_read(&key, &h, |conn, _, _kl| read(conn))?
         } else {
-            self.with_live_plain_access(&key, &h, read)
-        }
+            self.with_live_plain_access(&key, &h, read)?
+        };
+        check_cancel(cancel.as_ref())?;
+        Ok(report)
     }
 
     /// Evict the stale entry only if it still holds the failed write's incarnation.
     fn evict_stale_region(&self, key: &str, id: RegionId, err: &MemError) {
-        if !matches!(err, MemError::RegionNotFound(_)) {
-            return;
+        drop(self.take_stale_region(key, id, err));
+    }
+
+    fn defer_stale_region(
+        &self,
+        key: &str,
+        id: RegionId,
+        err: &MemError,
+        lifecycle: &KeyLifecycleGuard<'_>,
+    ) {
+        if let Some(state) = self.take_stale_region(key, id, err) {
+            lifecycle.retire_memory(Box::new(state));
         }
-        self.remove_attached_incarnation(key, id);
     }
 
-    fn remove_attached_incarnation(&self, key: &str, id: RegionId) {
-        self.detach_attached_region(key, Some(id));
+    fn take_stale_region(
+        &self,
+        key: &str,
+        id: RegionId,
+        err: &MemError,
+    ) -> Option<RetiredRegionState> {
+        matches!(err, MemError::RegionNotFound(_))
+            .then(|| self.take_attached_region(key, Some(id)))
+            .flatten()
     }
 
-    /// Detach and scrub the shared ANN cache so stale handles cannot hold plaintext.
-    fn detach_attached_region(&self, key: &str, expected_id: Option<RegionId>) {
+    fn take_attached_region(
+        &self,
+        key: &str,
+        expected_id: Option<RegionId>,
+    ) -> Option<RetiredRegionState> {
         let detached = {
             let mut guard = self.regions.lock().unwrap();
             let matches = expected_id.is_none_or(|id| guard.get(key).is_some_and(|st| st.id == id));
             matches.then(|| guard.remove(key)).flatten()
         };
-        if let Some(state) = detached {
-            *state.ann.write().unwrap() = None;
-        }
+        detached.map(retire_region_state)
     }
 
     /// Revalidate inside the caller's txn; a row left by a partial erase is NOT live.
@@ -3818,9 +6519,30 @@ impl MemoryEngine {
         h: &RegionHandle,
         region_key: &str,
     ) -> Result<()> {
+        self.verify_region_live_inner(conn, h, region_key, false)
+    }
+
+    fn verify_region_live_for_repair(
+        &self,
+        conn: &Connection<'_>,
+        h: &RegionHandle,
+        region_key: &str,
+    ) -> Result<()> {
+        self.verify_region_live_inner(conn, h, region_key, true)
+    }
+
+    fn verify_region_live_inner(
+        &self,
+        conn: &Connection<'_>,
+        h: &RegionHandle,
+        region_key: &str,
+        allow_repair: bool,
+    ) -> Result<()> {
         let not_found = || MemError::RegionNotFound(region_key.into());
         let qr = conn.query_params(
-            "SELECT name, encrypted, rsk_slot, rsk_gen FROM memory_regions WHERE id = $1",
+            "SELECT name, encrypted, rsk_slot, rsk_gen, embedding_dim, embedding_metric, \
+             model_id, CAST(metadata AS TEXT) \
+             FROM memory_regions WHERE id = $1",
             &[Value::Integer(h.id)],
         )?;
         let Some(row) = qr.rows.first() else {
@@ -3829,6 +6551,50 @@ impl MemoryEngine {
         let encrypted = as_exact_bool(&row[1], "encrypted")?;
         if as_text(&row[0])? != region_key || encrypted != h.atom_wrap.is_some() {
             return Err(not_found());
+        }
+        // A re-embed rewrites the shape and the model without changing the
+        // region's id, so identity does not tell a current handle from one taken
+        // before the migration. Every operation captures its handle - and, for a
+        // write, computes its vector - BEFORE reaching this check, so a handle
+        // that crossed a completed migration would otherwise commit an old
+        // model's vector under the new model's provenance, or address the table
+        // the rows have already left. Neither reports anything wrong.
+        let row_dim = u16::try_from(as_int(&row[4])?)
+            .map_err(|_| MemError::Invalid("stored embedding_dim out of range".into()))?;
+        let row_metric = metric_from_str(as_text(&row[5])?)?;
+        let row_model = as_text(&row[6])?;
+        if row_dim != h.dim || row_metric != h.metric || row_model != &*h.model_id {
+            return Err(MemError::Invalid(format!(
+                "region '{region_key}' was re-embedded to '{row_model}' ({row_dim} dim) while \
+                 this handle was in use; re-attach it before reading or writing again"
+            )));
+        }
+        // Attaching is not the only way in. A handle taken before a re-embed
+        // began keeps working from cached state, so a migration that stopped
+        // part-way would go on serving recalls that rank across two vector
+        // spaces and accepting writes the migration has already walked past.
+        // The mark is checked per access, on the row itself, because that is
+        // the one thing every read and every write already consults.
+        //
+        let metadata = match row.get(7) {
+            Some(Value::Text(value)) => Some(value.as_str()),
+            Some(Value::Null) | None => None,
+            _ => {
+                return Err(MemError::Invalid(format!(
+                    "memory region {} has unreadable metadata",
+                    h.id
+                )))
+            }
+        };
+        if let Some(mark) = parse_reembed_mark(metadata, h.id)? {
+            validate_repair_mark(&mark, row_model, row_dim, row_metric, h.id)?;
+            if mark.phase != ReembedPhase::Repair || !allow_repair {
+                return Err(MemError::Invalid(format!(
+                    "region '{region_key}' stopped during re-embedding to '{}'; resume \
+                     reembed_region before using it",
+                    mark.to_model
+                )));
+            }
         }
         if !encrypted {
             return Ok(());
@@ -3860,7 +6626,7 @@ impl MemoryEngine {
             self.verify_region_live(&conn, h, region_key)?;
             read(&conn, atom_wrap, &kl)
         })();
-        result.inspect_err(|e| self.evict_stale_region(region_key, h.id, e))
+        result.inspect_err(|e| self.defer_stale_region(region_key, h.id, e, &kl))
     }
 
     /// Span stops a cross-engine drop/recreate interleave; callbacks must not re-enter.
@@ -3871,13 +6637,37 @@ impl MemoryEngine {
         access: impl FnOnce(&Connection<'_>) -> Result<T>,
     ) -> Result<T> {
         debug_assert!(h.atom_wrap.is_none());
-        let _kl = self.db.key_lifecycle_lock();
-        let result = (|| {
-            let conn = Connection::open(&self.db)?;
-            self.verify_region_live(&conn, h, region_key)?;
-            access(&conn)
-        })();
-        result.inspect_err(|e| self.evict_stale_region(region_key, h.id, e))
+        let kl = self.db.key_lifecycle_lock();
+        let conn = Connection::open(&self.db)?;
+        if let Err(error) = self.verify_region_live(&conn, h, region_key) {
+            self.defer_stale_region(region_key, h.id, &error, &kl);
+            return Err(error);
+        }
+        let _reservation = kl.reserve_memory_region(h.id as u64);
+        drop(kl);
+        access(&conn).inspect_err(|error| self.evict_stale_region(region_key, h.id, error))
+    }
+
+    /// Every atoms table this region's rows may be in.
+    ///
+    /// One, normally: the shape the region row names. A region part-way
+    /// through a shape-changing re-embed has rows in two, because converted
+    /// rows move to the destination table before the row describing the region
+    /// is updated.
+    fn region_atom_tables(&self, conn: &Connection<'_>, row: &RegionRow) -> Result<Vec<String>> {
+        let home = atoms_table(row.dim, row.metric, row.encrypted);
+        let mut tables = vec![home.clone()];
+        if let Some(mark) = self.read_reembed_mark(conn, row.id)? {
+            let destination = atoms_table(
+                mark.to_dim,
+                metric_from_str(&mark.to_metric)?,
+                row.encrypted,
+            );
+            if destination != home {
+                tables.push(destination);
+            }
+        }
+        Ok(tables)
     }
 
     fn region_handle(&self, key: &str) -> Result<RegionHandle> {
@@ -3888,9 +6678,10 @@ impl MemoryEngine {
         Ok(RegionHandle {
             id: st.id,
             table: atoms_table(st.dim, st.metric, st.atom_wrap.is_some()),
-            embedder: Arc::clone(&st.embedder),
+            embedder: st.embedder.clone(),
             dim: st.dim,
             metric: st.metric,
+            model_id: Arc::clone(&st.model_id),
             atom_wrap: st.atom_wrap.clone(),
             identity_mac: st.identity_mac.clone(),
             ann: Arc::clone(&st.ann),
@@ -3898,28 +6689,92 @@ impl MemoryEngine {
         })
     }
 
-    /// Check the id before the embedder: stale config must not veto a successor.
+    /// Keep a region's provenance stable from before vector computation through
+    /// the write that stores the result. The reservation is registered while
+    /// the lifecycle capability is held, so reclassify, re-embed and drop either
+    /// order before it or observe it and refuse.
+    fn reserve_region_provenance<'a>(
+        &'a self,
+        key: &str,
+        h: &RegionHandle,
+        cancel: Option<&citadel_core::CancelToken>,
+    ) -> Result<MemoryRegionGuard<'a>> {
+        check_cancel(cancel)?;
+        let key_lifecycle = self.db.key_lifecycle_lock();
+        let conn = Connection::open(&self.db)?;
+        if let Err(error) = self.verify_region_live(&conn, h, key) {
+            let retired = matches!(error, MemError::RegionNotFound(_))
+                .then(|| self.take_attached_region(key, Some(h.id)))
+                .flatten();
+            drop(key_lifecycle);
+            drop(retired);
+            return Err(error);
+        }
+        let reservation = key_lifecycle.reserve_memory_region(h.id as u64);
+        drop(key_lifecycle);
+        check_cancel(cancel)?;
+        Ok(reservation)
+    }
+
+    /// Keep sealed atom keys live while a user reranker holds their plaintext.
+    fn reserve_reranker_atoms<'a>(
+        &'a self,
+        key: &str,
+        h: &RegionHandle,
+        atom_ids: impl IntoIterator<Item = AtomId>,
+    ) -> Result<Option<MemoryAtomCallbackGuard<'a>>> {
+        if h.atom_wrap.is_none() {
+            return Ok(None);
+        }
+        let atom_ids = dedup_sources(&atom_ids.into_iter().collect::<Vec<_>>());
+        if atom_ids.is_empty() {
+            return Ok(None);
+        }
+        let callback_ids = atom_ids
+            .iter()
+            .map(|&atom_id| {
+                u64::try_from(atom_id).map_err(|_| {
+                    MemError::Invalid(format!("atom id {atom_id} cannot name an atom key"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let key_lifecycle = self.db.key_lifecycle_lock();
+        let conn = Connection::open(&self.db)?;
+        self.verify_region_live(&conn, h, key)?;
+        for chunk in atom_ids.chunks(REEMBED_BATCH) {
+            self.verify_atoms_live(&conn, h, key, chunk)?;
+        }
+        let reservation = key_lifecycle.reserve_memory_atom_callbacks(&callback_ids);
+        drop(key_lifecycle);
+        Ok(Some(reservation))
+    }
+
+    /// Evict cached state that no longer describes the durable region before
+    /// checking the requested embedder.
     fn check_attached_incarnation(
         &self,
         key: &str,
-        persisted_id: RegionId,
+        persisted: &RegionRow,
         dim: u16,
         metric: EmbeddingMetric,
         model_id: &str,
         encrypted: bool,
-    ) -> Result<Option<RegionId>> {
-        let stale = self
-            .regions
-            .lock()
-            .unwrap()
-            .get(key)
-            .is_some_and(|st| st.id != persisted_id);
+    ) -> Result<(Option<RegionId>, bool)> {
+        let stale = self.regions.lock().unwrap().get(key).is_some_and(|state| {
+            state.id != persisted.id
+                || state.dim != persisted.dim
+                || state.metric != persisted.metric
+                || state.model_id.as_ref() != persisted.model_id
+                || state.atom_wrap.is_some() != persisted.encrypted
+        });
         if stale {
-            // Evict first: failed successor validation must leave reads unattached.
-            self.detach_attached_region(key, None);
-            return Ok(None);
+            return Ok((None, true));
         }
-        self.check_attached(key, dim, metric, model_id, encrypted)
+        Ok((
+            self.check_attached(key, dim, metric, model_id, encrypted)?,
+            false,
+        ))
     }
 
     /// Return the id if `key` is attached and the embedder matches; error on
@@ -3950,10 +6805,10 @@ impl MemoryEngine {
                 got: metric_tag(metric).into(),
             });
         }
-        if st.embedder.model_id() != model_id {
+        if &*st.model_id != model_id {
             return Err(MemError::ModelMismatch {
                 region: key.into(),
-                expected: st.embedder.model_id().into(),
+                expected: st.model_id.to_string(),
                 got: model_id.into(),
             });
         }
@@ -3964,6 +6819,44 @@ impl MemoryEngine {
             )));
         }
         Ok(Some(st.id))
+    }
+
+    /// The in-flight re-embed recorded against a region, if any.
+    fn read_reembed_mark(
+        &self,
+        conn: &Connection<'_>,
+        region_id: i64,
+    ) -> Result<Option<ReembedMark>> {
+        let metadata = read_metadata(conn, region_id)?;
+        parse_reembed_mark(metadata.as_deref(), region_id)
+    }
+
+    /// Prove that no operation changed the migration while its external
+    /// embedder callback ran without the key-lifecycle capability.
+    fn verify_reembed_continuation(
+        &self,
+        conn: &Connection<'_>,
+        key: &str,
+        original: &RegionRow,
+        expected_checkpoint: &ReembedMark,
+    ) -> Result<()> {
+        let Some(current) = self.load_region_row(conn, key)? else {
+            return Err(MemError::RegionNotFound(key.to_owned()));
+        };
+        if current != *original {
+            return Err(MemError::Invalid(format!(
+                "region '{key}' changed while its re-embedder was running; retry reembed_region"
+            )));
+        }
+        if current.encrypted {
+            self.verify_region_key_live(key, &current)?;
+        }
+        if self.read_reembed_mark(conn, current.id)?.as_ref() != Some(expected_checkpoint) {
+            return Err(MemError::Invalid(format!(
+                "region '{key}' advanced while its re-embedder was running; retry reembed_region"
+            )));
+        }
+        Ok(())
     }
 
     fn load_region_row(&self, conn: &Connection<'_>, key: &str) -> Result<Option<RegionRow>> {
@@ -4028,6 +6921,7 @@ impl MemoryEngine {
         conn: &Connection<'_>,
         table: &str,
         region_id: RegionId,
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<i64> {
         let generation = self.db.manager().commit_generation();
         if let Some((tagged, snap)) = self.attach_max.lock().unwrap().get(table) {
@@ -4042,9 +6936,11 @@ impl MemoryEngine {
                 &[],
             )?;
             for row in &qr.rows {
+                check_cancel(cancel)?;
                 snap.insert(as_int(&row[0])?, as_int(&row[1])?);
             }
         }
+        check_cancel(cancel)?;
         let max = snap.get(&region_id).copied().unwrap_or(0);
         self.attach_max
             .lock()
@@ -4162,16 +7058,16 @@ impl MemoryEngine {
     fn recall_sealed_candidates(
         &self,
         h: &RegionHandle,
-        q: &RecallQuery,
-        qvec: &[f32],
+        resolved: ResolvedRecall<'_>,
         conn: &Connection<'_>,
-        atom_wrap: &AtomWrapKey,
         kl: &KeyLifecycleGuard<'_>,
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<Vec<Candidate>> {
+        let q = resolved.query;
         let mut cand_k = q.k.saturating_mul(CAND_OVERFETCH).max(MIN_CANDIDATES);
         loop {
             let (cands, spanned) =
-                self.sealed_window_candidates(h, q, qvec, conn, atom_wrap, kl, cand_k)?;
+                self.sealed_window_candidates(h, resolved, conn, kl, cand_k, cancel)?;
             // Short is ambiguous: survivors ran out, or the window did. The window
             // is the nearest `cand_k`, so widening only appends.
             if spanned || cands.len() >= q.k {
@@ -4183,27 +7079,35 @@ impl MemoryEngine {
 
     /// Decrypted candidates for one candidate window, and whether that window
     /// already spanned every atom the scan can reach.
-    #[allow(clippy::too_many_arguments)]
     fn sealed_window_candidates(
         &self,
         h: &RegionHandle,
-        q: &RecallQuery,
-        qvec: &[f32],
+        resolved: ResolvedRecall<'_>,
         conn: &Connection<'_>,
-        atom_wrap: &AtomWrapKey,
         kl: &KeyLifecycleGuard<'_>,
         cand_k: usize,
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<(Vec<Candidate>, bool)> {
+        let q = resolved.query;
+        let atom_wrap = h
+            .atom_wrap
+            .as_deref()
+            .expect("sealed_window_candidates on plaintext region");
         let table = &h.table;
-        let mut ranked = self.sealed_ann_candidates(h, conn, qvec, q, cand_k, kl)?;
+        let mut ranked = self.sealed_ann_candidates(h, conn, resolved, cand_k, kl, cancel)?;
         // Fewer ids than asked for means every atom was reached. Read before the
         // retains below, which shrink it for reasons that are not exhaustion.
         let spanned = ranked.len() < cand_k;
         if !q.include_superseded {
             // Drop stale versions before any cache read or decrypt.
-            let ids: Vec<AtomId> = ranked.iter().map(|&(id, _)| id).collect();
-            let stale = superseded_ids(conn, &ids)?;
+            let mut ids = Vec::with_capacity(ranked.len());
+            for &(id, _) in &ranked {
+                check_cancel(cancel)?;
+                ids.push(id);
+            }
+            let stale = superseded_ids(conn, &ids, cancel)?;
             ranked.retain(|(id, _)| !stale.contains(id));
+            check_cancel(cancel)?;
         }
         if ranked.is_empty() {
             return Ok((Vec::new(), spanned));
@@ -4222,6 +7126,7 @@ impl MemoryEngine {
             let guard = h.ann.read().unwrap();
             let cache = guard.as_ref().map(|sa| &sa.cached);
             for &(id, dist) in &ranked {
+                check_cancel(cancel)?;
                 match cache.and_then(|c| c.get(&id)) {
                     Some(ca) => {
                         if ca.expires_micros.is_some_and(|e| e <= ttl_now) {
@@ -4253,22 +7158,26 @@ impl MemoryEngine {
         // steady state, so the key store is read only when the index lags).
         if !misses.is_empty() {
             let wrapped = self.db.atom_store_live_wrapped()?;
-            let id_params: Vec<Value> = misses.iter().map(|(id, _)| Value::Integer(*id)).collect();
-            let placeholders = (1..=id_params.len())
-                .map(|i| format!("${i}"))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let mut id_params = Vec::with_capacity(misses.len() + 1);
+            let mut placeholders = Vec::with_capacity(misses.len());
+            let mut dist_by_id: FxHashMap<AtomId, f32> = FxHashMap::default();
+            for (index, &(id, distance)) in misses.iter().enumerate() {
+                check_cancel(cancel)?;
+                id_params.push(Value::Integer(id));
+                placeholders.push(format!("${}", index + 1));
+                dist_by_id.insert(id, distance);
+            }
+            let placeholders = placeholders.join(", ");
             let sql = format!(
                 "SELECT id, kind, sealed, score, created_at, immutable FROM {table} \
                  WHERE id IN ({placeholders}) \
                  AND (expires_at IS NULL OR expires_at > ${})",
                 id_params.len() + 1
             );
-            let mut id_params = id_params;
             id_params.push(Value::Timestamp(ttl_now));
-            let dist_by_id: FxHashMap<AtomId, f32> = misses.iter().copied().collect();
             let qr = conn.query_params(&sql, &id_params)?;
             for row in &qr.rows {
+                check_cancel(cancel)?;
                 let id = as_int(&row[0])?;
                 let Some(w) = wrapped.get(&(id as u64)) else {
                     continue;
@@ -4295,7 +7204,8 @@ impl MemoryEngine {
             }
         }
 
-        assign_bm25_ranks(&mut cands, &query_terms);
+        assign_bm25_ranks(&mut cands, &query_terms, cancel)?;
+        check_cancel(cancel)?;
         Ok((cands, spanned))
     }
 
@@ -4306,11 +7216,13 @@ impl MemoryEngine {
         &self,
         h: &RegionHandle,
         conn: &Connection<'_>,
-        qvec: &[f32],
-        q: &RecallQuery,
+        resolved: ResolvedRecall<'_>,
         cand_k: usize,
         kl: &KeyLifecycleGuard<'_>,
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<Vec<(AtomId, f32)>> {
+        let q = resolved.query;
+        let qvec = resolved.vector;
         let atom_wrap = h
             .atom_wrap
             .as_ref()
@@ -4326,85 +7238,99 @@ impl MemoryEngine {
             if let Some(sa) = guard.as_ref() {
                 if !sealed_index_stale(sa, max_id, epoch) {
                     return search_sealed_index(
-                        sa, qvec, q, cand_k, conn, atom_wrap, &self.db, h, max_id,
+                        sa, qvec, q, cand_k, conn, atom_wrap, &self.db, h, max_id, cancel,
                     );
                 }
             }
         }
 
-        // Slow path under the write lock (re-checked in case another writer
-        // won): load the segment if it verifies, else rebuild from a scan.
-        {
+        // Slow path under the write lock (re-checked in case another writer won).
+        // A refused persisted segment is retired only after releasing this lock,
+        // because key retirement invalidates ANN caches in every open engine.
+        let rebuild_refusal = {
             let mut guard = h.ann.write().unwrap();
             let need_full = guard
                 .as_ref()
                 .map(|sa| sealed_index_stale(sa, max_id, epoch))
                 .unwrap_or(true);
-            if need_full {
-                let load = self.try_load_sealed_segment(h, conn, epoch, kl)?;
-                if let Ok(loaded) = load {
-                    *guard = Some(loaded);
-                } else {
-                    let refusal = load.err().flatten();
-                    // Pre-scan stamp: a heal may have bumped the epoch past the entry stamp.
-                    let build_epoch = self.db.cache_epoch();
-                    let mut rows = decrypt_scan(conn, &self.db, atom_wrap, &h.table, h.id, None)?;
-                    if rows.is_empty() {
-                        *guard = None;
-                        return Ok(Vec::new());
+            if !need_full {
+                None
+            } else {
+                match self.try_load_sealed_segment(h, conn, epoch, cancel)? {
+                    Ok(loaded) => {
+                        *guard = Some(loaded);
+                        None
                     }
-                    let mut kind_codes: FxHashMap<String, u32> = FxHashMap::default();
-                    let mut cached: FxHashMap<AtomId, CachedAtom> = FxHashMap::default();
-                    let triples: Vec<(u64, Vec<f32>, Vec<u32>)> = rows
-                        .drain()
-                        .map(
-                            |(
-                                id,
-                                emb,
-                                kind,
-                                text,
-                                payload,
-                                importance,
-                                created_micros,
-                                immutable,
-                                expires_micros,
-                            )| {
-                                let next = kind_codes.len() as u32;
-                                let code = *kind_codes.entry(kind.clone()).or_insert(next);
-                                cached.insert(
-                                    id,
-                                    CachedAtom {
-                                        kind,
-                                        text,
-                                        payload,
-                                        importance,
-                                        created_micros,
-                                        immutable,
-                                        expires_micros,
-                                    },
-                                );
-                                (id as u64, emb, vec![code])
-                            },
-                        )
-                        .collect();
-                    let index = AnnIndex::build_with_attrs(triples, 1, ann_metric(h.metric), h.dim)
-                        .map_err(|e| MemError::Invalid(format!("sealed ANN index build: {e}")))?;
-                    *guard = Some(SealedAnn {
-                        index,
-                        kind_codes,
-                        cached,
-                        source: AnnIndexSource::Built { refusal },
-                        build_epoch,
-                    });
+                    Err(refusal) => {
+                        drop(guard);
+                        Some(refusal)
+                    }
                 }
             }
+        };
+        if let Some(refusal) = rebuild_refusal {
+            if refusal.is_some() {
+                self.retire_sealed_segment(h, conn, kl)?;
+            }
+            let mut guard = h.ann.write().unwrap();
+            // Pre-scan stamp: retirement may have bumped the epoch.
+            let build_epoch = self.db.cache_epoch();
+            let mut rows = decrypt_scan(conn, &self.db, atom_wrap, &h.table, h.id, None, cancel)?;
+            if rows.is_empty() {
+                *guard = None;
+                return Ok(Vec::new());
+            }
+            let mut kind_codes: FxHashMap<String, u32> = FxHashMap::default();
+            let mut cached: FxHashMap<AtomId, CachedAtom> = FxHashMap::default();
+            let mut triples: Vec<(u64, Vec<f32>, Vec<u32>)> = Vec::with_capacity(rows.0.len());
+            for (
+                id,
+                emb,
+                kind,
+                text,
+                payload,
+                importance,
+                created_micros,
+                immutable,
+                expires_micros,
+            ) in rows.drain()
+            {
+                check_cancel(cancel)?;
+                let next = kind_codes.len() as u32;
+                let code = *kind_codes.entry(kind.clone()).or_insert(next);
+                cached.insert(
+                    id,
+                    CachedAtom {
+                        kind,
+                        text,
+                        payload,
+                        importance,
+                        created_micros,
+                        immutable,
+                        expires_micros,
+                    },
+                );
+                triples.push((id as u64, emb, vec![code]));
+            }
+            let index = AnnIndex::build_with_attrs(triples, 1, ann_metric(h.metric), h.dim)
+                .map_err(|e| MemError::Invalid(format!("sealed ANN index build: {e}")))?;
+            check_cancel(cancel)?;
+            *guard = Some(SealedAnn {
+                index,
+                kind_codes,
+                cached,
+                source: AnnIndexSource::Built { refusal },
+                build_epoch,
+            });
         }
 
         let guard = h.ann.read().unwrap();
         let Some(sa) = guard.as_ref() else {
             return Ok(Vec::new());
         };
-        search_sealed_index(sa, qvec, q, cand_k, conn, atom_wrap, &self.db, h, max_id)
+        search_sealed_index(
+            sa, qvec, q, cand_k, conn, atom_wrap, &self.db, h, max_id, cancel,
+        )
     }
 
     fn fetch_sealed(
@@ -4413,6 +7339,7 @@ impl MemoryEngine {
         q: &FetchQuery,
         conn: &Connection<'_>,
         atom_wrap: &AtomWrapKey,
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<Vec<AtomHit>> {
         let wrapped = self.db.atom_store_live_wrapped()?;
 
@@ -4464,6 +7391,7 @@ impl MemoryEngine {
             q.after_id.unwrap_or(i64::MIN)
         };
         'pages: loop {
+            check_cancel(cancel)?;
             let mut page_params = params.clone();
             page_params.push(Value::Integer(last_id));
             let qr = conn.query_params(&sql, &page_params)?;
@@ -4472,6 +7400,7 @@ impl MemoryEngine {
             }
             let batch = qr.rows.len();
             for row in &qr.rows {
+                check_cancel(cancel)?;
                 let id = as_int(&row[0])?;
                 last_id = id;
                 let Some(w) = wrapped.get(&(id as u64)) else {
@@ -4561,6 +7490,7 @@ impl MemoryEngine {
         kind: &str,
         conn: &Connection<'_>,
         atom_wrap: &AtomWrapKey,
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<Option<AtomHit>> {
         // Skip erased/recycled residue so it cannot mask the genuine latest atom.
         let qr = conn.query_params(
@@ -4577,6 +7507,7 @@ impl MemoryEngine {
             ],
         )?;
         for row in &qr.rows {
+            check_cancel(cancel)?;
             let id = as_int(&row[0])?;
             let rec = self.db.atom_store_slot(as_int(&row[5])? as u32)?;
             if rec.state != SlotState::Live
@@ -4675,7 +7606,9 @@ impl MemoryEngine {
         predicate: &serde_json::Value,
         conn: &Connection<'_>,
         atom_wrap: &AtomWrapKey,
+        cancel: Option<&citadel_core::CancelToken>,
     ) -> Result<Vec<AtomId>> {
+        check_cancel(cancel)?;
         let wrapped = self.db.atom_store_live_wrapped()?;
         let sql = format!(
             "SELECT id, sealed FROM {table} WHERE region_id = $1 AND immutable = 0 \
@@ -4685,11 +7618,15 @@ impl MemoryEngine {
         let mut ids = Vec::new();
         let mut last_id: AtomId = i64::MIN;
         loop {
+            check_cancel(cancel)?;
             let qr = conn.query_params(&sql, &[Value::Integer(h.id), Value::Integer(last_id)])?;
             if qr.rows.is_empty() {
                 break;
             }
             for row in &qr.rows {
+                #[cfg(test)]
+                debug_fire_cancel_after_local_work();
+                check_cancel(cancel)?;
                 let id = as_int(&row[0])?;
                 last_id = id;
                 let Some(w) = wrapped.get(&(id as u64)) else {
@@ -4707,6 +7644,7 @@ impl MemoryEngine {
                 break;
             }
         }
+        check_cancel(cancel)?;
         Ok(ids)
     }
 }
@@ -4730,17 +7668,21 @@ fn search_sealed_index(
     db: &Database,
     h: &RegionHandle,
     max_id: i64,
+    cancel: Option<&citadel_core::CancelToken>,
 ) -> Result<Vec<(AtomId, f32)>> {
+    check_cancel(cancel)?;
     // A kind absent from the snapshot can still exist in the tail, so an empty
     // code set skips only the index search, not the tail scan below.
     let filter = if q.kinds.is_empty() {
         Some(Filter::none())
     } else {
-        let codes: Vec<u32> = q
-            .kinds
-            .iter()
-            .filter_map(|k| sa.kind_codes.get(k).copied())
-            .collect();
+        let mut codes = Vec::with_capacity(q.kinds.len());
+        for kind in &q.kinds {
+            check_cancel(cancel)?;
+            if let Some(code) = sa.kind_codes.get(kind).copied() {
+                codes.push(code);
+            }
+        }
         if codes.is_empty() {
             None
         } else {
@@ -4748,22 +7690,26 @@ fn search_sealed_index(
         }
     };
 
-    let mut ranked: Vec<(AtomId, f32)> = filter
+    let found = filter
         .map(|f| sa.index.search_filtered_default_ef(qvec, cand_k, &f))
         .transpose()
         .map_err(|e| MemError::Invalid(format!("sealed ANN search failed: {e}")))?
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(id, d)| (id as AtomId, d))
-        .collect();
+        .unwrap_or_default();
+    check_cancel(cancel)?;
+    let mut ranked = Vec::with_capacity(found.len());
+    for (id, distance) in found {
+        check_cancel(cancel)?;
+        ranked.push((id as AtomId, distance));
+    }
 
     // Exact-rank atoms inserted after the snapshot (the key store is read only
     // here, when the index is behind the latest writes).
     let snap = sa.index.snapshot_max as i64;
     if max_id > snap {
         let ttl_now = now_micros();
-        let mut tail = decrypt_scan(conn, db, atom_wrap, &h.table, h.id, Some(snap))?;
+        let mut tail = decrypt_scan(conn, db, atom_wrap, &h.table, h.id, Some(snap), cancel)?;
         for (id, mut emb, kind, mut text, mut payload, _, _, _, expires) in tail.drain() {
+            check_cancel(cancel)?;
             let included = (q.kinds.is_empty() || q.kinds.iter().any(|k| k == &kind))
                 && expires.is_none_or(|expires| expires > ttl_now);
             if included {
@@ -4775,7 +7721,9 @@ fn search_sealed_index(
         }
     }
 
+    check_cancel(cancel)?;
     ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    check_cancel(cancel)?;
     ranked.truncate(cand_k);
     Ok(ranked)
 }
@@ -4884,10 +7832,8 @@ fn parse_atom_blob(b: &[u8]) -> Result<AtomBlobParts<'_>> {
 
 fn decode_embedding(parts: &AtomBlobParts<'_>) -> Vec<f32> {
     let mut embedding = Vec::with_capacity(parts.dim);
-    for bytes in parts.embedding.chunks_exact(4) {
-        embedding.push(f32::from_le_bytes(
-            bytes.try_into().expect("validated four-byte chunk"),
-        ));
+    for bytes in parts.embedding.as_chunks::<4>().0 {
+        embedding.push(f32::from_le_bytes(*bytes));
     }
     embedding
 }
@@ -5161,6 +8107,7 @@ fn decrypt_scan(
     table: &str,
     region_id: RegionId,
     after: Option<i64>,
+    cancel: Option<&citadel_core::CancelToken>,
 ) -> Result<DecryptedAtoms> {
     if conn.table_schema(table).is_none() {
         return Ok(DecryptedAtoms(Vec::new()));
@@ -5179,6 +8126,7 @@ fn decrypt_scan(
     let qr = conn.query_params(&sql, &params)?;
     let mut out = DecryptedAtoms(Vec::with_capacity(qr.rows.len()));
     for row in &qr.rows {
+        check_cancel(cancel)?;
         let id = as_int(&row[0])?;
         let kind = as_text(&row[1])?.to_string();
         let Some(wrapped) = exact_live_atom_wrapped(db, id, &row[7], &row[8])? else {
@@ -5197,6 +8145,7 @@ fn decrypt_scan(
             opt_ts(&row[6]),
         ));
     }
+    check_cancel(cancel)?;
     Ok(out)
 }
 
@@ -5262,6 +8211,7 @@ fn sealed_fp_scan(
     conn: &Connection<'_>,
     db: &Database,
     h: &RegionHandle,
+    cancel: Option<&citadel_core::CancelToken>,
     live: &mut SealedRowFn<'_>,
 ) -> Result<([u8; 32], bool)> {
     let mut fp = blake3::Hasher::new();
@@ -5281,6 +8231,7 @@ fn sealed_fp_scan(
     )?;
     let mut completed = true;
     for row in &qr.rows {
+        check_cancel(cancel)?;
         let id = as_int(&row[0])?;
         let sealed = as_blob(&row[2])?;
         let wrapped = exact_live_atom_wrapped(db, id, &row[7], &row[8])?;
@@ -5307,6 +8258,7 @@ fn sealed_fp_scan(
             }
         }
     }
+    check_cancel(cancel)?;
     Ok((*fp.finalize().as_bytes(), completed))
 }
 
@@ -5315,12 +8267,33 @@ fn sealed_fp_scan(
 #[allow(clippy::type_complexity)]
 fn parse_sealed_segment(
     inner: &[u8],
-) -> Option<(
-    [u8; 32],
-    [u8; 32],
-    FxHashMap<String, u32>,
-    citadel_vector::segment::SegmentParts,
-)> {
+    cancel: Option<&citadel_core::CancelToken>,
+) -> std::result::Result<
+    Option<(
+        [u8; 32],
+        [u8; 32],
+        FxHashMap<String, u32>,
+        citadel_vector::segment::SegmentParts,
+    )>,
+    citadel_vector::segment::SegmentOperationError,
+> {
+    macro_rules! malformed {
+        ($value:expr) => {
+            match $value {
+                Some(value) => value,
+                None => return Ok(None),
+            }
+        };
+    }
+
+    let check_cancel = || {
+        if cancel.is_some_and(citadel_core::CancelToken::is_cancelled) {
+            Err(citadel_vector::segment::SegmentOperationError::Interrupted)
+        } else {
+            Ok(())
+        }
+    };
+    check_cancel()?;
     let mut at = 0usize;
     let take = |at: &mut usize, n: usize| -> Option<&[u8]> {
         let end = at.checked_add(n).filter(|&e| e <= inner.len())?;
@@ -5328,18 +8301,37 @@ fn parse_sealed_segment(
         *at = end;
         Some(s)
     };
-    let fp: [u8; 32] = take(&mut at, 32)?.try_into().ok()?;
-    let cfg: [u8; 32] = take(&mut at, 32)?.try_into().ok()?;
-    let count = u32::from_le_bytes(take(&mut at, 4)?.try_into().ok()?) as usize;
-    let mut kind_codes = FxHashMap::default();
-    for _ in 0..count {
-        let len = u32::from_le_bytes(take(&mut at, 4)?.try_into().ok()?) as usize;
-        let kind = String::from_utf8(take(&mut at, len)?.to_vec()).ok()?;
-        let code = u32::from_le_bytes(take(&mut at, 4)?.try_into().ok()?);
-        kind_codes.insert(kind, code);
+    let fp: [u8; 32] = malformed!(take(&mut at, 32).and_then(|bytes| bytes.try_into().ok()));
+    let cfg: [u8; 32] = malformed!(take(&mut at, 32).and_then(|bytes| bytes.try_into().ok()));
+    let count = u32::from_le_bytes(malformed!(
+        take(&mut at, 4).and_then(|bytes| bytes.try_into().ok())
+    )) as usize;
+    if count == 0 || count > inner.len().saturating_sub(at) / 8 {
+        return Ok(None);
     }
-    let parts = citadel_vector::segment::decode(&inner[at..]).ok()?;
-    Some((fp, cfg, kind_codes, parts))
+    let mut kind_codes = FxHashMap::default();
+    for expected_code in 0..count {
+        check_cancel()?;
+        let len = u32::from_le_bytes(malformed!(
+            take(&mut at, 4).and_then(|bytes| bytes.try_into().ok())
+        )) as usize;
+        let kind =
+            malformed!(take(&mut at, len).and_then(|bytes| String::from_utf8(bytes.to_vec()).ok()));
+        let code = u32::from_le_bytes(malformed!(
+            take(&mut at, 4).and_then(|bytes| bytes.try_into().ok())
+        ));
+        if code != expected_code as u32 || kind_codes.insert(kind, code).is_some() {
+            return Ok(None);
+        }
+    }
+    check_cancel()?;
+    #[cfg(test)]
+    debug_fire_cancel_after_local_work();
+    let parts = citadel_vector::segment::decode_with_cancel(&inner[at..], cancel)?;
+    if !parts.attributes_fit_domains_with_cancel(&[kind_codes.len()], cancel)? {
+        return Ok(None);
+    }
+    Ok(Some((fp, cfg, kind_codes, parts)))
 }
 
 fn annseg_meta_key(region_id: RegionId, field: &str) -> String {
@@ -5499,6 +8491,29 @@ fn seal_atom(
     (sealed, wrapped)
 }
 
+/// Reseal an atom's content under the key it already has.
+///
+/// [`seal_atom`] mints a fresh ACK, which would leave the atom's `key_slot` and
+/// `key_gen` pointing at the old one and require retiring it. Re-embedding
+/// changes only the vector inside the blob, so keeping the same key keeps the
+/// key store untouched: nothing to allocate, nothing to tombstone, and no
+/// window where an atom's row and its key disagree.
+fn reseal_atom(
+    atom_wrap: &AtomWrapKey,
+    wrapped: &[u8; WRAPPED_KEY_SIZE],
+    id: AtomId,
+    embedding: &[f32],
+    text: &str,
+    payload_json: &str,
+) -> Result<Vec<u8>> {
+    let mut ack = atom_wrap.unwrap_atom_key(wrapped)?;
+    let seal_keys = derive_seal_keys(&ack);
+    let blob = Zeroizing::new(encode_atom_blob(embedding, text, payload_json));
+    let sealed = blob_seal::seal(&seal_keys, id as u64, &blob);
+    ack.zeroize();
+    Ok(sealed)
+}
+
 /// Distance between two vectors, matching citadel-sql's `<->`/`<#>`/`<=>` so
 /// sealed decrypt-then-rank recall matches the plaintext index path.
 fn vec_distance(metric: EmbeddingMetric, a: &[f32], b: &[f32]) -> f32 {
@@ -5558,36 +8573,39 @@ fn query_keyword_terms(text: Option<&str>) -> Vec<String> {
 /// Set each candidate's `text_rank` to its Okapi BM25 score for `query_terms`,
 /// with the candidate pool as the corpus. IDF down-weights pool-common terms,
 /// so no stoplist or stemmer is needed.
-fn assign_bm25_ranks(cands: &mut [Candidate], query_terms: &[String]) {
+fn assign_bm25_ranks(
+    cands: &mut [Candidate],
+    query_terms: &[String],
+    cancel: Option<&citadel_core::CancelToken>,
+) -> Result<()> {
     if query_terms.is_empty() || cands.is_empty() {
-        return;
+        return Ok(());
     }
     const K1: f32 = 1.2;
     const B: f32 = 0.75;
     let n = cands.len() as f32;
     // Tokenize each candidate once: per-term frequency + document length.
-    let docs: Vec<(FxHashMap<String, u32>, f32)> = cands
-        .iter()
-        .map(|c| {
-            let mut tf: FxHashMap<String, u32> = FxHashMap::default();
-            let mut len = 0u32;
-            for tok in tokenize(&c.text) {
-                *tf.entry(tok).or_insert(0) += 1;
-                len += 1;
-            }
-            (tf, len as f32)
-        })
-        .collect();
+    let mut docs: Vec<(FxHashMap<String, u32>, f32)> = Vec::with_capacity(cands.len());
+    for candidate in cands.iter() {
+        check_cancel(cancel)?;
+        let mut tf: FxHashMap<String, u32> = FxHashMap::default();
+        let mut len = 0u32;
+        for tok in tokenize(&candidate.text) {
+            *tf.entry(tok).or_insert(0) += 1;
+            len += 1;
+        }
+        docs.push((tf, len as f32));
+    }
     let avgdl = (docs.iter().map(|(_, l)| *l).sum::<f32>() / n).max(1.0);
     // IDF per query term over the pool (Lucene's +1 form, never negative).
-    let idf: Vec<f32> = query_terms
-        .iter()
-        .map(|t| {
-            let df = docs.iter().filter(|(tf, _)| tf.contains_key(t)).count() as f32;
-            ((n - df + 0.5) / (df + 0.5) + 1.0).ln()
-        })
-        .collect();
+    let mut idf = Vec::with_capacity(query_terms.len());
+    for term in query_terms {
+        check_cancel(cancel)?;
+        let df = docs.iter().filter(|(tf, _)| tf.contains_key(term)).count() as f32;
+        idf.push(((n - df + 0.5) / (df + 0.5) + 1.0).ln());
+    }
     for (c, (tf, dl)) in cands.iter_mut().zip(&docs) {
+        check_cancel(cancel)?;
         let mut score = 0.0;
         for (t, &w) in query_terms.iter().zip(&idf) {
             let f = tf.get(t).copied().unwrap_or(0) as f32;
@@ -5597,6 +8615,8 @@ fn assign_bm25_ranks(cands: &mut [Candidate], query_terms: &[String]) {
         }
         c.text_rank = score;
     }
+    check_cancel(cancel)?;
+    Ok(())
 }
 
 /// JSONB `@>` containment: every member of `needle` is present in `haystack`.
@@ -5640,6 +8660,7 @@ fn opt_u64(v: &Value) -> Option<u64> {
     }
 }
 
+#[derive(PartialEq, Eq)]
 struct RegionRow {
     id: RegionId,
     dim: u16,
@@ -5721,6 +8742,41 @@ pub(crate) fn atoms_table(dim: u16, metric: EmbeddingMetric, encrypted: bool) ->
 /// Whether `name` is an encrypted atoms table produced by [`atoms_table`].
 fn is_encrypted_atoms_table(name: &str) -> bool {
     parse_encrypted_atoms_table(name).is_some()
+}
+
+/// The fixed tables the memory schema creates, beside the per-shape atoms tables.
+const OWNED_TABLES: [&str; 6] = [
+    "memory_meta",
+    "memory_regions",
+    "memory_edges",
+    "memory_similarity_policies",
+    "memory_similarity_edges",
+    "memory_idempotency",
+];
+
+/// Whether this crate creates and owns `name`.
+///
+/// For a caller listing a vault's tables to a person: these are storage behind the memory
+/// API, not tables anyone wrote, and presenting them as the latter offers sealed blobs to
+/// browse and an atoms table's vectors as if they were a column someone chose.
+///
+/// A user table that merely shares the prefix is never claimed - the atoms tables are
+/// PARSED, as [`parse_atoms_table`] does, not prefix-matched.
+pub fn owns_table(name: &str) -> bool {
+    OWNED_TABLES.contains(&name) || parse_atoms_table(name).is_some()
+}
+
+/// Canonical inverse of [`atoms_table`], either encryption.
+fn parse_atoms_table(name: &str) -> Option<(u16, EmbeddingMetric, bool)> {
+    let rest = name.strip_prefix("memory_atoms_d")?;
+    let (rest, encrypted) = match rest.strip_suffix("_enc") {
+        Some(rest) => (rest, true),
+        None => (rest, false),
+    };
+    let (dim, metric) = rest.split_once('_')?;
+    let dim: u16 = dim.parse().ok()?;
+    let metric = metric_from_str(metric).ok()?;
+    (atoms_table(dim, metric, encrypted) == name).then_some((dim, metric, encrypted))
 }
 
 /// Canonical inverse of [`atoms_table`]; a prefix-sharing user table is never claimed.
@@ -5902,6 +8958,14 @@ fn as_exact_bool(v: &Value, field: &str) -> Result<bool> {
     }
 }
 
+fn validate_model_id(model_id: &str) -> Result<()> {
+    if model_id.trim().is_empty() {
+        Err(MemError::Invalid("model id must not be empty".into()))
+    } else {
+        Ok(())
+    }
+}
+
 /// Embedded, validated, serialized column values for one atom insert.
 struct PreparedAtomRow {
     vec: Vec<f32>,
@@ -5911,11 +8975,21 @@ struct PreparedAtomRow {
     immutable: i64,
 }
 
-fn prepare_atom_row(h: &RegionHandle, key: &str, atom: &AtomInput) -> Result<PreparedAtomRow> {
+fn prepare_atom_row(
+    h: &RegionHandle,
+    key: &str,
+    atom: &AtomInput,
+    cancel: Option<&citadel_core::CancelToken>,
+) -> Result<PreparedAtomRow> {
     validate_atom_input(atom)?;
     let vec = match &atom.embedding {
         Some(supplied) => supplied.clone(),
-        None => embed_one(&*h.embedder, &atom.text)?,
+        None => {
+            check_cancel(cancel)?;
+            let vec = embed_one(&*h.embedder, &atom.text);
+            check_cancel(cancel)?;
+            vec?
+        }
     };
     validate_embedding(key, h.dim, &vec, "passage")?;
     let payload = serde_json::to_string(&atom.payload)
@@ -6077,9 +9151,18 @@ fn link_derived_sources(
     id: AtomId,
     src_ids: &[AtomId],
     evidence_ref: Option<&serde_json::Value>,
+    edges_guard: &MemoryEdgesGuard<'_>,
 ) -> Result<()> {
     for &src in src_ids {
-        link_edge(conn, id, src, EdgeKind::DerivedFrom, 1.0, evidence_ref)?;
+        link_edge(
+            conn,
+            id,
+            src,
+            EdgeKind::DerivedFrom,
+            1.0,
+            evidence_ref,
+            edges_guard,
+        )?;
     }
     Ok(())
 }
@@ -6115,12 +9198,32 @@ fn atom_key_slots(
         .collect()
 }
 
-fn delete_atoms_in_txn(conn: &Connection<'_>, h: &RegionHandle, in_list: &str) -> Result<u64> {
+fn delete_atoms_in_txn(
+    conn: &Connection<'_>,
+    h: &RegionHandle,
+    in_list: &str,
+    _edges_guard: &MemoryEdgesGuard<'_>,
+) -> Result<u64> {
     let table = &h.table;
     conn.execute_params(
         &format!(
             "DELETE FROM memory_idempotency WHERE atom_id IN \
              (SELECT id FROM {table} WHERE region_id = $1 AND id IN ({in_list}))"
+        ),
+        &[Value::Integer(h.id)],
+    )?;
+    conn.execute_params(
+        &format!(
+            "DELETE FROM memory_similarity_policies WHERE src_id IN \
+             (SELECT id FROM {table} WHERE region_id = $1 AND id IN ({in_list}))"
+        ),
+        &[Value::Integer(h.id)],
+    )?;
+    conn.execute_params(
+        &format!(
+            "DELETE FROM memory_similarity_edges WHERE \
+             src_id IN (SELECT id FROM {table} WHERE region_id = $1 AND id IN ({in_list})) \
+             OR dst_id IN (SELECT id FROM {table} WHERE region_id = $1 AND id IN ({in_list}))"
         ),
         &[Value::Integer(h.id)],
     )?;
@@ -6140,6 +9243,17 @@ fn delete_atoms_in_txn(conn: &Connection<'_>, h: &RegionHandle, in_list: &str) -
         ExecutionResult::RowsAffected(n) => n,
         _ => 0,
     })
+}
+
+fn delete_similarity_state_for_atom_list(conn: &Connection<'_>, in_list: &str) -> Result<()> {
+    conn.execute(&format!(
+        "DELETE FROM memory_similarity_policies WHERE src_id IN ({in_list})"
+    ))?;
+    conn.execute(&format!(
+        "DELETE FROM memory_similarity_edges WHERE src_id IN ({in_list}) \
+         OR dst_id IN ({in_list})"
+    ))?;
+    Ok(())
 }
 
 fn build_erasure_receipt(
@@ -6282,16 +9396,25 @@ fn immutable_members(
         ),
         &[Value::Integer(h.id)],
     )?;
-    qr.rows.iter().map(|r| as_int(&r[0])).collect()
+    qr.rows.iter().map(|row| as_int(&row[0])).collect()
 }
 
 /// Which of `ids` are the target of a `supersedes` edge (stale versions).
-fn superseded_ids(conn: &Connection<'_>, ids: &[AtomId]) -> Result<FxHashSet<AtomId>> {
+fn superseded_ids(
+    conn: &Connection<'_>,
+    ids: &[AtomId],
+    cancel: Option<&citadel_core::CancelToken>,
+) -> Result<FxHashSet<AtomId>> {
     if ids.is_empty() {
         return Ok(FxHashSet::default());
     }
-    let ph: Vec<String> = (1..=ids.len()).map(|i| format!("${i}")).collect();
-    let params: Vec<Value> = ids.iter().map(|&i| Value::Integer(i)).collect();
+    let mut ph = Vec::with_capacity(ids.len());
+    let mut params = Vec::with_capacity(ids.len());
+    for (index, &id) in ids.iter().enumerate() {
+        check_cancel(cancel)?;
+        ph.push(format!("${}", index + 1));
+        params.push(Value::Integer(id));
+    }
     let qr = conn.query_params(
         &format!(
             "SELECT DISTINCT dst_id FROM memory_edges \
@@ -6300,7 +9423,13 @@ fn superseded_ids(conn: &Connection<'_>, ids: &[AtomId]) -> Result<FxHashSet<Ato
         ),
         &params,
     )?;
-    qr.rows.iter().map(|r| as_int(&r[0])).collect()
+    let mut stale = FxHashSet::default();
+    for row in &qr.rows {
+        check_cancel(cancel)?;
+        stale.insert(as_int(&row[0])?);
+    }
+    check_cancel(cancel)?;
+    Ok(stale)
 }
 
 /// Upsert one edge (caller owns the txn); rejects self-loops (every kind) and
@@ -6312,6 +9441,7 @@ fn link_edge(
     kind: EdgeKind,
     weight: f32,
     evidence_ref: Option<&serde_json::Value>,
+    _edges_guard: &MemoryEdgesGuard<'_>,
 ) -> Result<()> {
     validate_edge_weight(weight)?;
     if src == dst {
@@ -6416,9 +9546,20 @@ fn validate_embedding(region: &str, expected_dim: u16, vector: &[f32], role: &st
     Ok(())
 }
 
-fn select_ids(conn: &Connection<'_>, sql: &str, params: &[Value]) -> Result<Vec<AtomId>> {
+fn select_ids(
+    conn: &Connection<'_>,
+    sql: &str,
+    params: &[Value],
+    cancel: Option<&citadel_core::CancelToken>,
+) -> Result<Vec<AtomId>> {
     let qr = conn.query_params(sql, params)?;
-    qr.rows.iter().map(|r| as_int(&r[0])).collect()
+    let mut ids = Vec::with_capacity(qr.rows.len());
+    for row in &qr.rows {
+        check_cancel(cancel)?;
+        ids.push(as_int(&row[0])?);
+    }
+    check_cancel(cancel)?;
+    Ok(ids)
 }
 
 fn evict_target_ids(
@@ -6428,6 +9569,7 @@ fn evict_target_ids(
     policy: &EvictionPolicy,
     now: i64,
     accessed: &FxHashMap<AtomId, (i64, u32)>,
+    cancel: Option<&citadel_core::CancelToken>,
 ) -> Result<Vec<AtomId>> {
     match policy {
         EvictionPolicy::Stale { older_than_micros } => {
@@ -6443,8 +9585,11 @@ fn evict_target_ids(
                     Value::Integer(region_id),
                     Value::Timestamp(now - older_than_micros),
                 ],
+                cancel,
             )?;
+            check_cancel(cancel)?;
             ids.retain(|id| !accessed.contains_key(id));
+            check_cancel(cancel)?;
             Ok(ids)
         }
         EvictionPolicy::LowScore {
@@ -6461,6 +9606,7 @@ fn evict_target_ids(
                 Value::Real(*score_threshold as f64),
                 Value::Real(*confidence_threshold as f64),
             ],
+            cancel,
         ),
         EvictionPolicy::Expired => select_ids(
             conn,
@@ -6469,11 +9615,13 @@ fn evict_target_ids(
                  AND expires_at IS NOT NULL AND expires_at <= $2"
             ),
             &[Value::Integer(region_id), Value::Timestamp(now)],
+            cancel,
         ),
         EvictionPolicy::PurgeRegion => select_ids(
             conn,
             &format!("SELECT id FROM {table} WHERE region_id = $1"),
             &[Value::Integer(region_id)],
+            cancel,
         ),
         EvictionPolicy::PredicateMatch { predicate } => {
             let js = serde_json::to_string(predicate)
@@ -6485,6 +9633,7 @@ fn evict_target_ids(
                      AND payload @> CAST($2 AS JSONB)"
                 ),
                 &[Value::Integer(region_id), Value::Text(js.into())],
+                cancel,
             )
         }
         EvictionPolicy::Lru { keep_fraction } => {
@@ -6499,6 +9648,7 @@ fn evict_target_ids(
                 .transpose()?
                 .unwrap_or(0)
                 .max(0);
+            check_cancel(cancel)?;
             let delete_n = ((total as f32) * (1.0 - keep_fraction.clamp(0.0, 1.0))).floor() as i64;
             if delete_n <= 0 {
                 return Ok(Vec::new());
@@ -6514,6 +9664,7 @@ fn evict_target_ids(
             )?;
             let mut rows: Vec<(i64, u32, AtomId)> = Vec::with_capacity(qr.rows.len());
             for r in &qr.rows {
+                check_cancel(cancel)?;
                 let id = as_int(&r[0])?;
                 let mut last = as_ts(&r[1]);
                 let mut count = as_int(&r[2])?.max(0) as u32;
@@ -6523,9 +9674,16 @@ fn evict_target_ids(
                 }
                 rows.push((last, count, id));
             }
+            check_cancel(cancel)?;
             rows.sort_unstable();
+            check_cancel(cancel)?;
             rows.truncate(delete_n as usize);
-            Ok(rows.into_iter().map(|(_, _, id)| id).collect())
+            let mut ids = Vec::with_capacity(rows.len());
+            for (_, _, id) in rows {
+                check_cancel(cancel)?;
+                ids.push(id);
+            }
+            Ok(ids)
         }
     }
 }
@@ -6558,14 +9716,21 @@ fn graph_walk_depths(
     conn: &Connection<'_>,
     seeds: &[AtomId],
     ge: &GraphExpand,
+    cancel: Option<&citadel_core::CancelToken>,
 ) -> Result<FxHashMap<AtomId, usize>> {
-    let mut params: Vec<Value> = seeds.iter().map(|&s| Value::Integer(s)).collect();
-    let seed_ph: Vec<String> = (1..=seeds.len()).map(|i| format!("${i}")).collect();
+    let mut params = Vec::with_capacity(seeds.len() + ge.kinds.len());
+    let mut seed_ph = Vec::with_capacity(seeds.len());
+    for (index, &seed) in seeds.iter().enumerate() {
+        check_cancel(cancel)?;
+        params.push(Value::Integer(seed));
+        seed_ph.push(format!("${}", index + 1));
+    }
     let kind_clause = if ge.kinds.is_empty() {
         String::new()
     } else {
         let mut ph = Vec::with_capacity(ge.kinds.len());
         for k in &ge.kinds {
+            check_cancel(cancel)?;
             params.push(Value::Text(k.as_str().into()));
             ph.push(format!("${}", params.len()));
         }
@@ -6588,6 +9753,7 @@ fn graph_walk_depths(
     let seed_set: FxHashSet<AtomId> = seeds.iter().copied().collect();
     let mut depth_of: FxHashMap<AtomId, usize> = FxHashMap::default();
     for row in &walked.rows {
+        check_cancel(cancel)?;
         let id = as_int(&row[0])?;
         if seed_set.contains(&id) {
             continue;
@@ -6596,14 +9762,25 @@ fn graph_walk_depths(
         let slot = depth_of.entry(id).or_insert(usize::MAX);
         *slot = (*slot).min(d);
     }
+    check_cancel(cancel)?;
     Ok(depth_of)
 }
 
 /// Order graph-reached `(depth, hit)` pairs nearest-first (ties by id),
 /// dropping depth.
-fn order_graph_hits(mut hits: Vec<(usize, AtomHit)>) -> Vec<AtomHit> {
+fn order_graph_hits(
+    mut hits: Vec<(usize, AtomHit)>,
+    cancel: Option<&citadel_core::CancelToken>,
+) -> Result<Vec<AtomHit>> {
+    check_cancel(cancel)?;
     hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.id.cmp(&b.1.id)));
-    hits.into_iter().map(|(_, h)| h).collect()
+    check_cancel(cancel)?;
+    let mut ordered = Vec::with_capacity(hits.len());
+    for (_, hit) in hits {
+        check_cancel(cancel)?;
+        ordered.push(hit);
+    }
+    Ok(ordered)
 }
 
 #[derive(Clone, Copy)]
@@ -6622,10 +9799,12 @@ struct GraphFetchScope<'a> {
 fn graph_fetch_params(
     scope: GraphFetchScope<'_>,
     depth_of: &FxHashMap<AtomId, usize>,
-) -> (Vec<Value>, String, String) {
+    cancel: Option<&citadel_core::CancelToken>,
+) -> Result<(Vec<Value>, String, String)> {
     let mut fparams: Vec<Value> = vec![Value::Integer(scope.region_id)];
     let mut fph = Vec::with_capacity(depth_of.len());
     for &id in depth_of.keys() {
+        check_cancel(cancel)?;
         fparams.push(Value::Integer(id));
         fph.push(format!("${}", fparams.len()));
     }
@@ -6634,12 +9813,14 @@ fn graph_fetch_params(
     } else {
         let mut ph = Vec::with_capacity(scope.kind_allowlist.len());
         for kind in scope.kind_allowlist {
+            check_cancel(cancel)?;
             fparams.push(Value::Text(kind.clone().into()));
             ph.push(format!("${}", fparams.len()));
         }
         format!(" AND kind IN ({})", ph.join(", "))
     };
-    (fparams, fph.join(", "), kind_clause)
+    check_cancel(cancel)?;
+    Ok((fparams, fph.join(", "), kind_clause))
 }
 
 /// Walk `memory_edges` from `seeds` up to `ge.depth` hops; reachable atoms,
@@ -6649,15 +9830,16 @@ fn expand_graph(
     scope: GraphFetchScope<'_>,
     seeds: &[AtomId],
     ge: &GraphExpand,
+    cancel: Option<&citadel_core::CancelToken>,
 ) -> Result<Vec<AtomHit>> {
     if seeds.is_empty() || ge.depth == 0 {
         return Ok(Vec::new());
     }
-    let depth_of = graph_walk_depths(conn, seeds, ge)?;
+    let depth_of = graph_walk_depths(conn, seeds, ge, cancel)?;
     if depth_of.is_empty() {
         return Ok(Vec::new());
     }
-    let (fparams, in_list, kind_clause) = graph_fetch_params(scope, &depth_of);
+    let (fparams, in_list, kind_clause) = graph_fetch_params(scope, &depth_of, cancel)?;
     let table = scope.table;
     let fetch_sql = format!(
         "SELECT id, kind, CAST(payload AS TEXT), text_content, immutable, created_at \
@@ -6667,6 +9849,7 @@ fn expand_graph(
 
     let mut hits: Vec<(usize, AtomHit)> = Vec::with_capacity(fetched.rows.len());
     for row in &fetched.rows {
+        check_cancel(cancel)?;
         let id = as_int(&row[0])?;
         let depth = *depth_of.get(&id).unwrap_or(&1);
         let payload = parse_payload(&row[2]);
@@ -6689,7 +9872,7 @@ fn expand_graph(
             },
         ));
     }
-    Ok(order_graph_hits(hits))
+    order_graph_hits(hits, cancel)
 }
 
 /// Graph expansion for an encrypted region: walk plaintext edges, then decrypt
@@ -6701,15 +9884,16 @@ fn expand_graph_sealed(
     scope: GraphFetchScope<'_>,
     seeds: &[AtomId],
     ge: &GraphExpand,
+    cancel: Option<&citadel_core::CancelToken>,
 ) -> Result<Vec<AtomHit>> {
     if seeds.is_empty() || ge.depth == 0 {
         return Ok(Vec::new());
     }
-    let depth_of = graph_walk_depths(conn, seeds, ge)?;
+    let depth_of = graph_walk_depths(conn, seeds, ge, cancel)?;
     if depth_of.is_empty() {
         return Ok(Vec::new());
     }
-    let (fparams, in_list, kind_clause) = graph_fetch_params(scope, &depth_of);
+    let (fparams, in_list, kind_clause) = graph_fetch_params(scope, &depth_of, cancel)?;
     let table = scope.table;
     let fetch_sql = format!(
         "SELECT id, kind, sealed, immutable, created_at FROM {table} \
@@ -6719,6 +9903,7 @@ fn expand_graph_sealed(
 
     let mut hits: Vec<(usize, AtomHit)> = Vec::with_capacity(fetched.rows.len());
     for row in &fetched.rows {
+        check_cancel(cancel)?;
         let id = as_int(&row[0])?;
         let depth = *depth_of.get(&id).unwrap_or(&1);
         let Some(w) = wrapped.get(&(id as u64)) else {
@@ -6745,7 +9930,7 @@ fn expand_graph_sealed(
             },
         ));
     }
-    Ok(order_graph_hits(hits))
+    order_graph_hits(hits, cancel)
 }
 
 fn embed_one(embedder: &dyn Embedder, text: &str) -> Result<Vec<f32>> {

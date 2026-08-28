@@ -148,6 +148,12 @@ pub enum Error {
         "write transaction cannot be committed because an earlier mutation failed; roll it back"
     )]
     TransactionFailed,
+
+    #[error("memory region {region_id} is in use by another operation")]
+    RegionInUse { region_id: u64 },
+
+    #[error("memory atom {atom_id} is in use by an external callback")]
+    AtomInUse { atom_id: u64 },
 }
 
 #[cfg(test)]

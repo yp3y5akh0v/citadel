@@ -30,7 +30,14 @@ pub enum MemError {
         expected: String,
         got: String,
     },
-    #[error("region '{region}' exists for model '{expected}', embedder is '{got}'")]
+    /// Names both repairs, because the caller knows which one applies and the
+    /// engine cannot: only they know whether the stored vectors came from the
+    /// model they are asking for, or from the one on record.
+    #[error(
+        "region '{region}' exists for model '{expected}', requested '{got}'; if its vectors \
+         really came from '{got}' and only the label is wrong, call reclassify_region, and if \
+         they came from '{expected}' and you want '{got}', call reembed_region"
+    )]
     ModelMismatch {
         region: String,
         expected: String,
