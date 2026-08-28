@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 pub const MAX_POSITION: u16 = 16_383;
 pub const MAX_POSITIONS_PER_LEXEME: u16 = 255;
+pub const MAX_LEXEME_BYTES: usize = u16::MAX as usize;
 
 pub const TSV_FLAG_POSITION_OVERFLOW: u8 = 0x01;
 
@@ -79,14 +80,15 @@ impl TsVectorBuilder {
         }
     }
 
-    pub fn push(&mut self, lexeme: &[u8], position: u16, weight: Weight) {
+    pub fn push(&mut self, lexeme: &[u8], position: u16, weight: Weight) -> Result<()> {
+        validate_lexeme_length(lexeme)?;
         if position == 0 || position > MAX_POSITION {
             self.overflowed = true;
-            return;
+            return Ok(());
         }
         let entry = self.by_lex.entry(lexeme.to_vec()).or_default();
         if entry.len() >= MAX_POSITIONS_PER_LEXEME as usize {
-            return;
+            return Ok(());
         }
         let packed = pack_position(position, weight);
         let key = (position, weight as u8);
@@ -99,14 +101,17 @@ impl TsVectorBuilder {
         if insert_at < entry.len() {
             let (ep, ew) = unpack_position(entry[insert_at]);
             if ep == position && ew == weight {
-                return;
+                return Ok(());
             }
         }
         entry.insert(insert_at, packed);
+        Ok(())
     }
 
-    pub fn push_no_position(&mut self, lexeme: &[u8]) {
+    pub fn push_no_position(&mut self, lexeme: &[u8]) -> Result<()> {
+        validate_lexeme_length(lexeme)?;
         self.by_lex.entry(lexeme.to_vec()).or_default();
+        Ok(())
     }
 
     pub fn build(self) -> Arc<[u8]> {
@@ -119,7 +124,8 @@ impl TsVectorBuilder {
         buf.push(flags);
         buf.extend_from_slice(&(self.by_lex.len() as u32).to_le_bytes());
         for (lex, positions) in self.by_lex {
-            buf.extend_from_slice(&(lex.len() as u16).to_le_bytes());
+            let lexeme_len = u16::try_from(lex.len()).expect("FTS lexeme exceeds 65,535 bytes");
+            buf.extend_from_slice(&lexeme_len.to_le_bytes());
             buf.extend_from_slice(&lex);
             buf.extend_from_slice(&(positions.len() as u16).to_le_bytes());
             for p in positions {
@@ -127,6 +133,38 @@ impl TsVectorBuilder {
             }
         }
         Arc::from(buf)
+    }
+
+    fn build_with_cancel(self, cancel: Option<&citadel::CancelToken>) -> Result<Arc<[u8]>> {
+        if cancel.is_none() {
+            return Ok(self.build());
+        }
+        check_cancel(cancel)?;
+        let mut buf = Vec::with_capacity(8 + self.by_lex.len() * 16);
+        let flags = if self.overflowed {
+            TSV_FLAG_POSITION_OVERFLOW
+        } else {
+            0
+        };
+        buf.push(flags);
+        buf.extend_from_slice(&(self.by_lex.len() as u32).to_le_bytes());
+        let mut work = 0usize;
+        for (lexeme, positions) in self.by_lex {
+            check_cancel_at(cancel, work)?;
+            work = work.wrapping_add(1);
+            validate_lexeme_length(&lexeme)?;
+            let lexeme_len = u16::try_from(lexeme.len()).expect("length validated above");
+            buf.extend_from_slice(&lexeme_len.to_le_bytes());
+            buf.extend_from_slice(&lexeme);
+            buf.extend_from_slice(&(positions.len() as u16).to_le_bytes());
+            for position in positions {
+                check_cancel_at(cancel, work)?;
+                work = work.wrapping_add(1);
+                buf.extend_from_slice(&position.to_le_bytes());
+            }
+        }
+        check_cancel(cancel)?;
+        Ok(Arc::from(buf))
     }
 }
 
@@ -235,6 +273,55 @@ pub fn tsvector_display(bytes: &[u8]) -> String {
     out
 }
 
+pub(crate) fn tsvector_display_with_cancel(
+    bytes: &[u8],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<String> {
+    if cancel.is_none() {
+        return Ok(tsvector_display(bytes));
+    }
+    check_cancel(cancel)?;
+    let (_flags, reader) = match TsVectorReader::open(bytes) {
+        Ok(value) => value,
+        Err(_) => return Ok("<invalid tsvector>".into()),
+    };
+    let mut out = String::new();
+    let mut first = true;
+    let mut work = 0usize;
+    for item in reader {
+        check_cancel_at(cancel, work)?;
+        work = work.wrapping_add(1);
+        let (lexeme, positions) = match item {
+            Ok(value) => value,
+            Err(_) => return Ok("<invalid tsvector>".into()),
+        };
+        if !first {
+            out.push(' ');
+        }
+        first = false;
+        out.push('\'');
+        out.push_str(&String::from_utf8_lossy(lexeme));
+        out.push('\'');
+        if !positions.is_empty() {
+            out.push(':');
+            for (index, packed) in positions.into_iter().enumerate() {
+                check_cancel_at(cancel, work)?;
+                work = work.wrapping_add(1);
+                if index > 0 {
+                    out.push(',');
+                }
+                let (position, weight) = unpack_position(packed);
+                out.push_str(&position.to_string());
+                if weight != Weight::D {
+                    out.push(weight.label());
+                }
+            }
+        }
+    }
+    check_cancel(cancel)?;
+    Ok(out)
+}
+
 /// Tsquery AST. Wire format (preorder):
 /// ```text
 /// [u8 tag]
@@ -269,63 +356,321 @@ pub const TSQ_TAG_PHRASE: u8 = 4;
 
 pub const TSQ_FLAG_PREFIX: u8 = 0x01;
 
+// Keep every recursive consumer below a depth that is safe on the smallest
+// supported thread stack. The node cap also bounds adversarial, broadly
+// branching inputs without restricting ordinary search expressions.
+const MAX_TSQUERY_DEPTH: usize = 256;
+const MAX_TSQUERY_NODES: usize = 4_096;
+
+fn lexeme_length_error(len: usize) -> SqlError {
+    SqlError::InvalidValue(format!(
+        "FTS lexeme is {len} bytes; the maximum is {MAX_LEXEME_BYTES}"
+    ))
+}
+
+fn validate_lexeme_length(lexeme: &[u8]) -> Result<()> {
+    if lexeme.len() > MAX_LEXEME_BYTES {
+        return Err(lexeme_length_error(lexeme.len()));
+    }
+    Ok(())
+}
+
+fn tsquery_complexity_error() -> SqlError {
+    SqlError::InvalidValue(format!(
+        "tsquery exceeds the complexity limit ({MAX_TSQUERY_NODES} nodes, depth {MAX_TSQUERY_DEPTH})"
+    ))
+}
+
+fn validate_tsquery(ast: &TsQueryAst) -> Result<()> {
+    let mut stack = vec![(ast, 1usize)];
+    let mut nodes = 0usize;
+    while let Some((node, depth)) = stack.pop() {
+        nodes += 1;
+        if nodes > MAX_TSQUERY_NODES || depth > MAX_TSQUERY_DEPTH {
+            return Err(tsquery_complexity_error());
+        }
+        match node {
+            TsQueryAst::Lexeme { lexeme, .. } => validate_lexeme_length(lexeme)?,
+            TsQueryAst::And(left, right)
+            | TsQueryAst::Or(left, right)
+            | TsQueryAst::Phrase { left, right, .. } => {
+                stack.push((right, depth + 1));
+                stack.push((left, depth + 1));
+            }
+            TsQueryAst::Not(child) => stack.push((child, depth + 1)),
+        }
+    }
+    Ok(())
+}
+
 impl TsQueryAst {
-    pub fn encode(&self) -> Arc<[u8]> {
+    pub fn encode(&self) -> Result<Arc<[u8]>> {
+        validate_tsquery(self)?;
         let mut buf = Vec::new();
         self.encode_into(&mut buf);
-        Arc::from(buf)
+        Ok(Arc::from(buf))
+    }
+
+    pub(crate) fn encode_with_cancel(
+        &self,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Arc<[u8]>> {
+        if cancel.is_none() {
+            return self.encode();
+        }
+        validate_tsquery(self)?;
+        let mut buf = Vec::new();
+        let mut work = 0;
+        self.encode_into_with_cancel(&mut buf, cancel, &mut work)?;
+        check_cancel(cancel)?;
+        Ok(Arc::from(buf))
     }
 
     fn encode_into(&self, buf: &mut Vec<u8>) {
-        match self {
-            TsQueryAst::Lexeme {
-                lexeme,
-                weight_mask,
-                prefix,
-            } => {
-                buf.push(TSQ_TAG_LEXEME);
-                buf.extend_from_slice(&(lexeme.len() as u16).to_le_bytes());
-                buf.extend_from_slice(lexeme);
-                buf.push(*weight_mask);
-                buf.push(if *prefix { TSQ_FLAG_PREFIX } else { 0 });
-            }
-            TsQueryAst::And(l, r) => {
-                buf.push(TSQ_TAG_AND);
-                l.encode_into(buf);
-                r.encode_into(buf);
-            }
-            TsQueryAst::Or(l, r) => {
-                buf.push(TSQ_TAG_OR);
-                l.encode_into(buf);
-                r.encode_into(buf);
-            }
-            TsQueryAst::Not(c) => {
-                buf.push(TSQ_TAG_NOT);
-                c.encode_into(buf);
-            }
-            TsQueryAst::Phrase {
-                distance,
-                left,
-                right,
-            } => {
-                buf.push(TSQ_TAG_PHRASE);
-                buf.extend_from_slice(&distance.to_le_bytes());
-                left.encode_into(buf);
-                right.encode_into(buf);
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            match node {
+                TsQueryAst::Lexeme {
+                    lexeme,
+                    weight_mask,
+                    prefix,
+                } => {
+                    buf.push(TSQ_TAG_LEXEME);
+                    let lexeme_len =
+                        u16::try_from(lexeme.len()).expect("FTS lexeme exceeds 65,535 bytes");
+                    buf.extend_from_slice(&lexeme_len.to_le_bytes());
+                    buf.extend_from_slice(lexeme);
+                    buf.push(*weight_mask);
+                    buf.push(if *prefix { TSQ_FLAG_PREFIX } else { 0 });
+                }
+                TsQueryAst::And(left, right) => {
+                    buf.push(TSQ_TAG_AND);
+                    stack.push(right);
+                    stack.push(left);
+                }
+                TsQueryAst::Or(left, right) => {
+                    buf.push(TSQ_TAG_OR);
+                    stack.push(right);
+                    stack.push(left);
+                }
+                TsQueryAst::Not(child) => {
+                    buf.push(TSQ_TAG_NOT);
+                    stack.push(child);
+                }
+                TsQueryAst::Phrase {
+                    distance,
+                    left,
+                    right,
+                } => {
+                    buf.push(TSQ_TAG_PHRASE);
+                    buf.extend_from_slice(&distance.to_le_bytes());
+                    stack.push(right);
+                    stack.push(left);
+                }
             }
         }
     }
 
+    fn encode_into_with_cancel(
+        &self,
+        buf: &mut Vec<u8>,
+        cancel: Option<&citadel::CancelToken>,
+        work: &mut usize,
+    ) -> Result<()> {
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            check_cancel_at(cancel, *work)?;
+            *work = work.wrapping_add(1);
+            if *work > MAX_TSQUERY_NODES {
+                return Err(tsquery_complexity_error());
+            }
+            match node {
+                TsQueryAst::Lexeme {
+                    lexeme,
+                    weight_mask,
+                    prefix,
+                } => {
+                    buf.push(TSQ_TAG_LEXEME);
+                    validate_lexeme_length(lexeme)?;
+                    let lexeme_len = u16::try_from(lexeme.len()).expect("length validated above");
+                    buf.extend_from_slice(&lexeme_len.to_le_bytes());
+                    buf.extend_from_slice(lexeme);
+                    buf.push(*weight_mask);
+                    buf.push(if *prefix { TSQ_FLAG_PREFIX } else { 0 });
+                }
+                TsQueryAst::And(left, right) => {
+                    buf.push(TSQ_TAG_AND);
+                    stack.push(right);
+                    stack.push(left);
+                }
+                TsQueryAst::Or(left, right) => {
+                    buf.push(TSQ_TAG_OR);
+                    stack.push(right);
+                    stack.push(left);
+                }
+                TsQueryAst::Not(child) => {
+                    buf.push(TSQ_TAG_NOT);
+                    stack.push(child);
+                }
+                TsQueryAst::Phrase {
+                    distance,
+                    left,
+                    right,
+                } => {
+                    buf.push(TSQ_TAG_PHRASE);
+                    buf.extend_from_slice(&distance.to_le_bytes());
+                    stack.push(right);
+                    stack.push(left);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut cursor = 0;
-        let ast = Self::decode_at(bytes, &mut cursor)?;
+        let mut nodes = 0usize;
+        let ast = Self::decode_at(bytes, &mut cursor, 1, &mut nodes)?;
         if cursor != bytes.len() {
             return Err(SqlError::InvalidValue("trailing tsquery bytes".into()));
         }
         Ok(ast)
     }
 
-    fn decode_at(bytes: &[u8], cursor: &mut usize) -> Result<Self> {
+    pub(crate) fn decode_with_cancel(
+        bytes: &[u8],
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Self> {
+        if cancel.is_none() {
+            return Self::decode(bytes);
+        }
+        let mut cursor = 0;
+        let mut work = 0;
+        let ast = Self::decode_at_with_cancel(bytes, &mut cursor, cancel, 1, &mut work)?;
+        if cursor != bytes.len() {
+            return Err(SqlError::InvalidValue("trailing tsquery bytes".into()));
+        }
+        check_cancel(cancel)?;
+        Ok(ast)
+    }
+
+    fn decode_at_with_cancel(
+        bytes: &[u8],
+        cursor: &mut usize,
+        cancel: Option<&citadel::CancelToken>,
+        depth: usize,
+        work: &mut usize,
+    ) -> Result<Self> {
+        if depth > MAX_TSQUERY_DEPTH || *work >= MAX_TSQUERY_NODES {
+            return Err(tsquery_complexity_error());
+        }
+        check_cancel_at(cancel, *work)?;
+        *work += 1;
+        if *cursor >= bytes.len() {
+            return Err(SqlError::InvalidValue("truncated tsquery".into()));
+        }
+        let tag = bytes[*cursor];
+        *cursor += 1;
+        match tag {
+            TSQ_TAG_LEXEME => {
+                if *cursor + 2 > bytes.len() {
+                    return Err(SqlError::InvalidValue("truncated tsquery lex".into()));
+                }
+                let len = u16::from_le_bytes([bytes[*cursor], bytes[*cursor + 1]]) as usize;
+                *cursor += 2;
+                if *cursor + len + 2 > bytes.len() {
+                    return Err(SqlError::InvalidValue("truncated tsquery lex body".into()));
+                }
+                let lexeme = bytes[*cursor..*cursor + len].to_vec();
+                *cursor += len;
+                let weight_mask = bytes[*cursor];
+                let flags = bytes[*cursor + 1];
+                *cursor += 2;
+                Ok(TsQueryAst::Lexeme {
+                    lexeme,
+                    weight_mask,
+                    prefix: flags & TSQ_FLAG_PREFIX != 0,
+                })
+            }
+            TSQ_TAG_AND => Ok(TsQueryAst::And(
+                Box::new(Self::decode_at_with_cancel(
+                    bytes,
+                    cursor,
+                    cancel,
+                    depth + 1,
+                    work,
+                )?),
+                Box::new(Self::decode_at_with_cancel(
+                    bytes,
+                    cursor,
+                    cancel,
+                    depth + 1,
+                    work,
+                )?),
+            )),
+            TSQ_TAG_OR => Ok(TsQueryAst::Or(
+                Box::new(Self::decode_at_with_cancel(
+                    bytes,
+                    cursor,
+                    cancel,
+                    depth + 1,
+                    work,
+                )?),
+                Box::new(Self::decode_at_with_cancel(
+                    bytes,
+                    cursor,
+                    cancel,
+                    depth + 1,
+                    work,
+                )?),
+            )),
+            TSQ_TAG_NOT => Ok(TsQueryAst::Not(Box::new(Self::decode_at_with_cancel(
+                bytes,
+                cursor,
+                cancel,
+                depth + 1,
+                work,
+            )?))),
+            TSQ_TAG_PHRASE => {
+                if *cursor + 2 > bytes.len() {
+                    return Err(SqlError::InvalidValue("truncated phrase distance".into()));
+                }
+                let distance = u16::from_le_bytes([bytes[*cursor], bytes[*cursor + 1]]);
+                *cursor += 2;
+                Ok(TsQueryAst::Phrase {
+                    distance,
+                    left: Box::new(Self::decode_at_with_cancel(
+                        bytes,
+                        cursor,
+                        cancel,
+                        depth + 1,
+                        work,
+                    )?),
+                    right: Box::new(Self::decode_at_with_cancel(
+                        bytes,
+                        cursor,
+                        cancel,
+                        depth + 1,
+                        work,
+                    )?),
+                })
+            }
+            other => Err(SqlError::InvalidValue(format!(
+                "unknown tsquery tag: {other}"
+            ))),
+        }
+    }
+
+    fn decode_at(
+        bytes: &[u8],
+        cursor: &mut usize,
+        depth: usize,
+        nodes: &mut usize,
+    ) -> Result<Self> {
+        if depth > MAX_TSQUERY_DEPTH || *nodes >= MAX_TSQUERY_NODES {
+            return Err(tsquery_complexity_error());
+        }
+        *nodes += 1;
         if *cursor >= bytes.len() {
             return Err(SqlError::InvalidValue("truncated tsquery".into()));
         }
@@ -353,17 +698,17 @@ impl TsQueryAst {
                 })
             }
             TSQ_TAG_AND => {
-                let l = Self::decode_at(bytes, cursor)?;
-                let r = Self::decode_at(bytes, cursor)?;
+                let l = Self::decode_at(bytes, cursor, depth + 1, nodes)?;
+                let r = Self::decode_at(bytes, cursor, depth + 1, nodes)?;
                 Ok(TsQueryAst::And(Box::new(l), Box::new(r)))
             }
             TSQ_TAG_OR => {
-                let l = Self::decode_at(bytes, cursor)?;
-                let r = Self::decode_at(bytes, cursor)?;
+                let l = Self::decode_at(bytes, cursor, depth + 1, nodes)?;
+                let r = Self::decode_at(bytes, cursor, depth + 1, nodes)?;
                 Ok(TsQueryAst::Or(Box::new(l), Box::new(r)))
             }
             TSQ_TAG_NOT => {
-                let c = Self::decode_at(bytes, cursor)?;
+                let c = Self::decode_at(bytes, cursor, depth + 1, nodes)?;
                 Ok(TsQueryAst::Not(Box::new(c)))
             }
             TSQ_TAG_PHRASE => {
@@ -372,8 +717,8 @@ impl TsQueryAst {
                 }
                 let distance = u16::from_le_bytes([bytes[*cursor], bytes[*cursor + 1]]);
                 *cursor += 2;
-                let l = Self::decode_at(bytes, cursor)?;
-                let r = Self::decode_at(bytes, cursor)?;
+                let l = Self::decode_at(bytes, cursor, depth + 1, nodes)?;
+                let r = Self::decode_at(bytes, cursor, depth + 1, nodes)?;
                 Ok(TsQueryAst::Phrase {
                     distance,
                     left: Box::new(l),
@@ -391,6 +736,83 @@ pub fn tsquery_display(bytes: &[u8]) -> String {
     match TsQueryAst::decode(bytes) {
         Ok(ast) => display_ast(&ast),
         Err(_) => "<invalid tsquery>".into(),
+    }
+}
+
+pub(crate) fn tsquery_display_with_cancel(
+    bytes: &[u8],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<String> {
+    if cancel.is_none() {
+        return Ok(tsquery_display(bytes));
+    }
+    let ast = match TsQueryAst::decode_with_cancel(bytes, cancel) {
+        Ok(ast) => ast,
+        Err(SqlError::Storage(citadel_core::Error::Interrupted)) => {
+            return Err(SqlError::Storage(citadel_core::Error::Interrupted));
+        }
+        Err(_) => return Ok("<invalid tsquery>".into()),
+    };
+    let mut work = 0usize;
+    let result = display_ast_with_cancel(&ast, cancel, &mut work)?;
+    check_cancel(cancel)?;
+    Ok(result)
+}
+
+fn display_ast_with_cancel(
+    ast: &TsQueryAst,
+    cancel: Option<&citadel::CancelToken>,
+    work: &mut usize,
+) -> Result<String> {
+    check_cancel_at(cancel, *work)?;
+    *work = work.wrapping_add(1);
+    match ast {
+        TsQueryAst::Lexeme {
+            lexeme,
+            weight_mask,
+            prefix,
+        } => {
+            let mut output = format!("'{}'", String::from_utf8_lossy(lexeme));
+            if *prefix || *weight_mask != 0 {
+                output.push(':');
+                if *prefix {
+                    output.push('*');
+                }
+                for (bit, label) in [(8, 'A'), (4, 'B'), (2, 'C'), (1, 'D')] {
+                    if weight_mask & bit != 0 {
+                        output.push(label);
+                    }
+                }
+            }
+            Ok(output)
+        }
+        TsQueryAst::And(left, right) => Ok(format!(
+            "{} & {}",
+            display_ast_with_cancel(left, cancel, work)?,
+            display_ast_with_cancel(right, cancel, work)?
+        )),
+        TsQueryAst::Or(left, right) => Ok(format!(
+            "({} | {})",
+            display_ast_with_cancel(left, cancel, work)?,
+            display_ast_with_cancel(right, cancel, work)?
+        )),
+        TsQueryAst::Not(child) => Ok(format!(
+            "!{}",
+            display_ast_with_cancel(child, cancel, work)?
+        )),
+        TsQueryAst::Phrase {
+            distance,
+            left,
+            right,
+        } => {
+            let left = display_ast_with_cancel(left, cancel, work)?;
+            let right = display_ast_with_cancel(right, cancel, work)?;
+            if *distance == 1 {
+                Ok(format!("{left} <-> {right}"))
+            } else {
+                Ok(format!("{left} <{distance}> {right}"))
+            }
+        }
     }
 }
 
@@ -438,33 +860,82 @@ fn display_ast(ast: &TsQueryAst) -> String {
 }
 
 pub fn parse_tsquery(input: &str) -> Result<TsQueryAst> {
-    let mut p = TsQueryParser::new(input);
-    let ast = p.parse_or()?;
-    p.skip_ws();
+    parse_tsquery_with_cancel(input, None)
+}
+
+pub(crate) fn parse_tsquery_with_cancel(
+    input: &str,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<TsQueryAst> {
+    let mut p = TsQueryParser::new(input, cancel)?;
+    let (ast, _) = p.parse_or()?;
+    p.skip_ws()?;
     if p.cursor < p.input.len() {
         return Err(SqlError::InvalidValue(format!(
             "unexpected trailing input in tsquery: {}",
             &p.input[p.cursor..]
         )));
     }
+    validate_tsquery(&ast)?;
+    check_cancel(cancel)?;
     Ok(ast)
 }
 
 struct TsQueryParser<'a> {
     input: &'a str,
     cursor: usize,
+    cancel: Option<&'a citadel::CancelToken>,
+    work: usize,
+    syntax_depth: usize,
+    nodes: usize,
 }
 
+type ParsedTsQuery = (TsQueryAst, usize);
+
 impl<'a> TsQueryParser<'a> {
-    fn new(input: &'a str) -> Self {
-        Self { input, cursor: 0 }
+    fn new(input: &'a str, cancel: Option<&'a citadel::CancelToken>) -> Result<Self> {
+        check_cancel(cancel)?;
+        Ok(Self {
+            input,
+            cursor: 0,
+            cancel,
+            work: 0,
+            syntax_depth: 1,
+            nodes: 0,
+        })
     }
 
-    fn skip_ws(&mut self) {
+    fn tick(&mut self) -> Result<()> {
+        check_cancel_at(self.cancel, self.work)?;
+        self.work += 1;
+        Ok(())
+    }
+
+    fn enter_syntax(&mut self) -> Result<()> {
+        self.tick()?;
+        if self.syntax_depth >= MAX_TSQUERY_DEPTH {
+            return Err(tsquery_complexity_error());
+        }
+        self.syntax_depth += 1;
+        Ok(())
+    }
+
+    fn finish_node(&mut self, node: TsQueryAst, depth: usize) -> Result<ParsedTsQuery> {
+        self.tick()?;
+        self.nodes += 1;
+        if self.nodes > MAX_TSQUERY_NODES || depth > MAX_TSQUERY_DEPTH {
+            return Err(tsquery_complexity_error());
+        }
+        Ok((node, depth))
+    }
+
+    fn skip_ws(&mut self) -> Result<()> {
         let bytes = self.input.as_bytes();
         while self.cursor < bytes.len() && bytes[self.cursor].is_ascii_whitespace() {
+            self.tick()?;
             self.cursor += 1;
         }
+        Ok(())
     }
 
     fn peek(&self) -> Option<u8> {
@@ -480,57 +951,84 @@ impl<'a> TsQueryParser<'a> {
         }
     }
 
-    fn parse_or(&mut self) -> Result<TsQueryAst> {
-        let mut left = self.parse_and()?;
+    fn parse_or(&mut self) -> Result<ParsedTsQuery> {
+        let (mut left, mut left_depth) = self.parse_and()?;
+        let mut terms = 1usize;
         loop {
-            self.skip_ws();
+            self.skip_ws()?;
             if !self.eat(b'|') {
                 break;
             }
-            let right = self.parse_and()?;
-            left = TsQueryAst::Or(Box::new(left), Box::new(right));
+            let (right, right_depth) = self.parse_and()?;
+            terms += 1;
+            if terms > MAX_TSQUERY_DEPTH {
+                return Err(tsquery_complexity_error());
+            }
+            (left, left_depth) = self.finish_node(
+                TsQueryAst::Or(Box::new(left), Box::new(right)),
+                left_depth.max(right_depth) + 1,
+            )?;
         }
-        Ok(left)
+        Ok((left, left_depth))
     }
 
-    fn parse_and(&mut self) -> Result<TsQueryAst> {
-        let mut left = self.parse_not()?;
+    fn parse_and(&mut self) -> Result<ParsedTsQuery> {
+        let (mut left, mut left_depth) = self.parse_not()?;
+        let mut terms = 1usize;
         loop {
-            self.skip_ws();
+            self.skip_ws()?;
             if !self.eat(b'&') {
                 break;
             }
-            let right = self.parse_not()?;
-            left = TsQueryAst::And(Box::new(left), Box::new(right));
+            let (right, right_depth) = self.parse_not()?;
+            terms += 1;
+            if terms > MAX_TSQUERY_DEPTH {
+                return Err(tsquery_complexity_error());
+            }
+            (left, left_depth) = self.finish_node(
+                TsQueryAst::And(Box::new(left), Box::new(right)),
+                left_depth.max(right_depth) + 1,
+            )?;
         }
-        Ok(left)
+        Ok((left, left_depth))
     }
 
-    fn parse_not(&mut self) -> Result<TsQueryAst> {
-        self.skip_ws();
+    fn parse_not(&mut self) -> Result<ParsedTsQuery> {
+        self.skip_ws()?;
         if self.eat(b'!') {
-            let inner = self.parse_not()?;
-            return Ok(TsQueryAst::Not(Box::new(inner)));
+            self.enter_syntax()?;
+            let parsed = self.parse_not();
+            self.syntax_depth -= 1;
+            let (inner, inner_depth) = parsed?;
+            return self.finish_node(TsQueryAst::Not(Box::new(inner)), inner_depth + 1);
         }
         self.parse_phrase()
     }
 
-    fn parse_phrase(&mut self) -> Result<TsQueryAst> {
-        let mut left = self.parse_atom()?;
+    fn parse_phrase(&mut self) -> Result<ParsedTsQuery> {
+        let (mut left, mut left_depth) = self.parse_atom()?;
+        let mut terms = 1usize;
         loop {
-            self.skip_ws();
+            self.skip_ws()?;
             if self.peek() != Some(b'<') {
                 break;
             }
             let dist = self.parse_phrase_distance()?;
-            let right = self.parse_atom()?;
-            left = TsQueryAst::Phrase {
-                distance: dist,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
+            let (right, right_depth) = self.parse_atom()?;
+            terms += 1;
+            if terms > MAX_TSQUERY_DEPTH {
+                return Err(tsquery_complexity_error());
+            }
+            (left, left_depth) = self.finish_node(
+                TsQueryAst::Phrase {
+                    distance: dist,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                left_depth.max(right_depth) + 1,
+            )?;
         }
-        Ok(left)
+        Ok((left, left_depth))
     }
 
     fn parse_phrase_distance(&mut self) -> Result<u16> {
@@ -546,6 +1044,7 @@ impl<'a> TsQueryParser<'a> {
         let start = self.cursor;
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
+                self.tick()?;
                 self.cursor += 1;
             } else {
                 break;
@@ -571,11 +1070,14 @@ impl<'a> TsQueryParser<'a> {
         Ok(dist)
     }
 
-    fn parse_atom(&mut self) -> Result<TsQueryAst> {
-        self.skip_ws();
+    fn parse_atom(&mut self) -> Result<ParsedTsQuery> {
+        self.skip_ws()?;
         if self.eat(b'(') {
-            let inner = self.parse_or()?;
-            self.skip_ws();
+            self.enter_syntax()?;
+            let parsed = self.parse_or();
+            self.syntax_depth -= 1;
+            let inner = parsed?;
+            self.skip_ws()?;
             if !self.eat(b')') {
                 return Err(SqlError::InvalidValue("missing closing paren".into()));
             }
@@ -583,19 +1085,23 @@ impl<'a> TsQueryParser<'a> {
         }
         let lexeme = self.parse_lexeme_word()?;
         let (weight_mask, prefix) = self.parse_weight_and_prefix()?;
-        Ok(TsQueryAst::Lexeme {
-            lexeme: lexeme.into_bytes(),
-            weight_mask,
-            prefix,
-        })
+        self.finish_node(
+            TsQueryAst::Lexeme {
+                lexeme: lexeme.into_bytes(),
+                weight_mask,
+                prefix,
+            },
+            1,
+        )
     }
 
     fn parse_lexeme_word(&mut self) -> Result<String> {
-        self.skip_ws();
+        self.skip_ws()?;
         if self.eat(b'\'') {
             let start = self.cursor;
             let bytes = self.input.as_bytes();
             while self.cursor < bytes.len() && bytes[self.cursor] != b'\'' {
+                self.tick()?;
                 self.cursor += 1;
             }
             if self.cursor >= bytes.len() {
@@ -603,7 +1109,9 @@ impl<'a> TsQueryParser<'a> {
                     "unterminated quoted lexeme in tsquery".into(),
                 ));
             }
-            let word = self.input[start..self.cursor].to_string();
+            let word = &self.input[start..self.cursor];
+            validate_lexeme_length(word.as_bytes())?;
+            let word = word.to_string();
             self.cursor += 1; // closing quote
             if word.is_empty() {
                 return Err(SqlError::InvalidValue("empty lexeme in tsquery".into()));
@@ -613,6 +1121,7 @@ impl<'a> TsQueryParser<'a> {
         let start = self.cursor;
         for (i, ch) in self.input[self.cursor..].char_indices() {
             if ch.is_alphanumeric() || ch == '_' {
+                self.tick()?;
                 self.cursor = start + i + ch.len_utf8();
             } else {
                 break;
@@ -624,7 +1133,9 @@ impl<'a> TsQueryParser<'a> {
                 &self.input[self.cursor..]
             )));
         }
-        Ok(self.input[start..self.cursor].to_string())
+        let word = &self.input[start..self.cursor];
+        validate_lexeme_length(word.as_bytes())?;
+        Ok(word.to_string())
     }
 
     fn parse_weight_and_prefix(&mut self) -> Result<(u8, bool)> {
@@ -634,6 +1145,7 @@ impl<'a> TsQueryParser<'a> {
         let mut prefix = false;
         let mut mask: u8 = 0;
         loop {
+            self.tick()?;
             match self.peek() {
                 Some(b'*') => {
                     prefix = true;
@@ -670,6 +1182,30 @@ pub fn op_match(tsvector_bytes: &[u8], tsquery_bytes: &[u8]) -> Result<crate::ty
     Ok(crate::types::Value::Boolean(matched))
 }
 
+pub(crate) fn op_match_with_cancel(
+    tsvector_bytes: &[u8],
+    tsquery_bytes: &[u8],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
+    if cancel.is_none() {
+        return op_match(tsvector_bytes, tsquery_bytes);
+    }
+    check_cancel(cancel)?;
+    let ast = TsQueryAst::decode_with_cancel(tsquery_bytes, cancel)?;
+    let (flags, reader) = TsVectorReader::open(tsvector_bytes)?;
+    let mut entries = Vec::new();
+    for (work, item) in reader.enumerate() {
+        check_cancel_at(cancel, work)?;
+        let (lexeme, positions) = item?;
+        entries.push((lexeme.to_vec(), positions));
+    }
+    let mut work = 0usize;
+    let overflowed = flags & TSV_FLAG_POSITION_OVERFLOW != 0;
+    let matched = eval_match_with_cancel(&ast, &entries, overflowed, cancel, &mut work)?;
+    check_cancel(cancel)?;
+    Ok(crate::types::Value::Boolean(matched))
+}
+
 fn eval_match(ast: &TsQueryAst, entries: &[(Vec<u8>, Vec<u16>)], overflowed: bool) -> Result<bool> {
     match ast {
         TsQueryAst::Lexeme {
@@ -701,6 +1237,67 @@ fn eval_match(ast: &TsQueryAst, entries: &[(Vec<u8>, Vec<u16>)], overflowed: boo
     }
 }
 
+fn eval_match_with_cancel(
+    ast: &TsQueryAst,
+    entries: &[(Vec<u8>, Vec<u16>)],
+    overflowed: bool,
+    cancel: Option<&citadel::CancelToken>,
+    work: &mut usize,
+) -> Result<bool> {
+    check_cancel_at(cancel, *work)?;
+    *work = work.wrapping_add(1);
+    match ast {
+        TsQueryAst::Lexeme {
+            lexeme,
+            weight_mask,
+            prefix,
+        } => Ok(!collect_lex_positions_with_cancel(
+            entries,
+            lexeme,
+            *weight_mask,
+            *prefix,
+            cancel,
+            work,
+        )?
+        .is_empty()),
+        TsQueryAst::And(left, right) => {
+            if !eval_match_with_cancel(left, entries, overflowed, cancel, work)? {
+                return Ok(false);
+            }
+            eval_match_with_cancel(right, entries, overflowed, cancel, work)
+        }
+        TsQueryAst::Or(left, right) => {
+            if eval_match_with_cancel(left, entries, overflowed, cancel, work)? {
+                return Ok(true);
+            }
+            eval_match_with_cancel(right, entries, overflowed, cancel, work)
+        }
+        TsQueryAst::Not(child) => Ok(!eval_match_with_cancel(
+            child, entries, overflowed, cancel, work,
+        )?),
+        TsQueryAst::Phrase {
+            distance,
+            left,
+            right,
+        } => {
+            if overflowed {
+                return Err(SqlError::Unsupported(
+                    "tsvector position overflow; phrase queries unreliable".into(),
+                ));
+            }
+            let left_positions = phrase_positions_with_cancel(left, entries, cancel, work)?;
+            let right_positions = phrase_positions_with_cancel(right, entries, cancel, work)?;
+            positions_at_offset_with_cancel(
+                &left_positions,
+                &right_positions,
+                *distance,
+                cancel,
+                work,
+            )
+        }
+    }
+}
+
 fn phrase_positions(ast: &TsQueryAst, entries: &[(Vec<u8>, Vec<u16>)]) -> Result<Vec<u16>> {
     match ast {
         TsQueryAst::Lexeme {
@@ -721,6 +1318,43 @@ fn phrase_positions(ast: &TsQueryAst, entries: &[(Vec<u8>, Vec<u16>)]) -> Result
             let lp = phrase_positions(left, entries)?;
             let rp = phrase_positions(right, entries)?;
             Ok(positions_pairing_right(&lp, &rp, *distance))
+        }
+        _ => Err(SqlError::Unsupported(
+            "tsquery: AND/OR/NOT inside phrase operator not supported".into(),
+        )),
+    }
+}
+
+fn phrase_positions_with_cancel(
+    ast: &TsQueryAst,
+    entries: &[(Vec<u8>, Vec<u16>)],
+    cancel: Option<&citadel::CancelToken>,
+    work: &mut usize,
+) -> Result<Vec<u16>> {
+    check_cancel_at(cancel, *work)?;
+    *work = work.wrapping_add(1);
+    match ast {
+        TsQueryAst::Lexeme {
+            lexeme,
+            weight_mask,
+            prefix,
+        } => {
+            collect_lex_positions_with_cancel(entries, lexeme, *weight_mask, *prefix, cancel, work)
+        }
+        TsQueryAst::Phrase {
+            distance,
+            left,
+            right,
+        } => {
+            let left_positions = phrase_positions_with_cancel(left, entries, cancel, work)?;
+            let right_positions = phrase_positions_with_cancel(right, entries, cancel, work)?;
+            positions_pairing_right_with_cancel(
+                &left_positions,
+                &right_positions,
+                *distance,
+                cancel,
+                work,
+            )
         }
         _ => Err(SqlError::Unsupported(
             "tsquery: AND/OR/NOT inside phrase operator not supported".into(),
@@ -749,6 +1383,36 @@ fn positions_at_offset(left: &[u16], right: &[u16], distance: u16) -> bool {
     false
 }
 
+fn positions_at_offset_with_cancel(
+    left: &[u16],
+    right: &[u16],
+    distance: u16,
+    cancel: Option<&citadel::CancelToken>,
+    work: &mut usize,
+) -> Result<bool> {
+    if left.is_empty() || right.is_empty() {
+        return Ok(false);
+    }
+    let mut left_index = 0usize;
+    let mut right_index = 0usize;
+    while left_index < left.len() && right_index < right.len() {
+        check_cancel_at(cancel, *work)?;
+        *work = work.wrapping_add(1);
+        let left_position = left[left_index] & MAX_POSITION;
+        let right_position = right[right_index] & MAX_POSITION;
+        let target = left_position.saturating_add(distance);
+        if right_position == target {
+            return Ok(true);
+        }
+        if right_position < target {
+            right_index += 1;
+        } else {
+            left_index += 1;
+        }
+    }
+    Ok(false)
+}
+
 fn positions_pairing_right(left: &[u16], right: &[u16], distance: u16) -> Vec<u16> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -769,6 +1433,36 @@ fn positions_pairing_right(left: &[u16], right: &[u16], distance: u16) -> Vec<u1
         }
     }
     out
+}
+
+fn positions_pairing_right_with_cancel(
+    left: &[u16],
+    right: &[u16],
+    distance: u16,
+    cancel: Option<&citadel::CancelToken>,
+    work: &mut usize,
+) -> Result<Vec<u16>> {
+    let mut out = Vec::new();
+    let mut left_index = 0usize;
+    let mut right_index = 0usize;
+    while left_index < left.len() && right_index < right.len() {
+        check_cancel_at(cancel, *work)?;
+        *work = work.wrapping_add(1);
+        let left_position = left[left_index] & MAX_POSITION;
+        let right_position = right[right_index] & MAX_POSITION;
+        let target = left_position.saturating_add(distance);
+        if right_position == target {
+            if out.last().copied() != Some(right[right_index]) {
+                out.push(right[right_index]);
+            }
+            right_index += 1;
+        } else if right_position < target {
+            right_index += 1;
+        } else {
+            left_index += 1;
+        }
+    }
+    Ok(out)
 }
 
 fn collect_lex_positions(
@@ -821,9 +1515,42 @@ pub fn fn_length_tsvector(bytes: &[u8]) -> Result<crate::types::Value> {
     Ok(crate::types::Value::Integer(count))
 }
 
+pub(crate) fn fn_length_tsvector_with_cancel(
+    bytes: &[u8],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
+    if cancel.is_none() {
+        return fn_length_tsvector(bytes);
+    }
+    check_cancel(cancel)?;
+    let (_flags, reader) = TsVectorReader::open(bytes)?;
+    let mut count = 0i64;
+    for (work, item) in reader.enumerate() {
+        check_cancel_at(cancel, work)?;
+        item?;
+        count += 1;
+    }
+    check_cancel(cancel)?;
+    Ok(crate::types::Value::Integer(count))
+}
+
 pub fn fn_numnode(bytes: &[u8]) -> Result<crate::types::Value> {
     let ast = TsQueryAst::decode(bytes)?;
     Ok(crate::types::Value::Integer(count_nodes(&ast) as i64))
+}
+
+pub(crate) fn fn_numnode_with_cancel(
+    bytes: &[u8],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
+    if cancel.is_none() {
+        return fn_numnode(bytes);
+    }
+    let ast = TsQueryAst::decode_with_cancel(bytes, cancel)?;
+    let mut work = 0;
+    Ok(crate::types::Value::Integer(
+        count_nodes_with_cancel(&ast, cancel, &mut work)? as i64,
+    ))
 }
 
 fn count_nodes(ast: &TsQueryAst) -> usize {
@@ -853,6 +1580,45 @@ pub fn fn_ts_rank(tsv: &[u8], tsq: &[u8], norm: i64) -> Result<crate::types::Val
     Ok(crate::types::Value::Real(score))
 }
 
+fn count_nodes_with_cancel(
+    ast: &TsQueryAst,
+    cancel: Option<&citadel::CancelToken>,
+    work: &mut usize,
+) -> Result<usize> {
+    check_cancel_at(cancel, *work)?;
+    *work += 1;
+    Ok(match ast {
+        TsQueryAst::Lexeme { .. } => 1,
+        TsQueryAst::And(left, right) | TsQueryAst::Or(left, right) => {
+            1 + count_nodes_with_cancel(left, cancel, work)?
+                + count_nodes_with_cancel(right, cancel, work)?
+        }
+        TsQueryAst::Not(child) => 1 + count_nodes_with_cancel(child, cancel, work)?,
+        TsQueryAst::Phrase { left, right, .. } => {
+            1 + count_nodes_with_cancel(left, cancel, work)?
+                + count_nodes_with_cancel(right, cancel, work)?
+        }
+    })
+}
+
+pub(crate) fn fn_ts_rank_with_cancel(
+    tsv: &[u8],
+    tsq: &[u8],
+    norm: i64,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
+    if cancel.is_none() {
+        return fn_ts_rank(tsv, tsq, norm);
+    }
+    let entries = decode_entries_with_cancel(tsv, cancel)?;
+    let ast = TsQueryAst::decode_with_cancel(tsq, cancel)?;
+    let mut score = 0.0_f64;
+    let mut work = 0;
+    accumulate_rank_with_cancel(&ast, &entries, &mut score, true, cancel, &mut work)?;
+    score = apply_norm_with_cancel(score, &entries, norm, cancel)?;
+    Ok(crate::types::Value::Real(score))
+}
+
 pub fn fn_ts_rank_cd(tsv: &[u8], tsq: &[u8], norm: i64) -> Result<crate::types::Value> {
     let entries = decode_entries(tsv)?;
     let ast = TsQueryAst::decode(tsq)?;
@@ -863,6 +1629,28 @@ pub fn fn_ts_rank_cd(tsv: &[u8], tsq: &[u8], norm: i64) -> Result<crate::types::
     }
     let score = shortest_cover_score(&atom_lists);
     let score = apply_norm(score, &entries, norm);
+    Ok(crate::types::Value::Real(score))
+}
+
+pub(crate) fn fn_ts_rank_cd_with_cancel(
+    tsv: &[u8],
+    tsq: &[u8],
+    norm: i64,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
+    if cancel.is_none() {
+        return fn_ts_rank_cd(tsv, tsq, norm);
+    }
+    let entries = decode_entries_with_cancel(tsv, cancel)?;
+    let ast = TsQueryAst::decode_with_cancel(tsq, cancel)?;
+    let mut atom_lists = Vec::new();
+    let mut work = 0;
+    collect_positive_atoms_with_cancel(&ast, &entries, &mut atom_lists, cancel, &mut work)?;
+    if atom_lists.is_empty() || atom_lists.iter().any(Vec::is_empty) {
+        return Ok(crate::types::Value::Real(0.0));
+    }
+    let score = shortest_cover_score_with_cancel(&atom_lists, cancel)?;
+    let score = apply_norm_with_cancel(score, &entries, norm, cancel)?;
     Ok(crate::types::Value::Real(score))
 }
 
@@ -914,6 +1702,56 @@ fn accumulate_rank(
     }
 }
 
+fn accumulate_rank_with_cancel(
+    ast: &TsQueryAst,
+    entries: &[(Vec<u8>, Vec<u16>)],
+    out: &mut f64,
+    positive: bool,
+    cancel: Option<&citadel::CancelToken>,
+    work: &mut usize,
+) -> Result<()> {
+    check_cancel_at(cancel, *work)?;
+    *work += 1;
+    match ast {
+        TsQueryAst::Lexeme {
+            lexeme,
+            weight_mask,
+            prefix,
+        } if positive => {
+            let positions = collect_lex_positions_with_cancel(
+                entries,
+                lexeme,
+                *weight_mask,
+                *prefix,
+                cancel,
+                work,
+            )?;
+            if !positions.is_empty() {
+                let mut weight_sum = 0.0;
+                for packed in &positions {
+                    check_cancel_at(cancel, *work)?;
+                    *work += 1;
+                    weight_sum += weight_default(Weight::from_bits(*packed));
+                }
+                *out += weight_sum * (1.0 + (positions.len() as f64).ln_1p());
+            }
+        }
+        TsQueryAst::Lexeme { .. } => {}
+        TsQueryAst::And(left, right) | TsQueryAst::Or(left, right) => {
+            accumulate_rank_with_cancel(left, entries, out, positive, cancel, work)?;
+            accumulate_rank_with_cancel(right, entries, out, positive, cancel, work)?;
+        }
+        TsQueryAst::Not(child) => {
+            accumulate_rank_with_cancel(child, entries, out, !positive, cancel, work)?;
+        }
+        TsQueryAst::Phrase { left, right, .. } => {
+            accumulate_rank_with_cancel(left, entries, out, positive, cancel, work)?;
+            accumulate_rank_with_cancel(right, entries, out, positive, cancel, work)?;
+        }
+    }
+    Ok(())
+}
+
 fn collect_positive_atoms(
     ast: &TsQueryAst,
     entries: &[(Vec<u8>, Vec<u16>)],
@@ -938,6 +1776,39 @@ fn collect_positive_atoms(
         }
         TsQueryAst::Not(_) => {} // negated atoms don't contribute to cover
     }
+}
+
+fn collect_positive_atoms_with_cancel(
+    ast: &TsQueryAst,
+    entries: &[(Vec<u8>, Vec<u16>)],
+    out: &mut Vec<Vec<u16>>,
+    cancel: Option<&citadel::CancelToken>,
+    work: &mut usize,
+) -> Result<()> {
+    check_cancel_at(cancel, *work)?;
+    *work += 1;
+    match ast {
+        TsQueryAst::Lexeme {
+            lexeme,
+            weight_mask,
+            prefix,
+        } => out.push(collect_lex_positions_with_cancel(
+            entries,
+            lexeme,
+            *weight_mask,
+            *prefix,
+            cancel,
+            work,
+        )?),
+        TsQueryAst::And(left, right)
+        | TsQueryAst::Or(left, right)
+        | TsQueryAst::Phrase { left, right, .. } => {
+            collect_positive_atoms_with_cancel(left, entries, out, cancel, work)?;
+            collect_positive_atoms_with_cancel(right, entries, out, cancel, work)?;
+        }
+        TsQueryAst::Not(_) => {}
+    }
+    Ok(())
 }
 
 fn shortest_cover_score(atom_lists: &[Vec<u16>]) -> f64 {
@@ -985,6 +1856,60 @@ fn shortest_cover_score(atom_lists: &[Vec<u16>]) -> f64 {
     best_score
 }
 
+fn shortest_cover_score_with_cancel(
+    atom_lists: &[Vec<u16>],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<f64> {
+    if atom_lists.is_empty() {
+        return Ok(0.0);
+    }
+    let mut events = Vec::new();
+    let mut work = 0;
+    for (atom_index, list) in atom_lists.iter().enumerate() {
+        for &packed in list {
+            check_cancel_at(cancel, work)?;
+            work += 1;
+            let (position, _) = unpack_position(packed);
+            events.push((position, atom_index, packed));
+        }
+    }
+    events =
+        crate::executor::helpers::sort_vec_by(events, cancel, |left, right| left.0.cmp(&right.0))?;
+
+    let atom_count = atom_lists.len();
+    let mut count_per_atom = vec![0usize; atom_count];
+    let mut covered_count = 0usize;
+    let mut best_score = 0.0_f64;
+    let mut left = 0usize;
+    for right in 0..events.len() {
+        check_cancel_at(cancel, work)?;
+        work += 1;
+        let atom_index = events[right].1;
+        if count_per_atom[atom_index] == 0 {
+            covered_count += 1;
+        }
+        count_per_atom[atom_index] += 1;
+        while covered_count == atom_count {
+            let window_len = (events[right].0 - events[left].0 + 1) as f64;
+            let mut weight_sum = 0.0;
+            for event in &events[left..=right] {
+                check_cancel_at(cancel, work)?;
+                work += 1;
+                weight_sum += weight_default(Weight::from_bits(event.2));
+            }
+            best_score = best_score.max(weight_sum / window_len);
+            let left_atom = events[left].1;
+            count_per_atom[left_atom] -= 1;
+            if count_per_atom[left_atom] == 0 {
+                covered_count -= 1;
+            }
+            left += 1;
+        }
+    }
+    check_cancel(cancel)?;
+    Ok(best_score)
+}
+
 fn apply_norm(mut score: f64, entries: &[(Vec<u8>, Vec<u16>)], norm: i64) -> f64 {
     let doc_len: f64 = entries.iter().map(|e| e.1.len()).sum::<usize>() as f64;
     let unique = entries.len() as f64;
@@ -1004,6 +1929,38 @@ fn apply_norm(mut score: f64, entries: &[(Vec<u8>, Vec<u16>)], norm: i64) -> f64
         score /= score + 1.0;
     }
     score
+}
+
+fn apply_norm_with_cancel(
+    mut score: f64,
+    entries: &[(Vec<u8>, Vec<u16>)],
+    norm: i64,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<f64> {
+    let mut doc_len = 0usize;
+    for (work, entry) in entries.iter().enumerate() {
+        check_cancel_at(cancel, work)?;
+        doc_len += entry.1.len();
+    }
+    let doc_len = doc_len as f64;
+    let unique = entries.len() as f64;
+    if (norm & 1) != 0 && doc_len > 1.0 {
+        score /= 1.0 + doc_len.ln();
+    }
+    if (norm & 2) != 0 && doc_len > 0.0 {
+        score /= doc_len;
+    }
+    if (norm & 8) != 0 && unique > 0.0 {
+        score /= unique;
+    }
+    if (norm & 16) != 0 && unique > 1.0 {
+        score /= 1.0 + unique.ln();
+    }
+    if (norm & 32) != 0 {
+        score /= score + 1.0;
+    }
+    check_cancel(cancel)?;
+    Ok(score)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1183,6 +2140,125 @@ fn is_english_stopword(word: &str) -> bool {
     ENGLISH_STOP_WORDS.binary_search(&word).is_ok()
 }
 
+fn decode_entries_with_cancel(
+    tsv: &[u8],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<(Vec<u8>, Vec<u16>)>> {
+    check_cancel(cancel)?;
+    let (_flags, reader) = TsVectorReader::open(tsv)?;
+    let mut out = Vec::new();
+    for (work, item) in reader.enumerate() {
+        check_cancel_at(cancel, work)?;
+        let (lexeme, positions) = item?;
+        out.push((lexeme.to_vec(), positions));
+    }
+    check_cancel(cancel)?;
+    Ok(out)
+}
+
+const CANCEL_CHECK_INTERVAL: usize = 256;
+
+#[inline]
+fn check_cancel(cancel: Option<&citadel::CancelToken>) -> Result<()> {
+    match cancel {
+        Some(token) => token.check().map_err(SqlError::Storage),
+        None => Ok(()),
+    }
+}
+
+#[inline]
+fn check_cancel_at(cancel: Option<&citadel::CancelToken>, work: usize) -> Result<()> {
+    let Some(token) = cancel else {
+        return Ok(());
+    };
+    #[cfg(test)]
+    cancellation_poll_work();
+    if work.is_multiple_of(CANCEL_CHECK_INTERVAL) {
+        token.check().map_err(SqlError::Storage)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static POLL_CANCEL_HOOK: std::cell::RefCell<Option<(citadel::CancelToken, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct PollCancelGuard;
+
+#[cfg(test)]
+impl Drop for PollCancelGuard {
+    fn drop(&mut self) {
+        POLL_CANCEL_HOOK.with(|hook| *hook.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn cancel_on_poll_after(token: citadel::CancelToken, work: usize) -> PollCancelGuard {
+    assert!(work > 0, "the hook must trip after FTS work starts");
+    POLL_CANCEL_HOOK.with(|hook| *hook.borrow_mut() = Some((token, work)));
+    PollCancelGuard
+}
+
+#[cfg(test)]
+fn cancellation_poll_work() {
+    POLL_CANCEL_HOOK.with(|hook| {
+        let mut hook = hook.borrow_mut();
+        let Some((token, remaining)) = hook.as_mut() else {
+            return;
+        };
+        *remaining -= 1;
+        if *remaining == 0 {
+            token.cancel();
+            *hook = None;
+        }
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    static TOKENIZE_CANCEL_HOOK: std::cell::RefCell<Option<(citadel::CancelToken, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct TokenizeCancelGuard;
+
+#[cfg(test)]
+impl Drop for TokenizeCancelGuard {
+    fn drop(&mut self) {
+        TOKENIZE_CANCEL_HOOK.with(|hook| *hook.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cancel_tokenize_after(
+    token: citadel::CancelToken,
+    work: usize,
+) -> TokenizeCancelGuard {
+    assert!(work > 0, "the hook must trip after tokenization starts");
+    TOKENIZE_CANCEL_HOOK.with(|hook| *hook.borrow_mut() = Some((token, work)));
+    TokenizeCancelGuard
+}
+
+#[inline]
+fn tokenization_work() {
+    #[cfg(test)]
+    TOKENIZE_CANCEL_HOOK.with(|hook| {
+        let mut hook = hook.borrow_mut();
+        let Some((token, remaining)) = hook.as_mut() else {
+            return;
+        };
+        *remaining -= 1;
+        if *remaining == 0 {
+            token.cancel();
+            *hook = None;
+        }
+    });
+}
+
 pub fn tokenize(kind: TokenizerKind, text: &str) -> Vec<Token> {
     use unicode_normalization::UnicodeNormalization;
     use unicode_segmentation::UnicodeSegmentation;
@@ -1224,6 +2300,131 @@ pub fn tokenize(kind: TokenizerKind, text: &str) -> Vec<Token> {
     out
 }
 
+fn collect_lex_positions_with_cancel(
+    entries: &[(Vec<u8>, Vec<u16>)],
+    query_lex: &[u8],
+    weight_mask: u8,
+    prefix: bool,
+    cancel: Option<&citadel::CancelToken>,
+    work: &mut usize,
+) -> Result<Vec<u16>> {
+    let mut out = Vec::new();
+    if prefix {
+        let start = entries.partition_point(|(lexeme, _)| lexeme.as_slice() < query_lex);
+        for (lexeme, positions) in &entries[start..] {
+            check_cancel_at(cancel, *work)?;
+            *work += 1;
+            if !lexeme.starts_with(query_lex) {
+                break;
+            }
+            collect_positions_with_cancel(positions, weight_mask, cancel, work, &mut out)?;
+        }
+        out = crate::executor::helpers::sort_vec_by(out, cancel, |left, right| left.cmp(right))?;
+        out.dedup();
+    } else if let Ok(index) =
+        entries.binary_search_by(|(lexeme, _)| lexeme.as_slice().cmp(query_lex))
+    {
+        collect_positions_with_cancel(&entries[index].1, weight_mask, cancel, work, &mut out)?;
+    }
+    Ok(out)
+}
+
+fn collect_positions_with_cancel(
+    positions: &[u16],
+    weight_mask: u8,
+    cancel: Option<&citadel::CancelToken>,
+    work: &mut usize,
+    out: &mut Vec<u16>,
+) -> Result<()> {
+    for &packed in positions {
+        check_cancel_at(cancel, *work)?;
+        *work += 1;
+        if weight_mask != 0 {
+            let (_, weight) = unpack_position(packed);
+            let weight_bit = match weight {
+                Weight::A => 0b1000,
+                Weight::B => 0b0100,
+                Weight::C => 0b0010,
+                Weight::D => 0b0001,
+            };
+            if weight_bit & weight_mask == 0 {
+                continue;
+            }
+        }
+        out.push(packed);
+    }
+    Ok(())
+}
+
+/// Tokenize while polling `cancel`. The no-token path is exactly [`tokenize`], so
+/// ordinary indexing keeps the existing fast path.
+pub(crate) fn tokenize_with_cancel(
+    kind: TokenizerKind,
+    text: &str,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<Token>> {
+    use unicode_normalization::UnicodeNormalization;
+    use unicode_segmentation::UnicodeSegmentation;
+
+    if cancel.is_none() {
+        let tokens = tokenize(kind, text);
+        for token in &tokens {
+            validate_lexeme_length(token.lexeme.as_bytes())?;
+        }
+        return Ok(tokens);
+    }
+    check_cancel(cancel)?;
+
+    let mut normalized = String::with_capacity(text.len());
+    for (work, ch) in text.nfkc().enumerate() {
+        tokenization_work();
+        check_cancel_at(cancel, work)?;
+        normalized.push(ch);
+    }
+    check_cancel(cancel)?;
+    // Keep whole-string lowercasing: unlike `char::to_lowercase`, this applies
+    // context-sensitive mappings such as Greek final sigma.
+    let lowered = normalized.to_lowercase();
+    check_cancel(cancel)?;
+
+    let mut out = Vec::new();
+    let mut position: u32 = 0;
+    for (work, word) in lowered.unicode_words().enumerate() {
+        tokenization_work();
+        check_cancel_at(cancel, work)?;
+        position += 1;
+        let pos_u16 = if position <= MAX_POSITION as u32 {
+            position as u16
+        } else {
+            MAX_POSITION + 1
+        };
+        let mut stopped = false;
+        let lexeme = match kind {
+            TokenizerKind::Simple => word.to_string(),
+            TokenizerKind::English => {
+                if is_english_stopword(word) {
+                    stopped = true;
+                    String::new()
+                } else {
+                    tantivy_stemmers::algorithms::english_porter_2(word).into_owned()
+                }
+            }
+        };
+        if lexeme.is_empty() && !stopped {
+            position -= 1;
+            continue;
+        }
+        validate_lexeme_length(lexeme.as_bytes())?;
+        out.push(Token {
+            lexeme,
+            position: pos_u16,
+            stopped,
+        });
+    }
+    check_cancel(cancel)?;
+    Ok(out)
+}
+
 fn stem_one(kind: TokenizerKind, word: &str) -> Option<String> {
     use unicode_normalization::UnicodeNormalization;
     let normalized: String = word.nfkc().collect();
@@ -1241,15 +2442,25 @@ fn stem_one(kind: TokenizerKind, word: &str) -> Option<String> {
 }
 
 pub fn fn_to_tsvector_with(kind: TokenizerKind, text: &str) -> Result<crate::types::Value> {
-    let tokens = tokenize(kind, text);
+    fn_to_tsvector_with_cancel(kind, text, None)
+}
+
+pub(crate) fn fn_to_tsvector_with_cancel(
+    kind: TokenizerKind,
+    text: &str,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
+    let tokens = tokenize_with_cancel(kind, text, cancel)?;
     let mut b = TsVectorBuilder::new();
-    for t in tokens {
+    for (work, t) in tokens.into_iter().enumerate() {
+        check_cancel_at(cancel, work)?;
         if t.stopped {
             continue;
         }
-        b.push(t.lexeme.as_bytes(), t.position, Weight::D);
+        b.push(t.lexeme.as_bytes(), t.position, Weight::D)?;
     }
-    Ok(crate::types::Value::TsVector(b.build()))
+    check_cancel(cancel)?;
+    Ok(crate::types::Value::TsVector(b.build_with_cancel(cancel)?))
 }
 
 pub fn fn_to_tsvector(text: &str) -> Result<crate::types::Value> {
@@ -1259,7 +2470,23 @@ pub fn fn_to_tsvector(text: &str) -> Result<crate::types::Value> {
 pub fn fn_to_tsquery_with(kind: TokenizerKind, text: &str) -> Result<crate::types::Value> {
     let raw = parse_tsquery(text)?;
     let stemmed = stem_ast(&raw, kind)?;
-    Ok(crate::types::Value::TsQuery(stemmed.encode()))
+    Ok(crate::types::Value::TsQuery(stemmed.encode()?))
+}
+
+pub(crate) fn fn_to_tsquery_with_cancel(
+    kind: TokenizerKind,
+    text: &str,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
+    if cancel.is_none() {
+        return fn_to_tsquery_with(kind, text);
+    }
+    let raw = parse_tsquery_with_cancel(text, cancel)?;
+    let mut work = 0;
+    let stemmed = stem_ast_with_cancel(&raw, kind, cancel, &mut work)?;
+    Ok(crate::types::Value::TsQuery(
+        stemmed.encode_with_cancel(cancel)?,
+    ))
 }
 
 fn stem_ast(ast: &TsQueryAst, kind: TokenizerKind) -> Result<TsQueryAst> {
@@ -1274,6 +2501,7 @@ fn stem_ast(ast: &TsQueryAst, kind: TokenizerKind) -> Result<TsQueryAst> {
             let stemmed = stem_one(kind, s).ok_or_else(|| {
                 SqlError::InvalidValue(format!("tsquery: lexeme '{s}' is a stop-word"))
             })?;
+            validate_lexeme_length(stemmed.as_bytes())?;
             TsQueryAst::Lexeme {
                 lexeme: stemmed.into_bytes(),
                 weight_mask: *weight_mask,
@@ -1299,6 +2527,56 @@ fn stem_ast(ast: &TsQueryAst, kind: TokenizerKind) -> Result<TsQueryAst> {
     })
 }
 
+fn stem_ast_with_cancel(
+    ast: &TsQueryAst,
+    kind: TokenizerKind,
+    cancel: Option<&citadel::CancelToken>,
+    work: &mut usize,
+) -> Result<TsQueryAst> {
+    check_cancel_at(cancel, *work)?;
+    *work += 1;
+    Ok(match ast {
+        TsQueryAst::Lexeme {
+            lexeme,
+            weight_mask,
+            prefix,
+        } => {
+            let s = std::str::from_utf8(lexeme)
+                .map_err(|_| SqlError::InvalidValue("tsquery lexeme has invalid UTF-8".into()))?;
+            let stemmed = stem_one(kind, s).ok_or_else(|| {
+                SqlError::InvalidValue(format!("tsquery: lexeme '{s}' is a stop-word"))
+            })?;
+            validate_lexeme_length(stemmed.as_bytes())?;
+            check_cancel(cancel)?;
+            TsQueryAst::Lexeme {
+                lexeme: stemmed.into_bytes(),
+                weight_mask: *weight_mask,
+                prefix: *prefix,
+            }
+        }
+        TsQueryAst::And(l, r) => TsQueryAst::And(
+            Box::new(stem_ast_with_cancel(l, kind, cancel, work)?),
+            Box::new(stem_ast_with_cancel(r, kind, cancel, work)?),
+        ),
+        TsQueryAst::Or(l, r) => TsQueryAst::Or(
+            Box::new(stem_ast_with_cancel(l, kind, cancel, work)?),
+            Box::new(stem_ast_with_cancel(r, kind, cancel, work)?),
+        ),
+        TsQueryAst::Not(c) => {
+            TsQueryAst::Not(Box::new(stem_ast_with_cancel(c, kind, cancel, work)?))
+        }
+        TsQueryAst::Phrase {
+            distance,
+            left,
+            right,
+        } => TsQueryAst::Phrase {
+            distance: *distance,
+            left: Box::new(stem_ast_with_cancel(left, kind, cancel, work)?),
+            right: Box::new(stem_ast_with_cancel(right, kind, cancel, work)?),
+        },
+    })
+}
+
 pub fn fn_plainto_tsquery_with(kind: TokenizerKind, text: &str) -> Result<crate::types::Value> {
     let tokens = tokenize(kind, text);
     let lexemes: Vec<Vec<u8>> = tokens
@@ -1306,23 +2584,78 @@ pub fn fn_plainto_tsquery_with(kind: TokenizerKind, text: &str) -> Result<crate:
         .filter(|t| !t.stopped && !t.lexeme.is_empty())
         .map(|t| t.lexeme.into_bytes())
         .collect();
-    let ast = and_chain(&lexemes)?;
-    Ok(crate::types::Value::TsQuery(ast.encode()))
+    let ast = and_chain(lexemes)?;
+    Ok(crate::types::Value::TsQuery(ast.encode()?))
 }
 
-fn and_chain(lexemes: &[Vec<u8>]) -> Result<TsQueryAst> {
+pub(crate) fn fn_plainto_tsquery_with_cancel(
+    kind: TokenizerKind,
+    text: &str,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
+    if cancel.is_none() {
+        return fn_plainto_tsquery_with(kind, text);
+    }
+    let tokens = tokenize_with_cancel(kind, text, cancel)?;
+    let mut lexemes = Vec::new();
+    for (work, token) in tokens.into_iter().enumerate() {
+        check_cancel_at(cancel, work)?;
+        if !token.stopped && !token.lexeme.is_empty() {
+            lexemes.push(token.lexeme.into_bytes());
+        }
+    }
+    check_cancel(cancel)?;
+    let ast = and_chain(lexemes)?;
+    Ok(crate::types::Value::TsQuery(
+        ast.encode_with_cancel(cancel)?,
+    ))
+}
+
+fn and_chain(lexemes: Vec<Vec<u8>>) -> Result<TsQueryAst> {
     if lexemes.is_empty() {
         return Err(SqlError::InvalidValue(
             "tsquery would be empty (input had only stop-words?)".into(),
         ));
     }
-    let mut iter = lexemes.iter().map(|l| TsQueryAst::Lexeme {
-        lexeme: l.clone(),
+    let nodes = lexemes.into_iter().map(|lexeme| TsQueryAst::Lexeme {
+        lexeme,
         weight_mask: 0,
         prefix: false,
     });
-    let first = iter.next().unwrap();
-    Ok(iter.fold(first, |acc, x| TsQueryAst::And(Box::new(acc), Box::new(x))))
+    fold_tsquery_nodes(nodes.collect(), TsQueryAst::And)?.ok_or_else(|| {
+        SqlError::InvalidValue("tsquery would be empty (input had only stop-words?)".into())
+    })
+}
+
+fn fold_tsquery_nodes(
+    mut nodes: Vec<TsQueryAst>,
+    join: fn(Box<TsQueryAst>, Box<TsQueryAst>) -> TsQueryAst,
+) -> Result<Option<TsQueryAst>> {
+    if nodes.is_empty() {
+        return Ok(None);
+    }
+    while nodes.len() > 1 {
+        let mut next_level = Vec::with_capacity(nodes.len().div_ceil(2));
+        let mut iter = nodes.into_iter();
+        while let Some(left) = iter.next() {
+            match iter.next() {
+                Some(right) => next_level.push(join(Box::new(left), Box::new(right))),
+                None => next_level.push(left),
+            }
+        }
+        nodes = next_level;
+    }
+    let result = nodes.pop().expect("non-empty query reduction");
+    validate_tsquery(&result)?;
+    Ok(Some(result))
+}
+
+fn check_left_deep_query_size(leaves: usize) -> Result<()> {
+    let nodes = leaves.saturating_mul(2).saturating_sub(1);
+    if leaves > MAX_TSQUERY_DEPTH || nodes > MAX_TSQUERY_NODES {
+        return Err(tsquery_complexity_error());
+    }
+    Ok(())
 }
 
 pub fn fn_phraseto_tsquery_with(kind: TokenizerKind, text: &str) -> Result<crate::types::Value> {
@@ -1332,6 +2665,7 @@ pub fn fn_phraseto_tsquery_with(kind: TokenizerKind, text: &str) -> Result<crate
         if t.stopped || t.lexeme.is_empty() {
             continue;
         }
+        validate_lexeme_length(t.lexeme.as_bytes())?;
         lex_positions.push((t.lexeme.into_bytes(), t.position));
     }
     if lex_positions.is_empty() {
@@ -1339,6 +2673,7 @@ pub fn fn_phraseto_tsquery_with(kind: TokenizerKind, text: &str) -> Result<crate
             "tsquery would be empty (input had only stop-words?)".into(),
         ));
     }
+    check_left_deep_query_size(lex_positions.len())?;
     let mut iter = lex_positions.into_iter();
     let (first_lex, mut prev_pos) = iter.next().unwrap();
     let mut acc = TsQueryAst::Lexeme {
@@ -1360,31 +2695,88 @@ pub fn fn_phraseto_tsquery_with(kind: TokenizerKind, text: &str) -> Result<crate
         };
         prev_pos = pos;
     }
-    Ok(crate::types::Value::TsQuery(acc.encode()))
+    Ok(crate::types::Value::TsQuery(acc.encode()?))
+}
+
+pub(crate) fn fn_phraseto_tsquery_with_cancel(
+    kind: TokenizerKind,
+    text: &str,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
+    if cancel.is_none() {
+        return fn_phraseto_tsquery_with(kind, text);
+    }
+    let tokens = tokenize_with_cancel(kind, text, cancel)?;
+    let mut lex_positions: Vec<(Vec<u8>, u16)> = Vec::new();
+    for (work, token) in tokens.into_iter().enumerate() {
+        check_cancel_at(cancel, work)?;
+        if !token.stopped && !token.lexeme.is_empty() {
+            lex_positions.push((token.lexeme.into_bytes(), token.position));
+        }
+    }
+    if lex_positions.is_empty() {
+        return Err(SqlError::InvalidValue(
+            "tsquery would be empty (input had only stop-words?)".into(),
+        ));
+    }
+    check_left_deep_query_size(lex_positions.len())?;
+    let mut iter = lex_positions.into_iter();
+    let (first_lex, mut prev_pos) = iter.next().unwrap();
+    let mut acc = TsQueryAst::Lexeme {
+        lexeme: first_lex,
+        weight_mask: 0,
+        prefix: false,
+    };
+    for (work, (lexeme, position)) in iter.enumerate() {
+        check_cancel_at(cancel, work)?;
+        let distance = position.saturating_sub(prev_pos).max(1);
+        acc = TsQueryAst::Phrase {
+            distance,
+            left: Box::new(acc),
+            right: Box::new(TsQueryAst::Lexeme {
+                lexeme,
+                weight_mask: 0,
+                prefix: false,
+            }),
+        };
+        prev_pos = position;
+    }
+    check_cancel(cancel)?;
+    Ok(crate::types::Value::TsQuery(
+        acc.encode_with_cancel(cancel)?,
+    ))
 }
 
 pub fn fn_websearch_to_tsquery_with(
     kind: TokenizerKind,
     text: &str,
 ) -> Result<crate::types::Value> {
+    fn_websearch_to_tsquery_with_cancel(kind, text, None)
+}
+
+pub(crate) fn fn_websearch_to_tsquery_with_cancel(
+    kind: TokenizerKind,
+    text: &str,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
+    check_cancel(cancel)?;
     let mut groups: Vec<TsQueryAst> = Vec::new();
     let mut current_terms: Vec<TsQueryAst> = Vec::new();
     let mut cursor = 0usize;
     let bytes = text.as_bytes();
 
-    let flush_group = |terms: &mut Vec<TsQueryAst>, groups: &mut Vec<TsQueryAst>| {
-        if terms.is_empty() {
-            return;
+    let flush_group = |terms: &mut Vec<TsQueryAst>, groups: &mut Vec<TsQueryAst>| -> Result<()> {
+        if let Some(combined) = fold_tsquery_nodes(std::mem::take(terms), TsQueryAst::And)? {
+            groups.push(combined);
         }
-        let mut iter = std::mem::take(terms).into_iter();
-        let first = iter.next().unwrap();
-        let combined = iter.fold(first, |acc, x| TsQueryAst::And(Box::new(acc), Box::new(x)));
-        groups.push(combined);
+        Ok(())
     };
 
     while cursor < bytes.len() {
+        check_cancel_at(cancel, cursor)?;
         while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
+            check_cancel_at(cancel, cursor)?;
         }
         if cursor >= bytes.len() {
             break;
@@ -1400,30 +2792,40 @@ pub fn fn_websearch_to_tsquery_with(
             let start = cursor;
             while cursor < bytes.len() && bytes[cursor] != b'"' {
                 cursor += 1;
+                check_cancel_at(cancel, cursor)?;
             }
             let inner = &text[start..cursor];
             if cursor < bytes.len() {
                 cursor += 1; // closing quote
             }
-            if let Ok(crate::types::Value::TsQuery(q)) = fn_phraseto_tsquery_with(kind, inner) {
-                let mut ast = TsQueryAst::decode(&q)?;
-                if negate {
-                    ast = TsQueryAst::Not(Box::new(ast));
+            match fn_phraseto_tsquery_with_cancel(kind, inner, cancel) {
+                Ok(crate::types::Value::TsQuery(q)) => {
+                    let mut ast = TsQueryAst::decode_with_cancel(&q, cancel)?;
+                    if negate {
+                        ast = TsQueryAst::Not(Box::new(ast));
+                    }
+                    validate_tsquery(&ast)?;
+                    current_terms.push(ast);
                 }
-                current_terms.push(ast);
+                Err(error @ SqlError::Storage(citadel_core::Error::Interrupted)) => {
+                    return Err(error);
+                }
+                Ok(_) | Err(_) => {}
             }
             continue;
         }
         let start = cursor;
         while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
+            check_cancel_at(cancel, cursor)?;
         }
         let word = &text[start..cursor];
         if word.eq_ignore_ascii_case("or") {
-            flush_group(&mut current_terms, &mut groups);
+            flush_group(&mut current_terms, &mut groups)?;
             continue;
         }
         if let Some(stemmed) = stem_one(kind, word) {
+            check_cancel(cancel)?;
             let mut ast = TsQueryAst::Lexeme {
                 lexeme: stemmed.into_bytes(),
                 weight_mask: 0,
@@ -1432,19 +2834,21 @@ pub fn fn_websearch_to_tsquery_with(
             if negate {
                 ast = TsQueryAst::Not(Box::new(ast));
             }
+            validate_tsquery(&ast)?;
             current_terms.push(ast);
         }
     }
-    flush_group(&mut current_terms, &mut groups);
+    flush_group(&mut current_terms, &mut groups)?;
     if groups.is_empty() {
         return Err(SqlError::InvalidValue(
             "tsquery would be empty (input had only stop-words?)".into(),
         ));
     }
-    let mut iter = groups.into_iter();
-    let first = iter.next().unwrap();
-    let combined = iter.fold(first, |acc, x| TsQueryAst::Or(Box::new(acc), Box::new(x)));
-    Ok(crate::types::Value::TsQuery(combined.encode()))
+    let combined = fold_tsquery_nodes(groups, TsQueryAst::Or)?.expect("groups checked non-empty");
+    check_cancel(cancel)?;
+    Ok(crate::types::Value::TsQuery(
+        combined.encode_with_cancel(cancel)?,
+    ))
 }
 
 pub fn fn_ts_headline_with(
@@ -1452,12 +2856,23 @@ pub fn fn_ts_headline_with(
     text: &str,
     tsq_bytes: &[u8],
 ) -> Result<crate::types::Value> {
+    fn_ts_headline_with_cancel(kind, text, tsq_bytes, None)
+}
+
+pub(crate) fn fn_ts_headline_with_cancel(
+    kind: TokenizerKind,
+    text: &str,
+    tsq_bytes: &[u8],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
     use unicode_segmentation::UnicodeSegmentation;
-    let ast = TsQueryAst::decode(tsq_bytes)?;
+    check_cancel(cancel)?;
+    let ast = TsQueryAst::decode_with_cancel(tsq_bytes, cancel)?;
     let positive_lexemes = collect_query_atoms(&ast);
     let mut out = String::with_capacity(text.len() + 16);
     let mut last_end = 0usize;
-    for (idx, word) in text.split_word_bound_indices() {
+    for (work, (idx, word)) in text.split_word_bound_indices().enumerate() {
+        check_cancel_at(cancel, work)?;
         let word_lower: String = word.to_lowercase();
         let stemmed = stem_one(kind, &word_lower);
         let matched = stemmed.as_ref().is_some_and(|s| {
@@ -1474,6 +2889,7 @@ pub fn fn_ts_headline_with(
         }
     }
     out.push_str(&text[last_end..]);
+    check_cancel(cancel)?;
     Ok(crate::types::Value::Text(out.into()))
 }
 
@@ -1506,6 +2922,20 @@ pub fn fn_ts_lexize_with(kind: TokenizerKind, word: &str) -> Result<crate::types
         Some(s) => Ok(crate::types::Value::Text(s.into())),
         None => Ok(crate::types::Value::Null),
     }
+}
+
+pub(crate) fn fn_ts_lexize_with_cancel(
+    kind: TokenizerKind,
+    word: &str,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
+    if cancel.is_none() {
+        return fn_ts_lexize_with(kind, word);
+    }
+    check_cancel(cancel)?;
+    let value = fn_ts_lexize_with(kind, word)?;
+    check_cancel(cancel)?;
+    Ok(value)
 }
 
 pub fn fn_to_tsquery(text: &str) -> Result<crate::types::Value> {
@@ -1550,20 +2980,31 @@ pub fn parse_weight_char(s: &str) -> Result<Weight> {
 }
 
 pub fn fn_setweight(tsv: &[u8], weight: Weight) -> Result<crate::types::Value> {
+    fn_setweight_with_cancel(tsv, weight, None)
+}
+
+pub(crate) fn fn_setweight_with_cancel(
+    tsv: &[u8],
+    weight: Weight,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
+    check_cancel(cancel)?;
     let (_flags, reader) = TsVectorReader::open(tsv)?;
     let mut b = TsVectorBuilder::new();
-    for item in reader {
+    for (work, item) in reader.enumerate() {
+        check_cancel_at(cancel, work)?;
         let (lex, positions) = item?;
         if positions.is_empty() {
-            b.push_no_position(lex);
+            b.push_no_position(lex)?;
             continue;
         }
         for packed in positions {
             let pos = packed & MAX_POSITION;
-            b.push(lex, pos, weight);
+            b.push(lex, pos, weight)?;
         }
     }
-    Ok(crate::types::Value::TsVector(b.build()))
+    check_cancel(cancel)?;
+    Ok(crate::types::Value::TsVector(b.build_with_cancel(cancel)?))
 }
 
 /// Apply `weight` only to lexemes appearing in `filter`; leave others unchanged.
@@ -1572,8 +3013,19 @@ pub fn fn_setweight_selective(
     weight: Weight,
     filter: &[crate::types::Value],
 ) -> Result<crate::types::Value> {
+    fn_setweight_selective_with_cancel(tsv, weight, filter, None)
+}
+
+pub(crate) fn fn_setweight_selective_with_cancel(
+    tsv: &[u8],
+    weight: Weight,
+    filter: &[crate::types::Value],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
+    check_cancel(cancel)?;
     let mut filter_set: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-    for v in filter {
+    for (work, v) in filter.iter().enumerate() {
+        check_cancel_at(cancel, work)?;
         match v {
             crate::types::Value::Text(s) => {
                 filter_set.insert(s.as_bytes().to_vec());
@@ -1589,35 +3041,47 @@ pub fn fn_setweight_selective(
     }
     let (_flags, reader) = TsVectorReader::open(tsv)?;
     let mut b = TsVectorBuilder::new();
-    for item in reader {
+    for (work, item) in reader.enumerate() {
+        check_cancel_at(cancel, work)?;
         let (lex, positions) = item?;
         let should_reweight = filter_set.contains(lex);
         if positions.is_empty() {
-            b.push_no_position(lex);
+            b.push_no_position(lex)?;
             continue;
         }
         for packed in positions {
             let pos = packed & MAX_POSITION;
             if should_reweight {
-                b.push(lex, pos, weight);
+                b.push(lex, pos, weight)?;
             } else {
                 let (_p, w) = unpack_position(packed);
-                b.push(lex, pos, w);
+                b.push(lex, pos, w)?;
             }
         }
     }
-    Ok(crate::types::Value::TsVector(b.build()))
+    check_cancel(cancel)?;
+    Ok(crate::types::Value::TsVector(b.build_with_cancel(cancel)?))
 }
 
 /// Strip positions and weights from a TSVECTOR, keeping only the distinct lexeme set.
 pub fn fn_strip(tsv: &[u8]) -> Result<crate::types::Value> {
+    fn_strip_with_cancel(tsv, None)
+}
+
+pub(crate) fn fn_strip_with_cancel(
+    tsv: &[u8],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
+    check_cancel(cancel)?;
     let (_flags, reader) = TsVectorReader::open(tsv)?;
     let mut b = TsVectorBuilder::new();
-    for item in reader {
+    for (work, item) in reader.enumerate() {
+        check_cancel_at(cancel, work)?;
         let (lex, _positions) = item?;
-        b.push_no_position(lex);
+        b.push_no_position(lex)?;
     }
-    Ok(crate::types::Value::TsVector(b.build()))
+    check_cancel(cancel)?;
+    Ok(crate::types::Value::TsVector(b.build_with_cancel(cancel)?))
 }
 
 /// `tsvector || tsvector`: union the lexeme sets, merging positions per lexeme.
@@ -1628,26 +3092,59 @@ pub fn op_concat(a: &[u8], b: &[u8]) -> Result<crate::types::Value> {
     for item in reader_a {
         let (lex, positions) = item?;
         if positions.is_empty() {
-            builder.push_no_position(lex);
+            builder.push_no_position(lex)?;
             continue;
         }
         for packed in positions {
             let (pos, w) = unpack_position(packed);
-            builder.push(lex, pos, w);
+            builder.push(lex, pos, w)?;
         }
     }
     for item in reader_b {
         let (lex, positions) = item?;
         if positions.is_empty() {
-            builder.push_no_position(lex);
+            builder.push_no_position(lex)?;
             continue;
         }
         for packed in positions {
             let (pos, w) = unpack_position(packed);
-            builder.push(lex, pos, w);
+            builder.push(lex, pos, w)?;
         }
     }
     Ok(crate::types::Value::TsVector(builder.build()))
+}
+
+pub(crate) fn op_concat_with_cancel(
+    left: &[u8],
+    right: &[u8],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<crate::types::Value> {
+    if cancel.is_none() {
+        return op_concat(left, right);
+    }
+    check_cancel(cancel)?;
+    let (_, left_reader) = TsVectorReader::open(left)?;
+    let (_, right_reader) = TsVectorReader::open(right)?;
+    let mut builder = TsVectorBuilder::new();
+    let mut work = 0usize;
+    for item in left_reader.chain(right_reader) {
+        check_cancel_at(cancel, work)?;
+        work = work.wrapping_add(1);
+        let (lexeme, positions) = item?;
+        if positions.is_empty() {
+            builder.push_no_position(lexeme)?;
+            continue;
+        }
+        for packed in positions {
+            check_cancel_at(cancel, work)?;
+            work = work.wrapping_add(1);
+            let (position, weight) = unpack_position(packed);
+            builder.push(lexeme, position, weight)?;
+        }
+    }
+    Ok(crate::types::Value::TsVector(
+        builder.build_with_cancel(cancel)?,
+    ))
 }
 
 #[cfg(test)]

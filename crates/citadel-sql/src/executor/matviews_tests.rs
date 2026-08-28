@@ -51,7 +51,7 @@ fn encode_pk_key_clears_buffer_first() {
 fn derive_columns_infers_type_from_rows() {
     let names = vec!["id".into(), "label".into()];
     let rows = vec![vec![Value::Integer(1), Value::Text("a".into())]];
-    let cols = derive_columns(&names, &rows);
+    let cols = derive_columns(&names, &rows, &[]);
     assert_eq!(cols.len(), 2);
     assert_eq!(cols[0].data_type, DataType::Integer);
     assert_eq!(cols[1].data_type, DataType::Text);
@@ -61,7 +61,7 @@ fn derive_columns_infers_type_from_rows() {
 fn derive_columns_first_column_not_nullable() {
     let names = vec!["pk".into(), "val".into()];
     let rows = vec![vec![Value::Integer(1), Value::Integer(2)]];
-    let cols = derive_columns(&names, &rows);
+    let cols = derive_columns(&names, &rows, &[]);
     assert!(!cols[0].nullable);
     assert!(cols[1].nullable);
 }
@@ -70,7 +70,7 @@ fn derive_columns_first_column_not_nullable() {
 fn derive_columns_lowercases_names() {
     let names = vec!["MixedCase".into()];
     let rows = vec![vec![Value::Integer(1)]];
-    let cols = derive_columns(&names, &rows);
+    let cols = derive_columns(&names, &rows, &[]);
     assert_eq!(cols[0].name, "mixedcase");
 }
 
@@ -78,7 +78,7 @@ fn derive_columns_lowercases_names() {
 fn derive_columns_falls_back_to_text_when_all_null() {
     let names = vec!["x".into()];
     let rows = vec![vec![Value::Null], vec![Value::Null]];
-    let cols = derive_columns(&names, &rows);
+    let cols = derive_columns(&names, &rows, &[]);
     assert_eq!(cols[0].data_type, DataType::Text);
 }
 
@@ -86,7 +86,7 @@ fn derive_columns_falls_back_to_text_when_all_null() {
 fn derive_columns_skips_null_when_inferring_type() {
     let names = vec!["x".into()];
     let rows = vec![vec![Value::Null], vec![Value::Integer(7)]];
-    let cols = derive_columns(&names, &rows);
+    let cols = derive_columns(&names, &rows, &[]);
     assert_eq!(cols[0].data_type, DataType::Integer);
 }
 

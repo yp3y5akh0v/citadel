@@ -1013,11 +1013,11 @@ fn ambiguous_column_in_where_after_join() {
     exec(&c, "INSERT INTO t1 VALUES (1, 10)");
     exec(&c, "INSERT INTO t2 VALUES (1, 20)");
 
-    let qr = query(
-        &c,
-        "SELECT t1.val, t2.val FROM t1 JOIN t2 ON t1.id = t2.id WHERE val > 5",
-    );
-    assert_eq!(qr.rows.len(), 0);
+    let result = c.execute("SELECT t1.val, t2.val FROM t1 JOIN t2 ON t1.id = t2.id WHERE val > 5");
+    assert!(matches!(
+        result,
+        Err(SqlError::AmbiguousColumn(ref name)) if name == "val"
+    ));
 }
 
 #[test]
@@ -1037,12 +1037,11 @@ fn ambiguous_column_in_order_by_after_join() {
     exec(&c, "INSERT INTO t1 VALUES (1, 10)");
     exec(&c, "INSERT INTO t2 VALUES (1, 20)");
 
-    let qr = query(
-        &c,
-        "SELECT t1.val, t2.val FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY val",
-    );
-    assert_eq!(qr.rows.len(), 1);
-    assert_eq!(qr.rows[0], vec![Value::Integer(10), Value::Integer(20)]);
+    let result = c.execute("SELECT t1.val, t2.val FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY val");
+    assert!(matches!(
+        result,
+        Err(SqlError::AmbiguousColumn(ref name)) if name == "val"
+    ));
 }
 
 #[test]
@@ -2293,8 +2292,11 @@ fn join_column_not_found_in_on() {
     exec(&c, "INSERT INTO a VALUES (1)");
     exec(&c, "INSERT INTO b VALUES (1)");
 
-    let qr = query(&c, "SELECT * FROM a JOIN b ON a.nonexistent = b.id");
-    assert_eq!(qr.rows.len(), 0);
+    let result = c.execute("SELECT * FROM a JOIN b ON a.nonexistent = b.id");
+    assert!(matches!(
+        result,
+        Err(SqlError::ColumnNotFound(ref name)) if name == "a.nonexistent"
+    ));
 }
 
 #[test]

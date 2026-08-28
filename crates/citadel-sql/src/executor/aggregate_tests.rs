@@ -188,3 +188,81 @@ fn eval_aggregate_expr_sum_integer() {
     let result = eval_aggregate_expr(&e, &cm, &rows).unwrap();
     assert_eq!(result, i(60));
 }
+
+#[test]
+fn aggregate_materialization_honors_cancellation() {
+    let cs = cols(&[("v", DataType::Integer)]);
+    let cm = ColumnMap::new(&cs);
+    let owned: Vec<Vec<Value>> = (0..1_000).map(|n| vec![i(n)]).collect();
+    let rows: Vec<&Vec<Value>> = owned.iter().collect();
+    let expr = Expr::Function {
+        name: "SUM".into(),
+        args: vec![Expr::Column("v".into())],
+        distinct: false,
+    };
+    let token = citadel::CancelToken::new();
+    token.cancel();
+
+    let err = eval_aggregate_expr_with_cancel(&expr, &cm, &rows, Some(&token)).unwrap_err();
+
+    assert!(matches!(
+        err,
+        crate::error::SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+
+    let stmt = crate::parser::SelectStmt {
+        columns: vec![crate::parser::SelectColumn::Expr {
+            expr: Expr::CountStar,
+            alias: None,
+        }],
+        from: "t".into(),
+        from_alias: None,
+        from_subquery: None,
+        from_args: None,
+        from_json_table: None,
+        joins: vec![],
+        distinct: false,
+        where_clause: None,
+        order_by: vec![],
+        limit: None,
+        offset: None,
+        group_by: vec![],
+        having: None,
+    };
+    let err = exec_aggregate(
+        &owned,
+        crate::executor::SelectCtx::new(&cs, &stmt, Some(&token)),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+}
+
+#[test]
+fn aggregate_argument_passes_cancellation_into_scalar_evaluation() {
+    let cs = cols(&[("body", DataType::Text)]);
+    let col_map = ColumnMap::new(&cs);
+    let owned = [vec![Value::Text("several words to tokenize".into())]];
+    let rows: Vec<&Vec<Value>> = owned.iter().collect();
+    let expr = Expr::Function {
+        name: "COUNT".into(),
+        args: vec![Expr::Function {
+            name: "TO_TSVECTOR".into(),
+            args: vec![Expr::Column("body".into())],
+            distinct: false,
+        }],
+        distinct: false,
+    };
+    let token = citadel::CancelToken::new();
+    let _cancel = crate::fts::cancel_tokenize_after(token.clone(), 1);
+
+    let err = eval_aggregate_expr_with_cancel(&expr, &col_map, &rows, Some(&token))
+        .expect_err("the aggregate argument discarded its cancellation token");
+
+    assert!(matches!(
+        err,
+        crate::error::SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+}

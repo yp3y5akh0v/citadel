@@ -35,6 +35,149 @@ fn assert_rows(r: ExecutionResult, expected: u64) {
     }
 }
 
+#[test]
+fn rollback_to_savepoint_removes_temporary_table_alias_and_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT before_temp").unwrap();
+    conn.execute("CREATE TEMPORARY TABLE tmp (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO tmp VALUES (1)").unwrap();
+    conn.execute("ROLLBACK TO before_temp").unwrap();
+    assert!(matches!(
+        conn.query("SELECT * FROM tmp"),
+        Err(SqlError::TableNotFound(_))
+    ));
+    conn.execute("CREATE TEMPORARY TABLE tmp (id INTEGER PRIMARY KEY)")
+        .expect("the rolled-back TEMP alias must not reserve the name");
+    conn.execute("DROP TABLE tmp").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    assert!(db
+        .table_names()
+        .unwrap()
+        .into_iter()
+        .all(|name| !name.starts_with(b"__temp_")));
+}
+
+#[test]
+fn rollback_to_savepoint_restores_created_and_dropped_triggers() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit (id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT before_create").unwrap();
+    conn.execute(
+        "CREATE TRIGGER rolled_back AFTER INSERT ON src FOR EACH ROW \
+         BEGIN INSERT INTO audit VALUES (NEW.id); END",
+    )
+    .unwrap();
+    conn.execute("ROLLBACK TO before_create").unwrap();
+    conn.execute("INSERT INTO src VALUES (1)").unwrap();
+
+    conn.execute(
+        "CREATE TRIGGER retained AFTER INSERT ON src FOR EACH ROW \
+         BEGIN INSERT INTO audit VALUES (NEW.id + 100); END",
+    )
+    .unwrap();
+    conn.execute("SAVEPOINT before_drop").unwrap();
+    conn.execute("DROP TRIGGER retained").unwrap();
+    conn.execute("ROLLBACK TO before_drop").unwrap();
+    conn.execute("INSERT INTO src VALUES (2)").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let rows = conn.query("SELECT id FROM audit ORDER BY id").unwrap();
+    assert_eq!(rows.rows, vec![vec![Value::Integer(102)]]);
+}
+
+#[test]
+fn rollback_to_savepoint_discards_a_created_materialized_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT id FROM src")
+        .unwrap();
+    conn.execute("ROLLBACK TO s").unwrap();
+    conn.execute("CREATE TABLE mv (id INTEGER PRIMARY KEY)")
+        .expect("the rolled-back matview must not reserve its name");
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn rollback_to_savepoint_restores_a_dropped_materialized_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO src VALUES (1)").unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT id FROM src")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("DROP MATERIALIZED VIEW mv").unwrap();
+    conn.execute("ROLLBACK TO s").unwrap();
+    let rows = conn.query("SELECT id FROM mv").unwrap();
+    assert_eq!(rows.rows, vec![vec![Value::Integer(1)]]);
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn rollback_to_savepoint_restores_explain_analyze_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'before')").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT before_explain").unwrap();
+    conn.execute("EXPLAIN ANALYZE UPDATE t SET value = 'after' WHERE id = 1")
+        .unwrap();
+    conn.execute("ROLLBACK TO before_explain").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    assert_eq!(
+        conn.query("SELECT value FROM t WHERE id = 1").unwrap().rows[0][0],
+        Value::Text("before".into())
+    );
+}
+
+#[test]
+fn failed_explain_analyze_mutation_makes_transaction_uncommittable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    let error = conn
+        .execute("EXPLAIN ANALYZE INSERT INTO t VALUES (1), (2), (1)")
+        .unwrap_err();
+    assert!(matches!(error, SqlError::DuplicateKey));
+    let commit = conn.execute("COMMIT").unwrap_err();
+    assert!(matches!(
+        commit,
+        SqlError::Storage(citadel_core::Error::TransactionFailed)
+    ));
+}
+
 fn count(conn: &Connection<'_>, sql: &str) -> i64 {
     let qr = conn.query(sql).unwrap();
     match &qr.rows[0][0] {
@@ -465,6 +608,7 @@ fn unique_index_respected_across_rollback() {
         .execute("INSERT INTO t (id, val) VALUES (3, 'existing')")
         .unwrap_err();
     assert!(matches!(err, SqlError::UniqueViolation(_)));
+    conn.execute("ROLLBACK TO sp").unwrap();
     conn.execute("COMMIT").unwrap();
 }
 

@@ -9,13 +9,13 @@ use crate::parser::Statement;
 use crate::schema::SchemaManager;
 use crate::types::{ExecutionResult, QueryResult, Value};
 
-pub enum ActiveTxnRef<'a, 'db: 'a> {
+pub(crate) enum ActiveTxnRef<'a, 'db: 'a> {
     None,
     Read(&'a mut ReadTxn<'db>),
     Write(&'a mut WriteTxn<'db>),
 }
 
-pub trait CompiledPlan: Send + Sync {
+pub(crate) trait CompiledPlan: Send + Sync {
     fn execute(
         &self,
         db: &Database,
@@ -63,7 +63,7 @@ pub trait CompiledPlan: Send + Sync {
 }
 
 /// Internal trait: object-safe streaming source over decoded rows.
-pub trait RowSourceIter {
+pub(crate) trait RowSourceIter {
     fn next_row(&mut self) -> Result<Option<Vec<Value>>>;
     fn columns(&self) -> &[String];
     /// Upper bound on remaining rows, for output pre-sizing. 0 = unknown.
@@ -72,7 +72,7 @@ pub trait RowSourceIter {
     }
 }
 
-pub fn compile(schema: &SchemaManager, stmt: &Statement) -> Option<Arc<dyn CompiledPlan>> {
+pub(crate) fn compile(schema: &SchemaManager, stmt: &Statement) -> Option<Arc<dyn CompiledPlan>> {
     match stmt {
         Statement::Select(sq) => super::select::CompiledSelect::try_compile(schema, sq)
             .map(|c| Arc::new(c) as Arc<dyn CompiledPlan>),

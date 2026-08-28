@@ -643,14 +643,43 @@ fn group_by_over_virtual_column() {
     conn.execute("INSERT INTO t (id, a) VALUES (1, 10), (2, 10), (3, 30)")
         .unwrap();
 
-    let qr = conn
-        .query("SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g")
-        .unwrap();
+    let mut rows = conn
+        .query("SELECT g, COUNT(*) FROM t GROUP BY g")
+        .unwrap()
+        .rows;
+    rows.sort_by(|left, right| left[0].cmp(&right[0]));
     assert_eq!(
-        qr.rows,
+        rows,
         vec![
             vec![Value::Integer(20), Value::Integer(2)],
             vec![Value::Integer(60), Value::Integer(1)],
+        ]
+    );
+}
+
+#[test]
+fn stream_group_by_min_over_virtual_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, a INTEGER, \
+         g INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t (id, a) VALUES (1, 10), (2, 10), (3, 30)")
+        .unwrap();
+
+    let mut rows = conn
+        .query("SELECT a, MIN(g) FROM t GROUP BY a")
+        .unwrap()
+        .rows;
+    rows.sort_by(|left, right| left[0].cmp(&right[0]));
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(10), Value::Integer(20)],
+            vec![Value::Integer(30), Value::Integer(60)],
         ]
     );
 }

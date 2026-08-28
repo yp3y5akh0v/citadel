@@ -2,6 +2,34 @@ use crate::manager::tests::create_test_manager;
 use citadel_core::types::PageId;
 
 #[test]
+fn table_root_stamp_tracks_the_write_view_and_root_page_txn() {
+    let mgr = create_test_manager();
+    let mut create = mgr.begin_write().unwrap();
+    create.create_table(b"stamped").unwrap();
+    create.table_insert(b"stamped", b"key", b"old").unwrap();
+    create.commit().unwrap();
+
+    let committed_stamp = {
+        let mut rtx = mgr.begin_read();
+        rtx.table_root_stamp(b"stamped").unwrap().unwrap()
+    };
+    let mut wtx = mgr.begin_write().unwrap();
+    assert_eq!(
+        wtx.table_root_stamp(b"stamped").unwrap(),
+        Some(committed_stamp)
+    );
+    wtx.table_insert(b"stamped", b"key", b"new").unwrap();
+    let write_stamp = wtx.table_root_stamp(b"stamped").unwrap().unwrap();
+    assert_ne!(write_stamp, committed_stamp);
+    assert_eq!(write_stamp.1, wtx.txn_id());
+    wtx.commit().unwrap();
+
+    let mut rtx = mgr.begin_read();
+    assert_eq!(rtx.table_root_stamp(b"stamped").unwrap(), Some(write_stamp));
+    assert_eq!(rtx.table_root_stamp(b"missing").unwrap(), None);
+}
+
+#[test]
 fn insert_and_get() {
     let mgr = create_test_manager();
 

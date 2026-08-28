@@ -7,7 +7,103 @@ use crate::types::*;
 use super::helpers::*;
 use super::window::has_any_window_function;
 
-pub(super) fn explain(schema: &SchemaManager, stmt: &Statement) -> Result<ExecutionResult> {
+/// How EXPLAIN learns a table's size. `Ok(None)` for anything with no catalog
+/// descriptor to read: a CTE, a view, or a table that does not exist. The
+/// result stays fallible so cancellation cannot be mistaken for an unknown
+/// estimate.
+pub(super) type RowCountFn<'a> = &'a mut dyn FnMut(&str) -> Result<Option<u64>>;
+
+/// What an ANALYZE run observed. Flat rather than a tree mirroring the plan: a
+/// fused strategy does the scan, filter, sort and limit in one pass, so there is
+/// one duration to report and per-line times would be fabrication.
+#[derive(Debug, Default, Clone)]
+pub(super) struct Measured {
+    pub elapsed: std::time::Duration,
+    /// Rows the result actually returned.
+    pub emitted: u64,
+    /// Rows read from storage, when the strategy counts them. `None` when the
+    /// lane that ran keeps no such counter, which is stated rather than guessed.
+    pub scanned: Option<u64>,
+}
+
+impl Measured {
+    /// The one constructor, so `emitted` always comes from the result the
+    /// statement produced. `scanned` counts storage entries examined, including
+    /// rows a filter discarded - which is why it sits next to `emitted`.
+    pub(super) fn observed(
+        elapsed: std::time::Duration,
+        result: &ExecutionResult,
+        scanned: u64,
+    ) -> Self {
+        let emitted = match result {
+            ExecutionResult::Query(qr) => qr.rows.len() as u64,
+            ExecutionResult::RowsAffected(n) => *n,
+            ExecutionResult::Ok => 0,
+        };
+        Self {
+            elapsed,
+            emitted,
+            // Zero is ambiguous: an empty counted scan and a lane such as a
+            // point lookup that has no scan counter both produce it. Omitting
+            // the field is honest; reporting `scanned=0 emitted=1` is not.
+            scanned: (scanned > 0).then_some(scanned),
+        }
+    }
+
+    /// The `(actual time=.. emitted=.. scanned=..)` suffix for a plan line.
+    fn suffix(&self) -> String {
+        let ms = self.elapsed.as_secs_f64() * 1000.0;
+        match self.scanned {
+            Some(n) => format!(
+                " (actual time={ms:.3}ms scanned={n} emitted={})",
+                self.emitted
+            ),
+            None => format!(" (actual time={ms:.3}ms emitted={})", self.emitted),
+        }
+    }
+}
+
+/// What every explain function needs.
+pub(super) struct ExplainCtx<'a> {
+    pub schema: &'a SchemaManager,
+    pub rows: RowCountFn<'a>,
+}
+
+impl ExplainCtx<'_> {
+    /// The exact entry count for `table`, or `None` when it has no descriptor.
+    fn row_count(&mut self, table: &str) -> Result<Option<u64>> {
+        let storage_name = self
+            .schema
+            .get(table)
+            .map_or(table, |table_schema| table_schema.name.as_str());
+        (self.rows)(storage_name)
+    }
+
+    /// Borrow the context for a nested call without moving it.
+    fn reborrow(&mut self) -> ExplainCtx<'_> {
+        ExplainCtx {
+            schema: self.schema,
+            rows: &mut *self.rows,
+        }
+    }
+}
+
+/// Attach one completed execution's measurements to its already-built plan.
+/// Building first both validates the plan before side effects and preserves
+/// pre-mutation row counts for ANALYZE of UPDATE or DELETE.
+pub(super) fn attach_measurement(result: &mut ExecutionResult, measured: &Measured) {
+    let ExecutionResult::Query(query) = result else {
+        debug_assert!(false, "EXPLAIN returned a non-query result");
+        return;
+    };
+    let Some(Value::Text(line)) = query.rows.first_mut().and_then(|row| row.first_mut()) else {
+        debug_assert!(false, "EXPLAIN returned no root plan line");
+        return;
+    };
+    line.push_str(&measured.suffix());
+}
+
+pub(super) fn explain(ctx: &mut ExplainCtx<'_>, stmt: &Statement) -> Result<ExecutionResult> {
     let lines = match stmt {
         Statement::Select(sq) => {
             let mut lines = Vec::new();
@@ -15,12 +111,12 @@ pub(super) fn explain(schema: &SchemaManager, stmt: &Statement) -> Result<Execut
             for cte in &sq.ctes {
                 lines.push(format!("WITH {} AS", cte.name));
                 lines.extend(
-                    explain_query_body_cte(schema, &cte.body, &cte_names)?
+                    explain_query_body_cte(ctx, &cte.body, &cte_names)?
                         .into_iter()
                         .map(|l| format!("  {l}")),
                 );
             }
-            lines.extend(explain_query_body_cte(schema, &sq.body, &cte_names)?);
+            lines.extend(explain_query_body_cte(ctx, &sq.body, &cte_names)?);
             lines
         }
         Statement::Insert(ins) => match &ins.source {
@@ -40,19 +136,17 @@ pub(super) fn explain(schema: &SchemaManager, stmt: &Statement) -> Result<Execut
                 for cte in &sq.ctes {
                     lines.push(format!("  WITH {} AS", cte.name));
                     lines.extend(
-                        explain_query_body_cte(schema, &cte.body, &cte_names)?
+                        explain_query_body_cte(ctx, &cte.body, &cte_names)?
                             .into_iter()
                             .map(|l| format!("    {l}")),
                     );
                 }
-                lines.extend(explain_query_body_cte(schema, &sq.body, &cte_names)?);
+                lines.extend(explain_query_body_cte(ctx, &sq.body, &cte_names)?);
                 lines
             }
         },
-        Statement::Update(upd) => explain_dml(schema, &upd.table, &upd.where_clause, "UPDATE")?,
-        Statement::Delete(del) => {
-            explain_dml(schema, &del.table, &del.where_clause, "DELETE FROM")?
-        }
+        Statement::Update(upd) => explain_dml(ctx, &upd.table, &upd.where_clause, "UPDATE")?,
+        Statement::Delete(del) => explain_dml(ctx, &del.table, &del.where_clause, "DELETE FROM")?,
         Statement::AlterTable(at) => {
             let desc = match &at.op {
                 AlterTableOp::AddColumn { column, .. } => {
@@ -93,7 +187,7 @@ pub(super) fn explain(schema: &SchemaManager, stmt: &Statement) -> Result<Execut
         Statement::DropView(dv) => {
             vec![format!("DROP VIEW {}", dv.name.to_ascii_lowercase())]
         }
-        Statement::Explain(_) => {
+        Statement::Explain { .. } => {
             return Err(SqlError::Unsupported("EXPLAIN EXPLAIN".into()));
         }
         _ => {
@@ -114,27 +208,29 @@ pub(super) fn explain(schema: &SchemaManager, stmt: &Statement) -> Result<Execut
 }
 
 pub(super) fn explain_dml(
-    schema: &SchemaManager,
+    ctx: &mut ExplainCtx<'_>,
     table: &str,
     where_clause: &Option<Expr>,
     verb: &str,
 ) -> Result<Vec<String>> {
     let lower = table.to_ascii_lowercase();
-    let table_schema = schema
+    let table_schema = ctx
+        .schema
         .get(&lower)
         .ok_or_else(|| SqlError::TableNotFound(table.to_string()))?;
     let plan = planner::plan_select(table_schema, where_clause);
-    let scan_line = format_scan_line(&lower, &None, &plan, table_schema);
+    let rows = ctx.row_count(&table_schema.name)?;
+    let scan_line = format_scan_line(&lower, &None, &plan, table_schema, rows);
     Ok(vec![format!("{verb} {}", scan_line)])
 }
 
 pub(super) fn explain_query_body_cte(
-    schema: &SchemaManager,
+    ctx: &mut ExplainCtx<'_>,
     body: &QueryBody,
     cte_names: &[&str],
 ) -> Result<Vec<String>> {
     match body {
-        QueryBody::Select(sel) => explain_select_cte(schema, sel, cte_names),
+        QueryBody::Select(sel) => explain_select_cte(ctx, sel, cte_names),
         QueryBody::Compound(comp) => {
             let op_name = match (&comp.op, comp.all) {
                 (SetOp::Union, true) => "UNION ALL",
@@ -145,11 +241,11 @@ pub(super) fn explain_query_body_cte(
                 (SetOp::Except, false) => "EXCEPT",
             };
             let mut lines = vec![op_name.to_string()];
-            let left_lines = explain_query_body_cte(schema, &comp.left, cte_names)?;
+            let left_lines = explain_query_body_cte(ctx, &comp.left, cte_names)?;
             for l in left_lines {
                 lines.push(format!("  {l}"));
             }
-            let right_lines = explain_query_body_cte(schema, &comp.right, cte_names)?;
+            let right_lines = explain_query_body_cte(ctx, &comp.right, cte_names)?;
             for l in right_lines {
                 lines.push(format!("  {l}"));
             }
@@ -162,10 +258,11 @@ pub(super) fn explain_query_body_cte(
 }
 
 pub(super) fn explain_select_cte(
-    schema: &SchemaManager,
+    ctx: &mut ExplainCtx<'_>,
     stmt: &SelectStmt,
     cte_names: &[&str],
 ) -> Result<Vec<String>> {
+    let schema = ctx.schema;
     let mut lines = Vec::new();
 
     if stmt.from.is_empty() {
@@ -189,7 +286,8 @@ pub(super) fn explain_select_cte(
                     .get(&jname)
                     .ok_or_else(|| SqlError::TableNotFound(join.table.name.clone()))?;
                 let jp = planner::plan_select(js, &None);
-                lines.push(format_scan_line(&jname, &join.table.alias, &jp, js));
+                let n = ctx.row_count(&js.name)?;
+                lines.push(format_scan_line(&jname, &join.table.alias, &jp, js, n));
             }
         }
         if !stmt.joins.is_empty() {
@@ -216,7 +314,7 @@ pub(super) fn explain_select_cte(
     if let Some(view_def) = schema.get_view(&lower_from) {
         if let Ok(Some(fused)) = super::try_fuse_view(stmt, schema, view_def) {
             // Fused — explain against real table
-            return explain_select_cte(schema, &fused, cte_names);
+            return explain_select_cte(&mut ctx.reborrow(), &fused, cte_names);
         }
         lines.push(format!("SCAN VIEW {lower_from}"));
         if !stmt.order_by.is_empty() {
@@ -233,19 +331,38 @@ pub(super) fn explain_select_cte(
         .ok_or_else(|| SqlError::TableNotFound(stmt.from.clone()))?;
 
     if stmt.joins.is_empty() {
+        // The same decision the executor acts on. Without this, a query that
+        // runs a fused streaming aggregate was described here as an ordinary
+        // scan plus an aggregate step - a plan that never runs.
+        let strategy = super::select::choose_strategy(stmt, from_schema)?;
         let plan = planner::plan_select(from_schema, &stmt.where_clause);
-        let mut line = format_scan_line(&lower_from, &stmt.from_alias, &plan, from_schema);
+        let n = ctx.row_count(&from_schema.name)?;
+        let mut line = format_scan_line(&lower_from, &stmt.from_alias, &plan, from_schema, n);
         if super::select::select_would_cover(schema, stmt) {
             line.push_str(" COVERING");
         }
-        lines.push(line);
+        match strategy.label() {
+            // A fused strategy is one node: it does the scan and everything
+            // above it in a single pass, so it is reported as one line rather
+            // than as a scan with separate steps stacked on top.
+            Some(label) => {
+                lines.push(format!("{label} over {line}"));
+                if stmt.limit.is_some() {
+                    lines.push("LIMIT".into());
+                }
+                return Ok(lines);
+            }
+            None => lines.push(line),
+        }
     } else {
         let from_plan = planner::plan_select(from_schema, &None);
+        let n = ctx.row_count(&from_schema.name)?;
         lines.push(format_scan_line(
             &lower_from,
             &stmt.from_alias,
             &from_plan,
             from_schema,
+            n,
         ));
 
         for join in &stmt.joins {
@@ -260,11 +377,13 @@ pub(super) fn explain_select_cte(
                     .get(&inner_lower)
                     .ok_or_else(|| SqlError::TableNotFound(join.table.name.clone()))?;
                 let inner_plan = planner::plan_select(inner_schema, &None);
+                let n = ctx.row_count(&inner_schema.name)?;
                 lines.push(format_scan_line(
                     &inner_lower,
                     &join.table.alias,
                     &inner_plan,
                     inner_schema,
+                    n,
                 ));
             }
         }
@@ -362,6 +481,9 @@ pub(super) fn count_subqueries(expr: &Expr) -> usize {
         Expr::Like {
             expr: e, pattern, ..
         } => count_subqueries(e) + count_subqueries(pattern),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            count_subqueries(left) + count_subqueries(right)
+        }
         Expr::Case {
             operand,
             conditions,
@@ -393,6 +515,7 @@ pub(super) fn format_scan_line(
     alias: &Option<String>,
     plan: &ScanPlan,
     table_schema: &TableSchema,
+    rows: Option<u64>,
 ) -> String {
     let alias_part = match alias {
         Some(a) if !a.eq_ignore_ascii_case(table_name) => {
@@ -403,10 +526,15 @@ pub(super) fn format_scan_line(
 
     let desc = planner::describe_plan(plan, table_schema);
 
-    if desc.is_empty() {
-        format!("SCAN TABLE {table_name}{alias_part}")
-    } else {
-        format!("SEARCH TABLE {table_name}{alias_part} {desc}")
+    // The count is the table's exact size from the catalog, never an estimate
+    // of what the line returns. On a full scan those are the same number, so it
+    // reads as `rows=N`; on a search they are not, so it says what N is instead
+    // of implying the search returns that many.
+    match (desc.is_empty(), rows) {
+        (true, Some(n)) => format!("SCAN TABLE {table_name}{alias_part} rows={n}"),
+        (true, None) => format!("SCAN TABLE {table_name}{alias_part}"),
+        (false, Some(n)) => format!("SEARCH TABLE {table_name}{alias_part} {desc} of {n} rows"),
+        (false, None) => format!("SEARCH TABLE {table_name}{alias_part} {desc}"),
     }
 }
 

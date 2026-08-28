@@ -24,14 +24,21 @@ pub enum Statement {
     Update(UpdateStmt),
     Delete(DeleteStmt),
     Truncate(TruncateStmt),
-    Begin { access_mode: BeginAccessMode },
+    Begin {
+        access_mode: BeginAccessMode,
+    },
     Commit,
     Rollback,
     Savepoint(String),
     ReleaseSavepoint(String),
     RollbackTo(String),
     SetTimezone(String),
-    Explain(Box<Statement>),
+    Explain {
+        inner: Box<Statement>,
+        /// `EXPLAIN ANALYZE`: run the statement and report measured time and
+        /// rows, rather than only describing the plan.
+        analyze: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -459,6 +466,15 @@ pub enum SelectColumn {
 #[derive(Debug, Clone)]
 pub struct OrderByItem {
     pub expr: Expr,
+    /// Output alias this item resolved to. `expr` remains the underlying
+    /// expression so source-level fast paths can still recognize it; the
+    /// general executor uses this name to sort the value projected once.
+    pub output_name: Option<String>,
+    /// Zero-based projected-output position named by a top-level SQL ordinal.
+    /// Distinct from `expr`: `ORDER BY 1` addresses the first output, while the
+    /// same inside a window specification is an ordinary constant. The marker
+    /// also lets execution resolve positions after `*` expands.
+    pub output_ordinal: Option<usize>,
     pub descending: bool,
     pub nulls_first: Option<bool>,
 }
@@ -509,11 +525,24 @@ pub enum Expr {
         values: rustc_hash::FxHashSet<Value>,
         has_null: bool,
         negated: bool,
+        /// The collation of the column the values were selected from. `x IN (SELECT y)`
+        /// compares as `x = y` does, so when `x` carries no collation of its own the
+        /// subquery's column supplies it - and by then the values are bare, with nothing
+        /// left to read it from.
+        collation: crate::types::Collation,
     },
     Between {
         expr: Box<Expr>,
         low: Box<Expr>,
         high: Box<Expr>,
+        negated: bool,
+    },
+    /// `IS DISTINCT FROM`, and `IS NOT DISTINCT FROM` when negated: `=` that treats NULL as
+    /// a value, so two NULLs are not distinct and a NULL beside a value is. Unlike `=` it
+    /// never evaluates to NULL.
+    IsDistinctFrom {
+        left: Box<Expr>,
+        right: Box<Expr>,
         negated: bool,
     },
     Like {
@@ -648,6 +677,7 @@ pub fn has_subquery(expr: &Expr) -> bool {
         Expr::Between {
             expr, low, high, ..
         } => has_subquery(expr) || has_subquery(low) || has_subquery(high),
+        Expr::IsDistinctFrom { left, right, .. } => has_subquery(left) || has_subquery(right),
         Expr::Like {
             expr,
             pattern,
@@ -1164,7 +1194,7 @@ fn visit_exprs_stmt(stmt: &Statement, visitor: &mut impl FnMut(&Expr)) {
                 visit_expr(w, visitor);
             }
         }
-        Statement::Explain(inner) => visit_exprs_stmt(inner, visitor),
+        Statement::Explain { inner, .. } => visit_exprs_stmt(inner, visitor),
         _ => {}
     }
 }
@@ -1252,6 +1282,10 @@ fn visit_expr(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
         Expr::Exists { subquery, .. } => visit_exprs_select(subquery, visitor),
         Expr::ScalarSubquery(sq) => visit_exprs_select(sq, visitor),
         Expr::InSet { expr: e, .. } => visit_expr(e, visitor),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            visit_expr(left, visitor);
+            visit_expr(right, visitor);
+        }
         Expr::Between {
             expr: e, low, high, ..
         } => {
@@ -1329,6 +1363,27 @@ fn visit_expr(expr: &Expr, visitor: &mut impl FnMut(&Expr)) {
         | Expr::CountStar
         | Expr::Parameter(_)
         | Expr::TypedNullRecord(_) => {}
+    }
+}
+
+fn explain_option_bool(name: &str, arg: Option<&sp::Expr>) -> Result<bool> {
+    let value = match arg {
+        None => return Ok(true),
+        Some(sp::Expr::Value(value)) => match &value.value {
+            sp::Value::Boolean(value) => return Ok(*value),
+            sp::Value::Number(value, _) if value == "1" => return Ok(true),
+            sp::Value::Number(value, _) if value == "0" => return Ok(false),
+            _ => value.value.to_string(),
+        },
+        Some(sp::Expr::Identifier(value)) => value.value.clone(),
+        Some(value) => value.to_string(),
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "on" | "yes" => Ok(true),
+        "false" | "off" | "no" => Ok(false),
+        _ => Err(SqlError::Parse(format!(
+            "EXPLAIN option {name} expects a boolean, got {value}"
+        ))),
     }
 }
 
@@ -1455,13 +1510,51 @@ fn convert_statement(stmt: sp::Statement) -> Result<Statement> {
             Ok(Statement::SetTimezone(zone))
         }
         sp::Statement::Explain {
-            statement, analyze, ..
+            statement,
+            mut analyze,
+            verbose,
+            query_plan,
+            estimate,
+            format,
+            options,
+            ..
         } => {
-            if analyze {
-                return Err(SqlError::Unsupported("EXPLAIN ANALYZE".into()));
+            if verbose {
+                return Err(SqlError::Unsupported("EXPLAIN VERBOSE".into()));
+            }
+            if query_plan {
+                return Err(SqlError::Unsupported("EXPLAIN QUERY PLAN".into()));
+            }
+            if estimate {
+                return Err(SqlError::Unsupported("EXPLAIN ESTIMATE".into()));
+            }
+            if let Some(format) = format {
+                return Err(SqlError::Unsupported(format!("EXPLAIN {format}")));
+            }
+            if let Some(options) = options {
+                let mut saw_analyze = false;
+                for option in options {
+                    let name = option.name.value.to_ascii_lowercase();
+                    if name != "analyze" {
+                        return Err(SqlError::Unsupported(format!(
+                            "EXPLAIN option {}",
+                            option.name.value
+                        )));
+                    }
+                    if saw_analyze {
+                        return Err(SqlError::Parse(
+                            "EXPLAIN option ANALYZE was specified more than once".into(),
+                        ));
+                    }
+                    analyze = explain_option_bool(&option.name.value, option.arg.as_ref())?;
+                    saw_analyze = true;
+                }
             }
             let inner = convert_statement(*statement)?;
-            Ok(Statement::Explain(Box::new(inner)))
+            Ok(Statement::Explain {
+                inner: Box::new(inner),
+                analyze,
+            })
         }
         _ => Err(SqlError::Unsupported(format!("statement type: {}", stmt))),
     }
@@ -2764,6 +2857,76 @@ fn convert_set_expr(set_expr: &sp::SetExpr) -> Result<QueryBody> {
 fn convert_query_body(query: &sp::Query) -> Result<QueryBody> {
     let mut body = convert_set_expr(&query.body)?;
 
+    /// Rewrite `ORDER BY <name>` into the select-list expression `<name>` names.
+    ///
+    /// As PostgreSQL, SQLite and MySQL do: a bare name matches OUTPUT columns
+    /// first, then input columns. Only a bare `Expr::Column` is rewritten; a
+    /// qualified `t.c` names an input column by definition.
+    fn resolve_order_by_aliases(
+        order_by: Vec<OrderByItem>,
+        columns: &[SelectColumn],
+    ) -> Result<Vec<OrderByItem>> {
+        let alias_expr = |name: &str| -> Result<Option<(Expr, String)>> {
+            let mut matches = columns.iter().filter_map(|c| match c {
+                SelectColumn::Expr {
+                    expr,
+                    alias: Some(alias),
+                } if alias.eq_ignore_ascii_case(name) => Some((expr, alias)),
+                _ => None,
+            });
+            let Some((expr, alias)) = matches.next() else {
+                return Ok(None);
+            };
+            if matches.next().is_some() {
+                return Err(SqlError::AmbiguousColumn(name.to_string()));
+            }
+            Ok(Some((expr.clone(), alias.clone())))
+        };
+        order_by
+            .into_iter()
+            .map(|item| {
+                Ok(match &item.expr {
+                    Expr::Column(name) => match alias_expr(name)? {
+                        Some((expr, output_name)) => OrderByItem {
+                            expr,
+                            output_name: Some(output_name),
+                            ..item
+                        },
+                        None => item,
+                    },
+                    _ => item,
+                })
+            })
+            .collect()
+    }
+
+    fn mark_order_by_ordinals(mut order_by: Vec<OrderByItem>) -> Result<Vec<OrderByItem>> {
+        for item in &mut order_by {
+            let signed_position = match &item.expr {
+                Expr::Literal(Value::Integer(position)) => Some(*position),
+                Expr::UnaryOp {
+                    op: UnaryOp::Neg,
+                    expr,
+                } => match expr.as_ref() {
+                    Expr::Literal(Value::Integer(position)) => Some(position.saturating_neg()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(position) = signed_position else {
+                continue;
+            };
+            let output_ordinal = usize::try_from(position)
+                .ok()
+                .and_then(|position| position.checked_sub(1))
+                .ok_or_else(|| {
+                    SqlError::InvalidValue(format!("ORDER BY position {position} out of range"))
+                })?;
+            item.output_ordinal = Some(output_ordinal);
+        }
+        Ok(order_by)
+    }
+
     let order_by = if let Some(ref ob) = query.order_by {
         match &ob.kind {
             sp::OrderByKind::Expressions(exprs) => exprs
@@ -2777,6 +2940,7 @@ fn convert_query_body(query: &sp::Query) -> Result<QueryBody> {
     } else {
         vec![]
     };
+    let order_by = mark_order_by_ordinals(order_by)?;
 
     let (limit, offset) = match &query.limit_clause {
         Some(sp::LimitClause::LimitOffset { limit, offset, .. }) => {
@@ -2797,7 +2961,10 @@ fn convert_query_body(query: &sp::Query) -> Result<QueryBody> {
 
     match &mut body {
         QueryBody::Select(sel) => {
-            sel.order_by = order_by;
+            // Resolved against the select list HERE, where both are in hand. The
+            // executor sorts on source columns before projecting, so a name that
+            // exists only as an output alias could not be evaluated there.
+            sel.order_by = resolve_order_by_aliases(order_by, &sel.columns)?;
             sel.limit = limit;
             sel.offset = offset;
         }
@@ -3103,6 +3270,16 @@ fn convert_expr(expr: &sp::Expr) -> Result<Expr> {
             low: Box::new(convert_expr(low)?),
             high: Box::new(convert_expr(high)?),
             negated: *negated,
+        }),
+        sp::Expr::IsDistinctFrom(left, right) => Ok(Expr::IsDistinctFrom {
+            left: Box::new(convert_expr(left)?),
+            right: Box::new(convert_expr(right)?),
+            negated: false,
+        }),
+        sp::Expr::IsNotDistinctFrom(left, right) => Ok(Expr::IsDistinctFrom {
+            left: Box::new(convert_expr(left)?),
+            right: Box::new(convert_expr(right)?),
+            negated: true,
         }),
         sp::Expr::Like {
             expr: e,
@@ -3838,12 +4015,26 @@ fn convert_select_item(item: &sp::SelectItem) -> Result<SelectColumn> {
 }
 
 fn convert_order_by_expr(expr: &sp::OrderByExpr) -> Result<OrderByItem> {
-    let e = convert_expr(&expr.expr)?;
+    // SQLite treats unary `+1` like the integer ordinal `1`, while `+1.0`
+    // remains an ordinary constant. Unary plus is otherwise unsupported by
+    // the expression evaluator, so accept it here only for numeric literals.
+    let e = match &expr.expr {
+        sp::Expr::UnaryOp {
+            op: sp::UnaryOperator::Plus,
+            expr,
+        } => match convert_expr(expr)? {
+            literal @ Expr::Literal(Value::Integer(_) | Value::Real(_)) => literal,
+            _ => return Err(SqlError::Unsupported("unary op: +".into())),
+        },
+        _ => convert_expr(&expr.expr)?,
+    };
     let descending = expr.options.asc.map(|asc| !asc).unwrap_or(false);
     let nulls_first = expr.options.nulls_first;
 
     Ok(OrderByItem {
         expr: e,
+        output_name: None,
+        output_ordinal: None,
         descending,
         nulls_first,
     })

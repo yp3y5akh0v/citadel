@@ -14,7 +14,7 @@ fn create_db(dir: &std::path::Path) -> citadel::Database {
 fn tsvector(lexs: &[(&[u8], u16, Weight)]) -> Arc<[u8]> {
     let mut b = TsVectorBuilder::new();
     for (lex, p, w) in lexs {
-        b.push(lex, *p, *w);
+        b.push(lex, *p, *w).unwrap();
     }
     b.build()
 }
@@ -25,7 +25,7 @@ fn ts_rank_zero_for_no_match() {
     let db = create_db(dir.path());
     let conn = Connection::open(&db).unwrap();
     let v = tsvector(&[(b"cat", 1, Weight::D)]);
-    let q = parse_tsquery("dog").unwrap().encode();
+    let q = parse_tsquery("dog").unwrap().encode().unwrap();
     let stmt = conn.prepare("SELECT ts_rank($1, $2)").unwrap();
     let rows = stmt
         .query_collect(&[Value::TsVector(v), Value::TsQuery(q)])
@@ -44,7 +44,7 @@ fn ts_rank_higher_for_higher_weight() {
     let conn = Connection::open(&db).unwrap();
     let v_a = tsvector(&[(b"cat", 1, Weight::A)]);
     let v_d = tsvector(&[(b"cat", 1, Weight::D)]);
-    let q = parse_tsquery("cat").unwrap().encode();
+    let q = parse_tsquery("cat").unwrap().encode().unwrap();
     let stmt = conn.prepare("SELECT ts_rank($1, $2)").unwrap();
     let r_a = match &stmt
         .query_collect(&[Value::TsVector(v_a), Value::TsQuery(q.clone())])
@@ -72,7 +72,7 @@ fn ts_rank_more_terms_more_rank() {
     let conn = Connection::open(&db).unwrap();
     let v_match_one = tsvector(&[(b"cat", 1, Weight::D)]);
     let v_match_two = tsvector(&[(b"cat", 1, Weight::D), (b"dog", 2, Weight::D)]);
-    let q = parse_tsquery("cat & dog").unwrap().encode();
+    let q = parse_tsquery("cat & dog").unwrap().encode().unwrap();
     let stmt = conn.prepare("SELECT ts_rank($1, $2)").unwrap();
     let r1 = match &stmt
         .query_collect(&[Value::TsVector(v_match_one), Value::TsQuery(q.clone())])
@@ -103,7 +103,7 @@ fn ts_rank_cd_rewards_proximity() {
     let conn = Connection::open(&db).unwrap();
     let v_close = tsvector(&[(b"cat", 1, Weight::D), (b"dog", 2, Weight::D)]);
     let v_far = tsvector(&[(b"cat", 1, Weight::D), (b"dog", 100, Weight::D)]);
-    let q = parse_tsquery("cat & dog").unwrap().encode();
+    let q = parse_tsquery("cat & dog").unwrap().encode().unwrap();
     let stmt = conn.prepare("SELECT ts_rank_cd($1, $2)").unwrap();
     let r_close = match &stmt
         .query_collect(&[Value::TsVector(v_close), Value::TsQuery(q.clone())])
@@ -133,7 +133,7 @@ fn ts_rank_norm_squash_to_unit_interval() {
     let db = create_db(dir.path());
     let conn = Connection::open(&db).unwrap();
     let v = tsvector(&[(b"cat" as &[u8], 1, Weight::A)]);
-    let q = parse_tsquery("cat").unwrap().encode();
+    let q = parse_tsquery("cat").unwrap().encode().unwrap();
     // norm bit 32 squashes to [0, 1)
     let stmt = conn.prepare("SELECT ts_rank($1, $2, 32)").unwrap();
     let r = match &stmt
@@ -168,7 +168,7 @@ fn numnode_counts_ast_nodes() {
     let db = create_db(dir.path());
     let conn = Connection::open(&db).unwrap();
     // `a & b | c` = Or(And(a, b), c) → 5 nodes
-    let q = parse_tsquery("a & b | c").unwrap().encode();
+    let q = parse_tsquery("a & b | c").unwrap().encode().unwrap();
     let stmt = conn.prepare("SELECT numnode($1)").unwrap();
     let rows = stmt.query_collect(&[Value::TsQuery(q)]).unwrap();
     assert_eq!(rows.rows[0][0], Value::Integer(5));

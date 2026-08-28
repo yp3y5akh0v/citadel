@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use citadel::Database;
+use citadel::{CancelToken, Database};
 use citadel_txn::read_txn::ReadTxn;
 use rustc_hash::FxHashMap;
 
@@ -23,16 +23,99 @@ use super::helpers::*;
 use super::scan::*;
 use super::view::*;
 use super::window::*;
-use super::CteContext;
+use super::{CteContext, CteRows, SelectCtx};
 
-fn try_virtual_table(name: &str, schema: &SchemaManager) -> Option<Result<QueryResult>> {
+fn try_virtual_table(
+    name: &str,
+    schema: &SchemaManager,
+    cancel: Option<&CancelToken>,
+) -> Option<Result<QueryResult>> {
     let canonical = match name {
         "timezone_names" => "pg_timezone_names",
         "timezone_abbrevs" => "pg_timezone_abbrevs",
         other => other,
     };
     let vt = schema.get_virtual(canonical)?;
-    Some(vt.scan(schema))
+    Some(vt.scan(schema, cancel))
+}
+
+/// Which strategy a single-table SELECT actually takes.
+///
+/// One decision procedure, consulted by the executor and by EXPLAIN, so the two
+/// cannot describe different plans. Plans are boxed to keep the enum small.
+pub(super) enum Strategy {
+    CountStar,
+    StreamAgg(Box<StreamAggPlan>),
+    StreamGroupBy(Box<StreamGroupByPlan>),
+    AnnTopK(Box<super::ann_topk::AnnTopKPlan>),
+    VectorTopK(Box<super::ann_topk::VectorTopKPlan>),
+    TopKScan(Box<TopKScanPlan>),
+    /// A row scan, reading at most `limit` rows when the shape allows one.
+    /// Streaming DISTINCT and the two inverted-index lanes may still claim this
+    /// query; their eligibility is interleaved with execution, so it is not
+    /// decided here and `Strategy::label` says so.
+    Scan {
+        limit: Option<usize>,
+    },
+}
+
+impl Strategy {
+    /// The EXPLAIN line for this strategy, naming what will run.
+    pub(super) fn label(&self) -> Option<&'static str> {
+        match self {
+            Self::CountStar => Some("COUNT(*) FROM CATALOG"),
+            Self::StreamAgg(_) => Some("STREAM AGGREGATE (fused scan+aggregate)"),
+            Self::StreamGroupBy(_) => Some("STREAM GROUP BY (fused scan+group)"),
+            Self::AnnTopK(_) => Some("ANN TOP-K (approximate index)"),
+            Self::VectorTopK(_) => Some("VECTOR TOP-K (exact, streaming)"),
+            Self::TopKScan(_) => Some("TOPK SCAN (fused scan+filter+sort+limit)"),
+            Self::Scan { .. } => None,
+        }
+    }
+}
+
+/// Pick the strategy for a single-table SELECT.
+///
+/// Pure over `(stmt, table_schema)`: no transaction, no rows read. That is what
+/// lets EXPLAIN report the same answer the executor acts on.
+pub(super) fn choose_strategy(stmt: &SelectStmt, table_schema: &TableSchema) -> Result<Strategy> {
+    choose_strategy_with_cancel(stmt, table_schema, None)
+}
+
+fn choose_strategy_with_cancel(
+    stmt: &SelectStmt,
+    table_schema: &TableSchema,
+    cancel: Option<&CancelToken>,
+) -> Result<Strategy> {
+    if stmt.order_by.iter().any(order_by_uses_projected_output) {
+        let output_columns = build_output_columns(&stmt.columns, &table_schema.columns);
+        let output_map = ColumnMap::new(&output_columns);
+        for item in &stmt.order_by {
+            order_by_output_position(item, &output_map)?;
+        }
+    }
+
+    if count_star_output_name(stmt).is_some() {
+        return Ok(Strategy::CountStar);
+    }
+    if let Some(p) = StreamAggPlan::try_new_with_cancel(stmt, table_schema, cancel)? {
+        return Ok(Strategy::StreamAgg(Box::new(p)));
+    }
+    if let Some(p) = StreamGroupByPlan::try_new(stmt, table_schema)? {
+        return Ok(Strategy::StreamGroupBy(Box::new(p)));
+    }
+    if let Some(p) = super::ann_topk::AnnTopKPlan::try_new(stmt, table_schema)? {
+        return Ok(Strategy::AnnTopK(Box::new(p)));
+    }
+    if let Some(p) = super::ann_topk::VectorTopKPlan::try_new(stmt, table_schema)? {
+        return Ok(Strategy::VectorTopK(Box::new(p)));
+    }
+    if let Some(p) = TopKScanPlan::try_new(stmt, table_schema)? {
+        return Ok(Strategy::TopKScan(Box::new(p)));
+    }
+    Ok(Strategy::Scan {
+        limit: compute_scan_limit(stmt, table_schema),
+    })
 }
 
 pub(super) fn exec_select_with_read(
@@ -41,6 +124,10 @@ pub(super) fn exec_select_with_read(
     stmt: &SelectStmt,
     ctes: &CteContext,
 ) -> Result<ExecutionResult> {
+    // Cloned once so the post-scan phases can hold it without borrowing `rtx`,
+    // which stays mutably borrowed for the scan itself.
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     if stmt.from.is_empty() && stmt.from_subquery.is_none() {
         let materialized;
         let stmt = if stmt_has_subquery(stmt) {
@@ -51,7 +138,7 @@ pub(super) fn exec_select_with_read(
         } else {
             stmt
         };
-        return exec_select_no_from(stmt);
+        return exec_select_no_from(stmt, cancel);
     }
 
     if has_lateral(stmt) {
@@ -62,37 +149,49 @@ pub(super) fn exec_select_with_read(
     }
 
     if stmt.from_args.is_some() && crate::json::is_srf_name(&stmt.from) {
-        return exec_select_with_srf_with_read(rtx, schema, stmt, ctes);
+        return exec_select_with_srf_with_read(rtx, schema, stmt, ctes, cancel);
     }
     if stmt.from_json_table.is_some() {
-        return exec_select_with_json_table_with_read(rtx, schema, stmt, ctes);
+        return exec_select_with_json_table_with_read(rtx, schema, stmt, ctes, cancel);
     }
 
     let lower_name = stmt.from.to_ascii_lowercase();
 
-    if let Some(vt_result) = try_virtual_table(&lower_name, schema) {
-        let vt_result = vt_result?;
+    if let Some(vt_result) = try_virtual_table(&lower_name, schema, cancel) {
+        let vt_result = CteRows::binary(vt_result?);
         if stmt.joins.is_empty() {
-            return exec_select_from_cte(&vt_result, stmt, &mut |sub| {
-                exec_subquery_with_read(rtx, schema, sub, ctes)
-            });
+            return exec_select_from_cte(
+                &vt_result,
+                stmt,
+                &mut |sub| exec_subquery_with_read(rtx, schema, sub, ctes),
+                cancel,
+            );
         }
         let mut vt_ctes = ctes.clone();
-        vt_ctes.insert(lower_name.clone(), vt_result);
-        return super::exec_select_join_with_ctes(stmt, &vt_ctes, &mut |name| {
-            super::scan_table_with_read_or_view(rtx, schema, name)
-        });
+        vt_ctes.insert(lower_name.clone(), vt_result.shared());
+        return super::exec_select_join_with_ctes(
+            stmt,
+            &vt_ctes,
+            &mut |name| super::scan_table_with_read_or_view(rtx, schema, name),
+            cancel,
+        );
     }
 
     if let Some(cte_result) = ctes.get(&lower_name) {
         if stmt.joins.is_empty() {
-            return exec_select_from_cte(cte_result, stmt, &mut |sub| {
-                exec_subquery_with_read(rtx, schema, sub, ctes)
-            });
+            return exec_select_from_cte(
+                cte_result,
+                stmt,
+                &mut |sub| exec_subquery_with_read(rtx, schema, sub, ctes),
+                cancel,
+            );
         } else {
-            return super::exec_select_join_with_ctes(stmt, ctes, &mut |name| {
-                super::scan_table_with_read(rtx, schema, name)
-            });
+            return super::exec_select_join_with_ctes(
+                stmt,
+                ctes,
+                &mut |name| super::scan_table_with_read(rtx, schema, name),
+                cancel,
+            );
         }
     }
 
@@ -102,9 +201,12 @@ pub(super) fn exec_select_with_read(
             .iter()
             .any(|j| ctes.contains_key(&j.table.name.to_ascii_lowercase()))
     {
-        return super::exec_select_join_with_ctes(stmt, ctes, &mut |name| {
-            super::scan_table_with_read_or_view(rtx, schema, name)
-        });
+        return super::exec_select_join_with_ctes(
+            stmt,
+            ctes,
+            &mut |name| super::scan_table_with_read_or_view(rtx, schema, name),
+            cancel,
+        );
     }
 
     if let Some(view_def) = schema.get_view(&lower_name) {
@@ -119,7 +221,7 @@ pub(super) fn exec_select_with_read(
                 outer_alias: stmt.from_alias.as_deref(),
             };
             if has_correlated_where(&stmt.where_clause, &view_ctx, schema) {
-                let mut rows = view_qr.rows.clone();
+                let mut rows = super::clone_cte_rows_with_cancel(&view_qr.result.rows, cancel)?;
                 let remaining =
                     handle_correlated_where_with_read(rtx, schema, stmt, &view_ctx, &mut rows)?;
                 let clean_stmt = SelectStmt {
@@ -138,17 +240,26 @@ pub(super) fn exec_select_with_read(
                     group_by: stmt.group_by.clone(),
                     having: stmt.having.clone(),
                 };
-                return process_select(&view_schema.columns, rows, &clean_stmt, false);
+                return process_select(
+                    rows,
+                    SelectCtx::new(&view_schema.columns, &clean_stmt, cancel),
+                );
             }
-            return exec_select_from_cte(&view_qr, stmt, &mut |sub| {
-                exec_subquery_with_read(rtx, schema, sub, ctes)
-            });
+            return exec_select_from_cte(
+                &view_qr,
+                stmt,
+                &mut |sub| exec_subquery_with_read(rtx, schema, sub, ctes),
+                cancel,
+            );
         } else {
             let mut view_ctes = ctes.clone();
-            view_ctes.insert(lower_name.clone(), view_qr);
-            return super::exec_select_join_with_ctes(stmt, &view_ctes, &mut |name| {
-                super::scan_table_with_read_or_view(rtx, schema, name)
-            });
+            view_ctes.insert(lower_name.clone(), view_qr.shared());
+            return super::exec_select_join_with_ctes(
+                stmt,
+                &view_ctes,
+                &mut |name| super::scan_table_with_read_or_view(rtx, schema, name),
+                cancel,
+            );
         }
     }
 
@@ -164,13 +275,16 @@ pub(super) fn exec_select_with_read(
             if let Some(vd) = schema.get_view(&jname) {
                 if let std::collections::hash_map::Entry::Vacant(e) = view_ctes.entry(jname) {
                     let vqr = exec_view_with_read(rtx, schema, vd)?;
-                    e.insert(vqr);
+                    e.insert(vqr.shared());
                 }
             }
         }
-        return super::exec_select_join_with_ctes(stmt, &view_ctes, &mut |name| {
-            super::scan_table_with_read(rtx, schema, name)
-        });
+        return super::exec_select_join_with_ctes(
+            stmt,
+            &view_ctes,
+            &mut |name| super::scan_table_with_read(rtx, schema, name),
+            cancel,
+        );
     }
 
     let table_schema = schema
@@ -222,7 +336,7 @@ pub(super) fn exec_select_with_read(
         } else {
             &clean_stmt
         };
-        return process_select(&ext_cols, rows, s, false);
+        return process_select(rows, SelectCtx::new(&ext_cols, s, cancel));
     }
 
     if has_correlated_select(&stmt.columns, &corr_ctx, schema) {
@@ -245,7 +359,10 @@ pub(super) fn exec_select_with_read(
         } else {
             &clean_stmt
         };
-        return process_select(&ext_cols, rows, s, true);
+        return process_select(
+            rows,
+            SelectCtx::new(&ext_cols, s, cancel).predicate_applied(true),
+        );
     }
 
     let materialized;
@@ -262,89 +379,41 @@ pub(super) fn exec_select_with_read(
         return super::exec_select_join_with_read(rtx, schema, stmt);
     }
 
-    if let Some(result) = try_count_star_shortcut(stmt, || {
-        rtx.table_entry_count(lower_name.as_bytes())
-            .map_err(SqlError::Storage)
-    })? {
-        return Ok(result);
-    }
+    // One decision, shared with EXPLAIN. The arms below consume what it picked
+    // rather than re-deciding, so the two cannot drift apart.
+    let strategy = choose_strategy_with_cancel(stmt, table_schema, cancel)?;
 
-    if let Some(plan) = StreamAggPlan::try_new(stmt, table_schema)? {
-        let mut states: Vec<AggState> = plan.ops.iter().map(|(op, _)| AggState::new(op)).collect();
-        let mut scan_err: Option<SqlError> = None;
-        if stmt.where_clause.is_none() {
-            let leaves = rtx
-                .collect_table_leaves(lower_name.as_bytes())
-                .map_err(SqlError::Storage)?;
-            match try_parallel_stream_agg(rtx, &plan, &leaves)? {
-                Some(merged) => states = merged,
-                None => {
-                    rtx.scan_leaves(&leaves, |key, value| {
-                        plan.feed_row_raw(key, value, &mut states, &mut scan_err)
-                    })
-                    .map_err(SqlError::Storage)?;
-                }
-            }
-        } else if let Some(w) = &stmt.where_clause {
-            if plan
-                .ops
-                .iter()
-                .all(|(op, _)| matches!(op, StreamAgg::CountStar))
-            {
-                let scan_plan = crate::planner::plan_select(table_schema, &stmt.where_clause);
-                if crate::planner::index_scan_full_cover(table_schema, w, &scan_plan) {
-                    if let Some(n) =
-                        super::scan::covered_index_count_read(rtx, table_schema, &scan_plan)?
-                    {
-                        let states: Vec<AggState> = plan
-                            .ops
-                            .iter()
-                            .map(|_| AggState::CountStar(n as i64))
-                            .collect();
-                        return Ok(plan.finish(states));
-                    }
-                }
-            }
-            let col_map = table_schema.column_map();
-            rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
-                plan.feed_row(
-                    key,
-                    value,
-                    table_schema,
-                    col_map,
-                    &stmt.where_clause,
-                    &mut states,
-                    &mut scan_err,
+    let scan_limit = match strategy {
+        Strategy::CountStar => {
+            return try_count_star_shortcut(stmt, || {
+                rtx.table_entry_count(lower_name.as_bytes())
+                    .map_err(SqlError::Storage)
+            })?
+            .ok_or_else(|| {
+                SqlError::Unsupported(
+                    "count-star strategy was chosen but the shortcut declined".into(),
                 )
-            })
-            .map_err(SqlError::Storage)?;
+            });
         }
-        if let Some(e) = scan_err {
-            return Err(e);
+        Strategy::StreamAgg(plan) => {
+            return exec_stream_agg(rtx, stmt, table_schema, &lower_name, *plan)
         }
-        return Ok(plan.finish(states));
-    }
-
-    if let Some(plan) = StreamGroupByPlan::try_new(stmt, table_schema)? {
-        let lower = lower_name.clone();
-        return plan
-            .execute_scan(|cb| rtx.table_scan_raw(lower.as_bytes(), |key, value| cb(key, value)));
-    }
-
-    if let Some(plan) = super::ann_topk::AnnTopKPlan::try_new(stmt, table_schema)? {
-        return plan.execute_with_read(rtx, schema, stmt, table_schema);
-    }
-
-    if let Some(plan) = super::ann_topk::VectorTopKPlan::try_new(stmt, table_schema)? {
-        return plan.execute(rtx, table_schema, stmt);
-    }
-
-    if let Some(plan) = TopKScanPlan::try_new(stmt, table_schema)? {
-        let lower = lower_name.clone();
-        return plan.execute_scan(table_schema, stmt, |cb| {
-            rtx.table_scan_raw(lower.as_bytes(), |key, value| cb(key, value))
-        });
-    }
+        Strategy::StreamGroupBy(plan) => {
+            let lower = lower_name.clone();
+            return plan.execute_scan(cancel, |cb| {
+                rtx.table_scan_raw(lower.as_bytes(), |key, value| cb(key, value))
+            });
+        }
+        Strategy::AnnTopK(plan) => return plan.execute_with_read(rtx, schema, stmt, table_schema),
+        Strategy::VectorTopK(plan) => return plan.execute(rtx, table_schema, stmt),
+        Strategy::TopKScan(plan) => {
+            let lower = lower_name.clone();
+            return plan.execute_scan(table_schema, stmt, cancel, |cb| {
+                rtx.table_scan_raw(lower.as_bytes(), |key, value| cb(key, value))
+            });
+        }
+        Strategy::Scan { limit } => limit,
+    };
 
     if let Some(result) = try_streaming_distinct_with_read(rtx, stmt, table_schema)? {
         return Ok(result);
@@ -358,10 +427,88 @@ pub(super) fn exec_select_with_read(
         return Ok(result);
     }
 
-    let scan_limit = compute_scan_limit(stmt, table_schema);
     let (rows, predicate_applied) =
         collect_rows_with_read(rtx, table_schema, &stmt.where_clause, scan_limit)?;
-    process_select(&table_schema.columns, rows, stmt, predicate_applied)
+    process_select(
+        rows,
+        SelectCtx::new(&table_schema.columns, stmt, cancel).predicate_applied(predicate_applied),
+    )
+}
+
+/// The streaming-aggregate lane, lifted out of the strategy match so that arm
+/// stays one line like the others.
+fn exec_stream_agg(
+    rtx: &mut ReadTxn<'_>,
+    stmt: &SelectStmt,
+    table_schema: &TableSchema,
+    lower_name: &str,
+    plan: StreamAggPlan,
+) -> Result<ExecutionResult> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    let mut states: Vec<AggState> = plan.ops.iter().map(|(op, _)| AggState::new(op)).collect();
+    let mut scan_err: Option<SqlError> = None;
+
+    if stmt.where_clause.is_none() {
+        let leaves = rtx
+            .collect_table_leaves(lower_name.as_bytes())
+            .map_err(SqlError::Storage)?;
+        match try_parallel_stream_agg(rtx, &plan, &leaves)? {
+            Some(merged) => states = merged,
+            None => {
+                rtx.scan_leaves(&leaves, |key, value| {
+                    plan.feed_row_raw(key, value, &mut states, &mut scan_err)
+                })
+                .map_err(SqlError::Storage)?;
+            }
+        }
+    } else if let Some(w) = &stmt.where_clause {
+        let all_count_star = plan
+            .ops
+            .iter()
+            .all(|(op, _)| matches!(op, StreamAgg::CountStar));
+        let mut counted_from_index = false;
+        if all_count_star {
+            let scan_plan = crate::planner::plan_select(table_schema, &stmt.where_clause);
+            if crate::planner::index_scan_full_cover(table_schema, w, &scan_plan) {
+                if let Some(n) =
+                    super::scan::covered_index_count_read(rtx, table_schema, &scan_plan)?
+                {
+                    states = plan
+                        .ops
+                        .iter()
+                        .map(|_| AggState::CountStar(n as i64))
+                        .collect();
+                    counted_from_index = true;
+                }
+            }
+        }
+        if !counted_from_index {
+            let col_map = table_schema.column_map();
+            rtx.table_scan_raw(lower_name.as_bytes(), |key, value| {
+                plan.feed_row(
+                    key,
+                    value,
+                    table_schema,
+                    col_map,
+                    &stmt.where_clause,
+                    &mut states,
+                    &mut scan_err,
+                    cancel,
+                )
+            })
+            .map_err(SqlError::Storage)?;
+        }
+    }
+
+    if let Some(e) = scan_err {
+        return Err(e);
+    }
+    let mut result = plan.finish(states);
+    if let ExecutionResult::Query(query) = &mut result {
+        apply_offset_limit(&mut query.rows, stmt)?;
+    }
+    Ok(result)
 }
 
 fn fts_phrase_ast_from_predicate(expr: &Expr) -> Option<crate::fts::TsQueryAst> {
@@ -432,11 +579,26 @@ enum CompiledPhrase {
     },
 }
 
-fn eval_compiled(eval: &CompiledPhrase, per_probe_positions: &[Vec<u16>], out: &mut Vec<u16>) {
+fn eval_compiled(
+    eval: &CompiledPhrase,
+    per_probe_positions: &[Vec<u16>],
+    out: &mut Vec<u16>,
+    cancel: Option<&CancelToken>,
+    work: &mut usize,
+) -> Result<()> {
     out.clear();
     match eval {
         CompiledPhrase::Leaf(idx) => {
-            out.extend_from_slice(&per_probe_positions[*idx]);
+            let positions = &per_probe_positions[*idx];
+            if cancel.is_none() {
+                out.extend_from_slice(positions);
+            } else {
+                for chunk in positions.chunks(CANCEL_CHECK_INTERVAL) {
+                    check_cancel(cancel)?;
+                    out.extend_from_slice(chunk);
+                    *work += chunk.len();
+                }
+            }
         }
         CompiledPhrase::Phrase {
             distance,
@@ -445,13 +607,15 @@ fn eval_compiled(eval: &CompiledPhrase, per_probe_positions: &[Vec<u16>], out: &
         } => {
             let mut lp = Vec::new();
             let mut rp = Vec::new();
-            eval_compiled(left, per_probe_positions, &mut lp);
-            eval_compiled(right, per_probe_positions, &mut rp);
+            eval_compiled(left, per_probe_positions, &mut lp, cancel, work)?;
+            eval_compiled(right, per_probe_positions, &mut rp, cancel, work)?;
             if lp.is_empty() || rp.is_empty() {
-                return;
+                return Ok(());
             }
             let (mut i, mut j) = (0usize, 0usize);
             while i < lp.len() && j < rp.len() {
+                check_cancel_at(cancel, *work)?;
+                *work += 1;
                 let l = lp[i] & 0x3FFF;
                 let r = rp[j] & 0x3FFF;
                 let target = l.saturating_add(*distance);
@@ -468,6 +632,7 @@ fn eval_compiled(eval: &CompiledPhrase, per_probe_positions: &[Vec<u16>], out: &
             }
         }
     }
+    Ok(())
 }
 
 fn weight_default_score(packed: u16) -> f64 {
@@ -479,17 +644,26 @@ fn weight_default_score(packed: u16) -> f64 {
     }
 }
 
-fn ts_rank_from_index_positions(positions_per_lex: &[&[u16]]) -> f64 {
+fn ts_rank_from_index_positions(
+    positions_per_lex: &[&[u16]],
+    cancel: Option<&CancelToken>,
+    work: &mut usize,
+) -> Result<f64> {
     let mut score = 0.0_f64;
     for positions in positions_per_lex {
         if positions.is_empty() {
             continue;
         }
-        let weight_sum: f64 = positions.iter().map(|&p| weight_default_score(p)).sum();
+        let mut weight_sum = 0.0;
+        for &position in *positions {
+            check_cancel_at(cancel, *work)?;
+            *work += 1;
+            weight_sum += weight_default_score(position);
+        }
         let tf = (positions.len() as f64).ln_1p();
         score += weight_sum * (1.0 + tf);
     }
-    score
+    Ok(score)
 }
 
 fn try_inverted_ts_rank_topk_with_read(
@@ -497,6 +671,9 @@ fn try_inverted_ts_rank_topk_with_read(
     table_schema: &TableSchema,
     stmt: &SelectStmt,
 ) -> Result<Option<ExecutionResult>> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    check_cancel(cancel)?;
     if !stmt.joins.is_empty()
         || !stmt.group_by.is_empty()
         || stmt.distinct
@@ -623,7 +800,8 @@ fn try_inverted_ts_rank_topk_with_read(
         data: Vec<u16>,
     }
     let mut probes: Vec<Probe> = Vec::with_capacity(probe_entries.len());
-    for entry in &probe_entries {
+    for (entry_idx, entry) in probe_entries.iter().enumerate() {
+        check_cancel_at(cancel, entry_idx)?;
         let mut prefix = entry.clone();
         prefix.push(0x1F);
         let mut p = Probe {
@@ -646,6 +824,12 @@ fn try_inverted_ts_rank_topk_with_read(
             }
             let mut i = 0;
             while i + 2 <= value.len() {
+                if i != 0 {
+                    if let Err(e) = check_cancel_at(cancel, i / 2) {
+                        scan_err = Some(e);
+                        return Ok(false);
+                    }
+                }
                 p.data.push(u16::from_le_bytes([value[i], value[i + 1]]));
                 i += 2;
             }
@@ -686,8 +870,10 @@ fn try_inverted_ts_rank_topk_with_read(
     let driver = probes.swap_remove(driver_idx);
     let mut indices = vec![0usize; probes.len()];
     let mut positions_per_lex: Vec<&[u16]> = vec![&[]; probe_entries.len()];
+    let mut rank_work = 0usize;
 
     'outer: for di in 0..driver.pks.len() {
+        check_cancel_at(cancel, di)?;
         let pk = driver.pks[di];
         for (pi, probe) in probes.iter().enumerate() {
             while indices[pi] < probe.pks.len() && probe.pks[indices[pi]] < pk {
@@ -706,7 +892,7 @@ fn try_inverted_ts_rank_topk_with_read(
             let e = probe.offs[idx + 1] as usize;
             positions_per_lex[pi + 1] = &probe.data[s..e];
         }
-        let score = ts_rank_from_index_positions(&positions_per_lex);
+        let score = ts_rank_from_index_positions(&positions_per_lex, cancel, &mut rank_work)?;
         let key = score_to_key(score);
         if heap.len() < limit {
             heap.push(Reverse((key, pk)));
@@ -722,11 +908,16 @@ fn try_inverted_ts_rank_topk_with_read(
         let bits = if k < 0 { !k } else { k ^ i64::MIN };
         f64::from_bits(bits as u64)
     }
-    let mut sorted: Vec<(i64, i64)> = heap.into_iter().map(|r| r.0).collect();
-    sorted.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
+    let heap_rows: Vec<(i64, i64)> = heap.into_iter().map(|r| r.0).collect();
+    let mut sorted_indices: Vec<usize> = (0..heap_rows.len()).collect();
+    sort_indices_by(&mut sorted_indices, cancel, |a, b| {
+        heap_rows[b].0.cmp(&heap_rows[a].0)
+    })?;
 
-    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(sorted.len());
-    for (key, pk) in sorted {
+    let mut rows: Vec<Vec<Value>> = Vec::with_capacity(sorted_indices.len());
+    for (row_idx, source_idx) in sorted_indices.into_iter().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
+        let (key, pk) = heap_rows[source_idx];
         let score = key_to_score(key);
         let mut row = Vec::with_capacity(out_cols.len());
         for col in &out_cols {
@@ -737,6 +928,7 @@ fn try_inverted_ts_rank_topk_with_read(
         }
         rows.push(row);
     }
+    check_cancel(cancel)?;
     Ok(Some(ExecutionResult::Query(QueryResult {
         columns: out_col_names,
         rows,
@@ -748,6 +940,9 @@ fn try_inverted_index_only_with_read(
     table_schema: &TableSchema,
     stmt: &SelectStmt,
 ) -> Result<Option<ExecutionResult>> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    check_cancel(cancel)?;
     if !stmt.joins.is_empty()
         || !stmt.group_by.is_empty()
         || stmt.distinct
@@ -854,7 +1049,8 @@ fn try_inverted_index_only_with_read(
                 data: Vec<u16>,
             }
             let mut probes2: Vec<(Vec<u8>, Probe)> = Vec::with_capacity(phrase_lexemes.len());
-            for entry in &phrase_lexemes {
+            for (entry_idx, entry) in phrase_lexemes.iter().enumerate() {
+                check_cancel_at(cancel, entry_idx)?;
                 let mut prefix = entry.clone();
                 prefix.push(0x1F);
                 let mut p = Probe {
@@ -877,6 +1073,12 @@ fn try_inverted_index_only_with_read(
                     }
                     let mut i = 0;
                     while i + 2 <= value.len() {
+                        if i != 0 {
+                            if let Err(e) = check_cancel_at(cancel, i / 2) {
+                                scan_err = Some(e);
+                                return Ok(false);
+                            }
+                        }
                         p.data.push(u16::from_le_bytes([value[i], value[i + 1]]));
                         i += 2;
                     }
@@ -940,7 +1142,9 @@ fn try_inverted_index_only_with_read(
                     other_phrase_idx.iter().position(|&p| p == r_lex).unwrap()
                 };
 
+                let mut position_work = 0usize;
                 'outer: for di in 0..driver.pks.len() {
+                    check_cancel_at(cancel, di)?;
                     let pk = driver.pks[di];
                     for (pi, (_, probe)) in probes2.iter().enumerate() {
                         while indices[pi] < probe.pks.len() && probe.pks[indices[pi]] < pk {
@@ -974,6 +1178,8 @@ fn try_inverted_index_only_with_read(
                     };
                     let (mut i, mut j) = (0usize, 0usize);
                     while i < l_slice.len() && j < r_slice.len() {
+                        check_cancel_at(cancel, position_work)?;
+                        position_work += 1;
                         let l = l_slice[i] & 0x3FFF;
                         let r = r_slice[j] & 0x3FFF;
                         let target = l + dist;
@@ -990,7 +1196,9 @@ fn try_inverted_index_only_with_read(
             } else {
                 let mut probe_positions: Vec<Vec<u16>> = vec![Vec::new(); phrase_lexemes.len()];
                 let mut out_pos: Vec<u16> = Vec::new();
+                let mut phrase_work = 0usize;
                 'outer2: for di in 0..driver.pks.len() {
+                    check_cancel_at(cancel, di)?;
                     let pk = driver.pks[di];
                     for (pi, (_, probe)) in probes2.iter().enumerate() {
                         while indices[pi] < probe.pks.len() && probe.pks[indices[pi]] < pk {
@@ -1013,7 +1221,13 @@ fn try_inverted_index_only_with_read(
                         probe_positions[lex_idx].clear();
                         probe_positions[lex_idx].extend_from_slice(&probe.data[s..e]);
                     }
-                    eval_compiled(&compiled, &probe_positions, &mut out_pos);
+                    eval_compiled(
+                        &compiled,
+                        &probe_positions,
+                        &mut out_pos,
+                        cancel,
+                        &mut phrase_work,
+                    )?;
                     if !out_pos.is_empty() {
                         matched.push(pk);
                     }
@@ -1024,10 +1238,12 @@ fn try_inverted_index_only_with_read(
         } else {
             let mut per_probe: Vec<Vec<(Vec<u8>, Vec<u16>)>> =
                 Vec::with_capacity(phrase_lexemes.len());
-            for entry in &phrase_lexemes {
+            for (entry_idx, entry) in phrase_lexemes.iter().enumerate() {
+                check_cancel_at(cancel, entry_idx)?;
                 let mut prefix = entry.clone();
                 prefix.push(0x1F);
                 let mut list: Vec<(Vec<u8>, Vec<u16>)> = Vec::new();
+                let mut scan_err: Option<SqlError> = None;
                 rtx.table_scan_from_fast(&idx_table, &prefix, |key, value| {
                     if !key.starts_with(&prefix) {
                         return Ok(false);
@@ -1036,6 +1252,12 @@ fn try_inverted_index_only_with_read(
                     let mut positions = Vec::with_capacity(value.len() / 2);
                     let mut i = 0;
                     while i + 2 <= value.len() {
+                        if i != 0 {
+                            if let Err(e) = check_cancel_at(cancel, i / 2) {
+                                scan_err = Some(e);
+                                return Ok(false);
+                            }
+                        }
                         positions.push(u16::from_le_bytes([value[i], value[i + 1]]));
                         i += 2;
                     }
@@ -1043,6 +1265,9 @@ fn try_inverted_index_only_with_read(
                     Ok(true)
                 })
                 .map_err(SqlError::Storage)?;
+                if let Some(e) = scan_err {
+                    return Err(e);
+                }
                 if list.is_empty() {
                     return Ok(Some(ExecutionResult::Query(QueryResult {
                         columns: out_col_names,
@@ -1051,17 +1276,21 @@ fn try_inverted_index_only_with_read(
                 }
                 per_probe.push(list);
             }
-            per_probe.sort_by_key(|l| l.len());
+            per_probe = sort_lists_by_len(per_probe, cancel)?;
             let first = per_probe.remove(0);
             let mut candidates: Vec<(Vec<u8>, Vec<Vec<u16>>)> = first
                 .into_iter()
                 .map(|(pk, positions)| (pk, vec![positions]))
                 .collect();
-            for other in per_probe {
+            for (probe_idx, other) in per_probe.into_iter().enumerate() {
+                check_cancel_at(cancel, probe_idx)?;
                 let mut out: Vec<(Vec<u8>, Vec<Vec<u16>>)> =
                     Vec::with_capacity(candidates.len().min(other.len()));
                 let (mut i, mut j) = (0usize, 0usize);
+                let mut merge_work = 0usize;
                 while i < candidates.len() && j < other.len() {
+                    check_cancel_at(cancel, merge_work)?;
+                    merge_work += 1;
                     match candidates[i].0.cmp(&other[j].0) {
                         std::cmp::Ordering::Equal => {
                             let mut entry = std::mem::take(&mut candidates[i]);
@@ -1081,8 +1310,16 @@ fn try_inverted_index_only_with_read(
             }
             let mut matched: Vec<Vec<u8>> = Vec::with_capacity(candidates.len());
             let mut out_positions: Vec<u16> = Vec::new();
-            for (pk, per_probe_positions) in candidates {
-                eval_compiled(&compiled, &per_probe_positions, &mut out_positions);
+            let mut phrase_work = 0usize;
+            for (candidate_idx, (pk, per_probe_positions)) in candidates.into_iter().enumerate() {
+                check_cancel_at(cancel, candidate_idx)?;
+                eval_compiled(
+                    &compiled,
+                    &per_probe_positions,
+                    &mut out_positions,
+                    cancel,
+                    &mut phrase_work,
+                )?;
                 if !out_positions.is_empty() {
                     matched.push(pk);
                 }
@@ -1091,7 +1328,8 @@ fn try_inverted_index_only_with_read(
         }
     } else if single_int_pk {
         let mut lists: Vec<Vec<i64>> = Vec::with_capacity(probe_entries.len());
-        for entry in &probe_entries {
+        for (entry_idx, entry) in probe_entries.iter().enumerate() {
+            check_cancel_at(cancel, entry_idx)?;
             let mut prefix = entry.clone();
             prefix.push(0x1F);
             let mut list: Vec<i64> = Vec::with_capacity(1024);
@@ -1121,12 +1359,16 @@ fn try_inverted_index_only_with_read(
             }
             lists.push(list);
         }
-        lists.sort_by_key(|l| l.len());
+        lists = sort_lists_by_len(lists, cancel)?;
         let mut acc = lists.remove(0);
-        for other in lists {
+        for (list_idx, other) in lists.into_iter().enumerate() {
+            check_cancel_at(cancel, list_idx)?;
             let mut out: Vec<i64> = Vec::with_capacity(acc.len().min(other.len()));
             let (mut i, mut j) = (0usize, 0usize);
+            let mut merge_work = 0usize;
             while i < acc.len() && j < other.len() {
+                check_cancel_at(cancel, merge_work)?;
+                merge_work += 1;
                 match acc[i].cmp(&other[j]) {
                     std::cmp::Ordering::Equal => {
                         out.push(acc[i]);
@@ -1146,7 +1388,8 @@ fn try_inverted_index_only_with_read(
         Vec::new()
     } else {
         let mut lists: Vec<Vec<Vec<u8>>> = Vec::with_capacity(probe_entries.len());
-        for entry in &probe_entries {
+        for (entry_idx, entry) in probe_entries.iter().enumerate() {
+            check_cancel_at(cancel, entry_idx)?;
             let mut prefix = entry.clone();
             prefix.push(0x1F);
             let mut list: Vec<Vec<u8>> = Vec::new();
@@ -1166,12 +1409,16 @@ fn try_inverted_index_only_with_read(
             }
             lists.push(list);
         }
-        lists.sort_by_key(|l| l.len());
+        lists = sort_lists_by_len(lists, cancel)?;
         let mut acc = lists.remove(0);
-        for other in lists {
+        for (list_idx, other) in lists.into_iter().enumerate() {
+            check_cancel_at(cancel, list_idx)?;
             let mut out = Vec::with_capacity(acc.len().min(other.len()));
             let (mut i, mut j) = (0usize, 0usize);
+            let mut merge_work = 0usize;
             while i < acc.len() && j < other.len() {
+                check_cancel_at(cancel, merge_work)?;
+                merge_work += 1;
                 match acc[i].cmp(&other[j]) {
                     std::cmp::Ordering::Equal => {
                         out.push(std::mem::take(&mut acc[i]));
@@ -1196,19 +1443,24 @@ fn try_inverted_index_only_with_read(
         && out_col_to_pk_pos[0] == 0
         && table_schema.columns[pk_col_indices[0]].data_type == DataType::Integer;
     let mut result_rows: Vec<Vec<Value>> = if let Some(ints) = int_acc.take() {
-        ints.into_iter()
-            .map(|id| vec![Value::Integer(id)])
-            .collect()
+        let mut rows = Vec::with_capacity(ints.len());
+        for (row_idx, id) in ints.into_iter().enumerate() {
+            check_cancel_at(cancel, row_idx)?;
+            rows.push(vec![Value::Integer(id)]);
+        }
+        rows
     } else if single_int_fast {
         let mut rows = Vec::with_capacity(acc.len());
-        for pk_bytes in &acc {
+        for (row_idx, pk_bytes) in acc.iter().enumerate() {
+            check_cancel_at(cancel, row_idx)?;
             let id = decode_pk_integer(pk_bytes)?;
             rows.push(vec![Value::Integer(id)]);
         }
         rows
     } else {
         let mut rows = Vec::with_capacity(acc.len());
-        for pk_bytes in &acc {
+        for (row_idx, pk_bytes) in acc.iter().enumerate() {
+            check_cancel_at(cancel, row_idx)?;
             let pk_vals = decode_composite_key(pk_bytes, num_pk_cols)?;
             let mut out_row = Vec::with_capacity(out_col_to_pk_pos.len());
             for &pos in &out_col_to_pk_pos {
@@ -1244,7 +1496,7 @@ fn try_inverted_index_only_with_read(
         if order_cols.iter().any(|&(p, _)| p == usize::MAX) {
             return Ok(None);
         }
-        result_rows.sort_by(|a, b| {
+        result_rows = sort_vec_by(result_rows, cancel, |a, b| {
             for &(pos, desc) in &order_cols {
                 let cmp = a[pos].cmp(&b[pos]);
                 if cmp != std::cmp::Ordering::Equal {
@@ -1252,7 +1504,7 @@ fn try_inverted_index_only_with_read(
                 }
             }
             std::cmp::Ordering::Equal
-        });
+        })?;
     }
 
     if let Some(ref limit_expr) = stmt.limit {
@@ -1267,6 +1519,8 @@ fn try_inverted_index_only_with_read(
             result_rows = result_rows.split_off(offset);
         }
     }
+
+    check_cancel(cancel)?;
 
     Ok(Some(ExecutionResult::Query(QueryResult {
         columns: out_col_names,
@@ -1322,30 +1576,56 @@ fn order_by_is_pk_prefix_asc(stmt: &SelectStmt, table_schema: &TableSchema) -> b
     idx as u16 == pk0 && table_schema.columns[idx].collation == Collation::Binary
 }
 
-pub(super) fn try_count_star_shortcut(
-    stmt: &SelectStmt,
-    get_count: impl FnOnce() -> Result<u64>,
-) -> Result<Option<ExecutionResult>> {
+/// The `SELECT COUNT(*)` shortcut's eligibility, with no counting done.
+///
+/// Split out so the strategy decision can be made without a transaction, and
+/// so EXPLAIN and the executor read the same predicate rather than two copies.
+pub(super) fn count_star_output_name(stmt: &SelectStmt) -> Option<String> {
     if stmt.columns.len() != 1
         || stmt.where_clause.is_some()
         || !stmt.group_by.is_empty()
         || stmt.having.is_some()
     {
-        return Ok(None);
+        return None;
     }
-    let col = match &stmt.columns[0] {
-        SelectColumn::Expr { expr, alias } => (expr, alias),
-        _ => return Ok(None),
+    let SelectColumn::Expr { expr, alias } = &stmt.columns[0] else {
+        return None;
     };
-    if !matches!(col.0, Expr::CountStar) {
-        return Ok(None);
+    if !matches!(expr, Expr::CountStar) {
+        return None;
     }
+    Some(alias.as_deref().unwrap_or("COUNT(*)").to_string())
+}
+
+pub(super) fn try_count_star_shortcut(
+    stmt: &SelectStmt,
+    get_count: impl FnOnce() -> Result<u64>,
+) -> Result<Option<ExecutionResult>> {
+    let Some(col_name) = count_star_output_name(stmt) else {
+        return Ok(None);
+    };
     let count = get_count()? as i64;
-    let col_name = col.1.as_deref().unwrap_or("COUNT(*)").to_string();
+    let mut rows = vec![vec![Value::Integer(count)]];
+    apply_offset_limit(&mut rows, stmt)?;
     Ok(Some(ExecutionResult::Query(QueryResult {
         columns: vec![col_name],
-        rows: vec![vec![Value::Integer(count)]],
+        rows,
     })))
+}
+
+fn apply_offset_limit(rows: &mut Vec<Vec<Value>>, stmt: &SelectStmt) -> Result<()> {
+    if let Some(offset_expr) = &stmt.offset {
+        let offset = eval_const_int(offset_expr)?.max(0) as usize;
+        if offset < rows.len() {
+            *rows = rows.split_off(offset);
+        } else {
+            rows.clear();
+        }
+    }
+    if let Some(limit_expr) = &stmt.limit {
+        rows.truncate(eval_const_int(limit_expr)?.max(0) as usize);
+    }
+    Ok(())
 }
 
 pub(super) enum StreamAgg {
@@ -1353,8 +1633,8 @@ pub(super) enum StreamAgg {
     Count(usize),
     Sum(usize),
     Avg(usize),
-    Min(usize),
-    Max(usize),
+    Min(usize, Collation),
+    Max(usize, Collation),
 }
 
 pub(super) enum RawAggTarget {
@@ -1384,8 +1664,14 @@ pub(super) enum AggState {
         interval_micros: i128,
         is_interval: bool,
     },
-    Min(Option<Value>),
-    Max(Option<Value>),
+    Min {
+        current: Option<Value>,
+        collation: Collation,
+    },
+    Max {
+        current: Option<Value>,
+        collation: Collation,
+    },
 }
 
 impl AggState {
@@ -1411,8 +1697,14 @@ impl AggState {
                 interval_micros: 0,
                 is_interval: false,
             },
-            StreamAgg::Min(_) => AggState::Min(None),
-            StreamAgg::Max(_) => AggState::Max(None),
+            StreamAgg::Min(_, collation) => AggState::Min {
+                current: None,
+                collation: *collation,
+            },
+            StreamAgg::Max(_, collation) => AggState::Max {
+                current: None,
+                collation: *collation,
+            },
         }
     }
 
@@ -1457,12 +1749,22 @@ impl AggState {
                 *interval_micros = interval_micros.saturating_add(b_micros);
                 *is_interval |= b_is_interval;
             }
-            (AggState::Min(a), AggState::Min(b)) => {
+            (
+                AggState::Min {
+                    current: a,
+                    collation,
+                },
+                AggState::Min {
+                    current: b,
+                    collation: b_collation,
+                },
+            ) => {
+                debug_assert_eq!(*collation, b_collation);
                 if let Some(bv) = b {
                     *a = Some(match a.take() {
                         None => bv,
                         Some(av) => {
-                            if bv < av {
+                            if collation.cmp_value(&bv, &av).is_lt() {
                                 bv
                             } else {
                                 av
@@ -1471,12 +1773,22 @@ impl AggState {
                     });
                 }
             }
-            (AggState::Max(a), AggState::Max(b)) => {
+            (
+                AggState::Max {
+                    current: a,
+                    collation,
+                },
+                AggState::Max {
+                    current: b,
+                    collation: b_collation,
+                },
+            ) => {
+                debug_assert_eq!(*collation, b_collation);
                 if let Some(bv) = b {
                     *a = Some(match a.take() {
                         None => bv,
                         Some(av) => {
-                            if bv > av {
+                            if collation.cmp_value(&bv, &av).is_gt() {
                                 bv
                             } else {
                                 av
@@ -1574,12 +1886,15 @@ impl AggState {
                     })
                 }
             },
-            AggState::Min(cur) => {
+            AggState::Min {
+                current: cur,
+                collation,
+            } => {
                 if !val.is_null() {
                     *cur = Some(match cur.take() {
                         None => val.clone(),
                         Some(m) => {
-                            if val < &m {
+                            if collation.cmp_value(val, &m).is_lt() {
                                 val.clone()
                             } else {
                                 m
@@ -1588,12 +1903,15 @@ impl AggState {
                     });
                 }
             }
-            AggState::Max(cur) => {
+            AggState::Max {
+                current: cur,
+                collation,
+            } => {
                 if !val.is_null() {
                     *cur = Some(match cur.take() {
                         None => val.clone(),
                         Some(m) => {
-                            if val > &m {
+                            if collation.cmp_value(val, &m).is_gt() {
                                 val.clone()
                             } else {
                                 m
@@ -1689,13 +2007,16 @@ impl AggState {
                     })
                 }
             },
-            AggState::Min(cur) => {
+            AggState::Min {
+                current: cur,
+                collation,
+            } => {
                 if !matches!(raw, RawColumn::Null) {
                     let val = raw.to_value();
                     *cur = Some(match cur.take() {
                         None => val,
                         Some(m) => {
-                            if val < m {
+                            if collation.cmp_value(&val, &m).is_lt() {
                                 val
                             } else {
                                 m
@@ -1704,13 +2025,16 @@ impl AggState {
                     });
                 }
             }
-            AggState::Max(cur) => {
+            AggState::Max {
+                current: cur,
+                collation,
+            } => {
                 if !matches!(raw, RawColumn::Null) {
                     let val = raw.to_value();
                     *cur = Some(match cur.take() {
                         None => val,
                         Some(m) => {
-                            if val > m {
+                            if collation.cmp_value(&val, &m).is_gt() {
                                 val
                             } else {
                                 m
@@ -1772,7 +2096,9 @@ impl AggState {
                     Value::Real(sum / count as f64)
                 }
             }
-            AggState::Min(v) | AggState::Max(v) => v.unwrap_or(Value::Null),
+            AggState::Min { current, .. } | AggState::Max { current, .. } => {
+                current.unwrap_or(Value::Null)
+            }
         }
     }
 }
@@ -1971,6 +2297,14 @@ impl FastPredicate {
 
 impl StreamAggPlan {
     pub(super) fn try_new(stmt: &SelectStmt, table_schema: &TableSchema) -> Result<Option<Self>> {
+        Self::try_new_with_cancel(stmt, table_schema, None)
+    }
+
+    fn try_new_with_cancel(
+        stmt: &SelectStmt,
+        table_schema: &TableSchema,
+        cancel: Option<&CancelToken>,
+    ) -> Result<Option<Self>> {
         if !stmt.group_by.is_empty() || stmt.having.is_some() || !stmt.joins.is_empty() {
             return Ok(None);
         }
@@ -2013,8 +2347,14 @@ impl StreamAggPlan {
                         "COUNT" => ops.push((StreamAgg::Count(col_idx), name)),
                         "SUM" => ops.push((StreamAgg::Sum(col_idx), name)),
                         "AVG" => ops.push((StreamAgg::Avg(col_idx), name)),
-                        "MIN" => ops.push((StreamAgg::Min(col_idx), name)),
-                        "MAX" => ops.push((StreamAgg::Max(col_idx), name)),
+                        "MIN" => ops.push((
+                            StreamAgg::Min(col_idx, table_schema.columns[col_idx].collation),
+                            name,
+                        )),
+                        "MAX" => ops.push((
+                            StreamAgg::Max(col_idx, table_schema.columns[col_idx].collation),
+                            name,
+                        )),
                         _ => return Ok(None),
                     }
                 }
@@ -2029,8 +2369,8 @@ impl StreamAggPlan {
                 StreamAgg::Count(i)
                 | StreamAgg::Sum(i)
                 | StreamAgg::Avg(i)
-                | StreamAgg::Min(i)
-                | StreamAgg::Max(i) => Some(*i),
+                | StreamAgg::Min(i, _)
+                | StreamAgg::Max(i, _) => Some(*i),
             })
             .collect();
         if let Some(ref where_expr) = stmt.where_clause {
@@ -2040,7 +2380,11 @@ impl StreamAggPlan {
         needed.dedup();
 
         let partial_ctx = if needed.len() < table_schema.columns.len() {
-            Some(PartialDecodeCtx::new(table_schema, &needed))
+            Some(PartialDecodeCtx::new_with_cancel(
+                table_schema,
+                &needed,
+                cancel,
+            )?)
         } else {
             None
         };
@@ -2054,8 +2398,8 @@ impl StreamAggPlan {
                 StreamAgg::Count(idx)
                 | StreamAgg::Sum(idx)
                 | StreamAgg::Avg(idx)
-                | StreamAgg::Min(idx)
-                | StreamAgg::Max(idx) => {
+                | StreamAgg::Min(idx, _)
+                | StreamAgg::Max(idx, _) => {
                     if let Some(pk_pos) = table_schema
                         .primary_key_columns
                         .iter()
@@ -2075,20 +2419,23 @@ impl StreamAggPlan {
         let mapping = table_schema.decode_col_mapping();
         let nonpk_agg_defaults: Vec<Option<Value>> = raw_targets
             .iter()
-            .map(|t| match t {
-                RawAggTarget::NonPk(phys_idx) => {
-                    let schema_col = mapping[*phys_idx];
-                    if schema_col == usize::MAX {
-                        return None;
+            .map(|t| -> Result<Option<Value>> {
+                Ok(match t {
+                    RawAggTarget::NonPk(phys_idx) => {
+                        let schema_col = mapping[*phys_idx];
+                        if schema_col == usize::MAX {
+                            return Ok(None);
+                        }
+                        table_schema.columns[schema_col]
+                            .default_expr
+                            .as_ref()
+                            .map(|expr| eval_const_expr_with_cancel(expr, cancel))
+                            .transpose()?
                     }
-                    table_schema.columns[schema_col]
-                        .default_expr
-                        .as_ref()
-                        .and_then(|expr| eval_const_expr(expr).ok())
-                }
-                _ => None,
+                    _ => None,
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         // Raw-bytes predicate is only safe when every agg is CountStar.
         let all_count_star = ops.iter().all(|(op, _)| matches!(op, StreamAgg::CountStar));
@@ -2131,7 +2478,7 @@ impl StreamAggPlan {
                         table_schema.columns[*idx].data_type == DataType::Integer
                             && matches!(default, None | Some(Value::Null | Value::Integer(_)))
                     }
-                    StreamAgg::Min(idx) | StreamAgg::Max(idx) => {
+                    StreamAgg::Min(idx, _) | StreamAgg::Max(idx, _) => {
                         matches!(
                             table_schema.columns[*idx].data_type,
                             DataType::Integer
@@ -2169,6 +2516,7 @@ impl StreamAggPlan {
         where_clause: &Option<Expr>,
         states: &mut [AggState],
         scan_err: &mut Option<SqlError>,
+        cancel: Option<&CancelToken>,
     ) -> bool {
         if let Some(ref pred) = self.fast_pred {
             match pred.matches_raw(key, value) {
@@ -2189,14 +2537,14 @@ impl StreamAggPlan {
         }
 
         let row = match &self.partial_ctx {
-            Some(ctx) => match ctx.decode(key, value) {
+            Some(ctx) => match ctx.decode_with_cancel(key, value, cancel) {
                 Ok(r) => r,
                 Err(e) => {
                     *scan_err = Some(e);
                     return false;
                 }
             },
-            None => match decode_full_row(table_schema, key, value) {
+            None => match decode_full_row_with_cancel(table_schema, key, value, cancel) {
                 Ok(r) => r,
                 Err(e) => {
                     *scan_err = Some(e);
@@ -2206,7 +2554,7 @@ impl StreamAggPlan {
         };
 
         if let Some(expr) = where_clause {
-            match eval_expr(expr, &EvalCtx::new(col_map, &row)) {
+            match eval_expr(expr, &EvalCtx::new(col_map, &row).with_cancel(cancel)) {
                 Ok(val) if !is_truthy(&val) => return true,
                 Err(e) => {
                     *scan_err = Some(e);
@@ -2222,8 +2570,8 @@ impl StreamAggPlan {
                 StreamAgg::Count(idx)
                 | StreamAgg::Sum(idx)
                 | StreamAgg::Avg(idx)
-                | StreamAgg::Min(idx)
-                | StreamAgg::Max(idx) => &row[*idx],
+                | StreamAgg::Min(idx, _)
+                | StreamAgg::Max(idx, _) => &row[*idx],
             };
             if let Err(e) = states[i].feed_val(val) {
                 *scan_err = Some(e);
@@ -2290,6 +2638,8 @@ impl StreamGroupByPlan {
             || !stmt.joins.is_empty()
             || !stmt.order_by.is_empty()
             || stmt.limit.is_some()
+            || stmt.offset.is_some()
+            || stmt.distinct
         {
             return Ok(None);
         }
@@ -2316,6 +2666,12 @@ impl StreamGroupByPlan {
         };
 
         if schema.columns[group_col_idx].data_type != DataType::Integer {
+            return Ok(None);
+        }
+        if matches!(
+            schema.columns[group_col_idx].generated_kind,
+            Some(crate::parser::GeneratedKind::Virtual)
+        ) {
             return Ok(None);
         }
 
@@ -2373,6 +2729,12 @@ impl StreamGroupByPlan {
                         Some(idx) => idx,
                         None => return Ok(None),
                     };
+                    if matches!(
+                        schema.columns[col_idx].generated_kind,
+                        Some(crate::parser::GeneratedKind::Virtual)
+                    ) {
+                        return Ok(None);
+                    }
                     let target = if let Some(pk_pos) = schema
                         .primary_key_columns
                         .iter()
@@ -2388,8 +2750,12 @@ impl StreamGroupByPlan {
                         "COUNT" => agg_ops.push(StreamAgg::Count(col_idx)),
                         "SUM" => agg_ops.push(StreamAgg::Sum(col_idx)),
                         "AVG" => agg_ops.push(StreamAgg::Avg(col_idx)),
-                        "MIN" => agg_ops.push(StreamAgg::Min(col_idx)),
-                        "MAX" => agg_ops.push(StreamAgg::Max(col_idx)),
+                        "MIN" => {
+                            agg_ops.push(StreamAgg::Min(col_idx, schema.columns[col_idx].collation))
+                        }
+                        "MAX" => {
+                            agg_ops.push(StreamAgg::Max(col_idx, schema.columns[col_idx].collation))
+                        }
                         _ => return Ok(None),
                     }
                     raw_targets.push(target);
@@ -2411,10 +2777,12 @@ impl StreamGroupByPlan {
 
     pub(super) fn execute_scan(
         &self,
+        cancel: Option<&CancelToken>,
         scan: impl FnOnce(
             &mut dyn FnMut(&[u8], &[u8]) -> bool,
         ) -> std::result::Result<(), citadel::Error>,
     ) -> Result<ExecutionResult> {
+        check_cancel(cancel)?;
         let mut groups: FxHashMap<i64, Vec<AggState>> = FxHashMap::default();
         let mut null_group: Option<Vec<AggState>> = None;
         let mut scan_err: Option<SqlError> = None;
@@ -2539,6 +2907,7 @@ impl StreamGroupByPlan {
         if let Some(e) = scan_err {
             return Err(e);
         }
+        check_cancel(cancel)?;
 
         let col_names: Vec<String> = self.output.iter().map(|(_, name)| name.clone()).collect();
         let null_extra = if null_group.is_some() { 1 } else { 0 };
@@ -2554,7 +2923,8 @@ impl StreamGroupByPlan {
             }
             result_rows.push(row);
         }
-        for (group_key, states) in groups {
+        for (group_idx, (group_key, states)) in groups.into_iter().enumerate() {
+            check_cancel_at(cancel, group_idx)?;
             let mut row = Vec::with_capacity(self.output.len());
             let finished: Vec<Value> = states.into_iter().map(|s| s.finish()).collect();
             for (col, _) in &self.output {
@@ -2565,6 +2935,7 @@ impl StreamGroupByPlan {
             }
             result_rows.push(row);
         }
+        check_cancel(cancel)?;
 
         Ok(ExecutionResult::Query(QueryResult {
             columns: col_names,
@@ -2581,6 +2952,74 @@ pub(super) struct TopKScanPlan {
     nulls_first: bool,
     keep: usize,
     collation: crate::types::Collation,
+}
+
+fn topk_simple_sort_column(expr: &Expr, col_map: &ColumnMap) -> Option<(usize, Option<Collation>)> {
+    let (expr, explicit_collation) = match expr {
+        Expr::Collate { expr, collation } => (expr.as_ref(), Some(*collation)),
+        other => (other, None),
+    };
+    resolve_simple_col(expr, col_map).map(|index| (index, explicit_collation))
+}
+
+fn topk_ordinal_sort_column(
+    columns: &[SelectColumn],
+    mut position: usize,
+    schema: &TableSchema,
+    col_map: &ColumnMap,
+) -> Option<(usize, Option<Collation>)> {
+    for column in columns {
+        match column {
+            SelectColumn::AllColumns | SelectColumn::AllFromOld | SelectColumn::AllFromNew => {
+                if position < schema.columns.len() {
+                    return Some((position, None));
+                }
+                position -= schema.columns.len();
+            }
+            SelectColumn::Expr { expr, .. } => {
+                if position == 0 {
+                    return topk_simple_sort_column(expr, col_map);
+                }
+                position -= 1;
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+thread_local! {
+    static TOPK_SORT_CANCEL_HOOK: std::cell::RefCell<Option<(CancelToken, usize, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn arm_topk_sort_cancel(token: CancelToken, after_comparisons: usize) {
+    TOPK_SORT_CANCEL_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some((token, after_comparisons, 0));
+    });
+}
+
+#[cfg(test)]
+fn tick_topk_sort_cancel() {
+    TOPK_SORT_CANCEL_HOOK.with(|hook| {
+        let mut hook = hook.borrow_mut();
+        if let Some((token, cancel_after, comparisons)) = hook.as_mut() {
+            *comparisons += 1;
+            if *comparisons == *cancel_after {
+                token.cancel();
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+fn take_topk_sort_comparisons() -> usize {
+    TOPK_SORT_CANCEL_HOOK.with(|hook| {
+        hook.borrow_mut()
+            .take()
+            .map_or(0, |(_, _, comparisons)| comparisons)
+    })
 }
 
 impl TopKScanPlan {
@@ -2610,12 +3049,13 @@ impl TopKScanPlan {
 
         let ob = &stmt.order_by[0];
         let col_map = schema.column_map();
-        let (sort_expr, explicit_coll): (&Expr, Option<crate::types::Collation>) = match &ob.expr {
-            Expr::Collate { expr: e, collation } => (e.as_ref(), Some(*collation)),
-            other => (other, None),
+        let resolved = if let Some(position) = ob.output_ordinal {
+            topk_ordinal_sort_column(&stmt.columns, position, schema, col_map)
+        } else {
+            topk_simple_sort_column(&ob.expr, col_map)
         };
-        let col_idx = match resolve_simple_col(sort_expr, col_map) {
-            Some(idx) => idx,
+        let (col_idx, explicit_coll) = match resolved {
+            Some(resolved) => resolved,
             None => return Ok(None),
         };
         // Virtual generated columns are stored as NULL placeholders; the
@@ -2671,10 +3111,12 @@ impl TopKScanPlan {
         &self,
         schema: &TableSchema,
         stmt: &SelectStmt,
+        cancel: Option<&CancelToken>,
         scan: impl FnOnce(
             &mut dyn FnMut(&[u8], &[u8]) -> bool,
         ) -> std::result::Result<(), citadel::Error>,
     ) -> Result<ExecutionResult> {
+        check_cancel(cancel)?;
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
@@ -2707,7 +3149,9 @@ impl TopKScanPlan {
         // Max-heap: worst candidate on top for eviction.
         impl Ord for CandWrapper {
             fn cmp(&self, other: &Self) -> Ordering {
-                let ord = match (self.c.sort_key.is_null(), other.c.sort_key.is_null()) {
+                #[cfg(test)]
+                tick_topk_sort_cancel();
+                match (self.c.sort_key.is_null(), other.c.sort_key.is_null()) {
                     (true, true) => Ordering::Equal,
                     (true, false) => {
                         if self.nulls_first {
@@ -2724,7 +3168,7 @@ impl TopKScanPlan {
                         }
                     }
                     (false, false) => {
-                        if self.collation != crate::types::Collation::Binary {
+                        let ord = if self.collation != crate::types::Collation::Binary {
                             if let (Value::Text(a), Value::Text(b)) =
                                 (&self.c.sort_key, &other.c.sort_key)
                             {
@@ -2734,13 +3178,13 @@ impl TopKScanPlan {
                             }
                         } else {
                             self.c.sort_key.cmp(&other.c.sort_key)
+                        };
+                        if self.descending {
+                            ord.reverse()
+                        } else {
+                            ord
                         }
                     }
-                };
-                if self.descending {
-                    ord.reverse()
-                } else {
-                    ord
                 }
             }
         }
@@ -2758,10 +3202,11 @@ impl TopKScanPlan {
             })
             .map_err(SqlError::Storage)?;
             let mut rows: Vec<Vec<Value>> = Vec::with_capacity(firsts.len());
-            for (key, value) in &firsts {
-                rows.push(decode_full_row(schema, key, value)?);
+            for (row_idx, (key, value)) in firsts.iter().enumerate() {
+                check_cancel_at(cancel, row_idx)?;
+                rows.push(decode_full_row_with_cancel(schema, key, value, cancel)?);
             }
-            return finish_topk(schema, stmt, rows);
+            return finish_topk(schema, stmt, rows, cancel);
         }
         let mut heap: BinaryHeap<CandWrapper> = BinaryHeap::with_capacity(k + 1);
         let mut scan_err: Option<SqlError> = None;
@@ -2800,7 +3245,7 @@ impl TopKScanPlan {
             // Heap full and can't beat worst - skip
             if heap.len() >= k {
                 if let Some(top) = heap.peek() {
-                    let ord = match (sort_key.is_null(), top.c.sort_key.is_null()) {
+                    let cmp = match (sort_key.is_null(), top.c.sort_key.is_null()) {
                         (true, true) => Ordering::Equal,
                         (true, false) => {
                             if self.nulls_first {
@@ -2817,7 +3262,7 @@ impl TopKScanPlan {
                             }
                         }
                         (false, false) => {
-                            if self.collation != crate::types::Collation::Binary {
+                            let ord = if self.collation != crate::types::Collation::Binary {
                                 if let (Value::Text(a), Value::Text(b)) =
                                     (&sort_key, &top.c.sort_key)
                                 {
@@ -2827,10 +3272,14 @@ impl TopKScanPlan {
                                 }
                             } else {
                                 sort_key.cmp(&top.c.sort_key)
+                            };
+                            if self.descending {
+                                ord.reverse()
+                            } else {
+                                ord
                             }
                         }
                     };
-                    let cmp = if self.descending { ord.reverse() } else { ord };
                     if cmp != Ordering::Less {
                         return true;
                     }
@@ -2862,15 +3311,20 @@ impl TopKScanPlan {
             return Err(e);
         }
 
-        let mut winners: Vec<CandWrapper> = heap.into_vec();
-        winners.sort();
+        let winners = sort_vec_by(heap.into_vec(), cancel, |a, b| a.cmp(b))?;
 
         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(winners.len());
-        for w in &winners {
-            rows.push(decode_full_row(schema, &w.c.raw_key, &w.c.raw_value)?);
+        for (winner_idx, w) in winners.iter().enumerate() {
+            check_cancel_at(cancel, winner_idx)?;
+            rows.push(decode_full_row_with_cancel(
+                schema,
+                &w.c.raw_key,
+                &w.c.raw_value,
+                cancel,
+            )?);
         }
 
-        finish_topk(schema, stmt, rows)
+        finish_topk(schema, stmt, rows, cancel)
     }
 }
 
@@ -2878,6 +3332,7 @@ fn finish_topk(
     schema: &TableSchema,
     stmt: &SelectStmt,
     mut rows: Vec<Vec<Value>>,
+    cancel: Option<&CancelToken>,
 ) -> Result<ExecutionResult> {
     if let Some(ref offset_expr) = stmt.offset {
         let offset = eval_const_int(offset_expr)?.max(0) as usize;
@@ -2892,7 +3347,8 @@ fn finish_topk(
         rows.truncate(limit);
     }
 
-    let (col_names, projected) = project_rows(&schema.columns, &stmt.columns, rows)?;
+    let (col_names, projected) =
+        project_rows_with_cancel(&schema.columns, &stmt.columns, rows, cancel)?;
     Ok(ExecutionResult::Query(QueryResult {
         columns: col_names,
         rows: projected,
@@ -2936,6 +3392,12 @@ fn try_streaming_distinct_with_read(
             Some(idx) => idx,
             None => return Ok(None),
         };
+        // The dedup key below is raw stored bytes, which cannot express a collation that
+        // calls two spellings equal. The general path folds the key instead, so leave
+        // collated columns to it rather than returning both spellings as distinct.
+        if table_schema.columns[col_idx].collation != crate::types::Collation::Binary {
+            return Ok(None);
+        }
         let target = if let Some(pk_pos) = table_schema
             .primary_key_columns
             .iter()
@@ -3116,12 +3578,18 @@ fn has_non_lateral_derived(stmt: &SelectStmt) -> bool {
     from_has || join_has
 }
 
+/// A derived table's rows keep the collations of the columns its query selected, so reading
+/// a NOCASE column through `(SELECT ...) AS x` compares the way reading it directly does.
 fn materialize_derived(
     schema: &SchemaManager,
+    ctes: &CteContext,
     derived: &DerivedTable,
     io: &mut dyn LateralIo,
-) -> Result<QueryResult> {
-    io.exec_select(schema, &derived.query)
+) -> Result<CteRows> {
+    let result = io.exec_select(schema, &derived.query)?;
+    let collations =
+        super::dml::query_output_collations(schema, ctes, &derived.query, result.columns.len());
+    Ok(CteRows::new(result, collations))
 }
 
 fn exec_select_with_srf_with_read(
@@ -3129,6 +3597,7 @@ fn exec_select_with_srf_with_read(
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
+    cancel: Option<&CancelToken>,
 ) -> Result<ExecutionResult> {
     let args_exprs = stmt
         .from_args
@@ -3138,17 +3607,19 @@ fn exec_select_with_srf_with_read(
     let upper_name = stmt.from.to_ascii_uppercase();
     let (columns, rows) = match upper_name.as_str() {
         "JSONB_POPULATE_RECORD" | "JSONB_POPULATE_RECORDSET" => {
-            populate_record_dispatch(&upper_name, args_exprs, schema)?
+            populate_record_dispatch(&upper_name, args_exprs, schema, cancel)?
         }
         _ => {
-            let arg_values: Vec<Value> = args_exprs
-                .iter()
-                .map(|e| {
-                    let col_map = ColumnMap::new(&[]);
-                    eval_expr(e, &EvalCtx::new(&col_map, &[]))
-                })
-                .collect::<Result<_>>()?;
-            crate::json::dispatch_srf(&stmt.from, &arg_values)?
+            let col_map = ColumnMap::new(&[]);
+            let mut arg_values = Vec::with_capacity(args_exprs.len());
+            for (arg_idx, expr) in args_exprs.iter().enumerate() {
+                check_cancel_at(cancel, arg_idx)?;
+                arg_values.push(eval_expr(
+                    expr,
+                    &EvalCtx::new(&col_map, &[]).with_cancel(cancel),
+                )?);
+            }
+            crate::json::dispatch_srf_with_cancel(&stmt.from, &arg_values, cancel)?
         }
     };
 
@@ -3158,7 +3629,12 @@ fn exec_select_with_srf_with_read(
         .unwrap_or_else(|| stmt.from.to_ascii_lowercase());
 
     let mut new_ctes = ctes.clone();
-    new_ctes.insert(alias.to_ascii_lowercase(), QueryResult { columns, rows });
+    // The columns are invented by the source rather than read from a relation, so none of
+    // them carries a collation.
+    new_ctes.insert(
+        alias.to_ascii_lowercase(),
+        CteRows::binary(QueryResult { columns, rows }).shared(),
+    );
 
     let mut new_stmt = stmt.clone();
     new_stmt.from = alias;
@@ -3170,6 +3646,7 @@ fn populate_record_dispatch(
     upper_name: &str,
     args_exprs: &[Expr],
     schema: &SchemaManager,
+    cancel: Option<&CancelToken>,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
     if args_exprs.len() != 2 {
         return Err(SqlError::InvalidValue(format!(
@@ -3190,7 +3667,10 @@ fn populate_record_dispatch(
             SqlError::TableNotFound(format!("row type '{table_name}' (used in {upper_name})"))
         })?;
     let col_map = ColumnMap::new(&[]);
-    let jsonb_val = eval_expr(&args_exprs[1], &EvalCtx::new(&col_map, &[]))?;
+    let jsonb_val = eval_expr(
+        &args_exprs[1],
+        &EvalCtx::new(&col_map, &[]).with_cancel(cancel),
+    )?;
     let columns: Vec<String> = target_schema
         .columns
         .iter()
@@ -3199,15 +3679,16 @@ fn populate_record_dispatch(
     if jsonb_val.is_null() {
         return Ok((columns, vec![]));
     }
-    let j = crate::json::value_to_serde(&jsonb_val)?;
+    let j = crate::json::value_to_serde_with_cancel(&jsonb_val, cancel)?;
     let rows = match upper_name {
         "JSONB_POPULATE_RECORD" => {
             let obj = j.as_object().ok_or_else(|| {
                 SqlError::InvalidValue("jsonb_populate_record requires JSON object".into())
             })?;
-            vec![crate::json::populate_record_row(
+            vec![crate::json::populate_record_row_with_cancel(
                 obj,
                 &target_schema.columns,
+                cancel,
             )?]
         }
         "JSONB_POPULATE_RECORDSET" => {
@@ -3215,13 +3696,19 @@ fn populate_record_dispatch(
                 SqlError::InvalidValue("jsonb_populate_recordset requires JSON array".into())
             })?;
             arr.iter()
-                .map(|elem| {
+                .enumerate()
+                .map(|(row_idx, elem)| {
+                    check_cancel_at(cancel, row_idx)?;
                     let obj = elem.as_object().ok_or_else(|| {
                         SqlError::InvalidValue(
                             "jsonb_populate_recordset array elements must be objects".into(),
                         )
                     })?;
-                    crate::json::populate_record_row(obj, &target_schema.columns)
+                    crate::json::populate_record_row_with_cancel(
+                        obj,
+                        &target_schema.columns,
+                        cancel,
+                    )
                 })
                 .collect::<Result<Vec<_>>>()?
         }
@@ -3235,18 +3722,28 @@ fn exec_select_with_json_table_with_read(
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
+    cancel: Option<&CancelToken>,
 ) -> Result<ExecutionResult> {
     let spec = stmt
         .from_json_table
         .as_ref()
         .expect("from_json_table present when exec_select_with_json_table called");
     let col_map = ColumnMap::new(&[]);
-    let source_val = eval_expr(&spec.source, &EvalCtx::new(&col_map, &[]))?;
-    let (columns, rows) = crate::json::materialize_json_table(&source_val, spec)?;
+    let source_val = eval_expr(
+        &spec.source,
+        &EvalCtx::new(&col_map, &[]).with_cancel(cancel),
+    )?;
+    let (columns, rows) =
+        crate::json::materialize_json_table_with_cancel(&source_val, spec, cancel)?;
 
     let alias = stmt.from_alias.clone().unwrap_or_else(|| stmt.from.clone());
     let mut new_ctes = ctes.clone();
-    new_ctes.insert(alias.to_ascii_lowercase(), QueryResult { columns, rows });
+    // The columns are invented by the source rather than read from a relation, so none of
+    // them carries a collation.
+    new_ctes.insert(
+        alias.to_ascii_lowercase(),
+        CteRows::binary(QueryResult { columns, rows }).shared(),
+    );
 
     let mut new_stmt = stmt.clone();
     new_stmt.from = alias;
@@ -3267,16 +3764,16 @@ fn exec_select_with_derived_with_read(
         let mut io = ReadHeldIo { rtx: &mut *rtx };
 
         if let Some(d) = stmt.from_subquery.as_ref() {
-            let qr = materialize_derived(schema, d, &mut io)?;
-            new_ctes.insert(d.alias.to_ascii_lowercase(), qr);
+            let qr = materialize_derived(schema, &new_ctes, d, &mut io)?;
+            new_ctes.insert(d.alias.to_ascii_lowercase(), qr.shared());
             new_stmt.from = d.alias.clone();
             new_stmt.from_alias = None;
             new_stmt.from_subquery = None;
         }
         for j in new_stmt.joins.iter_mut() {
             if let Some(d) = j.subquery.take() {
-                let qr = materialize_derived(schema, &d, &mut io)?;
-                new_ctes.insert(d.alias.to_ascii_lowercase(), qr);
+                let qr = materialize_derived(schema, &new_ctes, &d, &mut io)?;
+                new_ctes.insert(d.alias.to_ascii_lowercase(), qr.shared());
                 j.table = TableRef {
                     name: d.alias.clone(),
                     alias: None,
@@ -3295,8 +3792,9 @@ fn exec_select_lateral_with_read(
     stmt: &SelectStmt,
     ctes: &CteContext,
 ) -> Result<ExecutionResult> {
+    let cancel = rtx.cancel_token().cloned();
     let mut io = ReadHeldIo { rtx };
-    exec_select_lateral_with_io(schema, stmt, ctes, &mut io)
+    exec_select_lateral_with_io(schema, stmt, ctes, &mut io, cancel.as_ref())
 }
 
 pub(super) fn exec_select_lateral_in_txn(
@@ -3305,8 +3803,9 @@ pub(super) fn exec_select_lateral_in_txn(
     stmt: &SelectStmt,
     ctes: &CteContext,
 ) -> Result<ExecutionResult> {
+    let cancel = wtx.cancel_token().cloned();
     let mut io = WriteIo { wtx };
-    exec_select_lateral_with_io(schema, stmt, ctes, &mut io)
+    exec_select_lateral_with_io(schema, stmt, ctes, &mut io, cancel.as_ref())
 }
 
 fn exec_select_lateral_with_io(
@@ -3314,7 +3813,9 @@ fn exec_select_lateral_with_io(
     stmt: &SelectStmt,
     ctes: &CteContext,
     io: &mut dyn LateralIo,
+    cancel: Option<&CancelToken>,
 ) -> Result<ExecutionResult> {
+    check_cancel(cancel)?;
     if !stmt.group_by.is_empty()
         || stmt.having.is_some()
         || stmt.distinct
@@ -3337,16 +3838,16 @@ fn exec_select_lateral_with_io(
                 "LATERAL is not allowed as the first FROM item".into(),
             ));
         }
-        let qr = materialize_derived(schema, d, io)?;
-        new_ctes.insert(d.alias.to_ascii_lowercase(), qr);
+        let qr = materialize_derived(schema, &new_ctes, d, io)?;
+        new_ctes.insert(d.alias.to_ascii_lowercase(), qr.shared());
         from_name = d.alias.clone();
         from_alias = None;
     }
 
     let (outer_schema, mut outer_rows) = match new_ctes.get(&from_name.to_ascii_lowercase()) {
-        Some(cte_qr) => (
-            super::cte::build_cte_schema(&from_name, cte_qr),
-            cte_qr.rows.clone(),
+        Some(cte) => (
+            super::cte::build_cte_schema(&from_name, cte),
+            super::clone_cte_rows_with_cancel(&cte.result.rows, cancel)?,
         ),
         None => io.scan_table(schema, &from_name)?,
     };
@@ -3361,8 +3862,8 @@ fn exec_select_lateral_with_io(
             SqlError::Plan("exec_select_lateral encountered non-subquery join".into())
         })?;
         if !derived.lateral {
-            let qr = materialize_derived(schema, derived, io)?;
-            new_ctes.insert(derived.alias.to_ascii_lowercase(), qr);
+            let qr = materialize_derived(schema, &new_ctes, derived, io)?;
+            new_ctes.insert(derived.alias.to_ascii_lowercase(), qr.shared());
             current_alias = derived.alias.clone();
             let mini = SelectStmt {
                 columns: vec![SelectColumn::AllColumns],
@@ -3389,14 +3890,20 @@ fn exec_select_lateral_with_io(
                 group_by: vec![],
                 having: None,
             };
-            let outer_qr = QueryResult {
-                columns: combined_cols.iter().map(|c| c.name.clone()).collect(),
-                rows: std::mem::take(&mut outer_rows),
-            };
-            new_ctes.insert(mini.from.clone(), outer_qr);
-            let qr = match super::exec_select_join_with_ctes(&mini, &new_ctes, &mut |n| {
-                io.scan_table(schema, n)
-            })? {
+            let outer_qr = CteRows::new(
+                QueryResult {
+                    columns: combined_cols.iter().map(|c| c.name.clone()).collect(),
+                    rows: std::mem::take(&mut outer_rows),
+                },
+                combined_cols.iter().map(|c| c.collation).collect(),
+            );
+            new_ctes.insert(mini.from.clone(), outer_qr.shared());
+            let qr = match super::exec_select_join_with_ctes(
+                &mini,
+                &new_ctes,
+                &mut |n| io.scan_table(schema, n),
+                cancel,
+            )? {
                 ExecutionResult::Query(qr) => qr,
                 _ => unreachable!(),
             };
@@ -3436,6 +3943,7 @@ fn exec_select_lateral_with_io(
             join.join_type,
             join.on_clause.as_ref(),
             io,
+            cancel,
         )? {
             outer_rows = fast.0;
             let alias_lc = derived.alias.to_ascii_lowercase();
@@ -3456,9 +3964,12 @@ fn exec_select_lateral_with_io(
         let mut probe_columns: Vec<String> = Vec::new();
         let mut combined_col_map: Option<ColumnMap> = None;
 
-        for outer_row in outer_rows.drain(..) {
+        let mut expansion_work = 0usize;
+        for (outer_idx, outer_row) in outer_rows.drain(..).enumerate() {
+            check_cancel_at(cancel, outer_idx)?;
             let bound_query = bind_query_with_outer(&derived.query, &outer_row, &outer_col_map)?;
             let inner_qr = io.exec_select(schema, &bound_query)?;
+            check_cancel(cancel)?;
             if probe_columns.is_empty() {
                 probe_columns = inner_qr.columns.clone();
                 if join.on_clause.is_some() {
@@ -3469,36 +3980,29 @@ fn exec_select_lateral_with_io(
                 }
             }
             let inner_count = inner_qr.columns.len();
-            if inner_qr.rows.is_empty() {
-                if matches!(join.join_type, JoinType::Left) {
-                    let mut combined = outer_row.clone();
-                    combined.resize(combined.len() + inner_count, Value::Null);
-                    if let (Some(on), Some(cm)) = (&join.on_clause, &combined_col_map) {
-                        if !matches!(
-                            eval_expr(on, &EvalCtx::new(cm, &combined)),
-                            Ok(v) if is_truthy(&v)
-                        ) {
-                            continue;
-                        }
-                    }
-                    new_rows.push(combined);
-                }
-                continue;
-            }
             let on_filter_needed = join.on_clause.is_some();
+            let mut matched = false;
             for inner_row in &inner_qr.rows {
+                check_cancel_at(cancel, expansion_work)?;
+                expansion_work += 1;
                 let mut combined = outer_row.clone();
                 combined.extend(inner_row.iter().cloned());
                 if on_filter_needed {
                     let on = join.on_clause.as_ref().unwrap();
                     let cm = combined_col_map.as_ref().unwrap();
-                    if !matches!(
-                        eval_expr(on, &EvalCtx::new(cm, &combined)),
-                        Ok(v) if is_truthy(&v)
-                    ) {
+                    if !is_truthy(&eval_expr(
+                        on,
+                        &EvalCtx::new(cm, &combined).with_cancel(cancel),
+                    )?) {
                         continue;
                     }
                 }
+                matched = true;
+                new_rows.push(combined);
+            }
+            if !matched && matches!(join.join_type, JoinType::Left) {
+                let mut combined = outer_row;
+                combined.resize(combined.len() + inner_count, Value::Null);
                 new_rows.push(combined);
             }
         }
@@ -3518,6 +4022,7 @@ fn exec_select_lateral_with_io(
             .collect();
         outer_rows = new_rows;
         current_alias = derived.alias.clone();
+        check_cancel(cancel)?;
     }
 
     let clean_stmt = SelectStmt {
@@ -3536,7 +4041,10 @@ fn exec_select_lateral_with_io(
         group_by: stmt.group_by.clone(),
         having: stmt.having.clone(),
     };
-    process_select(&combined_cols, outer_rows, &clean_stmt, false)
+    process_select(
+        outer_rows,
+        SelectCtx::new(&combined_cols, &clean_stmt, cancel),
+    )
 }
 
 type LateralRows = (Vec<Vec<Value>>, Vec<String>);
@@ -3551,7 +4059,9 @@ fn try_lateral_decorrelated(
     join_type: JoinType,
     on_clause: Option<&Expr>,
     io: &mut dyn LateralIo,
+    cancel: Option<&CancelToken>,
 ) -> Result<Option<LateralRows>> {
+    check_cancel(cancel)?;
     if !derived.query.ctes.is_empty() {
         return Ok(None);
     }
@@ -3660,6 +4170,7 @@ fn try_lateral_decorrelated(
             body: QueryBody::Select(Box::new(inner_stmt)),
         },
     )?;
+    check_cancel(cancel)?;
 
     let proj_plan = build_projection_indices(&sel.columns, &inner_qr.columns);
     let probe_columns: Vec<String> = match proj_plan.as_ref() {
@@ -3669,7 +4180,8 @@ fn try_lateral_decorrelated(
 
     let mut groups: FxHashMap<Vec<Value>, Vec<Vec<Value>>> = FxHashMap::default();
     let inner_col_idx: Vec<usize> = corr.iter().map(|&(_, inner_idx)| inner_idx).collect();
-    for row in inner_qr.rows {
+    for (row_idx, row) in inner_qr.rows.into_iter().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
         let key: Vec<Value> = inner_col_idx.iter().map(|&i| row[i].clone()).collect();
         if key.iter().any(|v| matches!(v, Value::Null)) {
             continue;
@@ -3677,19 +4189,24 @@ fn try_lateral_decorrelated(
         groups.entry(key).or_default().push(row);
     }
     if let Some(n) = limit_n {
-        for v in groups.values_mut() {
+        for (group_idx, v) in groups.values_mut().enumerate() {
+            check_cancel_at(cancel, group_idx)?;
             v.truncate(n);
         }
     }
 
     let outer_idx: Vec<usize> = corr.iter().map(|&(o, _)| o).collect();
     let mut new_rows: Vec<Vec<Value>> = Vec::new();
-    for outer_row in outer_rows {
+    let mut expansion_work = 0usize;
+    for (outer_row_idx, outer_row) in outer_rows.iter().enumerate() {
+        check_cancel_at(cancel, outer_row_idx)?;
         let key: Vec<Value> = outer_idx.iter().map(|&i| outer_row[i].clone()).collect();
         let inner_rows = groups.get(&key);
         match inner_rows {
             Some(rows) if !rows.is_empty() => {
                 for inner_row in rows {
+                    check_cancel_at(cancel, expansion_work)?;
+                    expansion_work += 1;
                     let mut combined = outer_row.clone();
                     if let Some(plan) = &proj_plan {
                         for &(_, idx) in plan {
@@ -3711,6 +4228,7 @@ fn try_lateral_decorrelated(
         }
     }
     let _ = outer_cols;
+    check_cancel(cancel)?;
     Ok(Some((new_rows, probe_columns)))
 }
 
@@ -3787,6 +4305,7 @@ fn expr_uses_outer(
                 escape,
                 ..
             } => walk(expr, f) || walk(pattern, f) || escape.as_ref().is_some_and(|e| walk(e, f)),
+            Expr::IsDistinctFrom { left, right, .. } => walk(left, f) || walk(right, f),
             _ => false,
         }
     }
@@ -3923,6 +4442,8 @@ fn bind_select_with_outer(
         .map(|o| {
             Ok(OrderByItem {
                 expr: bind_expr_with_outer(&o.expr, outer_row, outer_col_map)?,
+                output_name: o.output_name.clone(),
+                output_ordinal: o.output_ordinal,
                 descending: o.descending,
                 nulls_first: o.nulls_first,
             })
@@ -3966,6 +4487,15 @@ fn bind_expr_with_outer(
             left: Box::new(bind_expr_with_outer(left, outer_row, outer_col_map)?),
             op: *op,
             right: Box::new(bind_expr_with_outer(right, outer_row, outer_col_map)?),
+        }),
+        IsDistinctFrom {
+            left,
+            right,
+            negated,
+        } => Ok(IsDistinctFrom {
+            left: Box::new(bind_expr_with_outer(left, outer_row, outer_col_map)?),
+            right: Box::new(bind_expr_with_outer(right, outer_row, outer_col_map)?),
+            negated: *negated,
         }),
         UnaryOp { op, expr: inner } => Ok(UnaryOp {
             op: *op,
@@ -4041,36 +4571,133 @@ fn bind_expr_with_outer(
     }
 }
 
-pub(super) fn exec_select_no_from(stmt: &SelectStmt) -> Result<ExecutionResult> {
+pub(super) fn exec_select_no_from(
+    stmt: &SelectStmt,
+    cancel: Option<&CancelToken>,
+) -> Result<ExecutionResult> {
     let empty_cols: Vec<ColumnDef> = vec![];
-    let empty_row: Vec<Value> = vec![];
-    let (col_names, projected) = project_rows(&empty_cols, &stmt.columns, vec![empty_row])?;
-    Ok(ExecutionResult::Query(QueryResult {
-        columns: col_names,
-        rows: projected,
-    }))
+    process_select(
+        vec![Vec::new()],
+        SelectCtx::new(&empty_cols, stmt, cancel).predicate_applied(false),
+    )
 }
 
-pub(super) fn process_select(
+fn extract_pre_projection_sort_keys(
+    rows: &[Vec<Value>],
+    order_by: &[OrderByItem],
     columns: &[ColumnDef],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<Vec<Value>>> {
+    let col_map = ColumnMap::new(columns);
+    let mut keys = Vec::with_capacity(rows.len());
+    for (row_index, row) in rows.iter().enumerate() {
+        check_cancel_at(cancel, row_index)?;
+        keys.push(
+            order_by
+                .iter()
+                .map(|item| {
+                    if order_by_uses_projected_output(item) {
+                        Ok(Value::Null)
+                    } else {
+                        eval_expr(&item.expr, &EvalCtx::new(&col_map, row).with_cancel(cancel))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    check_cancel(cancel)?;
+    Ok(keys)
+}
+
+fn fill_projected_sort_keys(
+    keys: &mut [Vec<Value>],
+    projected: &[Vec<Value>],
+    order_by: &[OrderByItem],
+    output_columns: &[ColumnDef],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<()> {
+    debug_assert_eq!(keys.len(), projected.len());
+    let output_map = ColumnMap::new(output_columns);
+    let output_positions = order_by
+        .iter()
+        .map(|item| order_by_output_position(item, &output_map))
+        .collect::<Result<Vec<_>>>()?;
+    for (row_index, (key, row)) in keys.iter_mut().zip(projected).enumerate() {
+        check_cancel_at(cancel, row_index)?;
+        for (key_index, output_index) in output_positions.iter().enumerate() {
+            if let Some(output_index) = output_index {
+                key[key_index] = row.get(*output_index).cloned().unwrap_or(Value::Null);
+            }
+        }
+    }
+    check_cancel(cancel)
+}
+
+fn projection_sort_collations(
+    order_by: &[OrderByItem],
+    source_columns: &[ColumnDef],
+    output_columns: &[ColumnDef],
+) -> Result<Vec<Collation>> {
+    let source_map = ColumnMap::new(source_columns);
+    let output_map = ColumnMap::new(output_columns);
+    order_by
+        .iter()
+        .map(|item| {
+            Ok(order_by_output_position(item, &output_map)?.map_or_else(
+                || expr_collation(&item.expr, &source_map),
+                |position| output_map.collation_at(position),
+            ))
+        })
+        .collect()
+}
+
+/// Everything after the scan: filter, window, aggregate, distinct, sort, project.
+/// These run over rows already in memory and can outlast the read that produced
+/// them, so cancellation stopping at the scan would do nothing on long queries.
+pub(super) fn process_select(
     mut rows: Vec<Vec<Value>>,
-    stmt: &SelectStmt,
-    predicate_applied: bool,
+    ctx: SelectCtx<'_>,
 ) -> Result<ExecutionResult> {
+    let SelectCtx {
+        columns,
+        stmt,
+        predicate_applied,
+        ..
+    } = ctx;
+    ctx.check()?;
+
+    if stmt
+        .order_by
+        .iter()
+        .any(|item| item.output_ordinal.is_some())
+    {
+        let output_columns = build_output_columns(&stmt.columns, columns);
+        validate_order_by_ordinals(&stmt.order_by, output_columns.len())?;
+    }
+
     if !predicate_applied {
         if let Some(ref where_expr) = stmt.where_clause {
             let col_map = ColumnMap::new(columns);
-            rows.retain(
-                |row| match eval_expr(where_expr, &EvalCtx::new(&col_map, row)) {
-                    Ok(val) => is_truthy(&val),
-                    Err(_) => false,
-                },
-            );
+            let mut keep = Vec::with_capacity(rows.len());
+            for (row_idx, row) in rows.iter().enumerate() {
+                check_cancel_at(ctx.cancel, row_idx)?;
+                let value = eval_expr(
+                    where_expr,
+                    &EvalCtx::new(&col_map, row).with_cancel(ctx.cancel),
+                )?;
+                keep.push(is_truthy(&value));
+            }
+            let mut keep = keep.into_iter();
+            rows.retain(|_| keep.next().expect("one filter decision per row"));
+            debug_assert!(keep.next().is_none());
+            ctx.check()?;
         }
     }
 
+    ctx.check()?;
+
     if has_any_window_function(stmt) {
-        return eval_window_select(columns, rows, stmt);
+        return eval_window_select(rows, ctx);
     }
 
     let has_aggregates = stmt.columns.iter().any(|c| match c {
@@ -4079,29 +4706,81 @@ pub(super) fn process_select(
     });
 
     if has_aggregates || !stmt.group_by.is_empty() {
-        return exec_aggregate(columns, &rows, stmt);
+        return exec_aggregate(&rows, ctx);
     }
 
     if stmt.distinct {
-        let (col_names, mut projected) = project_rows(columns, &stmt.columns, rows)?;
+        // Extracted BEFORE the projection, which discards the source columns an
+        // ORDER BY expression names. Sorting projected rows resolves only against
+        // output names and keys every row `Value::Null`.
+        let col_map = ColumnMap::new(columns);
+        let output_columns = build_output_columns(&stmt.columns, columns);
+        let mut sort_keys = if stmt.order_by.is_empty() {
+            None
+        } else {
+            Some(extract_pre_projection_sort_keys(
+                &rows,
+                &stmt.order_by,
+                columns,
+                ctx.cancel,
+            )?)
+        };
+        let (col_names, mut projected) =
+            project_rows_with_cancel(columns, &stmt.columns, rows, ctx.cancel)?;
+        if let Some(keys) = &mut sort_keys {
+            fill_projected_sort_keys(
+                keys,
+                &projected,
+                &stmt.order_by,
+                &output_columns,
+                ctx.cancel,
+            )?;
+        }
+        ctx.check()?;
 
-        let mut seen: rustc_hash::FxHashSet<Vec<Value>> =
-            rustc_hash::FxHashSet::with_capacity_and_hasher(
-                projected.len().min(1024),
-                Default::default(),
-            );
-        projected.retain(|row| {
-            if seen.contains(row) {
-                false
-            } else {
-                seen.insert(row.clone());
-                true
+        // Keyed by the projected column's collation, so a column that calls two spellings
+        // equal does not return both of them as distinct rows.
+        let mut seen = RowKeys::with_capacity(
+            output_collations(&stmt.columns, &col_map),
+            projected.len().min(1024),
+        );
+        let mut kept_keys: Vec<Vec<Value>> = Vec::new();
+        if ctx.cancel.is_none() {
+            let mut row_idx = 0;
+            projected.retain(|row| {
+                let keep = seen.insert(row);
+                if keep {
+                    if let Some(keys) = &mut sort_keys {
+                        kept_keys.push(std::mem::take(&mut keys[row_idx]));
+                    }
+                }
+                row_idx += 1;
+                keep
+            });
+        } else {
+            let original = std::mem::take(&mut projected);
+            projected.reserve(original.len());
+            for (i, row) in original.into_iter().enumerate() {
+                check_cancel_at(ctx.cancel, i)?;
+                if seen.insert(&row) {
+                    if let Some(keys) = &mut sort_keys {
+                        kept_keys.push(std::mem::take(&mut keys[i]));
+                    }
+                    projected.push(row);
+                }
             }
-        });
+        }
+        ctx.check()?;
 
         if !stmt.order_by.is_empty() {
-            let output_cols = build_output_columns(&stmt.columns, columns);
-            sort_rows(&mut projected, &stmt.order_by, &output_cols)?;
+            let collations = projection_sort_collations(&stmt.order_by, columns, &output_columns)?;
+            sort_rows_by_keys(
+                &mut projected,
+                &kept_keys,
+                &stmt.order_by,
+                &collations,
+                ctx.cancel,
+            )?;
         }
 
         if let Some(ref offset_expr) = stmt.offset {
@@ -4118,6 +4797,83 @@ pub(super) fn process_select(
             projected.truncate(limit);
         }
 
+        ctx.check()?;
+        return Ok(ExecutionResult::Query(QueryResult {
+            columns: col_names,
+            rows: projected,
+        }));
+    }
+
+    ctx.check()?;
+
+    if stmt.order_by.iter().any(order_by_uses_projected_output) {
+        let output_columns = build_output_columns(&stmt.columns, columns);
+        let mut sort_keys =
+            extract_pre_projection_sort_keys(&rows, &stmt.order_by, columns, ctx.cancel)?;
+        let (col_names, mut projected) =
+            project_rows_with_cancel(columns, &stmt.columns, rows, ctx.cancel)?;
+        fill_projected_sort_keys(
+            &mut sort_keys,
+            &projected,
+            &stmt.order_by,
+            &output_columns,
+            ctx.cancel,
+        )?;
+        let collations = projection_sort_collations(&stmt.order_by, columns, &output_columns)?;
+
+        if let Some(ref limit_expr) = stmt.limit {
+            let limit = eval_const_int(limit_expr)?.max(0) as usize;
+            let offset = stmt
+                .offset
+                .as_ref()
+                .map(eval_const_int)
+                .transpose()?
+                .unwrap_or(0)
+                .max(0) as usize;
+            let keep = limit.saturating_add(offset);
+            if keep == 0 {
+                projected.clear();
+            } else if keep < projected.len() {
+                topk_rows_by_keys(
+                    &mut projected,
+                    &sort_keys,
+                    &stmt.order_by,
+                    &collations,
+                    keep,
+                    ctx.cancel,
+                )?;
+                projected.truncate(keep);
+            } else {
+                sort_rows_by_keys(
+                    &mut projected,
+                    &sort_keys,
+                    &stmt.order_by,
+                    &collations,
+                    ctx.cancel,
+                )?;
+            }
+        } else {
+            sort_rows_by_keys(
+                &mut projected,
+                &sort_keys,
+                &stmt.order_by,
+                &collations,
+                ctx.cancel,
+            )?;
+        }
+
+        if let Some(ref offset_expr) = stmt.offset {
+            let offset = eval_const_int(offset_expr)?.max(0) as usize;
+            if offset < projected.len() {
+                projected = projected.split_off(offset);
+            } else {
+                projected.clear();
+            }
+        }
+        if let Some(ref limit_expr) = stmt.limit {
+            projected.truncate(eval_const_int(limit_expr)?.max(0) as usize);
+        }
+        ctx.check()?;
         return Ok(ExecutionResult::Query(QueryResult {
             columns: col_names,
             rows: projected,
@@ -4135,13 +4891,13 @@ pub(super) fn process_select(
             if keep == 0 {
                 rows.clear();
             } else if keep < rows.len() {
-                topk_rows(&mut rows, &stmt.order_by, columns, keep)?;
+                topk_rows(&mut rows, &stmt.order_by, columns, keep, ctx.cancel)?;
                 rows.truncate(keep);
             } else {
-                sort_rows(&mut rows, &stmt.order_by, columns)?;
+                sort_rows(&mut rows, &stmt.order_by, columns, ctx.cancel)?;
             }
         } else {
-            sort_rows(&mut rows, &stmt.order_by, columns)?;
+            sort_rows(&mut rows, &stmt.order_by, columns, ctx.cancel)?;
         }
     }
 
@@ -4159,7 +4915,9 @@ pub(super) fn process_select(
         rows.truncate(limit);
     }
 
-    let (col_names, projected) = project_rows(columns, &stmt.columns, rows)?;
+    let (col_names, projected) =
+        project_rows_with_cancel(columns, &stmt.columns, rows, ctx.cancel)?;
+    ctx.check()?;
 
     Ok(ExecutionResult::Query(QueryResult {
         columns: col_names,
@@ -4289,6 +5047,9 @@ fn where_has_inverted_op(expr: &Expr) -> bool {
         } => {
             where_has_inverted_op(expr) || where_has_inverted_op(low) || where_has_inverted_op(high)
         }
+        Expr::IsDistinctFrom { left, right, .. } => {
+            where_has_inverted_op(left) || where_has_inverted_op(right)
+        }
         _ => false,
     }
 }
@@ -4376,6 +5137,8 @@ pub(super) fn select_would_cover(schema: &SchemaManager, sel: &SelectStmt) -> bo
 
 impl SimpleScanPlan {
     fn run(&self, rtx: &mut ReadTxn<'_>) -> Result<QueryResult> {
+        let cancel = rtx.cancel_token().cloned();
+        let cancel = cancel.as_ref();
         let plan = crate::planner::plan_select_inverted(&self.table_schema, &self.where_expr);
         let col_map = self.table_schema.column_map();
         // A fully consumed WHERE needs no per-row re-eval on covered rows.
@@ -4405,7 +5168,7 @@ impl SimpleScanPlan {
             }
             let mut out = Vec::with_capacity(rows.len());
             for row in &rows {
-                out.push(self.project(col_map, row)?);
+                out.push(self.project(col_map, row, cancel)?);
             }
             return Ok(QueryResult {
                 columns: self.columns.clone(),
@@ -4423,12 +5186,15 @@ impl SimpleScanPlan {
         for row in &rows {
             if !filtered {
                 if let Some(w) = &self.where_expr {
-                    if !eval_expr(w, &EvalCtx::new(col_map, row)).is_ok_and(|v| is_truthy(&v)) {
+                    if !is_truthy(&eval_expr(
+                        w,
+                        &EvalCtx::new(col_map, row).with_cancel(cancel),
+                    )?) {
                         continue;
                     }
                 }
             }
-            out.push(self.project(col_map, row)?);
+            out.push(self.project(col_map, row, cancel)?);
         }
         Ok(QueryResult {
             columns: self.columns.clone(),
@@ -4436,12 +5202,17 @@ impl SimpleScanPlan {
         })
     }
 
-    fn project(&self, col_map: &ColumnMap, row: &[Value]) -> Result<Vec<Value>> {
+    fn project(
+        &self,
+        col_map: &ColumnMap,
+        row: &[Value],
+        cancel: Option<&CancelToken>,
+    ) -> Result<Vec<Value>> {
         match &self.proj {
             StreamProj::Identity { .. } => Ok(row.to_vec()),
             StreamProj::Columns { idxs, .. } => Ok(idxs.iter().map(|&i| row[i].clone()).collect()),
             StreamProj::Exprs { exprs, .. } => {
-                let ectx = EvalCtx::new(col_map, row);
+                let ectx = EvalCtx::new(col_map, row).with_cancel(cancel);
                 exprs.iter().map(|e| eval_expr(e, &ectx)).collect()
             }
         }
@@ -4450,6 +5221,8 @@ impl SimpleScanPlan {
 
 impl PkPointPlan {
     fn run(&self, rtx: &mut ReadTxn<'_>) -> Result<QueryResult> {
+        let cancel = rtx.cancel_token().cloned();
+        let cancel = cancel.as_ref();
         let mut pk_values = Vec::with_capacity(self.pk_sources.len());
         for s in &self.pk_sources {
             pk_values.push(match s {
@@ -4463,9 +5236,12 @@ impl PkPointPlan {
             .map_err(SqlError::Storage)?
         {
             Some(value) => {
-                let row = decode_full_row(&self.table_schema, &key, &value)?;
+                let row = decode_full_row_with_cancel(&self.table_schema, &key, &value, cancel)?;
                 let col_map = self.table_schema.column_map();
-                match eval_expr(&self.where_expr, &EvalCtx::new(col_map, &row)) {
+                match eval_expr(
+                    &self.where_expr,
+                    &EvalCtx::new(col_map, &row).with_cancel(cancel),
+                ) {
                     Ok(v) if is_truthy(&v) => {
                         let mut scratch: Vec<Value> = Vec::new();
                         vec![decode_and_project(
@@ -4474,9 +5250,11 @@ impl PkPointPlan {
                             &key,
                             &value,
                             &mut scratch,
+                            cancel,
                         )?]
                     }
-                    _ => Vec::new(),
+                    Ok(_) => Vec::new(),
+                    Err(e) => return Err(e),
                 }
             }
             None => Vec::new(),
@@ -4494,7 +5272,7 @@ struct JoinPlanStatic {
     needed_per_table: Vec<Vec<usize>>,
     output_combined: Option<Vec<usize>>,
     /// Per join step: (equi_pairs, is_pure_equi), fixed by the statement.
-    step_equi: Vec<(Vec<(usize, usize)>, bool)>,
+    step_equi: Vec<super::join::EquiJoin>,
     /// Full-pk-eq WHERE on the outer table: fetch one row instead of a scan.
     outer_point: Option<Vec<PointSource>>,
 }
@@ -4577,6 +5355,10 @@ struct CompoundPlanStatic {
     all: bool,
     branches: Vec<BranchPlan>,
     columns: Vec<String>,
+    /// This lane runs the same six set operations as `apply_set_operation`, so it folds its
+    /// keys by the same rule: without it, `UNION` and `UNION ... ORDER BY` deduplicated a
+    /// collated column differently, the ORDER BY deciding which lane ran.
+    key_colls: Vec<crate::types::Collation>,
 }
 
 struct BranchPlan {
@@ -4797,6 +5579,7 @@ impl CompiledPlan for CompiledSelect {
     ) -> Option<Box<dyn super::compile::RowSourceIter + 'db>> {
         let (lower, table_schema, proj, columns) = stream_scan_setup(schema, stmt)?;
         let mut rtx = db.begin_read();
+        let cancel = rtx.cancel_token().cloned();
         let row_count = rtx.table_entry_count(lower.as_bytes()).unwrap_or(0) as usize;
         let iter = rtx.into_table_scan_iter(lower.as_bytes(), b"").ok()?;
         Some(Box::new(StreamingSelect {
@@ -4806,6 +5589,7 @@ impl CompiledPlan for CompiledSelect {
             columns,
             scratch: Vec::new(),
             row_count,
+            cancel,
         }))
     }
 
@@ -4863,6 +5647,7 @@ struct StreamingSelect<'db> {
     /// Reused decode buffer for projections that build a separate output row.
     scratch: Vec<Value>,
     row_count: usize,
+    cancel: Option<CancelToken>,
 }
 
 impl<'db> super::compile::RowSourceIter for StreamingSelect<'db> {
@@ -4876,6 +5661,7 @@ impl<'db> super::compile::RowSourceIter for StreamingSelect<'db> {
             key,
             value,
             &mut self.scratch,
+            self.cancel.as_ref(),
         )?))
     }
 
@@ -4895,6 +5681,7 @@ fn decode_and_project(
     key: &[u8],
     value: &[u8],
     scratch: &mut Vec<Value>,
+    cancel: Option<&CancelToken>,
 ) -> Result<Vec<Value>> {
     match proj {
         StreamProj::Identity { full_push } => {
@@ -4903,7 +5690,7 @@ fn decode_and_project(
                     return Ok(row);
                 }
             }
-            decode_full_row(schema, key, value)
+            decode_full_row_with_cancel(schema, key, value, cancel)
         }
         StreamProj::Columns {
             idxs,
@@ -4915,8 +5702,8 @@ fn decode_and_project(
                 return pd.decode(key, value);
             }
             match ctx {
-                Some(c) => c.decode_into(key, value, scratch)?,
-                None => decode_full_row_into(schema, key, value, scratch)?,
+                Some(c) => c.decode_into_with_cancel(key, value, scratch, cancel)?,
+                None => decode_full_row_into_with_cancel(schema, key, value, scratch, cancel)?,
             }
             if *unique {
                 Ok(idxs
@@ -4933,10 +5720,10 @@ fn decode_and_project(
             ctx,
         } => {
             match ctx {
-                Some(c) => c.decode_into(key, value, scratch)?,
-                None => decode_full_row_into(schema, key, value, scratch)?,
+                Some(c) => c.decode_into_with_cancel(key, value, scratch, cancel)?,
+                None => decode_full_row_into_with_cancel(schema, key, value, scratch, cancel)?,
             }
-            let ectx = EvalCtx::new(col_map, scratch);
+            let ectx = EvalCtx::new(col_map, scratch).with_cancel(cancel);
             let mut out = Vec::with_capacity(exprs.len());
             for e in exprs {
                 out.push(eval_expr(e, &ectx)?);
@@ -4995,6 +5782,8 @@ fn collect_scan(
     leaf_cache: &LeafScanCache,
 ) -> Result<QueryResult> {
     let mut rtx = db.begin_read();
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     let gen = rtx.commit_generation();
     let row_count = rtx.table_entry_count(table_lower.as_bytes()).unwrap_or(0) as usize;
 
@@ -5020,7 +5809,7 @@ fn collect_scan(
     let mut scratch: Vec<Value> = Vec::new();
     let mut err: Option<SqlError> = None;
     rtx.scan_leaves(&leaves, |key, value| {
-        match decode_and_project(proj, table_schema, key, value, &mut scratch) {
+        match decode_and_project(proj, table_schema, key, value, &mut scratch, cancel) {
             Ok(row) => {
                 rows.push(row);
                 true
@@ -5142,6 +5931,9 @@ fn is_streamable_scalar(expr: &Expr) -> bool {
         Expr::InList { expr, list, .. } => {
             is_streamable_scalar(expr) && list.iter().all(is_streamable_scalar)
         }
+        Expr::IsDistinctFrom { left, right, .. } => {
+            is_streamable_scalar(left) && is_streamable_scalar(right)
+        }
         Expr::Case {
             operand,
             conditions,
@@ -5260,6 +6052,8 @@ fn execute_cached_join_with_read(
     cache: &parking_lot::RwLock<Option<Arc<CachedJoin>>>,
     sel: &SelectStmt,
 ) -> Result<ExecutionResult> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     let snapshot_gen = rtx.commit_generation();
 
     let cached: Arc<CachedJoin> = {
@@ -5271,8 +6065,8 @@ fn execute_cached_join_with_read(
                 let probes = inner
                     .iter()
                     .zip(&plan.step_equi)
-                    .map(|(rows, (pairs, pure))| super::join::build_probe_index(rows, pairs, *pure))
-                    .collect();
+                    .map(|(rows, equi)| super::join::build_probe_index(rows, equi, cancel))
+                    .collect::<Result<Vec<_>>>()?;
                 let arc = Arc::new(CachedJoin {
                     cached_gen: snapshot_gen,
                     inner_per_table: inner,
@@ -5300,7 +6094,12 @@ fn execute_cached_join_with_read(
             .table_get(outer_schema.name.as_bytes(), &key)
             .map_err(SqlError::Storage)?
         {
-            Some(value) => vec![decode_full_row(outer_schema, &key, &value)?],
+            Some(value) => vec![decode_full_row_with_cancel(
+                outer_schema,
+                &key,
+                &value,
+                cancel,
+            )?],
             None => Vec::new(),
         }
     } else {
@@ -5344,8 +6143,6 @@ fn execute_cached_join_with_read(
             None
         };
 
-        let (equi_pairs, is_pure_equi) = &plan.step_equi[ji];
-
         outer_rows = super::join::exec_join_step_borrowed(
             outer_rows,
             &cached.inner_per_table[ji],
@@ -5355,10 +6152,10 @@ fn execute_cached_join_with_read(
             inner_col_count,
             cur_outer_pk_col,
             proj.as_ref(),
-            equi_pairs,
-            *is_pure_equi,
+            &plan.step_equi[ji],
             Some(&cached.probes[ji]),
-        );
+            cancel,
+        )?;
         cur_outer_pk_col = None;
     }
 
@@ -5366,10 +6163,10 @@ fn execute_cached_join_with_read(
         let actual_width = outer_rows.first().map_or(0, |r| r.len());
         if actual_width == oc.len() {
             let projected_cols = super::join::build_projected_columns(&combined_cols, oc);
-            return process_select(&projected_cols, outer_rows, sel, false);
+            return process_select(outer_rows, SelectCtx::new(&projected_cols, sel, cancel));
         }
     }
-    process_select(&combined_cols, outer_rows, sel, false)
+    process_select(outer_rows, SelectCtx::new(&combined_cols, sel, cancel))
 }
 
 fn build_inner_data(
@@ -5403,11 +6200,20 @@ fn build_compound_plan_static(
         return None;
     }
 
+    // This lane is only reached for a query with no WITH clause, so there is nothing for a
+    // branch to reference besides real tables.
+    let key_colls = super::dml::body_output_collations(
+        schema,
+        &CteContext::default(),
+        &comp.left,
+        columns.len(),
+    );
     Some(CompoundPlanStatic {
         op: comp.op.clone(),
         all: comp.all,
         branches: vec![left_branch, right_branch],
         columns,
+        key_colls,
     })
 }
 
@@ -5458,11 +6264,7 @@ fn resolve_branch_needed_cols(
     for sc in select_cols {
         match sc {
             SelectColumn::AllColumns => {
-                out.clear();
-                for i in 0..table_cols.len() {
-                    out.push(i);
-                }
-                return Some(out);
+                out.extend(0..table_cols.len());
             }
             SelectColumn::Expr { expr, .. } => match expr {
                 Expr::Column(name) => {
@@ -5494,11 +6296,7 @@ fn compound_branch_columns(schema: &SchemaManager, body: &QueryBody) -> Option<V
     for sc in &sel.columns {
         match sc {
             SelectColumn::AllColumns => {
-                out.clear();
-                for c in &table_schema.columns {
-                    out.push(c.name.clone());
-                }
-                return Some(out);
+                out.extend(table_schema.columns.iter().map(|c| c.name.clone()));
             }
             SelectColumn::Expr { alias: Some(a), .. } => out.push(a.clone()),
             SelectColumn::Expr {
@@ -5529,6 +6327,9 @@ fn execute_cached_compound_with_read(
     plan: &Arc<CompoundPlanStatic>,
     cache: &parking_lot::RwLock<Option<Arc<CachedCompound>>>,
 ) -> Result<ExecutionResult> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    check_cancel(cancel)?;
     let snapshot_gen = rtx.commit_generation();
 
     let cached: Arc<CachedCompound> = {
@@ -5536,7 +6337,7 @@ fn execute_cached_compound_with_read(
         match slot.as_ref() {
             Some(c) if c.cached_gen == snapshot_gen => Arc::clone(c),
             _ => {
-                let branch_rows = build_compound_branches(rtx, plan)?;
+                let branch_rows = build_compound_branches(rtx, plan, cancel)?;
                 let arc = Arc::new(CachedCompound {
                     cached_gen: snapshot_gen,
                     branch_rows,
@@ -5548,23 +6349,28 @@ fn execute_cached_compound_with_read(
     };
 
     let total: usize = cached.branch_rows.iter().map(|b| b.len()).sum();
+    let key = |row: &Vec<Value>| fold_key(row, &plan.key_colls);
+    let mut work = 0usize;
     let rows = match (&plan.op, plan.all) {
         (SetOp::Union, true) => {
             let mut out = Vec::with_capacity(total);
             for branch in &cached.branch_rows {
                 for row in branch {
+                    check_cancel_at(cancel, work)?;
+                    work += 1;
                     out.push(row.clone());
                 }
             }
             out
         }
         (SetOp::Union, false) => {
-            let mut seen: rustc_hash::FxHashSet<Vec<Value>> =
-                rustc_hash::FxHashSet::with_capacity_and_hasher(total, Default::default());
+            let mut seen = super::helpers::RowKeys::with_capacity(plan.key_colls.clone(), total);
             let mut out = Vec::with_capacity(total);
             for branch in &cached.branch_rows {
                 for row in branch {
-                    if seen.insert(row.clone()) {
+                    check_cancel_at(cancel, work)?;
+                    work += 1;
+                    if seen.insert(row) {
                         out.push(row.clone());
                     }
                 }
@@ -5574,13 +6380,17 @@ fn execute_cached_compound_with_read(
         (SetOp::Intersect, true) => {
             let left = &cached.branch_rows[0];
             let right = &cached.branch_rows[1];
-            let mut right_counts: FxHashMap<&Vec<Value>, usize> = FxHashMap::default();
+            let mut right_counts: FxHashMap<Vec<Value>, usize> = FxHashMap::default();
             for row in right {
-                *right_counts.entry(row).or_insert(0) += 1;
+                check_cancel_at(cancel, work)?;
+                work += 1;
+                *right_counts.entry(key(row)).or_insert(0) += 1;
             }
             let mut out = Vec::new();
             for row in left {
-                if let Some(count) = right_counts.get_mut(row) {
+                check_cancel_at(cancel, work)?;
+                work += 1;
+                if let Some(count) = right_counts.get_mut(&key(row)) {
                     if *count > 0 {
                         *count -= 1;
                         out.push(row.clone());
@@ -5592,11 +6402,18 @@ fn execute_cached_compound_with_read(
         (SetOp::Intersect, false) => {
             let left = &cached.branch_rows[0];
             let right = &cached.branch_rows[1];
-            let right_set: rustc_hash::FxHashSet<&Vec<Value>> = right.iter().collect();
-            let mut seen: rustc_hash::FxHashSet<Vec<Value>> = rustc_hash::FxHashSet::default();
+            let mut right_set = super::helpers::RowKeys::new(plan.key_colls.clone());
+            for row in right {
+                check_cancel_at(cancel, work)?;
+                work += 1;
+                right_set.insert(row);
+            }
+            let mut seen = super::helpers::RowKeys::new(plan.key_colls.clone());
             let mut out = Vec::new();
             for row in left {
-                if right_set.contains(row) && seen.insert(row.clone()) {
+                check_cancel_at(cancel, work)?;
+                work += 1;
+                if right_set.contains_row(row) && seen.insert(row) {
                     out.push(row.clone());
                 }
             }
@@ -5605,13 +6422,17 @@ fn execute_cached_compound_with_read(
         (SetOp::Except, true) => {
             let left = &cached.branch_rows[0];
             let right = &cached.branch_rows[1];
-            let mut right_counts: FxHashMap<&Vec<Value>, usize> = FxHashMap::default();
+            let mut right_counts: FxHashMap<Vec<Value>, usize> = FxHashMap::default();
             for row in right {
-                *right_counts.entry(row).or_insert(0) += 1;
+                check_cancel_at(cancel, work)?;
+                work += 1;
+                *right_counts.entry(key(row)).or_insert(0) += 1;
             }
             let mut out = Vec::new();
             for row in left {
-                if let Some(count) = right_counts.get_mut(row) {
+                check_cancel_at(cancel, work)?;
+                work += 1;
+                if let Some(count) = right_counts.get_mut(&key(row)) {
                     if *count > 0 {
                         *count -= 1;
                         continue;
@@ -5624,17 +6445,25 @@ fn execute_cached_compound_with_read(
         (SetOp::Except, false) => {
             let left = &cached.branch_rows[0];
             let right = &cached.branch_rows[1];
-            let right_set: rustc_hash::FxHashSet<&Vec<Value>> = right.iter().collect();
-            let mut seen: rustc_hash::FxHashSet<Vec<Value>> = rustc_hash::FxHashSet::default();
+            let mut right_set = super::helpers::RowKeys::new(plan.key_colls.clone());
+            for row in right {
+                check_cancel_at(cancel, work)?;
+                work += 1;
+                right_set.insert(row);
+            }
+            let mut seen = super::helpers::RowKeys::new(plan.key_colls.clone());
             let mut out = Vec::new();
             for row in left {
-                if !right_set.contains(row) && seen.insert(row.clone()) {
+                check_cancel_at(cancel, work)?;
+                work += 1;
+                if !right_set.contains_row(row) && seen.insert(row) {
                     out.push(row.clone());
                 }
             }
             out
         }
     };
+    check_cancel(cancel)?;
 
     Ok(ExecutionResult::Query(QueryResult {
         columns: plan.columns.clone(),
@@ -5645,17 +6474,26 @@ fn execute_cached_compound_with_read(
 fn build_compound_branches(
     rtx: &mut citadel_txn::read_txn::ReadTxn<'_>,
     plan: &Arc<CompoundPlanStatic>,
+    cancel: Option<&CancelToken>,
 ) -> Result<Vec<Vec<Vec<Value>>>> {
     let mut out = Vec::with_capacity(plan.branches.len());
-    for branch in &plan.branches {
-        let raw =
-            super::join::collect_rows_partial(rtx, &branch.table_schema, &branch.needed_cols)?;
-        let projected: Vec<Vec<Value>> = raw
-            .into_iter()
-            .map(|row| branch.needed_cols.iter().map(|&i| row[i].clone()).collect())
-            .collect();
+    for (branch_idx, branch) in plan.branches.iter().enumerate() {
+        check_cancel_at(cancel, branch_idx)?;
+        // Projection positions may repeat (`SELECT *, id`), but the partial
+        // decoder expects a set of schema columns. Preserve repetitions for
+        // projection while deduplicating only the scan input.
+        let mut scan_cols = branch.needed_cols.clone();
+        scan_cols.sort_unstable();
+        scan_cols.dedup();
+        let raw = super::join::collect_rows_partial(rtx, &branch.table_schema, &scan_cols)?;
+        let mut projected = Vec::with_capacity(raw.len());
+        for (row_idx, row) in raw.into_iter().enumerate() {
+            check_cancel_at(cancel, row_idx)?;
+            projected.push(branch.needed_cols.iter().map(|&i| row[i].clone()).collect());
+        }
         out.push(projected);
     }
+    check_cancel(cancel)?;
     Ok(out)
 }
 

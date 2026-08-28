@@ -32,6 +32,32 @@ fn create_matview_materializes_rows() {
 }
 
 #[test]
+fn matview_columns_preserve_query_collations() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE)")
+        .unwrap();
+    conn.execute("INSERT INTO src VALUES (1,'A'),(2,'a')")
+        .unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT id, s FROM src")
+        .unwrap();
+
+    let matching = conn
+        .prepare("SELECT id FROM mv WHERE s = 'a' ORDER BY id")
+        .unwrap()
+        .query_collect(&[])
+        .unwrap();
+    assert_eq!(matching.rows.len(), 2);
+    let distinct = conn
+        .prepare("SELECT DISTINCT s FROM mv")
+        .unwrap()
+        .query_collect(&[])
+        .unwrap();
+    assert_eq!(distinct.rows.len(), 1);
+}
+
+#[test]
 fn matview_does_not_reflect_underlying_changes_without_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());

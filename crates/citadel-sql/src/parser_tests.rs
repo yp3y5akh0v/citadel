@@ -830,8 +830,9 @@ fn parse_drop_index_if_exists() {
 fn parse_explain_select() {
     let stmt = parse_sql("EXPLAIN SELECT * FROM users WHERE id = 1").unwrap();
     match stmt {
-        Statement::Explain(inner) => {
+        Statement::Explain { inner, analyze } => {
             assert!(matches!(*inner, Statement::Select(_)));
+            assert!(!analyze, "plain EXPLAIN does not analyze");
         }
         _ => panic!("expected Explain"),
     }
@@ -840,12 +841,51 @@ fn parse_explain_select() {
 #[test]
 fn parse_explain_insert() {
     let stmt = parse_sql("EXPLAIN INSERT INTO t (a) VALUES (1)").unwrap();
-    assert!(matches!(stmt, Statement::Explain(_)));
+    assert!(matches!(stmt, Statement::Explain { .. }));
+}
+
+/// ANALYZE used to be refused outright; now it parses and carries the flag.
+#[test]
+fn parse_explain_analyze_carries_the_flag() {
+    let stmt = parse_sql("EXPLAIN ANALYZE SELECT * FROM users").unwrap();
+    match stmt {
+        Statement::Explain { inner, analyze } => {
+            assert!(matches!(*inner, Statement::Select(_)));
+            assert!(analyze, "ANALYZE must be recorded, not dropped");
+        }
+        _ => panic!("expected Explain"),
+    }
+}
+
+/// EXPLAIN ANALYZE used to be rejected outright. The parser now accepts it;
+/// `parse_explain_analyze_carries_the_flag` above checks
+/// that the flag survives, and the executor tests check that it measures.
+#[test]
+fn accept_explain_analyze() {
+    assert!(parse_sql("EXPLAIN ANALYZE SELECT * FROM t").is_ok());
 }
 
 #[test]
-fn reject_explain_analyze() {
-    assert!(parse_sql("EXPLAIN ANALYZE SELECT * FROM t").is_err());
+fn parse_parenthesized_explain_analyze_options() {
+    let enabled = parse_sql("EXPLAIN (ANALYZE TRUE) SELECT * FROM users").unwrap();
+    assert!(matches!(enabled, Statement::Explain { analyze: true, .. }));
+
+    let disabled = parse_sql("EXPLAIN (ANALYZE FALSE) SELECT * FROM users").unwrap();
+    assert!(matches!(
+        disabled,
+        Statement::Explain { analyze: false, .. }
+    ));
+}
+
+#[test]
+fn reject_explain_options_that_are_not_implemented() {
+    for sql in [
+        "EXPLAIN (VERBOSE TRUE) SELECT * FROM users",
+        "EXPLAIN (FORMAT JSON) SELECT * FROM users",
+        "EXPLAIN FORMAT JSON SELECT * FROM users",
+    ] {
+        assert!(parse_sql(sql).is_err(), "silently accepted {sql}");
+    }
 }
 
 #[test]

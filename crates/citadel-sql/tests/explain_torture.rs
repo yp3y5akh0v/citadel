@@ -446,7 +446,24 @@ fn plan_same_before_and_after_data() {
     }
 
     let after = explain_lines(&conn, "EXPLAIN SELECT * FROM users WHERE id = 1");
-    assert_eq!(before, after);
+
+    // The plan is not data-dependent; the size annotation on it deliberately is.
+    // Comparing the whole line would conflate the two and make either change
+    // look like the other.
+    let plan_only = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| match l.split_once(" of ") {
+                Some((plan, _size)) => plan.to_string(),
+                None => l.clone(),
+            })
+            .collect()
+    };
+    assert_eq!(plan_only(&before), plan_only(&after), "the plan changed");
+    assert!(
+        before[0].contains("of 0 rows") && after[0].contains("of 100 rows"),
+        "the size annotation did not follow the data: {before:?} then {after:?}"
+    );
 }
 
 #[test]

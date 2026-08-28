@@ -519,6 +519,11 @@ pub fn index_scan_full_cover(schema: &TableSchema, where_expr: &Expr, plan: &Sca
     else {
         return false;
     };
+    // Expression-index prefix keys have no physical column position in
+    // `index_columns`, so they cannot be proven to consume a simple predicate.
+    if *num_prefix_cols > index_columns.len() {
+        return false;
+    }
     let prefix_cols = &index_columns[..*num_prefix_cols];
     let range_col = index_columns.get(*num_prefix_cols);
     let mut eq_cols: Vec<u16> = Vec::with_capacity(*num_prefix_cols);
@@ -730,13 +735,7 @@ fn conjunct_proves_not_null(expr: &Expr, col: &str) -> bool {
 /// Fold a probe value the way index keys are folded at write time
 /// (`encode_key_value_collated_into`), so probe bytes match stored key bytes.
 fn fold_probe_value(value: Value, coll: crate::types::Collation) -> Value {
-    match (&value, coll) {
-        (Value::Text(s), crate::types::Collation::NoCase) => Value::Text(s.to_ascii_lowercase()),
-        (Value::Text(s), crate::types::Collation::Rtrim) => {
-            Value::Text(s.trim_end_matches(' ').into())
-        }
-        _ => value,
-    }
+    coll.fold(value)
 }
 
 fn try_index_scan(

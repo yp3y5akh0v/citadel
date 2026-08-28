@@ -6,14 +6,17 @@ use citadel_sql::Value;
 fn tsvector(lexs: &[(&[u8], u16, Weight)]) -> Vec<u8> {
     let mut b = TsVectorBuilder::new();
     for (lex, pos, w) in lexs {
-        b.push(lex, *pos, *w);
+        b.push(lex, *pos, *w).unwrap();
     }
     b.build().to_vec()
 }
 
 fn matched(v: &[u8], q: &str) -> bool {
     let ast = parse_tsquery(q).unwrap();
-    matches!(op_match(v, &ast.encode()).unwrap(), Value::Boolean(true))
+    matches!(
+        op_match(v, &ast.encode().unwrap()).unwrap(),
+        Value::Boolean(true)
+    )
 }
 
 #[test]
@@ -130,12 +133,12 @@ fn parser_phrase_distance_one_dash_form() {
 #[test]
 fn op_match_position_overflow_refuses_phrase() {
     let mut b = TsVectorBuilder::new();
-    b.push(b"hello", 1, Weight::D);
-    b.push(b"world", 2, Weight::D);
-    b.push(b"junk", MAX_POSITION + 5, Weight::D); // sets overflow flag
+    b.push(b"hello", 1, Weight::D).unwrap();
+    b.push(b"world", 2, Weight::D).unwrap();
+    b.push(b"junk", MAX_POSITION + 5, Weight::D).unwrap(); // sets overflow flag
     let v = b.build();
 
-    let q_phrase = parse_tsquery("hello <-> world").unwrap().encode();
+    let q_phrase = parse_tsquery("hello <-> world").unwrap().encode().unwrap();
     let err = op_match(&v, &q_phrase).unwrap_err().to_string();
     assert!(
         err.contains("position overflow") || err.contains("unreliable"),
@@ -143,6 +146,6 @@ fn op_match_position_overflow_refuses_phrase() {
     );
 
     // Non-phrase queries still answer.
-    let q_simple = parse_tsquery("hello & world").unwrap().encode();
+    let q_simple = parse_tsquery("hello & world").unwrap().encode().unwrap();
     assert_eq!(op_match(&v, &q_simple).unwrap(), Value::Boolean(true));
 }

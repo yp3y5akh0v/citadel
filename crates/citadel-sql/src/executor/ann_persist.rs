@@ -3,24 +3,19 @@
 //! tree `__annseg_{table}` (never registered in the schema manager, invisible
 //! to SQL) holding a header row plus body chunks, encrypted like every tree.
 //!
-//! Three independent layers refuse a stale segment (any failure falls through
-//! to a rebuild):
-//! - transactional: every DML/DDL site that marks a table dirty drops its
-//!   segment in the same write txn (shadow paging keeps "table changed but
-//!   segment survived" unrepresentable for those paths);
-//! - content fingerprint: BLAKE3 over the scan-order row content
-//!   (domain-separated, length-framed) at persist time, recomputed by the
-//!   load-time rehydration scan;
-//! - header checks: format/config/shape pins compared before the scan.
+//! Three independent layers refuse a stale segment, each falling through to a
+//! rebuild: a transactional drop in the same write txn that dirties the table,
+//! a non-ABA root stamp (root page id plus that page's txn id, so allocator
+//! reuse cannot look current), and header format/config/shape pins.
 
 use citadel_vector::segment;
 use citadel_vector::PrismConfig;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::{Result, SqlError};
 
 /// Bump on ANY layout change of the header or the segment body.
-pub const ANNSEG_FORMAT_VERSION: u16 = 3;
+pub const ANNSEG_FORMAT_VERSION: u16 = 4;
 
 const MAGIC: &[u8; 7] = b"ANNSEG\0";
 
@@ -40,8 +35,8 @@ pub fn segment_key(chunk_no: u32) -> [u8; 4] {
     chunk_no.to_be_bytes()
 }
 
-/// Everything the loader must verify BEFORE paying for the rehydration scan,
-/// plus the two content hashes it verifies during/after it.
+/// Everything the loader verifies before decoding the segment body, plus the
+/// artifact hashes retained for integrity and forensics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentHeader {
     pub format_version: u16,
@@ -49,12 +44,14 @@ pub struct SegmentHeader {
     pub prism_config_hash: [u8; 32],
     pub dim: u16,
     pub metric_tag: u8,
-    /// Indexed (non-null) row count - compared as `n <= live rows` pre-scan
-    /// (NULL vectors are unindexed), exactly via the fingerprint scan.
+    /// Indexed (non-null) row count recorded by the builder.
     pub n: u64,
     pub snapshot_max: u64,
-    /// The table's catalog root at persist - a differing live root means stale (CoW gate).
+    /// The table's catalog root at persist.
     pub table_root: u64,
+    /// Transaction id stored in `table_root`. Together the two fields form a
+    /// non-ABA CoW stamp even when the allocator recycles a physical page id.
+    pub table_root_txn: u64,
     /// The indexed column and the filter columns, IN ATTRIBUTE ORDER - an
     /// index re-created over different columns must be refused explicitly,
     /// never discovered via fingerprint luck.
@@ -62,12 +59,75 @@ pub struct SegmentHeader {
     pub filter_cols: Vec<u32>,
     /// Per attribute dim: encoded filter value -> PRISM code, in scan order.
     pub dicts: Vec<Vec<(Vec<u8>, u32)>>,
+    /// Persist-time source identity for manifests and forensics. Fast load does
+    /// not recompute this hash.
     pub content_fingerprint: [u8; 32],
     /// BLAKE3 of the concatenated body chunks (the segment.rs payload).
     pub segment_b3: [u8; 32],
     pub chunk_count: u32,
     /// Forensics only - never compared.
     pub writer: String,
+}
+
+fn header_error(what: &str) -> SqlError {
+    SqlError::InvalidValue(format!("ANN segment header: {what}"))
+}
+
+struct HeaderReader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> HeaderReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, at: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.at
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self
+            .at
+            .checked_add(n)
+            .filter(|&end| end <= self.bytes.len())
+            .ok_or_else(|| header_error("truncated"))?;
+        let value = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(value)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+        Ok(self
+            .take(N)?
+            .try_into()
+            .expect("reader returned the requested array width"))
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_le_bytes(self.array()?))
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.array()?))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.array()?))
+    }
+
+    fn finish(self) -> Result<()> {
+        if self.at == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(header_error("trailing bytes"))
+        }
+    }
 }
 
 impl SegmentHeader {
@@ -81,6 +141,7 @@ impl SegmentHeader {
         b.extend_from_slice(&self.n.to_le_bytes());
         b.extend_from_slice(&self.snapshot_max.to_le_bytes());
         b.extend_from_slice(&self.table_root.to_le_bytes());
+        b.extend_from_slice(&self.table_root_txn.to_le_bytes());
         b.extend_from_slice(&self.col_idx.to_le_bytes());
         b.extend_from_slice(&(self.filter_cols.len() as u32).to_le_bytes());
         for &c in &self.filter_cols {
@@ -108,59 +169,94 @@ impl SegmentHeader {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let fail = |what: &str| SqlError::InvalidValue(format!("ANN segment header: {what}"));
         if bytes.len() < 32 {
-            return Err(fail("truncated"));
+            return Err(header_error("truncated"));
         }
         let (body, hash) = bytes.split_at(bytes.len() - 32);
         if blake3::hash(body).as_bytes() != hash {
-            return Err(fail("self-hash mismatch (corrupt)"));
+            return Err(header_error("self-hash mismatch (corrupt)"));
         }
-        let mut at = 0usize;
-        let mut take = |n: usize| -> Result<&[u8]> {
-            let end = at.checked_add(n).filter(|&e| e <= body.len());
-            let end = end.ok_or_else(|| fail("truncated"))?;
-            let s = &body[at..end];
-            at = end;
-            Ok(s)
-        };
-        if take(7)? != MAGIC {
-            return Err(fail("bad magic"));
+        let mut reader = HeaderReader::new(body);
+        if reader.take(7)? != MAGIC {
+            return Err(header_error("bad magic"));
         }
-        let format_version = u16::from_le_bytes(take(2)?.try_into().unwrap());
-        let prism_config_hash: [u8; 32] = take(32)?.try_into().unwrap();
-        let dim = u16::from_le_bytes(take(2)?.try_into().unwrap());
-        let metric_tag = take(1)?[0];
-        let n = u64::from_le_bytes(take(8)?.try_into().unwrap());
-        let snapshot_max = u64::from_le_bytes(take(8)?.try_into().unwrap());
-        let table_root = u64::from_le_bytes(take(8)?.try_into().unwrap());
-        let col_idx = u32::from_le_bytes(take(4)?.try_into().unwrap());
-        let fc_len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
-        let mut filter_cols = Vec::with_capacity(fc_len);
+        let format_version = reader.u16()?;
+        let prism_config_hash = reader.array()?;
+        let dim = reader.u16()?;
+        let metric_tag = reader.u8()?;
+        let n = reader.u64()?;
+        let snapshot_max = reader.u64()?;
+        let table_root = reader.u64()?;
+        let table_root_txn = reader.u64()?;
+        let col_idx = reader.u32()?;
+        let fc_len = reader.u32()? as usize;
+        if fc_len > reader.remaining() / 4 {
+            return Err(header_error("filter column count exceeds the header"));
+        }
+        let mut filter_cols = Vec::new();
+        filter_cols
+            .try_reserve_exact(fc_len)
+            .map_err(|_| header_error("filter column count is too large"))?;
         for _ in 0..fc_len {
-            filter_cols.push(u32::from_le_bytes(take(4)?.try_into().unwrap()));
+            filter_cols.push(reader.u32()?);
         }
-        let dicts_len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
-        let mut dicts = Vec::with_capacity(dicts_len);
+        let dicts_len = reader.u32()? as usize;
+        if dicts_len != fc_len {
+            return Err(header_error(
+                "dictionary count does not match filter columns",
+            ));
+        }
+        if dicts_len > reader.remaining() / 8 {
+            return Err(header_error("dictionary count exceeds the header"));
+        }
+        let mut dicts = Vec::new();
+        dicts
+            .try_reserve_exact(dicts_len)
+            .map_err(|_| header_error("dictionary count is too large"))?;
         for _ in 0..dicts_len {
-            let entries = u64::from_le_bytes(take(8)?.try_into().unwrap()) as usize;
-            let mut dict = Vec::with_capacity(entries);
-            for _ in 0..entries {
-                let klen = u64::from_le_bytes(take(8)?.try_into().unwrap()) as usize;
-                let k = take(klen)?.to_vec();
-                let v = u32::from_le_bytes(take(4)?.try_into().unwrap());
+            let entries = usize::try_from(reader.u64()?)
+                .map_err(|_| header_error("dictionary entry count is not addressable"))?;
+            // Every entry needs at least its key length and code. Bound the
+            // allocation by authenticated bytes before reserving from it.
+            if entries > reader.remaining() / 12 {
+                return Err(header_error("dictionary entry count exceeds the header"));
+            }
+            let mut dict = Vec::new();
+            dict.try_reserve_exact(entries)
+                .map_err(|_| header_error("dictionary entry count is too large"))?;
+            for expected_code in 0..entries {
+                let klen = usize::try_from(reader.u64()?)
+                    .map_err(|_| header_error("dictionary key length is not addressable"))?;
+                if klen > reader.remaining().saturating_sub(4) {
+                    return Err(header_error("truncated"));
+                }
+                let k = reader.take(klen)?.to_vec();
+                let v = reader.u32()?;
+                let expected_code = u32::try_from(expected_code)
+                    .map_err(|_| header_error("dictionary has too many codes"))?;
+                if v != expected_code {
+                    return Err(header_error("dictionary codes are not canonical"));
+                }
                 dict.push((k, v));
+            }
+            let mut unique_keys = FxHashSet::default();
+            unique_keys
+                .try_reserve(dict.len())
+                .map_err(|_| header_error("dictionary key set is too large"))?;
+            if dict
+                .iter()
+                .any(|(key, _)| !unique_keys.insert(key.as_slice()))
+            {
+                return Err(header_error("dictionary contains duplicate keys"));
             }
             dicts.push(dict);
         }
-        let content_fingerprint: [u8; 32] = take(32)?.try_into().unwrap();
-        let segment_b3: [u8; 32] = take(32)?.try_into().unwrap();
-        let chunk_count = u32::from_le_bytes(take(4)?.try_into().unwrap());
-        let wlen = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
-        let writer = String::from_utf8_lossy(take(wlen)?).into_owned();
-        if at != body.len() {
-            return Err(fail("trailing bytes"));
-        }
+        let content_fingerprint = reader.array()?;
+        let segment_b3 = reader.array()?;
+        let chunk_count = reader.u32()?;
+        let wlen = reader.u32()? as usize;
+        let writer = String::from_utf8_lossy(reader.take(wlen)?).into_owned();
+        reader.finish()?;
         Ok(Self {
             format_version,
             prism_config_hash,
@@ -169,6 +265,7 @@ impl SegmentHeader {
             n,
             snapshot_max,
             table_root,
+            table_root_txn,
             col_idx,
             filter_cols,
             dicts,
@@ -188,10 +285,11 @@ impl SegmentHeader {
     }
 }
 
-/// The INJECTIVE content fingerprint: domain-separated, every component
+/// The content fingerprint is domain-separated, every component is
 /// length-framed (unframed concatenation admits boundary-shift collisions),
-/// bound to the table/column/filter identity, fed rows IN SCAN ORDER. Persist
-/// and load MUST construct it identically - both go through this one type.
+/// and it is bound to table/column/filter identity in scan order. It identifies
+/// the persisted source artifact for diagnostics; fast load does not recompute
+/// it because that would require an O(N) source-table scan.
 pub struct FingerprintHasher {
     h: blake3::Hasher,
 }
@@ -238,8 +336,8 @@ pub fn active_config_hash(metric: citadel_vector::Metric) -> [u8; 32] {
     segment::prism_config_hash(&cfg)
 }
 
-/// What `persist_ann_index` returns for the caller's manifest: the hashes a
-/// later attach verifies against, and the shape for the record.
+/// What `persist_ann_index` returns for the caller's manifest: the verified
+/// segment-body hash, forensic source fingerprint, and shape metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnnSegmentInfo {
     pub segment_b3: [u8; 32],
@@ -284,6 +382,7 @@ mod tests {
             n: 311_592,
             snapshot_max: 99,
             table_root: 1234,
+            table_root_txn: 5678,
             col_idx: 3,
             filter_cols: vec![1, 2],
             dicts: vec![
@@ -303,6 +402,19 @@ mod tests {
         assert_eq!(SegmentHeader::decode(&h.encode()).unwrap(), h);
     }
 
+    fn rehash_header(mut bytes: Vec<u8>, edit: impl FnOnce(&mut [u8])) -> Vec<u8> {
+        let body_len = bytes.len() - 32;
+        edit(&mut bytes[..body_len]);
+        let hash = blake3::hash(&bytes[..body_len]);
+        bytes[body_len..].copy_from_slice(hash.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn header_magic_bytes_are_frozen() {
+        assert_eq!(&header_fixture().encode()[..MAGIC.len()], b"ANNSEG\0");
+    }
+
     #[test]
     fn header_corruption_is_refused() {
         let bytes = header_fixture().encode();
@@ -314,6 +426,43 @@ mod tests {
                 "corruption at {spot} must refuse"
             );
         }
+    }
+
+    #[test]
+    fn authenticated_oversized_counts_are_refused_before_allocation() {
+        const FILTER_COUNT_AT: usize = 80;
+        const DICT_COUNT_AT: usize = FILTER_COUNT_AT + 4 + 2 * 4;
+        const FIRST_DICT_ENTRIES_AT: usize = DICT_COUNT_AT + 4;
+        const FIRST_KEY_LEN_AT: usize = FIRST_DICT_ENTRIES_AT + 8;
+
+        let encoded = header_fixture().encode();
+        for (at, bytes) in [
+            (FILTER_COUNT_AT, u64::from(u32::MAX).to_le_bytes()),
+            (DICT_COUNT_AT, u64::from(u32::MAX).to_le_bytes()),
+            (FIRST_DICT_ENTRIES_AT, u64::MAX.to_le_bytes()),
+            (FIRST_KEY_LEN_AT, u64::MAX.to_le_bytes()),
+        ] {
+            let corrupt = rehash_header(encoded.clone(), |body| {
+                let width = if at <= DICT_COUNT_AT { 4 } else { 8 };
+                body[at..at + width].copy_from_slice(&bytes[..width]);
+            });
+            assert!(SegmentHeader::decode(&corrupt).is_err(), "count at {at}");
+        }
+    }
+
+    #[test]
+    fn malformed_filter_dictionaries_are_refused() {
+        let mut mismatched = header_fixture();
+        mismatched.dicts.pop();
+        assert!(SegmentHeader::decode(&mismatched.encode()).is_err());
+
+        let mut noncanonical = header_fixture();
+        noncanonical.dicts[0][1].1 = 2;
+        assert!(SegmentHeader::decode(&noncanonical.encode()).is_err());
+
+        let mut duplicate = header_fixture();
+        duplicate.dicts[0][1].0 = duplicate.dicts[0][0].0.clone();
+        assert!(SegmentHeader::decode(&duplicate.encode()).is_err());
     }
 
     #[test]

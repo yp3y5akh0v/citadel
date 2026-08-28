@@ -17,7 +17,7 @@ use crate::schema::SchemaManager;
 
 use super::compile::CompiledPlan;
 use super::helpers::*;
-use super::CteContext;
+use super::{CteContext, CteRows};
 
 /// (before-insert, after-insert, after-update) row-trigger presence, hoisted once.
 fn row_insert_trigger_flags(schema: &SchemaManager, table_name: &str) -> (bool, bool, bool) {
@@ -169,12 +169,20 @@ pub(super) fn exec_insert(
     let row_col_map_for_gen = (!generated_cols.is_empty()).then(|| table_schema.column_map());
     let check_col_map = has_checks.then(|| table_schema.column_map());
 
+    let cancel = db.cancel_token();
     let select_rows = match &stmt.source {
         InsertSource::Select(sq) => {
-            let insert_ctes =
-                super::materialize_all_ctes(&sq.ctes, sq.recursive, &mut |body, ctx| {
-                    exec_query_body_read(db, schema, body, ctx)
-                })?;
+            let insert_ctes = super::materialize_all_ctes(
+                &sq.ctes,
+                sq.recursive,
+                cancel.as_ref(),
+                &mut |body, ctx| {
+                    let result = exec_query_body_read(db, schema, body, ctx)?;
+                    let collations =
+                        body_output_collations(schema, ctx, body, result.columns.len());
+                    Ok(CteRows::new(result, collations))
+                },
+            )?;
             let qr = exec_query_body_read(db, schema, &sq.body, &insert_ctes)?;
             Some(qr.rows)
         }
@@ -267,7 +275,12 @@ pub(super) fn exec_insert(
     let (has_before_insert_triggers, has_after_insert_triggers, has_after_update_triggers) =
         row_insert_trigger_flags(schema, &table_schema.name);
 
+    // The autocommit twin of the in-transaction row loop, and cancellable for
+    // the same reason: neither reaches a scan.
     for idx in 0..total {
+        if let Some(t) = &cancel {
+            t.check().map_err(SqlError::Storage)?;
+        }
         for v in row.iter_mut() {
             *v = Value::Null;
         }
@@ -288,7 +301,7 @@ pub(super) fn exec_insert(
                         .cloned()
                         .ok_or_else(|| SqlError::Parse(format!("unbound parameter ${n}")))?
                 } else {
-                    eval_const_expr(expr)?
+                    eval_const_expr_with_cancel(expr, cancel.as_ref())?
                 };
                 let col_idx = col_indices[i];
                 let col = &table_schema.columns[col_idx];
@@ -312,7 +325,7 @@ pub(super) fn exec_insert(
         }
 
         for &(pos, def_expr) in &defaults {
-            let val = eval_const_expr(def_expr)?;
+            let val = eval_const_expr_with_cancel(def_expr, cancel.as_ref())?;
             let col = &table_schema.columns[pos];
             if !val.is_null() {
                 row[pos] = coerce_for_column(val, col, strict)?;
@@ -321,7 +334,10 @@ pub(super) fn exec_insert(
 
         if let Some(gen_map) = row_col_map_for_gen {
             for &(pos, gen_expr) in &generated_cols {
-                let val = eval_expr(gen_expr, &EvalCtx::new(gen_map, &row))?;
+                let val = eval_expr(
+                    gen_expr,
+                    &EvalCtx::new(gen_map, &row).with_cancel(cancel.as_ref()),
+                )?;
                 let col = &table_schema.columns[pos];
                 row[pos] = if val.is_null() {
                     Value::Null
@@ -340,7 +356,10 @@ pub(super) fn exec_insert(
         if let Some(col_map) = check_col_map {
             for col in &table_schema.columns {
                 if let Some(ref check) = col.check_expr {
-                    let result = eval_expr(check, &EvalCtx::new(col_map, &row))?;
+                    let result = eval_expr(
+                        check,
+                        &EvalCtx::new(col_map, &row).with_cancel(cancel.as_ref()),
+                    )?;
                     if !is_truthy(&result) && !result.is_null() {
                         let name = col.check_name.as_deref().unwrap_or(&col.name);
                         return Err(SqlError::CheckViolation(name.to_string()));
@@ -348,7 +367,10 @@ pub(super) fn exec_insert(
                 }
             }
             for tc in &table_schema.check_constraints {
-                let result = eval_expr(&tc.expr, &EvalCtx::new(col_map, &row))?;
+                let result = eval_expr(
+                    &tc.expr,
+                    &EvalCtx::new(col_map, &row).with_cancel(cancel.as_ref()),
+                )?;
                 if !is_truthy(&result) && !result.is_null() {
                     let name = tc.name.as_deref().unwrap_or(&tc.sql);
                     return Err(SqlError::CheckViolation(name.to_string()));
@@ -450,7 +472,7 @@ pub(super) fn exec_insert(
         match compiled_conflict.as_ref() {
             None => {
                 let is_new = wtx
-                    .table_insert(table_schema.name.as_bytes(), &key_buf, &value_buf)
+                    .table_insert_if_absent(table_schema.name.as_bytes(), &key_buf, &value_buf)
                     .map_err(SqlError::Storage)?;
                 if !is_new {
                     return Err(SqlError::DuplicateKey);
@@ -508,6 +530,7 @@ pub(super) fn exec_insert(
                     &pk_values,
                     oc_ref,
                     row_col_map.unwrap(),
+                    cancel.as_ref(),
                     // Trigger dispatch needs the Updated outcome's rows too.
                     stmt.returning.is_some() || has_after_update_triggers,
                 )?;
@@ -589,14 +612,19 @@ pub(super) fn exec_insert(
     );
 
     if let (Some(returning_cols), Some(rows)) = (stmt.returning.as_ref(), returning_rows) {
-        let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
+        let qr = super::helpers::project_returning(
+            table_schema,
+            returning_cols,
+            &rows,
+            wtx.cancel_token(),
+        )?;
         super::helpers::drain_deferred_fk_checks(&mut wtx)?;
-        wtx.commit().map_err(SqlError::Storage)?;
+        super::commit_with_ann_publication(wtx, schema)?;
         return Ok(ExecutionResult::Query(qr));
     }
 
     super::helpers::drain_deferred_fk_checks(&mut wtx)?;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
     Ok(ExecutionResult::RowsAffected(count))
 }
 
@@ -644,7 +672,7 @@ pub(super) fn stmt_has_subquery(stmt: &SelectStmt) -> bool {
 
 pub(super) fn materialize_expr(
     expr: &Expr,
-    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
 ) -> Result<Expr> {
     match expr {
         Expr::InSubquery {
@@ -653,7 +681,8 @@ pub(super) fn materialize_expr(
             negated,
         } => {
             let inner = materialize_expr(e, exec_sub)?;
-            let qr = exec_sub(subquery)?;
+            let selected = exec_sub(subquery)?;
+            let qr = &selected.result;
             if !qr.columns.is_empty() && qr.columns.len() != 1 {
                 return Err(SqlError::SubqueryMultipleColumns);
             }
@@ -671,10 +700,13 @@ pub(super) fn materialize_expr(
                 values,
                 has_null,
                 negated: *negated,
+                // Carried because the set is bare values from here on: `x IN (SELECT y)`
+                // compares as `x = y` does, and there the collation may come from `y`.
+                collation: selected.collation_at(0),
             })
         }
         Expr::ScalarSubquery(subquery) => {
-            let qr = exec_sub(subquery)?;
+            let qr = exec_sub(subquery)?.result;
             if qr.rows.len() > 1 {
                 return Err(SqlError::SubqueryMultipleRows);
             }
@@ -686,7 +718,7 @@ pub(super) fn materialize_expr(
             Ok(Expr::Literal(val))
         }
         Expr::Exists { subquery, negated } => {
-            let qr = exec_sub(subquery)?;
+            let qr = exec_sub(subquery)?.result;
             let exists = !qr.rows.is_empty();
             let result = if *negated { !exists } else { exists };
             Ok(Expr::Literal(Value::Boolean(result)))
@@ -723,11 +755,13 @@ pub(super) fn materialize_expr(
             values,
             has_null,
             negated,
+            collation,
         } => Ok(Expr::InSet {
             expr: Box::new(materialize_expr(e, exec_sub)?),
             values: values.clone(),
             has_null: *has_null,
             negated: *negated,
+            collation: *collation,
         }),
         Expr::Between {
             expr: e,
@@ -738,6 +772,15 @@ pub(super) fn materialize_expr(
             expr: Box::new(materialize_expr(e, exec_sub)?),
             low: Box::new(materialize_expr(low, exec_sub)?),
             high: Box::new(materialize_expr(high, exec_sub)?),
+            negated: *negated,
+        }),
+        Expr::IsDistinctFrom {
+            left,
+            right,
+            negated,
+        } => Ok(Expr::IsDistinctFrom {
+            left: Box::new(materialize_expr(left, exec_sub)?),
+            right: Box::new(materialize_expr(right, exec_sub)?),
             negated: *negated,
         }),
         Expr::Like {
@@ -817,7 +860,7 @@ pub(super) fn materialize_expr(
 
 pub(super) fn materialize_stmt(
     stmt: &SelectStmt,
-    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
 ) -> Result<SelectStmt> {
     let where_clause = stmt
         .where_clause
@@ -848,6 +891,8 @@ pub(super) fn materialize_stmt(
         .map(|ob| {
             Ok(OrderByItem {
                 expr: materialize_expr(&ob.expr, exec_sub)?,
+                output_name: ob.output_name.clone(),
+                output_ordinal: ob.output_ordinal,
                 descending: ob.descending,
                 nulls_first: ob.nulls_first,
             })
@@ -898,9 +943,29 @@ pub(super) fn exec_subquery_read(
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
-) -> Result<QueryResult> {
+) -> Result<CteRows> {
     let mut rtx = db.begin_read();
     exec_subquery_with_read(&mut rtx, schema, stmt, ctes)
+}
+
+/// A subquery's rows carry the collation of the columns they were selected from, because
+/// `x IN (SELECT y ...)` has to compare the way `x = y` does - and there the collation may
+/// come from `y` rather than from `x`.
+fn subquery_rows(
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    stmt: &SelectStmt,
+    result: ExecutionResult,
+) -> CteRows {
+    let ExecutionResult::Query(result) = result else {
+        return CteRows::binary(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        });
+    };
+    let body = QueryBody::Select(Box::new(stmt.clone()));
+    let collations = body_output_collations(schema, ctes, &body, result.columns.len());
+    CteRows::new(result, collations)
 }
 
 pub(super) fn exec_subquery_with_read(
@@ -908,14 +973,9 @@ pub(super) fn exec_subquery_with_read(
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
-) -> Result<QueryResult> {
-    match super::exec_select_with_read(rtx, schema, stmt, ctes)? {
-        ExecutionResult::Query(qr) => Ok(qr),
-        _ => Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        }),
-    }
+) -> Result<CteRows> {
+    let result = super::exec_select_with_read(rtx, schema, stmt, ctes)?;
+    Ok(subquery_rows(schema, ctes, stmt, result))
 }
 
 pub(super) fn exec_subquery_write(
@@ -923,14 +983,9 @@ pub(super) fn exec_subquery_write(
     schema: &SchemaManager,
     stmt: &SelectStmt,
     ctes: &CteContext,
-) -> Result<QueryResult> {
-    match super::exec_select_in_txn(wtx, schema, stmt, ctes)? {
-        ExecutionResult::Query(qr) => Ok(qr),
-        _ => Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-        }),
-    }
+) -> Result<CteRows> {
+    let result = super::exec_select_in_txn(wtx, schema, stmt, ctes)?;
+    Ok(subquery_rows(schema, ctes, stmt, result))
 }
 
 pub(super) fn update_has_subquery(stmt: &UpdateStmt) -> bool {
@@ -940,7 +995,7 @@ pub(super) fn update_has_subquery(stmt: &UpdateStmt) -> bool {
 
 pub(super) fn materialize_update(
     stmt: &UpdateStmt,
-    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
 ) -> Result<UpdateStmt> {
     let where_clause = stmt
         .where_clause
@@ -966,7 +1021,7 @@ pub(super) fn delete_has_subquery(stmt: &DeleteStmt) -> bool {
 
 pub(super) fn materialize_delete(
     stmt: &DeleteStmt,
-    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
 ) -> Result<DeleteStmt> {
     let where_clause = stmt
         .where_clause
@@ -990,7 +1045,7 @@ pub(super) fn insert_has_subquery(stmt: &InsertStmt) -> bool {
 
 pub(super) fn materialize_insert(
     stmt: &InsertStmt,
-    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
 ) -> Result<InsertStmt> {
     let source = match &stmt.source {
         InsertSource::Values(rows) => {
@@ -1035,7 +1090,7 @@ pub(super) fn materialize_insert(
 
 pub(super) fn materialize_query_body(
     body: &QueryBody,
-    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<QueryResult>,
+    exec_sub: &mut dyn FnMut(&SelectStmt) -> Result<CteRows>,
 ) -> Result<QueryBody> {
     match body {
         QueryBody::Select(sel) => Ok(QueryBody::Select(Box::new(materialize_stmt(
@@ -1130,6 +1185,7 @@ pub(super) fn exec_compound_select_with_read(
     comp: &CompoundSelect,
     ctes: &CteContext,
 ) -> Result<ExecutionResult> {
+    let cancel = rtx.cancel_token().cloned();
     let left_qr = match exec_query_body_with_read(rtx, schema, &comp.left, ctes)? {
         ExecutionResult::Query(qr) => qr,
         _ => QueryResult {
@@ -1144,7 +1200,7 @@ pub(super) fn exec_compound_select_with_read(
             rows: vec![],
         },
     };
-    apply_set_operation(comp, left_qr, right_qr)
+    apply_set_operation(schema, ctes, comp, left_qr, right_qr, cancel.as_ref())
 }
 
 pub(super) fn exec_compound_select_in_txn(
@@ -1153,6 +1209,7 @@ pub(super) fn exec_compound_select_in_txn(
     comp: &CompoundSelect,
     ctes: &CteContext,
 ) -> Result<ExecutionResult> {
+    let cancel = wtx.cancel_token().cloned();
     let left_qr = match exec_query_body_in_txn(wtx, schema, &comp.left, ctes)? {
         ExecutionResult::Query(qr) => qr,
         _ => QueryResult {
@@ -1167,14 +1224,200 @@ pub(super) fn exec_compound_select_in_txn(
             rows: vec![],
         },
     };
-    apply_set_operation(comp, left_qr, right_qr)
+    apply_set_operation(schema, ctes, comp, left_qr, right_qr, cancel.as_ref())
+}
+
+/// The collation of each output column of a query body, so a set operation compares its rows
+/// the way `=` would. SQL takes a compound's collation from its leftmost branch.
+/// `width` is the row width the caller will compare; a disagreeing resolution is
+/// discarded rather than misapplied.
+pub(super) fn body_output_collations(
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    body: &QueryBody,
+    width: usize,
+) -> Vec<crate::types::Collation> {
+    let binary = || vec![crate::types::Collation::Binary; width];
+    match body_output_columns(schema, ctes, body) {
+        Some(columns) if columns.len() == width => {
+            columns.iter().map(|col| col.collation).collect()
+        }
+        _ => binary(),
+    }
+}
+
+/// The collations of a whole query's output, for a caller holding a `SelectQuery` rather
+/// than a bare body - a view, or a derived table.
+pub(super) fn query_output_collations(
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    query: &SelectQuery,
+    width: usize,
+) -> Vec<crate::types::Collation> {
+    match query_output_columns(schema, ctes, query) {
+        Some(columns) if columns.len() == width => {
+            columns.iter().map(|col| col.collation).collect()
+        }
+        _ => vec![crate::types::Collation::Binary; width],
+    }
+}
+
+/// The columns a whole query produces, resolving its own WITH definitions first so a body
+/// reading from one of them knows what its columns collate as. Nothing is executed here:
+/// only the shape of each relation is needed.
+fn query_output_columns(
+    schema: &SchemaManager,
+    outer: &CteContext,
+    query: &SelectQuery,
+) -> Option<Vec<ColumnDef>> {
+    if query.ctes.is_empty() {
+        return body_output_columns(schema, outer, &query.body);
+    }
+    let mut ctx = outer.clone();
+    for cte in &query.ctes {
+        // A recursive CTE takes its shape from its anchor, which is the leftmost branch
+        // `body_output_columns` already reads.
+        let Some(columns) = body_output_columns(schema, &ctx, &cte.body) else {
+            continue;
+        };
+        let names = if cte.column_aliases.is_empty() {
+            columns.iter().map(|col| col.name.clone()).collect()
+        } else {
+            cte.column_aliases.clone()
+        };
+        let collations = columns.iter().map(|col| col.collation).collect();
+        ctx.insert(cte.name.clone(), CteRows::shape(names, collations).shared());
+    }
+    body_output_columns(schema, &ctx, &query.body)
+}
+
+/// The columns a query body produces: their names, and the collation each one inherits from
+/// the column it was projected from.
+fn body_output_columns(
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    body: &QueryBody,
+) -> Option<Vec<ColumnDef>> {
+    let (projection, source) = match body {
+        QueryBody::Select(sel) => (&sel.columns, select_source_columns(schema, ctes, sel)?),
+        QueryBody::Compound(inner) => return body_output_columns(schema, ctes, &inner.left),
+        QueryBody::Insert(stmt) => (
+            stmt.returning.as_ref()?,
+            schema.get(&stmt.table)?.columns.clone(),
+        ),
+        QueryBody::Update(stmt) => (
+            stmt.returning.as_ref()?,
+            schema.get(&stmt.table)?.columns.clone(),
+        ),
+        QueryBody::Delete(stmt) => (
+            stmt.returning.as_ref()?,
+            schema.get(&stmt.table)?.columns.clone(),
+        ),
+    };
+    let col_map = crate::eval::ColumnMap::new(&source);
+    // `*` stands for every source column, so it contributes one output column each. Naming
+    // it as a single placeholder the way `build_output_columns` does would make the widths
+    // disagree, and a resolution that does not match the row it describes is discarded.
+    let mut out = Vec::with_capacity(projection.len());
+    for col in projection {
+        match col {
+            SelectColumn::AllColumns | SelectColumn::AllFromOld | SelectColumn::AllFromNew => {
+                out.extend(source.iter().cloned());
+            }
+            SelectColumn::Expr { expr, alias } => {
+                let name = alias
+                    .clone()
+                    .unwrap_or_else(|| super::helpers::expr_display_name(expr));
+                out.push(super::helpers::projected_column(
+                    name,
+                    out.len(),
+                    super::helpers::expr_collation(expr, &col_map),
+                ));
+            }
+        }
+    }
+    for (position, col) in out.iter_mut().enumerate() {
+        col.position = position as u16;
+    }
+    Some(out)
+}
+
+/// The columns a select projects FROM: its own relation, then each joined one in order,
+/// named the way the join executor names them so a qualified reference still resolves.
+fn select_source_columns(
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    sel: &SelectStmt,
+) -> Option<Vec<ColumnDef>> {
+    // A table function or a JSON table invents its columns rather than reading them from a
+    // relation, so none of them carries a collation to inherit.
+    if sel.from_json_table.is_some() || sel.from_args.is_some() {
+        return None;
+    }
+    if sel.from.is_empty() && sel.from_subquery.is_none() {
+        return Some(Vec::new());
+    }
+    let mut out = relation_columns(
+        schema,
+        ctes,
+        sel.from_subquery.as_deref(),
+        &sel.from,
+        sel.from_alias.as_deref().unwrap_or(&sel.from),
+    )?;
+    for join in &sel.joins {
+        let alias = join.table.alias.as_deref().unwrap_or(&join.table.name);
+        let joined = relation_columns(
+            schema,
+            ctes,
+            join.subquery.as_deref(),
+            &join.table.name,
+            alias,
+        )?;
+        out.extend(joined);
+    }
+    for (position, col) in out.iter_mut().enumerate() {
+        col.position = position as u16;
+    }
+    Some(out)
+}
+
+/// One relation of a FROM or a JOIN: a base table, a materialized CTE, or a derived table
+/// resolved from its own query.
+fn relation_columns(
+    schema: &SchemaManager,
+    ctes: &CteContext,
+    derived: Option<&DerivedTable>,
+    name: &str,
+    alias: &str,
+) -> Option<Vec<ColumnDef>> {
+    let table = match derived {
+        Some(table) => TableSchema::new(
+            alias.into(),
+            query_output_columns(schema, ctes, &table.query)?,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        ),
+        None => match ctes.get(&name.to_ascii_lowercase()) {
+            Some(cte) => super::cte::build_cte_schema(alias, cte),
+            None => schema.get(&schema.resolve_temp(name))?.clone(),
+        },
+    };
+    let mut out = Vec::new();
+    super::join::extend_joined_columns(&mut out, &(alias.to_string(), &table));
+    Some(out)
 }
 
 pub(super) fn apply_set_operation(
+    schema: &SchemaManager,
+    ctes: &CteContext,
     comp: &CompoundSelect,
     left_qr: QueryResult,
     right_qr: QueryResult,
+    cancel: Option<&citadel::CancelToken>,
 ) -> Result<ExecutionResult> {
+    super::check_cancelled(cancel)?;
     if !left_qr.columns.is_empty()
         && !right_qr.columns.is_empty()
         && left_qr.columns.len() != right_qr.columns.len()
@@ -1186,21 +1429,44 @@ pub(super) fn apply_set_operation(
     }
 
     let columns = left_qr.columns;
+    // A set operation decides equality by hashing whole rows, so a column collation has to
+    // be folded into the key exactly as GROUP BY and DISTINCT fold theirs.
+    let key_colls = body_output_collations(schema, ctes, &comp.left, columns.len());
+    let key = |row: &Vec<Value>| fold_key(row, &key_colls);
+    let mut work = 0usize;
+    let mut check_work = || -> Result<()> {
+        // Set operations can spend most of their time hashing materialized
+        // rows. Keep cancellation responsive without adding an atomic load to
+        // every hash-table probe.
+        if work & 0xff == 0 {
+            super::check_cancelled(cancel)?;
+        }
+        work = work.wrapping_add(1);
+        Ok(())
+    };
 
     let mut rows = match (&comp.op, comp.all) {
         (SetOp::Union, true) => {
-            let total = left_qr.rows.len().saturating_add(right_qr.rows.len());
-            let mut rows = Vec::with_capacity(total);
-            rows.extend(left_qr.rows);
-            rows.extend(right_qr.rows);
+            // Reuse the left branch's allocation. Building a third vector
+            // copies every row header even though UNION ALL does no hashing.
+            let mut rows = left_qr.rows;
+            rows.reserve(right_qr.rows.len());
+            if cancel.is_none() {
+                rows.extend(right_qr.rows);
+            } else {
+                for row in right_qr.rows {
+                    check_work()?;
+                    rows.push(row);
+                }
+            }
             rows
         }
         (SetOp::Union, false) => {
-            let mut seen: rustc_hash::FxHashSet<Vec<Value>> = rustc_hash::FxHashSet::default();
+            let mut seen = super::helpers::RowKeys::new(key_colls.clone());
             let mut rows = Vec::new();
             for row in left_qr.rows.into_iter().chain(right_qr.rows) {
-                if !seen.contains(&row) {
-                    seen.insert(row.clone());
+                check_work()?;
+                if seen.insert(&row) {
                     rows.push(row);
                 }
             }
@@ -1209,11 +1475,13 @@ pub(super) fn apply_set_operation(
         (SetOp::Intersect, true) => {
             let mut right_counts: FxHashMap<Vec<Value>, usize> = FxHashMap::default();
             for row in &right_qr.rows {
-                *right_counts.entry(row.clone()).or_insert(0) += 1;
+                check_work()?;
+                *right_counts.entry(key(row)).or_insert(0) += 1;
             }
             let mut rows = Vec::new();
             for row in left_qr.rows {
-                if let Some(count) = right_counts.get_mut(&row) {
+                check_work()?;
+                if let Some(count) = right_counts.get_mut(&key(&row)) {
                     if *count > 0 {
                         *count -= 1;
                         rows.push(row);
@@ -1223,12 +1491,16 @@ pub(super) fn apply_set_operation(
             rows
         }
         (SetOp::Intersect, false) => {
-            let right_set: rustc_hash::FxHashSet<Vec<Value>> = right_qr.rows.into_iter().collect();
-            let mut seen: rustc_hash::FxHashSet<Vec<Value>> = rustc_hash::FxHashSet::default();
+            let mut right_set = super::helpers::RowKeys::new(key_colls.clone());
+            for row in &right_qr.rows {
+                check_work()?;
+                right_set.insert(row);
+            }
+            let mut seen = super::helpers::RowKeys::new(key_colls.clone());
             let mut rows = Vec::new();
             for row in left_qr.rows {
-                if right_set.contains(&row) && !seen.contains(&row) {
-                    seen.insert(row.clone());
+                check_work()?;
+                if right_set.contains_row(&row) && seen.insert(&row) {
                     rows.push(row);
                 }
             }
@@ -1237,11 +1509,13 @@ pub(super) fn apply_set_operation(
         (SetOp::Except, true) => {
             let mut right_counts: FxHashMap<Vec<Value>, usize> = FxHashMap::default();
             for row in &right_qr.rows {
-                *right_counts.entry(row.clone()).or_insert(0) += 1;
+                check_work()?;
+                *right_counts.entry(key(row)).or_insert(0) += 1;
             }
             let mut rows = Vec::new();
             for row in left_qr.rows {
-                if let Some(count) = right_counts.get_mut(&row) {
+                check_work()?;
+                if let Some(count) = right_counts.get_mut(&key(&row)) {
                     if *count > 0 {
                         *count -= 1;
                         continue;
@@ -1252,12 +1526,16 @@ pub(super) fn apply_set_operation(
             rows
         }
         (SetOp::Except, false) => {
-            let right_set: rustc_hash::FxHashSet<Vec<Value>> = right_qr.rows.into_iter().collect();
-            let mut seen: rustc_hash::FxHashSet<Vec<Value>> = rustc_hash::FxHashSet::default();
+            let mut right_set = super::helpers::RowKeys::new(key_colls.clone());
+            for row in &right_qr.rows {
+                check_work()?;
+                right_set.insert(row);
+            }
+            let mut seen = super::helpers::RowKeys::new(key_colls.clone());
             let mut rows = Vec::new();
             for row in left_qr.rows {
-                if !right_set.contains(&row) && !seen.contains(&row) {
-                    seen.insert(row.clone());
+                check_work()?;
+                if !right_set.contains_row(&row) && seen.insert(&row) {
                     rows.push(row);
                 }
             }
@@ -1283,10 +1561,15 @@ pub(super) fn apply_set_operation(
                 generated_expr: None,
                 generated_sql: None,
                 generated_kind: None,
-                collation: crate::types::Collation::Binary,
+                // Carried from the branch, so ORDER BY over a compound sorts the way the
+                // same column sorts inside it.
+                collation: key_colls
+                    .get(i)
+                    .copied()
+                    .unwrap_or(crate::types::Collation::Binary),
             })
             .collect();
-        sort_rows(&mut rows, &comp.order_by, &col_defs)?;
+        sort_rows(&mut rows, &comp.order_by, &col_defs, cancel)?;
     }
 
     if let Some(ref offset_expr) = comp.offset {
@@ -1303,6 +1586,7 @@ pub(super) fn apply_set_operation(
         rows.truncate(limit);
     }
 
+    super::check_cancelled(cancel)?;
     Ok(ExecutionResult::Query(QueryResult { columns, rows }))
 }
 
@@ -1369,17 +1653,43 @@ pub fn exec_insert_in_txn(
     stmt: &InsertStmt,
     params: &[Value],
 ) -> Result<ExecutionResult> {
-    with_insert_scratch(|bufs| {
-        exec_insert_in_txn_impl(
-            wtx,
-            schema,
-            stmt,
-            params,
-            bufs,
-            None,
-            &CteContext::default(),
-        )
-    })
+    // This public lane is also called directly, without `Connection::guarded`
+    // or `execute_in_txn` around it.
+    wtx.check_usable().map_err(SqlError::Storage)?;
+    super::check_cancelled(wtx.cancel_token())?;
+    let mutation_marker = wtx.mutation_marker();
+    let mut outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_insert_scratch(|bufs| {
+            exec_insert_in_txn_impl(
+                wtx,
+                schema,
+                stmt,
+                params,
+                bufs,
+                None,
+                &CteContext::default(),
+            )
+        })
+    })) {
+        Ok(outcome) => outcome,
+        Err(payload) => {
+            wtx.mark_failed();
+            std::panic::resume_unwind(payload)
+        }
+    };
+    if outcome.is_ok() {
+        if let Err(err) = super::check_cancelled(wtx.cancel_token()) {
+            outcome = Err(err);
+        }
+    }
+    // `Connection` reaches this public lane directly. A later duplicate,
+    // trigger, or cancellation error must not leave an earlier row committable.
+    if wtx.mutated_since(mutation_marker) {
+        if let Err(error) = &outcome {
+            super::mark_write_statement_failed(wtx, error);
+        }
+    }
+    outcome
 }
 
 pub(super) fn exec_insert_in_txn_with_ctes(
@@ -1603,13 +1913,20 @@ fn exec_insert_in_txn_impl(
         .is_some()
         .then(|| table_schema.column_map());
 
+    let cancel = wtx.cancel_token().cloned();
     let select_rows = match &stmt.source {
         InsertSource::Select(sq) => {
             let insert_ctes = super::materialize_all_ctes_with_outer(
                 &sq.ctes,
                 sq.recursive,
                 outer_ctes,
-                &mut |body, ctx| exec_query_body_write(wtx, schema, body, ctx),
+                cancel.as_ref(),
+                &mut |body, ctx| {
+                    let result = exec_query_body_write(wtx, schema, body, ctx)?;
+                    let collations =
+                        body_output_collations(schema, ctx, body, result.columns.len());
+                    Ok(CteRows::new(result, collations))
+                },
             )?;
             let qr = exec_query_body_write(wtx, schema, &sq.body, &insert_ctes)?;
             Some(qr.rows)
@@ -1677,7 +1994,13 @@ fn exec_insert_in_txn_impl(
         row_insert_trigger_flags(schema, &table_schema.name);
 
     let skip_row_clear = cache.is_some_and(|c| c.row_fully_overwritten);
+    // A wide VALUES list or an INSERT ... SELECT is a row loop like any scan,
+    // and it never enters one, so this is the only place a cancel can land.
+    let cancel = wtx.cancel_token().cloned();
     for idx in 0..total {
+        if let Some(t) = &cancel {
+            t.check().map_err(SqlError::Storage)?;
+        }
         if !skip_row_clear {
             for v in bufs.row.iter_mut() {
                 *v = Value::Null;
@@ -1729,7 +2052,7 @@ fn exec_insert_in_txn_impl(
                             .cloned()
                             .ok_or_else(|| SqlError::Parse(format!("unbound parameter ${n}")))?,
                         Expr::Literal(v) => v.clone(),
-                        _ => eval_const_expr(expr)?,
+                        _ => eval_const_expr_with_cancel(expr, cancel.as_ref())?,
                     };
                     let col_idx = bufs.col_indices[i];
                     let col = &table_schema.columns[col_idx];
@@ -1766,7 +2089,7 @@ fn exec_insert_in_txn_impl(
 
         if has_defaults {
             for &(pos, def_expr) in &defaults {
-                let val = eval_const_expr(def_expr)?;
+                let val = eval_const_expr_with_cancel(def_expr, cancel.as_ref())?;
                 let col = &table_schema.columns[pos];
                 if !val.is_null() {
                     let got_type = val.data_type();
@@ -1788,7 +2111,13 @@ fn exec_insert_in_txn_impl(
                     .zip(cached_gen_fast_evals.iter())
                 {
                     let gen_expr = table_schema.columns[pos].generated_expr.as_ref().unwrap();
-                    let val = eval_fast_gen(fast, gen_expr, &bufs.row, gen_map)?;
+                    let val = eval_fast_gen_with_cancel(
+                        fast,
+                        gen_expr,
+                        &bufs.row,
+                        gen_map,
+                        cancel.as_ref(),
+                    )?;
                     let col = &table_schema.columns[pos];
                     bufs.row[pos] = if val.is_null() {
                         Value::Null
@@ -1803,7 +2132,13 @@ fn exec_insert_in_txn_impl(
                 }
             } else {
                 for (pos, gen_expr, fast) in &generated_cols_uncached {
-                    let val = eval_fast_gen(fast, gen_expr, &bufs.row, gen_map)?;
+                    let val = eval_fast_gen_with_cancel(
+                        fast,
+                        gen_expr,
+                        &bufs.row,
+                        gen_map,
+                        cancel.as_ref(),
+                    )?;
                     let col = &table_schema.columns[*pos];
                     bufs.row[*pos] = if val.is_null() {
                         Value::Null
@@ -1838,7 +2173,10 @@ fn exec_insert_in_txn_impl(
         if let Some(col_map) = check_col_map {
             for col in &table_schema.columns {
                 if let Some(ref check) = col.check_expr {
-                    let result = eval_expr(check, &EvalCtx::new(col_map, &bufs.row))?;
+                    let result = eval_expr(
+                        check,
+                        &EvalCtx::new(col_map, &bufs.row).with_cancel(cancel.as_ref()),
+                    )?;
                     if !is_truthy(&result) && !result.is_null() {
                         let name = col.check_name.as_deref().unwrap_or(&col.name);
                         return Err(SqlError::CheckViolation(name.to_string()));
@@ -1846,7 +2184,10 @@ fn exec_insert_in_txn_impl(
                 }
             }
             for tc in &table_schema.check_constraints {
-                let result = eval_expr(&tc.expr, &EvalCtx::new(col_map, &bufs.row))?;
+                let result = eval_expr(
+                    &tc.expr,
+                    &EvalCtx::new(col_map, &bufs.row).with_cancel(cancel.as_ref()),
+                )?;
                 if !is_truthy(&result) && !result.is_null() {
                     let name = tc.name.as_deref().unwrap_or(&tc.sql);
                     return Err(SqlError::CheckViolation(name.to_string()));
@@ -1965,7 +2306,7 @@ fn exec_insert_in_txn_impl(
         match compiled_conflict.as_ref() {
             None => {
                 let is_new = wtx
-                    .table_insert(table_bytes, &bufs.key_buf, &bufs.value_buf)
+                    .table_insert_if_absent(table_bytes, &bufs.key_buf, &bufs.value_buf)
                     .map_err(SqlError::Storage)?;
                 if !is_new {
                     return Err(SqlError::DuplicateKey);
@@ -2027,6 +2368,7 @@ fn exec_insert_in_txn_impl(
                     &bufs.pk_values,
                     oc_ref,
                     row_col_map.unwrap(),
+                    cancel.as_ref(),
                     // Trigger dispatch needs the Updated outcome's rows too.
                     stmt.returning.is_some() || has_after_update_triggers,
                 )?;
@@ -2111,6 +2453,7 @@ fn exec_insert_in_txn_impl(
             table_schema,
             returning_cols,
             &rows,
+            wtx.cancel_token(),
         )?));
     }
 
@@ -2571,6 +2914,7 @@ pub(super) fn apply_insert_with_conflict(
     pk_values: &[Value],
     on_conflict: &CompiledOnConflict,
     col_map: &ColumnMap,
+    cancel: Option<&citadel::CancelToken>,
     capture_returning: bool,
 ) -> Result<InsertRowOutcome> {
     let table_bytes = table_schema.name.as_bytes();
@@ -2608,6 +2952,7 @@ pub(super) fn apply_insert_with_conflict(
                 where_clause.as_ref(),
                 col_map,
                 fast_paths.as_deref(),
+                cancel,
                 capture_returning,
             );
         }
@@ -2666,6 +3011,7 @@ pub(super) fn apply_insert_with_conflict(
                                 assignments,
                                 where_clause.as_ref(),
                                 col_map,
+                                cancel,
                                 capture_returning,
                             )
                         }
@@ -2695,7 +3041,8 @@ pub(super) fn apply_insert_with_conflict(
                     where_clause,
                     ..
                 } => {
-                    let old_row = decode_full_row(table_schema, key_buf, &old_bytes)?;
+                    let old_row =
+                        decode_full_row_with_cancel(table_schema, key_buf, &old_bytes, cancel)?;
                     apply_do_update_with_old_row(
                         wtx,
                         table_schema,
@@ -2705,6 +3052,7 @@ pub(super) fn apply_insert_with_conflict(
                         assignments,
                         where_clause.as_ref(),
                         col_map,
+                        cancel,
                         capture_returning,
                     )
                 }
@@ -2807,6 +3155,7 @@ fn apply_do_update_fused(
     where_clause: Option<&Expr>,
     col_map: &ColumnMap,
     fast_paths: Option<&[DoUpdateFastPath]>,
+    cancel: Option<&citadel::CancelToken>,
     capture_returning: bool,
 ) -> Result<InsertRowOutcome> {
     let non_pk = table_schema.non_pk_indices();
@@ -2826,8 +3175,18 @@ fn apply_do_update_fused(
                     let action = apply_fast_path_patch(old_bytes, fps)?;
                     if capture_returning {
                         if let UpsertAction::Replace(ref new_bytes) = action {
-                            let old_row = decode_full_row(table_schema, key_buf, old_bytes)?;
-                            let new_row = decode_full_row(table_schema, key_buf, new_bytes)?;
+                            let old_row = decode_full_row_with_cancel(
+                                table_schema,
+                                key_buf,
+                                old_bytes,
+                                cancel,
+                            )?;
+                            let new_row = decode_full_row_with_cancel(
+                                table_schema,
+                                key_buf,
+                                new_bytes,
+                                cancel,
+                            )?;
                             *captured.borrow_mut() = Some((old_row, new_row));
                         }
                     }
@@ -2845,10 +3204,17 @@ fn apply_do_update_fused(
 
                 old_row.clear();
                 old_row.resize(table_schema.columns.len(), Value::Null);
-                decode_full_row_into(table_schema, key_buf, old_bytes, old_row)?;
+                decode_full_row_into_with_cancel(
+                    table_schema,
+                    key_buf,
+                    old_bytes,
+                    old_row,
+                    cancel,
+                )?;
 
                 if let Some(w) = where_clause {
-                    let ctx = EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row);
+                    let ctx = EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row)
+                        .with_cancel(cancel);
                     let result = eval_expr(w, &ctx)?;
                     if result.is_null() || !is_truthy(&result) {
                         return Ok(UpsertAction::Skip);
@@ -2858,7 +3224,8 @@ fn apply_do_update_fused(
                 new_row.clear();
                 new_row.extend_from_slice(old_row);
                 for (col_idx, expr) in assignments {
-                    let ctx = EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row);
+                    let ctx = EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row)
+                        .with_cancel(cancel);
                     let val = eval_expr(expr, &ctx)?;
                     let col = &table_schema.columns[*col_idx];
                     new_row[*col_idx] = if val.is_null() {
@@ -2882,7 +3249,7 @@ fn apply_do_update_fused(
                 if has_checks {
                     for col in &table_schema.columns {
                         if let Some(ref check) = col.check_expr {
-                            let ctx = EvalCtx::new(col_map, new_row);
+                            let ctx = EvalCtx::new(col_map, new_row).with_cancel(cancel);
                             let result = eval_expr(check, &ctx)?;
                             if !is_truthy(&result) && !result.is_null() {
                                 let name = col.check_name.as_deref().unwrap_or(&col.name);
@@ -2891,7 +3258,7 @@ fn apply_do_update_fused(
                         }
                     }
                     for tc in &table_schema.check_constraints {
-                        let ctx = EvalCtx::new(col_map, new_row);
+                        let ctx = EvalCtx::new(col_map, new_row).with_cancel(cancel);
                         let result = eval_expr(&tc.expr, &ctx)?;
                         if !is_truthy(&result) && !result.is_null() {
                             let name = tc.name.as_deref().unwrap_or(&tc.sql);
@@ -2973,13 +3340,14 @@ fn apply_do_update(
     assignments: &[(usize, Expr)],
     where_clause: Option<&Expr>,
     col_map: &ColumnMap,
+    cancel: Option<&citadel::CancelToken>,
     capture_returning: bool,
 ) -> Result<InsertRowOutcome> {
     let old_value = wtx
         .table_get(table_schema.name.as_bytes(), pk_key)
         .map_err(SqlError::Storage)?
         .ok_or_else(|| SqlError::InvalidValue("primary row missing for DO UPDATE target".into()))?;
-    let old_row = decode_full_row(table_schema, pk_key, &old_value)?;
+    let old_row = decode_full_row_with_cancel(table_schema, pk_key, &old_value, cancel)?;
     apply_do_update_with_old_row(
         wtx,
         table_schema,
@@ -2989,6 +3357,7 @@ fn apply_do_update(
         assignments,
         where_clause,
         col_map,
+        cancel,
         capture_returning,
     )
 }
@@ -3003,10 +3372,12 @@ fn apply_do_update_with_old_row(
     assignments: &[(usize, Expr)],
     where_clause: Option<&Expr>,
     col_map: &ColumnMap,
+    cancel: Option<&citadel::CancelToken>,
     capture_returning: bool,
 ) -> Result<InsertRowOutcome> {
     if let Some(w) = where_clause {
-        let ctx = EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row);
+        let ctx =
+            EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row).with_cancel(cancel);
         let result = eval_expr(w, &ctx)?;
         if result.is_null() || !is_truthy(&result) {
             return Ok(InsertRowOutcome::Skipped);
@@ -3015,7 +3386,8 @@ fn apply_do_update_with_old_row(
 
     let mut new_row = old_row.to_vec();
     for (col_idx, expr) in assignments {
-        let ctx = EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row);
+        let ctx =
+            EvalCtx::with_excluded(col_map, old_row, col_map, proposed_row).with_cancel(cancel);
         let val = eval_expr(expr, &ctx)?;
         let col = &table_schema.columns[*col_idx];
         new_row[*col_idx] = if val.is_null() {
@@ -3037,7 +3409,7 @@ fn apply_do_update_with_old_row(
         ) {
             let val = eval_expr(
                 col.generated_expr.as_ref().unwrap(),
-                &EvalCtx::new(col_map, &new_row),
+                &EvalCtx::new(col_map, &new_row).with_cancel(cancel),
             )?;
             let pos = col.position as usize;
             new_row[pos] = if val.is_null() {
@@ -3069,7 +3441,7 @@ fn apply_do_update_with_old_row(
     if table_schema.has_checks() {
         for col in &table_schema.columns {
             if let Some(ref check) = col.check_expr {
-                let ctx = EvalCtx::new(col_map, &new_row);
+                let ctx = EvalCtx::new(col_map, &new_row).with_cancel(cancel);
                 let result = eval_expr(check, &ctx)?;
                 if !is_truthy(&result) && !result.is_null() {
                     let name = col.check_name.as_deref().unwrap_or(&col.name);
@@ -3078,7 +3450,7 @@ fn apply_do_update_with_old_row(
             }
         }
         for tc in &table_schema.check_constraints {
-            let ctx = EvalCtx::new(col_map, &new_row);
+            let ctx = EvalCtx::new(col_map, &new_row).with_cancel(cancel);
             let result = eval_expr(&tc.expr, &ctx)?;
             if !is_truthy(&result) && !result.is_null() {
                 let name = tc.name.as_deref().unwrap_or(&tc.sql);
@@ -3166,6 +3538,7 @@ fn apply_do_update_with_old_row(
         });
     }
 
+    let col_map_partial = any_partial_index(table_schema).then(|| table_schema.column_map());
     if pk_changed {
         let new_pk_key = crate::encoding::encode_composite_key(&new_pk_values);
         let inserted = wtx
@@ -3177,23 +3550,47 @@ fn apply_do_update_with_old_row(
         wtx.table_delete(table_schema.name.as_bytes(), old_pk_key)
             .map_err(SqlError::Storage)?;
         for idx in &table_schema.indices {
+            let cols_changed = index_columns_changed(idx, old_row, &new_row, table_schema);
+            let (del, ins) = partial_idx_update_actions_with_cancel(
+                idx,
+                old_row,
+                &new_row,
+                cols_changed,
+                true,
+                col_map_partial,
+                cancel,
+            )?;
             let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
-            let old_idx_key =
-                encode_index_key_with_schema(idx, old_row, &old_pk_values, table_schema);
-            wtx.table_delete(&idx_table, &old_idx_key)
-                .map_err(SqlError::Storage)?;
-            let new_idx_key =
-                encode_index_key_with_schema(idx, &new_row, &new_pk_values, table_schema);
-            let new_idx_val = encode_index_value(idx, &new_row, &new_pk_values);
-            let is_new = wtx
-                .table_insert(&idx_table, &new_idx_key, &new_idx_val)
-                .map_err(SqlError::Storage)?;
-            if idx.unique && !is_new {
-                let any_null = idx
-                    .column_positions_iter()
-                    .any(|c| new_row[c as usize].is_null());
-                if !any_null {
-                    return Err(SqlError::UniqueViolation(idx.name.clone()));
+            if del {
+                let old_idx_key = encode_index_key_with_schema_and_cancel(
+                    idx,
+                    old_row,
+                    &old_pk_values,
+                    table_schema,
+                    cancel,
+                )?;
+                wtx.table_delete(&idx_table, &old_idx_key)
+                    .map_err(SqlError::Storage)?;
+            }
+            if ins {
+                let new_idx_key = encode_index_key_with_schema_and_cancel(
+                    idx,
+                    &new_row,
+                    &new_pk_values,
+                    table_schema,
+                    cancel,
+                )?;
+                let new_idx_val = encode_index_value(idx, &new_row, &new_pk_values);
+                let is_new = wtx
+                    .table_insert(&idx_table, &new_idx_key, &new_idx_val)
+                    .map_err(SqlError::Storage)?;
+                if idx.unique && !is_new {
+                    let any_null = idx
+                        .column_positions_iter()
+                        .any(|c| new_row[c as usize].is_null());
+                    if !any_null {
+                        return Err(SqlError::UniqueViolation(idx.name.clone()));
+                    }
                 }
             }
         }
@@ -3203,27 +3600,37 @@ fn apply_do_update_with_old_row(
             &[(old_pk_key, new_value_buf.as_slice())],
         )
         .map_err(SqlError::Storage)?;
-        let col_map_partial = any_partial_index(table_schema).then(|| table_schema.column_map());
         for idx in &table_schema.indices {
-            let cols_changed = index_columns_changed(idx, old_row, &new_row);
-            let (del, ins) = partial_idx_update_actions(
+            let cols_changed = index_columns_changed(idx, old_row, &new_row, table_schema);
+            let (del, ins) = partial_idx_update_actions_with_cancel(
                 idx,
                 old_row,
                 &new_row,
                 cols_changed,
                 false,
                 col_map_partial,
-            );
+                cancel,
+            )?;
             let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
             if del {
-                let old_idx_key =
-                    encode_index_key_with_schema(idx, old_row, &old_pk_values, table_schema);
+                let old_idx_key = encode_index_key_with_schema_and_cancel(
+                    idx,
+                    old_row,
+                    &old_pk_values,
+                    table_schema,
+                    cancel,
+                )?;
                 wtx.table_delete(&idx_table, &old_idx_key)
                     .map_err(SqlError::Storage)?;
             }
             if ins {
-                let new_idx_key =
-                    encode_index_key_with_schema(idx, &new_row, &new_pk_values, table_schema);
+                let new_idx_key = encode_index_key_with_schema_and_cancel(
+                    idx,
+                    &new_row,
+                    &new_pk_values,
+                    table_schema,
+                    cancel,
+                )?;
                 let new_idx_val = encode_index_value(idx, &new_row, &new_pk_values);
                 let is_new = wtx
                     .table_insert(&idx_table, &new_idx_key, &new_idx_val)
@@ -3763,7 +4170,7 @@ fn exec_instead_of_view_insert_auto(
 ) -> Result<ExecutionResult> {
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     let r = exec_instead_of_view_insert_in_txn(&mut wtx, schema, view_name, aliases, stmt, params)?;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
     Ok(r)
 }
 
@@ -3787,6 +4194,7 @@ fn exec_instead_of_view_insert_in_txn(
         .enumerate()
         .map(|(i, name)| (name.to_ascii_lowercase(), i))
         .collect();
+    let cancel = wtx.cancel_token().cloned();
 
     let target_positions: Vec<usize> = if stmt.columns.is_empty() {
         (0..resolved_aliases.len()).collect()
@@ -3821,7 +4229,7 @@ fn exec_instead_of_view_insert_in_txn(
                             .cloned()
                             .ok_or_else(|| SqlError::Parse(format!("unbound parameter ${n}")))?,
                         Expr::Literal(v) => v.clone(),
-                        other => eval_const_expr(other)?,
+                        other => eval_const_expr_with_cancel(other, cancel.as_ref())?,
                     };
                     vals.push(v);
                 }

@@ -1,8 +1,6 @@
-//! Persisted ANN segments end to end: persist/reopen/load equivalence, every
-//! staleness layer (transactional purge on each DML/DDL path, the content
-//! fingerprint, header pins), corruption refusals, rollback semantics, NULL
-//! vectors, negative PKs (scan order != u64 sort order - the rehydration
-//! permutation), filter pushdown from persisted dicts, and the cache markers.
+//! Persisted ANN segments end to end: load equivalence, every staleness layer,
+//! corruption refusals, rollback, NULL vectors, negative PKs (scan order is not
+//! u64 sort order), filter pushdown from persisted dicts, and cache markers.
 
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
 use citadel_sql::executor::AnnIndexSource;
@@ -365,6 +363,110 @@ fn resurrected_stale_segment_is_refused_by_the_root_stamp() {
             assert!(r.contains("stale"), "reason: {r}");
         }
         other => panic!("expected Built with a staleness refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn recycled_root_page_id_with_a_new_page_txn_refuses_the_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    seed(&conn);
+    conn.persist_ann_index("t", "v").unwrap();
+
+    let rows = {
+        let mut rtx = db.begin_read();
+        let mut rows = Vec::new();
+        rtx.table_scan_from(b"t", b"", &mut |key: &[u8], value: &[u8]| {
+            rows.push((key.to_vec(), value.to_vec()));
+            Ok(rows.len() < 2)
+        })
+        .unwrap();
+        rows
+    };
+    assert_eq!(rows.len(), 2);
+
+    // Raw storage writes intentionally bypass SQL's transactional segment
+    // purge. Keep row 0 deleted so the segment is stale throughout.
+    {
+        let mut wtx = db.begin_write().unwrap();
+        assert!(wtx.table_delete(b"t", &rows[0].0).unwrap());
+        wtx.commit().unwrap();
+    }
+    let stamped_before_recycle = {
+        let mut rtx = db.begin_read();
+        rtx.table_root_stamp(b"t").unwrap().expect("table stamp")
+    };
+
+    // Restamp the saved artifact to this real pre-recycle root. Rehashing the
+    // authenticated header models resurrection of an artifact persisted at
+    // this point while making page-id reuse deterministic for the regression.
+    const TABLE_ROOT_AT: usize = 60;
+    const TABLE_ROOT_TXN_AT: usize = 68;
+    {
+        let mut wtx = db.begin_write().unwrap();
+        let mut header = wtx
+            .table_get(b"__annseg_t", &0u32.to_be_bytes())
+            .unwrap()
+            .expect("segment header");
+        header[TABLE_ROOT_AT..TABLE_ROOT_AT + 8]
+            .copy_from_slice(&u64::from(stamped_before_recycle.0.as_u32()).to_le_bytes());
+        header[TABLE_ROOT_TXN_AT..TABLE_ROOT_TXN_AT + 8]
+            .copy_from_slice(&stamped_before_recycle.1.as_u64().to_le_bytes());
+        let body_len = header.len() - 32;
+        let self_hash = blake3::hash(&header[..body_len]);
+        header[body_len..].copy_from_slice(self_hash.as_bytes());
+        wtx.table_insert(b"__annseg_t", &0u32.to_be_bytes(), &header)
+            .unwrap();
+        wtx.commit().unwrap();
+    }
+
+    // Toggle a second valid row until the allocator reuses that exact physical
+    // root page id under a different page transaction id.
+    let mut second_present = true;
+    let mut seen_stamps = Vec::new();
+    let recycled_stamp = (0..512).find_map(|_| {
+        let stamp = {
+            let mut rtx = db.begin_read();
+            rtx.table_root_stamp(b"t").unwrap().expect("table stamp")
+        };
+        if seen_stamps.len() < 16 {
+            seen_stamps.push(stamp);
+        }
+        if stamp.0 == stamped_before_recycle.0 && stamp.1 != stamped_before_recycle.1 {
+            return Some(stamp);
+        }
+        let mut wtx = db.begin_write().unwrap();
+        if second_present {
+            assert!(wtx.table_delete(b"t", &rows[1].0).unwrap());
+        } else {
+            assert!(wtx.table_insert(b"t", &rows[1].0, &rows[1].1).unwrap());
+        }
+        second_present = !second_present;
+        wtx.commit().unwrap();
+        None
+    });
+    let recycled_stamp = recycled_stamp.unwrap_or_else(|| {
+        panic!(
+            "allocator should recycle root {:?}; first observed stamps: {:?}",
+            stamped_before_recycle, seen_stamps
+        )
+    });
+    assert_eq!(recycled_stamp.0, stamped_before_recycle.0);
+    assert_ne!(recycled_stamp.1, stamped_before_recycle.1);
+    drop(conn);
+    drop(db);
+
+    let db = open_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    let _ = ids(&conn, QUERY);
+    match status(&conn, "t") {
+        Some(AnnIndexSource::Built {
+            refusal: Some(reason),
+        }) => {
+            assert!(reason.contains("stale"), "reason: {reason}");
+        }
+        other => panic!("recycled root id must still refuse the segment: {other:?}"),
     }
 }
 

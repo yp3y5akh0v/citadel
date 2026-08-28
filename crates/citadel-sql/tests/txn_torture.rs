@@ -1889,6 +1889,11 @@ fn composite_pk_in_transaction() {
     assert!(matches!(err, SqlError::DuplicateKey));
 
     conn.execute("COMMIT").unwrap();
+
+    let qr = conn
+        .query("SELECT val FROM t WHERE a = 1 AND b = 'x'")
+        .unwrap();
+    assert_eq!(qr.rows, vec![vec![Value::Text("first".into())]]);
 }
 
 #[test]

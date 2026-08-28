@@ -9,10 +9,134 @@ use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
 
-use super::helpers::decode_full_row;
+use super::helpers::{check_cancel, check_cancel_at, decode_full_row_with_cancel};
 use super::CteContext;
 
-pub(super) type InMap = (FxHashMap<Vec<Value>, FxHashSet<Value>>, bool);
+#[derive(Default)]
+pub(super) struct InValues {
+    values: FxHashSet<Value>,
+    has_null: bool,
+}
+
+pub(super) type InMap = FxHashMap<Vec<Value>, InValues>;
+
+fn correlated_in_passes(
+    group: Option<&InValues>,
+    in_value: Value,
+    value_collation: Collation,
+    negated: bool,
+) -> bool {
+    let Some(group) = group else {
+        // The correlated subquery is empty for this key.  In particular,
+        // NULL NOT IN (empty) is true, unlike NULL NOT IN (nonempty).
+        return negated;
+    };
+    if in_value.is_null() {
+        return false;
+    }
+
+    let found = group.values.contains(&value_collation.fold(in_value));
+    if found {
+        !negated
+    } else if group.has_null {
+        false
+    } else {
+        negated
+    }
+}
+
+fn correlation_collations(corr_pairs: &[CorrEqPair]) -> Vec<Collation> {
+    corr_pairs.iter().map(|pair| pair.collation).collect()
+}
+
+fn correlation_key(row: &[Value], indices: &[usize], collations: &[Collation]) -> Vec<Value> {
+    indices
+        .iter()
+        .enumerate()
+        .map(|(position, &index)| {
+            collations
+                .get(position)
+                .copied()
+                .unwrap_or(Collation::Binary)
+                .fold(row[index].clone())
+        })
+        .collect()
+}
+
+fn in_subquery_value_collation(
+    subquery: &SelectStmt,
+    inner_schema: &TableSchema,
+) -> Result<Collation> {
+    let expr = match &subquery.columns[0] {
+        SelectColumn::Expr { expr, .. } => expr,
+        _ => return Err(SqlError::Unsupported("complex IN subquery column".into())),
+    };
+    let index = in_subquery_value_column_index(expr, inner_schema)?;
+    let col_map = inner_schema.column_map();
+    Ok(crate::eval::operand_collation(expr, col_map)
+        .unwrap_or(inner_schema.columns[index].collation))
+}
+
+fn in_subquery_value_column_index(expr: &Expr, inner_schema: &TableSchema) -> Result<usize> {
+    let name = match expr {
+        Expr::Column(name) => name,
+        Expr::QualifiedColumn { column, .. } => column,
+        Expr::Collate { expr, .. } => {
+            return in_subquery_value_column_index(expr, inner_schema);
+        }
+        _ => return Err(SqlError::Unsupported("complex IN subquery column".into())),
+    };
+    inner_schema
+        .column_index(name)
+        .ok_or_else(|| SqlError::ColumnNotFound(name.clone()))
+}
+
+fn retain_cancellable<T>(
+    values: &mut Vec<T>,
+    cancel: Option<&citadel::CancelToken>,
+    mut keep: impl FnMut(&T) -> Result<bool>,
+) -> Result<()> {
+    if cancel.is_none() {
+        let mut error = None;
+        values.retain(|item| {
+            if error.is_some() {
+                return false;
+            }
+            match keep(item) {
+                Ok(keep) => keep,
+                Err(err) => {
+                    error = Some(err);
+                    false
+                }
+            }
+        });
+        return error.map_or(Ok(()), Err);
+    }
+
+    let original = std::mem::take(values);
+    values.reserve(original.len());
+    for (item_idx, item) in original.into_iter().enumerate() {
+        check_cancel_at(cancel, item_idx)?;
+        if keep(&item)? {
+            values.push(item);
+        }
+    }
+    check_cancel(cancel)
+}
+
+fn any_cancellable<T>(
+    values: &[T],
+    cancel: Option<&citadel::CancelToken>,
+    mut predicate: impl FnMut(&T) -> Result<bool>,
+) -> Result<bool> {
+    for (item_idx, item) in values.iter().enumerate() {
+        check_cancel_at(cancel, item_idx)?;
+        if predicate(item)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 #[allow(clippy::type_complexity)]
 pub(super) fn handle_correlated_select_with_read(
@@ -23,8 +147,12 @@ pub(super) fn handle_correlated_select_with_read(
     rows: &mut [Vec<Value>],
     columns: &mut Vec<ColumnDef>,
 ) -> Result<SelectStmt> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    check_cancel(cancel)?;
     let mut new_columns = Vec::new();
-    let mut scalar_maps: Vec<(FxHashMap<Vec<Value>, Value>, Vec<usize>)> = Vec::new();
+    let mut scalar_maps: Vec<(FxHashMap<Vec<Value>, Value>, Vec<usize>, Vec<Collation>)> =
+        Vec::new();
     let mut corr_col_idx = columns.len();
 
     for col in &stmt.columns {
@@ -49,7 +177,11 @@ pub(super) fn handle_correlated_select_with_read(
                                 decorrelate_scalar_with_read(rtx, schema, sub, &corr_pairs, ctx)?;
                             let outer_indices: Vec<usize> =
                                 corr_pairs.iter().map(|p| p.outer_col_idx).collect();
-                            scalar_maps.push((map, outer_indices));
+                            scalar_maps.push((
+                                map,
+                                outer_indices,
+                                correlation_collations(&corr_pairs),
+                            ));
 
                             let col_name = alias
                                 .clone()
@@ -89,9 +221,10 @@ pub(super) fn handle_correlated_select_with_read(
         return Ok(stmt.clone());
     }
 
-    for row in rows.iter_mut() {
-        for (map, outer_indices) in &scalar_maps {
-            let key: Vec<Value> = outer_indices.iter().map(|&i| row[i].clone()).collect();
+    for (row_idx, row) in rows.iter_mut().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
+        for (map, outer_indices, key_collations) in &scalar_maps {
+            let key = correlation_key(row, outer_indices, key_collations);
             let val = if key.iter().any(|v| v.is_null()) {
                 Value::Null
             } else {
@@ -100,6 +233,8 @@ pub(super) fn handle_correlated_select_with_read(
             row.push(val);
         }
     }
+
+    check_cancel(cancel)?;
 
     Ok(SelectStmt {
         columns: new_columns,
@@ -190,10 +325,11 @@ pub(super) fn collect_column_names(expr: &Expr, out: &mut Vec<String>) {
         Expr::UnaryOp { expr: e, .. }
         | Expr::IsNull(e)
         | Expr::IsNotNull(e)
-        | Expr::Cast { expr: e, .. } => {
+        | Expr::Cast { expr: e, .. }
+        | Expr::Collate { expr: e, .. } => {
             collect_column_names(e, out);
         }
-        Expr::Function { args, .. } | Expr::Coalesce(args) => {
+        Expr::Function { args, .. } | Expr::Coalesce(args) | Expr::ArrayLiteral(args) => {
             for a in args {
                 collect_column_names(a, out);
             }
@@ -211,11 +347,21 @@ pub(super) fn collect_column_names(expr: &Expr, out: &mut Vec<String>) {
             collect_column_names(low, out);
             collect_column_names(high, out);
         }
+        Expr::IsDistinctFrom { left, right, .. } => {
+            collect_column_names(left, out);
+            collect_column_names(right, out);
+        }
         Expr::Like {
-            expr: e, pattern, ..
+            expr: e,
+            pattern,
+            escape,
+            ..
         } => {
             collect_column_names(e, out);
             collect_column_names(pattern, out);
+            if let Some(escape) = escape {
+                collect_column_names(escape, out);
+            }
         }
         Expr::Case {
             operand,
@@ -243,12 +389,28 @@ pub(super) fn collect_column_names(expr: &Expr, out: &mut Vec<String>) {
             for o in &spec.order_by {
                 collect_column_names(&o.expr, out);
             }
+            if let Some(frame) = &spec.frame {
+                for bound in [&frame.start, &frame.end] {
+                    match bound {
+                        WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
+                            collect_column_names(expr, out);
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
         Expr::InSubquery { expr: e, .. } => {
             collect_column_names(e, out);
         }
         Expr::InSet { expr: e, .. } => {
             collect_column_names(e, out);
+        }
+        Expr::Quantified { left, right, .. } => {
+            collect_column_names(left, out);
+            if let QuantifiedRhs::Array(expr) = right {
+                collect_column_names(expr, out);
+            }
         }
         _ => {}
     }
@@ -304,6 +466,8 @@ pub(super) struct CorrEqPair {
     outer_col_name: String,
     outer_col_idx: usize,
     inner_col_name: String,
+    /// Collation of the syntactic left operand of the extracted `=` predicate.
+    collation: Collation,
 }
 
 /// Extract equality correlation predicates. Returns (pairs, remaining inner-only WHERE).
@@ -373,10 +537,10 @@ pub(super) fn try_extract_corr_eq(
         _ => return None,
     };
 
-    if let Some(pair) = try_match_corr_pair(left, right, ctx, inner_schema, inner_alias) {
+    if let Some(pair) = try_match_corr_pair(left, right, ctx, inner_schema, inner_alias, true) {
         return Some(pair);
     }
-    try_match_corr_pair(right, left, ctx, inner_schema, inner_alias)
+    try_match_corr_pair(right, left, ctx, inner_schema, inner_alias, false)
 }
 
 pub(super) fn try_match_corr_pair(
@@ -385,6 +549,7 @@ pub(super) fn try_match_corr_pair(
     ctx: &CorrelationCtx,
     inner_schema: &TableSchema,
     inner_alias: Option<&str>,
+    outer_is_left: bool,
 ) -> Option<CorrEqPair> {
     let outer_col = match maybe_outer {
         Expr::QualifiedColumn { table, column } => {
@@ -426,11 +591,18 @@ pub(super) fn try_match_corr_pair(
     };
 
     let outer_col_idx = ctx.outer_schema.column_index(&outer_col)?;
+    let inner_col_idx = inner_schema.column_index(&inner_col)?;
+    let collation = if outer_is_left {
+        ctx.outer_schema.columns[outer_col_idx].collation
+    } else {
+        inner_schema.columns[inner_col_idx].collation
+    };
 
     Some(CorrEqPair {
         outer_col_name: outer_col,
         outer_col_idx,
         inner_col_name: inner_col,
+        collation,
     })
 }
 
@@ -525,8 +697,11 @@ pub(super) fn bind_outer_values_in_expr(
     expr: &Expr,
     outer_row: &[Value],
     outer_col_map: &ColumnMap,
+    inner_col_map: &ColumnMap,
     ctx: &CorrelationCtx,
 ) -> Expr {
+    let bind =
+        |expr: &Expr| bind_outer_values_in_expr(expr, outer_row, outer_col_map, inner_col_map, ctx);
     match expr {
         Expr::QualifiedColumn { table, column } => {
             if ctx.matches_outer(&table.to_ascii_lowercase()) {
@@ -538,31 +713,162 @@ pub(super) fn bind_outer_values_in_expr(
         }
         Expr::Column(name) => {
             let lower = name.to_ascii_lowercase();
-            if let Ok(idx) = outer_col_map.resolve(&lower) {
-                return Expr::Literal(outer_row[idx].clone());
+            if matches!(
+                inner_col_map.resolve(&lower),
+                Err(SqlError::ColumnNotFound(_))
+            ) {
+                if let Ok(idx) = outer_col_map.resolve(&lower) {
+                    return Expr::Literal(outer_row[idx].clone());
+                }
             }
             expr.clone()
         }
         Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(bind_outer_values_in_expr(
-                left,
-                outer_row,
-                outer_col_map,
-                ctx,
-            )),
+            left: Box::new(bind(left)),
             op: *op,
-            right: Box::new(bind_outer_values_in_expr(
-                right,
-                outer_row,
-                outer_col_map,
-                ctx,
-            )),
+            right: Box::new(bind(right)),
         },
         Expr::UnaryOp { op, expr: e } => Expr::UnaryOp {
             op: *op,
-            expr: Box::new(bind_outer_values_in_expr(e, outer_row, outer_col_map, ctx)),
+            expr: Box::new(bind(e)),
         },
-        _ => expr.clone(),
+        Expr::IsNull(expr) => Expr::IsNull(Box::new(bind(expr))),
+        Expr::IsNotNull(expr) => Expr::IsNotNull(Box::new(bind(expr))),
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => Expr::Function {
+            name: name.clone(),
+            args: args.iter().map(bind).collect(),
+            distinct: *distinct,
+        },
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Expr::InSubquery {
+            expr: Box::new(bind(expr)),
+            subquery: subquery.clone(),
+            negated: *negated,
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(bind(expr)),
+            list: list.iter().map(bind).collect(),
+            negated: *negated,
+        },
+        Expr::InSet {
+            expr,
+            values,
+            has_null,
+            negated,
+            collation,
+        } => Expr::InSet {
+            expr: Box::new(bind(expr)),
+            values: values.clone(),
+            has_null: *has_null,
+            negated: *negated,
+            collation: *collation,
+        },
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Expr::Between {
+            expr: Box::new(bind(expr)),
+            low: Box::new(bind(low)),
+            high: Box::new(bind(high)),
+            negated: *negated,
+        },
+        Expr::IsDistinctFrom {
+            left,
+            right,
+            negated,
+        } => Expr::IsDistinctFrom {
+            left: Box::new(bind(left)),
+            right: Box::new(bind(right)),
+            negated: *negated,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(bind(expr)),
+            pattern: Box::new(bind(pattern)),
+            escape: escape.as_ref().map(|expr| Box::new(bind(expr))),
+            negated: *negated,
+        },
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => Expr::Case {
+            operand: operand.as_ref().map(|expr| Box::new(bind(expr))),
+            conditions: conditions
+                .iter()
+                .map(|(condition, result)| (bind(condition), bind(result)))
+                .collect(),
+            else_result: else_result.as_ref().map(|expr| Box::new(bind(expr))),
+        },
+        Expr::Coalesce(args) => Expr::Coalesce(args.iter().map(bind).collect()),
+        Expr::Cast { expr, data_type } => Expr::Cast {
+            expr: Box::new(bind(expr)),
+            data_type: *data_type,
+        },
+        Expr::WindowFunction { name, args, spec } => {
+            let mut spec = spec.clone();
+            spec.partition_by = spec.partition_by.iter().map(bind).collect();
+            for item in &mut spec.order_by {
+                item.expr = bind(&item.expr);
+            }
+            if let Some(frame) = &mut spec.frame {
+                for bound in [&mut frame.start, &mut frame.end] {
+                    match bound {
+                        WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
+                            **expr = bind(expr);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Expr::WindowFunction {
+                name: name.clone(),
+                args: args.iter().map(bind).collect(),
+                spec,
+            }
+        }
+        Expr::Collate { expr, collation } => Expr::Collate {
+            expr: Box::new(bind(expr)),
+            collation: *collation,
+        },
+        Expr::ArrayLiteral(values) => Expr::ArrayLiteral(values.iter().map(bind).collect()),
+        Expr::Quantified {
+            left,
+            op,
+            quantifier,
+            right,
+        } => Expr::Quantified {
+            left: Box::new(bind(left)),
+            op: *op,
+            quantifier: *quantifier,
+            right: match right {
+                QuantifiedRhs::Subquery(subquery) => QuantifiedRhs::Subquery(subquery.clone()),
+                QuantifiedRhs::Array(expr) => QuantifiedRhs::Array(Box::new(bind(expr))),
+            },
+        },
+        Expr::Literal(_)
+        | Expr::CountStar
+        | Expr::Exists { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::Parameter(_)
+        | Expr::TypedNullRecord(_) => expr.clone(),
     }
 }
 
@@ -584,6 +890,9 @@ pub(super) fn decorrelate_exists_with_read(
     corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
 ) -> Result<ExistsResult> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    check_cancel(cancel)?;
     let inner_name = subquery.from.to_ascii_lowercase();
 
     let (inner_schema_owned, inner_rows) = if let Some(ts) = schema.get(&inner_name) {
@@ -598,15 +907,19 @@ pub(super) fn decorrelate_exists_with_read(
             strip_correlation_predicates(&subquery.where_clause, corr_pairs, ctx, &vs);
         let col_map = ColumnMap::new(&vs.columns);
         let rows: Vec<Vec<Value>> = if let Some(ref w) = inner_where {
-            vqr.rows
-                .into_iter()
-                .filter(|row| match eval_expr(w, &EvalCtx::new(&col_map, row)) {
-                    Ok(v) => is_truthy(&v),
-                    _ => false,
-                })
-                .collect()
+            let mut filtered = Vec::new();
+            for (row_idx, row) in vqr.result.rows.into_iter().enumerate() {
+                check_cancel_at(cancel, row_idx)?;
+                if is_truthy(&eval_expr(
+                    w,
+                    &EvalCtx::new(&col_map, &row).with_cancel(cancel),
+                )?) {
+                    filtered.push(row);
+                }
+            }
+            filtered
         } else {
-            vqr.rows
+            vqr.result.rows
         };
         (vs, rows)
     } else {
@@ -621,26 +934,31 @@ pub(super) fn decorrelate_exists_with_read(
         .iter()
         .map(|p| inner_schema.column_index(&p.inner_col_name).unwrap_or(0))
         .collect();
+    let key_collations = correlation_collations(corr_pairs);
 
     if non_eq.is_empty() {
         let mut key_set = FxHashSet::default();
-        for row in &inner_rows {
-            let key: Vec<Value> = inner_col_indices.iter().map(|&i| row[i].clone()).collect();
+        for (row_idx, row) in inner_rows.iter().enumerate() {
+            check_cancel_at(cancel, row_idx)?;
+            let key = correlation_key(row, &inner_col_indices, &key_collations);
             if key.iter().any(|v| v.is_null()) {
                 continue;
             }
             key_set.insert(key);
         }
+        check_cancel(cancel)?;
         Ok(ExistsResult::Simple(key_set))
     } else {
         let mut rows_by_key: FxHashMap<Vec<Value>, Vec<Vec<Value>>> = FxHashMap::default();
-        for row in inner_rows {
-            let key: Vec<Value> = inner_col_indices.iter().map(|&i| row[i].clone()).collect();
+        for (row_idx, row) in inner_rows.into_iter().enumerate() {
+            check_cancel_at(cancel, row_idx)?;
+            let key = correlation_key(&row, &inner_col_indices, &key_collations);
             if key.iter().any(|v| v.is_null()) {
                 continue;
             }
             rows_by_key.entry(key).or_default().push(row);
         }
+        check_cancel(cancel)?;
         Ok(ExistsResult::WithFilter(Box::new(ExistsFilterData {
             rows_by_key,
             non_eq_predicates: non_eq,
@@ -656,22 +974,21 @@ pub(super) fn decorrelate_in_with_read(
     subquery: &SelectStmt,
     corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
+    value_collation: Collation,
 ) -> Result<InMap> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    check_cancel(cancel)?;
     let inner_name = subquery.from.to_ascii_lowercase();
     let inner_schema = schema
         .get(&inner_name)
         .ok_or_else(|| SqlError::TableNotFound(subquery.from.clone()))?;
 
-    let in_col_name = match &subquery.columns[0] {
-        SelectColumn::Expr {
-            expr: Expr::Column(name),
-            ..
-        } => name.to_ascii_lowercase(),
+    let in_expr = match &subquery.columns[0] {
+        SelectColumn::Expr { expr, .. } => expr,
         _ => return Err(SqlError::Unsupported("complex IN subquery column".into())),
     };
-    let in_col_idx = inner_schema
-        .column_index(&in_col_name)
-        .ok_or_else(|| SqlError::ColumnNotFound(in_col_name.clone()))?;
+    let in_col_idx = in_subquery_value_column_index(in_expr, inner_schema)?;
 
     let (inner_where, _non_eq) =
         strip_correlation_predicates(&subquery.where_clause, corr_pairs, ctx, inner_schema);
@@ -681,24 +998,27 @@ pub(super) fn decorrelate_in_with_read(
         .iter()
         .map(|p| inner_schema.column_index(&p.inner_col_name).unwrap_or(0))
         .collect();
+    let key_collations = correlation_collations(corr_pairs);
 
-    let mut map: FxHashMap<Vec<Value>, FxHashSet<Value>> = FxHashMap::default();
-    let mut has_null_in_values = false;
+    let mut map: InMap = FxHashMap::default();
 
-    for row in &inner_rows {
-        let key: Vec<Value> = inner_corr_indices.iter().map(|&i| row[i].clone()).collect();
+    for (row_idx, row) in inner_rows.iter().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
+        let key = correlation_key(row, &inner_corr_indices, &key_collations);
         if key.iter().any(|v| v.is_null()) {
             continue;
         }
         let in_val = row[in_col_idx].clone();
+        let entry = map.entry(key).or_default();
         if in_val.is_null() {
-            has_null_in_values = true;
+            entry.has_null = true;
         } else {
-            map.entry(key).or_default().insert(in_val);
+            entry.values.insert(value_collation.fold(in_val));
         }
     }
 
-    Ok((map, has_null_in_values))
+    check_cancel(cancel)?;
+    Ok(map)
 }
 
 /// Decorrelate scalar subquery. Returns correlation key → scalar result.
@@ -709,6 +1029,9 @@ pub(super) fn decorrelate_scalar_with_read(
     corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
 ) -> Result<FxHashMap<Vec<Value>, Value>> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    check_cancel(cancel)?;
     let inner_name = subquery.from.to_ascii_lowercase();
     let inner_schema = schema
         .get(&inner_name)
@@ -760,9 +1083,12 @@ pub(super) fn decorrelate_scalar_with_read(
     };
 
     let num_corr = corr_pairs.len();
+    let key_collations = correlation_collations(corr_pairs);
+    let key_indices: Vec<usize> = (0..num_corr).collect();
     let mut map = FxHashMap::default();
-    for row in &qr.rows {
-        let key: Vec<Value> = row[..num_corr].to_vec();
+    for (row_idx, row) in qr.rows.iter().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
+        let key = correlation_key(row, &key_indices, &key_collations);
         if key.iter().any(|v| v.is_null()) {
             continue;
         }
@@ -774,6 +1100,7 @@ pub(super) fn decorrelate_scalar_with_read(
         map.insert(key, val);
     }
 
+    check_cancel(cancel)?;
     Ok(map)
 }
 
@@ -786,6 +1113,9 @@ pub(super) fn decorrelate_exists_write(
     corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
 ) -> Result<FxHashSet<Vec<Value>>> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    check_cancel(cancel)?;
     let inner_name = subquery.from.to_ascii_lowercase();
     let inner_schema = schema
         .get(&inner_name)
@@ -797,14 +1127,17 @@ pub(super) fn decorrelate_exists_write(
         .iter()
         .map(|p| inner_schema.column_index(&p.inner_col_name).unwrap_or(0))
         .collect();
+    let key_collations = correlation_collations(corr_pairs);
     let mut key_set = FxHashSet::default();
-    for row in &inner_rows {
-        let key: Vec<Value> = inner_col_indices.iter().map(|&i| row[i].clone()).collect();
+    for (row_idx, row) in inner_rows.iter().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
+        let key = correlation_key(row, &inner_col_indices, &key_collations);
         if key.iter().any(|v| v.is_null()) {
             continue;
         }
         key_set.insert(key);
     }
+    check_cancel(cancel)?;
     Ok(key_set)
 }
 
@@ -814,21 +1147,20 @@ pub(super) fn decorrelate_in_write(
     subquery: &SelectStmt,
     corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
+    value_collation: Collation,
 ) -> Result<InMap> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    check_cancel(cancel)?;
     let inner_name = subquery.from.to_ascii_lowercase();
     let inner_schema = schema
         .get(&inner_name)
         .ok_or_else(|| SqlError::TableNotFound(subquery.from.clone()))?;
-    let in_col_name = match &subquery.columns[0] {
-        SelectColumn::Expr {
-            expr: Expr::Column(name),
-            ..
-        } => name.to_ascii_lowercase(),
+    let in_expr = match &subquery.columns[0] {
+        SelectColumn::Expr { expr, .. } => expr,
         _ => return Err(SqlError::Unsupported("complex IN subquery column".into())),
     };
-    let in_col_idx = inner_schema
-        .column_index(&in_col_name)
-        .ok_or_else(|| SqlError::ColumnNotFound(in_col_name.clone()))?;
+    let in_col_idx = in_subquery_value_column_index(in_expr, inner_schema)?;
     let (inner_where, _non_eq) =
         strip_correlation_predicates(&subquery.where_clause, corr_pairs, ctx, inner_schema);
     let (inner_rows, _) = super::collect_rows_write(wtx, inner_schema, &inner_where, None)?;
@@ -836,21 +1168,24 @@ pub(super) fn decorrelate_in_write(
         .iter()
         .map(|p| inner_schema.column_index(&p.inner_col_name).unwrap_or(0))
         .collect();
-    let mut map: FxHashMap<Vec<Value>, FxHashSet<Value>> = FxHashMap::default();
-    let mut has_null_in_values = false;
-    for row in &inner_rows {
-        let key: Vec<Value> = inner_corr_indices.iter().map(|&i| row[i].clone()).collect();
+    let key_collations = correlation_collations(corr_pairs);
+    let mut map: InMap = FxHashMap::default();
+    for (row_idx, row) in inner_rows.iter().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
+        let key = correlation_key(row, &inner_corr_indices, &key_collations);
         if key.iter().any(|v| v.is_null()) {
             continue;
         }
         let in_val = row[in_col_idx].clone();
+        let entry = map.entry(key).or_default();
         if in_val.is_null() {
-            has_null_in_values = true;
+            entry.has_null = true;
         } else {
-            map.entry(key).or_default().insert(in_val);
+            entry.values.insert(value_collation.fold(in_val));
         }
     }
-    Ok((map, has_null_in_values))
+    check_cancel(cancel)?;
+    Ok(map)
 }
 
 pub(super) fn decorrelate_scalar_write(
@@ -860,6 +1195,9 @@ pub(super) fn decorrelate_scalar_write(
     corr_pairs: &[CorrEqPair],
     ctx: &CorrelationCtx,
 ) -> Result<FxHashMap<Vec<Value>, Value>> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    check_cancel(cancel)?;
     let inner_name = subquery.from.to_ascii_lowercase();
     let inner_schema = schema
         .get(&inner_name)
@@ -904,9 +1242,12 @@ pub(super) fn decorrelate_scalar_write(
         _ => return Ok(FxHashMap::default()),
     };
     let num_corr = corr_pairs.len();
+    let key_collations = correlation_collations(corr_pairs);
+    let key_indices: Vec<usize> = (0..num_corr).collect();
     let mut map = FxHashMap::default();
-    for row in &qr.rows {
-        let key: Vec<Value> = row[..num_corr].to_vec();
+    for (row_idx, row) in qr.rows.iter().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
+        let key = correlation_key(row, &key_indices, &key_collations);
         if key.iter().any(|v| v.is_null()) {
             continue;
         }
@@ -917,6 +1258,7 @@ pub(super) fn decorrelate_scalar_write(
         };
         map.insert(key, val);
     }
+    check_cancel(cancel)?;
     Ok(map)
 }
 
@@ -928,6 +1270,9 @@ pub(super) fn handle_correlated_where_write(
     ctx: &CorrelationCtx,
     rows: &mut Vec<Vec<Value>>,
 ) -> Result<Option<Expr>> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    check_cancel(cancel)?;
     let where_clause = match &stmt.where_clause {
         Some(w) => w,
         None => return Ok(None),
@@ -961,20 +1306,16 @@ pub(super) fn handle_correlated_where_write(
                         decorrelate_exists_write(wtx, schema, subquery, &corr_pairs, ctx)?;
                     let outer_col_indices: Vec<usize> =
                         corr_pairs.iter().map(|p| p.outer_col_idx).collect();
+                    let key_collations = correlation_collations(&corr_pairs);
                     let is_negated = *negated;
-                    rows.retain(|row| {
-                        let key: Vec<Value> =
-                            outer_col_indices.iter().map(|&i| row[i].clone()).collect();
+                    retain_cancellable(rows, cancel, |row| {
+                        let key = correlation_key(row, &outer_col_indices, &key_collations);
                         if key.iter().any(|v| v.is_null()) {
-                            return is_negated;
+                            return Ok(is_negated);
                         }
                         let found = key_set.contains(&key);
-                        if is_negated {
-                            !found
-                        } else {
-                            found
-                        }
-                    });
+                        Ok(if is_negated { !found } else { found })
+                    })?;
                 } else {
                     remaining_conjuncts.push(conj.clone());
                 }
@@ -1003,36 +1344,38 @@ pub(super) fn handle_correlated_where_write(
                         remaining_conjuncts.push(conj.clone());
                         continue;
                     }
-                    let (in_map, has_null) =
-                        decorrelate_in_write(wtx, schema, subquery, &corr_pairs, ctx)?;
+                    let col_map = ColumnMap::new(&ctx.outer_schema.columns);
+                    let selected_collation = in_subquery_value_collation(subquery, &inner_schema)?;
+                    let value_collation = crate::eval::operand_collation(in_expr, &col_map)
+                        .unwrap_or(selected_collation);
+                    let in_map = decorrelate_in_write(
+                        wtx,
+                        schema,
+                        subquery,
+                        &corr_pairs,
+                        ctx,
+                        value_collation,
+                    )?;
                     let outer_col_indices: Vec<usize> =
                         corr_pairs.iter().map(|p| p.outer_col_idx).collect();
+                    let key_collations = correlation_collations(&corr_pairs);
                     let is_negated = *negated;
-                    let col_map = ColumnMap::new(&ctx.outer_schema.columns);
-                    rows.retain(|row| {
-                        let key: Vec<Value> =
-                            outer_col_indices.iter().map(|&i| row[i].clone()).collect();
-                        let in_val = match eval_expr(in_expr, &EvalCtx::new(&col_map, row)) {
-                            Ok(v) => v,
-                            Err(_) => return false,
-                        };
-                        if in_val.is_null() {
-                            return false;
-                        }
-                        if key.iter().any(|v| v.is_null()) {
-                            return is_negated;
-                        }
-                        let found = in_map.get(&key).is_some_and(|vals| vals.contains(&in_val));
-                        if is_negated {
-                            if has_null && !found {
-                                false
-                            } else {
-                                !found
-                            }
+                    retain_cancellable(rows, cancel, |row| {
+                        let key = correlation_key(row, &outer_col_indices, &key_collations);
+                        let in_val =
+                            eval_expr(in_expr, &EvalCtx::new(&col_map, row).with_cancel(cancel))?;
+                        let group = if key.iter().any(|v| v.is_null()) {
+                            None
                         } else {
-                            found
-                        }
-                    });
+                            in_map.get(&key)
+                        };
+                        Ok(correlated_in_passes(
+                            group,
+                            in_val,
+                            value_collation,
+                            is_negated,
+                        ))
+                    })?;
                 } else {
                     remaining_conjuncts.push(conj.clone());
                 }
@@ -1060,29 +1403,29 @@ pub(super) fn handle_correlated_where_write(
                                     decorrelate_scalar_write(wtx, schema, sub, &corr_pairs, ctx)?;
                                 let outer_col_indices: Vec<usize> =
                                     corr_pairs.iter().map(|p| p.outer_col_idx).collect();
+                                let key_collations = correlation_collations(&corr_pairs);
                                 let cmp_op = *op;
                                 let left_expr = left.clone();
                                 let col_map = ColumnMap::new(&ctx.outer_schema.columns);
-                                rows.retain(|row| {
-                                    let key: Vec<Value> =
-                                        outer_col_indices.iter().map(|&i| row[i].clone()).collect();
+                                retain_cancellable(rows, cancel, |row| {
+                                    let key =
+                                        correlation_key(row, &outer_col_indices, &key_collations);
                                     let scalar_val =
                                         scalar_map.get(&key).cloned().unwrap_or(Value::Null);
-                                    let left_val =
-                                        match eval_expr(&left_expr, &EvalCtx::new(&col_map, row)) {
-                                            Ok(v) => v,
-                                            Err(_) => return false,
-                                        };
+                                    let left_val = eval_expr(
+                                        &left_expr,
+                                        &EvalCtx::new(&col_map, row).with_cancel(cancel),
+                                    )?;
                                     let cmp = Expr::BinaryOp {
                                         left: Box::new(Expr::Literal(left_val)),
                                         op: cmp_op,
                                         right: Box::new(Expr::Literal(scalar_val)),
                                     };
-                                    match eval_expr(&cmp, &EvalCtx::new(&col_map, row)) {
-                                        Ok(val) => is_truthy(&val),
-                                        Err(_) => false,
-                                    }
-                                });
+                                    Ok(is_truthy(&eval_expr(
+                                        &cmp,
+                                        &EvalCtx::new(&col_map, row).with_cancel(cancel),
+                                    )?))
+                                })?;
                                 handled = true;
                             }
                         }
@@ -1095,6 +1438,7 @@ pub(super) fn handle_correlated_where_write(
         }
     }
 
+    check_cancel(cancel)?;
     if remaining_conjuncts.is_empty() {
         Ok(None)
     } else {
@@ -1190,6 +1534,9 @@ pub(super) fn build_and_scan_correlated_with_read(
     outer_schema: &TableSchema,
     ctx: &CorrelationCtx,
 ) -> Result<(Vec<Vec<Value>>, Option<Expr>)> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    check_cancel(cancel)?;
     let where_clause = match &stmt.where_clause {
         Some(w) => w,
         None => {
@@ -1202,6 +1549,7 @@ pub(super) fn build_and_scan_correlated_with_read(
     let mut exists_filters: Vec<ExistsFilter> = Vec::new();
     let mut in_filters: Vec<InFilter> = Vec::new();
     let mut remaining_conjuncts: Vec<Expr> = Vec::new();
+    let outer_col_map = ColumnMap::new(&outer_schema.columns);
 
     for conj in &conjuncts {
         match conj {
@@ -1230,6 +1578,7 @@ pub(super) fn build_and_scan_correlated_with_read(
                 exists_filters.push(ExistsFilter {
                     result,
                     outer_col_indices,
+                    key_collations: correlation_collations(&corr_pairs),
                     negated: *negated,
                 });
             }
@@ -1256,14 +1605,24 @@ pub(super) fn build_and_scan_correlated_with_read(
                     remaining_conjuncts.push((*conj).clone());
                     continue;
                 }
-                let (map, has_null) =
-                    decorrelate_in_with_read(rtx, schema, subquery, &corr_pairs, ctx)?;
+                let selected_collation = in_subquery_value_collation(subquery, &inner_schema)?;
+                let value_collation = crate::eval::operand_collation(expr, &outer_col_map)
+                    .unwrap_or(selected_collation);
+                let map = decorrelate_in_with_read(
+                    rtx,
+                    schema,
+                    subquery,
+                    &corr_pairs,
+                    ctx,
+                    value_collation,
+                )?;
                 let outer_col_indices: Vec<usize> =
                     corr_pairs.iter().map(|p| p.outer_col_idx).collect();
                 in_filters.push(InFilter {
                     map,
-                    has_null,
                     outer_col_indices,
+                    key_collations: correlation_collations(&corr_pairs),
+                    value_collation,
                     in_expr: (**expr).clone(),
                     negated: *negated,
                 });
@@ -1283,8 +1642,6 @@ pub(super) fn build_and_scan_correlated_with_read(
     let num_pk_cols = outer_schema.primary_key_columns.len();
     let non_pk = outer_schema.non_pk_indices();
     let enc_pos = outer_schema.encoding_positions();
-    let outer_col_map = ColumnMap::new(&outer_schema.columns);
-
     // Pre-compute how to extract each needed outer column from raw bytes
     let mut needed_raw: Vec<(usize, RawColTarget)> = Vec::new();
     for ef in &exists_filters {
@@ -1328,17 +1685,24 @@ pub(super) fn build_and_scan_correlated_with_read(
             };
             col_vals.push((col_idx, val));
         }
+        let mut decoded_row: Option<Vec<Value>> = None;
 
         for ef in &exists_filters {
             outer_key.clear();
-            for &oci in &ef.outer_col_indices {
+            for (position, &oci) in ef.outer_col_indices.iter().enumerate() {
                 let val = col_vals
                     .iter()
                     .find(|(idx, _)| *idx == oci)
                     .unwrap()
                     .1
                     .clone();
-                outer_key.push(val);
+                outer_key.push(
+                    ef.key_collations
+                        .get(position)
+                        .copied()
+                        .unwrap_or(Collation::Binary)
+                        .fold(val),
+                );
             }
             if outer_key.iter().any(|v| v.is_null()) {
                 if !ef.negated {
@@ -1351,13 +1715,17 @@ pub(super) fn build_and_scan_correlated_with_read(
                 ExistsResult::Simple(set) => set.contains(&outer_key),
                 ExistsResult::WithFilter(filter_data) => {
                     // Non-equality correlation — need full decode for predicate eval
-                    let row = match decode_full_row(outer_schema, key, value) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            scan_err = Some(e);
-                            return false;
-                        }
-                    };
+                    if decoded_row.is_none() {
+                        decoded_row =
+                            match decode_full_row_with_cancel(outer_schema, key, value, cancel) {
+                                Ok(row) => Some(row),
+                                Err(e) => {
+                                    scan_err = Some(e);
+                                    return false;
+                                }
+                            };
+                    }
+                    let row = decoded_row.as_ref().unwrap();
                     let inner_col_map = filter_data.inner_schema.column_map();
                     let matched = match filter_data.rows_by_key.get(&outer_key) {
                         Some(inner_rows) if !inner_rows.is_empty() => {
@@ -1367,25 +1735,36 @@ pub(super) fn build_and_scan_correlated_with_read(
                                 .non_eq_predicates
                                 .iter()
                                 .map(|pred| {
-                                    bind_outer_values_in_expr(pred, &row, &outer_col_map, ctx)
+                                    bind_outer_values_in_expr(
+                                        pred,
+                                        row,
+                                        &outer_col_map,
+                                        inner_col_map,
+                                        ctx,
+                                    )
                                 })
                                 .collect();
-                            inner_rows.iter().any(|inner_row| {
-                                bound.iter().all(|b| {
-                                    match eval_expr(b, &EvalCtx::new(inner_col_map, inner_row)) {
-                                        Ok(v) => is_truthy(&v),
-                                        Err(_) => false,
+                            match any_cancellable(inner_rows, cancel, |inner_row| {
+                                for predicate in &bound {
+                                    if !is_truthy(&eval_expr(
+                                        predicate,
+                                        &EvalCtx::new(inner_col_map, inner_row).with_cancel(cancel),
+                                    )?) {
+                                        return Ok(false);
                                     }
-                                })
-                            })
+                                }
+                                Ok(true)
+                            }) {
+                                Ok(matched) => matched,
+                                Err(err) => {
+                                    scan_err = Some(err);
+                                    return false;
+                                }
+                            }
                         }
                         _ => false,
                     };
-                    let passes = if ef.negated { !matched } else { matched };
-                    if passes {
-                        rows.push(row);
-                    }
-                    return true; // Already handled — continue scan
+                    matched
                 }
             };
             if ef.negated == found {
@@ -1395,66 +1774,70 @@ pub(super) fn build_and_scan_correlated_with_read(
 
         for inf in &in_filters {
             corr_key.clear();
-            for &oci in &inf.outer_col_indices {
+            for (position, &oci) in inf.outer_col_indices.iter().enumerate() {
                 let val = col_vals
                     .iter()
                     .find(|(idx, _)| *idx == oci)
                     .unwrap()
                     .1
                     .clone();
-                corr_key.push(val);
+                corr_key.push(
+                    inf.key_collations
+                        .get(position)
+                        .copied()
+                        .unwrap_or(Collation::Binary)
+                        .fold(val),
+                );
             }
-            if corr_key.iter().any(|v| v.is_null()) {
-                if !inf.negated {
-                    return true;
-                } else {
-                    continue;
-                }
-            }
-            if let Some(values) = inf.map.get(&corr_key) {
+            let group = if corr_key.iter().any(|v| v.is_null()) {
+                None
+            } else {
+                inf.map.get(&corr_key)
+            };
+            if group.is_some() {
                 // Full decode needed for IN eval (subset: matching correlation keys only)
-                let row = match decode_full_row(outer_schema, key, value) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        scan_err = Some(e);
-                        return false;
-                    }
-                };
-                let in_val = match eval_expr(&inf.in_expr, &EvalCtx::new(&outer_col_map, &row)) {
+                if decoded_row.is_none() {
+                    decoded_row =
+                        match decode_full_row_with_cancel(outer_schema, key, value, cancel) {
+                            Ok(row) => Some(row),
+                            Err(e) => {
+                                scan_err = Some(e);
+                                return false;
+                            }
+                        };
+                }
+                let row = decoded_row.as_ref().unwrap();
+                let in_val = match eval_expr(
+                    &inf.in_expr,
+                    &EvalCtx::new(&outer_col_map, row).with_cancel(cancel),
+                ) {
                     Ok(v) => v,
                     Err(e) => {
                         scan_err = Some(e);
                         return false;
                     }
                 };
-                let found = if in_val.is_null() {
-                    false
-                } else {
-                    values.contains(&in_val)
-                };
-                let passes = if inf.negated {
-                    !found && !inf.has_null
-                } else {
-                    found
-                };
-                if !passes {
+                if !correlated_in_passes(group, in_val, inf.value_collation, inf.negated) {
                     return true;
                 }
-                rows.push(row);
+            } else if !correlated_in_passes(None, Value::Null, inf.value_collation, inf.negated) {
                 return true;
-            } else if !inf.negated {
-                return true; // No matching correlation key → not in set
             }
         }
 
-        // Row passed all filters — fully decode
-        match decode_full_row(outer_schema, key, value) {
-            Ok(row) => rows.push(row),
-            Err(e) => {
-                scan_err = Some(e);
-                return false;
-            }
-        }
+        // Row passed every filter. Reuse a full decode performed by a filtered
+        // EXISTS/IN clause, or decode once now for the output.
+        let row = match decoded_row {
+            Some(row) => row,
+            None => match decode_full_row_with_cancel(outer_schema, key, value, cancel) {
+                Ok(row) => row,
+                Err(e) => {
+                    scan_err = Some(e);
+                    return false;
+                }
+            },
+        };
+        rows.push(row);
         scan_err.is_none()
     })
     .map_err(SqlError::Storage)?;
@@ -1462,6 +1845,8 @@ pub(super) fn build_and_scan_correlated_with_read(
     if let Some(e) = scan_err {
         return Err(e);
     }
+
+    check_cancel(cancel)?;
 
     let remaining = if remaining_conjuncts.is_empty() {
         None
@@ -1525,13 +1910,15 @@ fn extract_raw_value(
 struct ExistsFilter {
     result: ExistsResult,
     outer_col_indices: Vec<usize>,
+    key_collations: Vec<Collation>,
     negated: bool,
 }
 
 struct InFilter {
-    map: FxHashMap<Vec<Value>, FxHashSet<Value>>,
-    has_null: bool,
+    map: InMap,
     outer_col_indices: Vec<usize>,
+    key_collations: Vec<Collation>,
+    value_collation: Collation,
     in_expr: Expr,
     negated: bool,
 }
@@ -1554,6 +1941,9 @@ pub(super) fn handle_correlated_where_with_read(
     ctx: &CorrelationCtx,
     rows: &mut Vec<Vec<Value>>,
 ) -> Result<Option<Expr>> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    check_cancel(cancel)?;
     let where_clause = match &stmt.where_clause {
         Some(w) => w,
         None => return Ok(None),
@@ -1588,33 +1978,27 @@ pub(super) fn handle_correlated_where_with_read(
                         decorrelate_exists_with_read(rtx, schema, subquery, &corr_pairs, ctx)?;
                     let outer_col_indices: Vec<usize> =
                         corr_pairs.iter().map(|p| p.outer_col_idx).collect();
+                    let key_collations = correlation_collations(&corr_pairs);
                     let is_negated = *negated;
                     match &exists_result {
                         ExistsResult::Simple(key_set) => {
-                            rows.retain(|row| {
-                                let key: Vec<Value> =
-                                    outer_col_indices.iter().map(|&i| row[i].clone()).collect();
+                            retain_cancellable(rows, cancel, |row| {
+                                let key = correlation_key(row, &outer_col_indices, &key_collations);
                                 if key.iter().any(|v| v.is_null()) {
-                                    return is_negated;
+                                    return Ok(is_negated);
                                 }
                                 let found = key_set.contains(&key);
-                                if is_negated {
-                                    !found
-                                } else {
-                                    found
-                                }
-                            });
+                                Ok(if is_negated { !found } else { found })
+                            })?;
                         }
                         ExistsResult::WithFilter(filter_data) => {
                             let inner_col_map = ColumnMap::new(&filter_data.inner_schema.columns);
                             let outer_col_map = ColumnMap::new(&ctx.outer_schema.columns);
-                            rows.retain(|outer_row| {
-                                let key: Vec<Value> = outer_col_indices
-                                    .iter()
-                                    .map(|&i| outer_row[i].clone())
-                                    .collect();
+                            retain_cancellable(rows, cancel, |outer_row| {
+                                let key =
+                                    correlation_key(outer_row, &outer_col_indices, &key_collations);
                                 if key.iter().any(|v| v.is_null()) {
-                                    return is_negated;
+                                    return Ok(is_negated);
                                 }
                                 let found = match filter_data.rows_by_key.get(&key) {
                                     Some(inner_rows) if !inner_rows.is_empty() => {
@@ -1627,30 +2011,28 @@ pub(super) fn handle_correlated_where_with_read(
                                                     pred,
                                                     outer_row,
                                                     &outer_col_map,
+                                                    &inner_col_map,
                                                     ctx,
                                                 )
                                             })
                                             .collect();
-                                        inner_rows.iter().any(|inner_row| {
-                                            bound.iter().all(|b| {
-                                                match eval_expr(
-                                                    b,
-                                                    &EvalCtx::new(&inner_col_map, inner_row),
-                                                ) {
-                                                    Ok(val) => is_truthy(&val),
-                                                    Err(_) => false,
+                                        any_cancellable(inner_rows, cancel, |inner_row| {
+                                            for predicate in &bound {
+                                                if !is_truthy(&eval_expr(
+                                                    predicate,
+                                                    &EvalCtx::new(&inner_col_map, inner_row)
+                                                        .with_cancel(cancel),
+                                                )?) {
+                                                    return Ok(false);
                                                 }
-                                            })
-                                        })
+                                            }
+                                            Ok(true)
+                                        })?
                                     }
                                     _ => false,
                                 };
-                                if is_negated {
-                                    !found
-                                } else {
-                                    found
-                                }
-                            });
+                                Ok(if is_negated { !found } else { found })
+                            })?;
                         }
                     }
                 } else {
@@ -1681,36 +2063,38 @@ pub(super) fn handle_correlated_where_with_read(
                         remaining_conjuncts.push(conj.clone());
                         continue;
                     }
-                    let (in_map, has_null) =
-                        decorrelate_in_with_read(rtx, schema, subquery, &corr_pairs, ctx)?;
+                    let col_map = ColumnMap::new(&ctx.outer_schema.columns);
+                    let selected_collation = in_subquery_value_collation(subquery, &inner_schema)?;
+                    let value_collation = crate::eval::operand_collation(in_expr, &col_map)
+                        .unwrap_or(selected_collation);
+                    let in_map = decorrelate_in_with_read(
+                        rtx,
+                        schema,
+                        subquery,
+                        &corr_pairs,
+                        ctx,
+                        value_collation,
+                    )?;
                     let outer_col_indices: Vec<usize> =
                         corr_pairs.iter().map(|p| p.outer_col_idx).collect();
                     let is_negated = *negated;
-                    let col_map = ColumnMap::new(&ctx.outer_schema.columns);
-                    rows.retain(|row| {
-                        let key: Vec<Value> =
-                            outer_col_indices.iter().map(|&i| row[i].clone()).collect();
-                        let in_val = match eval_expr(in_expr, &EvalCtx::new(&col_map, row)) {
-                            Ok(v) => v,
-                            Err(_) => return false,
-                        };
-                        if in_val.is_null() {
-                            return false; // NULL IN (...) is UNKNOWN
-                        }
-                        if key.iter().any(|v| v.is_null()) {
-                            return is_negated;
-                        }
-                        let found = in_map.get(&key).is_some_and(|vals| vals.contains(&in_val));
-                        if is_negated {
-                            if has_null && !found {
-                                false // NOT IN with NULL in set → UNKNOWN
-                            } else {
-                                !found
-                            }
+                    let key_collations = correlation_collations(&corr_pairs);
+                    retain_cancellable(rows, cancel, |row| {
+                        let key = correlation_key(row, &outer_col_indices, &key_collations);
+                        let in_val =
+                            eval_expr(in_expr, &EvalCtx::new(&col_map, row).with_cancel(cancel))?;
+                        let group = if key.iter().any(|v| v.is_null()) {
+                            None
                         } else {
-                            found
-                        }
-                    });
+                            in_map.get(&key)
+                        };
+                        Ok(correlated_in_passes(
+                            group,
+                            in_val,
+                            value_collation,
+                            is_negated,
+                        ))
+                    })?;
                 } else {
                     remaining_conjuncts.push(conj.clone());
                 }
@@ -1744,29 +2128,29 @@ pub(super) fn handle_correlated_where_with_read(
                                 )?;
                                 let outer_col_indices: Vec<usize> =
                                     corr_pairs.iter().map(|p| p.outer_col_idx).collect();
+                                let key_collations = correlation_collations(&corr_pairs);
                                 let cmp_op = *op;
                                 let left_expr = left.clone();
                                 let col_map = ColumnMap::new(&ctx.outer_schema.columns);
-                                rows.retain(|row| {
-                                    let key: Vec<Value> =
-                                        outer_col_indices.iter().map(|&i| row[i].clone()).collect();
+                                retain_cancellable(rows, cancel, |row| {
+                                    let key =
+                                        correlation_key(row, &outer_col_indices, &key_collations);
                                     let scalar_val =
                                         scalar_map.get(&key).cloned().unwrap_or(Value::Null);
-                                    let left_val =
-                                        match eval_expr(&left_expr, &EvalCtx::new(&col_map, row)) {
-                                            Ok(v) => v,
-                                            Err(_) => return false,
-                                        };
+                                    let left_val = eval_expr(
+                                        &left_expr,
+                                        &EvalCtx::new(&col_map, row).with_cancel(cancel),
+                                    )?;
                                     let cmp_expr = Expr::BinaryOp {
                                         left: Box::new(Expr::Literal(left_val)),
                                         op: cmp_op,
                                         right: Box::new(Expr::Literal(scalar_val)),
                                     };
-                                    match eval_expr(&cmp_expr, &EvalCtx::new(&col_map, row)) {
-                                        Ok(val) => is_truthy(&val),
-                                        Err(_) => false,
-                                    }
-                                });
+                                    Ok(is_truthy(&eval_expr(
+                                        &cmp_expr,
+                                        &EvalCtx::new(&col_map, row).with_cancel(cancel),
+                                    )?))
+                                })?;
                                 handled = true;
                             }
                         }
@@ -1779,6 +2163,7 @@ pub(super) fn handle_correlated_where_with_read(
         }
     }
 
+    check_cancel(cancel)?;
     if remaining_conjuncts.is_empty() {
         Ok(None)
     } else {

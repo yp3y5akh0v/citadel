@@ -4,11 +4,402 @@ use crate::encoding::{
     ProjectedOffsetPlan,
 };
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, ColumnMap, EvalCtx};
+use crate::eval::{eval_expr, is_truthy, operand_collation, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::types::*;
 
 pub(super) type ReturningRow = (Option<Vec<Value>>, Option<Vec<Value>>);
+
+pub(super) const CANCEL_CHECK_INTERVAL: usize = 256;
+const CANCELLABLE_SORT_RUN: usize = 1_024;
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct InjectedSortComparatorPanic;
+
+#[cfg(test)]
+thread_local! {
+    static PANIC_ON_NEXT_SORT_COMPARISON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct InjectSortComparatorPanic {
+    previous: bool,
+}
+
+#[cfg(test)]
+impl Drop for InjectSortComparatorPanic {
+    fn drop(&mut self) {
+        PANIC_ON_NEXT_SORT_COMPARISON.with(|armed| armed.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn inject_sort_comparator_panic() -> InjectSortComparatorPanic {
+    let previous = PANIC_ON_NEXT_SORT_COMPARISON.with(|armed| armed.replace(true));
+    InjectSortComparatorPanic { previous }
+}
+
+#[cfg(test)]
+fn maybe_inject_sort_comparator_panic() {
+    PANIC_ON_NEXT_SORT_COMPARISON.with(|armed| {
+        if armed.replace(false) {
+            std::panic::panic_any(InjectedSortComparatorPanic);
+        }
+    });
+}
+
+#[inline]
+pub(super) fn check_cancel(cancel: Option<&citadel::CancelToken>) -> Result<()> {
+    if cancel.is_some_and(|token| token.is_cancelled()) {
+        Err(SqlError::Storage(citadel_core::Error::Interrupted))
+    } else {
+        Ok(())
+    }
+}
+
+#[inline]
+pub(super) fn check_cancel_at(
+    cancel: Option<&citadel::CancelToken>,
+    iteration: usize,
+) -> Result<()> {
+    let Some(token) = cancel else {
+        return Ok(());
+    };
+    if iteration.is_multiple_of(CANCEL_CHECK_INTERVAL) && token.is_cancelled() {
+        return Err(SqlError::Storage(citadel_core::Error::Interrupted));
+    }
+    Ok(())
+}
+
+#[inline]
+fn check_sort_cancel(cancel: Option<&citadel::CancelToken>) -> Result<()> {
+    check_cancel(cancel)
+}
+
+/// Stable-sort row indices without using unwinding as control flow. With no token
+/// this stays on the standard-library fast path; with one, cancellation is bounded
+/// by `CANCELLABLE_SORT_RUN` and loops poll every `CANCEL_CHECK_INTERVAL`
+/// comparisons. Only indices move, so the caller's rows survive a cancellation.
+pub(super) fn sort_indices_by(
+    indices: &mut [usize],
+    cancel: Option<&citadel::CancelToken>,
+    mut compare: impl FnMut(usize, usize) -> std::cmp::Ordering,
+) -> Result<()> {
+    check_sort_cancel(cancel)?;
+    if indices.len() < 2 {
+        return Ok(());
+    }
+
+    if cancel.is_none() {
+        indices.sort_by(|&a, &b| {
+            #[cfg(test)]
+            maybe_inject_sort_comparator_panic();
+            compare(a, b)
+        });
+        return Ok(());
+    }
+
+    for run in indices.chunks_mut(CANCELLABLE_SORT_RUN) {
+        run.sort_by(|&a, &b| compare(a, b));
+        check_sort_cancel(cancel)?;
+    }
+    if indices.len() <= CANCELLABLE_SORT_RUN {
+        return Ok(());
+    }
+
+    let len = indices.len();
+    let mut scratch = indices.to_vec();
+    let mut width = CANCELLABLE_SORT_RUN;
+    let mut source_is_indices = true;
+    let mut merge_work = 0usize;
+
+    while width < len {
+        if source_is_indices {
+            merge_index_runs(
+                indices,
+                &mut scratch,
+                width,
+                cancel,
+                &mut merge_work,
+                &mut compare,
+            )?;
+        } else {
+            merge_index_runs(
+                &scratch,
+                indices,
+                width,
+                cancel,
+                &mut merge_work,
+                &mut compare,
+            )?;
+        }
+        source_is_indices = !source_is_indices;
+        width = width.saturating_mul(2);
+        check_sort_cancel(cancel)?;
+    }
+
+    if !source_is_indices {
+        indices.copy_from_slice(&scratch);
+    }
+    Ok(())
+}
+
+/// Sort owned materialized values with cancellable index movement. The common
+/// no-token path stays on the standard-library sort; the token path does not
+/// move a value until the fallible index sort has completed.
+pub(crate) fn sort_vec_by<T>(
+    mut values: Vec<T>,
+    cancel: Option<&citadel::CancelToken>,
+    mut compare: impl FnMut(&T, &T) -> std::cmp::Ordering,
+) -> Result<Vec<T>> {
+    check_cancel(cancel)?;
+    if cancel.is_none() {
+        values.sort_by(compare);
+        return Ok(values);
+    }
+    sort_vec_by_indices(values, cancel, &mut compare)
+}
+
+pub(super) fn sort_lists_by_len<T>(
+    lists: Vec<Vec<T>>,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<Vec<T>>> {
+    sort_vec_by(lists, cancel, |a, b| a.len().cmp(&b.len()))
+}
+
+/// As [`sort_vec_by`], retaining the allocation-free unstable std path when
+/// cancellation is not installed.
+pub(super) fn sort_vec_unstable_by<T>(
+    mut values: Vec<T>,
+    cancel: Option<&citadel::CancelToken>,
+    mut compare: impl FnMut(&T, &T) -> std::cmp::Ordering,
+) -> Result<Vec<T>> {
+    check_cancel(cancel)?;
+    if cancel.is_none() {
+        values.sort_unstable_by(compare);
+        return Ok(values);
+    }
+    sort_vec_by_indices(values, cancel, &mut compare)
+}
+
+fn sort_vec_by_indices<T>(
+    values: Vec<T>,
+    cancel: Option<&citadel::CancelToken>,
+    compare: &mut impl FnMut(&T, &T) -> std::cmp::Ordering,
+) -> Result<Vec<T>> {
+    let mut indices: Vec<usize> = (0..values.len()).collect();
+    sort_indices_by(&mut indices, cancel, |a, b| compare(&values[a], &values[b]))?;
+    check_cancel(cancel)?;
+
+    let len = values.len();
+    let mut slots: Vec<Option<T>> = values.into_iter().map(Some).collect();
+    let mut sorted = Vec::with_capacity(len);
+    for (output_idx, source_idx) in indices.into_iter().enumerate() {
+        check_cancel_at(cancel, output_idx)?;
+        sorted.push(slots[source_idx].take().expect("sort index used once"));
+    }
+    check_cancel(cancel)?;
+    Ok(sorted)
+}
+
+fn merge_index_runs(
+    source: &[usize],
+    destination: &mut [usize],
+    width: usize,
+    cancel: Option<&citadel::CancelToken>,
+    work: &mut usize,
+    compare: &mut impl FnMut(usize, usize) -> std::cmp::Ordering,
+) -> Result<()> {
+    let len = source.len();
+    let step = width.saturating_mul(2);
+    let mut start = 0;
+
+    while start < len {
+        let middle = start.saturating_add(width).min(len);
+        let end = start.saturating_add(step).min(len);
+        let (mut left, mut right, mut out) = (start, middle, start);
+
+        while left < middle && right < end {
+            check_cancel_at(cancel, *work)?;
+            *work = work.wrapping_add(1);
+            if compare(source[left], source[right]) != std::cmp::Ordering::Greater {
+                destination[out] = source[left];
+                left += 1;
+            } else {
+                destination[out] = source[right];
+                right += 1;
+            }
+            out += 1;
+        }
+
+        let left_len = middle - left;
+        destination[out..out + left_len].copy_from_slice(&source[left..middle]);
+        out += left_len;
+        destination[out..out + end - right].copy_from_slice(&source[right..end]);
+        start = end;
+    }
+    Ok(())
+}
+
+/// Move the selected rows only after the fallible index work has completed.
+/// On the token path, cancellation during collection restores every row to its
+/// source slot before returning. The final assignment moves only `Vec` handles
+/// and is the sort's completion boundary.
+fn reorder_rows_by_indices(
+    rows: &mut [Vec<Value>],
+    indices: &[usize],
+    output_len: usize,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<()> {
+    debug_assert!(output_len <= indices.len());
+    if cancel.is_none() {
+        let sorted: Vec<Vec<Value>> = indices[..output_len]
+            .iter()
+            .map(|&source_idx| std::mem::take(&mut rows[source_idx]))
+            .collect();
+        rows[..output_len]
+            .iter_mut()
+            .zip(sorted)
+            .for_each(|(slot, row)| *slot = row);
+        return Ok(());
+    }
+
+    let mut selected: Vec<(usize, Vec<Value>)> = Vec::with_capacity(output_len);
+    for (output_idx, &source_idx) in indices[..output_len].iter().enumerate() {
+        if let Err(err) = check_cancel_at(cancel, output_idx) {
+            for (source_idx, row) in selected {
+                rows[source_idx] = row;
+            }
+            return Err(err);
+        }
+        selected.push((source_idx, std::mem::take(&mut rows[source_idx])));
+    }
+    if let Err(err) = check_cancel(cancel) {
+        for (source_idx, row) in selected {
+            rows[source_idx] = row;
+        }
+        return Err(err);
+    }
+    for (output_idx, (_, row)) in selected.into_iter().enumerate() {
+        rows[output_idx] = row;
+    }
+    Ok(())
+}
+
+/// Keep the smallest `k` indices in the first `k` slots, sorted. The token path
+/// uses a fallible three-way introselect, preserving the expected linear-time
+/// shape of `select_nth_unstable_by` while bounding adversarial partitions with
+/// a checked sort fallback.
+pub(super) fn topk_indices_by(
+    indices: &mut [usize],
+    k: usize,
+    cancel: Option<&citadel::CancelToken>,
+    mut compare: impl FnMut(usize, usize) -> std::cmp::Ordering,
+) -> Result<()> {
+    check_sort_cancel(cancel)?;
+    if k == 0 || indices.is_empty() {
+        return Ok(());
+    }
+    debug_assert!(k <= indices.len());
+
+    if cancel.is_none() {
+        if k < indices.len() {
+            indices.select_nth_unstable_by(k - 1, |&a, &b| compare(a, b));
+        }
+        indices[..k].sort_by(|&a, &b| compare(a, b));
+        return Ok(());
+    }
+
+    if k < indices.len() {
+        select_index_nth(indices, k - 1, cancel, &mut compare)?;
+    }
+    sort_indices_by(&mut indices[..k], cancel, &mut compare)?;
+    check_sort_cancel(cancel)
+}
+
+fn select_index_nth(
+    indices: &mut [usize],
+    nth: usize,
+    cancel: Option<&citadel::CancelToken>,
+    compare: &mut impl FnMut(usize, usize) -> std::cmp::Ordering,
+) -> Result<()> {
+    let mut left = 0;
+    let mut right = indices.len();
+    let log2 = usize::BITS as usize - indices.len().leading_zeros() as usize;
+    let mut partition_budget = log2.saturating_mul(2);
+    let mut comparison_work = 0usize;
+
+    while right - left > 1 {
+        if partition_budget == 0 {
+            return sort_indices_by(&mut indices[left..right], cancel, compare);
+        }
+        partition_budget -= 1;
+
+        let middle = left + (right - left) / 2;
+        let pivot = median_index_value(
+            indices[left],
+            indices[middle],
+            indices[right - 1],
+            cancel,
+            &mut comparison_work,
+            compare,
+        )?;
+        let (mut lower, mut cursor, mut upper) = (left, left, right);
+
+        while cursor < upper {
+            check_cancel_at(cancel, comparison_work)?;
+            comparison_work = comparison_work.wrapping_add(1);
+            match compare(indices[cursor], pivot) {
+                std::cmp::Ordering::Less => {
+                    indices.swap(lower, cursor);
+                    lower += 1;
+                    cursor += 1;
+                }
+                std::cmp::Ordering::Equal => cursor += 1,
+                std::cmp::Ordering::Greater => {
+                    upper -= 1;
+                    indices.swap(cursor, upper);
+                }
+            }
+        }
+
+        if nth < lower {
+            right = lower;
+        } else if nth >= upper {
+            left = upper;
+        } else {
+            return check_sort_cancel(cancel);
+        }
+    }
+    check_sort_cancel(cancel)
+}
+
+fn median_index_value(
+    mut a: usize,
+    mut b: usize,
+    mut c: usize,
+    cancel: Option<&citadel::CancelToken>,
+    work: &mut usize,
+    compare: &mut impl FnMut(usize, usize) -> std::cmp::Ordering,
+) -> Result<usize> {
+    check_cancel_at(cancel, *work)?;
+    *work = work.wrapping_add(1);
+    if compare(a, b) == std::cmp::Ordering::Greater {
+        std::mem::swap(&mut a, &mut b);
+    }
+    check_cancel_at(cancel, *work)?;
+    *work = work.wrapping_add(1);
+    if compare(b, c) == std::cmp::Ordering::Greater {
+        std::mem::swap(&mut b, &mut c);
+    }
+    check_cancel_at(cancel, *work)?;
+    *work = work.wrapping_add(1);
+    if compare(a, b) == std::cmp::Ordering::Greater {
+        std::mem::swap(&mut a, &mut b);
+    }
+    Ok(b)
+}
 
 pub fn drain_deferred_fk_checks(wtx: &mut citadel_txn::write_txn::WriteTxn<'_>) -> Result<()> {
     let checks = wtx.take_deferred_fk_checks();
@@ -127,11 +518,22 @@ pub(super) fn detect_fast_gen_eval(expr: &Expr, table_schema: &TableSchema) -> F
     FastGenEval::None
 }
 
+#[cfg(test)]
 pub(super) fn eval_fast_gen(
     fast: &FastGenEval,
     expr: &Expr,
     partial_row: &[Value],
     col_map: &ColumnMap,
+) -> Result<Value> {
+    eval_fast_gen_with_cancel(fast, expr, partial_row, col_map, None)
+}
+
+pub(super) fn eval_fast_gen_with_cancel(
+    fast: &FastGenEval,
+    expr: &Expr,
+    partial_row: &[Value],
+    col_map: &ColumnMap,
+    cancel: Option<&citadel::CancelToken>,
 ) -> Result<Value> {
     match fast {
         FastGenEval::IntColMulAdd {
@@ -140,26 +542,36 @@ pub(super) fn eval_fast_gen(
             add,
         } => match partial_row[*col_schema_idx] {
             Value::Integer(v) => Ok(Value::Integer(v.wrapping_mul(*mul).wrapping_add(*add))),
-            _ => eval_expr(expr, &EvalCtx::new(col_map, partial_row)),
+            _ => eval_expr(
+                expr,
+                &EvalCtx::new(col_map, partial_row).with_cancel(cancel),
+            ),
         },
         FastGenEval::IntColAddCol {
             left_idx,
             right_idx,
         } => match (&partial_row[*left_idx], &partial_row[*right_idx]) {
             (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a.wrapping_add(*b))),
-            _ => eval_expr(expr, &EvalCtx::new(col_map, partial_row)),
+            _ => eval_expr(
+                expr,
+                &EvalCtx::new(col_map, partial_row).with_cancel(cancel),
+            ),
         },
-        FastGenEval::None => eval_expr(expr, &EvalCtx::new(col_map, partial_row)),
+        FastGenEval::None => eval_expr(
+            expr,
+            &EvalCtx::new(col_map, partial_row).with_cancel(cancel),
+        ),
     }
 }
 
-/// Checked variant of [`eval_fast_gen`]: integer overflow returns `IntegerOverflow` (never
-/// wraps); non-integer/NULL operands fall back to `eval_expr`, so results are byte-identical.
-pub(super) fn eval_fast_gen_checked(
+/// Integer overflow returns `IntegerOverflow` (never wraps); non-integer/NULL operands
+/// fall back to `eval_expr`, so results are byte-identical.
+pub(super) fn eval_fast_gen_checked_with_cancel(
     fast: &FastGenEval,
     expr: &Expr,
     partial_row: &[Value],
     col_map: &ColumnMap,
+    cancel: Option<&citadel::CancelToken>,
 ) -> Result<Value> {
     match fast {
         FastGenEval::IntColMulAdd {
@@ -172,7 +584,10 @@ pub(super) fn eval_fast_gen_checked(
                 .and_then(|p| p.checked_add(*add))
                 .map(Value::Integer)
                 .ok_or(SqlError::IntegerOverflow),
-            _ => eval_expr(expr, &EvalCtx::new(col_map, partial_row)),
+            _ => eval_expr(
+                expr,
+                &EvalCtx::new(col_map, partial_row).with_cancel(cancel),
+            ),
         },
         FastGenEval::IntColAddCol {
             left_idx,
@@ -182,9 +597,15 @@ pub(super) fn eval_fast_gen_checked(
                 .checked_add(*b)
                 .map(Value::Integer)
                 .ok_or(SqlError::IntegerOverflow),
-            _ => eval_expr(expr, &EvalCtx::new(col_map, partial_row)),
+            _ => eval_expr(
+                expr,
+                &EvalCtx::new(col_map, partial_row).with_cancel(cancel),
+            ),
         },
-        FastGenEval::None => eval_expr(expr, &EvalCtx::new(col_map, partial_row)),
+        FastGenEval::None => eval_expr(
+            expr,
+            &EvalCtx::new(col_map, partial_row).with_cancel(cancel),
+        ),
     }
 }
 
@@ -207,6 +628,24 @@ pub(super) struct PartialDecodeCtx {
 
 impl PartialDecodeCtx {
     pub(super) fn new(schema: &TableSchema, needed: &[usize]) -> Self {
+        Self::new_inner(schema, needed, None, false)
+            .expect("non-strict partial decoder construction cannot fail")
+    }
+
+    pub(super) fn new_with_cancel(
+        schema: &TableSchema,
+        needed: &[usize],
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Self> {
+        Self::new_inner(schema, needed, cancel, true)
+    }
+
+    fn new_inner(
+        schema: &TableSchema,
+        needed: &[usize],
+        cancel: Option<&citadel::CancelToken>,
+        propagate_default_error: bool,
+    ) -> Result<Self> {
         let non_pk = schema.non_pk_indices();
         let enc_pos = schema.encoding_positions();
         let mut pk_positions = Vec::new();
@@ -280,8 +719,10 @@ impl PartialDecodeCtx {
         let mut nonpk_defaults = Vec::new();
         for (&phys_pos, &schema_col) in nonpk_targets.iter().zip(nonpk_schema.iter()) {
             if let Some(ref expr) = schema.columns[schema_col].default_expr {
-                if let Ok(val) = eval_const_expr(expr) {
-                    nonpk_defaults.push((phys_pos, schema_col, val));
+                match eval_const_expr_with_cancel(expr, cancel) {
+                    Ok(val) => nonpk_defaults.push((phys_pos, schema_col, val)),
+                    Err(e) if propagate_default_error => return Err(e),
+                    Err(_) => {}
                 }
             }
         }
@@ -291,8 +732,10 @@ impl PartialDecodeCtx {
             .zip(remaining_nonpk_schema.iter())
         {
             if let Some(ref expr) = schema.columns[schema_col].default_expr {
-                if let Ok(val) = eval_const_expr(expr) {
-                    remaining_defaults.push((phys_pos, schema_col, val));
+                match eval_const_expr_with_cancel(expr, cancel) {
+                    Ok(val) => remaining_defaults.push((phys_pos, schema_col, val)),
+                    Err(e) if propagate_default_error => return Err(e),
+                    Err(_) => {}
                 }
             }
         }
@@ -316,7 +759,7 @@ impl PartialDecodeCtx {
         reset_cols.sort_unstable();
         reset_cols.dedup();
 
-        Self {
+        Ok(Self {
             pk_positions,
             nonpk_targets,
             nonpk_schema,
@@ -330,12 +773,16 @@ impl PartialDecodeCtx {
             virtuals_to_eval,
             col_map: ColumnMap::new(&schema.columns),
             reset_cols,
-        }
+        })
     }
 
-    fn materialize_virtuals(&self, row: &mut [Value]) -> Result<()> {
+    fn materialize_virtuals(
+        &self,
+        row: &mut [Value],
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<()> {
         for (pos, expr, dt, nullable, fast) in &self.virtuals_to_eval {
-            let val = eval_fast_gen_checked(fast, expr, row, &self.col_map)?;
+            let val = eval_fast_gen_checked_with_cancel(fast, expr, row, &self.col_map, cancel)?;
             row[*pos] = if val.is_null() {
                 if !*nullable {
                     return Err(SqlError::InvalidValue(format!(
@@ -354,14 +801,24 @@ impl PartialDecodeCtx {
         Ok(())
     }
 
-    pub(super) fn decode(&self, key: &[u8], value: &[u8]) -> Result<Vec<Value>> {
+    pub(super) fn decode_with_cancel(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<Vec<Value>> {
         let mut row = Vec::new();
-        self.decode_into(key, value, &mut row)?;
+        self.decode_into_with_cancel(key, value, &mut row, cancel)?;
         Ok(row)
     }
 
-    /// Decode the needed columns into a reused `row` buffer; others stay NULL.
-    pub(super) fn decode_into(&self, key: &[u8], value: &[u8], row: &mut Vec<Value>) -> Result<()> {
+    pub(super) fn decode_into_with_cancel(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        row: &mut Vec<Value>,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<()> {
         if row.len() != self.num_cols {
             row.clear();
             row.resize(self.num_cols, Value::Null);
@@ -396,7 +853,7 @@ impl PartialDecodeCtx {
         }
 
         if !self.virtuals_to_eval.is_empty() {
-            self.materialize_virtuals(row)?;
+            self.materialize_virtuals(row, cancel)?;
         }
 
         Ok(())
@@ -536,13 +993,14 @@ impl ProjectedDecoder {
     }
 }
 
-pub(crate) fn decode_full_row(
+pub(crate) fn decode_full_row_with_cancel(
     schema: &TableSchema,
     key: &[u8],
     value: &[u8],
+    cancel: Option<&citadel::CancelToken>,
 ) -> Result<Vec<Value>> {
     let mut row = Vec::with_capacity(schema.columns.len());
-    decode_full_row_into(schema, key, value, &mut row)?;
+    decode_full_row_into_with_cancel(schema, key, value, &mut row, cancel)?;
     Ok(row)
 }
 
@@ -572,11 +1030,12 @@ pub(crate) fn decode_full_row_push(
 }
 
 #[inline]
-pub(crate) fn decode_full_row_into(
+pub(crate) fn decode_full_row_into_with_cancel(
     schema: &TableSchema,
     key: &[u8],
     value: &[u8],
     row: &mut Vec<Value>,
+    cancel: Option<&citadel::CancelToken>,
 ) -> Result<()> {
     if row.len() != schema.columns.len() {
         row.clear();
@@ -599,20 +1058,24 @@ pub(crate) fn decode_full_row_into(
         for &logical_idx in mapping.iter().skip(stored_count) {
             if logical_idx != usize::MAX {
                 if let Some(ref expr) = schema.columns[logical_idx].default_expr {
-                    row[logical_idx] = eval_const_expr(expr)?;
+                    row[logical_idx] = eval_const_expr_with_cancel(expr, cancel)?;
                 }
             }
         }
     }
     if schema.has_virtual_columns() {
-        materialize_virtual(schema, row)?;
+        materialize_virtual_with_cancel(schema, row, cancel)?;
     }
     Ok(())
 }
 
 /// Caller must ensure all non-virtual columns in `row` are already populated.
 #[inline]
-pub(crate) fn materialize_virtual(schema: &TableSchema, row: &mut [Value]) -> Result<()> {
+pub(crate) fn materialize_virtual_with_cancel(
+    schema: &TableSchema,
+    row: &mut [Value],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<()> {
     let col_map = schema.column_map();
     for col in &schema.columns {
         if matches!(
@@ -621,7 +1084,7 @@ pub(crate) fn materialize_virtual(schema: &TableSchema, row: &mut [Value]) -> Re
         ) {
             let val = eval_expr(
                 col.generated_expr.as_ref().unwrap(),
-                &EvalCtx::new(col_map, row),
+                &EvalCtx::new(col_map, row).with_cancel(cancel),
             )?;
             let pos = col.position as usize;
             row[pos] = if val.is_null() {
@@ -640,9 +1103,16 @@ pub(crate) fn materialize_virtual(schema: &TableSchema, row: &mut [Value]) -> Re
 }
 
 pub(super) fn eval_const_expr(expr: &Expr) -> Result<Value> {
+    eval_const_expr_with_cancel(expr, None)
+}
+
+pub(super) fn eval_const_expr_with_cancel(
+    expr: &Expr,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Value> {
     static EMPTY: std::sync::OnceLock<ColumnMap> = std::sync::OnceLock::new();
     let empty = EMPTY.get_or_init(|| ColumnMap::new(&[]));
-    eval_expr(expr, &EvalCtx::new(empty, &[]))
+    eval_expr(expr, &EvalCtx::new(empty, &[]).with_cancel(cancel))
 }
 
 pub(super) fn eval_const_int(expr: &Expr) -> Result<i64> {
@@ -659,7 +1129,9 @@ pub(super) fn sort_rows(
     rows: &mut [Vec<Value>],
     order_by: &[OrderByItem],
     columns: &[ColumnDef],
+    cancel: Option<&citadel::CancelToken>,
 ) -> Result<()> {
+    validate_order_by_ordinals(order_by, columns.len())?;
     if rows.is_empty() {
         return Ok(());
     }
@@ -669,14 +1141,15 @@ pub(super) fn sort_rows(
     if let Some(col_idx) = try_resolve_flat_sort_col(order_by, &col_map) {
         let desc = order_by[0].descending;
         let nulls_first = order_by[0].nulls_first.unwrap_or(!desc);
-        indices.sort_by(|&a, &b| {
+        sort_indices_by(&mut indices, cancel, |a, b| {
             compare_flat_key(&rows[a][col_idx], &rows[b][col_idx], desc, nulls_first)
-        });
+        })?;
     } else if let Some((col_idx, coll)) = try_resolve_collated_flat_sort(order_by, &col_map) {
         let desc = order_by[0].descending;
         let nulls_first = order_by[0].nulls_first.unwrap_or(!desc);
-        let keys = precompute_collated_keys(rows, col_idx, coll);
-        indices.sort_by(|&a, &b| {
+        let keys = precompute_collated_keys_with_cancel(rows, col_idx, coll, cancel)?;
+        check_sort_cancel(cancel)?;
+        sort_indices_by(&mut indices, cancel, |a, b| {
             compare_collated_key(
                 &keys[a],
                 &keys[b],
@@ -685,21 +1158,62 @@ pub(super) fn sort_rows(
                 desc,
                 nulls_first,
             )
-        });
+        })?;
     } else {
-        let keys = extract_sort_keys(rows, order_by, &col_map);
+        let keys = extract_sort_keys_with_cancel(rows, order_by, &col_map, cancel)?;
         let collations = sort_key_collations(order_by, &col_map);
-        indices.sort_by(|&a, &b| compare_sort_keys(&keys[a], &keys[b], order_by, &collations));
+        check_sort_cancel(cancel)?;
+        sort_indices_by(&mut indices, cancel, |a, b| {
+            compare_sort_keys(&keys[a], &keys[b], order_by, &collations)
+        })?;
     }
+    check_sort_cancel(cancel)?;
 
-    let sorted: Vec<Vec<Value>> = indices
-        .iter()
-        .map(|&i| std::mem::take(&mut rows[i]))
-        .collect();
-    rows.iter_mut()
-        .zip(sorted)
-        .for_each(|(slot, row)| *slot = row);
-    Ok(())
+    reorder_rows_by_indices(rows, &indices, rows.len(), cancel)
+}
+
+/// Sort `rows` by keys taken from the rows they were projected FROM. `SELECT
+/// DISTINCT` is the only path that sorts after projecting, so its keys must be
+/// extracted first; every other path sorts source rows via [`sort_rows`].
+pub(super) fn sort_rows_by_keys(
+    rows: &mut [Vec<Value>],
+    keys: &[Vec<Value>],
+    order_by: &[OrderByItem],
+    collations: &[crate::types::Collation],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<()> {
+    debug_assert_eq!(rows.len(), keys.len(), "a key per row");
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut indices: Vec<usize> = (0..rows.len()).collect();
+
+    sort_indices_by(&mut indices, cancel, |a, b| {
+        compare_sort_keys(&keys[a], &keys[b], order_by, collations)
+    })?;
+    check_sort_cancel(cancel)?;
+
+    reorder_rows_by_indices(rows, &indices, rows.len(), cancel)
+}
+
+pub(super) fn topk_rows_by_keys(
+    rows: &mut [Vec<Value>],
+    keys: &[Vec<Value>],
+    order_by: &[OrderByItem],
+    collations: &[crate::types::Collation],
+    k: usize,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<()> {
+    debug_assert_eq!(rows.len(), keys.len(), "a key per row");
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut indices: Vec<usize> = (0..rows.len()).collect();
+    topk_indices_by(&mut indices, k, cancel, |a, b| {
+        compare_sort_keys(&keys[a], &keys[b], order_by, collations)
+    })?;
+    check_sort_cancel(cancel)?;
+    reorder_rows_by_indices(rows, &indices, k, cancel)
 }
 
 pub(super) fn topk_rows(
@@ -707,23 +1221,24 @@ pub(super) fn topk_rows(
     order_by: &[OrderByItem],
     columns: &[ColumnDef],
     k: usize,
+    cancel: Option<&citadel::CancelToken>,
 ) -> Result<()> {
+    validate_order_by_ordinals(order_by, columns.len())?;
     let col_map = ColumnMap::new(columns);
     let mut indices: Vec<usize> = (0..rows.len()).collect();
 
     if let Some(col_idx) = try_resolve_flat_sort_col(order_by, &col_map) {
         let desc = order_by[0].descending;
         let nulls_first = order_by[0].nulls_first.unwrap_or(!desc);
-        let cmp = |&a: &usize, &b: &usize| {
+        topk_indices_by(&mut indices, k, cancel, |a, b| {
             compare_flat_key(&rows[a][col_idx], &rows[b][col_idx], desc, nulls_first)
-        };
-        indices.select_nth_unstable_by(k - 1, cmp);
-        indices[..k].sort_by(cmp);
+        })?;
     } else if let Some((col_idx, coll)) = try_resolve_collated_flat_sort(order_by, &col_map) {
         let desc = order_by[0].descending;
         let nulls_first = order_by[0].nulls_first.unwrap_or(!desc);
-        let keys = precompute_collated_keys(rows, col_idx, coll);
-        let cmp = |&a: &usize, &b: &usize| {
+        let keys = precompute_collated_keys_with_cancel(rows, col_idx, coll, cancel)?;
+        check_sort_cancel(cancel)?;
+        topk_indices_by(&mut indices, k, cancel, |a, b| {
             compare_collated_key(
                 &keys[a],
                 &keys[b],
@@ -732,27 +1247,53 @@ pub(super) fn topk_rows(
                 desc,
                 nulls_first,
             )
-        };
-        indices.select_nth_unstable_by(k - 1, cmp);
-        indices[..k].sort_by(cmp);
+        })?;
     } else {
-        let keys = extract_sort_keys(rows, order_by, &col_map);
+        let keys = extract_sort_keys_with_cancel(rows, order_by, &col_map, cancel)?;
         let collations = sort_key_collations(order_by, &col_map);
-        let cmp =
-            |&a: &usize, &b: &usize| compare_sort_keys(&keys[a], &keys[b], order_by, &collations);
-        indices.select_nth_unstable_by(k - 1, cmp);
-        indices[..k].sort_by(cmp);
+        check_sort_cancel(cancel)?;
+        topk_indices_by(&mut indices, k, cancel, |a, b| {
+            compare_sort_keys(&keys[a], &keys[b], order_by, &collations)
+        })?;
     }
+    check_sort_cancel(cancel)?;
 
-    let sorted: Vec<Vec<Value>> = indices[..k]
-        .iter()
-        .map(|&i| std::mem::take(&mut rows[i]))
-        .collect();
-    rows[..k]
-        .iter_mut()
-        .zip(sorted)
-        .for_each(|(slot, row)| *slot = row);
+    reorder_rows_by_indices(rows, &indices, k, cancel)
+}
+
+pub(super) fn order_by_uses_projected_output(item: &OrderByItem) -> bool {
+    item.output_name.is_some() || item.output_ordinal.is_some()
+}
+
+pub(super) fn validate_order_by_ordinals(
+    order_by: &[OrderByItem],
+    output_width: usize,
+) -> Result<()> {
+    for item in order_by {
+        if let Some(position) = item.output_ordinal {
+            if position >= output_width {
+                return Err(SqlError::InvalidValue(format!(
+                    "ORDER BY position {} out of range",
+                    position + 1
+                )));
+            }
+        }
+    }
     Ok(())
+}
+
+pub(super) fn order_by_output_position(
+    item: &OrderByItem,
+    output_map: &ColumnMap,
+) -> Result<Option<usize>> {
+    if let Some(position) = item.output_ordinal {
+        validate_order_by_ordinals(std::slice::from_ref(item), output_map.len())?;
+        return Ok(Some(position));
+    }
+    item.output_name
+        .as_ref()
+        .map(|name| output_map.resolve(&name.to_ascii_lowercase()))
+        .transpose()
 }
 
 pub(super) fn try_resolve_flat_sort_col(
@@ -761,6 +1302,13 @@ pub(super) fn try_resolve_flat_sort_col(
 ) -> Option<usize> {
     if order_by.len() != 1 {
         return None;
+    }
+    if let Some(idx) = order_by[0].output_ordinal {
+        return (col_map.collation_at(idx) == crate::types::Collation::Binary).then_some(idx);
+    }
+    if let Some(name) = &order_by[0].output_name {
+        let idx = col_map.resolve(&name.to_ascii_lowercase()).ok()?;
+        return (col_map.collation_at(idx) == crate::types::Collation::Binary).then_some(idx);
     }
     match &order_by[0].expr {
         Expr::Column(name) => {
@@ -777,6 +1325,15 @@ pub(super) fn try_resolve_collated_flat_sort(
 ) -> Option<(usize, crate::types::Collation)> {
     if order_by.len() != 1 {
         return None;
+    }
+    if let Some(idx) = order_by[0].output_ordinal {
+        let coll = col_map.collation_at(idx);
+        return (coll != crate::types::Collation::Binary).then_some((idx, coll));
+    }
+    if let Some(name) = &order_by[0].output_name {
+        let idx = col_map.resolve(&name.to_ascii_lowercase()).ok()?;
+        let coll = col_map.collation_at(idx);
+        return (coll != crate::types::Collation::Binary).then_some((idx, coll));
     }
     match &order_by[0].expr {
         Expr::Collate { expr: e, collation } => match e.as_ref() {
@@ -856,6 +1413,37 @@ pub(super) fn precompute_collated_keys(
         .collect()
 }
 
+pub(super) fn precompute_collated_keys_with_cancel(
+    rows: &[Vec<Value>],
+    col_idx: usize,
+    coll: crate::types::Collation,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<CollatedKey>> {
+    check_cancel(cancel)?;
+    if cancel.is_none() {
+        return Ok(precompute_collated_keys(rows, col_idx, coll));
+    }
+    let mut keys = Vec::with_capacity(rows.len());
+    for (row_idx, row) in rows.iter().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
+        keys.push(match &row[col_idx] {
+            Value::Null => CollatedKey::Null,
+            Value::Text(s) => match coll {
+                crate::types::Collation::Binary => CollatedKey::Text(s.to_string()),
+                crate::types::Collation::NoCase => {
+                    CollatedKey::Text(s.as_str().to_ascii_lowercase())
+                }
+                crate::types::Collation::Rtrim => {
+                    CollatedKey::Text(s.trim_end_matches(' ').to_string())
+                }
+            },
+            _ => CollatedKey::Other,
+        });
+    }
+    check_cancel(cancel)?;
+    Ok(keys)
+}
+
 pub(super) fn compare_collated_key(
     a: &CollatedKey,
     b: &CollatedKey,
@@ -894,17 +1482,59 @@ pub(super) fn extract_sort_keys(
     rows: &[Vec<Value>],
     order_by: &[OrderByItem],
     col_map: &ColumnMap,
-) -> Vec<Vec<Value>> {
+) -> Result<Vec<Vec<Value>>> {
     rows.iter()
         .map(|row| {
             order_by
                 .iter()
-                .map(|item| {
-                    eval_expr(&item.expr, &EvalCtx::new(col_map, row)).unwrap_or(Value::Null)
-                })
-                .collect()
+                .map(|item| sort_item_value(item, row, col_map, None))
+                .collect::<Result<Vec<_>>>()
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()
+}
+
+pub(super) fn extract_sort_keys_with_cancel(
+    rows: &[Vec<Value>],
+    order_by: &[OrderByItem],
+    col_map: &ColumnMap,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<Vec<Value>>> {
+    check_cancel(cancel)?;
+    if cancel.is_none() {
+        return extract_sort_keys(rows, order_by, col_map);
+    }
+    let mut keys = Vec::with_capacity(rows.len());
+    for (row_idx, row) in rows.iter().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
+        keys.push(
+            order_by
+                .iter()
+                .map(|item| sort_item_value(item, row, col_map, cancel))
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    check_cancel(cancel)?;
+    Ok(keys)
+}
+
+fn sort_item_value(
+    item: &OrderByItem,
+    row: &[Value],
+    col_map: &ColumnMap,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Value> {
+    if let Some(position) = item.output_ordinal {
+        return row.get(position).cloned().ok_or_else(|| {
+            SqlError::InvalidValue(format!("ORDER BY position {} out of range", position + 1))
+        });
+    }
+    if let Some(name) = &item.output_name {
+        let index = col_map.resolve(&name.to_ascii_lowercase())?;
+        return row.get(index).cloned().ok_or_else(|| {
+            SqlError::InvalidValue(format!("ORDER BY column `{name}` is outside the row"))
+        });
+    }
+    eval_expr(&item.expr, &EvalCtx::new(col_map, row).with_cancel(cancel))
 }
 
 pub(super) fn compare_sort_keys(
@@ -959,22 +1589,134 @@ pub(super) fn compare_sort_keys(
     std::cmp::Ordering::Equal
 }
 
+/// A column that carries a name, a position and a collation and nothing else: the shape of a
+/// projected value, which has no stored column behind it to describe.
+pub(crate) fn projected_column(
+    name: String,
+    position: usize,
+    collation: crate::types::Collation,
+) -> ColumnDef {
+    ColumnDef {
+        name,
+        data_type: DataType::Null,
+        nullable: true,
+        position: position as u16,
+        default_expr: None,
+        default_sql: None,
+        check_expr: None,
+        check_sql: None,
+        check_name: None,
+        is_with_timezone: false,
+        generated_expr: None,
+        generated_sql: None,
+        generated_kind: None,
+        collation,
+    }
+}
+
+/// The collation a key expression carries: an explicit COLLATE anywhere in it, else a
+/// column's own preserved through CAST wrappers. Anything else has none. Grouping,
+/// deduplicating and sorting all key expressions by this same rule.
+pub(crate) fn expr_collation(expr: &Expr, col_map: &ColumnMap) -> crate::types::Collation {
+    operand_collation(expr, col_map).unwrap_or(crate::types::Collation::Binary)
+}
+
 pub(super) fn sort_key_collations(
     order_by: &[OrderByItem],
     col_map: &ColumnMap,
 ) -> Vec<crate::types::Collation> {
     order_by
         .iter()
-        .map(|item| match &item.expr {
-            Expr::Collate { collation, .. } => *collation,
-            Expr::Column(name) => col_map
-                .resolve(&name.to_ascii_lowercase())
-                .ok()
-                .map(|i| col_map.collation_at(i))
-                .unwrap_or(crate::types::Collation::Binary),
-            _ => crate::types::Collation::Binary,
+        .map(|item| {
+            item.output_ordinal
+                .map(|index| col_map.collation_at(index))
+                .or_else(|| {
+                    item.output_name
+                        .as_ref()
+                        .and_then(|name| col_map.resolve(&name.to_ascii_lowercase()).ok())
+                        .map(|index| col_map.collation_at(index))
+                })
+                .unwrap_or_else(|| expr_collation(&item.expr, col_map))
         })
         .collect()
+}
+
+/// The collation of each PROJECTED column, for deduplicating rows that have already been
+/// projected. `*` expands to the source columns, so it contributes one entry each.
+pub(crate) fn output_collations(
+    select_cols: &[SelectColumn],
+    col_map: &ColumnMap,
+) -> Vec<crate::types::Collation> {
+    let mut out = Vec::with_capacity(select_cols.len());
+    for col in select_cols {
+        match col {
+            SelectColumn::AllColumns | SelectColumn::AllFromOld | SelectColumn::AllFromNew => {
+                out.extend((0..col_map.len()).map(|i| col_map.collation_at(i)));
+            }
+            SelectColumn::Expr { expr, .. } => out.push(expr_collation(expr, col_map)),
+        }
+    }
+    out
+}
+
+/// A row folded into the key that decides its equality. A row longer than `collations` keeps
+/// its extra values as they are, which is the binary comparison they had before.
+pub(crate) fn fold_key(row: &[Value], collations: &[crate::types::Collation]) -> Vec<Value> {
+    row.iter()
+        .enumerate()
+        .map(|(i, v)| match collations.get(i) {
+            Some(coll) => coll.fold(v.clone()),
+            None => v.clone(),
+        })
+        .collect()
+}
+
+/// The set of rows already seen, under the collations that decide when two of them are
+/// the same row. When nothing collates the probe borrows the row, so only a surviving
+/// row is copied; folding a key for every row would allocate once per duplicate.
+pub(crate) struct RowKeys {
+    seen: rustc_hash::FxHashSet<Vec<Value>>,
+    collations: Vec<crate::types::Collation>,
+    folding: bool,
+}
+
+impl RowKeys {
+    pub(crate) fn new(collations: Vec<crate::types::Collation>) -> Self {
+        Self::with_capacity(collations, 0)
+    }
+
+    pub(crate) fn with_capacity(collations: Vec<crate::types::Collation>, cap: usize) -> Self {
+        let folding = collations
+            .iter()
+            .any(|c| *c != crate::types::Collation::Binary);
+        Self {
+            seen: rustc_hash::FxHashSet::with_capacity_and_hasher(cap, Default::default()),
+            collations,
+            folding,
+        }
+    }
+
+    /// True the first time this row is seen.
+    pub(crate) fn insert(&mut self, row: &[Value]) -> bool {
+        if self.folding {
+            return self.seen.insert(fold_key(row, &self.collations));
+        }
+        if self.seen.contains(row) {
+            false
+        } else {
+            self.seen.insert(row.to_vec());
+            true
+        }
+    }
+
+    /// Whether this row was already seen, borrowing it when nothing has to be folded.
+    pub(crate) fn contains_row(&self, row: &[Value]) -> bool {
+        if self.folding {
+            self.seen.contains(&fold_key(row, &self.collations))
+        } else {
+            self.seen.contains(row)
+        }
+    }
 }
 
 pub(super) fn try_identity_projection_names(
@@ -1075,8 +1817,18 @@ pub(super) fn try_build_index_map(
 pub(super) fn project_rows(
     columns: &[ColumnDef],
     select_cols: &[SelectColumn],
-    mut rows: Vec<Vec<Value>>,
+    rows: Vec<Vec<Value>>,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    project_rows_with_cancel(columns, select_cols, rows, None)
+}
+
+pub(super) fn project_rows_with_cancel(
+    columns: &[ColumnDef],
+    select_cols: &[SelectColumn],
+    mut rows: Vec<Vec<Value>>,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    check_cancel(cancel)?;
     if select_cols.len() == 1 && matches!(select_cols[0], SelectColumn::AllColumns) {
         let col_names = columns.iter().map(|c| c.name.clone()).collect();
         return Ok((col_names, rows));
@@ -1091,19 +1843,32 @@ pub(super) fn project_rows(
         if map.len() == columns.len() && map.iter().enumerate().all(|(i, &(_, idx))| idx == i) {
             return Ok((col_names, rows));
         }
-        let projected = rows
-            .iter_mut()
-            .map(|row| {
+        if cancel.is_none() {
+            let projected = rows
+                .iter_mut()
+                .map(|row| {
+                    map.iter()
+                        .map(|&(_, idx)| std::mem::take(&mut row[idx]))
+                        .collect()
+                })
+                .collect();
+            return Ok((col_names, projected));
+        }
+        let mut projected = Vec::with_capacity(rows.len());
+        for (row_idx, row) in rows.iter_mut().enumerate() {
+            check_cancel_at(cancel, row_idx)?;
+            projected.push(
                 map.iter()
                     .map(|&(_, idx)| std::mem::take(&mut row[idx]))
-                    .collect()
-            })
-            .collect();
+                    .collect(),
+            );
+        }
+        check_cancel(cancel)?;
         return Ok((col_names, projected));
     }
 
     let mut col_names = Vec::new();
-    type Projector = Box<dyn Fn(&[Value]) -> Result<Value>>;
+    type Projector = Box<dyn Fn(&[Value], Option<&citadel::CancelToken>) -> Result<Value>>;
     let mut projectors: Vec<Projector> = Vec::new();
     let col_map = std::sync::Arc::new(ColumnMap::new(columns));
 
@@ -1113,7 +1878,7 @@ pub(super) fn project_rows(
                 for col in columns {
                     let idx = col.position as usize;
                     col_names.push(col.name.clone());
-                    projectors.push(Box::new(move |row: &[Value]| Ok(row[idx].clone())));
+                    projectors.push(Box::new(move |row: &[Value], _| Ok(row[idx].clone())));
                 }
             }
             SelectColumn::Expr { expr, alias } => {
@@ -1121,22 +1886,37 @@ pub(super) fn project_rows(
                 col_names.push(name);
                 let expr = expr.clone();
                 let map = col_map.clone();
-                projectors.push(Box::new(move |row: &[Value]| {
-                    eval_expr(&expr, &EvalCtx::new(&map, row))
+                projectors.push(Box::new(move |row: &[Value], cancel| {
+                    eval_expr(&expr, &EvalCtx::new(&map, row).with_cancel(cancel))
                 }));
             }
         }
     }
 
-    let projected = rows
-        .iter()
-        .map(|row| {
+    if cancel.is_none() {
+        let projected = rows
+            .iter()
+            .map(|row| {
+                projectors
+                    .iter()
+                    .map(|p| p(row, cancel))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok((col_names, projected));
+    }
+
+    let mut projected = Vec::with_capacity(rows.len());
+    for (row_idx, row) in rows.iter().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
+        projected.push(
             projectors
                 .iter()
-                .map(|p| p(row))
-                .collect::<Result<Vec<_>>>()
-        })
-        .collect::<Result<Vec<_>>>()?;
+                .map(|p| p(row, cancel))
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    check_cancel(cancel)?;
 
     Ok((col_names, projected))
 }
@@ -1145,6 +1925,7 @@ pub(super) fn project_returning(
     table_schema: &TableSchema,
     returning: &[SelectColumn],
     rows: &[ReturningRow],
+    cancel: Option<&citadel::CancelToken>,
 ) -> Result<QueryResult> {
     let columns = &table_schema.columns;
     let col_map = table_schema.column_map();
@@ -1165,7 +1946,8 @@ pub(super) fn project_returning(
     let mut out_rows = Vec::with_capacity(rows.len());
     for (old, new) in rows {
         let default_row: &[Value] = new.as_deref().or(old.as_deref()).unwrap_or(&[]);
-        let ctx = EvalCtx::with_old_new(col_map, default_row, old.as_deref(), new.as_deref());
+        let ctx = EvalCtx::with_old_new(col_map, default_row, old.as_deref(), new.as_deref())
+            .with_cancel(cancel);
 
         let mut out = Vec::with_capacity(col_names.len());
         for sel_col in returning {
@@ -1292,35 +2074,36 @@ pub(crate) fn build_output_columns(
     columns: &[ColumnDef],
 ) -> Vec<ColumnDef> {
     let mut out = Vec::new();
-    for (i, col) in select_cols.iter().enumerate() {
-        let (name, data_type) = match col {
+    let col_map = ColumnMap::new(columns);
+    for col in select_cols {
+        let (name, data_type, collation) = match col {
             SelectColumn::AllColumns | SelectColumn::AllFromOld | SelectColumn::AllFromNew => {
-                (format!("col{i}"), DataType::Null)
+                for source in columns {
+                    let mut projected =
+                        projected_column(source.name.clone(), out.len(), source.collation);
+                    projected.data_type = source.data_type;
+                    projected.nullable = source.nullable;
+                    out.push(projected);
+                }
+                continue;
             }
             SelectColumn::Expr {
                 alias: Some(a),
                 expr,
-            } => (a.clone(), infer_expr_type(expr, columns)),
-            SelectColumn::Expr { expr, .. } => {
-                (expr_display_name(expr), infer_expr_type(expr, columns))
-            }
+            } => (
+                a.clone(),
+                infer_expr_type(expr, columns),
+                expr_collation(expr, &col_map),
+            ),
+            SelectColumn::Expr { expr, .. } => (
+                expr_display_name(expr),
+                infer_expr_type(expr, columns),
+                expr_collation(expr, &col_map),
+            ),
         };
-        out.push(ColumnDef {
-            name,
-            data_type,
-            nullable: true,
-            position: i as u16,
-            default_expr: None,
-            default_sql: None,
-            check_expr: None,
-            check_sql: None,
-            check_name: None,
-            is_with_timezone: false,
-            generated_expr: None,
-            generated_sql: None,
-            generated_kind: None,
-            collation: crate::types::Collation::Binary,
-        });
+        let mut projected = projected_column(name, out.len(), collation);
+        projected.data_type = data_type;
+        out.push(projected);
     }
     out
 }
@@ -1363,6 +2146,28 @@ pub(super) fn encode_index_key_with_schema(
     buf
 }
 
+pub(super) fn encode_index_key_with_schema_and_cancel(
+    idx: &IndexDef,
+    row: &[Value],
+    pk_values: &[Value],
+    schema: &TableSchema,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<u8>> {
+    if idx.is_pure_column_index() {
+        return Ok(encode_index_key_with_schema(idx, row, pk_values, schema));
+    }
+    let mut buf = Vec::new();
+    encode_index_key_into_with_schema_and_cancel(
+        idx,
+        row,
+        pk_values,
+        Some(schema),
+        &mut buf,
+        cancel,
+    )?;
+    Ok(buf)
+}
+
 /// If the index has expression keys but `schema` is None, expression results are NULL.
 pub(super) fn encode_index_key_into_with_schema(
     idx: &IndexDef,
@@ -1403,6 +2208,33 @@ pub(super) fn encode_index_key_into_with_schema(
     }
 }
 
+pub(super) fn encode_index_key_into_with_schema_and_cancel(
+    idx: &IndexDef,
+    row: &[Value],
+    pk_values: &[Value],
+    schema: Option<&TableSchema>,
+    buf: &mut Vec<u8>,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<()> {
+    if idx.is_pure_column_index() {
+        encode_index_key_into_with_schema(idx, row, pk_values, schema, buf);
+        return Ok(());
+    }
+    buf.clear();
+    let key_values = materialize_index_key_values_with_cancel(idx, row, schema, cancel)?;
+    let any_null = idx.unique && key_values.iter().any(Value::is_null);
+    let include_pk = !idx.unique || any_null;
+    for (i, value) in key_values.iter().enumerate() {
+        encode_index_key_component(value, idx.collation_at(i), buf);
+    }
+    if include_pk {
+        for value in pk_values {
+            crate::encoding::encode_key_value_into(value, buf);
+        }
+    }
+    Ok(())
+}
+
 #[inline]
 fn encode_index_key_component(value: &Value, coll: crate::types::Collation, buf: &mut Vec<u8>) {
     if coll == crate::types::Collation::Binary {
@@ -1429,6 +2261,30 @@ pub(super) fn materialize_index_key_values(
                     crate::eval::eval_expr(expr, &ctx).unwrap_or(Value::Null)
                 }
                 None => Value::Null,
+            },
+        })
+        .collect()
+}
+
+pub(super) fn materialize_index_key_values_with_cancel(
+    idx: &IndexDef,
+    row: &[Value],
+    schema: Option<&TableSchema>,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<Value>> {
+    let col_map = schema.map(TableSchema::column_map);
+    idx.keys
+        .iter()
+        .map(|key| match key {
+            crate::types::IndexKey::Column { idx: col_idx, .. } => {
+                Ok(row[*col_idx as usize].clone())
+            }
+            crate::types::IndexKey::Expr { expr, .. } => match col_map.as_ref() {
+                Some(cm) => crate::eval::eval_expr(
+                    expr,
+                    &crate::eval::EvalCtx::new(cm, row).with_cancel(cancel),
+                ),
+                None => Ok(Value::Null),
             },
         })
         .collect()
@@ -1467,6 +2323,8 @@ pub(super) fn insert_index_entries(
     row: &[Value],
     pk_values: &[Value],
 ) -> Result<()> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     let col_map = any_partial_index(table_schema).then(|| table_schema.column_map());
     IDX_KEY_BUF.with(|kb| {
         IDX_TABLE_BUF.with(|tb| {
@@ -1474,7 +2332,7 @@ pub(super) fn insert_index_entries(
             let mut table_buf = tb.borrow_mut();
             for idx in &table_schema.indices {
                 if let Some(cm) = col_map.as_ref() {
-                    if !row_matches_partial(idx, row, cm) {
+                    if !row_matches_partial_with_cancel(idx, row, cm, cancel)? {
                         continue;
                     }
                 }
@@ -1485,13 +2343,14 @@ pub(super) fn insert_index_entries(
                     continue;
                 }
 
-                encode_index_key_into_with_schema(
+                encode_index_key_into_with_schema_and_cancel(
                     idx,
                     row,
                     pk_values,
                     Some(table_schema),
                     &mut key_buf,
-                );
+                    cancel,
+                )?;
                 let value = encode_index_value(idx, row, pk_values);
 
                 let is_new = wtx
@@ -1520,47 +2379,72 @@ pub(crate) fn build_inverted_key(entry_bytes: &[u8], row_pk_encoded: &[u8]) -> V
     k
 }
 
-pub(crate) fn extract_inverted_entries(
+pub(crate) fn extract_inverted_entries_with_cancel(
     value: &Value,
     kind: crate::types::InvertedKind,
+    cancel: Option<&citadel::CancelToken>,
 ) -> Result<Vec<Vec<u8>>> {
     match kind {
-        crate::types::InvertedKind::Gin(ops) => crate::json::extract_gin_entries(value, ops),
-        crate::types::InvertedKind::Fts { config_id } => extract_fts_lexemes(value, config_id),
+        crate::types::InvertedKind::Gin(ops) => {
+            crate::json::extract_gin_entries_with_cancel(value, ops, cancel)
+        }
+        crate::types::InvertedKind::Fts { config_id } => {
+            extract_fts_lexemes(value, config_id, cancel)
+        }
         crate::types::InvertedKind::Ann { .. } => Ok(Vec::new()),
     }
 }
 
-pub(crate) fn extract_inverted_entries_with_values(
+pub(crate) fn extract_inverted_entries_with_values_and_cancel(
     value: &Value,
     kind: crate::types::InvertedKind,
+    cancel: Option<&citadel::CancelToken>,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     match kind {
         crate::types::InvertedKind::Gin(ops) => {
-            let keys = crate::json::extract_gin_entries(value, ops)?;
-            Ok(keys.into_iter().map(|k| (k, Vec::new())).collect())
+            let keys = crate::json::extract_gin_entries_with_cancel(value, ops, cancel)?;
+            if cancel.is_none() {
+                return Ok(keys.into_iter().map(|key| (key, Vec::new())).collect());
+            }
+            let mut entries = Vec::with_capacity(keys.len());
+            for (work, key) in keys.into_iter().enumerate() {
+                check_cancel_at(cancel, work)?;
+                entries.push((key, Vec::new()));
+            }
+            check_cancel(cancel)?;
+            Ok(entries)
         }
         crate::types::InvertedKind::Fts { config_id } => {
-            extract_fts_lexemes_with_positions(value, config_id)
+            extract_fts_lexemes_with_positions(value, config_id, cancel)
         }
         crate::types::InvertedKind::Ann { .. } => Ok(Vec::new()),
     }
 }
 
-fn extract_fts_lexemes(value: &Value, config_id: u8) -> Result<Vec<Vec<u8>>> {
+fn extract_fts_lexemes(
+    value: &Value,
+    config_id: u8,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<Vec<u8>>> {
+    check_cancel(cancel)?;
     let kind = crate::fts::TokenizerKind::from_config_id(config_id)?;
     let mut lexemes: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
     match value {
         Value::Null => return Ok(Vec::new()),
         Value::TsVector(bytes) => {
             let (_flags, reader) = crate::fts::TsVectorReader::open(bytes)?;
-            for item in reader {
+            for (work, item) in reader.enumerate() {
+                check_cancel_at(cancel, work)?;
                 let (lex, _positions) = item?;
                 lexemes.insert(lex.to_vec());
             }
         }
         Value::Text(s) => {
-            for tok in crate::fts::tokenize(kind, s) {
+            for (work, tok) in crate::fts::tokenize_with_cancel(kind, s, cancel)?
+                .into_iter()
+                .enumerate()
+            {
+                check_cancel_at(cancel, work)?;
                 if tok.stopped || tok.lexeme.is_empty() {
                     continue;
                 }
@@ -1574,13 +2458,22 @@ fn extract_fts_lexemes(value: &Value, config_id: u8) -> Result<Vec<Vec<u8>>> {
             )));
         }
     }
-    Ok(lexemes.into_iter().collect())
+    check_cancel(cancel)?;
+    let mut out = Vec::with_capacity(lexemes.len());
+    for (work, lexeme) in lexemes.into_iter().enumerate() {
+        check_cancel_at(cancel, work)?;
+        out.push(lexeme);
+    }
+    check_cancel(cancel)?;
+    Ok(out)
 }
 
 fn extract_fts_lexemes_with_positions(
     value: &Value,
     config_id: u8,
+    cancel: Option<&citadel::CancelToken>,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    check_cancel(cancel)?;
     let kind = crate::fts::TokenizerKind::from_config_id(config_id)?;
     let mut by_lex: std::collections::BTreeMap<Vec<u8>, Vec<u16>> =
         std::collections::BTreeMap::new();
@@ -1588,13 +2481,18 @@ fn extract_fts_lexemes_with_positions(
         Value::Null => return Ok(Vec::new()),
         Value::TsVector(bytes) => {
             let (_flags, reader) = crate::fts::TsVectorReader::open(bytes)?;
-            for item in reader {
+            for (work, item) in reader.enumerate() {
+                check_cancel_at(cancel, work)?;
                 let (lex, positions) = item?;
                 by_lex.entry(lex.to_vec()).or_default().extend(positions);
             }
         }
         Value::Text(s) => {
-            for tok in crate::fts::tokenize(kind, s) {
+            for (work, tok) in crate::fts::tokenize_with_cancel(kind, s, cancel)?
+                .into_iter()
+                .enumerate()
+            {
+                check_cancel_at(cancel, work)?;
                 if tok.stopped || tok.lexeme.is_empty() {
                     continue;
                 }
@@ -1613,7 +2511,8 @@ fn extract_fts_lexemes_with_positions(
         }
     }
     let mut out = Vec::with_capacity(by_lex.len());
-    for (lex, mut positions) in by_lex {
+    for (work, (lex, mut positions)) in by_lex.into_iter().enumerate() {
+        check_cancel_at(cancel, work)?;
         positions.sort_unstable();
         positions.dedup();
         let mut value_bytes = Vec::with_capacity(positions.len() * 2);
@@ -1622,6 +2521,7 @@ fn extract_fts_lexemes_with_positions(
         }
         out.push((lex, value_bytes));
     }
+    check_cancel(cancel)?;
     Ok(out)
 }
 
@@ -1640,7 +2540,8 @@ fn insert_inverted_entries(
     if value.is_null() {
         return Ok(());
     }
-    let entries = extract_inverted_entries_with_values(value, kind)?;
+    let cancel = wtx.cancel_token().cloned();
+    let entries = extract_inverted_entries_with_values_and_cancel(value, kind, cancel.as_ref())?;
     let pk_encoded = crate::encoding::encode_composite_key(pk_values);
     for (entry, val_bytes) in entries {
         let full_key = build_inverted_key(&entry, &pk_encoded);
@@ -1657,15 +2558,18 @@ pub(super) fn insert_index_entries_or_fetch(
     pk_values: &[Value],
     inserted_keys: &mut Vec<(usize, Vec<u8>)>,
 ) -> Result<Option<usize>> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     let col_map = any_partial_index(table_schema).then(|| table_schema.column_map());
     for (i, idx) in table_schema.indices.iter().enumerate() {
         if let Some(cm) = col_map.as_ref() {
-            if !row_matches_partial(idx, row, cm) {
+            if !row_matches_partial_with_cancel(idx, row, cm, cancel)? {
                 continue;
             }
         }
         let idx_table = TableSchema::index_table_name(&table_schema.name, &idx.name);
-        let key = encode_index_key_with_schema(idx, row, pk_values, table_schema);
+        let key =
+            encode_index_key_with_schema_and_cancel(idx, row, pk_values, table_schema, cancel)?;
         let value = encode_index_value(idx, row, pk_values);
 
         if idx.unique {
@@ -1726,10 +2630,12 @@ pub(super) fn delete_index_entries(
     row: &[Value],
     pk_values: &[Value],
 ) -> Result<()> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     let col_map = any_partial_index(table_schema).then(|| table_schema.column_map());
     for idx in &table_schema.indices {
         if let Some(cm) = col_map.as_ref() {
-            if !row_matches_partial(idx, row, cm) {
+            if !row_matches_partial_with_cancel(idx, row, cm, cancel)? {
                 continue;
             }
         }
@@ -1738,7 +2644,8 @@ pub(super) fn delete_index_entries(
             delete_inverted_entries(wtx, idx, inv_kind, row, pk_values, &idx_table)?;
             continue;
         }
-        let key = encode_index_key_with_schema(idx, row, pk_values, table_schema);
+        let key =
+            encode_index_key_with_schema_and_cancel(idx, row, pk_values, table_schema, cancel)?;
         wtx.table_delete(&idx_table, &key)
             .map_err(SqlError::Storage)?;
     }
@@ -1760,7 +2667,8 @@ fn delete_inverted_entries(
     if value.is_null() {
         return Ok(());
     }
-    let entries = extract_inverted_entries(value, kind)?;
+    let cancel = wtx.cancel_token().cloned();
+    let entries = extract_inverted_entries_with_cancel(value, kind, cancel.as_ref())?;
     let pk_encoded = crate::encoding::encode_composite_key(pk_values);
     for entry in entries {
         let full_key = build_inverted_key(&entry, &pk_encoded);
@@ -1770,9 +2678,22 @@ fn delete_inverted_entries(
     Ok(())
 }
 
-pub(super) fn index_columns_changed(idx: &IndexDef, old_row: &[Value], new_row: &[Value]) -> bool {
-    idx.column_positions_iter()
-        .any(|col_idx| old_row[col_idx as usize] != new_row[col_idx as usize])
+pub(super) fn index_columns_changed(
+    idx: &IndexDef,
+    old_row: &[Value],
+    new_row: &[Value],
+    schema: &TableSchema,
+) -> bool {
+    idx.keys.iter().any(|key| match key {
+        crate::types::IndexKey::Column { idx: col_idx, .. } => {
+            old_row[*col_idx as usize] != new_row[*col_idx as usize]
+        }
+        crate::types::IndexKey::Expr { expr, .. } => {
+            crate::eval::referenced_columns(expr, &schema.columns)
+                .into_iter()
+                .any(|col_idx| old_row[col_idx] != new_row[col_idx])
+        }
+    })
 }
 
 /// NULL or eval errors -> false (treated as predicate-false).
@@ -1784,6 +2705,21 @@ pub(super) fn row_matches_partial(idx: &IndexDef, row: &[Value], col_map: &Colum
         Ok(v) => is_truthy(&v),
         Err(_) => false,
     }
+}
+
+pub(super) fn row_matches_partial_with_cancel(
+    idx: &IndexDef,
+    row: &[Value],
+    col_map: &ColumnMap,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<bool> {
+    let Some(expr) = idx.predicate_expr.as_ref() else {
+        return Ok(row_matches_partial(idx, row, col_map));
+    };
+    Ok(is_truthy(&crate::eval::eval_expr(
+        expr,
+        &EvalCtx::new(col_map, row).with_cancel(cancel),
+    )?))
 }
 
 pub(super) fn any_partial_index(table_schema: &TableSchema) -> bool {
@@ -1812,6 +2748,33 @@ pub(super) fn partial_idx_update_actions(
     let del = old_match && (key_changed || !new_match);
     let ins = new_match && (key_changed || !old_match);
     (del, ins)
+}
+
+pub(super) fn partial_idx_update_actions_with_cancel(
+    idx: &IndexDef,
+    old_row: &[Value],
+    new_row: &[Value],
+    cols_changed: bool,
+    pk_changed: bool,
+    col_map: Option<&ColumnMap>,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<(bool, bool)> {
+    let key_changed = cols_changed || pk_changed;
+    let Some(cm) = col_map.filter(|_| idx.predicate_expr.is_some()) else {
+        return Ok(partial_idx_update_actions(
+            idx,
+            old_row,
+            new_row,
+            cols_changed,
+            pk_changed,
+            col_map,
+        ));
+    };
+    let old_match = row_matches_partial_with_cancel(idx, old_row, cm, cancel)?;
+    let new_match = row_matches_partial_with_cancel(idx, new_row, cm, cancel)?;
+    let del = old_match && (key_changed || !new_match);
+    let ins = new_match && (key_changed || !old_match);
+    Ok((del, ins))
 }
 
 /// Child-row hits from an FK index scan; all key bytes share one arena.
@@ -1953,7 +2916,8 @@ pub(super) fn cascade_after_parent_delete(
                     set_fk_columns(wtx, child_schema, fk, &rows, |_| Value::Null)?;
                 }
                 crate::parser::ReferentialAction::SetDefault => {
-                    let defaults = fk_defaults(child_schema, fk);
+                    let cancel = wtx.cancel_token().cloned();
+                    let defaults = fk_defaults(child_schema, fk, cancel.as_ref())?;
                     let rows = fetch_child_rows(wtx, child_schema, &hits)?;
                     set_fk_columns(wtx, child_schema, fk, &rows, |i| defaults[i].clone())?;
                 }
@@ -1970,6 +2934,8 @@ fn delete_cascade_hits(
     cascading_idx: &IndexDef,
     hits: &FkChildHits,
 ) -> Result<()> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     let child_table = child_schema.name.as_str();
     let cascading_idx_table = TableSchema::index_table_name(child_table, &cascading_idx.name);
     let cascading_cols = cascading_idx.columns_vec();
@@ -2012,17 +2978,18 @@ fn delete_cascade_hits(
             pk_values_buf.extend(pk_indices.iter().map(|&j| row[j].clone()));
             for (idx, idx_table) in other_indices.iter().zip(other_index_tables.iter()) {
                 if let Some(cm) = col_map_partial {
-                    if !row_matches_partial(idx, row, cm) {
+                    if !row_matches_partial_with_cancel(idx, row, cm, cancel)? {
                         continue;
                     }
                 }
-                encode_index_key_into_with_schema(
+                encode_index_key_into_with_schema_and_cancel(
                     idx,
                     row,
                     &pk_values_buf,
                     Some(child_schema),
                     &mut idx_key_buf,
-                );
+                    cancel,
+                )?;
                 wtx.table_delete(idx_table, &idx_key_buf)
                     .map_err(SqlError::Storage)?;
             }
@@ -2050,6 +3017,8 @@ fn fetch_child_rows(
     child_schema: &TableSchema,
     hits: &FkChildHits,
 ) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     let mut rows = Vec::with_capacity(hits.hits.len());
     for hit in &hits.hits {
         let pk = hits.pk_key(hit);
@@ -2057,18 +3026,25 @@ fn fetch_child_rows(
             .table_get(child_schema.name.as_bytes(), pk)
             .map_err(SqlError::Storage)?
         {
-            let row = decode_full_row(child_schema, pk, &value_bytes)?;
+            let row = decode_full_row_with_cancel(child_schema, pk, &value_bytes, cancel)?;
             rows.push((pk.to_vec(), row));
         }
     }
     Ok(rows)
 }
 
-fn fk_defaults(child_schema: &TableSchema, fk: &ForeignKeySchemaEntry) -> Vec<Value> {
+fn fk_defaults(
+    child_schema: &TableSchema,
+    fk: &ForeignKeySchemaEntry,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<Value>> {
     fk.columns
         .iter()
-        .map(|&col_idx| {
-            eval_default(&child_schema.columns[col_idx as usize]).unwrap_or(Value::Null)
+        .map(|&col_idx| -> Result<Value> {
+            Ok(
+                eval_default_with_cancel(&child_schema.columns[col_idx as usize], cancel)?
+                    .unwrap_or(Value::Null),
+            )
         })
         .collect()
 }
@@ -2080,6 +3056,8 @@ fn set_fk_columns<F: Fn(usize) -> Value>(
     rows: &[(Vec<u8>, Vec<Value>)],
     value_for: F,
 ) -> Result<()> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     for (i, &col_idx) in fk.columns.iter().enumerate() {
         let new_val = value_for(i);
         let col = &child_schema.columns[col_idx as usize];
@@ -2117,25 +3095,36 @@ fn set_fk_columns<F: Fn(usize) -> Value>(
             .map_err(SqlError::Storage)?;
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| new_row[i].clone()).collect();
         for idx in &child_schema.indices {
-            let cols_changed = index_columns_changed(idx, old_row, &new_row);
-            let (del, ins) = partial_idx_update_actions(
+            let cols_changed = index_columns_changed(idx, old_row, &new_row, child_schema);
+            let (del, ins) = partial_idx_update_actions_with_cancel(
                 idx,
                 old_row,
                 &new_row,
                 cols_changed,
                 false,
                 col_map_partial,
-            );
+                cancel,
+            )?;
             let idx_table = TableSchema::index_table_name(&child_schema.name, &idx.name);
             if del {
-                let old_idx_key =
-                    encode_index_key_with_schema(idx, old_row, &pk_values, child_schema);
+                let old_idx_key = encode_index_key_with_schema_and_cancel(
+                    idx,
+                    old_row,
+                    &pk_values,
+                    child_schema,
+                    cancel,
+                )?;
                 wtx.table_delete(&idx_table, &old_idx_key)
                     .map_err(SqlError::Storage)?;
             }
             if ins {
-                let new_idx_key =
-                    encode_index_key_with_schema(idx, &new_row, &pk_values, child_schema);
+                let new_idx_key = encode_index_key_with_schema_and_cancel(
+                    idx,
+                    &new_row,
+                    &pk_values,
+                    child_schema,
+                    cancel,
+                )?;
                 let new_idx_val = encode_index_value(idx, &new_row, &pk_values);
                 wtx.table_insert(&idx_table, &new_idx_key, &new_idx_val)
                     .map_err(SqlError::Storage)?;
@@ -2145,12 +3134,17 @@ fn set_fk_columns<F: Fn(usize) -> Value>(
     Ok(())
 }
 
-fn eval_default(col: &ColumnDef) -> Option<Value> {
-    let expr = col.default_expr.as_ref()?;
+fn eval_default_with_cancel(
+    col: &ColumnDef,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Option<Value>> {
+    let Some(expr) = col.default_expr.as_ref() else {
+        return Ok(None);
+    };
     let empty_cols: &[ColumnDef] = &[];
     let cm = ColumnMap::new(empty_cols);
     let row: &[Value] = &[];
-    crate::eval::eval_expr(expr, &EvalCtx::new(&cm, row)).ok()
+    crate::eval::eval_expr(expr, &EvalCtx::new(&cm, row).with_cancel(cancel)).map(Some)
 }
 
 pub(super) fn cascade_after_parent_update(
@@ -2209,7 +3203,8 @@ pub(super) fn cascade_after_parent_update(
                     set_fk_columns(wtx, child_schema, fk, &rows, |_| Value::Null)?;
                 }
                 crate::parser::ReferentialAction::SetDefault => {
-                    let defaults = fk_defaults(child_schema, fk);
+                    let cancel = wtx.cancel_token().cloned();
+                    let defaults = fk_defaults(child_schema, fk, cancel.as_ref())?;
                     let rows = fetch_child_rows(wtx, child_schema, &hits)?;
                     set_fk_columns(wtx, child_schema, fk, &rows, |i| defaults[i].clone())?;
                 }

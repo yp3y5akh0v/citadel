@@ -3,10 +3,29 @@ use crate::parser::{
     BinOp, Expr, SelectColumn, SelectStmt, WindowFrame, WindowFrameBound, WindowFrameUnits,
     WindowSpec,
 };
-use crate::types::Value;
+use crate::types::{Collation, ColumnDef, DataType, Value};
 
 fn i(n: i64) -> Value {
     Value::Integer(n)
+}
+
+fn column(name: &str, data_type: DataType) -> ColumnDef {
+    ColumnDef {
+        name: name.into(),
+        data_type,
+        nullable: true,
+        position: 0,
+        default_expr: None,
+        default_sql: None,
+        check_expr: None,
+        check_sql: None,
+        check_name: None,
+        is_with_timezone: false,
+        generated_expr: None,
+        generated_sql: None,
+        generated_kind: None,
+        collation: Collation::Binary,
+    }
 }
 
 fn empty_window_fn(name: &str) -> Expr {
@@ -160,6 +179,8 @@ fn resolve_frame_default_with_order_by_ends_at_current_row() {
         partition_by: vec![],
         order_by: vec![OrderByItem {
             expr: Expr::Column("x".into()),
+            output_name: None,
+            output_ordinal: None,
             descending: false,
             nulls_first: None,
         }],
@@ -337,4 +358,92 @@ fn extract_window_fns_inside_cast() {
     let mut out = Vec::new();
     let _ = extract_window_fns(&e, &mut counter, &mut out);
     assert_eq!(out.len(), 1);
+}
+
+#[test]
+fn window_order_keys_are_evaluated_once_per_row() {
+    use crate::parser::OrderByItem;
+
+    let columns = vec![column("x", DataType::Integer)];
+    let mut stmt = empty_select();
+    stmt.columns = vec![SelectColumn::Expr {
+        expr: Expr::WindowFunction {
+            name: "RANK".into(),
+            args: vec![],
+            spec: WindowSpec {
+                partition_by: vec![],
+                order_by: vec![OrderByItem {
+                    expr: Expr::Column("x".into()),
+                    output_name: None,
+                    output_ordinal: None,
+                    descending: false,
+                    nulls_first: None,
+                }],
+                frame: None,
+            },
+        },
+        alias: None,
+    }];
+    let rows: Vec<Vec<Value>> = (0..1_024).rev().map(|n| vec![i(n)]).collect();
+    let _ = take_window_key_evaluations();
+
+    eval_window_select(rows, crate::executor::SelectCtx::new(&columns, &stmt, None)).unwrap();
+
+    assert_eq!(take_window_key_evaluations(), 1_024);
+}
+
+#[test]
+fn one_large_peer_group_is_indexed_with_linear_comparisons() {
+    let n = 4_096;
+    let indices: Vec<usize> = (0..n).collect();
+    let keys: Vec<Vec<Value>> = (0..n)
+        .map(|position| {
+            let spelling = if position.is_multiple_of(2) { "A" } else { "a" };
+            vec![Value::Text(spelling.into())]
+        })
+        .collect();
+    let _ = take_window_peer_comparisons();
+
+    let bounds = peer_group_bounds(&indices, &keys, 0, &[Collation::NoCase], None).unwrap();
+
+    assert_eq!(take_window_peer_comparisons(), n - 1);
+    assert!(bounds.iter().all(|bound| *bound == (0, n - 1)));
+}
+
+#[test]
+fn window_argument_passes_cancellation_into_scalar_evaluation() {
+    let columns = vec![column("body", DataType::Text)];
+    let mut stmt = empty_select();
+    stmt.columns = vec![SelectColumn::Expr {
+        expr: Expr::WindowFunction {
+            name: "LAG".into(),
+            args: vec![
+                Expr::Function {
+                    name: "TO_TSVECTOR".into(),
+                    args: vec![Expr::Column("body".into())],
+                    distinct: false,
+                },
+                Expr::Literal(i(1)),
+            ],
+            spec: WindowSpec {
+                partition_by: vec![],
+                order_by: vec![],
+                frame: None,
+            },
+        },
+        alias: None,
+    }];
+    let token = citadel::CancelToken::new();
+    let _cancel = crate::fts::cancel_tokenize_after(token.clone(), 1);
+
+    let err = eval_window_select(
+        vec![vec![Value::Text("several words to tokenize".into())]],
+        crate::executor::SelectCtx::new(&columns, &stmt, Some(&token)),
+    )
+    .expect_err("the window argument discarded its cancellation token");
+
+    assert!(matches!(
+        err,
+        crate::error::SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
 }

@@ -364,7 +364,7 @@ pub(super) fn exec_create_table(
     let table_schema = create_fk_auto_indices(&mut wtx, table_schema)?;
 
     SchemaManager::save_schema(&mut wtx, &table_schema)?;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
 
     schema.register(table_schema);
     Ok(ExecutionResult::Ok)
@@ -419,7 +419,7 @@ pub(super) fn exec_drop_table(
         SchemaManager::delete_trigger(&mut wtx, tname)?;
     }
     SchemaManager::delete_schema(&mut wtx, &storage_name)?;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
 
     schema.remove_triggers_for(&storage_name);
     schema.remove(&storage_name);
@@ -583,31 +583,32 @@ pub(super) fn exec_drop_table_in_txn(
     }
 
     let table_schema = schema.get(&lower_name).unwrap();
+    let storage_name = table_schema.name.clone();
     let idx_tables: Vec<Vec<u8>> = table_schema
         .indices
         .iter()
-        .map(|idx| TableSchema::index_table_name(&lower_name, &idx.name))
+        .map(|idx| TableSchema::index_table_name(&storage_name, &idx.name))
         .collect();
 
     let trigger_names: Vec<String> = schema
-        .triggers_for(&lower_name)
+        .triggers_for(&storage_name)
         .iter()
         .map(|t| t.name.clone())
         .collect();
 
-    super::ann_persist::purge_segment(wtx, &lower_name)?;
+    super::ann_persist::purge_segment(wtx, &storage_name)?;
     for idx_table in &idx_tables {
         wtx.drop_table(idx_table).map_err(SqlError::Storage)?;
     }
-    wtx.drop_table(lower_name.as_bytes())
+    wtx.drop_table(storage_name.as_bytes())
         .map_err(SqlError::Storage)?;
     for tname in &trigger_names {
         SchemaManager::delete_trigger(wtx, tname)?;
     }
-    SchemaManager::delete_schema(wtx, &lower_name)?;
+    SchemaManager::delete_schema(wtx, &storage_name)?;
 
-    schema.remove_triggers_for(&lower_name);
-    schema.remove(&lower_name);
+    schema.remove_triggers_for(&storage_name);
+    schema.remove(&storage_name);
     Ok(ExecutionResult::Ok)
 }
 
@@ -618,7 +619,7 @@ pub(super) fn exec_truncate(
 ) -> Result<ExecutionResult> {
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     let count = truncate_tables(&mut wtx, schema, stmt)?;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
     Ok(ExecutionResult::RowsAffected(count))
 }
 
@@ -781,6 +782,8 @@ pub(super) fn exec_create_index(
     schema: &mut SchemaManager,
     stmt: &CreateIndexStmt,
 ) -> Result<ExecutionResult> {
+    let cancel = db.cancel_token();
+    let cancel = cancel.as_ref();
     let lower_table = stmt.table_name.to_ascii_lowercase();
     let lower_idx = stmt.index_name.to_ascii_lowercase();
 
@@ -811,7 +814,7 @@ pub(super) fn exec_create_index(
         let mut prescan: Vec<Vec<Value>> = Vec::new();
         let mut scan_err: Option<SqlError> = None;
         rtx.table_for_each(storage_table.as_bytes(), |key, value| {
-            match decode_full_row(table_schema, key, value) {
+            match decode_full_row_with_cancel(table_schema, key, value, cancel) {
                 Ok(row) => prescan.push(row),
                 Err(e) => scan_err = Some(e),
             }
@@ -839,7 +842,7 @@ pub(super) fn exec_create_index(
             rows.clear();
             let mut scan_err: Option<SqlError> = None;
             wtx.table_for_each(storage_table.as_bytes(), |key, value| {
-                match decode_full_row(table_schema, key, value) {
+                match decode_full_row_with_cancel(table_schema, key, value, cancel) {
                     Ok(row) => rows.push(row),
                     Err(e) => scan_err = Some(e),
                 }
@@ -853,7 +856,7 @@ pub(super) fn exec_create_index(
     } else {
         let mut scan_err: Option<SqlError> = None;
         wtx.table_for_each(storage_table.as_bytes(), |key, value| {
-            match decode_full_row(table_schema, key, value) {
+            match decode_full_row_with_cancel(table_schema, key, value, cancel) {
                 Ok(row) => rows.push(row),
                 Err(e) => scan_err = Some(e),
             }
@@ -911,8 +914,11 @@ pub(super) fn exec_create_index(
         if let crate::types::IndexKind::Inverted(inv_kind) = idx_def.kind {
             let value = &row[idx_def.column_positions_iter().next().unwrap() as usize];
             if !value.is_null() {
-                let entries =
-                    super::helpers::extract_inverted_entries_with_values(value, inv_kind)?;
+                let entries = super::helpers::extract_inverted_entries_with_values_and_cancel(
+                    value,
+                    inv_kind,
+                    wtx.cancel_token(),
+                )?;
                 let pk_encoded = crate::encoding::encode_composite_key(&pk_values);
                 for (entry, val_bytes) in entries {
                     let full_key = super::helpers::build_inverted_key(&entry, &pk_encoded);
@@ -922,7 +928,13 @@ pub(super) fn exec_create_index(
             }
             continue;
         }
-        let key = encode_index_key_with_schema(&idx_def, row, &pk_values, table_schema);
+        let key = encode_index_key_with_schema_and_cancel(
+            &idx_def,
+            row,
+            &pk_values,
+            table_schema,
+            cancel,
+        )?;
         let value = encode_index_value(&idx_def, row, &pk_values);
         let is_new = wtx
             .table_insert(&idx_table, &key, &value)
@@ -942,7 +954,7 @@ pub(super) fn exec_create_index(
     let mut updated_schema = table_schema.clone();
     updated_schema.indices.push(idx_def);
     SchemaManager::save_schema(&mut wtx, &updated_schema)?;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
 
     schema.register(updated_schema);
     Ok(ExecutionResult::Ok)
@@ -1006,7 +1018,7 @@ pub(super) fn exec_drop_index(
     let mut updated_schema = table_schema.clone();
     updated_schema.indices.retain(|i| i.name != lower_idx);
     SchemaManager::save_schema(&mut wtx, &updated_schema)?;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
 
     schema.register(updated_schema);
     Ok(ExecutionResult::Ok)
@@ -1017,6 +1029,8 @@ pub(super) fn exec_create_index_in_txn(
     schema: &mut SchemaManager,
     stmt: &CreateIndexStmt,
 ) -> Result<ExecutionResult> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     let lower_table = stmt.table_name.to_ascii_lowercase();
     let lower_idx = stmt.index_name.to_ascii_lowercase();
 
@@ -1043,7 +1057,7 @@ pub(super) fn exec_create_index_in_txn(
     {
         let mut scan_err: Option<SqlError> = None;
         wtx.table_for_each(lower_table.as_bytes(), |key, value| {
-            match decode_full_row(table_schema, key, value) {
+            match decode_full_row_with_cancel(table_schema, key, value, cancel) {
                 Ok(row) => rows.push(row),
                 Err(e) => scan_err = Some(e),
             }
@@ -1057,7 +1071,13 @@ pub(super) fn exec_create_index_in_txn(
 
     for row in &rows {
         let pk_values: Vec<Value> = pk_indices.iter().map(|&i| row[i].clone()).collect();
-        let key = encode_index_key_with_schema(&idx_def, row, &pk_values, table_schema);
+        let key = encode_index_key_with_schema_and_cancel(
+            &idx_def,
+            row,
+            &pk_values,
+            table_schema,
+            cancel,
+        )?;
         let value = encode_index_value(&idx_def, row, &pk_values);
         let is_new = wtx
             .table_insert(&idx_table, &key, &value)
@@ -1161,7 +1181,7 @@ pub(super) fn exec_create_view(
         SchemaManager::delete_view(&mut wtx, &lower_name)?;
     }
     SchemaManager::save_view(&mut wtx, &view_def)?;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
 
     schema.register_view(view_def);
     Ok(ExecutionResult::Ok)
@@ -1229,7 +1249,7 @@ pub(super) fn exec_drop_view(
 
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     SchemaManager::delete_view(&mut wtx, &lower_name)?;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
 
     schema.remove_view(&lower_name);
     Ok(ExecutionResult::Ok)
@@ -1263,7 +1283,7 @@ pub(super) fn exec_alter_table(
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     SchemaManager::ensure_schema_table(&mut wtx)?;
     alter_table_impl(&mut wtx, schema, stmt)?;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
     Ok(ExecutionResult::Ok)
 }
 

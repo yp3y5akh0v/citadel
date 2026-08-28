@@ -1,4 +1,4 @@
-use citadel::{Argon2Profile, DatabaseBuilder};
+use citadel::{Argon2Profile, CancelToken, DatabaseBuilder, Error};
 
 fn fast_builder(path: &std::path::Path) -> DatabaseBuilder {
     DatabaseBuilder::new(path)
@@ -15,6 +15,20 @@ fn integrity_check_empty_db() {
     let report = db.integrity_check().unwrap();
     assert!(report.is_ok(), "errors: {:?}", report.errors);
     assert!(report.pages_checked >= 1);
+}
+
+#[test]
+fn integrity_check_observes_the_database_cancel_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fast_builder(&dir.path().join("test.db")).create().unwrap();
+    let token = CancelToken::new();
+    token.cancel();
+    db.set_cancel(Some(token));
+
+    assert!(matches!(db.integrity_check(), Err(Error::Interrupted)));
+
+    db.set_cancel(None);
+    assert!(db.integrity_check().unwrap().is_ok());
 }
 
 #[test]

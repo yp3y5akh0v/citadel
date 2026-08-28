@@ -237,3 +237,147 @@ fn fold_temporal_offset_non_temporal_returns_none() {
     let expr = Expr::Literal(i(1));
     assert!(fold_temporal_offset(&expr).is_none());
 }
+
+#[test]
+fn inverted_intersection_honors_cancellation_and_preserves_results() {
+    let keys = |values: &[u16]| {
+        values
+            .iter()
+            .map(|value| value.to_be_bytes().to_vec())
+            .collect::<Vec<_>>()
+    };
+    let left = keys(&[1, 2, 4, 8]);
+    let right = keys(&[2, 3, 4, 9]);
+    assert_eq!(
+        sorted_intersect(&left, &right, None).unwrap(),
+        keys(&[2, 4])
+    );
+
+    let token = citadel::CancelToken::new();
+    token.cancel();
+    let err = sorted_intersect(&left, &right, Some(&token)).unwrap_err();
+    assert!(matches!(
+        err,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+}
+
+#[test]
+fn scan_predicate_passes_cancellation_into_scalar_evaluation() {
+    use crate::encoding::{encode_composite_key, encode_row};
+
+    let table = schema(
+        "docs",
+        columns(&[("id", DataType::Integer), ("body", DataType::Text)]),
+        vec![0],
+    );
+    let predicate = Expr::IsNotNull(Box::new(Expr::Function {
+        name: "TO_TSVECTOR".into(),
+        args: vec![Expr::Column("body".into())],
+        distinct: false,
+    }));
+    let col_map = ColumnMap::new(&table.columns);
+    let compiled = CompiledExpr::compile(&predicate, &col_map);
+    let key = encode_composite_key(&[i(1)]);
+    let value = encode_row(&[Value::Text("several words to tokenize".into())]);
+    let token = citadel::CancelToken::new();
+    let _cancel = crate::fts::cancel_tokenize_after(token.clone(), 1);
+
+    let err = scan_step(
+        &table,
+        &key,
+        &value,
+        Some(&compiled),
+        None,
+        None,
+        None,
+        Some(&col_map),
+        None,
+        Some(&token),
+    )
+    .expect_err("the scan predicate discarded its cancellation token");
+
+    assert!(matches!(
+        err,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+}
+
+#[test]
+fn point_lookup_does_not_turn_scalar_cancellation_into_no_match() {
+    use citadel::{Argon2Profile, DatabaseBuilder};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseBuilder::new(dir.path().join("point-value-cancel.citadel"))
+        .passphrase(b"point-value-cancel-passphrase")
+        .argon2_profile(Argon2Profile::Iot)
+        .create()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'several words to tokenize')")
+        .unwrap();
+    let schemas = crate::schema::SchemaManager::load(&db).unwrap();
+    let table = schemas.get("docs").unwrap();
+    let where_clause = Some(Expr::IsNotNull(Box::new(Expr::Function {
+        name: "TO_TSVECTOR".into(),
+        args: vec![Expr::Column("body".into())],
+        distinct: false,
+    })));
+
+    let token = citadel::CancelToken::new();
+    db.set_cancel(Some(token.clone()));
+    let mut rtx = db.begin_read();
+    let _cancel = crate::fts::cancel_tokenize_after(token, 1);
+    let err = collect_rows_with_read_planned(
+        &mut rtx,
+        table,
+        &where_clause,
+        None,
+        crate::planner::ScanPlan::PkLookup {
+            pk_values: vec![i(1)],
+            full_cover: false,
+        },
+    )
+    .expect_err("the point lookup treated Interrupted as a false predicate");
+
+    assert!(matches!(
+        err,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+}
+
+#[test]
+fn scan_decode_passes_cancellation_to_a_virtual_generated_value() {
+    use citadel::{Argon2Profile, DatabaseBuilder};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseBuilder::new(dir.path().join("virtual-value-cancel.citadel"))
+        .passphrase(b"virtual-value-cancel-passphrase")
+        .argon2_profile(Argon2Profile::Iot)
+        .create()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TABLE docs (\
+         id INTEGER PRIMARY KEY, \
+         body TEXT, \
+         search TSVECTOR GENERATED ALWAYS AS (TO_TSVECTOR(body)) VIRTUAL)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO docs (id, body) VALUES (1, 'several words to tokenize')")
+        .unwrap();
+
+    let token = citadel::CancelToken::new();
+    db.set_cancel(Some(token.clone()));
+    let _cancel = crate::fts::cancel_tokenize_after(token, 1);
+    let error = conn
+        .query("SELECT id FROM docs WHERE search IS NOT NULL")
+        .expect_err("the VIRTUAL generated expression discarded its cancellation token");
+
+    assert!(matches!(
+        error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+}

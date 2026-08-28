@@ -726,6 +726,29 @@ impl Collation {
             Collation::Rtrim => a.trim_end_matches(' ') == b.trim_end_matches(' '),
         }
     }
+
+    /// Compare two SQL values, applying this collation when both are text.
+    /// Non-text values keep the engine's ordinary total ordering.
+    pub(crate) fn cmp_value(self, a: &Value, b: &Value) -> std::cmp::Ordering {
+        match (a, b) {
+            (Value::Text(a), Value::Text(b)) => self.cmp_text(a, b),
+            _ => a.cmp(b),
+        }
+    }
+
+    /// Fold a value so that plain `Eq` and `Hash` agree with [`eq_text`]: two values this
+    /// collation calls equal fold to one value.
+    ///
+    /// Hashing cannot consult a collation the way an operator does, so grouping,
+    /// deduplicating and hash joins need a key that already carries it. Index keys fold the
+    /// same way at write time (`encode_key_value_collated_into`), which lets a probe find them.
+    pub fn fold(self, value: Value) -> Value {
+        match (&value, self) {
+            (Value::Text(s), Collation::NoCase) => Value::Text(s.to_ascii_lowercase()),
+            (Value::Text(s), Collation::Rtrim) => Value::Text(s.trim_end_matches(' ').into()),
+            _ => value,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

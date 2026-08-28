@@ -3,12 +3,12 @@
 use rustc_hash::FxHashMap;
 
 use crate::error::{Result, SqlError};
-use crate::parser::{BinOp, Expr, UnaryOp};
+use crate::parser::{BinOp, Expr, QuantifiedRhs, UnaryOp};
 use crate::types::{ColumnDef, CompactString, DataType, Value};
 
 #[derive(Debug)]
 pub struct ColumnMap {
-    exact: FxHashMap<String, usize>,
+    exact: FxHashMap<String, ShortMatch>,
     short: FxHashMap<String, ShortMatch>,
     collations: Vec<crate::types::Collation>,
     has_non_binary_collation: bool,
@@ -41,7 +41,10 @@ impl ColumnMap {
 
         for (i, col) in columns.iter().enumerate() {
             let lower = col.name.to_ascii_lowercase();
-            exact.insert(lower.clone(), i);
+            exact
+                .entry(lower.clone())
+                .and_modify(|entry| *entry = ShortMatch::Ambiguous)
+                .or_insert(ShortMatch::Unique(i));
 
             let unqualified = if let Some(dot) = lower.rfind('.') {
                 &lower[dot + 1..]
@@ -66,6 +69,10 @@ impl ColumnMap {
         }
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.collations.len()
+    }
+
     pub(crate) fn collation_at(&self, idx: usize) -> crate::types::Collation {
         self.collations
             .get(idx)
@@ -79,8 +86,12 @@ impl ColumnMap {
     }
 
     pub(crate) fn resolve(&self, name: &str) -> Result<usize> {
-        if let Some(&idx) = self.exact.get(name) {
-            return Ok(idx);
+        match self.exact.get(name) {
+            Some(ShortMatch::Unique(idx)) => return Ok(*idx),
+            Some(ShortMatch::Ambiguous) => {
+                return Err(SqlError::AmbiguousColumn(name.to_string()));
+            }
+            None => {}
         }
         match self.short.get(name) {
             Some(ShortMatch::Unique(idx)) => Ok(*idx),
@@ -91,8 +102,12 @@ impl ColumnMap {
 
     pub(crate) fn resolve_qualified(&self, table: &str, column: &str) -> Result<usize> {
         let qualified = format!("{table}.{column}");
-        if let Some(&idx) = self.exact.get(&qualified) {
-            return Ok(idx);
+        match self.exact.get(&qualified) {
+            Some(ShortMatch::Unique(idx)) => return Ok(*idx),
+            Some(ShortMatch::Ambiguous) => {
+                return Err(SqlError::AmbiguousColumn(qualified));
+            }
+            None => {}
         }
         match self.short.get(column) {
             Some(ShortMatch::Unique(idx)) => Ok(*idx),
@@ -105,6 +120,7 @@ pub struct EvalCtx<'a> {
     pub col_map: &'a ColumnMap,
     pub row: &'a [Value],
     pub params: &'a [Value],
+    pub(crate) cancel: Option<&'a citadel::CancelToken>,
     pub excluded: Option<ExcludedRow<'a>>,
     pub old_new: Option<OldNewRows<'a>>,
     pub session_tz: Option<jiff::tz::TimeZone>,
@@ -127,6 +143,7 @@ impl<'a> EvalCtx<'a> {
             col_map,
             row,
             params: &[],
+            cancel: None,
             excluded: None,
             old_new: None,
             session_tz: None,
@@ -138,11 +155,17 @@ impl<'a> EvalCtx<'a> {
         self
     }
 
+    pub(crate) fn with_cancel(mut self, cancel: Option<&'a citadel::CancelToken>) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
     pub fn with_params(col_map: &'a ColumnMap, row: &'a [Value], params: &'a [Value]) -> Self {
         Self {
             col_map,
             row,
             params,
+            cancel: None,
             excluded: None,
             old_new: None,
             session_tz: None,
@@ -159,6 +182,7 @@ impl<'a> EvalCtx<'a> {
             col_map,
             row,
             params: &[],
+            cancel: None,
             excluded: Some(ExcludedRow {
                 col_map: excluded_col_map,
                 row: excluded_row,
@@ -178,6 +202,7 @@ impl<'a> EvalCtx<'a> {
             col_map,
             row,
             params: &[],
+            cancel: None,
             excluded: None,
             old_new: Some(OldNewRows {
                 col_map,
@@ -299,34 +324,39 @@ impl<'a> CompiledExpr<'a> {
             } => {
                 let lval = left.eval(ctx)?;
                 let rval = right.eval(ctx)?;
-                if let Some(coll) = collation {
-                    if let Some(b) = eval_text_compare(&lval, *op, &rval, *coll) {
-                        return Ok(Value::Boolean(b));
-                    }
-                }
-                eval_binary_op(&lval, *op, &rval)
+                collated_compare_with_cancel(&lval, *op, &rval, *collation, ctx.cancel)
             }
             CompiledExpr::Dynamic(e) => eval_expr(e, ctx),
         }
     }
 }
 
-fn compile_collation(
+pub(crate) fn compile_collation(
     left: &Expr,
     right: &Expr,
     col_map: &ColumnMap,
 ) -> Option<crate::types::Collation> {
-    let needs_check = col_map.has_non_binary_collation()
-        || matches!(left, Expr::Collate { .. })
-        || matches!(right, Expr::Collate { .. });
+    let left_explicit = collation_of(left);
+    let right_explicit = collation_of(right);
+    let needs_check =
+        col_map.has_non_binary_collation() || left_explicit.is_some() || right_explicit.is_some();
     if !needs_check {
         return None;
     }
-    let coll = collation_of(left)
-        .or_else(|| collation_of(right))
+    let coll = left_explicit
+        .or(right_explicit)
         .or_else(|| column_collation(left, col_map))
         .or_else(|| column_collation(right, col_map))?;
     (coll != crate::types::Collation::Binary).then_some(coll)
+}
+
+/// The collation an operand carries by itself, for a comparison whose other side is a bare
+/// value rather than an expression - the result set of an `IN (subquery)`.
+pub(crate) fn operand_collation(
+    expr: &Expr,
+    col_map: &ColumnMap,
+) -> Option<crate::types::Collation> {
+    collation_of(expr).or_else(|| column_collation(expr, col_map))
 }
 
 pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
@@ -380,25 +410,13 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
         Expr::BinaryOp { left, op, right } => {
             let lval = eval_expr(left, ctx)?;
             let rval = eval_expr(right, ctx)?;
-            let needs_collation_check = ctx.col_map.has_non_binary_collation()
-                || matches!(left.as_ref(), Expr::Collate { .. })
-                || matches!(right.as_ref(), Expr::Collate { .. });
-            if needs_collation_check {
-                let coll = collation_of(left)
-                    .or_else(|| collation_of(right))
-                    .or_else(|| {
-                        column_collation(left, ctx.col_map)
-                            .or_else(|| column_collation(right, ctx.col_map))
-                    });
-                if let Some(c) = coll {
-                    if c != crate::types::Collation::Binary {
-                        if let Some(b) = eval_text_compare(&lval, *op, &rval, c) {
-                            return Ok(Value::Boolean(b));
-                        }
-                    }
-                }
-            }
-            eval_binary_op(&lval, *op, &rval)
+            collated_compare_with_cancel(
+                &lval,
+                *op,
+                &rval,
+                compile_collation(left, right, ctx.col_map),
+                ctx.cancel,
+            )
         }
 
         Expr::UnaryOp { op, expr } => {
@@ -428,7 +446,7 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             negated,
         } => {
             let lhs = eval_expr(e, ctx)?;
-            eval_in_values(&lhs, list, ctx, *negated)
+            eval_in_values(e, &lhs, list, ctx, *negated)
         }
 
         Expr::InSet {
@@ -436,9 +454,14 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             values,
             has_null,
             negated,
+            collation,
         } => {
             let lhs = eval_expr(e, ctx)?;
-            eval_in_set(&lhs, values, *has_null, *negated)
+            // `x IN (SELECT y)` collates as `x = y`, which takes it from either
+            // operand, left first.
+            let coll = operand_collation(e, ctx.col_map).unwrap_or(*collation);
+            let coll = (coll != crate::types::Collation::Binary).then_some(coll);
+            eval_in_set(&lhs, values, *has_null, *negated, coll)
         }
 
         Expr::Between {
@@ -450,7 +473,14 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             let val = eval_expr(e, ctx)?;
             let lo = eval_expr(low, ctx)?;
             let hi = eval_expr(high, ctx)?;
-            eval_between(&val, &lo, &hi, *negated)
+            eval_between(
+                &val,
+                &lo,
+                &hi,
+                *negated,
+                compile_collation(e, low, ctx.col_map),
+                compile_collation(e, high, ctx.col_map),
+            )
         }
 
         Expr::Like {
@@ -463,6 +493,25 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
             let pat = eval_expr(pattern, ctx)?;
             let esc = escape.as_ref().map(|e| eval_expr(e, ctx)).transpose()?;
             eval_like(&val, &pat, esc.as_ref(), *negated)
+        }
+
+        Expr::IsDistinctFrom {
+            left,
+            right,
+            negated,
+        } => {
+            let lval = eval_expr(left, ctx)?;
+            let rval = eval_expr(right, ctx)?;
+            // NULL is a value here, so the answer is never unknown: two NULLs are alike and
+            // a NULL beside anything else is not.
+            let alike = match (lval.is_null(), rval.is_null()) {
+                (true, true) => true,
+                (true, false) | (false, true) => false,
+                (false, false) => {
+                    collated_eq(&lval, &rval, compile_collation(left, right, ctx.col_map))?
+                }
+            };
+            Ok(Value::Boolean(if *negated { alike } else { !alike }))
         }
 
         Expr::Case {
@@ -483,7 +532,7 @@ pub fn eval_expr(expr: &Expr, ctx: &EvalCtx) -> Result<Value> {
 
         Expr::Cast { expr: e, data_type } => {
             let val = eval_expr(e, ctx)?;
-            eval_cast(&val, *data_type)
+            eval_cast_with_cancel(&val, *data_type, ctx.cancel)
         }
 
         Expr::Collate { expr: e, .. } => eval_expr(e, ctx),
@@ -628,10 +677,63 @@ fn eval_binary_compare(left: &Value, op: crate::parser::BinOp, right: &Value) ->
     Ok(Value::Boolean(result))
 }
 
-fn collation_of(expr: &Expr) -> Option<crate::types::Collation> {
+pub(crate) fn collation_of(expr: &Expr) -> Option<crate::types::Collation> {
     match expr {
         Expr::Collate { collation, .. } => Some(*collation),
-        _ => None,
+        Expr::BinaryOp { left, right, .. } | Expr::IsDistinctFrom { left, right, .. } => {
+            collation_of(left).or_else(|| collation_of(right))
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. }
+        | Expr::InSubquery { expr, .. }
+        | Expr::InSet { expr, .. } => collation_of(expr),
+        Expr::Function { args, .. }
+        | Expr::Coalesce(args)
+        | Expr::ArrayLiteral(args)
+        | Expr::WindowFunction { args, .. } => args.iter().find_map(collation_of),
+        Expr::InList { expr, list, .. } => {
+            collation_of(expr).or_else(|| list.iter().find_map(collation_of))
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => collation_of(expr)
+            .or_else(|| collation_of(low))
+            .or_else(|| collation_of(high)),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => collation_of(expr)
+            .or_else(|| collation_of(pattern))
+            .or_else(|| escape.as_deref().and_then(collation_of)),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => operand
+            .as_deref()
+            .and_then(collation_of)
+            .or_else(|| {
+                conditions.iter().find_map(|(condition, result)| {
+                    collation_of(condition).or_else(|| collation_of(result))
+                })
+            })
+            .or_else(|| else_result.as_deref().and_then(collation_of)),
+        Expr::Quantified { left, right, .. } => collation_of(left).or_else(|| match right {
+            QuantifiedRhs::Array(expr) => collation_of(expr),
+            QuantifiedRhs::Subquery(_) => None,
+        }),
+        Expr::Literal(_)
+        | Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::CountStar
+        | Expr::Exists { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::Parameter(_)
+        | Expr::TypedNullRecord(_) => None,
     }
 }
 
@@ -642,6 +744,9 @@ fn column_collation(expr: &Expr, col_map: &ColumnMap) -> Option<crate::types::Co
             .resolve_qualified(table, column)
             .ok()
             .map(|i| col_map.collation_at(i)),
+        // A CAST-wrapped column still counts as a column for implicit collation;
+        // Neg/Not must not inherit it.
+        Expr::Cast { expr, .. } => column_collation(expr, col_map),
         _ => None,
     }
 }
@@ -669,11 +774,58 @@ fn eval_text_compare(
     })
 }
 
+/// Compare under `coll`, falling back to binary when it does not apply. Every comparison in
+/// this module routes here, so a form that forgets its collation is one that does not call it.
+fn collated_compare(
+    left: &Value,
+    op: BinOp,
+    right: &Value,
+    coll: Option<crate::types::Collation>,
+) -> Result<Value> {
+    collated_compare_with_cancel(left, op, right, coll, None)
+}
+
+fn collated_compare_with_cancel(
+    left: &Value,
+    op: BinOp,
+    right: &Value,
+    coll: Option<crate::types::Collation>,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Value> {
+    if let Some(c) = coll {
+        if let Some(b) = eval_text_compare(left, op, right, c) {
+            return Ok(Value::Boolean(b));
+        }
+    }
+    eval_binary_op_with_cancel(left, op, right, cancel)
+}
+
+/// Equality under `coll`, including the temporal normalization used by the `=` operator.
+pub(crate) fn collated_eq(
+    left: &Value,
+    right: &Value,
+    coll: Option<crate::types::Collation>,
+) -> Result<bool> {
+    Ok(matches!(
+        collated_compare(left, BinOp::Eq, right, coll)?,
+        Value::Boolean(true)
+    ))
+}
+
 pub fn eval_binary_op_public(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
     eval_binary_op(left, op, right)
 }
 
 fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
+    eval_binary_op_with_cancel(left, op, right, None)
+}
+
+fn eval_binary_op_with_cancel(
+    left: &Value,
+    op: BinOp,
+    right: &Value,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Value> {
     match op {
         BinOp::And => return eval_and(left, right),
         BinOp::Or => return eval_or(left, right),
@@ -697,7 +849,9 @@ fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
         BinOp::GtEq => Ok(Value::Boolean(left >= right)),
         BinOp::Add => eval_arithmetic(left, right, i64::checked_add, |a, b| a + b),
         BinOp::Sub => match left {
-            Value::Json(_) | Value::Jsonb(_) => crate::json::op_delete_one(left, right),
+            Value::Json(_) | Value::Jsonb(_) => {
+                crate::json::op_delete_one_with_cancel(left, right, cancel)
+            }
             _ => eval_arithmetic(left, right, i64::checked_sub, |a, b| a - b),
         },
         BinOp::Mul => eval_arithmetic(left, right, i64::checked_mul, |a, b| a * b),
@@ -718,13 +872,15 @@ fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
             eval_arithmetic(left, right, i64::checked_rem, |a, b| a % b)
         }
         BinOp::Concat => match (left, right) {
-            (Value::TsVector(a), Value::TsVector(b)) => crate::fts::op_concat(a, b),
+            (Value::TsVector(a), Value::TsVector(b)) => {
+                crate::fts::op_concat_with_cancel(a, b, cancel)
+            }
             (Value::Json(_) | Value::Jsonb(_), _) | (_, Value::Json(_) | Value::Jsonb(_)) => {
-                crate::json::op_concat(left, right)
+                crate::json::op_concat_with_cancel(left, right, cancel)
             }
             _ => {
-                let ls = value_to_text(left);
-                let rs = value_to_text(right);
+                let ls = value_to_text_with_cancel(left, cancel)?;
+                let rs = value_to_text_with_cancel(right, cancel)?;
                 Ok(Value::Text(format!("{ls}{rs}").into()))
             }
         },
@@ -741,7 +897,7 @@ fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
         | BinOp::JsonPathExists
         | BinOp::JsonPathMatch
         | BinOp::JsonPathExistsTz
-        | BinOp::JsonPathMatchTz => eval_json_binary_op(left, op, right),
+        | BinOp::JsonPathMatchTz => eval_json_binary_op_with_cancel(left, op, right, cancel),
         BinOp::VectorL2 => eval_vector_distance(left, right, VectorMetric::L2),
         BinOp::VectorInner => eval_vector_distance(left, right, VectorMetric::Inner),
         BinOp::VectorCosine => eval_vector_distance(left, right, VectorMetric::Cosine),
@@ -750,25 +906,30 @@ fn eval_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
 }
 
 #[cold]
-fn eval_json_binary_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
+fn eval_json_binary_op_with_cancel(
+    left: &Value,
+    op: BinOp,
+    right: &Value,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Value> {
     match op {
-        BinOp::JsonGet => crate::json::op_get(left, right),
-        BinOp::JsonGetText => crate::json::op_get_text(left, right),
-        BinOp::JsonPath => crate::json::op_path(left, right),
-        BinOp::JsonPathText => crate::json::op_path_text(left, right),
-        BinOp::JsonContains => crate::json::op_contains(left, right),
-        BinOp::JsonContainedBy => crate::json::op_contained_by(left, right),
-        BinOp::JsonHasKey => crate::json::op_has_key(left, right),
-        BinOp::JsonHasAnyKey => crate::json::op_has_any_key(left, right),
-        BinOp::JsonHasAllKeys => crate::json::op_has_all_keys(left, right),
-        BinOp::JsonDeletePath => crate::json::op_delete_path(left, right),
-        BinOp::JsonPathExists => crate::json::op_path_exists(left, right),
-        BinOp::JsonPathMatch => eval_at_at(left, right),
+        BinOp::JsonGet => crate::json::op_get_with_cancel(left, right, cancel),
+        BinOp::JsonGetText => crate::json::op_get_text_with_cancel(left, right, cancel),
+        BinOp::JsonPath => crate::json::op_path_with_cancel(left, right, cancel),
+        BinOp::JsonPathText => crate::json::op_path_text_with_cancel(left, right, cancel),
+        BinOp::JsonContains => crate::json::op_contains_with_cancel(left, right, cancel),
+        BinOp::JsonContainedBy => crate::json::op_contained_by_with_cancel(left, right, cancel),
+        BinOp::JsonHasKey => crate::json::op_has_key_with_cancel(left, right, cancel),
+        BinOp::JsonHasAnyKey => crate::json::op_has_any_key_with_cancel(left, right, cancel),
+        BinOp::JsonHasAllKeys => crate::json::op_has_all_keys_with_cancel(left, right, cancel),
+        BinOp::JsonDeletePath => crate::json::op_delete_path_with_cancel(left, right, cancel),
+        BinOp::JsonPathExists => crate::json::op_path_exists_with_cancel(left, right, cancel),
+        BinOp::JsonPathMatch => eval_at_at_with_cancel(left, right, cancel),
         BinOp::JsonPathExistsTz => {
-            crate::json::fn_jsonb_path_exists_tz(&[left.clone(), right.clone()])
+            crate::json::fn_jsonb_path_exists_tz_with_cancel(&[left.clone(), right.clone()], cancel)
         }
         BinOp::JsonPathMatchTz => {
-            crate::json::fn_jsonb_path_match_tz(&[left.clone(), right.clone()])
+            crate::json::fn_jsonb_path_match_tz_with_cancel(&[left.clone(), right.clone()], cancel)
         }
         BinOp::VectorL2 => eval_vector_distance(left, right, VectorMetric::L2),
         BinOp::VectorInner => eval_vector_distance(left, right, VectorMetric::Inner),
@@ -841,19 +1002,29 @@ fn eval_vector_distance(left: &Value, right: &Value, metric: VectorMetric) -> Re
     Ok(Value::Real(d))
 }
 
-fn eval_at_at(left: &Value, right: &Value) -> Result<Value> {
+fn eval_at_at_with_cancel(
+    left: &Value,
+    right: &Value,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Value> {
     use crate::types::DataType as D;
     if left.is_null() || right.is_null() {
         return Ok(Value::Null);
     }
     match (left.data_type(), right.data_type()) {
-        (D::Json | D::Jsonb, D::Text) => crate::json::op_path_match(left, right),
+        (D::Json | D::Jsonb, D::Text) => {
+            crate::json::op_path_match_with_cancel(left, right, cancel)
+        }
         (D::TsVector, D::TsQuery) => match (left, right) {
-            (Value::TsVector(v), Value::TsQuery(q)) => crate::fts::op_match(v, q),
+            (Value::TsVector(v), Value::TsQuery(q)) => {
+                crate::fts::op_match_with_cancel(v, q, cancel)
+            }
             _ => unreachable!(),
         },
         (D::TsQuery, D::TsVector) => match (left, right) {
-            (Value::TsQuery(q), Value::TsVector(v)) => crate::fts::op_match(v, q),
+            (Value::TsQuery(q), Value::TsVector(v)) => {
+                crate::fts::op_match_with_cancel(v, q, cancel)
+            }
             _ => unreachable!(),
         },
         (D::Text, D::TsQuery) => {
@@ -861,16 +1032,24 @@ fn eval_at_at(left: &Value, right: &Value) -> Result<Value> {
                 Value::Text(s) => s.as_str(),
                 _ => unreachable!(),
             };
-            let lhs = crate::fts::fn_to_tsvector(s)?;
-            eval_at_at(&lhs, right)
+            let lhs = crate::fts::fn_to_tsvector_with_cancel(
+                crate::fts::TokenizerKind::English,
+                s,
+                cancel,
+            )?;
+            eval_at_at_with_cancel(&lhs, right, cancel)
         }
         (D::TsVector, D::Text) => {
             let s = match right {
                 Value::Text(s) => s.as_str(),
                 _ => unreachable!(),
             };
-            let rhs = crate::fts::fn_plainto_tsquery(s)?;
-            eval_at_at(left, &rhs)
+            let rhs = crate::fts::fn_plainto_tsquery_with_cancel(
+                crate::fts::TokenizerKind::English,
+                s,
+                cancel,
+            )?;
+            eval_at_at_with_cancel(left, &rhs, cancel)
         }
         (D::Text, D::Text) => {
             let ls = match left {
@@ -881,9 +1060,17 @@ fn eval_at_at(left: &Value, right: &Value) -> Result<Value> {
                 Value::Text(s) => s.as_str(),
                 _ => unreachable!(),
             };
-            let lhs = crate::fts::fn_to_tsvector(ls)?;
-            let rhs = crate::fts::fn_plainto_tsquery(rs)?;
-            eval_at_at(&lhs, &rhs)
+            let lhs = crate::fts::fn_to_tsvector_with_cancel(
+                crate::fts::TokenizerKind::English,
+                ls,
+                cancel,
+            )?;
+            let rhs = crate::fts::fn_plainto_tsquery_with_cancel(
+                crate::fts::TokenizerKind::English,
+                rs,
+                cancel,
+            )?;
+            eval_at_at_with_cancel(&lhs, &rhs, cancel)
         }
         (lt, rt) => Err(SqlError::TypeMismatch {
             expected: "JSONB @@ text, tsvector @@ tsquery".into(),
@@ -1289,7 +1476,14 @@ fn eval_arithmetic(
     }
 }
 
-fn eval_in_values(lhs: &Value, list: &[Expr], ctx: &EvalCtx, negated: bool) -> Result<Value> {
+/// `x IN (a, b)` is `x = a OR x = b`, so each item collates exactly as its own `=` would.
+fn eval_in_values(
+    lhs_expr: &Expr,
+    lhs: &Value,
+    list: &[Expr],
+    ctx: &EvalCtx,
+    negated: bool,
+) -> Result<Value> {
     if list.is_empty() {
         return Ok(Value::Boolean(negated));
     }
@@ -1301,7 +1495,7 @@ fn eval_in_values(lhs: &Value, list: &[Expr], ctx: &EvalCtx, negated: bool) -> R
         let rhs = eval_expr(item, ctx)?;
         if rhs.is_null() {
             has_null = true;
-        } else if lhs == &rhs {
+        } else if collated_eq(lhs, &rhs, compile_collation(lhs_expr, item, ctx.col_map))? {
             return Ok(Value::Boolean(!negated));
         }
     }
@@ -1317,6 +1511,7 @@ fn eval_in_set(
     values: &rustc_hash::FxHashSet<Value>,
     has_null: bool,
     negated: bool,
+    coll: Option<crate::types::Collation>,
 ) -> Result<Value> {
     if values.is_empty() && !has_null {
         return Ok(Value::Boolean(negated));
@@ -1324,7 +1519,16 @@ fn eval_in_set(
     if lhs.is_null() {
         return Ok(Value::Null);
     }
-    if values.contains(lhs) {
+    // The set is hashed on the raw value, so a collation that calls distinct bytes equal
+    // cannot be answered by a lookup. Only a non-binary collation reaches the scan.
+    let found = match (coll, lhs) {
+        (Some(c), Value::Text(s)) => values.iter().any(|v| match v {
+            Value::Text(t) => c.eq_text(s, t),
+            _ => false,
+        }),
+        _ => values.contains(lhs),
+    };
+    if found {
         return Ok(Value::Boolean(!negated));
     }
     if has_null {
@@ -1412,10 +1616,29 @@ fn value_to_text(val: &Value) -> String {
     }
 }
 
-fn eval_between(val: &Value, low: &Value, high: &Value, negated: bool) -> Result<Value> {
-    // BETWEEN routed through eval_binary_op so comparison logic lives in one place.
-    let ge = eval_binary_op(val, BinOp::GtEq, low)?;
-    let le = eval_binary_op(val, BinOp::LtEq, high)?;
+fn value_to_text_with_cancel(
+    value: &Value,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<String> {
+    match value {
+        Value::TsVector(bytes) => crate::fts::tsvector_display_with_cancel(bytes, cancel),
+        Value::TsQuery(bytes) => crate::fts::tsquery_display_with_cancel(bytes, cancel),
+        _ => Ok(value_to_text(value)),
+    }
+}
+
+/// `x BETWEEN lo AND hi` is `x >= lo AND x <= hi`, so each bound collates as its own
+/// comparison would.
+fn eval_between(
+    val: &Value,
+    low: &Value,
+    high: &Value,
+    negated: bool,
+    low_coll: Option<crate::types::Collation>,
+    high_coll: Option<crate::types::Collation>,
+) -> Result<Value> {
+    let ge = collated_compare(val, BinOp::GtEq, low, low_coll)?;
+    let le = collated_compare(val, BinOp::LtEq, high, high_coll)?;
 
     let result = match (as_bool(&ge), as_bool(&le)) {
         (Some(false), _) | (_, Some(false)) => Some(false),
@@ -1571,10 +1794,18 @@ fn eval_case(
     ctx: &EvalCtx,
 ) -> Result<Value> {
     if let Some(op_expr) = operand {
+        // `CASE x WHEN c` is `x = c`, down to the collation that comparison would use.
         let op_val = eval_expr(op_expr, ctx)?;
         for (cond, result) in conditions {
             let cond_val = eval_expr(cond, ctx)?;
-            if !op_val.is_null() && !cond_val.is_null() && op_val == cond_val {
+            if !op_val.is_null()
+                && !cond_val.is_null()
+                && collated_eq(
+                    &op_val,
+                    &cond_val,
+                    compile_collation(op_expr, cond, ctx.col_map),
+                )?
+            {
                 return eval_expr(result, ctx);
             }
         }
@@ -1696,6 +1927,98 @@ pub(crate) fn eval_cast(val: &Value, target: DataType) -> Result<Value> {
     }
 }
 
+fn eval_cast_with_cancel(
+    value: &Value,
+    target: DataType,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return eval_cast(value, target);
+    };
+    cancel.check().map_err(SqlError::Storage)?;
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+
+    let converted = match (value, target) {
+        (Value::Text(text), DataType::Json) => {
+            normalize_json_cast(
+                crate::json::validate_text_with_cancel(text, Some(cancel)),
+                value,
+                target,
+            )?;
+            Value::Json(
+                normalize_json_cast(
+                    crate::json::clone_text_with_cancel(text, Some(cancel)),
+                    value,
+                    target,
+                )?
+                .into(),
+            )
+        }
+        (Value::Json(text), DataType::Json) => Value::Json(
+            normalize_json_cast(
+                crate::json::clone_text_with_cancel(text, Some(cancel)),
+                value,
+                target,
+            )?
+            .into(),
+        ),
+        (Value::Jsonb(bytes), DataType::Json) => Value::Json(
+            normalize_json_cast(
+                crate::json::decode_to_text_with_cancel(bytes, Some(cancel)),
+                value,
+                target,
+            )?
+            .into(),
+        ),
+        (Value::Text(text), DataType::Jsonb) | (Value::Json(text), DataType::Jsonb) => {
+            normalize_json_cast(
+                crate::json::text_to_jsonb_with_cancel(text, Some(cancel)),
+                value,
+                target,
+            )?
+        }
+        (Value::Jsonb(_), DataType::Jsonb) => value.clone(),
+        (Value::Json(text), DataType::Text) => Value::Text(
+            normalize_json_cast(
+                crate::json::clone_text_with_cancel(text, Some(cancel)),
+                value,
+                target,
+            )?
+            .into(),
+        ),
+        (Value::Jsonb(bytes), DataType::Text) => Value::Text(
+            normalize_json_cast(
+                crate::json::decode_to_text_with_cancel(bytes, Some(cancel)),
+                value,
+                target,
+            )?
+            .into(),
+        ),
+        (Value::TsVector(bytes), DataType::Text) => {
+            Value::Text(crate::fts::tsvector_display_with_cancel(bytes, Some(cancel))?.into())
+        }
+        (Value::TsQuery(bytes), DataType::Text) => {
+            Value::Text(crate::fts::tsquery_display_with_cancel(bytes, Some(cancel))?.into())
+        }
+        _ => return eval_cast(value, target),
+    };
+    cancel.check().map_err(SqlError::Storage)?;
+    Ok(converted)
+}
+
+fn normalize_json_cast<T>(result: Result<T>, value: &Value, target: DataType) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error @ SqlError::Storage(citadel_core::Error::Interrupted)) => Err(error),
+        Err(_) => Err(SqlError::InvalidValue(format!(
+            "cannot cast {} to {target}",
+            value.data_type()
+        ))),
+    }
+}
+
 fn parse_vector_literal(s: &str, expected_dim: u16) -> Result<std::sync::Arc<[f32]>> {
     let trimmed = s.trim();
     let inner = trimmed
@@ -1773,9 +2096,11 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => Ok(Value::Integer(s.chars().count() as i64)),
                 Value::Blob(b) => Ok(Value::Integer(b.len() as i64)),
-                Value::TsVector(b) => crate::fts::fn_length_tsvector(b),
+                Value::TsVector(b) => crate::fts::fn_length_tsvector_with_cancel(b, ctx.cancel),
                 _ => Ok(Value::Integer(
-                    value_to_text(&evaluated[0]).chars().count() as i64
+                    value_to_text_with_cancel(&evaluated[0], ctx.cancel)?
+                        .chars()
+                        .count() as i64,
                 )),
             }
         }
@@ -1785,7 +2110,9 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => Ok(Value::Text(s.to_ascii_uppercase())),
                 _ => Ok(Value::Text(
-                    value_to_text(&evaluated[0]).to_ascii_uppercase().into(),
+                    value_to_text_with_cancel(&evaluated[0], ctx.cancel)?
+                        .to_ascii_uppercase()
+                        .into(),
                 )),
             }
         }
@@ -1795,7 +2122,9 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 Value::Null => Ok(Value::Null),
                 Value::Text(s) => Ok(Value::Text(s.to_ascii_lowercase())),
                 _ => Ok(Value::Text(
-                    value_to_text(&evaluated[0]).to_ascii_lowercase().into(),
+                    value_to_text_with_cancel(&evaluated[0], ctx.cancel)?
+                        .to_ascii_lowercase()
+                        .into(),
                 )),
             }
         }
@@ -1808,7 +2137,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             if evaluated.iter().any(|v| v.is_null()) {
                 return Ok(Value::Null);
             }
-            let s = value_to_text(&evaluated[0]);
+            let s = value_to_text_with_cancel(&evaluated[0], ctx.cancel)?;
             let chars: Vec<char> = s.chars().collect();
             let start = match &evaluated[1] {
                 Value::Integer(i) => *i,
@@ -1864,12 +2193,14 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             if evaluated[0].is_null() {
                 return Ok(Value::Null);
             }
-            let s = value_to_text(&evaluated[0]);
+            let s = value_to_text_with_cancel(&evaluated[0], ctx.cancel)?;
             let trim_chars: Vec<char> = if evaluated.len() == 2 {
                 if evaluated[1].is_null() {
                     return Ok(Value::Null);
                 }
-                value_to_text(&evaluated[1]).chars().collect()
+                value_to_text_with_cancel(&evaluated[1], ctx.cancel)?
+                    .chars()
+                    .collect()
             } else {
                 vec![' ']
             };
@@ -1892,9 +2223,9 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             if evaluated.iter().any(|v| v.is_null()) {
                 return Ok(Value::Null);
             }
-            let s = value_to_text(&evaluated[0]);
-            let from = value_to_text(&evaluated[1]);
-            let to = value_to_text(&evaluated[2]);
+            let s = value_to_text_with_cancel(&evaluated[0], ctx.cancel)?;
+            let from = value_to_text_with_cancel(&evaluated[1], ctx.cancel)?;
+            let to = value_to_text_with_cancel(&evaluated[2], ctx.cancel)?;
             if from.is_empty() {
                 return Ok(Value::Text(s.into()));
             }
@@ -1905,8 +2236,8 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             if evaluated.iter().any(|v| v.is_null()) {
                 return Ok(Value::Null);
             }
-            let haystack = value_to_text(&evaluated[0]);
-            let needle = value_to_text(&evaluated[1]);
+            let haystack = value_to_text_with_cancel(&evaluated[0], ctx.cancel)?;
+            let needle = value_to_text_with_cancel(&evaluated[1], ctx.cancel)?;
             let pos = haystack
                 .find(&needle)
                 .map(|i| haystack[..i].chars().count() as i64 + 1)
@@ -1921,7 +2252,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             for v in &evaluated {
                 match v {
                     Value::Null => {}
-                    _ => result.push_str(&value_to_text(v)),
+                    _ => result.push_str(&value_to_text_with_cancel(v, ctx.cancel)?),
                 }
             }
             Ok(Value::Text(result.into()))
@@ -2127,7 +2458,9 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                     }
                     Ok(Value::Text(r.into()))
                 }
-                _ => Ok(Value::Text(value_to_text(&evaluated[0]).into())),
+                _ => Ok(Value::Text(
+                    value_to_text_with_cancel(&evaluated[0], ctx.cancel)?.into(),
+                )),
             }
         }
         "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" => {
@@ -2649,21 +2982,21 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             if evaluated[0].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_typeof(&evaluated[0])
+            crate::json::fn_typeof_with_cancel(&evaluated[0], ctx.cancel)
         }
         "JSONB_ARRAY_LENGTH" | "JSON_ARRAY_LENGTH" => {
             check_args(name, &evaluated, 1)?;
             if evaluated[0].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_array_length(&evaluated[0])
+            crate::json::fn_array_length_with_cancel(&evaluated[0], ctx.cancel)
         }
         "JSONB_OBJECT_LENGTH" | "JSON_OBJECT_LENGTH" => {
             check_args(name, &evaluated, 1)?;
             if evaluated[0].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_object_length(&evaluated[0])
+            crate::json::fn_object_length_with_cancel(&evaluated[0], ctx.cancel)
         }
         "JSONB_EXTRACT_PATH" | "JSON_EXTRACT_PATH" => {
             if evaluated.is_empty() {
@@ -2679,7 +3012,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             } else {
                 crate::types::DataType::Json
             };
-            crate::json::fn_extract_path(&evaluated, target, false)
+            crate::json::fn_extract_path_with_cancel(&evaluated, target, false, ctx.cancel)
         }
         "JSONB_EXTRACT_PATH_TEXT" | "JSON_EXTRACT_PATH_TEXT" => {
             if evaluated.is_empty() {
@@ -2690,21 +3023,26 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             if evaluated[0].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_extract_path(&evaluated, crate::types::DataType::Text, true)
+            crate::json::fn_extract_path_with_cancel(
+                &evaluated,
+                crate::types::DataType::Text,
+                true,
+                ctx.cancel,
+            )
         }
         "JSON_EXTRACT" => {
             check_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_sqlite_extract(&evaluated[0], &evaluated[1])
+            crate::json::fn_sqlite_extract_with_cancel(&evaluated[0], &evaluated[1], ctx.cancel)
         }
         "JSON_VALID" => {
             check_args(name, &evaluated, 1)?;
             if evaluated[0].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_valid(&evaluated[0])
+            crate::json::fn_valid_with_cancel(&evaluated[0], ctx.cancel)
         }
         "JSONB_STRIP_NULLS" | "JSON_STRIP_NULLS" => {
             check_args(name, &evaluated, 1)?;
@@ -2716,14 +3054,14 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             } else {
                 crate::types::DataType::Json
             };
-            crate::json::fn_strip_nulls(&evaluated[0], target)
+            crate::json::fn_strip_nulls_with_cancel(&evaluated[0], target, ctx.cancel)
         }
         "JSONB_PRETTY" | "JSON_PRETTY" => {
             check_args(name, &evaluated, 1)?;
             if evaluated[0].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_pretty(&evaluated[0])
+            crate::json::fn_pretty_with_cancel(&evaluated[0], ctx.cancel)
         }
         "JSONB_BUILD_OBJECT" | "JSON_BUILD_OBJECT" => {
             let target = if name.eq_ignore_ascii_case("JSONB_BUILD_OBJECT") {
@@ -2731,7 +3069,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             } else {
                 crate::types::DataType::Json
             };
-            crate::json::fn_build_object(&evaluated, target)
+            crate::json::fn_build_object_with_cancel(&evaluated, target, ctx.cancel)
         }
         "JSONB_BUILD_ARRAY" | "JSON_BUILD_ARRAY" => {
             let target = if name.eq_ignore_ascii_case("JSONB_BUILD_ARRAY") {
@@ -2739,7 +3077,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             } else {
                 crate::types::DataType::Json
             };
-            crate::json::fn_build_array(&evaluated, target)
+            crate::json::fn_build_array_with_cancel(&evaluated, target, ctx.cancel)
         }
         "JSONB_SET" | "JSON_SET" => {
             if !(3..=4).contains(&evaluated.len()) {
@@ -2759,12 +3097,13 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 .get(3)
                 .map(|v| matches!(v, Value::Boolean(true)))
                 .unwrap_or(true);
-            crate::json::fn_set(
+            crate::json::fn_set_with_cancel(
                 &evaluated[0],
                 &evaluated[1],
                 &evaluated[2],
                 create_missing,
                 target,
+                ctx.cancel,
             )
         }
         "JSONB_INSERT" | "JSON_INSERT" => {
@@ -2785,12 +3124,13 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
                 .get(3)
                 .map(|v| matches!(v, Value::Boolean(true)))
                 .unwrap_or(false);
-            crate::json::fn_insert(
+            crate::json::fn_insert_with_cancel(
                 &evaluated[0],
                 &evaluated[1],
                 &evaluated[2],
                 insert_after,
                 target,
+                ctx.cancel,
             )
         }
         "TO_JSONB" | "TO_JSON" => {
@@ -2800,7 +3140,7 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             } else {
                 crate::types::DataType::Json
             };
-            crate::json::fn_to_json(&evaluated[0], target)
+            crate::json::fn_to_json_with_cancel(&evaluated[0], target, ctx.cancel)
         }
         "ROW_TO_JSON" | "ROW_TO_JSONB" => {
             check_args(name, &evaluated, 1)?;
@@ -2809,134 +3149,139 @@ fn eval_scalar_function(name: &str, args: &[Expr], ctx: &EvalCtx) -> Result<Valu
             } else {
                 crate::types::DataType::Json
             };
-            crate::json::fn_to_json(&evaluated[0], target)
+            crate::json::fn_to_json_with_cancel(&evaluated[0], target, ctx.cancel)
         }
-        "JSON_OBJECT" => crate::json::fn_json_object(&evaluated),
+        "JSON_OBJECT" => crate::json::fn_json_object_with_cancel(&evaluated, ctx.cancel),
         "JSON_EXISTS" => {
             check_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_json_exists(&evaluated[0], &evaluated[1])
+            crate::json::fn_json_exists_with_cancel(&evaluated[0], &evaluated[1], ctx.cancel)
         }
         "JSON_VALUE" => {
             check_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_json_value(&evaluated[0], &evaluated[1])
+            crate::json::fn_json_value_with_cancel(&evaluated[0], &evaluated[1], ctx.cancel)
         }
         "JSON_QUERY" => {
             check_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_json_query(&evaluated[0], &evaluated[1], crate::types::DataType::Jsonb)
+            crate::json::fn_json_query_with_cancel(
+                &evaluated[0],
+                &evaluated[1],
+                crate::types::DataType::Jsonb,
+                ctx.cancel,
+            )
         }
         "JSONB_PATH_EXISTS" => {
             check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_jsonb_path_exists(&evaluated)
+            crate::json::fn_jsonb_path_exists_with_cancel(&evaluated, ctx.cancel)
         }
         "JSONB_PATH_MATCH" => {
             check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_jsonb_path_match(&evaluated)
+            crate::json::fn_jsonb_path_match_with_cancel(&evaluated, ctx.cancel)
         }
         "JSONB_PATH_QUERY_FIRST" => {
             check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_jsonb_path_query_first(&evaluated)
+            crate::json::fn_jsonb_path_query_first_with_cancel(&evaluated, ctx.cancel)
         }
         "JSONB_PATH_QUERY_ARRAY" => {
             check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_jsonb_path_query_array(&evaluated)
+            crate::json::fn_jsonb_path_query_array_with_cancel(&evaluated, ctx.cancel)
         }
         "JSONB_PATH_EXISTS_TZ" => {
             check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_jsonb_path_exists_tz(&evaluated)
+            crate::json::fn_jsonb_path_exists_tz_with_cancel(&evaluated, ctx.cancel)
         }
         "JSONB_PATH_MATCH_TZ" => {
             check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_jsonb_path_match_tz(&evaluated)
+            crate::json::fn_jsonb_path_match_tz_with_cancel(&evaluated, ctx.cancel)
         }
         "JSONB_PATH_QUERY_TZ" => {
             check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_jsonb_path_query_tz(&evaluated)
+            crate::json::fn_jsonb_path_query_tz_with_cancel(&evaluated, ctx.cancel)
         }
         "JSONB_PATH_QUERY_FIRST_TZ" => {
             check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_jsonb_path_query_first_tz(&evaluated)
+            crate::json::fn_jsonb_path_query_first_tz_with_cancel(&evaluated, ctx.cancel)
         }
         "JSONB_PATH_QUERY_ARRAY_TZ" => {
             check_min_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::fn_jsonb_path_query_array_tz(&evaluated)
+            crate::json::fn_jsonb_path_query_array_tz_with_cancel(&evaluated, ctx.cancel)
         }
         "JSONB_HAS_KEY" | "JSON_HAS_KEY" => {
             check_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::op_has_key(&evaluated[0], &evaluated[1])
+            crate::json::op_has_key_with_cancel(&evaluated[0], &evaluated[1], ctx.cancel)
         }
         "JSONB_HAS_ANY_KEY" | "JSON_HAS_ANY_KEY" => {
             check_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::op_has_any_key(&evaluated[0], &evaluated[1])
+            crate::json::op_has_any_key_with_cancel(&evaluated[0], &evaluated[1], ctx.cancel)
         }
         "JSONB_HAS_ALL_KEYS" | "JSON_HAS_ALL_KEYS" => {
             check_args(name, &evaluated, 2)?;
             if evaluated[0].is_null() || evaluated[1].is_null() {
                 return Ok(Value::Null);
             }
-            crate::json::op_has_all_keys(&evaluated[0], &evaluated[1])
+            crate::json::op_has_all_keys_with_cancel(&evaluated[0], &evaluated[1], ctx.cancel)
         }
-        "TO_TSVECTOR" => fts_to_tsvector(&evaluated),
-        "TO_TSQUERY" => fts_to_tsquery(&evaluated),
-        "PLAINTO_TSQUERY" => fts_plainto_tsquery(&evaluated),
-        "PHRASETO_TSQUERY" => fts_phraseto_tsquery(&evaluated),
-        "WEBSEARCH_TO_TSQUERY" => fts_websearch_to_tsquery(&evaluated),
-        "TS_RANK" => fts_ts_rank(&evaluated, false),
-        "TS_RANK_CD" => fts_ts_rank(&evaluated, true),
-        "TS_HEADLINE" => fts_ts_headline(&evaluated),
-        "TS_LEXIZE" => fts_ts_lexize(&evaluated),
-        "NUMNODE" => fts_numnode(&evaluated),
-        "SETWEIGHT" => fts_setweight(&evaluated),
-        "STRIP" => fts_strip(&evaluated),
+        "TO_TSVECTOR" => fts_to_tsvector(&evaluated, ctx.cancel),
+        "TO_TSQUERY" => fts_to_tsquery(&evaluated, ctx.cancel),
+        "PLAINTO_TSQUERY" => fts_plainto_tsquery(&evaluated, ctx.cancel),
+        "PHRASETO_TSQUERY" => fts_phraseto_tsquery(&evaluated, ctx.cancel),
+        "WEBSEARCH_TO_TSQUERY" => fts_websearch_to_tsquery(&evaluated, ctx.cancel),
+        "TS_RANK" => fts_ts_rank(&evaluated, false, ctx.cancel),
+        "TS_RANK_CD" => fts_ts_rank(&evaluated, true, ctx.cancel),
+        "TS_HEADLINE" => fts_ts_headline(&evaluated, ctx.cancel),
+        "TS_LEXIZE" => fts_ts_lexize(&evaluated, ctx.cancel),
+        "NUMNODE" => fts_numnode(&evaluated, ctx.cancel),
+        "SETWEIGHT" => fts_setweight(&evaluated, ctx.cancel),
+        "STRIP" => fts_strip(&evaluated, ctx.cancel),
         _ => Err(SqlError::Unsupported(format!("scalar function: {name}"))),
     }
 }
 
-fn fts_resolve_config_and_text(
-    args: &[Value],
+fn fts_resolve_config_and_text<'a>(
+    args: &'a [Value],
     fname: &str,
-) -> Result<(crate::fts::TokenizerKind, String)> {
+) -> Result<(crate::fts::TokenizerKind, &'a str)> {
     if args.is_empty() || args.len() > 2 {
         return Err(SqlError::InvalidValue(format!(
             "{fname} requires 1 or 2 arguments"
@@ -2944,7 +3289,7 @@ fn fts_resolve_config_and_text(
     }
     let (config_name, text) = if args.len() == 2 {
         let cfg = match &args[0] {
-            Value::Text(s) => Some(s.as_str().to_string()),
+            Value::Text(s) => Some(s.as_str()),
             v => {
                 return Err(SqlError::TypeMismatch {
                     expected: "TEXT (config)".into(),
@@ -2953,7 +3298,7 @@ fn fts_resolve_config_and_text(
             }
         };
         let txt = match &args[1] {
-            Value::Text(s) => s.as_str().to_string(),
+            Value::Text(s) => s.as_str(),
             v => {
                 return Err(SqlError::TypeMismatch {
                     expected: "TEXT".into(),
@@ -2964,7 +3309,7 @@ fn fts_resolve_config_and_text(
         (cfg, txt)
     } else {
         let txt = match &args[0] {
-            Value::Text(s) => s.as_str().to_string(),
+            Value::Text(s) => s.as_str(),
             v => {
                 return Err(SqlError::TypeMismatch {
                     expected: "TEXT".into(),
@@ -2975,53 +3320,60 @@ fn fts_resolve_config_and_text(
         (None, txt)
     };
     let kind = match config_name {
-        Some(name) => crate::fts::TokenizerKind::from_name(&name)?,
+        Some(name) => crate::fts::TokenizerKind::from_name(name)?,
         None => crate::fts::TokenizerKind::English,
     };
     Ok((kind, text))
 }
 
-fn fts_to_tsvector(args: &[Value]) -> Result<Value> {
+fn fts_to_tsvector(args: &[Value], cancel: Option<&citadel::CancelToken>) -> Result<Value> {
     if args.iter().any(|v| v.is_null()) {
         return Ok(Value::Null);
     }
     let (kind, text) = fts_resolve_config_and_text(args, "to_tsvector")?;
-    crate::fts::fn_to_tsvector_with(kind, &text)
+    crate::fts::fn_to_tsvector_with_cancel(kind, text, cancel)
 }
 
-fn fts_to_tsquery(args: &[Value]) -> Result<Value> {
+fn fts_to_tsquery(args: &[Value], cancel: Option<&citadel::CancelToken>) -> Result<Value> {
     if args.iter().any(|v| v.is_null()) {
         return Ok(Value::Null);
     }
     let (kind, text) = fts_resolve_config_and_text(args, "to_tsquery")?;
-    crate::fts::fn_to_tsquery_with(kind, &text)
+    crate::fts::fn_to_tsquery_with_cancel(kind, text, cancel)
 }
 
-fn fts_plainto_tsquery(args: &[Value]) -> Result<Value> {
+fn fts_plainto_tsquery(args: &[Value], cancel: Option<&citadel::CancelToken>) -> Result<Value> {
     if args.iter().any(|v| v.is_null()) {
         return Ok(Value::Null);
     }
     let (kind, text) = fts_resolve_config_and_text(args, "plainto_tsquery")?;
-    crate::fts::fn_plainto_tsquery_with(kind, &text)
+    crate::fts::fn_plainto_tsquery_with_cancel(kind, text, cancel)
 }
 
-fn fts_phraseto_tsquery(args: &[Value]) -> Result<Value> {
+fn fts_phraseto_tsquery(args: &[Value], cancel: Option<&citadel::CancelToken>) -> Result<Value> {
     if args.iter().any(|v| v.is_null()) {
         return Ok(Value::Null);
     }
     let (kind, text) = fts_resolve_config_and_text(args, "phraseto_tsquery")?;
-    crate::fts::fn_phraseto_tsquery_with(kind, &text)
+    crate::fts::fn_phraseto_tsquery_with_cancel(kind, text, cancel)
 }
 
-fn fts_websearch_to_tsquery(args: &[Value]) -> Result<Value> {
+fn fts_websearch_to_tsquery(
+    args: &[Value],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Value> {
     if args.iter().any(|v| v.is_null()) {
         return Ok(Value::Null);
     }
     let (kind, text) = fts_resolve_config_and_text(args, "websearch_to_tsquery")?;
-    crate::fts::fn_websearch_to_tsquery_with(kind, &text)
+    crate::fts::fn_websearch_to_tsquery_with_cancel(kind, text, cancel)
 }
 
-fn fts_ts_rank(args: &[Value], cover_density: bool) -> Result<Value> {
+fn fts_ts_rank(
+    args: &[Value],
+    cover_density: bool,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Value> {
     let fname = if cover_density {
         "ts_rank_cd"
     } else {
@@ -3068,13 +3420,13 @@ fn fts_ts_rank(args: &[Value], cover_density: bool) -> Result<Value> {
         0
     };
     if cover_density {
-        crate::fts::fn_ts_rank_cd(tsv, tsq, norm)
+        crate::fts::fn_ts_rank_cd_with_cancel(tsv, tsq, norm, cancel)
     } else {
-        crate::fts::fn_ts_rank(tsv, tsq, norm)
+        crate::fts::fn_ts_rank_with_cancel(tsv, tsq, norm, cancel)
     }
 }
 
-fn fts_ts_headline(args: &[Value]) -> Result<Value> {
+fn fts_ts_headline(args: &[Value], cancel: Option<&citadel::CancelToken>) -> Result<Value> {
     if args.len() < 2 || args.len() > 4 {
         return Err(SqlError::InvalidValue(
             "ts_headline requires 2 to 4 arguments".into(),
@@ -3116,10 +3468,10 @@ fn fts_ts_headline(args: &[Value]) -> Result<Value> {
             })
         }
     };
-    crate::fts::fn_ts_headline_with(kind, text, tsq)
+    crate::fts::fn_ts_headline_with_cancel(kind, text, tsq, cancel)
 }
 
-fn fts_ts_lexize(args: &[Value]) -> Result<Value> {
+fn fts_ts_lexize(args: &[Value], cancel: Option<&citadel::CancelToken>) -> Result<Value> {
     if args.len() != 2 {
         return Err(SqlError::InvalidValue(
             "ts_lexize requires 2 arguments (config, word)".into(),
@@ -3146,10 +3498,10 @@ fn fts_ts_lexize(args: &[Value]) -> Result<Value> {
             })
         }
     };
-    crate::fts::fn_ts_lexize_with(kind, word)
+    crate::fts::fn_ts_lexize_with_cancel(kind, word, cancel)
 }
 
-fn fts_numnode(args: &[Value]) -> Result<Value> {
+fn fts_numnode(args: &[Value], cancel: Option<&citadel::CancelToken>) -> Result<Value> {
     check_args("numnode", args, 1)?;
     if args[0].is_null() {
         return Ok(Value::Null);
@@ -3163,12 +3515,12 @@ fn fts_numnode(args: &[Value]) -> Result<Value> {
             })
         }
     };
-    crate::fts::fn_numnode(tsq)
+    crate::fts::fn_numnode_with_cancel(tsq, cancel)
 }
 
-fn fts_setweight(args: &[Value]) -> Result<Value> {
+fn fts_setweight(args: &[Value], cancel: Option<&citadel::CancelToken>) -> Result<Value> {
     if args.len() == 3 {
-        return fts_setweight_selective(args);
+        return fts_setweight_selective(args, cancel);
     }
     check_args("setweight", args, 2)?;
     if args[0].is_null() || args[1].is_null() {
@@ -3193,10 +3545,10 @@ fn fts_setweight(args: &[Value]) -> Result<Value> {
         }
     };
     let weight = crate::fts::parse_weight_char(weight_text)?;
-    crate::fts::fn_setweight(tsv, weight)
+    crate::fts::fn_setweight_with_cancel(tsv, weight, cancel)
 }
 
-fn fts_setweight_selective(args: &[Value]) -> Result<Value> {
+fn fts_setweight_selective(args: &[Value], cancel: Option<&citadel::CancelToken>) -> Result<Value> {
     check_args("setweight", args, 3)?;
     if args[0].is_null() || args[1].is_null() || args[2].is_null() {
         return Ok(Value::Null);
@@ -3229,10 +3581,10 @@ fn fts_setweight_selective(args: &[Value]) -> Result<Value> {
             })
         }
     };
-    crate::fts::fn_setweight_selective(tsv, weight, filter)
+    crate::fts::fn_setweight_selective_with_cancel(tsv, weight, filter, cancel)
 }
 
-fn fts_strip(args: &[Value]) -> Result<Value> {
+fn fts_strip(args: &[Value], cancel: Option<&citadel::CancelToken>) -> Result<Value> {
     check_args("strip", args, 1)?;
     if args[0].is_null() {
         return Ok(Value::Null);
@@ -3246,7 +3598,7 @@ fn fts_strip(args: &[Value]) -> Result<Value> {
             })
         }
     };
-    crate::fts::fn_strip(tsv)
+    crate::fts::fn_strip_with_cancel(tsv, cancel)
 }
 
 /// Extract a timestamp (µs UTC) from a Value, coercing DATE → midnight.
@@ -3418,6 +3770,10 @@ fn collect_column_refs(expr: &Expr, columns: &[ColumnDef], out: &mut Vec<usize>)
             collect_column_refs(expr, columns, out);
             collect_column_refs(low, columns, out);
             collect_column_refs(high, columns, out);
+        }
+        Expr::IsDistinctFrom { left, right, .. } => {
+            collect_column_refs(left, columns, out);
+            collect_column_refs(right, columns, out);
         }
         Expr::Like {
             expr,

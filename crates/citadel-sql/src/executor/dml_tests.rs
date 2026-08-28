@@ -174,7 +174,15 @@ fn apply_set_operation_union_all_concatenates() {
         limit: None,
         offset: None,
     };
-    let result = apply_set_operation(&comp, left, right).unwrap();
+    let result = apply_set_operation(
+        &SchemaManager::empty(),
+        &CteContext::default(),
+        &comp,
+        left,
+        right,
+        None,
+    )
+    .unwrap();
     if let ExecutionResult::Query(q) = result {
         assert_eq!(q.rows.len(), 4);
     } else {
@@ -195,7 +203,15 @@ fn apply_set_operation_union_dedupes() {
         limit: None,
         offset: None,
     };
-    let result = apply_set_operation(&comp, left, right).unwrap();
+    let result = apply_set_operation(
+        &SchemaManager::empty(),
+        &CteContext::default(),
+        &comp,
+        left,
+        right,
+        None,
+    )
+    .unwrap();
     if let ExecutionResult::Query(q) = result {
         assert_eq!(q.rows.len(), 3);
     } else {
@@ -216,7 +232,15 @@ fn apply_set_operation_intersect_keeps_common() {
         limit: None,
         offset: None,
     };
-    let result = apply_set_operation(&comp, left, right).unwrap();
+    let result = apply_set_operation(
+        &SchemaManager::empty(),
+        &CteContext::default(),
+        &comp,
+        left,
+        right,
+        None,
+    )
+    .unwrap();
     if let ExecutionResult::Query(q) = result {
         assert_eq!(q.rows.len(), 2);
     } else {
@@ -237,7 +261,15 @@ fn apply_set_operation_except_removes_right() {
         limit: None,
         offset: None,
     };
-    let result = apply_set_operation(&comp, left, right).unwrap();
+    let result = apply_set_operation(
+        &SchemaManager::empty(),
+        &CteContext::default(),
+        &comp,
+        left,
+        right,
+        None,
+    )
+    .unwrap();
     if let ExecutionResult::Query(q) = result {
         assert_eq!(q.rows.len(), 2);
         assert!(q.rows.contains(&vec![i(1)]));
@@ -260,7 +292,15 @@ fn apply_set_operation_column_count_mismatch_errors() {
         limit: None,
         offset: None,
     };
-    assert!(apply_set_operation(&comp, left, right).is_err());
+    assert!(apply_set_operation(
+        &SchemaManager::empty(),
+        &CteContext::default(),
+        &comp,
+        left,
+        right,
+        None,
+    )
+    .is_err());
 }
 
 #[test]
@@ -271,7 +311,7 @@ fn materialize_expr_in_subquery_converts_to_in_set() {
         subquery: Box::new(empty_select("inner")),
         negated: false,
     };
-    let mut exec_sub = |_: &SelectStmt| Ok(inner_qr.clone());
+    let mut exec_sub = |_: &SelectStmt| Ok(CteRows::binary(inner_qr.clone()));
     let result = materialize_expr(&e, &mut exec_sub).unwrap();
     assert!(matches!(result, Expr::InSet { .. }));
 }
@@ -280,7 +320,7 @@ fn materialize_expr_in_subquery_converts_to_in_set() {
 fn materialize_expr_scalar_subquery_becomes_literal() {
     let inner_qr = qr(vec!["x"], vec![vec![i(42)]]);
     let e = scalar_subq("inner");
-    let mut exec_sub = |_: &SelectStmt| Ok(inner_qr.clone());
+    let mut exec_sub = |_: &SelectStmt| Ok(CteRows::binary(inner_qr.clone()));
     let result = materialize_expr(&e, &mut exec_sub).unwrap();
     assert!(matches!(result, Expr::Literal(Value::Integer(42))));
 }
@@ -289,7 +329,7 @@ fn materialize_expr_scalar_subquery_becomes_literal() {
 fn materialize_expr_scalar_subquery_empty_becomes_null() {
     let inner_qr = qr(vec!["x"], vec![]);
     let e = scalar_subq("inner");
-    let mut exec_sub = |_: &SelectStmt| Ok(inner_qr.clone());
+    let mut exec_sub = |_: &SelectStmt| Ok(CteRows::binary(inner_qr.clone()));
     let result = materialize_expr(&e, &mut exec_sub).unwrap();
     assert!(matches!(result, Expr::Literal(Value::Null)));
 }
@@ -301,7 +341,7 @@ fn materialize_expr_exists_true() {
         subquery: Box::new(empty_select("inner")),
         negated: false,
     };
-    let mut exec_sub = |_: &SelectStmt| Ok(inner_qr.clone());
+    let mut exec_sub = |_: &SelectStmt| Ok(CteRows::binary(inner_qr.clone()));
     let result = materialize_expr(&e, &mut exec_sub).unwrap();
     assert!(matches!(result, Expr::Literal(Value::Boolean(true))));
 }
@@ -313,7 +353,7 @@ fn materialize_expr_not_exists_false_when_rows_present() {
         subquery: Box::new(empty_select("inner")),
         negated: true,
     };
-    let mut exec_sub = |_: &SelectStmt| Ok(inner_qr.clone());
+    let mut exec_sub = |_: &SelectStmt| Ok(CteRows::binary(inner_qr.clone()));
     let result = materialize_expr(&e, &mut exec_sub).unwrap();
     assert!(matches!(result, Expr::Literal(Value::Boolean(false))));
 }
@@ -325,7 +365,7 @@ fn materialize_expr_exists_false_for_empty_subquery() {
         subquery: Box::new(empty_select("inner")),
         negated: false,
     };
-    let mut exec_sub = |_: &SelectStmt| Ok(inner_qr.clone());
+    let mut exec_sub = |_: &SelectStmt| Ok(CteRows::binary(inner_qr.clone()));
     let result = materialize_expr(&e, &mut exec_sub).unwrap();
     assert!(matches!(result, Expr::Literal(Value::Boolean(false))));
 }
@@ -334,17 +374,17 @@ fn materialize_expr_exists_false_for_empty_subquery() {
 fn materialize_expr_scalar_multiple_rows_errors() {
     let inner_qr = qr(vec!["x"], vec![vec![i(1)], vec![i(2)]]);
     let e = scalar_subq("inner");
-    let mut exec_sub = |_: &SelectStmt| Ok(inner_qr.clone());
+    let mut exec_sub = |_: &SelectStmt| Ok(CteRows::binary(inner_qr.clone()));
     assert!(materialize_expr(&e, &mut exec_sub).is_err());
 }
 
 #[test]
 fn materialize_expr_pass_through_literal() {
     let mut exec_sub = |_: &SelectStmt| {
-        Ok(QueryResult {
+        Ok(CteRows::binary(QueryResult {
             columns: vec![],
             rows: vec![],
-        })
+        }))
     };
     let e = Expr::Literal(i(5));
     let result = materialize_expr(&e, &mut exec_sub).unwrap();
@@ -361,10 +401,10 @@ fn materialize_query_body_pass_through_dml() {
         returning: None,
     }));
     let mut exec_sub = |_: &SelectStmt| {
-        Ok(QueryResult {
+        Ok(CteRows::binary(QueryResult {
             columns: vec![],
             rows: vec![],
-        })
+        }))
     };
     let result = materialize_query_body(&body, &mut exec_sub).unwrap();
     assert!(matches!(result, QueryBody::Insert(_)));

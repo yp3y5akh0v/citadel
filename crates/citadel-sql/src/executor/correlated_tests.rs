@@ -264,3 +264,63 @@ fn has_correlated_where_no_where_clause() {
     let mgr = crate::schema::SchemaManager::empty();
     assert!(!has_correlated_where(&None, &ctx, &mgr));
 }
+
+#[test]
+fn correlated_materialization_stops_after_a_mid_loop_cancel() {
+    let token = citadel::CancelToken::new();
+    let mut values: Vec<usize> = (0..1_000).collect();
+
+    let err = retain_cancellable(&mut values, Some(&token), |value| {
+        if *value == 1 {
+            token.cancel();
+        }
+        Ok(true)
+    })
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        crate::error::SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+    assert_eq!(
+        values.len(),
+        crate::executor::helpers::CANCEL_CHECK_INTERVAL
+    );
+}
+
+#[test]
+fn correlated_in_probe_passes_cancellation_into_scalar_evaluation() {
+    use citadel::{Argon2Profile, DatabaseBuilder};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseBuilder::new(dir.path().join("correlated-value-cancel.citadel"))
+        .passphrase(b"correlated-value-cancel-passphrase")
+        .argon2_profile(Argon2Profile::Iot)
+        .create()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE outer_docs (id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE inner_docs (id INTEGER PRIMARY KEY, outer_id INTEGER, body TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO outer_docs VALUES (1, 'several words to tokenize')")
+        .unwrap();
+    conn.execute("INSERT INTO inner_docs VALUES (1, 1, 'irrelevant')")
+        .unwrap();
+
+    let token = citadel::CancelToken::new();
+    db.set_cancel(Some(token.clone()));
+    let _cancel = crate::fts::cancel_tokenize_after(token, 1);
+    let err = conn
+        .query(
+            "SELECT id FROM outer_docs AS o \
+             WHERE TO_TSVECTOR(o.body) IN \
+                   (SELECT i.body FROM inner_docs AS i WHERE i.outer_id = o.id)",
+        )
+        .expect_err("the correlated IN probe discarded its cancellation token");
+
+    assert!(matches!(
+        err,
+        crate::error::SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+}

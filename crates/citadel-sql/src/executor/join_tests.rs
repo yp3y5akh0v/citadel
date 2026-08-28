@@ -151,15 +151,106 @@ fn resolve_col_idx_unknown_returns_none() {
 #[test]
 fn hash_key_extracts_indices_in_order() {
     let row = vec![i(1), i(2), i(3), i(4)];
-    let key = hash_key(&row, &[2, 0]);
+    let key = hash_key(&row, &[2, 0], &[]);
     assert_eq!(key, vec![i(3), i(1)]);
 }
 
 #[test]
 fn hash_key_empty_indices_yields_empty_key() {
     let row = vec![i(1), i(2)];
-    let key = hash_key(&row, &[]);
+    let key = hash_key(&row, &[], &[]);
     assert!(key.is_empty());
+}
+
+/// A collated key column folds, so two spellings the collation calls equal produce one key
+/// and land in the same hash bucket.
+#[test]
+fn hash_key_folds_a_collated_column() {
+    let upper = vec![Value::Text("A".into()), i(1)];
+    let lower = vec![Value::Text("a".into()), i(2)];
+    let colls = [crate::types::Collation::NoCase];
+
+    assert_eq!(
+        hash_key(&upper, &[0], &colls),
+        hash_key(&lower, &[0], &colls)
+    );
+    assert_ne!(
+        hash_key(&upper, &[0], &[crate::types::Collation::Binary]),
+        hash_key(&lower, &[0], &[crate::types::Collation::Binary])
+    );
+}
+
+/// The syntactic left operand supplies the collation even when it is BINARY. Join build/probe
+/// order must not change the comparison that the ON expression denotes.
+#[test]
+fn equi_key_collations_follow_syntactic_left_precedence() {
+    let mut cols = cols(&[("l", DataType::Text), ("r", DataType::Text)]);
+    cols[1].collation = crate::types::Collation::NoCase;
+    assert_eq!(
+        equi_key_collations(
+            &[KeyPair {
+                outer: 0,
+                inner: 0,
+                left_is_outer: true,
+            }],
+            &cols,
+            1,
+        ),
+        vec![crate::types::Collation::Binary],
+        "a BINARY left operand still wins over a NOCASE right operand"
+    );
+    assert_eq!(
+        equi_key_collations(
+            &[KeyPair {
+                outer: 0,
+                inner: 0,
+                left_is_outer: false,
+            }],
+            &cols,
+            1,
+        ),
+        vec![crate::types::Collation::NoCase],
+        "the inner column wins when it was written on the left"
+    );
+
+    cols[0].collation = crate::types::Collation::Rtrim;
+    assert_eq!(
+        equi_key_collations(
+            &[KeyPair {
+                outer: 0,
+                inner: 0,
+                left_is_outer: true,
+            }],
+            &cols,
+            1,
+        ),
+        vec![crate::types::Collation::Rtrim],
+        "a collated left wins"
+    );
+}
+
+#[test]
+fn equi_key_collations_offsets_inner_columns_past_the_outer_row() {
+    let mut cols = cols(&[
+        ("outer_id", DataType::Integer),
+        ("outer_text", DataType::Text),
+        ("inner_id", DataType::Integer),
+        ("inner_text", DataType::Text),
+    ]);
+    cols[3].collation = crate::types::Collation::NoCase;
+
+    assert_eq!(
+        equi_key_collations(
+            &[KeyPair {
+                outer: 1,
+                inner: 1,
+                left_is_outer: false,
+            }],
+            &cols,
+            2,
+        ),
+        vec![crate::types::Collation::NoCase]
+    );
 }
 
 #[test]
@@ -191,6 +282,103 @@ fn count_conjuncts_or_does_not_split() {
     assert_eq!(count_conjuncts(&e), 1);
 }
 
+fn cancellable_integer_join() -> (JoinClause, Vec<ColumnDef>, EquiJoin) {
+    let combined = cols(&[("a.id", DataType::Integer), ("b.id", DataType::Integer)]);
+    let join = JoinClause {
+        join_type: JoinType::Inner,
+        table: TableRef {
+            name: "b".into(),
+            alias: None,
+            args: None,
+        },
+        subquery: None,
+        on_clause: Some(Expr::BinaryOp {
+            left: Box::new(Expr::QualifiedColumn {
+                table: "a".into(),
+                column: "id".into(),
+            }),
+            op: BinOp::Eq,
+            right: Box::new(Expr::QualifiedColumn {
+                table: "b".into(),
+                column: "id".into(),
+            }),
+        }),
+    };
+    let equi = compute_equi_join_meta(&join, &combined, 1);
+    (join, combined, equi)
+}
+
+fn assert_interrupted(err: SqlError) {
+    assert!(
+        matches!(err, SqlError::Storage(citadel_core::Error::Interrupted)),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn materialized_integer_join_observes_an_async_cancel() {
+    let (join, combined, equi) = cancellable_integer_join();
+    // One key with many matches forces the integer lane to stay in its output
+    // loop long after both inputs have been materialized.
+    let outer = vec![vec![i(7)]; 1024];
+    let mut inner = vec![vec![i(7)]; 1024];
+    let token = citadel::CancelToken::new();
+    let trip = token.clone();
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        trip.cancel();
+    });
+
+    let err = exec_join_step(
+        outer,
+        &mut inner,
+        &join,
+        &combined,
+        1,
+        1,
+        None,
+        None,
+        &equi,
+        Some(&token),
+    )
+    .expect_err("the materialized join ignored cancellation");
+    stopper.join().unwrap();
+    assert_interrupted(err);
+}
+
+#[test]
+fn cached_borrowed_integer_join_observes_an_async_cancel() {
+    let (join, combined, equi) = cancellable_integer_join();
+    let outer = vec![vec![i(7)]; 1024];
+    let inner = vec![vec![i(7)]; 1024];
+    let probe = build_probe_index(&inner, &equi, None).unwrap();
+    assert!(matches!(probe, ProbeIndex::Int(_)));
+
+    let token = citadel::CancelToken::new();
+    let trip = token.clone();
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        trip.cancel();
+    });
+
+    let err = exec_join_step_borrowed(
+        outer,
+        &inner,
+        &join,
+        &combined,
+        1,
+        1,
+        None,
+        None,
+        &equi,
+        Some(&probe),
+        Some(&token),
+    )
+    .expect_err("the cached borrowed join ignored cancellation");
+    stopper.join().unwrap();
+    assert_interrupted(err);
+}
+
 #[test]
 fn combine_row_concatenates() {
     let combined = combine_row(&[i(1), i(2)], &[i(3), i(4)], 4);
@@ -212,7 +400,14 @@ fn extract_equi_join_keys_simple_equi() {
         }),
     };
     let pairs = extract_equi_join_keys(&on, &combined, 1);
-    assert_eq!(pairs, vec![(0, 0)]);
+    assert_eq!(
+        pairs,
+        vec![KeyPair {
+            outer: 0,
+            inner: 0,
+            left_is_outer: true,
+        }]
+    );
 }
 
 #[test]
@@ -231,4 +426,52 @@ fn extract_equi_join_keys_non_equi_returns_empty() {
     };
     let pairs = extract_equi_join_keys(&on, &combined, 1);
     assert!(pairs.is_empty());
+}
+
+#[test]
+fn residual_join_predicate_propagates_scalar_cancellation() {
+    let combined = cols(&[("a.body", DataType::Text), ("b.body", DataType::Text)]);
+    let vector = |table: &str| Expr::Function {
+        name: "TO_TSVECTOR".into(),
+        args: vec![Expr::QualifiedColumn {
+            table: table.into(),
+            column: "body".into(),
+        }],
+        distinct: false,
+    };
+    let join = JoinClause {
+        join_type: JoinType::Inner,
+        table: TableRef {
+            name: "b".into(),
+            alias: None,
+            args: None,
+        },
+        subquery: None,
+        on_clause: Some(Expr::BinaryOp {
+            left: Box::new(vector("a")),
+            op: BinOp::Eq,
+            right: Box::new(vector("b")),
+        }),
+    };
+    let equi = compute_equi_join_meta(&join, &combined, 1);
+    assert!(equi.is_empty());
+    let mut inner = vec![vec![Value::Text("inner words".into())]];
+    let token = citadel::CancelToken::new();
+    let _cancel = crate::fts::cancel_tokenize_after(token.clone(), 1);
+
+    let err = exec_join_step(
+        vec![vec![Value::Text("outer words".into())]],
+        &mut inner,
+        &join,
+        &combined,
+        1,
+        1,
+        None,
+        None,
+        &equi,
+        Some(&token),
+    )
+    .expect_err("the residual ON expression discarded its cancellation token");
+
+    assert_interrupted(err);
 }

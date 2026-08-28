@@ -6,13 +6,36 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashSet;
 
-use crate::error::Result;
+use crate::error::{Result, SqlError};
+use crate::executor::helpers::sort_vec_by;
 use crate::schema::SchemaManager;
 use crate::types::{DataType, QueryResult, Value};
 
 pub trait VirtualTable: Send + Sync {
     fn name(&self) -> &str;
-    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult>;
+
+    /// Materialize this table for one read operation. Implementations should poll
+    /// `cancel` inside every long loop; cancellation is cooperative, so the executor
+    /// cannot interrupt code that does not poll.
+    fn scan(
+        &self,
+        schema: &SchemaManager,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<QueryResult>;
+}
+
+fn check_cancel(cancel: Option<&citadel::CancelToken>) -> Result<()> {
+    match cancel {
+        Some(token) => token.check().map_err(SqlError::Storage),
+        None => Ok(()),
+    }
+}
+
+fn check_cancel_at(cancel: Option<&citadel::CancelToken>, work: usize) -> Result<()> {
+    if work.is_multiple_of(64) {
+        check_cancel(cancel)?;
+    }
+    Ok(())
 }
 
 pub fn register_builtins(schema: &mut SchemaManager) {
@@ -37,7 +60,12 @@ impl VirtualTable for PgTimezoneNames {
     fn name(&self) -> &str {
         "pg_timezone_names"
     }
-    fn scan(&self, _schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(
+        &self,
+        _schema: &SchemaManager,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<QueryResult> {
+        check_cancel(cancel)?;
         let columns = vec![
             "name".to_string(),
             "utc_offset".to_string(),
@@ -46,7 +74,8 @@ impl VirtualTable for PgTimezoneNames {
         let now = jiff::Timestamp::now();
         let db = jiff::tz::db();
         let mut rows = Vec::new();
-        for name in db.available() {
+        for (work, name) in db.available().enumerate() {
+            check_cancel_at(cancel, work)?;
             if let Ok(tz) = db.get(name.as_str()) {
                 let info = tz.to_offset_info(now);
                 let utc_offset = Value::Interval {
@@ -61,6 +90,7 @@ impl VirtualTable for PgTimezoneNames {
                 ]);
             }
         }
+        check_cancel(cancel)?;
         Ok(QueryResult { columns, rows })
     }
 }
@@ -70,7 +100,12 @@ impl VirtualTable for PgTimezoneAbbrevs {
     fn name(&self) -> &str {
         "pg_timezone_abbrevs"
     }
-    fn scan(&self, _schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(
+        &self,
+        _schema: &SchemaManager,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<QueryResult> {
+        check_cancel(cancel)?;
         let columns = vec![
             "abbrev".to_string(),
             "utc_offset".to_string(),
@@ -80,7 +115,8 @@ impl VirtualTable for PgTimezoneAbbrevs {
         let db = jiff::tz::db();
         let mut seen: FxHashSet<String> = FxHashSet::default();
         let mut rows = Vec::new();
-        for name in db.available() {
+        for (work, name) in db.available().enumerate() {
+            check_cancel_at(cancel, work)?;
             if let Ok(tz) = db.get(name.as_str()) {
                 let info = tz.to_offset_info(now);
                 let abbrev = info.abbreviation().to_string();
@@ -99,6 +135,7 @@ impl VirtualTable for PgTimezoneAbbrevs {
                 ]);
             }
         }
+        check_cancel(cancel)?;
         Ok(QueryResult { columns, rows })
     }
 }
@@ -108,7 +145,12 @@ impl VirtualTable for InfoSchemaTables {
     fn name(&self) -> &str {
         "information_schema.tables"
     }
-    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(
+        &self,
+        schema: &SchemaManager,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<QueryResult> {
+        check_cancel(cancel)?;
         let columns = vec![
             "table_catalog".to_string(),
             "table_schema".to_string(),
@@ -116,7 +158,10 @@ impl VirtualTable for InfoSchemaTables {
             "table_type".to_string(),
         ];
         let mut rows = Vec::new();
+        let mut work = 0;
         for ts in schema.all_schemas() {
+            check_cancel_at(cancel, work)?;
+            work += 1;
             // Listed separately below as MATERIALIZED VIEW.
             if schema.get_matview(&ts.name).is_some() {
                 continue;
@@ -129,6 +174,8 @@ impl VirtualTable for InfoSchemaTables {
             ]);
         }
         for vn in schema.view_names() {
+            check_cancel_at(cancel, work)?;
+            work += 1;
             rows.push(vec![
                 Value::Text("citadel".into()),
                 Value::Text("public".into()),
@@ -137,6 +184,8 @@ impl VirtualTable for InfoSchemaTables {
             ]);
         }
         for mv in schema.all_matviews() {
+            check_cancel_at(cancel, work)?;
+            work += 1;
             rows.push(vec![
                 Value::Text("citadel".into()),
                 Value::Text("public".into()),
@@ -144,10 +193,11 @@ impl VirtualTable for InfoSchemaTables {
                 Value::Text("MATERIALIZED VIEW".into()),
             ]);
         }
-        rows.sort_by(|a, b| match (&a[2], &b[2]) {
+        rows = sort_vec_by(rows, cancel, |a, b| match (&a[2], &b[2]) {
             (Value::Text(x), Value::Text(y)) => x.cmp(y),
             _ => std::cmp::Ordering::Equal,
-        });
+        })?;
+        check_cancel(cancel)?;
         Ok(QueryResult { columns, rows })
     }
 }
@@ -157,7 +207,12 @@ impl VirtualTable for InfoSchemaColumns {
     fn name(&self) -> &str {
         "information_schema.columns"
     }
-    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(
+        &self,
+        schema: &SchemaManager,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<QueryResult> {
+        check_cancel(cancel)?;
         let columns = vec![
             "table_catalog".to_string(),
             "table_schema".to_string(),
@@ -169,10 +224,13 @@ impl VirtualTable for InfoSchemaColumns {
             "data_type".to_string(),
         ];
         let mut rows = Vec::new();
-        let mut schemas: Vec<_> = schema.all_schemas().collect();
-        schemas.sort_by(|a, b| a.name.cmp(&b.name));
+        let schemas: Vec<_> = schema.all_schemas().collect();
+        let schemas = sort_vec_by(schemas, cancel, |a, b| a.name.cmp(&b.name))?;
+        let mut work = 0;
         for ts in schemas {
             for col in &ts.columns {
+                check_cancel_at(cancel, work)?;
+                work += 1;
                 rows.push(vec![
                     Value::Text("citadel".into()),
                     Value::Text("public".into()),
@@ -192,6 +250,7 @@ impl VirtualTable for InfoSchemaColumns {
                 ]);
             }
         }
+        check_cancel(cancel)?;
         Ok(QueryResult { columns, rows })
     }
 }
@@ -201,7 +260,12 @@ impl VirtualTable for InfoSchemaKeyColumnUsage {
     fn name(&self) -> &str {
         "information_schema.key_column_usage"
     }
-    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(
+        &self,
+        schema: &SchemaManager,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<QueryResult> {
+        check_cancel(cancel)?;
         let columns = vec![
             "constraint_catalog".to_string(),
             "constraint_schema".to_string(),
@@ -215,10 +279,13 @@ impl VirtualTable for InfoSchemaKeyColumnUsage {
             "referenced_column_name".to_string(),
         ];
         let mut rows = Vec::new();
-        let mut schemas: Vec<_> = schema.all_schemas().collect();
-        schemas.sort_by(|a, b| a.name.cmp(&b.name));
+        let schemas: Vec<_> = schema.all_schemas().collect();
+        let schemas = sort_vec_by(schemas, cancel, |a, b| a.name.cmp(&b.name))?;
+        let mut work = 0;
         for ts in schemas {
             for (i, &col_pos) in ts.primary_key_columns.iter().enumerate() {
+                check_cancel_at(cancel, work)?;
+                work += 1;
                 let col = &ts.columns[col_pos as usize];
                 rows.push(vec![
                     Value::Text("citadel".into()),
@@ -239,6 +306,8 @@ impl VirtualTable for InfoSchemaKeyColumnUsage {
                     .clone()
                     .unwrap_or_else(|| format!("{}_fkey", ts.name));
                 for (i, col_pos) in fk.columns.iter().enumerate() {
+                    check_cancel_at(cancel, work)?;
+                    work += 1;
                     let col = &ts.columns[*col_pos as usize];
                     let ref_col = fk.referred_columns.get(i).cloned().unwrap_or_default();
                     rows.push(vec![
@@ -256,6 +325,7 @@ impl VirtualTable for InfoSchemaKeyColumnUsage {
                 }
             }
         }
+        check_cancel(cancel)?;
         Ok(QueryResult { columns, rows })
     }
 }
@@ -265,7 +335,12 @@ impl VirtualTable for InfoSchemaTableConstraints {
     fn name(&self) -> &str {
         "information_schema.table_constraints"
     }
-    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(
+        &self,
+        schema: &SchemaManager,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<QueryResult> {
+        check_cancel(cancel)?;
         let columns = vec![
             "constraint_catalog".to_string(),
             "constraint_schema".to_string(),
@@ -276,9 +351,12 @@ impl VirtualTable for InfoSchemaTableConstraints {
             "constraint_type".to_string(),
         ];
         let mut rows = Vec::new();
-        let mut schemas: Vec<_> = schema.all_schemas().collect();
-        schemas.sort_by(|a, b| a.name.cmp(&b.name));
+        let schemas: Vec<_> = schema.all_schemas().collect();
+        let schemas = sort_vec_by(schemas, cancel, |a, b| a.name.cmp(&b.name))?;
+        let mut work = 0;
         for ts in schemas {
+            check_cancel_at(cancel, work)?;
+            work += 1;
             if !ts.primary_key_columns.is_empty() {
                 rows.push(constraint_row(
                     &format!("{}_pkey", ts.name),
@@ -287,6 +365,8 @@ impl VirtualTable for InfoSchemaTableConstraints {
                 ));
             }
             for fk in &ts.foreign_keys {
+                check_cancel_at(cancel, work)?;
+                work += 1;
                 let cname = fk
                     .name
                     .clone()
@@ -294,6 +374,8 @@ impl VirtualTable for InfoSchemaTableConstraints {
                 rows.push(constraint_row(&cname, &ts.name, "FOREIGN KEY"));
             }
             for chk in &ts.check_constraints {
+                check_cancel_at(cancel, work)?;
+                work += 1;
                 let cname = chk
                     .name
                     .clone()
@@ -301,6 +383,8 @@ impl VirtualTable for InfoSchemaTableConstraints {
                 rows.push(constraint_row(&cname, &ts.name, "CHECK"));
             }
             for col in &ts.columns {
+                check_cancel_at(cancel, work)?;
+                work += 1;
                 if col.check_expr.is_some() {
                     let cname = col
                         .check_name
@@ -310,11 +394,14 @@ impl VirtualTable for InfoSchemaTableConstraints {
                 }
             }
             for idx in &ts.indices {
+                check_cancel_at(cancel, work)?;
+                work += 1;
                 if idx.unique {
                     rows.push(constraint_row(&idx.name, &ts.name, "UNIQUE"));
                 }
             }
         }
+        check_cancel(cancel)?;
         Ok(QueryResult { columns, rows })
     }
 }
@@ -358,7 +445,12 @@ impl VirtualTable for InfoSchemaTriggers {
     fn name(&self) -> &str {
         "information_schema.triggers"
     }
-    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(
+        &self,
+        schema: &SchemaManager,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<QueryResult> {
+        check_cancel(cancel)?;
         let columns = vec![
             "trigger_catalog".to_string(),
             "trigger_schema".to_string(),
@@ -378,13 +470,18 @@ impl VirtualTable for InfoSchemaTriggers {
             "action_reference_new_row".to_string(),
             "created".to_string(),
         ];
-        let mut all: Vec<&crate::types::TriggerDef> = schema.all_triggers().collect();
-        all.sort_by(|a, b| a.target.cmp(&b.target).then(a.name.cmp(&b.name)));
+        let all: Vec<&crate::types::TriggerDef> = schema.all_triggers().collect();
+        let all = sort_vec_by(all, cancel, |a, b| {
+            a.target.cmp(&b.target).then(a.name.cmp(&b.name))
+        })?;
         let mut order_in_group: rustc_hash::FxHashMap<(String, String, String, String), i64> =
             rustc_hash::FxHashMap::default();
         let mut rows = Vec::new();
+        let mut work = 0;
         for td in all {
             for ev in &td.events {
+                check_cancel_at(cancel, work)?;
+                work += 1;
                 let event_name = match ev {
                     crate::parser::TriggerEvent::Insert => "INSERT".to_string(),
                     crate::parser::TriggerEvent::Update(_) => "UPDATE".to_string(),
@@ -445,6 +542,7 @@ impl VirtualTable for InfoSchemaTriggers {
                 ]);
             }
         }
+        check_cancel(cancel)?;
         Ok(QueryResult { columns, rows })
     }
 }
@@ -455,24 +553,31 @@ impl VirtualTable for CitadelTriggersStatus {
     fn name(&self) -> &str {
         "citadel_triggers_status"
     }
-    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(
+        &self,
+        schema: &SchemaManager,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<QueryResult> {
+        check_cancel(cancel)?;
         let columns = vec![
             "trigger_name".to_string(),
             "table_name".to_string(),
             "enabled".to_string(),
         ];
-        let mut all: Vec<&crate::types::TriggerDef> = schema.all_triggers().collect();
-        all.sort_by(|a, b| a.target.cmp(&b.target).then(a.name.cmp(&b.name)));
-        let rows = all
-            .into_iter()
-            .map(|td| {
-                vec![
-                    Value::Text(td.name.clone().into()),
-                    Value::Text(td.target.clone().into()),
-                    Value::Boolean(td.enabled),
-                ]
-            })
-            .collect();
+        let all: Vec<&crate::types::TriggerDef> = schema.all_triggers().collect();
+        let all = sort_vec_by(all, cancel, |a, b| {
+            a.target.cmp(&b.target).then(a.name.cmp(&b.name))
+        })?;
+        let mut rows = Vec::with_capacity(all.len());
+        for (work, td) in all.into_iter().enumerate() {
+            check_cancel_at(cancel, work)?;
+            rows.push(vec![
+                Value::Text(td.name.clone().into()),
+                Value::Text(td.target.clone().into()),
+                Value::Boolean(td.enabled),
+            ]);
+        }
+        check_cancel(cancel)?;
         Ok(QueryResult { columns, rows })
     }
 }
@@ -483,7 +588,12 @@ impl VirtualTable for PgMatviews {
     fn name(&self) -> &str {
         "pg_matviews"
     }
-    fn scan(&self, schema: &SchemaManager) -> Result<QueryResult> {
+    fn scan(
+        &self,
+        schema: &SchemaManager,
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<QueryResult> {
+        check_cancel(cancel)?;
         let columns = vec![
             "schemaname".to_string(),
             "matviewname".to_string(),
@@ -493,26 +603,26 @@ impl VirtualTable for PgMatviews {
             "ispopulated".to_string(),
             "definition".to_string(),
         ];
-        let mut entries: Vec<&crate::types::MatviewDef> = schema.all_matviews().collect();
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        let rows = entries
-            .into_iter()
-            .map(|mv| {
-                let hasindexes = schema
-                    .get(&mv.backing_table)
-                    .map(|ts| !ts.indices.is_empty())
-                    .unwrap_or(false);
-                vec![
-                    Value::Text("public".into()),
-                    Value::Text(mv.name.clone().into()),
-                    Value::Text("citadel".into()),
-                    Value::Null,
-                    Value::Boolean(hasindexes),
-                    Value::Boolean(mv.with_data),
-                    Value::Text(mv.select_sql.clone().into()),
-                ]
-            })
-            .collect();
+        let entries: Vec<&crate::types::MatviewDef> = schema.all_matviews().collect();
+        let entries = sort_vec_by(entries, cancel, |a, b| a.name.cmp(&b.name))?;
+        let mut rows = Vec::with_capacity(entries.len());
+        for (work, mv) in entries.into_iter().enumerate() {
+            check_cancel_at(cancel, work)?;
+            let hasindexes = schema
+                .get(&mv.backing_table)
+                .map(|ts| !ts.indices.is_empty())
+                .unwrap_or(false);
+            rows.push(vec![
+                Value::Text("public".into()),
+                Value::Text(mv.name.clone().into()),
+                Value::Text("citadel".into()),
+                Value::Null,
+                Value::Boolean(hasindexes),
+                Value::Boolean(mv.with_data),
+                Value::Text(mv.select_sql.clone().into()),
+            ]);
+        }
+        check_cancel(cancel)?;
         Ok(QueryResult { columns, rows })
     }
 }

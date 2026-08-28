@@ -19,7 +19,7 @@ use super::helpers::*;
 use super::scan::*;
 use super::select::*;
 use super::view::*;
-use super::CteContext;
+use super::{CteContext, CteRows};
 
 struct UpdateBufs {
     partial_row: Vec<Value>,
@@ -47,6 +47,28 @@ thread_local! {
 
 fn with_update_scratch<R>(f: impl FnOnce(&mut UpdateBufs) -> R) -> R {
     UPDATE_SCRATCH.with(|slot| f(&mut slot.borrow_mut()))
+}
+
+fn filter_keyed_rows(
+    rows: Vec<(Vec<u8>, Vec<Value>)>,
+    where_clause: &Option<Expr>,
+    col_map: &ColumnMap,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    let Some(where_expr) = where_clause else {
+        return Ok(rows);
+    };
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in rows {
+        let value = eval_expr(
+            where_expr,
+            &EvalCtx::new(col_map, &row.1).with_cancel(cancel),
+        )?;
+        if is_truthy(&value) {
+            kept.push(row);
+        }
+    }
+    Ok(kept)
 }
 
 pub struct CompiledUpdate {
@@ -254,6 +276,9 @@ fn fast_lane_column_refs(expr: &Expr, out: &mut Vec<String>) -> bool {
             fast_lane_column_refs(expr, out)
                 && fast_lane_column_refs(low, out)
                 && fast_lane_column_refs(high, out)
+        }
+        Expr::IsDistinctFrom { left, right, .. } => {
+            fast_lane_column_refs(left, out) && fast_lane_column_refs(right, out)
         }
         Expr::Like {
             expr,
@@ -559,6 +584,7 @@ fn apply_gen_col_patches_slice(
     gen_targets: &[GenColPatch],
     gen_extra_cols: &[(usize, usize)],
     col_map: &ColumnMap,
+    cancel: Option<&citadel::CancelToken>,
     patch_buf: &mut Vec<u8>,
 ) -> Result<()> {
     if gen_targets.is_empty() {
@@ -566,7 +592,7 @@ fn apply_gen_col_patches_slice(
     }
     decode_cols_into(value, gen_extra_cols, partial_row)?;
     for gp in gen_targets {
-        let raw = eval_fast_gen(&gp.fast_eval, &gp.expr, partial_row, col_map)?;
+        let raw = eval_fast_gen_with_cancel(&gp.fast_eval, &gp.expr, partial_row, col_map, cancel)?;
         let coerced = coerce_gen_value(raw, &gp.col)?;
         partial_row[gp.schema_idx] = coerced.clone();
         if !patch_column_in_place(value, gp.phys_idx, &coerced)? {
@@ -583,6 +609,7 @@ fn apply_gen_col_patches_vec(
     gen_targets: &[GenColPatch],
     gen_extra_cols: &[(usize, usize)],
     col_map: &ColumnMap,
+    cancel: Option<&citadel::CancelToken>,
     patch_buf: &mut Vec<u8>,
 ) -> Result<()> {
     if gen_targets.is_empty() {
@@ -590,7 +617,7 @@ fn apply_gen_col_patches_vec(
     }
     decode_cols_into(value, gen_extra_cols, partial_row)?;
     for gp in gen_targets {
-        let raw = eval_fast_gen(&gp.fast_eval, &gp.expr, partial_row, col_map)?;
+        let raw = eval_fast_gen_with_cancel(&gp.fast_eval, &gp.expr, partial_row, col_map, cancel)?;
         let coerced = coerce_gen_value(raw, &gp.col)?;
         partial_row[gp.schema_idx] = coerced.clone();
         if !patch_column_in_place(value, gp.phys_idx, &coerced)? {
@@ -868,7 +895,7 @@ impl CompiledPlan for CompiledDelete {
                 schema.mark_dml(&self.table_name_lower);
                 let result = with_update_scratch(|bufs| self.run_fast(&mut wtx, fast, bufs, true))?;
                 super::helpers::drain_deferred_fk_checks(&mut wtx)?;
-                wtx.commit().map_err(SqlError::Storage)?;
+                super::commit_with_ann_publication(wtx, schema)?;
                 Ok(result)
             }
             ActiveTxnRef::Read(_) => Err(SqlError::Unsupported(
@@ -1181,6 +1208,8 @@ fn exec_update_compiled(
 
     let fast = compiled.fast.as_ref().unwrap();
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     // No segment purge: this lane compiles only for index-free tables, so an
     // ANN segment cannot exist.
     schema.mark_dml(&compiled.table_name_lower);
@@ -1266,7 +1295,7 @@ fn exec_update_compiled(
                     let generic_eval = || {
                         eval_expr(
                             &target.expr,
-                            &EvalCtx::new(&fast.col_map, &bufs.partial_row),
+                            &EvalCtx::new(&fast.col_map, &bufs.partial_row).with_cancel(cancel),
                         )
                     };
                     let new_val = match target.fast_eval {
@@ -1349,6 +1378,7 @@ fn exec_update_compiled(
                     &fast.gen_targets,
                     &fast.gen_extra_cols,
                     &fast.col_map,
+                    cancel,
                     &mut bufs.patch_buf,
                 )?;
                 Ok(Some(true))
@@ -1356,7 +1386,7 @@ fn exec_update_compiled(
         )?;
 
         super::helpers::drain_deferred_fk_checks(&mut wtx)?;
-        wtx.commit().map_err(SqlError::Storage)?;
+        super::commit_with_ann_publication(wtx, schema)?;
         return Ok(ExecutionResult::RowsAffected(count));
     }
 
@@ -1369,6 +1399,8 @@ pub(super) fn exec_update(
     schema: &SchemaManager,
     stmt: &UpdateStmt,
 ) -> Result<ExecutionResult> {
+    let cancel = db.cancel_token();
+    let cancel = cancel.as_ref();
     let user_name = stmt.table.to_ascii_lowercase();
     if let Some(view_def) = schema.get_view(&user_name) {
         if super::triggers::has_instead_of(
@@ -1382,7 +1414,7 @@ pub(super) fn exec_update(
             let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
             let r =
                 exec_instead_of_view_update_in_txn(&mut wtx, schema, &user_name, &aliases, stmt)?;
-            wtx.commit().map_err(SqlError::Storage)?;
+            super::commit_with_ann_publication(wtx, schema)?;
             return Ok(r);
         }
         return Err(SqlError::CannotModifyView(stmt.table.clone()));
@@ -1430,24 +1462,30 @@ pub(super) fn exec_update(
 
         if let Some(ref w) = remaining {
             let col_map = table_schema.column_map();
-            rows.retain(|row| match eval_expr(w, &EvalCtx::new(col_map, row)) {
-                Ok(val) => is_truthy(&val),
-                Err(_) => false,
-            });
+            let mut kept = Vec::with_capacity(rows.len());
+            for row in rows {
+                let value = eval_expr(w, &EvalCtx::new(col_map, &row).with_cancel(cancel))?;
+                if is_truthy(&value) {
+                    kept.push(row);
+                }
+            }
+            rows = kept;
         }
 
         let pk_indices = table_schema.pk_indices();
         let pk_values: Vec<Value> = rows.iter().map(|row| row[pk_indices[0]].clone()).collect();
-        let pk_col = &table_schema.columns[pk_indices[0]].name;
+        let pk_column = &table_schema.columns[pk_indices[0]];
         let in_set: rustc_hash::FxHashSet<Value> = pk_values.into_iter().collect();
         let new_where = if in_set.is_empty() {
             Some(Expr::Literal(Value::Boolean(false)))
         } else {
             Some(Expr::InSet {
-                expr: Box::new(Expr::Column(pk_col.clone())),
+                expr: Box::new(Expr::Column(pk_column.name.clone())),
                 values: in_set,
                 has_null: false,
                 negated: false,
+                // The values came out of this very column, so it supplies the collation.
+                collation: pk_column.collation,
             })
         };
 
@@ -1616,8 +1654,10 @@ pub(super) fn exec_update(
                     }
                     decode_cols_into(value, &rhs_extra_cols, &mut partial_row)?;
                     for target in &targets {
-                        let new_val =
-                            eval_expr(&target.expr, &EvalCtx::new(col_map, &partial_row))?;
+                        let new_val = eval_expr(
+                            &target.expr,
+                            &EvalCtx::new(col_map, &partial_row).with_cancel(cancel),
+                        )?;
                         let coerced = if new_val.is_null() {
                             if !target.col.nullable {
                                 return Err(SqlError::NotNullViolation(target.col.name.clone()));
@@ -1646,12 +1686,13 @@ pub(super) fn exec_update(
                         &gen_targets,
                         &gen_extra_cols,
                         col_map,
+                        cancel,
                         &mut patch_buf,
                     )?;
                     Ok(Some(true))
                 })?;
 
-            wtx.commit().map_err(SqlError::Storage)?;
+            super::commit_with_ann_publication(wtx, schema)?;
             return Ok(ExecutionResult::RowsAffected(count));
         }
 
@@ -1715,8 +1756,9 @@ pub(super) fn exec_update(
         for (key, raw_value) in &mut kv_pairs {
             if !plan.covers_where() {
                 if let Some(ref w) = stmt.where_clause {
-                    let row = decode_full_row(table_schema, key, raw_value)?;
-                    if !eval_expr(w, &EvalCtx::new(col_map, &row)).is_ok_and(|v| is_truthy(&v)) {
+                    let row = decode_full_row_with_cancel(table_schema, key, raw_value, cancel)?;
+                    let value = eval_expr(w, &EvalCtx::new(col_map, &row).with_cancel(cancel))?;
+                    if !is_truthy(&value) {
                         continue;
                     }
                 }
@@ -1735,7 +1777,10 @@ pub(super) fn exec_update(
             }
             decode_cols_into(raw_value, &rhs_extra_cols, &mut partial_row)?;
             for target in &targets {
-                let new_val = eval_expr(&target.expr, &EvalCtx::new(col_map, &partial_row))?;
+                let new_val = eval_expr(
+                    &target.expr,
+                    &EvalCtx::new(col_map, &partial_row).with_cancel(cancel),
+                )?;
                 let coerced = if new_val.is_null() {
                     if !target.col.nullable {
                         return Err(SqlError::NotNullViolation(target.col.name.clone()));
@@ -1764,6 +1809,7 @@ pub(super) fn exec_update(
                 &gen_targets,
                 &gen_extra_cols,
                 col_map,
+                cancel,
                 &mut patch_buf,
             )?;
             patched.push((std::mem::take(key), std::mem::take(raw_value)));
@@ -1779,24 +1825,16 @@ pub(super) fn exec_update(
         }
         let count = patched.len() as u64;
         super::helpers::drain_deferred_fk_checks(&mut wtx)?;
-        wtx.commit().map_err(SqlError::Storage)?;
+        super::commit_with_ann_publication(wtx, schema)?;
         return Ok(ExecutionResult::RowsAffected(count));
     }
 
     let all_candidates = collect_keyed_rows_read(db, table_schema, &stmt.where_clause)?;
-    let matching_rows: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
-        .into_iter()
-        .filter(|(_, row)| match &stmt.where_clause {
-            Some(where_expr) => {
-                eval_expr(where_expr, &EvalCtx::new(col_map, row)).is_ok_and(|v| is_truthy(&v))
-            }
-            None => true,
-        })
-        .collect();
+    let matching_rows = filter_keyed_rows(all_candidates, &stmt.where_clause, col_map, cancel)?;
 
     if matching_rows.is_empty() {
         if let Some(returning_cols) = stmt.returning.as_ref() {
-            let qr = super::helpers::project_returning(table_schema, returning_cols, &[])?;
+            let qr = super::helpers::project_returning(table_schema, returning_cols, &[], cancel)?;
             return Ok(ExecutionResult::Query(qr));
         }
         return Ok(ExecutionResult::RowsAffected(0));
@@ -1839,7 +1877,7 @@ pub(super) fn exec_update(
             if col.generated_kind.is_some() {
                 return Err(SqlError::CannotUpdateGeneratedColumn(col.name.clone()));
             }
-            let new_val = eval_expr(expr, &EvalCtx::new(col_map, row))?;
+            let new_val = eval_expr(expr, &EvalCtx::new(col_map, row).with_cancel(cancel))?;
 
             let coerced = if new_val.is_null() {
                 if !col.nullable {
@@ -1860,7 +1898,7 @@ pub(super) fn exec_update(
         for col in &stored_gen_cols {
             let val = eval_expr(
                 col.generated_expr.as_ref().unwrap(),
-                &EvalCtx::new(col_map, &new_row),
+                &EvalCtx::new(col_map, &new_row).with_cancel(cancel),
             )?;
             let pos = col.position as usize;
             new_row[pos] = if val.is_null() {
@@ -1881,7 +1919,8 @@ pub(super) fn exec_update(
         if table_schema.has_checks() {
             for col in &table_schema.columns {
                 if let Some(ref check) = col.check_expr {
-                    let result = eval_expr(check, &EvalCtx::new(col_map, &new_row))?;
+                    let result =
+                        eval_expr(check, &EvalCtx::new(col_map, &new_row).with_cancel(cancel))?;
                     if !is_truthy(&result) && !result.is_null() {
                         let name = col.check_name.as_deref().unwrap_or(&col.name);
                         return Err(SqlError::CheckViolation(name.to_string()));
@@ -1889,7 +1928,10 @@ pub(super) fn exec_update(
                 }
             }
             for tc in &table_schema.check_constraints {
-                let result = eval_expr(&tc.expr, &EvalCtx::new(col_map, &new_row))?;
+                let result = eval_expr(
+                    &tc.expr,
+                    &EvalCtx::new(col_map, &new_row).with_cancel(cancel),
+                )?;
                 if !is_truthy(&result) && !result.is_null() {
                     let name = tc.name.as_deref().unwrap_or(&tc.sql);
                     return Err(SqlError::CheckViolation(name.to_string()));
@@ -2061,23 +2103,29 @@ pub(super) fn exec_update(
         let old_pk: Vec<Value> = pk_indices.iter().map(|&i| c.old_row[i].clone()).collect();
 
         for idx in &table_schema.indices {
-            let cols_changed = index_columns_changed(idx, &c.old_row, &c.new_row);
-            let (del, _) = partial_idx_update_actions(
+            let cols_changed = index_columns_changed(idx, &c.old_row, &c.new_row, table_schema);
+            let (del, _) = partial_idx_update_actions_with_cancel(
                 idx,
                 &c.old_row,
                 &c.new_row,
                 cols_changed,
                 c.pk_changed,
                 col_map_partial,
-            );
+                cancel,
+            )?;
             if !del {
                 continue;
             }
             let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
             match idx.kind {
                 crate::types::IndexKind::BTree => {
-                    let old_idx_key =
-                        encode_index_key_with_schema(idx, &c.old_row, &old_pk, table_schema);
+                    let old_idx_key = encode_index_key_with_schema_and_cancel(
+                        idx,
+                        &c.old_row,
+                        &old_pk,
+                        table_schema,
+                        cancel,
+                    )?;
                     wtx.table_delete(&idx_table, &old_idx_key)
                         .map_err(SqlError::Storage)?;
                 }
@@ -2087,8 +2135,11 @@ pub(super) fn exec_update(
                             "inverted index requires at least one column key".into(),
                         )
                     })? as usize;
-                    let entries =
-                        super::helpers::extract_inverted_entries(&c.old_row[col0], inv_kind)?;
+                    let entries = super::helpers::extract_inverted_entries_with_cancel(
+                        &c.old_row[col0],
+                        inv_kind,
+                        wtx.cancel_token(),
+                    )?;
                     let pk_encoded = encode_composite_key(&old_pk);
                     for entry in entries {
                         let full_key = super::helpers::build_inverted_key(&entry, &pk_encoded);
@@ -2121,23 +2172,29 @@ pub(super) fn exec_update(
         }
 
         for idx in &table_schema.indices {
-            let cols_changed = index_columns_changed(idx, &c.old_row, &c.new_row);
-            let (_, ins) = partial_idx_update_actions(
+            let cols_changed = index_columns_changed(idx, &c.old_row, &c.new_row, table_schema);
+            let (_, ins) = partial_idx_update_actions_with_cancel(
                 idx,
                 &c.old_row,
                 &c.new_row,
                 cols_changed,
                 c.pk_changed,
                 col_map_partial,
-            );
+                cancel,
+            )?;
             if !ins {
                 continue;
             }
             let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
             match idx.kind {
                 crate::types::IndexKind::BTree => {
-                    let new_idx_key =
-                        encode_index_key_with_schema(idx, &c.new_row, &new_pk, table_schema);
+                    let new_idx_key = encode_index_key_with_schema_and_cancel(
+                        idx,
+                        &c.new_row,
+                        &new_pk,
+                        table_schema,
+                        cancel,
+                    )?;
                     let new_idx_val = encode_index_value(idx, &c.new_row, &new_pk);
                     let is_new = wtx
                         .table_insert(&idx_table, &new_idx_key, &new_idx_val)
@@ -2162,7 +2219,11 @@ pub(super) fn exec_update(
                     let value = &c.new_row[col0];
                     if !value.is_null() {
                         let entries =
-                            super::helpers::extract_inverted_entries_with_values(value, inv_kind)?;
+                            super::helpers::extract_inverted_entries_with_values_and_cancel(
+                                value,
+                                inv_kind,
+                                wtx.cancel_token(),
+                            )?;
                         let pk_encoded = encode_composite_key(&new_pk);
                         for (entry, val_bytes) in entries {
                             let full_key = super::helpers::build_inverted_key(&entry, &pk_encoded);
@@ -2228,19 +2289,28 @@ pub(super) fn exec_update(
                 let mut new_row = c.new_row.clone();
                 // Virtual columns in new_row still hold pre-update values.
                 if table_schema.has_virtual_columns() {
-                    super::helpers::materialize_virtual(table_schema, &mut new_row)?;
+                    super::helpers::materialize_virtual_with_cancel(
+                        table_schema,
+                        &mut new_row,
+                        cancel,
+                    )?;
                 }
                 Ok((Some(c.old_row.clone()), Some(new_row)))
             })
             .collect::<Result<_>>()?;
-        let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
+        let qr = super::helpers::project_returning(
+            table_schema,
+            returning_cols,
+            &rows,
+            wtx.cancel_token(),
+        )?;
         super::helpers::drain_deferred_fk_checks(&mut wtx)?;
-        wtx.commit().map_err(SqlError::Storage)?;
+        super::commit_with_ann_publication(wtx, schema)?;
         return Ok(ExecutionResult::Query(qr));
     }
 
     let count = changes.len() as u64;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
     Ok(ExecutionResult::RowsAffected(count))
 }
 
@@ -2249,6 +2319,8 @@ pub(super) fn exec_delete(
     schema: &SchemaManager,
     stmt: &DeleteStmt,
 ) -> Result<ExecutionResult> {
+    let cancel = db.cancel_token();
+    let cancel = cancel.as_ref();
     let user_name = stmt.table.to_ascii_lowercase();
     if let Some(view_def) = schema.get_view(&user_name) {
         if super::triggers::has_instead_of(schema, &user_name, super::triggers::FireEvent::Delete) {
@@ -2256,7 +2328,7 @@ pub(super) fn exec_delete(
             let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
             let r =
                 exec_instead_of_view_delete_in_txn(&mut wtx, schema, &user_name, &aliases, stmt)?;
-            wtx.commit().map_err(SqlError::Storage)?;
+            super::commit_with_ann_publication(wtx, schema)?;
             return Ok(r);
         }
         return Err(SqlError::CannotModifyView(stmt.table.clone()));
@@ -2300,24 +2372,30 @@ pub(super) fn exec_delete(
 
         if let Some(ref w) = remaining {
             let col_map = table_schema.column_map();
-            rows.retain(|row| match eval_expr(w, &EvalCtx::new(col_map, row)) {
-                Ok(val) => is_truthy(&val),
-                Err(_) => false,
-            });
+            let mut kept = Vec::with_capacity(rows.len());
+            for row in rows {
+                let value = eval_expr(w, &EvalCtx::new(col_map, &row).with_cancel(cancel))?;
+                if is_truthy(&value) {
+                    kept.push(row);
+                }
+            }
+            rows = kept;
         }
 
         let pk_indices = table_schema.pk_indices();
         let pk_values: Vec<Value> = rows.iter().map(|row| row[pk_indices[0]].clone()).collect();
-        let pk_col = &table_schema.columns[pk_indices[0]].name;
+        let pk_column = &table_schema.columns[pk_indices[0]];
         let in_set: rustc_hash::FxHashSet<Value> = pk_values.into_iter().collect();
         let new_where = if in_set.is_empty() {
             Some(Expr::Literal(Value::Boolean(false)))
         } else {
             Some(Expr::InSet {
-                expr: Box::new(Expr::Column(pk_col.clone())),
+                expr: Box::new(Expr::Column(pk_column.name.clone())),
                 values: in_set,
                 has_null: false,
                 negated: false,
+                // The values came out of this very column, so it supplies the collation.
+                collation: pk_column.collation,
             })
         };
 
@@ -2361,30 +2439,26 @@ pub(super) fn exec_delete(
             wtx.table_truncate(&idx_table).map_err(SqlError::Storage)?;
         }
         super::helpers::drain_deferred_fk_checks(&mut wtx)?;
-        wtx.commit().map_err(SqlError::Storage)?;
+        super::commit_with_ann_publication(wtx, schema)?;
         return Ok(ExecutionResult::RowsAffected(count));
     }
 
     let all_candidates = collect_keyed_rows_write(&mut wtx, table_schema, &stmt.where_clause)?;
-    let rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
-        .into_iter()
-        .filter(|(_, row)| match &stmt.where_clause {
-            Some(where_expr) => match eval_expr(where_expr, &EvalCtx::new(col_map, row)) {
-                Ok(val) => is_truthy(&val),
-                Err(_) => false,
-            },
-            None => true,
-        })
-        .collect();
+    let rows_to_delete = filter_keyed_rows(all_candidates, &stmt.where_clause, col_map, cancel)?;
 
     if rows_to_delete.is_empty() {
         if let Some(returning_cols) = stmt.returning.as_ref() {
-            let qr = super::helpers::project_returning(table_schema, returning_cols, &[])?;
+            let qr = super::helpers::project_returning(
+                table_schema,
+                returning_cols,
+                &[],
+                wtx.cancel_token(),
+            )?;
             super::helpers::drain_deferred_fk_checks(&mut wtx)?;
-            wtx.commit().map_err(SqlError::Storage)?;
+            super::commit_with_ann_publication(wtx, schema)?;
             return Ok(ExecutionResult::Query(qr));
         }
-        wtx.commit().map_err(SqlError::Storage)?;
+        super::commit_with_ann_publication(wtx, schema)?;
         return Ok(ExecutionResult::RowsAffected(0));
     }
 
@@ -2501,14 +2575,19 @@ pub(super) fn exec_delete(
             .iter()
             .map(|(_, row)| (Some(row.clone()), None))
             .collect();
-        let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
+        let qr = super::helpers::project_returning(
+            table_schema,
+            returning_cols,
+            &rows,
+            wtx.cancel_token(),
+        )?;
         super::helpers::drain_deferred_fk_checks(&mut wtx)?;
-        wtx.commit().map_err(SqlError::Storage)?;
+        super::commit_with_ann_publication(wtx, schema)?;
         return Ok(ExecutionResult::Query(qr));
     }
 
     let count = rows_to_delete.len() as u64;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
     Ok(ExecutionResult::RowsAffected(count))
 }
 
@@ -2522,6 +2601,8 @@ pub(super) fn exec_select_in_txn(
     stmt: &SelectStmt,
     ctes: &CteContext,
 ) -> Result<ExecutionResult> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     if stmt.from.is_empty() && stmt.from_subquery.is_none() {
         let materialized;
         let stmt = if stmt_has_subquery(stmt) {
@@ -2531,7 +2612,7 @@ pub(super) fn exec_select_in_txn(
         } else {
             stmt
         };
-        return super::exec_select_no_from(stmt);
+        return super::exec_select_no_from(stmt, cancel);
     }
 
     if stmt
@@ -2553,7 +2634,12 @@ pub(super) fn exec_select_in_txn(
                 ExecutionResult::Query(qr) => qr,
                 _ => return Err(SqlError::Unsupported("derived returned non-Query".into())),
             };
-            new_ctes.insert(d.alias.to_ascii_lowercase(), qr);
+            let collations =
+                super::dml::query_output_collations(schema, ctes, &d.query, qr.columns.len());
+            new_ctes.insert(
+                d.alias.to_ascii_lowercase(),
+                CteRows::new(qr, collations).shared(),
+            );
             new_stmt.from = d.alias.clone();
             new_stmt.from_alias = None;
             new_stmt.from_subquery = None;
@@ -2568,7 +2654,12 @@ pub(super) fn exec_select_in_txn(
                     ExecutionResult::Query(qr) => qr,
                     _ => return Err(SqlError::Unsupported("derived returned non-Query".into())),
                 };
-                new_ctes.insert(d.alias.to_ascii_lowercase(), qr);
+                let collations =
+                    super::dml::query_output_collations(schema, ctes, &d.query, qr.columns.len());
+                new_ctes.insert(
+                    d.alias.to_ascii_lowercase(),
+                    CteRows::new(qr, collations).shared(),
+                );
                 j.table = crate::parser::TableRef {
                     name: d.alias.clone(),
                     alias: None,
@@ -2583,13 +2674,19 @@ pub(super) fn exec_select_in_txn(
 
     if let Some(cte_result) = ctes.get(&lower_name) {
         if stmt.joins.is_empty() {
-            return super::exec_select_from_cte(cte_result, stmt, &mut |sub| {
-                exec_subquery_write(wtx, schema, sub, ctes)
-            });
+            return super::exec_select_from_cte(
+                cte_result,
+                stmt,
+                &mut |sub| exec_subquery_write(wtx, schema, sub, ctes),
+                cancel,
+            );
         } else {
-            return super::exec_select_join_with_ctes(stmt, ctes, &mut |name| {
-                super::scan_table_write(wtx, schema, name)
-            });
+            return super::exec_select_join_with_ctes(
+                stmt,
+                ctes,
+                &mut |name| super::scan_table_write(wtx, schema, name),
+                cancel,
+            );
         }
     }
 
@@ -2599,9 +2696,12 @@ pub(super) fn exec_select_in_txn(
             .iter()
             .any(|j| ctes.contains_key(&j.table.name.to_ascii_lowercase()))
     {
-        return super::exec_select_join_with_ctes(stmt, ctes, &mut |name| {
-            super::scan_table_write_or_view(wtx, schema, name)
-        });
+        return super::exec_select_join_with_ctes(
+            stmt,
+            ctes,
+            &mut |name| super::scan_table_write_or_view(wtx, schema, name),
+            cancel,
+        );
     }
 
     if let Some(view_def) = schema.get_view(&lower_name) {
@@ -2610,15 +2710,21 @@ pub(super) fn exec_select_in_txn(
         }
         let view_qr = exec_view_write(wtx, schema, view_def)?;
         if stmt.joins.is_empty() {
-            return super::exec_select_from_cte(&view_qr, stmt, &mut |sub| {
-                exec_subquery_write(wtx, schema, sub, ctes)
-            });
+            return super::exec_select_from_cte(
+                &view_qr,
+                stmt,
+                &mut |sub| exec_subquery_write(wtx, schema, sub, ctes),
+                cancel,
+            );
         } else {
             let mut view_ctes = ctes.clone();
-            view_ctes.insert(lower_name.clone(), view_qr);
-            return super::exec_select_join_with_ctes(stmt, &view_ctes, &mut |name| {
-                super::scan_table_write_or_view(wtx, schema, name)
-            });
+            view_ctes.insert(lower_name.clone(), view_qr.shared());
+            return super::exec_select_join_with_ctes(
+                stmt,
+                &view_ctes,
+                &mut |name| super::scan_table_write_or_view(wtx, schema, name),
+                cancel,
+            );
         }
     }
 
@@ -2634,13 +2740,16 @@ pub(super) fn exec_select_in_txn(
             if let Some(vd) = schema.get_view(&jname) {
                 if let std::collections::hash_map::Entry::Vacant(e) = view_ctes.entry(jname) {
                     let vqr = exec_view_write(wtx, schema, vd)?;
-                    e.insert(vqr);
+                    e.insert(vqr.shared());
                 }
             }
         }
-        return super::exec_select_join_with_ctes(stmt, &view_ctes, &mut |name| {
-            super::scan_table_write(wtx, schema, name)
-        });
+        return super::exec_select_join_with_ctes(
+            stmt,
+            &view_ctes,
+            &mut |name| super::scan_table_write(wtx, schema, name),
+            cancel,
+        );
     }
 
     if !stmt.joins.is_empty() {
@@ -2686,7 +2795,10 @@ pub(super) fn exec_select_in_txn(
         } else {
             &clean_stmt
         };
-        return super::process_select(&table_schema.columns, rows, s, false);
+        return super::process_select(
+            rows,
+            super::SelectCtx::new(&table_schema.columns, s, cancel),
+        );
     }
 
     let materialized;
@@ -2724,6 +2836,7 @@ pub(super) fn exec_select_in_txn(
                     &stmt.where_clause,
                     &mut states,
                     &mut scan_err,
+                    cancel,
                 ))
             })
             .map_err(SqlError::Storage)?;
@@ -2736,7 +2849,7 @@ pub(super) fn exec_select_in_txn(
 
     if let Some(plan) = StreamGroupByPlan::try_new(stmt, table_schema)? {
         let lower = lower_name.clone();
-        return plan.execute_scan(|cb| {
+        return plan.execute_scan(cancel, |cb| {
             wtx.table_scan_from(lower.as_bytes(), b"", |key, value| Ok(cb(key, value)))
         });
     }
@@ -2747,7 +2860,7 @@ pub(super) fn exec_select_in_txn(
 
     if let Some(plan) = TopKScanPlan::try_new(stmt, table_schema)? {
         let lower = lower_name.clone();
-        return plan.execute_scan(table_schema, stmt, |cb| {
+        return plan.execute_scan(table_schema, stmt, cancel, |cb| {
             wtx.table_scan_from(lower.as_bytes(), b"", |key, value| Ok(cb(key, value)))
         });
     }
@@ -2755,7 +2868,11 @@ pub(super) fn exec_select_in_txn(
     let scan_limit = compute_scan_limit(stmt, table_schema);
     let (rows, predicate_applied) =
         collect_rows_write(wtx, table_schema, &stmt.where_clause, scan_limit)?;
-    super::process_select(&table_schema.columns, rows, stmt, predicate_applied)
+    super::process_select(
+        rows,
+        super::SelectCtx::new(&table_schema.columns, stmt, cancel)
+            .predicate_applied(predicate_applied),
+    )
 }
 
 fn exec_update_in_txn_compiled(
@@ -2775,6 +2892,8 @@ fn exec_update_in_txn_compiled(
         Some(f) => f,
         None => return exec_update_in_txn(wtx, schema, stmt),
     };
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
 
     let table_schema = schema
         .get(&compiled.table_name_lower)
@@ -2812,6 +2931,7 @@ fn exec_update_in_txn_compiled(
             &pk_value,
             fast,
             ret_fast,
+            cancel,
             bufs,
         );
     }
@@ -2882,7 +3002,7 @@ fn exec_update_in_txn_compiled(
                 }
                 decode_cols_into(value, rhs_extra_cols, partial_row)?;
                 for target in targets {
-                    let new_val = compiled_target_eval(target, partial_row, col_map)?;
+                    let new_val = compiled_target_eval(target, partial_row, col_map, cancel)?;
                     let coerced = coerce_gen_value(new_val, &target.col)?;
                     if !patch_column_in_place(value, target.phys_idx, &coerced)? {
                         patch_row_column(value, target.phys_idx, &coerced, patch_buf)?;
@@ -2898,6 +3018,7 @@ fn exec_update_in_txn_compiled(
                     gen_targets,
                     gen_extra_cols,
                     col_map,
+                    cancel,
                     patch_buf,
                 )?;
                 Ok(Some(true))
@@ -2934,7 +3055,7 @@ fn exec_update_in_txn_compiled(
                 decode_column_raw(&raw_value, target.phys_idx)?.to_value();
         }
         for target in targets {
-            let new_val = compiled_target_eval(target, partial_row, col_map)?;
+            let new_val = compiled_target_eval(target, partial_row, col_map, cancel)?;
             let coerced = coerce_gen_value(new_val, &target.col)?;
             if !patch_column_in_place(&mut raw_value, target.phys_idx, &coerced)? {
                 patch_row_column(&raw_value, target.phys_idx, &coerced, patch_buf)?;
@@ -2950,6 +3071,7 @@ fn exec_update_in_txn_compiled(
             gen_targets,
             gen_extra_cols,
             col_map,
+            cancel,
             patch_buf,
         )?;
         wtx.table_insert(compiled.table_name_lower.as_bytes(), &key, &raw_value)
@@ -3012,8 +3134,9 @@ fn exec_update_in_txn_compiled(
     for (key, raw_value) in bufs.kv_pairs.iter_mut() {
         if !plan.covers_where() {
             if let Some(ref w) = stmt.where_clause {
-                let row = decode_full_row(table_schema, key, raw_value)?;
-                if !eval_expr(w, &EvalCtx::new(col_map, &row)).is_ok_and(|v| is_truthy(&v)) {
+                let row = decode_full_row_with_cancel(table_schema, key, raw_value, cancel)?;
+                let value = eval_expr(w, &EvalCtx::new(col_map, &row).with_cancel(cancel))?;
+                if !is_truthy(&value) {
                     continue;
                 }
             }
@@ -3031,7 +3154,7 @@ fn exec_update_in_txn_compiled(
                 decode_column_raw(raw_value, target.phys_idx)?.to_value();
         }
         for target in targets {
-            let new_val = compiled_target_eval(target, partial_row, col_map)?;
+            let new_val = compiled_target_eval(target, partial_row, col_map, cancel)?;
             let coerced = coerce_gen_value(new_val, &target.col)?;
             if !patch_column_in_place(raw_value, target.phys_idx, &coerced)? {
                 patch_row_column(raw_value, target.phys_idx, &coerced, patch_buf)?;
@@ -3047,6 +3170,7 @@ fn exec_update_in_txn_compiled(
             gen_targets,
             gen_extra_cols,
             col_map,
+            cancel,
             patch_buf,
         )?;
         bufs.patched
@@ -3071,6 +3195,7 @@ fn exec_pk_lookup_update(
     pk_value: &Value,
     fast: &CompiledFastPath,
     ret_fast: Option<&ReturningFast>,
+    cancel: Option<&citadel::CancelToken>,
     bufs: &mut UpdateBufs,
 ) -> Result<ExecutionResult> {
     let targets = &fast.targets;
@@ -3099,7 +3224,7 @@ fn exec_pk_lookup_update(
     }
     decode_cols_into(&raw_value, &fast.rhs_extra_cols, partial_row)?;
     for target in targets {
-        let new_val = compiled_target_eval(target, partial_row, col_map)?;
+        let new_val = compiled_target_eval(target, partial_row, col_map, cancel)?;
         let coerced = coerce_gen_value(new_val, &target.col)?;
         if !patch_column_in_place(&mut raw_value, target.phys_idx, &coerced)? {
             patch_row_column(&raw_value, target.phys_idx, &coerced, patch_buf)?;
@@ -3115,6 +3240,7 @@ fn exec_pk_lookup_update(
         &fast.gen_targets,
         &fast.gen_extra_cols,
         col_map,
+        cancel,
         patch_buf,
     )?;
     wtx.table_insert(table_name_lower.as_bytes(), &key, &raw_value)
@@ -3135,8 +3261,14 @@ fn compiled_target_eval(
     target: &CompiledTarget,
     partial_row: &[Value],
     col_map: &ColumnMap,
+    cancel: Option<&citadel::CancelToken>,
 ) -> Result<Value> {
-    let generic = || eval_expr(&target.expr, &EvalCtx::new(col_map, partial_row));
+    let generic = || {
+        eval_expr(
+            &target.expr,
+            &EvalCtx::new(col_map, partial_row).with_cancel(cancel),
+        )
+    };
     match target.fast_eval {
         FastEval::IntAdd(n) => match partial_row[target.schema_idx] {
             Value::Integer(v) => Ok(Value::Integer(v.wrapping_add(n))),
@@ -3178,6 +3310,8 @@ fn try_fast_update_in_txn(
     table_schema: &TableSchema,
     col_map: &ColumnMap,
 ) -> Result<Option<ExecutionResult>> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     let lower_name = stmt.table.to_ascii_lowercase();
     let pk_changed_by_set = stmt.assignments.iter().any(|(col_name, _)| {
         table_schema
@@ -3310,7 +3444,10 @@ fn try_fast_update_in_txn(
                 }
                 decode_cols_into(value, &rhs_extra_cols, &mut partial_row)?;
                 for target in &targets {
-                    let new_val = eval_expr(&target.expr, &EvalCtx::new(col_map, &partial_row))?;
+                    let new_val = eval_expr(
+                        &target.expr,
+                        &EvalCtx::new(col_map, &partial_row).with_cancel(cancel),
+                    )?;
                     let coerced = coerce_gen_value(new_val, &target.col)?;
                     if !patch_column_in_place(value, target.phys_idx, &coerced)? {
                         patch_row_column(value, target.phys_idx, &coerced, &mut patch_buf)?;
@@ -3326,6 +3463,7 @@ fn try_fast_update_in_txn(
                     &gen_targets,
                     &gen_extra_cols,
                     col_map,
+                    cancel,
                     &mut patch_buf,
                 )?;
                 Ok(Some(true))
@@ -3387,8 +3525,9 @@ fn try_fast_update_in_txn(
     for (key, raw_value) in &mut kv_pairs {
         if !plan.covers_where() {
             if let Some(ref w) = stmt.where_clause {
-                let row = decode_full_row(table_schema, key, raw_value)?;
-                if !eval_expr(w, &EvalCtx::new(col_map, &row)).is_ok_and(|v| is_truthy(&v)) {
+                let row = decode_full_row_with_cancel(table_schema, key, raw_value, cancel)?;
+                let value = eval_expr(w, &EvalCtx::new(col_map, &row).with_cancel(cancel))?;
+                if !is_truthy(&value) {
                     continue;
                 }
             }
@@ -3407,7 +3546,10 @@ fn try_fast_update_in_txn(
         }
         decode_cols_into(raw_value, &rhs_extra_cols, &mut partial_row)?;
         for target in &targets {
-            let new_val = eval_expr(&target.expr, &EvalCtx::new(col_map, &partial_row))?;
+            let new_val = eval_expr(
+                &target.expr,
+                &EvalCtx::new(col_map, &partial_row).with_cancel(cancel),
+            )?;
             let coerced = coerce_gen_value(new_val, &target.col)?;
             if !patch_column_in_place(raw_value, target.phys_idx, &coerced)? {
                 patch_row_column(raw_value, target.phys_idx, &coerced, &mut patch_buf)?;
@@ -3423,6 +3565,7 @@ fn try_fast_update_in_txn(
             &gen_targets,
             &gen_extra_cols,
             col_map,
+            cancel,
             &mut patch_buf,
         )?;
         patched.push((std::mem::take(key), std::mem::take(raw_value)));
@@ -3454,6 +3597,8 @@ pub(super) fn exec_update_in_txn(
     } else {
         stmt
     };
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
 
     let user_name = stmt.table.to_ascii_lowercase();
     if let Some(view_def) = schema.get_view(&user_name) {
@@ -3492,20 +3637,16 @@ pub(super) fn exec_update_in_txn(
     }
 
     let all_candidates = collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?;
-    let matching_rows: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
-        .into_iter()
-        .filter(|(_, row)| match &stmt.where_clause {
-            Some(where_expr) => match eval_expr(where_expr, &EvalCtx::new(col_map, row)) {
-                Ok(val) => is_truthy(&val),
-                Err(_) => false,
-            },
-            None => true,
-        })
-        .collect();
+    let matching_rows = filter_keyed_rows(all_candidates, &stmt.where_clause, col_map, cancel)?;
 
     if matching_rows.is_empty() {
         if let Some(returning_cols) = stmt.returning.as_ref() {
-            let qr = super::helpers::project_returning(table_schema, returning_cols, &[])?;
+            let qr = super::helpers::project_returning(
+                table_schema,
+                returning_cols,
+                &[],
+                wtx.cancel_token(),
+            )?;
             return Ok(ExecutionResult::Query(qr));
         }
         return Ok(ExecutionResult::RowsAffected(0));
@@ -3547,7 +3688,7 @@ pub(super) fn exec_update_in_txn(
             if col.generated_kind.is_some() {
                 return Err(SqlError::CannotUpdateGeneratedColumn(col.name.clone()));
             }
-            let new_val = eval_expr(expr, &EvalCtx::new(col_map, row))?;
+            let new_val = eval_expr(expr, &EvalCtx::new(col_map, row).with_cancel(cancel))?;
 
             let coerced = if new_val.is_null() {
                 if !col.nullable {
@@ -3571,7 +3712,7 @@ pub(super) fn exec_update_in_txn(
         for col in &stored_gen_cols {
             let val = eval_expr(
                 col.generated_expr.as_ref().unwrap(),
-                &EvalCtx::new(col_map, &new_row),
+                &EvalCtx::new(col_map, &new_row).with_cancel(cancel),
             )?;
             let pos = col.position as usize;
             new_row[pos] = if val.is_null() {
@@ -3592,7 +3733,8 @@ pub(super) fn exec_update_in_txn(
         if table_schema.has_checks() {
             for col in &table_schema.columns {
                 if let Some(ref check) = col.check_expr {
-                    let result = eval_expr(check, &EvalCtx::new(col_map, &new_row))?;
+                    let result =
+                        eval_expr(check, &EvalCtx::new(col_map, &new_row).with_cancel(cancel))?;
                     if !is_truthy(&result) && !result.is_null() {
                         let name = col.check_name.as_deref().unwrap_or(&col.name);
                         return Err(SqlError::CheckViolation(name.to_string()));
@@ -3600,7 +3742,10 @@ pub(super) fn exec_update_in_txn(
                 }
             }
             for tc in &table_schema.check_constraints {
-                let result = eval_expr(&tc.expr, &EvalCtx::new(col_map, &new_row))?;
+                let result = eval_expr(
+                    &tc.expr,
+                    &EvalCtx::new(col_map, &new_row).with_cancel(cancel),
+                )?;
                 if !is_truthy(&result) && !result.is_null() {
                     let name = tc.name.as_deref().unwrap_or(&tc.sql);
                     return Err(SqlError::CheckViolation(name.to_string()));
@@ -3773,23 +3918,29 @@ pub(super) fn exec_update_in_txn(
         let old_pk: Vec<Value> = pk_indices.iter().map(|&i| c.old_row[i].clone()).collect();
 
         for idx in &table_schema.indices {
-            let cols_changed = index_columns_changed(idx, &c.old_row, &c.new_row);
-            let (del, _) = partial_idx_update_actions(
+            let cols_changed = index_columns_changed(idx, &c.old_row, &c.new_row, table_schema);
+            let (del, _) = partial_idx_update_actions_with_cancel(
                 idx,
                 &c.old_row,
                 &c.new_row,
                 cols_changed,
                 c.pk_changed,
                 col_map_partial,
-            );
+                cancel,
+            )?;
             if !del {
                 continue;
             }
             let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
             match idx.kind {
                 crate::types::IndexKind::BTree => {
-                    let old_idx_key =
-                        encode_index_key_with_schema(idx, &c.old_row, &old_pk, table_schema);
+                    let old_idx_key = encode_index_key_with_schema_and_cancel(
+                        idx,
+                        &c.old_row,
+                        &old_pk,
+                        table_schema,
+                        cancel,
+                    )?;
                     wtx.table_delete(&idx_table, &old_idx_key)
                         .map_err(SqlError::Storage)?;
                 }
@@ -3799,8 +3950,11 @@ pub(super) fn exec_update_in_txn(
                             "inverted index requires at least one column key".into(),
                         )
                     })? as usize;
-                    let entries =
-                        super::helpers::extract_inverted_entries(&c.old_row[col0], inv_kind)?;
+                    let entries = super::helpers::extract_inverted_entries_with_cancel(
+                        &c.old_row[col0],
+                        inv_kind,
+                        wtx.cancel_token(),
+                    )?;
                     let pk_encoded = encode_composite_key(&old_pk);
                     for entry in entries {
                         let full_key = super::helpers::build_inverted_key(&entry, &pk_encoded);
@@ -3833,23 +3987,29 @@ pub(super) fn exec_update_in_txn(
         }
 
         for idx in &table_schema.indices {
-            let cols_changed = index_columns_changed(idx, &c.old_row, &c.new_row);
-            let (_, ins) = partial_idx_update_actions(
+            let cols_changed = index_columns_changed(idx, &c.old_row, &c.new_row, table_schema);
+            let (_, ins) = partial_idx_update_actions_with_cancel(
                 idx,
                 &c.old_row,
                 &c.new_row,
                 cols_changed,
                 c.pk_changed,
                 col_map_partial,
-            );
+                cancel,
+            )?;
             if !ins {
                 continue;
             }
             let idx_table = TableSchema::index_table_name(&lower_name, &idx.name);
             match idx.kind {
                 crate::types::IndexKind::BTree => {
-                    let new_idx_key =
-                        encode_index_key_with_schema(idx, &c.new_row, &new_pk, table_schema);
+                    let new_idx_key = encode_index_key_with_schema_and_cancel(
+                        idx,
+                        &c.new_row,
+                        &new_pk,
+                        table_schema,
+                        cancel,
+                    )?;
                     let new_idx_val = encode_index_value(idx, &c.new_row, &new_pk);
                     let is_new = wtx
                         .table_insert(&idx_table, &new_idx_key, &new_idx_val)
@@ -3874,7 +4034,11 @@ pub(super) fn exec_update_in_txn(
                     let value = &c.new_row[col0];
                     if !value.is_null() {
                         let entries =
-                            super::helpers::extract_inverted_entries_with_values(value, inv_kind)?;
+                            super::helpers::extract_inverted_entries_with_values_and_cancel(
+                                value,
+                                inv_kind,
+                                wtx.cancel_token(),
+                            )?;
                         let pk_encoded = encode_composite_key(&new_pk);
                         for (entry, val_bytes) in entries {
                             let full_key = super::helpers::build_inverted_key(&entry, &pk_encoded);
@@ -3940,12 +4104,21 @@ pub(super) fn exec_update_in_txn(
                 let mut new_row = c.new_row.clone();
                 // Virtual columns in new_row still hold pre-update values.
                 if table_schema.has_virtual_columns() {
-                    super::helpers::materialize_virtual(table_schema, &mut new_row)?;
+                    super::helpers::materialize_virtual_with_cancel(
+                        table_schema,
+                        &mut new_row,
+                        cancel,
+                    )?;
                 }
                 Ok((Some(c.old_row.clone()), Some(new_row)))
             })
             .collect::<Result<_>>()?;
-        let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
+        let qr = super::helpers::project_returning(
+            table_schema,
+            returning_cols,
+            &rows,
+            wtx.cancel_token(),
+        )?;
         return Ok(ExecutionResult::Query(qr));
     }
 
@@ -3967,6 +4140,8 @@ pub(super) fn exec_delete_in_txn(
     } else {
         stmt
     };
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
 
     let user_name = stmt.table.to_ascii_lowercase();
     if let Some(view_def) = schema.get_view(&user_name) {
@@ -4010,16 +4185,7 @@ pub(super) fn exec_delete_in_txn(
 
     let col_map = table_schema.column_map();
     let all_candidates = collect_keyed_rows_write(wtx, table_schema, &stmt.where_clause)?;
-    let rows_to_delete: Vec<(Vec<u8>, Vec<Value>)> = all_candidates
-        .into_iter()
-        .filter(|(_, row)| match &stmt.where_clause {
-            Some(where_expr) => match eval_expr(where_expr, &EvalCtx::new(col_map, row)) {
-                Ok(val) => is_truthy(&val),
-                Err(_) => false,
-            },
-            None => true,
-        })
-        .collect();
+    let rows_to_delete = filter_keyed_rows(all_candidates, &stmt.where_clause, col_map, cancel)?;
 
     if rows_to_delete.is_empty() {
         return Ok(ExecutionResult::RowsAffected(0));
@@ -4138,7 +4304,12 @@ pub(super) fn exec_delete_in_txn(
             .iter()
             .map(|(_, row)| (Some(row.clone()), None))
             .collect();
-        let qr = super::helpers::project_returning(table_schema, returning_cols, &rows)?;
+        let qr = super::helpers::project_returning(
+            table_schema,
+            returning_cols,
+            &rows,
+            wtx.cancel_token(),
+        )?;
         return Ok(ExecutionResult::Query(qr));
     }
 
@@ -4169,6 +4340,8 @@ fn exec_instead_of_view_update_in_txn(
     let view_cols = super::triggers::view_columns_from_aliases(&resolved_aliases);
 
     let view_col_map = crate::eval::ColumnMap::new(&view_cols);
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
 
     let assignment_targets: Vec<(usize, &Expr)> = stmt
         .assignments
@@ -4192,7 +4365,10 @@ fn exec_instead_of_view_update_in_txn(
         }
         let mut new_row = old_row.clone();
         for (idx, expr) in &assignment_targets {
-            let v = eval_expr(expr, &EvalCtx::new(&view_col_map, &old_row))?;
+            let v = eval_expr(
+                expr,
+                &EvalCtx::new(&view_col_map, &old_row).with_cancel(cancel),
+            )?;
             new_row[*idx] = v;
         }
         let changed_cols: Vec<String> = stmt.assignments.iter().map(|(c, _)| c.clone()).collect();

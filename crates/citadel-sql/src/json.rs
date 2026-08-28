@@ -1,7 +1,191 @@
 use std::sync::Arc;
 
+use citadel::CancelToken;
+
 use crate::error::{Result, SqlError};
 use crate::types::Value;
+
+const CANCEL_CHECK_INTERVAL: usize = 256;
+const JSON_READ_CHUNK: usize = 8 * 1024;
+
+struct JsonWork<'a> {
+    cancel: Option<&'a CancelToken>,
+    completed: usize,
+}
+
+impl<'a> JsonWork<'a> {
+    fn new(cancel: Option<&'a CancelToken>) -> Result<Self> {
+        let work = Self {
+            cancel,
+            completed: 0,
+        };
+        work.check_now()?;
+        Ok(work)
+    }
+
+    #[inline]
+    fn check_now(&self) -> Result<()> {
+        match self.cancel {
+            Some(token) => token.check().map_err(SqlError::Storage),
+            None => Ok(()),
+        }
+    }
+
+    #[inline]
+    fn tick(&mut self) -> Result<()> {
+        if self.cancel.is_none() {
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        let injected = tick_json_cancel_hook();
+        #[cfg(not(test))]
+        let injected = false;
+
+        self.completed = self.completed.wrapping_add(1);
+        if injected || self.completed.is_multiple_of(CANCEL_CHECK_INTERVAL) {
+            self.check_now()?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn checkpoint(&mut self) -> Result<()> {
+        if self.cancel.is_none() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        tick_json_cancel_hook();
+        self.check_now()
+    }
+
+    fn finish(self) -> Result<()> {
+        self.check_now()
+    }
+}
+
+fn run_json_work<T>(
+    cancel: Option<&CancelToken>,
+    operation: impl FnOnce(&mut JsonWork<'_>) -> Result<T>,
+) -> Result<T> {
+    let mut work = JsonWork::new(cancel)?;
+    let result = operation(&mut work);
+    if result.is_ok() {
+        work.finish()?;
+    }
+    result
+}
+
+fn checked_json_phase<T>(
+    work: &mut JsonWork<'_>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    work.checkpoint()?;
+    let result = operation();
+    work.checkpoint()?;
+    result
+}
+
+struct CancellableJsonReader<'bytes, 'work, 'cancel> {
+    bytes: &'bytes [u8],
+    position: usize,
+    work: &'work mut JsonWork<'cancel>,
+    interrupted: bool,
+}
+
+impl std::io::Read for CancellableJsonReader<'_, '_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.position == self.bytes.len() {
+            return Ok(0);
+        }
+        if self.work.checkpoint().is_err() {
+            self.interrupted = true;
+            return Err(std::io::Error::other("JSON parsing interrupted"));
+        }
+        let count = buf
+            .len()
+            .min(JSON_READ_CHUNK)
+            .min(self.bytes.len() - self.position);
+        buf[..count].copy_from_slice(&self.bytes[self.position..self.position + count]);
+        self.position += count;
+        Ok(count)
+    }
+}
+
+struct CancellableJsonWriter<'work, 'cancel> {
+    bytes: Vec<u8>,
+    work: &'work mut JsonWork<'cancel>,
+    interrupted: bool,
+}
+
+impl std::io::Write for CancellableJsonWriter<'_, '_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        for chunk in buf.chunks(JSON_READ_CHUNK) {
+            if self.work.checkpoint().is_err() {
+                self.interrupted = true;
+                return Err(std::io::Error::other("JSON rendering interrupted"));
+            }
+            self.bytes.extend_from_slice(chunk);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static JSON_CANCEL_HOOK: std::cell::RefCell<Option<(CancelToken, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct JsonCancelGuard {
+    previous: Option<(CancelToken, usize)>,
+}
+
+#[cfg(test)]
+impl Drop for JsonCancelGuard {
+    fn drop(&mut self) {
+        JSON_CANCEL_HOOK.with(|hook| *hook.borrow_mut() = self.previous.take());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cancel_json_after(token: CancelToken, work: usize) -> JsonCancelGuard {
+    assert!(work > 0, "the hook must trip after JSON work starts");
+    let previous = JSON_CANCEL_HOOK.with(|hook| hook.borrow_mut().replace((token, work)));
+    JsonCancelGuard { previous }
+}
+
+#[cfg(test)]
+fn tick_json_cancel_hook() -> bool {
+    JSON_CANCEL_HOOK.with(|hook| {
+        let fire = {
+            let mut hook = hook.borrow_mut();
+            match hook.as_mut() {
+                Some((token, remaining)) if *remaining == 1 => {
+                    let token = token.clone();
+                    *hook = None;
+                    Some(token)
+                }
+                Some((_, remaining)) => {
+                    *remaining -= 1;
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(token) = fire {
+            token.cancel();
+            true
+        } else {
+            false
+        }
+    })
+}
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +227,15 @@ pub fn validate_text(s: &str) -> Result<()> {
         .map_err(|e| SqlError::InvalidValue(format!("invalid JSON: {e}")))
 }
 
+pub(crate) fn validate_text_with_cancel(s: &str, cancel: Option<&CancelToken>) -> Result<()> {
+    let Some(cancel) = cancel else {
+        return validate_text(s);
+    };
+    run_json_work(Some(cancel), |work| {
+        parse_json_text_with_work(s, work).map(|_| ())
+    })
+}
+
 pub fn text_to_jsonb(s: &str) -> Result<Value> {
     let v: serde_json::Value = serde_json::from_str(s)
         .map_err(|e| SqlError::InvalidValue(format!("invalid JSON: {e}")))?;
@@ -50,6 +243,19 @@ pub fn text_to_jsonb(s: &str) -> Result<Value> {
     let mut buf = Vec::with_capacity(s.len());
     encode_canonical(&v, &mut buf)?;
     Ok(Value::Jsonb(Arc::from(buf)))
+}
+
+pub(crate) fn text_to_jsonb_with_cancel(text: &str, cancel: Option<&CancelToken>) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return text_to_jsonb(text);
+    };
+    run_json_work(Some(cancel), |work| {
+        let value = parse_json_text_with_work(text, work)?;
+        reject_null_bytes_with_work(&value, work)?;
+        let mut bytes = Vec::with_capacity(text.len());
+        encode_canonical_with_work(&value, &mut bytes, work)?;
+        Ok(Value::Jsonb(Arc::from(bytes)))
+    })
 }
 
 fn reject_null_bytes(v: &serde_json::Value) -> Result<()> {
@@ -70,17 +276,82 @@ fn reject_null_bytes(v: &serde_json::Value) -> Result<()> {
     }
 }
 
+fn reject_null_bytes_with_work(value: &serde_json::Value, work: &mut JsonWork<'_>) -> Result<()> {
+    work.tick()?;
+    match value {
+        serde_json::Value::String(text) => {
+            for chunk in text.as_bytes().chunks(JSON_READ_CHUNK) {
+                work.checkpoint()?;
+                if chunk.contains(&0) {
+                    return Err(SqlError::InvalidValue(
+                        "unsupported Unicode escape sequence \\u0000".into(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                reject_null_bytes_with_work(item, work)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                work.tick()?;
+                for chunk in key.as_bytes().chunks(JSON_READ_CHUNK) {
+                    work.checkpoint()?;
+                    if chunk.contains(&0) {
+                        return Err(SqlError::InvalidValue(
+                            "unsupported Unicode escape sequence \\u0000".into(),
+                        ));
+                    }
+                }
+                reject_null_bytes_with_work(value, work)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 pub fn decode_to_text(bytes: &[u8]) -> Result<String> {
     let v = decode_to_serde(bytes)?;
     serde_json::to_string(&v).map_err(|e| SqlError::InvalidValue(format!("JSONB render: {e}")))
 }
 
+pub(crate) fn decode_to_text_with_cancel(
+    bytes: &[u8],
+    cancel: Option<&CancelToken>,
+) -> Result<String> {
+    let Some(cancel) = cancel else {
+        return decode_to_text(bytes);
+    };
+    run_json_work(Some(cancel), |work| {
+        let mut pos = 0usize;
+        let value = decode_value(bytes, &mut pos, work)?;
+        if pos != bytes.len() {
+            return Err(SqlError::InvalidValue("trailing bytes in JSONB".into()));
+        }
+        json_to_string_with_work(&value, false, work)
+    })
+}
+
 pub fn decode_to_serde(bytes: &[u8]) -> Result<serde_json::Value> {
+    decode_to_serde_with_cancel(bytes, None)
+}
+
+pub(crate) fn decode_to_serde_with_cancel(
+    bytes: &[u8],
+    cancel: Option<&CancelToken>,
+) -> Result<serde_json::Value> {
+    let mut work = JsonWork::new(cancel)?;
     let mut pos = 0;
-    let v = decode_value(bytes, &mut pos)?;
+    let v = decode_value(bytes, &mut pos, &mut work)?;
     if pos != bytes.len() {
         return Err(SqlError::InvalidValue("trailing bytes in JSONB".into()));
     }
+    work.finish()?;
     Ok(v)
 }
 
@@ -275,6 +546,10 @@ pub fn array_get(bytes: &[u8], idx: i64) -> Result<Option<&[u8]>> {
 }
 
 pub fn array_len_bytes(bytes: &[u8]) -> Result<Option<usize>> {
+    run_json_work(None, |work| array_len_bytes_with_work(bytes, work))
+}
+
+fn array_len_bytes_with_work(bytes: &[u8], work: &mut JsonWork<'_>) -> Result<Option<usize>> {
     let (ty, payload_start, payload_len) = read_header(bytes)?;
     if ty != JsonbType::Array {
         return Ok(None);
@@ -283,6 +558,7 @@ pub fn array_len_bytes(bytes: &[u8]) -> Result<Option<usize>> {
     let mut pos = 0usize;
     let mut count = 0usize;
     while pos < payload.len() {
+        work.tick()?;
         pos += skip_value(&payload[pos..])?;
         count += 1;
     }
@@ -290,6 +566,10 @@ pub fn array_len_bytes(bytes: &[u8]) -> Result<Option<usize>> {
 }
 
 pub fn object_len_bytes(bytes: &[u8]) -> Result<Option<usize>> {
+    run_json_work(None, |work| object_len_bytes_with_work(bytes, work))
+}
+
+fn object_len_bytes_with_work(bytes: &[u8], work: &mut JsonWork<'_>) -> Result<Option<usize>> {
     let (ty, payload_start, payload_len) = read_header(bytes)?;
     if ty != JsonbType::Object {
         return Ok(None);
@@ -298,6 +578,7 @@ pub fn object_len_bytes(bytes: &[u8]) -> Result<Option<usize>> {
     let mut pos = 0usize;
     let mut count = 0usize;
     while pos < payload.len() {
+        work.tick()?;
         pos += skip_value(&payload[pos..])?;
         pos += skip_value(&payload[pos..])?;
         count += 1;
@@ -425,6 +706,19 @@ pub fn jsonb_contains_bytes(lhs: &[u8], rhs: &[u8]) -> Result<bool> {
     }
 }
 
+pub(crate) fn jsonb_contains_bytes_with_cancel(
+    lhs: &[u8],
+    rhs: &[u8],
+    cancel: Option<&CancelToken>,
+) -> Result<bool> {
+    let Some(cancel) = cancel else {
+        return jsonb_contains_bytes(lhs, rhs);
+    };
+    run_json_work(Some(cancel), |work| {
+        jsonb_contains_bytes_with_work(lhs, rhs, work)
+    })
+}
+
 pub fn has_top_key_bytes(bytes: &[u8], key: &str) -> Result<bool> {
     let (ty, payload_start, payload_len) = read_header(bytes)?;
     let payload = &bytes[payload_start..payload_start + payload_len];
@@ -458,7 +752,12 @@ pub fn has_top_key_bytes(bytes: &[u8], key: &str) -> Result<bool> {
     }
 }
 
-fn decode_value(bytes: &[u8], pos: &mut usize) -> Result<serde_json::Value> {
+fn decode_value(
+    bytes: &[u8],
+    pos: &mut usize,
+    work: &mut JsonWork<'_>,
+) -> Result<serde_json::Value> {
+    work.tick()?;
     let (ty, payload_start, payload_len) = read_header(&bytes[*pos..])?;
     let payload = &bytes[*pos + payload_start..*pos + payload_start + payload_len];
     let total = payload_start + payload_len;
@@ -484,14 +783,14 @@ fn decode_value(bytes: &[u8], pos: &mut usize) -> Result<serde_json::Value> {
         JsonbType::String => {
             let s = std::str::from_utf8(payload)
                 .map_err(|_| SqlError::InvalidValue("JSONB string not UTF-8".into()))?;
-            serde_json::Value::String(s.to_string())
+            serde_json::Value::String(clone_string_with_work(s, work)?)
         }
         JsonbType::Array => {
             let mut items = Vec::new();
             let mut child_pos = 0usize;
             while child_pos < payload.len() {
                 let mut local = child_pos;
-                let item = decode_value(payload, &mut local)?;
+                let item = decode_value(payload, &mut local, work)?;
                 items.push(item);
                 child_pos = local;
             }
@@ -502,11 +801,11 @@ fn decode_value(bytes: &[u8], pos: &mut usize) -> Result<serde_json::Value> {
             let mut child_pos = 0usize;
             while child_pos < payload.len() {
                 let mut local = child_pos;
-                let key = match decode_value(payload, &mut local)? {
+                let key = match decode_value(payload, &mut local, work)? {
                     serde_json::Value::String(s) => s,
                     _ => return Err(SqlError::InvalidValue("JSONB object key not string".into())),
                 };
-                let value = decode_value(payload, &mut local)?;
+                let value = decode_value(payload, &mut local, work)?;
                 map.insert(key, value);
                 child_pos = local;
             }
@@ -518,14 +817,333 @@ fn decode_value(bytes: &[u8], pos: &mut usize) -> Result<serde_json::Value> {
 }
 
 pub(crate) fn value_to_serde(v: &Value) -> Result<serde_json::Value> {
+    value_to_serde_with_cancel(v, None)
+}
+
+pub(crate) fn value_to_serde_with_cancel(
+    v: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<serde_json::Value> {
+    let mut work = JsonWork::new(cancel)?;
+    let value = value_to_serde_with_work(v, &mut work)?;
+    work.finish()?;
+    Ok(value)
+}
+
+fn value_to_serde_with_work(v: &Value, work: &mut JsonWork<'_>) -> Result<serde_json::Value> {
     match v {
-        Value::Json(s) => serde_json::from_str(s)
-            .map_err(|e| SqlError::InvalidValue(format!("invalid JSON: {e}"))),
-        Value::Jsonb(b) => decode_to_serde(b),
+        Value::Json(s) => parse_json_text_with_work(s, work),
+        Value::Jsonb(b) => {
+            let mut pos = 0;
+            let value = decode_value(b, &mut pos, work)?;
+            if pos != b.len() {
+                return Err(SqlError::InvalidValue("trailing bytes in JSONB".into()));
+            }
+            Ok(value)
+        }
         _ => Err(SqlError::TypeMismatch {
             expected: "JSON or JSONB".into(),
             got: v.data_type().to_string(),
         }),
+    }
+}
+
+fn bytes_equal_with_work(left: &[u8], right: &[u8], work: &mut JsonWork<'_>) -> Result<bool> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    if work.cancel.is_none() {
+        return Ok(left == right);
+    }
+    for (left, right) in left
+        .chunks(JSON_READ_CHUNK)
+        .zip(right.chunks(JSON_READ_CHUNK))
+    {
+        work.checkpoint()?;
+        if left != right {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn find_object_key_with_work<'a>(
+    bytes: &'a [u8],
+    key: &str,
+    work: &mut JsonWork<'_>,
+) -> Result<Option<&'a [u8]>> {
+    let (ty, payload_start, payload_len) = read_header(bytes)?;
+    if ty != JsonbType::Object {
+        return Ok(None);
+    }
+    let payload = &bytes[payload_start..payload_start + payload_len];
+    let key_bytes = key.as_bytes();
+    let mut pos = 0usize;
+    while pos < payload.len() {
+        work.tick()?;
+        let (key_type, key_payload_start, key_payload_len) = read_header(&payload[pos..])?;
+        if key_type != JsonbType::String {
+            return Err(SqlError::InvalidValue("JSONB object key not string".into()));
+        }
+        let key_total = key_payload_start + key_payload_len;
+        let key_slice = &payload[pos + key_payload_start..pos + key_total];
+        let value_start = pos + key_total;
+        let value_total = skip_value(&payload[value_start..])?;
+        if bytes_equal_with_work(key_slice, key_bytes, work)? {
+            return Ok(Some(&payload[value_start..value_start + value_total]));
+        }
+        pos = value_start + value_total;
+    }
+    Ok(None)
+}
+
+fn array_get_with_work<'a>(
+    bytes: &'a [u8],
+    index: i64,
+    work: &mut JsonWork<'_>,
+) -> Result<Option<&'a [u8]>> {
+    let (ty, payload_start, payload_len) = read_header(bytes)?;
+    if ty != JsonbType::Array {
+        return Ok(None);
+    }
+    let payload = &bytes[payload_start..payload_start + payload_len];
+    if index < 0 {
+        let mut elements = Vec::new();
+        let mut pos = 0usize;
+        while pos < payload.len() {
+            work.tick()?;
+            let total = skip_value(&payload[pos..])?;
+            elements.push((pos, total));
+            pos += total;
+        }
+        let real = elements.len() as i64 + index;
+        if real < 0 {
+            return Ok(None);
+        }
+        let (start, total) = elements[real as usize];
+        return Ok(Some(&payload[start..start + total]));
+    }
+    let mut pos = 0usize;
+    let mut remaining = index;
+    while pos < payload.len() {
+        work.tick()?;
+        let total = skip_value(&payload[pos..])?;
+        if remaining == 0 {
+            return Ok(Some(&payload[pos..pos + total]));
+        }
+        remaining -= 1;
+        pos += total;
+    }
+    Ok(None)
+}
+
+fn read_scalar_text_with_work(bytes: &[u8], work: &mut JsonWork<'_>) -> Result<Option<String>> {
+    let (ty, payload_start, payload_len) = read_header(bytes)?;
+    let payload = &bytes[payload_start..payload_start + payload_len];
+    match ty {
+        JsonbType::Null => Ok(None),
+        JsonbType::True => Ok(Some("true".into())),
+        JsonbType::False => Ok(Some("false".into())),
+        JsonbType::Integer => {
+            let value: [u8; 8] = payload
+                .try_into()
+                .map_err(|_| SqlError::InvalidValue("JSONB integer payload size".into()))?;
+            Ok(Some(i64::from_le_bytes(value).to_string()))
+        }
+        JsonbType::Real => {
+            let value: [u8; 8] = payload
+                .try_into()
+                .map_err(|_| SqlError::InvalidValue("JSONB real payload size".into()))?;
+            let number = serde_json::Number::from_f64(f64::from_le_bytes(value))
+                .ok_or_else(|| SqlError::InvalidValue("non-finite JSONB number".into()))?;
+            Ok(Some(number.to_string()))
+        }
+        JsonbType::String => {
+            let text = std::str::from_utf8(payload)
+                .map_err(|_| SqlError::InvalidValue("JSONB string not UTF-8".into()))?;
+            Ok(Some(clone_string_with_work(text, work)?))
+        }
+        JsonbType::Array | JsonbType::Object => {
+            let mut pos = 0usize;
+            let value = decode_value(bytes, &mut pos, work)?;
+            if pos != bytes.len() {
+                return Err(SqlError::InvalidValue("trailing bytes in JSONB".into()));
+            }
+            Ok(Some(json_to_string_with_work(&value, false, work)?))
+        }
+    }
+}
+
+fn jsonb_contains_bytes_with_work(
+    left: &[u8],
+    right: &[u8],
+    work: &mut JsonWork<'_>,
+) -> Result<bool> {
+    work.tick()?;
+    let (left_type, left_payload_start, left_payload_len) = read_header(left)?;
+    let (right_type, right_payload_start, right_payload_len) = read_header(right)?;
+    let left_payload = &left[left_payload_start..left_payload_start + left_payload_len];
+    let right_payload = &right[right_payload_start..right_payload_start + right_payload_len];
+    match (left_type, right_type) {
+        (JsonbType::Object, JsonbType::Object) => {
+            let mut right_pos = 0usize;
+            while right_pos < right_payload.len() {
+                work.tick()?;
+                let (_, key_payload_start, key_payload_len) =
+                    read_header(&right_payload[right_pos..])?;
+                let key_total = key_payload_start + key_payload_len;
+                let key = &right_payload[right_pos + key_payload_start..right_pos + key_total];
+                let right_value_start = right_pos + key_total;
+                let right_value_total = skip_value(&right_payload[right_value_start..])?;
+                let right_value =
+                    &right_payload[right_value_start..right_value_start + right_value_total];
+                let mut left_pos = 0usize;
+                let mut found = false;
+                while left_pos < left_payload.len() {
+                    work.tick()?;
+                    let (_, left_key_payload_start, left_key_payload_len) =
+                        read_header(&left_payload[left_pos..])?;
+                    let left_key_total = left_key_payload_start + left_key_payload_len;
+                    let left_key =
+                        &left_payload[left_pos + left_key_payload_start..left_pos + left_key_total];
+                    let left_value_start = left_pos + left_key_total;
+                    let left_value_total = skip_value(&left_payload[left_value_start..])?;
+                    if bytes_equal_with_work(left_key, key, work)? {
+                        let left_value =
+                            &left_payload[left_value_start..left_value_start + left_value_total];
+                        if !jsonb_contains_bytes_with_work(left_value, right_value, work)? {
+                            return Ok(false);
+                        }
+                        found = true;
+                        break;
+                    }
+                    left_pos = left_value_start + left_value_total;
+                }
+                if !found {
+                    return Ok(false);
+                }
+                right_pos = right_value_start + right_value_total;
+            }
+            Ok(true)
+        }
+        (JsonbType::Array, JsonbType::Array) => {
+            let mut right_pos = 0usize;
+            while right_pos < right_payload.len() {
+                work.tick()?;
+                let right_value_total = skip_value(&right_payload[right_pos..])?;
+                let right_value = &right_payload[right_pos..right_pos + right_value_total];
+                let mut left_pos = 0usize;
+                let mut found = false;
+                while left_pos < left_payload.len() {
+                    work.tick()?;
+                    let left_value_total = skip_value(&left_payload[left_pos..])?;
+                    let left_value = &left_payload[left_pos..left_pos + left_value_total];
+                    if jsonb_contains_bytes_with_work(left_value, right_value, work)? {
+                        found = true;
+                        break;
+                    }
+                    left_pos += left_value_total;
+                }
+                if !found {
+                    return Ok(false);
+                }
+                right_pos += right_value_total;
+            }
+            Ok(true)
+        }
+        (JsonbType::Array, _) => {
+            let right_total = right_payload_start + right_payload_len;
+            let right_full = &right[..right_total];
+            let mut left_pos = 0usize;
+            while left_pos < left_payload.len() {
+                work.tick()?;
+                let left_value_total = skip_value(&left_payload[left_pos..])?;
+                if bytes_equal_with_work(
+                    &left_payload[left_pos..left_pos + left_value_total],
+                    right_full,
+                    work,
+                )? {
+                    return Ok(true);
+                }
+                left_pos += left_value_total;
+            }
+            Ok(false)
+        }
+        _ => {
+            let left_total = left_payload_start + left_payload_len;
+            let right_total = right_payload_start + right_payload_len;
+            bytes_equal_with_work(&left[..left_total], &right[..right_total], work)
+        }
+    }
+}
+
+fn has_top_key_bytes_with_work(bytes: &[u8], key: &str, work: &mut JsonWork<'_>) -> Result<bool> {
+    let (ty, payload_start, payload_len) = read_header(bytes)?;
+    let payload = &bytes[payload_start..payload_start + payload_len];
+    let key_bytes = key.as_bytes();
+    match ty {
+        JsonbType::Object => {
+            let mut pos = 0usize;
+            while pos < payload.len() {
+                work.tick()?;
+                let (_, key_payload_start, key_payload_len) = read_header(&payload[pos..])?;
+                let key_total = key_payload_start + key_payload_len;
+                if bytes_equal_with_work(
+                    &payload[pos + key_payload_start..pos + key_total],
+                    key_bytes,
+                    work,
+                )? {
+                    return Ok(true);
+                }
+                pos += key_total;
+                pos += skip_value(&payload[pos..])?;
+            }
+            Ok(false)
+        }
+        JsonbType::Array => {
+            let mut pos = 0usize;
+            while pos < payload.len() {
+                work.tick()?;
+                let (element_type, element_payload_start, element_payload_len) =
+                    read_header(&payload[pos..])?;
+                if element_type == JsonbType::String
+                    && bytes_equal_with_work(
+                        &payload[pos + element_payload_start
+                            ..pos + element_payload_start + element_payload_len],
+                        key_bytes,
+                        work,
+                    )?
+                {
+                    return Ok(true);
+                }
+                pos += element_payload_start + element_payload_len;
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn parse_json_text_with_work(text: &str, work: &mut JsonWork<'_>) -> Result<serde_json::Value> {
+    if work.cancel.is_none() {
+        return serde_json::from_str(text)
+            .map_err(|e| SqlError::InvalidValue(format!("invalid JSON: {e}")));
+    }
+
+    let reader = CancellableJsonReader {
+        bytes: text.as_bytes(),
+        position: 0,
+        work,
+        interrupted: false,
+    };
+    let mut reader = std::io::BufReader::with_capacity(JSON_READ_CHUNK, reader);
+    let value = serde_json::from_reader(&mut reader);
+    let interrupted = reader.get_ref().interrupted;
+    drop(reader);
+    if interrupted {
+        Err(SqlError::Storage(citadel_core::Error::Interrupted))
+    } else {
+        value.map_err(|e| SqlError::InvalidValue(format!("invalid JSON: {e}")))
     }
 }
 
@@ -546,6 +1164,83 @@ fn serde_to_value(j: serde_json::Value, target: crate::types::DataType) -> Resul
             "cannot serialize JSON to {target}"
         ))),
     }
+}
+
+fn serde_to_value_with_work(
+    j: serde_json::Value,
+    target: crate::types::DataType,
+    work: &mut JsonWork<'_>,
+) -> Result<Value> {
+    use crate::types::DataType;
+    if work.cancel.is_none() {
+        return serde_to_value(j, target);
+    }
+    match target {
+        DataType::Json => Ok(Value::Json(
+            json_to_string_with_work(&j, false, work)?.into(),
+        )),
+        DataType::Jsonb => {
+            let mut bytes = Vec::new();
+            encode_canonical_with_work(&j, &mut bytes, work)?;
+            Ok(Value::Jsonb(Arc::from(bytes)))
+        }
+        _ => Err(SqlError::InvalidValue(format!(
+            "cannot serialize JSON to {target}"
+        ))),
+    }
+}
+
+fn serde_ref_to_value_with_work(
+    value: &serde_json::Value,
+    target: crate::types::DataType,
+    work: &mut JsonWork<'_>,
+) -> Result<Value> {
+    use crate::types::DataType;
+    match target {
+        DataType::Json => Ok(Value::Json(
+            json_to_string_with_work(value, false, work)?.into(),
+        )),
+        DataType::Jsonb => {
+            let mut bytes = Vec::new();
+            encode_canonical_with_work(value, &mut bytes, work)?;
+            Ok(Value::Jsonb(Arc::from(bytes)))
+        }
+        _ => Err(SqlError::InvalidValue(format!(
+            "cannot serialize JSON to {target}"
+        ))),
+    }
+}
+
+fn json_to_string_with_work(
+    value: &serde_json::Value,
+    pretty: bool,
+    work: &mut JsonWork<'_>,
+) -> Result<String> {
+    if work.cancel.is_none() {
+        return if pretty {
+            serde_json::to_string_pretty(value)
+        } else {
+            serde_json::to_string(value)
+        }
+        .map_err(|e| SqlError::InvalidValue(format!("JSON render: {e}")));
+    }
+
+    let mut writer = CancellableJsonWriter {
+        bytes: Vec::new(),
+        work,
+        interrupted: false,
+    };
+    let result = if pretty {
+        serde_json::to_writer_pretty(&mut writer, value)
+    } else {
+        serde_json::to_writer(&mut writer, value)
+    };
+    if writer.interrupted {
+        return Err(SqlError::Storage(citadel_core::Error::Interrupted));
+    }
+    result.map_err(|e| SqlError::InvalidValue(format!("JSON render: {e}")))?;
+    String::from_utf8(writer.bytes)
+        .map_err(|e| SqlError::InvalidValue(format!("JSON render produced invalid UTF-8: {e}")))
 }
 
 fn serde_to_scalar_value(j: serde_json::Value) -> Value {
@@ -807,6 +1502,449 @@ pub fn op_concat(lhs: &Value, rhs: &Value) -> Result<Value> {
     serde_to_value(left, target)
 }
 
+pub(crate) fn op_get_with_cancel(
+    lhs: &Value,
+    key: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return op_get(lhs, key);
+    };
+    run_json_work(Some(cancel), |work| {
+        if let Value::Jsonb(bytes) = lhs {
+            let slice = match key {
+                Value::Text(key) => find_object_key_with_work(bytes, key, work)?,
+                Value::Integer(index) => array_get_with_work(bytes, *index, work)?,
+                _ => None,
+            };
+            return match slice {
+                Some(slice) => {
+                    let mut copied = Vec::with_capacity(slice.len());
+                    extend_bytes_with_work(&mut copied, slice, work)?;
+                    Ok(Value::Jsonb(Arc::from(copied)))
+                }
+                None => Ok(Value::Null),
+            };
+        }
+        let target = match lhs {
+            Value::Json(_) => crate::types::DataType::Json,
+            _ => {
+                return Err(SqlError::TypeMismatch {
+                    expected: "JSON or JSONB".into(),
+                    got: lhs.data_type().to_string(),
+                });
+            }
+        };
+        let value = value_to_serde_with_work(lhs, work)?;
+        match navigate_one_ref_with_work(&value, key, work)? {
+            Some(value) => serde_ref_to_value_with_work(value, target, work),
+            None => Ok(Value::Null),
+        }
+    })
+}
+
+pub(crate) fn op_get_text_with_cancel(
+    lhs: &Value,
+    key: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return op_get_text(lhs, key);
+    };
+    run_json_work(Some(cancel), |work| {
+        if let Value::Jsonb(bytes) = lhs {
+            let slice = match key {
+                Value::Text(key) => find_object_key_with_work(bytes, key, work)?,
+                Value::Integer(index) => array_get_with_work(bytes, *index, work)?,
+                _ => None,
+            };
+            return match slice {
+                Some(slice) => match read_scalar_text_with_work(slice, work)? {
+                    Some(text) => Ok(Value::Text(text.into())),
+                    None => Ok(Value::Null),
+                },
+                None => Ok(Value::Null),
+            };
+        }
+        let value = value_to_serde_with_work(lhs, work)?;
+        match navigate_one_ref_with_work(&value, key, work)? {
+            Some(serde_json::Value::Null) => Ok(Value::Null),
+            Some(serde_json::Value::String(text)) => {
+                Ok(Value::Text(clone_string_with_work(text, work)?.into()))
+            }
+            Some(value) => Ok(Value::Text(
+                json_to_string_with_work(value, false, work)?.into(),
+            )),
+            None => Ok(Value::Null),
+        }
+    })
+}
+
+pub(crate) fn op_path_with_cancel(
+    lhs: &Value,
+    path: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return op_path(lhs, path);
+    };
+    run_json_work(Some(cancel), |work| {
+        let target = match lhs {
+            Value::Json(_) => crate::types::DataType::Json,
+            Value::Jsonb(_) => crate::types::DataType::Jsonb,
+            _ => {
+                return Err(SqlError::TypeMismatch {
+                    expected: "JSON or JSONB".into(),
+                    got: lhs.data_type().to_string(),
+                });
+            }
+        };
+        let value = value_to_serde_with_work(lhs, work)?;
+        let segments = path_to_segments_with_work(path, work)?;
+        match navigate_path_ref_with_work(&value, &segments, work)? {
+            Some(value) => serde_ref_to_value_with_work(value, target, work),
+            None => Ok(Value::Null),
+        }
+    })
+}
+
+pub(crate) fn op_path_text_with_cancel(
+    lhs: &Value,
+    path: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return op_path_text(lhs, path);
+    };
+    run_json_work(Some(cancel), |work| {
+        let value = value_to_serde_with_work(lhs, work)?;
+        let segments = path_to_segments_with_work(path, work)?;
+        match navigate_path_ref_with_work(&value, &segments, work)? {
+            Some(serde_json::Value::Null) => Ok(Value::Null),
+            Some(serde_json::Value::String(text)) => {
+                Ok(Value::Text(clone_string_with_work(text, work)?.into()))
+            }
+            Some(value) => Ok(Value::Text(
+                json_to_string_with_work(value, false, work)?.into(),
+            )),
+            None => Ok(Value::Null),
+        }
+    })
+}
+
+pub(crate) fn op_contains_with_cancel(
+    lhs: &Value,
+    rhs: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return op_contains(lhs, rhs);
+    };
+    run_json_work(Some(cancel), |work| {
+        if let (Value::Jsonb(left), Value::Jsonb(right)) = (lhs, rhs) {
+            return Ok(Value::Boolean(jsonb_contains_bytes_with_work(
+                left, right, work,
+            )?));
+        }
+        let left = value_to_serde_with_work(lhs, work)?;
+        let right = value_to_serde_with_work(rhs, work)?;
+        Ok(Value::Boolean(json_contains_with_work(
+            &left, &right, work,
+        )?))
+    })
+}
+
+pub(crate) fn op_contained_by_with_cancel(
+    lhs: &Value,
+    rhs: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return op_contained_by(lhs, rhs);
+    };
+    run_json_work(Some(cancel), |work| {
+        if let (Value::Jsonb(left), Value::Jsonb(right)) = (lhs, rhs) {
+            return Ok(Value::Boolean(jsonb_contains_bytes_with_work(
+                right, left, work,
+            )?));
+        }
+        let left = value_to_serde_with_work(lhs, work)?;
+        let right = value_to_serde_with_work(rhs, work)?;
+        Ok(Value::Boolean(json_contains_with_work(
+            &right, &left, work,
+        )?))
+    })
+}
+
+pub(crate) fn op_has_key_with_cancel(
+    lhs: &Value,
+    rhs: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return op_has_key(lhs, rhs);
+    };
+    run_json_work(Some(cancel), |work| {
+        let key = match rhs {
+            Value::Text(key) => key.as_str(),
+            _ => {
+                return Err(SqlError::TypeMismatch {
+                    expected: "TEXT key".into(),
+                    got: rhs.data_type().to_string(),
+                });
+            }
+        };
+        if let Value::Jsonb(bytes) = lhs {
+            return Ok(Value::Boolean(has_top_key_bytes_with_work(
+                bytes, key, work,
+            )?));
+        }
+        let left = value_to_serde_with_work(lhs, work)?;
+        let exists = match &left {
+            serde_json::Value::Object(map) => {
+                work.checkpoint()?;
+                let exists = map.contains_key(key);
+                work.checkpoint()?;
+                exists
+            }
+            serde_json::Value::Array(array) => {
+                let mut exists = false;
+                for value in array {
+                    work.tick()?;
+                    if let serde_json::Value::String(text) = value {
+                        if bytes_equal_with_work(text.as_bytes(), key.as_bytes(), work)? {
+                            exists = true;
+                            break;
+                        }
+                    }
+                }
+                exists
+            }
+            _ => false,
+        };
+        Ok(Value::Boolean(exists))
+    })
+}
+
+pub(crate) fn op_has_any_key_with_cancel(
+    lhs: &Value,
+    rhs: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return op_has_any_key(lhs, rhs);
+    };
+    run_json_work(Some(cancel), |work| {
+        let left = value_to_serde_with_work(lhs, work)?;
+        let keys = text_array_with_work(rhs, work)?;
+        let serde_json::Value::Object(map) = &left else {
+            return Ok(Value::Boolean(false));
+        };
+        for key in keys {
+            work.tick()?;
+            if map.contains_key(key.as_str()) {
+                return Ok(Value::Boolean(true));
+            }
+        }
+        Ok(Value::Boolean(false))
+    })
+}
+
+pub(crate) fn op_has_all_keys_with_cancel(
+    lhs: &Value,
+    rhs: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return op_has_all_keys(lhs, rhs);
+    };
+    run_json_work(Some(cancel), |work| {
+        let left = value_to_serde_with_work(lhs, work)?;
+        let keys = text_array_with_work(rhs, work)?;
+        let serde_json::Value::Object(map) = &left else {
+            return Ok(Value::Boolean(keys.is_empty()));
+        };
+        for key in keys {
+            work.tick()?;
+            if !map.contains_key(key.as_str()) {
+                return Ok(Value::Boolean(false));
+            }
+        }
+        Ok(Value::Boolean(true))
+    })
+}
+
+pub(crate) fn op_delete_path_with_cancel(
+    lhs: &Value,
+    path: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return op_delete_path(lhs, path);
+    };
+    run_json_work(Some(cancel), |work| {
+        let target = match lhs {
+            Value::Json(_) => crate::types::DataType::Json,
+            Value::Jsonb(_) => crate::types::DataType::Jsonb,
+            _ => {
+                return Err(SqlError::TypeMismatch {
+                    expected: "JSON or JSONB".into(),
+                    got: lhs.data_type().to_string(),
+                });
+            }
+        };
+        let mut value = value_to_serde_with_work(lhs, work)?;
+        let segments = path_to_segments_with_work(path, work)?;
+        delete_at_path_with_work(&mut value, &segments, work)?;
+        serde_to_value_with_work(value, target, work)
+    })
+}
+
+pub(crate) fn op_delete_one_with_cancel(
+    lhs: &Value,
+    rhs: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return op_delete_one(lhs, rhs);
+    };
+    run_json_work(Some(cancel), |work| {
+        let target = match lhs {
+            Value::Json(_) => crate::types::DataType::Json,
+            Value::Jsonb(_) => crate::types::DataType::Jsonb,
+            _ => {
+                return Err(SqlError::TypeMismatch {
+                    expected: "JSON or JSONB".into(),
+                    got: lhs.data_type().to_string(),
+                });
+            }
+        };
+        let mut value = value_to_serde_with_work(lhs, work)?;
+        match (&mut value, rhs) {
+            (serde_json::Value::Object(map), Value::Text(key)) => {
+                work.checkpoint()?;
+                map.remove(key.as_str());
+                work.checkpoint()?;
+            }
+            (serde_json::Value::Array(array), Value::Integer(index)) => {
+                let len = array.len() as i64;
+                let index = if *index < 0 { len + index } else { *index };
+                if (0..len).contains(&index) {
+                    work.checkpoint()?;
+                    array.remove(index as usize);
+                    work.checkpoint()?;
+                }
+            }
+            (serde_json::Value::Array(array), Value::Text(key)) => {
+                let source = std::mem::take(array);
+                array.reserve(source.len());
+                for item in source {
+                    work.tick()?;
+                    let remove = match &item {
+                        serde_json::Value::String(text) => {
+                            bytes_equal_with_work(text.as_bytes(), key.as_bytes(), work)?
+                        }
+                        _ => false,
+                    };
+                    if !remove {
+                        array.push(item);
+                    }
+                }
+            }
+            _ => {}
+        }
+        serde_to_value_with_work(value, target, work)
+    })
+}
+
+pub(crate) fn op_concat_with_cancel(
+    lhs: &Value,
+    rhs: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return op_concat(lhs, rhs);
+    };
+    run_json_work(Some(cancel), |work| {
+        let target = match (lhs, rhs) {
+            (Value::Jsonb(_), _) | (_, Value::Jsonb(_)) => crate::types::DataType::Jsonb,
+            _ => crate::types::DataType::Json,
+        };
+        let mut left = value_to_serde_with_work(lhs, work)?;
+        let right = value_to_serde_with_work(rhs, work)?;
+        match (&mut left, right) {
+            (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+                for (key, value) in right {
+                    work.tick()?;
+                    left.insert(key, value);
+                }
+            }
+            (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+                left.reserve(right.len());
+                for value in right {
+                    work.tick()?;
+                    left.push(value);
+                }
+            }
+            (serde_json::Value::Array(left), other) => left.push(other),
+            (left, serde_json::Value::Array(right)) => {
+                let owned = std::mem::take(left);
+                let mut combined = Vec::with_capacity(right.len() + 1);
+                combined.push(owned);
+                for value in right {
+                    work.tick()?;
+                    combined.push(value);
+                }
+                *left = serde_json::Value::Array(combined);
+            }
+            (left, right) => {
+                let left_value = std::mem::take(left);
+                *left = serde_json::Value::Array(vec![left_value, right]);
+            }
+        }
+        serde_to_value_with_work(left, target, work)
+    })
+}
+
+pub(crate) fn op_path_exists_with_cancel(
+    lhs: &Value,
+    path: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return op_path_exists(lhs, path);
+    };
+    run_json_work(Some(cancel), |work| {
+        let value = value_to_serde_with_work(lhs, work)?;
+        let path = coerce_path_arg_with_work(path, work)?;
+        let exists =
+            checked_json_phase(work, || jp_exists(&value, &path, None, false))?.unwrap_or(false);
+        Ok(Value::Boolean(exists))
+    })
+}
+
+pub(crate) fn op_path_match_with_cancel(
+    lhs: &Value,
+    path: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return op_path_match(lhs, path);
+    };
+    run_json_work(Some(cancel), |work| {
+        let value = value_to_serde_with_work(lhs, work)?;
+        let path = coerce_path_arg_with_work(path, work)?;
+        let nodes = checked_json_phase(work, || jp_query(&value, &path, None, false))?;
+        for node in nodes {
+            work.tick()?;
+            if matches!(node, serde_json::Value::Bool(true)) {
+                return Ok(Value::Boolean(true));
+            }
+        }
+        Ok(Value::Boolean(false))
+    })
+}
+
 fn coerce_path_arg(v: &Value) -> Result<String> {
     match v {
         Value::Text(s) => Ok(s.to_string()),
@@ -818,11 +1956,24 @@ fn coerce_path_arg(v: &Value) -> Result<String> {
     }
 }
 
-fn coerce_vars_arg(v: &Value) -> Result<Option<serde_json::Value>> {
+fn coerce_path_arg_with_work(v: &Value, work: &mut JsonWork<'_>) -> Result<String> {
+    match v {
+        Value::Text(path) | Value::Json(path) => clone_string_with_work(path, work),
+        _ => Err(SqlError::TypeMismatch {
+            expected: "TEXT path".into(),
+            got: v.data_type().to_string(),
+        }),
+    }
+}
+
+fn coerce_vars_arg_with_work(
+    v: &Value,
+    work: &mut JsonWork<'_>,
+) -> Result<Option<serde_json::Value>> {
     if v.is_null() {
         return Ok(None);
     }
-    let j = value_to_serde(v)?;
+    let j = value_to_serde_with_work(v, work)?;
     if !j.is_object() {
         return Err(SqlError::InvalidValue(
             "jsonpath vars argument must be a JSONB object".into(),
@@ -919,130 +2070,215 @@ pub fn op_path_match(lhs: &Value, path: &Value) -> Result<Value> {
 }
 
 pub fn fn_json_exists(j_val: &Value, path: &Value) -> Result<Value> {
-    op_path_exists(j_val, path)
+    fn_json_exists_with_cancel(j_val, path, None)
+}
+
+pub(crate) fn fn_json_exists_with_cancel(
+    j_val: &Value,
+    path: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        let j = value_to_serde_with_work(j_val, work)?;
+        let path_str = coerce_path_arg_with_work(path, work)?;
+        let exists =
+            checked_json_phase(work, || jp_exists(&j, &path_str, None, false))?.unwrap_or(false);
+        Ok(Value::Boolean(exists))
+    })
 }
 
 pub fn fn_json_value(j_val: &Value, path: &Value) -> Result<Value> {
-    let j = value_to_serde(j_val)?;
-    let path_str = coerce_path_arg(path)?;
-    match jp_query_first(&j, &path_str, None, false)? {
-        Some(serde_json::Value::Null) => Ok(Value::Null),
-        Some(serde_json::Value::String(s)) => Ok(Value::Text(s.into())),
-        Some(other) => Ok(Value::Text(
-            serde_json::to_string(&other)
-                .map_err(|e| SqlError::InvalidValue(format!("JSON render: {e}")))?
-                .into(),
-        )),
-        None => Ok(Value::Null),
-    }
+    fn_json_value_with_cancel(j_val, path, None)
+}
+
+pub(crate) fn fn_json_value_with_cancel(
+    j_val: &Value,
+    path: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        let j = value_to_serde_with_work(j_val, work)?;
+        let path_str = coerce_path_arg_with_work(path, work)?;
+        match checked_json_phase(work, || jp_query_first(&j, &path_str, None, false))? {
+            Some(serde_json::Value::Null) => Ok(Value::Null),
+            Some(serde_json::Value::String(s)) => Ok(Value::Text(s.into())),
+            Some(other) => {
+                let text = json_to_string_with_work(&other, false, work)?;
+                Ok(Value::Text(text.into()))
+            }
+            None => Ok(Value::Null),
+        }
+    })
 }
 
 pub fn fn_json_query(j_val: &Value, path: &Value, target: crate::types::DataType) -> Result<Value> {
-    let j = value_to_serde(j_val)?;
-    let path_str = coerce_path_arg(path)?;
-    let nodes = jp_query(&j, &path_str, None, false)?;
-    if nodes.is_empty() {
-        return Ok(Value::Null);
-    }
-    let result_json = if nodes.len() == 1 {
-        nodes[0].clone()
-    } else {
-        serde_json::Value::Array(nodes)
-    };
-    serde_to_value(result_json, target)
+    fn_json_query_with_cancel(j_val, path, target, None)
+}
+
+pub(crate) fn fn_json_query_with_cancel(
+    j_val: &Value,
+    path: &Value,
+    target: crate::types::DataType,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        let j = value_to_serde_with_work(j_val, work)?;
+        let path_str = coerce_path_arg_with_work(path, work)?;
+        let nodes = checked_json_phase(work, || jp_query(&j, &path_str, None, false))?;
+        if nodes.is_empty() {
+            return Ok(Value::Null);
+        }
+        let result_json = if nodes.len() == 1 {
+            nodes[0].clone()
+        } else {
+            serde_json::Value::Array(nodes)
+        };
+        serde_to_value_with_work(result_json, target, work)
+    })
 }
 
 pub fn fn_jsonb_path_exists(args: &[Value]) -> Result<Value> {
-    if !(2..=4).contains(&args.len()) {
-        return Err(SqlError::InvalidValue(
-            "jsonb_path_exists: expected 2..=4 arguments".into(),
-        ));
-    }
-    let j = value_to_serde(&args[0])?;
-    let path_str = coerce_path_arg(&args[1])?;
-    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
-    let silent = args
-        .get(3)
-        .map(coerce_silent_arg)
-        .transpose()?
-        .unwrap_or(false);
-    match jp_exists(&j, &path_str, vars.as_ref(), silent)? {
-        Some(b) => Ok(Value::Boolean(b)),
-        None => Ok(Value::Null),
-    }
+    fn_jsonb_path_exists_with_cancel(args, None)
+}
+
+pub(crate) fn fn_jsonb_path_exists_with_cancel(
+    args: &[Value],
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        if !(2..=4).contains(&args.len()) {
+            return Err(SqlError::InvalidValue(
+                "jsonb_path_exists: expected 2..=4 arguments".into(),
+            ));
+        }
+        let j = value_to_serde_with_work(&args[0], work)?;
+        let path_str = coerce_path_arg_with_work(&args[1], work)?;
+        let vars = match args.get(2) {
+            Some(value) => coerce_vars_arg_with_work(value, work)?,
+            None => None,
+        };
+        let silent = args
+            .get(3)
+            .map(coerce_silent_arg)
+            .transpose()?
+            .unwrap_or(false);
+        match checked_json_phase(work, || jp_exists(&j, &path_str, vars.as_ref(), silent))? {
+            Some(b) => Ok(Value::Boolean(b)),
+            None => Ok(Value::Null),
+        }
+    })
 }
 
 pub fn fn_jsonb_path_match(args: &[Value]) -> Result<Value> {
-    if !(2..=4).contains(&args.len()) {
-        return Err(SqlError::InvalidValue(
-            "jsonb_path_match: expected 2..=4 arguments".into(),
-        ));
-    }
-    let j = value_to_serde(&args[0])?;
-    let path_str = coerce_path_arg(&args[1])?;
-    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
-    let silent = args
-        .get(3)
-        .map(coerce_silent_arg)
-        .transpose()?
-        .unwrap_or(false);
-    let nodes = jp_query(&j, &path_str, vars.as_ref(), silent)?;
-    if nodes.len() != 1 {
-        if silent {
-            return Ok(Value::Null);
+    fn_jsonb_path_match_with_cancel(args, None)
+}
+
+pub(crate) fn fn_jsonb_path_match_with_cancel(
+    args: &[Value],
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        if !(2..=4).contains(&args.len()) {
+            return Err(SqlError::InvalidValue(
+                "jsonb_path_match: expected 2..=4 arguments".into(),
+            ));
         }
-        return Err(SqlError::InvalidValue(
-            "jsonb_path_match: expected exactly one boolean result".into(),
-        ));
-    }
-    match &nodes[0] {
-        serde_json::Value::Bool(b) => Ok(Value::Boolean(*b)),
-        _ if silent => Ok(Value::Null),
-        _ => Err(SqlError::InvalidValue(
-            "jsonb_path_match: result is not a boolean".into(),
-        )),
-    }
+        let j = value_to_serde_with_work(&args[0], work)?;
+        let path_str = coerce_path_arg_with_work(&args[1], work)?;
+        let vars = match args.get(2) {
+            Some(value) => coerce_vars_arg_with_work(value, work)?,
+            None => None,
+        };
+        let silent = args
+            .get(3)
+            .map(coerce_silent_arg)
+            .transpose()?
+            .unwrap_or(false);
+        let nodes = checked_json_phase(work, || jp_query(&j, &path_str, vars.as_ref(), silent))?;
+        if nodes.len() != 1 {
+            if silent {
+                return Ok(Value::Null);
+            }
+            return Err(SqlError::InvalidValue(
+                "jsonb_path_match: expected exactly one boolean result".into(),
+            ));
+        }
+        match &nodes[0] {
+            serde_json::Value::Bool(b) => Ok(Value::Boolean(*b)),
+            _ if silent => Ok(Value::Null),
+            _ => Err(SqlError::InvalidValue(
+                "jsonb_path_match: result is not a boolean".into(),
+            )),
+        }
+    })
 }
 
 pub fn fn_jsonb_path_query_first(args: &[Value]) -> Result<Value> {
-    if !(2..=4).contains(&args.len()) {
-        return Err(SqlError::InvalidValue(
-            "jsonb_path_query_first: expected 2..=4 arguments".into(),
-        ));
-    }
-    let j = value_to_serde(&args[0])?;
-    let path_str = coerce_path_arg(&args[1])?;
-    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
-    let silent = args
-        .get(3)
-        .map(coerce_silent_arg)
-        .transpose()?
-        .unwrap_or(false);
-    match jp_query_first(&j, &path_str, vars.as_ref(), silent)? {
-        Some(v) => serde_to_value(v, crate::types::DataType::Jsonb),
-        None => Ok(Value::Null),
-    }
+    fn_jsonb_path_query_first_with_cancel(args, None)
+}
+
+pub(crate) fn fn_jsonb_path_query_first_with_cancel(
+    args: &[Value],
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        if !(2..=4).contains(&args.len()) {
+            return Err(SqlError::InvalidValue(
+                "jsonb_path_query_first: expected 2..=4 arguments".into(),
+            ));
+        }
+        let j = value_to_serde_with_work(&args[0], work)?;
+        let path_str = coerce_path_arg_with_work(&args[1], work)?;
+        let vars = match args.get(2) {
+            Some(value) => coerce_vars_arg_with_work(value, work)?,
+            None => None,
+        };
+        let silent = args
+            .get(3)
+            .map(coerce_silent_arg)
+            .transpose()?
+            .unwrap_or(false);
+        match checked_json_phase(work, || {
+            jp_query_first(&j, &path_str, vars.as_ref(), silent)
+        })? {
+            Some(v) => serde_to_value_with_work(v, crate::types::DataType::Jsonb, work),
+            None => Ok(Value::Null),
+        }
+    })
 }
 
 pub fn fn_jsonb_path_query_array(args: &[Value]) -> Result<Value> {
-    if !(2..=4).contains(&args.len()) {
-        return Err(SqlError::InvalidValue(
-            "jsonb_path_query_array: expected 2..=4 arguments".into(),
-        ));
-    }
-    let j = value_to_serde(&args[0])?;
-    let path_str = coerce_path_arg(&args[1])?;
-    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
-    let silent = args
-        .get(3)
-        .map(coerce_silent_arg)
-        .transpose()?
-        .unwrap_or(false);
-    let nodes = jp_query(&j, &path_str, vars.as_ref(), silent)?;
-    serde_to_value(
-        serde_json::Value::Array(nodes),
-        crate::types::DataType::Jsonb,
-    )
+    fn_jsonb_path_query_array_with_cancel(args, None)
+}
+
+pub(crate) fn fn_jsonb_path_query_array_with_cancel(
+    args: &[Value],
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        if !(2..=4).contains(&args.len()) {
+            return Err(SqlError::InvalidValue(
+                "jsonb_path_query_array: expected 2..=4 arguments".into(),
+            ));
+        }
+        let j = value_to_serde_with_work(&args[0], work)?;
+        let path_str = coerce_path_arg_with_work(&args[1], work)?;
+        let vars = match args.get(2) {
+            Some(value) => coerce_vars_arg_with_work(value, work)?,
+            None => None,
+        };
+        let silent = args
+            .get(3)
+            .map(coerce_silent_arg)
+            .transpose()?
+            .unwrap_or(false);
+        let nodes = checked_json_phase(work, || jp_query(&j, &path_str, vars.as_ref(), silent))?;
+        serde_to_value_with_work(
+            serde_json::Value::Array(nodes),
+            crate::types::DataType::Jsonb,
+            work,
+        )
+    })
 }
 
 fn jp_query_tz(
@@ -1103,100 +2339,158 @@ fn jp_exists_tz(
 }
 
 pub fn fn_jsonb_path_exists_tz(args: &[Value]) -> Result<Value> {
-    if !(2..=4).contains(&args.len()) {
-        return Err(SqlError::InvalidValue(
-            "jsonb_path_exists_tz: expected 2..=4 arguments".into(),
-        ));
-    }
-    let j = value_to_serde(&args[0])?;
-    let path_str = coerce_path_arg(&args[1])?;
-    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
-    let silent = args
-        .get(3)
-        .map(coerce_silent_arg)
-        .transpose()?
-        .unwrap_or(false);
-    match jp_exists_tz(&j, &path_str, vars.as_ref(), silent)? {
-        Some(b) => Ok(Value::Boolean(b)),
-        None => Ok(Value::Null),
-    }
+    fn_jsonb_path_exists_tz_with_cancel(args, None)
+}
+
+pub(crate) fn fn_jsonb_path_exists_tz_with_cancel(
+    args: &[Value],
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        if !(2..=4).contains(&args.len()) {
+            return Err(SqlError::InvalidValue(
+                "jsonb_path_exists_tz: expected 2..=4 arguments".into(),
+            ));
+        }
+        let j = value_to_serde_with_work(&args[0], work)?;
+        let path_str = coerce_path_arg_with_work(&args[1], work)?;
+        let vars = match args.get(2) {
+            Some(value) => coerce_vars_arg_with_work(value, work)?,
+            None => None,
+        };
+        let silent = args
+            .get(3)
+            .map(coerce_silent_arg)
+            .transpose()?
+            .unwrap_or(false);
+        match checked_json_phase(work, || jp_exists_tz(&j, &path_str, vars.as_ref(), silent))? {
+            Some(b) => Ok(Value::Boolean(b)),
+            None => Ok(Value::Null),
+        }
+    })
 }
 
 pub fn fn_jsonb_path_match_tz(args: &[Value]) -> Result<Value> {
-    if !(2..=4).contains(&args.len()) {
-        return Err(SqlError::InvalidValue(
-            "jsonb_path_match_tz: expected 2..=4 arguments".into(),
-        ));
-    }
-    let j = value_to_serde(&args[0])?;
-    let path_str = coerce_path_arg(&args[1])?;
-    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
-    let silent = args
-        .get(3)
-        .map(coerce_silent_arg)
-        .transpose()?
-        .unwrap_or(false);
-    let nodes = jp_query_tz(&j, &path_str, vars.as_ref(), silent)?;
-    if nodes.len() != 1 {
-        if silent {
-            return Ok(Value::Null);
+    fn_jsonb_path_match_tz_with_cancel(args, None)
+}
+
+pub(crate) fn fn_jsonb_path_match_tz_with_cancel(
+    args: &[Value],
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        if !(2..=4).contains(&args.len()) {
+            return Err(SqlError::InvalidValue(
+                "jsonb_path_match_tz: expected 2..=4 arguments".into(),
+            ));
         }
-        return Err(SqlError::InvalidValue(
-            "jsonb_path_match_tz: expected exactly one boolean result".into(),
-        ));
-    }
-    match &nodes[0] {
-        serde_json::Value::Bool(b) => Ok(Value::Boolean(*b)),
-        _ if silent => Ok(Value::Null),
-        _ => Err(SqlError::InvalidValue(
-            "jsonb_path_match_tz: result is not a boolean".into(),
-        )),
-    }
+        let j = value_to_serde_with_work(&args[0], work)?;
+        let path_str = coerce_path_arg_with_work(&args[1], work)?;
+        let vars = match args.get(2) {
+            Some(value) => coerce_vars_arg_with_work(value, work)?,
+            None => None,
+        };
+        let silent = args
+            .get(3)
+            .map(coerce_silent_arg)
+            .transpose()?
+            .unwrap_or(false);
+        let nodes = checked_json_phase(work, || jp_query_tz(&j, &path_str, vars.as_ref(), silent))?;
+        if nodes.len() != 1 {
+            if silent {
+                return Ok(Value::Null);
+            }
+            return Err(SqlError::InvalidValue(
+                "jsonb_path_match_tz: expected exactly one boolean result".into(),
+            ));
+        }
+        match &nodes[0] {
+            serde_json::Value::Bool(b) => Ok(Value::Boolean(*b)),
+            _ if silent => Ok(Value::Null),
+            _ => Err(SqlError::InvalidValue(
+                "jsonb_path_match_tz: result is not a boolean".into(),
+            )),
+        }
+    })
 }
 
 pub fn fn_jsonb_path_query_first_tz(args: &[Value]) -> Result<Value> {
-    if !(2..=4).contains(&args.len()) {
-        return Err(SqlError::InvalidValue(
-            "jsonb_path_query_first_tz: expected 2..=4 arguments".into(),
-        ));
-    }
-    let j = value_to_serde(&args[0])?;
-    let path_str = coerce_path_arg(&args[1])?;
-    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
-    let silent = args
-        .get(3)
-        .map(coerce_silent_arg)
-        .transpose()?
-        .unwrap_or(false);
-    match jp_query_first_tz(&j, &path_str, vars.as_ref(), silent)? {
-        Some(v) => serde_to_value(v, crate::types::DataType::Jsonb),
-        None => Ok(Value::Null),
-    }
+    fn_jsonb_path_query_first_tz_with_cancel(args, None)
+}
+
+pub(crate) fn fn_jsonb_path_query_first_tz_with_cancel(
+    args: &[Value],
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        if !(2..=4).contains(&args.len()) {
+            return Err(SqlError::InvalidValue(
+                "jsonb_path_query_first_tz: expected 2..=4 arguments".into(),
+            ));
+        }
+        let j = value_to_serde_with_work(&args[0], work)?;
+        let path_str = coerce_path_arg_with_work(&args[1], work)?;
+        let vars = match args.get(2) {
+            Some(value) => coerce_vars_arg_with_work(value, work)?,
+            None => None,
+        };
+        let silent = args
+            .get(3)
+            .map(coerce_silent_arg)
+            .transpose()?
+            .unwrap_or(false);
+        match checked_json_phase(work, || {
+            jp_query_first_tz(&j, &path_str, vars.as_ref(), silent)
+        })? {
+            Some(v) => serde_to_value_with_work(v, crate::types::DataType::Jsonb, work),
+            None => Ok(Value::Null),
+        }
+    })
 }
 
 pub fn fn_jsonb_path_query_array_tz(args: &[Value]) -> Result<Value> {
-    if !(2..=4).contains(&args.len()) {
-        return Err(SqlError::InvalidValue(
-            "jsonb_path_query_array_tz: expected 2..=4 arguments".into(),
-        ));
-    }
-    let j = value_to_serde(&args[0])?;
-    let path_str = coerce_path_arg(&args[1])?;
-    let vars = args.get(2).map(coerce_vars_arg).transpose()?.flatten();
-    let silent = args
-        .get(3)
-        .map(coerce_silent_arg)
-        .transpose()?
-        .unwrap_or(false);
-    let nodes = jp_query_tz(&j, &path_str, vars.as_ref(), silent)?;
-    serde_to_value(
-        serde_json::Value::Array(nodes),
-        crate::types::DataType::Jsonb,
-    )
+    fn_jsonb_path_query_array_tz_with_cancel(args, None)
+}
+
+pub(crate) fn fn_jsonb_path_query_array_tz_with_cancel(
+    args: &[Value],
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        if !(2..=4).contains(&args.len()) {
+            return Err(SqlError::InvalidValue(
+                "jsonb_path_query_array_tz: expected 2..=4 arguments".into(),
+            ));
+        }
+        let j = value_to_serde_with_work(&args[0], work)?;
+        let path_str = coerce_path_arg_with_work(&args[1], work)?;
+        let vars = match args.get(2) {
+            Some(value) => coerce_vars_arg_with_work(value, work)?,
+            None => None,
+        };
+        let silent = args
+            .get(3)
+            .map(coerce_silent_arg)
+            .transpose()?
+            .unwrap_or(false);
+        let nodes = checked_json_phase(work, || jp_query_tz(&j, &path_str, vars.as_ref(), silent))?;
+        serde_to_value_with_work(
+            serde_json::Value::Array(nodes),
+            crate::types::DataType::Jsonb,
+            work,
+        )
+    })
 }
 
 pub fn fn_jsonb_path_query_tz(args: &[Value]) -> Result<Value> {
-    fn_jsonb_path_query_first_tz(args)
+    fn_jsonb_path_query_tz_with_cancel(args, None)
+}
+
+pub(crate) fn fn_jsonb_path_query_tz_with_cancel(
+    args: &[Value],
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    fn_jsonb_path_query_first_tz_with_cancel(args, cancel)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1253,21 +2547,78 @@ pub fn parse_dollar_path(s: &str) -> Result<Vec<PathSeg>> {
     Ok(out)
 }
 
+fn parse_dollar_path_with_work(s: &str, work: &mut JsonWork<'_>) -> Result<Vec<PathSeg>> {
+    if work.cancel.is_none() {
+        return parse_dollar_path(s);
+    }
+    let s = s.trim();
+    let s = s.strip_prefix('$').unwrap_or(s);
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        work.tick()?;
+        match bytes[i] {
+            b'.' => {
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'[' {
+                    work.tick()?;
+                    i += 1;
+                }
+                if i > start {
+                    let key = std::str::from_utf8(&bytes[start..i])
+                        .map_err(|_| SqlError::InvalidValue("invalid path segment".into()))?;
+                    out.push(PathSeg::Key(clone_string_with_work(key, work)?));
+                }
+            }
+            b'[' => {
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i] != b']' {
+                    work.tick()?;
+                    i += 1;
+                }
+                if i > bytes.len() {
+                    return Err(SqlError::InvalidValue("unterminated index".into()));
+                }
+                let inner = std::str::from_utf8(&bytes[start..i])
+                    .map_err(|_| SqlError::InvalidValue("invalid path index".into()))?;
+                if inner.trim() == "*" {
+                    out.push(PathSeg::Wildcard);
+                } else if let Some(index) = parse_i64_with_work(inner, work)? {
+                    out.push(PathSeg::Index(index));
+                } else {
+                    let key = inner.trim_matches('"').trim_matches('\'');
+                    out.push(PathSeg::Key(clone_string_with_work(key, work)?));
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(out)
+}
+
 fn path_to_segments(v: &Value) -> Result<Vec<PathSeg>> {
+    run_json_work(None, |work| path_to_segments_with_work(v, work))
+}
+
+fn path_to_segments_with_work(v: &Value, work: &mut JsonWork<'_>) -> Result<Vec<PathSeg>> {
     match v {
         Value::Text(s) => {
             if s.starts_with('$') {
-                parse_dollar_path(s)
+                parse_dollar_path_with_work(s, work)
             } else if s.starts_with('{') && s.ends_with('}') {
-                parse_pg_array_path(s)
+                parse_pg_array_path_with_work(s, work)
             } else {
-                Ok(vec![PathSeg::Key(s.to_string())])
+                Ok(vec![PathSeg::Key(clone_string_with_work(s, work)?)])
             }
         }
         Value::Integer(i) => Ok(vec![PathSeg::Index(*i)]),
         Value::Json(_) | Value::Jsonb(_) => {
-            let parsed = value_to_serde(v)?;
-            json_to_path(&parsed)
+            let parsed = value_to_serde_with_work(v, work)?;
+            json_to_path_with_work(&parsed, work)
         }
         _ => Err(SqlError::TypeMismatch {
             expected: "TEXT or path array".into(),
@@ -1295,20 +2646,82 @@ fn parse_pg_array_path(s: &str) -> Result<Vec<PathSeg>> {
         .collect()
 }
 
-fn json_to_path(j: &serde_json::Value) -> Result<Vec<PathSeg>> {
+fn parse_pg_array_path_with_work(s: &str, work: &mut JsonWork<'_>) -> Result<Vec<PathSeg>> {
+    if work.cancel.is_none() {
+        return parse_pg_array_path(s);
+    }
+    let inner = &s[1..s.len() - 1];
+    if inner.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut out = Vec::new();
+    for raw in inner.split(',') {
+        work.tick()?;
+        let trimmed = raw.trim().trim_matches('"');
+        if let Some(index) = parse_i64_with_work(trimmed, work)? {
+            out.push(PathSeg::Index(index));
+            continue;
+        }
+        out.push(PathSeg::Key(clone_string_with_work(trimmed, work)?));
+    }
+    Ok(out)
+}
+
+fn parse_i64_with_work(text: &str, work: &mut JsonWork<'_>) -> Result<Option<i64>> {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let (negative, digits) = match bytes[0] {
+        b'-' => (true, &bytes[1..]),
+        b'+' => (false, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    if digits.is_empty() {
+        return Ok(None);
+    }
+    let mut magnitude = 0u64;
+    for digit in digits {
+        work.tick()?;
+        if !digit.is_ascii_digit() {
+            return Ok(None);
+        }
+        let Some(next) = magnitude
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u64::from(*digit - b'0')))
+        else {
+            return Ok(None);
+        };
+        magnitude = next;
+    }
+    if negative {
+        if magnitude == (i64::MAX as u64) + 1 {
+            Ok(Some(i64::MIN))
+        } else {
+            Ok(i64::try_from(magnitude).ok().map(|value| -value))
+        }
+    } else {
+        Ok(i64::try_from(magnitude).ok())
+    }
+}
+
+fn json_to_path_with_work(j: &serde_json::Value, work: &mut JsonWork<'_>) -> Result<Vec<PathSeg>> {
     let arr = j
         .as_array()
         .ok_or_else(|| SqlError::InvalidValue("path must be a JSON array".into()))?;
     arr.iter()
-        .map(|item| match item {
-            serde_json::Value::String(s) => Ok(PathSeg::Key(s.clone())),
-            serde_json::Value::Number(n) => n
-                .as_i64()
-                .map(PathSeg::Index)
-                .ok_or_else(|| SqlError::InvalidValue("path index out of range".into())),
-            _ => Err(SqlError::InvalidValue(
-                "path segments must be strings or integers".into(),
-            )),
+        .map(|item| {
+            work.tick()?;
+            match item {
+                serde_json::Value::String(s) => clone_string_with_work(s, work).map(PathSeg::Key),
+                serde_json::Value::Number(n) => n
+                    .as_i64()
+                    .map(PathSeg::Index)
+                    .ok_or_else(|| SqlError::InvalidValue("path index out of range".into())),
+                _ => Err(SqlError::InvalidValue(
+                    "path segments must be strings or integers".into(),
+                )),
+            }
         })
         .collect()
 }
@@ -1359,6 +2772,54 @@ fn navigate_path(j: &serde_json::Value, segments: &[PathSeg]) -> Option<serde_js
     Some(cur)
 }
 
+fn navigate_path_ref_with_work<'a>(
+    j: &'a serde_json::Value,
+    segments: &[PathSeg],
+    work: &mut JsonWork<'_>,
+) -> Result<Option<&'a serde_json::Value>> {
+    let mut current = j;
+    for segment in segments {
+        work.tick()?;
+        current = match (current, segment) {
+            (serde_json::Value::Object(map), PathSeg::Key(key)) => {
+                let Some(value) = map.get(key.as_str()) else {
+                    return Ok(None);
+                };
+                value
+            }
+            (serde_json::Value::Array(array), PathSeg::Index(index)) => {
+                let len = array.len() as i64;
+                let index = if *index < 0 { len + index } else { *index };
+                let Some(value) = usize::try_from(index)
+                    .ok()
+                    .filter(|index| *index < array.len())
+                    .map(|index| &array[index])
+                else {
+                    return Ok(None);
+                };
+                value
+            }
+            (serde_json::Value::Array(array), PathSeg::Key(key)) => {
+                let Ok(index) = key.parse::<i64>() else {
+                    return Ok(None);
+                };
+                let len = array.len() as i64;
+                let index = if index < 0 { len + index } else { index };
+                let Some(value) = usize::try_from(index)
+                    .ok()
+                    .filter(|index| *index < array.len())
+                    .map(|index| &array[index])
+                else {
+                    return Ok(None);
+                };
+                value
+            }
+            _ => return Ok(None),
+        };
+    }
+    Ok(Some(current))
+}
+
 fn delete_at_path(j: &mut serde_json::Value, segments: &[PathSeg]) {
     if segments.is_empty() {
         return;
@@ -1405,6 +2866,39 @@ fn navigate_mut<'a>(
     Some(cur)
 }
 
+fn navigate_mut_with_work<'a>(
+    value: &'a mut serde_json::Value,
+    segments: &[PathSeg],
+    work: &mut JsonWork<'_>,
+) -> Result<Option<&'a mut serde_json::Value>> {
+    let mut current = value;
+    for segment in segments {
+        work.tick()?;
+        current = match (current, segment) {
+            (serde_json::Value::Object(map), PathSeg::Key(key)) => {
+                let Some(value) = map.get_mut(key.as_str()) else {
+                    return Ok(None);
+                };
+                value
+            }
+            (serde_json::Value::Array(array), PathSeg::Index(index)) => {
+                let len = array.len() as i64;
+                let index = if *index < 0 { len + index } else { *index };
+                let Some(value) = usize::try_from(index)
+                    .ok()
+                    .filter(|index| *index < array.len())
+                    .and_then(|index| array.get_mut(index))
+                else {
+                    return Ok(None);
+                };
+                value
+            }
+            _ => return Ok(None),
+        };
+    }
+    Ok(Some(current))
+}
+
 fn json_contains(left: &serde_json::Value, right: &serde_json::Value) -> bool {
     match (left, right) {
         (serde_json::Value::Object(a), serde_json::Value::Object(b)) => b
@@ -1419,18 +2913,25 @@ fn json_contains(left: &serde_json::Value, right: &serde_json::Value) -> bool {
 }
 
 fn text_array(v: &Value) -> Result<Vec<String>> {
+    run_json_work(None, |work| text_array_with_work(v, work))
+}
+
+fn text_array_with_work(v: &Value, work: &mut JsonWork<'_>) -> Result<Vec<String>> {
     match v {
         Value::Text(s) => Ok(vec![s.to_string()]),
         Value::Json(_) | Value::Jsonb(_) => {
-            let j = value_to_serde(v)?;
+            let j = value_to_serde_with_work(v, work)?;
             j.as_array()
                 .ok_or_else(|| SqlError::InvalidValue("expected JSON text array".into()))?
                 .iter()
-                .map(|e| match e {
-                    serde_json::Value::String(s) => Ok(s.clone()),
-                    _ => Err(SqlError::InvalidValue(
-                        "array elements must be strings".into(),
-                    )),
+                .map(|e| {
+                    work.tick()?;
+                    match e {
+                        serde_json::Value::String(s) => clone_string_with_work(s, work),
+                        _ => Err(SqlError::InvalidValue(
+                            "array elements must be strings".into(),
+                        )),
+                    }
                 })
                 .collect()
         }
@@ -1446,30 +2947,54 @@ pub fn agg_array(values: &[Value], target: crate::types::DataType) -> Result<Val
     serde_to_value(serde_json::Value::Array(items?), target)
 }
 
+pub(crate) fn agg_array_with_cancel(
+    values: &[Value],
+    target: crate::types::DataType,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return agg_array(values, target);
+    };
+    run_json_work(Some(cancel), |work| {
+        let mut items = Vec::with_capacity(values.len());
+        for value in values {
+            work.tick()?;
+            items.push(value_to_serde_lossy_with_work(value, work)?);
+        }
+        serde_to_value_with_work(serde_json::Value::Array(items), target, work)
+    })
+}
+
 pub fn materialize_json_table(
     source: &Value,
     spec: &crate::parser::JsonTableSpec,
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    materialize_json_table_with_cancel(source, spec, None)
+}
+
+pub(crate) fn materialize_json_table_with_cancel(
+    source: &Value,
+    spec: &crate::parser::JsonTableSpec,
+    cancel: Option<&CancelToken>,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    let mut work = JsonWork::new(cancel)?;
     if source.is_null() {
         let names = json_table_column_names(&spec.columns);
+        work.finish()?;
         return Ok((names, vec![]));
     }
-    let root = value_to_serde(source)?;
-    let root_segs = parse_dollar_path(&spec.root_path)?;
-    let matches = json_table_walk(&root, &root_segs);
+    let root = value_to_serde_with_work(source, &mut work)?;
+    let root_segs = parse_dollar_path_with_work(&spec.root_path, &mut work)?;
+    let matches = json_table_walk(&root, &root_segs, &mut work)?;
     let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut ordinality_counter = 0i64;
     for m in matches {
+        work.tick()?;
         ordinality_counter += 1;
-        emit_json_table_rows(
-            &m,
-            &spec.columns,
-            ordinality_counter,
-            &mut Vec::new(),
-            &mut rows,
-        )?;
+        emit_json_table_rows(m, &spec.columns, ordinality_counter, &mut rows, &mut work)?;
     }
     let names = json_table_column_names(&spec.columns);
+    work.finish()?;
     Ok((names, rows))
 }
 
@@ -1485,47 +3010,59 @@ fn json_table_column_names(columns: &[crate::parser::JsonTableCol]) -> Vec<Strin
     out
 }
 
-fn json_table_walk(j: &serde_json::Value, segs: &[PathSeg]) -> Vec<serde_json::Value> {
-    let mut frontier = vec![j.clone()];
+fn json_table_walk<'a>(
+    j: &'a serde_json::Value,
+    segs: &[PathSeg],
+    work: &mut JsonWork<'_>,
+) -> Result<Vec<&'a serde_json::Value>> {
+    let mut frontier = vec![j];
     for seg in segs {
         let mut next = Vec::new();
         for cur in frontier {
+            work.tick()?;
             match (cur, seg) {
                 (serde_json::Value::Object(m), PathSeg::Key(k)) => {
                     if let Some(v) = m.get(k.as_str()) {
-                        next.push(v.clone());
+                        next.push(v);
                     }
                 }
                 (serde_json::Value::Array(arr), PathSeg::Index(i)) => {
                     let len = arr.len() as i64;
                     let idx = if *i < 0 { len + i } else { *i };
                     if (0..len).contains(&idx) {
-                        next.push(arr[idx as usize].clone());
+                        next.push(&arr[idx as usize]);
                     }
                 }
                 (serde_json::Value::Array(arr), PathSeg::Wildcard) => {
-                    next.extend(arr);
+                    next.extend(arr.iter());
                 }
                 _ => {}
             }
         }
         frontier = next;
     }
-    frontier
-        .into_iter()
-        .flat_map(|v| match v {
-            serde_json::Value::Array(arr) if segs.last() == Some(&PathSeg::Wildcard) => arr,
-            other => vec![other],
-        })
-        .collect()
+
+    if segs.last() != Some(&PathSeg::Wildcard) {
+        return Ok(frontier);
+    }
+
+    let mut flattened = Vec::new();
+    for value in frontier {
+        work.tick()?;
+        match value {
+            serde_json::Value::Array(arr) => flattened.extend(arr.iter()),
+            other => flattened.push(other),
+        }
+    }
+    Ok(flattened)
 }
 
 fn emit_json_table_rows(
     row_doc: &serde_json::Value,
     columns: &[crate::parser::JsonTableCol],
     parent_ordinality: i64,
-    _prefix: &mut Vec<Value>,
     out: &mut Vec<Vec<Value>>,
+    work: &mut JsonWork<'_>,
 ) -> Result<()> {
     use crate::parser::JsonTableCol as C;
 
@@ -1534,18 +3071,19 @@ fn emit_json_table_rows(
     let mut widths: Vec<usize> = Vec::with_capacity(columns.len());
 
     for (idx, c) in columns.iter().enumerate() {
+        work.tick()?;
         match c {
             C::Named {
                 ty, path, exists, ..
             } => {
-                let segs = parse_dollar_path(path)?;
-                let matches = json_table_walk(row_doc, &segs);
+                let segs = parse_dollar_path_with_work(path, work)?;
+                let matches = json_table_walk(row_doc, &segs, work)?;
                 let v = if *exists {
                     Value::Boolean(!matches.is_empty())
                 } else if matches.is_empty() {
                     Value::Null
                 } else {
-                    json_table_coerce(&matches[0], *ty)?
+                    json_table_coerce(matches[0], *ty, work)?
                 };
                 scalars.push((idx, v));
                 widths.push(1);
@@ -1555,15 +3093,15 @@ fn emit_json_table_rows(
                 widths.push(1);
             }
             C::Nested { path, columns } => {
-                let segs = parse_dollar_path(path)?;
-                let matches = json_table_walk(row_doc, &segs);
+                let segs = parse_dollar_path_with_work(path, work)?;
+                let matches = json_table_walk(row_doc, &segs, work)?;
                 let inner_width = json_table_column_names(columns).len();
                 let mut inner: Vec<Vec<Value>> = Vec::new();
                 let mut ord = 0i64;
                 for m in matches {
+                    work.tick()?;
                     ord += 1;
-                    let mut empty_prefix: Vec<Value> = Vec::new();
-                    emit_json_table_rows(&m, columns, ord, &mut empty_prefix, &mut inner)?;
+                    emit_json_table_rows(m, columns, ord, &mut inner, work)?;
                 }
                 if inner.is_empty() {
                     inner.push(vec![Value::Null; inner_width]);
@@ -1595,6 +3133,7 @@ fn emit_json_table_rows(
 
     let mut indices = vec![0usize; nesteds.len()];
     loop {
+        work.tick()?;
         let mut row = vec![Value::Null; total];
         for (idx, v) in &scalars {
             row[offsets[*idx]] = v.clone();
@@ -1626,14 +3165,18 @@ fn emit_json_table_rows(
     }
 }
 
-fn json_table_coerce(v: &serde_json::Value, target: crate::types::DataType) -> Result<Value> {
+fn json_table_coerce(
+    v: &serde_json::Value,
+    target: crate::types::DataType,
+    work: &mut JsonWork<'_>,
+) -> Result<Value> {
     use crate::types::DataType;
     if matches!(v, serde_json::Value::Null) {
         return Ok(Value::Null);
     }
     match (v, target) {
-        (_, DataType::Json) => serde_to_value(v.clone(), DataType::Json),
-        (_, DataType::Jsonb) => serde_to_value(v.clone(), DataType::Jsonb),
+        (_, DataType::Json) => serde_to_value_with_work(v.clone(), DataType::Json, work),
+        (_, DataType::Jsonb) => serde_to_value_with_work(v.clone(), DataType::Jsonb, work),
         (serde_json::Value::Number(n), DataType::Integer) => n
             .as_i64()
             .map(Value::Integer)
@@ -1643,12 +3186,13 @@ fn json_table_coerce(v: &serde_json::Value, target: crate::types::DataType) -> R
             .map(Value::Real)
             .ok_or_else(|| SqlError::InvalidValue("JSON_TABLE: number not f64".into())),
         (serde_json::Value::Bool(b), DataType::Boolean) => Ok(Value::Boolean(*b)),
-        (serde_json::Value::String(s), DataType::Text) => Ok(Value::Text(s.clone().into())),
+        (serde_json::Value::String(s), DataType::Text) => {
+            Ok(Value::Text(clone_string_with_work(s, work)?.into()))
+        }
         _ => {
             let text_form = match v {
                 serde_json::Value::String(s) => s.clone(),
-                _ => serde_json::to_string(v)
-                    .map_err(|e| SqlError::InvalidValue(format!("JSON_TABLE render: {e}")))?,
+                _ => json_to_string_with_work(v, false, work)?,
             };
             let text_val = Value::Text(text_form.into());
             text_val.coerce_into(target).ok_or_else(|| {
@@ -1661,73 +3205,210 @@ fn json_table_coerce(v: &serde_json::Value, target: crate::types::DataType) -> R
 /// GIN entry layout (jsonb_ops): `0x01‖key` (key-exists, `?`),
 /// `0x02‖key‖0x00‖value` (pair, `@>`), `0x03‖value` (array element).
 pub fn extract_gin_entries(value: &Value, ops: crate::types::GinOpsClass) -> Result<Vec<Vec<u8>>> {
+    extract_gin_entries_with_cancel(value, ops, None)
+}
+
+pub(crate) fn extract_gin_entries_with_cancel(
+    value: &Value,
+    ops: crate::types::GinOpsClass,
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<Vec<u8>>> {
     use crate::types::GinOpsClass;
+    let mut work = JsonWork::new(cancel)?;
     if value.is_null() {
+        work.finish()?;
         return Ok(vec![]);
     }
-    let j = value_to_serde(value)?;
+    let j = value_to_serde_with_work(value, &mut work)?;
     let mut out: Vec<Vec<u8>> = Vec::new();
     match ops {
-        GinOpsClass::JsonbOps => extract_jsonb_ops_walk(&j, &mut out),
-        GinOpsClass::JsonbPathOps => extract_path_ops_walk(&j, 0, &mut out),
+        GinOpsClass::JsonbOps => extract_jsonb_ops_walk(&j, &mut out, &mut work)?,
+        GinOpsClass::JsonbPathOps => extract_path_ops_walk(&j, 0, &mut out, &mut work)?,
     }
     out.sort();
     out.dedup();
+    work.finish()?;
     Ok(out)
 }
 
-fn extract_jsonb_ops_walk(j: &serde_json::Value, out: &mut Vec<Vec<u8>>) {
+fn extract_jsonb_ops_walk(
+    j: &serde_json::Value,
+    out: &mut Vec<Vec<u8>>,
+    work: &mut JsonWork<'_>,
+) -> Result<()> {
     match j {
         serde_json::Value::Object(m) => {
             for (k, v) in m {
+                work.tick()?;
+                let large_copy = k.len() >= JSON_READ_CHUNK || is_large_json_string(v);
+                if large_copy {
+                    work.checkpoint()?;
+                }
                 let mut key_entry = Vec::with_capacity(k.len() + 1);
                 key_entry.push(0x01);
-                key_entry.extend_from_slice(k.as_bytes());
+                extend_bytes_with_work(&mut key_entry, k.as_bytes(), work)?;
                 out.push(key_entry);
-                if let Some(s) = scalar_repr(v) {
+                if let Some(s) = scalar_repr_with_work(v, work)? {
                     let mut pair = Vec::with_capacity(k.len() + s.len() + 2);
                     pair.push(0x02);
-                    pair.extend_from_slice(k.as_bytes());
+                    extend_bytes_with_work(&mut pair, k.as_bytes(), work)?;
                     pair.push(0x00);
-                    pair.extend_from_slice(s.as_bytes());
+                    extend_bytes_with_work(&mut pair, s.as_bytes(), work)?;
                     out.push(pair);
                 }
-                extract_jsonb_ops_walk(v, out);
+                extract_jsonb_ops_walk(v, out, work)?;
+                if large_copy {
+                    work.checkpoint()?;
+                }
             }
         }
         serde_json::Value::Array(arr) => {
             for v in arr {
-                if let Some(s) = scalar_repr(v) {
+                work.tick()?;
+                let large_copy = is_large_json_string(v);
+                if large_copy {
+                    work.checkpoint()?;
+                }
+                if let Some(s) = scalar_repr_with_work(v, work)? {
                     let mut entry = Vec::with_capacity(s.len() + 1);
                     entry.push(0x03);
-                    entry.extend_from_slice(s.as_bytes());
+                    extend_bytes_with_work(&mut entry, s.as_bytes(), work)?;
                     out.push(entry);
                 }
-                extract_jsonb_ops_walk(v, out);
+                extract_jsonb_ops_walk(v, out, work)?;
+                if large_copy {
+                    work.checkpoint()?;
+                }
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
-fn extract_path_ops_walk(j: &serde_json::Value, path: u32, out: &mut Vec<Vec<u8>>) {
+fn encode_canonical_with_work(
+    v: &serde_json::Value,
+    out: &mut Vec<u8>,
+    work: &mut JsonWork<'_>,
+) -> Result<()> {
+    work.tick()?;
+    match v {
+        serde_json::Value::Null => out.push(header_byte(JsonbType::Null, 0)),
+        serde_json::Value::Bool(true) => out.push(header_byte(JsonbType::True, 0)),
+        serde_json::Value::Bool(false) => out.push(header_byte(JsonbType::False, 0)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                out.push(header_byte(JsonbType::Integer, 0));
+                out.extend_from_slice(&i.to_le_bytes());
+            } else if let Some(f) = n.as_f64() {
+                if f.is_finite() {
+                    out.push(header_byte(JsonbType::Real, 0));
+                    out.extend_from_slice(&f.to_le_bytes());
+                } else {
+                    return Err(SqlError::InvalidValue("non-finite number in JSON".into()));
+                }
+            } else {
+                return Err(SqlError::InvalidValue(format!("unsupported number: {n}")));
+            }
+        }
+        serde_json::Value::String(s) => {
+            write_header_with_len(JsonbType::String, s.len(), out);
+            extend_bytes_with_work(out, s.as_bytes(), work)?;
+        }
+        serde_json::Value::Array(items) => {
+            let mut payload = Vec::new();
+            for item in items {
+                encode_canonical_with_work(item, &mut payload, work)?;
+            }
+            write_header_with_len(JsonbType::Array, payload.len(), out);
+            extend_bytes_with_work(out, &payload, work)?;
+        }
+        serde_json::Value::Object(map) => {
+            work.checkpoint()?;
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            work.checkpoint()?;
+            let mut payload = Vec::new();
+            for key in keys {
+                work.tick()?;
+                write_header_with_len(JsonbType::String, key.len(), &mut payload);
+                extend_bytes_with_work(&mut payload, key.as_bytes(), work)?;
+                encode_canonical_with_work(&map[key], &mut payload, work)?;
+            }
+            write_header_with_len(JsonbType::Object, payload.len(), out);
+            extend_bytes_with_work(out, &payload, work)?;
+        }
+    }
+    Ok(())
+}
+
+fn extend_bytes_with_work(out: &mut Vec<u8>, bytes: &[u8], work: &mut JsonWork<'_>) -> Result<()> {
+    if work.cancel.is_none() {
+        out.extend_from_slice(bytes);
+        return Ok(());
+    }
+    for chunk in bytes.chunks(JSON_READ_CHUNK) {
+        work.checkpoint()?;
+        out.extend_from_slice(chunk);
+    }
+    Ok(())
+}
+
+fn clone_string_with_work(text: &str, work: &mut JsonWork<'_>) -> Result<String> {
+    if work.cancel.is_none() {
+        return Ok(text.to_owned());
+    }
+    let mut bytes = Vec::with_capacity(text.len());
+    extend_bytes_with_work(&mut bytes, text.as_bytes(), work)?;
+    String::from_utf8(bytes)
+        .map_err(|e| SqlError::InvalidValue(format!("JSON string was not UTF-8: {e}")))
+}
+
+pub(crate) fn clone_text_with_cancel(text: &str, cancel: Option<&CancelToken>) -> Result<String> {
+    let Some(cancel) = cancel else {
+        return Ok(text.to_owned());
+    };
+    run_json_work(Some(cancel), |work| clone_string_with_work(text, work))
+}
+
+fn extract_path_ops_walk(
+    j: &serde_json::Value,
+    path: u32,
+    out: &mut Vec<Vec<u8>>,
+    work: &mut JsonWork<'_>,
+) -> Result<()> {
     match j {
         serde_json::Value::Object(m) => {
             for (k, v) in m {
+                work.tick()?;
+                if k.len() >= JSON_READ_CHUNK {
+                    work.checkpoint()?;
+                }
                 let next = path.rotate_left(1) ^ fx_hash_u32(k.as_bytes());
-                extract_path_ops_walk(v, next, out);
+                if k.len() >= JSON_READ_CHUNK {
+                    work.checkpoint()?;
+                }
+                extract_path_ops_walk(v, next, out, work)?;
             }
         }
         serde_json::Value::Array(arr) => {
             for v in arr {
-                extract_path_ops_walk(v, path, out);
+                work.tick()?;
+                extract_path_ops_walk(v, path, out, work)?;
             }
         }
         _ => {
+            work.checkpoint()?;
             let leaf = path.rotate_left(1) ^ hash_scalar_for_path(j);
+            work.checkpoint()?;
             out.push(leaf.to_le_bytes().to_vec());
         }
     }
+    Ok(())
+}
+
+fn is_large_json_string(value: &serde_json::Value) -> bool {
+    matches!(value, serde_json::Value::String(text) if text.len() >= JSON_READ_CHUNK)
 }
 
 fn fx_hash_u32(bytes: &[u8]) -> u32 {
@@ -1772,6 +3453,116 @@ fn scalar_repr(v: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn delete_at_path_with_work(
+    value: &mut serde_json::Value,
+    segments: &[PathSeg],
+    work: &mut JsonWork<'_>,
+) -> Result<()> {
+    let Some((last, prefix)) = segments.split_last() else {
+        return Ok(());
+    };
+    let Some(target) = navigate_mut_with_work(value, prefix, work)? else {
+        return Ok(());
+    };
+    work.checkpoint()?;
+    match (target, last) {
+        (serde_json::Value::Object(map), PathSeg::Key(key)) => {
+            map.remove(key.as_str());
+        }
+        (serde_json::Value::Array(array), PathSeg::Index(index)) => {
+            let len = array.len() as i64;
+            let index = if *index < 0 { len + index } else { *index };
+            if (0..len).contains(&index) {
+                array.remove(index as usize);
+            }
+        }
+        _ => {}
+    }
+    work.checkpoint()
+}
+
+fn json_contains_with_work(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+    work: &mut JsonWork<'_>,
+) -> Result<bool> {
+    work.tick()?;
+    match (left, right) {
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            for (key, right_value) in right {
+                work.tick()?;
+                let Some(left_value) = left.get(key) else {
+                    return Ok(false);
+                };
+                if !json_contains_with_work(left_value, right_value, work)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            for right_value in right {
+                work.tick()?;
+                let mut found = false;
+                for left_value in left {
+                    work.tick()?;
+                    if json_contains_with_work(left_value, right_value, work)? {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (serde_json::Value::Array(left), right) => {
+            for left_value in left {
+                work.tick()?;
+                if json_contains_with_work(left_value, right, work)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        (serde_json::Value::String(left), serde_json::Value::String(right)) => {
+            bytes_equal_with_work(left.as_bytes(), right.as_bytes(), work)
+        }
+        (left, right) => Ok(left == right),
+    }
+}
+
+fn navigate_one_ref_with_work<'a>(
+    value: &'a serde_json::Value,
+    key: &Value,
+    work: &mut JsonWork<'_>,
+) -> Result<Option<&'a serde_json::Value>> {
+    work.tick()?;
+    Ok(match (value, key) {
+        (serde_json::Value::Object(map), Value::Text(key)) => map.get(key.as_str()),
+        (serde_json::Value::Array(array), Value::Integer(index)) => {
+            let len = array.len() as i64;
+            let index = if *index < 0 { len + index } else { *index };
+            usize::try_from(index)
+                .ok()
+                .filter(|index| *index < array.len())
+                .map(|index| &array[index])
+        }
+        _ => None,
+    })
+}
+
+fn scalar_repr_with_work(
+    value: &serde_json::Value,
+    work: &mut JsonWork<'_>,
+) -> Result<Option<String>> {
+    match value {
+        serde_json::Value::String(text) => clone_string_with_work(text, work).map(Some),
+        _ => Ok(scalar_repr(value)),
+    }
+}
+
 pub fn agg_object(pairs: &[(Value, Value)], target: crate::types::DataType) -> Result<Value> {
     let mut map = serde_json::Map::new();
     for (k, v) in pairs {
@@ -1789,33 +3580,97 @@ pub fn agg_object(pairs: &[(Value, Value)], target: crate::types::DataType) -> R
     serde_to_value(serde_json::Value::Object(map), target)
 }
 
+pub(crate) fn agg_object_with_cancel(
+    pairs: &[(Value, Value)],
+    target: crate::types::DataType,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    let Some(cancel) = cancel else {
+        return agg_object(pairs, target);
+    };
+    run_json_work(Some(cancel), |work| {
+        let mut map = serde_json::Map::new();
+        for (key, value) in pairs {
+            work.tick()?;
+            if key.is_null() {
+                continue;
+            }
+            let key = match key {
+                Value::Text(text) | Value::Json(text) => clone_string_with_work(text, work)?,
+                _ => {
+                    work.checkpoint()?;
+                    let text = format!("{key}");
+                    work.checkpoint()?;
+                    text
+                }
+            };
+            let value = value_to_serde_lossy_with_work(value, work)?;
+            map.insert(key, value);
+        }
+        serde_to_value_with_work(serde_json::Value::Object(map), target, work)
+    })
+}
+
 pub fn populate_record_row(
     obj: &serde_json::Map<String, serde_json::Value>,
     columns: &[crate::types::ColumnDef],
 ) -> Result<Vec<Value>> {
-    columns
-        .iter()
-        .map(|col| match obj.get(&col.name) {
-            None | Some(serde_json::Value::Null) => Ok(Value::Null),
-            Some(v) => coerce_json_field(v, col.data_type),
-        })
-        .collect()
+    populate_record_row_with_cancel(obj, columns, None)
 }
 
-fn coerce_json_field(j: &serde_json::Value, target: crate::types::DataType) -> Result<Value> {
+pub(crate) fn populate_record_row_with_cancel(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    columns: &[crate::types::ColumnDef],
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<Value>> {
+    let mut work = JsonWork::new(cancel)?;
+    let mut row = Vec::with_capacity(columns.len());
+    for col in columns {
+        work.tick()?;
+        row.push(match obj.get(&col.name) {
+            None | Some(serde_json::Value::Null) => Ok(Value::Null),
+            Some(v) => coerce_json_field(v, col.data_type, &mut work),
+        }?);
+    }
+    work.finish()?;
+    Ok(row)
+}
+
+fn coerce_json_field(
+    j: &serde_json::Value,
+    target: crate::types::DataType,
+    work: &mut JsonWork<'_>,
+) -> Result<Value> {
     use crate::types::DataType;
+    if target == DataType::Text {
+        if let serde_json::Value::String(text) = j {
+            return Ok(Value::Text(clone_string_with_work(text, work)?.into()));
+        }
+    }
     match target {
-        DataType::Json | DataType::Jsonb => serde_to_value(j.clone(), target),
+        DataType::Json | DataType::Jsonb => serde_to_value_with_work(j.clone(), target, work),
         _ => {
+            work.checkpoint()?;
             let v = serde_to_scalar_value(j.clone());
-            crate::eval::eval_cast(&v, target)
+            let value = crate::eval::eval_cast(&v, target)?;
+            work.checkpoint()?;
+            Ok(value)
         }
     }
 }
 
 pub fn dispatch_srf(name: &str, args: &[Value]) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    dispatch_srf_with_cancel(name, args, None)
+}
+
+pub(crate) fn dispatch_srf_with_cancel(
+    name: &str,
+    args: &[Value],
+    cancel: Option<&CancelToken>,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    let mut work = JsonWork::new(cancel)?;
     let upper = name.to_ascii_uppercase();
-    match upper.as_str() {
+    let result = match upper.as_str() {
         "JSONB_ARRAY_ELEMENTS" | "JSON_ARRAY_ELEMENTS" => {
             if args.len() != 1 {
                 return Err(SqlError::InvalidValue(format!(
@@ -1823,22 +3678,28 @@ pub fn dispatch_srf(name: &str, args: &[Value]) -> Result<(Vec<String>, Vec<Vec<
                 )));
             }
             if args[0].is_null() {
-                return Ok((vec!["value".into()], vec![]));
-            }
-            let j = value_to_serde(&args[0])?;
-            let arr = j
-                .as_array()
-                .ok_or_else(|| SqlError::InvalidValue(format!("{name} requires JSON array")))?;
-            let target = if upper.starts_with("JSONB") {
-                crate::types::DataType::Jsonb
+                Ok((vec!["value".into()], vec![]))
             } else {
-                crate::types::DataType::Json
-            };
-            let rows: Result<Vec<Vec<Value>>> = arr
-                .iter()
-                .map(|v| serde_to_value(v.clone(), target).map(|val| vec![val]))
-                .collect();
-            Ok((vec!["value".into()], rows?))
+                let j = value_to_serde_with_work(&args[0], &mut work)?;
+                let arr = j
+                    .as_array()
+                    .ok_or_else(|| SqlError::InvalidValue(format!("{name} requires JSON array")))?;
+                let target = if upper.starts_with("JSONB") {
+                    crate::types::DataType::Jsonb
+                } else {
+                    crate::types::DataType::Json
+                };
+                let mut rows = Vec::with_capacity(arr.len());
+                for v in arr {
+                    work.tick()?;
+                    rows.push(vec![serde_to_value_with_work(
+                        v.clone(),
+                        target,
+                        &mut work,
+                    )?]);
+                }
+                Ok((vec!["value".into()], rows))
+            }
         }
         "JSONB_ARRAY_ELEMENTS_TEXT" | "JSON_ARRAY_ELEMENTS_TEXT" => {
             if args.len() != 1 {
@@ -1847,23 +3708,23 @@ pub fn dispatch_srf(name: &str, args: &[Value]) -> Result<(Vec<String>, Vec<Vec<
                 )));
             }
             if args[0].is_null() {
-                return Ok((vec!["value".into()], vec![]));
-            }
-            let j = value_to_serde(&args[0])?;
-            let arr = j
-                .as_array()
-                .ok_or_else(|| SqlError::InvalidValue(format!("{name} requires JSON array")))?;
-            let rows: Vec<Vec<Value>> = arr
-                .iter()
-                .map(|v| {
+                Ok((vec!["value".into()], vec![]))
+            } else {
+                let j = value_to_serde_with_work(&args[0], &mut work)?;
+                let arr = j
+                    .as_array()
+                    .ok_or_else(|| SqlError::InvalidValue(format!("{name} requires JSON array")))?;
+                let mut rows = Vec::with_capacity(arr.len());
+                for v in arr {
+                    work.tick()?;
                     let text = match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        _ => serde_json::to_string(v).unwrap_or_default(),
+                        serde_json::Value::String(s) => clone_string_with_work(s, &mut work)?,
+                        _ => json_to_string_with_work(v, false, &mut work)?,
                     };
-                    vec![Value::Text(text.into())]
-                })
-                .collect();
-            Ok((vec!["value".into()], rows))
+                    rows.push(vec![Value::Text(text.into())]);
+                }
+                Ok((vec!["value".into()], rows))
+            }
         }
         "JSONB_EACH" | "JSON_EACH" => {
             if args.len() != 1 {
@@ -1872,27 +3733,27 @@ pub fn dispatch_srf(name: &str, args: &[Value]) -> Result<(Vec<String>, Vec<Vec<
                 )));
             }
             if args[0].is_null() {
-                return Ok((vec!["key".into(), "value".into()], vec![]));
-            }
-            let j = value_to_serde(&args[0])?;
-            let obj = j
-                .as_object()
-                .ok_or_else(|| SqlError::InvalidValue(format!("{name} requires JSON object")))?;
-            let target = if upper.starts_with("JSONB") {
-                crate::types::DataType::Jsonb
+                Ok((vec!["key".into(), "value".into()], vec![]))
             } else {
-                crate::types::DataType::Json
-            };
-            let rows: Result<Vec<Vec<Value>>> = obj
-                .iter()
-                .map(|(k, v)| {
-                    Ok(vec![
+                let j = value_to_serde_with_work(&args[0], &mut work)?;
+                let obj = j.as_object().ok_or_else(|| {
+                    SqlError::InvalidValue(format!("{name} requires JSON object"))
+                })?;
+                let target = if upper.starts_with("JSONB") {
+                    crate::types::DataType::Jsonb
+                } else {
+                    crate::types::DataType::Json
+                };
+                let mut rows = Vec::with_capacity(obj.len());
+                for (k, v) in obj {
+                    work.tick()?;
+                    rows.push(vec![
                         Value::Text(k.clone().into()),
-                        serde_to_value(v.clone(), target)?,
-                    ])
-                })
-                .collect();
-            Ok((vec!["key".into(), "value".into()], rows?))
+                        serde_to_value_with_work(v.clone(), target, &mut work)?,
+                    ]);
+                }
+                Ok((vec!["key".into(), "value".into()], rows))
+            }
         }
         "JSONB_EACH_TEXT" | "JSON_EACH_TEXT" => {
             if args.len() != 1 {
@@ -1901,23 +3762,26 @@ pub fn dispatch_srf(name: &str, args: &[Value]) -> Result<(Vec<String>, Vec<Vec<
                 )));
             }
             if args[0].is_null() {
-                return Ok((vec!["key".into(), "value".into()], vec![]));
-            }
-            let j = value_to_serde(&args[0])?;
-            let obj = j
-                .as_object()
-                .ok_or_else(|| SqlError::InvalidValue(format!("{name} requires JSON object")))?;
-            let rows: Vec<Vec<Value>> = obj
-                .iter()
-                .map(|(k, v)| {
+                Ok((vec!["key".into(), "value".into()], vec![]))
+            } else {
+                let j = value_to_serde_with_work(&args[0], &mut work)?;
+                let obj = j.as_object().ok_or_else(|| {
+                    SqlError::InvalidValue(format!("{name} requires JSON object"))
+                })?;
+                let mut rows = Vec::with_capacity(obj.len());
+                for (k, v) in obj {
+                    work.tick()?;
                     let text = match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        _ => serde_json::to_string(v).unwrap_or_default(),
+                        serde_json::Value::String(s) => clone_string_with_work(s, &mut work)?,
+                        _ => json_to_string_with_work(v, false, &mut work)?,
                     };
-                    vec![Value::Text(k.clone().into()), Value::Text(text.into())]
-                })
-                .collect();
-            Ok((vec!["key".into(), "value".into()], rows))
+                    rows.push(vec![
+                        Value::Text(k.clone().into()),
+                        Value::Text(text.into()),
+                    ]);
+                }
+                Ok((vec!["key".into(), "value".into()], rows))
+            }
         }
         "JSONB_OBJECT_KEYS" | "JSON_OBJECT_KEYS" => {
             if args.len() != 1 {
@@ -1926,22 +3790,28 @@ pub fn dispatch_srf(name: &str, args: &[Value]) -> Result<(Vec<String>, Vec<Vec<
                 )));
             }
             if args[0].is_null() {
-                return Ok((vec!["key".into()], vec![]));
+                Ok((vec!["key".into()], vec![]))
+            } else {
+                let j = value_to_serde_with_work(&args[0], &mut work)?;
+                let obj = j.as_object().ok_or_else(|| {
+                    SqlError::InvalidValue(format!("{name} requires JSON object"))
+                })?;
+                let mut rows = Vec::with_capacity(obj.len());
+                for k in obj.keys() {
+                    work.tick()?;
+                    rows.push(vec![Value::Text(k.clone().into())]);
+                }
+                Ok((vec!["key".into()], rows))
             }
-            let j = value_to_serde(&args[0])?;
-            let obj = j
-                .as_object()
-                .ok_or_else(|| SqlError::InvalidValue(format!("{name} requires JSON object")))?;
-            let rows: Vec<Vec<Value>> = obj
-                .keys()
-                .map(|k| vec![Value::Text(k.clone().into())])
-                .collect();
-            Ok((vec!["key".into()], rows))
         }
         _ => Err(SqlError::Unsupported(format!(
             "set-returning function: {name}"
         ))),
+    };
+    if result.is_ok() {
+        work.finish()?;
     }
+    result
 }
 
 pub fn is_srf_name(name: &str) -> bool {
@@ -1971,64 +3841,89 @@ pub fn to_scalar(j: serde_json::Value) -> Value {
 }
 
 pub fn fn_typeof(v: &Value) -> Result<Value> {
-    if let Value::Jsonb(b) = v {
-        let (ty, _, _) = read_header(b)?;
-        let s = match ty {
-            JsonbType::Null => "null",
-            JsonbType::True | JsonbType::False => "boolean",
-            JsonbType::Integer | JsonbType::Real => "number",
-            JsonbType::String => "string",
-            JsonbType::Array => "array",
-            JsonbType::Object => "object",
+    fn_typeof_with_cancel(v, None)
+}
+
+pub(crate) fn fn_typeof_with_cancel(v: &Value, cancel: Option<&CancelToken>) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        if let Value::Jsonb(b) = v {
+            work.checkpoint()?;
+            let (ty, _, _) = read_header(b)?;
+            let s = match ty {
+                JsonbType::Null => "null",
+                JsonbType::True | JsonbType::False => "boolean",
+                JsonbType::Integer | JsonbType::Real => "number",
+                JsonbType::String => "string",
+                JsonbType::Array => "array",
+                JsonbType::Object => "object",
+            };
+            return Ok(Value::Text(s.into()));
+        }
+        let j = value_to_serde_with_work(v, work)?;
+        let s = match j {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "boolean",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
         };
-        return Ok(Value::Text(s.into()));
-    }
-    let j = value_to_serde(v)?;
-    let s = match j {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    };
-    Ok(Value::Text(s.into()))
+        Ok(Value::Text(s.into()))
+    })
 }
 
 pub fn fn_array_length(v: &Value) -> Result<Value> {
-    if let Value::Jsonb(b) = v {
-        return match array_len_bytes(b)? {
-            Some(n) => Ok(Value::Integer(n as i64)),
-            None => Err(SqlError::InvalidValue(
+    fn_array_length_with_cancel(v, None)
+}
+
+pub(crate) fn fn_array_length_with_cancel(
+    v: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        if let Value::Jsonb(b) = v {
+            return match array_len_bytes_with_work(b, work)? {
+                Some(n) => Ok(Value::Integer(n as i64)),
+                None => Err(SqlError::InvalidValue(
+                    "jsonb_array_length called on non-array".into(),
+                )),
+            };
+        }
+        let j = value_to_serde_with_work(v, work)?;
+        match j {
+            serde_json::Value::Array(arr) => Ok(Value::Integer(arr.len() as i64)),
+            _ => Err(SqlError::InvalidValue(
                 "jsonb_array_length called on non-array".into(),
             )),
-        };
-    }
-    let j = value_to_serde(v)?;
-    match j {
-        serde_json::Value::Array(arr) => Ok(Value::Integer(arr.len() as i64)),
-        _ => Err(SqlError::InvalidValue(
-            "jsonb_array_length called on non-array".into(),
-        )),
-    }
+        }
+    })
 }
 
 pub fn fn_object_length(v: &Value) -> Result<Value> {
-    if let Value::Jsonb(b) = v {
-        return match object_len_bytes(b)? {
-            Some(n) => Ok(Value::Integer(n as i64)),
-            None => Err(SqlError::InvalidValue(
+    fn_object_length_with_cancel(v, None)
+}
+
+pub(crate) fn fn_object_length_with_cancel(
+    v: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        if let Value::Jsonb(b) = v {
+            return match object_len_bytes_with_work(b, work)? {
+                Some(n) => Ok(Value::Integer(n as i64)),
+                None => Err(SqlError::InvalidValue(
+                    "jsonb_object_length called on non-object".into(),
+                )),
+            };
+        }
+        let j = value_to_serde_with_work(v, work)?;
+        match j {
+            serde_json::Value::Object(m) => Ok(Value::Integer(m.len() as i64)),
+            _ => Err(SqlError::InvalidValue(
                 "jsonb_object_length called on non-object".into(),
             )),
-        };
-    }
-    let j = value_to_serde(v)?;
-    match j {
-        serde_json::Value::Object(m) => Ok(Value::Integer(m.len() as i64)),
-        _ => Err(SqlError::InvalidValue(
-            "jsonb_object_length called on non-object".into(),
-        )),
-    }
+        }
+    })
 }
 
 pub fn fn_extract_path(
@@ -2036,140 +3931,215 @@ pub fn fn_extract_path(
     target: crate::types::DataType,
     as_text: bool,
 ) -> Result<Value> {
-    let mut j = value_to_serde(&args[0])?;
-    for key_val in &args[1..] {
-        if key_val.is_null() {
-            return Ok(Value::Null);
+    fn_extract_path_with_cancel(args, target, as_text, None)
+}
+
+pub(crate) fn fn_extract_path_with_cancel(
+    args: &[Value],
+    target: crate::types::DataType,
+    as_text: bool,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        let mut j = value_to_serde_with_work(&args[0], work)?;
+        for key_val in &args[1..] {
+            work.tick()?;
+            if key_val.is_null() {
+                return Ok(Value::Null);
+            }
+            let key = match key_val {
+                Value::Text(s) => s.to_string(),
+                other => other.to_string(),
+            };
+            match &mut j {
+                serde_json::Value::Object(m) => {
+                    if let Some(next) = m.remove(&key) {
+                        j = next;
+                    } else {
+                        return Ok(Value::Null);
+                    }
+                }
+                serde_json::Value::Array(arr) => {
+                    let idx: i64 = key.parse().map_err(|_| {
+                        SqlError::InvalidValue(format!("array path key not integer: {key}"))
+                    })?;
+                    let len = arr.len() as i64;
+                    let idx = if idx < 0 { len + idx } else { idx };
+                    if (0..len).contains(&idx) {
+                        j = arr.remove(idx as usize);
+                    } else {
+                        return Ok(Value::Null);
+                    }
+                }
+                _ => return Ok(Value::Null),
+            }
         }
-        let key = match key_val {
-            Value::Text(s) => s.to_string(),
-            other => other.to_string(),
-        };
-        match &mut j {
-            serde_json::Value::Object(m) => {
-                if let Some(next) = m.remove(&key) {
-                    j = next;
-                } else {
-                    return Ok(Value::Null);
+        if as_text {
+            match j {
+                serde_json::Value::Null => Ok(Value::Null),
+                serde_json::Value::String(s) => Ok(Value::Text(s.into())),
+                other => {
+                    let text = json_to_string_with_work(&other, false, work)?;
+                    Ok(Value::Text(text.into()))
                 }
             }
-            serde_json::Value::Array(arr) => {
-                let idx: i64 = key.parse().map_err(|_| {
-                    SqlError::InvalidValue(format!("array path key not integer: {key}"))
-                })?;
-                let len = arr.len() as i64;
-                let idx = if idx < 0 { len + idx } else { idx };
-                if (0..len).contains(&idx) {
-                    j = arr.remove(idx as usize);
-                } else {
-                    return Ok(Value::Null);
-                }
-            }
-            _ => return Ok(Value::Null),
+        } else {
+            serde_to_value_with_work(j, target, work)
         }
-    }
-    if as_text {
-        match j {
-            serde_json::Value::Null => Ok(Value::Null),
-            serde_json::Value::String(s) => Ok(Value::Text(s.into())),
-            other => Ok(Value::Text(
-                serde_json::to_string(&other)
-                    .map_err(|e| SqlError::InvalidValue(format!("JSON render: {e}")))?
-                    .into(),
-            )),
-        }
-    } else {
-        serde_to_value(j, target)
-    }
+    })
 }
 
 pub fn fn_sqlite_extract(j_val: &Value, path: &Value) -> Result<Value> {
-    let path_str = match path {
-        Value::Text(s) => s.to_string(),
-        _ => {
-            return Err(SqlError::TypeMismatch {
-                expected: "TEXT path".into(),
-                got: path.data_type().to_string(),
-            })
+    fn_sqlite_extract_with_cancel(j_val, path, None)
+}
+
+pub(crate) fn fn_sqlite_extract_with_cancel(
+    j_val: &Value,
+    path: &Value,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        let path_str = match path {
+            Value::Text(s) => s.to_string(),
+            _ => {
+                return Err(SqlError::TypeMismatch {
+                    expected: "TEXT path".into(),
+                    got: path.data_type().to_string(),
+                })
+            }
+        };
+        let j = value_to_serde_with_work(j_val, work)?;
+        let segments = parse_dollar_path_with_work(&path_str, work)?;
+        match navigate_path_ref_with_work(&j, &segments, work)? {
+            Some(serde_json::Value::Null) => Ok(Value::Null),
+            Some(serde_json::Value::String(s)) => {
+                Ok(Value::Text(clone_string_with_work(s, work)?.into()))
+            }
+            Some(other) => {
+                let text = json_to_string_with_work(other, false, work)?;
+                Ok(Value::Text(text.into()))
+            }
+            None => Ok(Value::Null),
         }
-    };
-    let j = value_to_serde(j_val)?;
-    let segments = parse_dollar_path(&path_str)?;
-    match navigate_path(&j, &segments) {
-        Some(serde_json::Value::Null) => Ok(Value::Null),
-        Some(serde_json::Value::String(s)) => Ok(Value::Text(s.into())),
-        Some(other) => Ok(Value::Text(
-            serde_json::to_string(&other)
-                .map_err(|e| SqlError::InvalidValue(format!("JSON render: {e}")))?
-                .into(),
-        )),
-        None => Ok(Value::Null),
-    }
+    })
 }
 
 pub fn fn_valid(v: &Value) -> Result<Value> {
-    let s = match v {
-        Value::Text(s) => s.as_str(),
-        Value::Json(s) => s.as_str(),
-        _ => return Ok(Value::Boolean(false)),
-    };
-    Ok(Value::Boolean(
-        serde_json::from_str::<serde_json::Value>(s).is_ok(),
-    ))
+    fn_valid_with_cancel(v, None)
+}
+
+pub(crate) fn fn_valid_with_cancel(v: &Value, cancel: Option<&CancelToken>) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        let text = match v {
+            Value::Text(text) | Value::Json(text) => text.as_str(),
+            _ => return Ok(Value::Boolean(false)),
+        };
+        match parse_json_text_with_work(text, work) {
+            Ok(_) => Ok(Value::Boolean(true)),
+            Err(SqlError::InvalidValue(_)) => Ok(Value::Boolean(false)),
+            Err(error) => Err(error),
+        }
+    })
 }
 
 pub fn fn_strip_nulls(v: &Value, target: crate::types::DataType) -> Result<Value> {
-    let mut j = value_to_serde(v)?;
-    strip_nulls_inplace(&mut j);
-    serde_to_value(j, target)
+    fn_strip_nulls_with_cancel(v, target, None)
 }
 
-fn strip_nulls_inplace(j: &mut serde_json::Value) {
+pub(crate) fn fn_strip_nulls_with_cancel(
+    v: &Value,
+    target: crate::types::DataType,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        let mut j = value_to_serde_with_work(v, work)?;
+        strip_nulls_inplace(&mut j, work)?;
+        serde_to_value_with_work(j, target, work)
+    })
+}
+
+fn strip_nulls_inplace(j: &mut serde_json::Value, work: &mut JsonWork<'_>) -> Result<()> {
+    work.tick()?;
     match j {
         serde_json::Value::Object(m) => {
-            m.retain(|_, v| !matches!(v, serde_json::Value::Null));
-            for v in m.values_mut() {
-                strip_nulls_inplace(v);
+            let entries = std::mem::take(m);
+            for (key, mut value) in entries {
+                work.tick()?;
+                if matches!(value, serde_json::Value::Null) {
+                    continue;
+                }
+                strip_nulls_inplace(&mut value, work)?;
+                m.insert(key, value);
             }
         }
         serde_json::Value::Array(arr) => {
             for v in arr.iter_mut() {
-                strip_nulls_inplace(v);
+                strip_nulls_inplace(v, work)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 pub fn fn_pretty(v: &Value) -> Result<Value> {
-    let j = value_to_serde(v)?;
-    let s = serde_json::to_string_pretty(&j)
-        .map_err(|e| SqlError::InvalidValue(format!("JSON pretty render: {e}")))?;
-    Ok(Value::Text(s.into()))
+    fn_pretty_with_cancel(v, None)
+}
+
+pub(crate) fn fn_pretty_with_cancel(v: &Value, cancel: Option<&CancelToken>) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        let j = value_to_serde_with_work(v, work)?;
+        let text = json_to_string_with_work(&j, true, work)?;
+        Ok(Value::Text(text.into()))
+    })
 }
 
 pub fn fn_build_object(args: &[Value], target: crate::types::DataType) -> Result<Value> {
-    if !args.len().is_multiple_of(2) {
-        return Err(SqlError::InvalidValue(
-            "jsonb_build_object requires an even number of arguments".into(),
-        ));
-    }
-    let mut map = serde_json::Map::new();
-    for pair in args.chunks(2) {
-        let key = match &pair[0] {
-            Value::Null => continue,
-            Value::Text(s) => s.to_string(),
-            other => other.to_string(),
-        };
-        let val = value_to_serde_lossy(&pair[1])?;
-        map.insert(key, val);
-    }
-    serde_to_value(serde_json::Value::Object(map), target)
+    fn_build_object_with_cancel(args, target, None)
+}
+
+pub(crate) fn fn_build_object_with_cancel(
+    args: &[Value],
+    target: crate::types::DataType,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        if !args.len().is_multiple_of(2) {
+            return Err(SqlError::InvalidValue(
+                "jsonb_build_object requires an even number of arguments".into(),
+            ));
+        }
+        let mut map = serde_json::Map::new();
+        for pair in args.chunks(2) {
+            work.tick()?;
+            let key = match &pair[0] {
+                Value::Null => continue,
+                Value::Text(s) => s.to_string(),
+                other => other.to_string(),
+            };
+            let value = value_to_serde_lossy_with_work(&pair[1], work)?;
+            map.insert(key, value);
+        }
+        serde_to_value_with_work(serde_json::Value::Object(map), target, work)
+    })
 }
 
 pub fn fn_build_array(args: &[Value], target: crate::types::DataType) -> Result<Value> {
-    let items: Result<Vec<serde_json::Value>> = args.iter().map(value_to_serde_lossy).collect();
-    serde_to_value(serde_json::Value::Array(items?), target)
+    fn_build_array_with_cancel(args, target, None)
+}
+
+pub(crate) fn fn_build_array_with_cancel(
+    args: &[Value],
+    target: crate::types::DataType,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        let mut items = Vec::with_capacity(args.len());
+        for value in args {
+            items.push(value_to_serde_lossy_with_work(value, work)?);
+        }
+        serde_to_value_with_work(serde_json::Value::Array(items), target, work)
+    })
 }
 
 pub fn fn_set(
@@ -2179,13 +4149,26 @@ pub fn fn_set(
     create_missing: bool,
     target: crate::types::DataType,
 ) -> Result<Value> {
-    let mut root = value_to_serde(j)?;
-    let segments = path_to_segments(path)?;
-    let new_serde = value_to_serde_lossy(new_value)?;
-    if !set_at_path(&mut root, &segments, new_serde, create_missing, false) {
-        return serde_to_value(root, target);
-    }
-    serde_to_value(root, target)
+    fn_set_with_cancel(j, path, new_value, create_missing, target, None)
+}
+
+pub(crate) fn fn_set_with_cancel(
+    j: &Value,
+    path: &Value,
+    new_value: &Value,
+    create_missing: bool,
+    target: crate::types::DataType,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        let mut root = value_to_serde_with_work(j, work)?;
+        let segments = path_to_segments_with_work(path, work)?;
+        let new_serde = value_to_serde_lossy_with_work(new_value, work)?;
+        work.checkpoint()?;
+        set_at_path(&mut root, &segments, new_serde, create_missing, false);
+        work.checkpoint()?;
+        serde_to_value_with_work(root, target, work)
+    })
 }
 
 pub fn fn_insert(
@@ -2195,11 +4178,26 @@ pub fn fn_insert(
     insert_after: bool,
     target: crate::types::DataType,
 ) -> Result<Value> {
-    let mut root = value_to_serde(j)?;
-    let segments = path_to_segments(path)?;
-    let new_serde = value_to_serde_lossy(new_value)?;
-    set_at_path(&mut root, &segments, new_serde, true, insert_after);
-    serde_to_value(root, target)
+    fn_insert_with_cancel(j, path, new_value, insert_after, target, None)
+}
+
+pub(crate) fn fn_insert_with_cancel(
+    j: &Value,
+    path: &Value,
+    new_value: &Value,
+    insert_after: bool,
+    target: crate::types::DataType,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        let mut root = value_to_serde_with_work(j, work)?;
+        let segments = path_to_segments_with_work(path, work)?;
+        let new_serde = value_to_serde_lossy_with_work(new_value, work)?;
+        work.checkpoint()?;
+        set_at_path(&mut root, &segments, new_serde, true, insert_after);
+        work.checkpoint()?;
+        serde_to_value_with_work(root, target, work)
+    })
 }
 
 fn set_at_path(
@@ -2258,20 +4256,38 @@ fn set_at_path(
 }
 
 pub fn fn_to_json(v: &Value, target: crate::types::DataType) -> Result<Value> {
-    let j = value_to_serde_lossy(v)?;
-    serde_to_value(j, target)
+    fn_to_json_with_cancel(v, target, None)
+}
+
+pub(crate) fn fn_to_json_with_cancel(
+    v: &Value,
+    target: crate::types::DataType,
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| {
+        let j = value_to_serde_lossy_with_work(v, work)?;
+        serde_to_value_with_work(j, target, work)
+    })
 }
 
 pub fn fn_json_object(args: &[Value]) -> Result<Value> {
-    match args.len() {
+    fn_json_object_with_cancel(args, None)
+}
+
+pub(crate) fn fn_json_object_with_cancel(
+    args: &[Value],
+    cancel: Option<&CancelToken>,
+) -> Result<Value> {
+    run_json_work(cancel, |work| match args.len() {
         1 => {
-            let j = value_to_serde(&args[0])?;
+            let j = value_to_serde_with_work(&args[0], work)?;
             let arr = j
                 .as_array()
                 .ok_or_else(|| SqlError::InvalidValue("json_object expects text array".into()))?;
             let mut map = serde_json::Map::new();
             let mut i = 0;
             while i + 1 < arr.len() {
+                work.tick()?;
                 let key = arr[i]
                     .as_str()
                     .ok_or_else(|| SqlError::InvalidValue("json_object key must be string".into()))?
@@ -2280,11 +4296,15 @@ pub fn fn_json_object(args: &[Value]) -> Result<Value> {
                 map.insert(key, val);
                 i += 2;
             }
-            serde_to_value(serde_json::Value::Object(map), crate::types::DataType::Json)
+            serde_to_value_with_work(
+                serde_json::Value::Object(map),
+                crate::types::DataType::Json,
+                work,
+            )
         }
         2 => {
-            let keys = text_array(&args[0])?;
-            let vals = text_array(&args[1])?;
+            let keys = text_array_with_work(&args[0], work)?;
+            let vals = text_array_with_work(&args[1], work)?;
             if keys.len() != vals.len() {
                 return Err(SqlError::InvalidValue(
                     "json_object: keys and values must be same length".into(),
@@ -2292,17 +4312,27 @@ pub fn fn_json_object(args: &[Value]) -> Result<Value> {
             }
             let mut map = serde_json::Map::new();
             for (k, v) in keys.into_iter().zip(vals) {
+                work.tick()?;
                 map.insert(k, serde_json::Value::String(v));
             }
-            serde_to_value(serde_json::Value::Object(map), crate::types::DataType::Json)
+            serde_to_value_with_work(
+                serde_json::Value::Object(map),
+                crate::types::DataType::Json,
+                work,
+            )
         }
         _ => Err(SqlError::InvalidValue(
             "json_object requires 1 or 2 arguments".into(),
         )),
-    }
+    })
 }
 
 fn value_to_serde_lossy(v: &Value) -> Result<serde_json::Value> {
+    run_json_work(None, |work| value_to_serde_lossy_with_work(v, work))
+}
+
+fn value_to_serde_lossy_with_work(v: &Value, work: &mut JsonWork<'_>) -> Result<serde_json::Value> {
+    work.tick()?;
     match v {
         Value::Null => Ok(serde_json::Value::Null),
         Value::Boolean(b) => Ok(serde_json::Value::Bool(*b)),
@@ -2310,12 +4340,12 @@ fn value_to_serde_lossy(v: &Value) -> Result<serde_json::Value> {
         Value::Real(r) => serde_json::Number::from_f64(*r)
             .map(serde_json::Value::Number)
             .ok_or_else(|| SqlError::InvalidValue("non-finite number".into())),
-        Value::Text(s) => Ok(serde_json::Value::String(s.to_string())),
-        Value::Json(s) => serde_json::from_str(s)
-            .map_err(|e| SqlError::InvalidValue(format!("invalid JSON: {e}"))),
-        Value::Jsonb(b) => decode_to_serde(b),
+        Value::Text(s) => Ok(serde_json::Value::String(clone_string_with_work(s, work)?)),
+        Value::Json(_) | Value::Jsonb(_) => value_to_serde_with_work(v, work),
         Value::Blob(b) => {
+            work.checkpoint()?;
             let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
+            work.checkpoint()?;
             Ok(serde_json::Value::String(hex))
         }
         Value::Date(_) | Value::Time(_) | Value::Timestamp(_) | Value::Interval { .. } => {
@@ -2325,19 +4355,20 @@ fn value_to_serde_lossy(v: &Value) -> Result<serde_json::Value> {
         Value::Array(a) => {
             let mut out = Vec::with_capacity(a.len());
             for elem in a.iter() {
-                out.push(value_to_serde_lossy(elem)?);
+                out.push(value_to_serde_lossy_with_work(elem, work)?);
             }
             Ok(serde_json::Value::Array(out))
         }
         Value::Vector(v) => {
-            let out: Vec<serde_json::Value> = v
-                .iter()
-                .map(|&x| {
+            let mut out = Vec::with_capacity(v.len());
+            for &x in v.iter() {
+                work.tick()?;
+                out.push(
                     serde_json::Number::from_f64(x as f64)
                         .map(serde_json::Value::Number)
-                        .unwrap_or(serde_json::Value::Null)
-                })
-                .collect();
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
             Ok(serde_json::Value::Array(out))
         }
     }
