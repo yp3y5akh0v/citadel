@@ -11,5 +11,6 @@ pub use activation::{
 pub use audit::{audit_provenance, ProvenanceAudit, ProvenanceViolation, AUDIT_DEPTH_CAP};
 pub use reweight::{reweight_turns_from_provenance, ReweightStats, WeightShape, REWEIGHT_REVISION};
 pub use weave::{
-    weave_similar_notes, WeaveStats, WEAVE_MAX_DISTANCE, WEAVE_NEIGHBORS, WEAVE_REVISION,
+    weave_similar_notes, weave_similar_notes_replacing, WeaveStats, WEAVE_MAX_DISTANCE,
+    WEAVE_NEIGHBORS, WEAVE_REVISION,
 };

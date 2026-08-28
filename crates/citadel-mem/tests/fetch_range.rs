@@ -195,6 +195,60 @@ fn empty_results_and_zero_limit() {
 }
 
 #[test]
+fn the_whole_region_counts_without_naming_a_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    eng.create_region("notes", Arc::new(MockEmbedder::new(DIM)))
+        .unwrap();
+    seed(&eng, "notes");
+
+    assert_eq!(eng.count_region("notes").unwrap(), 9);
+    assert_eq!(
+        eng.count("notes", "fact").unwrap() + eng.count("notes", "event").unwrap(),
+        9
+    );
+    assert_eq!(
+        eng.fetch_range("notes", &FetchQuery::new(100))
+            .unwrap()
+            .len() as u64,
+        eng.count_region("notes").unwrap()
+    );
+}
+
+#[test]
+fn a_sealed_region_counts_every_kind_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    eng.create_encrypted_region("vault", Arc::new(MockEmbedder::new(DIM)))
+        .unwrap();
+    seed(&eng, "vault");
+
+    assert_eq!(eng.count_region("vault").unwrap(), 9);
+    assert_eq!(eng.count("vault", "fact").unwrap(), 5);
+}
+
+#[test]
+fn an_expired_atom_is_outside_the_region_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let eng = engine(dir.path());
+    eng.create_region("notes", Arc::new(MockEmbedder::new(DIM)))
+        .unwrap();
+    seed(&eng, "notes");
+    eng.remember(
+        "notes",
+        AtomInput::new("fact", "already expired").with_expires_at(1),
+    )
+    .unwrap();
+
+    assert_eq!(
+        eng.count_region("notes").unwrap(),
+        9,
+        "an expired atom is not live"
+    );
+    assert_eq!(eng.count("notes", "fact").unwrap(), 5);
+}
+
+#[test]
 fn fetch_wrapper_is_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let eng = engine(dir.path());

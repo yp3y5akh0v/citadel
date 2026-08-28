@@ -1,10 +1,11 @@
 use std::any::Any;
+use std::cell::RefCell;
 use std::fs;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use citadel_core::{
     CancelToken, Error, Result, KEY_FILE_SIZE, KEY_SIZE, MERKLE_HASH_SIZE, WRAPPED_KEY_SIZE,
@@ -33,30 +34,99 @@ use crate::region_store::RegionKeyStore;
 #[must_use = "the capability releases the lifecycle span when dropped"]
 pub struct KeyLifecycleGuard<'a> {
     db: &'a Database,
-    _span: parking_lot::MutexGuard<'a, ()>,
+    span: Option<parking_lot::MutexGuard<'a, ()>>,
+    retired_memory: RefCell<Vec<Box<dyn Any + Send>>>,
 }
 
-impl KeyLifecycleGuard<'_> {
+impl<'a> KeyLifecycleGuard<'a> {
+    /// Reserve one memory region while an operation depends on its provenance.
+    ///
+    /// Registration happens while this database-wide capability is held, but
+    /// the returned region-specific guard deliberately outlives it. That lets
+    /// callbacks re-enter unrelated encrypted operations without allowing the
+    /// source region to be destroyed underneath the callback.
+    #[doc(hidden)]
+    pub fn reserve_memory_region(&self, region_id: u64) -> MemoryRegionGuard<'a> {
+        *self
+            .db
+            .memory_regions_in_use
+            .lock()
+            .entry(region_id)
+            .or_default() += 1;
+        MemoryRegionGuard {
+            db: self.db,
+            region_id,
+        }
+    }
+
+    /// Whether a memory operation currently holds this region.
+    #[doc(hidden)]
+    pub fn memory_region_active(&self, region_id: u64) -> bool {
+        self.db
+            .memory_regions_in_use
+            .lock()
+            .contains_key(&region_id)
+    }
+
+    /// Reserve the atom keys whose plaintext is held by an external callback.
+    #[doc(hidden)]
+    pub fn reserve_memory_atom_callbacks(&self, atom_ids: &[u64]) -> MemoryAtomCallbackGuard<'a> {
+        let mut callbacks = self.db.memory_atom_callbacks.lock();
+        for &atom_id in atom_ids {
+            *callbacks.entry(atom_id).or_default() += 1;
+        }
+        MemoryAtomCallbackGuard {
+            db: self.db,
+            atom_ids: atom_ids.to_vec(),
+        }
+    }
+
+    /// Whether an external memory callback currently holds this atom.
+    #[doc(hidden)]
+    pub fn memory_atom_callback_active(&self, atom_id: u64) -> bool {
+        self.db.memory_atom_callbacks.lock().contains_key(&atom_id)
+    }
+
+    /// Drop memory-owned state only after releasing the lifecycle capability.
+    #[doc(hidden)]
+    pub fn retire_memory(&self, state: Box<dyn Any + Send>) {
+        self.retired_memory.borrow_mut().push(state);
+    }
+
     /// Cryptographically erase region key `slot` (no-op if already erased).
     pub fn region_store_tombstone(&self, slot: u32, region_id: u64) -> Result<()> {
-        self.db.with_region_store(|s| {
+        if self.memory_region_active(region_id) {
+            return Err(Error::RegionInUse { region_id });
+        }
+        let result = self.db.with_region_store(|s| {
             // Bump before and after: a cache built between them is never stamped current.
             self.db.bump_cache_epoch();
             let result = s.tombstone(slot, region_id);
             self.db.bump_cache_epoch();
             result
-        })
+        });
+        self.retired_memory
+            .borrow_mut()
+            .extend(self.db.drain_memory_region_caches(region_id));
+        result
     }
 
     /// Cryptographically erase atom key `slot` (no-op if already erased).
     pub fn atom_store_tombstone(&self, slot: u32, atom_id: u64) -> Result<()> {
-        self.db.with_atom_store(|s| {
+        if self.memory_atom_callback_active(atom_id) {
+            return Err(Error::AtomInUse { atom_id });
+        }
+        let result = self.db.with_atom_store(|s| {
             // Armed before and after the attempt (see region_store_tombstone).
             self.db.bump_cache_epoch();
             let result = s.tombstone(slot, atom_id);
             self.db.bump_cache_epoch();
             result
-        })
+        });
+        self.retired_memory
+            .borrow_mut()
+            .extend(self.db.drain_memory_atom_caches(&[atom_id]));
+        result
     }
 
     /// Batch erase, two fsyncs; recycled slots skip so retries converge; returns receipts.
@@ -67,18 +137,98 @@ impl KeyLifecycleGuard<'_> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        self.db.with_atom_store(|s| {
+        let reserved = {
+            let callbacks = self.db.memory_atom_callbacks.lock();
+            items
+                .iter()
+                .map(|&(_, atom_id, _)| atom_id)
+                .find(|atom_id| callbacks.contains_key(atom_id))
+        };
+        if let Some(atom_id) = reserved {
+            return Err(Error::AtomInUse { atom_id });
+        }
+        let result = self.db.with_atom_store(|s| {
             // Armed before and after the attempt (see region_store_tombstone).
             self.db.bump_cache_epoch();
             let result = s.tombstone_batch(items);
             self.db.bump_cache_epoch();
             result
-        })
+        });
+        let atom_ids: Vec<u64> = items.iter().map(|&(_, atom_id, _)| atom_id).collect();
+        self.retired_memory
+            .borrow_mut()
+            .extend(self.db.drain_memory_atom_caches(&atom_ids));
+        result
     }
 
     /// Finish torn batch erases; no epoch bump - only already-armed keys are touched.
     pub fn normalize_atom_store_torn_erases(&self) -> Result<usize> {
         self.db.with_atom_store(|s| s.normalize_torn_tombstones())
+    }
+}
+
+impl Drop for KeyLifecycleGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.span.take());
+        drop(std::mem::take(self.retired_memory.get_mut()));
+    }
+}
+
+/// Exclusive capability for mutating `citadel-mem`'s shared edge table.
+///
+/// This lives on [`Database`] rather than `MemoryEngine`, because callers may
+/// open more than one memory engine over the same database. Operations that
+/// also need [`KeyLifecycleGuard`] must acquire that guard first.
+#[must_use = "the capability releases the edge-mutation span when dropped"]
+pub struct MemoryEdgesGuard<'a> {
+    _span: parking_lot::MutexGuard<'a, ()>,
+}
+
+/// Region-specific reservation for an operation whose vector/provenance pair
+/// must remain stable. It never grants access to either key store.
+#[doc(hidden)]
+#[must_use = "dropping the guard releases the region reservation"]
+pub struct MemoryRegionGuard<'a> {
+    db: &'a Database,
+    region_id: u64,
+}
+
+impl Drop for MemoryRegionGuard<'_> {
+    fn drop(&mut self) {
+        let mut callbacks = self.db.memory_regions_in_use.lock();
+        let Some(active) = callbacks.get_mut(&self.region_id) else {
+            debug_assert!(false, "memory region reservation was lost");
+            return;
+        };
+        *active -= 1;
+        if *active == 0 {
+            callbacks.remove(&self.region_id);
+        }
+    }
+}
+
+/// Atom-specific reservations for plaintext held by an external memory
+/// callback. It never grants access to the atom key store.
+#[doc(hidden)]
+#[must_use = "dropping the guard releases the callback reservations"]
+pub struct MemoryAtomCallbackGuard<'a> {
+    db: &'a Database,
+    atom_ids: Vec<u64>,
+}
+
+impl Drop for MemoryAtomCallbackGuard<'_> {
+    fn drop(&mut self) {
+        let mut callbacks = self.db.memory_atom_callbacks.lock();
+        for atom_id in &self.atom_ids {
+            let Some(active) = callbacks.get_mut(atom_id) else {
+                debug_assert!(false, "memory atom callback reservation was lost");
+                continue;
+            };
+            *active -= 1;
+            if *active == 0 {
+                callbacks.remove(atom_id);
+            }
+        }
     }
 }
 
@@ -312,6 +462,12 @@ impl Drop for CreatedFileGuard {
     }
 }
 
+#[doc(hidden)]
+pub type MemoryRegionInvalidator =
+    dyn Fn(u64) -> Option<Box<dyn Any + Send>> + Send + Sync + 'static;
+#[doc(hidden)]
+pub type MemoryAtomInvalidator = dyn Fn(&[u64]) -> Vec<Box<dyn Any + Send>> + Send + Sync + 'static;
+
 /// An open Citadel database (`Send + Sync`).
 ///
 /// Exclusively locks the database file for its lifetime.
@@ -341,6 +497,24 @@ pub struct Database {
     /// in-flight write just allocated. Store calls are already internally
     /// locked; this guards the spans between them.
     key_lifecycle: Mutex<()>,
+    /// Active external memory callbacks by region id. Registered and checked
+    /// while `key_lifecycle` is held; the narrow reservation remains while the
+    /// global guard is released around user code.
+    memory_regions_in_use: Mutex<FxHashMap<u64, usize>>,
+    /// Per-engine attachment maps registered without creating an ownership
+    /// cycle. Region erasure drains matching states while the lifecycle lock is
+    /// held, then drops user embedders after that lock is released.
+    memory_region_invalidators: Mutex<Vec<Weak<MemoryRegionInvalidator>>>,
+    /// Per-engine decrypted ANN caches, cleared immediately when an atom key is
+    /// destroyed and dropped after the lifecycle capability is released.
+    memory_atom_invalidators: Mutex<Vec<Weak<MemoryAtomInvalidator>>>,
+    /// Active external memory callbacks by atom id. These narrow reservations
+    /// keep only the source batch's atom keys alive while user code runs.
+    memory_atom_callbacks: Mutex<FxHashMap<u64, usize>>,
+    /// Serializes every mutation of `citadel-mem`'s `memory_edges` table across
+    /// all memory-engine handles over this database. Kept here to avoid a
+    /// dependency cycle from `citadel` back to `citadel-mem`.
+    memory_edges: Mutex<()>,
     /// Bumped before key destruction and rewrites; caches refuse older-epoch plaintext.
     cache_epoch: AtomicU64,
     /// Token cloned into transactions and consulted by non-transactional fast paths.
@@ -348,6 +522,13 @@ pub struct Database {
     /// Test-only hook fired as a destruction wrapper reaches the acquisition boundary.
     #[cfg(any(test, feature = "test-util"))]
     destruction_acquire_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Test-only pause after a reweave has computed a replacement but before it
+    /// writes it, while the shared edge guard is held.
+    #[cfg(any(test, feature = "test-util"))]
+    memory_edges_reweave_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Test-only observation point immediately before an edge-guard acquisition.
+    #[cfg(any(test, feature = "test-util"))]
+    memory_edges_acquire_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl std::fmt::Debug for Database {
@@ -387,10 +568,19 @@ impl Database {
             region_store: Mutex::new(None),
             atom_store: Mutex::new(None),
             key_lifecycle: Mutex::new(()),
+            memory_regions_in_use: Mutex::new(FxHashMap::default()),
+            memory_region_invalidators: Mutex::new(Vec::new()),
+            memory_atom_invalidators: Mutex::new(Vec::new()),
+            memory_atom_callbacks: Mutex::new(FxHashMap::default()),
+            memory_edges: Mutex::new(()),
             cache_epoch: AtomicU64::new(0),
             cancel: Mutex::new(None),
             #[cfg(any(test, feature = "test-util"))]
             destruction_acquire_hook: Mutex::new(None),
+            #[cfg(any(test, feature = "test-util"))]
+            memory_edges_reweave_hook: Mutex::new(None),
+            #[cfg(any(test, feature = "test-util"))]
+            memory_edges_acquire_hook: Mutex::new(None),
         }
     }
 
@@ -414,10 +604,19 @@ impl Database {
             region_store: Mutex::new(None),
             atom_store: Mutex::new(None),
             key_lifecycle: Mutex::new(()),
+            memory_regions_in_use: Mutex::new(FxHashMap::default()),
+            memory_region_invalidators: Mutex::new(Vec::new()),
+            memory_atom_invalidators: Mutex::new(Vec::new()),
+            memory_atom_callbacks: Mutex::new(FxHashMap::default()),
+            memory_edges: Mutex::new(()),
             cache_epoch: AtomicU64::new(0),
             cancel: Mutex::new(None),
             #[cfg(any(test, feature = "test-util"))]
             destruction_acquire_hook: Mutex::new(None),
+            #[cfg(any(test, feature = "test-util"))]
+            memory_edges_reweave_hook: Mutex::new(None),
+            #[cfg(any(test, feature = "test-util"))]
+            memory_edges_acquire_hook: Mutex::new(None),
         }
     }
 
@@ -425,8 +624,68 @@ impl Database {
     pub fn key_lifecycle_lock(&self) -> KeyLifecycleGuard<'_> {
         KeyLifecycleGuard {
             db: self,
-            _span: self.key_lifecycle.lock(),
+            span: Some(self.key_lifecycle.lock()),
+            retired_memory: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Serialize a mutation span over `citadel-mem`'s edge table.
+    ///
+    /// Higher layers acquire this only after [`Database::key_lifecycle_lock`]
+    /// when both capabilities are needed.
+    #[doc(hidden)]
+    pub fn memory_edges_lock(&self) -> MemoryEdgesGuard<'_> {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(hook) = self.memory_edges_acquire_hook.lock().as_ref() {
+            hook();
+        }
+        MemoryEdgesGuard {
+            _span: self.memory_edges.lock(),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn register_memory_region_invalidator(&self, invalidator: Arc<MemoryRegionInvalidator>) {
+        let mut registered = self.memory_region_invalidators.lock();
+        registered.retain(|entry| entry.strong_count() > 0);
+        registered.push(Arc::downgrade(&invalidator));
+    }
+
+    #[doc(hidden)]
+    pub fn register_memory_atom_invalidator(&self, invalidator: Arc<MemoryAtomInvalidator>) {
+        let mut registered = self.memory_atom_invalidators.lock();
+        registered.retain(|entry| entry.strong_count() > 0);
+        registered.push(Arc::downgrade(&invalidator));
+    }
+
+    /// Detach one region from every memory engine sharing this Database. The
+    /// returned states must be dropped after the key-lifecycle guard.
+    #[doc(hidden)]
+    pub fn drain_memory_region_caches(&self, region_id: u64) -> Vec<Box<dyn Any + Send>> {
+        let invalidators = {
+            let mut registered = self.memory_region_invalidators.lock();
+            let active: Vec<_> = registered.iter().filter_map(Weak::upgrade).collect();
+            registered.retain(|entry| entry.strong_count() > 0);
+            active
+        };
+        invalidators
+            .into_iter()
+            .filter_map(|invalidate| invalidate(region_id))
+            .collect()
+    }
+
+    #[doc(hidden)]
+    pub fn drain_memory_atom_caches(&self, atom_ids: &[u64]) -> Vec<Box<dyn Any + Send>> {
+        let invalidators = {
+            let mut registered = self.memory_atom_invalidators.lock();
+            let active: Vec<_> = registered.iter().filter_map(Weak::upgrade).collect();
+            registered.retain(|entry| entry.strong_count() > 0);
+            active
+        };
+        invalidators
+            .into_iter()
+            .flat_map(|invalidate| invalidate(atom_ids))
+            .collect()
     }
 
     /// Fires the test-only hook at the acquisition boundary; no-op unless armed.
@@ -441,6 +700,34 @@ impl Database {
     #[doc(hidden)]
     pub fn debug_set_destruction_acquire_hook(&self, hook: Option<Box<dyn Fn() + Send + Sync>>) {
         *self.destruction_acquire_hook.lock() = hook;
+    }
+
+    /// Install a deterministic test pause inside a reweave's edge-mutation
+    /// span. Production builds retain only the no-op call site.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn debug_set_memory_edges_reweave_hook(&self, hook: Option<Box<dyn Fn() + Send + Sync>>) {
+        *self.memory_edges_reweave_hook.lock() = hook;
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn debug_set_memory_edges_acquire_hook(&self, hook: Option<Box<dyn Fn() + Send + Sync>>) {
+        *self.memory_edges_acquire_hook.lock() = hook;
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn debug_memory_edges_is_locked(&self) -> bool {
+        self.memory_edges.try_lock().is_none()
+    }
+
+    #[doc(hidden)]
+    pub fn debug_fire_memory_edges_reweave_hook(&self) {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(hook) = self.memory_edges_reweave_hook.lock().as_ref() {
+            hook();
+        }
     }
 
     /// Current invalidation epoch (see the field doc); caches refuse reads once it moves.

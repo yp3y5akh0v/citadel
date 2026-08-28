@@ -10,7 +10,7 @@ use crate::types::{AtomHit, AtomId, FusionWeights, RerankStrategy};
 const RECENCY_HALF_LIFE_DAYS: f32 = 30.0;
 
 /// Cross-encoding every candidate is CPU-bound; rerank pre-trims to this pool.
-const RERANK_POOL: usize = 256;
+pub(crate) const RERANK_POOL: usize = 256;
 
 /// An ANN candidate with the raw signals recall projected for it.
 pub(crate) struct Candidate {

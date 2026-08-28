@@ -158,7 +158,9 @@ fn cache_status_reports_only_current_generation_entries() {
     let (_, current) = reader.ann_cache_status_current("r").unwrap().unwrap();
     assert!(current);
 
-    writer.forget_atoms("r", &[atom], false).unwrap();
+    writer
+        .remember("r", AtomInput::new("fact", "newer generation"))
+        .unwrap();
     assert!(
         reader.ann_cache_status("r").unwrap().is_none(),
         "a stale entry must not report as the serving index"

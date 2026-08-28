@@ -119,6 +119,8 @@ fn core_category(e: &CoreError) -> Category {
         // DB-API has no cancellation or failed-transaction exception class.
         CoreError::Interrupted
         | CoreError::TransactionFailed
+        | CoreError::RegionInUse { .. }
+        | CoreError::AtomInUse { .. }
         | CoreError::DatabaseLocked
         | CoreError::TransactionTooLarge { .. }
         | CoreError::PageOutOfBounds(_)

@@ -338,10 +338,13 @@ fn stale_handles_never_write_into_a_recreated_region() {
     assert!(hits.iter().any(|h| h.id == rebound));
 }
 
-/// Retry WriteTransactionActive collisions until `f` reaches a terminal outcome.
+/// Retry transient writer or provenance-reservation collisions until `f` is terminal.
 fn retry_busy<T>(f: impl Fn() -> Result<T, MemError>) -> Result<T, MemError> {
     for _ in 0..100_000 {
         match f() {
+            Err(MemError::Core(citadel_core::Error::RegionInUse { .. })) => {
+                std::thread::yield_now();
+            }
             Err(e)
                 if e.to_string()
                     .contains("write transaction is already active") =>

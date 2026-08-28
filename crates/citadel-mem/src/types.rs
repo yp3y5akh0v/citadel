@@ -572,6 +572,27 @@ pub const ERASURE_SCOPE_CAVEAT: &str =
      retain stale physical copies, and any external backup, replica, or escrowed key is out of \
      scope. Plaintext regions are logically deleted only, not cryptographically erased.";
 
+/// Outcome of re-embedding a region.
+#[derive(Debug, Clone, Default)]
+pub struct ReembedReport {
+    /// Atoms given a new vector.
+    pub atoms_migrated: u64,
+    /// Model the region records afterwards.
+    pub model_id: String,
+    /// Whether the region's ANN index was rebuilt for the new vectors.
+    ///
+    /// When false, no persisted plaintext ANN was rebuilt. Plaintext recall
+    /// falls back to an exact scan until `persist_ann_index` is called;
+    /// encrypted recall lazily rebuilds its in-memory sealed ANN.
+    pub ann_rebuilt: bool,
+    /// Managed `SimilarTo` edges rebuilt from their persisted neighbor policy.
+    /// Authored edges are untouched. Score thresholds and fusion weights may
+    /// need recalibration for the new model's score distribution.
+    pub similarity_edges_rewoven: u64,
+    /// Managed or explicitly adopted edges no longer selected by their policy.
+    pub similarity_edges_cleared: u64,
+}
+
 /// Result of [`forget_atoms`](crate::MemoryEngine::forget_atoms). On a
 /// plaintext region `cryptographic_erasure` is false (logical delete only).
 #[derive(Debug, Clone)]
