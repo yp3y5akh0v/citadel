@@ -1,5 +1,46 @@
 use super::*;
-use crate::key_manager::create_key_file;
+use crate::key_manager::{
+    create_key_file, KEY_FILE_FLAG_AUDIT_V2_REQUIRED, KEY_FILE_FLAG_SLOTS_V1_REQUIRED,
+};
+
+#[test]
+fn backup_mac_key_derivation_is_frozen() {
+    let key = derive_backup_mac_key(&[0x42u8; KEY_SIZE]);
+    let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(
+        hex,
+        "5e956eca50e2dffc33f10e015c5f7d1c088af24a1b1550bc06771c4583dd0873"
+    );
+}
+
+#[test]
+fn backup_mac_payload_boundary_has_a_stable_known_answer() {
+    let mut backup = KeyBackup {
+        magic: KEY_BACKUP_MAGIC,
+        version: KEY_BACKUP_VERSION,
+        file_id: 0x0102_0304_0506_0708,
+        cipher_id: CipherId::ChaCha20,
+        kdf_algorithm: KdfAlgorithm::Pbkdf2HmacSha256,
+        key_file_flags: KEY_FILE_FLAG_SLOTS_V1_REQUIRED | KEY_FILE_FLAG_AUDIT_V2_REQUIRED,
+        kdf_param1: 0x1112_1314,
+        kdf_param2: 0x2122_2324,
+        kdf_param3: 0x3132_3334,
+        backup_salt: [0x10; ARGON2_SALT_SIZE],
+        wrapped_rek: [0x22; WRAPPED_KEY_SIZE],
+        epoch: 0x4142_4344,
+        hmac: [0; MAC_SIZE],
+    };
+    backup.update_hmac(&[0x42; KEY_SIZE]);
+
+    assert_eq!(
+        backup.hmac,
+        [
+            0xc1, 0xdb, 0x53, 0xad, 0xdf, 0x4e, 0x1a, 0xec, 0x6d, 0xe2, 0xc2, 0x6d, 0x1a, 0x6a,
+            0x64, 0xf4, 0xd8, 0xb0, 0x24, 0x86, 0x3a, 0xbc, 0x06, 0x91, 0x83, 0xbf, 0x38, 0x41,
+            0xa7, 0x08, 0xdf, 0x97,
+        ]
+    );
+}
 
 #[test]
 fn serialize_deserialize_roundtrip() {
@@ -14,6 +55,7 @@ fn serialize_deserialize_roundtrip() {
         1,
         1,
         1,
+        0,
     )
     .unwrap();
 
@@ -41,6 +83,7 @@ fn serialize_deserialize_pbkdf2() {
         0,
         0,
         1,
+        0,
     )
     .unwrap();
 
@@ -85,6 +128,7 @@ fn hmac_verification() {
         1,
         1,
         1,
+        0,
     )
     .unwrap();
 
@@ -117,6 +161,7 @@ fn tamper_detected() {
         1,
         1,
         1,
+        0,
     )
     .unwrap();
 
@@ -160,6 +205,7 @@ fn restore_roundtrip() {
         kf.argon2_t_cost,
         kf.argon2_p_cost,
         kf.current_epoch,
+        0,
     )
     .unwrap();
 
@@ -184,6 +230,7 @@ fn wrong_backup_passphrase_fails() {
         1,
         1,
         1,
+        0,
     )
     .unwrap();
 
@@ -205,12 +252,130 @@ fn backup_preserves_file_id() {
         1,
         1,
         5,
+        0,
     )
     .unwrap();
 
     let result = restore_rek_from_backup(&backup_data, b"pass").unwrap();
     assert_eq!(result.file_id, file_id);
     assert_eq!(result.epoch, 5);
+}
+
+#[test]
+fn backup_preserves_authenticated_key_file_flags() {
+    let rek = [0x42u8; KEY_SIZE];
+    let flags = crate::key_manager::KEY_FILE_FLAG_SLOTS_V1_REQUIRED
+        | crate::key_manager::KEY_FILE_FLAG_AUDIT_V2_REQUIRED;
+    let backup_data = create_key_backup(
+        &rek,
+        b"pass",
+        42,
+        CipherId::Aes256Ctr,
+        KdfAlgorithm::Argon2id,
+        64,
+        1,
+        1,
+        5,
+        flags,
+    )
+    .unwrap();
+
+    let result = restore_rek_from_backup(&backup_data, b"pass").unwrap();
+    assert_eq!(result.key_file_flags, flags);
+}
+
+#[test]
+fn backup_policy_layout_has_a_stable_known_answer() {
+    let backup = KeyBackup {
+        magic: KEY_BACKUP_MAGIC,
+        version: KEY_BACKUP_VERSION,
+        file_id: 0x0102_0304_0506_0708,
+        cipher_id: CipherId::ChaCha20,
+        kdf_algorithm: KdfAlgorithm::Pbkdf2HmacSha256,
+        key_file_flags: crate::key_manager::KEY_FILE_FLAG_SLOTS_V1_REQUIRED
+            | crate::key_manager::KEY_FILE_FLAG_AUDIT_V2_REQUIRED,
+        kdf_param1: 0x1112_1314,
+        kdf_param2: 0x2122_2324,
+        kdf_param3: 0x3132_3334,
+        backup_salt: [0x10; ARGON2_SALT_SIZE],
+        wrapped_rek: [0x22; WRAPPED_KEY_SIZE],
+        epoch: 0x4142_4344,
+        hmac: [0x44; MAC_SIZE],
+    };
+    let hex: String = backup
+        .serialize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    assert_eq!(
+        hex,
+        "4259454b010000000807060504030201010103001413121124232221343332311010101010101010101010101010101022222222222222222222222222222222222222222222222222222222222222222222222222222222444342414444444444444444444444444444444444444444444444444444444444444444"
+    );
+}
+
+#[test]
+fn backup_rejects_unknown_must_understand_flags() {
+    let rek = [0x42u8; KEY_SIZE];
+    assert!(matches!(
+        create_key_backup(
+            &rek,
+            b"pass",
+            42,
+            CipherId::Aes256Ctr,
+            KdfAlgorithm::Argon2id,
+            64,
+            1,
+            1,
+            5,
+            0x0040,
+        ),
+        Err(citadel_core::Error::KeyFileIntegrity)
+    ));
+}
+
+#[test]
+fn backup_rejects_audit_v2_policy_without_protected_slots() {
+    let rek = [0x42u8; KEY_SIZE];
+    assert!(matches!(
+        create_key_backup(
+            &rek,
+            b"pass",
+            42,
+            CipherId::Aes256Ctr,
+            KdfAlgorithm::Argon2id,
+            64,
+            1,
+            1,
+            5,
+            crate::key_manager::KEY_FILE_FLAG_AUDIT_V2_REQUIRED,
+        ),
+        Err(citadel_core::Error::KeyFileIntegrity)
+    ));
+}
+
+#[test]
+fn backup_key_file_flags_are_hmac_covered() {
+    let rek = [0x42u8; KEY_SIZE];
+    let mut backup_data = create_key_backup(
+        &rek,
+        b"pass",
+        42,
+        CipherId::Aes256Ctr,
+        KdfAlgorithm::Argon2id,
+        64,
+        1,
+        1,
+        1,
+        crate::key_manager::KEY_FILE_FLAG_SLOTS_V1_REQUIRED,
+    )
+    .unwrap();
+    backup_data[18] ^= 1;
+
+    assert!(matches!(
+        restore_rek_from_backup(&backup_data, b"pass"),
+        Err(citadel_core::Error::KeyFileIntegrity)
+    ));
 }
 
 #[test]
@@ -226,6 +391,7 @@ fn backup_size_exact() {
         1,
         1,
         1,
+        0,
     )
     .unwrap();
     assert_eq!(backup_data.len(), 124);
@@ -244,6 +410,7 @@ fn backup_binary_format_magic() {
         1,
         1,
         1,
+        0,
     )
     .unwrap();
 

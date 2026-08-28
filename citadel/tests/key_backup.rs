@@ -1,19 +1,35 @@
+#[cfg(not(feature = "fips"))]
+use citadel::Argon2Profile;
 use citadel::{Database, DatabaseBuilder, KdfAlgorithm};
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
-fn create_test_db(dir: &Path, passphrase: &[u8]) -> Database {
-    DatabaseBuilder::new(dir.join("test.citadel"))
-        .passphrase(passphrase)
-        .kdf_algorithm(KdfAlgorithm::Pbkdf2HmacSha256)
-        .pbkdf2_iterations(600_000)
-        .cache_size(64)
-        .create()
-        .unwrap()
+#[cfg(unix)]
+fn sidecar(data: &Path, suffix: &str) -> PathBuf {
+    let mut name = data.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
+fn create_test_db(dir: &Path, passphrase: &[u8]) -> Database {
+    let builder = DatabaseBuilder::new(dir.join("test.citadel"))
+        .passphrase(passphrase)
+        .cache_size(64);
+    #[cfg(not(feature = "fips"))]
+    let builder = builder.argon2_profile(Argon2Profile::Iot);
+    #[cfg(feature = "fips")]
+    let builder = builder
+        .kdf_algorithm(KdfAlgorithm::Pbkdf2HmacSha256)
+        .pbkdf2_iterations(600_000);
+    builder.create().unwrap()
+}
+
+#[cfg(not(feature = "fips"))]
 fn create_test_db_argon2(dir: &Path, passphrase: &[u8]) -> Database {
     DatabaseBuilder::new(dir.join("test.citadel"))
         .passphrase(passphrase)
+        .argon2_profile(Argon2Profile::Iot)
         .cache_size(64)
         .create()
         .unwrap()
@@ -513,6 +529,232 @@ fn restore_overwrite_existing_key_file() {
         .unwrap();
     let mut rtx = db.begin_read();
     assert_eq!(rtx.get(b"key").unwrap(), Some(b"val".to_vec()));
+}
+
+#[test]
+fn restore_refuses_to_race_an_open_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.citadel");
+    let backup_path = dir.path().join("backup.bin");
+    let db = create_test_db(dir.path(), b"pass");
+    db.export_key_backup(b"pass", b"backup", &backup_path)
+        .unwrap();
+
+    let result = Database::restore_key_from_backup(&backup_path, b"backup", b"new-pass", &db_path);
+    assert!(matches!(result, Err(citadel::Error::DatabaseLocked)));
+
+    drop(db);
+    drop(
+        DatabaseBuilder::new(db_path)
+            .passphrase(b"pass")
+            .open()
+            .unwrap(),
+    );
+}
+
+#[test]
+fn restore_refuses_a_missing_live_audit_log_with_retained_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.citadel");
+    let key_path = dir.path().join("test.citadel.citadel-keys");
+    let audit_path = dir.path().join("test.citadel.citadel-audit");
+    let rotated_path = dir.path().join("test.citadel.citadel-audit.1");
+    let backup_path = dir.path().join("backup.bin");
+    let db = create_test_db(dir.path(), b"pass");
+    db.export_key_backup(b"pass", b"backup", &backup_path)
+        .unwrap();
+    drop(db);
+
+    std::fs::remove_file(&key_path).unwrap();
+    std::fs::rename(&audit_path, &rotated_path).unwrap();
+    let error = Database::restore_key_from_backup(&backup_path, b"backup", b"new-pass", &db_path)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("rotated generations"));
+    assert!(!key_path.exists());
+    assert!(!audit_path.exists());
+    assert!(rotated_path.exists());
+}
+
+#[test]
+fn restore_refuses_a_pending_audit_upgrade_before_publishing_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.citadel");
+    let key_path = dir.path().join("test.citadel.citadel-keys");
+    let audit_path = dir.path().join("test.citadel.citadel-audit");
+    let upgrade_path = dir.path().join("test.citadel.citadel-audit.upgrade");
+    let backup_path = dir.path().join("backup.bin");
+    let db = create_test_db(dir.path(), b"pass");
+    db.export_key_backup(b"pass", b"backup", &backup_path)
+        .unwrap();
+    drop(db);
+
+    std::fs::remove_file(&key_path).unwrap();
+    std::fs::remove_file(&audit_path).unwrap();
+    std::fs::write(&upgrade_path, b"pending upgrade").unwrap();
+    let error = Database::restore_key_from_backup(&backup_path, b"backup", b"new-pass", &db_path)
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("upgrade image exists without a live audit log"));
+    assert!(!key_path.exists());
+    assert_eq!(std::fs::read(upgrade_path).unwrap(), b"pending upgrade");
+}
+
+#[test]
+fn restore_recovers_an_abandoned_upgrade_beside_the_live_audit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.citadel");
+    let key_path = dir.path().join("test.citadel.citadel-keys");
+    let upgrade_path = dir.path().join("test.citadel.citadel-audit.upgrade");
+    let backup_path = dir.path().join("backup.bin");
+    let db = create_test_db(dir.path(), b"pass");
+    db.export_key_backup(b"pass", b"backup", &backup_path)
+        .unwrap();
+    drop(db);
+
+    std::fs::remove_file(&key_path).unwrap();
+    std::fs::write(&upgrade_path, b"abandoned upgrade").unwrap();
+    Database::restore_key_from_backup(&backup_path, b"backup", b"new-pass", &db_path).unwrap();
+
+    assert!(!upgrade_path.exists());
+    drop(
+        DatabaseBuilder::new(db_path)
+            .passphrase(b"new-pass")
+            .open()
+            .unwrap(),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn backup_refuses_a_dangling_destination_audit_sidecar() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_test_db(dir.path(), b"pass");
+    let destination = dir.path().join("backup.citadel");
+    let destination_key = sidecar(&destination, ".citadel-keys");
+    let destination_audit = sidecar(&destination, ".citadel-audit");
+    symlink(
+        dir.path().join("missing-destination-audit"),
+        &destination_audit,
+    )
+    .unwrap();
+
+    let error = db.backup(&destination).unwrap_err();
+    assert!(error.to_string().contains("audit log"));
+    assert!(!destination.exists());
+    assert!(!destination_key.exists());
+    assert!(std::fs::symlink_metadata(&destination_audit)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn compact_refuses_a_dangling_destination_audit_upgrade() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_test_db(dir.path(), b"pass");
+    let destination = dir.path().join("compact.citadel");
+    let destination_key = sidecar(&destination, ".citadel-keys");
+    let destination_upgrade = sidecar(&destination, ".citadel-audit.upgrade");
+    symlink(
+        dir.path().join("missing-destination-upgrade"),
+        &destination_upgrade,
+    )
+    .unwrap();
+
+    let error = db.compact(&destination).unwrap_err();
+    assert!(error.to_string().contains("audit upgrade image"));
+    assert!(!destination.exists());
+    assert!(!destination_key.exists());
+    assert!(std::fs::symlink_metadata(&destination_upgrade)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_refuses_a_dangling_live_audit_before_publishing_the_key() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.citadel");
+    let key_path = sidecar(&db_path, ".citadel-keys");
+    let audit_path = sidecar(&db_path, ".citadel-audit");
+    let backup_path = dir.path().join("backup.bin");
+    let db = create_test_db(dir.path(), b"pass");
+    db.export_key_backup(b"pass", b"backup", &backup_path)
+        .unwrap();
+    drop(db);
+    std::fs::remove_file(&key_path).unwrap();
+    std::fs::remove_file(&audit_path).unwrap();
+    symlink(dir.path().join("missing-live-audit"), &audit_path).unwrap();
+
+    Database::restore_key_from_backup(&backup_path, b"backup", b"new-pass", &db_path).unwrap_err();
+    assert!(!key_path.exists());
+    assert!(std::fs::symlink_metadata(&audit_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_refuses_a_symlinked_backup_before_publishing_the_key() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.citadel");
+    let key_path = sidecar(&db_path, ".citadel-keys");
+    let backup_path = dir.path().join("backup.bin");
+    let backup_link = dir.path().join("backup-link.bin");
+    let db = create_test_db(dir.path(), b"pass");
+    db.export_key_backup(b"pass", b"backup", &backup_path)
+        .unwrap();
+    drop(db);
+    std::fs::remove_file(&key_path).unwrap();
+    symlink(&backup_path, &backup_link).unwrap();
+
+    Database::restore_key_from_backup(&backup_link, b"backup", b"new-pass", &db_path).unwrap_err();
+
+    assert!(!key_path.exists());
+    assert!(backup_path.exists());
+    assert!(std::fs::symlink_metadata(&backup_link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_refuses_a_dangling_key_sidecar_instead_of_replacing_it() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.citadel");
+    let key_path = sidecar(&db_path, ".citadel-keys");
+    let missing_target = dir.path().join("missing-key-target");
+    let backup_path = dir.path().join("backup.bin");
+    let db = create_test_db(dir.path(), b"pass");
+    db.export_key_backup(b"pass", b"backup", &backup_path)
+        .unwrap();
+    drop(db);
+    std::fs::remove_file(&key_path).unwrap();
+    symlink(&missing_target, &key_path).unwrap();
+
+    Database::restore_key_from_backup(&backup_path, b"backup", b"new-pass", &db_path).unwrap_err();
+    assert!(!missing_target.exists());
+    assert!(std::fs::symlink_metadata(&key_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
 }
 
 #[test]

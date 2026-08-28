@@ -100,6 +100,32 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("{operation} completed, but audit logging failed: {source}")]
+    AuditFailureAfterOperation {
+        operation: &'static str,
+        #[source]
+        source: Box<Error>,
+    },
+
+    #[error(
+        "{operation} completed, but its directory entry could not be confirmed durable: {source}"
+    )]
+    DurabilityFailureAfterOperation {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "{operation} completed, but its directory entry could not be confirmed durable: {durability}; audit logging also failed: {audit}"
+    )]
+    DurabilityAndAuditFailureAfterOperation {
+        operation: &'static str,
+        #[source]
+        durability: std::io::Error,
+        audit: Box<Error>,
+    },
+
     #[error("corrupted overflow chain: {0}")]
     CorruptOverflowChain(String),
 
