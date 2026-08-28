@@ -38,8 +38,9 @@ struct Compiled {
 impl<'c, 'db> PreparedStatement<'c, 'db> {
     pub(crate) fn new(conn: &'c Connection<'db>, sql: &str) -> Result<Self> {
         let c = compile_for_sql(conn, sql)?;
-        let readonly = matches!(*c.ast, Statement::Select(_) | Statement::Explain(_));
-        let is_explain = matches!(*c.ast, Statement::Explain(_));
+        let readonly = matches!(*c.ast, Statement::Select(_) | Statement::Explain { .. })
+            && !crate::executor::stmt_mutates(&c.ast);
+        let is_explain = matches!(*c.ast, Statement::Explain { .. });
         let mut column_index =
             FxHashMap::with_capacity_and_hasher(c.columns.len(), Default::default());
         for (i, name) in c.columns.iter().enumerate() {
@@ -378,7 +379,7 @@ fn compile_inside(
 fn derive_columns(stmt: &Statement, schema: &SchemaManager) -> Vec<String> {
     match stmt {
         Statement::Select(sq) => derive_select_columns(sq, schema),
-        Statement::Explain(_) => vec!["plan".into()],
+        Statement::Explain { .. } => vec!["plan".into()],
         _ => Vec::new(),
     }
 }

@@ -755,6 +755,7 @@ dependencies = [
  "thiserror 2.0.18",
  "unicode-normalization",
  "unicode-segmentation",
+ "zeroize",
 ]
 
 [[package]]

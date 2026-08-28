@@ -7,6 +7,8 @@ use crate::parser::*;
 use crate::schema::SchemaManager;
 use crate::types::*;
 
+use super::CteRows;
+
 thread_local! {
     static VIEW_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
@@ -17,7 +19,7 @@ pub(super) fn exec_view_with_read(
     rtx: &mut ReadTxn<'_>,
     schema: &SchemaManager,
     view_def: &ViewDef,
-) -> Result<QueryResult> {
+) -> Result<CteRows> {
     let depth = VIEW_DEPTH.with(|d| {
         let v = d.get() + 1;
         d.set(v);
@@ -37,7 +39,7 @@ pub(super) fn exec_view_with_read(
         match super::exec_select_query_with_read(rtx, schema, &sq)? {
             ExecutionResult::Query(mut qr) => {
                 apply_view_aliases(&mut qr, &view_def.column_aliases);
-                Ok(qr)
+                Ok(view_rows(schema, &sq, qr))
             }
             _ => Err(SqlError::InvalidValue(
                 "view query did not return results".into(),
@@ -53,7 +55,7 @@ pub(super) fn exec_view_write(
     wtx: &mut citadel_txn::write_txn::WriteTxn<'_>,
     schema: &SchemaManager,
     view_def: &ViewDef,
-) -> Result<QueryResult> {
+) -> Result<CteRows> {
     let depth = VIEW_DEPTH.with(|d| {
         let v = d.get() + 1;
         d.set(v);
@@ -73,7 +75,7 @@ pub(super) fn exec_view_write(
         match super::exec_select_query_in_txn(wtx, schema, &sq)? {
             ExecutionResult::Query(mut qr) => {
                 apply_view_aliases(&mut qr, &view_def.column_aliases);
-                Ok(qr)
+                Ok(view_rows(schema, &sq, qr))
             }
             _ => Err(SqlError::InvalidValue(
                 "view query did not return results".into(),
@@ -83,6 +85,18 @@ pub(super) fn exec_view_write(
 
     VIEW_DEPTH.with(|d| d.set(d.get() - 1));
     result
+}
+
+/// A view's rows keep the collations of the columns its query selected, so reading a NOCASE
+/// column through a view compares the way reading it directly does.
+fn view_rows(schema: &SchemaManager, sq: &SelectQuery, qr: QueryResult) -> CteRows {
+    let collations = super::dml::query_output_collations(
+        schema,
+        &super::CteContext::default(),
+        sq,
+        qr.columns.len(),
+    );
+    CteRows::new(qr, collations)
 }
 
 pub(super) fn apply_view_aliases(qr: &mut QueryResult, aliases: &[String]) {
@@ -183,8 +197,8 @@ pub(super) fn try_fuse_view(
     }))
 }
 
-pub(super) fn build_view_schema(name: &str, qr: &QueryResult) -> TableSchema {
-    super::build_cte_schema(name, qr)
+pub(super) fn build_view_schema(name: &str, view: &CteRows) -> TableSchema {
+    super::build_cte_schema(name, view)
 }
 
 #[cfg(test)]

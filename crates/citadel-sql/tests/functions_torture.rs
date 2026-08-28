@@ -1621,13 +1621,11 @@ fn case_simple_null_operand() {
 }
 
 #[test]
-fn select_no_from_count_star_error() {
+fn select_no_from_count_star_counts_the_implicit_row() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
     let conn = Connection::open(&db).unwrap();
-    // COUNT(*) without FROM is unsupported (non-aggregate context)
-    let err = conn.execute("SELECT COUNT(*)").unwrap_err();
-    assert!(matches!(err, SqlError::Unsupported(_)));
+    assert_eq!(scalar(&conn, "SELECT COUNT(*)"), Value::Integer(1));
 }
 
 #[test]

@@ -1,30 +1,60 @@
 use std::collections::BTreeMap;
 
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, is_truthy, ColumnMap, EvalCtx};
+use crate::eval::{
+    collated_eq, compile_collation, eval_expr, is_truthy, operand_collation, ColumnMap, EvalCtx,
+};
 use crate::parser::*;
 use crate::types::*;
 
 use super::helpers::*;
 
+/// Takes the same `(rows, ctx)` shape as `process_select`: it is the other
+/// post-scan entry point, over the same columns, statement and token.
 pub(super) fn exec_aggregate(
-    columns: &[ColumnDef],
     rows: &[Vec<Value>],
-    stmt: &SelectStmt,
+    ctx: super::SelectCtx<'_>,
 ) -> Result<ExecutionResult> {
+    let super::SelectCtx {
+        columns,
+        stmt,
+        cancel,
+        ..
+    } = ctx;
+    check_cancel(cancel)?;
     let col_map = ColumnMap::new(columns);
     let group_exprs = resolve_group_by_exprs(&stmt.group_by, &stmt.columns, &col_map)?;
     let groups: BTreeMap<Vec<Value>, Vec<&Vec<Value>>> = if group_exprs.is_empty() {
         let mut m = BTreeMap::new();
-        m.insert(vec![], rows.iter().collect());
+        let group_rows = if cancel.is_none() {
+            rows.iter().collect()
+        } else {
+            let mut group_rows = Vec::with_capacity(rows.len());
+            for (row_idx, row) in rows.iter().enumerate() {
+                check_cancel_at(cancel, row_idx)?;
+                group_rows.push(row);
+            }
+            check_cancel(cancel)?;
+            group_rows
+        };
+        m.insert(vec![], group_rows);
         m
     } else {
+        // Folded, so a column whose collation calls two spellings equal groups them.
+        // The key decides equality by comparing, not by an operator, so the
+        // collation has to be baked into it.
+        let group_colls: Vec<crate::types::Collation> = group_exprs
+            .iter()
+            .map(|expr| expr_collation(expr, &col_map))
+            .collect();
         let mut m: BTreeMap<Vec<Value>, Vec<&Vec<Value>>> = BTreeMap::new();
-        for row in rows {
-            let ctx = EvalCtx::new(&col_map, row);
+        for (row_idx, row) in rows.iter().enumerate() {
+            check_cancel_at(cancel, row_idx)?;
+            let ctx = EvalCtx::new(&col_map, row).with_cancel(cancel);
             let group_key: Vec<Value> = group_exprs
                 .iter()
-                .map(|expr| eval_expr(expr, &ctx))
+                .zip(&group_colls)
+                .map(|(expr, coll)| eval_expr(expr, &ctx).map(|v| coll.fold(v)))
                 .collect::<Result<_>>()?;
             m.entry(group_key).or_default().push(row);
         }
@@ -33,8 +63,27 @@ pub(super) fn exec_aggregate(
 
     let mut result_rows = Vec::new();
     let output_cols = build_output_columns(&stmt.columns, columns);
+    let output_map = ColumnMap::new(&output_cols);
+    let order_output_positions = stmt
+        .order_by
+        .iter()
+        .map(|item| order_by_output_position(item, &output_map))
+        .collect::<Result<Vec<_>>>()?;
+    let order_collations: Vec<Collation> = stmt
+        .order_by
+        .iter()
+        .zip(&order_output_positions)
+        .map(|(item, output_position)| {
+            output_position.map_or_else(
+                || expr_collation(&item.expr, &col_map),
+                |position| output_map.collation_at(position),
+            )
+        })
+        .collect();
+    let mut result_sort_keys = Vec::with_capacity(groups.len());
 
-    for group_rows in groups.values() {
+    for (group_idx, group_rows) in groups.values().enumerate() {
+        check_cancel_at(cancel, group_idx)?;
         let mut result_row = Vec::new();
 
         for sel_col in &stmt.columns {
@@ -43,21 +92,22 @@ pub(super) fn exec_aggregate(
                     return Err(SqlError::Unsupported("SELECT * with GROUP BY".into()));
                 }
                 SelectColumn::Expr { expr, .. } => {
-                    let val = eval_aggregate_expr(expr, &col_map, group_rows)?;
+                    let val = eval_aggregate_expr_with_cancel(expr, &col_map, group_rows, cancel)?;
                     result_row.push(val);
                 }
             }
         }
 
         if let Some(ref having) = stmt.having {
-            let passes = match eval_aggregate_expr(having, &col_map, group_rows) {
+            let passes = match eval_aggregate_expr_with_cancel(having, &col_map, group_rows, cancel)
+            {
                 Ok(val) => is_truthy(&val),
                 Err(SqlError::ColumnNotFound(_)) => {
                     let output_map = ColumnMap::new(&output_cols);
-                    match eval_expr(having, &EvalCtx::new(&output_map, &result_row)) {
-                        Ok(val) => is_truthy(&val),
-                        Err(_) => false,
-                    }
+                    is_truthy(&eval_expr(
+                        having,
+                        &EvalCtx::new(&output_map, &result_row).with_cancel(cancel),
+                    )?)
                 }
                 Err(e) => return Err(e),
             };
@@ -66,25 +116,64 @@ pub(super) fn exec_aggregate(
             }
         }
 
+        if !stmt.order_by.is_empty() {
+            let mut key = Vec::with_capacity(stmt.order_by.len());
+            for (item, output_position) in stmt.order_by.iter().zip(&order_output_positions) {
+                let value = match output_position {
+                    Some(position) => result_row[*position].clone(),
+                    None => {
+                        eval_aggregate_expr_with_cancel(&item.expr, &col_map, group_rows, cancel)?
+                    }
+                };
+                key.push(value);
+            }
+            result_sort_keys.push(key);
+        }
         result_rows.push(result_row);
     }
 
     if stmt.distinct {
+        let out_colls = output_collations(&stmt.columns, &col_map);
         let mut seen: rustc_hash::FxHashSet<Vec<Value>> = rustc_hash::FxHashSet::default();
-        result_rows.retain(|row| {
-            if seen.contains(row) {
-                false
-            } else {
-                seen.insert(row.clone());
-                true
+        if !stmt.order_by.is_empty() {
+            let original_rows = std::mem::take(&mut result_rows);
+            let original_keys = std::mem::take(&mut result_sort_keys);
+            result_rows.reserve(original_rows.len());
+            result_sort_keys.reserve(original_keys.len());
+            for (row_idx, (row, key)) in original_rows.into_iter().zip(original_keys).enumerate() {
+                check_cancel_at(cancel, row_idx)?;
+                if seen.insert(fold_key(&row, &out_colls)) {
+                    result_rows.push(row);
+                    result_sort_keys.push(key);
+                }
             }
-        });
+            check_cancel(cancel)?;
+        } else if cancel.is_none() {
+            result_rows.retain(|row| seen.insert(fold_key(row, &out_colls)));
+        } else {
+            let original = std::mem::take(&mut result_rows);
+            result_rows.reserve(original.len());
+            for (row_idx, row) in original.into_iter().enumerate() {
+                check_cancel_at(cancel, row_idx)?;
+                if seen.insert(fold_key(&row, &out_colls)) {
+                    result_rows.push(row);
+                }
+            }
+            check_cancel(cancel)?;
+        }
     }
 
     if !stmt.order_by.is_empty() {
-        let output_cols = build_output_columns(&stmt.columns, columns);
-        sort_rows(&mut result_rows, &stmt.order_by, &output_cols)?;
+        sort_rows_by_keys(
+            &mut result_rows,
+            &result_sort_keys,
+            &stmt.order_by,
+            &order_collations,
+            cancel,
+        )?;
     }
+
+    check_cancel(cancel)?;
 
     if let Some(ref offset_expr) = stmt.offset {
         let offset = eval_const_int(offset_expr)?.max(0) as usize;
@@ -111,6 +200,7 @@ pub(super) fn exec_aggregate(
         })
         .collect();
 
+    check_cancel(cancel)?;
     Ok(ExecutionResult::Query(QueryResult {
         columns: col_names,
         rows: result_rows,
@@ -157,11 +247,35 @@ fn resolve_group_by_exprs<'a>(
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn eval_aggregate_expr(
     expr: &Expr,
     col_map: &ColumnMap,
     group_rows: &[&Vec<Value>],
 ) -> Result<Value> {
+    eval_aggregate_expr_with_cancel(expr, col_map, group_rows, None)
+}
+
+fn first_non_null_is_interval(
+    values: &[Value],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<bool> {
+    for (value_idx, value) in values.iter().enumerate() {
+        check_cancel_at(cancel, value_idx)?;
+        if !value.is_null() {
+            return Ok(matches!(value, Value::Interval { .. }));
+        }
+    }
+    Ok(false)
+}
+
+fn eval_aggregate_expr_with_cancel(
+    expr: &Expr,
+    col_map: &ColumnMap,
+    group_rows: &[&Vec<Value>],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Value> {
+    check_cancel(cancel)?;
     match expr {
         Expr::CountStar => Ok(Value::Integer(group_rows.len() as i64)),
 
@@ -182,21 +296,22 @@ pub(super) fn eval_aggregate_expr(
                         "DISTINCT not supported with {func}"
                     )));
                 }
-                let pairs: Vec<(Value, Value)> = group_rows
-                    .iter()
-                    .map(|row| {
-                        let ctx = EvalCtx::new(col_map, row);
-                        let k = eval_expr(&args[0], &ctx)?;
-                        let v = eval_expr(&args[1], &ctx)?;
-                        Ok((k, v))
-                    })
-                    .collect::<Result<_>>()?;
+                let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(group_rows.len());
+                for (row_idx, row) in group_rows.iter().enumerate() {
+                    check_cancel_at(cancel, row_idx)?;
+                    let ctx = EvalCtx::new(col_map, row).with_cancel(cancel);
+                    let k = eval_expr(&args[0], &ctx)?;
+                    let v = eval_expr(&args[1], &ctx)?;
+                    pairs.push((k, v));
+                }
                 let target = if func == "JSONB_OBJECT_AGG" {
                     crate::types::DataType::Jsonb
                 } else {
                     crate::types::DataType::Json
                 };
-                return crate::json::agg_object(&pairs, target);
+                let result = crate::json::agg_object_with_cancel(&pairs, target, cancel)?;
+                check_cancel(cancel)?;
+                return Ok(result);
             }
             if args.len() != 1 {
                 return Err(SqlError::Unsupported(format!(
@@ -205,39 +320,48 @@ pub(super) fn eval_aggregate_expr(
                 )));
             }
             let arg = &args[0];
-            let mut values: Vec<Value> = group_rows
-                .iter()
-                .map(|row| eval_expr(arg, &EvalCtx::new(col_map, row)))
-                .collect::<Result<_>>()?;
+            let mut values: Vec<Value> = Vec::with_capacity(group_rows.len());
+            for (row_idx, row) in group_rows.iter().enumerate() {
+                check_cancel_at(cancel, row_idx)?;
+                values.push(eval_expr(
+                    arg,
+                    &EvalCtx::new(col_map, row).with_cancel(cancel),
+                )?);
+            }
             if *distinct {
+                // `COUNT(DISTINCT s)` counts the values `s = s` calls equal, so the argument's
+                // collation folds the key here as it does for GROUP BY.
+                let coll = expr_collation(arg, col_map);
                 let mut seen: rustc_hash::FxHashSet<Value> = rustc_hash::FxHashSet::default();
-                values.retain(|v| {
-                    if v.is_null() || seen.contains(v) {
-                        false
-                    } else {
-                        seen.insert(v.clone());
-                        true
+                let mut distinct_values = Vec::with_capacity(values.len());
+                for (value_idx, value) in values.into_iter().enumerate() {
+                    check_cancel_at(cancel, value_idx)?;
+                    if !value.is_null() && seen.insert(coll.fold(value.clone())) {
+                        distinct_values.push(value);
                     }
-                });
+                }
+                values = distinct_values;
             }
 
             match func.as_str() {
                 "COUNT" => {
-                    let count = values.iter().filter(|v| !v.is_null()).count();
+                    let mut count = 0;
+                    for (value_idx, value) in values.iter().enumerate() {
+                        check_cancel_at(cancel, value_idx)?;
+                        count += usize::from(!value.is_null());
+                    }
                     Ok(Value::Integer(count as i64))
                 }
                 "SUM" => {
                     // INTERVAL sum: field-wise saturating add (PG semantic).
-                    let is_interval = values
-                        .iter()
-                        .find(|v| !v.is_null())
-                        .is_some_and(|v| matches!(v, Value::Interval { .. }));
+                    let is_interval = first_non_null_is_interval(&values, cancel)?;
                     if is_interval {
                         let mut months: i32 = 0;
                         let mut days: i32 = 0;
                         let mut micros: i64 = 0;
                         let mut all_null = true;
-                        for v in &values {
+                        for (value_idx, v) in values.iter().enumerate() {
+                            check_cancel_at(cancel, value_idx)?;
                             match v {
                                 Value::Null => {}
                                 Value::Interval {
@@ -272,7 +396,8 @@ pub(super) fn eval_aggregate_expr(
                     let mut real_sum: f64 = 0.0;
                     let mut has_real = false;
                     let mut all_null = true;
-                    for v in &values {
+                    for (value_idx, v) in values.iter().enumerate() {
+                        check_cancel_at(cancel, value_idx)?;
                         match v {
                             Value::Integer(i) => {
                                 int_sum += i;
@@ -303,16 +428,14 @@ pub(super) fn eval_aggregate_expr(
                 }
                 "AVG" => {
                     // INTERVAL avg: field-wise sum / count.
-                    let is_interval = values
-                        .iter()
-                        .find(|v| !v.is_null())
-                        .is_some_and(|v| matches!(v, Value::Interval { .. }));
+                    let is_interval = first_non_null_is_interval(&values, cancel)?;
                     if is_interval {
                         let mut months: i64 = 0;
                         let mut days: i64 = 0;
                         let mut micros: i128 = 0;
                         let mut count: i64 = 0;
-                        for v in &values {
+                        for (value_idx, v) in values.iter().enumerate() {
+                            check_cancel_at(cancel, value_idx)?;
                             match v {
                                 Value::Null => {}
                                 Value::Interval {
@@ -346,7 +469,8 @@ pub(super) fn eval_aggregate_expr(
                     }
                     let mut sum: f64 = 0.0;
                     let mut count: i64 = 0;
-                    for v in &values {
+                    for (value_idx, v) in values.iter().enumerate() {
+                        check_cancel_at(cancel, value_idx)?;
                         match v {
                             Value::Integer(i) => {
                                 sum += *i as f64;
@@ -372,15 +496,17 @@ pub(super) fn eval_aggregate_expr(
                     }
                 }
                 "MIN" => {
+                    let collation = operand_collation(arg, col_map).unwrap_or_default();
                     let mut min: Option<&Value> = None;
-                    for v in &values {
+                    for (value_idx, v) in values.iter().enumerate() {
+                        check_cancel_at(cancel, value_idx)?;
                         if v.is_null() {
                             continue;
                         }
                         min = Some(match min {
                             None => v,
                             Some(m) => {
-                                if v < m {
+                                if collation.cmp_value(v, m).is_lt() {
                                     v
                                 } else {
                                     m
@@ -391,15 +517,17 @@ pub(super) fn eval_aggregate_expr(
                     Ok(min.cloned().unwrap_or(Value::Null))
                 }
                 "MAX" => {
+                    let collation = operand_collation(arg, col_map).unwrap_or_default();
                     let mut max: Option<&Value> = None;
-                    for v in &values {
+                    for (value_idx, v) in values.iter().enumerate() {
+                        check_cancel_at(cancel, value_idx)?;
                         if v.is_null() {
                             continue;
                         }
                         max = Some(match max {
                             None => v,
                             Some(m) => {
-                                if v > m {
+                                if collation.cmp_value(v, m).is_gt() {
                                     v
                                 } else {
                                     m
@@ -415,7 +543,9 @@ pub(super) fn eval_aggregate_expr(
                     } else {
                         crate::types::DataType::Json
                     };
-                    crate::json::agg_array(&values, target)
+                    let result = crate::json::agg_array_with_cancel(&values, target, cancel)?;
+                    check_cancel(cancel)?;
+                    Ok(result)
                 }
                 _ => Err(SqlError::Unsupported(format!("aggregate function: {func}"))),
             }
@@ -423,7 +553,7 @@ pub(super) fn eval_aggregate_expr(
 
         Expr::Column(_) | Expr::QualifiedColumn { .. } => {
             if let Some(first) = group_rows.first() {
-                eval_expr(expr, &EvalCtx::new(col_map, first))
+                eval_expr(expr, &EvalCtx::new(col_map, first).with_cancel(cancel))
             } else {
                 Ok(Value::Null)
             }
@@ -432,47 +562,47 @@ pub(super) fn eval_aggregate_expr(
         Expr::Literal(v) => Ok(v.clone()),
 
         Expr::BinaryOp { left, op, right } => {
-            let l = eval_aggregate_expr(left, col_map, group_rows)?;
-            let r = eval_aggregate_expr(right, col_map, group_rows)?;
+            let l = eval_aggregate_expr_with_cancel(left, col_map, group_rows, cancel)?;
+            let r = eval_aggregate_expr_with_cancel(right, col_map, group_rows, cancel)?;
             eval_expr(
                 &Expr::BinaryOp {
                     left: Box::new(Expr::Literal(l)),
                     op: *op,
                     right: Box::new(Expr::Literal(r)),
                 },
-                &EvalCtx::new(col_map, &[]),
+                &EvalCtx::new(col_map, &[]).with_cancel(cancel),
             )
         }
 
         Expr::UnaryOp { op, expr: e } => {
-            let v = eval_aggregate_expr(e, col_map, group_rows)?;
+            let v = eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel)?;
             eval_expr(
                 &Expr::UnaryOp {
                     op: *op,
                     expr: Box::new(Expr::Literal(v)),
                 },
-                &EvalCtx::new(col_map, &[]),
+                &EvalCtx::new(col_map, &[]).with_cancel(cancel),
             )
         }
 
         Expr::IsNull(e) => {
-            let v = eval_aggregate_expr(e, col_map, group_rows)?;
+            let v = eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel)?;
             Ok(Value::Boolean(v.is_null()))
         }
 
         Expr::IsNotNull(e) => {
-            let v = eval_aggregate_expr(e, col_map, group_rows)?;
+            let v = eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel)?;
             Ok(Value::Boolean(!v.is_null()))
         }
 
         Expr::Cast { expr: e, data_type } => {
-            let v = eval_aggregate_expr(e, col_map, group_rows)?;
+            let v = eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel)?;
             eval_expr(
                 &Expr::Cast {
                     expr: Box::new(Expr::Literal(v)),
                     data_type: *data_type,
                 },
-                &EvalCtx::new(col_map, &[]),
+                &EvalCtx::new(col_map, &[]).with_cancel(cancel),
             )
         }
 
@@ -483,32 +613,36 @@ pub(super) fn eval_aggregate_expr(
         } => {
             let op_val = operand
                 .as_ref()
-                .map(|e| eval_aggregate_expr(e, col_map, group_rows))
+                .map(|e| eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel))
                 .transpose()?;
             if let Some(ov) = &op_val {
                 for (cond, result) in conditions {
-                    let cv = eval_aggregate_expr(cond, col_map, group_rows)?;
+                    let cv = eval_aggregate_expr_with_cancel(cond, col_map, group_rows, cancel)?;
                     if !ov.is_null() && !cv.is_null() && *ov == cv {
-                        return eval_aggregate_expr(result, col_map, group_rows);
+                        return eval_aggregate_expr_with_cancel(
+                            result, col_map, group_rows, cancel,
+                        );
                     }
                 }
             } else {
                 for (cond, result) in conditions {
-                    let cv = eval_aggregate_expr(cond, col_map, group_rows)?;
+                    let cv = eval_aggregate_expr_with_cancel(cond, col_map, group_rows, cancel)?;
                     if is_truthy(&cv) {
-                        return eval_aggregate_expr(result, col_map, group_rows);
+                        return eval_aggregate_expr_with_cancel(
+                            result, col_map, group_rows, cancel,
+                        );
                     }
                 }
             }
             match else_result {
-                Some(e) => eval_aggregate_expr(e, col_map, group_rows),
+                Some(e) => eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel),
                 None => Ok(Value::Null),
             }
         }
 
         Expr::Coalesce(args) => {
             for arg in args {
-                let v = eval_aggregate_expr(arg, col_map, group_rows)?;
+                let v = eval_aggregate_expr_with_cancel(arg, col_map, group_rows, cancel)?;
                 if !v.is_null() {
                     return Ok(v);
                 }
@@ -516,15 +650,29 @@ pub(super) fn eval_aggregate_expr(
             Ok(Value::Null)
         }
 
+        Expr::IsDistinctFrom {
+            left,
+            right,
+            negated,
+        } => {
+            let l = eval_aggregate_expr_with_cancel(left, col_map, group_rows, cancel)?;
+            let r = eval_aggregate_expr_with_cancel(right, col_map, group_rows, cancel)?;
+            let alike = match (l.is_null(), r.is_null()) {
+                (true, true) => true,
+                (true, false) | (false, true) => false,
+                (false, false) => collated_eq(&l, &r, compile_collation(left, right, col_map))?,
+            };
+            Ok(Value::Boolean(if *negated { alike } else { !alike }))
+        }
         Expr::Between {
             expr: e,
             low,
             high,
             negated,
         } => {
-            let v = eval_aggregate_expr(e, col_map, group_rows)?;
-            let lo = eval_aggregate_expr(low, col_map, group_rows)?;
-            let hi = eval_aggregate_expr(high, col_map, group_rows)?;
+            let v = eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel)?;
+            let lo = eval_aggregate_expr_with_cancel(low, col_map, group_rows, cancel)?;
+            let hi = eval_aggregate_expr_with_cancel(high, col_map, group_rows, cancel)?;
             eval_expr(
                 &Expr::Between {
                     expr: Box::new(Expr::Literal(v)),
@@ -532,7 +680,7 @@ pub(super) fn eval_aggregate_expr(
                     high: Box::new(Expr::Literal(hi)),
                     negated: *negated,
                 },
-                &EvalCtx::new(col_map, &[]),
+                &EvalCtx::new(col_map, &[]).with_cancel(cancel),
             )
         }
 
@@ -542,11 +690,11 @@ pub(super) fn eval_aggregate_expr(
             escape,
             negated,
         } => {
-            let v = eval_aggregate_expr(e, col_map, group_rows)?;
-            let p = eval_aggregate_expr(pattern, col_map, group_rows)?;
+            let v = eval_aggregate_expr_with_cancel(e, col_map, group_rows, cancel)?;
+            let p = eval_aggregate_expr_with_cancel(pattern, col_map, group_rows, cancel)?;
             let esc = escape
                 .as_ref()
-                .map(|es| eval_aggregate_expr(es, col_map, group_rows))
+                .map(|es| eval_aggregate_expr_with_cancel(es, col_map, group_rows, cancel))
                 .transpose()?;
             let esc_box = esc.map(|v| Box::new(Expr::Literal(v)));
             eval_expr(
@@ -556,14 +704,14 @@ pub(super) fn eval_aggregate_expr(
                     escape: esc_box,
                     negated: *negated,
                 },
-                &EvalCtx::new(col_map, &[]),
+                &EvalCtx::new(col_map, &[]).with_cancel(cancel),
             )
         }
 
         Expr::Function { name, args, .. } => {
             let evaluated: Vec<Value> = args
                 .iter()
-                .map(|a| eval_aggregate_expr(a, col_map, group_rows))
+                .map(|a| eval_aggregate_expr_with_cancel(a, col_map, group_rows, cancel))
                 .collect::<Result<_>>()?;
             let literal_args: Vec<Expr> = evaluated.into_iter().map(Expr::Literal).collect();
             eval_expr(
@@ -572,11 +720,11 @@ pub(super) fn eval_aggregate_expr(
                     args: literal_args,
                     distinct: false,
                 },
-                &EvalCtx::new(col_map, &[]),
+                &EvalCtx::new(col_map, &[]).with_cancel(cancel),
             )
         }
 
-        Expr::Parameter(_) => eval_expr(expr, &EvalCtx::new(col_map, &[])),
+        Expr::Parameter(_) => eval_expr(expr, &EvalCtx::new(col_map, &[]).with_cancel(cancel)),
 
         _ => Err(SqlError::Unsupported(format!(
             "expression in aggregate: {expr:?}"
@@ -619,6 +767,9 @@ pub(super) fn is_aggregate_expr(expr: &Expr) -> bool {
         Expr::Between {
             expr, low, high, ..
         } => is_aggregate_expr(expr) || is_aggregate_expr(low) || is_aggregate_expr(high),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            is_aggregate_expr(left) || is_aggregate_expr(right)
+        }
         Expr::Like {
             expr,
             pattern,

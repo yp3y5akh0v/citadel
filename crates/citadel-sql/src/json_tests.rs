@@ -188,3 +188,415 @@ fn parse_dollar_path_wildcard() {
     assert_eq!(segs.len(), 1);
     matches!(segs[0], PathSeg::Wildcard);
 }
+
+fn assert_interrupted<T>(result: Result<T>) {
+    assert!(
+        matches!(
+            result,
+            Err(SqlError::Storage(citadel_core::Error::Interrupted))
+        ),
+        "expected an interrupted error"
+    );
+}
+
+fn json_text(value: serde_json::Value) -> Value {
+    Value::Json(serde_json::to_string(&value).unwrap().into())
+}
+
+#[test]
+fn gin_extraction_can_cancel_after_traversal_starts() {
+    let object = (0..512)
+        .map(|i| (format!("key_{i}"), serde_json::Value::from(i)))
+        .collect();
+    let value = json_text(serde_json::Value::Object(object));
+    let token = CancelToken::new();
+    let _guard = cancel_json_after(token.clone(), 32);
+
+    assert!(!token.is_cancelled());
+    assert_interrupted(extract_gin_entries_with_cancel(
+        &value,
+        crate::types::GinOpsClass::JsonbOps,
+        Some(&token),
+    ));
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn gin_extraction_can_cancel_inside_one_large_scalar_copy() {
+    let value = serde_json::Value::Array(vec![serde_json::Value::String("x".repeat(128 * 1024))]);
+    let token = CancelToken::new();
+    let _guard = cancel_json_after(token.clone(), 4);
+    let mut work = JsonWork::new(Some(&token)).unwrap();
+    let mut entries = Vec::new();
+
+    assert!(!token.is_cancelled());
+    assert_interrupted(extract_jsonb_ops_walk(&value, &mut entries, &mut work));
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn jsonb_decode_can_cancel_after_value_traversal_starts() {
+    let value = json_text(serde_json::Value::Array(
+        (0..512).map(serde_json::Value::from).collect(),
+    ));
+    let Value::Json(text) = value else {
+        unreachable!();
+    };
+    let jsonb = text_to_jsonb(&text).unwrap();
+    let Value::Jsonb(bytes) = jsonb else {
+        unreachable!();
+    };
+    let token = CancelToken::new();
+    let _guard = cancel_json_after(token.clone(), 32);
+
+    assert!(!token.is_cancelled());
+    assert_interrupted(decode_to_serde_with_cancel(&bytes, Some(&token)));
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn json_text_parse_can_cancel_after_bytes_are_consumed() {
+    let value = Value::Json(
+        serde_json::to_string(&(0..100_000).collect::<Vec<i64>>())
+            .unwrap()
+            .into(),
+    );
+    let token = CancelToken::new();
+    let _guard = cancel_json_after(token.clone(), 4);
+
+    assert!(!token.is_cancelled());
+    assert_interrupted(value_to_serde_with_cancel(&value, Some(&token)));
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn json_table_can_cancel_during_row_materialization() {
+    let source = json_text(serde_json::Value::Array(
+        (0..512).map(serde_json::Value::from).collect(),
+    ));
+    let spec = crate::parser::JsonTableSpec {
+        source: crate::parser::Expr::Literal(Value::Null),
+        root_path: "$[*]".into(),
+        columns: vec![crate::parser::JsonTableCol::Named {
+            name: "value".into(),
+            ty: crate::types::DataType::Integer,
+            path: "$".into(),
+            exists: false,
+        }],
+    };
+    let token = CancelToken::new();
+    let _guard = cancel_json_after(token.clone(), 32);
+
+    assert!(!token.is_cancelled());
+    assert_interrupted(materialize_json_table_with_cancel(
+        &source,
+        &spec,
+        Some(&token),
+    ));
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn json_srf_can_cancel_during_row_materialization() {
+    let source = json_text(serde_json::Value::Array(
+        (0..512).map(serde_json::Value::from).collect(),
+    ));
+    let token = CancelToken::new();
+    let _guard = cancel_json_after(token.clone(), 32);
+
+    assert!(!token.is_cancelled());
+    assert_interrupted(dispatch_srf_with_cancel(
+        "json_array_elements",
+        &[source],
+        Some(&token),
+    ));
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn json_srf_can_cancel_inside_one_large_output_value() {
+    let source =
+        text_to_jsonb(&serde_json::to_string(&vec!["x".repeat(128 * 1024)]).unwrap()).unwrap();
+    let token = CancelToken::new();
+    let _guard = cancel_json_after(token.clone(), 24);
+
+    assert!(!token.is_cancelled());
+    assert_interrupted(dispatch_srf_with_cancel(
+        "jsonb_array_elements",
+        &[source],
+        Some(&token),
+    ));
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn populate_record_can_cancel_between_columns() {
+    let object: serde_json::Map<String, serde_json::Value> = (0..64)
+        .map(|i| (format!("col_{i}"), serde_json::Value::from(i)))
+        .collect();
+    let columns: Vec<crate::types::ColumnDef> = (0..64)
+        .map(|i| crate::types::ColumnDef {
+            name: format!("col_{i}"),
+            data_type: crate::types::DataType::Integer,
+            nullable: true,
+            position: i,
+            default_expr: None,
+            default_sql: None,
+            check_expr: None,
+            check_sql: None,
+            check_name: None,
+            is_with_timezone: false,
+            generated_expr: None,
+            generated_sql: None,
+            generated_kind: None,
+            collation: crate::types::Collation::Binary,
+        })
+        .collect();
+    let token = CancelToken::new();
+    let _guard = cancel_json_after(token.clone(), 8);
+
+    assert!(!token.is_cancelled());
+    assert_interrupted(populate_record_row_with_cancel(
+        &object,
+        &columns,
+        Some(&token),
+    ));
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn untripped_token_preserves_json_binary_operator_results() {
+    let token = CancelToken::new();
+    let json = Value::Json(r#"{"a":[1,2,3],"flag":true,"name":"citadel"}"#.into());
+    let jsonb = text_to_jsonb(r#"{"a":[1,2,3],"flag":true,"name":"citadel"}"#).unwrap();
+    let probe = text_to_jsonb(r#"{"flag":true}"#).unwrap();
+    let key = Value::Text("name".into());
+    let path = Value::Text("{a,1}".into());
+    let keys = Value::Json(r#"["missing","flag"]"#.into());
+    let all_keys = Value::Json(r#"["name","flag"]"#.into());
+    let json_path = Value::Text("$.flag".into());
+
+    assert_eq!(
+        op_get(&jsonb, &key).unwrap(),
+        op_get_with_cancel(&jsonb, &key, Some(&token)).unwrap()
+    );
+    assert_eq!(
+        op_get_text(&jsonb, &key).unwrap(),
+        op_get_text_with_cancel(&jsonb, &key, Some(&token)).unwrap()
+    );
+    assert_eq!(
+        op_path(&json, &path).unwrap(),
+        op_path_with_cancel(&json, &path, Some(&token)).unwrap()
+    );
+    assert_eq!(
+        op_path_text(&jsonb, &path).unwrap(),
+        op_path_text_with_cancel(&jsonb, &path, Some(&token)).unwrap()
+    );
+    assert_eq!(
+        op_contains(&jsonb, &probe).unwrap(),
+        op_contains_with_cancel(&jsonb, &probe, Some(&token)).unwrap()
+    );
+    assert_eq!(
+        op_contained_by(&probe, &jsonb).unwrap(),
+        op_contained_by_with_cancel(&probe, &jsonb, Some(&token)).unwrap()
+    );
+    assert_eq!(
+        op_has_key(&json, &key).unwrap(),
+        op_has_key_with_cancel(&json, &key, Some(&token)).unwrap()
+    );
+    assert_eq!(
+        op_has_any_key(&json, &keys).unwrap(),
+        op_has_any_key_with_cancel(&json, &keys, Some(&token)).unwrap()
+    );
+    assert_eq!(
+        op_has_all_keys(&json, &all_keys).unwrap(),
+        op_has_all_keys_with_cancel(&json, &all_keys, Some(&token)).unwrap()
+    );
+    assert_eq!(
+        op_delete_path(&jsonb, &path).unwrap(),
+        op_delete_path_with_cancel(&jsonb, &path, Some(&token)).unwrap()
+    );
+    assert_eq!(
+        op_delete_one(&json, &key).unwrap(),
+        op_delete_one_with_cancel(&json, &key, Some(&token)).unwrap()
+    );
+    assert_eq!(
+        op_concat(&json, &probe).unwrap(),
+        op_concat_with_cancel(&json, &probe, Some(&token)).unwrap()
+    );
+    assert_eq!(
+        op_path_exists(&json, &json_path).unwrap(),
+        op_path_exists_with_cancel(&json, &json_path, Some(&token)).unwrap()
+    );
+    assert_eq!(
+        op_path_match(&json, &json_path).unwrap(),
+        op_path_match_with_cancel(&json, &json_path, Some(&token)).unwrap()
+    );
+    assert!(!token.is_cancelled());
+}
+
+#[test]
+fn jsonb_get_text_can_cancel_inside_one_large_output_copy() {
+    let source = text_to_jsonb(
+        &serde_json::to_string(&serde_json::json!({ "payload": "x".repeat(256 * 1024) })).unwrap(),
+    )
+    .unwrap();
+    let token = CancelToken::new();
+    let _guard = cancel_json_after(token.clone(), 8);
+
+    assert_interrupted(op_get_text_with_cancel(
+        &source,
+        &Value::Text("payload".into()),
+        Some(&token),
+    ));
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn evaluator_threads_cancellation_into_json_binary_operators() {
+    let left =
+        text_to_jsonb(&serde_json::to_string(&(0..2_048).collect::<Vec<i64>>()).unwrap()).unwrap();
+    let right =
+        text_to_jsonb(&serde_json::to_string(&(1_024..2_048).collect::<Vec<i64>>()).unwrap())
+            .unwrap();
+    let expression = crate::parser::Expr::BinaryOp {
+        left: Box::new(crate::parser::Expr::Literal(left)),
+        op: crate::parser::BinOp::JsonContains,
+        right: Box::new(crate::parser::Expr::Literal(right)),
+    };
+    let columns = crate::eval::ColumnMap::new(&[]);
+    let token = CancelToken::new();
+    let _guard = cancel_json_after(token.clone(), 64);
+
+    assert_interrupted(crate::eval::eval_expr(
+        &expression,
+        &crate::eval::EvalCtx::new(&columns, &[]).with_cancel(Some(&token)),
+    ));
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn untripped_token_preserves_json_cast_results_and_errors() {
+    use crate::parser::Expr;
+    use crate::types::DataType;
+
+    let columns = crate::eval::ColumnMap::new(&[]);
+    let token = CancelToken::new();
+    let evaluate = |value: Value, target| {
+        let expression = Expr::Cast {
+            expr: Box::new(Expr::Literal(value)),
+            data_type: target,
+        };
+        let normal = crate::eval::eval_expr(&expression, &crate::eval::EvalCtx::new(&columns, &[]));
+        let cancellable = crate::eval::eval_expr(
+            &expression,
+            &crate::eval::EvalCtx::new(&columns, &[]).with_cancel(Some(&token)),
+        );
+        (normal, cancellable)
+    };
+
+    let text = Value::Text(r#"{"items":[1,2,3]}"#.into());
+    for target in [DataType::Json, DataType::Jsonb] {
+        let (normal, cancellable) = evaluate(text.clone(), target);
+        assert_eq!(normal.unwrap(), cancellable.unwrap());
+    }
+    let jsonb = text_to_jsonb(r#"{"items":[1,2,3]}"#).unwrap();
+    for target in [DataType::Text, DataType::Json] {
+        let (normal, cancellable) = evaluate(jsonb.clone(), target);
+        assert_eq!(normal.unwrap(), cancellable.unwrap());
+    }
+    let (normal, cancellable) = evaluate(Value::Text("{".into()), DataType::Jsonb);
+    assert_eq!(
+        normal.unwrap_err().to_string(),
+        cancellable.unwrap_err().to_string()
+    );
+    assert!(!token.is_cancelled());
+}
+
+#[test]
+fn evaluator_can_cancel_inside_one_large_jsonb_cast() {
+    let text = serde_json::to_string(&(0..100_000).collect::<Vec<i64>>()).unwrap();
+    let expression = crate::parser::Expr::Cast {
+        expr: Box::new(crate::parser::Expr::Literal(Value::Text(text.into()))),
+        data_type: crate::types::DataType::Jsonb,
+    };
+    let columns = crate::eval::ColumnMap::new(&[]);
+    let token = CancelToken::new();
+    let _guard = cancel_json_after(token.clone(), 4);
+
+    assert_interrupted(crate::eval::eval_expr(
+        &expression,
+        &crate::eval::EvalCtx::new(&columns, &[]).with_cancel(Some(&token)),
+    ));
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn json_text_path_parsing_can_cancel_inside_one_large_segment() {
+    let source = text_to_jsonb(r#"{"value":1}"#).unwrap();
+    let path = Value::Text(format!("$.{}", "x".repeat(128 * 1024)).into());
+    let token = CancelToken::new();
+    let _guard = cancel_json_after(token.clone(), 16);
+
+    assert_interrupted(op_path_with_cancel(&source, &path, Some(&token)));
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn json_aggregate_serialization_can_cancel_inside_one_large_value() {
+    let values = vec![Value::Text("x".repeat(256 * 1024).into())];
+    let token = CancelToken::new();
+    let _guard = cancel_json_after(token.clone(), 16);
+
+    assert_interrupted(agg_array_with_cancel(
+        &values,
+        crate::types::DataType::Jsonb,
+        Some(&token),
+    ));
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn untripped_token_preserves_json_aggregate_results() {
+    let values = vec![Value::Integer(1), Value::Text("two".into())];
+    let pairs = vec![
+        (Value::Text("a".into()), Value::Integer(1)),
+        (Value::Text("b".into()), Value::Text("two".into())),
+    ];
+    let token = CancelToken::new();
+
+    assert_eq!(
+        agg_array(&values, crate::types::DataType::Jsonb).unwrap(),
+        agg_array_with_cancel(&values, crate::types::DataType::Jsonb, Some(&token)).unwrap()
+    );
+    assert_eq!(
+        agg_object(&pairs, crate::types::DataType::Json).unwrap(),
+        agg_object_with_cancel(&pairs, crate::types::DataType::Json, Some(&token)).unwrap()
+    );
+    assert!(!token.is_cancelled());
+}
+
+#[test]
+fn evaluator_threads_cancellation_into_json_has_key_functions() {
+    let object: serde_json::Map<String, serde_json::Value> = (0..1_024)
+        .map(|index| (format!("key_{index:04}"), serde_json::Value::from(index)))
+        .collect();
+    let source = text_to_jsonb(&serde_json::to_string(&object).unwrap()).unwrap();
+    let expression = crate::parser::Expr::Function {
+        name: "JSONB_HAS_KEY".into(),
+        args: vec![
+            crate::parser::Expr::Literal(source),
+            crate::parser::Expr::Literal(Value::Text("missing".into())),
+        ],
+        distinct: false,
+    };
+    let columns = crate::eval::ColumnMap::new(&[]);
+    let token = CancelToken::new();
+    let _guard = cancel_json_after(token.clone(), 32);
+
+    assert_interrupted(crate::eval::eval_expr(
+        &expression,
+        &crate::eval::EvalCtx::new(&columns, &[]).with_cancel(Some(&token)),
+    ));
+    assert!(token.is_cancelled());
+}

@@ -19,6 +19,21 @@ const VIEWS_TABLE: &[u8] = b"_views";
 const TRIGGERS_TABLE: &[u8] = b"_triggers";
 const MATVIEWS_TABLE: &[u8] = b"_matviews";
 
+/// Whether a schema load may be stopped by the database's cancel token.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cancellable {
+    Yes,
+    No,
+}
+
+fn schema_read(db: &Database, cancellable: Cancellable) -> citadel_txn::read_txn::ReadTxn<'_> {
+    let mut rtx = db.begin_read();
+    if cancellable == Cancellable::No {
+        rtx.set_cancel(None);
+    }
+    rtx
+}
+
 thread_local! {
     /// Stack of `(alias → storage_name)` frames pushed by FOR EACH STATEMENT trigger
     /// firings so `REFERENCING NEW TABLE AS new_t` resolves while the body runs.
@@ -101,7 +116,17 @@ pub struct DmlDirty {
 pub struct SchemaSnapshot {
     tables: FxHashMap<String, TableSchema>,
     views: FxHashMap<String, ViewDef>,
+    triggers: FxHashMap<String, Vec<crate::types::TriggerDef>>,
+    matviews: FxHashMap<String, crate::types::MatviewDef>,
+    temp_aliases: FxHashMap<String, String>,
+    dml_dirty_tables: FxHashSet<String>,
+    dml_append_tables: FxHashMap<String, i64>,
     generation: u64,
+}
+
+pub(crate) struct DmlSnapshot {
+    dirty_tables: FxHashSet<String>,
+    append_tables: FxHashMap<String, i64>,
 }
 
 impl SchemaManager {
@@ -193,10 +218,17 @@ impl SchemaManager {
     ///
     /// They live only in memory, so a reload would otherwise hide this connection's
     /// TEMP tables while their rows stay on disk under the prefixed name.
+    /// Carry the prior schema's TEMP aliases onto a freshly loaded one.
+    ///
+    /// An alias whose backing table is absent from the reload is dropped: a TEMP
+    /// table created in a rolled-back transaction has no physical table, and
+    /// keeping its alias would make that name permanently unusable.
     pub fn adopt_temp_aliases(&mut self, prior: &SchemaManager) {
         for (name, prefixed) in prior.temp_alias_iter() {
-            self.temp_aliases
-                .insert(name.to_string(), prefixed.to_string());
+            if self.tables.contains_key(&prefixed.to_ascii_lowercase()) {
+                self.temp_aliases
+                    .insert(name.to_string(), prefixed.to_string());
+            }
         }
     }
 
@@ -209,9 +241,22 @@ impl SchemaManager {
     }
 
     pub fn load(db: &Database) -> Result<Self> {
+        Self::load_inner(db, Cancellable::Yes)
+    }
+
+    /// Loads the schema with cancellation suspended.
+    ///
+    /// Restoring the schema after a transaction ends is recovery, not the
+    /// caller's query: a ROLLBACK under a tripped token must not fail before
+    /// replacing the schema it just rolled back.
+    pub(crate) fn load_ignoring_cancel(db: &Database) -> Result<Self> {
+        Self::load_inner(db, Cancellable::No)
+    }
+
+    fn load_inner(db: &Database, cancellable: Cancellable) -> Result<Self> {
         let mut tables = FxHashMap::default();
 
-        let mut rtx = db.begin_read();
+        let mut rtx = schema_read(db, cancellable);
         let mut parse_err: Option<crate::error::SqlError> = None;
         let scan_result = rtx.table_for_each(SCHEMA_TABLE, |_key, value| {
             match TableSchema::deserialize(value) {
@@ -235,7 +280,7 @@ impl SchemaManager {
         }
 
         let mut views = FxHashMap::default();
-        let mut rtx2 = db.begin_read();
+        let mut rtx2 = schema_read(db, cancellable);
         let mut view_err: Option<crate::error::SqlError> = None;
         let view_scan = rtx2.table_for_each(VIEWS_TABLE, |_key, value| {
             match ViewDef::deserialize(value) {
@@ -259,7 +304,7 @@ impl SchemaManager {
         }
 
         let mut triggers: FxHashMap<String, Vec<crate::types::TriggerDef>> = FxHashMap::default();
-        let mut rtx3 = db.begin_read();
+        let mut rtx3 = schema_read(db, cancellable);
         let mut trig_err: Option<crate::error::SqlError> = None;
         let trig_scan = rtx3.table_for_each(TRIGGERS_TABLE, |_key, value| {
             match crate::types::TriggerDef::deserialize(value) {
@@ -289,7 +334,7 @@ impl SchemaManager {
         }
 
         let mut matviews: FxHashMap<String, crate::types::MatviewDef> = FxHashMap::default();
-        let mut rtx4 = db.begin_read();
+        let mut rtx4 = schema_read(db, cancellable);
         let mut mv_err: Option<crate::error::SqlError> = None;
         let mv_scan = rtx4.table_for_each(MATVIEWS_TABLE, |_key, value| {
             match crate::types::MatviewDef::deserialize(value) {
@@ -728,8 +773,25 @@ impl SchemaManager {
         SchemaSnapshot {
             tables: self.tables.clone(),
             views: self.views.clone(),
+            triggers: self.triggers.clone(),
+            matviews: self.matviews.clone(),
+            temp_aliases: self.temp_aliases.clone(),
+            dml_dirty_tables: self.dml_dirty_tables.borrow().clone(),
+            dml_append_tables: self.dml_append_tables.borrow().clone(),
             generation: self.generation,
         }
+    }
+
+    pub(crate) fn save_dml_snapshot(&self) -> DmlSnapshot {
+        DmlSnapshot {
+            dirty_tables: self.dml_dirty_tables.borrow().clone(),
+            append_tables: self.dml_append_tables.borrow().clone(),
+        }
+    }
+
+    pub(crate) fn restore_dml_snapshot(&self, snap: DmlSnapshot) {
+        *self.dml_dirty_tables.borrow_mut() = snap.dirty_tables;
+        *self.dml_append_tables.borrow_mut() = snap.append_tables;
     }
 
     pub fn restore_snapshot(&mut self, snap: SchemaSnapshot) {
@@ -741,6 +803,11 @@ impl SchemaManager {
         }
         self.tables = snap.tables;
         self.views = snap.views;
+        self.triggers = snap.triggers;
+        self.matviews = snap.matviews;
+        self.temp_aliases = snap.temp_aliases;
+        *self.dml_dirty_tables.borrow_mut() = snap.dml_dirty_tables;
+        *self.dml_append_tables.borrow_mut() = snap.dml_append_tables;
     }
 
     /// Advance the generation strictly past `prior` so plans compiled against

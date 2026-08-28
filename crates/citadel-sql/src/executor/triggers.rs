@@ -91,7 +91,7 @@ pub(super) fn exec_create_trigger(
 ) -> Result<ExecutionResult> {
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     let result = exec_create_trigger_in_txn(&mut wtx, schema, stmt)?;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
     Ok(result)
 }
 
@@ -144,7 +144,7 @@ pub(super) fn exec_drop_trigger(
 ) -> Result<ExecutionResult> {
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     let result = exec_drop_trigger_in_txn(&mut wtx, schema, stmt)?;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
     Ok(result)
 }
 
@@ -345,6 +345,8 @@ pub(crate) fn fire_row_triggers(
     new_row: Option<Vec<Value>>,
     table_cols: &[crate::types::ColumnDef],
 ) -> Result<bool> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     let _guard = enter_trigger()?;
     let candidates: Vec<TriggerDef> = schema
         .triggers_for(target)
@@ -373,7 +375,7 @@ pub(crate) fn fire_row_triggers(
     for td in &candidates {
         let pre_when_pass = match &td.when_sql {
             None => true,
-            Some(when_sql) => evaluate_when(when_sql, &bindings)?,
+            Some(when_sql) => evaluate_when(when_sql, &bindings, cancel)?,
         };
         if !pre_when_pass {
             continue;
@@ -388,7 +390,11 @@ pub(crate) fn fire_row_triggers(
     Ok(handled_instead_of)
 }
 
-fn evaluate_when(when_sql: &str, bindings: &TriggerBindings) -> Result<bool> {
+fn evaluate_when(
+    when_sql: &str,
+    bindings: &TriggerBindings,
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<bool> {
     let when_expr = crate::parser::parse_sql_expr(when_sql)?;
     let cols_for_eval = if !bindings.new_columns.is_empty() {
         &bindings.new_columns
@@ -406,7 +412,8 @@ fn evaluate_when(when_sql: &str, bindings: &TriggerBindings) -> Result<bool> {
         row_for_default,
         bindings.old_row.as_deref(),
         bindings.new_row.as_deref(),
-    );
+    )
+    .with_cancel(cancel);
     let val = crate::eval::eval_expr(&when_expr, &ctx)?;
     Ok(crate::eval::is_truthy(&val))
 }
@@ -424,6 +431,8 @@ pub(crate) fn fire_statement_triggers(
     old_rows: &[Vec<Value>],
     new_rows: &[Vec<Value>],
 ) -> Result<()> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     let candidates: Vec<TriggerDef> = schema
         .triggers_for(target)
         .iter()
@@ -442,6 +451,11 @@ pub(crate) fn fire_statement_triggers(
 
     for td in &candidates {
         let _guard = enter_trigger()?;
+        if let Some(when_sql) = &td.when_sql {
+            if !evaluate_when(when_sql, &TriggerBindings::default(), cancel)? {
+                continue;
+            }
+        }
         let mut storages: Vec<Vec<u8>> = Vec::new();
         let mut aliases: rustc_hash::FxHashMap<String, String> = rustc_hash::FxHashMap::default();
         if let Some(ref tt) = td.referencing {
@@ -570,4 +584,56 @@ fn execute_trigger_body(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_row_trigger_when_poisoned_the_enclosing_write() {
+        use citadel::{Argon2Profile, DatabaseBuilder};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = DatabaseBuilder::new(dir.path().join("trigger-when-cancel.citadel"))
+            .passphrase(b"trigger-when-cancel-passphrase")
+            .argon2_profile(Argon2Profile::Iot)
+            .create()
+            .unwrap();
+        let conn = crate::Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER inspect_body AFTER INSERT ON docs FOR EACH ROW \
+             WHEN TO_TSVECTOR(NEW.body) IS NOT NULL BEGIN SELECT 1; END",
+        )
+        .unwrap();
+        conn.execute("BEGIN").unwrap();
+
+        let token = citadel::CancelToken::new();
+        db.set_cancel(Some(token.clone()));
+        let error = {
+            let _cancel = crate::fts::cancel_tokenize_after(token, 1);
+            conn.execute("INSERT INTO docs VALUES (1, 'several words to tokenize')")
+                .expect_err("the trigger WHEN expression discarded its cancellation token")
+        };
+        assert!(matches!(
+            error,
+            SqlError::Storage(citadel_core::Error::Interrupted)
+        ));
+
+        db.set_cancel(None);
+        let commit_error = conn
+            .execute("COMMIT")
+            .expect_err("the interrupted trigger left its write transaction committable");
+        assert!(matches!(
+            commit_error,
+            SqlError::Storage(citadel_core::Error::Interrupted)
+        ));
+        drop(conn);
+
+        let conn = crate::Connection::open(&db).unwrap();
+        let result = conn.query("SELECT COUNT(*) FROM docs").unwrap();
+        assert_eq!(result.rows, vec![vec![Value::Integer(0)]]);
+    }
 }

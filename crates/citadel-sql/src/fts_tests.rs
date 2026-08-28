@@ -1,12 +1,255 @@
 use super::*;
+use crate::types::Value;
+
+fn many_lexeme_vector(count: usize) -> Arc<[u8]> {
+    let mut builder = TsVectorBuilder::new();
+    for index in 0..count {
+        builder
+            .push(format!("term{index:05}").as_bytes(), 1, Weight::D)
+            .unwrap();
+    }
+    builder.build()
+}
+
+#[test]
+fn deeply_nested_text_queries_are_rejected_before_the_stack_is_exhausted() {
+    let not_chain = format!("{}term", "!".repeat(MAX_TSQUERY_DEPTH + 32));
+    let error = parse_tsquery(&not_chain).expect_err("deep NOT chain was accepted");
+    assert!(error.to_string().contains("complexity limit"));
+
+    let parenthesized = format!(
+        "{}term{}",
+        "(".repeat(MAX_TSQUERY_DEPTH + 32),
+        ")".repeat(MAX_TSQUERY_DEPTH + 32)
+    );
+    let error = parse_tsquery(&parenthesized).expect_err("deep parentheses were accepted");
+    assert!(error.to_string().contains("complexity limit"));
+}
+
+#[test]
+fn deeply_nested_wire_queries_are_rejected_before_recursive_decode() {
+    let mut bytes = vec![TSQ_TAG_NOT; MAX_TSQUERY_DEPTH + 32];
+    bytes.extend_from_slice(&[TSQ_TAG_LEXEME, 1, 0, b'x', 0, 0]);
+
+    let error = TsQueryAst::decode(&bytes).expect_err("deep wire query was accepted");
+    assert!(error.to_string().contains("complexity limit"));
+}
+
+#[test]
+fn public_encode_rejects_an_externally_built_deep_ast() {
+    let mut ast = TsQueryAst::Lexeme {
+        lexeme: b"term".to_vec(),
+        weight_mask: 0,
+        prefix: false,
+    };
+    for _ in 0..(MAX_TSQUERY_DEPTH + 32) {
+        ast = TsQueryAst::Not(Box::new(ast));
+    }
+
+    let error = ast.encode().expect_err("deep external AST was encoded");
+    assert!(error.to_string().contains("complexity limit"));
+}
+
+#[test]
+fn associative_generated_queries_are_balanced_but_phrase_chains_are_bounded() {
+    let text = "term ".repeat(MAX_TSQUERY_DEPTH + 32);
+    for value in [
+        fn_plainto_tsquery_with(TokenizerKind::Simple, &text).unwrap(),
+        fn_websearch_to_tsquery_with(TokenizerKind::Simple, &text).unwrap(),
+    ] {
+        let Value::TsQuery(bytes) = value else {
+            panic!("query constructor returned the wrong value type");
+        };
+        let ast = TsQueryAst::decode(&bytes).unwrap();
+        validate_tsquery(&ast).unwrap();
+    }
+
+    let error = fn_phraseto_tsquery_with(TokenizerKind::Simple, &text)
+        .expect_err("phrase query built an over-deep AST");
+    assert!(error.to_string().contains("complexity limit"));
+}
+
+#[test]
+fn lexeme_wire_lengths_accept_u16_max_and_reject_the_next_byte() {
+    let maximum = "x".repeat(MAX_LEXEME_BYTES);
+
+    let Value::TsVector(vector) =
+        fn_to_tsvector_with(TokenizerKind::Simple, &maximum).expect("maximum TSVECTOR lexeme")
+    else {
+        panic!("vector constructor returned the wrong value type");
+    };
+    let (_, mut reader) = TsVectorReader::open(&vector).unwrap();
+    assert_eq!(reader.next().unwrap().unwrap().0.len(), MAX_LEXEME_BYTES);
+
+    let Value::TsQuery(query) =
+        fn_to_tsquery_with(TokenizerKind::Simple, &maximum).expect("maximum TSQUERY lexeme")
+    else {
+        panic!("query constructor returned the wrong value type");
+    };
+    let TsQueryAst::Lexeme { lexeme, .. } = TsQueryAst::decode(&query).unwrap() else {
+        panic!("single lexeme decoded to a compound query");
+    };
+    assert_eq!(lexeme.len(), MAX_LEXEME_BYTES);
+
+    let overlong = "x".repeat(MAX_LEXEME_BYTES + 1);
+    for error in [
+        fn_to_tsvector_with(TokenizerKind::Simple, &overlong)
+            .expect_err("TSVECTOR accepted an overlong lexeme"),
+        fn_to_tsquery_with(TokenizerKind::Simple, &overlong)
+            .expect_err("TSQUERY accepted an overlong lexeme"),
+    ] {
+        assert!(error.to_string().contains("maximum is 65535"));
+    }
+}
+
+#[test]
+fn public_fts_encoders_return_errors_for_overlong_lexemes() {
+    let overlong = vec![b'x'; MAX_LEXEME_BYTES + 1];
+    let mut builder = TsVectorBuilder::new();
+    let error = builder
+        .push(&overlong, 1, Weight::D)
+        .expect_err("builder accepted an overlong lexeme");
+    assert!(error.to_string().contains("maximum is 65535"));
+
+    let query = TsQueryAst::Lexeme {
+        lexeme: overlong,
+        weight_mask: 0,
+        prefix: false,
+    };
+    let error = query
+        .encode()
+        .expect_err("query encoder accepted an overlong lexeme");
+    assert!(error.to_string().contains("maximum is 65535"));
+}
+
+#[test]
+fn websearch_propagates_cancellation_from_a_quoted_phrase() {
+    let token = citadel::CancelToken::new();
+    let _cancel = cancel_tokenize_after(token.clone(), CANCEL_CHECK_INTERVAL + 1);
+    let text = format!("\"{}\"", "searchable ".repeat(CANCEL_CHECK_INTERVAL));
+
+    let error = fn_websearch_to_tsquery_with_cancel(TokenizerKind::Simple, &text, Some(&token))
+        .expect_err("quoted-phrase cancellation was swallowed");
+
+    assert!(matches!(
+        error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+}
+
+#[test]
+fn match_length_and_display_poll_inside_large_fts_values() {
+    let vector = many_lexeme_vector(CANCEL_CHECK_INTERVAL * 3);
+    let query = TsQueryAst::Lexeme {
+        lexeme: b"term".to_vec(),
+        weight_mask: 0,
+        prefix: true,
+    }
+    .encode()
+    .unwrap();
+
+    let match_token = citadel::CancelToken::new();
+    let _match_cancel = cancel_on_poll_after(match_token.clone(), 3);
+    let match_error = op_match_with_cancel(&vector, &query, Some(&match_token))
+        .expect_err("matching ignored in-work cancellation");
+    assert!(matches!(
+        match_error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+    drop(_match_cancel);
+
+    let length_token = citadel::CancelToken::new();
+    let _length_cancel = cancel_on_poll_after(length_token.clone(), 3);
+    let length_error = fn_length_tsvector_with_cancel(&vector, Some(&length_token))
+        .expect_err("length ignored in-work cancellation");
+    assert!(matches!(
+        length_error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+    drop(_length_cancel);
+
+    let vector_display_token = citadel::CancelToken::new();
+    let _vector_display_cancel = cancel_on_poll_after(vector_display_token.clone(), 3);
+    let display_error = tsvector_display_with_cancel(&vector, Some(&vector_display_token))
+        .expect_err("TSVECTOR display ignored in-work cancellation");
+    assert!(matches!(
+        display_error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+    drop(_vector_display_cancel);
+
+    let query = and_chain(vec![b"term".to_vec(); CANCEL_CHECK_INTERVAL * 2])
+        .unwrap()
+        .encode()
+        .unwrap();
+    let query_display_token = citadel::CancelToken::new();
+    let _query_display_cancel = cancel_on_poll_after(query_display_token.clone(), 3);
+    let display_error = tsquery_display_with_cancel(&query, Some(&query_display_token))
+        .expect_err("TSQUERY display ignored in-work cancellation");
+    assert!(matches!(
+        display_error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+}
+
+#[test]
+fn untripped_tokens_preserve_match_concat_and_length_results() {
+    let token = citadel::CancelToken::new();
+    let left = many_lexeme_vector(64);
+    let right = many_lexeme_vector(96);
+    let query = parse_tsquery("term00001 | term00095")
+        .unwrap()
+        .encode()
+        .unwrap();
+
+    assert_eq!(
+        op_match_with_cancel(&right, &query, Some(&token)).unwrap(),
+        op_match(&right, &query).unwrap()
+    );
+    assert_eq!(
+        op_concat_with_cancel(&left, &right, Some(&token)).unwrap(),
+        op_concat(&left, &right).unwrap()
+    );
+    assert_eq!(
+        fn_length_tsvector_with_cancel(&right, Some(&token)).unwrap(),
+        fn_length_tsvector(&right).unwrap()
+    );
+}
+
+#[test]
+fn cancellable_tokenizer_matches_the_fast_path() {
+    let token = citadel::CancelToken::new();
+    let text = "The \u{fb01}le\u{301}d cats were RUNNING; ΟΣ ΟΣΑ";
+
+    assert_eq!(
+        tokenize_with_cancel(TokenizerKind::English, text, Some(&token)).unwrap(),
+        tokenize(TokenizerKind::English, text)
+    );
+}
+
+#[test]
+fn tokenizer_observes_cancellation_inside_one_large_value() {
+    let token = citadel::CancelToken::new();
+    let _cancel = cancel_tokenize_after(token.clone(), CANCEL_CHECK_INTERVAL + 1);
+    let text = "a".repeat(CANCEL_CHECK_INTERVAL * 4);
+
+    let error = tokenize_with_cancel(TokenizerKind::Simple, &text, Some(&token))
+        .expect_err("tokenization completed after its in-value hook tripped");
+
+    assert!(token.is_cancelled());
+    assert!(matches!(
+        error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+}
 
 #[test]
 fn tsvector_builder_sorts_and_dedups() {
     let mut b = TsVectorBuilder::new();
-    b.push(b"dog", 2, Weight::D);
-    b.push(b"cat", 1, Weight::A);
-    b.push(b"cat", 1, Weight::A); // dup
-    b.push(b"cat", 5, Weight::B);
+    b.push(b"dog", 2, Weight::D).unwrap();
+    b.push(b"cat", 1, Weight::A).unwrap();
+    b.push(b"cat", 1, Weight::A).unwrap(); // dup
+    b.push(b"cat", 5, Weight::B).unwrap();
     let bytes = b.build();
     assert!(!tsvector_overflowed(&bytes));
     let s = tsvector_display(&bytes);
@@ -16,13 +259,13 @@ fn tsvector_builder_sorts_and_dedups() {
 #[test]
 fn tsvector_canonical_byte_equality() {
     let mut a = TsVectorBuilder::new();
-    a.push(b"foo", 3, Weight::B);
-    a.push(b"bar", 1, Weight::A);
+    a.push(b"foo", 3, Weight::B).unwrap();
+    a.push(b"bar", 1, Weight::A).unwrap();
     let ab = a.build();
 
     let mut b = TsVectorBuilder::new();
-    b.push(b"bar", 1, Weight::A);
-    b.push(b"foo", 3, Weight::B);
+    b.push(b"bar", 1, Weight::A).unwrap();
+    b.push(b"foo", 3, Weight::B).unwrap();
     let bb = b.build();
 
     assert_eq!(ab.as_ref(), bb.as_ref());
@@ -31,8 +274,8 @@ fn tsvector_canonical_byte_equality() {
 #[test]
 fn tsvector_position_overflow_flag() {
     let mut b = TsVectorBuilder::new();
-    b.push(b"cat", 1, Weight::D);
-    b.push(b"dog", MAX_POSITION + 1, Weight::D); // overflow
+    b.push(b"cat", 1, Weight::D).unwrap();
+    b.push(b"dog", MAX_POSITION + 1, Weight::D).unwrap(); // overflow
     let bytes = b.build();
     assert!(tsvector_overflowed(&bytes));
     assert!(tsvector_display(&bytes).contains("'cat'"));
@@ -42,7 +285,7 @@ fn tsvector_position_overflow_flag() {
 fn tsvector_per_lexeme_position_cap() {
     let mut b = TsVectorBuilder::new();
     for p in 1..=300 {
-        b.push(b"cat", p, Weight::D);
+        b.push(b"cat", p, Weight::D).unwrap();
     }
     let bytes = b.build();
     let (_flags, reader) = TsVectorReader::open(&bytes).unwrap();
@@ -54,9 +297,9 @@ fn tsvector_per_lexeme_position_cap() {
 #[test]
 fn tsvector_reader_round_trip() {
     let mut b = TsVectorBuilder::new();
-    b.push(b"hello", 1, Weight::A);
-    b.push(b"world", 2, Weight::B);
-    b.push(b"world", 3, Weight::D);
+    b.push(b"hello", 1, Weight::A).unwrap();
+    b.push(b"world", 2, Weight::B).unwrap();
+    b.push(b"world", 3, Weight::D).unwrap();
     let bytes = b.build();
     let (flags, reader) = TsVectorReader::open(&bytes).unwrap();
     assert_eq!(flags, 0);
@@ -74,8 +317,8 @@ fn tsvector_reader_round_trip() {
 #[test]
 fn tsvector_no_position_lexemes() {
     let mut b = TsVectorBuilder::new();
-    b.push_no_position(b"cat");
-    b.push_no_position(b"dog");
+    b.push_no_position(b"cat").unwrap();
+    b.push_no_position(b"dog").unwrap();
     let bytes = b.build();
     assert_eq!(tsvector_display(&bytes), "'cat' 'dog'");
 }
@@ -99,7 +342,7 @@ fn tsquery_codec_round_trip_lexeme() {
         weight_mask: 0b1010, // A | C
         prefix: true,
     };
-    let bytes = q.encode();
+    let bytes = q.encode().unwrap();
     let decoded = TsQueryAst::decode(&bytes).unwrap();
     assert_eq!(decoded, q);
 }
@@ -133,7 +376,7 @@ fn tsquery_codec_round_trip_combinators() {
             }),
         )),
     );
-    let bytes = q.encode();
+    let bytes = q.encode().unwrap();
     let decoded = TsQueryAst::decode(&bytes).unwrap();
     assert_eq!(decoded, q);
 }
@@ -152,7 +395,7 @@ fn tsquery_display_handles_prefix_and_weights() {
         weight_mask: 0b1000, // A
         prefix: true,
     };
-    let s = tsquery_display(&q.encode());
+    let s = tsquery_display(&q.encode().unwrap());
     assert_eq!(s, "'cat':*A");
 }
 
@@ -171,7 +414,7 @@ fn tsquery_display_phrase() {
             prefix: false,
         }),
     };
-    assert_eq!(tsquery_display(&q.encode()), "'hello' <2> 'world'");
+    assert_eq!(tsquery_display(&q.encode().unwrap()), "'hello' <2> 'world'");
 }
 
 fn lex(name: &str) -> TsQueryAst {
@@ -316,10 +559,10 @@ fn tsv_with(lexemes: &[LexEntry<'_>]) -> Vec<u8> {
     let mut b = TsVectorBuilder::new();
     for (lex, positions) in lexemes {
         if positions.is_empty() {
-            b.push_no_position(lex);
+            b.push_no_position(lex).unwrap();
         } else {
             for (p, w) in *positions {
-                b.push(lex, *p, *w);
+                b.push(lex, *p, *w).unwrap();
             }
         }
     }
@@ -329,12 +572,12 @@ fn tsv_with(lexemes: &[LexEntry<'_>]) -> Vec<u8> {
 #[test]
 fn op_match_simple_lexeme() {
     let v = tsv_with(&[(b"cat", &[(1, Weight::A)]), (b"dog", &[(2, Weight::D)])]);
-    let q = parse_tsquery("cat").unwrap().encode();
+    let q = parse_tsquery("cat").unwrap().encode().unwrap();
     assert!(matches!(
         op_match(&v, &q).unwrap(),
         crate::types::Value::Boolean(true)
     ));
-    let q2 = parse_tsquery("mouse").unwrap().encode();
+    let q2 = parse_tsquery("mouse").unwrap().encode().unwrap();
     assert!(matches!(
         op_match(&v, &q2).unwrap(),
         crate::types::Value::Boolean(false)
@@ -344,12 +587,12 @@ fn op_match_simple_lexeme() {
 #[test]
 fn op_match_and_combinator() {
     let v = tsv_with(&[(b"cat", &[(1, Weight::D)]), (b"dog", &[(2, Weight::D)])]);
-    let q_both = parse_tsquery("cat & dog").unwrap().encode();
+    let q_both = parse_tsquery("cat & dog").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q_both).unwrap(),
         crate::types::Value::Boolean(true)
     );
-    let q_miss = parse_tsquery("cat & mouse").unwrap().encode();
+    let q_miss = parse_tsquery("cat & mouse").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q_miss).unwrap(),
         crate::types::Value::Boolean(false)
@@ -359,12 +602,12 @@ fn op_match_and_combinator() {
 #[test]
 fn op_match_or_combinator() {
     let v = tsv_with(&[(b"cat", &[(1, Weight::D)])]);
-    let q = parse_tsquery("dog | cat").unwrap().encode();
+    let q = parse_tsquery("dog | cat").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q).unwrap(),
         crate::types::Value::Boolean(true)
     );
-    let q2 = parse_tsquery("dog | mouse").unwrap().encode();
+    let q2 = parse_tsquery("dog | mouse").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q2).unwrap(),
         crate::types::Value::Boolean(false)
@@ -374,12 +617,12 @@ fn op_match_or_combinator() {
 #[test]
 fn op_match_not_combinator() {
     let v = tsv_with(&[(b"cat", &[(1, Weight::D)])]);
-    let q = parse_tsquery("!mouse").unwrap().encode();
+    let q = parse_tsquery("!mouse").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q).unwrap(),
         crate::types::Value::Boolean(true)
     );
-    let q2 = parse_tsquery("!cat").unwrap().encode();
+    let q2 = parse_tsquery("!cat").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q2).unwrap(),
         crate::types::Value::Boolean(false)
@@ -389,7 +632,7 @@ fn op_match_not_combinator() {
 #[test]
 fn op_match_phrase_distance_one() {
     let v = tsv_with(&[(b"hello", &[(1, Weight::D)]), (b"world", &[(2, Weight::D)])]);
-    let q = parse_tsquery("hello <-> world").unwrap().encode();
+    let q = parse_tsquery("hello <-> world").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q).unwrap(),
         crate::types::Value::Boolean(true)
@@ -406,12 +649,12 @@ fn op_match_phrase_distance_one() {
 #[test]
 fn op_match_phrase_distance_n() {
     let v = tsv_with(&[(b"hello", &[(1, Weight::D)]), (b"world", &[(4, Weight::D)])]);
-    let q = parse_tsquery("hello <3> world").unwrap().encode();
+    let q = parse_tsquery("hello <3> world").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q).unwrap(),
         crate::types::Value::Boolean(true)
     );
-    let q2 = parse_tsquery("hello <2> world").unwrap().encode();
+    let q2 = parse_tsquery("hello <2> world").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q2).unwrap(),
         crate::types::Value::Boolean(false)
@@ -421,16 +664,16 @@ fn op_match_phrase_distance_n() {
 #[test]
 fn op_match_phrase_overflow_refused() {
     let mut b = TsVectorBuilder::new();
-    b.push(b"hello", 1, Weight::D);
-    b.push(b"world", 2, Weight::D);
-    b.push(b"junk", MAX_POSITION + 1, Weight::D); // sets overflow flag
+    b.push(b"hello", 1, Weight::D).unwrap();
+    b.push(b"world", 2, Weight::D).unwrap();
+    b.push(b"junk", MAX_POSITION + 1, Weight::D).unwrap(); // sets overflow flag
     let v = b.build();
 
-    let q_phrase = parse_tsquery("hello <-> world").unwrap().encode();
+    let q_phrase = parse_tsquery("hello <-> world").unwrap().encode().unwrap();
     assert!(op_match(&v, &q_phrase).is_err());
 
     // Non-phrase queries still work on overflowed tsvectors.
-    let q_simple = parse_tsquery("hello & world").unwrap().encode();
+    let q_simple = parse_tsquery("hello & world").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q_simple).unwrap(),
         crate::types::Value::Boolean(true)
@@ -444,12 +687,12 @@ fn op_match_prefix_wildcard() {
         (b"caterpillar", &[(2, Weight::D)]),
         (b"dog", &[(3, Weight::D)]),
     ]);
-    let q = parse_tsquery("cat:*").unwrap().encode();
+    let q = parse_tsquery("cat:*").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q).unwrap(),
         crate::types::Value::Boolean(true)
     );
-    let q2 = parse_tsquery("zebr:*").unwrap().encode();
+    let q2 = parse_tsquery("zebr:*").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q2).unwrap(),
         crate::types::Value::Boolean(false)
@@ -459,17 +702,17 @@ fn op_match_prefix_wildcard() {
 #[test]
 fn op_match_weight_filter() {
     let v = tsv_with(&[(b"cat", &[(1, Weight::B), (3, Weight::A)])]);
-    let q_a = parse_tsquery("cat:A").unwrap().encode();
+    let q_a = parse_tsquery("cat:A").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q_a).unwrap(),
         crate::types::Value::Boolean(true)
     );
-    let q_c = parse_tsquery("cat:C").unwrap().encode();
+    let q_c = parse_tsquery("cat:C").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q_c).unwrap(),
         crate::types::Value::Boolean(false)
     );
-    let q_ab = parse_tsquery("cat:AB").unwrap().encode();
+    let q_ab = parse_tsquery("cat:AB").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q_ab).unwrap(),
         crate::types::Value::Boolean(true)
@@ -484,7 +727,7 @@ fn op_match_nested_phrase() {
         (b"b", &[(2, Weight::D)]),
         (b"c", &[(3, Weight::D)]),
     ]);
-    let q = parse_tsquery("a <-> b <-> c").unwrap().encode();
+    let q = parse_tsquery("a <-> b <-> c").unwrap().encode().unwrap();
     assert_eq!(
         op_match(&v, &q).unwrap(),
         crate::types::Value::Boolean(true)

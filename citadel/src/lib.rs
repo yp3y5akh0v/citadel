@@ -22,7 +22,9 @@ pub use audit::{
 };
 pub use citadel_core::error::{Error, Result};
 pub use citadel_core::types::{Argon2Profile, CipherId, KdfAlgorithm, SyncMode};
+pub use citadel_core::CancelToken;
 pub use citadel_txn::integrity::{IntegrityError, IntegrityReport};
+pub use citadel_txn::manager::ScanMeasurement;
 
 // Internal crate re-exports (used by integration tests and advanced usage)
 pub use citadel_buffer as buffer;

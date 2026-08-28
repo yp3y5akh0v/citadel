@@ -1,16 +1,47 @@
 use std::collections::VecDeque;
 
 use crate::error::{Result, SqlError};
-use crate::eval::{eval_expr, ColumnMap, EvalCtx};
+use crate::eval::{collation_of, eval_expr, operand_collation, ColumnMap, EvalCtx};
 use crate::parser::*;
 use crate::types::*;
 
 use super::helpers::*;
 
+#[cfg(test)]
+thread_local! {
+    static WINDOW_KEY_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WINDOW_PEER_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn note_window_key_evaluation() {
+    #[cfg(test)]
+    WINDOW_KEY_EVALUATIONS.with(|count| count.set(count.get() + 1));
+}
+
+#[inline]
+fn note_window_peer_comparison() {
+    #[cfg(test)]
+    WINDOW_PEER_COMPARISONS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+fn take_window_key_evaluations() -> usize {
+    WINDOW_KEY_EVALUATIONS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+fn take_window_peer_comparisons() -> usize {
+    WINDOW_PEER_COMPARISONS.with(|count| count.replace(0))
+}
+
 pub(super) fn has_window_function(expr: &Expr) -> bool {
     match expr {
         Expr::WindowFunction { .. } => true,
         Expr::BinaryOp { left, right, .. } => {
+            has_window_function(left) || has_window_function(right)
+        }
+        Expr::IsDistinctFrom { left, right, .. } => {
             has_window_function(left) || has_window_function(right)
         }
         Expr::UnaryOp { expr: e, .. }
@@ -57,6 +88,15 @@ pub(super) fn extract_window_fns(
             left: Box::new(extract_window_fns(left, slot_counter, extracted)),
             op: *op,
             right: Box::new(extract_window_fns(right, slot_counter, extracted)),
+        },
+        Expr::IsDistinctFrom {
+            left,
+            right,
+            negated,
+        } => Expr::IsDistinctFrom {
+            left: Box::new(extract_window_fns(left, slot_counter, extracted)),
+            right: Box::new(extract_window_fns(right, slot_counter, extracted)),
+            negated: *negated,
         },
         Expr::UnaryOp { op, expr: e } => Expr::UnaryOp {
             op: *op,
@@ -167,54 +207,75 @@ pub(super) fn rows_frame_indices(
     Ok((start, end.min(n - 1)))
 }
 
-/// For RANGE frames, find peer group boundaries (rows with same ORDER BY key).
-pub(super) fn find_peer_range(
-    rows: &[Vec<Value>],
-    order_by: &[OrderByItem],
-    col_map: &ColumnMap,
-    i: usize,
-) -> (usize, usize) {
-    let key: Vec<Value> = order_by
-        .iter()
-        .map(|o| eval_expr(&o.expr, &EvalCtx::new(col_map, &rows[i])).unwrap_or(Value::Null))
-        .collect();
-    let mut start = i;
-    while start > 0 {
-        let prev_key: Vec<Value> = order_by
-            .iter()
-            .map(|o| {
-                eval_expr(&o.expr, &EvalCtx::new(col_map, &rows[start - 1])).unwrap_or(Value::Null)
-            })
-            .collect();
-        if prev_key != key {
-            break;
-        }
-        start -= 1;
+/// For RANGE frames, index every peer group once. `part_indices` are already in
+/// window order, and `keys` are the values used to establish that order.
+fn peer_group_bounds(
+    part_indices: &[usize],
+    keys: &[Vec<Value>],
+    order_key_start: usize,
+    order_collations: &[Collation],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<(usize, usize)>> {
+    let n = part_indices.len();
+    if n == 0 {
+        return Ok(Vec::new());
     }
-    let mut end = i;
-    while end + 1 < rows.len() {
-        let next_key: Vec<Value> = order_by
-            .iter()
-            .map(|o| {
-                eval_expr(&o.expr, &EvalCtx::new(col_map, &rows[end + 1])).unwrap_or(Value::Null)
-            })
-            .collect();
-        if next_key != key {
-            break;
+    if order_collations.is_empty() {
+        if cancel.is_none() {
+            return Ok(vec![(0, n - 1); n]);
         }
-        end += 1;
+        let mut bounds = Vec::with_capacity(n);
+        for work in 0..n {
+            check_cancel_at(cancel, work)?;
+            bounds.push((0, n - 1));
+        }
+        check_cancel(cancel)?;
+        return Ok(bounds);
     }
-    (start, end)
+
+    let mut bounds = vec![(0, 0); n];
+    let mut group_start = 0;
+    for pos in 1..=n {
+        check_cancel_at(cancel, pos)?;
+        let group_ended = if pos == n {
+            true
+        } else {
+            note_window_peer_comparison();
+            let previous = &keys[part_indices[pos - 1]][order_key_start..];
+            let current = &keys[part_indices[pos]][order_key_start..];
+            !collated_keys_equal(previous, current, order_collations)
+        };
+        if group_ended {
+            let group_end = pos - 1;
+            for (work, bound) in bounds[group_start..pos].iter_mut().enumerate() {
+                check_cancel_at(cancel, work)?;
+                *bound = (group_start, group_end);
+            }
+            group_start = pos;
+        }
+    }
+    check_cancel(cancel)?;
+    Ok(bounds)
+}
+
+fn collated_keys_equal(left: &[Value], right: &[Value], collations: &[Collation]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).enumerate().all(|(i, (a, b))| {
+            collations
+                .get(i)
+                .copied()
+                .unwrap_or_default()
+                .cmp_value(a, b)
+                .is_eq()
+        })
 }
 
 /// Resolve frame indices for a given row position within a partition.
-pub(super) fn frame_indices(
+fn frame_indices(
     frame: &WindowFrame,
     i: usize,
     n: usize,
-    rows: &[Vec<Value>],
-    order_by: &[OrderByItem],
-    col_map: &ColumnMap,
+    peer_bounds: &[(usize, usize)],
 ) -> Result<(usize, usize)> {
     match frame.units {
         WindowFrameUnits::Rows => rows_frame_indices(frame, i, n),
@@ -222,12 +283,12 @@ pub(super) fn frame_indices(
             // For RANGE, only UNBOUNDED and CURRENT ROW are supported
             let start = match &frame.start {
                 WindowFrameBound::UnboundedPreceding => 0,
-                WindowFrameBound::CurrentRow => find_peer_range(rows, order_by, col_map, i).0,
+                WindowFrameBound::CurrentRow => peer_bounds[i].0,
                 _ => return Err(SqlError::Unsupported("RANGE with numeric offset".into())),
             };
             let end = match &frame.end {
                 WindowFrameBound::UnboundedFollowing => n - 1,
-                WindowFrameBound::CurrentRow => find_peer_range(rows, order_by, col_map, i).1,
+                WindowFrameBound::CurrentRow => peer_bounds[i].1,
                 _ => return Err(SqlError::Unsupported("RANGE with numeric offset".into())),
             };
             Ok((start, end))
@@ -240,13 +301,15 @@ pub(super) fn frame_indices(
 pub(super) struct MonoDeque {
     deque: VecDeque<(usize, Value)>,
     is_min: bool,
+    collation: Collation,
 }
 
 impl MonoDeque {
-    pub(super) fn new(is_min: bool) -> Self {
+    pub(super) fn new(is_min: bool, collation: Collation) -> Self {
         Self {
             deque: VecDeque::new(),
             is_min,
+            collation,
         }
     }
 
@@ -255,10 +318,11 @@ impl MonoDeque {
             return;
         }
         while let Some(back) = self.deque.back() {
+            let ordering = self.collation.cmp_value(&val, &back.1);
             let evict = if self.is_min {
-                val <= back.1
+                ordering.is_lt()
             } else {
-                val >= back.1
+                ordering.is_gt()
             };
             if evict {
                 self.deque.pop_back();
@@ -363,10 +427,16 @@ impl SlidingSum {
 }
 
 pub(super) fn eval_window_select(
-    columns: &[ColumnDef],
     mut rows: Vec<Vec<Value>>,
-    stmt: &SelectStmt,
+    ctx: super::SelectCtx<'_>,
 ) -> Result<ExecutionResult> {
+    ctx.check()?;
+    let super::SelectCtx {
+        columns,
+        stmt,
+        cancel,
+        ..
+    } = ctx;
     if rows.is_empty() {
         let col_names = stmt
             .columns
@@ -405,19 +475,30 @@ pub(super) fn eval_window_select(
     }
 
     if all_extracted.is_empty() {
-        return super::process_select(columns, rows, stmt, false);
+        return super::process_select(rows, ctx.predicate_applied(false));
     }
 
     let col_map = ColumnMap::new(columns);
+    let slot_collations: Vec<Collation> = all_extracted
+        .iter()
+        .map(|(_, _, args, _)| {
+            args.iter()
+                .find_map(collation_of)
+                .or_else(|| args.iter().find_map(|arg| operand_collation(arg, &col_map)))
+                .unwrap_or_default()
+        })
+        .collect();
     let num_win = all_extracted.len();
     let mut arg_values: Vec<Vec<Vec<Value>>> = Vec::with_capacity(num_win);
-    for (_, _, args, _) in &all_extracted {
+    for (window_idx, (_, _, args, _)) in all_extracted.iter().enumerate() {
+        check_cancel_at(cancel, window_idx)?;
         let mut per_row = Vec::with_capacity(rows.len());
-        for row in &rows {
+        for (row_idx, row) in rows.iter().enumerate() {
+            check_cancel_at(cancel, row_idx)?;
             let vals: Vec<Value> = args
                 .iter()
-                .map(|a| eval_expr(a, &EvalCtx::new(&col_map, row)).unwrap_or(Value::Null))
-                .collect();
+                .map(|a| eval_expr(a, &EvalCtx::new(&col_map, row).with_cancel(cancel)))
+                .collect::<Result<Vec<_>>>()?;
             per_row.push(vals);
         }
         arg_values.push(per_row);
@@ -426,59 +507,62 @@ pub(super) fn eval_window_select(
     let n = rows.len();
     let mut row_results: Vec<Vec<Value>> = (0..n).map(|_| vec![Value::Null; num_win]).collect();
 
-    for (win_idx, (_, fn_name, _, spec)) in all_extracted.iter().enumerate() {
+    for (win_idx, (_, fn_name, args, spec)) in all_extracted.iter().enumerate() {
+        check_cancel_at(cancel, win_idx)?;
         let mut sort_keys: Vec<OrderByItem> = Vec::new();
         for pb in &spec.partition_by {
             sort_keys.push(OrderByItem {
                 expr: pb.clone(),
+                output_name: None,
+                output_ordinal: None,
                 descending: false,
                 nulls_first: Some(true),
             });
         }
         sort_keys.extend(spec.order_by.clone());
+        let key_collations: Vec<Collation> = sort_keys
+            .iter()
+            .map(|key| operand_collation(&key.expr, &col_map).unwrap_or_default())
+            .collect();
 
         let mut indices: Vec<usize> = (0..n).collect();
-        if !sort_keys.is_empty() {
-            let keys: Vec<Vec<Value>> = indices
-                .iter()
-                .map(|&i| {
+        let keys: Vec<Vec<Value>> = if sort_keys.is_empty() {
+            Vec::new()
+        } else {
+            let mut keys = Vec::with_capacity(n);
+            for (position, row) in rows.iter().enumerate() {
+                check_cancel_at(cancel, position)?;
+                note_window_key_evaluation();
+                keys.push(
                     sort_keys
                         .iter()
                         .map(|o| {
-                            eval_expr(&o.expr, &EvalCtx::new(&col_map, &rows[i]))
-                                .unwrap_or(Value::Null)
+                            eval_expr(&o.expr, &EvalCtx::new(&col_map, row).with_cancel(cancel))
                         })
-                        .collect()
-                })
-                .collect();
-            let collations = sort_key_collations(&sort_keys, &col_map);
-            indices
-                .sort_by(|&a, &b| compare_sort_keys(&keys[a], &keys[b], &sort_keys, &collations));
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
+            keys
+        };
+        if !sort_keys.is_empty() {
+            sort_indices_by(&mut indices, cancel, |a, b| {
+                compare_sort_keys(&keys[a], &keys[b], &sort_keys, &key_collations)
+            })?;
         }
 
         let part_count = spec.partition_by.len();
+        let partition_collations = &key_collations[..part_count];
+        let order_collations = &key_collations[part_count..];
         let mut partitions: Vec<(usize, usize)> = Vec::new();
         let mut part_start = 0;
         for pos in 1..n {
-            let mut same = true;
-            if part_count > 0 {
-                for p in 0..part_count {
-                    let prev = eval_expr(
-                        &spec.partition_by[p],
-                        &EvalCtx::new(&col_map, &rows[indices[pos - 1]]),
-                    )
-                    .unwrap_or(Value::Null);
-                    let cur = eval_expr(
-                        &spec.partition_by[p],
-                        &EvalCtx::new(&col_map, &rows[indices[pos]]),
-                    )
-                    .unwrap_or(Value::Null);
-                    if prev != cur {
-                        same = false;
-                        break;
-                    }
-                }
-            }
+            check_cancel_at(cancel, pos)?;
+            let same = part_count == 0
+                || collated_keys_equal(
+                    &keys[indices[pos - 1]][..part_count],
+                    &keys[indices[pos]][..part_count],
+                    partition_collations,
+                );
             if !same {
                 partitions.push((part_start, pos));
                 part_start = pos;
@@ -489,13 +573,28 @@ pub(super) fn eval_window_select(
         let frame = resolve_frame(spec);
         let upper_name = fn_name.to_ascii_uppercase();
 
-        for &(ps, pe) in &partitions {
+        for (partition_idx, &(ps, pe)) in partitions.iter().enumerate() {
+            check_cancel_at(cancel, partition_idx)?;
             let part_len = pe - ps;
             let part_indices = &indices[ps..pe];
+            let uses_frame = matches!(
+                upper_name.as_str(),
+                "FIRST_VALUE" | "LAST_VALUE" | "SUM" | "COUNT" | "AVG" | "MIN" | "MAX"
+            );
+            let range_uses_peers = uses_frame
+                && matches!(frame.units, WindowFrameUnits::Range)
+                && (matches!(frame.start, WindowFrameBound::CurrentRow)
+                    || matches!(frame.end, WindowFrameBound::CurrentRow));
+            let peer_bounds = if range_uses_peers {
+                peer_group_bounds(part_indices, &keys, part_count, order_collations, cancel)?
+            } else {
+                Vec::new()
+            };
 
             match upper_name.as_str() {
                 "ROW_NUMBER" => {
                     for (rank, &orig_idx) in part_indices.iter().enumerate() {
+                        check_cancel_at(cancel, rank)?;
                         row_results[orig_idx][win_idx] = Value::Integer(rank as i64 + 1);
                     }
                 }
@@ -504,18 +603,12 @@ pub(super) fn eval_window_select(
                         return Err(SqlError::WindowFunctionRequiresOrderBy("RANK".into()));
                     }
                     let mut rank = 1i64;
-                    let mut prev_key: Option<Vec<Value>> = None;
+                    let mut prev_key: Option<&[Value]> = None;
                     for (pos, &orig_idx) in part_indices.iter().enumerate() {
-                        let key: Vec<Value> = spec
-                            .order_by
-                            .iter()
-                            .map(|o| {
-                                eval_expr(&o.expr, &EvalCtx::new(&col_map, &rows[orig_idx]))
-                                    .unwrap_or(Value::Null)
-                            })
-                            .collect();
-                        if let Some(ref pk) = prev_key {
-                            if &key != pk {
+                        check_cancel_at(cancel, pos)?;
+                        let key = &keys[orig_idx][part_count..];
+                        if let Some(pk) = prev_key {
+                            if !collated_keys_equal(key, pk, order_collations) {
                                 rank = pos as i64 + 1;
                             }
                         }
@@ -528,18 +621,12 @@ pub(super) fn eval_window_select(
                         return Err(SqlError::WindowFunctionRequiresOrderBy("DENSE_RANK".into()));
                     }
                     let mut rank = 1i64;
-                    let mut prev_key: Option<Vec<Value>> = None;
-                    for &orig_idx in part_indices {
-                        let key: Vec<Value> = spec
-                            .order_by
-                            .iter()
-                            .map(|o| {
-                                eval_expr(&o.expr, &EvalCtx::new(&col_map, &rows[orig_idx]))
-                                    .unwrap_or(Value::Null)
-                            })
-                            .collect();
-                        if let Some(ref pk) = prev_key {
-                            if &key != pk {
+                    let mut prev_key: Option<&[Value]> = None;
+                    for (pos, &orig_idx) in part_indices.iter().enumerate() {
+                        check_cancel_at(cancel, pos)?;
+                        let key = &keys[orig_idx][part_count..];
+                        if let Some(pk) = prev_key {
+                            if !collated_keys_equal(key, pk, order_collations) {
                                 rank += 1;
                             }
                         }
@@ -571,7 +658,8 @@ pub(super) fn eval_window_select(
                             base
                         }
                     };
-                    for &orig_idx in part_indices {
+                    for (pos, &orig_idx) in part_indices.iter().enumerate() {
+                        check_cancel_at(cancel, pos)?;
                         row_results[orig_idx][win_idx] = Value::Integer(bucket as i64);
                         count_in_bucket += 1;
                         if count_in_bucket >= bucket_size(bucket) && bucket < ntile_n {
@@ -596,6 +684,7 @@ pub(super) fn eval_window_select(
                     };
                     let is_lag = upper_name == "LAG";
                     for (pos, &orig_idx) in part_indices.iter().enumerate() {
+                        check_cancel_at(cancel, pos)?;
                         let target_pos = if is_lag {
                             if pos >= offset {
                                 Some(pos - offset)
@@ -616,34 +705,16 @@ pub(super) fn eval_window_select(
                 }
                 "FIRST_VALUE" => {
                     for (pos, &orig_idx) in part_indices.iter().enumerate() {
-                        let (fs, _) = frame_indices(
-                            &frame,
-                            pos,
-                            part_len,
-                            &part_indices
-                                .iter()
-                                .map(|&i| rows[i].clone())
-                                .collect::<Vec<_>>(),
-                            &spec.order_by,
-                            &col_map,
-                        )?;
+                        check_cancel_at(cancel, pos)?;
+                        let (fs, _) = frame_indices(&frame, pos, part_len, &peer_bounds)?;
                         let source_idx = part_indices[fs];
                         row_results[orig_idx][win_idx] = arg_values[win_idx][source_idx][0].clone();
                     }
                 }
                 "LAST_VALUE" => {
                     for (pos, &orig_idx) in part_indices.iter().enumerate() {
-                        let (_, fe) = frame_indices(
-                            &frame,
-                            pos,
-                            part_len,
-                            &part_indices
-                                .iter()
-                                .map(|&i| rows[i].clone())
-                                .collect::<Vec<_>>(),
-                            &spec.order_by,
-                            &col_map,
-                        )?;
+                        check_cancel_at(cancel, pos)?;
+                        let (_, fe) = frame_indices(&frame, pos, part_len, &peer_bounds)?;
                         let source_idx = part_indices[fe];
                         row_results[orig_idx][win_idx] = arg_values[win_idx][source_idx][0].clone();
                     }
@@ -664,9 +735,11 @@ pub(super) fn eval_window_select(
                         let mut acc = SlidingSum::new();
                         let mut prev_start = 0usize;
                         for (pos, &orig_idx) in part_indices.iter().enumerate() {
+                            check_cancel_at(cancel, pos)?;
                             let (fs, fe) = rows_frame_indices(&frame, pos, part_len)?;
                             // Remove expired rows
                             while prev_start < fs {
+                                check_cancel_at(cancel, prev_start)?;
                                 if is_count_star {
                                     acc.count -= 1;
                                 } else {
@@ -681,7 +754,8 @@ pub(super) fn eval_window_select(
                                 let (_, prev_fe) = rows_frame_indices(&frame, pos - 1, part_len)?;
                                 prev_fe + 1
                             };
-                            for add_pos in add_from..=fe {
+                            for (add_iteration, add_pos) in (add_from..=fe).enumerate() {
+                                check_cancel_at(cancel, add_iteration)?;
                                 if is_count_star {
                                     acc.count += 1;
                                 } else {
@@ -698,18 +772,11 @@ pub(super) fn eval_window_select(
                     } else {
                         // Fallback: recompute per row
                         for (pos, &orig_idx) in part_indices.iter().enumerate() {
-                            let part_rows: Vec<Vec<Value>> =
-                                part_indices.iter().map(|&i| rows[i].clone()).collect();
-                            let (fs, fe) = frame_indices(
-                                &frame,
-                                pos,
-                                part_len,
-                                &part_rows,
-                                &spec.order_by,
-                                &col_map,
-                            )?;
+                            check_cancel_at(cancel, pos)?;
+                            let (fs, fe) = frame_indices(&frame, pos, part_len, &peer_bounds)?;
                             let mut acc = SlidingSum::new();
-                            for fpos in fs..=fe {
+                            for (frame_iteration, fpos) in (fs..=fe).enumerate() {
+                                check_cancel_at(cancel, frame_iteration)?;
                                 if is_count_star {
                                     acc.count += 1;
                                 } else {
@@ -727,6 +794,10 @@ pub(super) fn eval_window_select(
                 }
                 "MIN" | "MAX" => {
                     let is_min = upper_name == "MIN";
+                    let value_collation = args
+                        .first()
+                        .and_then(|arg| operand_collation(arg, &col_map))
+                        .unwrap_or_default();
                     if matches!(frame.units, WindowFrameUnits::Rows)
                         && matches!(
                             frame.start,
@@ -737,12 +808,14 @@ pub(super) fn eval_window_select(
                             WindowFrameBound::CurrentRow | WindowFrameBound::Following(_)
                         )
                     {
-                        let mut deque = MonoDeque::new(is_min);
+                        let mut deque = MonoDeque::new(is_min, value_collation);
                         let mut prev_end: Option<usize> = None;
                         for (pos, &orig_idx) in part_indices.iter().enumerate() {
+                            check_cancel_at(cancel, pos)?;
                             let (fs, fe) = rows_frame_indices(&frame, pos, part_len)?;
                             let add_from = prev_end.map(|pe| pe + 1).unwrap_or(fs);
-                            for add_pos in add_from..=fe {
+                            for (add_iteration, add_pos) in (add_from..=fe).enumerate() {
+                                check_cancel_at(cancel, add_iteration)?;
                                 deque.push(
                                     add_pos,
                                     arg_values[win_idx][part_indices[add_pos]][0].clone(),
@@ -755,24 +828,20 @@ pub(super) fn eval_window_select(
                     } else {
                         // Fallback
                         for (pos, &orig_idx) in part_indices.iter().enumerate() {
-                            let part_rows: Vec<Vec<Value>> =
-                                part_indices.iter().map(|&i| rows[i].clone()).collect();
-                            let (fs, fe) = frame_indices(
-                                &frame,
-                                pos,
-                                part_len,
-                                &part_rows,
-                                &spec.order_by,
-                                &col_map,
-                            )?;
+                            check_cancel_at(cancel, pos)?;
+                            let (fs, fe) = frame_indices(&frame, pos, part_len, &peer_bounds)?;
                             let mut result = Value::Null;
-                            for fpos in fs..=fe {
+                            for (frame_iteration, fpos) in (fs..=fe).enumerate() {
+                                check_cancel_at(cancel, frame_iteration)?;
                                 let v = &arg_values[win_idx][part_indices[fpos]][0];
                                 if !v.is_null() {
                                     result = match result {
                                         Value::Null => v.clone(),
                                         ref cur => {
-                                            if (is_min && v < cur) || (!is_min && v > cur) {
+                                            let ordering = value_collation.cmp_value(v, cur);
+                                            if (is_min && ordering.is_lt())
+                                                || (!is_min && ordering.is_gt())
+                                            {
                                                 v.clone()
                                             } else {
                                                 cur.clone()
@@ -809,13 +878,16 @@ pub(super) fn eval_window_select(
             generated_expr: None,
             generated_sql: None,
             generated_kind: None,
-            collation: crate::types::Collation::Binary,
+            collation: slot_collations[i],
         });
     }
 
     for (row_idx, row) in rows.iter_mut().enumerate() {
+        check_cancel_at(cancel, row_idx)?;
         row.extend_from_slice(&row_results[row_idx]);
     }
+
+    ctx.check()?;
 
     let rewritten_stmt = SelectStmt {
         columns: rewritten_columns,
@@ -834,7 +906,11 @@ pub(super) fn eval_window_select(
         having: None,
     };
 
-    super::process_select(&extended_columns, rows, &rewritten_stmt, true)
+    super::process_select(
+        rows,
+        super::SelectCtx::new(&extended_columns, &rewritten_stmt, ctx.cancel)
+            .predicate_applied(true),
+    )
 }
 
 #[cfg(test)]

@@ -305,8 +305,8 @@ impl<'db> ReadTxn<'db> {
         self.snapshot.tree_entries
     }
 
-    /// The table's catalog root in this txn (a lookup, no scan); a version
-    /// stamp.
+    /// The table's catalog root in this transaction (a lookup, no scan).
+    /// Use [`ReadTxn::table_root_stamp`] when allocator reuse must be detected.
     pub fn table_root_page(&self, table: &[u8]) -> Result<Option<PageId>> {
         self.check_cancel()?;
         let root = match self.lookup_table_uncached(table) {
@@ -316,6 +316,21 @@ impl<'db> ReadTxn<'db> {
         };
         self.check_cancel()?;
         Ok(root)
+    }
+
+    /// The table root together with the transaction id stored in that root
+    /// page. Unlike a bare [`PageId`], this stamp does not alias when the page
+    /// allocator later recycles the same physical id for different contents.
+    pub fn table_root_stamp(&mut self, table: &[u8]) -> Result<Option<(PageId, TxnId)>> {
+        self.check_cancel()?;
+        let root = match self.lookup_table(table) {
+            Ok(desc) => desc.root_page,
+            Err(Error::TableNotFound(_)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let root_txn = self.load_page(root)?.txn_id();
+        self.check_cancel()?;
+        Ok(Some((root, root_txn)))
     }
 
     /// List named tables exactly as they exist in this transaction's catalog

@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 fn generate_temp_id() -> u64 {
@@ -24,42 +24,140 @@ use citadel_txn::write_txn::{WriteTxn, WriteTxnSnapshot};
 use crate::error::{Result, SqlError};
 use crate::executor;
 use crate::parser;
-use crate::parser::{BeginAccessMode, QueryBody, SelectQuery, Statement};
+use crate::parser::{BeginAccessMode, Statement};
 use crate::prepared::PreparedStatement;
 use crate::schema::{SchemaManager, SchemaSnapshot};
 use crate::types::{ExecutionResult, QueryResult, TableSchema, Value};
 
 const DEFAULT_CACHE_CAPACITY: usize = 64;
+const DEFERRED_TEMP_DROPS_CACHE_KEY: &str = "citadel-sql:internal:deferred-temp-drops:v1";
+static PENDING_TEMP_DROP_QUEUES: AtomicUsize = AtomicUsize::new(0);
 
-/// On commit, evict shared caches (e.g. ANN indexes) for DML-touched tables,
-/// and stamp each table's last-DML generation marker: an index whose snapshot
-/// predates the marker is refused at lookup and at insert, closing the
-/// build-races-a-commit window that prefix eviction alone leaves open.
-fn invalidate_dml_caches(schema: &SchemaManager, db: &Database) {
-    if !schema.has_dml_dirty() {
+#[derive(Default)]
+struct DeferredTempDrops {
+    names: parking_lot::Mutex<Vec<String>>,
+    pending: AtomicBool,
+}
+
+impl Drop for DeferredTempDrops {
+    fn drop(&mut self) {
+        if self.pending.load(Ordering::Acquire) {
+            PENDING_TEMP_DROP_QUEUES.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Return the per-database TEMP cleanup queue. The shared SQL cache is already
+/// the database-scoped rendezvous point used by independent connections, so it
+/// lets a connection hand cleanup to whichever connection next releases the
+/// single-writer slot.
+fn deferred_temp_drops(db: &Database, create_if_missing: bool) -> Option<Arc<DeferredTempDrops>> {
+    let handle = db.sql_cache_handle();
+    let mut cache = handle.lock();
+    if let Some(entry) = cache.get(DEFERRED_TEMP_DROPS_CACHE_KEY) {
+        if let Ok(pending) = Arc::clone(entry).downcast::<DeferredTempDrops>() {
+            return Some(pending);
+        }
+    }
+    if !create_if_missing {
+        return None;
+    }
+    let pending = Arc::new(DeferredTempDrops::default());
+    cache.insert(
+        DEFERRED_TEMP_DROPS_CACHE_KEY.to_owned(),
+        Arc::clone(&pending) as Arc<dyn std::any::Any + Send + Sync>,
+    );
+    Some(pending)
+}
+
+/// Remove a drained queue from the diagnostic cache surface when nobody else
+/// has already cloned it to enqueue or drain work. A missed removal is benign;
+/// the global pending counter still keeps empty queues off the statement path.
+fn remove_drained_temp_queue(db: &Database, pending: &Arc<DeferredTempDrops>) {
+    if pending.pending.load(Ordering::Acquire) {
         return;
     }
-    let gen = db.manager().commit_generation();
-    let hard_invalidate = |table: &str| {
-        db.sql_cache_invalidate_prefix(&format!("ann:{table}:"));
-        let marker: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(gen);
-        schema
-            .sql_caches
-            .lock()
-            .insert(crate::executor::ann_dml_gen_key(table), marker);
+    let handle = db.sql_cache_handle();
+    let Some(mut cache) = handle.try_lock() else {
+        return;
     };
-
-    let dirty = schema.drain_dml_dirty();
-    for table in &dirty.mutating {
-        hard_invalidate(table);
+    let Some(current) = cache
+        .get(DEFERRED_TEMP_DROPS_CACHE_KEY)
+        .map(Arc::clone)
+        .and_then(|entry| entry.downcast::<DeferredTempDrops>().ok())
+    else {
+        return;
+    };
+    // `cache`, `pending`, and `current` are the three references owned here.
+    // Any fourth reference can be an enqueuer which must keep this queue
+    // reachable until its own drain attempt.
+    if Arc::ptr_eq(&current, pending) && Arc::strong_count(pending) == 3 {
+        cache.remove(DEFERRED_TEMP_DROPS_CACHE_KEY);
     }
-    // A pure append keeps the cached index (recall tail-merges the new rows)
-    // unless it landed at/below an index snapshot.
-    for (table, min_pk) in &dirty.appends {
-        if crate::executor::ann_appends_safe(schema, table, *min_pk) {
-            continue;
+}
+
+/// Make one non-blocking attempt to remove every queued TEMP backing table.
+///
+/// The queue lock is held through the cleanup transaction, and `begin_write`
+/// refuses when a writer is active, so this never waits on what it cleans up.
+fn try_drain_deferred_temp_drops(db: &Database) {
+    // TEMP tables are uncommon. Keep the normal statement path to one atomic
+    // load rather than taking the shared cache mutex twice per statement.
+    if PENDING_TEMP_DROP_QUEUES.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let Some(pending) = deferred_temp_drops(db, false) else {
+        return;
+    };
+    let mut names = pending.names.lock();
+    if names.is_empty() {
+        remove_drained_temp_queue(db, &pending);
+        return;
+    }
+    let Ok(mut wtx) = db.begin_write() else {
+        return;
+    };
+    // Cleanup restores an internal invariant and must not inherit the token
+    // that interrupted the user operation which scheduled it.
+    wtx.set_cancel(None);
+    for name in names.iter() {
+        match wtx.drop_table(name.as_bytes()) {
+            Ok(()) | Err(citadel_core::Error::TableNotFound(_)) => {}
+            Err(_) => {
+                wtx.abort();
+                return;
+            }
         }
-        hard_invalidate(table);
+    }
+    if wtx.commit().is_ok() {
+        names.clear();
+        if pending.pending.swap(false, Ordering::AcqRel) {
+            PENDING_TEMP_DROP_QUEUES.fetch_sub(1, Ordering::AcqRel);
+        }
+        remove_drained_temp_queue(db, &pending);
+    }
+}
+
+fn defer_temp_drops(db: &Database, temp_names: Vec<String>) {
+    let pending = if temp_names.is_empty() {
+        None
+    } else {
+        let pending = deferred_temp_drops(db, true).expect("TEMP cleanup queue was just created");
+        let mut names = pending.names.lock();
+        let was_empty = names.is_empty();
+        names.extend(temp_names);
+        if was_empty && !pending.pending.swap(true, Ordering::AcqRel) {
+            PENDING_TEMP_DROP_QUEUES.fetch_add(1, Ordering::Release);
+        }
+        drop(names);
+        Some(pending)
+    };
+    // Dropping any connection can release the writer which blocked cleanup
+    // queued by a different connection, even when this connection owns no TEMP
+    // tables itself.
+    try_drain_deferred_temp_drops(db);
+    if let Some(pending) = pending {
+        remove_drained_temp_queue(db, &pending);
     }
 }
 
@@ -141,41 +239,24 @@ fn rewrite_show_matviews(sql: &str) -> Option<String> {
     )
 }
 
-fn stmt_mutates(stmt: &Statement) -> bool {
-    if matches!(
-        stmt,
-        Statement::Insert(_)
-            | Statement::Update(_)
-            | Statement::Delete(_)
-            | Statement::Truncate(_)
-            | Statement::CreateTable(_)
-            | Statement::DropTable(_)
-            | Statement::AlterTable(_)
-            | Statement::CreateIndex(_)
-            | Statement::DropIndex(_)
-            | Statement::CreateView(_)
-            | Statement::DropView(_)
-            | Statement::CreateTrigger(_)
-            | Statement::DropTrigger(_)
-            | Statement::CreateMaterializedView(_)
-            | Statement::RefreshMaterializedView(_)
-            | Statement::DropMaterializedView(_)
-    ) {
-        return true;
-    }
-    if let Statement::Select(sq) = stmt {
-        if select_query_has_dml(sq) {
-            return true;
-        }
-    }
-    false
+/// Whether a statement may be refused before it starts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AtTheDoor {
+    /// An ordinary statement: a tripped token stops it before it touches
+    /// anything, which is the only check a statement that never enters a scan
+    /// loop would otherwise get.
+    Refuse,
+    /// Transaction control. It still needs the current token installed, because
+    /// COMMIT is refused by the transaction itself, but refusing it here would
+    /// leave a cancelled connection with no way to close its transaction:
+    /// ROLLBACK is the caller doing exactly what the cancel asked for.
+    Admit,
 }
 
-fn is_txn_control(stmt: &Statement) -> bool {
+fn is_active_txn_control(stmt: &Statement) -> bool {
     matches!(
         stmt,
-        Statement::Begin { .. }
-            | Statement::Commit
+        Statement::Commit
             | Statement::Rollback
             | Statement::Savepoint(_)
             | Statement::ReleaseSavepoint(_)
@@ -183,16 +264,8 @@ fn is_txn_control(stmt: &Statement) -> bool {
     )
 }
 
-fn select_query_has_dml(sq: &SelectQuery) -> bool {
-    sq.ctes.iter().any(|cte| query_body_has_dml(&cte.body)) || query_body_has_dml(&sq.body)
-}
-
-fn query_body_has_dml(body: &QueryBody) -> bool {
-    match body {
-        QueryBody::Insert(_) | QueryBody::Update(_) | QueryBody::Delete(_) => true,
-        QueryBody::Compound(c) => query_body_has_dml(&c.left) || query_body_has_dml(&c.right),
-        QueryBody::Select(_) => false,
-    }
+fn is_txn_control(stmt: &Statement) -> bool {
+    matches!(stmt, Statement::Begin { .. }) || is_active_txn_control(stmt)
 }
 
 fn try_normalize_insert(sql: &str) -> Option<(String, Vec<Value>)> {
@@ -387,6 +460,7 @@ struct SavepointEntry {
 struct SavepointSnapshot {
     wtx_snap: WriteTxnSnapshot,
     schema_snap: SchemaSnapshot,
+    temp_table_names_len: usize,
 }
 
 /// Active transaction held by a Connection. `None` outside BEGIN/COMMIT;
@@ -438,7 +512,14 @@ pub struct Connection<'a> {
 }
 
 impl<'a> Connection<'a> {
+    /// Open a SQL session and load its initial schema. Loading uses a read
+    /// transaction, so an already-tripped token returns `Interrupted`; later
+    /// statements re-read the token at each boundary.
     pub fn open(db: &'a Database) -> Result<Self> {
+        // A previous connection may have closed while another connection held
+        // the single-writer slot. Opening a connection is a deterministic
+        // writer-free retry point, and cleanup ignores the user token.
+        try_drain_deferred_temp_drops(db);
         let schema = SchemaManager::load(db)?;
         let stmt_cache = LruCache::new(NonZeroUsize::new(DEFAULT_CACHE_CAPACITY).unwrap());
         let temp_id = generate_temp_id();
@@ -516,6 +597,20 @@ impl<'a> Connection<'a> {
 
     pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<ExecutionResult> {
         self.with_schema_retry(|inner| inner.execute_params_impl(self.db, sql, params))
+    }
+
+    /// Execute one internal recovery write without inheriting the database's
+    /// cancellation token. Owns and finishes its own write transaction and
+    /// refuses transaction-control or read-only SQL.
+    #[doc(hidden)]
+    pub fn execute_params_uncancelled_recovery(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecutionResult> {
+        self.inner
+            .borrow_mut()
+            .execute_params_uncancelled_recovery(self.db, sql, params)
     }
 
     /// Execute `;`-separated SQL statements. Stops at the first failure.
@@ -607,11 +702,9 @@ impl<'a> Connection<'a> {
         Ok(())
     }
 
-    /// Freeze the ANN index for `table.column` into a persisted segment: one
-    /// write txn scans, builds, serializes, and commits atomically; subsequent
-    /// cold attaches load it (seconds) instead of rebuilding (minutes), with
-    /// the load-time scan re-proving freshness by content. The single writer
-    /// lock is held for the whole build - an offline/builder operation.
+    /// Freeze the ANN index for `table.column` into a persisted segment: build
+    /// off a read snapshot without the writer lock, then verify the non-ABA
+    /// table stamp in a short write transaction before committing.
     /// Refused inside an explicit transaction (it owns its own txn), and for
     /// TEMP tables (their storage bypasses the DDL paths that purge segments).
     pub fn persist_ann_index(
@@ -619,6 +712,9 @@ impl<'a> Connection<'a> {
         table: &str,
         column: &str,
     ) -> Result<crate::executor::AnnSegmentInfo> {
+        if let Some(token) = self.db.cancel_token() {
+            token.check().map_err(SqlError::Storage)?;
+        }
         if self.in_transaction() {
             return Err(SqlError::InvalidValue(
                 "persist_ann_index: not allowed inside an explicit transaction".into(),
@@ -706,6 +802,9 @@ impl<'a> ConnectionInner<'a> {
         if self.active_txn.is_active() {
             return Err(SqlError::TransactionAlreadyActive);
         }
+        if let Some(token) = db.cancel_token() {
+            token.check().map_err(SqlError::Storage)?;
+        }
         let stmts = parser::parse_sql_multi(sql)?;
         if stmts.iter().any(is_txn_control) {
             return Err(SqlError::Unsupported(
@@ -719,40 +818,56 @@ impl<'a> ConnectionInner<'a> {
         self.txn_start_ts = Some(ts);
         crate::datetime::set_txn_clock(Some(ts));
 
-        let mut results = Vec::with_capacity(stmts.len());
-        for stmt in &stmts {
-            match self.dispatch(db, stmt, &[]) {
-                Ok(r) => results.push(r),
-                Err(e) => {
-                    self.abort_active_txn(db);
-                    return Err(e);
-                }
-            }
-        }
-
-        let commit = match self.active_txn.take() {
-            ActiveTxn::Write(mut wtx) => {
-                match crate::executor::helpers::drain_deferred_fk_checks(&mut wtx) {
-                    Ok(()) => wtx.commit().map_err(SqlError::Storage),
+        let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut results = Vec::with_capacity(stmts.len());
+            for stmt in &stmts {
+                match self.dispatch(db, stmt, &[]) {
+                    Ok(r) => results.push(r),
                     Err(e) => {
-                        wtx.abort();
-                        Err(e)
+                        self.abort_active_txn(db);
+                        return Err(e);
                     }
                 }
             }
-            _ => Err(SqlError::NoActiveTransaction),
-        };
-        self.reset_txn_state();
-        match commit {
-            Ok(()) => {
-                invalidate_dml_caches(&self.schema, db);
-                Ok(results)
+
+            let commit = match self.active_txn.take() {
+                ActiveTxn::Write(mut wtx) => {
+                    match crate::executor::helpers::drain_deferred_fk_checks(&mut wtx) {
+                        Ok(()) => {
+                            executor::commit_with_ann_publication(wtx, &self.schema).map(|_| ())
+                        }
+                        Err(e) => {
+                            wtx.abort();
+                            Err(e)
+                        }
+                    }
+                }
+                _ => Err(SqlError::NoActiveTransaction),
+            };
+            self.reset_txn_state();
+            try_drain_deferred_temp_drops(db);
+            match commit {
+                Ok(()) => Ok(results),
+                Err(e) => {
+                    // Past the current generation, not merely reloaded: the batch's
+                    // schema edits were just rolled back, and plans compiled against
+                    // them are still cached under their original generation.
+                    let mut fresh = SchemaManager::load_ignoring_cancel(db)?;
+                    fresh.bump_generation_past(self.schema.generation());
+                    fresh.adopt_temp_aliases(&self.schema);
+                    self.schema = fresh;
+                    Err(e)
+                }
             }
-            Err(e) => {
-                let mut fresh = SchemaManager::load(db)?;
-                fresh.adopt_temp_aliases(&self.schema);
-                self.schema = fresh;
-                Err(e)
+        }));
+        match execution {
+            Ok(result) => result,
+            Err(payload) => {
+                // The batch owns the writer across every statement. If an executor bug
+                // unwinds, release that writer and discard its prefix before preserving the
+                // original panic for the caller.
+                self.abort_active_txn(db);
+                std::panic::resume_unwind(payload)
             }
         }
     }
@@ -767,12 +882,13 @@ impl<'a> ConnectionInner<'a> {
         if let ActiveTxn::Write(wtx) = self.active_txn.take() {
             wtx.abort();
         }
-        if let Ok(mut fresh) = SchemaManager::load(db) {
+        if let Ok(mut fresh) = SchemaManager::load_ignoring_cancel(db) {
             fresh.bump_generation_past(self.schema.generation());
             fresh.adopt_temp_aliases(&self.schema);
             self.schema = fresh;
         }
         self.reset_txn_state();
+        try_drain_deferred_temp_drops(db);
     }
 
     fn execute_params_impl(
@@ -815,6 +931,78 @@ impl<'a> ConnectionInner<'a> {
         self.dispatch(db, &stmt, params)
     }
 
+    fn execute_params_uncancelled_recovery(
+        &mut self,
+        db: &'a Database,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecutionResult> {
+        if self.active_txn.is_active() {
+            return Err(SqlError::TransactionAlreadyActive);
+        }
+        try_drain_deferred_temp_drops(db);
+        let stmt = parser::parse_sql(sql)?;
+        let expected = parser::count_params(&stmt);
+        if expected != params.len() {
+            return Err(SqlError::ParameterCountMismatch {
+                expected,
+                got: params.len(),
+            });
+        }
+        if is_txn_control(&stmt) || !executor::stmt_mutates(&stmt) {
+            return Err(SqlError::Unsupported(
+                "uncancelled recovery execution accepts one mutating statement".into(),
+            ));
+        }
+
+        let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
+        // `begin_write` inherits the handle token. Recovery is the exceptional
+        // case: clear it before the first storage operation.
+        wtx.set_cancel(None);
+        let ts = crate::datetime::txn_or_clock_micros();
+        self.active_txn = ActiveTxn::Write(wtx);
+        self.txn_start_ts = Some(ts);
+        crate::datetime::set_txn_clock(Some(ts));
+
+        let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let outcome = self.dispatch_clocked(db, &stmt, params);
+            let result = match outcome {
+                Ok(value) => match self.active_txn.take() {
+                    ActiveTxn::Write(mut wtx) => {
+                        match crate::executor::helpers::drain_deferred_fk_checks(&mut wtx) {
+                            Ok(()) => executor::commit_with_ann_publication(wtx, &self.schema)
+                                .map(|_| value),
+                            Err(error) => {
+                                wtx.abort();
+                                Err(error)
+                            }
+                        }
+                    }
+                    _ => Err(SqlError::NoActiveTransaction),
+                },
+                Err(error) => {
+                    if let ActiveTxn::Write(wtx) = self.active_txn.take() {
+                        wtx.abort();
+                    }
+                    Err(error)
+                }
+            };
+            self.reset_txn_state();
+            try_drain_deferred_temp_drops(db);
+            result
+        }));
+        match execution {
+            Ok(result) => result,
+            Err(payload) => {
+                // Recovery ignores cancellation, not genuine
+                // executor bugs. Never leave its private transaction or session
+                // state reachable if a caller catches the original unwind.
+                self.abort_active_txn(db);
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
     fn run_compiled(
         &mut self,
         db: &'a Database,
@@ -823,26 +1011,26 @@ impl<'a> ConnectionInner<'a> {
         params: &[Value],
     ) -> Result<ExecutionResult> {
         use executor::compile::ActiveTxnRef;
-        let schema = &self.schema;
-        let exec = || {
-            if params.is_empty() {
-                plan.execute(db, schema, stmt, params, ActiveTxnRef::None)
-            } else {
-                crate::eval::with_scoped_params(params, || {
+        self.guarded(db, AtTheDoor::Refuse, stmt, |conn| {
+            let schema = &conn.schema;
+            let exec = || {
+                if params.is_empty() {
                     plan.execute(db, schema, stmt, params, ActiveTxnRef::None)
-                })
+                } else {
+                    crate::eval::with_scoped_params(params, || {
+                        plan.execute(db, schema, stmt, params, ActiveTxnRef::None)
+                    })
+                }
+            };
+            if plan.needs_txn_clock() {
+                let cached_ts = conn
+                    .txn_start_ts
+                    .or_else(|| Some(crate::datetime::now_micros()));
+                crate::datetime::with_txn_clock(cached_ts, exec)
+            } else {
+                exec()
             }
-        };
-        let outcome = if plan.needs_txn_clock() {
-            let cached_ts = self
-                .txn_start_ts
-                .or_else(|| Some(crate::datetime::now_micros()));
-            crate::datetime::with_txn_clock(cached_ts, exec)
-        } else {
-            exec()
-        }?;
-        invalidate_dml_caches(&self.schema, db);
-        Ok(outcome)
+        })
     }
 
     pub(crate) fn parse_and_cache(
@@ -913,9 +1101,6 @@ impl<'a> ConnectionInner<'a> {
             if self.active_txn.is_none() {
                 return self.run_compiled(db, plan, stmt, params);
             }
-            if !self.savepoint_stack.is_empty() && stmt_mutates(stmt) {
-                self.capture_pending_snapshots();
-            }
             return self.run_compiled_in_txn(db, plan, stmt, params);
         }
         self.dispatch(db, stmt, params)
@@ -929,20 +1114,143 @@ impl<'a> ConnectionInner<'a> {
         params: &[Value],
     ) -> Result<ExecutionResult> {
         use executor::compile::ActiveTxnRef;
-        let schema = &self.schema;
-        let txn = match &mut self.active_txn {
-            ActiveTxn::Write(wtx) => ActiveTxnRef::Write(wtx),
-            ActiveTxn::Read(rtx) => ActiveTxnRef::Read(rtx),
-            ActiveTxn::None => ActiveTxnRef::None,
-        };
-        if params.is_empty() || !plan.uses_scoped_params() {
-            plan.execute(db, schema, stmt, params, txn)
-        } else {
-            crate::eval::with_scoped_params(params, || plan.execute(db, schema, stmt, params, txn))
+        self.guarded(db, AtTheDoor::Refuse, stmt, |conn| {
+            // The guard installs and checks the current token before this
+            // closure runs. A refused prepared mutation must not advance
+            // the write transaction just because a savepoint is pending.
+            if !conn.savepoint_stack.is_empty() && executor::stmt_mutates(stmt) {
+                conn.capture_pending_snapshots();
+            }
+            let schema = &conn.schema;
+            let txn = match &mut conn.active_txn {
+                ActiveTxn::Write(wtx) => ActiveTxnRef::Write(wtx),
+                ActiveTxn::Read(rtx) => ActiveTxnRef::Read(rtx),
+                ActiveTxn::None => ActiveTxnRef::None,
+            };
+            if params.is_empty() || !plan.uses_scoped_params() {
+                plan.execute(db, schema, stmt, params, txn)
+            } else {
+                crate::eval::with_scoped_params(params, || {
+                    plan.execute(db, schema, stmt, params, txn)
+                })
+            }
+        })
+    }
+
+    /// Install and check cancellation around one statement, and refuse an
+    /// explicit transaction when any mutating statement leaves a prefix. All
+    /// three lanes call this; guarding one leaves the others unguarded.
+    fn guarded<F>(
+        &mut self,
+        db: &'a Database,
+        door: AtTheDoor,
+        stmt: &Statement,
+        run: F,
+    ) -> Result<ExecutionResult>
+    where
+        F: FnOnce(&mut Self) -> Result<ExecutionResult>,
+    {
+        // Retry before the statement so a tripped user token cannot strand
+        // internal cleanup. If this connection owns the writer, the bounded
+        // attempt simply defers until the post-statement retry below.
+        try_drain_deferred_temp_drops(db);
+        // Re-read per statement rather than captured at BEGIN. An explicit
+        // transaction outlives many statements, so a token installed after it
+        // opened would never reach it, and the token it opened with would go on
+        // cancelling statements the caller has since moved past.
+        let token = db.cancel_token();
+        let mutates = executor::stmt_mutates(stmt);
+        let explicit = door == AtTheDoor::Refuse && self.active_txn.is_active();
+        if door == AtTheDoor::Refuse {
+            if let Some(wtx) = self.active_txn.as_write_mut() {
+                wtx.check_usable().map_err(SqlError::Storage)?;
+            }
         }
+        match &mut self.active_txn {
+            ActiveTxn::Write(wtx) => wtx.set_cancel(token.clone()),
+            ActiveTxn::Read(rtx) => rtx.set_cancel(token.clone()),
+            ActiveTxn::None => {}
+        }
+        // At the door, because not every statement reaches a scan loop.
+        if door == AtTheDoor::Refuse {
+            if let Some(t) = &token {
+                t.check().map_err(SqlError::Storage)?;
+            }
+        }
+        let mutation_marker = if explicit && mutates {
+            self.active_txn
+                .as_write_mut()
+                .map(|wtx| wtx.mutation_marker())
+        } else {
+            None
+        };
+        let timezone_before = if explicit && matches!(stmt, Statement::SetTimezone(_)) {
+            Some(self.session_timezone.clone())
+        } else {
+            None
+        };
+        let mut outcome = if mutation_marker.is_some() {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(self))) {
+                Ok(outcome) => outcome,
+                Err(payload) => {
+                    // A callback can panic between an in-place write and the
+                    // transaction's mutation counter advancing. Any panic from
+                    // an explicit mutator therefore poisons conservatively.
+                    if let Some(wtx) = self.active_txn.as_write_mut() {
+                        wtx.mark_failed();
+                    }
+                    std::panic::resume_unwind(payload)
+                }
+            }
+        } else {
+            run(self)
+        };
+        // An explicit transaction has not committed, so a late cancel can still
+        // be reported and the transaction refused. Autocommit is excluded:
+        // checking after its commit would flag a write that is already durable.
+        if explicit && outcome.is_ok() {
+            if let Some(t) = &token {
+                if let Err(err) = t.check() {
+                    if let Some(timezone) = timezone_before {
+                        self.session_timezone = timezone;
+                    }
+                    outcome = Err(SqlError::Storage(err));
+                }
+            }
+        }
+        // A failed statement with a changed marker left a prefix in its
+        // explicit transaction. Errors before the first write remain
+        // recoverable; autocommit has already committed or aborted internally.
+        if let Some(marker) = mutation_marker {
+            if let (Err(error), Some(wtx)) = (&outcome, self.active_txn.as_write_mut()) {
+                if wtx.mutated_since(marker) {
+                    executor::mark_write_statement_failed(wtx, error);
+                }
+            }
+        }
+        // COMMIT/ROLLBACK and autocommit statements may have released the
+        // writer which made an earlier connection's destructor defer cleanup.
+        try_drain_deferred_temp_drops(db);
+        outcome
     }
 
     pub(crate) fn dispatch(
+        &mut self,
+        db: &'a Database,
+        stmt: &Statement,
+        params: &[Value],
+    ) -> Result<ExecutionResult> {
+        let door = if is_active_txn_control(stmt) {
+            AtTheDoor::Admit
+        } else {
+            AtTheDoor::Refuse
+        };
+        self.guarded(db, door, stmt, |conn| {
+            conn.dispatch_clocked(db, stmt, params)
+        })
+    }
+
+    fn dispatch_clocked(
         &mut self,
         db: &'a Database,
         stmt: &Statement,
@@ -987,24 +1295,46 @@ impl<'a> ConnectionInner<'a> {
                 Ok(ExecutionResult::Ok)
             }
             Statement::Commit => {
-                match self.active_txn.take() {
+                let outcome = match self.active_txn.take() {
                     ActiveTxn::None => return Err(SqlError::NoActiveTransaction),
                     ActiveTxn::Write(mut wtx) => {
-                        crate::executor::helpers::drain_deferred_fk_checks(&mut wtx)?;
-                        wtx.commit().map_err(SqlError::Storage)?;
-                        invalidate_dml_caches(&self.schema, db);
+                        match crate::executor::helpers::drain_deferred_fk_checks(&mut wtx) {
+                            Ok(()) => {
+                                executor::commit_with_ann_publication(wtx, &self.schema).map(|_| ())
+                            }
+                            Err(e) => {
+                                wtx.abort();
+                                Err(e)
+                            }
+                        }
                     }
-                    ActiveTxn::Read(_rtx) => {}
-                }
+                    ActiveTxn::Read(_rtx) => Ok(()),
+                };
+                // A refused COMMIT ends the transaction as surely as a
+                // successful one, so returning early would strand the frozen
+                // clock, savepoint stack and rolled-back schema edits.
                 self.reset_txn_state();
-                Ok(ExecutionResult::Ok)
+                match outcome {
+                    Ok(()) => Ok(ExecutionResult::Ok),
+                    Err(e) => {
+                        // Past the current generation: transactional schema
+                        // edits were just rolled back, and plans compiled
+                        // against them are still cached under the generation
+                        // they were written at.
+                        let mut fresh = SchemaManager::load_ignoring_cancel(db)?;
+                        fresh.bump_generation_past(self.schema.generation());
+                        fresh.adopt_temp_aliases(&self.schema);
+                        self.schema = fresh;
+                        Err(e)
+                    }
+                }
             }
             Statement::Rollback => {
                 match self.active_txn.take() {
                     ActiveTxn::None => return Err(SqlError::NoActiveTransaction),
                     ActiveTxn::Write(wtx) => {
                         wtx.abort();
-                        let mut fresh = SchemaManager::load(db)?;
+                        let mut fresh = SchemaManager::load_ignoring_cancel(db)?;
                         fresh.bump_generation_past(self.schema.generation());
                         fresh.adopt_temp_aliases(&self.schema);
                         self.schema = fresh;
@@ -1035,6 +1365,9 @@ impl<'a> ConnectionInner<'a> {
                     }
                     return Err(SqlError::TableAlreadyExists(user_name));
                 }
+                if self.active_txn.as_write_mut().is_some() {
+                    self.capture_pending_snapshots();
+                }
                 let mut clone = ct.clone();
                 clone.name = prefixed.clone();
                 clone.temporary = false;
@@ -1055,15 +1388,14 @@ impl<'a> ConnectionInner<'a> {
                 executor::exec_insert_in_txn(wtx, &self.schema, ins, params)
             }
             _ => {
-                if self.active_txn.is_read_only() && stmt_mutates(stmt) {
+                if self.active_txn.is_read_only() && executor::stmt_mutates(stmt) {
                     return Err(SqlError::Unsupported(
                         "cannot execute mutating statement inside a read-only transaction".into(),
                     ));
                 }
-                if self.active_txn.as_write_mut().is_some() && stmt_mutates(stmt) {
+                if self.active_txn.as_write_mut().is_some() && executor::stmt_mutates(stmt) {
                     self.capture_pending_snapshots();
                 }
-                let was_auto_commit = matches!(self.active_txn, ActiveTxn::None);
                 let outcome = match &mut self.active_txn {
                     ActiveTxn::Write(wtx) => {
                         executor::execute_in_txn(wtx, &mut self.schema, stmt, params)?
@@ -1073,9 +1405,6 @@ impl<'a> ConnectionInner<'a> {
                     }
                     ActiveTxn::None => executor::execute(db, &mut self.schema, stmt, params)?,
                 };
-                if was_auto_commit {
-                    invalidate_dml_caches(&self.schema, db);
-                }
                 if let Statement::DropTable(dt) = stmt {
                     self.schema.unregister_temp_alias(&dt.name);
                 }
@@ -1116,18 +1445,21 @@ impl<'a> ConnectionInner<'a> {
         };
         let wtx_snap = wtx.begin_savepoint();
         let schema_snap = self.schema.save_snapshot();
+        let temp_table_names_len = self.temp_table_names.len();
 
         for i in 0..last_pending {
             if self.savepoint_stack[i].snapshot.is_none() {
                 self.savepoint_stack[i].snapshot = Some(SavepointSnapshot {
                     wtx_snap: wtx_snap.clone(),
                     schema_snap: schema_snap.clone(),
+                    temp_table_names_len,
                 });
             }
         }
         self.savepoint_stack[last_pending].snapshot = Some(SavepointSnapshot {
             wtx_snap,
             schema_snap,
+            temp_table_names_len,
         });
     }
 
@@ -1170,6 +1502,8 @@ impl<'a> ConnectionInner<'a> {
         };
         wtx.restore_snapshot(snapshot.wtx_snap);
         self.schema.restore_snapshot(snapshot.schema_snap);
+        self.temp_table_names
+            .truncate(snapshot.temp_table_names_len);
 
         Ok(ExecutionResult::Ok)
     }
@@ -1177,16 +1511,18 @@ impl<'a> ConnectionInner<'a> {
 
 impl<'a> Drop for Connection<'a> {
     fn drop(&mut self) {
-        let temp_names = std::mem::take(&mut self.inner.borrow_mut().temp_table_names);
-        if temp_names.is_empty() {
-            return;
-        }
-        if let Ok(mut wtx) = self.db.begin_write() {
-            for prefixed in &temp_names {
-                let _ = wtx.drop_table(prefixed.as_bytes());
-            }
-            let _ = wtx.commit();
-        }
+        let (temp_names, active_txn) = {
+            let mut inner = self.inner.borrow_mut();
+            (
+                std::mem::take(&mut inner.temp_table_names),
+                inner.active_txn.take(),
+            )
+        };
+        // An explicit transaction owns the single-writer slot; drop it first or
+        // begin_write fails and leaves TEMP tables behind. Dropping also aborts
+        // uncommitted work, which is the expected close behavior.
+        drop(active_txn);
+        defer_temp_drops(self.db, temp_names);
     }
 }
 
@@ -1201,6 +1537,315 @@ mod tests {
             .argon2_profile(Argon2Profile::Iot)
             .create()
             .unwrap()
+    }
+
+    fn install_sorting_insert_trigger(conn: &Connection<'_>) {
+        conn.execute("CREATE TABLE sort_input (id INTEGER PRIMARY KEY, label TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO sort_input VALUES (1, 'charlie'), (2, 'alpha'), (3, 'bravo')")
+            .unwrap();
+        conn.execute("CREATE TABLE sort_sink (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER sort_after_insert AFTER INSERT ON sort_sink FOR EACH ROW \
+             BEGIN SELECT label FROM sort_input ORDER BY label; END",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_refused_prepared_mutator_does_not_capture_a_pending_savepoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'before')").unwrap();
+        let update = conn
+            .prepare("UPDATE t SET value = $1 WHERE id = $2")
+            .unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        let token = citadel::CancelToken::new();
+        token.cancel();
+        db.set_cancel(Some(token));
+        let error = update
+            .execute(&[Value::Text("after".into()), Value::Integer(1)])
+            .expect_err("the prepared update ignored cancellation");
+        assert!(matches!(
+            error,
+            SqlError::Storage(citadel_core::Error::Interrupted)
+        ));
+        assert!(conn.inner.borrow().savepoint_stack[0].snapshot.is_none());
+
+        db.set_cancel(None);
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    #[cfg(panic = "unwind")]
+    fn assert_injected_sort_panic(payload: Box<dyn std::any::Any + Send>) {
+        assert!(
+            payload.is::<crate::executor::helpers::InjectedSortComparatorPanic>(),
+            "the executor replaced the comparator's panic payload"
+        );
+    }
+
+    /// A row is durable in the in-memory write set before its AFTER trigger
+    /// runs. If that trigger's sort has a genuine comparator bug, catching the
+    /// unwind must not turn the row prefix into a committable transaction.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn an_unwinding_sort_poisons_its_explicit_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        install_sorting_insert_trigger(&conn);
+        conn.execute("BEGIN").unwrap();
+
+        let injection = crate::executor::helpers::inject_sort_comparator_panic();
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = conn.execute("INSERT INTO sort_sink VALUES (1)");
+        }))
+        .expect_err("the injected comparator panic did not surface");
+        drop(injection);
+        assert_injected_sort_panic(payload);
+
+        let commit = conn
+            .execute("COMMIT")
+            .expect_err("the unwound row prefix remained committable");
+        assert!(matches!(
+            commit,
+            SqlError::Storage(citadel_core::Error::TransactionFailed)
+        ));
+
+        drop(conn);
+        drop(db);
+        let reopened = DatabaseBuilder::new(dir.path().join("t.db"))
+            .passphrase(b"test-passphrase")
+            .argon2_profile(Argon2Profile::Iot)
+            .open()
+            .unwrap();
+        let observer = Connection::open(&reopened).unwrap();
+        let count = observer.query("SELECT COUNT(*) FROM sort_sink").unwrap();
+        assert_eq!(count.rows[0][0], Value::Integer(0));
+    }
+
+    /// The recovery escape hatch owns a private transaction. A genuine
+    /// executor panic must abort that transaction and restore the connection
+    /// before the same panic payload is resumed to its caller.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn an_unwinding_uncancelled_recovery_write_does_not_strand_its_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        install_sorting_insert_trigger(&conn);
+
+        let injection = crate::executor::helpers::inject_sort_comparator_panic();
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ =
+                conn.execute_params_uncancelled_recovery("INSERT INTO sort_sink VALUES (1)", &[]);
+        }))
+        .expect_err("the injected comparator panic did not surface");
+        drop(injection);
+        assert_injected_sort_panic(payload);
+
+        assert!(!conn.in_transaction(), "recovery left its writer installed");
+        assert!(matches!(
+            conn.execute("COMMIT"),
+            Err(SqlError::NoActiveTransaction)
+        ));
+        let count = conn.query("SELECT COUNT(*) FROM sort_sink").unwrap();
+        assert_eq!(count.rows[0][0], Value::Integer(0));
+    }
+
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn an_unwinding_batch_aborts_its_private_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        install_sorting_insert_trigger(&conn);
+
+        let injection = crate::executor::helpers::inject_sort_comparator_panic();
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = conn.execute_batch("INSERT INTO sort_sink VALUES (1)");
+        }))
+        .expect_err("the injected comparator panic did not surface");
+        drop(injection);
+        assert_injected_sort_panic(payload);
+
+        assert!(!conn.in_transaction(), "batch left its writer installed");
+        assert!(matches!(
+            conn.execute("COMMIT"),
+            Err(SqlError::NoActiveTransaction)
+        ));
+        conn.execute("INSERT INTO sort_sink VALUES (2)").unwrap();
+        let rows = conn.query("SELECT id FROM sort_sink").unwrap().rows;
+        assert_eq!(rows, vec![vec![Value::Integer(2)]]);
+    }
+
+    #[test]
+    fn a_pre_cancelled_batch_stops_before_parsing_or_taking_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        let token = citadel::CancelToken::new();
+        token.cancel();
+        db.set_cancel(Some(token));
+
+        let error = conn
+            .execute_batch("this is deliberately not sql")
+            .expect_err("the pre-cancelled batch reached the parser");
+        assert!(matches!(
+            error,
+            SqlError::Storage(citadel_core::Error::Interrupted)
+        ));
+        assert!(!conn.in_transaction());
+
+        db.set_cancel(None);
+        conn.execute_batch("CREATE TABLE after_cancel (id INTEGER PRIMARY KEY)")
+            .unwrap();
+    }
+
+    /// The two public executor entry points can be called without a Connection,
+    /// so each must apply the same unwind poisoning on its own.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn direct_mutating_executor_entries_poison_on_unwind() {
+        for direct_insert in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = fresh_db(dir.path());
+            let conn = Connection::open(&db).unwrap();
+            install_sorting_insert_trigger(&conn);
+            drop(conn);
+
+            let mut schema = SchemaManager::load(&db).unwrap();
+            let mut wtx = db.begin_write().unwrap();
+            let stmt = parser::parse_sql("INSERT INTO sort_sink VALUES (1)").unwrap();
+            let injection = crate::executor::helpers::inject_sort_comparator_panic();
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if direct_insert {
+                    let Statement::Insert(insert) = &stmt else {
+                        unreachable!("the test parsed an INSERT")
+                    };
+                    let _ = crate::executor::exec_insert_in_txn(&mut wtx, &schema, insert, &[]);
+                } else {
+                    let _ = crate::executor::execute_in_txn(&mut wtx, &mut schema, &stmt, &[]);
+                }
+            }))
+            .expect_err("the injected comparator panic did not surface");
+            drop(injection);
+            assert_injected_sort_panic(payload);
+            assert!(matches!(
+                wtx.commit(),
+                Err(citadel_core::Error::TransactionFailed)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_tripped_token_does_not_strand_temp_storage_on_connection_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TEMPORARY TABLE tmp (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let physical_name = conn.inner.borrow().temp_table_names[0].clone();
+        conn.execute("BEGIN").unwrap();
+
+        let token = citadel::CancelToken::new();
+        token.cancel();
+        db.set_cancel(Some(token));
+        drop(conn);
+        db.set_cancel(None);
+
+        let observer = Connection::open(&db).unwrap();
+        let err = observer
+            .query(&format!("SELECT * FROM {physical_name}"))
+            .expect_err("cancelled connection drop left its TEMP backing table behind");
+        assert!(
+            matches!(
+                err,
+                crate::SqlError::TableNotFound(_)
+                    | crate::SqlError::Storage(citadel_core::Error::TableNotFound(_))
+            ),
+            "unexpected lookup error for cleaned TEMP backing table: {err:?}"
+        );
+    }
+
+    #[test]
+    fn deferred_temp_cleanup_drains_after_the_competing_writer_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let temp_owner = Connection::open(&db).unwrap();
+        temp_owner
+            .execute("CREATE TEMPORARY TABLE tmp (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let physical_name = temp_owner.inner.borrow().temp_table_names[0].clone();
+
+        let writer = Connection::open(&db).unwrap();
+        writer.execute("BEGIN").unwrap();
+        drop(temp_owner);
+
+        writer.execute("COMMIT").unwrap();
+
+        let mut read = db.begin_read();
+        assert!(
+            matches!(
+                read.table_entry_count(physical_name.as_bytes()),
+                Err(citadel_core::Error::TableNotFound(_))
+            ),
+            "COMMIT must drain the cleanup queued behind its writer slot"
+        );
+        drop(read);
+
+        let observer = Connection::open(&db).unwrap();
+        let err = observer
+            .query(&format!("SELECT * FROM {physical_name}"))
+            .expect_err("the next writer-release boundary must drain deferred TEMP cleanup");
+        assert!(
+            matches!(
+                err,
+                crate::SqlError::TableNotFound(_)
+                    | crate::SqlError::Storage(citadel_core::Error::TableNotFound(_))
+            ),
+            "unexpected lookup error for cleaned TEMP backing table: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_write_transaction_is_not_misreported_as_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("BEGIN").unwrap();
+
+        let injected = {
+            let mut inner = conn.inner.borrow_mut();
+            let wtx = inner.active_txn.as_write_mut().unwrap();
+            wtx.table_update_range(b"t", b"", |_key, _value| {
+                Err::<Option<bool>, _>(citadel_core::Error::DatabaseCorrupted)
+            })
+            .unwrap_err()
+        };
+        assert!(matches!(injected, citadel_core::Error::DatabaseCorrupted));
+
+        let next = conn.query("SELECT 1").unwrap_err();
+        assert!(matches!(
+            next,
+            SqlError::Storage(citadel_core::Error::TransactionFailed)
+        ));
+        let commit = conn.execute("COMMIT").unwrap_err();
+        assert!(matches!(
+            commit,
+            SqlError::Storage(citadel_core::Error::TransactionFailed)
+        ));
+        assert!(!conn.in_transaction());
     }
 
     /// The streaming dedup key is the whole encoded row key, so a composite primary key made

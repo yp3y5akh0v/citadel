@@ -534,6 +534,18 @@ fn prepare_readonly_flag() {
         .prepare("DELETE FROM users WHERE id = $1")
         .unwrap()
         .readonly());
+
+    let dml_cte = "WITH d AS (DELETE FROM users WHERE id = 1 RETURNING *) SELECT * FROM d";
+    assert!(!conn.prepare(dml_cte).unwrap().readonly());
+    assert!(!conn
+        .prepare(&format!("EXPLAIN ANALYZE {dml_cte}"))
+        .unwrap()
+        .readonly());
+    assert!(conn
+        .prepare(&format!("EXPLAIN {dml_cte}"))
+        .unwrap()
+        .readonly());
+    assert!(!conn.prepare("BEGIN").unwrap().readonly());
 }
 
 #[test]

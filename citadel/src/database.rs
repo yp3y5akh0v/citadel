@@ -6,13 +6,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use citadel_core::{Error, Result, KEY_FILE_SIZE, KEY_SIZE, MERKLE_HASH_SIZE, WRAPPED_KEY_SIZE};
+use citadel_core::{
+    CancelToken, Error, Result, KEY_FILE_SIZE, KEY_SIZE, MERKLE_HASH_SIZE, WRAPPED_KEY_SIZE,
+};
 use citadel_crypto::hkdf_utils::RegionWrapKeys;
 use citadel_io::durable;
 #[cfg(not(target_arch = "wasm32"))]
 use citadel_io::mmap_io::MmapPageIO;
 use citadel_txn::integrity::IntegrityReport;
-use citadel_txn::manager::TxnManager;
+use citadel_txn::manager::{ScanMeasurement, TxnManager};
 use citadel_txn::read_txn::ReadTxn;
 use citadel_txn::write_txn::WriteTxn;
 use parking_lot::Mutex;
@@ -135,6 +137,8 @@ pub struct Database {
     key_lifecycle: Mutex<()>,
     /// Bumped before key destruction and rewrites; caches refuse older-epoch plaintext.
     cache_epoch: AtomicU64,
+    /// Token cloned into transactions and consulted by non-transactional fast paths.
+    cancel: Mutex<Option<CancelToken>>,
     /// Test-only hook fired as a destruction wrapper reaches the acquisition boundary.
     #[cfg(any(test, feature = "test-util"))]
     destruction_acquire_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -176,6 +180,7 @@ impl Database {
             atom_store: Mutex::new(None),
             key_lifecycle: Mutex::new(()),
             cache_epoch: AtomicU64::new(0),
+            cancel: Mutex::new(None),
             #[cfg(any(test, feature = "test-util"))]
             destruction_acquire_hook: Mutex::new(None),
         }
@@ -200,6 +205,7 @@ impl Database {
             atom_store: Mutex::new(None),
             key_lifecycle: Mutex::new(()),
             cache_epoch: AtomicU64::new(0),
+            cancel: Mutex::new(None),
             #[cfg(any(test, feature = "test-util"))]
             destruction_acquire_hook: Mutex::new(None),
         }
@@ -270,13 +276,49 @@ impl Database {
     }
 
     /// Begin a read-only transaction with snapshot isolation.
+    ///
+    /// The transaction clones the currently installed cancellation token.
+    /// Replacing the handle token later does not retarget an open transaction;
+    /// install the desired token before this call or use [`ReadTxn::set_cancel`].
     pub fn begin_read(&self) -> ReadTxn<'_> {
-        self.manager.begin_read()
+        let mut txn = self.manager.begin_read();
+        txn.set_cancel(self.cancel.lock().clone());
+        txn
     }
 
     /// Begin a read-write transaction. Only one can be active at a time.
+    ///
+    /// The transaction clones the currently installed cancellation token.
+    /// Replacing the handle token later does not retarget an open transaction;
+    /// install the desired token before this call or use [`WriteTxn::set_cancel`].
     pub fn begin_write(&self) -> Result<WriteTxn<'_>> {
-        self.manager.begin_write()
+        let mut txn = self.manager.begin_write()?;
+        txn.set_cancel(self.cancel.lock().clone());
+        Ok(txn)
+    }
+
+    /// Install the token cloned by future transactions and checked by work
+    /// that can complete without opening a transaction. `None` clears it.
+    /// Existing raw transactions retain the token they already cloned.
+    pub fn set_cancel(&self, token: Option<CancelToken>) {
+        *self.cancel.lock() = token;
+    }
+
+    /// Clone the currently installed cancellation token.
+    pub fn cancel_token(&self) -> Option<CancelToken> {
+        self.cancel.lock().clone()
+    }
+
+    /// Database-wide storage entries examined since this database opened.
+    /// This is monotonic telemetry across all connections and threads.
+    pub fn rows_scanned(&self) -> u64 {
+        self.manager.rows_scanned()
+    }
+
+    /// Begin an operation-local scan measurement on the current thread.
+    /// The returned RAII guard reports the work done until it is dropped.
+    pub fn measure_scans(&self) -> ScanMeasurement {
+        self.manager.measure_scans()
     }
 
     /// Get database statistics from the current commit slot.
@@ -592,7 +634,8 @@ impl Database {
     }
 
     pub fn integrity_check(&self) -> Result<IntegrityReport> {
-        let report = self.manager.integrity_check()?;
+        let cancel = self.cancel_token();
+        let report = self.manager.integrity_check_with_cancel(cancel.as_ref())?;
 
         #[cfg(feature = "audit-log")]
         {

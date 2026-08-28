@@ -1,7 +1,7 @@
 use super::*;
 use crate::eval::ColumnMap;
 use crate::parser::{BinOp, Expr, GeneratedKind, SelectColumn};
-use crate::types::{Collation, ColumnDef, DataType, TableSchema, Value};
+use crate::types::{Collation, ColumnDef, DataType, IndexDef, IndexKey, TableSchema, Value};
 
 fn col(name: &str, dt: DataType) -> ColumnDef {
     ColumnDef {
@@ -40,6 +40,145 @@ fn schema(name: &str, cs: Vec<ColumnDef>, pk: Vec<u16>) -> TableSchema {
 
 fn i(n: i64) -> Value {
     Value::Integer(n)
+}
+
+#[test]
+fn posting_lists_sort_by_length_stably() {
+    let lists = vec![vec![1, 2], vec![3], vec![4, 5], vec![]];
+    assert_eq!(
+        sort_lists_by_len(lists, None).unwrap(),
+        vec![vec![], vec![3], vec![1, 2], vec![4, 5]]
+    );
+}
+
+#[test]
+fn posting_list_sort_honours_a_pre_cancelled_token() {
+    let token = citadel::CancelToken::new();
+    token.cancel();
+    let error = sort_lists_by_len(vec![vec![1], vec![]], Some(&token)).unwrap_err();
+    assert!(matches!(
+        error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+}
+
+#[test]
+fn scalar_to_tsvector_observes_cancellation_inside_one_value() {
+    use citadel::{Argon2Profile, CancelToken, DatabaseBuilder};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseBuilder::new(dir.path().join("scalar-fts-value-cancel.citadel"))
+        .passphrase(b"scalar-fts-value-cancel-passphrase")
+        .argon2_profile(Argon2Profile::Iot)
+        .create()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    let token = CancelToken::new();
+    db.set_cancel(Some(token.clone()));
+    let text = "searchable ".repeat(CANCEL_CHECK_INTERVAL * 4);
+    let _cancel = crate::fts::cancel_tokenize_after(token, CANCEL_CHECK_INTERVAL + 1);
+
+    let error = conn
+        .query_params("SELECT to_tsvector($1)", &[Value::Text(text.into())])
+        .expect_err("scalar tokenization completed after the in-value hook tripped");
+
+    assert!(matches!(
+        error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+}
+
+#[test]
+fn implicit_text_match_observes_cancellation_inside_vectorization() {
+    use citadel::{Argon2Profile, CancelToken, DatabaseBuilder};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseBuilder::new(dir.path().join("implicit-fts-match-cancel.citadel"))
+        .passphrase(b"implicit-fts-match-cancel-passphrase")
+        .argon2_profile(Argon2Profile::Iot)
+        .create()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    let token = CancelToken::new();
+    db.set_cancel(Some(token.clone()));
+    let text = "searchable ".repeat(CANCEL_CHECK_INTERVAL * 4);
+    // The short right-hand query is evaluated first; trip only once the
+    // implicit TEXT -> TSVECTOR conversion has begun.
+    let _cancel = crate::fts::cancel_tokenize_after(token, CANCEL_CHECK_INTERVAL + 64);
+
+    let error = conn
+        .query_params(
+            "SELECT $1 @@ plainto_tsquery('searchable')",
+            &[Value::Text(text.into())],
+        )
+        .expect_err("implicit vectorization ignored in-value cancellation");
+
+    assert!(matches!(
+        error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+}
+
+#[test]
+fn cancelled_fts_value_update_cannot_commit_a_partial_index_change() {
+    use citadel::{Argon2Profile, CancelToken, DatabaseBuilder};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseBuilder::new(dir.path().join("fts-value-cancel.citadel"))
+        .passphrase(b"fts-value-cancel-passphrase")
+        .argon2_profile(Argon2Profile::Iot)
+        .create()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts (body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'original marker')")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+
+    let token = CancelToken::new();
+    db.set_cancel(Some(token.clone()));
+    let replacement = "replacement ".repeat(CANCEL_CHECK_INTERVAL * 4);
+    let error = {
+        // The old index value is extracted first. The hook trips only after
+        // that deletion and the base-row update, inside the replacement text.
+        let _cancel = crate::fts::cancel_tokenize_after(token, CANCEL_CHECK_INTERVAL + 64);
+        conn.execute_params(
+            "UPDATE docs SET body = $1 WHERE id = 1",
+            &[Value::Text(replacement.into())],
+        )
+        .expect_err("the large FTS value ignored its in-value cancellation")
+    };
+    assert!(matches!(
+        error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+
+    // A cleared handle token cannot make the interrupted transaction
+    // committable again.
+    db.set_cancel(None);
+    let commit_error = conn
+        .execute("COMMIT")
+        .expect_err("the partially updated transaction remained committable");
+    assert!(matches!(
+        commit_error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+    drop(conn);
+
+    let conn = crate::Connection::open(&db).unwrap();
+    let row = conn.query("SELECT body FROM docs WHERE id = 1").unwrap();
+    assert_eq!(row.rows, vec![vec![Value::Text("original marker".into())]]);
+    let old_hit = conn
+        .query("SELECT id FROM docs WHERE body @@ to_tsquery('original')")
+        .unwrap();
+    assert_eq!(old_hit.rows, vec![vec![Value::Integer(1)]]);
+    let replacement_hit = conn
+        .query("SELECT id FROM docs WHERE body @@ to_tsquery('replacement')")
+        .unwrap();
+    assert!(replacement_hit.rows.is_empty());
 }
 
 #[test]
@@ -376,7 +515,7 @@ fn materialize_virtual_evaluates_generated_columns() {
         vec![0],
     );
     let mut row = vec![i(7), Value::Null];
-    materialize_virtual(&ts, &mut row).unwrap();
+    materialize_virtual_with_cancel(&ts, &mut row, None).unwrap();
     assert_eq!(row[1], i(14));
 }
 
@@ -388,16 +527,162 @@ fn materialize_virtual_no_op_when_no_virtual_columns() {
         vec![0],
     );
     let mut row = vec![i(1), i(2)];
-    materialize_virtual(&ts, &mut row).unwrap();
+    materialize_virtual_with_cancel(&ts, &mut row, None).unwrap();
     assert_eq!(row, vec![i(1), i(2)]);
 }
 
 #[test]
-fn build_output_columns_all_columns_yields_col_n() {
-    let cs = cols(&[("a", DataType::Integer)]);
+fn decoding_an_old_row_passes_cancellation_to_its_default_expression() {
+    use crate::encoding::{encode_composite_key, encode_row};
+
+    let mut search = col("search", DataType::TsVector);
+    search.position = 1;
+    search.default_expr = Some(Expr::Function {
+        name: "TO_TSVECTOR".into(),
+        args: vec![Expr::Literal(Value::Text(
+            "several words to tokenize".into(),
+        ))],
+        distinct: false,
+    });
+    let ts = schema(
+        "docs",
+        {
+            let mut columns = cols(&[("id", DataType::Integer)]);
+            columns.push(search);
+            columns
+        },
+        vec![0],
+    );
+    let key = encode_composite_key(&[i(1)]);
+    let old_value = encode_row(&[]);
+    let token = citadel::CancelToken::new();
+    let _cancel = crate::fts::cancel_tokenize_after(token.clone(), 1);
+
+    let error = decode_full_row_with_cancel(&ts, &key, &old_value, Some(&token))
+        .expect_err("the old-row default discarded its cancellation token");
+
+    assert!(matches!(
+        error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+}
+
+#[test]
+fn expression_index_key_evaluation_propagates_cancellation() {
+    use citadel::{Argon2Profile, DatabaseBuilder};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseBuilder::new(dir.path().join("expression-index-cancel.citadel"))
+        .passphrase(b"expression-index-cancel-passphrase")
+        .argon2_profile(Argon2Profile::Iot)
+        .create()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_terms ON docs (TO_TSVECTOR(body))")
+        .unwrap();
+
+    let token = citadel::CancelToken::new();
+    db.set_cancel(Some(token.clone()));
+    let _cancel = crate::fts::cancel_tokenize_after(token, 1);
+    let error = conn
+        .execute("INSERT INTO docs VALUES (1, 'several words to tokenize')")
+        .expect_err("expression-index key evaluation discarded its cancellation token");
+
+    assert!(matches!(
+        error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+    db.set_cancel(None);
+    let result = conn.query("SELECT COUNT(*) FROM docs").unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Integer(0)]]);
+}
+
+#[test]
+fn partial_index_predicate_evaluation_propagates_cancellation() {
+    use citadel::{Argon2Profile, DatabaseBuilder};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DatabaseBuilder::new(dir.path().join("partial-index-cancel.citadel"))
+        .passphrase(b"partial-index-cancel-passphrase")
+        .argon2_profile(Argon2Profile::Iot)
+        .create()
+        .unwrap();
+    let conn = crate::Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute(
+        "CREATE INDEX docs_nonempty ON docs (id) \
+         WHERE TO_TSVECTOR(body) IS NOT NULL",
+    )
+    .unwrap();
+
+    let token = citadel::CancelToken::new();
+    db.set_cancel(Some(token.clone()));
+    let _cancel = crate::fts::cancel_tokenize_after(token, 1);
+    let error = conn
+        .execute("INSERT INTO docs VALUES (1, 'several words to tokenize')")
+        .expect_err("partial-index predicate evaluation discarded its cancellation token");
+
+    assert!(matches!(
+        error,
+        SqlError::Storage(citadel_core::Error::Interrupted)
+    ));
+    db.set_cancel(None);
+    let result = conn.query("SELECT COUNT(*) FROM docs").unwrap();
+    assert_eq!(result.rows, vec![vec![Value::Integer(0)]]);
+}
+
+#[test]
+fn expression_index_change_detection_uses_only_its_dependencies() {
+    let table = schema(
+        "users",
+        cols(&[
+            ("id", DataType::Integer),
+            ("email", DataType::Text),
+            ("note", DataType::Text),
+        ]),
+        vec![0],
+    );
+    let index = IndexDef {
+        name: "users_lower_email".into(),
+        keys: vec![IndexKey::Expr {
+            expr: crate::parser::parse_sql_expr("LOWER(email)").unwrap(),
+            original_sql: "LOWER(email)".into(),
+        }],
+        unique: false,
+        predicate_sql: None,
+        predicate_expr: None,
+        kind: crate::types::IndexKind::BTree,
+        ann_filter_cols: Vec::new(),
+    };
+    let old = vec![i(1), Value::Text("old@example.test".into()), Value::Null];
+    let email_changed = vec![i(1), Value::Text("new@example.test".into()), Value::Null];
+    let unrelated_changed = vec![
+        i(1),
+        Value::Text("old@example.test".into()),
+        Value::Text("changed".into()),
+    ];
+
+    assert!(index_columns_changed(&index, &old, &email_changed, &table));
+    assert!(!index_columns_changed(
+        &index,
+        &old,
+        &unrelated_changed,
+        &table
+    ));
+}
+
+#[test]
+fn build_output_columns_expands_all_columns() {
+    let cs = cols(&[("a", DataType::Integer), ("b", DataType::Text)]);
     let out = build_output_columns(&[SelectColumn::AllColumns], &cs);
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].name, "col0");
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].name, "a");
+    assert_eq!(out[1].name, "b");
+    assert_eq!(out[0].position, 0);
+    assert_eq!(out[1].position, 1);
 }
 
 #[test]

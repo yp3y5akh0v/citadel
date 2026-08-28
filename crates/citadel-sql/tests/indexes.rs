@@ -3899,6 +3899,45 @@ fn partial_index_update_crosses_predicate_boundary_out() {
 }
 
 #[test]
+fn pk_changing_upsert_respects_partial_unique_membership() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, active INTEGER, email TEXT)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX active_email ON users(email) WHERE active = 1")
+        .unwrap();
+    conn.execute("INSERT INTO users VALUES (1, 1, 'reusable@example.test')")
+        .unwrap();
+
+    conn.execute(
+        "INSERT INTO users VALUES (1, 0, 'reusable@example.test') \
+         ON CONFLICT (id) DO UPDATE SET \
+         id = 2, active = excluded.active, email = excluded.email",
+    )
+    .unwrap();
+
+    // The row moved out of the predicate while its PK changed. Its old unique
+    // entry must be gone, and the inactive replacement must not get a new one.
+    conn.execute("INSERT INTO users VALUES (3, 1, 'reusable@example.test')")
+        .unwrap();
+
+    conn.execute("INSERT INTO users VALUES (4, 0, 'claimed@example.test')")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO users VALUES (4, 1, 'claimed@example.test') \
+         ON CONFLICT (id) DO UPDATE SET \
+         id = 5, active = excluded.active, email = excluded.email",
+    )
+    .unwrap();
+    let duplicate = conn
+        .execute("INSERT INTO users VALUES (6, 1, 'claimed@example.test')")
+        .expect_err("the active PK-moved row was omitted from its partial unique index");
+    assert!(matches!(duplicate, SqlError::UniqueViolation(_)));
+}
+
+#[test]
 fn partial_index_drop_cleans_up() {
     let dir = tempfile::tempdir().unwrap();
     let db = create_db(dir.path());
@@ -4152,6 +4191,58 @@ fn expression_index_used_by_planner_when_query_matches() {
         plan_text.contains("idx_lower_email") || plan_text.contains("INDEX"),
         "planner should pick expression index, EXPLAIN said: {plan_text}"
     );
+}
+
+#[test]
+fn expression_index_keys_follow_updates_in_both_write_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, note TEXT)")
+        .unwrap();
+    for id in 0..32 {
+        conn.execute(&format!(
+            "INSERT INTO users VALUES ({id}, 'user{id}@old.test', 'unchanged')"
+        ))
+        .unwrap();
+    }
+    conn.execute("CREATE INDEX users_lower_email ON users (LOWER(email))")
+        .unwrap();
+
+    conn.execute("UPDATE users SET email = 'first@new.test' WHERE id = 1")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("UPDATE users SET email = 'second@new.test' WHERE id = 2")
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let plan = conn
+        .query("EXPLAIN SELECT id FROM users WHERE LOWER(email) = 'first@new.test'")
+        .unwrap();
+    assert!(format!("{}", plan.rows[0][0]).contains("users_lower_email"));
+
+    let first = conn
+        .query("SELECT id FROM users WHERE LOWER(email) = 'first@new.test'")
+        .unwrap();
+    assert_eq!(first.rows, vec![vec![Value::Integer(1)]]);
+    let second = conn
+        .query("SELECT id FROM users WHERE LOWER(email) = 'second@new.test'")
+        .unwrap();
+    assert_eq!(second.rows, vec![vec![Value::Integer(2)]]);
+    assert!(conn
+        .query("SELECT id FROM users WHERE LOWER(email) IN ('user1@old.test', 'user2@old.test')")
+        .unwrap()
+        .rows
+        .is_empty());
+
+    // An unrelated update must not force an expression-index key change.
+    conn.execute("UPDATE users SET note = 'changed' WHERE id = 3")
+        .unwrap();
+    let unrelated = conn
+        .query("SELECT id FROM users WHERE LOWER(email) = 'user3@old.test'")
+        .unwrap();
+    assert_eq!(unrelated.rows, vec![vec![Value::Integer(3)]]);
 }
 
 #[test]

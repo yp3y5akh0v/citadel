@@ -453,13 +453,41 @@ impl<'db> WriteTxn<'db> {
         self.tree.entry_count
     }
 
-    /// The table's catalog root in its committed view (a lookup, no scan); a
-    /// version stamp.
+    /// The table's catalog root in its committed view (a lookup, no scan).
+    /// Use [`WriteTxn::table_root_stamp`] for the non-ABA write-view identity.
     pub fn table_root_page(&self, table: &[u8]) -> Result<Option<PageId>> {
         self.check_cancel()?;
         let root = self.manager.table_root(table)?;
         self.check_cancel()?;
         Ok(root)
+    }
+
+    /// The table root in this transaction's write view together with the
+    /// transaction id stored in that root page. The page transaction id keeps
+    /// this stamp distinct after physical page-id recycling.
+    pub fn table_root_stamp(&mut self, table: &[u8]) -> Result<Option<(PageId, TxnId)>> {
+        self.check_cancel()?;
+        match self.ensure_table(table) {
+            Ok(()) => {}
+            Err(Error::TableNotFound(_)) => return Ok(None),
+            Err(err) => return Err(err),
+        }
+        let root = self
+            .named_trees
+            .get(table)
+            .expect("ensure_table installed the requested tree")
+            .root;
+        if !self.pages.contains_key(&root) {
+            let page = self.manager.fetch_page_owned(root)?;
+            self.pages.insert(root, page);
+        }
+        let root_txn = self
+            .pages
+            .get(&root)
+            .expect("root page was loaded into the write view")
+            .txn_id();
+        self.check_cancel()?;
+        Ok(Some((root, root_txn)))
     }
 
     pub fn pending_free_count(&self) -> usize {

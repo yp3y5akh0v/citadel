@@ -68,6 +68,756 @@ fn empty_select(from: &str) -> SelectStmt {
     }
 }
 
+/// The agreement test the refactor stands on.
+///
+/// `choose_strategy` is the only place a single-table SELECT's path is decided,
+/// and EXPLAIN reads the same answer. These pin which path each shape takes.
+mod strategy {
+    use super::*;
+    use crate::executor::select::{choose_strategy, Strategy};
+    use crate::parser::OrderByItem;
+
+    fn schema() -> crate::types::TableSchema {
+        scan_limit_schema()
+    }
+
+    fn count_star_stmt() -> SelectStmt {
+        let mut s = empty_select("t");
+        s.columns = vec![SelectColumn::Expr {
+            expr: Expr::CountStar,
+            alias: None,
+        }];
+        s
+    }
+
+    #[test]
+    fn a_bare_count_star_takes_the_catalog_shortcut() {
+        let s = count_star_stmt();
+        assert!(matches!(
+            choose_strategy(&s, &schema()).unwrap(),
+            Strategy::CountStar
+        ));
+    }
+
+    /// The same query with a WHERE clause cannot use the catalog count, so it
+    /// must fall to a strategy that actually reads rows.
+    #[test]
+    fn a_filtered_count_star_does_not() {
+        let mut s = count_star_stmt();
+        s.where_clause = Some(Expr::Column("x".into()));
+        assert!(!matches!(
+            choose_strategy(&s, &schema()).unwrap(),
+            Strategy::CountStar
+        ));
+    }
+
+    #[test]
+    fn a_plain_select_scans() {
+        let s = empty_select("t");
+        assert!(matches!(
+            choose_strategy(&s, &schema()).unwrap(),
+            Strategy::Scan { limit: None }
+        ));
+    }
+
+    /// A bare LIMIT lets the scan stop early; the strategy carries that limit
+    /// rather than the scan rediscovering it.
+    #[test]
+    fn a_limited_select_carries_its_limit() {
+        let mut s = empty_select("t");
+        s.limit = Some(Expr::Literal(i(10)));
+        assert!(matches!(
+            choose_strategy(&s, &schema()).unwrap(),
+            Strategy::Scan { limit: Some(10) }
+        ));
+    }
+
+    /// ORDER BY plus LIMIT is the top-k shape: the whole table is read but only
+    /// k rows are kept, so it is one fused node rather than scan-then-sort.
+    #[test]
+    fn order_by_with_a_limit_is_top_k() {
+        let mut s = empty_select("t");
+        s.limit = Some(Expr::Literal(i(10)));
+        s.order_by = vec![OrderByItem {
+            expr: Expr::Column("x".into()),
+            output_name: None,
+            output_ordinal: None,
+            descending: true,
+            nulls_first: None,
+        }];
+        assert!(matches!(
+            choose_strategy(&s, &schema()).unwrap(),
+            Strategy::TopKScan(_)
+        ));
+    }
+
+    /// Every strategy that runs as one fused pass names itself for EXPLAIN; the
+    /// plain scan does not, because its plan lines describe it already.
+    #[test]
+    fn only_the_fused_strategies_claim_an_explain_label() {
+        let plain = choose_strategy(&empty_select("t"), &schema()).unwrap();
+        assert_eq!(plain.label(), None);
+
+        let fused = choose_strategy(&count_star_stmt(), &schema()).unwrap();
+        let label = fused.label().expect("a fused strategy must name itself");
+        assert!(!label.is_empty());
+    }
+}
+
+/// Driven through `process_select` directly rather than through SQL, because a
+/// query would stop at the scan and never reach a phase boundary at all. The
+/// rows are already materialized here, which is exactly the state these checks
+/// exist for: the scan is over, and the sort or filter still has to run.
+mod post_scan_cancellation {
+    use super::*;
+    use citadel::CancelToken;
+
+    fn rows(n: i64) -> Vec<Vec<Value>> {
+        (0..n).map(|k| vec![i(k), i(n - k)]).collect()
+    }
+
+    fn schema_cols() -> Vec<ColumnDef> {
+        cols(&[("id", DataType::Integer), ("x", DataType::Integer)])
+    }
+
+    fn cancelled_token() -> CancelToken {
+        let t = CancelToken::new();
+        t.cancel();
+        t
+    }
+
+    fn is_interrupted(e: &crate::error::SqlError) -> bool {
+        matches!(
+            e,
+            crate::error::SqlError::Storage(citadel_core::Error::Interrupted)
+        )
+    }
+
+    #[test]
+    fn a_pre_cancelled_filter_shape_is_refused() {
+        let token = cancelled_token();
+        let columns = schema_cols();
+        let mut stmt = empty_select("t");
+        stmt.where_clause = Some(Expr::Column("x".into()));
+
+        let err =
+            process_select(rows(500), SelectCtx::new(&columns, &stmt, Some(&token))).unwrap_err();
+
+        assert!(is_interrupted(&err), "got {err:?}");
+    }
+
+    #[test]
+    fn a_pre_cancelled_distinct_shape_is_refused() {
+        let token = cancelled_token();
+        let columns = schema_cols();
+        let mut stmt = empty_select("t");
+        stmt.distinct = true;
+
+        let err =
+            process_select(rows(500), SelectCtx::new(&columns, &stmt, Some(&token))).unwrap_err();
+
+        assert!(is_interrupted(&err), "got {err:?}");
+    }
+
+    #[test]
+    fn a_pre_cancelled_sort_shape_is_refused() {
+        use crate::parser::OrderByItem;
+        let token = cancelled_token();
+        let columns = schema_cols();
+        let mut stmt = empty_select("t");
+        stmt.order_by = vec![OrderByItem {
+            expr: Expr::Column("x".into()),
+            output_name: None,
+            output_ordinal: None,
+            descending: false,
+            nulls_first: None,
+        }];
+
+        let err =
+            process_select(rows(500), SelectCtx::new(&columns, &stmt, Some(&token))).unwrap_err();
+
+        assert!(is_interrupted(&err), "got {err:?}");
+    }
+
+    /// The default path is untouched: no token, identical results.
+    #[test]
+    fn no_token_means_no_behaviour_change() {
+        let columns = schema_cols();
+        let stmt = empty_select("t");
+
+        let out = process_select(rows(10), SelectCtx::new(&columns, &stmt, None)).unwrap();
+
+        let ExecutionResult::Query(qr) = out else {
+            panic!("expected a query result");
+        };
+        assert_eq!(qr.rows.len(), 10);
+    }
+
+    fn division_by_zero() -> Expr {
+        Expr::BinaryOp {
+            left: Box::new(Expr::Literal(i(1))),
+            op: crate::parser::BinOp::Div,
+            right: Box::new(Expr::Literal(i(0))),
+        }
+    }
+
+    #[test]
+    fn no_from_where_propagates_evaluator_errors() {
+        let mut stmt = empty_select("");
+        stmt.where_clause = Some(division_by_zero());
+
+        let err = exec_select_no_from(&stmt, None).unwrap_err();
+
+        assert!(matches!(err, crate::error::SqlError::DivisionByZero));
+    }
+
+    #[test]
+    fn post_scan_where_propagates_evaluator_errors() {
+        let columns = schema_cols();
+        let mut stmt = empty_select("t");
+        stmt.where_clause = Some(division_by_zero());
+
+        let err = process_select(rows(3), SelectCtx::new(&columns, &stmt, None)).unwrap_err();
+
+        assert!(matches!(err, crate::error::SqlError::DivisionByZero));
+    }
+
+    /// Every sort shape shares the same pre-work cancellation boundary.
+    #[test]
+    fn every_sort_shape_refuses_a_pre_cancelled_token() {
+        use crate::executor::helpers::sort_rows;
+        use crate::parser::OrderByItem;
+
+        let by = |name: &str| OrderByItem {
+            expr: Expr::Column(name.into()),
+            output_name: None,
+            output_ordinal: None,
+            descending: false,
+            nulls_first: None,
+        };
+        let lanes: [(&str, Vec<OrderByItem>); 3] = [
+            ("single flat key", vec![by("x")]),
+            (
+                "single collated key",
+                vec![OrderByItem {
+                    expr: Expr::Collate {
+                        expr: Box::new(Expr::Column("x".into())),
+                        collation: crate::types::Collation::NoCase,
+                    },
+                    output_name: None,
+                    output_ordinal: None,
+                    descending: false,
+                    nulls_first: None,
+                }],
+            ),
+            ("multiple keys", vec![by("x"), by("id")]),
+        ];
+
+        for (lane, order_by) in lanes {
+            let token = cancelled_token();
+            let columns = schema_cols();
+            let mut r = rows(5_000);
+
+            let err = sort_rows(&mut r, &order_by, &columns, Some(&token)).unwrap_err();
+
+            assert!(is_interrupted(&err), "{lane}: got {err:?}");
+        }
+    }
+
+    /// The token is tripped by the comparator itself, proving this is an
+    /// in-progress cancellation rather than only an entry-boundary check.
+    #[test]
+    fn a_sort_stops_after_comparisons_have_started() {
+        use crate::executor::helpers::sort_indices_by;
+
+        let token = CancelToken::new();
+        let mut indices: Vec<usize> = (0..5_000).rev().collect();
+        let mut comparisons = 0;
+
+        let err = sort_indices_by(&mut indices, Some(&token), |a, b| {
+            comparisons += 1;
+            if comparisons == 64 {
+                token.cancel();
+            }
+            a.cmp(&b)
+        })
+        .unwrap_err();
+
+        assert!(is_interrupted(&err), "got {err:?}");
+        assert!(comparisons >= 64, "the comparator was never reached");
+    }
+
+    #[test]
+    fn owned_materialized_sorts_stop_after_comparisons_start() {
+        use crate::executor::helpers::{sort_vec_by, sort_vec_unstable_by};
+
+        let token = CancelToken::new();
+        let mut comparisons = 0;
+        let values: Vec<usize> = (0..5_000).rev().collect();
+        let err = sort_vec_by(values, Some(&token), |a, b| {
+            comparisons += 1;
+            if comparisons == 64 {
+                token.cancel();
+            }
+            a.cmp(b)
+        })
+        .unwrap_err();
+        assert!(is_interrupted(&err), "stable owned sort: got {err:?}");
+        assert!(comparisons >= 64, "stable comparator was never reached");
+
+        let token = CancelToken::new();
+        let mut comparisons = 0;
+        let values: Vec<usize> = (0..5_000).rev().collect();
+        let err = sort_vec_unstable_by(values, Some(&token), |a, b| {
+            comparisons += 1;
+            if comparisons == 64 {
+                token.cancel();
+            }
+            a.cmp(b)
+        })
+        .unwrap_err();
+        assert!(is_interrupted(&err), "unstable owned sort: got {err:?}");
+        assert!(comparisons >= 64, "unstable comparator was never reached");
+    }
+
+    /// Cancellation is ordinary error propagation, so crash reporters and
+    /// other process-wide panic hooks must not observe it.
+    #[test]
+    #[cfg(panic = "unwind")]
+    fn a_cancelled_sort_does_not_trip_the_panic_hook() {
+        use crate::executor::helpers::sort_indices_by;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let hits = StdArc::new(AtomicUsize::new(0));
+        let counter = StdArc::clone(&hits);
+        // Only this thread's panics count: the hook is process-wide and the
+        // rest of the suite is running beside it.
+        let mine = std::thread::current().id();
+
+        let token = CancelToken::new();
+        let mut indices: Vec<usize> = (0..5_000).rev().collect();
+        let mut comparisons = 0;
+
+        // Catch only at the test boundary so an unexpected implementation
+        // panic cannot leave the process-wide hook installed for other tests.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |_| {
+            if std::thread::current().id() == mine {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sort_indices_by(&mut indices, Some(&token), |a, b| {
+                comparisons += 1;
+                if comparisons == 64 {
+                    token.cancel();
+                }
+                a.cmp(&b)
+            })
+        }));
+        let panics = hits.load(Ordering::Relaxed);
+        std::panic::set_hook(previous);
+
+        let outcome = outcome.expect("cancellation must not unwind");
+        assert!(
+            outcome.as_ref().is_err_and(is_interrupted),
+            "got {outcome:?}"
+        );
+        assert!(comparisons >= 64, "the comparator was never reached");
+        assert_eq!(panics, 0, "cancellation reached the process panic hook");
+    }
+
+    #[test]
+    fn a_topk_sort_stops_too() {
+        use crate::executor::helpers::topk_rows;
+        use crate::parser::OrderByItem;
+
+        let token = cancelled_token();
+        let columns = schema_cols();
+        let mut r = rows(5_000);
+        let order_by = vec![OrderByItem {
+            expr: Expr::Column("x".into()),
+            output_name: None,
+            output_ordinal: None,
+            descending: false,
+            nulls_first: None,
+        }];
+
+        let err = topk_rows(&mut r, &order_by, &columns, 10, Some(&token)).unwrap_err();
+
+        assert!(is_interrupted(&err), "got {err:?}");
+    }
+
+    #[test]
+    fn a_topk_selection_stops_after_comparisons_have_started() {
+        use crate::executor::helpers::topk_indices_by;
+
+        let token = CancelToken::new();
+        let mut indices: Vec<usize> = (0..5_000).rev().collect();
+        let mut comparisons = 0;
+
+        let err = topk_indices_by(&mut indices, 37, Some(&token), |a, b| {
+            comparisons += 1;
+            if comparisons == 64 {
+                token.cancel();
+            }
+            a.cmp(&b)
+        })
+        .unwrap_err();
+
+        assert!(is_interrupted(&err), "got {err:?}");
+        assert!(comparisons >= 64, "selection never reached its comparator");
+    }
+
+    #[test]
+    fn fused_topk_winner_sort_stops_after_comparisons_have_started() {
+        use crate::encoding::{encode_composite_key, encode_row};
+        use crate::executor::select::{
+            arm_topk_sort_cancel, take_topk_sort_comparisons, TopKScanPlan,
+        };
+        use crate::parser::OrderByItem;
+
+        let schema = scan_limit_schema();
+        let mut stmt = empty_select("t");
+        stmt.order_by = vec![OrderByItem {
+            expr: Expr::Column("x".into()),
+            output_name: None,
+            output_ordinal: None,
+            descending: false,
+            nulls_first: None,
+        }];
+        stmt.limit = Some(Expr::Literal(i(1_500)));
+        let plan = TopKScanPlan::try_new(&stmt, &schema)
+            .unwrap()
+            .expect("top-k scan shape");
+        let records: Vec<(Vec<u8>, Vec<u8>)> = (0..2_048i64)
+            .map(|id| (encode_composite_key(&[i(id)]), encode_row(&[i(2_048 - id)])))
+            .collect();
+        let token = CancelToken::new();
+        let _ = take_topk_sort_comparisons();
+
+        let err = plan
+            .execute_scan(&schema, &stmt, Some(&token), |visit| {
+                for (key, value) in &records {
+                    assert!(visit(key, value));
+                }
+                // Arm only after the heap has been built, so the cancellation
+                // is caused by the final user-sized winner sort itself.
+                arm_topk_sort_cancel(token.clone(), 64);
+                Ok(())
+            })
+            .unwrap_err();
+        let comparisons = take_topk_sort_comparisons();
+
+        assert!(is_interrupted(&err), "got {err:?}");
+        assert!(
+            comparisons >= 64,
+            "winner sort comparator was never reached"
+        );
+    }
+
+    /// Refusal at sort entry leaves the input untouched.
+    #[test]
+    fn a_pre_cancelled_sort_leaves_the_rows_untouched() {
+        use crate::executor::helpers::sort_rows;
+        use crate::parser::OrderByItem;
+
+        let token = cancelled_token();
+        let columns = schema_cols();
+        let mut r = rows(5_000);
+        let before = r.clone();
+        let order_by = vec![OrderByItem {
+            expr: Expr::Column("x".into()),
+            output_name: None,
+            output_ordinal: None,
+            descending: false,
+            nulls_first: None,
+        }];
+
+        sort_rows(&mut r, &order_by, &columns, Some(&token)).unwrap_err();
+
+        assert_eq!(r, before, "a cancelled sort half-reordered the rows");
+    }
+
+    /// A comparator bug still has its normal panic behavior; cancellation does
+    /// not install a catch boundary that could translate or swallow it.
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn a_genuine_panic_is_re_raised_rather_than_reported_as_cancelled() {
+        use crate::executor::helpers::sort_rows;
+        use crate::parser::OrderByItem;
+
+        let token = CancelToken::new();
+        let columns = schema_cols();
+        let order_by = vec![OrderByItem {
+            expr: Expr::Column("x".into()),
+            output_name: None,
+            output_ordinal: None,
+            descending: false,
+            nulls_first: None,
+        }];
+        let mut r: Vec<Vec<Value>> = (0..64i64)
+            .map(|k| {
+                if k == 32 {
+                    vec![i(k)] // one column short: comparator indexes past it
+                } else {
+                    vec![i(k), i(64 - k)]
+                }
+            })
+            .collect();
+
+        let _ = sort_rows(&mut r, &order_by, &columns, Some(&token));
+    }
+
+    #[test]
+    fn materialized_checks_are_amortized_but_bounded() {
+        use crate::executor::helpers::{check_cancel_at, CANCEL_CHECK_INTERVAL};
+
+        let token = cancelled_token();
+        for iteration in 1..CANCEL_CHECK_INTERVAL {
+            check_cancel_at(Some(&token), iteration)
+                .expect("a materialized loop should not load the token on every item");
+        }
+        let err = check_cancel_at(Some(&token), CANCEL_CHECK_INTERVAL).unwrap_err();
+        assert!(is_interrupted(&err), "got {err:?}");
+    }
+
+    #[test]
+    fn projection_honors_a_cancelled_token() {
+        use crate::executor::helpers::project_rows_with_cancel;
+
+        let token = cancelled_token();
+        let columns = schema_cols();
+        let stmt = empty_select("t");
+        let err = project_rows_with_cancel(&columns, &stmt.columns, rows(5_000), Some(&token))
+            .unwrap_err();
+
+        assert!(is_interrupted(&err), "got {err:?}");
+    }
+
+    #[test]
+    fn an_untripped_token_matches_the_standard_sort_path() {
+        use crate::executor::helpers::sort_rows;
+        use crate::parser::OrderByItem;
+
+        let columns = schema_cols();
+        let order_by = vec![OrderByItem {
+            expr: Expr::Column("x".into()),
+            output_name: None,
+            output_ordinal: None,
+            descending: false,
+            nulls_first: None,
+        }];
+        let source: Vec<Vec<Value>> = (0..5_003i64)
+            .map(|id| vec![i(id), i((id * 7_919) % 113)])
+            .collect();
+        let mut expected = source.clone();
+        let mut actual = source;
+
+        sort_rows(&mut expected, &order_by, &columns, None).unwrap();
+        sort_rows(&mut actual, &order_by, &columns, Some(&CancelToken::new())).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn an_untripped_token_matches_the_standard_topk_path() {
+        use crate::executor::helpers::{sort_rows, topk_rows};
+        use crate::parser::OrderByItem;
+
+        let columns = schema_cols();
+        let order_by = vec![
+            OrderByItem {
+                expr: Expr::Column("x".into()),
+                output_name: None,
+                output_ordinal: None,
+                descending: false,
+                nulls_first: None,
+            },
+            OrderByItem {
+                expr: Expr::Column("id".into()),
+                output_name: None,
+                output_ordinal: None,
+                descending: false,
+                nulls_first: None,
+            },
+        ];
+        let source: Vec<Vec<Value>> = (0..5_003i64)
+            .map(|id| vec![i(id), i((id * 7_919) % 113)])
+            .collect();
+        let mut expected = source.clone();
+        let mut actual = source;
+        let keep = 137;
+
+        sort_rows(&mut expected, &order_by, &columns, None).unwrap();
+        expected.truncate(keep);
+        topk_rows(
+            &mut actual,
+            &order_by,
+            &columns,
+            keep,
+            Some(&CancelToken::new()),
+        )
+        .unwrap();
+        actual.truncate(keep);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn fallible_topk_selection_matches_a_full_sort_across_input_shapes() {
+        use crate::executor::helpers::topk_indices_by;
+
+        let inputs: Vec<Vec<usize>> = vec![
+            (0..257).collect(),
+            (0..257).rev().collect(),
+            vec![7; 257],
+            (0..257).map(|n| (n * 97) % 31).collect(),
+        ];
+
+        for values in inputs {
+            for keep in [1, 2, 17, values.len() / 2, values.len() - 1, values.len()] {
+                let mut expected = values.clone();
+                expected.sort();
+                expected.truncate(keep);
+
+                let mut indices: Vec<usize> = (0..values.len()).collect();
+                topk_indices_by(&mut indices, keep, Some(&CancelToken::new()), |a, b| {
+                    values[a].cmp(&values[b])
+                })
+                .unwrap();
+                let actual: Vec<usize> = indices[..keep].iter().map(|&i| values[i]).collect();
+
+                assert_eq!(actual, expected, "keep={keep}, values={values:?}");
+            }
+        }
+    }
+
+    /// A token that was never tripped must not interfere either.
+    #[test]
+    fn an_untripped_token_lets_every_phase_run() {
+        use crate::parser::OrderByItem;
+        let token = CancelToken::new();
+        let columns = schema_cols();
+        let mut stmt = empty_select("t");
+        stmt.distinct = true;
+        stmt.order_by = vec![OrderByItem {
+            expr: Expr::Column("x".into()),
+            output_name: None,
+            output_ordinal: None,
+            descending: false,
+            nulls_first: None,
+        }];
+
+        let out = process_select(rows(10), SelectCtx::new(&columns, &stmt, Some(&token))).unwrap();
+
+        let ExecutionResult::Query(qr) = out else {
+            panic!("expected a query result");
+        };
+        assert_eq!(qr.rows.len(), 10);
+    }
+}
+
+mod materialized_row_clone_cancellation {
+    use super::*;
+    use crate::error::{Result, SqlError};
+    use crate::types::{QueryResult, TableSchema};
+    use citadel::CancelToken;
+
+    fn assert_interrupted<T>(outcome: Result<T>) {
+        let err = match outcome {
+            Err(err) => err,
+            Ok(_) => panic!("materialized rows ignored cancellation"),
+        };
+        assert!(matches!(
+            err,
+            SqlError::Storage(citadel_core::Error::Interrupted)
+        ));
+    }
+
+    struct NoIo;
+
+    impl LateralIo for NoIo {
+        fn exec_select(
+            &mut self,
+            _: &crate::schema::SchemaManager,
+            _: &crate::parser::SelectQuery,
+        ) -> Result<QueryResult> {
+            panic!("the outer CTE clone must finish before a lateral query runs")
+        }
+
+        fn scan_table(
+            &mut self,
+            _: &crate::schema::SchemaManager,
+            _: &str,
+        ) -> Result<(TableSchema, Vec<Vec<Value>>)> {
+            panic!("the outer source is a materialized CTE")
+        }
+    }
+
+    #[test]
+    fn lateral_outer_cte_clone_stops_when_cancelled_during_copy() {
+        let token = CancelToken::new();
+        let _cancel = crate::executor::cancel_on_nth_cte_row(token.clone(), 2);
+        let mut ctes = CteContext::default();
+        ctes.insert(
+            "c".into(),
+            CteRows::binary(QueryResult {
+                columns: vec!["x".into()],
+                rows: (0..1_024).map(|n| vec![Value::Integer(n)]).collect(),
+            })
+            .shared(),
+        );
+
+        let outcome = exec_select_lateral_with_io(
+            &crate::schema::SchemaManager::empty(),
+            &empty_select("c"),
+            &ctes,
+            &mut NoIo,
+            Some(&token),
+        );
+
+        assert_interrupted(outcome);
+        assert!(token.is_cancelled());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn correlated_view_clone_stops_when_cancelled_during_copy() {
+        use crate::connection::Connection;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = citadel::DatabaseBuilder::new(dir.path().join("view-clone.db"))
+            .passphrase(b"x")
+            .argon2_profile(citadel::Argon2Profile::Iot)
+            .create()
+            .unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        let insert = conn.prepare("INSERT INTO t VALUES ($1)").unwrap();
+        for n in 0..1_024 {
+            insert.execute(&[Value::Integer(n)]).unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        conn.execute("CREATE VIEW v (x) AS SELECT id FROM t")
+            .unwrap();
+
+        let token = CancelToken::new();
+        db.set_cancel(Some(token.clone()));
+        let _cancel = crate::executor::cancel_on_nth_cte_row(token.clone(), 2);
+
+        let outcome = conn.query(
+            "SELECT x FROM v WHERE EXISTS (SELECT 1 FROM t AS inner_t WHERE inner_t.id = v.x)",
+        );
+
+        assert_interrupted(outcome);
+        assert!(token.is_cancelled());
+    }
+}
+
 #[test]
 fn compute_scan_limit_none_when_no_limit() {
     let s = empty_select("t");
@@ -96,6 +846,8 @@ fn compute_scan_limit_none_with_order_by() {
     s.limit = Some(Expr::Literal(i(10)));
     s.order_by = vec![OrderByItem {
         expr: Expr::Column("x".into()),
+        output_name: None,
+        output_ordinal: None,
         descending: false,
         nulls_first: None,
     }];
@@ -268,17 +1020,45 @@ fn merge_sum_overflow_parity_with_serial_feed() {
 
 #[test]
 fn merge_min_max_keep_left_on_tie() {
-    let mut left = AggState::Min(Some(Value::Integer(3)));
-    left.merge(AggState::Min(Some(Value::Integer(3))));
+    let mut left = AggState::Min {
+        current: Some(Value::Integer(3)),
+        collation: Collation::Binary,
+    };
+    left.merge(AggState::Min {
+        current: Some(Value::Integer(3)),
+        collation: Collation::Binary,
+    });
     assert_eq!(left.finish(), Value::Integer(3));
 
-    let mut left = AggState::Max(Some(Value::Text("b".into())));
-    left.merge(AggState::Max(Some(Value::Text("a".into()))));
+    let mut left = AggState::Max {
+        current: Some(Value::Text("b".into())),
+        collation: Collation::Binary,
+    };
+    left.merge(AggState::Max {
+        current: Some(Value::Text("a".into())),
+        collation: Collation::Binary,
+    });
     assert_eq!(left.finish(), Value::Text("b".into()));
 
-    let mut left = AggState::Min(None);
-    left.merge(AggState::Min(Some(Value::Integer(7))));
+    let mut left = AggState::Min {
+        current: None,
+        collation: Collation::Binary,
+    };
+    left.merge(AggState::Min {
+        current: Some(Value::Integer(7)),
+        collation: Collation::Binary,
+    });
     assert_eq!(left.finish(), Value::Integer(7));
+
+    let mut left = AggState::Min {
+        current: Some(Value::Text("A".into())),
+        collation: Collation::NoCase,
+    };
+    left.merge(AggState::Min {
+        current: Some(Value::Text("a".into())),
+        collation: Collation::NoCase,
+    });
+    assert_eq!(left.finish(), Value::Text("A".into()));
 }
 
 #[test]
@@ -415,6 +1195,8 @@ fn compute_scan_limit_allows_pk_asc_order() {
     s.offset = Some(Expr::Literal(i(5)));
     s.order_by = vec![OrderByItem {
         expr: Expr::Column("id".into()),
+        output_name: None,
+        output_ordinal: None,
         descending: false,
         nulls_first: None,
     }];

@@ -16,7 +16,7 @@ pub(super) fn exec_create_matview(
 ) -> Result<ExecutionResult> {
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     let r = exec_create_matview_in_txn(&mut wtx, schema, stmt)?;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
     Ok(r)
 }
 
@@ -56,7 +56,13 @@ pub(super) fn exec_create_matview_in_txn(
     };
 
     let backing_table = MatviewDef::backing_table_name(&name_lower);
-    let columns = derive_columns(&column_names, &rows);
+    let collations = super::dml::query_output_collations(
+        schema,
+        &super::CteContext::default(),
+        &stmt.select_parsed,
+        column_names.len(),
+    );
+    let columns = derive_columns(&column_names, &rows, &collations);
     if columns.is_empty() {
         return Err(SqlError::Unsupported(
             "materialized view must project at least one column".into(),
@@ -101,7 +107,7 @@ pub(super) fn exec_refresh_matview(
     if !stmt.concurrently {
         let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
         let r = exec_refresh_matview_in_txn(&mut wtx, schema, stmt)?;
-        wtx.commit().map_err(SqlError::Storage)?;
+        super::commit_with_ann_publication(wtx, schema)?;
         return Ok(r);
     }
 
@@ -166,7 +172,7 @@ pub(super) fn exec_refresh_matview(
     }
 
     diff_merge_concurrent(&mut wtx, &mv, &rows)?;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
     Ok(ExecutionResult::Ok)
 }
 
@@ -241,7 +247,7 @@ pub(super) fn exec_drop_matview(
 ) -> Result<ExecutionResult> {
     let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
     let r = exec_drop_matview_in_txn(&mut wtx, schema, stmt)?;
-    wtx.commit().map_err(SqlError::Storage)?;
+    super::commit_with_ann_publication(wtx, schema)?;
     Ok(r)
 }
 
@@ -447,7 +453,11 @@ fn decode_pk_value(key: &[u8]) -> Result<Value> {
     Ok(val)
 }
 
-fn derive_columns(column_names: &[String], rows: &[Vec<Value>]) -> Vec<ColumnDef> {
+fn derive_columns(
+    column_names: &[String],
+    rows: &[Vec<Value>],
+    collations: &[crate::types::Collation],
+) -> Vec<ColumnDef> {
     column_names
         .iter()
         .enumerate()
@@ -477,7 +487,10 @@ fn derive_columns(column_names: &[String], rows: &[Vec<Value>]) -> Vec<ColumnDef
                 generated_expr: None,
                 generated_sql: None,
                 generated_kind: None,
-                collation: crate::types::Collation::Binary,
+                collation: collations
+                    .get(i)
+                    .copied()
+                    .unwrap_or(crate::types::Collation::Binary),
             }
         })
         .collect()

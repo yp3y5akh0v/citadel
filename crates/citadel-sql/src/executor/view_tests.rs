@@ -39,7 +39,7 @@ fn apply_view_aliases_empty_aliases_no_change() {
 #[test]
 fn build_view_schema_columns_derived_from_query_result() {
     let q = qr(vec!["id", "name"], vec![]);
-    let ts = build_view_schema("v", &q);
+    let ts = build_view_schema("v", &CteRows::binary(q));
     assert_eq!(ts.name, "v");
     assert_eq!(ts.columns.len(), 2);
     assert_eq!(ts.columns[0].name, "id");
@@ -49,14 +49,14 @@ fn build_view_schema_columns_derived_from_query_result() {
 #[test]
 fn build_view_schema_empty_columns() {
     let q = qr(vec![], vec![]);
-    let ts = build_view_schema("v", &q);
+    let ts = build_view_schema("v", &CteRows::binary(q));
     assert!(ts.columns.is_empty());
 }
 
 #[test]
 fn build_view_schema_preserves_column_count() {
     let q = qr(vec!["a", "b", "c", "d", "e"], vec![]);
-    let ts = build_view_schema("v", &q);
+    let ts = build_view_schema("v", &CteRows::binary(q));
     assert_eq!(ts.columns.len(), 5);
     for (i, want) in ["a", "b", "c", "d", "e"].iter().enumerate() {
         assert_eq!(&ts.columns[i].name, want);
@@ -66,7 +66,7 @@ fn build_view_schema_preserves_column_count() {
 #[test]
 fn build_view_schema_uses_position_index() {
     let q = qr(vec!["a", "b", "c"], vec![]);
-    let ts = build_view_schema("v", &q);
+    let ts = build_view_schema("v", &CteRows::binary(q));
     for (i, col) in ts.columns.iter().enumerate() {
         assert_eq!(col.position as usize, i);
     }

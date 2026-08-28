@@ -76,6 +76,14 @@ fn cacheable_refuses_volatile_and_unknown() {
     assert!(!cacheable(&s, "SELECT v FROM t WHERE v > RANDOM()"));
     assert!(!cacheable(
         &s,
+        "SELECT ROW_NUMBER() OVER (ORDER BY RANDOM()) FROM t"
+    ));
+    assert!(!cacheable(
+        &s,
+        "SELECT ROW_NUMBER() OVER (PARTITION BY RANDOM() ORDER BY v) FROM t"
+    ));
+    assert!(!cacheable(
+        &s,
         "WITH x AS (SELECT NOW() AS n) SELECT n FROM x"
     ));
 }
@@ -132,4 +140,16 @@ fn oversized_results_and_params_are_not_stored() {
     };
     slot.store(1, &[Value::Text(big_text.into())], &small);
     assert!(slot.lookup(1, &[]).is_none());
+}
+
+#[test]
+fn oversized_arrays_are_rejected_by_the_budgeted_walk() {
+    let too_many_inline_values =
+        Value::Array(vec![Value::Null; RESULT_CACHE_MAX_BYTES / 32 + 1].into());
+    let result = QueryResult {
+        columns: vec!["a".into()],
+        rows: vec![vec![too_many_inline_values]],
+    };
+
+    assert!(!within_cap(&[], &result));
 }

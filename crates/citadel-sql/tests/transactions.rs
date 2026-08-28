@@ -1,4 +1,7 @@
 use citadel::{Argon2Profile, DatabaseBuilder};
+use citadel_sql::executor::{exec_insert_in_txn, execute_in_txn};
+use citadel_sql::parser::{parse_sql, Statement};
+use citadel_sql::schema::SchemaManager;
 use citadel_sql::{Connection, ExecutionResult, SqlError, Value};
 
 fn create_db(dir: &std::path::Path) -> citadel::Database {
@@ -31,6 +34,143 @@ fn assert_rows_affected(result: ExecutionResult, expected: u64) {
         ExecutionResult::RowsAffected(n) => assert_eq!(n, expected),
         other => panic!("expected RowsAffected({expected}), got {other:?}"),
     }
+}
+
+#[test]
+fn partial_statement_error_makes_explicit_transaction_uncommittable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    let error = conn
+        .execute("INSERT INTO t VALUES (2), (3), (2)")
+        .unwrap_err();
+    assert!(matches!(error, SqlError::DuplicateKey));
+    let commit = conn.execute("COMMIT").unwrap_err();
+    assert!(matches!(
+        commit,
+        SqlError::Storage(citadel_core::Error::TransactionFailed)
+    ));
+
+    drop(conn);
+    drop(db);
+    let reopened = open_db(dir.path());
+    let conn = Connection::open(&reopened).unwrap();
+    assert_eq!(
+        conn.query("SELECT COUNT(*) FROM t").unwrap().rows[0][0],
+        Value::Integer(0)
+    );
+}
+
+#[test]
+fn savepoint_rollback_recovers_from_partial_statement_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SAVEPOINT before_batch").unwrap();
+    let error = conn
+        .execute("INSERT INTO t VALUES (2), (3), (2)")
+        .unwrap_err();
+    assert!(matches!(error, SqlError::DuplicateKey));
+    conn.execute("ROLLBACK TO before_batch").unwrap();
+    conn.execute("INSERT INTO t VALUES (4)").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    assert_eq!(
+        conn.query("SELECT COUNT(*) FROM t").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+    assert_eq!(
+        conn.query("SELECT id FROM t").unwrap().rows[0][0],
+        Value::Integer(4)
+    );
+}
+
+#[test]
+fn prepared_partial_statement_error_also_makes_transaction_uncommittable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let insert = conn.prepare("INSERT INTO t VALUES (2), (3), (2)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    let error = insert.execute(&[]).unwrap_err();
+    assert!(matches!(error, SqlError::DuplicateKey));
+    let commit = conn.execute("COMMIT").unwrap_err();
+    assert!(matches!(
+        commit,
+        SqlError::Storage(citadel_core::Error::TransactionFailed)
+    ));
+    assert_eq!(
+        conn.query("SELECT COUNT(*) FROM t").unwrap().rows[0][0],
+        Value::Integer(0)
+    );
+}
+
+#[test]
+fn direct_execute_in_txn_refuses_commit_after_partial_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX t_value ON t (value)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+
+    let mut schema = SchemaManager::load(&db).unwrap();
+    let statement = parse_sql("UPDATE t SET value = 'same'").unwrap();
+    let mut wtx = db.begin_write().unwrap();
+    let error = execute_in_txn(&mut wtx, &mut schema, &statement, &[]).unwrap_err();
+    assert!(matches!(error, SqlError::UniqueViolation(_)));
+    assert!(matches!(
+        wtx.commit(),
+        Err(citadel_core::Error::TransactionFailed)
+    ));
+
+    assert_eq!(
+        conn.query("SELECT COUNT(*) FROM t WHERE value = 'same'")
+            .unwrap()
+            .rows[0][0],
+        Value::Integer(0)
+    );
+}
+
+#[test]
+fn direct_exec_insert_in_txn_refuses_commit_after_partial_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create_db(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    let schema = SchemaManager::load(&db).unwrap();
+    let statement = parse_sql("INSERT INTO t VALUES (2), (3), (2)").unwrap();
+    let Statement::Insert(insert) = statement else {
+        panic!("expected INSERT statement");
+    };
+    let mut wtx = db.begin_write().unwrap();
+    let error = exec_insert_in_txn(&mut wtx, &schema, &insert, &[]).unwrap_err();
+    assert!(matches!(error, SqlError::DuplicateKey));
+    assert!(matches!(
+        wtx.commit(),
+        Err(citadel_core::Error::TransactionFailed)
+    ));
+
+    assert_eq!(
+        conn.query("SELECT COUNT(*) FROM t").unwrap().rows[0][0],
+        Value::Integer(0)
+    );
 }
 
 #[test]

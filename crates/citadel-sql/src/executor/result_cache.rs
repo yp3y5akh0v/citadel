@@ -10,6 +10,7 @@ use rustc_hash::FxHashSet;
 
 use crate::parser::{
     BinOp, CteDefinition, Expr, QueryBody, SelectColumn, SelectQuery, SelectStmt, Statement,
+    WindowFrameBound,
 };
 use crate::schema::SchemaManager;
 use crate::types::{QueryResult, Value};
@@ -96,51 +97,98 @@ fn value_bit_eq(a: &Value, b: &Value) -> bool {
 
 fn within_cap(params: &[Value], result: &QueryResult) -> bool {
     // O(1) pre-reject: each row costs at least a Vec header + one Value.
-    if result.rows.len() * 56 > RESULT_CACHE_MAX_BYTES {
+    if result
+        .rows
+        .len()
+        .checked_mul(56)
+        .is_none_or(|bytes| bytes > RESULT_CACHE_MAX_BYTES)
+    {
         return false;
     }
-    let mut total: usize = result.columns.iter().map(|c| 24 + c.len()).sum();
+    let mut remaining = RESULT_CACHE_MAX_BYTES;
+    for column in &result.columns {
+        if !charge(&mut remaining, 24usize.saturating_add(column.len())) {
+            return false;
+        }
+    }
     for v in params {
-        total += 32 + value_heap_bytes(v);
-        if total > RESULT_CACHE_MAX_BYTES {
+        if !charge(&mut remaining, 32) || !value_fits(v, &mut remaining) {
             return false;
         }
     }
     for row in &result.rows {
-        total += 24 + row.len() * 32;
-        for v in row {
-            total += value_heap_bytes(v);
-        }
-        if total > RESULT_CACHE_MAX_BYTES {
+        let Some(row_bytes) = row.len().checked_mul(32).and_then(|n| n.checked_add(24)) else {
             return false;
+        };
+        if !charge(&mut remaining, row_bytes) {
+            return false;
+        }
+        for v in row {
+            if !value_fits(v, &mut remaining) {
+                return false;
+            }
         }
     }
     true
 }
 
-fn value_heap_bytes(v: &Value) -> usize {
-    match v {
-        Value::Text(s) | Value::Json(s) => {
-            // CompactString stores up to 24 bytes inline.
-            if s.len() > 24 {
-                s.len()
-            } else {
-                0
-            }
-        }
-        Value::Blob(b) => b.len(),
-        Value::Jsonb(b) | Value::TsVector(b) | Value::TsQuery(b) => b.len(),
-        Value::Array(vs) => vs.len() * 32 + vs.iter().map(value_heap_bytes).sum::<usize>(),
-        Value::Vector(fs) => fs.len() * 4,
-        Value::Null
-        | Value::Integer(_)
-        | Value::Real(_)
-        | Value::Boolean(_)
-        | Value::Time(_)
-        | Value::Date(_)
-        | Value::Timestamp(_)
-        | Value::Interval { .. } => 0,
+#[inline]
+fn charge(remaining: &mut usize, bytes: usize) -> bool {
+    if bytes > *remaining {
+        false
+    } else {
+        *remaining -= bytes;
+        true
     }
+}
+
+/// Charge a value's heap storage, stopping once the cache budget is exhausted. The
+/// explicit stack avoids recursive sizing, and charging array slots before pushing
+/// children bounds the walk.
+fn value_fits(root: &Value, remaining: &mut usize) -> bool {
+    let mut pending = vec![root];
+    while let Some(value) = pending.pop() {
+        let bytes = match value {
+            Value::Text(s) | Value::Json(s) => {
+                // CompactString stores up to 24 bytes inline.
+                if s.len() > 24 {
+                    s.len()
+                } else {
+                    0
+                }
+            }
+            Value::Blob(b) => b.len(),
+            Value::Jsonb(b) | Value::TsVector(b) | Value::TsQuery(b) => b.len(),
+            Value::Array(values) => {
+                let Some(bytes) = values.len().checked_mul(32) else {
+                    return false;
+                };
+                if !charge(remaining, bytes) {
+                    return false;
+                }
+                pending.extend(values.iter());
+                continue;
+            }
+            Value::Vector(values) => {
+                let Some(bytes) = values.len().checked_mul(4) else {
+                    return false;
+                };
+                bytes
+            }
+            Value::Null
+            | Value::Integer(_)
+            | Value::Real(_)
+            | Value::Boolean(_)
+            | Value::Time(_)
+            | Value::Date(_)
+            | Value::Timestamp(_)
+            | Value::Interval { .. } => 0,
+        };
+        if !charge(remaining, bytes) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Deny-unless-known cacheability decision, made once at compile time. True
@@ -304,6 +352,17 @@ fn cacheable_table_ref(ctx: &mut WalkCtx<'_>, name: &str) -> bool {
     false
 }
 
+fn cacheable_window_bound(ctx: &mut WalkCtx<'_>, bound: &WindowFrameBound) -> bool {
+    match bound {
+        WindowFrameBound::Preceding(expr) | WindowFrameBound::Following(expr) => {
+            cacheable_expr(ctx, expr)
+        }
+        WindowFrameBound::UnboundedPreceding
+        | WindowFrameBound::CurrentRow
+        | WindowFrameBound::UnboundedFollowing => true,
+    }
+}
+
 fn cacheable_expr(ctx: &mut WalkCtx<'_>, expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_)
@@ -359,6 +418,9 @@ fn cacheable_expr(ctx: &mut WalkCtx<'_>, expr: &Expr) -> bool {
         Expr::Between {
             expr, low, high, ..
         } => cacheable_expr(ctx, expr) && cacheable_expr(ctx, low) && cacheable_expr(ctx, high),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            cacheable_expr(ctx, left) && cacheable_expr(ctx, right)
+        }
         Expr::Like {
             expr,
             pattern,
@@ -391,9 +453,21 @@ fn cacheable_expr(ctx: &mut WalkCtx<'_>, expr: &Expr) -> bool {
         Expr::Coalesce(items) | Expr::ArrayLiteral(items) => {
             items.iter().all(|e| cacheable_expr(ctx, e))
         }
-        Expr::WindowFunction { name, args, .. } => {
+        Expr::WindowFunction { name, args, spec } => {
             !crate::eval::is_volatile_function(&name.to_ascii_uppercase(), args.len())
                 && args.iter().all(|a| cacheable_expr(ctx, a))
+                && spec
+                    .partition_by
+                    .iter()
+                    .all(|expr| cacheable_expr(ctx, expr))
+                && spec
+                    .order_by
+                    .iter()
+                    .all(|item| cacheable_expr(ctx, &item.expr))
+                && spec.frame.as_ref().is_none_or(|frame| {
+                    cacheable_window_bound(ctx, &frame.start)
+                        && cacheable_window_bound(ctx, &frame.end)
+                })
         }
         Expr::Quantified { left, right, .. } => {
             cacheable_expr(ctx, left)

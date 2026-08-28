@@ -72,6 +72,8 @@ pub(super) fn try_covered_index_collect_read(
     limit: Option<usize>,
     emit_direct: Option<&[usize]>,
 ) -> Result<Option<Vec<Vec<Value>>>> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     let Some(comp_of) = covered_index_components(table_schema, plan, needed) else {
         return Ok(None);
     };
@@ -197,11 +199,14 @@ pub(super) fn try_covered_index_collect_read(
                 return Ok(false);
             }
         };
-        // Row-mode parity: residual WHERE eval errors drop the row.
         if let Some(expr) = where_clause {
-            match eval_expr(expr, &EvalCtx::new(col_map, &row)) {
+            match eval_expr(expr, &EvalCtx::new(col_map, &row).with_cancel(cancel)) {
                 Ok(v) if is_truthy(&v) => {}
-                _ => return Ok(true),
+                Ok(_) => return Ok(true),
+                Err(e) => {
+                    scan_err = Some(e);
+                    return Ok(false);
+                }
             }
         }
         rows.push(row);
@@ -388,46 +393,55 @@ fn scan_step(
     jsonb_pred: Option<&JsonbContainsPredicate>,
     col_map: Option<&ColumnMap>,
     partial_ctx: Option<&PartialDecodeCtx>,
+    cancel: Option<&citadel::CancelToken>,
 ) -> Result<Option<Vec<Value>>> {
     if let Some(pred) = simple_pred {
         return if pred.matches_raw(key, value)? {
-            Ok(Some(decode_full_row(schema, key, value)?))
+            Ok(Some(decode_full_row_with_cancel(
+                schema, key, value, cancel,
+            )?))
         } else {
             Ok(None)
         };
     }
     if let Some(pred) = between_pred {
         return if pred.matches_raw(key, value)? {
-            Ok(Some(decode_full_row(schema, key, value)?))
+            Ok(Some(decode_full_row_with_cancel(
+                schema, key, value, cancel,
+            )?))
         } else {
             Ok(None)
         };
     }
     if let Some(pred) = jsonb_pred {
-        return if pred.matches_raw(key, value)? {
-            Ok(Some(decode_full_row(schema, key, value)?))
+        return if pred.matches_raw(key, value, cancel)? {
+            Ok(Some(decode_full_row_with_cancel(
+                schema, key, value, cancel,
+            )?))
         } else {
             Ok(None)
         };
     }
     match (compiled, col_map, partial_ctx) {
         (Some(pred), Some(map), Some(pctx)) => {
-            let partial = pctx.decode(key, value)?;
-            if is_truthy(&pred.eval(&EvalCtx::new(map, &partial))?) {
+            let partial = pctx.decode_with_cancel(key, value, cancel)?;
+            if is_truthy(&pred.eval(&EvalCtx::new(map, &partial).with_cancel(cancel))?) {
                 Ok(Some(pctx.complete(partial, key, value)?))
             } else {
                 Ok(None)
             }
         }
         (Some(pred), Some(map), None) => {
-            let row = decode_full_row(schema, key, value)?;
-            if is_truthy(&pred.eval(&EvalCtx::new(map, &row))?) {
+            let row = decode_full_row_with_cancel(schema, key, value, cancel)?;
+            if is_truthy(&pred.eval(&EvalCtx::new(map, &row).with_cancel(cancel))?) {
                 Ok(Some(row))
             } else {
                 Ok(None)
             }
         }
-        _ => Ok(Some(decode_full_row(schema, key, value)?)),
+        _ => Ok(Some(decode_full_row_with_cancel(
+            schema, key, value, cancel,
+        )?)),
     }
 }
 
@@ -458,8 +472,12 @@ pub(super) fn collect_rows_with_read_planned(
     limit: Option<usize>,
     plan: ScanPlan,
 ) -> Result<(Vec<Vec<Value>>, bool)> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     let lower_name = &table_schema.name;
     let columns = &table_schema.columns;
+    let decode =
+        |key: &[u8], value: &[u8]| decode_full_row_with_cancel(table_schema, key, value, cancel);
 
     match plan {
         ScanPlan::SeqScan => {
@@ -487,14 +505,20 @@ pub(super) fn collect_rows_with_read_planned(
 
             let col_map = needs_generic_eval.then(|| table_schema.column_map());
             let partial_ctx = if needs_generic_eval {
-                where_clause.as_ref().and_then(|expr| {
+                if let Some(expr) = where_clause.as_ref() {
                     let needed = referenced_columns(expr, columns);
                     if needed.len() < columns.len() {
-                        Some(PartialDecodeCtx::new(table_schema, &needed))
+                        Some(PartialDecodeCtx::new_with_cancel(
+                            table_schema,
+                            &needed,
+                            cancel,
+                        )?)
                     } else {
                         None
                     }
-                })
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -523,6 +547,7 @@ pub(super) fn collect_rows_with_read_planned(
                     jsonb_pred.as_ref(),
                     col_map,
                     partial_ctx.as_ref(),
+                    cancel,
                 );
                 match step {
                     Ok(Some(row)) => rows.push(row),
@@ -548,12 +573,13 @@ pub(super) fn collect_rows_with_read_planned(
                 .map_err(SqlError::Storage)?
             {
                 Some(value) => {
-                    let row = decode_full_row(table_schema, &key, &value)?;
+                    let row = decode(&key, &value)?;
                     if let Some(ref expr) = where_clause {
                         let col_map = table_schema.column_map();
-                        match eval_expr(expr, &EvalCtx::new(col_map, &row)) {
+                        match eval_expr(expr, &EvalCtx::new(col_map, &row).with_cancel(cancel)) {
                             Ok(val) if is_truthy(&val) => Ok((vec![row], true)),
-                            _ => Ok((vec![], true)),
+                            Ok(_) => Ok((vec![], true)),
+                            Err(e) => Err(e),
                         }
                     } else {
                         Ok((vec![row], false))
@@ -585,11 +611,21 @@ pub(super) fn collect_rows_with_read_planned(
                     1 => return Ok(true),
                     _ => {}
                 }
-                match decode_full_row(table_schema, key, value) {
+                match decode(key, value) {
                     Ok(row) => {
                         let keep = match &where_clause {
-                            Some(expr) => eval_expr(expr, &EvalCtx::new(col_map, &row))
-                                .is_ok_and(|v| is_truthy(&v)),
+                            Some(expr) => {
+                                match eval_expr(
+                                    expr,
+                                    &EvalCtx::new(col_map, &row).with_cancel(cancel),
+                                ) {
+                                    Ok(value) => is_truthy(&value),
+                                    Err(e) => {
+                                        scan_err = Some(e);
+                                        return Ok(false);
+                                    }
+                                }
+                            }
                             None => true,
                         };
                         if keep {
@@ -611,6 +647,7 @@ pub(super) fn collect_rows_with_read_planned(
         }
 
         ScanPlan::IndexScan {
+            index_name,
             idx_table,
             prefix,
             num_prefix_cols,
@@ -620,7 +657,9 @@ pub(super) fn collect_rows_with_read_planned(
             ..
         } => {
             let num_pk_cols = table_schema.primary_key_columns.len();
-            let num_index_cols = index_columns.len();
+            let num_index_cols = table_schema
+                .index_by_name(&index_name)
+                .map_or(index_columns.len(), |idx| idx.keys.len());
             let mut pk_keys: Vec<Vec<u8>> = Vec::new();
 
             {
@@ -663,11 +702,12 @@ pub(super) fn collect_rows_with_read_planned(
                     .table_get(lower_name.as_bytes(), pk_key)
                     .map_err(SqlError::Storage)?
                 {
-                    let row = decode_full_row(table_schema, pk_key, &value)?;
+                    let row = decode(pk_key, &value)?;
                     if let Some(ref expr) = where_clause {
-                        match eval_expr(expr, &EvalCtx::new(col_map, &row)) {
+                        match eval_expr(expr, &EvalCtx::new(col_map, &row).with_cancel(cancel)) {
                             Ok(val) if is_truthy(&val) => rows.push(row),
-                            _ => {}
+                            Ok(_) => {}
+                            Err(e) => return Err(e),
                         }
                     } else {
                         rows.push(row);
@@ -692,14 +732,18 @@ pub(super) fn collect_rows_with_read_planned(
                     .table_get(lower_name.as_bytes(), pk_key)
                     .map_err(SqlError::Storage)?
                 {
-                    let row = decode_full_row(table_schema, pk_key, &value)?;
+                    let row = decode(pk_key, &value)?;
                     if !recheck_needed {
                         rows.push(row);
                         continue;
                     }
-                    match eval_expr(&recheck_expr, &EvalCtx::new(col_map, &row)) {
+                    match eval_expr(
+                        &recheck_expr,
+                        &EvalCtx::new(col_map, &row).with_cancel(cancel),
+                    ) {
                         Ok(val) if is_truthy(&val) => rows.push(row),
-                        _ => {}
+                        Ok(_) => {}
+                        Err(e) => return Err(e),
                     }
                 }
             }
@@ -713,8 +757,12 @@ fn inverted_intersect_candidates(
     idx_table: &[u8],
     probe_entries: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    check_cancel(cancel)?;
     let mut lists: Vec<Vec<Vec<u8>>> = Vec::with_capacity(probe_entries.len());
-    for entry in probe_entries {
+    for (entry_idx, entry) in probe_entries.iter().enumerate() {
+        check_cancel_at(cancel, entry_idx)?;
         let mut prefix = entry.clone();
         prefix.push(0x1F);
         let mut list: Vec<Vec<u8>> = Vec::new();
@@ -731,18 +779,49 @@ fn inverted_intersect_candidates(
         }
         lists.push(list);
     }
-    lists.sort_by_key(|l| l.len());
+    lists = sort_lists_by_len(lists, cancel)?;
     let mut acc = lists.remove(0);
-    for other in lists {
-        acc = sorted_intersect(&acc, &other);
+    for (list_idx, other) in lists.into_iter().enumerate() {
+        check_cancel_at(cancel, list_idx)?;
+        acc = sorted_intersect(&acc, &other, cancel)?;
         if acc.is_empty() {
             return Ok(acc);
         }
     }
+    check_cancel(cancel)?;
     Ok(acc)
 }
 
-fn sorted_intersect(a: &[Vec<u8>], b: &[Vec<u8>]) -> Vec<Vec<u8>> {
+fn sorted_intersect(
+    a: &[Vec<u8>],
+    b: &[Vec<u8>],
+    cancel: Option<&citadel::CancelToken>,
+) -> Result<Vec<Vec<u8>>> {
+    check_cancel(cancel)?;
+    if cancel.is_none() {
+        return Ok(sorted_intersect_unchecked(a, b));
+    }
+    let mut out = Vec::with_capacity(a.len().min(b.len()));
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut comparisons = 0usize;
+    while i < a.len() && j < b.len() {
+        check_cancel_at(cancel, comparisons)?;
+        comparisons += 1;
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => {
+                out.push(a[i].clone());
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    check_cancel(cancel)?;
+    Ok(out)
+}
+
+fn sorted_intersect_unchecked(a: &[Vec<u8>], b: &[Vec<u8>]) -> Vec<Vec<u8>> {
     let mut out = Vec::with_capacity(a.len().min(b.len()));
     let (mut i, mut j) = (0usize, 0usize);
     while i < a.len() && j < b.len() {
@@ -765,9 +844,13 @@ pub(super) fn collect_rows_write(
     where_clause: &Option<Expr>,
     limit: Option<usize>,
 ) -> Result<(Vec<Vec<Value>>, bool)> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
     let plan = planner::plan_select(table_schema, where_clause);
     let lower_name = &table_schema.name;
     let columns = &table_schema.columns;
+    let decode =
+        |key: &[u8], value: &[u8]| decode_full_row_with_cancel(table_schema, key, value, cancel);
 
     match plan {
         ScanPlan::SeqScan => {
@@ -780,7 +863,7 @@ pub(super) fn collect_rows_write(
                 let mut scan_err: Option<SqlError> = None;
                 wtx.table_scan_from(lower_name.as_bytes(), b"", |key, value| {
                     match pred.matches_raw(key, value) {
-                        Ok(true) => match decode_full_row(table_schema, key, value) {
+                        Ok(true) => match decode(key, value) {
                             Ok(row) => rows.push(row),
                             Err(e) => scan_err = Some(e),
                         },
@@ -801,19 +884,28 @@ pub(super) fn collect_rows_write(
             let mut scan_err: Option<SqlError> = None;
 
             let col_map = table_schema.column_map();
-            let partial_ctx = where_clause.as_ref().and_then(|expr| {
+            let partial_ctx = if let Some(expr) = where_clause.as_ref() {
                 let needed = referenced_columns(expr, columns);
                 if needed.len() < columns.len() {
-                    Some(PartialDecodeCtx::new(table_schema, &needed))
+                    Some(PartialDecodeCtx::new_with_cancel(
+                        table_schema,
+                        &needed,
+                        cancel,
+                    )?)
                 } else {
                     None
                 }
-            });
+            } else {
+                None
+            };
 
             wtx.table_scan_from(lower_name.as_bytes(), b"", |key, value| {
                 match (&where_clause, &partial_ctx) {
-                    (Some(expr), Some(ctx)) => match ctx.decode(key, value) {
-                        Ok(partial) => match eval_expr(expr, &EvalCtx::new(col_map, &partial)) {
+                    (Some(expr), Some(ctx)) => match ctx.decode_with_cancel(key, value, cancel) {
+                        Ok(partial) => match eval_expr(
+                            expr,
+                            &EvalCtx::new(col_map, &partial).with_cancel(cancel),
+                        ) {
                             Ok(val) if is_truthy(&val) => match ctx.complete(partial, key, value) {
                                 Ok(row) => rows.push(row),
                                 Err(e) => scan_err = Some(e),
@@ -823,15 +915,18 @@ pub(super) fn collect_rows_write(
                         },
                         Err(e) => scan_err = Some(e),
                     },
-                    (Some(expr), None) => match decode_full_row(table_schema, key, value) {
-                        Ok(row) => match eval_expr(expr, &EvalCtx::new(col_map, &row)) {
-                            Ok(val) if is_truthy(&val) => rows.push(row),
-                            Err(e) => scan_err = Some(e),
-                            _ => {}
-                        },
+                    (Some(expr), None) => match decode(key, value) {
+                        Ok(row) => {
+                            match eval_expr(expr, &EvalCtx::new(col_map, &row).with_cancel(cancel))
+                            {
+                                Ok(val) if is_truthy(&val) => rows.push(row),
+                                Err(e) => scan_err = Some(e),
+                                _ => {}
+                            }
+                        }
                         Err(e) => scan_err = Some(e),
                     },
-                    _ => match decode_full_row(table_schema, key, value) {
+                    _ => match decode(key, value) {
                         Ok(row) => rows.push(row),
                         Err(e) => scan_err = Some(e),
                     },
@@ -853,12 +948,13 @@ pub(super) fn collect_rows_write(
                 .map_err(SqlError::Storage)?
             {
                 Some(value) => {
-                    let row = decode_full_row(table_schema, &key, &value)?;
+                    let row = decode(&key, &value)?;
                     if let Some(ref expr) = where_clause {
                         let col_map = table_schema.column_map();
-                        match eval_expr(expr, &EvalCtx::new(col_map, &row)) {
+                        match eval_expr(expr, &EvalCtx::new(col_map, &row).with_cancel(cancel)) {
                             Ok(val) if is_truthy(&val) => Ok((vec![row], true)),
-                            _ => Ok((vec![], true)),
+                            Ok(_) => Ok((vec![], true)),
+                            Err(e) => Err(e),
                         }
                     } else {
                         Ok((vec![row], false))
@@ -890,11 +986,21 @@ pub(super) fn collect_rows_write(
                     1 => return Ok(true),
                     _ => {}
                 }
-                match decode_full_row(table_schema, key, value) {
+                match decode(key, value) {
                     Ok(row) => {
                         let keep = match &where_clause {
-                            Some(expr) => eval_expr(expr, &EvalCtx::new(col_map, &row))
-                                .is_ok_and(|v| is_truthy(&v)),
+                            Some(expr) => {
+                                match eval_expr(
+                                    expr,
+                                    &EvalCtx::new(col_map, &row).with_cancel(cancel),
+                                ) {
+                                    Ok(value) => is_truthy(&value),
+                                    Err(e) => {
+                                        scan_err = Some(e);
+                                        return Ok(false);
+                                    }
+                                }
+                            }
                             None => true,
                         };
                         if keep {
@@ -916,6 +1022,7 @@ pub(super) fn collect_rows_write(
         }
 
         ScanPlan::IndexScan {
+            index_name,
             idx_table,
             prefix,
             num_prefix_cols,
@@ -925,7 +1032,9 @@ pub(super) fn collect_rows_write(
             ..
         } => {
             let num_pk_cols = table_schema.primary_key_columns.len();
-            let num_index_cols = index_columns.len();
+            let num_index_cols = table_schema
+                .index_by_name(&index_name)
+                .map_or(index_columns.len(), |idx| idx.keys.len());
             let mut pk_keys: Vec<Vec<u8>> = Vec::new();
 
             {
@@ -968,11 +1077,12 @@ pub(super) fn collect_rows_write(
                     .table_get(lower_name.as_bytes(), pk_key)
                     .map_err(SqlError::Storage)?
                 {
-                    let row = decode_full_row(table_schema, pk_key, &value)?;
+                    let row = decode(pk_key, &value)?;
                     if let Some(ref expr) = where_clause {
-                        match eval_expr(expr, &EvalCtx::new(col_map, &row)) {
+                        match eval_expr(expr, &EvalCtx::new(col_map, &row).with_cancel(cancel)) {
                             Ok(val) if is_truthy(&val) => rows.push(row),
-                            _ => {}
+                            Ok(_) => {}
+                            Err(e) => return Err(e),
                         }
                     } else {
                         rows.push(row);
@@ -1002,6 +1112,10 @@ pub(super) fn collect_keyed_rows_with_read(
     table_schema: &TableSchema,
     where_clause: &Option<Expr>,
 ) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    let cancel = rtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    let decode =
+        |key: &[u8], value: &[u8]| decode_full_row_with_cancel(table_schema, key, value, cancel);
     let plan = planner::plan_select(table_schema, where_clause);
     let lower_name = &table_schema.name;
 
@@ -1010,7 +1124,7 @@ pub(super) fn collect_keyed_rows_with_read(
             let mut rows = Vec::new();
             let mut scan_err: Option<SqlError> = None;
             rtx.table_for_each(lower_name.as_bytes(), |key, value| {
-                match decode_full_row(table_schema, key, value) {
+                match decode(key, value) {
                     Ok(row) => rows.push((key.to_vec(), row)),
                     Err(e) => scan_err = Some(e),
                 }
@@ -1030,7 +1144,7 @@ pub(super) fn collect_keyed_rows_with_read(
                 .map_err(SqlError::Storage)?
             {
                 Some(value) => {
-                    let row = decode_full_row(table_schema, &key, &value)?;
+                    let row = decode(&key, &value)?;
                     Ok(vec![(key, row)])
                 }
                 None => Ok(vec![]),
@@ -1058,7 +1172,7 @@ pub(super) fn collect_keyed_rows_with_read(
                     1 => return Ok(true),
                     _ => {}
                 }
-                match decode_full_row(table_schema, key, value) {
+                match decode(key, value) {
                     Ok(row) => rows.push((key.to_vec(), row)),
                     Err(e) => {
                         scan_err = Some(e);
@@ -1075,6 +1189,7 @@ pub(super) fn collect_keyed_rows_with_read(
         }
 
         ScanPlan::IndexScan {
+            index_name,
             idx_table,
             prefix,
             num_prefix_cols,
@@ -1084,7 +1199,9 @@ pub(super) fn collect_keyed_rows_with_read(
             ..
         } => {
             let num_pk_cols = table_schema.primary_key_columns.len();
-            let num_index_cols = index_columns.len();
+            let num_index_cols = table_schema
+                .index_by_name(&index_name)
+                .map_or(index_columns.len(), |idx| idx.keys.len());
             let mut pk_keys: Vec<Vec<u8>> = Vec::new();
             {
                 let start = index_scan_start(&prefix, &range_conds);
@@ -1124,10 +1241,7 @@ pub(super) fn collect_keyed_rows_with_read(
                     .table_get(lower_name.as_bytes(), pk_key)
                     .map_err(SqlError::Storage)?
                 {
-                    rows.push((
-                        pk_key.clone(),
-                        decode_full_row(table_schema, pk_key, &value)?,
-                    ));
+                    rows.push((pk_key.clone(), decode(pk_key, &value)?));
                 }
             }
             Ok(rows)
@@ -1144,6 +1258,10 @@ pub(super) fn collect_keyed_rows_write(
     table_schema: &TableSchema,
     where_clause: &Option<Expr>,
 ) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    let cancel = wtx.cancel_token().cloned();
+    let cancel = cancel.as_ref();
+    let decode =
+        |key: &[u8], value: &[u8]| decode_full_row_with_cancel(table_schema, key, value, cancel);
     let plan = planner::plan_select(table_schema, where_clause);
     let lower_name = &table_schema.name;
 
@@ -1152,7 +1270,7 @@ pub(super) fn collect_keyed_rows_write(
             let mut rows = Vec::new();
             let mut scan_err: Option<SqlError> = None;
             wtx.table_for_each(lower_name.as_bytes(), |key, value| {
-                match decode_full_row(table_schema, key, value) {
+                match decode(key, value) {
                     Ok(row) => rows.push((key.to_vec(), row)),
                     Err(e) => scan_err = Some(e),
                 }
@@ -1172,7 +1290,7 @@ pub(super) fn collect_keyed_rows_write(
                 .map_err(SqlError::Storage)?
             {
                 Some(value) => {
-                    let row = decode_full_row(table_schema, &key, &value)?;
+                    let row = decode(&key, &value)?;
                     Ok(vec![(key, row)])
                 }
                 None => Ok(vec![]),
@@ -1200,7 +1318,7 @@ pub(super) fn collect_keyed_rows_write(
                     1 => return Ok(true),
                     _ => {}
                 }
-                match decode_full_row(table_schema, key, value) {
+                match decode(key, value) {
                     Ok(row) => rows.push((key.to_vec(), row)),
                     Err(e) => {
                         scan_err = Some(e);
@@ -1217,6 +1335,7 @@ pub(super) fn collect_keyed_rows_write(
         }
 
         ScanPlan::IndexScan {
+            index_name,
             idx_table,
             prefix,
             num_prefix_cols,
@@ -1226,7 +1345,9 @@ pub(super) fn collect_keyed_rows_write(
             ..
         } => {
             let num_pk_cols = table_schema.primary_key_columns.len();
-            let num_index_cols = index_columns.len();
+            let num_index_cols = table_schema
+                .index_by_name(&index_name)
+                .map_or(index_columns.len(), |idx| idx.keys.len());
             let mut pk_keys: Vec<Vec<u8>> = Vec::new();
 
             {
@@ -1268,10 +1389,7 @@ pub(super) fn collect_keyed_rows_write(
                     .table_get(lower_name.as_bytes(), pk_key)
                     .map_err(SqlError::Storage)?
                 {
-                    rows.push((
-                        pk_key.clone(),
-                        decode_full_row(table_schema, pk_key, &value)?,
-                    ));
+                    rows.push((pk_key.clone(), decode(pk_key, &value)?));
                 }
             }
             Ok(rows)
@@ -1632,12 +1750,19 @@ pub(super) struct JsonbContainsPredicate {
 }
 
 impl JsonbContainsPredicate {
-    pub(super) fn matches_raw(&self, _key: &[u8], value: &[u8]) -> Result<bool> {
+    pub(super) fn matches_raw(
+        &self,
+        _key: &[u8],
+        value: &[u8],
+        cancel: Option<&citadel::CancelToken>,
+    ) -> Result<bool> {
         if self.nonpk_idx >= row_non_pk_count(value) {
             return Ok(false);
         }
         match decode_column_raw(value, self.nonpk_idx)? {
-            RawColumn::Jsonb(bytes) => crate::json::jsonb_contains_bytes(bytes, &self.literal),
+            RawColumn::Jsonb(bytes) => {
+                crate::json::jsonb_contains_bytes_with_cancel(bytes, &self.literal, cancel)
+            }
             _ => Ok(false),
         }
     }
