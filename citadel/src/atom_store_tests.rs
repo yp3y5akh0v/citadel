@@ -11,6 +11,20 @@ fn store(dir: &std::path::Path) -> AtomKeyStore {
     AtomKeyStore::create_or_open(&dir.join("db.citadel-atomkeys"), FILE_ID, MAC_KEY).unwrap()
 }
 
+fn install_authenticated_slot(
+    store: &AtomKeyStore,
+    slot: u32,
+    state: SlotState,
+    owner: u64,
+    generation: u64,
+    wrapped: &[u8; WRAPPED_KEY_SIZE],
+) {
+    let block = build_slot_block(&MAC_KEY, state, owner, generation, wrapped);
+    for copy_b in [false, true] {
+        overwrite_in_place(&store.path, slot_offset(slot, copy_b), &block).unwrap();
+    }
+}
+
 #[test]
 fn create_preallocates_empty_slots() {
     let dir = tempfile::tempdir().unwrap();
@@ -32,6 +46,25 @@ fn allocate_write_read_roundtrip() {
     assert_eq!(rec.region_id, 42);
     assert_eq!(rec.gen, gen);
     assert_eq!(rec.wrapped, wrapped(0xAB));
+}
+
+#[test]
+fn selected_slot_batch_preserves_order_and_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = store(dir.path());
+    let first = store.allocate_write(41, &wrapped(0xA1)).unwrap().0;
+    let second = store.allocate_write(42, &wrapped(0xA2)).unwrap().0;
+
+    let records = store.read_slots(&[second, first, second]).unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.region_id)
+            .collect::<Vec<_>>(),
+        [42, 41, 42]
+    );
+    assert_eq!(records[0].wrapped, wrapped(0xA2));
+    assert_eq!(records[1].wrapped, wrapped(0xA1));
 }
 
 #[test]
@@ -140,7 +173,7 @@ fn interrupted_erasure_sibling_is_scrubbed_on_open_retry_and_batch_retry() {
     let dir2 = tempfile::tempdir().unwrap();
     let mut s2 = store(dir2.path());
     crash_shape(&s2, 3);
-    s2.tombstone(3, 9).unwrap();
+    s2.tombstone(3, 9, 1).unwrap();
     assert!(key_gone(&s2), "retry scrubbed the stale sibling");
 
     // Batch path: an already-tombstoned entry yields no receipt but still scrubs.
@@ -159,7 +192,7 @@ fn batch_skips_recycled_slot_and_spares_the_new_owner() {
     let mut s = store(dir.path());
     let slot = s.allocate_slot().unwrap();
     let old_gen = s.write_live(slot, 1, &wrapped(0x11)).unwrap();
-    s.tombstone(slot, 1).unwrap();
+    s.tombstone(slot, 1, old_gen).unwrap();
     let reused = s.allocate_slot().unwrap();
     assert_eq!(reused, slot, "tombstoned slot is reused");
     s.write_live(slot, 2, &wrapped(0x22)).unwrap();
@@ -194,8 +227,8 @@ fn tombstone_erases_and_frees_slot() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = store(dir.path());
     let slot = s.allocate_slot().unwrap();
-    s.write_live(slot, 7, &wrapped(0x11)).unwrap();
-    s.tombstone(slot, 7).unwrap();
+    let live_gen = s.write_live(slot, 7, &wrapped(0x11)).unwrap();
+    s.tombstone(slot, 7, live_gen).unwrap();
     let rec = s.read_slot(slot).unwrap();
     assert_eq!(rec.state, SlotState::Tombstone);
     assert_eq!(
@@ -215,9 +248,9 @@ fn tombstone_wrong_atom_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = store(dir.path());
     let slot = s.allocate_slot().unwrap();
-    s.write_live(slot, 100, &wrapped(0x22)).unwrap();
+    let live_gen = s.write_live(slot, 100, &wrapped(0x22)).unwrap();
     assert!(
-        s.tombstone(slot, 999).is_err(),
+        s.tombstone(slot, 999, live_gen).is_err(),
         "atom-id mismatch is rejected"
     );
     assert_eq!(
@@ -232,9 +265,166 @@ fn tombstone_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = store(dir.path());
     let slot = s.allocate_slot().unwrap();
-    s.write_live(slot, 5, &wrapped(0x33)).unwrap();
-    s.tombstone(slot, 5).unwrap();
-    s.tombstone(slot, 5).unwrap(); // no-op, no double-free of the slot
+    let live_gen = s.write_live(slot, 5, &wrapped(0x33)).unwrap();
+    s.tombstone(slot, 5, live_gen).unwrap();
+    s.tombstone(slot, 5, live_gen).unwrap(); // no-op, no double-free of the slot
+}
+
+#[test]
+fn max_binding_generation_is_retired_before_and_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.citadel-atomkeys");
+    let exhausted;
+    {
+        let mut s = store(dir.path());
+        exhausted = s.allocate_slot().unwrap();
+        install_authenticated_slot(
+            &s,
+            exhausted,
+            SlotState::Live,
+            41,
+            MAX_BINDING_GENERATION,
+            &wrapped(0x41),
+        );
+
+        s.tombstone(exhausted, 41, MAX_BINDING_GENERATION).unwrap();
+        let retired = s.read_slot(exhausted).unwrap();
+        assert_eq!(retired.state, SlotState::Tombstone);
+        assert_eq!(retired.gen, MAX_BINDING_GENERATION + 1);
+
+        let (next, generation) = s.allocate_write(42, &wrapped(0x42)).unwrap();
+        assert_ne!(next, exhausted, "an exhausted slot cannot hold another key");
+        assert!(generation <= MAX_BINDING_GENERATION);
+        let still_retired = s.read_slot(exhausted).unwrap();
+        assert_eq!(still_retired.state, retired.state);
+        assert_eq!(still_retired.gen, retired.gen);
+        assert_eq!(still_retired.wrapped, retired.wrapped);
+    }
+
+    let mut reopened = AtomKeyStore::create_or_open(&path, FILE_ID, MAC_KEY).unwrap();
+    assert_eq!(
+        reopened.read_slot(exhausted).unwrap().gen,
+        MAX_BINDING_GENERATION + 1
+    );
+    let rebound = reopened
+        .allocate_write_batch(&[(51, wrapped(0x51)), (52, wrapped(0x52))])
+        .unwrap();
+    assert!(
+        rebound.iter().all(|&(slot, _)| slot != exhausted),
+        "free-list reconstruction must keep the exhausted slot retired"
+    );
+}
+
+#[test]
+fn batch_generation_overflow_is_an_error_without_partial_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = store(dir.path());
+    let exhausted = s.allocate_slot().unwrap();
+    let unrelated = s.allocate_slot().unwrap();
+    install_authenticated_slot(
+        &s,
+        exhausted,
+        SlotState::Tombstone,
+        0,
+        MAX_BINDING_GENERATION,
+        &[0u8; WRAPPED_KEY_SIZE],
+    );
+
+    let before = std::fs::read(&s.path).unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        s.write_live_batch(&[
+            (unrelated, 71, wrapped(0x71)),
+            (exhausted, 72, wrapped(0x72)),
+        ])
+    }));
+    let error = outcome
+        .expect("write_live_batch must not panic on generation exhaustion")
+        .unwrap_err();
+    assert!(matches!(error, Error::RegionStoreCorrupt(_)));
+    assert_eq!(
+        std::fs::read(&s.path).unwrap(),
+        before,
+        "validation must finish before any batch write"
+    );
+
+    let unrelated_gen = s.write_live(unrelated, 71, &wrapped(0x71)).unwrap();
+    install_authenticated_slot(&s, exhausted, SlotState::Live, 72, u64::MAX, &wrapped(0x72));
+    let before = std::fs::read(&s.path).unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        s.tombstone_batch(&[(unrelated, 71, unrelated_gen), (exhausted, 72, u64::MAX)])
+    }));
+    let error = outcome
+        .expect("tombstone_batch must not panic on generation exhaustion")
+        .unwrap_err();
+    assert!(matches!(error, Error::RegionStoreCorrupt(_)));
+    assert_eq!(
+        std::fs::read(&s.path).unwrap(),
+        before,
+        "a later overflowing item must not erase an earlier live item"
+    );
+    assert_eq!(s.read_slot(unrelated).unwrap().state, SlotState::Live);
+}
+
+#[test]
+fn stale_same_owner_tombstone_cannot_erase_a_recycled_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = store(dir.path());
+    let slot = s.allocate_slot().unwrap();
+    let old_gen = s.write_live(slot, 5, &wrapped(0x33)).unwrap();
+    s.tombstone(slot, 5, old_gen).unwrap();
+
+    assert_eq!(s.allocate_slot().unwrap(), slot);
+    let successor = wrapped(0x44);
+    let successor_gen = s.write_live(slot, 5, &successor).unwrap();
+    assert!(successor_gen > old_gen);
+
+    let err = s.tombstone(slot, 5, old_gen).unwrap_err();
+    assert!(matches!(err, Error::RegionStoreCorrupt(_)));
+    let record = s.read_slot(slot).unwrap();
+    assert_eq!(record.state, SlotState::Live);
+    assert_eq!(record.gen, successor_gen);
+    assert_eq!(record.wrapped, successor);
+
+    s.tombstone(slot, 5, successor_gen).unwrap();
+    s.tombstone(slot, 5, old_gen)
+        .expect("a later tombstone proves the stale binding is already erased");
+}
+
+#[test]
+fn stale_batch_retry_accepts_a_later_tombstone() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = store(dir.path());
+    let slot = s.allocate_slot().unwrap();
+    let old_gen = s.write_live(slot, 7, &wrapped(0x55)).unwrap();
+    s.tombstone(slot, 7, old_gen).unwrap();
+    assert_eq!(s.allocate_slot().unwrap(), slot);
+    let successor_gen = s.write_live(slot, 7, &wrapped(0x66)).unwrap();
+    s.tombstone(slot, 7, successor_gen).unwrap();
+
+    let receipts = s.tombstone_batch(&[(slot, 7, old_gen)]).unwrap();
+    assert!(receipts.is_empty());
+    assert_eq!(s.read_slot(slot).unwrap().state, SlotState::Tombstone);
+}
+
+#[test]
+fn tombstone_batch_rejects_duplicate_slots_before_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = store(dir.path());
+    let slot = s.allocate_slot().unwrap();
+    let live_gen = s.write_live(slot, 7, &wrapped(0x55)).unwrap();
+
+    let err = s
+        .tombstone_batch(&[(slot, 7, live_gen), (slot, 7, live_gen)])
+        .unwrap_err();
+    assert!(matches!(err, Error::RegionStoreCorrupt(_)));
+    assert_eq!(s.read_slot(slot).unwrap().state, SlotState::Live);
+
+    let first = s.allocate_slot().unwrap();
+    let second = s.allocate_slot().unwrap();
+    assert_ne!(
+        first, second,
+        "one physical slot must not enter the free list twice"
+    );
 }
 
 #[test]
@@ -276,9 +466,9 @@ fn live_wrapped_returns_only_live_atoms() {
     let s2 = s.allocate_slot().unwrap();
     let s3 = s.allocate_slot().unwrap();
     s.write_live(s1, 11, &wrapped(0x01)).unwrap();
-    s.write_live(s2, 22, &wrapped(0x02)).unwrap();
+    let gen2 = s.write_live(s2, 22, &wrapped(0x02)).unwrap();
     s.write_live(s3, 33, &wrapped(0x03)).unwrap();
-    s.tombstone(s2, 22).unwrap();
+    s.tombstone(s2, 22, gen2).unwrap();
 
     let live = s.live_wrapped().unwrap();
     assert_eq!(live.len(), 2);
@@ -297,8 +487,8 @@ fn reopen_recovers_state_and_reuses_tombstones() {
         live_slot = s.allocate_slot().unwrap();
         tomb_slot = s.allocate_slot().unwrap();
         s.write_live(live_slot, 71, &wrapped(0x71)).unwrap();
-        s.write_live(tomb_slot, 72, &wrapped(0x72)).unwrap();
-        s.tombstone(tomb_slot, 72).unwrap();
+        let tomb_gen = s.write_live(tomb_slot, 72, &wrapped(0x72)).unwrap();
+        s.tombstone(tomb_slot, 72, tomb_gen).unwrap();
     }
     let mut s = AtomKeyStore::create_or_open(&path, FILE_ID, MAC_KEY).unwrap();
     assert_eq!(
@@ -383,7 +573,7 @@ fn tombstone_retries_restore_a_stranded_slot() {
     assert!(!s.free.contains(&slot_a) && !s.free.contains(&slot_b));
 
     // The single retry converges and restores its slot...
-    s.tombstone(slot_a, 71).unwrap();
+    s.tombstone(slot_a, 71, gen_a).unwrap();
     assert!(s.free.contains(&slot_a));
     // ...and so does the batch retry (a no-op receipt, never a wedge).
     assert!(s

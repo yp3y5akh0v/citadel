@@ -198,7 +198,12 @@ fn interrupted_erase_is_completed_at_next_open() {
     let citadel_sql::Value::Integer(slot) = qr.rows[0][0] else {
         panic!("slot shape");
     };
-    db.atom_store_tombstone(slot as u32, victim as u64).unwrap();
+    db.atom_store_tombstone(
+        slot as u32,
+        victim as u64,
+        db.atom_store_slot(slot as u32).unwrap().gen,
+    )
+    .unwrap();
     drop(conn);
     drop(eng);
 
@@ -253,7 +258,12 @@ fn recycled_slot_attests_key_erased() {
     let citadel_sql::Value::Integer(slot) = qr.rows[0][0] else {
         panic!("slot shape");
     };
-    db.atom_store_tombstone(slot as u32, victim as u64).unwrap();
+    db.atom_store_tombstone(
+        slot as u32,
+        victim as u64,
+        db.atom_store_slot(slot as u32).unwrap().gen,
+    )
+    .unwrap();
     // New inserts may recycle the freed slot under a different
     // owner/generation.
     for i in 0..3 {

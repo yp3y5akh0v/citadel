@@ -16,6 +16,11 @@ pub enum MemError {
     RegionForgotten(String),
     #[error("region '{0}' not found (call create_region first)")]
     RegionNotFound(String),
+    #[error(
+        "region '{0}' exists but is not attached to an embedder in this engine (call \
+         attach_existing_region first)"
+    )]
+    RegionNotAttached(String),
     #[error("link {src}->{dst} would create a cycle")]
     Cycle { src: i64, dst: i64 },
     #[error("region '{region}' exists with dim {expected}, embedder has dim {got}")]

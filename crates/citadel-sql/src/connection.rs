@@ -613,6 +613,18 @@ impl<'a> Connection<'a> {
             .execute_params_uncancelled_recovery(self.db, sql, params)
     }
 
+    /// Execute internal recovery writes atomically without inheriting the database's
+    /// cancellation token. Every entry must be INSERT, UPDATE, or DELETE.
+    #[doc(hidden)]
+    pub fn execute_params_batch_uncancelled_recovery(
+        &self,
+        statements: &[(&str, &[Value])],
+    ) -> Result<Vec<ExecutionResult>> {
+        self.inner
+            .borrow_mut()
+            .execute_params_batch_uncancelled_recovery(self.db, statements)
+    }
+
     /// Execute `;`-separated SQL statements. Stops at the first failure.
     pub fn execute_script(&self, sql: &str) -> ScriptExecution {
         let stmts = match parser::parse_sql_multi(sql) {
@@ -937,22 +949,44 @@ impl<'a> ConnectionInner<'a> {
         sql: &str,
         params: &[Value],
     ) -> Result<ExecutionResult> {
+        let statements = [(sql, params)];
+        let mut results = self.execute_params_batch_uncancelled_recovery(db, &statements)?;
+        Ok(results
+            .pop()
+            .expect("one recovery statement returns one result"))
+    }
+
+    fn execute_params_batch_uncancelled_recovery(
+        &mut self,
+        db: &'a Database,
+        statements: &[(&str, &[Value])],
+    ) -> Result<Vec<ExecutionResult>> {
         if self.active_txn.is_active() {
             return Err(SqlError::TransactionAlreadyActive);
         }
         try_drain_deferred_temp_drops(db);
-        let stmt = parser::parse_sql(sql)?;
-        let expected = parser::count_params(&stmt);
-        if expected != params.len() {
-            return Err(SqlError::ParameterCountMismatch {
-                expected,
-                got: params.len(),
-            });
+        let mut parsed = Vec::with_capacity(statements.len());
+        for &(sql, params) in statements {
+            let stmt = parser::parse_sql(sql)?;
+            let expected = parser::count_params(&stmt);
+            if expected != params.len() {
+                return Err(SqlError::ParameterCountMismatch {
+                    expected,
+                    got: params.len(),
+                });
+            }
+            if !matches!(
+                stmt,
+                Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+            ) {
+                return Err(SqlError::Unsupported(
+                    "uncancelled recovery execution accepts only INSERT, UPDATE, or DELETE".into(),
+                ));
+            }
+            parsed.push((stmt, params));
         }
-        if is_txn_control(&stmt) || !executor::stmt_mutates(&stmt) {
-            return Err(SqlError::Unsupported(
-                "uncancelled recovery execution accepts one mutating statement".into(),
-            ));
+        if parsed.is_empty() {
+            return Ok(Vec::new());
         }
 
         let mut wtx = db.begin_write().map_err(SqlError::Storage)?;
@@ -965,27 +999,33 @@ impl<'a> ConnectionInner<'a> {
         crate::datetime::set_txn_clock(Some(ts));
 
         let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let outcome = self.dispatch_clocked(db, &stmt, params);
-            let result = match outcome {
-                Ok(value) => match self.active_txn.take() {
-                    ActiveTxn::Write(mut wtx) => {
-                        match crate::executor::helpers::drain_deferred_fk_checks(&mut wtx) {
-                            Ok(()) => executor::commit_with_ann_publication(wtx, &self.schema)
-                                .map(|_| value),
-                            Err(error) => {
-                                wtx.abort();
-                                Err(error)
-                            }
+            let mut values = Vec::with_capacity(parsed.len());
+            for (stmt, params) in &parsed {
+                match self.dispatch_clocked(db, stmt, params) {
+                    Ok(value) => values.push(value),
+                    Err(error) => {
+                        if let ActiveTxn::Write(wtx) = self.active_txn.take() {
+                            wtx.abort();
+                        }
+                        self.reset_txn_state();
+                        try_drain_deferred_temp_drops(db);
+                        return Err(error);
+                    }
+                }
+            }
+            let result = match self.active_txn.take() {
+                ActiveTxn::Write(mut wtx) => {
+                    match crate::executor::helpers::drain_deferred_fk_checks(&mut wtx) {
+                        Ok(()) => {
+                            executor::commit_with_ann_publication(wtx, &self.schema).map(|_| values)
+                        }
+                        Err(error) => {
+                            wtx.abort();
+                            Err(error)
                         }
                     }
-                    _ => Err(SqlError::NoActiveTransaction),
-                },
-                Err(error) => {
-                    if let ActiveTxn::Write(wtx) = self.active_txn.take() {
-                        wtx.abort();
-                    }
-                    Err(error)
                 }
+                _ => Err(SqlError::NoActiveTransaction),
             };
             self.reset_txn_state();
             try_drain_deferred_temp_drops(db);
@@ -1629,6 +1669,55 @@ mod tests {
         let observer = Connection::open(&reopened).unwrap();
         let count = observer.query("SELECT COUNT(*) FROM sort_sink").unwrap();
         assert_eq!(count.rows[0][0], Value::Integer(0));
+    }
+
+    #[test]
+    fn recovery_batch_ignores_handle_cancellation_and_finishes_its_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE recovery_sink (id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+        let token = citadel::CancelToken::new();
+        token.cancel();
+        db.set_cancel(Some(token));
+        let first = [Value::Integer(1), Value::Integer(10)];
+        let second = [Value::Integer(20), Value::Integer(1)];
+
+        let result = conn.execute_params_batch_uncancelled_recovery(&[
+            ("INSERT INTO recovery_sink VALUES ($1, $2)", &first),
+            ("UPDATE recovery_sink SET value = $1 WHERE id = $2", &second),
+        ]);
+        db.set_cancel(None);
+        let results = result.unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(!conn.in_transaction());
+        assert_eq!(
+            conn.query("SELECT value FROM recovery_sink WHERE id = 1")
+                .unwrap()
+                .rows[0][0],
+            Value::Integer(20)
+        );
+    }
+
+    #[test]
+    fn recovery_batch_rejects_ddl_before_it_can_stale_the_schema_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(dir.path());
+        let conn = Connection::open(&db).unwrap();
+
+        let error = conn
+            .execute_params_batch_uncancelled_recovery(&[
+                ("CREATE TABLE ghost (id INTEGER PRIMARY KEY)", &[]),
+                ("INSERT INTO missing VALUES (1)", &[]),
+            ])
+            .unwrap_err();
+
+        assert!(matches!(error, SqlError::Unsupported(_)));
+        assert!(conn.table_schema("ghost").is_none());
+        conn.execute("CREATE TABLE ghost (id INTEGER PRIMARY KEY)")
+            .unwrap();
     }
 
     /// The recovery escape hatch owns a private transaction. A genuine

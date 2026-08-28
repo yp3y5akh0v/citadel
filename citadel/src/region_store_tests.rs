@@ -7,6 +7,20 @@ fn store(dir: &std::path::Path) -> RegionKeyStore {
     RegionKeyStore::create_or_open(&dir.join("db.citadel-regions"), FILE_ID, MAC_KEY).unwrap()
 }
 
+fn install_authenticated_slot(
+    store: &RegionKeyStore,
+    slot: u32,
+    state: SlotState,
+    owner: u64,
+    generation: u64,
+    wrapped: &[u8; WRAPPED_KEY_SIZE],
+) {
+    let block = build_slot_block(&MAC_KEY, state, owner, generation, wrapped);
+    for copy_b in [false, true] {
+        overwrite_in_place(&store.path, slot_offset(slot, copy_b), &block).unwrap();
+    }
+}
+
 #[test]
 fn create_preallocates_empty_slots() {
     let dir = tempfile::tempdir().unwrap();
@@ -33,19 +47,48 @@ fn reopen_recovers_slot_count_and_state() {
 }
 
 #[test]
+fn selected_slot_reads_share_one_file_open_and_preserve_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.citadel-regions");
+    let mut s = store(dir.path());
+    let first = s.allocate_slot().unwrap();
+    s.write_live(first, 7, &[0xA7; WRAPPED_KEY_SIZE]).unwrap();
+    let second = s.allocate_slot().unwrap();
+    s.write_live(second, 9, &[0xB9; WRAPPED_KEY_SIZE]).unwrap();
+
+    let warm = s.read_slots(&[second, first, second]).unwrap();
+    assert_eq!(
+        warm.iter()
+            .map(|record| record.region_id)
+            .collect::<Vec<_>>(),
+        [9, 7, 9]
+    );
+    drop(s);
+    let cold =
+        RegionKeyStore::read_existing_slots(&path, FILE_ID, MAC_KEY, &[second, first, second])
+            .unwrap();
+    for (warm, cold) in warm.iter().zip(&cold) {
+        assert_eq!(warm.state, cold.state);
+        assert_eq!(warm.gen, cold.gen);
+        assert_eq!(warm.region_id, cold.region_id);
+        assert_eq!(warm.wrapped, cold.wrapped);
+    }
+}
+
+#[test]
 fn allocate_skips_live_and_recycles_tombstone() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = store(dir.path());
 
     let a = s.allocate_slot().unwrap();
-    s.write_live(a, 1, &[0x11; WRAPPED_KEY_SIZE]).unwrap();
+    let gen_a = s.write_live(a, 1, &[0x11; WRAPPED_KEY_SIZE]).unwrap();
     assert_eq!(a, 0);
 
     let b = s.allocate_slot().unwrap();
     assert_eq!(b, 1, "live slot 0 must be skipped");
     s.write_live(b, 2, &[0x22; WRAPPED_KEY_SIZE]).unwrap();
 
-    s.tombstone(0, 1).unwrap();
+    s.tombstone(a, 1, gen_a).unwrap();
     let recycled = s.allocate_slot().unwrap();
     assert_eq!(recycled, 0, "tombstoned slot 0 is the lowest free slot");
 }
@@ -80,7 +123,7 @@ fn tombstone_makes_wrapped_key_unrecoverable() {
     let mut s = store(dir.path());
     let slot = s.allocate_slot().unwrap();
     let wrapped = [0xC3; WRAPPED_KEY_SIZE];
-    s.write_live(slot, 9, &wrapped).unwrap();
+    let live_gen = s.write_live(slot, 9, &wrapped).unwrap();
 
     // Present before forget.
     assert_eq!(s.read_slot(slot).unwrap().wrapped, wrapped);
@@ -90,7 +133,7 @@ fn tombstone_makes_wrapped_key_unrecoverable() {
         "harness sanity: key present pre-forget"
     );
 
-    s.tombstone(slot, 9).unwrap();
+    s.tombstone(slot, 9, live_gen).unwrap();
 
     assert_eq!(s.read_slot(slot).unwrap().state, SlotState::Tombstone);
     let after = std::fs::read(&s.path).unwrap();
@@ -105,10 +148,81 @@ fn tombstone_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = store(dir.path());
     let slot = s.allocate_slot().unwrap();
-    s.write_live(slot, 3, &[0x44; WRAPPED_KEY_SIZE]).unwrap();
-    s.tombstone(slot, 3).unwrap();
-    s.tombstone(slot, 3).unwrap(); // second call is a no-op success
+    let live_gen = s.write_live(slot, 3, &[0x44; WRAPPED_KEY_SIZE]).unwrap();
+    s.tombstone(slot, 3, live_gen).unwrap();
+    s.tombstone(slot, 3, live_gen).unwrap(); // second call is a no-op success
     assert_eq!(s.read_slot(slot).unwrap().state, SlotState::Tombstone);
+}
+
+#[test]
+fn max_binding_generation_is_retired_before_and_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.citadel-regions");
+    let exhausted;
+    {
+        let mut s = store(dir.path());
+        exhausted = s.allocate_slot().unwrap();
+        install_authenticated_slot(
+            &s,
+            exhausted,
+            SlotState::Live,
+            41,
+            MAX_BINDING_GENERATION,
+            &[0x41; WRAPPED_KEY_SIZE],
+        );
+
+        s.tombstone(exhausted, 41, MAX_BINDING_GENERATION).unwrap();
+        let retired = s.read_slot(exhausted).unwrap();
+        assert_eq!(retired.state, SlotState::Tombstone);
+        assert_eq!(retired.gen, MAX_BINDING_GENERATION + 1);
+
+        let (next, generation) = s.allocate_write(42, &[0x42; WRAPPED_KEY_SIZE]).unwrap();
+        assert_ne!(next, exhausted, "an exhausted slot cannot hold another key");
+        assert!(generation <= MAX_BINDING_GENERATION);
+        let still_retired = s.read_slot(exhausted).unwrap();
+        assert_eq!(still_retired.state, retired.state);
+        assert_eq!(still_retired.gen, retired.gen);
+        assert_eq!(still_retired.wrapped, retired.wrapped);
+    }
+
+    let mut reopened = RegionKeyStore::create_or_open(&path, FILE_ID, MAC_KEY).unwrap();
+    assert_eq!(
+        reopened.read_slot(exhausted).unwrap().gen,
+        MAX_BINDING_GENERATION + 1
+    );
+    let (next, generation) = reopened
+        .allocate_write(43, &[0x43; WRAPPED_KEY_SIZE])
+        .unwrap();
+    assert_ne!(
+        next, exhausted,
+        "reopen must not make an exhausted tombstone reusable"
+    );
+    assert!(generation <= MAX_BINDING_GENERATION);
+}
+
+#[test]
+fn stale_same_owner_tombstone_cannot_erase_a_recycled_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = store(dir.path());
+    let slot = s.allocate_slot().unwrap();
+    let old_gen = s.write_live(slot, 3, &[0x44; WRAPPED_KEY_SIZE]).unwrap();
+    s.tombstone(slot, 3, old_gen).unwrap();
+
+    assert_eq!(s.allocate_slot().unwrap(), slot);
+    let successor = [0x55; WRAPPED_KEY_SIZE];
+    let successor_gen = s.write_live(slot, 3, &successor).unwrap();
+    assert!(successor_gen > old_gen);
+
+    let err = s.tombstone(slot, 3, old_gen).unwrap_err();
+    assert!(matches!(err, Error::RegionStoreCorrupt(_)));
+    let record = s.read_slot(slot).unwrap();
+    assert_eq!(record.state, SlotState::Live);
+    assert_eq!(record.gen, successor_gen);
+    assert_eq!(record.wrapped, successor);
+
+    s.tombstone(slot, 3, successor_gen).unwrap();
+    s.tombstone(slot, 3, old_gen)
+        .expect("a later tombstone proves the stale binding is already erased");
 }
 
 #[test]
@@ -221,7 +335,7 @@ fn interrupted_erasure_sibling_is_scrubbed_on_open_and_on_retry() {
     let dir2 = tempfile::tempdir().unwrap();
     let s2 = store(dir2.path());
     crash_shape(&s2, 0);
-    s2.tombstone(0, 4).unwrap();
+    s2.tombstone(0, 4, 1).unwrap();
     assert!(key_gone(&s2.path), "retry scrubbed the stale sibling");
 }
 
@@ -287,15 +401,16 @@ fn tombstone_guards_empty_and_region_id_mismatch() {
     let slot = s.allocate_slot().unwrap();
 
     // (a) tombstone of an EMPTY slot is rejected (nothing to erase).
-    let err = s.tombstone(slot, 1).unwrap_err();
+    let empty_gen = s.read_slot(slot).unwrap().gen;
+    let err = s.tombstone(slot, 1, empty_gen).unwrap_err();
     assert!(
         matches!(err, Error::RegionStoreCorrupt(ref m) if m.contains("no live key")),
         "got {err}"
     );
 
     // (b) a wrong expected_region_id is rejected and must NOT destroy the live key.
-    s.write_live(slot, 9, &[0xAB; WRAPPED_KEY_SIZE]).unwrap();
-    let err = s.tombstone(slot, 8).unwrap_err();
+    let live_gen = s.write_live(slot, 9, &[0xAB; WRAPPED_KEY_SIZE]).unwrap();
+    let err = s.tombstone(slot, 8, live_gen).unwrap_err();
     assert!(
         matches!(err, Error::RegionStoreCorrupt(ref m) if m.contains("region 9 not 8")),
         "got {err}"
@@ -315,8 +430,8 @@ fn recycle_tombstone_then_write_read_gen_monotonic() {
     {
         let mut s = store(dir.path());
         let slot = s.allocate_slot().unwrap();
-        s.write_live(slot, 1, &[0x11; WRAPPED_KEY_SIZE]).unwrap();
-        s.tombstone(slot, 1).unwrap();
+        let live_gen = s.write_live(slot, 1, &[0x11; WRAPPED_KEY_SIZE]).unwrap();
+        s.tombstone(slot, 1, live_gen).unwrap();
         let tomb_gen = s.read_slot(slot).unwrap().gen;
 
         let recycled = s.allocate_slot().unwrap();
@@ -394,10 +509,10 @@ fn tombstone_fails_safely_when_overwrite_cannot_persist() {
     let path = dir.path().join("db.citadel-regions");
     let mut s = store(dir.path());
     let slot = s.allocate_slot().unwrap();
-    s.write_live(slot, 1, &[0x55; WRAPPED_KEY_SIZE]).unwrap();
+    let live_gen = s.write_live(slot, 1, &[0x55; WRAPPED_KEY_SIZE]).unwrap();
 
     set_readonly(&path, true);
-    let result = s.tombstone(slot, 1);
+    let result = s.tombstone(slot, 1, live_gen);
     set_readonly(&path, false); // restore so the slot is readable / tempdir can clean up
 
     assert!(
@@ -431,7 +546,7 @@ fn tombstone_gen_is_exactly_one_above_live() {
     let slot = s.allocate_slot().unwrap();
     let live_gen = s.write_live(slot, 7, &[0x9E; WRAPPED_KEY_SIZE]).unwrap();
 
-    s.tombstone(slot, 7).unwrap();
+    s.tombstone(slot, 7, live_gen).unwrap();
 
     let rec = s.read_slot(slot).unwrap();
     assert_eq!(
@@ -465,7 +580,9 @@ fn tombstone_erases_sibling_copy_residue() {
         "harness sanity: both wrapped keys present before forget"
     );
 
-    s.tombstone(slot, 7).unwrap();
+    let live_gen = s.read_slot(slot).unwrap().gen;
+    assert_eq!(live_gen, 2);
+    s.tombstone(slot, 7, live_gen).unwrap();
 
     assert_eq!(s.read_slot(slot).unwrap().state, SlotState::Tombstone);
     let after = std::fs::read(&s.path).unwrap();
@@ -484,9 +601,9 @@ fn live_bindings_returns_exact_live_slot_region_gen_triples_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let s = store(dir.path());
     let g2 = s.write_live(2, 100, &[0xA2; WRAPPED_KEY_SIZE]).unwrap();
-    s.write_live(3, 150, &[0xA3; WRAPPED_KEY_SIZE]).unwrap();
+    let g3 = s.write_live(3, 150, &[0xA3; WRAPPED_KEY_SIZE]).unwrap();
     let g4 = s.write_live(4, 200, &[0xA4; WRAPPED_KEY_SIZE]).unwrap();
-    s.tombstone(3, 150).unwrap();
+    s.tombstone(3, 150, g3).unwrap();
     let bindings = s.live_bindings().unwrap();
     assert_eq!(bindings, vec![(2u32, 100u64, g2), (4u32, 200u64, g4)]);
 }

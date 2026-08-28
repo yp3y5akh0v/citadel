@@ -1054,6 +1054,7 @@ struct ReentrantDatabaseEmbedder {
     db: Arc<citadel::Database>,
     source_region_id: u64,
     source_region_slot: u32,
+    source_region_gen: u64,
     source_atom_id: u64,
     source_atom_slot: u32,
     source_atom_gen: u64,
@@ -1116,10 +1117,11 @@ impl citadel_mem::Embedder for ReentrantDatabaseEmbedder {
                     ))
                 }
             }
-            match self
-                .db
-                .region_store_tombstone(self.source_region_slot, self.source_region_id)
-            {
+            match self.db.region_store_tombstone(
+                self.source_region_slot,
+                self.source_region_id,
+                self.source_region_gen,
+            ) {
                 Err(citadel::Error::RegionInUse { region_id })
                     if region_id == self.source_region_id => {}
                 Err(error) => {
@@ -1133,10 +1135,11 @@ impl citadel_mem::Embedder for ReentrantDatabaseEmbedder {
                     ))
                 }
             }
-            match self
-                .db
-                .atom_store_tombstone(self.source_atom_slot, self.source_atom_id)
-            {
+            match self.db.atom_store_tombstone(
+                self.source_atom_slot,
+                self.source_atom_id,
+                self.source_atom_gen,
+            ) {
                 Err(citadel::Error::AtomInUse { atom_id }) if atom_id == self.source_atom_id => {}
                 Err(error) => {
                     return Err(citadel_mem::EmbedError::Backend(format!(
@@ -1198,10 +1201,11 @@ fn a_reembedder_can_reenter_an_encrypted_write_on_the_same_database() {
 
     let conn = citadel_sql::Connection::open(&db).unwrap();
     let source = conn
-        .query("SELECT id, rsk_slot FROM memory_regions WHERE name = 'notes'")
+        .query("SELECT id, rsk_slot, rsk_gen FROM memory_regions WHERE name = 'notes'")
         .unwrap();
     let source_region_id = as_int(&source.rows[0][0]) as u64;
     let source_region_slot = as_int(&source.rows[0][1]) as u32;
+    let source_region_gen = as_int(&source.rows[0][2]) as u64;
     let source_atom = conn
         .query(&format!(
             "SELECT id, key_slot, key_gen FROM memory_atoms_d{DIM}_cosine_enc \
@@ -1222,6 +1226,7 @@ fn a_reembedder_can_reenter_an_encrypted_write_on_the_same_database() {
                 db: Arc::clone(&db),
                 source_region_id,
                 source_region_slot,
+                source_region_gen,
                 source_atom_id,
                 source_atom_slot,
                 source_atom_gen,
