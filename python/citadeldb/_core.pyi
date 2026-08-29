@@ -157,7 +157,13 @@ class MockEmbedder:
     def embed_queries(self, texts: list[str]) -> list[list[float]]: ...
 
 class CandleEmbedder:
-    """Only present in builds with the ``candle-embed`` feature."""
+    """Local model whose ``model_id`` binds its label, artifacts, and pipeline.
+
+    Only present in builds with the ``candle-embed`` feature.
+    Presets: ``bge-small``, ``bge-base``, ``bge-large``, ``minilm``,
+    ``e5-large``, ``e5-large-v2``, ``granite-r2``, ``arctic``, and
+    ``modernbert-embed``.
+    """
 
     def __init__(self, model_dir: str, preset: str = ...) -> None: ...
     @property

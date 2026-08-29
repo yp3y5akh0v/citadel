@@ -5,6 +5,8 @@ use crate::types::FusionWeights;
 use citadel::{Argon2Profile, Database, DatabaseBuilder};
 use std::sync::Arc;
 
+const MOCK_MODEL_ID: &str = "mock-fnv1a-bow-v1";
+
 fn create_db(path: &std::path::Path) -> Arc<Database> {
     Arc::new(
         DatabaseBuilder::new(path.join("m.db"))
@@ -648,9 +650,9 @@ fn stored_region_names_reads_sorted_persisted_live_inventory() {
     assert_eq!(
         fields,
         vec![
-            ("alpha", false, 8, EmbeddingMetric::Cosine, "mock"),
-            ("middle", false, 12, EmbeddingMetric::L2, "mock"),
-            ("zebra", true, 8, EmbeddingMetric::Cosine, "mock"),
+            ("alpha", false, 8, EmbeddingMetric::Cosine, MOCK_MODEL_ID),
+            ("middle", false, 12, EmbeddingMetric::L2, MOCK_MODEL_ID),
+            ("zebra", true, 8, EmbeddingMetric::Cosine, MOCK_MODEL_ID),
         ],
         "identity inventory preserves every exact persisted reader binding"
     );
@@ -667,7 +669,7 @@ fn stored_region_names_reads_sorted_persisted_live_inventory() {
     assert!(zebra.encrypted());
     assert_eq!(zebra.dim(), 8);
     assert_eq!(zebra.metric(), EmbeddingMetric::Cosine);
-    assert_eq!(zebra.model_id(), "mock");
+    assert_eq!(zebra.model_id(), MOCK_MODEL_ID);
     assert_eq!(inventory.stored_region_identity("absent").unwrap(), None);
     writer.drop_region("middle").unwrap();
     assert_eq!(
@@ -5298,14 +5300,14 @@ fn check_attached_rejects_mismatch_against_cached_region() {
         .unwrap();
 
     assert_eq!(
-        eng.check_attached("notes", 8, EmbeddingMetric::Cosine, "mock", false)
+        eng.check_attached("notes", 8, EmbeddingMetric::Cosine, MOCK_MODEL_ID, false)
             .unwrap(),
         Some(id),
         "an exact match returns the cached id"
     );
     assert!(
         matches!(
-            eng.check_attached("notes", 16, EmbeddingMetric::Cosine, "mock", false),
+            eng.check_attached("notes", 16, EmbeddingMetric::Cosine, MOCK_MODEL_ID, false),
             Err(MemError::DimMismatch {
                 expected: 8,
                 got: 16,
@@ -5316,7 +5318,7 @@ fn check_attached_rejects_mismatch_against_cached_region() {
     );
     assert!(
         matches!(
-            eng.check_attached("notes", 8, EmbeddingMetric::L2, "mock", false),
+            eng.check_attached("notes", 8, EmbeddingMetric::L2, MOCK_MODEL_ID, false),
             Err(MemError::MetricMismatch { .. })
         ),
         "cached metric mismatch must error"
@@ -5330,7 +5332,7 @@ fn check_attached_rejects_mismatch_against_cached_region() {
     );
     assert!(
         matches!(
-            eng.check_attached("notes", 8, EmbeddingMetric::Cosine, "mock", true),
+            eng.check_attached("notes", 8, EmbeddingMetric::Cosine, MOCK_MODEL_ID, true),
             Err(MemError::Invalid(_))
         ),
         "cached encrypted-flag mismatch must error"

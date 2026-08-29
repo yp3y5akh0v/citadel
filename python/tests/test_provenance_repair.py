@@ -10,6 +10,7 @@ import citadeldb
 
 DIM = 32
 REAL_MODEL = "text-embedding-3-small"
+MOCK_MODEL = citadeldb.MockEmbedder(DIM).model_id
 
 
 class CallerSideEmbedder:
@@ -27,12 +28,26 @@ class CallerSideEmbedder:
         return out
 
 
+class LegacyMockEmbedder:
+    """The label-only identity written by releases before the versioned mock."""
+
+    dim = DIM
+    metric = "cosine"
+    model_id = "mock"
+
+    def __init__(self):
+        self._inner = citadeldb.MockEmbedder(DIM)
+
+    def embed(self, texts):
+        return self._inner.embed(texts)
+
+
 def shim_store():
     """Build a region whose caller-provided vectors are mislabeled as mock."""
     path = os.path.join(tempfile.mkdtemp(), "shim.cdl")
     db = citadeldb.connect(path, key="k", create=True, region_keys=True)
     mem = db.memory()
-    mem.create_region("shimmed", citadeldb.MockEmbedder(DIM))
+    mem.create_region("shimmed", LegacyMockEmbedder())
     embedder = CallerSideEmbedder()
     for text, embedding in zip(
         ["alpha beta", "gamma delta"],
@@ -121,8 +136,8 @@ def test_reclassifying_changes_no_atom():
 
 def test_reclassifying_to_the_attached_model_keeps_it_attached():
     db, mem = mock_store()
-    mem.reclassify_region("shimmed", "mock")
-    assert recorded_model(db) == "mock"
+    mem.reclassify_region("shimmed", MOCK_MODEL)
+    assert recorded_model(db) == MOCK_MODEL
     mem.remember("shimmed", {"kind": "note", "text": "epsilon zeta"})
     assert mem.count("shimmed", "note") == 3
 

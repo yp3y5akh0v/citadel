@@ -1,9 +1,32 @@
 mod upgrade_fixtures;
 
-use citadel_mem::{Embedder, MemoryEngine, MockEmbedder};
+use citadel_mem::{
+    AtomInput, EmbedError, Embedder, EmbeddingMetric, MemError, MemoryEngine, MockEmbedder,
+    RecallQuery,
+};
 use upgrade_fixtures::{
     fixture_vault, seed_ordinary_region, seed_shim_region, NamedEmbedder, SHIM_VECTOR_MODEL,
 };
+
+struct LegacyMockEmbedder(MockEmbedder);
+
+impl Embedder for LegacyMockEmbedder {
+    fn dim(&self) -> usize {
+        self.0.dim()
+    }
+
+    fn metric(&self) -> EmbeddingMetric {
+        self.0.metric()
+    }
+
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.0.embed(texts)
+    }
+}
 
 #[test]
 fn an_ordinary_fixture_region_records_its_model() {
@@ -82,5 +105,48 @@ fn provenance_fixtures_survive_reopen() {
             ("documents".to_string(), "mock".to_string()),
             ("notes".to_string(), "fixture-model-v1".to_string()),
         ]
+    );
+}
+
+#[test]
+fn a_genuine_legacy_mock_region_can_be_explicitly_reclassified() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture_vault(&dir.path().join("legacy-mock.citadel"));
+    let legacy = MemoryEngine::open(std::sync::Arc::clone(&db)).unwrap();
+    legacy
+        .create_region(
+            "notes",
+            std::sync::Arc::new(LegacyMockEmbedder(MockEmbedder::new(32))),
+        )
+        .unwrap();
+    legacy
+        .remember("notes", AtomInput::new("fact", "alpha beta"))
+        .unwrap();
+    drop(legacy);
+
+    let current = std::sync::Arc::new(MockEmbedder::new(32));
+    let current_model = current.model_id().to_owned();
+    let reopened = MemoryEngine::open(db).unwrap();
+    assert!(matches!(
+        reopened.attach_existing_region("notes", current.clone()),
+        Err(MemError::ModelMismatch { .. })
+    ));
+
+    reopened
+        .reclassify_region("notes", current_model.clone())
+        .unwrap();
+    reopened.attach_existing_region("notes", current).unwrap();
+    let hits = reopened
+        .recall("notes", RecallQuery::by_text("alpha beta", 1))
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].text, "alpha beta");
+    assert_eq!(
+        reopened
+            .stored_region_identity("notes")
+            .unwrap()
+            .unwrap()
+            .model_id(),
+        current_model
     );
 }

@@ -688,7 +688,7 @@ fn prov() -> citadel_membench::Provenance {
     provenance(
         "mock",
         "mock",
-        "mock",
+        "mock-fnv1a-bow-v1",
         BenchConfig::default(),
         "inline fixture",
         "0000000000000000000000000000000000000000000000000000000000000000",

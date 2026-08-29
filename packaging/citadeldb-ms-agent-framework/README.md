@@ -75,9 +75,9 @@ multi-part contents and `additional_properties` all survive.
 ## Context provider
 
 Recalls with Citadel's hybrid search: vector distance, keyword rank and recency, fused
-into one score. `embedder=` is required and has no default: one substituted quietly would rank
-lexically while recording `mock` as the model that wrote the vectors. `MockEmbedder` is lexical
-and needs no download; pass a real model to match across wording.
+into one score. `embedder=` is required and has no default: silent substitution would change
+ranking semantics and persist different provenance. `MockEmbedder` is lexical and needs no
+download; pass a real model to match across wording.
 
 ```python
 memory = CitadelContextProvider(

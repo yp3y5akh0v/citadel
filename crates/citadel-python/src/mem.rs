@@ -107,7 +107,7 @@ fn dict_to_atom_input(py: Python<'_>, d: &Bound<'_, PyDict>) -> PyResult<AtomInp
 // ---- embedder bridge -------------------------------------------------------
 
 /// Adapts a Python embedder object to citadel-mem's `Embedder`. An
-/// `embed_queries` method, if present, enables asymmetric (E5/granite) encoding.
+/// `embed_queries` method, if present, enables E5-style asymmetric encoding.
 struct PyEmbedder {
     callable: Py<PyAny>,
     dim: usize,
@@ -352,13 +352,39 @@ fn candle_config_for(preset: &str) -> PyResult<CandleConfig> {
         "bge-large" => CandleConfig::bge_large(),
         "minilm" => CandleConfig::minilm_l6(),
         "e5-large" => CandleConfig::e5_large(),
+        "e5-large-v2" => CandleConfig::e5_large_v2(),
         "granite-r2" => CandleConfig::granite_r2(),
+        "arctic" => CandleConfig::arctic(),
+        "modernbert-embed" => CandleConfig::modernbert_embed(),
         other => {
             return Err(PyValueError::new_err(format!(
-                "unknown model preset '{other}' (bge-small|bge-base|bge-large|minilm|e5-large|granite-r2)"
+                "unknown model preset '{other}' (bge-small|bge-base|bge-large|minilm|e5-large|e5-large-v2|granite-r2|arctic|modernbert-embed)"
             )))
         }
     })
+}
+
+#[cfg(all(test, feature = "candle-embed"))]
+mod candle_config_tests {
+    use super::candle_config_for;
+
+    #[test]
+    fn python_exposes_every_rust_candle_preset() {
+        let expected = [
+            ("bge-small", "bge-small-en-v1.5"),
+            ("bge-base", "bge-base-en-v1.5"),
+            ("bge-large", "bge-large-en-v1.5"),
+            ("minilm", "all-MiniLM-L6-v2"),
+            ("e5-large", "e5-large"),
+            ("e5-large-v2", "e5-large-v2"),
+            ("granite-r2", "granite-embedding-english-r2"),
+            ("arctic", "snowflake-arctic-embed"),
+            ("modernbert-embed", "modernbert-embed-base"),
+        ];
+        for (preset, model_id) in expected {
+            assert_eq!(candle_config_for(preset).unwrap().model_id, model_id);
+        }
+    }
 }
 
 /// In-process Candle sentence embedder loaded from a local model directory.
@@ -373,7 +399,8 @@ pub(crate) struct PyCandleEmbedder {
 #[pymethods]
 impl PyCandleEmbedder {
     /// Load `config.json` + `tokenizer.json` + `model.safetensors` from `model_dir`.
-    /// `preset` selects pooling/prefixes: e5-large|bge-small|bge-base|bge-large|minilm|granite-r2.
+    /// `preset` selects pooling/prefixes: bge-small|bge-base|bge-large|minilm|
+    /// e5-large|e5-large-v2|granite-r2|arctic|modernbert-embed.
     #[new]
     #[pyo3(signature = (model_dir, preset="e5-large"))]
     fn new(py: Python<'_>, model_dir: &str, preset: &str) -> PyResult<Self> {
@@ -398,6 +425,7 @@ impl PyCandleEmbedder {
     }
 
     #[getter]
+    /// Friendly model label plus the artifact and pipeline fingerprint.
     fn model_id(&self) -> String {
         self.inner.model_id().to_string()
     }
@@ -412,8 +440,8 @@ impl PyCandleEmbedder {
         .map_err(to_pyerr)
     }
 
-    /// Embed queries with the model's query prefix (E5/granite asymmetric
-    /// retrieval); equals `embed` for symmetric presets.
+    /// Embed queries with the model's query prefix for asymmetric retrieval;
+    /// equals `embed` for symmetric presets.
     fn embed_queries(&self, py: Python<'_>, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
         let inner = self.inner.clone();
         py.detach(move || {

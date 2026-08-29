@@ -51,8 +51,8 @@ from citadeldb_langgraph import CitadelStore
 from citadeldb_openai_agents import CitadelSession
 
 PATH, KEY = "agent.cdl", "your-passphrase"
-# No adapter defaults an embedder: one substituted quietly would rank lexically
-# while recording `mock` as the model that wrote the vectors.
+# No adapter defaults an embedder: silent substitution would change ranking
+# semantics and persist different provenance.
 EMB = citadeldb.MockEmbedder(dim=64)
 
 store = CitadelStore(PATH, key=KEY, embedder=EMB)            # LangGraph state

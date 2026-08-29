@@ -85,9 +85,8 @@ Citadel is embedded and one process owns the file. A path already open on this t
 under the same passphrase, is shared, so this can sit on the same database as another
 Citadel adapter; construct them on the same thread.
 
-`embedder=` is required. There is no default: a store that quietly substituted `MockEmbedder`
-would rank lexically while recording `mock` as the model that wrote its vectors, and neither
-of those is something you can find out from the outside. `MockEmbedder` needs no download and
+`embedder=` is required. There is no default: quietly substituting `MockEmbedder` would change
+ranking semantics and persist different provenance. `MockEmbedder` needs no download and
 is enough to build and test a graph, so pass it explicitly if that is what you want. For
 semantic recall pass a real embedder. `CandleEmbedder` is not in the default `citadeldb` wheel
 and needs a source build (`maturin build --features candle-embed`); any object exposing `dim`,

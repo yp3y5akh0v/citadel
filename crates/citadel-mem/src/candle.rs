@@ -10,7 +10,7 @@ use candle_transformers::models::bert::{BertModel, Config, DTYPE};
 use candle_transformers::models::modernbert::{Config as ModernBertConfig, ModernBert};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
-use crate::embed::{EmbedError, Embedder, EmbeddingMetric, Reranker};
+use crate::embed::{normalize_model_id_label, EmbedError, Embedder, EmbeddingMetric, Reranker};
 
 fn backend(e: impl std::fmt::Display) -> EmbedError {
     EmbedError::Backend(e.to_string())
@@ -53,6 +53,8 @@ pub enum Arch {
 /// config).
 #[derive(Debug, Clone)]
 pub struct CandleConfig {
+    /// Human-readable label. The loaded embedder appends a content fingerprint
+    /// to make its durable [`Embedder::model_id`] artifact-specific.
     pub model_id: String,
     pub arch: Arch,
     pub metric: EmbeddingMetric,
@@ -182,6 +184,113 @@ impl CandleConfig {
     }
 }
 
+/// `v1` freezes the fingerprint encoding. The pipeline revision is separate:
+/// bump it when inference or preprocessing semantics can change for identical
+/// artifacts and settings.
+const CANDLE_FINGERPRINT_CONTEXT: &str = "CitadelDB Candle embedding pipeline identity v1";
+const CANDLE_PIPELINE_REVISION: u64 = 1;
+
+fn fingerprint_field(hasher: &mut blake3::Hasher, tag: u8, bytes: &[u8]) {
+    let len = u64::try_from(bytes.len()).expect("fingerprint field length fits u64");
+    hasher.update(&[tag]);
+    hasher.update(&len.to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn fingerprint_optional_field(hasher: &mut blake3::Hasher, tag: u8, value: Option<&str>) {
+    let value_len = value.map_or(0, str::len);
+    let len = u64::try_from(value_len)
+        .expect("fingerprint field length fits u64")
+        .checked_add(1)
+        .expect("fingerprint option length fits u64");
+    hasher.update(&[tag]);
+    hasher.update(&len.to_le_bytes());
+    match value {
+        Some(value) => {
+            hasher.update(&[1]);
+            hasher.update(value.as_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}
+
+fn candle_pipeline_fingerprint_with_revision(
+    config_json: &[u8],
+    tokenizer_json: &[u8],
+    weights: &[u8],
+    cfg: &CandleConfig,
+    pipeline_revision: u64,
+) -> [u8; 32] {
+    let CandleConfig {
+        model_id: _,
+        arch,
+        metric,
+        pooling,
+        normalize,
+        passage_prefix,
+        query_prefix,
+        max_length,
+    } = cfg;
+    let arch = match arch {
+        Arch::Bert => 1,
+        Arch::ModernBert => 2,
+    };
+    let metric = match metric {
+        EmbeddingMetric::Cosine => 1,
+        EmbeddingMetric::L2 => 2,
+        EmbeddingMetric::InnerProduct => 3,
+    };
+    let pooling = match pooling {
+        Pooling::Cls => 1,
+        Pooling::Mean => 2,
+    };
+    let max_length = u64::try_from(*max_length).expect("maximum token length fits u64");
+    let micro_batch = u64::try_from(MICRO_BATCH).expect("micro-batch size fits u64");
+
+    let mut hasher = blake3::Hasher::new_derive_key(CANDLE_FINGERPRINT_CONTEXT);
+    fingerprint_field(&mut hasher, 1, &pipeline_revision.to_le_bytes());
+    fingerprint_field(&mut hasher, 2, config_json);
+    fingerprint_field(&mut hasher, 3, tokenizer_json);
+    fingerprint_field(&mut hasher, 4, weights);
+    fingerprint_field(&mut hasher, 5, &[arch]);
+    fingerprint_field(&mut hasher, 6, &[metric]);
+    fingerprint_field(&mut hasher, 7, &[pooling]);
+    fingerprint_field(&mut hasher, 8, &[u8::from(*normalize)]);
+    fingerprint_optional_field(&mut hasher, 9, passage_prefix.as_deref());
+    fingerprint_optional_field(&mut hasher, 10, query_prefix.as_deref());
+    fingerprint_field(&mut hasher, 11, &max_length.to_le_bytes());
+    fingerprint_field(&mut hasher, 12, &micro_batch.to_le_bytes());
+    fingerprint_field(&mut hasher, 13, b"f32");
+    *hasher.finalize().as_bytes()
+}
+
+fn candle_pipeline_fingerprint(
+    config_json: &[u8],
+    tokenizer_json: &[u8],
+    weights: &[u8],
+    cfg: &CandleConfig,
+) -> [u8; 32] {
+    candle_pipeline_fingerprint_with_revision(
+        config_json,
+        tokenizer_json,
+        weights,
+        cfg,
+        CANDLE_PIPELINE_REVISION,
+    )
+}
+
+fn content_bound_model_id(label: &str, fingerprint: [u8; 32], pipeline_revision: u64) -> String {
+    let fingerprint = blake3::Hash::from_bytes(fingerprint);
+    format!("{label}@citadel-candle-v1-p{pipeline_revision}:{fingerprint}")
+}
+
+enum ParsedEncoderConfig {
+    Bert(Config),
+    ModernBert(ModernBertConfig),
+}
+
 /// The loaded encoder. BERT consumes `(ids, type_ids, mask)`; ModernBERT has no
 /// token-type embedding and consumes `(ids, mask)`. Boxed: the BERT struct is
 /// several times the ModernBERT one (clippy::large_enum_variant).
@@ -248,6 +357,19 @@ impl CandleEmbedder {
         weights: Vec<u8>,
         cfg: CandleConfig,
     ) -> Result<Self, EmbedError> {
+        let model_label = normalize_model_id_label(&cfg.model_id).map_err(EmbedError::Backend)?;
+        let mut tokenizer = Tokenizer::from_bytes(tokenizer_json).map_err(backend)?;
+        let parsed_config = match cfg.arch {
+            Arch::Bert => {
+                ParsedEncoderConfig::Bert(serde_json::from_slice(config_json).map_err(backend)?)
+            }
+            Arch::ModernBert => ParsedEncoderConfig::ModernBert(
+                serde_json::from_slice(config_json).map_err(backend)?,
+            ),
+        };
+        let fingerprint = candle_pipeline_fingerprint(config_json, tokenizer_json, &weights, &cfg);
+        let model_id = content_bound_model_id(&model_label, fingerprint, CANDLE_PIPELINE_REVISION);
+
         let device = select_device();
         // f32 GEMM via TF32 tensor cores (Ampere+); full f32 range. No-op on
         // CPU.
@@ -256,24 +378,20 @@ impl CandleEmbedder {
             eprintln!("[citadel-mem] cuda-embed: TF32 f32 GEMM enabled (tensor cores)");
         }
 
-        let mut tokenizer = Tokenizer::from_bytes(tokenizer_json).map_err(backend)?;
         let mut padding = PaddingParams {
             strategy: PaddingStrategy::BatchLongest,
             ..Default::default()
         };
         let vb = VarBuilder::from_buffered_safetensors(weights, DTYPE, &device).map_err(backend)?;
-        let (model, dim) = match cfg.arch {
-            Arch::Bert => {
-                let config: Config = serde_json::from_slice(config_json).map_err(backend)?;
+        let (model, dim) = match parsed_config {
+            ParsedEncoderConfig::Bert(config) => {
                 let dim = config.hidden_size;
                 (
                     Backbone::Bert(Box::new(BertModel::load(vb, &config).map_err(backend)?)),
                     dim,
                 )
             }
-            Arch::ModernBert => {
-                let config: ModernBertConfig =
-                    serde_json::from_slice(config_json).map_err(backend)?;
+            ParsedEncoderConfig::ModernBert(config) => {
                 // ModernBERT vocabs don't put [PAD] at id 0; take it from the
                 // config.
                 padding.pad_id = config.pad_token_id;
@@ -316,7 +434,7 @@ impl CandleEmbedder {
             normalize: cfg.normalize,
             passage_prefix: cfg.passage_prefix,
             query_prefix: cfg.query_prefix,
-            model_id: cfg.model_id,
+            model_id,
         })
     }
 
@@ -667,6 +785,202 @@ mod tests {
         (a - b).abs() < eps
     }
 
+    fn fingerprint_fixture() -> CandleConfig {
+        CandleConfig {
+            model_id: "fixture-label".into(),
+            arch: Arch::Bert,
+            metric: EmbeddingMetric::Cosine,
+            pooling: Pooling::Mean,
+            normalize: true,
+            passage_prefix: Some("passage: ".into()),
+            query_prefix: Some("query: ".into()),
+            max_length: 384,
+        }
+    }
+
+    #[test]
+    fn pipeline_fingerprint_has_a_stable_known_answer() {
+        let cfg = fingerprint_fixture();
+        let fingerprint = candle_pipeline_fingerprint(
+            b"{\"hidden_size\":32}",
+            b"{\"tokenizer\":\"wordpiece\"}",
+            b"fixed safetensors bytes\0\xff",
+            &cfg,
+        );
+        assert_eq!(
+            fingerprint,
+            [
+                9, 214, 58, 246, 145, 158, 91, 166, 93, 14, 8, 154, 70, 33, 81, 188, 134, 177, 214,
+                181, 68, 226, 33, 13, 226, 38, 28, 101, 15, 204, 199, 16,
+            ],
+            "changing fingerprint framing or pipeline policy requires a new scheme or revision"
+        );
+        assert_eq!(
+            content_bound_model_id("fixture-label", fingerprint, CANDLE_PIPELINE_REVISION),
+            "fixture-label@citadel-candle-v1-p1:09d63af6919e5ba65d0e089a462151bc86b1d6b544e2210de2261c650fccc710"
+        );
+    }
+
+    #[test]
+    fn every_pipeline_input_perturbs_the_fingerprint() {
+        let config = b"config";
+        let tokenizer = b"tokenizer";
+        let weights = b"weights";
+        let cfg = fingerprint_fixture();
+        let base = candle_pipeline_fingerprint(config, tokenizer, weights, &cfg);
+
+        let mut variants = Vec::new();
+        variants.push(candle_pipeline_fingerprint(
+            b"config changed",
+            tokenizer,
+            weights,
+            &cfg,
+        ));
+        variants.push(candle_pipeline_fingerprint(
+            config,
+            b"tokenizer changed",
+            weights,
+            &cfg,
+        ));
+        variants.push(candle_pipeline_fingerprint(
+            config,
+            tokenizer,
+            b"weights changed",
+            &cfg,
+        ));
+
+        let mut changed = cfg.clone();
+        changed.arch = Arch::ModernBert;
+        variants.push(candle_pipeline_fingerprint(
+            config, tokenizer, weights, &changed,
+        ));
+
+        let metric_hashes = [
+            EmbeddingMetric::Cosine,
+            EmbeddingMetric::L2,
+            EmbeddingMetric::InnerProduct,
+        ]
+        .map(|metric| {
+            let mut changed = cfg.clone();
+            changed.metric = metric;
+            candle_pipeline_fingerprint(config, tokenizer, weights, &changed)
+        });
+        for (index, left) in metric_hashes.iter().enumerate() {
+            for right in &metric_hashes[index + 1..] {
+                assert_ne!(left, right, "every metric needs a unique tag");
+            }
+        }
+        variants.extend(metric_hashes[1..].iter().copied());
+
+        let mut changed = cfg.clone();
+        changed.pooling = Pooling::Cls;
+        variants.push(candle_pipeline_fingerprint(
+            config, tokenizer, weights, &changed,
+        ));
+        let mut changed = cfg.clone();
+        changed.normalize = false;
+        variants.push(candle_pipeline_fingerprint(
+            config, tokenizer, weights, &changed,
+        ));
+        let mut changed = cfg.clone();
+        changed.passage_prefix = Some("document: ".into());
+        variants.push(candle_pipeline_fingerprint(
+            config, tokenizer, weights, &changed,
+        ));
+        let mut changed = cfg.clone();
+        changed.query_prefix = Some("search: ".into());
+        variants.push(candle_pipeline_fingerprint(
+            config, tokenizer, weights, &changed,
+        ));
+        let mut changed = cfg.clone();
+        changed.max_length += 1;
+        variants.push(candle_pipeline_fingerprint(
+            config, tokenizer, weights, &changed,
+        ));
+        variants.push(candle_pipeline_fingerprint_with_revision(
+            config,
+            tokenizer,
+            weights,
+            &cfg,
+            CANDLE_PIPELINE_REVISION + 1,
+        ));
+
+        for (index, variant) in variants.iter().enumerate() {
+            assert_ne!(
+                *variant, base,
+                "pipeline input {index} was not fingerprinted"
+            );
+        }
+    }
+
+    #[test]
+    fn fingerprint_frames_fields_and_option_presence() {
+        let cfg = fingerprint_fixture();
+        assert_ne!(
+            candle_pipeline_fingerprint(b"a", b"bc", b"weights", &cfg),
+            candle_pipeline_fingerprint(b"ab", b"c", b"weights", &cfg),
+            "artifact boundaries must not alias"
+        );
+
+        let mut left = cfg.clone();
+        left.passage_prefix = Some("a".into());
+        left.query_prefix = Some("bc".into());
+        let mut right = cfg.clone();
+        right.passage_prefix = Some("ab".into());
+        right.query_prefix = Some("c".into());
+        assert_ne!(
+            candle_pipeline_fingerprint(b"c", b"t", b"w", &left),
+            candle_pipeline_fingerprint(b"c", b"t", b"w", &right),
+            "prefix boundaries must not alias"
+        );
+
+        let mut none = cfg.clone();
+        none.passage_prefix = None;
+        let mut empty = cfg;
+        empty.passage_prefix = Some(String::new());
+        assert_ne!(
+            candle_pipeline_fingerprint(b"c", b"t", b"w", &none),
+            candle_pipeline_fingerprint(b"c", b"t", b"w", &empty),
+            "an absent prefix differs from an explicitly empty prefix"
+        );
+    }
+
+    #[test]
+    fn friendly_label_is_not_pipeline_fingerprint_material() {
+        let first = fingerprint_fixture();
+        let mut renamed = first.clone();
+        renamed.model_id = "another-friendly-label".into();
+        let first_fingerprint = candle_pipeline_fingerprint(b"c", b"t", b"w", &first);
+        let renamed_fingerprint = candle_pipeline_fingerprint(b"c", b"t", b"w", &renamed);
+        assert_eq!(first_fingerprint, renamed_fingerprint);
+        assert_ne!(
+            content_bound_model_id(&first.model_id, first_fingerprint, CANDLE_PIPELINE_REVISION),
+            content_bound_model_id(
+                &renamed.model_id,
+                renamed_fingerprint,
+                CANDLE_PIPELINE_REVISION
+            ),
+            "the human label remains part of the complete persisted identity"
+        );
+    }
+
+    #[test]
+    fn placeholder_labels_are_rejected_before_artifacts_are_loaded() {
+        for label in ["", "   ", "unknown", " UNKNOWN ", "default", " Default "] {
+            let mut cfg = fingerprint_fixture();
+            cfg.model_id = label.into();
+            let result =
+                CandleEmbedder::from_bytes(b"bad config", b"bad tokenizer", Vec::new(), cfg);
+            let Err(error) = result else {
+                panic!("placeholder label {label:?} unexpectedly loaded")
+            };
+            assert!(
+                error.to_string().contains("model id"),
+                "label {label:?} reached artifact parsing: {error}"
+            );
+        }
+    }
+
     #[test]
     fn masked_mean_pool_averages_unmasked_tokens() {
         let dev = Device::Cpu;
@@ -703,12 +1017,7 @@ mod tests {
         assert!(approx(norm, 1.0, 1e-6));
     }
 
-    /// Tiny random-weight BERT + WordPiece tokenizer; runs the full path in CI
-    /// offline.
-    fn synthetic_embedder() -> CandleEmbedder {
-        let device = Device::Cpu;
-        // WordPieceBuilder::vocab wants Into<AHashMap>; the array form avoids
-        // ahash.
+    fn synthetic_tokenizer() -> Tokenizer {
         let vocab = [
             ("[PAD]".to_string(), 0u32),
             ("[UNK]".to_string(), 1),
@@ -721,7 +1030,6 @@ mod tests {
             ("query".to_string(), 8),
             ("passage".to_string(), 9),
         ];
-        let vocab_size = vocab.len();
         let wp = WordPieceBuilder::new()
             .vocab(vocab)
             .unk_token("[UNK]".into())
@@ -733,9 +1041,12 @@ mod tests {
             strategy: PaddingStrategy::BatchLongest,
             ..Default::default()
         }));
+        tokenizer
+    }
 
-        let config = Config {
-            vocab_size,
+    fn synthetic_config() -> Config {
+        Config {
+            vocab_size: 10,
             hidden_size: 32,
             num_hidden_layers: 2,
             num_attention_heads: 2,
@@ -743,7 +1054,37 @@ mod tests {
             max_position_embeddings: 64,
             type_vocab_size: 2,
             ..Config::default()
-        };
+        }
+    }
+
+    fn make_varmap_deterministic(varmap: &VarMap, device: &Device) {
+        let variables = varmap.data().lock().unwrap();
+        for (name, variable) in variables.iter() {
+            let values = (0..variable.elem_count())
+                .map(|index| {
+                    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+                    for byte in name
+                        .bytes()
+                        .chain(u64::try_from(index).unwrap().to_le_bytes())
+                    {
+                        hash ^= u64::from(byte);
+                        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                    }
+                    let unit = ((hash >> 40) as u32) as f32 / 16_777_215.0;
+                    (unit - 0.5) * 0.1
+                })
+                .collect::<Vec<_>>();
+            let tensor = Tensor::from_vec(values, variable.shape().clone(), device).unwrap();
+            variable.set(&tensor).unwrap();
+        }
+    }
+
+    /// Tiny random-weight BERT + WordPiece tokenizer; runs the full path in CI
+    /// offline.
+    fn synthetic_embedder() -> CandleEmbedder {
+        let device = Device::Cpu;
+        let tokenizer = synthetic_tokenizer();
+        let config = synthetic_config();
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DTYPE, &device);
         let model = BertModel::load(vb, &config).unwrap();
@@ -760,6 +1101,147 @@ mod tests {
             query_prefix: None,
             model_id: "synthetic".into(),
         }
+    }
+
+    fn synthetic_artifacts() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let config_json = br#"{
+            "vocab_size": 10,
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "intermediate_size": 64,
+            "hidden_act": "gelu",
+            "hidden_dropout_prob": 0.1,
+            "max_position_embeddings": 64,
+            "type_vocab_size": 2,
+            "initializer_range": 0.02,
+            "layer_norm_eps": 1e-12,
+            "pad_token_id": 0,
+            "position_embedding_type": "absolute",
+            "use_cache": true,
+            "classifier_dropout": null,
+            "model_type": "bert"
+        }"#
+        .to_vec();
+        let tokenizer_json = synthetic_tokenizer().to_string(false).unwrap().into_bytes();
+
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DTYPE, &device);
+        let _model = BertModel::load(vb, &synthetic_config()).unwrap();
+        make_varmap_deterministic(&varmap, &device);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        varmap.save(&path).unwrap();
+        let weights = std::fs::read(path).unwrap();
+        (config_json, tokenizer_json, weights)
+    }
+
+    fn synthetic_artifact_config() -> CandleConfig {
+        CandleConfig {
+            model_id: "synthetic-artifact".into(),
+            arch: Arch::Bert,
+            metric: EmbeddingMetric::Cosine,
+            pooling: Pooling::Mean,
+            normalize: true,
+            passage_prefix: None,
+            query_prefix: None,
+            max_length: 64,
+        }
+    }
+
+    #[test]
+    fn from_bytes_and_from_dir_publish_the_content_bound_identity() {
+        let (config_json, tokenizer_json, weights) = synthetic_artifacts();
+        let cfg = synthetic_artifact_config();
+        let fingerprint =
+            candle_pipeline_fingerprint(&config_json, &tokenizer_json, &weights, &cfg);
+        let expected = content_bound_model_id(&cfg.model_id, fingerprint, CANDLE_PIPELINE_REVISION);
+
+        let from_bytes =
+            CandleEmbedder::from_bytes(&config_json, &tokenizer_json, weights.clone(), cfg.clone())
+                .unwrap();
+        assert_eq!(from_bytes.model_id(), expected);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), &config_json).unwrap();
+        std::fs::write(dir.path().join("tokenizer.json"), &tokenizer_json).unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), &weights).unwrap();
+        let from_dir = CandleEmbedder::from_dir(dir.path(), cfg).unwrap();
+        assert_eq!(from_dir.model_id(), expected);
+        assert_eq!(
+            from_dir.model_id().rsplit_once(':').unwrap().1.len(),
+            64,
+            "the complete 256-bit fingerprint must be retained"
+        );
+    }
+
+    #[test]
+    fn pipeline_revision_pins_reference_inference_output() {
+        let (config_json, tokenizer_json, weights) = synthetic_artifacts();
+        let embedder = CandleEmbedder::from_bytes(
+            &config_json,
+            &tokenizer_json,
+            weights,
+            synthetic_artifact_config(),
+        )
+        .unwrap();
+        let output = embedder.embed(&["hello world"]).unwrap().remove(0);
+        let expected = [
+            -0.203_813, -0.330_531, 0.014_233, 0.255_428, 0.099_244, 0.131_812, 0.357_670,
+            -0.191_728, -0.219_566, -0.457_037, 0.090_915, 0.159_536, 0.108_990, 0.138_407,
+            0.010_061, -0.169_396, -0.268_809, -0.019_827, 0.026_564, 0.083_869, 0.115_970,
+            0.160_870, -0.051_976, -0.138_320, 0.172_926, -0.062_050, 0.069_390, 0.038_648,
+            0.131_878, 0.154_857, 0.017_256, -0.133_886,
+        ];
+        assert_eq!(output.len(), expected.len());
+        let max_abs_error = output
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_error <= 1e-4,
+            "an inference change requires bumping CANDLE_PIPELINE_REVISION; max error {max_abs_error}"
+        );
+    }
+
+    #[test]
+    fn a_region_refuses_changed_artifacts_under_the_same_friendly_label() {
+        let (config_json, tokenizer_json, weights) = synthetic_artifacts();
+        let mut changed_weights = weights.clone();
+        *changed_weights.last_mut().unwrap() ^= 1;
+        let cfg = synthetic_artifact_config();
+        let original =
+            CandleEmbedder::from_bytes(&config_json, &tokenizer_json, weights, cfg.clone())
+                .unwrap();
+        let changed =
+            CandleEmbedder::from_bytes(&config_json, &tokenizer_json, changed_weights, cfg)
+                .unwrap();
+        assert_ne!(original.model_id(), changed.model_id());
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(
+            citadel::DatabaseBuilder::new(dir.path().join("provenance.citadel"))
+                .passphrase(b"test-passphrase")
+                .argon2_profile(citadel::Argon2Profile::Iot)
+                .create()
+                .unwrap(),
+        );
+        let engine = crate::MemoryEngine::open(std::sync::Arc::clone(&db)).unwrap();
+        engine
+            .create_region("notes", std::sync::Arc::new(original))
+            .unwrap();
+        drop(engine);
+
+        let reopened = crate::MemoryEngine::open(db).unwrap();
+        let error = reopened
+            .attach_existing_region("notes", std::sync::Arc::new(changed))
+            .expect_err("changed model bytes reused vectors written by another artifact");
+        assert!(
+            matches!(error, crate::MemError::ModelMismatch { .. }),
+            "expected a model mismatch, got {error:?}"
+        );
     }
 
     #[test]
