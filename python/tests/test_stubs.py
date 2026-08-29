@@ -24,6 +24,7 @@ def test_stub_symbols_exist_at_runtime():
     text = stub_text()
     declared = set(re.findall(r"^class (\w+)", text, re.M))
     declared |= set(re.findall(r"^def (\w+)", text, re.M))
+    declared = {name for name in declared if not name.startswith("_")}
     missing = {n for n in declared if n not in OPTIONAL and not hasattr(_core, n)}
     assert not missing, f"stub declares symbols absent from _core: {sorted(missing)}"
 

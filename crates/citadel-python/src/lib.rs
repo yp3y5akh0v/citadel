@@ -195,6 +195,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cli_main, m)?)?;
     m.add_function(wrap_pyfunction!(mcp::mcp_main, m)?)?;
     m.add_function(wrap_pyfunction!(sql::connect, m)?)?;
+    m.add_class::<sql::PyCancelToken>()?;
     m.add_class::<sql::PyDatabase>()?;
     m.add_class::<sql::PyQueryResult>()?;
     m.add_class::<sql::PyDatabaseOptions>()?;
@@ -209,8 +210,13 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<mem::PyRecallOptions>()?;
     m.add_class::<mem::PyMockEmbedder>()?;
     m.add_class::<mem::PyAtomHit>()?;
+    m.add_class::<mem::PyMemoryMaintenance>()?;
+    m.add_class::<mem::PyMemoryRegionInfo>()?;
+    m.add_class::<mem::PyMemoryRegionInventory>()?;
     m.add_class::<mem::PyEvictionPolicy>()?;
     m.add_class::<mem::PyErasureReceipt>()?;
+    m.add_class::<mem::PyReembedReport>()?;
+    m.add_class::<mem::PyRegionIdentity>()?;
     m.add_class::<mem::PySlotErasure>()?;
     m.add_class::<mem::PyAtomAttestation>()?;
     m.add_class::<mem::PyMockReranker>()?;

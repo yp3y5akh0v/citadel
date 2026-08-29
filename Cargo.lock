@@ -720,10 +720,12 @@ dependencies = [
  "citadeldb-sql",
  "citadeldb-vector",
  "numpy",
+ "parking_lot",
  "pyo3",
  "rand 0.8.6",
  "self_cell",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
