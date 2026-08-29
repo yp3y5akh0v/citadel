@@ -55,11 +55,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Install MSRV toolchain
-        run: rustup toolchain install 1.88 --profile minimal
+        run: rustup toolchain install 1.95 --profile minimal
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
-      - run: cargo +1.88 check --workspace --exclude citadeldb-python
+      - run: cargo +1.95 check --workspace --locked
 
   test:
     needs: [fmt, clippy]

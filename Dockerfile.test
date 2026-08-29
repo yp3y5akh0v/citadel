@@ -1,4 +1,10 @@
-FROM rust:latest
+FROM rust:1.98.0-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PYO3_PYTHON=/usr/bin/python3
 
 WORKDIR /app
 
@@ -8,7 +14,7 @@ COPY citadel/ citadel/
 COPY citadel-cli/ citadel-cli/
 
 # Build everything with io-uring feature (compile-only, no io_uring syscalls)
-RUN cargo test --workspace --features citadeldb/io-uring --no-run 2>&1
+RUN cargo test --workspace --locked --features citadeldb/io-uring --no-run 2>&1
 
 # Tests run via: docker run --security-opt seccomp=unconfined <image>
-CMD ["cargo", "test", "--workspace", "--features", "citadeldb/io-uring"]
+CMD ["cargo", "test", "--workspace", "--locked", "--features", "citadeldb/io-uring"]
