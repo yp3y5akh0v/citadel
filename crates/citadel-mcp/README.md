@@ -13,10 +13,10 @@ connected by a typed edge graph, and forgotten by **destroying keys** (cryptogra
 
 ## Install
 
-Run it with no install (keyword-only recall - works immediately, no downloads):
+Run it with no install and explicitly select the keyword-only test embedder (no downloads):
 
 ```sh
-uvx citadeldb-mcp --db memory.cdl
+uvx citadeldb-mcp --db memory.cdl --embedder mock
 ```
 
 **For the best recall (recommended - this is the benchmark config):** pull the semantic
@@ -64,10 +64,10 @@ Tools (over a synchronous, hand-rolled JSON-RPC 2.0 stdio transport):
 The `citadeldb-mcp` binary reads the passphrase from `CITADEL_KEY` and serves one region
 (encrypted by default); only protocol messages go to stdout, diagnostics to stderr.
 
-Recall is keyword-only (a mock embedder) until you enable a semantic model. The (CPU) Candle
-embedder is compiled into the default build; models are fetched only on explicit `pull`,
-never automatically. `e5-large` + the `ms-marco-minilm` reranker (shown above) is the
-recommended, highest-recall setup.
+Every server invocation must select an embedder. Use `--embedder mock` only when keyword-only
+recall is intentional. The (CPU) Candle embedder is compiled into the default build;
+models are fetched only on explicit `pull`, never automatically. `e5-large` + the
+`ms-marco-minilm` reranker (shown above) is the recommended, highest-recall setup.
 
 Embedder pull names: `e5-large` (recommended), `e5-large-v2`, `bge-small`, `bge-base`,
 `bge-large`, `minilm`. Reranker: `ms-marco-minilm`. Or point `--model-dir` at a

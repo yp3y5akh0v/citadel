@@ -29,6 +29,12 @@
           "description": "Path to the Citadel database/region file",
           "isRequired": true,
           "format": "filepath"
+        },
+        {
+          "type": "named",
+          "name": "--embedder",
+          "description": "Embedder name; use e5-large after running citadeldb-mcp pull e5-large, or mock for immediate keyword-only recall",
+          "isRequired": true
         }
       ]
     }

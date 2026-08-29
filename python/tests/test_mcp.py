@@ -5,6 +5,10 @@ import os
 import subprocess
 import sys
 
+import pytest
+
+import citadeldb.mcp as mcp
+
 
 def _send(proc, obj):
     proc.stdin.write(json.dumps(obj) + "\n")
@@ -26,6 +30,8 @@ def test_mcp_server_initialize_and_tools_list(tmp_path):
             "default",
             "--region-mode",
             "plaintext",
+            "--embedder",
+            "mock",
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -76,3 +82,26 @@ def test_mcp_missing_db_errors():
     )
     assert proc.returncode != 0
     assert "--db" in proc.stderr
+
+
+def test_mcp_missing_embedder_errors_without_creating_a_database(tmp_path):
+    db = tmp_path / "missing-embedder.cdl"
+    proc = subprocess.run(
+        [sys.executable, "-m", "citadeldb.mcp", "--db", str(db)],
+        capture_output=True,
+        text=True,
+        env=dict(os.environ, CITADEL_KEY="x"),
+    )
+    assert proc.returncode != 0
+    assert "--embedder <name> is required" in proc.stderr
+    assert not db.exists()
+
+
+def test_python_serve_requires_and_forwards_an_explicit_embedder(monkeypatch):
+    seen = []
+    monkeypatch.setattr(mcp, "mcp_main", lambda argv: seen.extend(argv) or 0)
+
+    with pytest.raises(TypeError, match="embedder"):
+        mcp.serve("memory.cdl")
+    assert mcp.serve("memory.cdl", embedder="mock") == 0
+    assert seen[-2:] == ["--embedder", "mock"]

@@ -5,9 +5,10 @@
 //! goes to stderr. The region is encrypted by default (per-atom sealed + crypto
 //! erasure); pass `--region-mode plaintext` to opt out.
 //!
-//! Recall is keyword-only (`mock` embedder) until you opt into a real model.
-//! The Candle embedder ships in the default build; models are fetched only on
-//! request, never automatically:
+//! Every server invocation selects an embedder explicitly. The Candle embedder ships
+//! in the default build; models are fetched only on request, never
+//! automatically. Use `--embedder mock` only when keyword-only recall is
+//! intentional:
 //!
 //! ```text
 //! citadeldb-mcp pull e5-large              # download to ~/.citadel/models

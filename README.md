@@ -204,7 +204,8 @@ as `dev.citadeldb/mcp`. Run it with no install via `uvx citadeldb-mcp`, or
 ```
 
 For the best recall (the benchmark config), `pull e5-large` + `pull ms-marco-minilm` first,
-then use `--embedder e5-large --reranker ms-marco-minilm`. Omit both for instant keyword-only recall.
+then use `--embedder e5-large --reranker ms-marco-minilm`. Every server invocation must select an
+embedder; use `--embedder mock` explicitly when keyword-only recall is intentional.
 
 ## Memory benchmarks
 

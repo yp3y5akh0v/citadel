@@ -27,6 +27,7 @@ citadel = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 rustc-hash = { workspace = true }
+zeroize = { workspace = true }
 # sync HTTPS (rustls, no tokio) for the `hub` pull subcommand.
 ureq = { version = "2", optional = true }
 
@@ -34,7 +35,7 @@ ureq = { version = "2", optional = true }
 tempfile = "3"
 
 [features]
-# Candle CPU embedder + pull built in; recall is keyword-only until a model is pulled.
+# Candle CPU embedder + pull built in; the caller still selects an embedder explicitly.
 default = ["candle-embed", "hub"]
 # CPU Candle embedders (BGE / MiniLM / E5).
 candle-embed = ["citadel-mem/candle-embed"]
