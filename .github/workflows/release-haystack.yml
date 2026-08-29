@@ -95,7 +95,7 @@ jobs:
           pip install --constraint "$RUNNER_TEMP/citadeldb-constraint.txt" dist/*.whl
           # Scratch dir imports the wheel; pyproject carries asyncio_mode.
           mkdir -p /tmp/run && cp -r tests pyproject.toml /tmp/run/
-          cd /tmp/run && pytest tests -q
+          cd /tmp/run && pytest --strict-config tests -q
 
   publish:
     name: Publish to PyPI

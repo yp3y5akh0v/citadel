@@ -155,7 +155,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install tooling
-        run: pip install maturin pytest numpy mypy
+        run: pip install maturin pytest pytest-asyncio numpy mypy
       - name: Build the wheel
         run: maturin build --profile dev --out dist
       - name: Install the wheel
@@ -163,7 +163,7 @@ jobs:
           pip install --no-index --find-links dist citadeldb
           python -c "from importlib.metadata import version; print('citadeldb==' + version('citadeldb'))" > "$RUNNER_TEMP/citadeldb-constraint.txt"
       - name: pytest
-        run: pytest python/tests -q
+        run: pytest --strict-config python/tests -q
       - name: mypy (stubs + facades)
         run: mypy -p citadeldb
         env:

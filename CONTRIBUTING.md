@@ -54,10 +54,10 @@ cargo clippy -p citadeldb-python --all-targets --features candle-embed -- -D war
 cargo build -p citadeldb-ai --target wasm32-unknown-unknown --features claude,openai,ollama
 
 # the Python bindings, stubs or facades
-pip install maturin pytest numpy mypy
+pip install maturin pytest pytest-asyncio numpy mypy
 maturin build --profile dev --out dist
 pip install --no-index --find-links dist citadeldb
-pytest python/tests -q
+pytest --strict-config python/tests -q
 $env:MYPYPATH = "python"; mypy -p citadeldb      # PowerShell
 MYPYPATH=python mypy -p citadeldb                # sh
 ```
