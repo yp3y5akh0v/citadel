@@ -82,9 +82,9 @@ jobs:
       - name: Install and test the wheel
         shell: bash
         run: |
-          python -m pip install pytest numpy
+          python -m pip install pytest pytest-asyncio numpy
           python -m pip install --no-index --find-links dist citadeldb
-          python -m pytest python/tests -q
+          python -m pytest --strict-config python/tests -q
 
   publish:
     name: Publish to PyPI
