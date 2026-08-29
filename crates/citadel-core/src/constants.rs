@@ -1,4 +1,4 @@
-// File magic number: 0xC17AD3EL ("CITADEL" without vowels)
+// File magic number: 0xC17AD3E1 ("CITADEL" without vowels)
 pub const MAGIC: u32 = 0xC17A_D3E1;
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -62,6 +62,7 @@ pub const HKDF_INFO_ATOM_WRAP: &[u8] = b"citadel-atom-wrap-v1";
 // label (never the atom-wrap KEK) so no plaintext equality tag reaches disk.
 pub const HKDF_INFO_IDENTITY_MAC: &[u8] = b"citadel-identity-mac-v1";
 pub const ATOM_STORE_MAGIC: u32 = 0x4154_4D53; // "ATMS"
+pub const ATOM_STORE_VERSION: u32 = 1;
 pub const ATOM_STORE_PREALLOC_SLOTS: u32 = 256; // initial capacity (grows append-only)
 
 pub const PBKDF2_MIN_ITERATIONS: u32 = 600_000;
@@ -78,7 +79,8 @@ pub const OVERFLOW_THRESHOLD: usize = MAX_INLINE_VALUE_SIZE;
 pub const MAX_VALUE_SIZE: usize = 1 << 30; // 1 GiB
 
 pub const PENDING_FREE_ENTRY_SIZE: usize = 12; // page_id(4) + freed_at_txn(8)
-pub const PENDING_FREE_ENTRIES_PER_PAGE: usize = USABLE_SIZE / PENDING_FREE_ENTRY_SIZE; // 674
+pub const PENDING_FREE_ENTRIES_PER_PAGE: usize =
+    (USABLE_SIZE - core::mem::size_of::<u32>()) / PENDING_FREE_ENTRY_SIZE; // 674
 
 // Merkle hash: BLAKE3 truncated to 28 bytes (224 bits) to fit inline in the
 // page header.

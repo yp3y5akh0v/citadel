@@ -28,6 +28,11 @@ use citadel_core::{
 
 use crate::traits::PageIO;
 
+// Canonical access requirements encoded by file format v1. Changing either
+// value requires a format-version bump rather than redefining v1 in place.
+const FORMAT_V1_MIN_READER_VERSION: u16 = 1;
+const FORMAT_V1_MIN_WRITER_VERSION: u16 = 1;
+
 /// Wire format of a commit slot; see the module doc for the boundary each
 /// format enforces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -428,6 +433,18 @@ impl FileHeader {
             return Err(Error::UnsupportedVersion(format_version));
         }
 
+        let page_size = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let body_size = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        let min_reader_ver = u16::from_le_bytes(buf[16..18].try_into().unwrap());
+        let min_writer_ver = u16::from_le_bytes(buf[18..20].try_into().unwrap());
+        if page_size != PAGE_SIZE as u32
+            || body_size != citadel_core::BODY_SIZE as u32
+            || min_reader_ver != FORMAT_V1_MIN_READER_VERSION
+            || min_writer_ver != FORMAT_V1_MIN_WRITER_VERSION
+        {
+            return Err(Error::DatabaseCorrupted);
+        }
+
         let slot0_buf: [u8; COMMIT_SLOT_SIZE] = buf
             [COMMIT_SLOT_OFFSET..COMMIT_SLOT_OFFSET + COMMIT_SLOT_SIZE]
             .try_into()
@@ -440,10 +457,10 @@ impl FileHeader {
         Ok(Self {
             magic,
             format_version,
-            page_size: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            body_size: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
-            min_reader_ver: u16::from_le_bytes(buf[16..18].try_into().unwrap()),
-            min_writer_ver: u16::from_le_bytes(buf[18..20].try_into().unwrap()),
+            page_size,
+            body_size,
+            min_reader_ver,
+            min_writer_ver,
             god_byte: buf[GOD_BYTE_OFFSET],
             flags: buf[HEADER_FLAGS_OFFSET],
             file_id: u64::from_le_bytes(
@@ -478,8 +495,8 @@ impl FileHeader {
             format_version: FORMAT_VERSION,
             page_size: PAGE_SIZE as u32,
             body_size: citadel_core::BODY_SIZE as u32,
-            min_reader_ver: 1,
-            min_writer_ver: 1,
+            min_reader_ver: FORMAT_V1_MIN_READER_VERSION,
+            min_writer_ver: FORMAT_V1_MIN_WRITER_VERSION,
             god_byte: 0,
             // New files only ever write sealed V1 slots.
             flags: HEADER_FLAG_SLOTS_V1,
@@ -553,19 +570,18 @@ pub fn read_header_flags(io: &dyn PageIO) -> Result<u8> {
 /// authenticated V1 records, so legacy slots are rejected thereafter. Returns
 /// whether the flag is set. A lost write just re-runs on the next open.
 pub fn mark_slots_v1_if_upgraded(io: &dyn PageIO, mac_key: &[u8; MAC_KEY_SIZE]) -> Result<bool> {
-    let flags = read_header_flags(io)?;
-    if flags & HEADER_FLAG_SLOTS_V1 != 0 {
+    let header = read_file_header(io)?;
+    if header.flags & HEADER_FLAG_SLOTS_V1 != 0 {
         return Ok(true);
     }
-    let both_v1 = (0..2).try_fold(true, |acc, idx| {
-        read_commit_slot(io, idx).map(|slot| {
-            acc && slot.slot_format == SlotFormat::V1
-                && slot.verify_checksum()
-                && slot.verify_mac(mac_key)
-        })
-    })?;
+    let both_v1 = header.slots.iter().all(|slot| {
+        slot.slot_format == SlotFormat::V1 && slot.verify_checksum() && slot.verify_mac(mac_key)
+    });
     if both_v1 {
-        io.write_at(HEADER_FLAGS_OFFSET as u64, &[flags | HEADER_FLAG_SLOTS_V1])?;
+        io.write_at(
+            HEADER_FLAGS_OFFSET as u64,
+            &[header.flags | HEADER_FLAG_SLOTS_V1],
+        )?;
         io.fsync()?;
     }
     Ok(both_v1)
@@ -586,18 +602,21 @@ pub fn recover_with_v1_requirement(
     mac_key: &[u8; MAC_KEY_SIZE],
     authenticated_v1_required: bool,
 ) -> Result<(usize, CommitSlot)> {
-    let god_byte = read_god_byte(io)?;
+    // Read and validate one coherent header image before recovery can mutate
+    // the selector byte. This also protects lower-level TxnManager callers
+    // that do not pass through the facade's header check.
+    let header = read_file_header(io)?;
+    let god_byte = header.god_byte;
     let active = (god_byte & GOD_BIT_ACTIVE_SLOT) as usize;
     let inactive = 1 - active;
 
-    let slot_active = read_commit_slot(io, active)?;
-    let slot_inactive = read_commit_slot(io, inactive)?;
+    let slot_active = header.slots[active].clone();
+    let slot_inactive = header.slots[inactive].clone();
 
     // A checksum-valid legacy slot in a flagged file is downgrade evidence
     // (rollback or a pre-v1 binary wrote it). Refuse loudly rather than
     // silently open the older generation.
-    let v1_required =
-        authenticated_v1_required || read_header_flags(io)? & HEADER_FLAG_SLOTS_V1 != 0;
+    let v1_required = authenticated_v1_required || header.flags & HEADER_FLAG_SLOTS_V1 != 0;
     if v1_required {
         for slot in [&slot_active, &slot_inactive] {
             if slot.slot_format == SlotFormat::Legacy && slot.verify_checksum() {
