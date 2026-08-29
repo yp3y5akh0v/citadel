@@ -368,6 +368,32 @@ fn create_and_open() {
 }
 
 #[test]
+fn open_validates_the_header_before_repairing_it() {
+    use citadel_io::file_manager::{read_file_header, read_god_byte, write_file_header};
+
+    let (dek, mac_key, dek_id) = test_keys();
+    let io = MemIO::new(1024 * 1024);
+    let manager =
+        TxnManager::create(Box::new(io.share()), dek, mac_key, 1, 0x1234, dek_id, 256).unwrap();
+    drop(manager);
+
+    let mut header = read_file_header(&io).unwrap();
+    header.page_size = 0;
+    header.god_byte = citadel_core::GOD_BIT_RECOVERY;
+    write_file_header(&io, &header).unwrap();
+
+    assert!(matches!(
+        TxnManager::open(Box::new(io.share()), dek, mac_key, 1, 256),
+        Err(Error::DatabaseCorrupted)
+    ));
+    assert_eq!(
+        read_god_byte(&io).unwrap(),
+        citadel_core::GOD_BIT_RECOVERY,
+        "open changed the selector before validating the fixed header"
+    );
+}
+
+#[test]
 fn begin_read_registers_reader() {
     let mgr = create_test_manager();
     assert_eq!(mgr.reader_count(), 0);

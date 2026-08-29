@@ -7,7 +7,9 @@
 
 use citadel_buffer::allocator::PageAllocator;
 use citadel_core::types::{PageId, PageType, TxnId};
-use citadel_core::{Error, Result, PAGE_HEADER_SIZE, PENDING_FREE_ENTRY_SIZE, USABLE_SIZE};
+use citadel_core::{
+    Error, Result, PAGE_HEADER_SIZE, PENDING_FREE_ENTRIES_PER_PAGE, PENDING_FREE_ENTRY_SIZE,
+};
 use citadel_page::page::Page;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -20,7 +22,7 @@ pub struct PendingFreeEntry {
 
 /// Maximum entries per pending-free page.
 /// Body layout: [entry_count: u32 (4B)] [entries: 12B each] [padding]
-pub(crate) const MAX_ENTRIES_PER_PAGE: usize = (USABLE_SIZE - 4) / PENDING_FREE_ENTRY_SIZE;
+pub(crate) const MAX_ENTRIES_PER_PAGE: usize = PENDING_FREE_ENTRIES_PER_PAGE;
 
 /// Decode one pending-free page without trusting its entry count.
 pub(crate) fn read_page_entries(page: &Page) -> Result<Vec<PendingFreeEntry>> {

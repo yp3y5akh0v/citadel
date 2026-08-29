@@ -14,7 +14,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use citadel_core::{
-    Error, Result, ATOM_STORE_MAGIC, ATOM_STORE_PREALLOC_SLOTS, KEY_SIZE, REGION_STORE_VERSION,
+    Error, Result, ATOM_STORE_MAGIC, ATOM_STORE_PREALLOC_SLOTS, ATOM_STORE_VERSION, KEY_SIZE,
     WRAPPED_KEY_SIZE,
 };
 use citadel_io::durable::{
@@ -28,8 +28,6 @@ use crate::key_codec::{
     BLOCK,
 };
 
-/// Atom store version (shares the region store's `1`; the magic distinguishes the files).
-const VERSION: u32 = REGION_STORE_VERSION;
 /// Slots appended per growth step once the free list and pre-allocated run are exhausted.
 const GROW_SLOTS: u32 = ATOM_STORE_PREALLOC_SLOTS;
 const MAX_BINDING_GENERATION: u64 = i64::MAX as u64;
@@ -58,11 +56,18 @@ pub(crate) fn fail_next_batch_before_sibling() {
 }
 
 fn build_header(mac_key: &[u8; KEY_SIZE], file_id: u64, slot_count: u32, gen: u64) -> [u8; BLOCK] {
-    key_codec::build_header_block(mac_key, ATOM_STORE_MAGIC, VERSION, file_id, slot_count, gen)
+    key_codec::build_header_block(
+        mac_key,
+        ATOM_STORE_MAGIC,
+        ATOM_STORE_VERSION,
+        file_id,
+        slot_count,
+        gen,
+    )
 }
 
 fn parse_header(mac_key: &[u8; KEY_SIZE], file_id: u64, b: &[u8]) -> Option<(u32, u64)> {
-    key_codec::parse_header_block(mac_key, ATOM_STORE_MAGIC, VERSION, file_id, b)
+    key_codec::parse_header_block(mac_key, ATOM_STORE_MAGIC, ATOM_STORE_VERSION, file_id, b)
 }
 
 /// Random-access per-atom key store. Holds the store MAC key (zeroized on drop); the engine
@@ -1029,7 +1034,14 @@ impl AtomKeyStore {
         file_id: u64,
         mac_key: &[u8; KEY_SIZE],
     ) -> Result<(u32, u32)> {
-        key_codec::inspect_store_counts(path, mac_key, ATOM_STORE_MAGIC, VERSION, file_id, "atom")
+        key_codec::inspect_store_counts(
+            path,
+            mac_key,
+            ATOM_STORE_MAGIC,
+            ATOM_STORE_VERSION,
+            file_id,
+            "atom",
+        )
     }
 
     #[cfg(test)]

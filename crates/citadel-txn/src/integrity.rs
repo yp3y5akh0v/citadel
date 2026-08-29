@@ -12,8 +12,7 @@ use crate::catalog::{TableDescriptor, TABLE_DESCRIPTOR_SIZE};
 use crate::manager::TxnManager;
 use crate::merkle::OverflowPayloadDigest;
 
-const PENDING_FREE_ENTRY_CAPACITY: usize =
-    (citadel_core::USABLE_SIZE - 4) / citadel_core::PENDING_FREE_ENTRY_SIZE;
+const PENDING_FREE_ENTRY_CAPACITY: usize = citadel_core::PENDING_FREE_ENTRIES_PER_PAGE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntegrityReport {

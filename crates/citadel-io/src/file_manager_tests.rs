@@ -4,6 +4,19 @@ fn test_mac_key() -> [u8; MAC_KEY_SIZE] {
     [0x5A; MAC_KEY_SIZE]
 }
 
+#[test]
+fn slot_mac_domain_has_stable_known_answer() {
+    let mac = compute_slot_mac(&test_mac_key(), b"CitadelDB slot MAC known-answer input");
+
+    assert_eq!(
+        mac,
+        [
+            0xfe, 0xf2, 0x02, 0xd2, 0xe3, 0xf0, 0x39, 0x19, 0xc3, 0x0b, 0x00, 0x7d, 0x94, 0x66,
+            0x2e, 0xe2,
+        ]
+    );
+}
+
 fn sample_slot() -> CommitSlot {
     CommitSlot {
         txn_id: TxnId(42),
@@ -490,6 +503,27 @@ fn mark_slots_v1_waits_for_both_slots() {
     assert_ne!(read_header_flags(&io).unwrap() & HEADER_FLAG_SLOTS_V1, 0);
 }
 
+#[test]
+fn mark_slots_v1_validates_the_header_before_stamping_it() {
+    use crate::memory_io::MemoryPageIO;
+
+    let mac_key = test_mac_key();
+    let io = MemoryPageIO::new();
+    let mut header = FileHeader::new(0x55, [0xDD; MAC_SIZE]);
+    header.flags = 0;
+    header.page_size = 0;
+    for slot in &mut header.slots {
+        slot.seal(&mac_key);
+    }
+    write_file_header(&io, &header).unwrap();
+
+    assert!(matches!(
+        mark_slots_v1_if_upgraded(&io, &mac_key),
+        Err(Error::DatabaseCorrupted)
+    ));
+    assert_eq!(read_header_flags(&io).unwrap(), 0);
+}
+
 /// A flagged file whose slots have both been downgraded to legacy must fail
 /// closed with the downgrade diagnosis, never silently accept a MAC-stripped
 /// slot.
@@ -697,6 +731,19 @@ fn file_header_serialize_roundtrip() {
     assert!(!header2.recovery_required());
 }
 
+#[test]
+fn file_header_prefix_has_a_stable_known_answer() {
+    let header = FileHeader::new(0x0102_0304_0506_0708, [0xBB; MAC_SIZE]);
+    assert_eq!(
+        &header.serialize()[..COMMIT_SLOT_OFFSET],
+        &[
+            0xe1, 0xd3, 0x7a, 0xc1, 0x01, 0x00, 0x00, 0x00, 0x10, 0x20, 0x00, 0x00, 0xe0, 0x1f,
+            0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x08, 0x07, 0x06, 0x05,
+            0x04, 0x03, 0x02, 0x01,
+        ]
+    );
+}
+
 /// The field-by-field test above covers the fields someone remembered to list.
 /// This one covers every field, including both commit slots, so a field the
 /// serializer drops fails here instead of surviving to a reopen.
@@ -730,6 +777,23 @@ fn file_header_invalid_magic() {
     buf[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
     let result = FileHeader::deserialize(&buf);
     assert!(matches!(result, Err(Error::InvalidMagic { .. })));
+}
+
+#[test]
+fn file_header_rejects_noncanonical_geometry_and_access_versions() {
+    for (offset, field) in [
+        (8, "page_size"),
+        (12, "body_size"),
+        (16, "min_reader_ver"),
+        (18, "min_writer_ver"),
+    ] {
+        let mut buf = FileHeader::new(0x1234, [0xBB; MAC_SIZE]).serialize();
+        buf[offset] = 0;
+        assert!(
+            matches!(FileHeader::deserialize(&buf), Err(Error::DatabaseCorrupted)),
+            "noncanonical {field} was accepted"
+        );
+    }
 }
 
 #[test]

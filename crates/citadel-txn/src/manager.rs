@@ -1888,9 +1888,7 @@ impl TxnManager {
                     .try_into()
                     .unwrap(),
             ) as usize;
-            let max_entries =
-                (citadel_core::USABLE_SIZE - 4) / citadel_core::PENDING_FREE_ENTRY_SIZE;
-            if count > max_entries {
+            if count > citadel_core::PENDING_FREE_ENTRIES_PER_PAGE {
                 return Err(Error::DatabaseCorrupted);
             }
             current = page.right_child();

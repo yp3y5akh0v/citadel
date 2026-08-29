@@ -19,7 +19,7 @@ pub enum Error {
     #[error("transaction requires more pages than buffer pool capacity ({capacity})")]
     TransactionTooLarge { capacity: usize },
 
-    #[error("database file is corrupted: both commit slots are invalid")]
+    #[error("database file is corrupted")]
     DatabaseCorrupted,
 
     #[error("commit-slot downgrade detected: this file requires authenticated (V1) slots but holds a valid legacy slot; a pre-v1 binary or a rollback wrote to it - reopen with the binary that wrote it or restore from a trusted backup")]
