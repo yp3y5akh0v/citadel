@@ -28,6 +28,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 rustc-hash = { workspace = true }
 zeroize = { workspace = true }
+blake3 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 # sync HTTPS (rustls, no tokio) for the `hub` pull subcommand.
 ureq = { version = "2", optional = true }
 
@@ -40,6 +42,6 @@ default = ["candle-embed", "hub"]
 # CPU Candle embedders (BGE / MiniLM / E5).
 candle-embed = ["citadel-mem/candle-embed"]
 # On-demand model download for `citadeldb-mcp pull`.
-hub = ["candle-embed", "dep:ureq"]
+hub = ["candle-embed", "dep:blake3", "dep:sha2", "dep:ureq"]
 # GPU (CUDA) embeddings; needs the CUDA toolkit.
 cuda-embed = ["candle-embed", "citadel-mem/cuda-embed"]

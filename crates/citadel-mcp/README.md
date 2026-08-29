@@ -31,6 +31,13 @@ uvx citadeldb-mcp --db memory.cdl --embedder e5-large --reranker ms-marco-minilm
 `e5-large` + `ms-marco-minilm` is the highest-recall setup and the exact config behind the
 memory benchmark numbers. Models are never downloaded automatically.
 
+Built-in pulls use release-pinned Hugging Face revisions. Each complete snapshot is verified
+against compiled sizes and SHA-256 digests, then stored with a BLAKE3 manifest under
+`<models-dir>/<name>/<revision>/`. A flat cache created by an earlier CitadelDB release is not
+trusted; run `pull` again to create the pinned snapshot. `--model-dir` and `--reranker-dir`
+remain explicit bring-your-own-artifact paths and bypass the managed-cache manifest. Citadel
+treats those directories as user-trusted and does not attest their contents.
+
 Or install the command with `pip install citadeldb-mcp` or `cargo install citadeldb-mcp`,
 then wire it into Claude Desktop (`claude_desktop_config.json`):
 
@@ -71,8 +78,8 @@ models are fetched only on explicit `pull`, never automatically. `e5-large` + th
 
 Embedder pull names: `e5-large` (recommended), `e5-large-v2`, `bge-small`, `bge-base`,
 `bge-large`, `minilm`. Reranker: `ms-marco-minilm`. Or point `--model-dir` at a
-local model directory for a fully offline setup, and build with `--features cuda-embed` to run
-on an NVIDIA GPU.
+compatible local checkpoint for the selected catalog pipeline, and build with
+`--features cuda-embed` to run on an NVIDIA GPU.
 
 This crate is part of the Citadel workspace.
 

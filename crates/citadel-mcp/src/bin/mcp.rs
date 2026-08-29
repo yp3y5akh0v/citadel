@@ -17,8 +17,8 @@
 //! ```
 //!
 //! `e5-large` + `ms-marco-minilm` is the highest-recall config. Or
-//! `--model-dir <dir>` for your own local model; a `cuda-embed` build uses an
-//! NVIDIA GPU.
+//! `--model-dir <dir>` for a compatible local checkpoint; a `cuda-embed`
+//! build uses an NVIDIA GPU.
 //!
 //! Claude Desktop config (claude_desktop_config.json):
 //! ```json

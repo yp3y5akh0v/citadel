@@ -645,11 +645,13 @@ dependencies = [
 name = "citadeldb-mcp"
 version = "2.0.0"
 dependencies = [
+ "blake3",
  "citadeldb",
  "citadeldb-mem",
  "rustc-hash",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "ureq 2.12.1",
  "zeroize",
